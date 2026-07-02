@@ -928,7 +928,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
         if live:
             print(f"leaving {len(live)} live session(s) untouched")
         return 0
-    killed = runs.prune_sessions(project)
+    killed, _ = runs.prune_sessions(project)
     windows = launch.prune_ctl_windows(project)
     print(f"removed {len(killed)} session(s), {len(windows)} ctl window(s)")
     if live:

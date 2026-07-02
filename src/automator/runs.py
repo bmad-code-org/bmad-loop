@@ -269,14 +269,17 @@ def prunable_sessions(project: Path) -> tuple[list[str], list[str], set[str]]:
     return prunable, live, unknown
 
 
-def prune_sessions(project: Path, *, dry_run: bool = False) -> list[str]:
+def prune_sessions(project: Path, *, dry_run: bool = False) -> tuple[list[str], set[str]]:
     """Kill every prunable bmad-auto-<id> session (see prunable_sessions);
-    returns the run ids that were (or, with dry_run, would be) killed."""
-    prunable, _, _ = prunable_sessions(project)
+    returns (killed, unknown): the run ids that were (or, with dry_run, would
+    be) killed, plus the subset whose engine liveness read 'unknown'. Both come
+    from the same partition sample, so a frontend warning built from `unknown`
+    always describes sessions that were actually pruned."""
+    prunable, _, unknown = prunable_sessions(project)
     if not dry_run:
         for run_id in prunable:
             kill_session(run_id)
-    return prunable
+    return prunable, unknown
 
 
 def stop_run(run_dir: Path) -> bool:

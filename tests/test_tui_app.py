@@ -1090,8 +1090,7 @@ async def test_cleanup_unknown_sessions_notifies(project, monkeypatch):
     from automator import runs
 
     monkeypatch.setattr(launch, "tmux_available", lambda: True)
-    monkeypatch.setattr(runs, "prunable_sessions", lambda _p: (["odd-1"], [], {"odd-1"}))
-    monkeypatch.setattr(runs, "prune_sessions", lambda _p: ["odd-1"])
+    monkeypatch.setattr(runs, "prune_sessions", lambda _p: (["odd-1"], {"odd-1"}))
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: [])
     make_run(project.project, "20260611-100000-aaaa")
     app = BmadAutoApp(project.project)

@@ -797,7 +797,7 @@ def test_cleanup_dry_run_lists_without_pruning(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(runs, "prunable_sessions", lambda _proj: (["fin-1"], ["live-1"], set()))
     monkeypatch.setattr(launch, "prunable_ctl_windows", lambda _proj: ["sweep-fin-1"])
     pruned: list[str] = []
-    monkeypatch.setattr(runs, "prune_sessions", lambda _proj: pruned.append("x") or [])
+    monkeypatch.setattr(runs, "prune_sessions", lambda _proj: pruned.append("x") or ([], set()))
 
     assert cli.main(["cleanup", "--project", str(tmp_path), "--dry-run"]) == 0
     out = capsys.readouterr().out
@@ -812,7 +812,7 @@ def test_cleanup_prunes_sessions_and_windows(tmp_path, monkeypatch, capsys):
     from automator.tui import launch
 
     monkeypatch.setattr(runs, "prunable_sessions", lambda _proj: (["fin-1"], [], set()))
-    monkeypatch.setattr(runs, "prune_sessions", lambda _proj: ["fin-1"])
+    monkeypatch.setattr(runs, "prune_sessions", lambda _proj: (["fin-1"], set()))
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _proj: ["sweep-fin-1"])
 
     assert cli.main(["cleanup", "--project", str(tmp_path)]) == 0
@@ -826,7 +826,7 @@ def test_cleanup_warns_per_unknown_session(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(
         runs, "prunable_sessions", lambda _proj: (["fin-1", "odd-1"], [], {"odd-1"})
     )
-    monkeypatch.setattr(runs, "prune_sessions", lambda _proj: ["fin-1", "odd-1"])
+    monkeypatch.setattr(runs, "prune_sessions", lambda _proj: (["fin-1", "odd-1"], {"odd-1"}))
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _proj: [])
 
     assert cli.main(["cleanup", "--project", str(tmp_path)]) == 0

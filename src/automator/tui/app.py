@@ -555,10 +555,9 @@ class BmadAutoApp(App[None]):
 
     @work(thread=True, group="lifecycle")
     def _cleanup_sessions_worker(self) -> None:
-        # sample once for the unknown warning; prune_sessions re-partitions itself
-        # (same double-sample shape as cmd_cleanup — warnings only, never a gate)
-        _prunable, _live, unknown = runs.prunable_sessions(self.project)
-        killed = runs.prune_sessions(self.project)
+        # killed and unknown come from prune_sessions' single partition sample,
+        # so the warning below only ever names sessions that were actually pruned
+        killed, unknown = runs.prune_sessions(self.project)
         windows = launch.prune_ctl_windows(self.project)
         if unknown:
             self.call_from_thread(

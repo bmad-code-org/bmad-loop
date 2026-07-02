@@ -503,10 +503,25 @@ def test_prune_sessions_dry_run_kills_nothing(tmp_path, monkeypatch):
     monkeypatch.setattr(
         runs, "session_project_tags", lambda: {"bmad-auto-fin-1": runs.project_tag(tmp_path)}
     )
-    assert runs.prune_sessions(tmp_path, dry_run=True) == ["fin-1"]
+    assert runs.prune_sessions(tmp_path, dry_run=True) == (["fin-1"], set())
     assert killed == []
-    assert runs.prune_sessions(tmp_path) == ["fin-1"]
+    assert runs.prune_sessions(tmp_path) == (["fin-1"], set())
     assert killed == ["fin-1"]
+
+
+def test_prune_sessions_returns_unknown_from_same_sample(tmp_path, monkeypatch):
+    # the unknown subset must come from the partition prune_sessions itself
+    # killed, so a frontend warning built from it never names an unpruned session
+    mine = runs.project_tag(tmp_path)
+    odd = _make_state_run(tmp_path, "odd-1")
+    (odd / "engine.pid").write_text("4242 123.0")
+    killed: list[str] = []
+    monkeypatch.setattr(runs, "kill_session", lambda rid: killed.append(rid))
+    monkeypatch.setattr(runs, "tmux_sessions", lambda: ["bmad-auto-odd-1"])
+    monkeypatch.setattr(runs, "session_project_tags", lambda: {"bmad-auto-odd-1": mine})
+    monkeypatch.setattr(runs, "get_process_host", lambda: _FakeHost(alive=True, identity=None))
+    assert runs.prune_sessions(tmp_path) == (["odd-1"], {"odd-1"})
+    assert killed == ["odd-1"]
 
 
 def test_delete_run(tmp_path):
