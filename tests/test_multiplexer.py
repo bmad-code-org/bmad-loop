@@ -8,6 +8,7 @@ role for the transport axis.
 """
 
 import json
+import os
 import subprocess
 
 import pytest
@@ -269,3 +270,58 @@ def test_seam_honesty_holds_for_psmux_style_run_override(monkeypatch):
         mux.window_alive("s", "@1")
     # sentinel methods still degrade rather than leak the raw timeout
     assert mux.list_windows("s", ["window_id"]) == []
+
+
+# ---------------------------------------------- _run seam: encoding + env (#40)
+#
+# The spawn primitive carries the two knobs its docstring promises — output
+# decoding (class attr _ENCODING) and a per-call env — both defaulting to today's
+# POSIX behavior, so a native-Windows leaf overrides zero lines of spawn plumbing.
+
+
+class _RecordRun:
+    """Stand-in for subprocess.run that records the kwargs of the one spawn."""
+
+    def __init__(self):
+        self.kwargs: dict = {}
+
+    def __call__(self, argv, **kwargs):
+        self.kwargs = kwargs
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+
+def test_run_posix_default_passes_no_encoding_and_no_env(monkeypatch):
+    rec = _RecordRun()
+    monkeypatch.setattr(tmux_base.subprocess, "run", rec)
+
+    TmuxMultiplexer()._run(["list-windows"])
+
+    # byte-identical to today: locale-default decode (encoding=None ≡ bare text=True),
+    # inherit the parent env (env=None).
+    assert rec.kwargs["text"] is True
+    assert rec.kwargs["encoding"] is None
+    assert rec.kwargs["env"] is None
+
+
+def test_run_subclass_encoding_reaches_subprocess(monkeypatch):
+    rec = _RecordRun()
+    monkeypatch.setattr(tmux_base.subprocess, "run", rec)
+
+    class Utf8Backend(TmuxMultiplexer):
+        _ENCODING = "utf-8"  # a Windows leaf forces UTF-8 without touching _run
+
+    Utf8Backend()._run(["list-windows"])
+    assert rec.kwargs["encoding"] == "utf-8"
+
+
+def test_run_custom_env_is_forwarded_without_leaking(monkeypatch):
+    rec = _RecordRun()
+    monkeypatch.setattr(tmux_base.subprocess, "run", rec)
+    before = dict(os.environ)
+
+    scrubbed = {"PATH": os.environ.get("PATH", "")}  # e.g. nesting-guard vars dropped
+    TmuxMultiplexer()._run(["new-session"], env=scrubbed)
+
+    assert rec.kwargs["env"] == scrubbed
+    # the scrubbed env is confined to the child spawn — this process's env is untouched
+    assert dict(os.environ) == before

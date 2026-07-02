@@ -5,7 +5,8 @@ invocation and POSIX-shell trailer lives here (and in its POSIX leaf
 :mod:`.tmux_backend`). The point of the split is that a tmux-*family* backend —
 an eventual native-Windows "psmux" — can subclass :class:`BaseTmuxBackend` and
 override only the single spawn primitive :meth:`BaseTmuxBackend._run` (to tweak
-the binary / decoding / timeout) plus the few divergent methods (e.g. the
+the binary or timeout — output decoding and per-call ``env`` are ``_run``
+parameters, not overrides) plus the few divergent methods (e.g. the
 parked-window trailer), **without editing** :mod:`.tmux_backend`.
 
 Every method that talks to tmux funnels through :meth:`BaseTmuxBackend._run`, the
@@ -37,7 +38,17 @@ class BaseTmuxBackend(TerminalMultiplexer):
     """tmux-family backend: all argv construction and every contract method, with
     one overridable subprocess primitive (:meth:`_run`) every call funnels through."""
 
-    def _run(self, argv: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+    #: Output decoding for captured tmux text. ``None`` (POSIX) = locale default,
+    #: byte-identical to a bare ``text=True``; a Windows leaf sets ``"utf-8"``.
+    _ENCODING: str | None = None
+
+    def _run(
+        self,
+        argv: list[str],
+        *,
+        check: bool = True,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         """The ONE place tmux is spawned. ``argv`` are the args after ``tmux``.
 
         With ``check=True`` a non-zero exit raises :class:`TmuxError` (the strict
@@ -46,11 +57,17 @@ class BaseTmuxBackend(TerminalMultiplexer):
         A timeout / missing binary always propagates (``TimeoutExpired`` / ``OSError``)
         so callers' existing ``try/except`` still fires.
 
-        Subclasses (e.g. a native-Windows psmux) override this to tweak the binary,
-        decoding (``encoding="utf-8"``), or timeout — and nothing else.
+        ``env`` (keyword-only, default ``None`` → inherit the parent env) lets one
+        caller spawn with a scrubbed env without mutating this process's; decoding is
+        the :attr:`_ENCODING` class attr. A leaf sets those rather than overriding here.
         """
         proc = subprocess.run(
-            ["tmux", *argv], capture_output=True, text=True, timeout=TMUX_TIMEOUT_S
+            ["tmux", *argv],
+            capture_output=True,
+            text=True,
+            encoding=self._ENCODING,
+            env=env,
+            timeout=TMUX_TIMEOUT_S,
         )
         if check and proc.returncode != 0:
             raise TmuxError(f"tmux {' '.join(argv[:2])} failed: {proc.stderr.strip()}")
