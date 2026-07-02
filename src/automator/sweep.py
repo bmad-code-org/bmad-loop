@@ -1014,7 +1014,11 @@ class SweepEngine(Engine):
         self._close_bundle_ledger_when_spec_status(task, str(spec_file), success_status)
 
     def _close_bundle_ledger_when_spec_status(
-        self, task: StoryTask, spec_file: str, success_status: str
+        self,
+        task: StoryTask,
+        spec_file: str,
+        success_status: str,
+        kind: str = "sweep-bundle-closed",
     ) -> None:
         spec_path = verify.resolve_spec_path(spec_file, self.workspace.paths)
         if not spec_path.is_file():
@@ -1025,7 +1029,7 @@ class SweepEngine(Engine):
         note = f"resolved by sweep bundle {task.story_key}"
         marked = [i for i in task.dw_ids if deferredwork.mark_done(ledger, i, self._today(), note)]
         if marked:
-            self.journal.append("sweep-bundle-closed", story_key=task.story_key, dw_ids=marked)
+            self.journal.append(kind, story_key=task.story_key, dw_ids=marked)
 
     def _verify_dev_artifacts(self, task: StoryTask, result_json: dict | None):
         return verify.verify_dev_bundle(
@@ -1037,9 +1041,12 @@ class SweepEngine(Engine):
         # orchestrator is the ledger writer. A follow-up review can rewrite the
         # ledger from its own snapshot and re-open entries that were already
         # closed after dev. Re-apply that idempotent closure immediately before
-        # verify_review_bundle requires those entries.
+        # verify_review_bundle requires those entries. The distinct journal kind
+        # makes "a review rewrote the ledger" greppable when diagnosing runs.
         if self._generic_dev() and task.spec_file:
-            self._close_bundle_ledger_when_spec_status(task, task.spec_file, "done")
+            self._close_bundle_ledger_when_spec_status(
+                task, task.spec_file, "done", kind="sweep-bundle-reclosed"
+            )
         return verify.verify_review_bundle(task, self.workspace.paths, self.policy)
 
     def _commit_message(self, task: StoryTask) -> str:

@@ -1587,7 +1587,17 @@ class Engine:
         # and routes to step-04 for a fresh independent review pass (BMAD-METHOD
         # #2508) — so the follow-up review is just another dev-skill run, no
         # separate review skill. task.spec_file is set by verify_dev on success.
-        return f"/bmad-dev-auto {task.spec_file}"
+        # The ledger instruction is the prevention side of the reclose in
+        # SweepEngine._verify_review: a review that rewrites deferred-work.md
+        # from a stale snapshot clobbers orchestrator-recorded closures. The
+        # ledger is append-only for sessions — new findings are fine, existing
+        # entries are orchestrator-owned.
+        return (
+            f"/bmad-dev-auto {task.spec_file} — If this review defers new "
+            f"findings, append them to the deferred-work ledger as NEW entries "
+            f"only; do NOT modify, re-open, or rewrite existing ledger entries — "
+            f"the orchestrator owns their status and resolution."
+        )
 
     def _render_commit_template(self, task: StoryTask) -> str | None:
         """The configured commit message template with {story_key}/{run_id}

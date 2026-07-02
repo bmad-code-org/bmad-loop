@@ -20,6 +20,7 @@ from automator.adapters.mock import MockAdapter
 from automator.journal import Journal, load_state
 from automator.model import Phase, RunState, StoryTask, TokenUsage
 from automator.policy import (
+    DevPolicy,
     GatesPolicy,
     LimitsPolicy,
     NotifyPolicy,
@@ -431,8 +432,6 @@ def test_generic_skill_bundle_orchestrator_closes_ledger(project):
     """B4: on the generic bmad-dev-auto path the bundle session never edits the
     ledger; the orchestrator marks each owned dw id done (in _post_dev_state_sync)
     and verify_review_bundle confirms its own write. The invocation is freeform."""
-    from automator.policy import DevPolicy
-
     write_ledger(project, {"DW-1": "open", "DW-2": "open"})
     plan = triage_result(
         ["DW-1", "DW-2"],
@@ -475,8 +474,6 @@ def test_generic_bundle_review_verify_recloses_ledger_after_review_rewrites_it(p
     re-open entries the orchestrator already closed after dev. The review gate
     should re-apply the orchestrator-owned ledger closure before verification,
     otherwise the sweep launches a spurious repair/dev pass for complete work."""
-    from automator.policy import DevPolicy
-
     write_ledger(project, {"DW-1": "open", "DW-2": "open"})
     baseline = git(project.project, "rev-parse", "HEAD")
     spec = project.implementation_artifacts / "spec-dw-fix-things.md"
@@ -503,7 +500,7 @@ def test_generic_bundle_review_verify_recloses_ledger_after_review_rewrites_it(p
     assert entries["DW-1"].status.startswith("done")
     assert entries["DW-2"].status.startswith("done")
     assert "resolved by sweep bundle dw-fix-things" in entries["DW-1"].body
-    assert "sweep-bundle-closed" in {e["kind"] for e in engine.journal.entries()}
+    assert "sweep-bundle-reclosed" in {e["kind"] for e in engine.journal.entries()}
 
 
 def test_generic_bundle_reconcile_closes_ledger_on_stale_frontmatter(project):
@@ -512,8 +509,6 @@ def test_generic_bundle_reconcile_closes_ledger_on_stale_frontmatter(project):
     at the template default `draft`. The orchestrator reconciles the frontmatter
     before the ledger sync, so the bundle CLOSES — its dw ids are marked done and
     not stranded in failed_ids — instead of falsely deferring completed work."""
-    from automator.policy import DevPolicy
-
     write_ledger(project, {"DW-1": "open", "DW-2": "open"})
     plan = triage_result(
         ["DW-1", "DW-2"],
@@ -562,8 +557,6 @@ def test_generic_bundle_reconcile_closes_ledger_on_in_review_frontmatter(project
     the generic path (the legacy review-handoff fork is retired), so the
     orchestrator reconciles it to done before the ledger sync — the bundle CLOSES
     instead of false-deferring + rolling back into an endless re-sweep loop."""
-    from automator.policy import DevPolicy
-
     write_ledger(project, {"DW-1": "open", "DW-2": "open"})
     plan = triage_result(
         ["DW-1", "DW-2"],
