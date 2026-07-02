@@ -571,6 +571,25 @@ def cmd_resume(args: argparse.Namespace) -> int:
     except runs.RunRefError as e:
         print(str(e), file=sys.stderr)
         return 1
+    args.run_id = run_dir.name  # normalize so messages show the full id
+    # Gate here, NOT in _resume_paused_run: that helper is also resolve's re-arm
+    # path, which is already gated at resolve entry. A provably-live engine blocks
+    # outright (the TUI warns in its confirm modal instead; the CLI has no confirm
+    # step). 'unknown' warns but proceeds: resume is the recovery path that
+    # rewrites engine.pid, so it must stay usable when liveness is unverifiable.
+    live = runs.engine_liveness(run_dir)
+    if live == "alive":
+        print(
+            f"run {args.run_id} is still live — resuming would double-drive it; stop it first",
+            file=sys.stderr,
+        )
+        return 1
+    if live == "unknown":
+        print(
+            f"run {args.run_id}: engine may still be live (unverifiable pid) — "
+            "resuming could double-drive this run",
+            file=sys.stderr,
+        )
     return _resume_paused_run(project, run_dir)
 
 
@@ -601,11 +620,28 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         )
         return 1
     # Not a cleanup path, so the "unknown must not block" invariant does not apply:
-    # an unverifiable-but-live pid must not be re-driven. Refuse on alive OR unknown.
-    if runs.engine_liveness(run_dir) != "dead":
-        # "may" not "is": the gate fires on unknown too, where liveness is unverifiable.
-        print(f"run {args.run_id} may still be live — stop it first", file=sys.stderr)
+    # an unverifiable-but-live pid must not be re-driven. A provably-live engine
+    # always blocks (--force never bypasses it); unknown blocks unless the operator
+    # vouches with --force — `stop` cannot verify or clear an unverifiable pid, so
+    # without an escape hatch a squatted pid would lock resolve out forever.
+    live = runs.engine_liveness(run_dir)
+    if live == "alive":
+        print(f"run {args.run_id} is still live — stop it first", file=sys.stderr)
         return 1
+    if live == "unknown":
+        if not args.force:
+            print(
+                f"run {args.run_id}: engine may still be live (unverifiable pid) — "
+                "refusing to re-arm. Confirm the engine process is gone, then re-run "
+                "with --force (`stop` cannot verify or clear an unverifiable pid).",
+                file=sys.stderr,
+            )
+            return 1
+        print(
+            f"run {args.run_id}: engine may still be live (unverifiable pid) — "
+            "proceeding anyway (--force)",
+            file=sys.stderr,
+        )
     story_key = args.story or state.paused_story_key
     task = state.tasks.get(story_key) if story_key else None
     if story_key is None or task is None or task.phase != Phase.ESCALATED:
@@ -1256,6 +1292,12 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="--resume: re-arm + resume without prompting; --no-resume: re-arm only "
         "(default: prompt to confirm, then resume)",
+    )
+    resolve_p.add_argument(
+        "--force",
+        action="store_true",
+        help="proceed when engine liveness is unverifiable (unknown); "
+        "a provably-live engine still blocks",
     )
 
     decisions_p = add(

@@ -615,14 +615,50 @@ def test_resolve_rejects_non_escalation_stage(tmp_path, capsys):
 
 
 # resolve refuses 'unknown' too, not just 'alive' — re-driving a possibly-live engine.
-@pytest.mark.parametrize("liveness", ["alive", "unknown"])
-def test_resolve_refuses_live_run(tmp_path, monkeypatch, capsys, liveness):
+@pytest.mark.parametrize(
+    "liveness,msg",
+    [("alive", "is still live — stop it first"), ("unknown", "unverifiable pid")],
+)
+def test_resolve_refuses_live_run(tmp_path, monkeypatch, capsys, liveness, msg):
     from automator import runs
 
     monkeypatch.setattr(runs, "engine_liveness", lambda _rd: liveness)
     _escalated_run(tmp_path, "r1")
     assert cli.main(["resolve", "--project", str(tmp_path), "r1"]) == 1
-    assert "may still be live" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert msg in err
+    if liveness == "unknown":
+        assert "--force" in err  # the refusal carries the recovery instructions
+
+
+def test_resolve_force_alive_still_refuses(tmp_path, monkeypatch, capsys):
+    from automator import runs
+
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive")
+    _escalated_run(tmp_path, "r1")
+    assert cli.main(["resolve", "--project", str(tmp_path), "r1", "--force"]) == 1
+    assert "is still live — stop it first" in capsys.readouterr().err
+
+
+def test_resolve_force_unknown_proceeds(tmp_path, monkeypatch, capsys):
+    # --force is the only escape from a squatted/unverifiable pid: `stop` cannot
+    # clear 'unknown' (engine.pid is never deleted), so without it resolve would
+    # refuse forever.
+    from automator import runs
+    from automator.journal import load_state
+    from automator.model import Phase
+
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "unknown")
+    run_dir = _escalated_run(tmp_path, "r1")
+    resumed = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: resumed.append(rd) or 0)
+    rc = cli.main(
+        ["resolve", "--project", str(tmp_path), "r1", "--force", "--no-interactive", "--resume"]
+    )
+    assert rc == 0
+    assert "proceeding anyway (--force)" in capsys.readouterr().err
+    assert resumed == [run_dir]
+    assert load_state(run_dir).tasks["s1"].phase == Phase.PENDING  # past the gate, re-armed
 
 
 def test_resolve_no_escalated_story(tmp_path, capsys):
@@ -840,6 +876,48 @@ def test_resume_restores_persisted_run_scope(project, monkeypatch):
     assert captured["epic_filter"] == 9
     assert captured["story_filter"] == "9-0"
     assert captured["max_stories"] == 4
+
+
+def test_resume_refuses_live_run(tmp_path, monkeypatch, capsys):
+    from automator import runs
+
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive")
+
+    def _fail(*_a, **_k):
+        raise AssertionError("resumed a live run")
+
+    monkeypatch.setattr(cli, "_resume_paused_run", _fail)
+    _make_run_with_state(tmp_path, "r1", paused_reason="x", paused_stage="spec-approval")
+    assert cli.main(["resume", "--project", str(tmp_path), "r1"]) == 1
+    assert "double-drive" in capsys.readouterr().err
+
+
+def test_resume_unknown_warns_but_proceeds(project, monkeypatch, capsys):
+    # resume must remain the unknown-recovery path: it warns, then rewrites
+    # engine.pid via runs.write_pid — blocking here would make a squatted pid
+    # permanently unrecoverable (resolve refuses 'unknown' without --force).
+    from conftest import install_base_skills
+
+    from automator import runs
+
+    install_bmad_config(project)
+    install_base_skills(project)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    run_dir = _make_run_with_state(
+        project.project,
+        "20990101-000000-beef",
+        paused_reason="escalation",
+        paused_stage="escalation",
+    )
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "unknown")
+    monkeypatch.setattr(runs, "kill_session", lambda _rid: None)
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {r: None for r in cli.ROLES})
+
+    rc = cli.main(["resume", "--project", str(project.project), "20990101-000000-beef"])
+    assert rc == 0
+    assert "may still be live (unverifiable pid)" in capsys.readouterr().err
+    assert (run_dir / "engine.pid").is_file()  # pid rewritten — recovery happened
 
 
 def test_diagnose_default_latest_and_out(project, tmp_path, capsys):
