@@ -80,6 +80,20 @@ class _FakeHost:
             return self.is_alive(pid)
         return self.identity(pid) == identity
 
+    def liveness_of(self, pid, identity):
+        # Mirrors ProcessHost.liveness_of (tri-state, biased away from false-dead):
+        # a still-alive pid with an unreadable identity reads 'unknown', not 'dead'.
+        if pid <= 0:
+            return "dead"
+        if identity is None:
+            return "alive" if self.is_alive(pid) else "dead"
+        current = self.identity(pid)
+        if current == identity:
+            return "alive"
+        if current is None and self.is_alive(pid):
+            return "unknown"
+        return "dead"
+
 
 def test_list_run_dirs_sorted_and_filtered(tmp_path):
     _make_run(tmp_path, "20260611-120000-bbbb")
@@ -201,6 +215,44 @@ def test_read_pid_identity_forms(tmp_path):
     assert runs.read_pid_identity(run_dir) == (4242, 678.5)
     (run_dir / "engine.pid").write_text("not-a-pid 1.0")  # unparseable pid
     assert runs.read_pid_identity(run_dir) == (None, None)
+
+
+def test_engine_liveness(tmp_path, monkeypatch):
+    run_dir = _make_run(tmp_path, "r1")
+    assert runs.engine_liveness(run_dir) == "dead"  # no pid file → nothing to gate on
+
+    (run_dir / "engine.pid").write_text("4242 100.0")
+
+    def use(host):
+        monkeypatch.setattr(runs, "get_process_host", lambda: host)
+
+    use(_FakeHost(alive=True, identity=100.0))
+    assert runs.engine_liveness(run_dir) == "alive"  # identity matches
+
+    use(_FakeHost(alive=True, identity=999.0))
+    assert runs.engine_liveness(run_dir) == "dead"  # reused pid: identity differs
+
+    # live pid whose identity is unreadable (win32 ERROR_ACCESS_DENIED) → unknown, not dead
+    use(_FakeHost(alive=True, identity=None))
+    assert runs.engine_liveness(run_dir) == "unknown"
+
+    class _Boom:  # an unexpected probe failure degrades to unknown, never a false dead
+        def liveness_of(self, pid, identity):
+            raise RuntimeError("probe blew up")
+
+    use(_Boom())
+    assert runs.engine_liveness(run_dir) == "unknown"
+
+    # A misconfigured host (get_process_host itself raising) is a hard error, not a
+    # flaky per-pid probe — it must propagate, never mask as 'unknown'.
+    from automator.process_host import ProcessHostError
+
+    def _boom_host():
+        raise ProcessHostError("BMAD_AUTO_PROCESS_HOST matches no registered host")
+
+    monkeypatch.setattr(runs, "get_process_host", _boom_host)
+    with pytest.raises(ProcessHostError):
+        runs.engine_liveness(run_dir)
 
 
 @pytest.mark.parametrize("identity_token", ["garbage", "nan", "inf", "-inf"])

@@ -30,8 +30,7 @@ from ..adapters.multiplexer import MultiplexerError, get_multiplexer
 from ..gates import ATTENTION_FILE
 from ..journal import JOURNAL_FILE, LOGS_DIR, STATE_FILE, load_state
 from ..model import RunState
-from ..process_host import get_process_host
-from ..runs import list_run_dirs, read_pid_identity, session_name
+from ..runs import list_run_dirs, probe_liveness, read_pid_identity, session_name
 
 # Run statuses shown by the dashboard.
 RUNNING = "running"
@@ -73,12 +72,10 @@ def liveness(run_dir: Path) -> str:
     pid, identity = read_pid_identity(run_dir)
     if pid is None:
         return _session_liveness(run_dir.name)
-    try:
-        # non-destructive identity-aware tri-state probe
-        return get_process_host().liveness_of(pid, identity)
-    except Exception:
-        # never falsely dead — an unexpected probe failure stays 'unknown'
-        return "unknown"
+    # Probe the pid we just read (shared body with runs.engine_liveness) rather than
+    # re-reading it, so a non-atomic pid rewrite can't split the two reads and flash
+    # a false 'dead' between "pid present" here and a re-read seeing an empty file.
+    return probe_liveness(pid, identity)
 
 
 def _session_liveness(run_id: str) -> str:

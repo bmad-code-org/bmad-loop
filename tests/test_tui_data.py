@@ -130,6 +130,8 @@ def test_discover_runs_classification(tmp_path):
 
 
 def test_live_pid_with_unreadable_identity_is_unknown_not_interrupted(tmp_path, monkeypatch):
+    from automator import runs
+
     run_dir = make_run(tmp_path, "20260611-100000-aaaa")
     (run_dir / "engine.pid").write_text("4242 123.0")
 
@@ -137,8 +139,9 @@ def test_live_pid_with_unreadable_identity_is_unknown_not_interrupted(tmp_path, 
         def liveness_of(self, pid, identity):
             return "unknown"
 
-    host = Host()
-    monkeypatch.setattr(data, "get_process_host", lambda: host)
+    # data.liveness delegates its pid branch to runs.engine_liveness, so the host seam
+    # is now read there; patch it there to exercise the full delegation path.
+    monkeypatch.setattr(runs, "get_process_host", lambda: Host())
     assert data.liveness(run_dir) == "unknown"
     assert data.discover_runs(tmp_path)[0].status == data.UNKNOWN
 

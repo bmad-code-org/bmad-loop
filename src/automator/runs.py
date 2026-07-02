@@ -166,6 +166,28 @@ def engine_alive(run_dir: Path) -> bool:
     return get_process_host().alive_and_ours(pid, identity)
 
 
+def engine_liveness(run_dir: Path) -> str:
+    """Tri-state read of the local engine: ``'alive'`` | ``'dead'`` | ``'unknown'``.
+    Wraps :meth:`ProcessHost.liveness_of` so a live-but-unreadable pid (win32
+    ``ERROR_ACCESS_DENIED``) reads ``'unknown'``, not a false ``'dead'``. No pid →
+    ``'dead'`` (the session fallback lives in the TUI layer)."""
+    pid, identity = read_pid_identity(run_dir)
+    if pid is None:
+        return "dead"
+    return probe_liveness(pid, identity)
+
+
+def probe_liveness(pid: int, identity: float | None) -> str:
+    """Tri-state probe of an already-read ``(pid, identity)`` — the shared body of
+    :func:`engine_liveness` and ``tui.data.liveness``, so both read the pid file once.
+    A probe failure degrades to ``'unknown'``, never a false ``'dead'``."""
+    host = get_process_host()  # ProcessHostError (misconfig) propagates, not masked as unknown
+    try:
+        return host.liveness_of(pid, identity)
+    except Exception:
+        return "unknown"
+
+
 # ----------------------------------------------------------- stop / delete / archive
 
 

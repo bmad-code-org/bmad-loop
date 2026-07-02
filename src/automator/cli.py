@@ -600,8 +600,11 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
-    if runs.engine_alive(run_dir):
-        print(f"run {args.run_id} is still live — stop it first", file=sys.stderr)
+    # Not a cleanup path, so the "unknown must not block" invariant does not apply:
+    # an unverifiable-but-live pid must not be re-driven. Refuse on alive OR unknown.
+    if runs.engine_liveness(run_dir) != "dead":
+        # "may" not "is": the gate fires on unknown too, where liveness is unverifiable.
+        print(f"run {args.run_id} may still be live — stop it first", file=sys.stderr)
         return 1
     story_key = args.story or state.paused_story_key
     task = state.tasks.get(story_key) if story_key else None
@@ -815,6 +818,27 @@ def cmd_stop(args: argparse.Namespace) -> int:
     return 0
 
 
+def _stop_or_block_live_engine(run_dir: Path, run_id: str, force: bool) -> int | None:
+    """Shared delete/archive guard. One liveness sample drives both the warning and the
+    block, so a mid-check identity flip can't fire one without the other. An unverifiable
+    pid (``unknown``) warns but never blocks cleanup; only a provably-live engine blocks,
+    or is stopped first under ``force``. Returns an exit code to propagate, or None to
+    proceed with cleanup."""
+    live = runs.engine_liveness(run_dir)
+    if live == "unknown":
+        print(f"run {run_id}: engine may still be live (unverifiable pid)", file=sys.stderr)
+    if live == "alive":
+        if not force:
+            print(f"run {run_id} is still live — stop it first (or pass --force)", file=sys.stderr)
+            return 1
+        try:
+            runs.stop_run(run_dir)
+        except (runs.StopRunError, ProcessHostError) as e:
+            print(str(e), file=sys.stderr)
+            return 1
+    return None
+
+
 def cmd_delete(args: argparse.Namespace) -> int:
     project = _project(args)
     try:
@@ -823,18 +847,9 @@ def cmd_delete(args: argparse.Namespace) -> int:
         print(str(e), file=sys.stderr)
         return 1
     args.run_id = run_dir.name
-    if runs.engine_alive(run_dir):
-        if not args.force:
-            print(
-                f"run {args.run_id} is still live — stop it first (or pass --force)",
-                file=sys.stderr,
-            )
-            return 1
-        try:
-            runs.stop_run(run_dir)
-        except (runs.StopRunError, ProcessHostError) as e:
-            print(str(e), file=sys.stderr)
-            return 1
+    rc = _stop_or_block_live_engine(run_dir, args.run_id, args.force)
+    if rc is not None:
+        return rc
     runs.delete_run(run_dir)
     print(f"run {args.run_id} deleted")
     return 0
@@ -848,18 +863,9 @@ def cmd_archive(args: argparse.Namespace) -> int:
         print(str(e), file=sys.stderr)
         return 1
     args.run_id = run_dir.name
-    if runs.engine_alive(run_dir):
-        if not args.force:
-            print(
-                f"run {args.run_id} is still live — stop it first (or pass --force)",
-                file=sys.stderr,
-            )
-            return 1
-        try:
-            runs.stop_run(run_dir)
-        except (runs.StopRunError, ProcessHostError) as e:
-            print(str(e), file=sys.stderr)
-            return 1
+    rc = _stop_or_block_live_engine(run_dir, args.run_id, args.force)
+    if rc is not None:
+        return rc
     dest = runs.archive_run(project, run_dir)
     print(f"run {args.run_id} archived to {dest}")
     return 0

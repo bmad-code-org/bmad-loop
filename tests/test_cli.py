@@ -523,7 +523,7 @@ def test_stop_already_finished(tmp_path, monkeypatch, capsys):
 def test_delete_refuses_live_run_without_force(tmp_path, monkeypatch, capsys):
     from automator import runs
 
-    monkeypatch.setattr(runs, "engine_alive", lambda _rd: True)
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive")
     run_dir = _make_run_with_state(tmp_path, "r1")
     assert cli.main(["delete", "--project", str(tmp_path), "r1"]) == 1
     assert "stop it first" in capsys.readouterr().err
@@ -534,7 +534,7 @@ def test_delete_force_stops_then_removes(tmp_path, monkeypatch, capsys):
     from automator import runs
 
     stopped = []
-    monkeypatch.setattr(runs, "engine_alive", lambda _rd: True)
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive")
     monkeypatch.setattr(runs, "stop_run", lambda rd: stopped.append(rd) or True)
     run_dir = _make_run_with_state(tmp_path, "r1")
     assert cli.main(["delete", "--project", str(tmp_path), "r1", "--force"]) == 0
@@ -546,6 +546,26 @@ def test_delete_force_stops_then_removes(tmp_path, monkeypatch, capsys):
 def test_delete_dead_run(tmp_path, capsys):
     run_dir = _make_run_with_state(tmp_path, "r1")  # no pid -> not alive
     assert cli.main(["delete", "--project", str(tmp_path), "r1"]) == 0
+    assert not run_dir.exists()
+
+
+def test_delete_unknown_warns_but_proceeds(tmp_path, monkeypatch, capsys):
+    from automator import runs
+
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "unknown")
+    run_dir = _make_run_with_state(tmp_path, "r1")  # no pid -> engine_alive False
+    assert cli.main(["delete", "--project", str(tmp_path), "r1"]) == 0
+    assert "unverifiable pid" in capsys.readouterr().err
+    assert not run_dir.exists()
+
+
+def test_archive_unknown_warns_but_proceeds(tmp_path, monkeypatch, capsys):
+    from automator import runs
+
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "unknown")
+    run_dir = _make_run_with_state(tmp_path, "20260611-100000-aaaa")
+    assert cli.main(["archive", "--project", str(tmp_path), "20260611-100000-aaaa"]) == 0
+    assert "unverifiable pid" in capsys.readouterr().err
     assert not run_dir.exists()
 
 
@@ -562,7 +582,7 @@ def test_archive_creates_tarball_and_removes_run(tmp_path, capsys):
 def test_archive_refuses_live_run_without_force(tmp_path, monkeypatch, capsys):
     from automator import runs
 
-    monkeypatch.setattr(runs, "engine_alive", lambda _rd: True)
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive")
     run_dir = _make_run_with_state(tmp_path, "r1")
     assert cli.main(["archive", "--project", str(tmp_path), "r1"]) == 1
     assert "stop it first" in capsys.readouterr().err
@@ -594,13 +614,15 @@ def test_resolve_rejects_non_escalation_stage(tmp_path, capsys):
     assert "not paused at an escalation" in capsys.readouterr().err
 
 
-def test_resolve_refuses_live_run(tmp_path, monkeypatch, capsys):
+# resolve refuses 'unknown' too, not just 'alive' — re-driving a possibly-live engine.
+@pytest.mark.parametrize("liveness", ["alive", "unknown"])
+def test_resolve_refuses_live_run(tmp_path, monkeypatch, capsys, liveness):
     from automator import runs
 
-    monkeypatch.setattr(runs, "engine_alive", lambda _rd: True)
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: liveness)
     _escalated_run(tmp_path, "r1")
     assert cli.main(["resolve", "--project", str(tmp_path), "r1"]) == 1
-    assert "still live" in capsys.readouterr().err
+    assert "may still be live" in capsys.readouterr().err
 
 
 def test_resolve_no_escalated_story(tmp_path, capsys):
