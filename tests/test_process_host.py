@@ -107,8 +107,16 @@ def test_alive_and_ours_matches_only_same_identity(host, monkeypatch):
     monkeypatch.setattr(host, "identity", lambda pid: 123.0)
     assert host.alive_and_ours(4242, 123.0) is True
     assert host.alive_and_ours(4242, 999.0) is False  # reused
+    # Unreadable identity is not-ours whether the pid is gone or still running —
+    # 'unknown' must never read as ours on the strict/destructive path. Stub
+    # is_alive too: alive_and_ours (via liveness_of) probes it on this branch, and
+    # the real PosixProcessHost.is_alive would os.kill on a native-Windows CI
+    # runner (WinError 87).
     monkeypatch.setattr(host, "identity", lambda pid: None)
-    assert host.alive_and_ours(4242, 123.0) is False  # gone or unreadable → not-ours
+    monkeypatch.setattr(host, "is_alive", lambda pid: False)
+    assert host.alive_and_ours(4242, 123.0) is False  # gone
+    monkeypatch.setattr(host, "is_alive", lambda pid: True)
+    assert host.alive_and_ours(4242, 123.0) is False  # live but unreadable → unknown
 
 
 def test_liveness_of_reads_alive_dead_and_unknown(host, monkeypatch):
