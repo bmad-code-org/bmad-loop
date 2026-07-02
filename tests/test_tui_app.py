@@ -948,6 +948,23 @@ async def test_resume_unknown_pid_warns(project, monkeypatch):
         assert "may still be live" in app.screen._warning
 
 
+async def test_delete_unknown_pid_warns_but_does_not_block(project, monkeypatch):
+    # 'unknown' liveness (a live-but-unreadable pid) must not block cleanup — the
+    # deliberate runs.engine_alive invariant — but the irreversible delete confirm
+    # must warn the run may still be live rather than imply it is safely dead.
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "unknown")
+    run_dir = make_run(project.project, "20260611-100000-aaaa")
+    (run_dir / "engine.pid").write_text("4242 123.0", encoding="utf-8")
+    app = BmadAutoApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await until(pilot, lambda: dashboard(app).selected_run_id is not None)
+        await pilot.press("D")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        assert "may still be live" in app.screen._warning  # not blocked, but flagged
+        assert "cannot be undone" in app.screen._warning
+
+
 async def test_resume_finished_run_refused(project, monkeypatch):
     monkeypatch.setattr(launch, "tmux_available", lambda: True)
     make_run(project.project, "20260611-100000-aaaa", finished=True)

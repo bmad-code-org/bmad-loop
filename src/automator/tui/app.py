@@ -465,9 +465,16 @@ class BmadAutoApp(App[None]):
         if selected is None:
             return
         run_id, run_dir = selected
-        if data.liveness(run_dir) == "alive":
+        # 'unknown' (a live-but-unreadable pid) does not block cleanup — see the
+        # deliberate runs.engine_alive invariant — but the irreversible confirm
+        # must not imply the run is safely dead, so it says so.
+        live = data.liveness(run_dir)
+        if live == "alive":
             self.notify(f"run {run_id} is live — stop it first", severity="warning")
             return
+        warning = "this cannot be undone"
+        if live == "unknown":
+            warning = f"engine may still be live (unverifiable pid) — {warning}"
 
         def done(ok: bool | None) -> None:
             if ok:
@@ -478,7 +485,7 @@ class BmadAutoApp(App[None]):
                 "delete run",
                 f"permanently delete run {run_id}?",
                 confirm_label="delete",
-                warning="this cannot be undone",
+                warning=warning,
             ),
             done,
         )
@@ -498,7 +505,8 @@ class BmadAutoApp(App[None]):
         if selected is None:
             return
         run_id, run_dir = selected
-        if data.liveness(run_dir) == "alive":
+        live = data.liveness(run_dir)
+        if live == "alive":
             self.notify(f"run {run_id} is live — stop it first", severity="warning")
             return
 
@@ -511,6 +519,9 @@ class BmadAutoApp(App[None]):
                 "archive run",
                 f"archive run {run_id} to .automator/archive?",
                 confirm_label="archive",
+                warning=(
+                    "engine may still be live (unverifiable pid)" if live == "unknown" else None
+                ),
             ),
             done,
         )
