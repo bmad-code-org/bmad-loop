@@ -808,10 +808,10 @@ def verify_dev_bundle(
 ) -> VerifyOutcome:
     """verify_dev for a deferred-work bundle: bundles have no sprint-status
     entry. The orchestrator owns the bundle→dw-id binding (``task.dw_ids``,
-    marked done by ``SweepEngine._post_dev_state_sync``); the generic
-    ``bmad-dev-auto`` primitive never authors dw ids. So the dw_ids cross-check
-    is enforced only when the session actually claims them — an empty/absent
-    claim is the normal generic path and passes."""
+    marked done by ``SweepEngine``'s ledger sync); the generic ``bmad-dev-auto``
+    primitive never authors dw ids. So the dw_ids cross-check is enforced only
+    when the session actually claims them — an empty/absent claim is the normal
+    generic path and passes."""
     rj = result_json or {}
     spec_file = rj.get("spec_file")
     if not spec_file:
@@ -923,8 +923,9 @@ def verify_review_bundle(task: StoryTask, paths: ProjectPaths, policy: Policy) -
     """verify_review for a deferred-work bundle: no sprint-status check, but
     every dw id the bundle owns must be marked done in the ledger on disk. The
     legacy --dw-bundle skill flips them; on the generic bmad-dev-auto path the
-    orchestrator flips them in _post_dev_state_sync. Either way this gate is why
-    we can trust it happened."""
+    orchestrator flips them after dev and, if review rewrites the ledger diff,
+    again immediately before this review gate. Either way this gate is why we
+    can trust it happened."""
     if not task.spec_file:
         return VerifyOutcome.retry("no spec file recorded for task")
     fm = read_frontmatter(Path(task.spec_file))
