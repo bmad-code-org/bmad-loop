@@ -489,10 +489,26 @@ def test_prunable_sessions_partitions(tmp_path, monkeypatch):
             # untag-* and unrelated intentionally absent (no tag)
         },
     )
-    prunable, alive = runs.prunable_sessions(tmp_path)
+    prunable, alive, unknown = runs.prunable_sessions(tmp_path)
     # other-1 (foreign tag) and untag-orphan (unprovable) are skipped entirely
     assert sorted(prunable) == ["fin-1", "orphan-1", "untag-fin"]
     assert alive == ["live-1"]
+    assert unknown == set()
+
+
+def test_prunable_sessions_flags_unknown(tmp_path, monkeypatch):
+    # live pid, unreadable identity (win32 ERROR_ACCESS_DENIED) → prunable anyway
+    # (unknown never blocks cleanup) but flagged so frontends can warn.
+    mine = runs.project_tag(tmp_path)
+    odd = _make_state_run(tmp_path, "odd-1")
+    (odd / "engine.pid").write_text("4242 123.0")
+    monkeypatch.setattr(runs, "tmux_sessions", lambda: ["bmad-auto-odd-1"])
+    monkeypatch.setattr(runs, "session_project_tags", lambda: {"bmad-auto-odd-1": mine})
+    monkeypatch.setattr(runs, "get_process_host", lambda: _FakeHost(alive=True, identity=None))
+    prunable, live, unknown = runs.prunable_sessions(tmp_path)
+    assert prunable == ["odd-1"]
+    assert live == []
+    assert unknown == {"odd-1"}
 
 
 def test_prune_sessions_dry_run_kills_nothing(tmp_path, monkeypatch):

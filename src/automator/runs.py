@@ -226,15 +226,18 @@ def session_project_tags() -> dict[str, str]:
     return get_multiplexer().session_options(PROJECT_OPTION)
 
 
-def prunable_sessions(project: Path) -> tuple[list[str], list[str]]:
-    """Partition the bmad-auto-<id> agent sessions into (prunable, live) run ids.
+def prunable_sessions(project: Path) -> tuple[list[str], list[str], set[str]]:
+    """Partition the bmad-auto-<id> agent sessions into (prunable, live) run ids,
+    plus the subset of prunable ids whose engine liveness read 'unknown'
+    (unverifiable pid). Unknown never blocks cleanup — those sessions stay
+    prunable — but frontends surface a warning for them.
 
     The control session (bmad-auto-ctl) is never a candidate. Pruning is scoped
     to `project` via the PROJECT_OPTION tag set at session creation:
 
     - tag == this project: ours — prunable unless a provably-alive engine pid is
       running (covers finished/stopped/crashed *and* orphans whose run dir was
-      deleted, since engine_alive is False with no pid).
+      deleted, since engine_liveness reads 'dead' with no pid).
     - tag is another project: skipped — never touched.
     - tag empty (pre-upgrade, untagged session): can't prove ownership, so fall
       back to the run dir — prunable only when the dir exists under this project
@@ -244,6 +247,7 @@ def prunable_sessions(project: Path) -> tuple[list[str], list[str]]:
     mine = project_tag(project)
     prunable: list[str] = []
     live: list[str] = []
+    unknown: set[str] = set()
     for name in tmux_sessions():
         if name == CTL_SESSION or not name.startswith(_SESSION_PREFIX):
             continue
@@ -255,17 +259,20 @@ def prunable_sessions(project: Path) -> tuple[list[str], list[str]]:
                 continue  # another project's session
         elif not is_run(run_dir):
             continue  # untagged and no run dir here — ownership unprovable
-        if engine_alive(run_dir):
+        liveness = engine_liveness(run_dir)
+        if liveness == "alive":
             live.append(run_id)
-        else:
-            prunable.append(run_id)
-    return prunable, live
+            continue
+        prunable.append(run_id)
+        if liveness == "unknown":
+            unknown.add(run_id)
+    return prunable, live, unknown
 
 
 def prune_sessions(project: Path, *, dry_run: bool = False) -> list[str]:
     """Kill every prunable bmad-auto-<id> session (see prunable_sessions);
     returns the run ids that were (or, with dry_run, would be) killed."""
-    prunable, _ = prunable_sessions(project)
+    prunable, _, _ = prunable_sessions(project)
     if not dry_run:
         for run_id in prunable:
             kill_session(run_id)

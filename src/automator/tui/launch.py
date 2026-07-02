@@ -209,6 +209,9 @@ def _ctl_window_candidates(project: Path) -> list[tuple[str, str]]:
                 continue  # another project's window
         elif not runs.is_run(run_dir):
             continue  # untagged and no run dir here — ownership unprovable
+        # boolean gate on purpose: an 'unknown' engine stays a candidate (unknown
+        # never blocks cleanup) with no per-window warning — the session-level
+        # unknown warning from prunable_sessions covers the operator surface.
         if runs.engine_alive(run_dir):
             continue
         candidates.append((win_id, name))

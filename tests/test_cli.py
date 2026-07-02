@@ -794,7 +794,7 @@ def test_cleanup_dry_run_lists_without_pruning(tmp_path, monkeypatch, capsys):
     from automator import runs
     from automator.tui import launch
 
-    monkeypatch.setattr(runs, "prunable_sessions", lambda _proj: (["fin-1"], ["live-1"]))
+    monkeypatch.setattr(runs, "prunable_sessions", lambda _proj: (["fin-1"], ["live-1"], set()))
     monkeypatch.setattr(launch, "prunable_ctl_windows", lambda _proj: ["sweep-fin-1"])
     pruned: list[str] = []
     monkeypatch.setattr(runs, "prune_sessions", lambda _proj: pruned.append("x") or [])
@@ -811,12 +811,29 @@ def test_cleanup_prunes_sessions_and_windows(tmp_path, monkeypatch, capsys):
     from automator import runs
     from automator.tui import launch
 
-    monkeypatch.setattr(runs, "prunable_sessions", lambda _proj: (["fin-1"], []))
+    monkeypatch.setattr(runs, "prunable_sessions", lambda _proj: (["fin-1"], [], set()))
     monkeypatch.setattr(runs, "prune_sessions", lambda _proj: ["fin-1"])
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _proj: ["sweep-fin-1"])
 
     assert cli.main(["cleanup", "--project", str(tmp_path)]) == 0
     assert "removed 1 session(s), 1 ctl window(s)" in capsys.readouterr().out
+
+
+def test_cleanup_warns_per_unknown_session(tmp_path, monkeypatch, capsys):
+    from automator import runs
+    from automator.tui import launch
+
+    monkeypatch.setattr(
+        runs, "prunable_sessions", lambda _proj: (["fin-1", "odd-1"], [], {"odd-1"})
+    )
+    monkeypatch.setattr(runs, "prune_sessions", lambda _proj: ["fin-1", "odd-1"])
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _proj: [])
+
+    assert cli.main(["cleanup", "--project", str(tmp_path)]) == 0
+    captured = capsys.readouterr()
+    assert "run odd-1: engine may still be live (unverifiable pid)" in captured.err
+    assert "fin-1: engine may still be live" not in captured.err  # only unknown ids warn
+    assert "removed 2 session(s), 0 ctl window(s)" in captured.out
 
 
 def test_resume_kills_stale_session_before_running(project, monkeypatch):

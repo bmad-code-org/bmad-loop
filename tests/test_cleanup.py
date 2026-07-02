@@ -203,6 +203,20 @@ def test_cmd_clean_dry_run_removes_nothing(project, capsys):
     assert "would remove worktree" in out
 
 
+def test_cmd_clean_warns_unknown_liveness(project, monkeypatch, capsys):
+    # warn-only: 'unknown' stays reclaimable (classification unchanged); the
+    # frontend re-probes just to say so before removal.
+    install_bmad_config(project)
+    repo = project.project
+    run_dir = repo / ".automator" / "runs" / "20260101-000000-aaaa"
+    save_state(run_dir, RunState(run_id="r", project=str(repo), started_at="x", stopped=True))
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "unknown")
+
+    assert cli.cmd_clean(_clean_args(repo)) == 0
+    err = capsys.readouterr().err
+    assert "run 20260101-000000-aaaa: engine may still be live (unverifiable pid)" in err
+
+
 def test_cmd_clean_reclaims_and_keeps_protected(project, capsys):
     install_bmad_config(project)
     repo = project.project

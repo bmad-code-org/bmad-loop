@@ -30,6 +30,7 @@ from ..adapters.multiplexer import MultiplexerError, get_multiplexer
 from ..gates import ATTENTION_FILE
 from ..journal import JOURNAL_FILE, LOGS_DIR, STATE_FILE, load_state
 from ..model import RunState
+from ..process_host import ProcessHostError
 from ..runs import list_run_dirs, probe_liveness, read_pid_identity, session_name
 
 # Run statuses shown by the dashboard.
@@ -75,7 +76,13 @@ def liveness(run_dir: Path) -> str:
     # Probe the pid we just read (shared body with runs.engine_liveness) rather than
     # re-reading it, so a non-atomic pid rewrite can't split the two reads and flash
     # a false 'dead' between "pid present" here and a re-read seeing an empty file.
-    return probe_liveness(pid, identity)
+    try:
+        return probe_liveness(pid, identity)
+    except ProcessHostError:
+        # A misconfigured host (bad BMAD_AUTO_PROCESS_HOST) stays a hard error on
+        # CLI decision paths, but the display layer must degrade, not crash: the
+        # dashboard poll worker has no except and would take the whole app down.
+        return "unknown"
 
 
 def _session_liveness(run_id: str) -> str:

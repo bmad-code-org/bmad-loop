@@ -911,7 +911,11 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     from .tui import launch  # pure stdlib; no textual import
 
     project = _project(args)
-    prunable, live = runs.prunable_sessions(project)
+    prunable, live, unknown = runs.prunable_sessions(project)
+    for run_id in sorted(unknown):
+        # warn-only: unknown never blocks cleanup (same wording as delete/archive).
+        # Printed for --dry-run too — it describes state, not action.
+        print(f"run {run_id}: engine may still be live (unverifiable pid)", file=sys.stderr)
     if args.dry_run:
         windows = launch.prunable_ctl_windows(project)
         if not prunable and not windows:
@@ -990,6 +994,12 @@ def cmd_clean(args: argparse.Namespace) -> int:
     archived: list[str] = []
     deleted: list[str] = []
     for run_dir in reclaimable:
+        if runs.engine_liveness(run_dir) == "unknown":
+            # warn-only: unknown never blocks cleanup, but say so before removal
+            print(
+                f"run {run_dir.name}: engine may still be live (unverifiable pid)",
+                file=sys.stderr,
+            )
         # measure before mutating so the reclaim estimate holds for --dry-run too
         wt_dir = run_dir / "worktrees"
         wt_bytes = _dir_size(wt_dir) if wt_dir.is_dir() else 0

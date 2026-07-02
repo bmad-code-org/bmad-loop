@@ -1084,6 +1084,28 @@ async def test_delete_unknown_pid_warns_but_does_not_block(project, monkeypatch)
         assert "cannot be undone" in app.screen._warning
 
 
+async def test_cleanup_unknown_sessions_notifies(project, monkeypatch):
+    # cleanup still prunes 'unknown' sessions (unknown never blocks cleanup) but
+    # must say so instead of silently killing a possibly-live engine's session.
+    from automator import runs
+
+    monkeypatch.setattr(launch, "tmux_available", lambda: True)
+    monkeypatch.setattr(runs, "prunable_sessions", lambda _p: (["odd-1"], [], {"odd-1"}))
+    monkeypatch.setattr(runs, "prune_sessions", lambda _p: ["odd-1"])
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: [])
+    make_run(project.project, "20260611-100000-aaaa")
+    app = BmadAutoApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("c")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        await until(
+            pilot, lambda: any("unverifiable engine pid" in m for m in notifications(app))
+        )
+        assert any("removed 1 session(s)" in m for m in notifications(app))
+
+
 async def test_resume_finished_run_refused(project, monkeypatch):
     monkeypatch.setattr(launch, "tmux_available", lambda: True)
     make_run(project.project, "20260611-100000-aaaa", finished=True)
