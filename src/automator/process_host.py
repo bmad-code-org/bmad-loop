@@ -82,13 +82,11 @@ class ProcessHost(ABC):
         conflated again.
 
         Destructive paths use this strict check; non-destructive TUI reads use
-        :meth:`liveness_of` to preserve an ``'unknown'`` state."""
-        if pid <= 0:
-            return False
-        if identity is None:
-            return self.is_alive(pid)
-        # Gone, reused, or unreadable all read not-ours here.
-        return self.identity(pid) == identity
+        :meth:`liveness_of` to preserve an ``'unknown'`` state. Derived from
+        :meth:`liveness_of` — one decision table, two projections — so the binary
+        and tri-state probes can never drift: gone, reused, or unreadable
+        (``'unknown'``) all read not-ours here."""
+        return self.liveness_of(pid, identity) == "alive"
 
     def liveness_of(self, pid: int, identity: float | None) -> str:
         """Non-destructive tri-state read of *our* engine: ``'alive'`` |

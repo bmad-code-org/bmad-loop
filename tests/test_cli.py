@@ -553,7 +553,7 @@ def test_delete_unknown_warns_but_proceeds(tmp_path, monkeypatch, capsys):
     from automator import runs
 
     monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "unknown")
-    run_dir = _make_run_with_state(tmp_path, "r1")  # no pid -> engine_alive False
+    run_dir = _make_run_with_state(tmp_path, "r1")
     assert cli.main(["delete", "--project", str(tmp_path), "r1"]) == 0
     assert "unverifiable pid" in capsys.readouterr().err
     assert not run_dir.exists()

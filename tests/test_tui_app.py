@@ -1100,9 +1100,7 @@ async def test_cleanup_unknown_sessions_notifies(project, monkeypatch):
         await pilot.press("c")
         await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
         await pilot.click(await ready(pilot, "#ok"))
-        await until(
-            pilot, lambda: any("unverifiable engine pid" in m for m in notifications(app))
-        )
+        await until(pilot, lambda: any("unverifiable engine pid" in m for m in notifications(app)))
         assert any("removed 1 session(s)" in m for m in notifications(app))
 
 

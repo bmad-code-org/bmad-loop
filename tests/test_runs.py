@@ -12,6 +12,7 @@ from automator import runs
 from automator.adapters import tmux_base
 from automator.journal import load_state, save_state
 from automator.model import RunState
+from automator.process_host import ProcessHost
 
 
 def _make_run(project, run_id, with_state=True):
@@ -44,11 +45,13 @@ def _dead_pid() -> int:
     return proc.pid
 
 
-class _FakeHost:
-    """A ProcessHost stand-in for driving stop_run's escalation deterministically
-    without spawning real processes. ``alive`` / ``identity`` may be a value or a
-    zero-arg callable (so they can change between the stop-time read and the
-    post-grace check)."""
+class _FakeHost(ProcessHost):
+    """A ProcessHost for driving stop_run's escalation deterministically without
+    spawning real processes. ``alive`` / ``identity`` may be a value or a zero-arg
+    callable (so they can change between the stop-time read and the post-grace
+    check). A real subclass on purpose: ``alive_and_ours`` and ``liveness_of``
+    are inherited, so these tests exercise the production decision table instead
+    of a hand-copied mirror that could silently drift."""
 
     def __init__(self, *, alive, identity=1.0, on_terminate=None):
         self._alive = alive
@@ -71,28 +74,8 @@ class _FakeHost:
     def identity(self, pid):
         return self._identity() if callable(self._identity) else self._identity
 
-    def alive_and_ours(self, pid, identity):
-        # Mirrors ProcessHost.alive_and_ours (strict): pid<=0 short-circuits, identity
-        # None degrades to is_alive, else the recorded identity must still match.
-        if pid <= 0:
-            return False
-        if identity is None:
-            return self.is_alive(pid)
-        return self.identity(pid) == identity
-
-    def liveness_of(self, pid, identity):
-        # Mirrors ProcessHost.liveness_of (tri-state, biased away from false-dead):
-        # a still-alive pid with an unreadable identity reads 'unknown', not 'dead'.
-        if pid <= 0:
-            return "dead"
-        if identity is None:
-            return "alive" if self.is_alive(pid) else "dead"
-        current = self.identity(pid)
-        if current == identity:
-            return "alive"
-        if current is None and self.is_alive(pid):
-            return "unknown"
-        return "dead"
+    def hook_interpreter(self):
+        return "python3"
 
 
 def test_list_run_dirs_sorted_and_filtered(tmp_path):
