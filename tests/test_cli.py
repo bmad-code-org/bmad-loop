@@ -543,6 +543,38 @@ def test_delete_force_stops_then_removes(tmp_path, monkeypatch, capsys):
     assert not run_dir.exists()
 
 
+def test_delete_force_stop_error_blocks(tmp_path, monkeypatch, capsys):
+    # a failed --force stop must propagate, never fall through to deletion
+    from automator import runs
+
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive")
+
+    def _raise(_rd):
+        raise runs.StopRunError("boom")
+
+    monkeypatch.setattr(runs, "stop_run", _raise)
+    run_dir = _make_run_with_state(tmp_path, "r1")
+    assert cli.main(["delete", "--project", str(tmp_path), "r1", "--force"]) == 1
+    assert "boom" in capsys.readouterr().err
+    assert run_dir.exists()
+
+
+def test_archive_force_stop_error_blocks(tmp_path, monkeypatch, capsys):
+    from automator import runs
+    from automator.process_host import ProcessHostError
+
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive")
+
+    def _raise(_rd):
+        raise ProcessHostError("host probe failed")
+
+    monkeypatch.setattr(runs, "stop_run", _raise)
+    run_dir = _make_run_with_state(tmp_path, "r1")
+    assert cli.main(["archive", "--project", str(tmp_path), "r1", "--force"]) == 1
+    assert "host probe failed" in capsys.readouterr().err
+    assert run_dir.exists()
+
+
 def test_delete_dead_run(tmp_path, capsys):
     run_dir = _make_run_with_state(tmp_path, "r1")  # no pid -> not alive
     assert cli.main(["delete", "--project", str(tmp_path), "r1"]) == 0
