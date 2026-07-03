@@ -83,21 +83,47 @@ class AutoRunResult:
     detail: str  # the prose body after the heading, trimmed (human-readable)
 
 
+def _fenced(text: str, offset: int) -> bool:
+    """True when `offset` falls inside a ``` / ~~~ fenced code block. Counting
+    fence lines before the offset suffices: an odd count means a fence is open.
+    Fences may be indented up to three spaces (CommonMark; a tab would make an
+    indented code block instead, so tabs are excluded)."""
+    return sum(1 for _ in re.finditer(r"^ {0,3}(?:```|~~~)", text[:offset], re.MULTILINE)) % 2 == 1
+
+
+def _section_headings(text: str) -> list[re.Match[str]]:
+    """`AUTO_RUN_HEADING_RE` matches that are real section headings. A heading
+    quoted inside a fenced code block (a frozen intent showing an example of the
+    terminal section, a log excerpt) is documentation, not structure — treating
+    it as terminal would let such a spec read as a result artifact from the
+    agent's first save (#52)."""
+    return [m for m in AUTO_RUN_HEADING_RE.finditer(text) if not _fenced(text, m.start())]
+
+
+def _next_heading_start(text: str, offset: int) -> int:
+    """Offset of the first non-fenced same-level (`## `) heading at/after
+    `offset`, or end-of-text — the shared section boundary. Fenced `## ` lines
+    inside the section (quoted shell comments, log output) are content, not
+    boundaries."""
+    for nxt in re.finditer(r"^##\s", text, re.MULTILINE):
+        if nxt.start() >= offset and not _fenced(text, nxt.start()):
+            return nxt.start()
+    return len(text)
+
+
 def parse_auto_run_result(text: str) -> AutoRunResult:
     """Tolerantly extract the trailing `## Auto Run Result` section from a spec.
 
-    Reads the LAST such heading (the finalize step appends; a re-derivation loop
-    could in principle append more than one — the last is the live outcome) and
-    pulls its `Status:` value plus the remaining prose as detail.
+    Reads the LAST real (non-fenced) such heading (the finalize step appends; a
+    re-derivation loop could in principle append more than one — the last is the
+    live outcome) and pulls its `Status:` value plus the remaining prose as
+    detail, spanning to the next real same-level heading.
     """
-    matches = list(AUTO_RUN_HEADING_RE.finditer(text))
+    matches = _section_headings(text)
     if not matches:
         return AutoRunResult(present=False, status="", detail="")
-    body = text[matches[-1].end() :]
-    # stop at the next top-level heading if the skill ever appends past it
-    nxt = re.search(r"^##\s+", body, re.MULTILINE)
-    if nxt:
-        body = body[: nxt.start()]
+    last = matches[-1]
+    body = text[last.end() : _next_heading_start(text, last.end())]
     status_m = STATUS_LINE_RE.search(body)
     status = status_m.group(1).strip().lower() if status_m else ""
     return AutoRunResult(present=True, status=status, detail=body.strip())
@@ -198,13 +224,14 @@ def find_result_artifact(impl_artifacts: Path, *, since_ns: int) -> Path | None:
         if mtime_ns < since_ns:
             continue
         # The no-spec fallback is recognized by name (it has no Auto Run Result
-        # heading); every other artifact must carry the terminal section.
+        # heading); every other artifact must carry a real (non-fenced) terminal
+        # section — a fence-quoted example must not qualify the spec (#52).
         if not path.name.startswith(FALLBACK_RESULT_PREFIX):
             try:
                 text = path.read_text(encoding="utf-8")
             except OSError:
                 continue
-            if not AUTO_RUN_HEADING_RE.search(text):
+            if not _section_headings(text):
                 continue
         if best is None or mtime_ns > best[0]:
             best = (mtime_ns, path)
@@ -265,17 +292,6 @@ def reset_spec_status(spec_path: Path, new_status: str) -> bool:
     return True
 
 
-def _fenced(text: str, offset: int) -> bool:
-    """True when `offset` falls inside a ``` / ~~~ fenced code block. Counting
-    fence lines before the offset suffices: an odd count means a fence is open.
-    Fences may be indented up to three spaces (CommonMark; a tab would make an
-    indented code block instead, so tabs are excluded). Deleting content is
-    destructive, so unlike the read-only heading scans (`find_result_artifact`,
-    `parse_auto_run_result`) the strip below must not mistake a fenced example
-    for a real section boundary."""
-    return sum(1 for _ in re.finditer(r"^ {0,3}(?:```|~~~)", text[:offset], re.MULTILINE)) % 2 == 1
-
-
 def strip_auto_run_result(spec_path: Path) -> bool:
     """Remove every ``## Auto Run Result`` section from a spec, in place.
 
@@ -283,12 +299,12 @@ def strip_auto_run_result(spec_path: Path) -> bool:
     flipping only its frontmatter would leave the stale terminal section behind,
     and `find_result_artifact` keys on that heading — the re-driven session's
     very first save of the spec would then qualify as a terminal result. Each
-    section spans its heading to the next same-level heading (mirroring
-    `parse_auto_run_result`'s boundary) or end-of-file; headings quoted inside
+    section spans its heading to the next same-level heading (the shared
+    `parse_auto_run_result` boundary) or end-of-file; headings quoted inside
     fenced code blocks are ignored on both ends. Returns True when a section was
     removed, False when none was present."""
     text = spec_path.read_text(encoding="utf-8")
-    matches = [m for m in AUTO_RUN_HEADING_RE.finditer(text) if not _fenced(text, m.start())]
+    matches = _section_headings(text)
     if not matches:
         return False
     kept: list[str] = []
@@ -297,11 +313,7 @@ def strip_auto_run_result(spec_path: Path) -> bool:
         if m.start() < pos:
             continue  # heading inside a section already being removed
         kept.append(text[pos : m.start()])
-        pos = len(text)
-        for nxt in re.finditer(r"^##\s", text, re.MULTILINE):
-            if nxt.start() >= m.end() and not _fenced(text, nxt.start()):
-                pos = nxt.start()
-                break
+        pos = _next_heading_start(text, m.end())
     kept.append(text[pos:])
     spec_path.write_text("".join(kept), encoding="utf-8")
     return True

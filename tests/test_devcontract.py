@@ -64,6 +64,35 @@ def test_parse_stops_at_next_heading():
     assert arr.status == "done" and "blocked" not in arr.detail
 
 
+def test_parse_ignores_fence_quoted_heading():
+    """A heading quoted inside a fenced example (a frozen intent showing the
+    section format) is documentation, not a terminal section (#52)."""
+    text = "## Intent\n\n```md\n## Auto Run Result\n\nStatus: done\n```\n\nbody\n"
+    arr = devcontract.parse_auto_run_result(text)
+    assert not arr.present and arr.status == ""
+
+
+def test_parse_real_section_wins_over_later_fenced_example():
+    """A fenced copy of the heading inside the real section's detail must not
+    displace it as the 'last' section — the real outcome stays authoritative."""
+    text = (
+        "## Auto Run Result\n\nStatus: done\n\n"
+        "the format appended was:\n\n```md\n## Auto Run Result\n\nStatus: blocked\n```\n"
+    )
+    arr = devcontract.parse_auto_run_result(text)
+    assert arr.status == "done"
+
+
+def test_parse_detail_spans_fenced_heading_line():
+    """Column-0 `## ` lines inside a fenced block within the section (quoted
+    shell comments, log output) are content, not the next-section boundary —
+    the detail must not truncate there (#52)."""
+    text = "## Auto Run Result\n\nStatus: done\n\n```sh\n## run tests\npytest -q\n```\n\ntrailing\n"
+    arr = devcontract.parse_auto_run_result(text)
+    assert arr.status == "done"
+    assert "pytest -q" in arr.detail and "trailing" in arr.detail
+
+
 # ------------------------------------------------------------- synthesize_result
 
 
@@ -182,6 +211,19 @@ def test_find_artifact_accepts_no_spec_fallback_prefix(tmp_path):
         encoding="utf-8",
     )
     assert devcontract.find_result_artifact(tmp_path, since_ns=0) == fallback
+
+
+def test_find_artifact_ignores_fence_quoted_heading(tmp_path):
+    """A spec whose only `## Auto Run Result` is a fenced example must not
+    qualify as a terminal artifact, even with a fresh mtime — otherwise the
+    agent's first save of such a spec reads as this session's result (#52)."""
+    sp = tmp_path / "spec-1-1-a.md"
+    sp.write_text(
+        "---\nstatus: in-progress\n---\n\n## Intent\n\n"
+        "```md\n## Auto Run Result\n\nStatus: done\n```\n\nbody\n",
+        encoding="utf-8",
+    )
+    assert devcontract.find_result_artifact(tmp_path, since_ns=0) is None
 
 
 # ----------------------------------------------------------- reset_spec_status
