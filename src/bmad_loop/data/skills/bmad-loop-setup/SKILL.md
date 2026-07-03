@@ -35,16 +35,31 @@ Both config scripts use an anti-zombie pattern — existing entries for this mod
 - The user asked for one in their arguments — `upgrade`, `update`, `upgrade tool and skills`, or similar.
 - `{project-root}/_bmad/config.yaml` already has a `bmad-loop` section (step 2 above).
 - The orchestrator tool is already installed under uv: run `uv tool list` and look for a `bmad-loop` entry. (A bare `bmad-loop --version` is **not** sufficient on its own — it can be satisfied by a source checkout or unrelated virtualenv; see step 1 of "Install the Orchestrator Tool".)
+- **A pre-rename install is present** — the project (or the machine) is on the old `bmad-auto`. Two tells: `{project-root}/_bmad/config.yaml` has a legacy `bauto` section, or `uv tool list` shows a `bmad-auto` entry (the tool's former name). Treat this as an **upgrade from bmad-auto (renamed to bmad-loop)** and follow "Migrating from bmad-auto (renamed)" below in addition to the normal upgrade path.
 
 Otherwise it is a **fresh install**. State the decision to the user before proceeding — e.g. "Detected an existing bmad-loop install — running an upgrade: tool + skills + config" or "No existing install detected — running a fresh setup". When the signals conflict (e.g. config has a `bmad-loop` section but the tool isn't uv-managed), prefer the upgrade path for whatever **is** present and call out what's missing.
 
 If the user provides arguments (e.g. `accept all defaults`, `--headless`, `upgrade`, or inline values like `user name is BMad, I speak Swahili`), map any provided values to config keys, use defaults for the rest, and skip interactive prompting. Still display the full confirmation summary at the end.
 
+## Migrating from bmad-auto (renamed)
+
+Only when you detected a **pre-rename install** ("Decide fresh-install vs upgrade" above). The project was set up under the tool's former name, `bmad-auto`. The rename was a clean break — module code `bauto` → `bmad-loop`, tool package `bmad-auto` → `bmad-loop`, state dir `.automator/` → `.bmad-loop/` — with no compatibility shims, so a few steps below need explicit handling. Do these as part of the normal upgrade:
+
+1. **Carry old config defaults over.** `merge-config.py --legacy-dir` reads `_bmad/bmad-loop/` (the new code), so it won't find the old `bauto` config on its own. Before collecting values, read the legacy `bauto:` section from `{project-root}/_bmad/config.yaml` (and, if present, the old installer file `{project-root}/_bmad/bauto/config.yaml`) and fold any keys that still match the current `module.yaml` schema into your defaults. Priority: existing `bmad-loop` values > legacy `bauto` section > legacy `_bmad/bauto/config.yaml` > `module.yaml` defaults.
+2. **Reinstall the tool under its new name** — uv can't rename a package in place, so this is an uninstall + install, not an upgrade. See the renamed-tool note in "Install the Orchestrator Tool" step 2.
+3. **Run `bmad-loop init`** as usual. It handles the on-disk migration for you: strips the old `.automator/` Stop hook from each CLI's settings, removes the `bmad-auto-*` skill dirs, and carries `.automator/policy.toml` over to `.bmad-loop/policy.toml` — leaving the rest of `.automator/` (runs, archives, profiles, plugins) in place for you to delete once satisfied.
+4. **Post-merge cleanup** — the anti-zombie merges key on the **new** names, so old rows and sections survive and need explicit removal:
+   - Delete the leftover `bauto:` section from `{project-root}/_bmad/config.yaml`, plus any `bauto`-marked keys in `{project-root}/_bmad/config.user.yaml`.
+   - Delete rows from `{project-root}/_bmad/module-help.csv` whose module column (column 1) reads `BMAD Automator Skills` — `merge-help-csv.py`'s anti-zombie filter keys on the new `BMAD Loop Skills`, so it leaves the old-named rows behind.
+   - The legacy installer dir `_bmad/bauto/` is removed by the cleanup step's `--also-remove bauto` (see "Cleanup Legacy Directories").
+
+Then continue with the normal flow below.
+
 ## Collect Configuration
 
 Ask the user for values. Show defaults in brackets. Present all values together so the user can respond once with only the values they want to change (e.g. "change language to Swahili, rest are fine"). Never tell the user to "press enter" or "leave blank" — in a chat interface they must type something to respond.
 
-**Default priority** (highest wins): existing new config values > legacy config values > `./assets/module.yaml` defaults. When legacy configs exist, read them and use matching values as defaults instead of `module.yaml` defaults. Only keys that match the current schema are carried forward — changed or removed keys are ignored.
+**Default priority** (highest wins): existing new config values > legacy config values > `./assets/module.yaml` defaults. When legacy configs exist, read them and use matching values as defaults instead of `module.yaml` defaults. Only keys that match the current schema are carried forward — changed or removed keys are ignored. On a **rename-upgrade from bmad-auto**, the old `bauto` section (in `_bmad/config.yaml`) and any `_bmad/bauto/config.yaml` installer file slot in below existing `bmad-loop` values and above `module.yaml` defaults — you read them yourself (see "Migrating from bmad-auto (renamed)"), since merge-config's `--legacy-dir` only looks under the new code.
 
 **Core config** (only if no core keys exist yet): `user_name` (default: BMad), `communication_language` and `document_output_language` (default: English — ask as a single language question, both keys get the same answer), `output_folder` (default: `{project-root}/_bmad-output`). Of these, `user_name` and `communication_language` are written exclusively to `config.user.yaml`. The rest go to `config.yaml` at root and are shared across all modules.
 
@@ -80,6 +95,15 @@ Unless the user explicitly asked to skip it (e.g. `skills only` / `--no-tool`), 
 1. **Check what's already on PATH:** run `bmad-loop --version`. A version printing here does **not** mean this project is set up — it only means _some_ `bmad-loop` is importable in the current environment. Before trusting it, run `uv tool list` and look for `bmad-loop`: if it's absent (the on-PATH copy comes from a source checkout or an unrelated virtualenv), warn the user that the active environment is shadowing a clean install and that the project would be relying on that checkout. Unless the user explicitly declines, install/upgrade from the canonical source below so the project doesn't depend on an incidental dev environment. Only skip the install if the user confirms the on-PATH copy is the one they want this project to use.
 
 2. **Install or upgrade from the Git repository** (the `[tui]` extra pulls in the Textual dashboard so `bmad-loop tui` works). `uv tool install` puts `bmad-loop` in uv's own managed environment, so there's no PEP 668 externally-managed conflict and no need for `--user`, an activated virtualenv, or `--break-system-packages`.
+
+   - **Renamed from bmad-auto** (`uv tool list` shows `bmad-auto`, not `bmad-loop`): uv can't rename a package in place, so `uv tool upgrade` won't move you across the rename. Record `bmad-auto --version` first (for the delta), then uninstall the old tool and install the new one fresh:
+
+     ```bash
+     uv tool uninstall bmad-auto
+     uv tool install "bmad-loop[tui] @ git+https://github.com/bmad-code-org/bmad-loop.git"
+     ```
+
+     After this the machine is on `bmad-loop`; later runs follow the plain upgrade path below.
 
    - **Fresh install** (no uv-managed `bmad-loop`):
 
@@ -162,6 +186,14 @@ python3 ./scripts/cleanup-legacy.py --bmad-dir "{project-root}/_bmad" --module-c
 ```
 
 The script verifies that every skill in the legacy directories exists at `.claude/skills/` before removing anything. Directories without skills (like `_config/`) are removed directly. If the script exits non-zero, surface the error and stop. Missing directories (already cleaned by a prior run) are not errors — the script is idempotent.
+
+**On a rename-upgrade from bmad-auto**, also remove the old `_bmad/bauto/` installer directory. When it was populated by the BMAD-method installer it holds the pre-rename `bmad-auto-*` skill copies, which no longer exist at `.claude/skills/` — so run this cleanup **without** `--skills-dir` to skip the installed-skill verification (their removal is exactly the point). It is a no-op when `_bmad/bauto/` isn't present:
+
+```bash
+python3 ./scripts/cleanup-legacy.py --bmad-dir "{project-root}/_bmad" --module-code bauto
+```
+
+(`--module-code bauto` also targets `core`, already handled above — a missing directory is a no-op.)
 
 Check `directories_removed` and `files_removed_count` in the JSON output for the confirmation step. Run `./scripts/cleanup-legacy.py --help` for full usage.
 

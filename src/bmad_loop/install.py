@@ -32,6 +32,11 @@ HOOK_SCRIPT_REL = ".bmad-loop/bmad_loop_hook.py"
 # relay (bmad_loop_hook.py) and the probe-adapter capture hook
 # (bmad_loop_probe_hook.py) — so merge_hooks stays idempotent for either.
 HOOK_MARKER = "bmad_loop"
+# Pre-rename marker: the old relay/probe hooks lived under .automator/ and carried
+# `bmad_auto` in their command. `bmad-loop init` strips them on upgrade so a project
+# renamed from bmad-auto isn't left double-signalling. Underscore form, so it never
+# matches the hyphenated upstream `bmad-dev-auto` skill.
+LEGACY_HOOK_MARKER = "bmad_auto"
 GEMINI_HOOK_TIMEOUT_MS = 60_000
 COPILOT_HOOK_TIMEOUT_SEC = 60
 
@@ -42,6 +47,16 @@ MODULE_SKILLS = (
     "bmad-loop-resolve",
     "bmad-loop-sweep",
     "bmad-loop-setup",
+)
+
+# Pre-rename skill dirs (bmad-auto-*). `bmad-loop init` removes them from each CLI
+# skill tree on upgrade so a renamed project isn't left with both the old and new
+# forks side by side. Guarded on a SKILL.md inside, so only a real skill dir we own
+# is ever deleted.
+LEGACY_MODULE_SKILLS = (
+    "bmad-auto-resolve",
+    "bmad-auto-sweep",
+    "bmad-auto-setup",
 )
 
 # Upstream skills the orchestrator invokes but does NOT bundle in the wheel — the
@@ -137,6 +152,54 @@ def merge_hooks(config: dict, registrations: dict[str, str], dialect: str) -> tu
     return config, changed
 
 
+def strip_legacy_hooks(config: dict) -> tuple[dict, int]:
+    """Remove hook handlers carrying the pre-rename `bmad_auto` marker.
+
+    Mirrors merge_hooks' dialect shapes: copilot stores the handler dict directly
+    in the event list; claude/codex/gemini nest handlers under ``entry["hooks"]``.
+    Emptied matcher entries — and event lists left empty — are dropped so a
+    re-registered `bmad_loop` hook doesn't share space with a dead `bmad_auto` one.
+    Returns (config, removed_count). The hyphenated upstream `bmad-dev-auto` skill
+    never matches the underscore marker.
+    """
+    hooks = config.get("hooks")
+    if not isinstance(hooks, dict):
+        return config, 0
+    removed = 0
+    for native_event in list(hooks):
+        matchers = hooks.get(native_event)
+        if not isinstance(matchers, list):
+            continue
+        kept: list = []
+        for entry in matchers:
+            if not isinstance(entry, dict):
+                kept.append(entry)
+                continue
+            # copilot: the handler dict is the entry itself
+            if LEGACY_HOOK_MARKER in entry.get("command", ""):
+                removed += 1
+                continue
+            # claude/codex/gemini: handlers nest under "hooks"
+            nested = entry.get("hooks")
+            if isinstance(nested, list):
+                pruned = [
+                    h
+                    for h in nested
+                    if not (isinstance(h, dict) and LEGACY_HOOK_MARKER in h.get("command", ""))
+                ]
+                if len(pruned) != len(nested):
+                    removed += len(nested) - len(pruned)
+                    if not pruned:
+                        continue  # emptied matcher entry -> drop it
+                    entry["hooks"] = pruned
+            kept.append(entry)
+        if kept:
+            hooks[native_event] = kept
+        else:
+            del hooks[native_event]  # emptied event -> drop it
+    return config, removed
+
+
 def _register_hooks(project: Path, profile: CLIProfile) -> int:
     config_path = project / profile.hooks.config_path
     config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -151,11 +214,15 @@ def _register_hooks(project: Path, profile: CLIProfile) -> int:
         native: _hook_command(project, profile, canonical)
         for native, canonical in profile.hooks.events.items()
     }
+    config, removed = strip_legacy_hooks(config)
     config, changed = merge_hooks(config, registrations, profile.hooks.dialect)
-    if changed:
+    if removed:
+        print(f"  removed {removed} legacy bmad-auto hook(s) ({profile.name})")
+    if changed or removed:
         config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
-        print(f"  hooks registered ({profile.name}): {config_path}")
-    else:
+        if changed:
+            print(f"  hooks registered ({profile.name}): {config_path}")
+    elif not removed:
         print(f"  hooks already registered ({profile.name})")
     return 0
 
@@ -235,6 +302,20 @@ def _copy_skills(project: Path, trees: Sequence[str], force: bool) -> bool:
             skipped_any = True
         print(f"  skills -> {tree}/: {'; '.join(parts) if parts else 'nothing to do'}")
     return skipped_any
+
+
+def _remove_legacy_skills(project: Path, trees: Sequence[str]) -> None:
+    """Delete the pre-rename bmad-auto-* skill dirs from each project skill tree.
+
+    Guarded on a SKILL.md inside, so an unrelated same-named folder is never touched.
+    Idempotent (a missing dir is a no-op); prints one line per removal.
+    """
+    for tree in dict.fromkeys(trees):
+        for skill in LEGACY_MODULE_SKILLS:
+            dst = project / tree / skill
+            if dst.is_dir() and (dst / "SKILL.md").is_file():
+                shutil.rmtree(dst)
+                print(f"  removed legacy skill: {tree}/{skill}")
 
 
 def provision_worktree(
@@ -409,12 +490,18 @@ def install_into(
     skills_skipped = False
     if skills:
         trees = list(dict.fromkeys(p.skill_tree for p in profiles))
+        _remove_legacy_skills(project, trees)
         skills_skipped = _copy_skills(project, trees, force_skills)
 
-    # 4. policy template
+    # 4. policy template — on an upgrade from bmad-auto, carry the old policy over
+    #    (its contents are unchanged by the rename) rather than resetting to default.
     policy_path = bmad_loop_dir / "policy.toml"
+    legacy_policy = project / ".automator" / "policy.toml"
     if policy_path.is_file():
         print("  policy exists, leaving untouched")
+    elif legacy_policy.is_file():
+        policy_path.write_text(legacy_policy.read_text(encoding="utf-8"), encoding="utf-8")
+        print(f"  migrated policy: {legacy_policy} -> {policy_path}")
     else:
         policy_path.write_text(POLICY_TEMPLATE, encoding="utf-8")
         print(f"  policy written: {policy_path}")
@@ -436,6 +523,16 @@ def install_into(
 
     if skills_skipped:
         print("  some skills already present; re-run with --force-skills to overwrite")
+
+    # 6. legacy state left in place: init never deletes the old .automator/ tree
+    #    (runs/archives/profiles/plugins) or its stale .automator/* gitignore lines.
+    #    Policy was carried over above; everything else is yours to keep or remove.
+    if (project / ".automator").is_dir():
+        print(
+            "  note: legacy .automator/ left in place (runs, archives, profiles, "
+            "plugins, and any stale .automator/* gitignore lines). Delete it or "
+            "hand-move state once you've confirmed the migration."
+        )
 
     print(
         "init complete. One-time setup before `bmad-loop run` — spawned "

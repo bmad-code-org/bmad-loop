@@ -5,6 +5,38 @@ All notable changes to `bmad-loop` are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). While the project is pre-1.0,
 breaking changes may land in a minor release.
 
+## [0.8.0] — 2026-07-03
+
+### Changed
+
+- **BREAKING: the project is renamed `bmad-auto` → `bmad-loop`.** The distribution, console script,
+  and CLI are now `bmad-loop`; the Python package is `bmad_loop` (was `automator`); the BMAD module
+  code and marketplace plugin are `bmad-loop` (was `bauto`); per-project state moves from
+  `.automator/` to `.bmad-loop/`. The GitHub repo is now
+  [bmad-code-org/bmad-loop](https://github.com/bmad-code-org/bmad-loop) — old web and git URLs
+  redirect. Clean break: no compatibility shims.
+- **BREAKING: renamed public identifiers.** Env vars `BMAD_AUTO_*` → `BMAD_LOOP_*`; plugin
+  entry-point group `bmad_auto.plugins` → `bmad_loop.plugins`; hook relays `bmad_auto_hook.py` /
+  `bmad_auto_probe_hook.py` → `bmad_loop_hook.py` / `bmad_loop_probe_hook.py`; skills
+  `/bmad-auto-{setup,sweep,resolve}` → `/bmad-loop-{setup,sweep,resolve}`; tmux session/window
+  prefixes `bmad-auto-*` → `bmad-loop-*`; worktree branches `automator/<run-id>` →
+  `bmad-loop/<run-id>`; TUI class `BmadAutoApp` → `BmadLoopApp`. Custom plugins, CLI profiles, and
+  policy files that reference any of these must be updated.
+
+### Migration
+
+- **Reinstall the tool under its new name** — uv can't rename a package in place:
+  `uv tool uninstall bmad-auto`, then
+  `uv tool install "bmad-loop[tui] @ git+https://github.com/bmad-code-org/bmad-loop.git"`.
+- **Re-run `/bmad-loop-setup`** (or `bmad-loop init` directly). `init` migrates a project in place:
+  it strips the old `.automator/` Stop hook from each CLI's settings, removes the `bmad-auto-*`
+  skill dirs, and carries `.automator/policy.toml` over to `.bmad-loop/policy.toml`. Setup folds the
+  old `bauto` config into `bmad-loop` and clears the leftover `bauto` config section, stale
+  `BMAD Automator Skills` help rows, and the `_bmad/bauto/` installer dir.
+- **Legacy `.automator/` is left in place** (runs, archives, profiles, plugins) and can be deleted
+  or hand-moved once the migration is confirmed; stale `.automator/*` gitignore lines are left
+  untouched.
+
 ## [0.7.12] — 2026-07-01
 
 ### Added
