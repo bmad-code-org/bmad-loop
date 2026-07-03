@@ -33,12 +33,16 @@ SUPPORTED_API: frozenset[int] = frozenset({1})
 SETTING_TYPES = {"bool", "int", "float", "str", "select"}
 
 # Stages at which a plugin-provided workflow may inject an extra agent session
-# (Phase 4). Deliberately small + conservative: both fire *inside* the unit's
+# (Phase 4). Deliberately small + conservative: all fire *inside* the unit's
 # live worktree with the dev/review work already on disk, so an injected session
-# sees the real tree. Other stages either lack a worktree (run-boundary) or run
-# after teardown (post_story restores the main checkout), so a session there
+# sees the real tree. post_review_result fires only when the orchestrator review
+# loop actually runs (review.trigger="recommended" skips it on most stories);
+# pre_commit_gate fires unconditionally just before commit on every path —
+# review, skip, and budget-rescue alike — so a gate session evaluates the exact
+# tree about to commit. Other stages either lack a worktree (run-boundary) or
+# run after teardown (post_story restores the main checkout), so a session there
 # would target the wrong tree — they are intentionally excluded.
-WORKFLOW_STAGES = frozenset({"post_dev_phase", "post_review_result"})
+WORKFLOW_STAGES = frozenset({"post_dev_phase", "post_review_result", "pre_commit_gate"})
 
 # Roles a workflow session may run as — the engine's two adapters. A workflow
 # names one so it reuses that role's resolved adapter config (model, timeout).

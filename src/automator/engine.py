@@ -1473,6 +1473,17 @@ class Engine:
         self._commit(task)
 
     def _commit(self, task: StoryTask) -> None:
+        # pre_commit_gate: the unconditional workflow-injection point before a
+        # commit, on every path here (review-converged, skip-review, and the
+        # review-budget rescue) — unlike post_review_result, which fires only
+        # when the orchestrator review loop runs. Gate sessions (e.g. TEA's
+        # trace/nfr/review) evaluate the exact tree about to commit and write
+        # the artifacts the pre_commit hook then enforces on. Placed BEFORE
+        # advance(COMMITTING): the task is still DEV_VERIFY / REVIEW_VERIFY,
+        # both of which may legally defer, so a blocking gate whose session
+        # does not complete can unwind cleanly (COMMITTING cannot defer).
+        if self._run_workflows("pre_commit_gate", task, task.review_cycle):
+            return
         advance(task, Phase.COMMITTING)
         self._save()
         message = self._commit_message(task)

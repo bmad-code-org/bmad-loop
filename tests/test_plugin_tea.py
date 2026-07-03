@@ -200,7 +200,9 @@ def test_builtin_tea_plugin_workflows_shape():
     for name in DEV_STEPS:
         assert by_name[name].stage == "post_dev_phase" and by_name[name].role == "dev"
     for name in REVIEW_STEPS:
-        assert by_name[name].stage == "post_review_result" and by_name[name].role == "review"
+        # gates bind to pre_commit_gate (fires on EVERY path into a commit),
+        # not post_review_result (fires only when the review loop runs)
+        assert by_name[name].stage == "pre_commit_gate" and by_name[name].role == "review"
     # ship advisory: nothing blocking in the manifest (operators flip *_blocking).
     assert not any(w.blocking for w in tea.workflows)
     # prompts name the explicit TEA workflow/skill so they degrade across CLIs.
@@ -308,6 +310,85 @@ def test_runs_inject_six_tea_workflows_in_order(project, monkeypatch):
     starts, ends = workflow_trail(engine)
     assert starts == [("tea", n) for n in DEV_STEPS + REVIEW_STEPS]
     assert ends == list(DEV_STEPS + REVIEW_STEPS)
+
+
+def test_gates_run_even_when_review_loop_is_skipped(project, monkeypatch):
+    """The hey-dad regression: with review.trigger="recommended" (the default)
+    and a dev session that recommends no follow-up, the orchestrator review loop
+    never runs, so post_review_result never fires. The gates bind to
+    pre_commit_gate, which fires on the skip path too — the three gate sessions
+    must still run, at that stage, before the story commits."""
+    install_tea(project)
+    monkeypatch.chdir(project.project)
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    policy = tea_policy()
+    reg = PluginRegistry.build(project.project, policy)
+
+    captured: list = []
+    script = [
+        dev_effect(project, "1-1-a", followup_review=False),
+        workflow_effect(captured),  # td
+        workflow_effect(captured),  # atdd
+        workflow_effect(captured),  # automate
+        # NO review session: the review loop is skipped entirely
+        workflow_effect(captured),  # trace
+        workflow_effect(captured),  # nfr
+        workflow_effect(captured),  # review
+    ]
+    engine = make_engine(project, script, reg, policy)
+    summary = engine.run()
+
+    assert summary.done == 1
+    # gate seq is task.review_cycle — still 0 here, since no review ever ran
+    assert [s.task_id for s in captured] == [
+        "1-1-a-tea.td-1",
+        "1-1-a-tea.atdd-1",
+        "1-1-a-tea.automate-1",
+        "1-1-a-tea.trace-0",
+        "1-1-a-tea.nfr-0",
+        "1-1-a-tea.review-0",
+    ]
+    entries = engine.journal.entries()
+    kinds = [e["kind"] for e in entries]
+    assert "review-skipped" in kinds  # the review loop really was skipped
+    gate_starts = [
+        e for e in entries if e["kind"] == "workflow-start" and e["workflow"] in REVIEW_STEPS
+    ]
+    assert [e["workflow"] for e in gate_starts] == list(REVIEW_STEPS)
+    assert all(e["stage"] == "pre_commit_gate" for e in gate_starts)
+    # every gate finished before the commit landed
+    assert max(i for i, k in enumerate(kinds) if k == "workflow-end") < kinds.index("story-done")
+
+
+def test_blocking_gate_fail_escalates_even_when_review_skipped(project, monkeypatch):
+    """End-to-end enforcement on the skip path (the half of the hey-dad failure
+    that made *_blocking inert): a FAIL nfr artifact with nfr_blocking=true must
+    escalate at commit — the story must NOT land — even though the review loop
+    never ran."""
+    install_tea(project)
+    monkeypatch.chdir(project.project)
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    policy = tea_policy(nfr_blocking=True)
+    reg = PluginRegistry.build(project.project, policy)
+
+    write_gate_artifact(project, "nfr", "FAIL")
+    script = [
+        dev_effect(project, "1-1-a", followup_review=False),
+        workflow_effect([]),  # td
+        workflow_effect([]),  # atdd
+        workflow_effect([]),  # automate
+        workflow_effect([]),  # trace
+        workflow_effect([]),  # nfr — its FAIL verdict artifact is on disk
+        workflow_effect([]),  # review
+    ]
+    engine = make_engine(project, script, reg, policy)
+    summary = engine.run()
+
+    assert summary.escalated == 1
+    assert summary.done == 0
+    assert summary.paused  # pre_commit pause-veto escalates + pauses the run
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "story-escalated" in kinds and "story-done" not in kinds
 
 
 def test_automate_enabled_false_suppresses_only_that_step(project, monkeypatch):

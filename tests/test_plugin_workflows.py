@@ -247,6 +247,49 @@ def test_nonblocking_workflow_failure_is_advisory(project):
     assert ends and ends[0]["status"] == "error"
 
 
+def test_pre_commit_gate_workflow_injects_before_commit(project):
+    """A workflow bound to pre_commit_gate runs just before the commit — on the
+    review-skip path too (dev recommends no follow-up, so the review loop and
+    its post_review_result stage never run)."""
+    captured: list = []
+    setup_story(project)
+    reg = PluginRegistry([LoadedPlugin(manifest=wf_manifest("wf", stage="pre_commit_gate"))])
+    script = [
+        dev_effect(project, "1-1-a", followup_review=False),
+        workflow_effect(captured),  # no review session between dev and this
+    ]
+    engine, _ = make_engine(project, script, reg)
+    summary = engine.run()
+    assert summary.done == 1
+    # seq is task.review_cycle, still 0 on the skip path (no review ever ran)
+    assert len(captured) == 1 and captured[0].task_id == "1-1-a-wf.doc-0"
+    entries = engine.journal.entries()
+    starts = [e for e in entries if e["kind"] == "workflow-start"]
+    assert [e["stage"] for e in starts] == ["pre_commit_gate"]
+    kinds = [e["kind"] for e in entries]
+    # the gate session finished before the commit landed
+    assert kinds.index("workflow-end") < kinds.index("story-done")
+
+
+def test_blocking_pre_commit_gate_failure_defers_the_unit(project):
+    """A blocking pre_commit_gate workflow whose session doesn't complete defers
+    the unit cleanly: the stage fires before the task enters COMMITTING (which
+    has no legal move to DEFERRED), so the defer is a legal transition."""
+    setup_story(project)
+    reg = PluginRegistry(
+        [LoadedPlugin(manifest=wf_manifest("wf", stage="pre_commit_gate", blocking=True))]
+    )
+    script = [
+        dev_effect(project, "1-1-a", followup_review=False),
+        workflow_effect([], status="error"),
+    ]
+    engine, _ = make_engine(project, script, reg)
+    summary = engine.run()
+    assert summary.deferred == 1 and summary.done == 0
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "story-deferred" in kinds and "story-done" not in kinds
+
+
 def test_no_workflow_no_extra_session(project):
     # a plugin with hooks but no workflow injects nothing; the guard is O(1).
     reg = PluginRegistry([])

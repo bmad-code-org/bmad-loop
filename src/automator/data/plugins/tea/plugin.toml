@@ -4,11 +4,18 @@
 # `bmad-testarch-*` workflows) into every run and sweep as advisory-by-default
 # quality steps. It assumes TEA is already installed in the project
 # (`npx bmad-method install` -> Test Architect), and orchestrates by injecting
-# natural-language sessions that invoke the relevant TEA workflow at the two
+# natural-language sessions that invoke the relevant TEA workflow at two
 # stages that have a live worktree:
 #
 #   post_dev_phase     test-design (TD) + atdd (AT) + automate (TA)   [role=dev]
-#   post_review_result trace (TR) + nfr (NR) + test-review (RV)       [role=review]
+#   pre_commit_gate    trace (TR) + nfr (NR) + test-review (RV)       [role=review]
+#
+# The gate steps bind to pre_commit_gate — the injection point that fires
+# unconditionally just before every commit — NOT post_review_result, which fires
+# only when the orchestrator review loop runs (review.trigger="recommended"
+# skips it whenever the dev session doesn't recommend a follow-up). Gates
+# therefore evaluate the exact tree about to commit, and the `*_blocking` flags
+# enforce on every path.
 #
 # Because sweep bundles run the same inherited dev/review pipeline, these
 # workflows fire for runs AND sweep bundles with no sweep-specific code.
@@ -93,21 +100,21 @@ key = "trace_enabled"
 type = "bool"
 default = true
 label = "Enable trace (TR)"
-help = "post_review_result: map requirements to tests + record the quality-gate decision (bmad-testarch-trace)."
+help = "pre_commit_gate: map requirements to tests + record the quality-gate decision (bmad-testarch-trace)."
 
 [[settings]]
 key = "nfr_enabled"
 type = "bool"
 default = true
 label = "Enable NFR (NR)"
-help = "post_review_result: assess non-functional requirements + record the gate decision (bmad-testarch-nfr)."
+help = "pre_commit_gate: assess non-functional requirements + record the gate decision (bmad-testarch-nfr)."
 
 [[settings]]
 key = "review_enabled"
 type = "bool"
 default = true
 label = "Enable test-review (RV)"
-help = "post_review_result: quality check against the written tests (bmad-testarch-test-review)."
+help = "pre_commit_gate: quality check against the written tests (bmad-testarch-test-review)."
 
 # Per-gate blocking flags (workflow-overlay convention: <name>_blocking). The
 # gate steps ship advisory; flip one true so a FAIL/CONCERNS verdict escalates
@@ -159,19 +166,19 @@ prompt = "Run the TEA Test Automation workflow (skill `bmad-testarch-automate`) 
 blocking = false
 
 [workflows.trace]
-stage = "post_review_result"
+stage = "pre_commit_gate"
 role = "review"
 prompt = "Run the TEA Trace Requirements workflow (skill `bmad-testarch-trace`) for `{story_key}`. Map the requirements to the tests covering the changes currently in the working tree and record the quality-gate decision under TEA's configured test_artifacts directory."
 blocking = false
 
 [workflows.nfr]
-stage = "post_review_result"
+stage = "pre_commit_gate"
 role = "review"
 prompt = "Run the TEA Non-Functional Requirements workflow (skill `bmad-testarch-nfr`) for `{story_key}`. Assess the NFRs of the changes currently in the working tree and record the gate decision under TEA's configured test_artifacts directory."
 blocking = false
 
 [workflows.review]
-stage = "post_review_result"
+stage = "pre_commit_gate"
 role = "review"
 prompt = "Run the TEA Test Review workflow (skill `bmad-testarch-test-review`) for `{story_key}`. Perform a quality check against the tests covering the changes currently in the working tree, using TEA's knowledge base and best practices, and record findings under TEA's configured test_artifacts directory."
 blocking = false

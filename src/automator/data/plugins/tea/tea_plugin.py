@@ -1,7 +1,7 @@
 """In-process brain for the bundled Test Architect Enterprise (TEA) plugin.
 
 The plugin's behaviour is mostly declarative — six ``[workflows.*]`` inject TEA
-sessions at ``post_dev_phase`` / ``post_review_result``, and the generic
+sessions at ``post_dev_phase`` / ``pre_commit_gate``, and the generic
 workflow-overlay convention (``<name>_enabled`` / ``<name>_blocking``) turns the
 per-step settings into enable/blocking switches with no code. This module owns
 the two things that need logic:
@@ -15,8 +15,10 @@ the two things that need logic:
     = true), parse that gate's latest TEA artifact at commit time and, on a
     FAIL/CONCERNS verdict, escalate the unit (``ctx.veto("pause", …)``) instead of
     letting it land. ``pre_commit`` is the first vetoable stage *after* the
-    ``post_review_result`` workflows have written their artifacts (a same-stage
-    Python hook fires before the workflows, so it can't read their output).
+    ``pre_commit_gate`` workflows have written their artifacts, and both fire
+    unconditionally on every path into a commit — review-converged, skip-review
+    (``review.trigger="recommended"`` with no follow-up recommended), and the
+    review-budget rescue — so the gates evaluate the exact tree about to commit.
 
 Enforcement is **fail-open by design**: if a gate has no blocking flag, no
 artifact, or an artifact that can't be parsed into a known verdict, the commit is
@@ -35,7 +37,7 @@ from automator.plugins.model import Plugin, PluginError
 if TYPE_CHECKING:
     from automator.plugins.context import HookContext
 
-# The gate steps that expose a ``*_blocking`` flag (the post_review_result steps
+# The gate steps that expose a ``*_blocking`` flag (the pre_commit_gate steps
 # an operator is likely to enforce). Generation steps (td/atdd/automate) stay
 # advisory by design and are deliberately absent — they are never gate-enforced.
 GATE_STEPS = ("trace", "nfr", "review")
@@ -155,7 +157,7 @@ class TeaPlugin(Plugin):
             return  # nothing flagged blocking -> advisory only, no artifact read
 
         # Resolve the tree TEA wrote into: the unit's worktree (where the
-        # post_review_result sessions just ran), falling back to the repo root.
+        # pre_commit_gate sessions just ran), falling back to the repo root.
         # Under isolation = none the two coincide.
         root = ctx.worktree or ctx.repo_root
         if not root:

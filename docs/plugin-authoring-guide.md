@@ -152,7 +152,7 @@ An extra agent session injected at a stage. See [Workflows](#workflows-provides)
 
 ```toml
 [workflows.lint-sweep]
-stage = "post_dev_phase"   # post_dev_phase | post_review_result
+stage = "post_dev_phase"   # post_dev_phase | post_review_result | pre_commit_gate
 role = "dev"               # dev | review
 prompt = "/lint-sweep {story_key}"
 blocking = false           # true: a failed session defers the unit
@@ -403,10 +403,11 @@ there.
 
 ### Commit
 
-| Stage         | When              | Mutable surface                                                                        |
-| ------------- | ----------------- | -------------------------------------------------------------------------------------- |
-| `pre_commit`  | before committing | **`proposed_commit_message`**; only a `pause` veto is honored (the unit is mid-commit) |
-| `post_commit` | after committing  | —                                                                                      |
+| Stage             | When                                        | Mutable surface                                                                          |
+| ----------------- | ------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| `pre_commit_gate` | just before every commit, on every path     | a [workflow injection point](#workflows-provides); defer-safe (the unit may still defer) |
+| `pre_commit`      | before committing (after `pre_commit_gate`) | **`proposed_commit_message`**; only a `pause` veto is honored (the unit is mid-commit)   |
+| `post_commit`     | after committing                            | —                                                                                        |
 
 ### Generic session boundary
 
@@ -447,8 +448,14 @@ blocking = false           # true: a non-completed session defers the unit
 
 - **Injection stages** are deliberately limited to where the unit's worktree is
   live and the dev/review work is on disk: **`post_dev_phase`** (right after dev
-  lands) and **`post_review_result`** (after a review verdict). Other stages lack
-  a worktree or run after teardown.
+  lands), **`post_review_result`** (after a review verdict — fires only when the
+  orchestrator review loop actually runs; `review.trigger = "recommended"` skips
+  it on stories whose dev session recommends no follow-up), and
+  **`pre_commit_gate`** (unconditionally just before every commit — review, skip,
+  and budget-rescue paths alike — so a session there evaluates the exact tree
+  about to commit). `pre_commit_gate` is **defer-safe**: it fires before the unit
+  enters COMMITTING, so a _blocking_ workflow whose session doesn't complete
+  still defers cleanly. Other stages lack a worktree or run after teardown.
 - **`prompt`** expands `{story_key}`, `{run_id}`, and `{scripts}`.
 - The injected session is a **first-class session**: it fires `pre_workflow_session`
   → `pre_session` → `post_session`, is recorded on the task, and counts toward the
@@ -487,7 +494,7 @@ documented, surfaced in the settings UI) and operators can flip them from
 ```toml
 # A gate step: generated advisory by default, an operator can make it block.
 [workflows.nfr]
-stage = "post_review_result"
+stage = "pre_commit_gate"
 role = "review"
 prompt = "Run the NFR assessment for the changes in {story_key}."
 blocking = false              # manifest default: advisory

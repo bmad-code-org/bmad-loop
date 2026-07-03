@@ -4,9 +4,9 @@ The bundled **`tea`** plugin wires the BMAD **Test Architect Enterprise (TEA)**
 module — the "Murat" agent and its `bmad-testarch-*` workflows — into every
 bmad-auto run and sweep as **advisory-by-default quality steps**. It injects
 six TEA sessions across the pipeline (test-design, ATDD, automate after dev;
-trace, NFR, test-review after review), and an operator can flip any of the three
-gate steps to **blocking** so a failing quality gate escalates the unit for human
-review instead of committing.
+trace, NFR, test-review just before commit), and an operator can flip any of the
+three gate steps to **blocking** so a failing quality gate escalates the unit for
+human review instead of committing.
 
 Like the [game-engine layer](game-engine-plugin-guide.md), TEA is **just a
 plugin** on the general [plugin system](plugin-authoring-guide.md) — same
@@ -54,26 +54,32 @@ is toggled on — see the [TUI guide](tui-guide.md).
 
 ## The six steps and where they run
 
-TEA work injects at the **two** lifecycle stages that have a live worktree
-(`post_dev_phase` and `post_review_result` — the only stages workflow injection
-is permitted; see the [stage reference](plugin-authoring-guide.md#stage-reference)).
+TEA work injects at **two** lifecycle stages that have a live worktree
+(`post_dev_phase` and `pre_commit_gate`; see the
+[stage reference](plugin-authoring-guide.md#stage-reference)).
 Each step runs as an extra agent session through the `dev` or `review` adapter,
 with `workflow-start` / `workflow-end` journal entries.
 
-| Step       | TEA workflow                | Stage                | Adapter | What it does                                                           |
-| ---------- | --------------------------- | -------------------- | ------- | ---------------------------------------------------------------------- |
-| `td`       | `bmad-testarch-test-design` | `post_dev_phase`     | dev     | Risk assessment + risk-based coverage strategy for the change.         |
-| `atdd`     | `bmad-testarch-atdd`        | `post_dev_phase`     | dev     | Failing acceptance tests + an implementation checklist.                |
-| `automate` | `bmad-testarch-automate`    | `post_dev_phase`     | dev     | Prioritized API/E2E tests, fixtures, and a Definition-of-Done summary. |
-| `trace`    | `bmad-testarch-trace`       | `post_review_result` | review  | Map requirements → tests and record the quality-gate decision.         |
-| `nfr`      | `bmad-testarch-nfr`         | `post_review_result` | review  | Assess non-functional requirements and record the gate decision.       |
-| `review`   | `bmad-testarch-test-review` | `post_review_result` | review  | Quality-check the written tests against TEA's knowledge base.          |
+| Step       | TEA workflow                | Stage             | Adapter | What it does                                                           |
+| ---------- | --------------------------- | ----------------- | ------- | ---------------------------------------------------------------------- |
+| `td`       | `bmad-testarch-test-design` | `post_dev_phase`  | dev     | Risk assessment + risk-based coverage strategy for the change.         |
+| `atdd`     | `bmad-testarch-atdd`        | `post_dev_phase`  | dev     | Failing acceptance tests + an implementation checklist.                |
+| `automate` | `bmad-testarch-automate`    | `post_dev_phase`  | dev     | Prioritized API/E2E tests, fixtures, and a Definition-of-Done summary. |
+| `trace`    | `bmad-testarch-trace`       | `pre_commit_gate` | review  | Map requirements → tests and record the quality-gate decision.         |
+| `nfr`      | `bmad-testarch-nfr`         | `pre_commit_gate` | review  | Assess non-functional requirements and record the gate decision.       |
+| `review`   | `bmad-testarch-test-review` | `pre_commit_gate` | review  | Quality-check the written tests against TEA's knowledge base.          |
 
 The three `post_dev_phase` steps run **after** the dev phase, in the order above;
-the three `post_review_result` steps run **after** review. Each prompt is
-**CLI-agnostic** — natural-language intent plus the explicit `bmad-testarch-*`
-workflow name, phrased around "the changes currently in the working tree for
-`{story_key}`" so the same step works for a single story **and** a sweep bundle.
+the three `pre_commit_gate` steps run **just before the commit**. That stage fires
+on **every** path into a commit — the review-converged path, the skip path
+(`review.trigger = "recommended"` with no follow-up recommended, where
+`post_review_result` never fires because the review loop never runs), and the
+review-budget rescue — so the gates always evaluate the exact tree about to
+commit, and the `*_blocking` flags enforce even on stories that skip the review
+loop. Each prompt is **CLI-agnostic** — natural-language intent plus the explicit
+`bmad-testarch-*` workflow name, phrased around "the changes currently in the
+working tree for `{story_key}`" so the same step works for a single story **and**
+a sweep bundle.
 
 ### Runs and sweeps, no extra wiring
 
@@ -100,15 +106,17 @@ Two key families, both keyed on the step name:
 | ----------------------------------------------------- | ------- | ----------------------------------------------------------------------------------------------- |
 | `require_tea`                                         | `true`  | Fail fast at startup if TEA isn't installed. `false` = run the steps advisory-only without TEA. |
 | `td_enabled` / `atdd_enabled` / `automate_enabled`    | `true`  | Enable each `post_dev_phase` generation step.                                                   |
-| `trace_enabled` / `nfr_enabled` / `review_enabled`    | `true`  | Enable each `post_review_result` gate step.                                                     |
+| `trace_enabled` / `nfr_enabled` / `review_enabled`    | `true`  | Enable each `pre_commit_gate` gate step.                                                        |
 | `trace_blocking` / `nfr_blocking` / `review_blocking` | `false` | When `true`, a FAIL/CONCERNS verdict from that gate escalates the unit at commit.               |
 
 ## Escalate-on-gate: how blocking works
 
 A workflow's manifest `blocking` flag only checks session **completion**, not test
 pass/fail — so true quality gating lives in the plugin's in-process
-`on_pre_commit` hook, the first vetoable stage **after** the `post_review_result`
-sessions have written their artifacts.
+`on_pre_commit` hook, the first vetoable stage **after** the `pre_commit_gate`
+sessions have written their artifacts. Both fire unconditionally before every
+commit, so enforcement holds even when `review.trigger = "recommended"` skips
+the orchestrator review loop entirely.
 
 When you mark a gate blocking (e.g. `nfr_blocking = true`), at commit time the
 plugin:
