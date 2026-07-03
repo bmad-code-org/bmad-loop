@@ -327,6 +327,7 @@ def test_scm_defaults_reproduce_today(tmp_path):
     assert pol.scm.merge_strategy == "merge"
     assert pol.scm.delete_branch is True
     assert pol.scm.keep_failed is True
+    assert pol.scm.preserve_keep == 20
     assert pol.scm.failed_diff_max_mb == 5
     assert pol.scm.failed_diff_unlimited is False
     assert pol.scm.commit_message_template == ""
@@ -381,6 +382,23 @@ def test_scm_max_parallel_clamped_to_one(tmp_path):
     p.write_text("[scm]\nmax_parallel = 0\n")
     with pytest.raises(policy.PolicyError, match="scm.max_parallel"):
         policy.load(p)
+
+
+def test_scm_preserve_keep_settings(tmp_path):
+    p = tmp_path / "policy.toml"
+    p.write_text("[scm]\npreserve_keep = 5\n")
+    assert policy.load(p).scm.preserve_keep == 5
+    # 0 = never prune (maximum safety) — valid
+    p.write_text("[scm]\npreserve_keep = 0\n")
+    assert policy.load(p).scm.preserve_keep == 0
+    p.write_text("[scm]\npreserve_keep = -1\n")
+    with pytest.raises(policy.PolicyError, match="scm.preserve_keep"):
+        policy.load(p)
+    # strict typing: bool/float/string must not coerce into a smaller budget
+    for bad in ("true", "1.9", '"5"'):
+        p.write_text(f"[scm]\npreserve_keep = {bad}\n")
+        with pytest.raises(policy.PolicyError, match="scm.preserve_keep must be an integer"):
+            policy.load(p)
 
 
 def test_scm_failed_diff_settings(tmp_path):

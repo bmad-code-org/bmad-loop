@@ -252,6 +252,13 @@ default_ref = "ScmPolicy.rollback_on_failure"
 label = "auto-rollback failed attempts"
 description = "⚠ in-place mode (isolation=none): when ON, a failed attempt's tracked changes are auto-reverted and the untracked files this run created are deleted (its uncommitted work is lost). When OFF (default), the orchestrator never touches your tree — it pauses with manual recovery steps. Governs unattended/stopped attempts only: a resolved escalation's re-drive always auto-recovers regardless (reverts the failed source, keeps the corrected spec). Prefer isolation=worktree to keep failures off your main checkout."
 [[section.field]]
+key = "preserve_keep"
+kind = "int"
+minimum = 0
+default_ref = "ScmPolicy.preserve_keep"
+label = "preserve-ref retention"
+description = "attempt-preserve/* recovery branches kept at each run start · the newest by committer date survive and the tail is deleted (0 = never prune)"
+[[section.field]]
 key = "seed_adapter_defaults"
 kind = "switch"
 default_ref = "ScmPolicy.seed_adapter_defaults"

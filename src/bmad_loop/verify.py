@@ -249,6 +249,73 @@ def preserve_commits(
     return ref_name
 
 
+class PrunePreserveError(GitError):
+    """Partial :func:`prune_preserve_refs` failure. The prune is per-ref
+    best-effort, so refs may already be gone when a later one sticks — the
+    ``deleted`` list keeps that destructive half structurally auditable (a
+    caller can journal it, not just grep the message) and ``failed`` names
+    each stuck ref with its git detail."""
+
+    def __init__(self, message: str, *, deleted: list[str], failed: list[str]) -> None:
+        super().__init__(message)
+        self.deleted = deleted
+        self.failed = failed
+
+
+def prune_preserve_refs(repo: Path, keep: int) -> list[str]:
+    """Bounded retention for the ``attempt-preserve/*`` recovery branches that
+    :func:`preserve_commits` parks before an auto-rollback reset: keep the
+    ``keep`` most recent refs by committer date, force-delete the rest, and
+    return the deleted branch names (empty when nothing is over budget). Only
+    ``refs/heads/attempt-preserve/`` is ever listed, so branches outside that
+    prefix and the ``refs/attempt-preserve-dirty/*`` snapshot refs are
+    untouchable by construction — but the prefix itself is owned by the pruner:
+    anything parked under it, however it got there, is subject to deletion.
+    ``keep <= 0`` means "never prune" — returns ``[]`` without running git.
+
+    Raises :class:`GitError` when the listing fails, or
+    :class:`PrunePreserveError` — after attempting every tail ref — when any
+    individual delete failed (e.g. the ref is checked out here or in a
+    worktree). One stuck ref must not wedge the retention for everything
+    behind it, so deletes are per-ref best-effort and the error carries both
+    what was deleted and what was not."""
+    if keep <= 0:
+        return []
+    rc, out = _git(
+        repo,
+        "for-each-ref",
+        # ties on committerdate (same-second rollbacks) break by ascending
+        # refname — an explicit, observable order rather than git's implicit
+        # stable-sort fallback. Last --sort key is the primary one.
+        "--sort=refname",
+        "--sort=-committerdate",
+        # full refname, not :short — a tag or remote ref sharing the name would
+        # make :short emit "heads/attempt-preserve/x", which `branch -D` can't use
+        "--format=%(refname)",
+        "refs/heads/attempt-preserve/",
+    )
+    if rc != 0:
+        raise GitError(f"git for-each-ref attempt-preserve failed in {repo}: {out}")
+    refs = [line.removeprefix("refs/heads/") for line in out.splitlines() if line]
+    deleted: list[str] = []
+    failed: list[str] = []
+    for name in refs[keep:]:
+        try:
+            delete_branch(repo, name, force=True)
+        except GitError as exc:
+            failed.append(f"{name} ({exc})")
+            continue
+        deleted.append(name)
+    if failed:
+        raise PrunePreserveError(
+            f"attempt-preserve prune in {repo}: deleted {deleted or 'nothing'}, "
+            f"could not delete {'; '.join(failed)}",
+            deleted=deleted,
+            failed=failed,
+        )
+    return deleted
+
+
 def snapshot_worktree(
     repo: Path, ref_name: str, *, baseline_untracked: list[str] | None
 ) -> str | None:

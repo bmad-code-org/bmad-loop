@@ -41,7 +41,13 @@ from bmad_loop.policy import (
     VerifyPolicy,
 )
 from bmad_loop.runs import rearm_escalation
-from bmad_loop.verify import GitError, read_frontmatter, rev_parse_head, worktree_clean
+from bmad_loop.verify import (
+    GitError,
+    PrunePreserveError,
+    read_frontmatter,
+    rev_parse_head,
+    worktree_clean,
+)
 
 QUIET = NotifyPolicy(desktop=False, file=True)
 
@@ -1182,6 +1188,92 @@ def test_rollback_preserves_distinct_refs_across_repeated_dirty_rollbacks(projec
     # both snapshots remain reachable and carry their own attempt's uncommitted edit
     assert git(repo, "show", f"{refs[0]}:src.txt") == "attempt 0 edit"
     assert git(repo, "show", f"{refs[1]}:src.txt") == "attempt 1 edit"
+
+
+def test_run_start_prunes_excess_preserve_refs(project):
+    """Run start with scm.preserve_keep set and more attempt-preserve/* refs than
+    the budget: the tail is deleted before the loop, only preserve_keep refs
+    survive, and the deletions are journalled."""
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(rollback_on_failure=True, preserve_keep=2),
+    )
+    repo = project.project
+    write_sprint(project, {"epic-1": "backlog"})  # nothing actionable: run start + finish only
+    for i in range(3):
+        (repo / "impl.txt").write_text(f"parked attempt {i}\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", f"attempt {i}")
+        git(repo, "branch", "-f", f"attempt-preserve/run-{i}")
+    engine, _ = make_engine(project, [], policy=policy)
+
+    engine.run()
+
+    remaining = git(
+        repo, "for-each-ref", "--format=%(refname:short)", "refs/heads/attempt-preserve/"
+    ).splitlines()
+    assert len(remaining) == 2  # tail pruned down to the budget
+    entry = next(e for e in engine.journal.entries() if e["kind"] == "attempt-preserve-pruned")
+    assert entry["count"] == 1
+    assert set(entry["refs"]) | set(remaining) == {f"attempt-preserve/run-{i}" for i in range(3)}
+
+
+def test_run_start_prune_failure_journals_and_run_proceeds(project, monkeypatch):
+    """A failing prune at run start is journalled and never blocks the run —
+    the recovery refs are a housekeeping concern, not run state."""
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(rollback_on_failure=True, preserve_keep=2),
+    )
+    write_sprint(project, {"epic-1": "backlog"})  # nothing actionable: run start + finish only
+
+    def _fail(*a, **k):
+        raise GitError("simulated for-each-ref failure")
+
+    monkeypatch.setattr("bmad_loop.verify.prune_preserve_refs", _fail)
+    engine, _ = make_engine(project, [], policy=policy)
+
+    engine.run()
+
+    entry = next(
+        e for e in engine.journal.entries() if e["kind"] == "attempt-preserve-prune-failed"
+    )
+    assert "simulated for-each-ref failure" in entry["error"]
+    assert engine.state.finished  # the prune failure never blocked or crashed the run
+
+
+def test_run_start_partial_prune_journals_deletions_and_failure(project, monkeypatch):
+    """A partial prune (some refs deleted before one stuck) journals BOTH the
+    structured deletions and the failure — the destructive half of a stuck
+    prune must never be auditable only via the error string."""
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(rollback_on_failure=True, preserve_keep=1),
+    )
+    write_sprint(project, {"epic-1": "backlog"})  # nothing actionable: run start + finish only
+
+    def _partial(*a, **k):
+        raise PrunePreserveError(
+            "one ref stuck",
+            deleted=["attempt-preserve/gone"],
+            failed=["attempt-preserve/stuck (checked out)"],
+        )
+
+    monkeypatch.setattr("bmad_loop.verify.prune_preserve_refs", _partial)
+    engine, _ = make_engine(project, [], policy=policy)
+
+    engine.run()
+
+    pruned = next(e for e in engine.journal.entries() if e["kind"] == "attempt-preserve-pruned")
+    assert pruned["count"] == 1 and pruned["refs"] == ["attempt-preserve/gone"]
+    failed = next(
+        e for e in engine.journal.entries() if e["kind"] == "attempt-preserve-prune-failed"
+    )
+    assert "one ref stuck" in failed["error"]
+    assert engine.state.finished
 
 
 def test_rollback_worktree_preserve_failure_journals_git_error(project, monkeypatch):

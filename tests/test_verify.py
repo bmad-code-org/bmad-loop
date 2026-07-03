@@ -1,4 +1,6 @@
 import dataclasses
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -826,6 +828,122 @@ def test_preserve_commits_raises_on_branch_failure(project):
     git(repo, "commit", "-q", "-m", "attempt work")
     with pytest.raises(verify.GitError):
         verify.preserve_commits(repo, baseline, "bad..ref")  # ".." is an illegal git ref name
+
+
+def _dated_commit(repo, message, date):
+    """Empty commit with a forced committer date, so ref-age ordering across
+    branches is deterministic (back-to-back commits share a same-second date)."""
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-q", "--allow-empty", "-m", message],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "GIT_AUTHOR_DATE": date, "GIT_COMMITTER_DATE": date},
+    )
+
+
+def _preserve_ref_names(repo):
+    out = git(repo, "for-each-ref", "--format=%(refname:short)", "refs/heads/attempt-preserve/")
+    return sorted(line for line in out.splitlines() if line)
+
+
+def test_prune_preserve_refs_deletes_oldest_beyond_keep(project):
+    """5 preserve refs, keep=3: the 2 oldest by committer date are deleted (and
+    returned); the 3 newest survive. Dates deliberately disagree with creation/
+    name order, so this proves committer-date ordering — not name or creation
+    order."""
+    repo = project.project
+    # ref index -> date rank: run-2 is oldest, run-4 second-oldest, run-1 newest
+    for i, day in ((0, 3), (1, 5), (2, 1), (3, 4), (4, 2)):
+        _dated_commit(repo, f"attempt {i}", f"2026-01-0{day}T12:00:00")
+        git(repo, "branch", "-f", f"attempt-preserve/run-{i}")
+
+    deleted = verify.prune_preserve_refs(repo, keep=3)
+
+    assert sorted(deleted) == ["attempt-preserve/run-2", "attempt-preserve/run-4"]
+    assert _preserve_ref_names(repo) == [f"attempt-preserve/run-{i}" for i in (0, 1, 3)]
+
+
+def test_prune_preserve_refs_at_or_under_budget_noop(project):
+    """At/under budget (refs <= keep) nothing is deleted."""
+    repo = project.project
+    for i in range(3):
+        _dated_commit(repo, f"attempt {i}", f"2026-01-0{i + 1}T12:00:00")
+        git(repo, "branch", "-f", f"attempt-preserve/run-{i}")
+    assert verify.prune_preserve_refs(repo, keep=3) == []
+    assert len(_preserve_ref_names(repo)) == 3
+
+
+def test_prune_preserve_refs_keep_zero_never_prunes(project):
+    """keep=0 means "never prune" — no ref is deleted no matter how many exist."""
+    repo = project.project
+    for i in range(4):
+        _dated_commit(repo, f"attempt {i}", f"2026-01-0{i + 1}T12:00:00")
+        git(repo, "branch", "-f", f"attempt-preserve/run-{i}")
+    assert verify.prune_preserve_refs(repo, keep=0) == []
+    assert len(_preserve_ref_names(repo)) == 4
+
+
+def test_prune_preserve_refs_ignores_other_branches(project):
+    """Only attempt-preserve/* refs are considered or deleted: user and unit
+    branches alongside them never count against the budget and are never
+    touched, however old they are."""
+    repo = project.project
+    _dated_commit(repo, "old user work", "2025-06-01T12:00:00")
+    git(repo, "branch", "-f", "feature/user-branch")
+    git(repo, "branch", "-f", "bmad-loop/test-run/1-1-a")
+    for i in range(2):
+        _dated_commit(repo, f"attempt {i}", f"2026-01-0{i + 1}T12:00:00")
+        git(repo, "branch", "-f", f"attempt-preserve/run-{i}")
+
+    deleted = verify.prune_preserve_refs(repo, keep=1)
+
+    assert deleted == ["attempt-preserve/run-0"]  # only the older preserve ref
+    assert _preserve_ref_names(repo) == ["attempt-preserve/run-1"]
+    assert git(repo, "branch", "--list", "feature/user-branch").strip() != ""
+    assert git(repo, "branch", "--list", "bmad-loop/test-run/1-1-a").strip() != ""
+
+
+def test_prune_preserve_refs_ties_break_by_refname(project):
+    """Equal committer dates (same-second rollbacks, or two refs parked on the
+    same commit) break by ascending refname — an explicit deterministic order,
+    so the same repo state always prunes the same ref."""
+    repo = project.project
+    _dated_commit(repo, "tied attempts", "2026-01-01T12:00:00")
+    git(repo, "branch", "-f", "attempt-preserve/tie-a")  # same commit ⇒ same date
+    git(repo, "branch", "-f", "attempt-preserve/tie-b")
+    _dated_commit(repo, "fresh attempt", "2026-01-02T12:00:00")
+    git(repo, "branch", "-f", "attempt-preserve/newer")
+
+    deleted = verify.prune_preserve_refs(repo, keep=2)
+
+    # newest survives outright; within the tie, ascending refname wins (tie-a kept)
+    assert deleted == ["attempt-preserve/tie-b"]
+    assert _preserve_ref_names(repo) == ["attempt-preserve/newer", "attempt-preserve/tie-a"]
+
+
+def test_prune_preserve_refs_continues_past_undeletable_ref(project):
+    """A tail ref that can't be deleted (here: checked out) must not wedge the
+    prune — the rest of the tail is still deleted, and the error raised at the
+    end names both what was deleted and what was not."""
+    repo = project.project
+    for i in range(3):
+        _dated_commit(repo, f"attempt {i}", f"2026-01-0{i + 1}T12:00:00")
+        git(repo, "branch", "-f", f"attempt-preserve/run-{i}")
+    git(repo, "checkout", "-q", "attempt-preserve/run-0")  # oldest tail ref is checked out
+
+    with pytest.raises(verify.GitError) as excinfo:
+        verify.prune_preserve_refs(repo, keep=1)
+
+    # run-1 (the deletable tail ref) is gone; run-0 survived only because git
+    # refuses to delete the checked-out branch; run-2 (newest) was kept
+    assert _preserve_ref_names(repo) == ["attempt-preserve/run-0", "attempt-preserve/run-2"]
+    assert "attempt-preserve/run-1" in str(excinfo.value)  # deleted, still auditable
+    assert "attempt-preserve/run-0" in str(excinfo.value)  # the stuck ref is named
+    # the destructive half is carried structurally, not just in the message
+    assert isinstance(excinfo.value, verify.PrunePreserveError)
+    assert excinfo.value.deleted == ["attempt-preserve/run-1"]
+    assert len(excinfo.value.failed) == 1 and "run-0" in excinfo.value.failed[0]
 
 
 def test_snapshot_worktree_survives_reset_and_gc(project):

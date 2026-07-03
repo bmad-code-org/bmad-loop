@@ -215,6 +215,7 @@ class Engine:
                 # repo), so it must sit inside the pause handler, not before it.
                 self._emit_run_boundary("pre_run")
                 self._ensure_target_branch()
+                self._prune_preserve_refs()
                 self._loop()
                 self.state.finished = True
                 self._gc_run_worktrees()
@@ -845,6 +846,32 @@ class Engine:
             keep=(".bmad-loop", *self._protected_relpaths()),
             preserve=preserve,
         )
+
+    def _prune_preserve_refs(self) -> None:
+        """Bounded retention for the attempt-preserve/* recovery branches at run
+        start: keep the newest scm.preserve_keep by committer date, delete the
+        tail (mirrors the runs/cleanup retention knobs — without it the refs
+        grow unbounded on a long-lived project). Best-effort: a git failure is
+        journalled and never blocks or pauses the run — the refs are a safety
+        net, not run state. preserve_keep = 0 disables pruning entirely."""
+        keep = self.policy.scm.preserve_keep
+        if keep <= 0:
+            return
+        try:
+            deleted = verify.prune_preserve_refs(self.workspace.root, keep)
+        except Exception as exc:  # noqa: BLE001 - housekeeping must never crash the
+            # run: a git timeout/OSError here would otherwise escape to the crash
+            # handler, so anything beyond the expected GitError is journalled too
+            # A partial prune (PrunePreserveError) already deleted refs before one
+            # stuck — that destructive half must stay structurally auditable, not
+            # buried in the error string.
+            partial = getattr(exc, "deleted", [])
+            if partial:
+                self.journal.append("attempt-preserve-pruned", count=len(partial), refs=partial)
+            self.journal.append("attempt-preserve-prune-failed", error=str(exc))
+            return
+        if deleted:
+            self.journal.append("attempt-preserve-pruned", count=len(deleted), refs=deleted)
 
     def _preserve_attempt_commits(self, task: StoryTask, *, allow_pause: bool) -> None:
         """Before an auto-rollback's hard reset, park any commits the attempt made
