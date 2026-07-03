@@ -9,6 +9,7 @@ role for the transport axis.
 
 import json
 import os
+import shlex
 import subprocess
 
 import pytest
@@ -400,6 +401,33 @@ def test_new_window_posix_argv_byte_identical(monkeypatch, tmp_path):
         "-e",
         "B=2",
         "cmd",
+    ]
+
+
+def test_new_window_posix_command_reaches_tmux_verbatim(monkeypatch, tmp_path):
+    # The contract says `command` is a shlex-joined argv, not a shell line.
+    # The POSIX leaf must not parse or re-quote it: whatever the caller built
+    # arrives at tmux as one verbatim trailing argument, so operator-looking
+    # tokens the caller quoted (here a literal "&&" argument) survive intact.
+    rec = _RecordRun()
+    monkeypatch.setattr(tmux_base.subprocess, "run", rec)
+
+    command = shlex.join(["echo", "a b", "&&", "reboot"])
+    TmuxMultiplexer().new_window("s", "n", tmp_path, {}, command)
+
+    assert rec.argv == [
+        "tmux",
+        "new-window",
+        "-t",
+        "=s:",
+        "-n",
+        "n",
+        "-c",
+        str(tmp_path),
+        "-P",
+        "-F",
+        "#{window_id}",
+        command,
     ]
 
 

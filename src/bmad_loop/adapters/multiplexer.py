@@ -80,7 +80,12 @@ class TerminalMultiplexer(ABC):
         self, session: str, name: str, cwd: Path, env: dict[str, str], command: str
     ) -> str:
         """Create a window running ``command`` (with ``env`` layered on) in
-        ``session``, rooted at ``cwd``. Returns the backend-native window id."""
+        ``session``, rooted at ``cwd``. Returns the backend-native window id.
+
+        ``command`` is a POSIX shlex-joined argv string, not a shell line:
+        shell-operator behavior (``&&``, ``|``, ...) is backend-defined —
+        one backend may hand the string to a shell, another may shlex
+        re-split it into literal argv — so callers must not rely on it."""
 
     @abstractmethod
     def new_parked_window(
