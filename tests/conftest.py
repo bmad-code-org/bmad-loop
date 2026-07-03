@@ -3,6 +3,7 @@ that simulate the side effects skill sessions would have on disk."""
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -107,10 +108,13 @@ def git(repo: Path, *args: str) -> str:
     return proc.stdout.strip()
 
 
-@pytest.fixture
-def project(tmp_path: Path) -> ProjectPaths:
-    """Git repo with BMAD-shaped artifact dirs and an initial commit."""
-    root = tmp_path / "sandbox"
+@pytest.fixture(scope="session")
+def _project_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Master sandbox repo, built once per xdist worker. NEVER hand this path to
+    a test — a mutation would poison every later test in the worker; tests get
+    disposable copies via `project`. (Do not chmod it read-only either: copytree
+    preserves modes, so the copies would inherit it and break every write.)"""
+    root = tmp_path_factory.mktemp("project-template") / "sandbox"
     impl = root / "_bmad-output" / "implementation-artifacts"
     plan = root / "_bmad-output" / "planning-artifacts"
     impl.mkdir(parents=True)
@@ -118,11 +122,27 @@ def project(tmp_path: Path) -> ProjectPaths:
     (root / "src.txt").write_text("original\n")
     (root / ".gitignore").write_text(".automator/runs/\n")  # as `bmad-auto init` would
     git(root, "init", "-q", "-b", "main")
+    # Local config: copies (and their worktrees) inherit it via the copied .git/config.
     git(root, "config", "user.email", "test@test")
     git(root, "config", "user.name", "test")
+    git(root, "config", "core.fsync", "none")  # cheapen commits; old git ignores unknown keys
     git(root, "add", "-A")
     git(root, "commit", "-q", "-m", "initial")
-    return ProjectPaths(project=root, implementation_artifacts=impl, planning_artifacts=plan)
+    return root
+
+
+@pytest.fixture
+def project(tmp_path: Path, _project_template: Path) -> ProjectPaths:
+    """Git repo with BMAD-shaped artifact dirs and an initial commit — a copytree
+    clone of the per-worker template, so no git subprocesses per test (git spawn
+    plus fsync made this fixture ~3s per test on Windows CI)."""
+    root = tmp_path / "sandbox"
+    shutil.copytree(_project_template, root)
+    return ProjectPaths(
+        project=root,
+        implementation_artifacts=root / "_bmad-output" / "implementation-artifacts",
+        planning_artifacts=root / "_bmad-output" / "planning-artifacts",
+    )
 
 
 def install_bmad_config(paths: ProjectPaths) -> None:
