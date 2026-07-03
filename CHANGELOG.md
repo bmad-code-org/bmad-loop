@@ -23,6 +23,37 @@ breaking changes may land in a minor release.
   `bmad-loop/<run-id>`; TUI class `BmadAutoApp` → `BmadLoopApp`. Custom plugins, CLI profiles, and
   policy files that reference any of these must be updated.
 
+### Added
+
+- **New `pre_commit_gate` plugin workflow-injection stage.** Gate workflows can bind to
+  `pre_commit_gate`, which fires unconditionally just before every commit — on the review-converged,
+  review-skipped, and review-budget-rescue paths alike — while the phase can still legally defer.
+  TEA's trace/nfr/review gates rebind to it, fixing blocking gates that were previously inert
+  whenever a dev session recommended no review follow-up (so `on_pre_commit` fail-opened on the
+  missing artifacts).
+
+### Fixed
+
+- **A workflow session that finishes its work but never writes a completion marker no longer
+  livelocks the run.** Each result-less Stop used to refill the stall-nudge budget, re-nudging a
+  responsive-but-signal-less session until `session_timeout_min`. The engine now appends an explicit
+  completion contract (absolute marker path + frontmatter shape) to every workflow-session prompt,
+  and a new `limits.workflow_stall_nudges_cap` (default 3) caps the total nudges a workflow session
+  may receive — degrading a still-missing marker to "stalled" in ~30 min instead of hours. Dev/review
+  session nudging is unchanged.
+- **On Windows, a live engine whose process identity can't be read now shows `UNKNOWN` instead of a
+  false `INTERRUPTED`.** psutil raises `ERROR_ACCESS_DENIED` for a process in another session or
+  elevation, which the identity-aware liveness read had surfaced as dead — mislabeling running runs
+  and weakening the resume/delete guards. Liveness is now tri-state (`alive`/`dead`/`unknown`) and
+  biased away from false-dead; `resume`, `resolve`, `delete`, `archive`, and cleanup all surface and
+  warn on `unknown` without ever letting an unverifiable pid block cleanup forever, and `resolve`
+  gains `--force` to override a squatted-pid block.
+- **A review session that appends to the deferred-work ledger no longer leaves a sweep bundle
+  unclosed.** The bundle ledger is reclosed after review (journaled distinctly as
+  `sweep-bundle-reclosed`), and the review prompt now states the ledger is append-only for sessions.
+- **Worktree git-exclude patterns now anchor correctly on native Windows.** `install.py` normalizes
+  backslashes in the per-worktree exclude paths so the ignore rules match (a no-op on POSIX).
+
 ### Migration
 
 - **Reinstall the tool under its new name** — uv can't rename a package in place:
@@ -914,6 +945,7 @@ enforced in CI.
   implementation phase, driven by a Python control loop with hook-based session transport and
   resumable on-disk run state.
 
+[0.8.0]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.8.0
 [0.7.12]: https://github.com/bmad-code-org/bmad-auto/releases/tag/v0.7.12
 [0.7.11]: https://github.com/bmad-code-org/bmad-auto/releases/tag/v0.7.11
 [0.7.9]: https://github.com/bmad-code-org/bmad-auto/releases/tag/v0.7.9

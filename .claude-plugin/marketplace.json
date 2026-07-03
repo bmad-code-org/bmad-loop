@@ -12,7 +12,7 @@
       "name": "bmad-loop",
       "source": "./src/bmad_loop/data/skills",
       "description": "Automation-mode skills driven by the bmad-loop orchestrator: interactive escalation resolution (bmad-loop-resolve) and deferred-work sweep triage (bmad-loop-sweep) — the inner dev primitive (which self-reviews and commits) is the upstream bmad-dev-auto skill",
-      "version": "0.7.12",
+      "version": "0.8.0",
       "author": {
         "name": "pinkyd"
       },
