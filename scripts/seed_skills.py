@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Reseed the dev-workspace skill forks from the canonical wheel source.
 
-``src/automator/data/skills/<skill>`` is the single source of truth for the
-``bmad-auto-*`` automation skills (bundled into the wheel; ``bmad-auto init``
+``src/bmad_loop/data/skills/<skill>`` is the single source of truth for the
+``bmad-loop-*`` automation skills (bundled into the wheel; ``bmad-loop init``
 installs them). Two dev-workspace trees hold byte-identical *forks* of those
 skills so the local agents can run them out of this repo:
 
@@ -11,7 +11,7 @@ skills so the local agents can run them out of this repo:
 
 ``tests/test_module_skills_sync.py`` turns any drift between canonical and a
 fork into a failure. The version bump in ``scripts/sync_version.py`` stamps the
-canonical ``bmad-auto-setup/assets/module.yaml``, which immediately drifts both
+canonical ``bmad-loop-setup/assets/module.yaml``, which immediately drifts both
 forks — so every release had to be followed by a hand reseed before the local
 suite went green again. This script is that reseed, and ``release.py prepare``
 runs it automatically right after stamping.
@@ -36,9 +36,9 @@ ROOT = Path(__file__).resolve().parent.parent
 # Import MODULE_SKILLS straight from the package so this list can never drift
 # from the one the installer and the sync test use.
 sys.path.insert(0, str(ROOT / "src"))
-from automator.install import MODULE_SKILLS  # noqa: E402
+from bmad_loop.install import MODULE_SKILLS  # noqa: E402
 
-SKILLS_SRC = ROOT / "src" / "automator" / "data" / "skills"
+SKILLS_SRC = ROOT / "src" / "bmad_loop" / "data" / "skills"
 FORK_TREES = (".claude/skills", ".agents/skills")
 
 

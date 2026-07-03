@@ -1,7 +1,7 @@
 """Tests for the back-compat shims over the ProcessHost seam.
 
 The kill/liveness bodies (and their pid<=0 guards) now live in
-``automator.process_host`` — see ``test_process_host.py``. These cover only that
+``bmad_loop.process_host`` — see ``test_process_host.py``. These cover only that
 the legacy ``platform_util`` entry points still delegate, plus the real
 ``detach_kwargs`` that stayed behind."""
 
@@ -12,7 +12,7 @@ import sys
 
 import pytest
 
-from automator import platform_util
+from bmad_loop import platform_util
 
 
 def test_pid_alive_shim_true_for_self():

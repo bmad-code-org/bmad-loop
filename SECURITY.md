@@ -9,7 +9,7 @@ We release security patches for the following versions:
 | Latest   | :white_check_mark: |
 | < Latest | :x:                |
 
-We recommend always using the latest version of bmad-auto to ensure you have the most recent security updates.
+We recommend always using the latest version of bmad-loop to ensure you have the most recent security updates.
 
 ## Reporting a Vulnerability
 
@@ -21,7 +21,7 @@ We take security vulnerabilities seriously. If you discover a security issue, pl
 
 Instead, please report them via one of these methods:
 
-1. **GitHub Security Advisories** (Preferred): Use [GitHub's private vulnerability reporting](https://github.com/bmad-code-org/bmad-auto/security/advisories/new) to submit a confidential report.
+1. **GitHub Security Advisories** (Preferred): Use [GitHub's private vulnerability reporting](https://github.com/bmad-code-org/bmad-loop/security/advisories/new) to submit a confidential report.
 
 2. **Discord**: Contact a maintainer directly via DM on our [Discord server](https://discord.gg/gk8jAdXWmj).
 
@@ -50,16 +50,16 @@ Please include as much of the following information as possible:
 
 ## Security Scope
 
-bmad-auto orchestrates coding-CLI sessions: it spawns subprocesses in tmux, reads structured event files written by CLI hooks, runs your configured test/lint commands, and (optionally) manages git worktrees and branches. The security boundary is the orchestrator code and the trust it places in configuration, plugins, and on-disk signals.
+bmad-loop orchestrates coding-CLI sessions: it spawns subprocesses in tmux, reads structured event files written by CLI hooks, runs your configured test/lint commands, and (optionally) manages git worktrees and branches. The security boundary is the orchestrator code and the trust it places in configuration, plugins, and on-disk signals.
 
 ### In Scope
 
-- Vulnerabilities in the bmad-auto orchestrator / control-loop code
+- Vulnerabilities in the bmad-loop orchestrator / control-loop code
 - Issues in hook / signal-file handling that let a session forge state, escape verification gates, or trigger unintended commits
 - Command or path injection via configuration, profiles, or spawned coding-CLI / tmux sessions
 - Flaws in the **plugin trust model** (see [docs/plugin-authoring-guide.md](docs/plugin-authoring-guide.md)) that let a plugin gain unintended capabilities
 - Unsafe git worktree / branch handling that affects checkouts outside the run
-- Supply chain vulnerabilities in bmad-auto's own dependencies
+- Supply chain vulnerabilities in bmad-loop's own dependencies
 
 ### Out of Scope
 
@@ -71,7 +71,7 @@ bmad-auto orchestrates coding-CLI sessions: it spawns subprocesses in tmux, read
 
 ## Security Best Practices for Users
 
-When using bmad-auto:
+When using bmad-loop:
 
 1. **Review Agent Outputs**: Always review AI-generated code and diffs before merging or executing them
 2. **Trust Your Plugins and Profiles**: Only install plugins and CLI profiles from sources you trust — they run with your orchestrator's privileges
@@ -81,8 +81,8 @@ When using bmad-auto:
 
 ## Acknowledgments
 
-We appreciate the security research community's efforts in helping keep bmad-auto secure. Contributors who report valid security issues will be acknowledged in our security advisories.
+We appreciate the security research community's efforts in helping keep bmad-loop secure. Contributors who report valid security issues will be acknowledged in our security advisories.
 
 ---
 
-Thank you for helping keep bmad-auto and our community safe.
+Thank you for helping keep bmad-loop and our community safe.

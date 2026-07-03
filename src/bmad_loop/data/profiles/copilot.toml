@@ -1,0 +1,52 @@
+# GitHub Copilot CLI (GA since 2026-02). `-i "<prompt>"` starts an interactive
+# session and auto-runs the prompt (a bare `-p` prompt runs headless and exits).
+# Copilot has no native skill discovery, so the prompt tells it to read the
+# SKILL.md directly (skills live in .agents/skills/, shared with codex/gemini and
+# matching upstream BMAD-METHOD's github-copilot installer). "use subagents as
+# needed" keeps parallel skill phases (e.g. review layers) actually spawning
+# subagents, same as codex.
+#
+# Hook events (verified against Copilot CLI 1.0.63 via `bmad-loop probe-adapter
+# copilot --probe`): the turn-end event is `agentStop` — PascalCase `Stop` does
+# NOT fire on this build, so it must NOT be registered (it yields no completion
+# signal and every session reads as a timeout). `sessionStart`/`sessionEnd` cover
+# session lifecycle; Copilot has no PreCompact equivalent. Payload keys are
+# camelCase (sessionId, transcriptPath, cwd) regardless of event-name casing, and
+# the `agentStop` payload carries `transcriptPath` + `stopReason: end_turn` — the
+# shared relay reads both camelCase and snake_case, so the usage_parser gets the
+# transcript. CAVEAT: single build/OS (1.0.63, macOS); a future build may alias
+# `Stop`. NOTE: an enterprise policy permissions.disableBypassPermissionsMode =
+# 'disable' suppresses the --allow-all-* flags and will block unattended runs.
+name = "copilot"
+binary = "copilot"
+prompt_template = "LOAD the FULL .agents/skills/{skill}/SKILL.md, read its entire contents and follow its directions exactly, using subagents as needed: {args}"
+launch_args = ["-i"]
+bypass_args = ["--allow-all-tools", "--allow-all-paths"]
+model_flag = "--model"
+usage_parser = "copilot-events"
+# Copilot writes its token totals (modelMetrics) only in the trailing
+# `session.shutdown` events.jsonl line, ~1s AFTER the agentStop hook fires — so
+# read usage on a short grace poll, not the instant the turn ends, or it samples
+# the transcript before the totals land (reads as 0/None).
+usage_grace_s = 8.0
+# agentStop fires PER response turn, so a parallel-subagent review (e.g. the
+# bmad-dev-auto step-04 hunter layers) ends several turns; the global default of
+# 1 nudge would declare it stalled on the 2nd Stop. 5 lets a multi-turn review finish.
+stop_without_result_nudges = 5
+# agentStop also fires for each SUBAGENT turn — with an empty transcriptPath and a
+# tool-use session id (toolu_…), not the main session's id. Those are not the main
+# turn-end: ignore a Stop with no transcript so a subagent's premature Stop is not
+# read as a (result-less) completion. Without this the dev stage (0 nudges) stalls
+# outright on the first subagent Stop, before bmad-dev-auto writes its terminal spec.
+subagent_stop_without_transcript = true
+first_run_note = "run `copilot` once and authenticate (gh / Copilot subscription); requires Copilot CLI GA (>= 2026-02)"
+skill_tree = ".agents/skills"
+# .github/copilot/settings.json is the inline hook config (and can also hold MCP
+# servers) — gitignored in many projects, so a worktree checkout omits it and
+# isolated sessions lose it; seeded first, then the agentStop hook is merged in.
+seed_files = [".github/copilot/settings.json"]
+
+[hooks]
+dialect = "copilot-settings-json"
+config_path = ".github/copilot/settings.json"
+events = { agentStop = "Stop", sessionStart = "SessionStart", sessionEnd = "SessionEnd" }

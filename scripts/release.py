@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Standardized release driver for ``bmad-auto``.
+"""Standardized release driver for ``bmad-loop``.
 
 This is the deterministic engine behind the release flow. It does *not* own the
 version regexes — :mod:`sync_version` is the single source of truth for the
@@ -11,7 +11,7 @@ The flow is two-phase:
 * ``prepare X.Y.Z`` runs on a feature/release branch. It validates the CHANGELOG
   section for the target version (the human curates it *before* calling this),
   stamps the version everywhere via ``sync_version.py``,
-  regenerates screenshots + demo *only* when ``src/automator/tui`` changed since
+  regenerates screenshots + demo *only* when ``src/bmad_loop/tui`` changed since
   the last tag, and commits the result — leaving the branch ready for a PR.
 * ``publish`` runs on ``main`` after the PR merges (driven by
   ``.github/workflows/release.yml``). It is idempotent: if the ``vX.Y.Z`` tag
@@ -48,22 +48,22 @@ SYNC_VERSION = REPO / "scripts" / "sync_version.py"
 SEED_SKILLS = REPO / "scripts" / "seed_skills.py"
 GEN_SCREENSHOTS = REPO / "scripts" / "gen_screenshots.py"
 GEN_DEMO = REPO / "scripts" / "gen_demo.py"
-TUI_PATH = "src/automator/tui"
+TUI_PATH = "src/bmad_loop/tui"
 
 # Files the release commit touches. Staged explicitly (not `git add -A`) so the
 # commit can never sweep in unrelated working-tree changes.
 STAMPED_PATHS = [
-    "src/automator/__init__.py",
+    "src/bmad_loop/__init__.py",
     "pyproject.toml",
     "module.yaml",
-    "src/automator/data/skills/bmad-auto-setup/assets/module.yaml",
+    "src/bmad_loop/data/skills/bmad-loop-setup/assets/module.yaml",
     ".claude-plugin/marketplace.json",
     "uv.lock",
     "CHANGELOG.md",
 ]
 ASSET_PATH = "docs/images"
 
-DEFAULT_REPO_URL = "https://github.com/bmad-code-org/bmad-auto"
+DEFAULT_REPO_URL = "https://github.com/bmad-code-org/bmad-loop"
 
 
 # --------------------------------------------------------------------------- #
@@ -176,7 +176,7 @@ def repo_url() -> str:
         origin = _git_out("remote", "get-url", "origin")
     except subprocess.CalledProcessError:
         return DEFAULT_REPO_URL
-    # git@github.com:bmad-code-org/bmad-auto.git  ->  https://github.com/bmad-code-org/bmad-auto
+    # git@github.com:bmad-code-org/bmad-loop.git  ->  https://github.com/bmad-code-org/bmad-loop
     m = re.match(r"^git@([^:]+):(.+?)(?:\.git)?$", origin)
     if m:
         return f"https://{m.group(1)}/{m.group(2)}"
@@ -259,7 +259,7 @@ def _regen_assets(dry_run: bool) -> None:
 
 
 def _reseed_skills(dry_run: bool) -> None:
-    """Re-copy the canonical bmad-auto skills into the gitignored dev-workspace
+    """Re-copy the canonical bmad-loop skills into the gitignored dev-workspace
     forks (.claude/skills, .agents/skills) so they pick up the just-stamped
     module.yaml version. Without this the version bump drifts the forks and the
     local `tests/test_module_skills_sync.py` fails until reseeded by hand. The

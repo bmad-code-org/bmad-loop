@@ -1,6 +1,6 @@
 """RunState serialization + lifecycle-flag tests."""
 
-from automator.model import RunState, StoryTask
+from bmad_loop.model import RunState, StoryTask
 
 
 def _state(**kw) -> RunState:

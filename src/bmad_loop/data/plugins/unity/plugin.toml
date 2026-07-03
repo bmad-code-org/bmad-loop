@@ -1,0 +1,74 @@
+# Bundled Unity game-engine plugin for bmad-loop.
+#
+# This is the proof that the plugin framework is general enough to carry the
+# whole game-engine layer with no engine-specific code in core. Unity drives a
+# project whose dev/sweep cycle needs a live Editor + MCP bridge.
+#
+# Opt in from .bmad-loop/policy.toml:
+#   [plugins]
+#   enabled = ["unity"]          # [python] module loads only when enabled
+#
+#   [plugins.unity]
+#   editor_mode = "shared"       # shared (live Editor, isolation=none)
+#                                # | per_worktree (one Editor per worktree, isolation=worktree)
+#   mcp = "ivanmurzak"           # ivanmurzak | coplaydev
+#
+# Override per project by copying this dir to .bmad-loop/plugins/unity/ and
+# editing it (the project-local copy wins, and its dir becomes {scripts}).
+
+[plugin]
+name = "unity"
+version = "1.0.0"
+api_version = 1
+description = "Drive a Unity project whose dev/sweep cycle needs a live Editor + MCP bridge."
+author = "bmad-loop"
+# MCP-generated skills are gitignored; seed them into per_worktree checkouts so
+# the agent's CLI can reach the worktree Editor's tools.
+seed_globs = [".claude/skills/*"]
+
+# The in-process module owns the engine glue: the readiness gate, per_worktree
+# Editor setup/teardown, MCP agent routing, Library priming, and the
+# editor_mode<->scm.isolation coupling validation. It hooks the engine's
+# lifecycle stages (pre_ready_gate / pre_worktree_setup / pre_worktree_teardown)
+# and vetoes (defers) the unit when the Editor can't be made ready.
+[python]
+module = "unity_plugin.py"
+class = "UnityPlugin"
+
+[[settings]]
+key = "editor_mode"
+type = "select"
+options = ["shared", "per_worktree"]
+default = "shared"
+label = "Editor mode"
+help = "shared = agent works in place on the live Editor's checkout (requires scm.isolation = none); per_worktree = one managed Editor per worktree (requires scm.isolation = worktree)"
+
+[[settings]]
+key = "mcp"
+type = "select"
+options = ["ivanmurzak", "coplaydev"]
+default = "ivanmurzak"
+label = "Editor MCP"
+help = "which Editor MCP server the scripts target"
+
+[[settings]]
+key = "unity_path"
+type = "str"
+default = ""
+label = "Unity editor path"
+help = "Editor binary used to launch a per_worktree Editor; '' auto-detects. Ignored in shared mode."
+
+[[settings]]
+key = "ready_timeout_sec"
+type = "int"
+default = 600
+min = 1
+label = "Readiness timeout (sec)"
+help = "how long the readiness gate blocks for the Editor + MCP to come up"
+
+[[settings]]
+key = "ready_grace_sec"
+type = "int"
+default = -1
+label = "Readiness grace (sec)"
+help = "seconds to wait before the first readiness probe (-1 = auto: per_worktree waits for a cold Editor, shared does not)"

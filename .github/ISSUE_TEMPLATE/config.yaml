@@ -6,6 +6,6 @@ contact_links:
   - name: 💬 Discord Community
     url: https://discord.gg/gk8jAdXWmj
     about: Join for questions, discussion, and help before opening an issue
-  - name: 🛠 Troubleshooting — run `bmad-auto diagnose`
-    url: https://github.com/bmad-code-org/bmad-auto/blob/main/README.md#contributing
-    about: Before filing a bug, run `bmad-auto diagnose` and attach the sanitized dump — and verify it has no PII first
+  - name: 🛠 Troubleshooting — run `bmad-loop diagnose`
+    url: https://github.com/bmad-code-org/bmad-loop/blob/main/README.md#contributing
+    about: Before filing a bug, run `bmad-loop diagnose` and attach the sanitized dump — and verify it has no PII first

@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from automator.plugins import (
+from bmad_loop.plugins import (
     PluginError,
     PluginRegistry,
     is_enabled,
@@ -22,9 +22,9 @@ from automator.plugins import (
     require_enabled,
     trust,
 )
-from automator.plugins.loader import USER_PLUGINS_REL
-from automator.plugins.trust import PluginUntrusted
-from automator.policy import PluginsPolicy, Policy
+from bmad_loop.plugins.loader import USER_PLUGINS_REL
+from bmad_loop.plugins.trust import PluginUntrusted
+from bmad_loop.policy import PluginsPolicy, Policy
 
 # A [python] plugin whose module touches a marker file the instant it is
 # imported, so a test can assert it was (or was never) executed. Its Plugin
@@ -40,7 +40,7 @@ class = "{cls}"
 
 PY_MODULE = """
 from pathlib import Path
-from automator.plugins import Plugin
+from bmad_loop.plugins import Plugin
 
 Path(__file__).with_name("IMPORTED").write_text("yes")
 
@@ -159,7 +159,7 @@ def test_thirdparty_api_mismatch_is_skipped_with_warning(tmp_path):
 
 
 CONSTRUCT_RAISES = """
-from automator.plugins import Plugin as _Base
+from bmad_loop.plugins import Plugin as _Base
 class Plugin(_Base):
     def __init__(self, manifest, settings):
         raise RuntimeError("boom on construct")

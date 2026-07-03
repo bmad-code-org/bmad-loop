@@ -8,15 +8,15 @@ import tarfile
 
 import pytest
 
-from automator import runs
-from automator.adapters import tmux_base
-from automator.journal import load_state, save_state
-from automator.model import RunState
-from automator.process_host import ProcessHost
+from bmad_loop import runs
+from bmad_loop.adapters import tmux_base
+from bmad_loop.journal import load_state, save_state
+from bmad_loop.model import RunState
+from bmad_loop.process_host import ProcessHost
 
 
 def _make_run(project, run_id, with_state=True):
-    run_dir = project / ".automator" / "runs" / run_id
+    run_dir = project / ".bmad-loop" / "runs" / run_id
     run_dir.mkdir(parents=True)
     if with_state:
         (run_dir / "state.json").write_text("{}")
@@ -24,7 +24,7 @@ def _make_run(project, run_id, with_state=True):
 
 
 def _make_state_run(project, run_id, **state_kwargs):
-    run_dir = project / ".automator" / "runs" / run_id
+    run_dir = project / ".bmad-loop" / "runs" / run_id
     save_state(
         run_dir,
         RunState(
@@ -115,12 +115,12 @@ def test_write_pid(tmp_path):
 
 def test_attach_argv_outside_tmux(monkeypatch):
     monkeypatch.delenv("TMUX", raising=False)
-    assert runs.attach_argv("r1") == ["tmux", "attach", "-t", "=bmad-auto-r1"]
+    assert runs.attach_argv("r1") == ["tmux", "attach", "-t", "=bmad-loop-r1"]
 
 
 def test_attach_argv_inside_tmux(monkeypatch):
     monkeypatch.setenv("TMUX", "/tmp/tmux-1000/default,123,0")
-    assert runs.attach_argv("r1") == ["tmux", "switch-client", "-t", "=bmad-auto-r1"]
+    assert runs.attach_argv("r1") == ["tmux", "switch-client", "-t", "=bmad-loop-r1"]
 
 
 # --------------------------------------------------------- resolution / liveness
@@ -130,7 +130,7 @@ def test_run_dir_for_and_is_run(tmp_path):
     run_dir = _make_run(tmp_path, "r1")
     assert runs.run_dir_for(tmp_path, "r1") == run_dir
     assert runs.is_run(run_dir)
-    assert not runs.is_run(tmp_path / ".automator" / "runs" / "nope")
+    assert not runs.is_run(tmp_path / ".bmad-loop" / "runs" / "nope")
 
 
 def test_short_ref():
@@ -228,10 +228,10 @@ def test_engine_liveness(tmp_path, monkeypatch):
 
     # A misconfigured host (get_process_host itself raising) is a hard error, not a
     # flaky per-pid probe — it must propagate, never mask as 'unknown'.
-    from automator.process_host import ProcessHostError
+    from bmad_loop.process_host import ProcessHostError
 
     def _boom_host():
-        raise ProcessHostError("BMAD_AUTO_PROCESS_HOST matches no registered host")
+        raise ProcessHostError("BMAD_LOOP_PROCESS_HOST matches no registered host")
 
     monkeypatch.setattr(runs, "get_process_host", _boom_host)
     with pytest.raises(ProcessHostError):
@@ -451,13 +451,13 @@ def test_prunable_sessions_partitions(tmp_path, monkeypatch):
     (untag_fin / "engine.pid").write_text(str(_dead_pid()))
 
     sessions = [
-        "bmad-auto-live-1",
-        "bmad-auto-fin-1",
-        "bmad-auto-orphan-1",
-        "bmad-auto-other-1",  # another project's live run
-        "bmad-auto-untag-fin",  # pre-upgrade session, no tag
-        "bmad-auto-untag-orphan",  # pre-upgrade, no tag, no run dir here
-        "bmad-auto-ctl",  # control session: never a candidate
+        "bmad-loop-live-1",
+        "bmad-loop-fin-1",
+        "bmad-loop-orphan-1",
+        "bmad-loop-other-1",  # another project's live run
+        "bmad-loop-untag-fin",  # pre-upgrade session, no tag
+        "bmad-loop-untag-orphan",  # pre-upgrade, no tag, no run dir here
+        "bmad-loop-ctl",  # control session: never a candidate
         "unrelated",  # not ours
     ]
     monkeypatch.setattr(runs, "tmux_sessions", lambda: sessions)
@@ -465,10 +465,10 @@ def test_prunable_sessions_partitions(tmp_path, monkeypatch):
         runs,
         "session_project_tags",
         lambda: {
-            "bmad-auto-live-1": mine,
-            "bmad-auto-fin-1": mine,
-            "bmad-auto-orphan-1": mine,
-            "bmad-auto-other-1": "/some/other/project",
+            "bmad-loop-live-1": mine,
+            "bmad-loop-fin-1": mine,
+            "bmad-loop-orphan-1": mine,
+            "bmad-loop-other-1": "/some/other/project",
             # untag-* and unrelated intentionally absent (no tag)
         },
     )
@@ -485,8 +485,8 @@ def test_prunable_sessions_flags_unknown(tmp_path, monkeypatch):
     mine = runs.project_tag(tmp_path)
     odd = _make_state_run(tmp_path, "odd-1")
     (odd / "engine.pid").write_text("4242 123.0")
-    monkeypatch.setattr(runs, "tmux_sessions", lambda: ["bmad-auto-odd-1"])
-    monkeypatch.setattr(runs, "session_project_tags", lambda: {"bmad-auto-odd-1": mine})
+    monkeypatch.setattr(runs, "tmux_sessions", lambda: ["bmad-loop-odd-1"])
+    monkeypatch.setattr(runs, "session_project_tags", lambda: {"bmad-loop-odd-1": mine})
     monkeypatch.setattr(runs, "get_process_host", lambda: _FakeHost(alive=True, identity=None))
     prunable, live, unknown = runs.prunable_sessions(tmp_path)
     assert prunable == ["odd-1"]
@@ -499,9 +499,9 @@ def test_prune_sessions_dry_run_kills_nothing(tmp_path, monkeypatch):
     (finished / "engine.pid").write_text(str(_dead_pid()))
     killed: list[str] = []
     monkeypatch.setattr(runs, "kill_session", lambda rid: killed.append(rid))
-    monkeypatch.setattr(runs, "tmux_sessions", lambda: ["bmad-auto-fin-1"])
+    monkeypatch.setattr(runs, "tmux_sessions", lambda: ["bmad-loop-fin-1"])
     monkeypatch.setattr(
-        runs, "session_project_tags", lambda: {"bmad-auto-fin-1": runs.project_tag(tmp_path)}
+        runs, "session_project_tags", lambda: {"bmad-loop-fin-1": runs.project_tag(tmp_path)}
     )
     assert runs.prune_sessions(tmp_path, dry_run=True) == (["fin-1"], [], set())
     assert killed == []
@@ -517,8 +517,8 @@ def test_prune_sessions_returns_unknown_from_same_sample(tmp_path, monkeypatch):
     (odd / "engine.pid").write_text("4242 123.0")
     killed: list[str] = []
     monkeypatch.setattr(runs, "kill_session", lambda rid: killed.append(rid))
-    monkeypatch.setattr(runs, "tmux_sessions", lambda: ["bmad-auto-odd-1"])
-    monkeypatch.setattr(runs, "session_project_tags", lambda: {"bmad-auto-odd-1": mine})
+    monkeypatch.setattr(runs, "tmux_sessions", lambda: ["bmad-loop-odd-1"])
+    monkeypatch.setattr(runs, "session_project_tags", lambda: {"bmad-loop-odd-1": mine})
     monkeypatch.setattr(runs, "get_process_host", lambda: _FakeHost(alive=True, identity=None))
     assert runs.prune_sessions(tmp_path) == (["odd-1"], [], {"odd-1"})
     assert killed == ["odd-1"]
@@ -535,7 +535,7 @@ def test_archive_run(tmp_path):
     (run_dir / "journal.jsonl").write_text('{"kind":"x"}\n')
     dest = runs.archive_run(tmp_path, run_dir)
 
-    assert dest == tmp_path / ".automator" / "archive" / "20260611-100000-aaaa.tar.gz"
+    assert dest == tmp_path / ".bmad-loop" / "archive" / "20260611-100000-aaaa.tar.gz"
     assert dest.is_file()
     assert not run_dir.exists()  # original removed
     assert not dest.with_suffix(".tar.gz.tmp").exists()  # temp cleaned via replace

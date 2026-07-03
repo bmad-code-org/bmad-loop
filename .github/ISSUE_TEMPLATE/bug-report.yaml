@@ -1,5 +1,5 @@
 name: Bug Report
-description: File a bug report to help us improve bmad-auto
+description: File a bug report to help us improve bmad-loop
 title: "[BUG] "
 labels: bug
 assignees: []
@@ -9,7 +9,7 @@ body:
       value: |
         Thanks for filing a bug report! Please fill out the information below to help us reproduce and fix the issue.
 
-        Running `bmad-auto diagnose --out diag.md` produces a **sanitized** dump (no code, specs, prompts, paths, or PII) that helps us debug — please attach it below. **Review it first** and confirm it contains nothing private.
+        Running `bmad-loop diagnose --out diag.md` produces a **sanitized** dump (no code, specs, prompts, paths, or PII) that helps us debug — please attach it below. **Review it first** and confirm it contains nothing private.
 
   - type: textarea
     id: description
@@ -26,7 +26,7 @@ body:
       label: Steps to reproduce
       description: Step-by-step instructions to reproduce the behavior
       placeholder: |
-        1. Run 'bmad-auto run <story-key>'
+        1. Run 'bmad-loop run <story-key>'
         2. Watch the TUI / journal
         3. See error
     validations:
@@ -61,12 +61,12 @@ body:
     id: area
     attributes:
       label: Which area is this for?
-      description: Select the part of bmad-auto this issue relates to
+      description: Select the part of bmad-loop this issue relates to
       options:
         - Orchestrator / control loop
         - TUI (dashboard)
         - Plugins
-        - Skills (bmad-auto-*)
+        - Skills (bmad-loop-*)
         - CLI adapters & profiles
         - Setup / init
         - Not sure / Other
@@ -76,8 +76,8 @@ body:
   - type: input
     id: version
     attributes:
-      label: bmad-auto Version
-      description: "Check with: bmad-auto --version"
+      label: bmad-loop Version
+      description: "Check with: bmad-loop --version"
       placeholder: e.g., 0.5.1
     validations:
       required: true
@@ -117,9 +117,9 @@ body:
   - type: textarea
     id: diagnostics
     attributes:
-      label: Diagnostic dump (bmad-auto diagnose)
+      label: Diagnostic dump (bmad-loop diagnose)
       description: |
-        Output of `bmad-auto diagnose --out diag.md` (add `--json` for a machine-readable block, or `--all` to cover every run). **Drag-and-drop the `diag.md` file here** (or paste its contents). It's sanitized — identifiers are pseudonymized and the output is re-scanned by a fail-closed leak check before it's written — but **no scrubber is perfect**: open the file and verify it contains no PII, secrets, or project-specific content before attaching.
+        Output of `bmad-loop diagnose --out diag.md` (add `--json` for a machine-readable block, or `--all` to cover every run). **Drag-and-drop the `diag.md` file here** (or paste its contents). It's sanitized — identifiers are pseudonymized and the output is re-scanned by a fail-closed leak check before it's written — but **no scrubber is perfect**: open the file and verify it contains no PII, secrets, or project-specific content before attaching.
 
   - type: checkboxes
     id: terms

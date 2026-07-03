@@ -1,10 +1,10 @@
-"""The Unity game-engine plugin: it is now a first-class bmad-auto plugin (the
+"""The Unity game-engine plugin: it is now a first-class bmad-loop plugin (the
 proof the framework carries an engine layer), not a bespoke ``engines/`` subsystem.
 
 Covered here:
   * the bundled unity ``plugin.toml`` manifest (shape, settings, scripts, seeds);
   * the ``UnityPlugin`` in-process hooks — readiness gate / per_worktree setup /
-    teardown — veto on failure and inject the ``BMAD_AUTO_ENGINE_*`` env contract;
+    teardown — veto on failure and inject the ``BMAD_LOOP_ENGINE_*`` env contract;
   * ``UnityPlugin.validate`` enforcing the editor_mode↔scm.isolation coupling;
   * the engine's MCP agent-routing helpers that feed ``ctx.agents``;
   * the unchanged unity helper-script unit tests (``unity_ready`` / ``unity_setup``
@@ -26,10 +26,10 @@ import time
 import pytest
 from conftest import write_script_launcher
 
-from automator.engine import Engine, _setup_mcp_agent_id
-from automator.plugins import HookContext, PluginError, get_plugin, load_plugins
-from automator.plugins.model import PluginManifest
-from automator.policy import NotifyPolicy, PluginsPolicy, Policy, ScmPolicy
+from bmad_loop.engine import Engine, _setup_mcp_agent_id
+from bmad_loop.plugins import HookContext, PluginError, get_plugin, load_plugins
+from bmad_loop.plugins.model import PluginManifest
+from bmad_loop.policy import NotifyPolicy, PluginsPolicy, Policy, ScmPolicy
 
 QUIET = NotifyPolicy(desktop=False, file=True)
 
@@ -72,7 +72,7 @@ def test_builtin_unity_plugin_settings_schema():
 
 def test_unity_is_trust_gated():
     """The [python] module is never built unless unity is in [plugins] enabled."""
-    from automator.plugins import PluginRegistry
+    from bmad_loop.plugins import PluginRegistry
 
     off = PluginRegistry.build(policy=Policy())
     assert off.get("unity").instance is None  # untrusted: not enabled
@@ -188,21 +188,21 @@ def test_engine_env_carries_settings_and_agents(tmp_path):
     )
     ctx = _ctx("pre_ready_gate", tmp_path, agents=["claude-code", "codex"])
     env = inst.engine_env(ctx)
-    assert env["BMAD_AUTO_ENGINE_MCP"] == "coplaydev"
-    assert env["BMAD_AUTO_ENGINE_EDITOR_MODE"] == "per_worktree"
-    assert env["BMAD_AUTO_ENGINE_READY_TIMEOUT"] == "120"
-    assert env["BMAD_AUTO_ENGINE_READY_GRACE"] == "30"
-    assert env["BMAD_AUTO_UNITY_PATH"] == "/opt/Unity/Editor"
-    assert env["BMAD_AUTO_WORKTREE"] == str(tmp_path)
-    assert env["BMAD_AUTO_STORY_KEY"] == "1-1-a"
+    assert env["BMAD_LOOP_ENGINE_MCP"] == "coplaydev"
+    assert env["BMAD_LOOP_ENGINE_EDITOR_MODE"] == "per_worktree"
+    assert env["BMAD_LOOP_ENGINE_READY_TIMEOUT"] == "120"
+    assert env["BMAD_LOOP_ENGINE_READY_GRACE"] == "30"
+    assert env["BMAD_LOOP_UNITY_PATH"] == "/opt/Unity/Editor"
+    assert env["BMAD_LOOP_WORKTREE"] == str(tmp_path)
+    assert env["BMAD_LOOP_STORY_KEY"] == "1-1-a"
     # MCP agent routing: dev + review CLIs, from ctx.agents
-    assert env["BMAD_AUTO_ENGINE_AGENTS"] == "claude-code,codex"
+    assert env["BMAD_LOOP_ENGINE_AGENTS"] == "claude-code,codex"
 
 
 def test_engine_env_omits_agents_when_none(tmp_path):
     inst = _make_unity({}, tmp_path)
     env = inst.engine_env(_ctx("pre_ready_gate", tmp_path, agents=()))
-    assert "BMAD_AUTO_ENGINE_AGENTS" not in env
+    assert "BMAD_LOOP_ENGINE_AGENTS" not in env
 
 
 # --------------------------------------------------- editor_mode↔isolation coupling
@@ -245,11 +245,11 @@ def test_engine_rejects_invalid_coupling_at_construction(project):
         ),
         scm=ScmPolicy(isolation="none"),  # violates per_worktree's coupling
     )
-    from automator.adapters.mock import MockAdapter
-    from automator.journal import Journal
-    from automator.model import RunState, TokenUsage
+    from bmad_loop.adapters.mock import MockAdapter
+    from bmad_loop.journal import Journal
+    from bmad_loop.model import RunState, TokenUsage
 
-    run_dir = project.project / ".automator" / "runs" / "r"
+    run_dir = project.project / ".bmad-loop" / "runs" / "r"
     with pytest.raises(PluginError, match="per_worktree.*requires scm.isolation"):
         Engine(
             paths=project,
@@ -284,11 +284,11 @@ class _FakeAdapter:
 
 
 def _make_engine(project, policy):
-    from automator.adapters.mock import MockAdapter
-    from automator.journal import Journal
-    from automator.model import RunState, TokenUsage
+    from bmad_loop.adapters.mock import MockAdapter
+    from bmad_loop.journal import Journal
+    from bmad_loop.model import RunState, TokenUsage
 
-    run_dir = project.project / ".automator" / "runs" / "test-run"
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
     adapter = MockAdapter([], usage_per_session=TokenUsage(input_tokens=1, output_tokens=1))
     state = RunState(run_id="test-run", project=str(project.project), started_at="now")
     return Engine(
@@ -330,15 +330,15 @@ def _load_unity_ready():
 
 def test_unity_ready_grace_auto_per_mode(monkeypatch):
     mod = _load_unity_ready()
-    monkeypatch.delenv("BMAD_AUTO_ENGINE_READY_GRACE", raising=False)
+    monkeypatch.delenv("BMAD_LOOP_ENGINE_READY_GRACE", raising=False)
     # cold per_worktree Editor waits; warm shared Editor does not
-    monkeypatch.setenv("BMAD_AUTO_ENGINE_EDITOR_MODE", "per_worktree")
+    monkeypatch.setenv("BMAD_LOOP_ENGINE_EDITOR_MODE", "per_worktree")
     assert mod._grace() == 120.0
-    monkeypatch.setenv("BMAD_AUTO_ENGINE_EDITOR_MODE", "shared")
+    monkeypatch.setenv("BMAD_LOOP_ENGINE_EDITOR_MODE", "shared")
     assert mod._grace() == 0.0
     # explicit -1 is the same auto path
-    monkeypatch.setenv("BMAD_AUTO_ENGINE_READY_GRACE", "-1")
-    monkeypatch.setenv("BMAD_AUTO_ENGINE_EDITOR_MODE", "per_worktree")
+    monkeypatch.setenv("BMAD_LOOP_ENGINE_READY_GRACE", "-1")
+    monkeypatch.setenv("BMAD_LOOP_ENGINE_EDITOR_MODE", "per_worktree")
     assert mod._grace() == 120.0
 
 
@@ -437,10 +437,10 @@ def test_unity_teardown_sweep_skips_force_kill_on_identity_mismatch(tmp_path, mo
 
 def test_unity_ready_grace_explicit_override(monkeypatch):
     mod = _load_unity_ready()
-    monkeypatch.setenv("BMAD_AUTO_ENGINE_EDITOR_MODE", "per_worktree")
-    monkeypatch.setenv("BMAD_AUTO_ENGINE_READY_GRACE", "30")
+    monkeypatch.setenv("BMAD_LOOP_ENGINE_EDITOR_MODE", "per_worktree")
+    monkeypatch.setenv("BMAD_LOOP_ENGINE_READY_GRACE", "30")
     assert mod._grace() == 30.0  # explicit value wins over the per-mode default
-    monkeypatch.setenv("BMAD_AUTO_ENGINE_READY_GRACE", "0")
+    monkeypatch.setenv("BMAD_LOOP_ENGINE_READY_GRACE", "0")
     assert mod._grace() == 0.0  # operator can force no grace even for per_worktree
 
 
@@ -464,8 +464,8 @@ def test_unity_ready_default_is_wait_for_ready_only(tmp_path, monkeypatch):
     mod = _load_unity_ready()
     script, log = _fake_cli(tmp_path)
     monkeypatch.setenv("UNITY_MCP_CLI", str(script))
-    monkeypatch.setenv("BMAD_AUTO_WORKTREE", str(tmp_path))
-    monkeypatch.delenv("BMAD_AUTO_UNITY_READY_TOOL", raising=False)
+    monkeypatch.setenv("BMAD_LOOP_WORKTREE", str(tmp_path))
+    monkeypatch.delenv("BMAD_LOOP_UNITY_READY_TOOL", raising=False)
     # default: the Editor hosts its own server, so wait-for-ready alone gates it
     assert mod._ready_ivanmurzak(time.monotonic() + 10) == 0
     calls = log.read_text()
@@ -477,8 +477,8 @@ def test_unity_ready_optional_tool_roundtrip(tmp_path, monkeypatch):
     mod = _load_unity_ready()
     script, log = _fake_cli(tmp_path)
     monkeypatch.setenv("UNITY_MCP_CLI", str(script))
-    monkeypatch.setenv("BMAD_AUTO_WORKTREE", str(tmp_path))
-    monkeypatch.setenv("BMAD_AUTO_UNITY_READY_TOOL", "ping")  # opt in
+    monkeypatch.setenv("BMAD_LOOP_WORKTREE", str(tmp_path))
+    monkeypatch.setenv("BMAD_LOOP_UNITY_READY_TOOL", "ping")  # opt in
     assert mod._ready_ivanmurzak(time.monotonic() + 10) == 0
     assert "run-tool ping" in log.read_text()
 
@@ -497,8 +497,8 @@ def test_unity_ready_tool_error_marker_means_not_ready(tmp_path, monkeypatch):
         "sys.exit(0)\n",
     )
     monkeypatch.setenv("UNITY_MCP_CLI", str(script))
-    monkeypatch.setenv("BMAD_AUTO_WORKTREE", str(tmp_path))
-    monkeypatch.setenv("BMAD_AUTO_UNITY_READY_TOOL", "ping")
+    monkeypatch.setenv("BMAD_LOOP_WORKTREE", str(tmp_path))
+    monkeypatch.setenv("BMAD_LOOP_UNITY_READY_TOOL", "ping")
     monkeypatch.setattr(mod.time, "sleep", lambda *_: None)
     assert mod._ready_ivanmurzak(time.monotonic() + 0.2) == 1
 
@@ -507,8 +507,8 @@ def test_unity_ready_not_ready_when_tool_never_answers(tmp_path, monkeypatch):
     mod = _load_unity_ready()
     script, _ = _fake_cli(tmp_path, wait_rc=0, tool_rc=1)  # bridge up, tool failing
     monkeypatch.setenv("UNITY_MCP_CLI", str(script))
-    monkeypatch.setenv("BMAD_AUTO_WORKTREE", str(tmp_path))
-    monkeypatch.setenv("BMAD_AUTO_UNITY_READY_TOOL", "ping")  # opt in to exercise the loop
+    monkeypatch.setenv("BMAD_LOOP_WORKTREE", str(tmp_path))
+    monkeypatch.setenv("BMAD_LOOP_UNITY_READY_TOOL", "ping")  # opt in to exercise the loop
     monkeypatch.setattr(mod.time, "sleep", lambda *_: None)  # don't burn the retry pause
     assert mod._ready_ivanmurzak(time.monotonic() + 0.2) == 1
 
@@ -525,18 +525,18 @@ def _load_unity_setup():
 
 
 _SETUP_KNOBS = (
-    "BMAD_AUTO_UNITY_MCP_LOCAL",
-    "BMAD_AUTO_UNITY_MCP_URL",
-    "BMAD_AUTO_UNITY_MCP_TOKEN",
-    "BMAD_AUTO_UNITY_MCP_TRANSPORT",
-    "BMAD_AUTO_UNITY_MCP_AUTH",
-    "BMAD_AUTO_UNITY_MCP_START_SERVER",
-    "BMAD_AUTO_UNITY_MCP_KEEP_CONNECTED",
-    "BMAD_AUTO_UNITY_PATH",
-    "BMAD_AUTO_UNITY_LIBRARY_SEED",
-    "BMAD_AUTO_UNITY_LIBRARY_SEED_MODE",
-    "BMAD_AUTO_UNITY_LIBRARY_CACHE",
-    "BMAD_AUTO_REPO_ROOT",
+    "BMAD_LOOP_UNITY_MCP_LOCAL",
+    "BMAD_LOOP_UNITY_MCP_URL",
+    "BMAD_LOOP_UNITY_MCP_TOKEN",
+    "BMAD_LOOP_UNITY_MCP_TRANSPORT",
+    "BMAD_LOOP_UNITY_MCP_AUTH",
+    "BMAD_LOOP_UNITY_MCP_START_SERVER",
+    "BMAD_LOOP_UNITY_MCP_KEEP_CONNECTED",
+    "BMAD_LOOP_UNITY_PATH",
+    "BMAD_LOOP_UNITY_LIBRARY_SEED",
+    "BMAD_LOOP_UNITY_LIBRARY_SEED_MODE",
+    "BMAD_LOOP_UNITY_LIBRARY_CACHE",
+    "BMAD_LOOP_REPO_ROOT",
 )
 
 
@@ -555,7 +555,7 @@ def test_unity_setup_local_url_from_mcp_json(tmp_path, monkeypatch):
     )
     assert mod._local_url(tmp_path) == "http://localhost:28536"
     # explicit override wins over the file
-    monkeypatch.setenv("BMAD_AUTO_UNITY_MCP_URL", "http://localhost:9999")
+    monkeypatch.setenv("BMAD_LOOP_UNITY_MCP_URL", "http://localhost:9999")
     assert mod._local_url(tmp_path) == "http://localhost:9999"
 
 
@@ -584,17 +584,17 @@ def test_unity_setup_open_command_cloud_fallback(tmp_path, monkeypatch):
     # no derivable URL → bare open (project's persisted/cloud config)
     assert mod._open_command("ucli", tmp_path, None) == ["ucli", "open", str(tmp_path)]
     # explicit opt-out even with a URL available
-    monkeypatch.setenv("BMAD_AUTO_UNITY_MCP_LOCAL", "0")
+    monkeypatch.setenv("BMAD_LOOP_UNITY_MCP_LOCAL", "0")
     assert "--url" not in mod._open_command("ucli", tmp_path, "http://localhost:1")
 
 
 def test_unity_setup_open_command_overrides(tmp_path, monkeypatch):
     mod = _load_unity_setup()
     _clear_setup_knobs(monkeypatch)
-    monkeypatch.setenv("BMAD_AUTO_UNITY_PATH", "/opt/Unity/Editor")
-    monkeypatch.setenv("BMAD_AUTO_UNITY_MCP_TOKEN", "secret")
-    monkeypatch.setenv("BMAD_AUTO_UNITY_MCP_START_SERVER", "false")
-    monkeypatch.setenv("BMAD_AUTO_UNITY_MCP_KEEP_CONNECTED", "false")
+    monkeypatch.setenv("BMAD_LOOP_UNITY_PATH", "/opt/Unity/Editor")
+    monkeypatch.setenv("BMAD_LOOP_UNITY_MCP_TOKEN", "secret")
+    monkeypatch.setenv("BMAD_LOOP_UNITY_MCP_START_SERVER", "false")
+    monkeypatch.setenv("BMAD_LOOP_UNITY_MCP_KEEP_CONNECTED", "false")
     cmd = mod._open_command("ucli", tmp_path, "http://localhost:1")
     assert cmd[cmd.index("--start-server") + 1] == "false"
     assert "--keep-connected" not in cmd
@@ -631,7 +631,7 @@ def test_unity_setup_prime_reflink_from_warm_library(tmp_path, monkeypatch):
     mod = _load_unity_setup()
     _clear_setup_knobs(monkeypatch)
     seed = _warm_library(tmp_path / "main")
-    monkeypatch.setenv("BMAD_AUTO_UNITY_LIBRARY_SEED", str(seed))
+    monkeypatch.setenv("BMAD_LOOP_UNITY_LIBRARY_SEED", str(seed))
     wt = tmp_path / "wt"
     wt.mkdir()
     mod._prime_library(wt)
@@ -649,7 +649,7 @@ def test_unity_setup_prime_leaves_substantive_library(tmp_path, monkeypatch):
     mod = _load_unity_setup()
     _clear_setup_knobs(monkeypatch)
     seed = _warm_library(tmp_path / "main")
-    monkeypatch.setenv("BMAD_AUTO_UNITY_LIBRARY_SEED", str(seed))
+    monkeypatch.setenv("BMAD_LOOP_UNITY_LIBRARY_SEED", str(seed))
     wt = tmp_path / "wt"
     (wt / "Library" / "Artifacts").mkdir(parents=True)
     (wt / "Library" / "existing").write_text("keep")
@@ -663,7 +663,7 @@ def test_unity_setup_prime_scriptassemblies_only_is_cold(tmp_path, monkeypatch):
     mod = _load_unity_setup()
     _clear_setup_knobs(monkeypatch)
     seed = _warm_library(tmp_path / "main")
-    monkeypatch.setenv("BMAD_AUTO_UNITY_LIBRARY_SEED", str(seed))
+    monkeypatch.setenv("BMAD_LOOP_UNITY_LIBRARY_SEED", str(seed))
     wt = tmp_path / "wt"
     (wt / "Library" / "ScriptAssemblies").mkdir(parents=True)  # cold leftover only
     mod._prime_library(wt)
@@ -680,8 +680,8 @@ _skip_win_symlink = pytest.mark.skipif(
 def test_unity_setup_prime_symlink_fallback_when_no_seed(tmp_path, monkeypatch):
     mod = _load_unity_setup()
     _clear_setup_knobs(monkeypatch)
-    monkeypatch.setenv("BMAD_AUTO_UNITY_LIBRARY_SEED", "")  # disable priming
-    monkeypatch.setenv("BMAD_AUTO_UNITY_LIBRARY_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv("BMAD_LOOP_UNITY_LIBRARY_SEED", "")  # disable priming
+    monkeypatch.setenv("BMAD_LOOP_UNITY_LIBRARY_CACHE", str(tmp_path / "cache"))
     wt = tmp_path / "wt"
     wt.mkdir()
     mod._prime_library(wt)
@@ -693,9 +693,9 @@ def test_unity_setup_prime_seed_mode_off_uses_symlink(tmp_path, monkeypatch):
     mod = _load_unity_setup()
     _clear_setup_knobs(monkeypatch)
     seed = _warm_library(tmp_path / "main")
-    monkeypatch.setenv("BMAD_AUTO_UNITY_LIBRARY_SEED", str(seed))
-    monkeypatch.setenv("BMAD_AUTO_UNITY_LIBRARY_SEED_MODE", "off")
-    monkeypatch.setenv("BMAD_AUTO_UNITY_LIBRARY_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv("BMAD_LOOP_UNITY_LIBRARY_SEED", str(seed))
+    monkeypatch.setenv("BMAD_LOOP_UNITY_LIBRARY_SEED_MODE", "off")
+    monkeypatch.setenv("BMAD_LOOP_UNITY_LIBRARY_CACHE", str(tmp_path / "cache"))
     wt = tmp_path / "wt"
     wt.mkdir()
     mod._prime_library(wt)
@@ -707,7 +707,7 @@ def test_unity_setup_prime_drops_stale_symlink(tmp_path, monkeypatch):
     mod = _load_unity_setup()
     _clear_setup_knobs(monkeypatch)
     seed = _warm_library(tmp_path / "main")
-    monkeypatch.setenv("BMAD_AUTO_UNITY_LIBRARY_SEED", str(seed))
+    monkeypatch.setenv("BMAD_LOOP_UNITY_LIBRARY_SEED", str(seed))
     wt = tmp_path / "wt"
     wt.mkdir()
     (wt / "Library").symlink_to(tmp_path / "old-cache")  # stale symlink-mode link
@@ -721,12 +721,12 @@ def test_unity_setup_prime_drops_stale_symlink(tmp_path, monkeypatch):
 
 def test_unity_setup_engine_agent_ids_env_parsing(monkeypatch):
     mod = _load_unity_setup()
-    monkeypatch.delenv("BMAD_AUTO_ENGINE_AGENTS", raising=False)
-    monkeypatch.delenv("BMAD_AUTO_ENGINE_AGENT", raising=False)
+    monkeypatch.delenv("BMAD_LOOP_ENGINE_AGENTS", raising=False)
+    monkeypatch.delenv("BMAD_LOOP_ENGINE_AGENT", raising=False)
     assert mod._engine_agent_ids() == ["claude-code"]  # default
-    monkeypatch.setenv("BMAD_AUTO_ENGINE_AGENT", "codex")  # legacy singular fallback
+    monkeypatch.setenv("BMAD_LOOP_ENGINE_AGENT", "codex")  # legacy singular fallback
     assert mod._engine_agent_ids() == ["codex"]
-    monkeypatch.setenv("BMAD_AUTO_ENGINE_AGENTS", "claude-code, codex ,claude-code")
+    monkeypatch.setenv("BMAD_LOOP_ENGINE_AGENTS", "claude-code, codex ,claude-code")
     assert mod._engine_agent_ids() == ["claude-code", "codex"]  # strip + dedup, plural wins
 
 
@@ -781,7 +781,7 @@ def test_unity_setup_configures_every_agent_at_worktree_port(tmp_path, monkeypat
     _clear_setup_knobs(monkeypatch)
     script, log = _fake_setup_cli(tmp_path)
     monkeypatch.setenv("UNITY_MCP_CLI", str(script))
-    monkeypatch.setenv("BMAD_AUTO_ENGINE_AGENTS", "claude-code,codex")
+    monkeypatch.setenv("BMAD_LOOP_ENGINE_AGENTS", "claude-code,codex")
     monkeypatch.delenv("FAKE_CODEX_FORCE_URL", raising=False)
     assert mod._setup_ivanmurzak(tmp_path) == 0
     calls = log.read_text()
@@ -797,7 +797,7 @@ def test_unity_setup_fails_loud_when_agent_config_leaks(tmp_path, monkeypatch):
     _clear_setup_knobs(monkeypatch)
     script, _ = _fake_setup_cli(tmp_path)
     monkeypatch.setenv("UNITY_MCP_CLI", str(script))
-    monkeypatch.setenv("BMAD_AUTO_ENGINE_AGENTS", "claude-code,codex")
+    monkeypatch.setenv("BMAD_LOOP_ENGINE_AGENTS", "claude-code,codex")
     # simulate the bug: codex config still pinned to the main project's port
     monkeypatch.setenv("FAKE_CODEX_FORCE_URL", "http://localhost:23191")
     # isolation check rejects -> non-zero so the engine defers the unit (no work)

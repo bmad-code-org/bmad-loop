@@ -13,13 +13,13 @@ import tomllib
 from test_tui_app import until
 from textual.widgets import Collapsible, Input, Select, Switch
 
-from automator import policy as policy_mod
-from automator.plugins import load_plugins
-from automator.policy import POLICY_FILE, POLICY_TEMPLATE
-from automator.tui.app import BmadAutoApp
-from automator.tui.screens.dashboard import DashboardScreen
-from automator.tui.screens.settings_screen import SettingsScreen
-from automator.tui.settings import PolicyDoc
+from bmad_loop import policy as policy_mod
+from bmad_loop.plugins import load_plugins
+from bmad_loop.policy import POLICY_FILE, POLICY_TEMPLATE
+from bmad_loop.tui.app import BmadLoopApp
+from bmad_loop.tui.screens.dashboard import DashboardScreen
+from bmad_loop.tui.screens.settings_screen import SettingsScreen
+from bmad_loop.tui.settings import PolicyDoc
 
 
 def fresh_doc(tmp_path) -> PolicyDoc:
@@ -29,7 +29,7 @@ def fresh_doc(tmp_path) -> PolicyDoc:
 def test_load_missing_file_starts_from_template(tmp_path):
     doc = fresh_doc(tmp_path)
     assert doc.get("limits", "max_review_cycles") == 3
-    assert "# bmad-auto orchestration policy" in doc.dumps()
+    assert "# bmad-loop orchestration policy" in doc.dumps()
     assert doc.validate() is None
 
 
@@ -122,7 +122,7 @@ def test_validate_surfaces_policy_error(tmp_path):
 
 
 def test_save_creates_parent_and_leaves_no_tmp(tmp_path):
-    path = tmp_path / ".automator" / "policy.toml"
+    path = tmp_path / ".bmad-loop" / "policy.toml"
     doc = PolicyDoc.load(path)
     doc.set("limits", "max_dev_attempts", 3)
     doc.save(path)
@@ -194,7 +194,7 @@ def write_policy(project) -> None:
 
 async def test_settings_screen_saves_minimal_diff(project):
     write_policy(project)
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test(size=(100, 40)) as pilot:
         screen = await open_settings(app, pilot)
         screen.query_one("#limits-max_review_cycles", Input).value = "5"
@@ -207,7 +207,7 @@ async def test_settings_screen_saves_minimal_diff(project):
 
 async def test_settings_screen_untouched_save_writes_nothing_new(project):
     write_policy(project)
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test(size=(100, 40)) as pilot:
         await open_settings(app, pilot)
         await pilot.press("ctrl+s")
@@ -217,7 +217,7 @@ async def test_settings_screen_untouched_save_writes_nothing_new(project):
 
 async def test_settings_screen_blocks_invalid_value(project):
     write_policy(project)
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test(size=(100, 40)) as pilot:
         screen = await open_settings(app, pilot)
         screen.query_one("#limits-cache_read_weight", Input).value = "5"
@@ -233,7 +233,7 @@ async def test_settings_screen_blocks_invalid_value(project):
 
 async def test_settings_screen_review_toggle_roundtrip(project):
     write_policy(project)
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test(size=(100, 40)) as pilot:
         screen = await open_settings(app, pilot)
         screen.query_one("#review-enabled", Switch).value = False
@@ -245,7 +245,7 @@ async def test_settings_screen_review_toggle_roundtrip(project):
 
 async def test_settings_screen_low_frame_rate_toggle_roundtrip(project):
     write_policy(project)
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test(size=(100, 40)) as pilot:
         screen = await open_settings(app, pilot)
         screen.query_one("#tui-low_frame_rate", Switch).value = True
@@ -272,7 +272,7 @@ async def test_settings_screen_unity_roster_reveals_settings_on_enable(project):
     stays clean; flipping the toggle reveals it live (no save/reopen needed). With
     the policy already enabling unity, its settings are visible on open."""
     write_policy(project)
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test(size=(100, 40)) as pilot:
         screen = await open_settings(app, pilot)
         assert screen.query_one("#plugin-enabled-unity", Switch).value is False
@@ -284,7 +284,7 @@ async def test_settings_screen_unity_roster_reveals_settings_on_enable(project):
         await until(pilot, lambda: cfg.display is True)  # revealed live on enable
 
     write_policy_enabling_unity(project)
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test(size=(100, 40)) as pilot:
         screen = await open_settings(app, pilot)
         assert screen.query_one("#plugin-enabled-unity", Switch).value is True
@@ -296,7 +296,7 @@ async def test_settings_screen_enable_toggle_roundtrip(project):
     flipping it off again empties the list. The default editor_mode='shared' is a
     valid coupling with the default scm.isolation='none', so the save succeeds."""
     write_policy(project)  # template: enabled = []
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test(size=(100, 40)) as pilot:
         screen = await open_settings(app, pilot)
         screen.query_one("#plugin-enabled-unity", Switch).value = True
@@ -305,7 +305,7 @@ async def test_settings_screen_enable_toggle_roundtrip(project):
         assert policy_mod.load(project.project / POLICY_FILE).plugins.enabled == ("unity",)
 
     write_policy_enabling_unity(project)
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test(size=(100, 40)) as pilot:
         screen = await open_settings(app, pilot)
         screen.query_one("#plugin-enabled-unity", Switch).value = False
@@ -320,7 +320,7 @@ async def test_settings_screen_enable_toggle_preserves_unmanaged_names(project):
     path = project.project / POLICY_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text('[plugins]\nenabled = ["ghost"]\n', encoding="utf-8")
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test(size=(100, 40)) as pilot:
         screen = await open_settings(app, pilot)
         screen.query_one("#plugin-enabled-unity", Switch).value = True
@@ -334,7 +334,7 @@ async def test_settings_screen_blocks_invalid_plugin_coupling(project):
     'worktree' is rejected at save time — the engine's startup coupling check now
     runs on the TUI save path — so the save is blocked and the screen stays open."""
     write_policy_enabling_unity(project)
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test(size=(100, 40)) as pilot:
         screen = await open_settings(app, pilot)
         screen.query_one("#plugins-unity-editor_mode", Select).value = "shared"
@@ -349,7 +349,7 @@ async def test_settings_screen_blocks_invalid_plugin_coupling(project):
 
 async def test_settings_screen_unity_editor_mode_roundtrip(project):
     write_policy_enabling_unity(project)
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test(size=(100, 40)) as pilot:
         screen = await open_settings(app, pilot)
         screen.query_one("#plugins-unity-editor_mode", Select).value = "per_worktree"
@@ -365,7 +365,7 @@ async def test_settings_screen_unity_editor_mode_roundtrip(project):
 
 async def test_settings_screen_unity_ready_fields_roundtrip(project):
     write_policy_enabling_unity(project)
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test(size=(100, 40)) as pilot:
         screen = await open_settings(app, pilot)
         screen.query_one("#plugins-unity-ready_timeout_sec", Input).value = "300"
@@ -379,7 +379,7 @@ async def test_settings_screen_unity_ready_fields_roundtrip(project):
 
 async def test_settings_screen_stage_override_roundtrip(project):
     write_policy(project)
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test(size=(100, 40)) as pilot:
         screen = await open_settings(app, pilot)
         screen.query_one("#adapter-review-model", Input).value = "gpt-5-codex"
@@ -413,7 +413,7 @@ async def test_data_only_plugin_renders_without_toggle(project):
     the Plugins roster with no enable toggle and its settings are visible (not
     hidden) by default."""
     write_policy(project)
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test(size=(100, 40)) as pilot:
         screen = await open_settings(app, pilot)
         titles = [str(c.title) for c in screen.query(Collapsible)]
@@ -426,7 +426,7 @@ async def test_data_only_plugin_renders_without_toggle(project):
 async def test_enabled_plugin_section_renders_and_round_trips(project):
     """An enabled plugin's setting renders and persists under [plugins.<name>]."""
     write_policy_enabling_example(project)
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test(size=(100, 40)) as pilot:
         screen = await open_settings(app, pilot)
         titles = [str(c.title) for c in screen.query(Collapsible)]
@@ -448,7 +448,7 @@ async def test_save_preserves_disabled_plugin_settings(project):
     path.write_text(
         '[plugins]\nenabled = []\n\n[plugins.unity]\nmcp = "coplaydev"\n', encoding="utf-8"
     )
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test(size=(100, 40)) as pilot:
         screen = await open_settings(app, pilot)
         assert screen.query_one("#plugin-cfg-unity", Collapsible).display is False  # hidden
@@ -465,7 +465,7 @@ async def test_save_preserves_disabled_plugin_settings(project):
 
 async def test_sections_start_collapsed_and_toggle_all(project):
     write_policy(project)
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test(size=(100, 40)) as pilot:
         screen = await open_settings(app, pilot)
         sections = list(screen.query(Collapsible))
@@ -486,7 +486,7 @@ async def test_sections_start_collapsed_and_toggle_all(project):
 
 async def test_arrow_keys_navigate_fields(project):
     write_policy(project)
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test(size=(100, 40)) as pilot:
         screen = await open_settings(app, pilot)
         expand_all(screen)
@@ -504,7 +504,7 @@ async def test_arrow_keys_navigate_fields(project):
 
 async def test_arrow_down_skips_disabled_args_input(project):
     write_policy(project)
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test(size=(100, 40)) as pilot:
         screen = await open_settings(app, pilot)
         expand_all(screen)
@@ -521,7 +521,7 @@ async def test_arrow_down_skips_disabled_args_input(project):
 
 async def test_enter_opens_select_and_arrows_pick(project):
     write_policy(project)
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test(size=(100, 40)) as pilot:
         from textual.widgets import Select
 
@@ -544,7 +544,7 @@ async def test_enter_opens_select_and_arrows_pick(project):
 
 async def test_textarea_enter_edit_mode_and_escape(project):
     write_policy(project)
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test(size=(100, 40)) as pilot:
         from textual.widgets import TextArea
 
@@ -579,7 +579,7 @@ async def test_textarea_enter_edit_mode_and_escape(project):
 
 async def test_escape_in_nav_mode_pops_screen(project):
     write_policy(project)
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test(size=(100, 40)) as pilot:
         await open_settings(app, pilot)
         await pilot.press("escape")

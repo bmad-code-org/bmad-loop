@@ -8,7 +8,7 @@ helpers carry no engine wiring yet — they are the plumbing Phase 3 builds on.
 import pytest
 from conftest import git
 
-from automator import verify
+from bmad_loop import verify
 
 
 def commit(repo, name, content="x\n", msg="work"):
@@ -320,8 +320,8 @@ def test_capture_diff_empty_when_clean(project):
 def test_capture_diff_ignores_gitignored(project):
     repo = project.project
     base = verify.rev_parse_head(repo)
-    # .gitignore (from the fixture) excludes .automator/runs/
-    run_dir = repo / ".automator" / "runs" / "r1"
+    # .gitignore (from the fixture) excludes .bmad-loop/runs/
+    run_dir = repo / ".bmad-loop" / "runs" / "r1"
     run_dir.mkdir(parents=True)
     (run_dir / "state.json").write_text("{}")
     assert verify.capture_diff(repo, base) == ""

@@ -30,7 +30,7 @@ the current unit.
 
 from __future__ import annotations
 
-from automator.plugins import Plugin
+from bmad_loop.plugins import Plugin
 
 
 class GuardrailsPlugin(Plugin):

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render the README demo GIF of the bmad-auto TUI — headlessly, no live run.
+"""Render the README demo GIF of the bmad-loop TUI — headlessly, no live run.
 
 The TUI is a pure read-only observer, so (exactly like ``gen_screenshots.py``)
 we build a throwaway, fully-populated BMAD project on disk, drive the app through
@@ -39,15 +39,15 @@ sys.path.insert(0, str(REPO / "scripts"))
 from gen_screenshots import MONO_FONT, SIZE, STORY_RUN, SWEEP_RUN, build_project  # noqa: E402
 from textual.widgets import Checkbox, Collapsible, Input  # noqa: E402
 
-from automator.tui import launch  # noqa: E402
-from automator.tui.app import BmadAutoApp  # noqa: E402
-from automator.tui.screens.dashboard import DashboardScreen  # noqa: E402
-from automator.tui.screens.modals import (  # noqa: E402
+from bmad_loop.tui import launch  # noqa: E402
+from bmad_loop.tui.app import BmadLoopApp  # noqa: E402
+from bmad_loop.tui.screens.dashboard import DashboardScreen  # noqa: E402
+from bmad_loop.tui.screens.modals import (  # noqa: E402
     DecisionModal,
     DeferredEntryModal,
     StartRunModal,
 )
-from automator.tui.screens.settings_screen import SettingsScreen  # noqa: E402
+from bmad_loop.tui.screens.settings_screen import SettingsScreen  # noqa: E402
 
 OUT_DIR = REPO / "docs" / "images"
 GIF = OUT_DIR / "demo.gif"
@@ -99,7 +99,7 @@ async def capture(root: Path, frames_dir: Path) -> list[tuple[str, float]]:
             shot(0.06)  # one character appears
         await hold_last(0.7, pilot)
 
-    app = BmadAutoApp(root)
+    app = BmadLoopApp(root)
     async with app.run_test(size=SIZE) as pilot:
         await _wait(pilot, lambda: isinstance(app.screen, DashboardScreen))
         screen = app.screen
@@ -322,7 +322,7 @@ def optimise() -> None:
 
 
 def main() -> int:
-    with tempfile.TemporaryDirectory(prefix="bmad-auto-demo-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="bmad-loop-demo-") as tmp:
         work = Path(tmp)
         root = work / "acme-search"
         root.mkdir()

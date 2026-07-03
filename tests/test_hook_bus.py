@@ -20,20 +20,20 @@ import sys
 import pytest
 from conftest import dev_effect, review_effect, write_sprint
 
-from automator.adapters.mock import MockAdapter
-from automator.engine import Engine
-from automator.journal import Journal
-from automator.model import RunState, TokenUsage
-from automator.plugins import (
+from bmad_loop.adapters.mock import MockAdapter
+from bmad_loop.engine import Engine
+from bmad_loop.journal import Journal
+from bmad_loop.model import RunState, TokenUsage
+from bmad_loop.plugins import (
     HookBus,
     HookContext,
     Plugin,
     PluginManifest,
     PluginRegistry,
 )
-from automator.plugins.bus import _HookError, _run_subprocess
-from automator.plugins.model import HookSpec, LoadedPlugin
-from automator.policy import GatesPolicy, LimitsPolicy, NotifyPolicy, Policy, ScmPolicy
+from bmad_loop.plugins.bus import _HookError, _run_subprocess
+from bmad_loop.plugins.model import HookSpec, LoadedPlugin
+from bmad_loop.policy import GatesPolicy, LimitsPolicy, NotifyPolicy, Policy, ScmPolicy
 
 QUIET = NotifyPolicy(desktop=False, file=True)
 
@@ -180,7 +180,7 @@ def test_declarative_nonzero_exit_vetoes_blocking():
     runs = {}
 
     def runner(cmd, *, cwd, env, timeout):  # noqa: ANN001
-        runs["env_stage"] = env["BMAD_AUTO_STAGE"]
+        runs["env_stage"] = env["BMAD_LOOP_STAGE"]
         return 3, "build failed"
 
     c = ctx()
@@ -273,7 +273,7 @@ class _FakeJournal:
 
 
 def make_engine(project, script, registry=None, policy=None, **kw):
-    run_dir = project.project / ".automator" / "runs" / "hb-run"
+    run_dir = project.project / ".bmad-loop" / "runs" / "hb-run"
     adapter = MockAdapter(script, usage_per_session=TokenUsage(input_tokens=10, output_tokens=5))
     state = RunState(run_id="hb-run", project=str(project.project), started_at="now")
     engine = Engine(

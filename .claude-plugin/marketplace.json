@@ -1,25 +1,25 @@
 {
-  "name": "bauto",
+  "name": "bmad-loop",
   "owner": {
     "name": "bmad-code-org"
   },
   "license": "MIT",
   "homepage": "",
-  "repository": "https://github.com/bmad-code-org/bmad-auto",
-  "keywords": ["bmad", "bmad-auto", "automation"],
+  "repository": "https://github.com/bmad-code-org/bmad-loop",
+  "keywords": ["bmad", "bmad-loop", "automation"],
   "plugins": [
     {
-      "name": "bauto",
-      "source": "./src/automator/data/skills",
-      "description": "Automation-mode skills driven by the bmad-auto orchestrator: interactive escalation resolution (bmad-auto-resolve) and deferred-work sweep triage (bmad-auto-sweep) — the inner dev primitive (which self-reviews and commits) is the upstream bmad-dev-auto skill",
+      "name": "bmad-loop",
+      "source": "./src/bmad_loop/data/skills",
+      "description": "Automation-mode skills driven by the bmad-loop orchestrator: interactive escalation resolution (bmad-loop-resolve) and deferred-work sweep triage (bmad-loop-sweep) — the inner dev primitive (which self-reviews and commits) is the upstream bmad-dev-auto skill",
       "version": "0.7.12",
       "author": {
         "name": "pinkyd"
       },
       "skills": [
-        "./src/automator/data/skills/bmad-auto-setup",
-        "./src/automator/data/skills/bmad-auto-resolve",
-        "./src/automator/data/skills/bmad-auto-sweep"
+        "./src/bmad_loop/data/skills/bmad-loop-setup",
+        "./src/bmad_loop/data/skills/bmad-loop-resolve",
+        "./src/bmad_loop/data/skills/bmad-loop-sweep"
       ]
     }
   ]

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Record the README demo GIF of a bmad-auto run / TUI session.
+# Record the README demo GIF of a bmad-loop run / TUI session.
 #
 # Two routes, pick whichever you have:
 #
@@ -39,7 +39,7 @@ Set Height 850
 Set Padding 12
 Set Theme "Catppuccin Mocha"
 
-Type "bmad-auto tui"   Sleep 500ms   Enter
+Type "bmad-loop tui"   Sleep 500ms   Enter
 Sleep 3s
 # 'r' opens the start-run modal; drive a short --max-stories 1 run
 Type "r"               Sleep 1s
@@ -60,7 +60,7 @@ TAPE
 
 cast)
   command -v asciinema >/dev/null || { echo "asciinema not found — see https://docs.asciinema.org"; exit 1; }
-  echo "Recording to $CAST — drive a short run (e.g. 'bmad-auto run --max-stories 1' or 'bmad-auto tui'),"
+  echo "Recording to $CAST — drive a short run (e.g. 'bmad-loop run --max-stories 1' or 'bmad-loop tui'),"
   echo "then press Ctrl-D or type 'exit' to stop."
   asciinema rec --overwrite "$CAST"
   echo "Recorded $CAST — now: scripts/record-demo.sh gif"

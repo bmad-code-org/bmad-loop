@@ -18,7 +18,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 import release  # noqa: E402
 
-REPO_URL = "https://github.com/bmad-code-org/bmad-auto"
+REPO_URL = "https://github.com/bmad-code-org/bmad-loop"
 
 
 # --- version parsing / ordering ------------------------------------------- #
@@ -72,8 +72,8 @@ SAMPLE = """# Changelog
 
 - **Older thing.** Context here.
 
-[0.4.3]: https://github.com/bmad-code-org/bmad-auto/releases/tag/v0.4.3
-[0.4.2]: https://github.com/bmad-code-org/bmad-auto/releases/tag/v0.4.2
+[0.4.3]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.4.3
+[0.4.2]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.4.2
 """
 
 

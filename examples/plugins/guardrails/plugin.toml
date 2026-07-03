@@ -1,12 +1,12 @@
-# Guardrails — the worked-example plugin for the bmad-auto plugin system.
+# Guardrails — the worked-example plugin for the bmad-loop plugin system.
 #
 # One small in-process plugin that exercises every extension point a third party
 # is likely to reach for. It is the companion to docs/plugin-authoring-guide.md.
 #
-# It lives under examples/ (NOT src/automator/data/plugins/) on purpose: builtins
+# It lives under examples/ (NOT src/bmad_loop/data/plugins/) on purpose: builtins
 # are auto-discovered on every run, and a builtin with active hooks would break
 # the zero-plugin "byte-identical" guarantee. To try it, copy this folder into a
-# project's .automator/plugins/ and enable it:
+# project's .bmad-loop/plugins/ and enable it:
 #
 #   [plugins]
 #   enabled = ["guardrails"]
@@ -19,7 +19,7 @@ name = "guardrails"
 version = "1.0.0"
 api_version = 1
 description = "Worked example: a setting, an observe hook, a veto gate, a commit-message mutation, and a provided workflow."
-author = "bmad-auto"
+author = "bmad-loop"
 
 # In-process Python brain. Trust-gated: not imported unless guardrails is in
 # [plugins] enabled. Defaults class = "Plugin"; we name our subclass explicitly.
@@ -33,7 +33,7 @@ class = "GuardrailsPlugin"
 [[settings]]
 key = "trailer"
 type = "str"
-default = "Automated-by: bmad-auto guardrails plugin"
+default = "Automated-by: bmad-loop guardrails plugin"
 label = "Commit trailer"
 help = "Appended to every commit message the plugin sees at pre_commit. Empty disables it."
 

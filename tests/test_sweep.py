@@ -14,12 +14,12 @@ from conftest import (
     write_spec,
 )
 
-from automator import deferredwork
-from automator.adapters.base import SessionResult
-from automator.adapters.mock import MockAdapter
-from automator.journal import Journal, load_state
-from automator.model import Phase, RunState, StoryTask, TokenUsage
-from automator.policy import (
+from bmad_loop import deferredwork
+from bmad_loop.adapters.base import SessionResult
+from bmad_loop.adapters.mock import MockAdapter
+from bmad_loop.journal import Journal, load_state
+from bmad_loop.model import Phase, RunState, StoryTask, TokenUsage
+from bmad_loop.policy import (
     DevPolicy,
     GatesPolicy,
     LimitsPolicy,
@@ -29,8 +29,8 @@ from automator.policy import (
     ScmPolicy,
     SweepPolicy,
 )
-from automator.sweep import DecisionPrompter, SweepEngine, validate_migration, validate_triage
-from automator.verify import worktree_clean
+from bmad_loop.sweep import DecisionPrompter, SweepEngine, validate_migration, validate_triage
+from bmad_loop.verify import worktree_clean
 
 QUIET = NotifyPolicy(desktop=False, file=True)
 
@@ -49,7 +49,7 @@ def triage_result(open_ids, **sections):
 
 
 def make_sweep(project, script, policy=None, answers=(), prompting=False, **kwargs):
-    run_dir = project.project / ".automator" / "runs" / "sweep-run"
+    run_dir = project.project / ".bmad-loop" / "runs" / "sweep-run"
     adapter = MockAdapter(script, usage_per_session=TokenUsage(input_tokens=10, output_tokens=5))
     state = RunState(run_id="sweep-run", project=str(project.project), started_at="now")
     inputs = iter(answers)
@@ -320,7 +320,7 @@ def test_sweep_worktree_bundle_merges_to_target(project):
     closes land on the target branch and the worktree is cleaned up."""
     from conftest import _spec_baseline, write_spec
 
-    from automator.verify import branch_exists, rev_parse_head, worktree_list
+    from bmad_loop.verify import branch_exists, rev_parse_head, worktree_list
 
     write_ledger(project, {"DW-1": "open"})  # committed → visible in the worktree
     plan = triage_result(
@@ -382,7 +382,7 @@ def test_sweep_worktree_bundle_merges_to_target(project):
     assert "change for dw-fix" in (project.project / "src.txt").read_text()
     # worktree cleaned up, branch deleted
     assert [p.resolve() for p in worktree_list(project.project)] == [project.project.resolve()]
-    assert not branch_exists(project.project, "automator/sweep-run/dw-fix")
+    assert not branch_exists(project.project, "bmad_loop/sweep-run/dw-fix")
     assert worktree_clean(project.project)
 
 
@@ -418,7 +418,7 @@ def test_sweep_happy_path(project):
 
     log = git(project.project, "log", "--oneline")
     assert "chore(sweep): close resolved deferred-work entries" in log
-    assert "sweep dw-fix-things: DW-2, DW-3 via bmad-auto" in log
+    assert "sweep dw-fix-things: DW-2, DW-3 via bmad-loop" in log
 
     # dev session was invoked in bundle mode with the rendered intent file
     dev_spec = adapter.sessions[1]
@@ -725,7 +725,7 @@ def test_interactive_decisions_return_client_goes_unattended(project, monkeypatc
     detached window."""
     returned: list[bool] = []
     monkeypatch.setattr(
-        "automator.tui.launch.return_attached_client",
+        "bmad_loop.tui.launch.return_attached_client",
         lambda: bool(returned.append(True)) or True,
     )
     write_ledger(project, {"DW-1": "open"})
@@ -745,7 +745,7 @@ def test_interactive_decisions_return_client_goes_unattended(project, monkeypatc
 def test_interactive_decisions_no_attach_stays_attended(project, monkeypatch):
     """A plain foreground sweep (nobody attached, no return target) keeps
     prompting and never emits the return event."""
-    monkeypatch.setattr("automator.tui.launch.return_attached_client", lambda: False)
+    monkeypatch.setattr("bmad_loop.tui.launch.return_attached_client", lambda: False)
     write_ledger(project, {"DW-1": "open"})
     engine, _adapter = make_sweep(
         project,
@@ -868,8 +868,8 @@ def test_preanswered_build_materializes_bundle_unattended(project):
     """A build pre-answered out of band is consumed by a later unattended sweep
     even though triage re-surfaced it as a decision — and the stored intent is
     used when the triage option keys no longer match (option renumbered)."""
-    from automator import decisions
-    from automator.sweep import DecisionOption
+    from bmad_loop import decisions
+    from bmad_loop.sweep import DecisionOption
 
     write_ledger(project, {"DW-1": "open"})
     # answered out of band against an earlier triage: stored key "9" is NOT one
@@ -917,8 +917,8 @@ def test_preanswered_build_materializes_bundle_unattended(project):
 def test_preanswered_keep_open_suppresses_prompt_and_persists(project):
     """A keep-open pre-answer is adopted (no skip, no re-prompt) and, since the
     entry stays open, the store keeps it for the next sweep too."""
-    from automator import decisions
-    from automator.sweep import DecisionOption
+    from bmad_loop import decisions
+    from bmad_loop.sweep import DecisionOption
 
     write_ledger(project, {"DW-1": "open"})
     decisions.record_pre_answer(

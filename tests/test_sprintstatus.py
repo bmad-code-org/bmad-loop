@@ -1,7 +1,7 @@
 import pytest
 from conftest import write_sprint
 
-from automator import sprintstatus
+from bmad_loop import sprintstatus
 
 
 def test_load_classifies_keys(project):

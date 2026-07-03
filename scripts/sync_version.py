@@ -6,18 +6,18 @@ external consumer (the BMAD-method installer). They drifted once already
 (package ``0.1.0`` vs module metadata ``1.0.0``), so this script is the only
 sanctioned way to change the version, and CI runs ``--check`` to fail on drift.
 
-The canonical value is ``automator.__version__`` in ``src/automator/__init__.py``.
+The canonical value is ``bmad_loop.__version__`` in ``src/bmad_loop/__init__.py``.
 Every other field is derived from it:
 
 * ``pyproject.toml``                              -> ``[project] version``
-* ``src/.../bmad-auto-setup/assets/module.yaml``  -> ``module_version``
+* ``src/.../bmad-loop-setup/assets/module.yaml``  -> ``module_version``
 * ``.claude-plugin/marketplace.json``             -> ``plugins[*].version``
 * ``<repo-root>/module.yaml``                     -> byte-identical copy of the
   canonical module.yaml above. The BMAD installer's ``resolveInstalledModuleYaml``
   only discovers a descriptor at shallow paths (``skills/``, ``src/``, a
   ``*-setup/assets/`` directly under those, or the repo root) — the canonical
-  copy under ``src/automator/data/skills/...`` is too deep, so this root mirror
-  is what lets the installer locate the ``bauto`` module.
+  copy under ``src/bmad_loop/data/skills/...`` is too deep, so this root mirror
+  is what lets the installer locate the ``bmad-loop`` module.
 
 Stamping also runs ``uv lock`` to refresh ``uv.lock`` (which pins the project
 version); CI's ``uv sync --locked`` fails the install step on a stale lock, so
@@ -40,10 +40,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
-INIT = ROOT / "src" / "automator" / "__init__.py"
+INIT = ROOT / "src" / "bmad_loop" / "__init__.py"
 PYPROJECT = ROOT / "pyproject.toml"
 CANONICAL_MODULE_YAML = (
-    ROOT / "src" / "automator" / "data" / "skills" / "bmad-auto-setup" / "assets" / "module.yaml"
+    ROOT / "src" / "bmad_loop" / "data" / "skills" / "bmad-loop-setup" / "assets" / "module.yaml"
 )
 ROOT_MODULE_YAML = ROOT / "module.yaml"
 MARKETPLACE = ROOT / ".claude-plugin" / "marketplace.json"

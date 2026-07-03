@@ -6,14 +6,14 @@ import subprocess
 
 from conftest import install_bmad_config
 
-from automator import cli, runs, verify
-from automator.journal import save_state
-from automator.model import RunState
-from automator.tui import data
+from bmad_loop import cli, runs, verify
+from bmad_loop.journal import save_state
+from bmad_loop.model import RunState
+from bmad_loop.tui import data
 
 
 def _state_run(project, run_id, **kw):
-    run_dir = project / ".automator" / "runs" / run_id
+    run_dir = project / ".bmad-loop" / "runs" / run_id
     save_state(
         run_dir,
         RunState(run_id=run_id, project=str(project), started_at="2026-06-11T10:00:00", **kw),
@@ -62,7 +62,7 @@ def test_reclaimable_excludes_live(tmp_path):
 
 
 def test_reclaimable_unreadable_state(tmp_path):
-    run_dir = tmp_path / ".automator" / "runs" / "20260101-000000-aaaa"
+    run_dir = tmp_path / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
     run_dir.mkdir(parents=True)
     (run_dir / "state.json").write_text("{ not json")
     assert not runs.reclaimable(run_dir)
@@ -73,7 +73,7 @@ def test_reclaimable_unreadable_state(tmp_path):
 
 def test_reconcile_orphan_worktrees(project):
     repo = project.project
-    run_dir = repo / ".automator" / "runs" / "20260101-000000-aaaa"
+    run_dir = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
     wt = run_dir / "worktrees" / "unit"
     wt.parent.mkdir(parents=True)
     verify.worktree_add(repo, wt, "feat", "main")
@@ -90,7 +90,7 @@ def test_reconcile_orphan_worktrees(project):
 
 def test_reconcile_orphan_worktrees_dry_run(project):
     repo = project.project
-    run_dir = repo / ".automator" / "runs" / "20260101-000000-aaaa"
+    run_dir = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
     wt = run_dir / "worktrees" / "unit"
     wt.parent.mkdir(parents=True)
     verify.worktree_add(repo, wt, "feat", "main")
@@ -103,8 +103,8 @@ def test_reconcile_orphan_worktrees_dry_run(project):
 
 def test_reconcile_stale_worktrees_finished_only(project):
     repo = project.project
-    fin = repo / ".automator" / "runs" / "20260101-000000-aaaa"
-    stp = repo / ".automator" / "runs" / "20260101-000001-bbbb"
+    fin = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
+    stp = repo / ".bmad-loop" / "runs" / "20260101-000001-bbbb"
     fin_wt = fin / "worktrees" / "u"
     stp_wt = stp / "worktrees" / "u"
     fin_wt.parent.mkdir(parents=True)
@@ -188,7 +188,7 @@ def _clean_args(project, **kw):
 def test_cmd_clean_dry_run_removes_nothing(project, capsys):
     install_bmad_config(project)
     repo = project.project
-    run_dir = repo / ".automator" / "runs" / "20260101-000000-aaaa"
+    run_dir = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
     wt = run_dir / "worktrees" / "u"
     wt.parent.mkdir(parents=True)
     verify.worktree_add(repo, wt, "fb", "main")
@@ -208,7 +208,7 @@ def test_cmd_clean_warns_unknown_liveness(project, monkeypatch, capsys):
     # frontend re-probes just to say so before removal.
     install_bmad_config(project)
     repo = project.project
-    run_dir = repo / ".automator" / "runs" / "20260101-000000-aaaa"
+    run_dir = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
     save_state(run_dir, RunState(run_id="r", project=str(repo), started_at="x", stopped=True))
     monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "unknown")
 
@@ -221,12 +221,12 @@ def test_cmd_clean_reclaims_and_keeps_protected(project, capsys):
     install_bmad_config(project)
     repo = project.project
     # one stopped run with a worktree (reclaim), one finished run protected by --keep
-    r1 = repo / ".automator" / "runs" / "20260101-000000-aaaa"
+    r1 = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
     wt = r1 / "worktrees" / "u"
     wt.parent.mkdir(parents=True)
     verify.worktree_add(repo, wt, "fb", "main")
     save_state(r1, RunState(run_id="r1", project=str(repo), started_at="x", stopped=True))
-    r2 = repo / ".automator" / "runs" / "20260101-000001-bbbb"
+    r2 = repo / ".bmad-loop" / "runs" / "20260101-000001-bbbb"
     save_state(r2, RunState(run_id="r2", project=str(repo), started_at="x", finished=True))
 
     rc = cli.cmd_clean(_clean_args(repo, keep=["20260101-000001-bbbb"]))
@@ -242,24 +242,24 @@ def test_cmd_clean_reclaims_and_keeps_protected(project, capsys):
 def test_cmd_clean_archives_past_retention(project):
     install_bmad_config(project)
     repo = project.project
-    run_dir = repo / ".automator" / "runs" / "20260101-000000-aaaa"
+    run_dir = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
     save_state(run_dir, RunState(run_id="r", project=str(repo), started_at="x", finished=True))
 
     rc = cli.cmd_clean(_clean_args(repo, retain=0))  # nothing kept by count -> archive
 
     assert rc == 0
     assert not run_dir.exists()
-    assert (repo / ".automator" / "archive" / "20260101-000000-aaaa.tar.gz").is_file()
+    assert (repo / ".bmad-loop" / "archive" / "20260101-000000-aaaa.tar.gz").is_file()
 
 
 def test_cmd_clean_hard_deletes_past_retention(project):
     install_bmad_config(project)
     repo = project.project
-    run_dir = repo / ".automator" / "runs" / "20260101-000000-aaaa"
+    run_dir = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
     save_state(run_dir, RunState(run_id="r", project=str(repo), started_at="x", finished=True))
 
     rc = cli.cmd_clean(_clean_args(repo, retain=0, hard=True))
 
     assert rc == 0
     assert not run_dir.exists()
-    assert not (repo / ".automator" / "archive").exists()
+    assert not (repo / ".bmad-loop" / "archive").exists()

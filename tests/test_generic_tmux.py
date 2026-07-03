@@ -16,15 +16,15 @@ from pathlib import Path
 
 import pytest
 
-from automator.adapters import generic, tmux_base
-from automator.adapters.base import SessionHandle, SessionResult, SessionSpec
-from automator.adapters.generic import GenericDevAdapter, GenericTmuxAdapter
-from automator.adapters.multiplexer import MultiplexerError
-from automator.adapters.profile import get_profile
-from automator.bmadconfig import ProjectPaths
-from automator.model import TokenUsage
-from automator.policy import LimitsPolicy, Policy
-from automator.signals import HookEvent
+from bmad_loop.adapters import generic, tmux_base
+from bmad_loop.adapters.base import SessionHandle, SessionResult, SessionSpec
+from bmad_loop.adapters.generic import GenericDevAdapter, GenericTmuxAdapter
+from bmad_loop.adapters.multiplexer import MultiplexerError
+from bmad_loop.adapters.profile import get_profile
+from bmad_loop.bmadconfig import ProjectPaths
+from bmad_loop.model import TokenUsage
+from bmad_loop.policy import LimitsPolicy, Policy
+from bmad_loop.signals import HookEvent
 
 HAVE_TMUX = sys.platform != "win32" and shutil.which("tmux") is not None
 
@@ -32,14 +32,14 @@ FAKE_CLI = """#!/bin/bash
 # fake CLI: last positional arg is the prompt; env comes from tmux -e
 prompt="${@: -1}"
 ts=$(date +%s%N)
-mkdir -p "$BMAD_AUTO_RUN_DIR/events" "$BMAD_AUTO_RUN_DIR/tasks/$BMAD_AUTO_TASK_ID"
+mkdir -p "$BMAD_LOOP_RUN_DIR/events" "$BMAD_LOOP_RUN_DIR/tasks/$BMAD_LOOP_TASK_ID"
 printf '{"ts": %s, "event": "SessionStart", "task_id": "%s", "session_id": "fake-1"}' \\
-    "$ts" "$BMAD_AUTO_TASK_ID" > "$BMAD_AUTO_RUN_DIR/events/$ts-$BMAD_AUTO_TASK_ID-SessionStart.json"
+    "$ts" "$BMAD_LOOP_TASK_ID" > "$BMAD_LOOP_RUN_DIR/events/$ts-$BMAD_LOOP_TASK_ID-SessionStart.json"
 echo "{\\"workflow\\": \\"auto-dev\\", \\"prompt\\": \\"$prompt\\"}" \\
-    > "$BMAD_AUTO_RUN_DIR/tasks/$BMAD_AUTO_TASK_ID/result.json"
+    > "$BMAD_LOOP_RUN_DIR/tasks/$BMAD_LOOP_TASK_ID/result.json"
 ts2=$(( ts + 1 ))
 printf '{"ts": %s, "event": "Stop", "task_id": "%s", "session_id": "fake-1"}' \\
-    "$ts2" "$BMAD_AUTO_TASK_ID" > "$BMAD_AUTO_RUN_DIR/events/$ts2-$BMAD_AUTO_TASK_ID-Stop.json"
+    "$ts2" "$BMAD_LOOP_TASK_ID" > "$BMAD_LOOP_RUN_DIR/events/$ts2-$BMAD_LOOP_TASK_ID-Stop.json"
 sleep 60  # stay alive like an idle interactive session
 """
 
@@ -67,10 +67,10 @@ def test_ensure_session_tags_project(tmp_path, monkeypatch):
     """A freshly created agent session is stamped with its project so a cleanup
     in another project never prunes this run. The set-option now flows through
     the tmux backend, so patch its subprocess seam."""
-    from automator import runs
+    from bmad_loop import runs
 
     project = tmp_path
-    run_dir = project / ".automator" / "runs" / "RID"  # parents[2] == project
+    run_dir = project / ".bmad-loop" / "runs" / "RID"  # parents[2] == project
     adapter = GenericTmuxAdapter(
         run_dir=run_dir, policy=Policy(limits=LimitsPolicy()), profile=get_profile("claude")
     )
@@ -103,7 +103,7 @@ def make_spec(tmp_path, task_id="1-1-a-dev-1", timeout_s=30.0, model="sonnet") -
         role="dev",
         prompt="/bmad-dev-auto 1-1-a",
         cwd=tmp_path,
-        env={"BMAD_AUTO_MODE": "1", "BMAD_AUTO_TASK_ID": task_id},
+        env={"BMAD_LOOP_MODE": "1", "BMAD_LOOP_TASK_ID": task_id},
         model=model,
         timeout_s=timeout_s,
     )
@@ -225,7 +225,7 @@ def _dev_spec(tmp_path, story_key="3-1") -> SessionSpec:
         role="dev",
         prompt="/bmad-dev-auto 3-1",
         cwd=tmp_path,
-        env={"BMAD_AUTO_STORY_KEY": story_key},
+        env={"BMAD_LOOP_STORY_KEY": story_key},
     )
 
 
@@ -241,7 +241,7 @@ def test_generic_dev_synthesizes_done_spec(tmp_path):
     assert rj["baseline_commit"] == "abc123"  # mapped from baseline_revision
     assert rj["story_key"] == "3-1"
     assert rj["escalations"] == []
-    assert "dw_ids" not in rj  # a normal story exports no BMAD_AUTO_DW_IDS
+    assert "dw_ids" not in rj  # a normal story exports no BMAD_LOOP_DW_IDS
 
 
 def test_generic_dev_bundle_stamps_dw_ids_from_env(tmp_path):
@@ -258,14 +258,14 @@ def test_generic_dev_bundle_stamps_dw_ids_from_env(tmp_path):
         role="dev",
         prompt="/bmad-dev-auto bundle",
         cwd=tmp_path,
-        env={"BMAD_AUTO_STORY_KEY": "dw-bundle", "BMAD_AUTO_DW_IDS": "DW-1, DW-2"},
+        env={"BMAD_LOOP_STORY_KEY": "dw-bundle", "BMAD_LOOP_DW_IDS": "DW-1, DW-2"},
     )
     rj = adapter._result_json(_dev_handle(), spec, wait=True)
     assert rj["dw_ids"] == ["DW-1", "DW-2"]
 
 
 def test_generic_dev_dw_ids_none_env_does_not_crash(tmp_path):
-    # A misbehaving plugin/hook could set BMAD_AUTO_DW_IDS to None instead of
+    # A misbehaving plugin/hook could set BMAD_LOOP_DW_IDS to None instead of
     # deleting it; synthesis must not crash (it would false-stall a completed
     # session), and emits no dw ids.
     adapter, impl = make_dev_adapter(tmp_path)
@@ -278,7 +278,7 @@ def test_generic_dev_dw_ids_none_env_does_not_crash(tmp_path):
         role="dev",
         prompt="/bmad-dev-auto 3-1",
         cwd=tmp_path,
-        env={"BMAD_AUTO_STORY_KEY": "3-1", "BMAD_AUTO_DW_IDS": None},
+        env={"BMAD_LOOP_STORY_KEY": "3-1", "BMAD_LOOP_DW_IDS": None},
     )
     rj = adapter._result_json(_dev_handle(), spec, wait=True)
     assert rj["status"] == "done"
@@ -565,7 +565,7 @@ def test_dev_log_activity_keeps_grace_window_alive(tmp_path, monkeypatch):
 
 
 def test_dev_grace_expiry_nudges_awake_before_stalling(tmp_path, monkeypatch):
-    """bmad-auto can't re-invoke a turn ended to await a background process, so an
+    """bmad-loop can't re-invoke a turn ended to await a background process, so an
     idle dev session is woken with up to dev_stall_nudges wake nudges on grace
     expiry before it is declared stalled (the Mode-1 fix)."""
     monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
@@ -650,7 +650,7 @@ def _capped_spec(tmp_path, cap: int) -> SessionSpec:
         role="dev",
         prompt="/tea-automate 3-1",
         cwd=tmp_path,
-        env={"BMAD_AUTO_STORY_KEY": "3-1"},
+        env={"BMAD_LOOP_STORY_KEY": "3-1"},
         stall_nudges_cap=cap,
     )
 
@@ -816,7 +816,7 @@ def test_wait_for_completion_persistent_probe_failure_times_out_not_crashes(tmp_
         role="dev",
         prompt="/bmad-dev-auto 3-1",
         cwd=tmp_path,
-        env={"BMAD_AUTO_STORY_KEY": "3-1"},
+        env={"BMAD_LOOP_STORY_KEY": "3-1"},
         timeout_s=30.0,
     )
     result = adapter.wait_for_completion(_dev_handle(), spec)
@@ -936,9 +936,9 @@ def test_tmux_end_to_end_with_fake_cli(tmp_path, profile_name):
     # entry for every profile (claude/codex positional, gemini behind -i).
     adapter = make_adapter(tmp_path, profile_name=profile_name, binary=str(fake), extra_args=())
     spec_env = {
-        "BMAD_AUTO_MODE": "1",
-        "BMAD_AUTO_RUN_DIR": str(adapter.run_dir),
-        "BMAD_AUTO_TASK_ID": "t-int-1",
+        "BMAD_LOOP_MODE": "1",
+        "BMAD_LOOP_RUN_DIR": str(adapter.run_dir),
+        "BMAD_LOOP_TASK_ID": "t-int-1",
     }
     spec = SessionSpec(
         task_id="t-int-1",
@@ -985,7 +985,7 @@ def test_tmux_reused_task_id_ignores_stale_artifacts(tmp_path):
         role="dev",
         prompt="/bmad-dev-auto 1-1-a",
         cwd=tmp_path,
-        env={"BMAD_AUTO_RUN_DIR": str(adapter.run_dir), "BMAD_AUTO_TASK_ID": task_id},
+        env={"BMAD_LOOP_RUN_DIR": str(adapter.run_dir), "BMAD_LOOP_TASK_ID": task_id},
         timeout_s=30.0,
     )
     try:
@@ -1014,7 +1014,7 @@ def test_tmux_crash_detected(tmp_path):
         role="dev",
         prompt="x",
         cwd=tmp_path,
-        env={"BMAD_AUTO_RUN_DIR": str(adapter.run_dir), "BMAD_AUTO_TASK_ID": "t-crash"},
+        env={"BMAD_LOOP_RUN_DIR": str(adapter.run_dir), "BMAD_LOOP_TASK_ID": "t-crash"},
         timeout_s=20.0,
     )
     try:

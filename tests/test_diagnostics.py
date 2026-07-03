@@ -10,9 +10,9 @@ from __future__ import annotations
 import json
 import re
 
-from automator import diagnostics, sanitize
-from automator.journal import Journal, save_state
-from automator.model import Phase, RunState, SessionRecord, StoryTask, TokenUsage
+from bmad_loop import diagnostics, sanitize
+from bmad_loop.journal import Journal, save_state
+from bmad_loop.model import Phase, RunState, SessionRecord, StoryTask, TokenUsage
 
 # Labelled canaries planted across the run dir. NONE may appear in the dump.
 EMAIL = "victim.canary@example.com"
@@ -51,7 +51,7 @@ CANARIES = [
 
 def _seed_run(root, run_id="20260627-120000-aaaa", *, extra_journal=None):
     """Build a run dir loaded with canaries in every readable sink."""
-    run_dir = root / ".automator" / "runs" / run_id
+    run_dir = root / ".bmad-loop" / "runs" / run_id
 
     task = StoryTask(
         story_key=STORY_KEY,
@@ -233,7 +233,7 @@ def test_legend_reverses_locally_but_never_ships(project):
 
 
 def test_unreadable_run_does_not_crash(project):
-    run_dir = project.project / ".automator" / "runs" / "20260627-120000-cccc"
+    run_dir = project.project / ".bmad-loop" / "runs" / "20260627-120000-cccc"
     run_dir.mkdir(parents=True)
     (run_dir / "state.json").write_text("{ this is not valid json")
     pseudo = sanitize.Pseudonymizer()

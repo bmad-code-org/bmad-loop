@@ -1,6 +1,6 @@
 # Writing a Game Engine plugin
 
-The **Game Engine** layer adapts the bmad-auto dev/sweep cycle to projects whose
+The **Game Engine** layer adapts the bmad-loop dev/sweep cycle to projects whose
 work needs a **live engine Editor** — e.g. a Unity project the agent drives through
 an Editor MCP. It is niche and **opt-in**: a normal project enables no engine
 plugin and the orchestrator behaves exactly as before.
@@ -16,7 +16,7 @@ guide](plugin-authoring-guide.md) first** for the manifest, settings, hook, and
 trust fundamentals.
 
 Unity ships bundled as the reference engine plugin
-(`src/automator/data/plugins/unity/`). This guide is for adding **another engine**
+(`src/bmad_loop/data/plugins/unity/`). This guide is for adding **another engine**
 (Godot, Unreal, …) — or reshaping the Unity one for your project. For wiring a
 specific Editor MCP (IvanMurzak vs CoplayDev, readiness probing, the full env-var
 reference), see the companion [Game Engine MCP guide](game-engine-mcp-guide.md).
@@ -31,14 +31,14 @@ discovered and overlaid from:
 
 | Source        | Path                                              | Wins         |
 | ------------- | ------------------------------------------------- | ------------ |
-| Bundled       | `automator/data/plugins/<name>/plugin.toml`       | base         |
-| Project-local | `<project>/.automator/plugins/<name>/plugin.toml` | **override** |
+| Bundled       | `bmad_loop/data/plugins/<name>/plugin.toml`       | base         |
+| Project-local | `<project>/.bmad-loop/plugins/<name>/plugin.toml` | **override** |
 
 A project-local plugin with the **same name** overrides the bundled one. The
 plugin's directory is its `{scripts}` dir, so its manifest and helper scripts sit
 together.
 
-Enable it in `.automator/policy.toml`:
+Enable it in `.bmad-loop/policy.toml`:
 
 ```toml
 [plugins]
@@ -53,8 +53,8 @@ mcp = "ivanmurzak"
 > block loads with a deprecation warning, folded into the `[plugins]` allowlist
 > plus a `[plugins.unity]` table. The _policy block_ is the only thing folded,
 > though — project-local plugin overrides are now discovered under
-> `.automator/plugins/<name>/`, so move an old `.automator/engines/unity/`
-> override dir to `.automator/plugins/unity/`. Migrate to `[plugins]` when
+> `.bmad-loop/plugins/<name>/`, so move an old `.bmad-loop/engines/unity/`
+> override dir to `.bmad-loop/plugins/unity/`. Migrate to `[plugins]` when
 > convenient.
 
 ## Mapping the Editor lifecycle onto hook stages
@@ -72,7 +72,7 @@ worktree and sessions. The relevant ones (full list in the
 | `post_run`              | once, on clean finish             | once, on clean finish — reclaim per-run scratch (the Unity plugin clears the MCP server's `/tmp` zips + truncates its editor log) |
 
 A **blocking** hook at `pre_ready_gate` or `pre_worktree_setup` whose command
-exits non-zero **defers the unit** — bmad-auto never starts a session against a
+exits non-zero **defers the unit** — bmad-loop never starts a session against a
 half-open Editor. `pre_worktree_teardown` is **observe-only** for veto purposes
 (a veto can't un-tear-down) but the command still **runs** — best-effort, even
 when a unit pauses or escalates, so a managed Editor never outlives its worktree.
@@ -109,20 +109,20 @@ once the in-place flow is solid.
 
 A declarative hook receives the **generic bus environment** (full table in the
 [authoring guide](plugin-authoring-guide.md#declarative-hooks)) — the run/unit
-identity plus **`BMAD_AUTO_SETTING_<KEY>`** for each of your `[[settings]]`. So a
+identity plus **`BMAD_LOOP_SETTING_<KEY>`** for each of your `[[settings]]`. So a
 readiness script reads its knobs from its own settings:
 
 | Variable                  | Source                                    |
 | ------------------------- | ----------------------------------------- |
-| `BMAD_AUTO_WORKTREE`      | the workspace/worktree the Editor opens   |
-| `BMAD_AUTO_REPO_ROOT`     | main repo root                            |
-| `BMAD_AUTO_STORY_KEY`     | the current story key                     |
-| `BMAD_AUTO_SETTING_<KEY>` | each of your plugin's settings (resolved) |
+| `BMAD_LOOP_WORKTREE`      | the workspace/worktree the Editor opens   |
+| `BMAD_LOOP_REPO_ROOT`     | main repo root                            |
+| `BMAD_LOOP_STORY_KEY`     | the current story key                     |
+| `BMAD_LOOP_SETTING_<KEY>` | each of your plugin's settings (resolved) |
 
 The bundled Unity plugin's in-process module additionally exports
-`BMAD_AUTO_ENGINE_MCP`, `BMAD_AUTO_ENGINE_EDITOR_MODE`,
-`BMAD_AUTO_ENGINE_READY_TIMEOUT`, `BMAD_AUTO_ENGINE_READY_GRACE`, and
-`BMAD_AUTO_UNITY_PATH` for its bundled scripts (derived from its settings) — a
+`BMAD_LOOP_ENGINE_MCP`, `BMAD_LOOP_ENGINE_EDITOR_MODE`,
+`BMAD_LOOP_ENGINE_READY_TIMEOUT`, `BMAD_LOOP_ENGINE_READY_GRACE`, and
+`BMAD_LOOP_UNITY_PATH` for its bundled scripts (derived from its settings) — a
 plugin-internal contract, not part of the generic env. The
 [Game Engine MCP guide](game-engine-mcp-guide.md) tables every knob the Unity
 scripts read.
@@ -130,7 +130,7 @@ scripts read.
 ## Worked example: a minimal `shared`-mode Godot plugin
 
 The smallest useful engine plugin is a single readiness gate. Drop two files under
-`<project>/.automator/plugins/godot/`:
+`<project>/.bmad-loop/plugins/godot/`:
 
 `plugin.toml`:
 
@@ -169,8 +169,8 @@ timeout_sec = 600
 import os, sys, time, socket
 from urllib.parse import urlparse
 
-url = os.environ.get("BMAD_AUTO_SETTING_MCP_URL", "http://localhost:9000")
-deadline = time.time() + int(os.environ.get("BMAD_AUTO_SETTING_READY_TIMEOUT_SEC", "600"))
+url = os.environ.get("BMAD_LOOP_SETTING_MCP_URL", "http://localhost:9000")
+deadline = time.time() + int(os.environ.get("BMAD_LOOP_SETTING_READY_TIMEOUT_SEC", "600"))
 
 host, port = urlparse(url).hostname, urlparse(url).port or 80
 while time.time() < deadline:
@@ -204,7 +204,7 @@ module (see the [authoring guide](plugin-authoring-guide.md#in-process-hooks)).
 
 ## Reference: the bundled Unity plugin
 
-The canonical example lives at `src/automator/data/plugins/unity/`:
+The canonical example lives at `src/bmad_loop/data/plugins/unity/`:
 
 - `plugin.toml` — a `[python]` module + five `[[settings]]` (`editor_mode`, `mcp`,
   `unity_path`, `ready_timeout_sec`, `ready_grace_sec`) + `seed_globs =
@@ -212,7 +212,7 @@ The canonical example lives at `src/automator/data/plugins/unity/`:
 - `unity_plugin.py` — the in-process brain: the readiness gate
   (`on_pre_ready_gate`), `per_worktree` Editor setup/teardown, MCP agent routing,
   Library priming, and the `editor_mode`↔`scm.isolation` coupling validation.
-- `unity_ready.py` — readiness gate script (branches on `BMAD_AUTO_ENGINE_MCP`).
+- `unity_ready.py` — readiness gate script (branches on `BMAD_LOOP_ENGINE_MCP`).
 - `unity_setup.py` — `per_worktree` Library priming, `.mcp.json` write, Custom-mode
   pin, and Editor launch.
 - `unity_teardown.py` — Editor quit + MCP-server reap + symlink-Library cleanup.
@@ -243,7 +243,7 @@ guards, by script:
 - **`unity_teardown.py` — process discovery.** Linux uses a zero-dependency
   `/proc` scan to find the worktree-bound Editor/MCP-server; non-Linux falls back
   to the same scan over **`psutil`**, imported lazily from the optional `non-linux`
-  extra (`pip install 'bmad-auto[non-linux]'`) with a clear error if missing. The
+  extra (`pip install 'bmad-loop[non-linux]'`) with a clear error if missing. The
   hard-kill uses `signal.SIGKILL` where present, degrading to `SIGTERM`/`taskkill`
   on Windows. Liveness uses `os.kill(pid, 0)` on POSIX but `psutil.pid_exists` on
   Windows (where `os.kill(pid, 0)` would _terminate_ the process).

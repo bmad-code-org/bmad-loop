@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from automator.deferredwork import (
+from bmad_loop.deferredwork import (
     append_decision,
     append_entry,
     field_line_present,

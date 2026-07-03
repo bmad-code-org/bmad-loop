@@ -1,7 +1,7 @@
 import json
 
-from automator.model import TokenUsage
-from automator.tokens import (
+from bmad_loop.model import TokenUsage
+from bmad_loop.tokens import (
     read_usage,
     tally,
     tally_codex_rollout,

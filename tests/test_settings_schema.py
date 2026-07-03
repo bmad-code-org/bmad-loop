@@ -12,9 +12,9 @@ from importlib import resources
 
 import pytest
 
-from automator import policy as policy_mod
-from automator.plugins import load_plugins
-from automator.policy import (
+from bmad_loop import policy as policy_mod
+from bmad_loop.plugins import load_plugins
+from bmad_loop.policy import (
     BRANCH_PER_MODES,
     GATE_MODES,
     ISOLATION_MODES,
@@ -36,7 +36,7 @@ from automator.policy import (
     TuiPolicy,
     VerifyPolicy,
 )
-from automator.settings_schema import build_registry, load_core_schema
+from bmad_loop.settings_schema import build_registry, load_core_schema
 
 # Which policy dataclass backs each core schema section. The game-engine layer is
 # no longer a core section — it is the "unity" plugin, rendered from its own
@@ -129,7 +129,7 @@ def test_every_policy_field_is_covered_by_exactly_one_spec():
 
 
 def test_core_schema_ships_in_installed_context():
-    packaged = resources.files("automator.data").joinpath("settings/core.toml")
+    packaged = resources.files("bmad_loop.data").joinpath("settings/core.toml")
     assert packaged.is_file()
     # and it parses into the same sections the loader produces
     assert [s.name for s in load_core_schema()][0] == "gates"

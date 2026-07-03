@@ -11,12 +11,12 @@ from pathlib import Path
 
 from conftest import install_bmad_config, write_sprint
 
-from automator import deferredwork
-from automator.adapters import tmux_base
-from automator.journal import Journal, save_state
-from automator.model import RunState
-from automator.runs import RUNS_DIR, write_pid
-from automator.tui import data
+from bmad_loop import deferredwork
+from bmad_loop.adapters import tmux_base
+from bmad_loop.journal import Journal, save_state
+from bmad_loop.model import RunState
+from bmad_loop.runs import RUNS_DIR, write_pid
+from bmad_loop.tui import data
 
 
 def make_run(root: Path, run_id: str, **state_kwargs) -> Path:
@@ -130,7 +130,7 @@ def test_discover_runs_classification(tmp_path):
 
 
 def test_live_pid_with_unreadable_identity_is_unknown_not_interrupted(tmp_path, monkeypatch):
-    from automator import runs
+    from bmad_loop import runs
 
     run_dir = make_run(tmp_path, "20260611-100000-aaaa")
     (run_dir / "engine.pid").write_text("4242 123.0")
@@ -147,17 +147,17 @@ def test_live_pid_with_unreadable_identity_is_unknown_not_interrupted(tmp_path, 
 
 
 def test_process_host_misconfig_degrades_to_unknown(tmp_path, monkeypatch):
-    # A ProcessHostError from get_process_host (bad BMAD_AUTO_PROCESS_HOST) must not
+    # A ProcessHostError from get_process_host (bad BMAD_LOOP_PROCESS_HOST) must not
     # escape the display layer: the dashboard poll worker has no except and would
     # take the whole app down. The status column degrades to 'unknown' instead.
-    from automator import runs
-    from automator.process_host import ProcessHostError
+    from bmad_loop import runs
+    from bmad_loop.process_host import ProcessHostError
 
     run_dir = make_run(tmp_path, "20260611-100000-aaaa")
     (run_dir / "engine.pid").write_text("4242 123.0")
 
     def boom():
-        raise ProcessHostError("BMAD_AUTO_PROCESS_HOST matches no registered host")
+        raise ProcessHostError("BMAD_LOOP_PROCESS_HOST matches no registered host")
 
     monkeypatch.setattr(runs, "get_process_host", boom)
     assert data.liveness(run_dir) == "unknown"
@@ -200,7 +200,7 @@ def test_legacy_run_with_live_tmux_session_is_running(tmp_path, monkeypatch):
     monkeypatch.setattr(tmux_base.subprocess, "run", fake_run)
     assert data.discover_runs(tmp_path)[0].status == data.RUNNING
     assert calls[0][:3] == ["tmux", "has-session", "-t"]
-    assert calls[0][3] == f"=bmad-auto-{run_dir.name}"
+    assert calls[0][3] == f"=bmad-loop-{run_dir.name}"
 
 
 def test_legacy_run_liveness_unknown_when_backend_query_fails(tmp_path, monkeypatch):

@@ -5,7 +5,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-SCRIPT = Path(__file__).parent.parent / "src" / "automator" / "data" / "bmad_auto_probe_hook.py"
+SCRIPT = Path(__file__).parent.parent / "src" / "bmad_loop" / "data" / "bmad_loop_probe_hook.py"
 
 
 def run_hook(event: str, env: dict, payload) -> subprocess.CompletedProcess:
@@ -27,7 +27,7 @@ def test_noop_without_capture_dir(tmp_path):
 
 def test_writes_signal_and_payload(tmp_path):
     capture = tmp_path / "capture"
-    env = {"BMAD_AUTO_PROBE_CAPTURE_DIR": str(capture), "BMAD_AUTO_TASK_ID": "probe"}
+    env = {"BMAD_LOOP_PROBE_CAPTURE_DIR": str(capture), "BMAD_LOOP_TASK_ID": "probe"}
     payload = {
         "session_id": "abc-123",
         "transcript_path": "/home/u/.copilot/x/events.jsonl",
@@ -57,7 +57,7 @@ def test_writes_signal_and_payload(tmp_path):
 
 def test_conversation_id_fallback(tmp_path):
     capture = tmp_path / "capture"
-    env = {"BMAD_AUTO_PROBE_CAPTURE_DIR": str(capture)}
+    env = {"BMAD_LOOP_PROBE_CAPTURE_DIR": str(capture)}
     proc = run_hook("Stop", env, {"conversation_id": "conv-9"})
     assert proc.returncode == 0
     signal = json.loads(next(capture.glob("*.signal.json")).read_text())
@@ -68,7 +68,7 @@ def test_conversation_id_fallback(tmp_path):
 
 def test_tolerates_garbage_stdin(tmp_path):
     capture = tmp_path / "capture"
-    env = {"BMAD_AUTO_PROBE_CAPTURE_DIR": str(capture)}
+    env = {"BMAD_LOOP_PROBE_CAPTURE_DIR": str(capture)}
     proc = run_hook("SessionStart", env, None)  # empty stdin
     assert proc.returncode == 0
     assert len(list(capture.glob("*.signal.json"))) == 1
@@ -80,5 +80,5 @@ def test_installed_copy_matches_source(tmp_path):
     # packaged alongside the real relay; importlib.resources resolves it
     from importlib import resources
 
-    packaged = resources.files("automator.data").joinpath("bmad_auto_probe_hook.py")
+    packaged = resources.files("bmad_loop.data").joinpath("bmad_loop_probe_hook.py")
     assert packaged.read_text(encoding="utf-8") == SCRIPT.read_text(encoding="utf-8")

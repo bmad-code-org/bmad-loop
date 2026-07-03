@@ -24,13 +24,13 @@ from textual.widgets import (
     TabbedContent,
 )
 
-from automator.journal import Journal, save_state
-from automator.model import Phase, RunState, StoryTask, TokenUsage
-from automator.runs import RUNS_DIR
-from automator.tui import data, launch
-from automator.tui.app import BmadAutoApp
-from automator.tui.screens.dashboard import DashboardScreen, _Snapshot
-from automator.tui.screens.modals import (
+from bmad_loop.journal import Journal, save_state
+from bmad_loop.model import Phase, RunState, StoryTask, TokenUsage
+from bmad_loop.runs import RUNS_DIR
+from bmad_loop.tui import data, launch
+from bmad_loop.tui.app import BmadLoopApp
+from bmad_loop.tui.screens.dashboard import DashboardScreen, _Snapshot
+from bmad_loop.tui.screens.modals import (
     ConfirmModal,
     ConfirmResumeModal,
     DecisionModal,
@@ -39,7 +39,7 @@ from automator.tui.screens.modals import (
     StartSweepModal,
     TextOutputModal,
 )
-from automator.tui.widgets import RunHeader, SelectableRichLog, SprintTree
+from bmad_loop.tui.widgets import RunHeader, SelectableRichLog, SprintTree
 
 
 def make_run(
@@ -76,7 +76,7 @@ def make_run(
     return run_dir
 
 
-def notifications(app: BmadAutoApp) -> list[str]:
+def notifications(app: BmadLoopApp) -> list[str]:
     return [n.message for n in app._notifications]
 
 
@@ -115,13 +115,13 @@ async def ready(pilot, selector: str):
     return _hit()
 
 
-def dashboard(app: BmadAutoApp) -> DashboardScreen:
+def dashboard(app: BmadLoopApp) -> DashboardScreen:
     assert isinstance(app.screen, DashboardScreen)
     return app.screen
 
 
 async def test_empty_project_shows_hint(project):
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         screen = dashboard(app)
@@ -134,7 +134,7 @@ async def test_run_table_populates_and_selects_newest(project):
     root = project.project
     make_run(root, "20260611-100000-aaaa", finished=True)
     make_run(root, "20260611-110000-bbbb", run_type="sweep", alive=True)
-    app = BmadAutoApp(root)
+    app = BmadLoopApp(root)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         screen = dashboard(app)
@@ -162,7 +162,7 @@ async def test_selection_switches_task_table(project):
     task.commit_sha = "abc1234def567890"
     make_run(root, "20260611-100000-aaaa", finished=True, tasks={"1-1-login": task})
     make_run(root, "20260611-110000-bbbb", alive=True)
-    app = BmadAutoApp(root)
+    app = BmadLoopApp(root)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         screen = dashboard(app)
@@ -192,7 +192,7 @@ async def test_task_table_shows_weighted_and_raw_tokens(project):
         tasks={"1-1-login": task},
         policy_snapshot={"limits": {"cache_read_weight": 0.5}},
     )
-    app = BmadAutoApp(root)
+    app = BmadLoopApp(root)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         screen = dashboard(app)
@@ -219,7 +219,7 @@ async def test_zero_weighted_tokens_shows_zero_not_dash(project):
         tasks={"1-1-login": task},
         policy_snapshot={"limits": {"cache_read_weight": 0.0}},  # fully discount cache reads
     )
-    app = BmadAutoApp(root)
+    app = BmadLoopApp(root)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         screen = dashboard(app)
@@ -238,7 +238,7 @@ async def test_apply_snapshot_after_unmount_is_noop(project):
     settings screen is open as the app tears down."""
     root = project.project
     make_run(root, "20260611-100000-aaaa", finished=True, tasks={})
-    app = BmadAutoApp(root)
+    app = BmadLoopApp(root)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         screen = dashboard(app)
@@ -258,7 +258,7 @@ async def test_token_weight_falls_back_to_default(project):
     # empty snapshot (e.g. a pre-feature run) -> default weight 0.1.
     # weighted = 100+50+10+round(1000*0.1) = 260.
     make_run(root, "20260611-100000-aaaa", finished=True, tasks={"1-1-login": task})
-    app = BmadAutoApp(root)
+    app = BmadLoopApp(root)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         screen = dashboard(app)
@@ -280,7 +280,7 @@ def log_text(screen: DashboardScreen) -> str:
 async def test_journal_pane_updates_after_poll(project):
     root = project.project
     run_dir = make_run(root, "20260611-100000-aaaa", alive=True)
-    app = BmadAutoApp(root)
+    app = BmadLoopApp(root)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         screen = dashboard(app)
@@ -304,7 +304,7 @@ async def test_log_pane_shows_emulated_content(project):
     (run_dir / "logs").mkdir()
     (run_dir / "logs" / "story-1.log").write_bytes(ink_stream())
     Journal(run_dir).append("session-start", task_id="story-1")
-    app = BmadAutoApp(root)
+    app = BmadLoopApp(root)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         screen = dashboard(app)
@@ -331,7 +331,7 @@ async def test_log_pane_shows_emulated_content(project):
 
 
 async def test_selectable_rich_log_get_selection(project):
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         screen = dashboard(app)
@@ -350,7 +350,7 @@ async def test_selectable_rich_log_get_selection(project):
 
 async def test_copy_pane_action_copies_log(project, monkeypatch):
     copied: list[str] = []
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         screen = dashboard(app)
@@ -368,7 +368,7 @@ async def test_copy_pane_action_copies_log(project, monkeypatch):
 
 
 async def test_copy_pane_wrong_tab_notifies(project):
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         screen = dashboard(app)
@@ -381,7 +381,7 @@ async def test_copy_pane_wrong_tab_notifies(project):
 
 
 async def test_copy_pane_empty_notifies(project):
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         screen = dashboard(app)
@@ -415,7 +415,7 @@ async def test_journal_enter_jumps_to_log_position(project):
     journal.append("session-start", task_id="story-1")
     # a mid-log event: explicit log_pos wins over the stamped file size
     journal.append("checkpoint", log_task="story-1", log_pos=offsets[100])
-    app = BmadAutoApp(root)
+    app = BmadLoopApp(root)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         screen = dashboard(app)
@@ -436,7 +436,7 @@ async def test_journal_enter_without_position_notifies(project):
     root = project.project
     run_dir = make_run(root, "20260611-100000-aaaa", alive=True)
     Journal(run_dir).append("story-start", story_key="1-2-search")  # no session yet
-    app = BmadAutoApp(root)
+    app = BmadLoopApp(root)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         screen = dashboard(app)
@@ -461,7 +461,7 @@ async def test_journal_jump_pins_other_sessions_log(project):
     journal.append("session-end", task_id="story-1")
     journal.set_active_log("story-2")
     journal.append("session-start", task_id="story-2")  # active session: story-2
-    app = BmadAutoApp(root)
+    app = BmadLoopApp(root)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         screen = dashboard(app)
@@ -490,7 +490,7 @@ async def test_journal_jump_near_tail_does_not_chase_growing_log(project):
     journal.set_active_log("story-1")
     journal.append("session-start", task_id="story-1")
     journal.append("checkpoint", log_task="story-1", log_pos=offsets[-1])  # the last row
-    app = BmadAutoApp(root)
+    app = BmadLoopApp(root)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         screen = dashboard(app)
@@ -522,7 +522,7 @@ async def test_poll_skips_while_another_holds_the_lock(project):
     journal = Journal(run_dir)
     journal.set_active_log("story-1")
     journal.append("session-start", task_id="story-1")
-    app = BmadAutoApp(root)
+    app = BmadLoopApp(root)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         screen = dashboard(app)
@@ -561,7 +561,7 @@ async def test_sprint_tree_populates(project):
             "2-1-billing": "backlog",
         },
     )
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         screen = dashboard(app)
@@ -583,7 +583,7 @@ async def test_sprint_tree_populates(project):
 async def test_sprint_tree_preserves_expansion_across_refresh(project):
     install_bmad_config(project)
     write_sprint(project, {"epic-1": "in-progress", "1-1-auth": "in-progress"})
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         screen = dashboard(app)
@@ -607,7 +607,7 @@ async def test_sprint_tree_preserves_expansion_across_refresh(project):
 async def test_sprint_tree_forgives_malformed_yaml(project):
     install_bmad_config(project)
     project.sprint_status.write_text("{ not valid yaml [")
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         screen = dashboard(app)
@@ -641,7 +641,7 @@ def deferred_rows(deferred: OptionList) -> list[str]:
 async def test_deferred_pane_lists_and_opens_modal(project):
     install_bmad_config(project)
     project.deferred_work.write_text(_LEDGER, encoding="utf-8")
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         screen = dashboard(app)
@@ -666,7 +666,7 @@ async def test_deferred_pane_lists_and_opens_modal(project):
 async def test_deferred_pane_preserves_highlight_across_refresh(project):
     install_bmad_config(project)
     project.deferred_work.write_text(_LEDGER, encoding="utf-8")
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         screen = dashboard(app)
@@ -690,7 +690,7 @@ async def test_deferred_pane_shows_legacy_items(project):
         "- **Open legacy thing here** — still pending. [MAJOR]\n\n" + _LEDGER.split("\n\n", 1)[1],
         encoding="utf-8",
     )
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         screen = dashboard(app)
@@ -715,7 +715,7 @@ async def test_deferred_pane_shows_legacy_items(project):
 
 async def test_deferred_pane_placeholder_without_ledger(project):
     install_bmad_config(project)
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         screen = dashboard(app)
@@ -757,7 +757,7 @@ def _write_triage_decision(run_dir: Path, dw_id: str = "DW-1") -> None:
 
 
 async def test_missed_decision_count_and_answer_via_modal(project):
-    from automator import decisions
+    from bmad_loop import decisions
 
     install_bmad_config(project)
     project.deferred_work.write_text(
@@ -766,7 +766,7 @@ async def test_missed_decision_count_and_answer_via_modal(project):
         encoding="utf-8",
     )
     _write_triage_decision(make_run(project.project, "20260101-000000-aaaa", run_type="sweep"))
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         deferred = dashboard(app).query_one("#deferred", OptionList)
@@ -784,7 +784,7 @@ async def test_answer_decisions_none_notifies(project):
         "# Deferred Work\n\n### DW-1: done thing\n\norigin: t\nstatus: done 2026-06-01\n",
         encoding="utf-8",
     )
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await pilot.press("d")
@@ -792,10 +792,10 @@ async def test_answer_decisions_none_notifies(project):
 
 
 def test_cli_tui_hint_without_textual(project, monkeypatch, capsys):
-    """`bmad-auto tui` prints the install hint when the extra is missing."""
+    """`bmad-loop tui` prints the install hint when the extra is missing."""
     import builtins
 
-    from automator import cli
+    from bmad_loop import cli
 
     real_import = builtins.__import__
 
@@ -804,19 +804,19 @@ def test_cli_tui_hint_without_textual(project, monkeypatch, capsys):
             raise ModuleNotFoundError(f"No module named '{name}'", name=name)
         return real_import(name, *args, **kwargs)
 
-    monkeypatch.delitem(__import__("sys").modules, "automator.tui.app", raising=False)
+    monkeypatch.delitem(__import__("sys").modules, "bmad_loop.tui.app", raising=False)
     monkeypatch.setattr(builtins, "__import__", fake_import)
     rc = cli.main(["tui", "--project", str(project.project)])
     assert rc == 1
-    assert "bmad-auto[tui]" in capsys.readouterr().err
+    assert "bmad-loop[tui]" in capsys.readouterr().err
 
 
 async def test_settings_binding_opens_editor(project):
     """g opens the settings screen (template-backed when no policy.toml) and
     escape returns; editor behavior itself lives in test_tui_settings.py."""
-    from automator.tui.screens.settings_screen import SettingsScreen
+    from bmad_loop.tui.screens.settings_screen import SettingsScreen
 
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await pilot.press("g")
@@ -835,7 +835,7 @@ async def test_start_run_modal_escape_cancels(project, monkeypatch):
     calls = []
     monkeypatch.setattr(launch, "tmux_available", lambda: True)
     monkeypatch.setattr(launch, "start_run_detached", lambda *a, **kw: calls.append(a))
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await pilot.press("r")
@@ -853,7 +853,7 @@ async def test_start_run_modal_launches(project, monkeypatch):
         calls.update(project=proj, run_id=run_id, epic=epic, story=story, max_stories=max_stories)
 
     monkeypatch.setattr(launch, "start_run_detached", fake_start)
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await pilot.press("r")
@@ -882,7 +882,7 @@ async def test_dirty_worktree_blocks_launch(project, monkeypatch):
     monkeypatch.setattr(launch, "tmux_available", lambda: True)
     monkeypatch.setattr(launch, "start_run_detached", lambda *a, **kw: calls.append(a))
     (project.project / "src.txt").write_text("dirty\n")
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await pilot.press("r")
@@ -897,7 +897,7 @@ async def test_live_run_asks_for_confirmation(project, monkeypatch):
     monkeypatch.setattr(launch, "tmux_available", lambda: True)
     monkeypatch.setattr(launch, "start_run_detached", lambda *a, **kw: calls.append(a))
     make_run(project.project, "20260611-100000-aaaa", alive=True)  # our pid: running
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await pilot.press("r")
@@ -921,7 +921,7 @@ async def test_unknown_pid_run_asks_for_confirmation(project, monkeypatch):
     monkeypatch.setattr(data, "liveness", lambda run_dir: "unknown")
     run_dir = make_run(project.project, "20260611-100000-aaaa")
     (run_dir / "engine.pid").write_text("4242 123.0", encoding="utf-8")
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await pilot.press("r")
@@ -947,7 +947,7 @@ async def test_legacy_pidless_but_live_run_asks_for_confirmation(project, monkey
     monkeypatch.setattr(launch, "start_run_detached", lambda *a, **kw: calls.append(a))
     monkeypatch.setattr(data, "liveness", lambda run_dir: "alive")
     make_run(project.project, "20260611-100000-aaaa")  # no engine.pid: legacy run
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await pilot.press("r")
@@ -976,7 +976,7 @@ async def test_start_sweep_modal_launches(project, monkeypatch):
         )
 
     monkeypatch.setattr(launch, "start_sweep_detached", fake_sweep)
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await pilot.press("s")
@@ -1000,7 +1000,7 @@ async def test_dry_run_shows_captured_output(project, monkeypatch):
         return 0, "would process 2 stories\n"
 
     monkeypatch.setattr(launch, "run_captured", fake_captured)
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await pilot.press("r")
@@ -1017,7 +1017,7 @@ async def test_dry_run_shows_captured_output(project, monkeypatch):
 
 async def test_validate_shows_output_modal(project, monkeypatch):
     monkeypatch.setattr(launch, "run_captured", lambda tail: (1, "FAIL: no policy\n"))
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await pilot.press("v")
@@ -1038,7 +1038,7 @@ async def test_resume_confirm_launches(project, monkeypatch):
         paused_stage="DEV_VERIFY",
         paused_reason="verify failed",
     )
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await until(pilot, lambda: dashboard(app).selected_run_id is not None)
@@ -1058,7 +1058,7 @@ async def test_resume_unknown_pid_warns(project, monkeypatch):
         paused_reason="verify failed",
     )
     (run_dir / "engine.pid").write_text("4242 123.0", encoding="utf-8")
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await until(pilot, lambda: dashboard(app).selected_run_id is not None)
@@ -1074,7 +1074,7 @@ async def test_delete_unknown_pid_warns_but_does_not_block(project, monkeypatch)
     monkeypatch.setattr(data, "liveness", lambda run_dir: "unknown")
     run_dir = make_run(project.project, "20260611-100000-aaaa")
     (run_dir / "engine.pid").write_text("4242 123.0", encoding="utf-8")
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await until(pilot, lambda: dashboard(app).selected_run_id is not None)
@@ -1087,13 +1087,13 @@ async def test_delete_unknown_pid_warns_but_does_not_block(project, monkeypatch)
 async def test_cleanup_unknown_sessions_notifies(project, monkeypatch):
     # cleanup still prunes 'unknown' sessions (unknown never blocks cleanup) but
     # must say so instead of silently killing a possibly-live engine's session.
-    from automator import runs
+    from bmad_loop import runs
 
     monkeypatch.setattr(launch, "tmux_available", lambda: True)
     monkeypatch.setattr(runs, "prune_sessions", lambda _p: (["odd-1"], [], {"odd-1"}))
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: [])
     make_run(project.project, "20260611-100000-aaaa")
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await pilot.press("c")
@@ -1106,7 +1106,7 @@ async def test_cleanup_unknown_sessions_notifies(project, monkeypatch):
 async def test_resume_finished_run_refused(project, monkeypatch):
     monkeypatch.setattr(launch, "tmux_available", lambda: True)
     make_run(project.project, "20260611-100000-aaaa", finished=True)
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await until(pilot, lambda: dashboard(app).selected_run_id is not None)
@@ -1118,7 +1118,7 @@ async def test_resume_finished_run_refused(project, monkeypatch):
 async def test_attach_without_tmux_notifies(project, monkeypatch):
     monkeypatch.setattr(launch, "tmux_available", lambda: False)
     make_run(project.project, "20260611-100000-aaaa")
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await pilot.press("a")
@@ -1130,7 +1130,7 @@ async def test_attach_without_agent_session_notifies(project, monkeypatch):
     monkeypatch.setattr(launch, "session_exists", lambda session: False)
     monkeypatch.setattr(launch, "ctl_window", lambda run_id: None)
     make_run(project.project, "20260611-100000-aaaa")
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await until(pilot, lambda: dashboard(app).selected_run_id is not None)
@@ -1146,7 +1146,7 @@ async def test_decision_banner_shows_and_clears(project):
     journal = Journal(run_dir)
     journal.append("sweep-start")
     journal.append("decision-pending", dw_id="DW-7", question="reopen the cache work?")
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         screen = dashboard(app)
@@ -1178,7 +1178,7 @@ async def test_decision_footer_suppressed_for_crashed(project):
     )
     journal = Journal(run_dir)
     journal.append("decision-pending", dw_id="DW-7", question="reopen the cache work?")
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         screen = dashboard(app)
@@ -1197,7 +1197,7 @@ def _patch_attach_exec(monkeypatch) -> tuple[list[list[str]], list[tuple[str, st
     stamps: list[tuple[str, str]] = []
     monkeypatch.setenv("TMUX", "/tmp/fake-tmux,1,0")
     monkeypatch.setattr(
-        "automator.tui.app.subprocess.call", lambda argv: calls.append(list(argv)) or 0
+        "bmad_loop.tui.app.subprocess.call", lambda argv: calls.append(list(argv)) or 0
     )
     monkeypatch.setattr(launch, "current_pane_id", lambda: "%9")
     monkeypatch.setattr(launch, "set_return_pane", lambda w, p: stamps.append((w, p)))
@@ -1213,16 +1213,16 @@ async def test_attach_targets_ctl_window_when_decision_pending(project, monkeypa
     monkeypatch.setattr(launch, "ctl_window", lambda run_id: f"sweep-{run_id}")
     monkeypatch.setattr(launch, "select_ctl_window", lambda w: selected.append(w))
     calls, stamps = _patch_attach_exec(monkeypatch)
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await until(pilot, lambda: dashboard(app).decision_pending is not None)
         await pilot.press("a")
         await until(pilot, lambda: bool(calls))
     assert selected == ["sweep-20260611-100000-aaaa"]
-    assert calls == [["tmux", "switch-client", "-t", "=bmad-auto-ctl"]]
+    assert calls == [["tmux", "switch-client", "-t", "=bmad-loop-ctl"]]
     # the ctl window is stamped with our pane so it switches us back on exit
-    assert stamps == [("=bmad-auto-ctl:sweep-20260611-100000-aaaa", "%9")]
+    assert stamps == [("=bmad-loop-ctl:sweep-20260611-100000-aaaa", "%9")]
 
 
 async def test_attach_outside_tmux_stamps_detach(project, monkeypatch):
@@ -1238,13 +1238,13 @@ async def test_attach_outside_tmux_stamps_detach(project, monkeypatch):
     monkeypatch.setattr(launch, "ctl_window", lambda run_id: f"sweep-{run_id}")
     monkeypatch.setattr(launch, "select_ctl_window", lambda w: None)
     monkeypatch.setattr(launch, "set_return_pane", lambda w, p: stamps.append((w, p)))
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await until(pilot, lambda: dashboard(app).decision_pending is not None)
         await pilot.press("a")
         await until(pilot, lambda: bool(stamps))
-    assert stamps == [("=bmad-auto-ctl:sweep-20260611-100000-aaaa", "detach")]
+    assert stamps == [("=bmad-loop-ctl:sweep-20260611-100000-aaaa", "detach")]
 
 
 async def test_attach_prefers_agent_session_without_decision(project, monkeypatch):
@@ -1253,13 +1253,13 @@ async def test_attach_prefers_agent_session_without_decision(project, monkeypatc
     monkeypatch.setattr(launch, "session_exists", lambda session: True)
     monkeypatch.setattr(launch, "ctl_window", lambda run_id: f"run-{run_id}")
     calls, stamps = _patch_attach_exec(monkeypatch)
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await until(pilot, lambda: dashboard(app).selected_run_id is not None)
         await pilot.press("a")
         await until(pilot, lambda: bool(calls))
-    assert calls == [["tmux", "switch-client", "-t", "=bmad-auto-20260611-100000-aaaa"]]
+    assert calls == [["tmux", "switch-client", "-t", "=bmad-loop-20260611-100000-aaaa"]]
     # attaching to a live agent session is not our parked window — nothing stamped
     assert stamps == []
 
@@ -1272,15 +1272,15 @@ async def test_attach_falls_back_to_ctl_window(project, monkeypatch):
     monkeypatch.setattr(launch, "ctl_window", lambda run_id: f"run-{run_id}")
     monkeypatch.setattr(launch, "select_ctl_window", lambda w: selected.append(w))
     calls, stamps = _patch_attach_exec(monkeypatch)
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await until(pilot, lambda: dashboard(app).selected_run_id is not None)
         await pilot.press("a")
         await until(pilot, lambda: bool(calls))
     assert selected == ["run-20260611-100000-aaaa"]
-    assert calls == [["tmux", "switch-client", "-t", "=bmad-auto-ctl"]]
-    assert stamps == [("=bmad-auto-ctl:run-20260611-100000-aaaa", "%9")]
+    assert calls == [["tmux", "switch-client", "-t", "=bmad-loop-ctl"]]
+    assert stamps == [("=bmad-loop-ctl:run-20260611-100000-aaaa", "%9")]
 
 
 async def test_resolve_escalation_launches_and_attaches(project, monkeypatch):
@@ -1302,7 +1302,7 @@ async def test_resolve_escalation_launches_and_attaches(project, monkeypatch):
         paused_stage="escalation",
         paused_reason="CRITICAL escalation",
     )
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await until(pilot, lambda: dashboard(app).selected_run_id is not None)
@@ -1312,7 +1312,7 @@ async def test_resolve_escalation_launches_and_attaches(project, monkeypatch):
         await until(pilot, lambda: bool(calls))
     assert launched == ["20260611-100000-aaaa"]
     assert selected == ["@7"]
-    assert calls == [["tmux", "switch-client", "-t", "=bmad-auto-ctl"]]
+    assert calls == [["tmux", "switch-client", "-t", "=bmad-loop-ctl"]]
     # resolve runs in the freshly launched ctl window (@7) — stamp it to return
     assert stamps == [("@7", "%9")]
 
@@ -1329,7 +1329,7 @@ async def test_resolve_unknown_pid_refused(project, monkeypatch):
         paused_reason="CRITICAL escalation",
     )
     (run_dir / "engine.pid").write_text("4242 123.0", encoding="utf-8")
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await until(pilot, lambda: dashboard(app).selected_run_id is not None)
@@ -1349,7 +1349,7 @@ async def test_resolve_refused_when_not_escalation(project, monkeypatch):
         paused_stage="spec-approval",
         paused_reason="awaiting approval",
     )
-    app = BmadAutoApp(project.project)
+    app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await until(pilot, lambda: dashboard(app).selected_run_id is not None)

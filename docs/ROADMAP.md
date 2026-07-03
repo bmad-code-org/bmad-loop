@@ -1,4 +1,4 @@
-# bmad-auto roadmap
+# bmad-loop roadmap
 
 Forward-looking work for the orchestrator itself — design intent and rationale for features
 we've deliberately deferred, so the "why" survives between sessions.
@@ -12,17 +12,17 @@ Status legend: **planned** (agreed, not started) · **exploring** (shape still o
 **Status:** planned · **Foundation:** the full platform-seam series landed (multiplexer registry + `BaseTmuxBackend` + `ProcessHost` + hook interpreter + validate preflight, v0.7.6; original seam v0.7.0)
 
 The orchestrator no longer fuses tmux into the engine. All session/window/pane operations
-go through a single `TerminalMultiplexer` ABC (`src/automator/adapters/multiplexer.py`),
+go through a single `TerminalMultiplexer` ABC (`src/bmad_loop/adapters/multiplexer.py`),
 obtained from `get_multiplexer()`; the tmux backend — argv + spawn primitive in
 `BaseTmuxBackend` (`adapters/tmux_base.py`), POSIX leaf `TmuxMultiplexer`
 (`adapters/tmux_backend.py`) — is the **only** place allowed to shell out to `tmux`, and it
 quarantines the POSIX `sh -c` parked-window trailer. Backends now self-**register**
-(`register_multiplexer`, selected by platform with a `BMAD_AUTO_MUX_BACKEND` override) rather
+(`register_multiplexer`, selected by platform with a `BMAD_LOOP_MUX_BACKEND` override) rather
 than being hardcoded into `get_multiplexer()`. The process-lifecycle POSIX-isms moved behind a
-matching seam, `ProcessHost` (`src/automator/process_host.py`): `terminate` / `force_kill` /
+matching seam, `ProcessHost` (`src/bmad_loop/process_host.py`): `terminate` / `force_kill` /
 `is_alive` / `identity` (a PID-reuse guard) plus `hook_interpreter()` (so hook registration
 never branches on platform), registered the same way (`register_process_host`,
-`BMAD_AUTO_PROCESS_HOST`); `WindowsProcessHost` already ships. `bmad-auto validate` runs a
+`BMAD_LOOP_PROCESS_HOST`); `WindowsProcessHost` already ships. `bmad-loop validate` runs a
 `_platform_preflight()` that reports the selected backend's readiness and names the process
 host — so a new OS surfaces in preflight by registering, not by a `validate` edit. The Unity
 plugin's `/proc`/`/tmp`/`cp -a`/symlink primitives degrade off Linux (with `psutil` from the
@@ -38,7 +38,7 @@ change to the adapters, `runs.py`, `tui/launch.py`, `probe.py`, `tui/data.py`, o
 `cli.py`'s `validate`** (`WindowsProcessHost` and its hook interpreter are already in place
 and registered). The end-to-end port path — both build options, the test-override env vars,
 and exactly what a native-Windows port costs — is documented in
-[Porting bmad-auto to a new OS](porting-to-a-new-os.md); the deep transport contract is in
+[Porting bmad-loop to a new OS](porting-to-a-new-os.md); the deep transport contract is in
 the [adapter authoring guide](adapter-authoring-guide.md#the-transport-contract-for-a-backend-author).
 
 **Open questions:** what hosts the windows on native Windows (Windows Terminal panes, a
@@ -54,7 +54,7 @@ left as a documented follow-up in Phase 4.
 
 Worktree isolation (`[scm] isolation = "worktree"`) already gives each story/bundle its own
 worktree and branch, and the `max_parallel` knob is parsed and validated in
-`src/automator/policy.py` (`ScmPolicy`). But it is **clamped to `1` in `loads()`** — merge-back
+`src/bmad_loop/policy.py` (`ScmPolicy`). But it is **clamped to `1` in `loads()`** — merge-back
 is serialized, one unit at a time — because the internal fan-out scheduler isn't built yet. The
 knob exists so the config surface is stable; it stays inert until this phase lands.
 
@@ -73,14 +73,14 @@ multiple in-flight units per run.
 **Status:** planned · **Blocked-by:** retro-item detail isn't standardized yet
 
 The parser now recognizes `epic-{N}-retro-item-{M}-{slug}` keys in `sprint-status.yaml`
-(`src/automator/sprintstatus.py` → `RetroItem` / `SprintStatus.retro_items`), so the
+(`src/bmad_loop/sprintstatus.py` → `RetroItem` / `SprintStatus.retro_items`), so the
 `sprint-status-unknown-keys` warning no longer fires. They are tracked but **not driven** as work.
 
 The goal is to run actionable (`backlog`) retro items through the dev → review → commit pipeline,
 the same way deferred-work sweeps already run.
 
-**Approach (designed, not built):** a separate `bmad-auto retro` run type that mirrors the
-`SweepEngine` (`src/automator/sweep.py`) end-to-end — `RetroEngine`, a `retro` CLI command + resume
+**Approach (designed, not built):** a separate `bmad-loop retro` run type that mirrors the
+`SweepEngine` (`src/bmad_loop/sweep.py`) end-to-end — `RetroEngine`, a `retro` CLI command + resume
 branch, a retro-item intent fed to the `bmad-dev-auto` primitive, and `verify` helpers paralleling
 the bundle verifiers. Story runs stay untouched.
 
@@ -136,7 +136,7 @@ The BMAD **GDS** module (game dev — Unity / Unreal / Godot) carries its own te
 `gametest` workflow (`_bmad/gds/workflows/gametest`). For game projects, the testarch/TEA pipeline
 above doesn't map cleanly; GDS has its own design → technical → production → gametest flow.
 
-The goal is to let bmad-auto recognize and drive GDS game-test items the same way it drives
+The goal is to let bmad-loop recognize and drive GDS game-test items the same way it drives
 sprint stories and (eventually) retro items, so game projects get the same unattended
 implement → test → review loop.
 

@@ -4,9 +4,9 @@ import json
 
 import pytest
 
-from automator import resolve, runs, verify
-from automator.journal import load_state, save_state
-from automator.model import (
+from bmad_loop import resolve, runs, verify
+from bmad_loop.journal import load_state, save_state
+from bmad_loop.model import (
     PAUSE_ESCALATION,
     Phase,
     RunState,
@@ -54,7 +54,7 @@ def _escalated_run(project, run_id="20260613-111429-6a14", *, spec_file=None, wi
         paused_story_key="6-4-cli-list-command",
         tasks={task.story_key: task},
     )
-    run_dir = project / ".automator" / "runs" / run_id
+    run_dir = project / ".bmad-loop" / "runs" / run_id
     save_state(run_dir, state)
     return run_dir, state, task
 
@@ -156,7 +156,7 @@ def test_rearm_journals_event(tmp_path):
 
 
 def test_rearm_rejects_non_escalation_stage(tmp_path):
-    run_dir = tmp_path / ".automator" / "runs" / "r1"
+    run_dir = tmp_path / ".bmad-loop" / "runs" / "r1"
     save_state(
         run_dir,
         RunState(

@@ -1,9 +1,9 @@
 """Backend-registry selection proof.
 
 The multiplexer seam selects its transport backend through a registry
-(:func:`~automator.adapters.multiplexer.register_multiplexer`) rather than a
+(:func:`~bmad_loop.adapters.multiplexer.register_multiplexer`) rather than a
 hardcoded constructor, so a new OS/backend is a registration — not a core edit.
-These tests pin selection: by platform match, by the ``BMAD_AUTO_MUX_BACKEND``
+These tests pin selection: by platform match, by the ``BMAD_LOOP_MUX_BACKEND``
 override, the safe tmux fallback, and the lru_cache gotcha. Backends register a
 sentinel ``object()`` factory so a test need not implement the whole ABC.
 """
@@ -12,9 +12,9 @@ import sys
 
 import pytest
 
-from automator.adapters import multiplexer as m
-from automator.adapters.multiplexer import MultiplexerError
-from automator.adapters.tmux_backend import TmuxMultiplexer
+from bmad_loop.adapters import multiplexer as m
+from bmad_loop.adapters.multiplexer import MultiplexerError
+from bmad_loop.adapters.tmux_backend import TmuxMultiplexer
 
 
 @pytest.fixture
@@ -22,7 +22,7 @@ def fresh_registry(monkeypatch):
     """Isolate the global registry + lru_cache: snapshot, clear, restore. The env
     override is removed so a test opts in explicitly. Teardown restores the real
     tmux registry so unrelated tests see normal selection."""
-    monkeypatch.delenv("BMAD_AUTO_MUX_BACKEND", raising=False)
+    monkeypatch.delenv("BMAD_LOOP_MUX_BACKEND", raising=False)
     saved_backends = list(m._BACKENDS)
     saved_loaded = m._BUILTINS_LOADED
     m._BACKENDS.clear()
@@ -41,18 +41,18 @@ def test_default_is_tmux(fresh_registry):
 
 
 def test_env_override_selects_named_backend(fresh_registry, monkeypatch):
-    """``BMAD_AUTO_MUX_BACKEND`` resolves a backend by name without monkeypatching
+    """``BMAD_LOOP_MUX_BACKEND`` resolves a backend by name without monkeypatching
     sys.platform. ``matches`` returns False here, so only the name path can pick it."""
     sentinel = object()
     fresh_registry.register_multiplexer("fake", lambda p: False, lambda: sentinel)
-    monkeypatch.setenv("BMAD_AUTO_MUX_BACKEND", "fake")
+    monkeypatch.setenv("BMAD_LOOP_MUX_BACKEND", "fake")
     fresh_registry.get_multiplexer.cache_clear()
     assert fresh_registry.get_multiplexer() is sentinel
 
 
 def test_env_override_tmux_returns_tmux(fresh_registry, monkeypatch):
     """Forcing the default by name still works (name match short-circuits)."""
-    monkeypatch.setenv("BMAD_AUTO_MUX_BACKEND", "tmux")
+    monkeypatch.setenv("BMAD_LOOP_MUX_BACKEND", "tmux")
     fresh_registry.get_multiplexer.cache_clear()
     assert isinstance(fresh_registry.get_multiplexer(), TmuxMultiplexer)
 
@@ -60,7 +60,7 @@ def test_env_override_tmux_returns_tmux(fresh_registry, monkeypatch):
 def test_unknown_forced_name_raises(fresh_registry, monkeypatch):
     """An explicit but unregistered forced name is a misconfiguration: it must fail
     loudly rather than silently fall back to tmux (wrong/unsafe on a non-POSIX host)."""
-    monkeypatch.setenv("BMAD_AUTO_MUX_BACKEND", "nope")
+    monkeypatch.setenv("BMAD_LOOP_MUX_BACKEND", "nope")
     fresh_registry.get_multiplexer.cache_clear()
     with pytest.raises(MultiplexerError, match="nope"):
         fresh_registry.get_multiplexer()

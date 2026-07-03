@@ -21,19 +21,19 @@ from pathlib import Path
 
 from conftest import dev_effect, git, review_effect, write_sprint
 
-from automator.adapters.base import SessionResult
-from automator.adapters.mock import MockAdapter
-from automator.engine import Engine
-from automator.journal import Journal
-from automator.model import RunState, TokenUsage
-from automator.plugins import PluginRegistry
-from automator.plugins.model import (
+from bmad_loop.adapters.base import SessionResult
+from bmad_loop.adapters.mock import MockAdapter
+from bmad_loop.engine import Engine
+from bmad_loop.journal import Journal
+from bmad_loop.model import RunState, TokenUsage
+from bmad_loop.plugins import PluginRegistry
+from bmad_loop.plugins.model import (
     LoadedPlugin,
     PluginManifest,
     PythonSpec,
     WorkflowSpec,
 )
-from automator.policy import GatesPolicy, NotifyPolicy, PluginsPolicy, Policy, ScmPolicy
+from bmad_loop.policy import GatesPolicy, NotifyPolicy, PluginsPolicy, Policy, ScmPolicy
 
 QUIET = NotifyPolicy(desktop=False, file=True)
 EXAMPLE_DIR = Path(__file__).resolve().parents[1] / "examples" / "plugins" / "guardrails"
@@ -59,7 +59,7 @@ def wf_manifest(name: str = "wf", *, python: bool = False, **wf_kw) -> PluginMan
 
 
 def make_engine(project, script, registry=None, policy=None, **kw):
-    run_dir = project.project / ".automator" / "runs" / "wf-run"
+    run_dir = project.project / ".bmad-loop" / "runs" / "wf-run"
     adapter = MockAdapter(script, usage_per_session=TokenUsage(input_tokens=10, output_tokens=5))
     state = RunState(run_id="wf-run", project=str(project.project), started_at="now")
     engine = Engine(
@@ -341,7 +341,7 @@ def test_no_workflow_no_extra_session(project):
 
 
 def install_example(project) -> None:
-    dest = project.project / ".automator" / "plugins" / "guardrails"
+    dest = project.project / ".bmad-loop" / "plugins" / "guardrails"
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(EXAMPLE_DIR, dest)
 

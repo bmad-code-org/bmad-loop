@@ -2,7 +2,7 @@
 
 The POSIX-decoupling pass (multiplexer seam + portability fixes) quarantined
 every Unix assumption behind a single tmux backend and a handful of
-platform-guarded helpers. This guard byte/AST-scans ``src/automator`` so a new
+platform-guarded helpers. This guard byte/AST-scans ``src/bmad_loop`` so a new
 hard POSIX dependency can't sneak in unnoticed. Each sanctioned exception lives
 in an allowlisted file and — outside the wholesale tmux quarantine — carries a
 ``# portability:`` ack on its line, so exceptions stay deliberate.
@@ -16,9 +16,9 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-import automator
+import bmad_loop
 
-SRC = Path(automator.__file__).resolve().parent
+SRC = Path(bmad_loop.__file__).resolve().parent
 # Marker an allowlisted exception line must carry. Written as ``# portability: …``;
 # matched as the bare keyword so it also rides along on a ``# nosec B108 portability: …``.
 ACK = "portability:"

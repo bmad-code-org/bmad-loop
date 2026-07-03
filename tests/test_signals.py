@@ -1,6 +1,6 @@
 import json
 
-from automator.signals import SignalWatcher
+from bmad_loop.signals import SignalWatcher
 
 
 def write_event(events_dir, ts, task_id, event, **extra):

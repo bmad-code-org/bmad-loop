@@ -10,7 +10,7 @@ reference** for tuning the bundled Unity plugin without forking it.
 ## The `mcp` policy key
 
 `[plugins.unity] mcp` is passed through to the plugin's scripts as
-`BMAD_AUTO_ENGINE_MCP`. The bundled Unity scripts **branch** on it to support two
+`BMAD_LOOP_ENGINE_MCP`. The bundled Unity scripts **branch** on it to support two
 different server implementations from one plugin:
 
 ```toml
@@ -22,7 +22,7 @@ mcp = "ivanmurzak"        # ivanmurzak | coplaydev
 ```
 
 A plugin you write is free to ignore this key (if it targets one server) or to use
-the same branch-on-`BMAD_AUTO_ENGINE_MCP` pattern to support several.
+the same branch-on-`BMAD_LOOP_ENGINE_MCP` pattern to support several.
 
 ## IvanMurzak vs CoplayDev (the two wired Unity MCPs)
 
@@ -39,17 +39,17 @@ operator's already-open Editor + MCP are up. **`per_worktree` is IvanMurzak-only
 the bundled plugin**, because its per-path port derivation gives each worktree's
 Editor its own server with no manual wiring. For CoplayDev's single-shared-server
 model, point `worktree_setup_cmd` / `worktree_teardown_cmd` at your own scripts
-(override the plugin under `.automator/plugins/unity/`), or use `shared` mode.
+(override the plugin under `.bmad-loop/plugins/unity/`), or use `shared` mode.
 
 ## Writing an MCP-agnostic readiness probe
 
 The contract is simple: **`ready_cmd` exits `0` when a session can safely start,
 non-zero otherwise** (which defers the unit). Within that, a few things matter:
 
-- **Respect the budget.** Poll until `BMAD_AUTO_ENGINE_READY_TIMEOUT` seconds elapse,
+- **Respect the budget.** Poll until `BMAD_LOOP_ENGINE_READY_TIMEOUT` seconds elapse,
   then fail. The CLI's own default timeout is often far shorter (IvanMurzak's
   `wait-for-ready` defaults to 120s), so pass an explicit `--timeout`.
-- **Honor the grace.** Sleep `BMAD_AUTO_ENGINE_READY_GRACE` seconds before the first
+- **Honor the grace.** Sleep `BMAD_LOOP_ENGINE_READY_GRACE` seconds before the first
   probe. A cold `per_worktree` Editor isn't listening yet, and a fast
   connection-refused would otherwise abort the gate early. `-1` means _auto_ — the
   Unity gate picks **120s for `per_worktree`** (cold launch) and **0s for `shared`**
@@ -58,12 +58,12 @@ non-zero otherwise** (which defers the unit). Within that, a few things matter:
   Editor↔server bridge can answer. The Unity gate uses `wait-for-ready` (sound for
   IvanMurzak because the Editor hosts its own server, so readiness is observable
   _before_ any client connects) and optionally a read-only `run-tool` round-trip
-  (`BMAD_AUTO_UNITY_READY_TOOL`) for a stricter check — off by default because tool
+  (`BMAD_LOOP_UNITY_READY_TOOL`) for a stricter check — off by default because tool
   names are version-specific.
 
 > CLI subcommand names and MCP endpoints move between releases. Keep the
 > version-specific bits in the plugin (and document the version you verified
-> against), so an operator can override `ready_cmd` under `.automator/plugins/<name>/`
+> against), so an operator can override `ready_cmd` under `.bmad-loop/plugins/<name>/`
 > when their installed version differs.
 
 ## `per_worktree` isolation (IvanMurzak)
@@ -107,7 +107,7 @@ checkout (tracked files only) doesn't have it. The plugin closes that gap with s
 
 These compose with the `[scm]` worktree seeds (`seed_adapter_defaults`,
 `worktree_seed`) that already copy adapter MCP/CLI configs like `.mcp.json` and
-`.claude/settings.json`. (Sources: `src/automator/install.py`, `engine.py`.)
+`.claude/settings.json`. (Sources: `src/bmad_loop/install.py`, `engine.py`.)
 
 ## Full env-var reference (Unity plugin)
 
@@ -115,26 +115,26 @@ The five `[plugins.unity]` keys are the operator-facing settings (editable in th
 under the Unity plugin's section). Everything below is a **script-level knob** with a
 built-in default. The plugin builds the helper scripts' environment from `os.environ`
 (then overlays the identity + settings vars below), so **override a knob by exporting it
-in the environment that launches `bmad-auto`** — e.g. in your shell profile or run
+in the environment that launches `bmad-loop`** — e.g. in your shell profile or run
 wrapper:
 
 ```sh
 export UNITY_MCP_CLI="unity-mcp-cli"
-export BMAD_AUTO_UNITY_LIBRARY_SEED_MODE="copy"   # e.g. force a deep copy off-CoW
-bmad-auto run …
+export BMAD_LOOP_UNITY_LIBRARY_SEED_MODE="copy"   # e.g. force a deep copy off-CoW
+bmad-loop run …
 ```
 
 **Always injected by the plugin** (identity from the run context + the five settings; do
-not set by hand): `BMAD_AUTO_REPO_ROOT`, `BMAD_AUTO_WORKTREE`, `BMAD_AUTO_RUN_DIR`,
-`BMAD_AUTO_STORY_KEY`, `BMAD_AUTO_ENGINE_MCP`, `BMAD_AUTO_ENGINE_EDITOR_MODE`,
-`BMAD_AUTO_ENGINE_READY_TIMEOUT`, `BMAD_AUTO_ENGINE_READY_GRACE`, `BMAD_AUTO_UNITY_PATH`,
-and `BMAD_AUTO_ENGINE_AGENTS` (the dev + review CLI ids, for per-worktree MCP routing).
+not set by hand): `BMAD_LOOP_REPO_ROOT`, `BMAD_LOOP_WORKTREE`, `BMAD_LOOP_RUN_DIR`,
+`BMAD_LOOP_STORY_KEY`, `BMAD_LOOP_ENGINE_MCP`, `BMAD_LOOP_ENGINE_EDITOR_MODE`,
+`BMAD_LOOP_ENGINE_READY_TIMEOUT`, `BMAD_LOOP_ENGINE_READY_GRACE`, `BMAD_LOOP_UNITY_PATH`,
+and `BMAD_LOOP_ENGINE_AGENTS` (the dev + review CLI ids, for per-worktree MCP routing).
 
 ### Readiness gate (`unity_ready.py`)
 
 | Variable                     | Default                 | Effect                                                                   |
 | ---------------------------- | ----------------------- | ------------------------------------------------------------------------ |
-| `BMAD_AUTO_UNITY_READY_TOOL` | `""` (off)              | Opt-in read-only `run-tool` name for a stricter round-trip confirmation. |
+| `BMAD_LOOP_UNITY_READY_TOOL` | `""` (off)              | Opt-in read-only `run-tool` name for a stricter round-trip confirmation. |
 | `UNITY_MCP_CLI`              | `unity-mcp-cli`         | IvanMurzak CLI binary.                                                   |
 | `UNITY_MCP_URL`              | `http://localhost:8080` | CoplayDev MCP server URL for the connectivity check.                     |
 
@@ -142,24 +142,24 @@ and `BMAD_AUTO_ENGINE_AGENTS` (the dev + review CLI ids, for per-worktree MCP ro
 
 | Variable                             | Default                 | Effect                                                                            |
 | ------------------------------------ | ----------------------- | --------------------------------------------------------------------------------- |
-| `BMAD_AUTO_ENGINE_AGENT`             | `claude-code`           | Agent id passed to `setup-mcp`.                                                   |
-| `BMAD_AUTO_UNITY_LIBRARY_CACHE`      | (derived)               | Override the symlink-fallback `Library` cache root.                               |
-| `BMAD_AUTO_UNITY_LIBRARY_SEED`       | `<repo>/Library`        | Warm `Library` to prime from; empty string disables priming → symlink fallback.   |
-| `BMAD_AUTO_UNITY_LIBRARY_SEED_MODE`  | `reflink`               | `reflink` \| `copy` \| `symlink` \| `off`.                                        |
-| `BMAD_AUTO_UNITY_MCP_LOCAL`          | `1`                     | `1`/true pins Custom/local mode; `0`/false reverts to a bare cloud-config `open`. |
-| `BMAD_AUTO_UNITY_MCP_URL`            | (read from `.mcp.json`) | Local server URL.                                                                 |
-| `BMAD_AUTO_UNITY_MCP_TOKEN`          | `""`                    | Bearer token (empty → auth none).                                                 |
-| `BMAD_AUTO_UNITY_MCP_TRANSPORT`      | `streamableHttp`        | `streamableHttp` \| `stdio`.                                                      |
-| `BMAD_AUTO_UNITY_MCP_AUTH`           | `none`                  | `none` \| `required`.                                                             |
-| `BMAD_AUTO_UNITY_MCP_START_SERVER`   | `true`                  | `true` \| `false` — Editor hosts its own server.                                  |
-| `BMAD_AUTO_UNITY_MCP_KEEP_CONNECTED` | `true`                  | `true` \| `false`.                                                                |
+| `BMAD_LOOP_ENGINE_AGENT`             | `claude-code`           | Agent id passed to `setup-mcp`.                                                   |
+| `BMAD_LOOP_UNITY_LIBRARY_CACHE`      | (derived)               | Override the symlink-fallback `Library` cache root.                               |
+| `BMAD_LOOP_UNITY_LIBRARY_SEED`       | `<repo>/Library`        | Warm `Library` to prime from; empty string disables priming → symlink fallback.   |
+| `BMAD_LOOP_UNITY_LIBRARY_SEED_MODE`  | `reflink`               | `reflink` \| `copy` \| `symlink` \| `off`.                                        |
+| `BMAD_LOOP_UNITY_MCP_LOCAL`          | `1`                     | `1`/true pins Custom/local mode; `0`/false reverts to a bare cloud-config `open`. |
+| `BMAD_LOOP_UNITY_MCP_URL`            | (read from `.mcp.json`) | Local server URL.                                                                 |
+| `BMAD_LOOP_UNITY_MCP_TOKEN`          | `""`                    | Bearer token (empty → auth none).                                                 |
+| `BMAD_LOOP_UNITY_MCP_TRANSPORT`      | `streamableHttp`        | `streamableHttp` \| `stdio`.                                                      |
+| `BMAD_LOOP_UNITY_MCP_AUTH`           | `none`                  | `none` \| `required`.                                                             |
+| `BMAD_LOOP_UNITY_MCP_START_SERVER`   | `true`                  | `true` \| `false` — Editor hosts its own server.                                  |
+| `BMAD_LOOP_UNITY_MCP_KEEP_CONNECTED` | `true`                  | `true` \| `false`.                                                                |
 | `UNITY_MCP_CLI`                      | `unity-mcp-cli`         | IvanMurzak CLI binary.                                                            |
 
 ### `per_worktree` teardown (`unity_teardown.py`)
 
 | Variable                        | Default         | Effect                                              |
 | ------------------------------- | --------------- | --------------------------------------------------- |
-| `BMAD_AUTO_UNITY_CLOSE_TIMEOUT` | `30`            | Polite-quit seconds before escalating to `--force`. |
+| `BMAD_LOOP_UNITY_CLOSE_TIMEOUT` | `30`            | Polite-quit seconds before escalating to `--force`. |
 | `UNITY_MCP_CLI`                 | `unity-mcp-cli` | IvanMurzak CLI binary.                              |
 
 > These defaults are verified against `unity-mcp-cli` v0.81.1. The exact flags and
@@ -176,20 +176,20 @@ also writes an unbounded `Temp/mcp-server/ai-editor-logs.txt`. On a clean finish
 plugin's `post_run` hook runs `unity_cleanup.py`, which removes this project's server
 zips and truncates the log once it exceeds the cap. It runs once per run in **both**
 editor modes, after the loop, so it never races an in-flight `setup-mcp` download.
-Gated by `[cleanup] clean_tmp` (the engine maps it onto `BMAD_AUTO_CLEAN_TMP`); only the
+Gated by `[cleanup] clean_tmp` (the engine maps it onto `BMAD_LOOP_CLEAN_TMP`); only the
 IvanMurzak MCP downloads per-project, so CoplayDev is skipped.
 
 | Variable                     | Default | Effect                                              |
 | ---------------------------- | ------- | --------------------------------------------------- |
-| `BMAD_AUTO_CLEAN_TMP`        | `1`     | `0` disables the post-run /tmp + log cleanup.       |
-| `BMAD_AUTO_UNITY_LOG_CAP_MB` | `5`     | Truncate `ai-editor-logs.txt` once it exceeds this. |
+| `BMAD_LOOP_CLEAN_TMP`        | `1`     | `0` disables the post-run /tmp + log cleanup.       |
+| `BMAD_LOOP_UNITY_LOG_CAP_MB` | `5`     | Truncate `ai-editor-logs.txt` once it exceeds this. |
 
 ## Dev-control HTTP bridge (upstream, dev-only — not wired)
 
 Unity-MCP **0.81.1** added an optional **dev-control HTTP bridge** — a
 `127.0.0.1`-only HTTP server the Unity plugin exposes for driving and inspecting its
 "AI Game Developer" Editor window from outside the process. It is **off by default in
-shipped builds**, and **bmad-auto does not use it** — the bundled plugin's readiness
+shipped builds**, and **bmad-loop does not use it** — the bundled plugin's readiness
 and per_worktree lifecycle run entirely through the `unity-mcp-cli` subcommands above.
 It is documented here only so operators know it exists.
 

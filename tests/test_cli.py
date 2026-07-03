@@ -6,8 +6,8 @@ import json
 import pytest
 from conftest import install_bmad_config, write_sprint
 
-from automator import cli
-from automator import policy as policy_mod
+from bmad_loop import cli
+from bmad_loop import policy as policy_mod
 
 DUAL_CLIENT_POLICY = """\
 [adapter]
@@ -20,9 +20,9 @@ model = "gpt-5-codex"
 
 
 def _write_policy(project, text=DUAL_CLIENT_POLICY) -> None:
-    automator_dir = project / ".automator"
-    automator_dir.mkdir(parents=True, exist_ok=True)
-    (automator_dir / "policy.toml").write_text(text)
+    bmad_loop_dir = project / ".bmad-loop"
+    bmad_loop_dir.mkdir(parents=True, exist_ok=True)
+    (bmad_loop_dir / "policy.toml").write_text(text)
 
 
 def test_init_registers_hooks_for_all_policy_profiles(tmp_path):
@@ -37,7 +37,7 @@ def test_init_without_policy_defaults_to_claude(tmp_path):
     assert (tmp_path / ".claude" / "settings.json").is_file()
     assert not (tmp_path / ".codex").exists()
     # init installs the bundled skills by default
-    assert (tmp_path / ".claude" / "skills" / "bmad-auto-sweep" / "SKILL.md").is_file()
+    assert (tmp_path / ".claude" / "skills" / "bmad-loop-sweep" / "SKILL.md").is_file()
 
 
 def test_init_no_skills_flag(tmp_path):
@@ -47,7 +47,7 @@ def test_init_no_skills_flag(tmp_path):
 
 
 def test_init_force_skills_flag(tmp_path):
-    skill_md = tmp_path / ".claude" / "skills" / "bmad-auto-sweep" / "SKILL.md"
+    skill_md = tmp_path / ".claude" / "skills" / "bmad-loop-sweep" / "SKILL.md"
     skill_md.parent.mkdir(parents=True)
     skill_md.write_text("CUSTOM", encoding="utf-8")
     assert cli.main(["init", "--project", str(tmp_path), "--force-skills"]) == 0
@@ -57,7 +57,7 @@ def test_init_force_skills_flag(tmp_path):
 def test_dry_run_renders_per_stage_commands(project, capsys):
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     _write_policy(project.project)
-    pol = policy_mod.load(project.project / ".automator" / "policy.toml")
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
     args = argparse.Namespace(epic=None, story=None, max_stories=None)
 
     assert cli._dry_run(project, pol, args) == 0
@@ -79,7 +79,7 @@ def test_dry_run_selects_story_by_short_ref(project, capsys, epic, story):
         {"3-1-user-auth": "ready-for-dev", "3-2-foo": "backlog", "4-1-bar": "backlog"},
     )
     _write_policy(project.project)
-    pol = policy_mod.load(project.project / ".automator" / "policy.toml")
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
     args = argparse.Namespace(epic=epic, story=story, max_stories=None)
 
     assert cli._dry_run(project, pol, args) == 0
@@ -91,7 +91,7 @@ def test_dry_run_selects_story_by_short_ref(project, capsys, epic, story):
 def test_dry_run_reports_targeted_not_actionable(project, capsys):
     write_sprint(project, {"3-1-user-auth": "ready-for-dev", "3-2-foo": "done"})
     _write_policy(project.project)
-    pol = policy_mod.load(project.project / ".automator" / "policy.toml")
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
     args = argparse.Namespace(epic=None, story="3-2", max_stories=None)
 
     assert cli._dry_run(project, pol, args) == 1
@@ -100,7 +100,7 @@ def test_dry_run_reports_targeted_not_actionable(project, capsys):
 
 
 def _make_run_with_decision(project, run_id="20260101-000000-aaaa", dw_id="DW-1"):
-    run_dir = project.project / ".automator" / "runs" / run_id
+    run_dir = project.project / ".bmad-loop" / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "state.json").write_text(
         json.dumps(
@@ -166,7 +166,7 @@ def test_decisions_list(project, capsys):
 def test_decisions_answer_records_and_carries_forward(project, capsys, monkeypatch):
     from conftest import write_ledger
 
-    from automator import decisions
+    from bmad_loop import decisions
 
     install_bmad_config(project)
     write_ledger(project, {"DW-1": "open"})
@@ -176,7 +176,7 @@ def test_decisions_answer_records_and_carries_forward(project, capsys, monkeypat
         def ask(self, decision):
             return decision.option("1")  # choose build
 
-    monkeypatch.setattr("automator.sweep.DecisionPrompter", lambda *a, **k: _StubPrompter())
+    monkeypatch.setattr("bmad_loop.sweep.DecisionPrompter", lambda *a, **k: _StubPrompter())
     assert cli.main(["decisions", "--project", str(project.project)]) == 0
     out = capsys.readouterr().out
     assert "DW-1: queued" in out
@@ -234,15 +234,15 @@ def test_list_no_runs(project, capsys):
 
 
 def test_attach_records_return_pane_inside_tmux(project, monkeypatch):
-    from automator.tui import launch
+    from bmad_loop.tui import launch
 
     _make_run_with_decision(project, run_id="20260101-000000-aaaa")
     monkeypatch.setattr(
         launch,
         "attach_plan",
         lambda proj, rid: (
-            ["tmux", "switch-client", "-t", "=bmad-auto-ctl"],
-            "=bmad-auto-ctl:sweep-RID",
+            ["tmux", "switch-client", "-t", "=bmad-loop-ctl"],
+            "=bmad-loop-ctl:sweep-RID",
         ),
     )
     monkeypatch.setenv("TMUX", "/tmp/tmux-1000/default,1,0")
@@ -253,20 +253,20 @@ def test_attach_records_return_pane_inside_tmux(project, monkeypatch):
     monkeypatch.setattr(cli.subprocess, "call", lambda argv: called.append(argv) or 0)
 
     assert cli.main(["attach", "--project", str(project.project), "20260101-000000-aaaa"]) == 0
-    assert recorded == [("=bmad-auto-ctl:sweep-RID", "%3")]
-    assert called == [["tmux", "switch-client", "-t", "=bmad-auto-ctl"]]
+    assert recorded == [("=bmad-loop-ctl:sweep-RID", "%3")]
+    assert called == [["tmux", "switch-client", "-t", "=bmad-loop-ctl"]]
 
 
 def test_attach_records_detach_outside_tmux(project, monkeypatch):
-    from automator.tui import launch
+    from bmad_loop.tui import launch
 
     _make_run_with_decision(project, run_id="20260101-000000-aaaa")
     monkeypatch.setattr(
         launch,
         "attach_plan",
         lambda proj, rid: (
-            ["tmux", "attach", "-t", "=bmad-auto-ctl"],
-            "=bmad-auto-ctl:sweep-RID",
+            ["tmux", "attach", "-t", "=bmad-loop-ctl"],
+            "=bmad-loop-ctl:sweep-RID",
         ),
     )
     monkeypatch.delenv("TMUX", raising=False)
@@ -275,17 +275,17 @@ def test_attach_records_detach_outside_tmux(project, monkeypatch):
     monkeypatch.setattr(cli.subprocess, "call", lambda argv: 0)
 
     assert cli.main(["attach", "--project", str(project.project), "20260101-000000-aaaa"]) == 0
-    assert recorded == [("=bmad-auto-ctl:sweep-RID", launch.RETURN_DETACH)]
+    assert recorded == [("=bmad-loop-ctl:sweep-RID", launch.RETURN_DETACH)]
 
 
 def test_attach_agent_session_records_no_return(project, monkeypatch):
-    from automator.tui import launch
+    from bmad_loop.tui import launch
 
     _make_run_with_decision(project, run_id="20260101-000000-aaaa")
     monkeypatch.setattr(
         launch,
         "attach_plan",
-        lambda proj, rid: (["tmux", "attach", "-t", "=bmad-auto-20260101-000000-aaaa"], None),
+        lambda proj, rid: (["tmux", "attach", "-t", "=bmad-loop-20260101-000000-aaaa"], None),
     )
     recorded: list = []
     monkeypatch.setattr(launch, "set_return_pane", lambda w, p: recorded.append((w, p)))
@@ -294,11 +294,11 @@ def test_attach_agent_session_records_no_return(project, monkeypatch):
 
     assert cli.main(["attach", "--project", str(project.project), "20260101-000000-aaaa"]) == 0
     assert recorded == []
-    assert called == [["tmux", "attach", "-t", "=bmad-auto-20260101-000000-aaaa"]]
+    assert called == [["tmux", "attach", "-t", "=bmad-loop-20260101-000000-aaaa"]]
 
 
 def test_attach_nothing_to_attach(project, monkeypatch, capsys):
-    from automator.tui import launch
+    from bmad_loop.tui import launch
 
     _make_run_with_decision(project, run_id="20260101-000000-aaaa")
     monkeypatch.setattr(launch, "attach_plan", lambda proj, rid: None)
@@ -316,7 +316,7 @@ def test_sweep_dry_run_lists_open_entries(project, capsys):
     assert "1 open" in out
     assert "DW-1" in out and "DW-2" not in out
     triage_line = next(line for line in out.splitlines() if "triage:" in line)
-    assert "bmad-auto-sweep" in triage_line
+    assert "bmad-loop-sweep" in triage_line
 
 
 def test_sweep_dry_run_reports_legacy_entries(project, capsys):
@@ -346,7 +346,7 @@ def test_sweep_dry_run_renders_triage_adapter_from_policy(project, capsys):
         project.project,
         '[adapter]\nmodel = "opus"\n[adapter.triage]\nname = "gemini"\n',
     )
-    pol = policy_mod.load(project.project / ".automator" / "policy.toml")
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
     assert cli._sweep_dry_run(project, pol) == 0
     out = capsys.readouterr().out
     triage_line = next(line for line in out.splitlines() if "triage:" in line)
@@ -364,11 +364,11 @@ def test_make_adapters_review_synthesizes_from_spec(project):
     """Both dev AND review are bmad-dev-auto runs that write no result.json, so
     both roles must get the spec-synthesizing GenericDevAdapter; triage (a real
     result.json skill) stays a plain GenericAdapter."""
-    from automator.adapters.generic import GenericAdapter, GenericDevAdapter
+    from bmad_loop.adapters.generic import GenericAdapter, GenericDevAdapter
 
     install_bmad_config(project)
     adapters = cli._make_adapters(
-        project.project, project.project / ".automator" / "runs" / "r", policy_mod.load(None)
+        project.project, project.project / ".bmad-loop" / "runs" / "r", policy_mod.load(None)
     )
     assert isinstance(adapters["dev"], GenericDevAdapter)
     assert isinstance(adapters["review"], GenericDevAdapter)
@@ -405,7 +405,7 @@ def test_run_honors_preassigned_run_id_and_writes_pid(project, monkeypatch):
 
     run_id = "20990101-000000-beef"
     assert cli.main(["run", "--project", str(project.project), "--run-id", run_id]) == 0
-    run_dir = project.project / ".automator" / "runs" / run_id
+    run_dir = project.project / ".bmad-loop" / "runs" / run_id
     assert json.loads((run_dir / "state.json").read_text())["run_id"] == run_id
     # engine.pid is "<pid>" or "<pid> <identity>" (identity persisted on platforms
     # that provide one) — assert on the pid token, not the whole line.
@@ -432,7 +432,7 @@ def test_run_aborts_when_base_skills_missing(project, monkeypatch, capsys):
 
 
 def _stub_run_tui(monkeypatch):
-    import automator.tui.app as tui_app
+    import bmad_loop.tui.app as tui_app
 
     monkeypatch.setattr(tui_app, "run_tui", lambda _project: 0)
 
@@ -483,10 +483,10 @@ def test_tui_low_frame_rate_preserves_explicit_env(tmp_path, monkeypatch):
 
 
 def _make_run_with_state(project, run_id, **state_kwargs):
-    from automator.journal import save_state
-    from automator.model import RunState
+    from bmad_loop.journal import save_state
+    from bmad_loop.model import RunState
 
-    run_dir = project / ".automator" / "runs" / run_id
+    run_dir = project / ".bmad-loop" / "runs" / run_id
     save_state(
         run_dir,
         RunState(run_id=run_id, project=str(project), started_at="now", **state_kwargs),
@@ -500,19 +500,19 @@ def test_stop_no_such_run(tmp_path, capsys):
 
 
 def test_stop_marks_stopped(tmp_path, monkeypatch, capsys):
-    from automator import runs
+    from bmad_loop import runs
 
     monkeypatch.setattr(runs, "kill_session", lambda _rid: None)
     run_dir = _make_run_with_state(tmp_path, "r1")  # no pid -> fallback marks stopped
     assert cli.main(["stop", "--project", str(tmp_path), "r1"]) == 0
     assert "r1 stopped" in capsys.readouterr().out
-    from automator.journal import load_state
+    from bmad_loop.journal import load_state
 
     assert load_state(run_dir).stopped is True
 
 
 def test_stop_already_finished(tmp_path, monkeypatch, capsys):
-    from automator import runs
+    from bmad_loop import runs
 
     monkeypatch.setattr(runs, "kill_session", lambda _rid: None)
     _make_run_with_state(tmp_path, "r1", finished=True)
@@ -521,7 +521,7 @@ def test_stop_already_finished(tmp_path, monkeypatch, capsys):
 
 
 def test_delete_refuses_live_run_without_force(tmp_path, monkeypatch, capsys):
-    from automator import runs
+    from bmad_loop import runs
 
     monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive")
     run_dir = _make_run_with_state(tmp_path, "r1")
@@ -531,7 +531,7 @@ def test_delete_refuses_live_run_without_force(tmp_path, monkeypatch, capsys):
 
 
 def test_delete_force_stops_then_removes(tmp_path, monkeypatch, capsys):
-    from automator import runs
+    from bmad_loop import runs
 
     stopped = []
     monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive")
@@ -545,7 +545,7 @@ def test_delete_force_stops_then_removes(tmp_path, monkeypatch, capsys):
 
 def test_delete_force_stop_error_blocks(tmp_path, monkeypatch, capsys):
     # a failed --force stop must propagate, never fall through to deletion
-    from automator import runs
+    from bmad_loop import runs
 
     monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive")
 
@@ -560,8 +560,8 @@ def test_delete_force_stop_error_blocks(tmp_path, monkeypatch, capsys):
 
 
 def test_archive_force_stop_error_blocks(tmp_path, monkeypatch, capsys):
-    from automator import runs
-    from automator.process_host import ProcessHostError
+    from bmad_loop import runs
+    from bmad_loop.process_host import ProcessHostError
 
     monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive")
 
@@ -582,7 +582,7 @@ def test_delete_dead_run(tmp_path, capsys):
 
 
 def test_delete_unknown_warns_but_proceeds(tmp_path, monkeypatch, capsys):
-    from automator import runs
+    from bmad_loop import runs
 
     monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "unknown")
     run_dir = _make_run_with_state(tmp_path, "r1")
@@ -592,7 +592,7 @@ def test_delete_unknown_warns_but_proceeds(tmp_path, monkeypatch, capsys):
 
 
 def test_archive_unknown_warns_but_proceeds(tmp_path, monkeypatch, capsys):
-    from automator import runs
+    from bmad_loop import runs
 
     monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "unknown")
     run_dir = _make_run_with_state(tmp_path, "20260611-100000-aaaa")
@@ -605,14 +605,14 @@ def test_archive_creates_tarball_and_removes_run(tmp_path, capsys):
     run_dir = _make_run_with_state(tmp_path, "20260611-100000-aaaa")
     assert cli.main(["archive", "--project", str(tmp_path), "20260611-100000-aaaa"]) == 0
     out = capsys.readouterr().out
-    dest = tmp_path / ".automator" / "archive" / "20260611-100000-aaaa.tar.gz"
+    dest = tmp_path / ".bmad-loop" / "archive" / "20260611-100000-aaaa.tar.gz"
     assert "archived to" in out
     assert dest.is_file()
     assert not run_dir.exists()
 
 
 def test_archive_refuses_live_run_without_force(tmp_path, monkeypatch, capsys):
-    from automator import runs
+    from bmad_loop import runs
 
     monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive")
     run_dir = _make_run_with_state(tmp_path, "r1")
@@ -622,7 +622,7 @@ def test_archive_refuses_live_run_without_force(tmp_path, monkeypatch, capsys):
 
 
 def _escalated_run(project, run_id="r1", *, story="s1", spec_file=None):
-    from automator.model import Phase, StoryTask
+    from bmad_loop.model import Phase, StoryTask
 
     task = StoryTask(story_key=story, epic=1, phase=Phase.ESCALATED, attempt=1, spec_file=spec_file)
     return _make_run_with_state(
@@ -652,7 +652,7 @@ def test_resolve_rejects_non_escalation_stage(tmp_path, capsys):
     [("alive", "is still live — stop it first"), ("unknown", "unverifiable pid")],
 )
 def test_resolve_refuses_live_run(tmp_path, monkeypatch, capsys, liveness, msg):
-    from automator import runs
+    from bmad_loop import runs
 
     monkeypatch.setattr(runs, "engine_liveness", lambda _rd: liveness)
     _escalated_run(tmp_path, "r1")
@@ -664,7 +664,7 @@ def test_resolve_refuses_live_run(tmp_path, monkeypatch, capsys, liveness, msg):
 
 
 def test_resolve_force_alive_still_refuses(tmp_path, monkeypatch, capsys):
-    from automator import runs
+    from bmad_loop import runs
 
     monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive")
     _escalated_run(tmp_path, "r1")
@@ -676,9 +676,9 @@ def test_resolve_force_unknown_proceeds(tmp_path, monkeypatch, capsys):
     # --force is the only escape from a squatted/unverifiable pid: `stop` cannot
     # clear 'unknown' (engine.pid is never deleted), so without it resolve would
     # refuse forever.
-    from automator import runs
-    from automator.journal import load_state
-    from automator.model import Phase
+    from bmad_loop import runs
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
 
     monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "unknown")
     run_dir = _escalated_run(tmp_path, "r1")
@@ -702,8 +702,8 @@ def test_resolve_no_escalated_story(tmp_path, capsys):
 
 
 def test_resolve_no_interactive_rearms_and_resumes(tmp_path, monkeypatch, capsys):
-    from automator.journal import load_state
-    from automator.model import Phase
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
 
     spec = tmp_path / "spec.md"
     spec.write_text("---\nstatus: in-review\n---\n", encoding="utf-8")
@@ -721,9 +721,9 @@ def test_resolve_no_interactive_rearms_and_resumes(tmp_path, monkeypatch, capsys
 
 
 def test_resolve_interactive_runs_session_then_rearms(tmp_path, monkeypatch):
-    from automator import resolve
-    from automator.journal import load_state
-    from automator.model import Phase
+    from bmad_loop import resolve
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
 
     _escalated_run(tmp_path, "r1")
     calls = {}
@@ -733,7 +733,7 @@ def test_resolve_interactive_runs_session_then_rearms(tmp_path, monkeypatch):
         resolve, "run_session", lambda *a, **k: calls.setdefault("session", True) or True
     )
     monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
-    run_dir = tmp_path / ".automator" / "runs" / "r1"
+    run_dir = tmp_path / ".bmad-loop" / "runs" / "r1"
     rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--resume"])
     assert rc == 0
     assert calls == {"ctx": True, "session": True}
@@ -741,7 +741,7 @@ def test_resolve_interactive_runs_session_then_rearms(tmp_path, monkeypatch):
 
 
 def test_resolve_interactive_unsupported_adapter(tmp_path, monkeypatch, capsys):
-    from automator import resolve
+    from bmad_loop import resolve
 
     _escalated_run(tmp_path, "r1")
     monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
@@ -757,7 +757,7 @@ def test_resolve_interactive_unsupported_adapter(tmp_path, monkeypatch, capsys):
 
 
 def test_resolve_in_ctl_session_detaches_before_resume(tmp_path, monkeypatch, capsys):
-    from automator.tui import launch
+    from bmad_loop.tui import launch
 
     _escalated_run(tmp_path, "r1")
     order = []
@@ -823,8 +823,8 @@ def test_sweep_command_parses_flags():
 
 
 def test_cleanup_dry_run_lists_without_pruning(tmp_path, monkeypatch, capsys):
-    from automator import runs
-    from automator.tui import launch
+    from bmad_loop import runs
+    from bmad_loop.tui import launch
 
     monkeypatch.setattr(launch, "prunable_ctl_windows", lambda _proj: ["sweep-fin-1"])
     dry_runs: list[bool] = []
@@ -836,15 +836,15 @@ def test_cleanup_dry_run_lists_without_pruning(tmp_path, monkeypatch, capsys):
 
     assert cli.main(["cleanup", "--project", str(tmp_path), "--dry-run"]) == 0
     out = capsys.readouterr().out
-    assert "would kill session bmad-auto-fin-1" in out
+    assert "would kill session bmad-loop-fin-1" in out
     assert "would close ctl window sweep-fin-1" in out
     assert "leaving 1 live session(s) untouched" in out
     assert dry_runs == [True]  # one partition sample, with the kill suppressed
 
 
 def test_cleanup_prunes_sessions_and_windows(tmp_path, monkeypatch, capsys):
-    from automator import runs
-    from automator.tui import launch
+    from bmad_loop import runs
+    from bmad_loop.tui import launch
 
     monkeypatch.setattr(runs, "prune_sessions", lambda _proj, dry_run=False: (["fin-1"], [], set()))
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _proj: ["sweep-fin-1"])
@@ -854,8 +854,8 @@ def test_cleanup_prunes_sessions_and_windows(tmp_path, monkeypatch, capsys):
 
 
 def test_cleanup_warns_per_unknown_session(tmp_path, monkeypatch, capsys):
-    from automator import runs
-    from automator.tui import launch
+    from bmad_loop import runs
+    from bmad_loop.tui import launch
 
     monkeypatch.setattr(
         runs, "prune_sessions", lambda _proj, dry_run=False: (["fin-1", "odd-1"], [], {"odd-1"})
@@ -872,7 +872,7 @@ def test_cleanup_warns_per_unknown_session(tmp_path, monkeypatch, capsys):
 def test_resume_kills_stale_session_before_running(project, monkeypatch):
     from conftest import install_base_skills
 
-    from automator import runs
+    from bmad_loop import runs
 
     install_bmad_config(project)
     install_base_skills(project)
@@ -898,7 +898,7 @@ def test_resume_restores_persisted_run_scope(project, monkeypatch):
     can jump out of its epic (the Epic-9 boundary bug)."""
     from conftest import install_base_skills
 
-    from automator import runs
+    from bmad_loop import runs
 
     install_bmad_config(project)
     install_base_skills(project)
@@ -929,7 +929,7 @@ def test_resume_restores_persisted_run_scope(project, monkeypatch):
 
 
 def test_resume_refuses_live_run(tmp_path, monkeypatch, capsys):
-    from automator import runs
+    from bmad_loop import runs
 
     monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive")
 
@@ -948,7 +948,7 @@ def test_resume_unknown_warns_but_proceeds(project, monkeypatch, capsys):
     # permanently unrecoverable (resolve refuses 'unknown' without --force).
     from conftest import install_base_skills
 
-    from automator import runs
+    from bmad_loop import runs
 
     install_bmad_config(project)
     install_base_skills(project)
@@ -1031,8 +1031,8 @@ class _FakeHost:
 
 
 def _patch_preflight(monkeypatch, backend):
-    from automator import process_host as ph_mod
-    from automator.adapters import multiplexer as mux_mod
+    from bmad_loop import process_host as ph_mod
+    from bmad_loop.adapters import multiplexer as mux_mod
 
     monkeypatch.setattr(mux_mod, "get_multiplexer", lambda: backend)
     monkeypatch.setattr(ph_mod, "get_process_host", lambda: _FakeHost())
@@ -1057,13 +1057,13 @@ def test_platform_preflight_flags_unavailable_backend(monkeypatch):
 
 
 def test_platform_preflight_reports_multiplexer_selection_error(monkeypatch):
-    # A bad BMAD_AUTO_MUX_BACKEND makes get_multiplexer() raise; preflight must report
+    # A bad BMAD_LOOP_MUX_BACKEND makes get_multiplexer() raise; preflight must report
     # it as a problem (so `validate` exits cleanly) rather than let it abort the command.
-    from automator.adapters import multiplexer as mux_mod
-    from automator.adapters.multiplexer import MultiplexerError
+    from bmad_loop.adapters import multiplexer as mux_mod
+    from bmad_loop.adapters.multiplexer import MultiplexerError
 
     def _boom():
-        raise MultiplexerError("BMAD_AUTO_MUX_BACKEND='bogus' matches no registered backend")
+        raise MultiplexerError("BMAD_LOOP_MUX_BACKEND='bogus' matches no registered backend")
 
     monkeypatch.setattr(mux_mod, "get_multiplexer", _boom)
     notes, problems = cli._platform_preflight()  # must not raise
@@ -1071,15 +1071,15 @@ def test_platform_preflight_reports_multiplexer_selection_error(monkeypatch):
 
 
 def test_platform_preflight_reports_process_host_selection_error(monkeypatch):
-    # A bad BMAD_AUTO_PROCESS_HOST makes get_process_host() raise; preflight must report
+    # A bad BMAD_LOOP_PROCESS_HOST makes get_process_host() raise; preflight must report
     # it as a problem, and an otherwise-healthy multiplexer still gets its note.
-    from automator import process_host as ph_mod
-    from automator.process_host import ProcessHostError
+    from bmad_loop import process_host as ph_mod
+    from bmad_loop.process_host import ProcessHostError
 
     _patch_preflight(monkeypatch, _FakeBackend(ok=True, version="tmux 3.4"))
 
     def _boom():
-        raise ProcessHostError("BMAD_AUTO_PROCESS_HOST='bogus' matches no registered host")
+        raise ProcessHostError("BMAD_LOOP_PROCESS_HOST='bogus' matches no registered host")
 
     monkeypatch.setattr(ph_mod, "get_process_host", _boom)
     notes, problems = cli._platform_preflight()  # must not raise

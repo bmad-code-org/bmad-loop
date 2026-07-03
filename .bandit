@@ -1,6 +1,6 @@
 # Bandit configuration (read by trunk via `bandit --ini .bandit`).
 #
-# bmad-auto is a deterministic orchestrator: it shells out to tmux and coding-CLI
+# bmad-loop is a deterministic orchestrator: it shells out to tmux and coding-CLI
 # binaries by design, and uses `assert` for internal type-narrowing invariants.
 # Skip the low-severity rules those patterns trip so the signal isn't drowned out.
 # Higher-signal checks stay ON — notably B602 (subprocess with shell=True), which is

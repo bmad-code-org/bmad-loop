@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Render the documentation screenshots of the bmad-auto TUI.
+"""Render the documentation screenshots of the bmad-loop TUI.
 
-The TUI is a pure read-only observer (see ``automator.tui``): it renders from
-the artifacts an engine writes under ``.automator/runs/<id>/`` plus the BMAD
+The TUI is a pure read-only observer (see ``bmad_loop.tui``): it renders from
+the artifacts an engine writes under ``.bmad-loop/runs/<id>/`` plus the BMAD
 ``sprint-status.yaml`` / ``deferred-work.md`` ledgers. So we can produce a fully
 populated dashboard with no live engine and no tmux: build a throwaway project
 on disk, drive the app headlessly through Textual's ``run_test`` pilot, and call
@@ -33,14 +33,14 @@ import yaml
 from textual.widgets import Collapsible
 
 # Import the package the same way the installed CLI does.
-from automator.journal import Journal, save_state
-from automator.model import Phase, RunState, StoryTask, TokenUsage
-from automator.runs import RUNS_DIR
-from automator.tui import launch
-from automator.tui.app import BmadAutoApp
-from automator.tui.screens.dashboard import DashboardScreen
-from automator.tui.screens.modals import DecisionModal, DeferredEntryModal, StartRunModal
-from automator.tui.screens.settings_screen import SettingsScreen
+from bmad_loop.journal import Journal, save_state
+from bmad_loop.model import Phase, RunState, StoryTask, TokenUsage
+from bmad_loop.runs import RUNS_DIR
+from bmad_loop.tui import launch
+from bmad_loop.tui.app import BmadLoopApp
+from bmad_loop.tui.screens.dashboard import DashboardScreen
+from bmad_loop.tui.screens.modals import DecisionModal, DeferredEntryModal, StartRunModal
+from bmad_loop.tui.screens.settings_screen import SettingsScreen
 
 REPO = Path(__file__).resolve().parent.parent
 OUT_DIR = REPO / "docs" / "images"
@@ -200,7 +200,7 @@ def build_project(root: Path) -> None:
     )
     (impl / "deferred-work.md").write_text(DEFERRED_WORK, encoding="utf-8")
 
-    policy = root / ".automator" / "policy.toml"
+    policy = root / ".bmad-loop" / "policy.toml"
     policy.parent.mkdir(parents=True, exist_ok=True)
     policy.write_text(POLICY_TOML, encoding="utf-8")
 
@@ -280,7 +280,7 @@ def _build_sweep_run(root: Path) -> None:
         ),
     )
     (run_dir / "engine.pid").write_text(str(os.getpid()), encoding="utf-8")
-    # The triage output this sweep produced. `bmad-auto decisions` / the TUI's
+    # The triage output this sweep produced. `bmad-loop decisions` / the TUI's
     # `d` key reconstruct unanswered decisions from these triage*.json files, so
     # writing it makes the missed-decisions feature show: DW-1 and DW-3 are still
     # open and unanswered, so the Deferred Work pane reads "2 to answer (d)".
@@ -454,7 +454,7 @@ async def _wait(pilot, predicate, timeout: float = 8.0) -> None:
         waited += 0.05
 
 
-def _dashboard(app: BmadAutoApp) -> DashboardScreen:
+def _dashboard(app: BmadLoopApp) -> DashboardScreen:
     assert isinstance(app.screen, DashboardScreen)
     return app.screen
 
@@ -464,7 +464,7 @@ async def capture(root: Path) -> list[str]:
     # tmux exists on CI/dev boxes, but make the run-control bindings unconditional.
     launch.tmux_available = lambda: True  # type: ignore[assignment]
 
-    app = BmadAutoApp(root)
+    app = BmadLoopApp(root)
     async with app.run_test(size=SIZE) as pilot:
         await _wait(pilot, lambda: isinstance(app.screen, DashboardScreen))
         screen = _dashboard(app)
@@ -604,7 +604,7 @@ def scrub_paths(names: list[str], root: Path) -> None:
 
 def main() -> int:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="bmad-auto-shots-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="bmad-loop-shots-") as tmp:
         root = Path(tmp) / "acme-search"
         root.mkdir()
         build_project(root)

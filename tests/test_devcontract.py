@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from automator import devcontract
+from bmad_loop import devcontract
 
 
 def _spec(
@@ -239,7 +239,7 @@ def test_reconcilable_from_includes_in_review_excludes_terminal_statuses():
     """The allowlist contains only statuses a half-finalized generic spec can be
     reconciled FROM. `in-review` is included: on the sole generic `bmad-dev-auto`
     path it is the transient marker step-04 sets at its start, not a deliberate
-    terminal (the legacy `bmad-auto-dev` review-handoff fork is retired). `done`
+    terminal (the legacy `bmad-loop-dev` review-handoff fork is retired). `done`
     and `blocked` are never reconciled (idempotent / must route to PAUSE)."""
     assert devcontract.RECONCILABLE_FROM == frozenset(
         {"", "draft", "ready-for-dev", "in-progress", "in-review"}
@@ -273,7 +273,7 @@ def test_reset_status_fills_bare_yaml_null(tmp_path):
     """A bare `status:` (YAML null, no trailing space) is filled to a VALID
     `status: done` line — never `status:done`, which would drop the key on
     re-parse. Re-reading the frontmatter must yield the new status."""
-    from automator import verify
+    from bmad_loop import verify
 
     sp = tmp_path / "spec.md"
     sp.write_text(
@@ -292,7 +292,7 @@ def test_reset_status_blank_value_keeps_inline_comment(tmp_path):
     """A blank value with a trailing inline comment (`status: # tbd`, parsed as
     YAML-null) is filled without merging the comment into the scalar: the result
     must stay valid YAML re-parsing to the new status, comment preserved."""
-    from automator import verify
+    from bmad_loop import verify
 
     sp = tmp_path / "spec.md"
     sp.write_text(

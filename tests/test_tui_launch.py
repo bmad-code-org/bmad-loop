@@ -16,8 +16,8 @@ from pathlib import Path
 
 import pytest
 
-from automator.adapters import tmux_base
-from automator.tui import launch
+from bmad_loop.adapters import tmux_base
+from bmad_loop.tui import launch
 
 
 class FakeRun:
@@ -46,7 +46,7 @@ def fake_run(monkeypatch) -> FakeRun:
 
 
 def expected_cli(*tail: str) -> str:
-    return shlex.join([sys.executable, "-m", "automator.cli", *tail])
+    return shlex.join([sys.executable, "-m", "bmad_loop.cli", *tail])
 
 
 def test_start_run_detached_argv(fake_run, tmp_path: Path):
@@ -64,7 +64,7 @@ def test_start_run_detached_argv(fake_run, tmp_path: Path):
         "new-window",
         "set-option",
     ]
-    from automator import runs
+    from bmad_loop import runs
 
     assert fake_run.by_verb("set-option")[0] == [
         "tmux",
@@ -81,7 +81,7 @@ def test_start_run_detached_argv(fake_run, tmp_path: Path):
         "new-session",
         "-d",
         "-s",
-        "bmad-auto-ctl",
+        "bmad-loop-ctl",
         "-c",
         str(tmp_path),
     ]
@@ -89,7 +89,7 @@ def test_start_run_detached_argv(fake_run, tmp_path: Path):
     nw = fake_run.by_verb("new-window")[0]
     assert nw[:2] == ["tmux", "new-window"]
     assert "-d" in nw
-    assert nw[nw.index("-t") + 1] == "=bmad-auto-ctl:"
+    assert nw[nw.index("-t") + 1] == "=bmad-loop-ctl:"
     assert nw[nw.index("-n") + 1] == "run-RID"
     assert nw[nw.index("-c") + 1] == str(tmp_path)
     assert nw[-3:-1] == ["sh", "-c"]
@@ -183,8 +183,8 @@ def test_new_window_failure_raises(monkeypatch, tmp_path: Path):
 def test_session_exists(monkeypatch):
     fake = FakeRun(has_session_rc=0)
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
-    assert launch.session_exists("bmad-auto-x")
-    assert fake.calls[0] == ["tmux", "has-session", "-t", "=bmad-auto-x"]
+    assert launch.session_exists("bmad-loop-x")
+    assert fake.calls[0] == ["tmux", "has-session", "-t", "=bmad-loop-x"]
 
 
 def test_ctl_window_matches_run_id_suffix(monkeypatch):
@@ -211,13 +211,13 @@ def test_ctl_window_no_session_or_tmux(monkeypatch):
 
 def test_select_ctl_window_argv(fake_run):
     launch.select_ctl_window("sweep-RID")
-    assert fake_run.calls == [["tmux", "select-window", "-t", "=bmad-auto-ctl:sweep-RID"]]
+    assert fake_run.calls == [["tmux", "select-window", "-t", "=bmad-loop-ctl:sweep-RID"]]
 
 
 def test_set_return_pane_argv(fake_run):
-    launch.set_return_pane("=bmad-auto-ctl:sweep-RID", "%9")
+    launch.set_return_pane("=bmad-loop-ctl:sweep-RID", "%9")
     assert fake_run.calls == [
-        ["tmux", "set-option", "-w", "-t", "=bmad-auto-ctl:sweep-RID", "@bmad_return_pane", "%9"]
+        ["tmux", "set-option", "-w", "-t", "=bmad-loop-ctl:sweep-RID", "@bmad_return_pane", "%9"]
     ]
 
 
@@ -242,11 +242,11 @@ def test_start_detached_returns_window_id(fake_run, tmp_path: Path):
 
 
 def test_prune_ctl_windows(monkeypatch, tmp_path: Path):
-    from automator import runs
+    from bmad_loop import runs
 
     mine = runs.project_tag(tmp_path)
     # one live run (this process's pid); the others have no run dir
-    live = tmp_path / ".automator" / "runs" / "20260101-000000-live"
+    live = tmp_path / ".bmad-loop" / "runs" / "20260101-000000-live"
     live.mkdir(parents=True)
     (live / "state.json").write_text("{}")
     runs.write_pid(live)
@@ -297,13 +297,13 @@ def test_select_ctl_window_id_argv(fake_run):
 
 
 def test_in_ctl_session(monkeypatch):
-    monkeypatch.setattr(launch, "current_session", lambda: "bmad-auto-ctl")
+    monkeypatch.setattr(launch, "current_session", lambda: "bmad-loop-ctl")
     monkeypatch.setenv("TMUX", "/tmp/tmux-1000/default,123,0")
     assert launch.in_ctl_session() is True
     monkeypatch.setattr(launch, "current_session", lambda: "some-other-session")
     assert launch.in_ctl_session() is False
     monkeypatch.delenv("TMUX", raising=False)
-    monkeypatch.setattr(launch, "current_session", lambda: "bmad-auto-ctl")
+    monkeypatch.setattr(launch, "current_session", lambda: "bmad-loop-ctl")
     assert launch.in_ctl_session() is False  # not inside tmux
 
 
@@ -373,7 +373,7 @@ def test_return_attached_client_noop_without_tmux(monkeypatch):
 
 
 def test_decision_pending_true(tmp_path: Path):
-    from automator.journal import Journal
+    from bmad_loop.journal import Journal
 
     rd = tmp_path / "run"
     j = Journal(rd)
@@ -383,7 +383,7 @@ def test_decision_pending_true(tmp_path: Path):
 
 
 def test_decision_pending_false_after_answer(tmp_path: Path):
-    from automator.journal import Journal
+    from bmad_loop.journal import Journal
 
     rd = tmp_path / "run"
     j = Journal(rd)
@@ -404,8 +404,8 @@ def test_attach_plan_prefers_ctl_when_decision_pending(monkeypatch):
     selected: list[str] = []
     monkeypatch.setattr(launch, "select_ctl_window", lambda w: selected.append(w))
     argv, return_window = launch.attach_plan(Path("/proj"), "RID")
-    assert argv == ["tmux", "attach", "-t", "=bmad-auto-ctl"]
-    assert return_window == "=bmad-auto-ctl:sweep-RID"
+    assert argv == ["tmux", "attach", "-t", "=bmad-loop-ctl"]
+    assert return_window == "=bmad-loop-ctl:sweep-RID"
     assert selected == ["sweep-RID"]
 
 
@@ -416,8 +416,8 @@ def test_attach_plan_prefers_ctl_when_no_agent_session(monkeypatch):
     monkeypatch.setattr(launch, "decision_pending", lambda rd: False)
     monkeypatch.setattr(launch, "select_ctl_window", lambda w: None)
     argv, return_window = launch.attach_plan(Path("/proj"), "RID")
-    assert argv == ["tmux", "attach", "-t", "=bmad-auto-ctl"]
-    assert return_window == "=bmad-auto-ctl:sweep-RID"
+    assert argv == ["tmux", "attach", "-t", "=bmad-loop-ctl"]
+    assert return_window == "=bmad-loop-ctl:sweep-RID"
 
 
 def test_attach_plan_agent_session_when_no_decision(monkeypatch):
@@ -426,7 +426,7 @@ def test_attach_plan_agent_session_when_no_decision(monkeypatch):
     monkeypatch.setattr(launch, "session_exists", lambda s: True)
     monkeypatch.setattr(launch, "decision_pending", lambda rd: False)
     assert launch.attach_plan(Path("/proj"), "RID") == (
-        ["tmux", "attach", "-t", "=bmad-auto-RID"],
+        ["tmux", "attach", "-t", "=bmad-loop-RID"],
         None,
     )
 
@@ -440,7 +440,7 @@ def test_attach_plan_none_when_nothing_to_attach(monkeypatch):
 
 def test_run_captured_merges_streams(monkeypatch):
     def fake(argv, **kwargs):
-        assert argv[:3] == [sys.executable, "-m", "automator.cli"]
+        assert argv[:3] == [sys.executable, "-m", "bmad_loop.cli"]
         assert argv[3:] == ["validate", "--project", "/p"]
         assert kwargs.get("capture_output") and kwargs.get("text")
         return subprocess.CompletedProcess(argv, 1, stdout="ok line", stderr="FAIL line\n")
@@ -452,7 +452,7 @@ def test_run_captured_merges_streams(monkeypatch):
 
 
 def test_run_captured_real_subprocess():
-    """End-to-end: the module really is invocable as `python -m automator.cli`."""
+    """End-to-end: the module really is invocable as `python -m bmad_loop.cli`."""
     rc, out = launch.run_captured(["--version"])
     assert rc == 0
-    assert "bmad-auto" in out
+    assert "bmad-loop" in out

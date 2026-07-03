@@ -2,7 +2,7 @@
 
 The bundled **`tea`** plugin wires the BMAD **Test Architect Enterprise (TEA)**
 module — the "Murat" agent and its `bmad-testarch-*` workflows — into every
-bmad-auto run and sweep as **advisory-by-default quality steps**. It injects
+bmad-loop run and sweep as **advisory-by-default quality steps**. It injects
 six TEA sessions across the pipeline (test-design, ATDD, automate after dev;
 trace, NFR, test-review just before commit), and an operator can flip any of the
 three gate steps to **blocking** so a failing quality gate escalates the unit for
@@ -11,7 +11,7 @@ human review instead of committing.
 Like the [game-engine layer](game-engine-plugin-guide.md), TEA is **just a
 plugin** on the general [plugin system](plugin-authoring-guide.md) — same
 `plugin.toml` manifest, same [lifecycle hooks](plugin-authoring-guide.md#stage-reference),
-same trust model. It ships bundled (`src/automator/data/plugins/tea/`) but is
+same trust model. It ships bundled (`src/bmad_loop/data/plugins/tea/`) but is
 **inert until enabled**: a project that doesn't list `tea` in `[plugins] enabled`
 behaves exactly as before (the zero-plugin "byte-identical" guarantee holds).
 **Read the [plugin authoring guide](plugin-authoring-guide.md) first** for the
@@ -37,7 +37,7 @@ watching six sessions flail.
 
 ## Enabling the plugin
 
-In `.automator/policy.toml`:
+In `.bmad-loop/policy.toml`:
 
 ```toml
 [plugins]
@@ -162,7 +162,7 @@ checkout that wouldn't otherwise carry TEA's runtime.
 
 ## Reference: the bundled plugin
 
-The canonical source lives at `src/automator/data/plugins/tea/`:
+The canonical source lives at `src/bmad_loop/data/plugins/tea/`:
 
 - `plugin.toml` — the `[python]` module, the `require_tea` + per-step
   enable/blocking `[[settings]]`, the six `[workflows.*]` (CLI-agnostic prompts),

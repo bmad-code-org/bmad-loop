@@ -7,7 +7,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Help us improve the bmad-auto documentation!
+        Help us improve the bmad-loop documentation!
 
   - type: dropdown
     id: doc-type
@@ -51,5 +51,5 @@ body:
   - type: input
     id: version
     attributes:
-      label: bmad-auto Version (if applicable)
+      label: bmad-loop Version (if applicable)
       placeholder: e.g., 0.5.1

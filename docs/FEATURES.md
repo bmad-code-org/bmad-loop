@@ -1,4 +1,4 @@
-# bmad-auto — Features & Functionality
+# bmad-loop — Features & Functionality
 
 For BMAD users who have run `bmad-sprint-planning` and have a `sprint-status.yaml` full of `ready-for-dev` stories. This is what the tool actually does and the problem each capability addresses.
 
@@ -20,7 +20,7 @@ See [README.md](../README.md) for the narrative overview and [setup-guide.md](se
 | Deferred-work sweeps                 | Triages an append-only ledger against real code, bundles + executes                                                                                                                  | Split-off goals and review findings get lost                                              |
 | Multi-CLI adapter + profiles         | Generic driver runs claude/codex/gemini; per-stage overrides; TOML profiles; transport + process-lifecycle + hook-interpreter behind a pluggable OS-seam registry (tmux/POSIX today) | Vendor lock-in; no way to mix models per stage; future non-tmux/Windows transport         |
 | Cost-weighted token budgets          | Per-story budget counts cache reads at ~0.1x; raw totals displayed                                                                                                                   | Naive token caps misjudge real cost (cache reads dominate)                                |
-| Non-invasive skill forks             | Drives its own `bmad-auto-*` skill forks; reads `sprint-status.yaml` only                                                                                                            | Modifying a user's standard BMAD install                                                  |
+| Non-invasive skill forks             | Drives its own `bmad-loop-*` skill forks; reads `sprint-status.yaml` only                                                                                                            | Modifying a user's standard BMAD install                                                  |
 | Read-only TUI + launcher             | Live dashboard over run-dir artifacts; launches detached runs                                                                                                                        | No visibility into what an unattended run is doing                                        |
 | Git worktree isolation (opt-in)      | Each unit runs in its own worktree/branch (seeded with the adapters' gitignored MCP/CLI configs), merging back into the target locally; failed units kept for inspection             | A long unattended run mutating the working tree you're actively using                     |
 
@@ -58,28 +58,28 @@ See [README.md](../README.md) for the narrative overview and [setup-guide.md](se
 - Bounded dev retries (default 2): verify-failures keep the tree and feed the failing output to the next session via `--feedback`; other failures roll back to baseline.
 - Plateau-defer: when review won't converge, the story is skipped, the spec stashed into the run dir, deferred-work preserved, the run continues.
 - Typed escalations: `CRITICAL` pauses the run + notifies (desktop + `ATTENTION` file); `PREFERENCE` is journaled and continues.
-- CRITICAL resolution: `bmad-auto resolve <run-id>` opens an interactive resolve agent seeded with the escalation + frozen spec; you disambiguate, it re-arms the story (`escalated → pending`, spec reset to `ready-for-dev`) and resumes. `--no-interactive` skips to re-arm if you fixed the spec yourself.
+- CRITICAL resolution: `bmad-loop resolve <run-id>` opens an interactive resolve agent seeded with the escalation + frozen spec; you disambiguate, it re-arms the story (`escalated → pending`, spec reset to `ready-for-dev`) and resumes. `--no-interactive` skips to re-arm if you fixed the spec yourself.
 
 ### Git worktree isolation (opt-in)
 
-- Off by default (`[scm] isolation = "none"` — work in place on the checked-out branch, byte-for-byte the prior behavior). Set `isolation = "worktree"` and each story (and each sweep bundle) runs in its own `git worktree` on an `automator/<run_id>[/<story>]` branch cut from the target branch, then merges back **locally** — the main checkout stays free while a run is in flight.
+- Off by default (`[scm] isolation = "none"` — work in place on the checked-out branch, byte-for-byte the prior behavior). Set `isolation = "worktree"` and each story (and each sweep bundle) runs in its own `git worktree` on a `bmad-loop/<run_id>[/<story>]` branch cut from the target branch, then merges back **locally** — the main checkout stays free while a run is in flight.
 - Merge knobs: `merge_strategy` (`ff` / `merge` / `squash`), `target_branch` (default = branch checked out at run start; created if missing — a detached HEAD or unborn repo pauses the run instead of merging onto an unreferenced commit), `branch_per` (`story` or a shared `run` branch; `run` forces `delete_branch = false`), and `delete_branch`.
 - Failed-unit forensics: a deferred/escalated unit's worktree + branch stay mounted (`keep_failed`, default on) and its full diff is preserved to `run_dir/failed/<unit>/changes.patch`; `failed_diff_max_mb` caps per-file untracked-file size (oversized skipped with a marker), `failed_diff_unlimited` lifts the cap.
 - Config seeding: a worktree checks out _tracked_ files only, so a project's gitignored MCP/CLI configs (`.mcp.json`, `.claude/settings.json`, `.codex/config.toml`, `.gemini/settings.json`) would be missing — an isolated session couldn't reach its MCP server. With `seed_adapter_defaults` (default on) each loaded adapter's own `seed_files` are copied in from the main repo before the session launches; `worktree_seed` adds extra paths. Copy-when-absent, seeded before the hook-merge (a seeded `settings.json` keeps its content and just gains the Stop hook), and shielded from the unit's `git add -A`.
-- Run state never moves into a worktree — `.automator/` always lives in the main repo; spec paths are persisted relative to the worktree so a kept-failed run stays portable.
+- Run state never moves into a worktree — `.bmad-loop/` always lives in the main repo; spec paths are persisted relative to the worktree so a kept-failed run stays portable.
 - Merge-back is serialized; `max_parallel` is a validated knob clamped to `1` until parallel fan-out is built. The `repo_root` key in `_bmad/bmm/config.yaml` (defaults to the project dir) decouples where git/code work happens from where run state lives (monorepos).
 - `commit_message_template` (`{story_key}` / `{run_id}` substituted) customizes story/bundle commit messages.
 
 ### Plugins (extensibility)
 
-- A first-class **plugin system** extends the orchestrator without touching the core loop. A plugin is a folder-drop `plugin.toml` manifest (under `.automator/plugins/<name>/`, overlaying bundled `automator/data/plugins/<name>/`) that can: **observe / veto / mutate** the run at every lifecycle stage via a hook bus; contribute **settings** that render in the settings TUI and persist to `[plugins.<name>]`; and inject its own **workflow** sessions at `post_dev_phase` / `post_review_result`.
+- A first-class **plugin system** extends the orchestrator without touching the core loop. A plugin is a folder-drop `plugin.toml` manifest (under `.bmad-loop/plugins/<name>/`, overlaying bundled `bmad_loop/data/plugins/<name>/`) that can: **observe / veto / mutate** the run at every lifecycle stage via a hook bus; contribute **settings** that render in the settings TUI and persist to `[plugins.<name>]`; and inject its own **workflow** sessions at `post_dev_phase` / `post_review_result`.
 - **Two trust tiers:** a data-only / declarative plugin (settings + `[hooks.<stage>]` shell commands) runs on discovery; a plugin that ships an in-process `[python]` module is **never imported unless listed in `[plugins] enabled`** — dropping a folder in never runs code. Every hook (subprocess or Python) is failure-isolated: a raise is caught, journalled, and disables that instance for the run — never crashes it.
-- Veto maps onto the engine's **existing** control flow (`skip`/`defer`/`pause`), and mutation is confined to a per-stage whitelist (`proposed_prompt`, `proposed_commit_message`, …) plus a persisted `shared` dict — no new abort path. Distribution is folder-drop now, with a documented `bmad_auto.plugins` entry-point seam for pip-installed plugins later.
-- See **[Writing a bmad-auto plugin](plugin-authoring-guide.md)** for the manifest, settings, hook, stage, trust, and workflow reference, plus a worked walkthrough; a complete example ships under [`examples/plugins/guardrails/`](../examples/plugins/guardrails/).
+- Veto maps onto the engine's **existing** control flow (`skip`/`defer`/`pause`), and mutation is confined to a per-stage whitelist (`proposed_prompt`, `proposed_commit_message`, …) plus a persisted `shared` dict — no new abort path. Distribution is folder-drop now, with a documented `bmad_loop.plugins` entry-point seam for pip-installed plugins later.
+- See **[Writing a bmad-loop plugin](plugin-authoring-guide.md)** for the manifest, settings, hook, stage, trust, and workflow reference, plus a worked walkthrough; a complete example ships under [`examples/plugins/guardrails/`](../examples/plugins/guardrails/).
 
 ### Game-engine projects (opt-in)
 
-- A niche engine layer — built **on the plugin system** — for projects whose dev/sweep cycle drives a **live engine Editor** via an Editor MCP (Unity bundled as `automator/data/plugins/unity/`; Godot/Unreal later). Off by default; enable with `[plugins] enabled = ["unity"]` + a `[plugins.unity]` table. (The legacy `[engine]` policy block still loads, folded onto `[plugins.unity]` with a deprecation warning; project-local overrides now live under `.automator/plugins/<name>/`.)
+- A niche engine layer — built **on the plugin system** — for projects whose dev/sweep cycle drives a **live engine Editor** via an Editor MCP (Unity bundled as `bmad_loop/data/plugins/unity/`; Godot/Unreal later). Off by default; enable with `[plugins] enabled = ["unity"]` + a `[plugins.unity]` table. (The legacy `[engine]` policy block still loads, folded onto `[plugins.unity]` with a deprecation warning; project-local overrides now live under `.bmad-loop/plugins/<name>/`.)
 - `editor_mode` is coupled to `[scm] isolation` because a live Editor MCP can only act on the folder its Editor has open: **`shared`** (requires `isolation = "none"`) runs the agent in place on the project the operator's warm Editor already has open — zero relaunches, full live MCP; **`per_worktree`** (requires `isolation = "worktree"`) gives each worktree its own managed Editor.
 - Readiness gate: before each unit, the plugin's `pre_ready_gate` hook blocks until the Editor + MCP report ready (Unity: `wait-for-ready` for IvanMurzak, connectivity check for CoplayDev); on timeout the unit is deferred with an `ATTENTION` notice rather than starting a session against a half-open Editor.
 - `per_worktree` lifecycle (Unity/IvanMurzak): a setup hook launches the worktree's own Editor (MCP port auto-derived from the worktree path, so it self-isolates from the operator's main Editor), writes the worktree `.mcp.json`, and primes the worktree's `Library` with a reflink/CoW copy of the warm main `Library` (so Unity reimports incrementally instead of a cold full reimport that crashes the import workers; deep-copy then symlinked-empty-cache fallbacks off-CoW); the readiness gate then waits for it; a teardown hook quits the Editor on completion **and** on pause/escalation. The MCP-generated skill tree (gitignored) is copied into each worktree via the plugin's `seed_globs`; a setup failure defers the unit instead of running it against no Editor.
@@ -87,8 +87,8 @@ See [README.md](../README.md) for the narrative overview and [setup-guide.md](se
 
 ### Resumability & state
 
-- Every run is a resumable on-disk state machine: `bmad-auto resume <run-id>` continues from a gate, escalation, or interruption.
-- All run state in `.automator/runs/<run-id>/` (gitignored): `state.json`, `journal.jsonl` (every decision), `events/` (hook signals), `tasks/<id>/`, `logs/`, `deferred/`, `resolve/`, `ATTENTION`.
+- Every run is a resumable on-disk state machine: `bmad-loop resume <run-id>` continues from a gate, escalation, or interruption.
+- All run state in `.bmad-loop/runs/<run-id>/` (gitignored): `state.json`, `journal.jsonl` (every decision), `events/` (hook signals), `tasks/<id>/`, `logs/`, `deferred/`, `resolve/`, `ATTENTION`.
 
 ### Hook-based transport (no pane-scraping)
 
@@ -97,13 +97,13 @@ See [README.md](../README.md) for the narrative overview and [setup-guide.md](se
 ### Deferred-work sweeps
 
 - Skills accumulate an append-only ledger (`deferred-work.md`, `DW-<n>` entries): split-off goals, pre-existing findings, "needs human decision" items.
-- `bmad-auto sweep` triages every open entry against the actual code (ledger statuses treated as unreliable) → partition: already-resolved (auto-closed with evidence) / bundles / blocked / skip / decisions.
+- `bmad-loop sweep` triages every open entry against the actual code (ledger statuses treated as unreliable) → partition: already-resolved (auto-closed with evidence) / bundles / blocked / skip / decisions.
 - Bundles run the full pipeline (dev `--dw-bundle` → review → verify → commit); the review gate checks every bundle entry is `status: done`.
 - Interactive decision walkthrough (build / close / keep-open per option, with a recommendation); answers written back as `decision:` lines. Unattended runs leave decisions open.
-- Answer skipped/missed decisions out of band with `bmad-auto decisions` (or `d` in the TUI): reconstructed from past triage output, saved to `.automator/decisions.json`, and consumed by the next sweep with no re-prompt (build → bundle, close → closed, keep-open → recorded).
+- Answer skipped/missed decisions out of band with `bmad-loop decisions` (or `d` in the TUI): reconstructed from past triage output, saved to `.bmad-loop/decisions.json`, and consumed by the next sweep with no re-prompt (build → bundle, close → closed, keep-open → recorded).
 - Auto-sweep at epic boundaries or run-end (`[sweep] auto`); a failed/paused child sweep never interrupts the parent run.
 - Repeat mode (`--repeat` / `[sweep] repeat`): re-triages after each cycle to absorb newly generated deferred work, stopping when a cycle does nothing addressable or hits `max_cycles`.
-- Sweeps are their own resumable runs (`bmad-auto resume <id>`).
+- Sweeps are their own resumable runs (`bmad-loop resume <id>`).
 
 ### Gates & human checkpoints
 
@@ -113,18 +113,18 @@ See [README.md](../README.md) for the narrative overview and [setup-guide.md](se
 ### Multi-CLI / multi-agent support
 
 - Generic adapter drives any CLI fitting the injection + hook-signal transport; CLI specifics live in declarative TOML profiles. Two independent axes: the **CLI** (`CodingCLIAdapter` + profile) and the **terminal transport** (`TerminalMultiplexer`) — tmux is the only backend today, behind a pluggable seam so a native-Windows backend can be added without touching the engine (see the [adapter authoring guide](adapter-authoring-guide.md#two-axes-cli-vs-transport)).
-- The OS is abstracted by a **registry of seams**, each selecting an implementation by platform (with a test-override env var) and extended by a single registration line: the terminal multiplexer (`register_multiplexer`), the process-lifecycle `ProcessHost` (`register_process_host` — `terminate`/`force_kill`/`is_alive`/`identity`), and the hook interpreter (`ProcessHost.hook_interpreter()`); `bmad-auto validate` runs a platform preflight over them. Porting to a new OS is new files + registrations, no core edits — see [Porting bmad-auto to a new OS](porting-to-a-new-os.md).
+- The OS is abstracted by a **registry of seams**, each selecting an implementation by platform (with a test-override env var) and extended by a single registration line: the terminal multiplexer (`register_multiplexer`), the process-lifecycle `ProcessHost` (`register_process_host` — `terminate`/`force_kill`/`is_alive`/`identity`), and the hook interpreter (`ProcessHost.hook_interpreter()`); `bmad-loop validate` runs a platform preflight over them. Porting to a new OS is new files + registrations, no core edits — see [Porting bmad-loop to a new OS](porting-to-a-new-os.md).
 - Supported, E2E-verified: `claude` (reference), `codex` (≥ 0.139), `gemini` (≥ 0.46), `copilot` (GitHub Copilot CLI ≥ 2026-02 — the `copilot` binary, not the VS Code extension; `agentStop` turn-end, `-i` interactive launch, `--allow-all-tools`; pin a capable model — the free GPT-5 mini default is unreliable for multi-step skills).
 - Per-stage CLI/model overrides: run dev on one CLI/model, review on another (`[adapter.dev]`, `[adapter.review]`, `[adapter.triage]`).
-- Add a CLI without touching Python: drop a TOML profile in `.automator/profiles/<name>.toml` (binary, prompt template, bypass flags, hook dialect, native→canonical event map).
-- `bmad-auto probe-adapter` collects + sanitizes the data needed to finalize/add a profile (hook payload shape, transcript location/format, token schema): a zero-launch scan by default, opt-in `--probe` for live capture. See the [adapter authoring guide](adapter-authoring-guide.md).
+- Add a CLI without touching Python: drop a TOML profile in `.bmad-loop/profiles/<name>.toml` (binary, prompt template, bypass flags, hook dialect, native→canonical event map).
+- `bmad-loop probe-adapter` collects + sanitizes the data needed to finalize/add a profile (hook payload shape, transcript location/format, token schema): a zero-launch scan by default, opt-in `--probe` for live capture. See the [adapter authoring guide](adapter-authoring-guide.md).
 
 ### Budgeting & cost tracking
 
 - Per-story token budget (`max_tokens_per_story`) using a cost-weighted total — cache reads counted at `cache_read_weight` (default 0.1, matching ~0.1x vendor billing); displayed totals stay raw.
-- Token usage read from each CLI's local session transcript (per-profile `usage_parser`), aggregated per story (`bmad-auto status`).
+- Token usage read from each CLI's local session transcript (per-profile `usage_parser`), aggregated per story (`bmad-loop status`).
 
-### Configuration (`.automator/policy.toml`)
+### Configuration (`.bmad-loop/policy.toml`)
 
 - Single policy file written by `init`, snapshotted at run start (applies to new runs and resumes; editable live from the TUI).
 - Sections: `[gates]`, `[limits]`, `[verify]`, `[notify]`, `[review]`, `[adapter]` (+ per-stage), `[sweep]`, `[scm]` (worktree isolation + merge-back), `[cleanup]` (run-dir retention + disk reclamation), `[plugins]` (trust allowlist + per-plugin `[plugins.<name>]` config — e.g. the opt-in game-engine layer via `[plugins.unity]`, off by default), `[tui]` (`low_frame_rate` for slow/SSH links).
@@ -132,47 +132,47 @@ See [README.md](../README.md) for the narrative overview and [setup-guide.md](se
 
 ### TUI dashboard
 
-- Read-only observer + launcher (`bmad-auto tui`): runs table, expandable sprint tree (epics → stories/retro), severity-colored deferred-work ledger, per-story phase table (phase · dev attempts · review cycles · tokens · commit/defer), tabs tailing journal / pane log / `ATTENTION`.
+- Read-only observer + launcher (`bmad-loop tui`): runs table, expandable sprint tree (epics → stories/retro), severity-colored deferred-work ledger, per-story phase table (phase · dev attempts · review cycles · tokens · commit/defer), tabs tailing journal / pane log / `ATTENTION`.
 - Launch & manage from keys: start run/sweep (`r`/`s`), resume (`e`), resolve escalation (`R`), answer missed decisions (`d`), attach (`a`), cleanup (`c`), validate (`v`), settings editor (`g`), theme/mode toggle (`M`), quit (`q`).
-- Survives TUI exit/crash: runs launched from the TUI are detached `bmad-auto` processes in a dedicated `bmad-auto-ctl` tmux session; the dashboard watches purely via run-dir artifacts, so shell-started runs appear identically.
+- Survives TUI exit/crash: runs launched from the TUI are detached `bmad-loop` processes in a dedicated `bmad-loop-ctl` tmux session; the dashboard watches purely via run-dir artifacts, so shell-started runs appear identically.
 - Comment-preserving policy editor (`g`): grouped form, sections collapsed by default with one-line descriptions (`ctrl+e` toggles all), validated with the engine's own parser, unset keys show defaults as placeholders.
 
 ### tmux session management
 
-- Each run drives agents in a dedicated `bmad-auto-<run-id>` session; `attach` to watch live.
+- Each run drives agents in a dedicated `bmad-loop-<run-id>` session; `attach` to watch live.
 - Auto-teardown on finish (`cleanup_session_on_finish`, disable to inspect); `stop` always kills it; paused/interrupted runs keep the session for `resume`.
-- `bmad-auto cleanup` (or `c` in the TUI) sweeps leftover sessions/windows for finished/stopped/orphaned runs **of the current project**; live runs, and anything belonging to another project, are never touched.
+- `bmad-loop cleanup` (or `c` in the TUI) sweeps leftover sessions/windows for finished/stopped/orphaned runs **of the current project**; live runs, and anything belonging to another project, are never touched.
 
 ### Disk reclamation (`[cleanup]`)
 
-- `bmad-auto clean` reclaims **disk** (distinct from `cleanup`, which is only tmux). It tears down git worktrees a mid-flight stop left mounted — the main accumulation source: each carries a real Unity `Library/` (incl. the MCP-server build), which `git worktree remove` cannot reach once the engine was killed before teardown. It then trims the heavy `worktrees/` tree from runs kept for history (the run still lists in the dashboard — discovery reads `state.json`, not the worktree), and archives or deletes runs past the retention window.
+- `bmad-loop clean` reclaims **disk** (distinct from `cleanup`, which is only tmux). It tears down git worktrees a mid-flight stop left mounted — the main accumulation source: each carries a real Unity `Library/` (incl. the MCP-server build), which `git worktree remove` cannot reach once the engine was killed before teardown. It then trims the heavy `worktrees/` tree from runs kept for history (the run still lists in the dashboard — discovery reads `state.json`, not the worktree), and archives or deletes runs past the retention window.
 - Safe by construction: only **finished or stopped** runs are touched; running, unknown-host, paused and interrupted (resumable) runs are never reclaimed. `--keep <run-id>` protects a specific run (e.g. a finished one whose Editor is still live), `--dry-run` previews, `--retain N`/`--hard` tune the window and archive-vs-delete.
-- Prevention is automatic: every `run`/`sweep` start reconciles worktrees leaked by a prior **finished** run (`[cleanup] auto_clean_on_finish`), and the Unity plugin's `post_run` hook removes the IvanMurzak MCP server's downloaded `/tmp/<company>/<product>/*.zip` and truncates its unbounded editor log (`[cleanup] clean_tmp`). For recurring housekeeping of stopped runs, schedule `bmad-auto clean`.
+- Prevention is automatic: every `run`/`sweep` start reconciles worktrees leaked by a prior **finished** run (`[cleanup] auto_clean_on_finish`), and the Unity plugin's `post_run` hook removes the IvanMurzak MCP server's downloaded `/tmp/<company>/<product>/*.zip` and truncates its unbounded editor log (`[cleanup] clean_tmp`). For recurring housekeeping of stopped runs, schedule `bmad-loop clean`.
 
 ### Setup & install
 
-- `bmad-auto init` installs the five `bmad-auto-*` skills (`.claude/skills/` and/or `.agents/skills/`), the hook relay, `.automator/policy.toml`, and a runs-dir gitignore. Flags: `--cli` (repeatable), `--no-skills`, `--force-skills`.
-- `bmad-auto validate` preflights every prerequisite: BMAD config, sprint-status, git, tmux, CLI binary, hook registration.
+- `bmad-loop init` installs the five `bmad-loop-*` skills (`.claude/skills/` and/or `.agents/skills/`), the hook relay, `.bmad-loop/policy.toml`, and a runs-dir gitignore. Flags: `--cli` (repeatable), `--no-skills`, `--force-skills`.
+- `bmad-loop validate` preflights every prerequisite: BMAD config, sprint-status, git, tmux, CLI binary, hook registration.
 - Non-invasive: drives the upstream `bmad-dev-auto` skill unmodified — there is no fork to keep in sync — and review is just a re-invocation of it on the `done` spec. Your standard BMAD install is never modified.
 
 ### Command reference
 
-- `bmad-auto init` — install skills, hooks, policy, gitignore.
-- `bmad-auto validate` — preflight all prerequisites.
-- `bmad-auto run` — drive the dev → review → verify → commit loop.
-- `bmad-auto sweep` — triage + execute open deferred-work entries.
-- `bmad-auto resume <run-id>` — continue a paused/interrupted run.
-- `bmad-auto resolve <run-id>` — resolve a CRITICAL escalation, then re-arm + resume.
-- `bmad-auto decisions` — answer deferred-work decisions past sweeps left unanswered (`--list` to just show them).
-- `bmad-auto list` (`ls`) — list every run/sweep with its short ref, type, and status.
-- `bmad-auto status [<run-id>]` — run + sprint summary with per-story token totals.
-- `bmad-auto diagnose [<run-id>]` (`diag`) — emit a sanitized diagnostic dump of a run/sweep to hand maintainers (histograms, counts, env, file sizes — no code/spec/prompts/paths/PII); defaults to the latest run (`--all`, `--out`, `--json`, `--max-journal-entries`).
-- `bmad-auto attach [<run-id>]` — tmux-attach to a run's live agent session.
-- `bmad-auto stop <run-id>` — stop a live run (engine + agent session).
-- `bmad-auto delete <run-id>` — delete a run directory (`--force` stops it first if live).
-- `bmad-auto archive <run-id>` — compress a run into `.automator/archive` and remove it (`--force` stops it first if live).
-- `bmad-auto cleanup` — remove leftover tmux artifacts for finished/stopped runs.
-- `bmad-auto clean` — reclaim disk from concluded runs per `[cleanup]`: tear down worktrees a mid-flight stop orphaned, trim heavy `worktrees/` from runs kept for history, archive/delete past the retention window (`--dry-run`, `--keep`, `--retain N`, `--hard`).
-- `bmad-auto tui` — the interactive dashboard (`--low-frame-rate` for slow/SSH links).
-- `bmad-auto probe-adapter <cli>` (`collect-adapter-data`) — collect + sanitize adapter-finalization data for a CLI profile; default zero-launch scan, opt-in `--probe` live capture.
+- `bmad-loop init` — install skills, hooks, policy, gitignore.
+- `bmad-loop validate` — preflight all prerequisites.
+- `bmad-loop run` — drive the dev → review → verify → commit loop.
+- `bmad-loop sweep` — triage + execute open deferred-work entries.
+- `bmad-loop resume <run-id>` — continue a paused/interrupted run.
+- `bmad-loop resolve <run-id>` — resolve a CRITICAL escalation, then re-arm + resume.
+- `bmad-loop decisions` — answer deferred-work decisions past sweeps left unanswered (`--list` to just show them).
+- `bmad-loop list` (`ls`) — list every run/sweep with its short ref, type, and status.
+- `bmad-loop status [<run-id>]` — run + sprint summary with per-story token totals.
+- `bmad-loop diagnose [<run-id>]` (`diag`) — emit a sanitized diagnostic dump of a run/sweep to hand maintainers (histograms, counts, env, file sizes — no code/spec/prompts/paths/PII); defaults to the latest run (`--all`, `--out`, `--json`, `--max-journal-entries`).
+- `bmad-loop attach [<run-id>]` — tmux-attach to a run's live agent session.
+- `bmad-loop stop <run-id>` — stop a live run (engine + agent session).
+- `bmad-loop delete <run-id>` — delete a run directory (`--force` stops it first if live).
+- `bmad-loop archive <run-id>` — compress a run into `.bmad-loop/archive` and remove it (`--force` stops it first if live).
+- `bmad-loop cleanup` — remove leftover tmux artifacts for finished/stopped runs.
+- `bmad-loop clean` — reclaim disk from concluded runs per `[cleanup]`: tear down worktrees a mid-flight stop orphaned, trim heavy `worktrees/` from runs kept for history, archive/delete past the retention window (`--dry-run`, `--keep`, `--retain N`, `--hard`).
+- `bmad-loop tui` — the interactive dashboard (`--low-frame-rate` for slow/SSH links).
+- `bmad-loop probe-adapter <cli>` (`collect-adapter-data`) — collect + sanitize adapter-finalization data for a CLI profile; default zero-launch scan, opt-in `--probe` live capture.
 - Every command takes `--project <dir>` (default: current directory). Any `<run-id>` accepts a partial — the tail after the last `-`, shortened to any unique prefix.

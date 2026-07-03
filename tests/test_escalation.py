@@ -1,11 +1,11 @@
 """Unit tests for the dev/review retry-budget decisions — specifically the
 resolved-escalation guard that re-escalates instead of silently deferring."""
 
-from automator.adapters.base import SessionResult
-from automator.escalation import Action, decide_dev, decide_review_session
-from automator.model import StoryTask
-from automator.policy import LimitsPolicy, NotifyPolicy, Policy
-from automator.verify import VerifyOutcome
+from bmad_loop.adapters.base import SessionResult
+from bmad_loop.escalation import Action, decide_dev, decide_review_session
+from bmad_loop.model import StoryTask
+from bmad_loop.policy import LimitsPolicy, NotifyPolicy, Policy
+from bmad_loop.verify import VerifyOutcome
 
 POLICY = Policy(
     limits=LimitsPolicy(max_dev_attempts=2, max_review_cycles=2),

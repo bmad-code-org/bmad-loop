@@ -1,6 +1,6 @@
 import pytest
 
-from automator import policy
+from bmad_loop import policy
 
 
 def test_defaults_when_file_missing(tmp_path):
@@ -19,7 +19,7 @@ def test_dev_skill_select_and_validate():
         policy.loads('[dev]\nskill = "nope"\n')
     # the retired legacy fork is no longer an accepted value
     with pytest.raises(policy.PolicyError, match="dev.skill"):
-        policy.loads('[dev]\nskill = "bmad-auto-dev"\n')
+        policy.loads('[dev]\nskill = "bmad-loop-dev"\n')
 
 
 def test_review_enabled_default_and_parse():

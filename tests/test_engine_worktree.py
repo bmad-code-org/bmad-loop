@@ -20,13 +20,13 @@ from conftest import (
     write_sprint,
 )
 
-from automator.adapters.base import SessionResult
-from automator.adapters.mock import MockAdapter
-from automator.engine import Engine
-from automator.journal import Journal, load_state
-from automator.model import Phase, RunState, StoryTask, TokenUsage
-from automator.policy import GatesPolicy, NotifyPolicy, Policy, ScmPolicy
-from automator.verify import (
+from bmad_loop.adapters.base import SessionResult
+from bmad_loop.adapters.mock import MockAdapter
+from bmad_loop.engine import Engine
+from bmad_loop.journal import Journal, load_state
+from bmad_loop.model import Phase, RunState, StoryTask, TokenUsage
+from bmad_loop.policy import GatesPolicy, NotifyPolicy, Policy, ScmPolicy
+from bmad_loop.verify import (
     branch_exists,
     current_branch,
     rev_parse_head,
@@ -115,7 +115,7 @@ def wt_review_effect(project, story_key, clean: bool, patched: int = 0):
 
 
 def make_engine(project, script, policy=None, run_id="test-run", **kwargs):
-    run_dir = project.project / ".automator" / "runs" / run_id
+    run_dir = project.project / ".bmad-loop" / "runs" / run_id
     adapter = MockAdapter(script, usage_per_session=TokenUsage(input_tokens=10, output_tokens=5))
     state = RunState(run_id=run_id, project=str(project.project), started_at="now")
     engine = Engine(
@@ -155,7 +155,7 @@ def test_worktree_happy_path_merges_to_target(project):
     assert "change for 1-1-a" in (project.project / "src.txt").read_text()
     # worktree cleaned up, branch deleted (delete_branch default), tree clean
     assert [p.resolve() for p in worktree_list(project.project)] == [project.project.resolve()]
-    assert not branch_exists(project.project, "automator/test-run/1-1-a")
+    assert not branch_exists(project.project, "bmad-loop/test-run/1-1-a")
     assert worktree_clean(project.project)
     kinds = journal_kinds(engine)
     assert "worktree-opened" in kinds and "unit-merged" in kinds
@@ -219,8 +219,8 @@ def test_branch_per_story_naming(project):
         policy=wt_policy(branch_per="story", delete_branch=False),
     )
     engine.run()
-    assert engine.state.tasks["1-1-a"].branch == "automator/test-run/1-1-a"
-    assert branch_exists(project.project, "automator/test-run/1-1-a")
+    assert engine.state.tasks["1-1-a"].branch == "bmad-loop/test-run/1-1-a"
+    assert branch_exists(project.project, "bmad-loop/test-run/1-1-a")
 
 
 def test_branch_per_run_naming(project):
@@ -231,8 +231,8 @@ def test_branch_per_run_naming(project):
         policy=wt_policy(branch_per="run", delete_branch=False),
     )
     engine.run()
-    assert engine.state.tasks["1-1-a"].branch == "automator/test-run"
-    assert branch_exists(project.project, "automator/test-run")
+    assert engine.state.tasks["1-1-a"].branch == "bmad-loop/test-run"
+    assert branch_exists(project.project, "bmad-loop/test-run")
 
 
 # ----------------------------------------------------------------- merge strategies
@@ -273,7 +273,7 @@ def test_worktree_defer_keeps_failed_unit(project):
     assert patch.is_file()
     assert "change for 1-1-a" in patch.read_text()
     # keep_failed default → worktree + branch remain mounted for inspection
-    assert branch_exists(project.project, "automator/test-run/1-1-a")
+    assert branch_exists(project.project, "bmad-loop/test-run/1-1-a")
     listed = [p.resolve() for p in worktree_list(project.project)]
     assert project.project.resolve() in listed and len(listed) == 2
     # the main repo is untouched by the failed unit
@@ -292,7 +292,7 @@ def test_worktree_defer_without_keep_drops_worktree_but_saves_patch(project):
     patch = engine.run_dir / "failed" / "1-1-a" / "changes.patch"
     assert patch.is_file() and "change for 1-1-a" in patch.read_text()
     # not kept → worktree removed, branch deleted
-    assert not branch_exists(project.project, "automator/test-run/1-1-a")
+    assert not branch_exists(project.project, "bmad-loop/test-run/1-1-a")
     assert [p.resolve() for p in worktree_list(project.project)] == [project.project.resolve()]
 
 
@@ -353,7 +353,7 @@ def test_worktree_merge_conflict_escalates_and_keeps_branch(project):
         policy=wt_policy(merge_strategy="ff"),
     )
     # diverge the target right after the worktree is cut so ff-only cannot apply
-    import automator.engine as eng
+    import bmad_loop.engine as eng
 
     real_open = eng.open_unit_workspace
 
@@ -374,7 +374,7 @@ def test_worktree_merge_conflict_escalates_and_keeps_branch(project):
     task = engine.state.tasks["1-1-a"]
     assert task.phase == Phase.ESCALATED
     # the unit branch is kept for manual merge
-    assert branch_exists(project.project, "automator/test-run/1-1-a")
+    assert branch_exists(project.project, "bmad-loop/test-run/1-1-a")
 
 
 # ----------------------------------------------------------------- resume
@@ -395,7 +395,7 @@ def test_worktree_spec_approval_pause_resumes_in_same_worktree(project):
     task = saved.tasks["1-1-a"]
     assert task.phase == Phase.DEV_VERIFY and task.worktree_path and task.branch
     # the worktree stays mounted across the pause so resume can review in it
-    assert branch_exists(project.project, "automator/test-run/1-1-a")
+    assert branch_exists(project.project, "bmad-loop/test-run/1-1-a")
     assert len(worktree_list(project.project)) == 2
 
     state = load_state(engine.run_dir)
@@ -424,7 +424,7 @@ def test_worktree_crash_restart_discards_stale_worktree(project):
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
     engine, _ = make_engine(project, [wt_dev_effect(project, "1-1-a")])
     # simulate an interrupted unit left mid-flight (DEV_RUNNING, worktree mounted)
-    from automator.workspace import open_unit_workspace
+    from bmad_loop.workspace import open_unit_workspace
 
     unit = open_unit_workspace(
         project.project, project, "test-run", "1-1-a", "main", "story", engine.run_dir
@@ -520,7 +520,7 @@ def _write_stub_plugin(project, name, *, ready=_OK, setup=_OK, teardown=_OK, see
     per_worktree flow. A blocking hook's non-zero exit vetoes (defers) the unit.
     Commands are TOML literal strings, so they may embed double quotes but not
     single quotes. No [python], so it loads on folder-drop (no [plugins] enabled)."""
-    plug_dir = project.project / ".automator" / "plugins" / name
+    plug_dir = project.project / ".bmad-loop" / "plugins" / name
     plug_dir.mkdir(parents=True)
     lines = ["[plugin]", f'name = "{name}"', "api_version = 1"]
     if seed_globs:
@@ -735,7 +735,7 @@ def test_merge_stray_dirt_escalates_with_clear_message(project):
     reason = engine.state.paused_reason or ""
     assert "not part of this branch" in reason and "stray.txt" in reason
     # branch kept for manual merge; the stray file was left untouched
-    assert branch_exists(project.project, "automator/test-run/1-1-a")
+    assert branch_exists(project.project, "bmad-loop/test-run/1-1-a")
     assert (project.project / "stray.txt").read_text() == "editor leaked\n"
     assert "merge-target-cleaned" not in journal_kinds(engine)
 
@@ -744,8 +744,8 @@ def test_spec_file_serialized_relative_to_worktree():
     """A worktree task persists spec_file relative to its worktree so a kept run's
     state stays portable (no dangling absolute path into a pruned worktree)."""
     task = StoryTask(story_key="1-1-a", epic=1, phase=Phase.DEFERRED)
-    task.worktree_path = "/repo/.automator/runs/run/worktrees/1-1-a"
-    task.spec_file = "/repo/.automator/runs/run/worktrees/1-1-a/_out/spec.md"
+    task.worktree_path = "/repo/.bmad-loop/runs/run/worktrees/1-1-a"
+    task.spec_file = "/repo/.bmad-loop/runs/run/worktrees/1-1-a/_out/spec.md"
     assert task.to_dict()["spec_file"] == "_out/spec.md"
     # a spec living outside the worktree stays absolute
     task.spec_file = "/elsewhere/spec.md"

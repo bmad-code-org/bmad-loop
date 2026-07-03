@@ -3,7 +3,7 @@ revision = 3
 requires-python = ">=3.11"
 
 [[package]]
-name = "bmad-auto"
+name = "bmad-loop"
 version = "0.7.12"
 source = { editable = "." }
 dependencies = [

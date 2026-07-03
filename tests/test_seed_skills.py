@@ -1,6 +1,6 @@
 """Unit tests for scripts/seed_skills.py — the reseed that keeps the gitignored
 dev-workspace skill forks (.claude/skills, .agents/skills) byte-identical to the
-canonical src/automator/data/skills/ source after a version bump.
+canonical src/bmad_loop/data/skills/ source after a version bump.
 
 The module's paths and skill list are module-level globals, so each test points
 them at a throwaway tmp workspace via monkeypatch rather than touching the real
@@ -23,7 +23,7 @@ import seed_skills  # noqa: E402
 def _build_workspace(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, trees: tuple[str, ...]):
     """Lay out canonical + fork trees under tmp_path and repoint the module at
     them. Returns (canonical_skill_dir, {tree: fork_skill_dir})."""
-    canonical = tmp_path / "src" / "automator" / "data" / "skills" / "demo-skill"
+    canonical = tmp_path / "src" / "bmad_loop" / "data" / "skills" / "demo-skill"
     canonical.mkdir(parents=True)
     (canonical / "SKILL.md").write_text("canonical body\n")
     (canonical / "assets").mkdir()
@@ -70,7 +70,7 @@ def test_reseed_prunes_extra_fork_files(monkeypatch, tmp_path):
 
 def test_missing_fork_tree_is_skipped(monkeypatch, tmp_path, capsys):
     # No .claude/.agents trees present at all (the CI shape).
-    canonical = tmp_path / "src" / "automator" / "data" / "skills" / "demo-skill"
+    canonical = tmp_path / "src" / "bmad_loop" / "data" / "skills" / "demo-skill"
     canonical.mkdir(parents=True)
     (canonical / "SKILL.md").write_text("body\n")
     monkeypatch.setattr(seed_skills, "ROOT", tmp_path)

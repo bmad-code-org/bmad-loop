@@ -4,8 +4,8 @@ import json
 
 from conftest import install_bmad_config, write_ledger
 
-from automator import decisions, deferredwork
-from automator.sweep import DecisionOption
+from bmad_loop import decisions, deferredwork
+from bmad_loop.sweep import DecisionOption
 
 
 def _decision(dw_id, *, question="q", options=None, recommendation="1"):
@@ -36,7 +36,7 @@ def _triage(open_ids, decisions_):
 
 
 def _make_run(project, run_id, triage_rj, cycle=1):
-    run_dir = project.project / ".automator" / "runs" / run_id
+    run_dir = project.project / ".bmad-loop" / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "state.json").write_text("{}", encoding="utf-8")  # so list_run_dirs sees it
     name = "triage.json" if cycle == 1 else f"triage-{cycle}.json"
@@ -117,7 +117,7 @@ def test_pending_missed_decisions_empty_when_nothing_open(project):
 def test_apply_pre_answer_build_records_store_and_ledger(project):
     install_bmad_config(project)
     write_ledger(project, {"DW-1": "open"})
-    from automator.sweep import Decision
+    from bmad_loop.sweep import Decision
 
     opt = DecisionOption(key="1", label="Build", effect="build", intent="widen field")
     d = Decision(id="DW-1", question="build it?", context="", options=(opt,), recommendation="1")
@@ -136,7 +136,7 @@ def test_apply_pre_answer_build_records_store_and_ledger(project):
 def test_apply_pre_answer_close_marks_done_no_store(project):
     install_bmad_config(project)
     write_ledger(project, {"DW-1": "open"})
-    from automator.sweep import Decision
+    from bmad_loop.sweep import Decision
 
     opt = DecisionOption(key="1", label="Close", effect="close", resolution="superseded")
     d = Decision(id="DW-1", question="close?", context="", options=(opt,), recommendation="1")
@@ -155,7 +155,7 @@ def test_apply_pre_answer_commit_leaves_unrelated_changes(project):
     install_bmad_config(project)
     write_ledger(project, {"DW-1": "open"})
     (project.project / "src.txt").write_text("user edit, uncommitted\n")  # unrelated work
-    from automator.sweep import Decision
+    from bmad_loop.sweep import Decision
 
     opt = DecisionOption(key="1", label="Close", effect="close", resolution="x")
     d = Decision(id="DW-1", question="?", context="", options=(opt,), recommendation="1")

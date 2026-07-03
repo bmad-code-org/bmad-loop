@@ -2,9 +2,9 @@ import json
 
 from conftest import git
 
-from automator import verify
-from automator.adapters.profile import get_profile
-from automator.install import (
+from bmad_loop import verify
+from bmad_loop.adapters.profile import get_profile
+from bmad_loop.install import (
     BASE_SKILLS,
     MODULE_SKILLS,
     install_into,
@@ -24,7 +24,7 @@ def _install_base_skills(root, tree=".claude/skills"):
             (d / marker).write_text("x\n", encoding="utf-8")
 
 
-def _registrations(profile, command="python3 /x/.automator/bmad_auto_hook.py {event}"):
+def _registrations(profile, command="python3 /x/.bmad-loop/bmad_loop_hook.py {event}"):
     return {
         native: command.format(event=canonical)
         for native, canonical in profile.hooks.events.items()
@@ -60,7 +60,7 @@ def test_merge_hooks_preserves_existing():
         handler["command"] for matcher in settings["hooks"]["Stop"] for handler in matcher["hooks"]
     ]
     assert "echo hi" in commands
-    assert any("bmad_auto_hook" in c for c in commands)
+    assert any("bmad_loop_hook" in c for c in commands)
 
 
 def test_merge_hooks_gemini_entry_shape():
@@ -71,7 +71,7 @@ def test_merge_hooks_gemini_entry_shape():
     handler = entry["hooks"][0]
     assert handler["timeout"] == 60_000  # Gemini hook timeouts are milliseconds
     # registered under the native event but relaying the canonical name
-    assert handler["command"].endswith("bmad_auto_hook.py Stop")
+    assert handler["command"].endswith("bmad_loop_hook.py Stop")
 
 
 def test_merge_hooks_copilot_entry_shape():
@@ -83,7 +83,7 @@ def test_merge_hooks_copilot_entry_shape():
     assert handler["type"] == "command"
     assert handler["timeoutSec"] == 60  # Copilot hook timeouts are seconds
     # registered under the native event (agentStop) but relaying the canonical name
-    assert handler["command"].endswith("bmad_auto_hook.py Stop")
+    assert handler["command"].endswith("bmad_loop_hook.py Stop")
 
 
 def test_merge_hooks_copilot_idempotent():
@@ -126,35 +126,35 @@ def test_install_into_copilot(tmp_path):
 
 def test_install_into_full(tmp_path):
     assert install_into(tmp_path) == 0
-    assert (tmp_path / ".automator" / "bmad_auto_hook.py").is_file()
-    assert (tmp_path / ".automator" / "policy.toml").is_file()
+    assert (tmp_path / ".bmad-loop" / "bmad_loop_hook.py").is_file()
+    assert (tmp_path / ".bmad-loop" / "policy.toml").is_file()
     settings = json.loads((tmp_path / ".claude" / "settings.json").read_text())
     assert "Stop" in settings["hooks"]
     gitignore = (tmp_path / ".gitignore").read_text()
-    assert ".automator/runs/" in gitignore
-    assert ".automator/cache/" in gitignore  # engine plugins' rebuildable caches
+    assert ".bmad-loop/runs/" in gitignore
+    assert ".bmad-loop/cache/" in gitignore  # engine plugins' rebuildable caches
 
     # all bundled skills land in claude's tree, with nested files intact
     skills_dir = tmp_path / ".claude" / "skills"
     for skill in MODULE_SKILLS:
         assert (skills_dir / skill / "SKILL.md").is_file()
-    assert (skills_dir / "bmad-auto-sweep" / "deferred-work-format.md").is_file()
+    assert (skills_dir / "bmad-loop-sweep" / "deferred-work-format.md").is_file()
 
     # second run: idempotent, does not duplicate
     assert install_into(tmp_path) == 0
     settings = json.loads((tmp_path / ".claude" / "settings.json").read_text())
     assert len(settings["hooks"]["Stop"]) == 1
     final_gitignore = (tmp_path / ".gitignore").read_text()
-    assert final_gitignore.count(".automator/runs/") == 1
-    assert final_gitignore.count(".automator/cache/") == 1
+    assert final_gitignore.count(".bmad-loop/runs/") == 1
+    assert final_gitignore.count(".bmad-loop/cache/") == 1
 
 
 def test_hook_command_uses_selected_process_host(tmp_path, monkeypatch):
     # The hook interpreter is platform-selected: forcing the Windows host swaps the
     # registered command's prefix without `install` branching on sys.platform.
-    from automator.process_host import get_process_host
+    from bmad_loop.process_host import get_process_host
 
-    monkeypatch.setenv("BMAD_AUTO_PROCESS_HOST", "windows")
+    monkeypatch.setenv("BMAD_LOOP_PROCESS_HOST", "windows")
     get_process_host.cache_clear()
     try:
         assert install_into(tmp_path) == 0
@@ -162,7 +162,7 @@ def test_hook_command_uses_selected_process_host(tmp_path, monkeypatch):
         cmd = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
         assert cmd.startswith("uv run --no-project python ")
     finally:
-        monkeypatch.delenv("BMAD_AUTO_PROCESS_HOST", raising=False)
+        monkeypatch.delenv("BMAD_LOOP_PROCESS_HOST", raising=False)
         get_process_host.cache_clear()
 
 
@@ -193,18 +193,18 @@ def test_install_skills_dedupes_agents_tree(tmp_path):
 
 
 def test_install_skills_skip_existing(tmp_path):
-    skill_md = tmp_path / ".claude" / "skills" / "bmad-auto-sweep" / "SKILL.md"
+    skill_md = tmp_path / ".claude" / "skills" / "bmad-loop-sweep" / "SKILL.md"
     skill_md.parent.mkdir(parents=True)
     skill_md.write_text("CUSTOM", encoding="utf-8")
     # default run must not clobber an existing skill dir
     assert install_into(tmp_path) == 0
     assert skill_md.read_text() == "CUSTOM"
     # but a skill that was absent still gets installed
-    assert (tmp_path / ".claude" / "skills" / "bmad-auto-resolve" / "SKILL.md").is_file()
+    assert (tmp_path / ".claude" / "skills" / "bmad-loop-resolve" / "SKILL.md").is_file()
 
 
 def test_install_skills_force(tmp_path):
-    skill_md = tmp_path / ".claude" / "skills" / "bmad-auto-resolve" / "SKILL.md"
+    skill_md = tmp_path / ".claude" / "skills" / "bmad-loop-resolve" / "SKILL.md"
     skill_md.parent.mkdir(parents=True)
     skill_md.write_text("CUSTOM", encoding="utf-8")
     assert install_into(tmp_path, force_skills=True) == 0
@@ -220,7 +220,7 @@ def test_install_no_skills(tmp_path):
 
 def test_install_unknown_cli(tmp_path):
     assert install_into(tmp_path, clis=("acme-cli",)) == 1
-    assert not (tmp_path / ".automator").exists()
+    assert not (tmp_path / ".bmad-loop").exists()
 
 
 def test_install_resolves_legacy_alias(tmp_path):
@@ -229,7 +229,7 @@ def test_install_resolves_legacy_alias(tmp_path):
 
 
 def test_provision_worktree_lays_down_skills_and_hook(tmp_path):
-    """A worktree must receive the bmad-auto-* skills + signal hook even though
+    """A worktree must receive the bmad-loop-* skills + signal hook even though
     those dirs are gitignored (absent from a fresh checkout), or the bundled
     skills are missing and the Stop hook never fires."""
     wt, repo = tmp_path / "wt", tmp_path / "repo"
@@ -240,12 +240,12 @@ def test_provision_worktree_lays_down_skills_and_hook(tmp_path):
     for skill in MODULE_SKILLS:
         assert (wt / claude.skill_tree / skill / "SKILL.md").is_file()
     # hook registered, baked to the MAIN repo's relay (absolute) — nothing written
-    # into the worktree's .automator/ (which a project may not gitignore)
+    # into the worktree's .bmad-loop/ (which a project may not gitignore)
     settings = json.loads((wt / claude.hooks.config_path).read_text())
     assert set(claude.hooks.events) <= set(settings["hooks"])
     cmd = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
-    assert str((repo / ".automator" / "bmad_auto_hook.py")) in cmd
-    assert not (wt / ".automator").exists()
+    assert str((repo / ".bmad-loop" / "bmad_loop_hook.py")) in cmd
+    assert not (wt / ".bmad-loop").exists()
 
 
 def test_provision_worktree_covers_multiple_profiles(tmp_path):
@@ -255,8 +255,8 @@ def test_provision_worktree_covers_multiple_profiles(tmp_path):
     claude, codex = get_profile("claude"), get_profile("codex")
     provision_worktree(wt, [claude, codex], repo)
 
-    assert (wt / claude.skill_tree / "bmad-auto-sweep" / "SKILL.md").is_file()
-    assert (wt / codex.skill_tree / "bmad-auto-sweep" / "SKILL.md").is_file()
+    assert (wt / claude.skill_tree / "bmad-loop-sweep" / "SKILL.md").is_file()
+    assert (wt / codex.skill_tree / "bmad-loop-sweep" / "SKILL.md").is_file()
     assert (wt / claude.hooks.config_path).is_file()
     assert (wt / codex.hooks.config_path).is_file()
 
@@ -266,14 +266,14 @@ def test_provision_worktree_does_not_clobber_existing_skill(tmp_path):
     is left untouched, so no diff is merged back."""
     wt, repo = tmp_path / "wt", tmp_path / "repo"
     claude = get_profile("claude")
-    existing = wt / claude.skill_tree / "bmad-auto-sweep" / "SKILL.md"
+    existing = wt / claude.skill_tree / "bmad-loop-sweep" / "SKILL.md"
     existing.parent.mkdir(parents=True)
     existing.write_text("COMMITTED", encoding="utf-8")
 
     provision_worktree(wt, [claude], repo)
     assert existing.read_text() == "COMMITTED"
     # a skill that was absent is still laid down
-    assert (wt / claude.skill_tree / "bmad-auto-resolve" / "SKILL.md").is_file()
+    assert (wt / claude.skill_tree / "bmad-loop-resolve" / "SKILL.md").is_file()
 
 
 def test_provision_worktree_empty_profiles_is_noop(tmp_path):

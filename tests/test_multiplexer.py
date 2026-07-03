@@ -13,13 +13,13 @@ import subprocess
 
 import pytest
 
-from automator.adapters import tmux_base
-from automator.adapters.base import SessionSpec
-from automator.adapters.generic import GenericAdapter
-from automator.adapters.multiplexer import MultiplexerError, TerminalMultiplexer
-from automator.adapters.profile import get_profile
-from automator.adapters.tmux_backend import TmuxMultiplexer
-from automator.policy import LimitsPolicy, Policy
+from bmad_loop.adapters import tmux_base
+from bmad_loop.adapters.base import SessionSpec
+from bmad_loop.adapters.generic import GenericAdapter
+from bmad_loop.adapters.multiplexer import MultiplexerError, TerminalMultiplexer
+from bmad_loop.adapters.profile import get_profile
+from bmad_loop.adapters.tmux_backend import TmuxMultiplexer
+from bmad_loop.policy import LimitsPolicy, Policy
 
 
 class StubMux(TerminalMultiplexer):
@@ -141,7 +141,7 @@ def _spec(tmp_path):
         role="dev",
         prompt="/bmad-dev-auto 1-1",
         cwd=tmp_path,
-        env={"BMAD_AUTO_RUN_DIR": str(tmp_path / "run"), "BMAD_AUTO_TASK_ID": task_id},
+        env={"BMAD_LOOP_RUN_DIR": str(tmp_path / "run"), "BMAD_LOOP_TASK_ID": task_id},
         timeout_s=10.0,
     )
 

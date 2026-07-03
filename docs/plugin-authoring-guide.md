@@ -1,6 +1,6 @@
-# Writing a bmad-auto plugin
+# Writing a bmad-loop plugin
 
-A **plugin** extends the bmad-auto orchestrator **without touching its core loop**.
+A **plugin** extends the bmad-loop orchestrator **without touching its core loop**.
 It can be as simple as a settings-only data file or as complex as the bundled
 Unity game-engine layer. A plugin can:
 
@@ -9,7 +9,7 @@ Unity game-engine layer. A plugin can:
 - inject its own **workflow** sessions at defined points in the dev/review cycle.
 
 Plugins are **folder-drop**: a directory with a `plugin.toml` manifest (plus any
-helper scripts) dropped under `.automator/plugins/<name>/`. No registration, no
+helper scripts) dropped under `.bmad-loop/plugins/<name>/`. No registration, no
 install step. A plugin that ships **in-process Python** is loaded only when you
 **trust** it by name — dropping a folder in never runs code.
 
@@ -22,7 +22,7 @@ install step. A plugin that ships **in-process Python** is loaded only when you
 ## Quick start: the smallest plugin
 
 A data-only plugin carries one setting and zero behavior. Create
-`.automator/plugins/hello/plugin.toml`:
+`.bmad-loop/plugins/hello/plugin.toml`:
 
 ```toml
 [plugin]
@@ -43,12 +43,12 @@ help = "Shown in the settings UI once this plugin is enabled."
 That's a complete, loadable plugin. It has no `[hooks]` and no `[python]`, so it
 runs no code and is byte-identical to "no plugin" at run time — it exists only to
 contribute a setting. This is the shape the bundled
-[`example`](../src/automator/data/plugins/example/plugin.toml) plugin ships in.
+[`example`](../src/bmad_loop/data/plugins/example/plugin.toml) plugin ships in.
 
 A setting-only section appears in the TUI only once the plugin is **enabled**:
 
 ```toml
-# .automator/policy.toml
+# .bmad-loop/policy.toml
 [plugins]
 enabled = ["hello"]
 ```
@@ -62,9 +62,9 @@ same-name plugin **overrides** an earlier one; a new name **extends** the set):
 
 | Source        | Path                                              | Precedence             |
 | ------------- | ------------------------------------------------- | ---------------------- |
-| Builtin       | `automator/data/plugins/<name>/plugin.toml`       | base                   |
-| Entry point   | `bmad_auto.plugins` group                         | _reserved (see below)_ |
-| Project-local | `<project>/.automator/plugins/<name>/plugin.toml` | **highest**            |
+| Builtin       | `bmad_loop/data/plugins/<name>/plugin.toml`       | base                   |
+| Entry point   | `bmad_loop.plugins` group                         | _reserved (see below)_ |
+| Project-local | `<project>/.bmad-loop/plugins/<name>/plugin.toml` | **highest**            |
 
 Each plugin lives in its **own directory** — that directory is the plugin's
 `{scripts}` root (see [`{scripts}` substitution](#scripts-substitution)), so its
@@ -75,7 +75,7 @@ manifest and helper scripts sit together.
 returns nothing today — folder-drop is the only live distribution path. When
 pip-installable plugins land, they slot in here with **no change to authors or to
 discovery order** (`importlib.metadata` selectable entry points, group
-`bmad_auto.plugins`). See `src/automator/plugins/loader.py`.
+`bmad_loop.plugins`). See `src/bmad_loop/plugins/loader.py`.
 
 ---
 
@@ -84,7 +84,7 @@ discovery order** (`importlib.metadata` selectable entry points, group
 Every plugin is one `plugin.toml`. Only `[plugin] name` + `api_version` are
 required; every section below is optional, so a plugin opts into exactly what it
 needs. The manifest parses into the immutable `PluginManifest`
-(`src/automator/plugins/model.py`).
+(`src/bmad_loop/plugins/model.py`).
 
 ### `[plugin]` — metadata
 
@@ -140,7 +140,7 @@ fail_closed = false        # default: a hook *error* (timeout/launch) fails open
 ```toml
 [python]
 module = "hooks.py"        # plugin-relative file
-class = "MyPlugin"         # subclass of automator.plugins.Plugin (default "Plugin")
+class = "MyPlugin"         # subclass of bmad_loop.plugins.Plugin (default "Plugin")
 ```
 
 Declaring `[python]` makes the **whole plugin trust-gated**: the module is never
@@ -227,7 +227,7 @@ matches the core settings fields exactly:
 
 **Rendering.** Once a plugin is enabled, its settings appear as their own section
 in the settings TUI (generated from the schema — see
-`src/automator/settings_schema.py`). They persist to a `[plugins.<name>]` table in
+`src/bmad_loop/settings_schema.py`). They persist to a `[plugins.<name>]` table in
 `policy.toml`:
 
 ```toml
@@ -244,7 +244,7 @@ mode = "b"
 - In an **in-process** plugin: `self.settings["strict"]` — the manifest defaults
   overlaid by the operator's `[plugins.<name>]` table.
 - In a **declarative** hook: each setting is exported as an environment variable
-  `BMAD_AUTO_SETTING_<KEY>` (uppercased), already resolved.
+  `BMAD_LOOP_SETTING_<KEY>` (uppercased), already resolved.
 - Anywhere with a `Policy`: `policy.plugin_setting("my-plugin", "strict", default)`.
 
 Settings are **data**, not code — a plugin can carry `[plugins.<name>]` settings
@@ -256,7 +256,7 @@ section). Only the in-process `[python]` module is trust-gated.
 ## Hooks
 
 A hook binds a [stage](#stage-reference) to behavior. The **hook bus**
-(`src/automator/plugins/bus.py`) fans each stage out to every bound plugin, in
+(`src/bmad_loop/plugins/bus.py`) fans each stage out to every bound plugin, in
 registry order (`priority`, then load order). A run with no plugin bound to a
 stage does no work for it (an O(1) fast-path) — zero-plugin runs stay
 byte-identical.
@@ -266,17 +266,17 @@ byte-identical.
 A `[hooks.<stage>]` shell command. The bus runs it with:
 
 - **cwd** = the unit's worktree (or repo root);
-- a `BMAD_AUTO_*` environment describing the run:
+- a `BMAD_LOOP_*` environment describing the run:
 
   | Var                                                                               | Meaning                                       |
   | --------------------------------------------------------------------------------- | --------------------------------------------- |
-  | `BMAD_AUTO_STAGE`                                                                 | the stage firing                              |
-  | `BMAD_AUTO_RUN_ID` / `BMAD_AUTO_RUN_DIR`                                          | run identity                                  |
-  | `BMAD_AUTO_REPO_ROOT` / `BMAD_AUTO_WORKTREE`                                      | git roots                                     |
-  | `BMAD_AUTO_STORY_KEY` / `BMAD_AUTO_ROLE` / `BMAD_AUTO_PHASE` / `BMAD_AUTO_BRANCH` | unit context                                  |
-  | `BMAD_AUTO_AGENTS`                                                                | comma-separated CLI agent ids in the worktree |
-  | `BMAD_AUTO_PLUGIN`                                                                | your plugin's name                            |
-  | `BMAD_AUTO_SETTING_<KEY>`                                                         | each resolved setting                         |
+  | `BMAD_LOOP_STAGE`                                                                 | the stage firing                              |
+  | `BMAD_LOOP_RUN_ID` / `BMAD_LOOP_RUN_DIR`                                          | run identity                                  |
+  | `BMAD_LOOP_REPO_ROOT` / `BMAD_LOOP_WORKTREE`                                      | git roots                                     |
+  | `BMAD_LOOP_STORY_KEY` / `BMAD_LOOP_ROLE` / `BMAD_LOOP_PHASE` / `BMAD_LOOP_BRANCH` | unit context                                  |
+  | `BMAD_LOOP_AGENTS`                                                                | comma-separated CLI agent ids in the worktree |
+  | `BMAD_LOOP_PLUGIN`                                                                | your plugin's name                            |
+  | `BMAD_LOOP_SETTING_<KEY>`                                                         | each resolved setting                         |
 
 A **blocking** hook's non-zero exit **vetoes** (defers) the unit. A non-blocking
 hook is advisory (logged `plugin-hook`).
@@ -301,12 +301,12 @@ Any non-JSON output is treated as advisory log text.
 
 ### In-process hooks
 
-Subclass `automator.plugins.Plugin` and define `on_<stage>(self, ctx)` methods.
+Subclass `bmad_loop.plugins.Plugin` and define `on_<stage>(self, ctx)` methods.
 The bus calls the handler for each stage you implement; you only mark the stages
 you handle, so the fast path holds for the rest.
 
 ```python
-from automator.plugins import Plugin
+from bmad_loop.plugins import Plugin
 
 class MyPlugin(Plugin):
     fail_closed = False   # a raised handler is isolated; True also defers the unit
@@ -326,7 +326,7 @@ core policy field. This runs once before any stage; a raise fails the run fast
 
 ### The `HookContext`
 
-Every hook receives one `HookContext` (`src/automator/plugins/context.py`) for the
+Every hook receives one `HookContext` (`src/bmad_loop/plugins/context.py`) for the
 stage. It carries:
 
 - **Read-only facts** (properties, no setter): `run_id`, `story_key`, `epic`,
@@ -546,7 +546,7 @@ workflow — in ~40 lines of Python plus a manifest. Build it yourself:
 **1. Make the folder.** In your project:
 
 ```text
-.automator/plugins/guardrails/
+.bmad-loop/plugins/guardrails/
   plugin.toml
   guardrails.py
 ```
@@ -558,7 +558,7 @@ workflow — in ~40 lines of Python plus a manifest. Build it yourself:
 **3. Write the module** (`guardrails.py`):
 
 ```python
-from automator.plugins import Plugin
+from bmad_loop.plugins import Plugin
 
 class GuardrailsPlugin(Plugin):
     fail_closed = False
@@ -581,18 +581,18 @@ class GuardrailsPlugin(Plugin):
             ctx.proposed_commit_message = f"{base}\n\n{trailer}" if base else trailer
 ```
 
-**4. Enable + configure** in `.automator/policy.toml`:
+**4. Enable + configure** in `.bmad-loop/policy.toml`:
 
 ```toml
 [plugins]
 enabled = ["guardrails"]
 
 [plugins.guardrails]
-trailer = "Automated-by: bmad-auto"
+trailer = "Automated-by: bmad-loop"
 forbid_epic = 0           # set to an epic number to park it
 ```
 
-**5. Run.** On the next `bmad-auto run`:
+**5. Run.** On the next `bmad-loop run`:
 
 - the settings TUI shows a **guardrails** section with `trailer` + `forbid_epic`;
 - each story increments `stories_seen` in the run's `plugin_shared`;
@@ -607,11 +607,11 @@ goes completely inert — proof of the trust gate.
 
 ## Platform portability
 
-bmad-auto's core is portable Python, and the OS-specific work is quarantined behind
+bmad-loop's core is portable Python, and the OS-specific work is quarantined behind
 seams (the tmux transport, the `ProcessHost` lifecycle, the hook interpreter — see
-[Porting bmad-auto to a new OS](porting-to-a-new-os.md)). Plugin **helper scripts**
+[Porting bmad-loop to a new OS](porting-to-a-new-os.md)). Plugin **helper scripts**
 are spawned under the orchestrator's own interpreter (`sys.executable`), **not** a
-PATH-resolved `python3` — so a bundled script may `import automator` and reach those
+PATH-resolved `python3` — so a bundled script may `import bmad_loop` and reach those
 seams instead of re-implementing OS primitives. Follow this discipline:
 
 - **Use the `ProcessHost` seam for pid lifecycle.** For terminate / force-kill /
@@ -619,7 +619,7 @@ seams instead of re-implementing OS primitives. Follow this discipline:
   `signal.SIGKILL` / `taskkill` behind your own `sys.platform` branch:
 
   ```python
-  from automator.process_host import get_process_host
+  from bmad_loop.process_host import get_process_host
 
   host = get_process_host()
   host.terminate(pid)
@@ -630,7 +630,7 @@ seams instead of re-implementing OS primitives. Follow this discipline:
   The seam already carries the POSIX and Windows behavior, so the script gains a
   new OS for free when a host registers.
 
-- **Stay dependency-free.** Beyond `automator` itself, import only the stdlib so the
+- **Stay dependency-free.** Beyond `bmad_loop` itself, import only the stdlib so the
   script runs anywhere the core does. If you genuinely need a third-party package on
   one platform, make it an **optional extra** in `pyproject.toml` and **import it
   lazily** with a clear error if missing — never at module top level. The bundled
@@ -655,14 +655,14 @@ scan. See it alongside `unity_setup.py` / `unity_cleanup.py` (and the
 
 ## Reference
 
-- Model + base class: `src/automator/plugins/model.py`
-- Manifest parser: `src/automator/plugins/manifest.py`
-- Discovery + overlay + api-check: `src/automator/plugins/loader.py`
-- Trust gate: `src/automator/plugins/trust.py`
-- Registry (the inter-pillar contract): `src/automator/plugins/registry.py`
-- Hook bus + dispatch: `src/automator/plugins/bus.py`
-- Hook context + veto: `src/automator/plugins/context.py`
-- Settings schema: `src/automator/settings_schema.py`
+- Model + base class: `src/bmad_loop/plugins/model.py`
+- Manifest parser: `src/bmad_loop/plugins/manifest.py`
+- Discovery + overlay + api-check: `src/bmad_loop/plugins/loader.py`
+- Trust gate: `src/bmad_loop/plugins/trust.py`
+- Registry (the inter-pillar contract): `src/bmad_loop/plugins/registry.py`
+- Hook bus + dispatch: `src/bmad_loop/plugins/bus.py`
+- Hook context + veto: `src/bmad_loop/plugins/context.py`
+- Settings schema: `src/bmad_loop/settings_schema.py`
 - The bundled Unity engine plugin (a real, complex example):
-  `src/automator/data/plugins/unity/`
+  `src/bmad_loop/data/plugins/unity/`
 - Game-engine specifics: [Game Engine plugin guide](game-engine-plugin-guide.md)

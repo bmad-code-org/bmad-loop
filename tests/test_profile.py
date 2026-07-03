@@ -1,6 +1,6 @@
 import pytest
 
-from automator.adapters.profile import (
+from bmad_loop.adapters.profile import (
     ProfileError,
     get_profile,
     load_profiles,
@@ -66,7 +66,7 @@ def test_builtin_profiles_load():
 
 def test_usage_grace_and_nudges_default_when_unset(tmp_path):
     # MINIMAL_PROFILE omits both -> 0.0 / None
-    profiles_dir = tmp_path / ".automator" / "profiles"
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
     profiles_dir.mkdir(parents=True)
     (profiles_dir / "mycli.toml").write_text(MINIMAL_PROFILE)
     prof = load_profiles(tmp_path)["mycli"]
@@ -77,7 +77,7 @@ def test_usage_grace_and_nudges_default_when_unset(tmp_path):
 
 def test_seed_files_default_empty_when_unset(tmp_path):
     # MINIMAL_PROFILE omits seed_files -> defaults to ()
-    profiles_dir = tmp_path / ".automator" / "profiles"
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
     profiles_dir.mkdir(parents=True)
     (profiles_dir / "mycli.toml").write_text(MINIMAL_PROFILE)
     assert load_profiles(tmp_path)["mycli"].seed_files == ()
@@ -109,7 +109,7 @@ def test_render_prompt_passthrough_and_template():
 
 
 def test_user_profile_overlay(tmp_path):
-    profiles_dir = tmp_path / ".automator" / "profiles"
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
     profiles_dir.mkdir(parents=True)
     (profiles_dir / "mycli.toml").write_text(MINIMAL_PROFILE)
     # override a built-in by reusing its name
@@ -168,7 +168,7 @@ def test_user_profile_overlay(tmp_path):
     ],
 )
 def test_invalid_profiles_rejected(tmp_path, mutation, match):
-    profiles_dir = tmp_path / ".automator" / "profiles"
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
     profiles_dir.mkdir(parents=True)
     (profiles_dir / "bad.toml").write_text(mutation)
     with pytest.raises(ProfileError, match=match):

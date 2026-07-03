@@ -4,9 +4,9 @@ from pathlib import Path
 import pytest
 from conftest import git, spec_path, write_spec, write_sprint
 
-from automator import verify
-from automator.model import StoryTask
-from automator.policy import Policy, VerifyPolicy
+from bmad_loop import verify
+from bmad_loop.model import StoryTask
+from bmad_loop.policy import Policy, VerifyPolicy
 
 
 def make_task(paths, story_key="1-1-a"):
@@ -357,14 +357,14 @@ def test_safe_rollback_reverts_tracked_and_removes_run_created(project):
     snap = sorted(verify.untracked_files(repo))  # snapshot before the attempt
     (repo / "src.txt").write_text("dirty\n")  # tracked edit
     (repo / "junk.txt").write_text("run-created\n")  # untracked, created now
-    keep = repo / ".automator" / "runs" / "r1"
+    keep = repo / ".bmad-loop" / "runs" / "r1"
     keep.mkdir(parents=True)
     (keep / "state.json").write_text("{}")
 
-    verify.safe_rollback(repo, baseline, baseline_untracked=snap, keep=(".automator",))
+    verify.safe_rollback(repo, baseline, baseline_untracked=snap, keep=(".bmad-loop",))
     assert (repo / "src.txt").read_text() == "original\n"  # tracked reverted
     assert not (repo / "junk.txt").exists()  # run-created removed
-    assert (keep / "state.json").exists()  # .automator preserved
+    assert (keep / "state.json").exists()  # .bmad-loop preserved
 
 
 def test_safe_rollback_preserves_preexisting_untracked(project):
@@ -377,7 +377,7 @@ def test_safe_rollback_preserves_preexisting_untracked(project):
     snap = sorted(verify.untracked_files(repo))  # includes the two files above
     (repo / "junk.txt").write_text("run-created\n")
 
-    verify.safe_rollback(repo, baseline, baseline_untracked=snap, keep=(".automator",))
+    verify.safe_rollback(repo, baseline, baseline_untracked=snap, keep=(".bmad-loop",))
     assert (repo / "_bmad-output" / "project-context.md").read_text() == "keep me\n"
     assert (repo / ".design-build" / "x").read_text() == "keep me too\n"
     assert not (repo / "junk.txt").exists()  # only run-created file removed
@@ -392,7 +392,7 @@ def test_safe_rollback_keep_dir_protects_run_created(project):
     (out / "fresh-artifact.md").write_text("generated this run\n")  # run-created
 
     verify.safe_rollback(
-        repo, baseline, baseline_untracked=snap, keep=(".automator", "_bmad-output")
+        repo, baseline, baseline_untracked=snap, keep=(".bmad-loop", "_bmad-output")
     )
     assert (out / "fresh-artifact.md").exists()  # protected by keep even though new
 
@@ -403,7 +403,7 @@ def test_safe_rollback_none_snapshot_removes_nothing(project):
     (repo / "src.txt").write_text("dirty\n")
     (repo / "junk.txt").write_text("untracked\n")
 
-    verify.safe_rollback(repo, baseline, baseline_untracked=None, keep=(".automator",))
+    verify.safe_rollback(repo, baseline, baseline_untracked=None, keep=(".bmad-loop",))
     assert (repo / "src.txt").read_text() == "original\n"  # tracked still reverted
     assert (repo / "junk.txt").exists()  # no snapshot => never delete untracked
 
@@ -416,7 +416,7 @@ def test_safe_rollback_prunes_emptied_dirs(project):
     nested.mkdir(parents=True)
     (nested / "f.txt").write_text("x\n")
 
-    verify.safe_rollback(repo, baseline, baseline_untracked=snap, keep=(".automator",))
+    verify.safe_rollback(repo, baseline, baseline_untracked=snap, keep=(".bmad-loop",))
     assert not (repo / "tmpdir").exists()  # emptied parent dirs pruned
 
 
@@ -440,7 +440,7 @@ def test_safe_rollback_preserves_tracked_artifact(project):
         repo,
         baseline,
         baseline_untracked=snap,
-        keep=(".automator", artifact_rel),
+        keep=(".bmad-loop", artifact_rel),
         preserve=(artifact_rel,),
     )
     assert (repo / "src.txt").read_text() == "original\n"  # source reverted
@@ -474,7 +474,7 @@ def test_safe_rollback_raises_on_genuine_restore_failure(project, monkeypatch):
             repo,
             baseline,
             baseline_untracked=snap,
-            keep=(".automator", artifact_rel),
+            keep=(".bmad-loop", artifact_rel),
             preserve=(artifact_rel,),
         )
 
@@ -491,20 +491,20 @@ def test_safe_rollback_tolerates_empty_preserve_dir(project):
         repo,
         baseline,
         baseline_untracked=snap,
-        keep=(".automator", "_bmad-output"),
+        keep=(".bmad-loop", "_bmad-output"),
         preserve=("_bmad-output",),  # no tracked files here at snapshot time
     )
     assert (repo / "src.txt").read_text() == "original\n"  # source still reverted
 
 
 def test_safe_rollback_preserves_uncommitted_policy_edit(project):
-    """A hand-edited, tracked but *uncommitted* .automator/policy.toml (e.g. a
+    """A hand-edited, tracked but *uncommitted* .bmad-loop/policy.toml (e.g. a
     freshly enabled scm.rollback_on_failure) must survive the hard reset — it is
     operator config, not the dev attempt's work. Regression: a `git reset --hard`
     used to silently revert it, so the very setting that gates auto-rollback was
     gone before it could fire."""
     repo = project.project
-    pol = repo / ".automator" / "policy.toml"
+    pol = repo / ".bmad-loop" / "policy.toml"
     pol.parent.mkdir(parents=True, exist_ok=True)
     pol.write_text("[scm]\nrollback_on_failure = false\n")
     git(repo, "add", "-f", str(pol))
@@ -515,7 +515,7 @@ def test_safe_rollback_preserves_uncommitted_policy_edit(project):
     pol.write_text("[scm]\nrollback_on_failure = true\n")  # operator enables it, uncommitted
     (repo / "src.txt").write_text("dev attempt\n")  # a real dev-attempt change
 
-    verify.safe_rollback(repo, baseline, baseline_untracked=snap, keep=(".automator",))
+    verify.safe_rollback(repo, baseline, baseline_untracked=snap, keep=(".bmad-loop",))
     assert (repo / "src.txt").read_text() == "original\n"  # attempt reverted
     assert pol.read_text() == "[scm]\nrollback_on_failure = true\n"  # edit preserved
 
@@ -527,7 +527,7 @@ def test_safe_rollback_restores_policy_deleted_by_reset(project):
     clean-tree, empty-snapshot path is covered by the test below)."""
     repo = project.project
     baseline = verify.rev_parse_head(repo)  # baseline predates policy.toml
-    pol = repo / ".automator" / "policy.toml"
+    pol = repo / ".bmad-loop" / "policy.toml"
     pol.parent.mkdir(parents=True, exist_ok=True)
     pol.write_text("[scm]\nrollback_on_failure = true\n")
     git(repo, "add", "-f", str(pol))
@@ -535,7 +535,7 @@ def test_safe_rollback_restores_policy_deleted_by_reset(project):
     snap = sorted(verify.untracked_files(repo))
     (repo / "src.txt").write_text("dev attempt\n")
 
-    verify.safe_rollback(repo, baseline, baseline_untracked=snap, keep=(".automator",))
+    verify.safe_rollback(repo, baseline, baseline_untracked=snap, keep=(".bmad-loop",))
     assert (repo / "src.txt").read_text() == "original\n"
     assert pol.read_text() == "[scm]\nrollback_on_failure = true\n"  # survived the reset
 
@@ -546,7 +546,7 @@ def test_safe_rollback_restores_committed_policy_on_clean_tree(project):
     `git reset --hard` reverted the operator's config. It must still survive."""
     repo = project.project
     baseline = verify.rev_parse_head(repo)  # baseline predates policy.toml
-    pol = repo / ".automator" / "policy.toml"
+    pol = repo / ".bmad-loop" / "policy.toml"
     pol.parent.mkdir(parents=True, exist_ok=True)
     pol.write_text("[scm]\nrollback_on_failure = true\n")
     git(repo, "add", "-f", str(pol))
@@ -554,7 +554,7 @@ def test_safe_rollback_restores_committed_policy_on_clean_tree(project):
     snap = sorted(verify.untracked_files(repo))
     # NOTE: no other working-tree change — tree is clean -> empty stash snapshot
 
-    verify.safe_rollback(repo, baseline, baseline_untracked=snap, keep=(".automator",))
+    verify.safe_rollback(repo, baseline, baseline_untracked=snap, keep=(".bmad-loop",))
     assert pol.read_text() == "[scm]\nrollback_on_failure = true\n"  # survived
 
 
@@ -563,7 +563,7 @@ def test_attempt_dirty_ignores_lone_policy_edit(project):
     dirtiness — so a stopped attempt whose only residue is a policy edit reads as
     clean and the manual-recovery loop can terminate."""
     repo = project.project
-    pol = repo / ".automator" / "policy.toml"
+    pol = repo / ".bmad-loop" / "policy.toml"
     pol.parent.mkdir(parents=True, exist_ok=True)
     pol.write_text("[scm]\nrollback_on_failure = false\n")
     git(repo, "add", "-f", str(pol))
@@ -577,10 +577,10 @@ def test_attempt_dirty_ignores_lone_policy_edit(project):
 
 
 def test_worktree_clean_ignores_policy_file(project):
-    # A tracked-but-modified .automator/policy.toml (rewritten by the TUI
+    # A tracked-but-modified .bmad-loop/policy.toml (rewritten by the TUI
     # settings editor) must not count as a dirty tree, or every settings edit
     # would force a commit before run/sweep/validate.
-    pol = project.project / ".automator" / "policy.toml"
+    pol = project.project / ".bmad-loop" / "policy.toml"
     pol.parent.mkdir(parents=True, exist_ok=True)
     pol.write_text('[gates]\nmode = "none"\n')
     git(project.project, "add", "-f", str(pol))
@@ -602,7 +602,7 @@ def test_worktree_clean_flags_untracked_non_policy(project):
 def test_commit_story(project):
     task = make_task(project)
     (project.project / "src.txt").write_text("done work\n")
-    sha = verify.commit_story(project.project, f"story {task.story_key}: via bmad-auto")
+    sha = verify.commit_story(project.project, f"story {task.story_key}: via bmad-loop")
     assert sha != task.baseline_commit
     assert verify.worktree_clean(project.project)
 
@@ -622,13 +622,13 @@ def test_finalize_commit_squashes_chain_to_one(project):
     # an uncommitted orchestrator bookkeeping write (e.g. sprint-status)
     (project.project / "sprint.txt").write_text("done\n")
 
-    sha = verify.finalize_commit(project.project, baseline, "story 1-1-a: via bmad-auto")
+    sha = verify.finalize_commit(project.project, baseline, "story 1-1-a: via bmad-loop")
 
     assert sha is not None and sha != baseline
     assert verify.worktree_clean(project.project)
     # exactly one commit on top of baseline, with the orchestrator's message
     log = git(project.project, "log", "--format=%s", f"{baseline}..HEAD")
-    assert log.splitlines() == ["story 1-1-a: via bmad-auto"]
+    assert log.splitlines() == ["story 1-1-a: via bmad-loop"]
     # all the content (skill commits + bookkeeping) is in that single commit
     assert (project.project / "src.txt").read_text() == "dev work\nreview fix\n"
     assert (project.project / "sprint.txt").read_text() == "done\n"
@@ -649,7 +649,7 @@ def test_finalize_commit_restores_head_when_commit_fails(project):
     hook.chmod(0o755)
 
     with pytest.raises(verify.GitError, match="git commit failed"):
-        verify.finalize_commit(project.project, baseline, "story: via bmad-auto")
+        verify.finalize_commit(project.project, baseline, "story: via bmad-loop")
 
     assert verify.rev_parse_head(project.project) == head_before  # chain preserved
 
@@ -671,12 +671,12 @@ def test_finalize_commit_only_uncommitted_bookkeeping(project):
     baseline = verify.rev_parse_head(project.project)
     (project.project / "src.txt").write_text("uncommitted change\n")
 
-    sha = verify.finalize_commit(project.project, baseline, "story: via bmad-auto")
+    sha = verify.finalize_commit(project.project, baseline, "story: via bmad-loop")
 
     assert sha is not None and sha != baseline
     assert verify.worktree_clean(project.project)
     log = git(project.project, "log", "--format=%s", f"{baseline}..HEAD")
-    assert log.splitlines() == ["story: via bmad-auto"]
+    assert log.splitlines() == ["story: via bmad-loop"]
 
 
 def test_commit_paths_commits_only_listed(project):
@@ -887,7 +887,7 @@ def test_snapshot_worktree_excludes_gitignored(project):
 
 
 def test_snapshot_worktree_succeeds_without_git_identity(project, monkeypatch, tmp_path):
-    """The snapshot commit uses a synthetic `bmad-auto` identity, so it succeeds even
+    """The snapshot commit uses a synthetic `bmad-loop` identity, so it succeeds even
     with no git user.name/user.email configured — otherwise the best-effort caller
     would catch the GitError and reset past the very work this ref preserves. Locks
     the fix machine-independently by isolating ambient git config and unsetting the
@@ -904,7 +904,7 @@ def test_snapshot_worktree_succeeds_without_git_identity(project, monkeypatch, t
         repo, "refs/attempt-preserve-dirty/run-noident", baseline_untracked=[]
     )
     assert ref == "refs/attempt-preserve-dirty/run-noident"
-    assert git(repo, "show", "-s", "--format=%an", ref) == "bmad-auto"  # synthetic author used
+    assert git(repo, "show", "-s", "--format=%an", ref) == "bmad-loop"  # synthetic author used
     assert git(repo, "show", f"{ref}:src.txt") == "edit with no identity"  # work captured
 
 

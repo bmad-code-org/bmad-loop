@@ -16,11 +16,11 @@ from conftest import (
     write_sprint,
 )
 
-from automator.adapters.base import SessionResult
-from automator.adapters.mock import MockAdapter
-from automator.engine import Engine, RunPaused, RunStopped
-from automator.journal import Journal, load_state
-from automator.model import (
+from bmad_loop.adapters.base import SessionResult
+from bmad_loop.adapters.mock import MockAdapter
+from bmad_loop.engine import Engine, RunPaused, RunStopped
+from bmad_loop.journal import Journal, load_state
+from bmad_loop.model import (
     PAUSE_EPIC_BOUNDARY,
     PAUSE_ESCALATION,
     PAUSE_SPEC_APPROVAL,
@@ -29,7 +29,7 @@ from automator.model import (
     StoryTask,
     TokenUsage,
 )
-from automator.policy import (
+from bmad_loop.policy import (
     AdapterPolicy,
     GatesPolicy,
     LimitsPolicy,
@@ -40,14 +40,14 @@ from automator.policy import (
     SweepPolicy,
     VerifyPolicy,
 )
-from automator.runs import rearm_escalation
-from automator.verify import GitError, read_frontmatter, rev_parse_head, worktree_clean
+from bmad_loop.runs import rearm_escalation
+from bmad_loop.verify import GitError, read_frontmatter, rev_parse_head, worktree_clean
 
 QUIET = NotifyPolicy(desktop=False, file=True)
 
 
 def make_engine(project, script, policy=None, **kwargs) -> tuple[Engine, MockAdapter]:
-    run_dir = project.project / ".automator" / "runs" / "test-run"
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
     adapter = MockAdapter(script, usage_per_session=TokenUsage(input_tokens=10, output_tokens=5))
     state = RunState(run_id="test-run", project=str(project.project), started_at="now")
     engine = Engine(
@@ -96,7 +96,7 @@ def test_token_budget_discounts_cache_reads(project):
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     # per session: raw = 620k (would bust 1.2M over 2 sessions), weighted = 80k
     usage = TokenUsage(input_tokens=15_000, output_tokens=5_000, cache_read_tokens=600_000)
-    run_dir = project.project / ".automator" / "runs" / "test-run"
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
     adapter = MockAdapter(
         [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
         usage_per_session=usage,
@@ -125,7 +125,7 @@ def test_token_budget_discounts_cache_reads(project):
 def test_token_budget_exceeded_journals_weighted(project):
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     usage = TokenUsage(input_tokens=15_000, output_tokens=5_000, cache_read_tokens=600_000)
-    run_dir = project.project / ".automator" / "runs" / "test-run"
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
     adapter = MockAdapter(
         [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
         usage_per_session=usage,
@@ -169,7 +169,7 @@ def test_happy_path(project):
     assert worktree_clean(project.project)
     assert summary.total_tokens == 30  # 2 sessions x 15
     assert [s.role for s in adapter.sessions] == ["dev", "review"]
-    assert adapter.sessions[0].env["BMAD_AUTO_MODE"] == "1"
+    assert adapter.sessions[0].env["BMAD_LOOP_MODE"] == "1"
     assert adapter.sessions[1].prompt.startswith("/bmad-dev-auto ")
 
 
@@ -180,7 +180,7 @@ def test_inplace_ready_gate_veto_defers_before_any_session(project):
     gate + honors a veto outside the worktree path, with no engine-specific code."""
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     # a declarative plugin whose blocking pre_ready_gate hook fails -> defer veto
-    plug = project.project / ".automator" / "plugins" / "gate"
+    plug = project.project / ".bmad-loop" / "plugins" / "gate"
     plug.mkdir(parents=True)
     (plug / "plugin.toml").write_text(
         '[plugin]\nname = "gate"\napi_version = 1\n'
@@ -197,7 +197,7 @@ def test_inplace_ready_gate_veto_defers_before_any_session(project):
 
 
 def test_review_disabled_skips_review_session(project):
-    from automator.policy import ReviewPolicy
+    from bmad_loop.policy import ReviewPolicy
 
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     pol = Policy(
@@ -215,11 +215,11 @@ def test_review_disabled_skips_review_session(project):
     assert task.review_cycle == 0
     # exactly one session, and it carries the skip-review signal
     assert [s.role for s in adapter.sessions] == ["dev"]
-    assert adapter.sessions[0].env["BMAD_AUTO_SKIP_REVIEW"] == "1"
+    assert adapter.sessions[0].env["BMAD_LOOP_SKIP_REVIEW"] == "1"
     kinds = {e["kind"] for e in Journal(engine.run_dir).entries()}
     assert "review-skipped" in kinds
     msg = _head_commit_message(project.project)
-    assert "implemented via bmad-auto" in msg and "reviewed" not in msg
+    assert "implemented via bmad-loop" in msg and "reviewed" not in msg
 
 
 def test_review_not_recommended_skips_review_session(project):
@@ -267,7 +267,7 @@ def test_review_recommended_runs_review_session(project):
 def test_review_trigger_always_runs_without_recommendation(project):
     """review.trigger = "always" runs the review even when the dev session did
     not recommend a follow-up (pre-#2505 behavior)."""
-    from automator.policy import ReviewPolicy
+    from bmad_loop.policy import ReviewPolicy
 
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     pol = Policy(
@@ -294,10 +294,10 @@ def test_review_trigger_always_runs_without_recommendation(project):
 
 def test_generic_dev_path_orchestrator_advances_sprint(project):
     """On the generic bmad-dev-auto path the skill self-finalizes the spec but
-    never writes the automator's sprint board; the orchestrator (B2 seam) is the
+    never writes the bmad_loop's sprint board; the orchestrator (B2 seam) is the
     single sprint-status writer and advances the story to match verify_dev."""
-    from automator.policy import DevPolicy, ReviewPolicy
-    from automator.sprintstatus import story_status
+    from bmad_loop.policy import DevPolicy, ReviewPolicy
+    from bmad_loop.sprintstatus import story_status
 
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     pol = Policy(
@@ -323,8 +323,8 @@ def test_generic_dev_path_no_sprint_advance_when_spec_unfinalized(project):
     """The sprint write is gated on the spec actually reaching the success
     status. A session that completes but leaves the spec short of done must not
     advance the sprint, and the story defers (verify_dev fails on spec status)."""
-    from automator.policy import DevPolicy, ReviewPolicy
-    from automator.sprintstatus import story_status
+    from bmad_loop.policy import DevPolicy, ReviewPolicy
+    from bmad_loop.sprintstatus import story_status
 
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     pol = Policy(
@@ -351,9 +351,9 @@ def test_generic_reconcile_advances_stale_frontmatter_done(project):
     the frontmatter at the template default. The orchestrator reconciles the
     frontmatter before the sprint sync + verify, so completed, tested work reaches
     DONE instead of falsely deferring — and the repair is journaled loudly."""
-    from automator.policy import DevPolicy, ReviewPolicy
-    from automator.sprintstatus import story_status
-    from automator.verify import read_frontmatter, status_of
+    from bmad_loop.policy import DevPolicy, ReviewPolicy
+    from bmad_loop.sprintstatus import story_status
+    from bmad_loop.verify import read_frontmatter, status_of
 
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     pol = Policy(
@@ -388,9 +388,9 @@ def test_generic_reconcile_advances_in_review_frontmatter_done(project):
     never a deliberate terminal — the legacy review-handoff fork is retired — so the
     orchestrator reconciles it to done before the gates, closing the false-defer +
     rollback re-sweep loop instead of discarding completed, tested work."""
-    from automator.policy import DevPolicy, ReviewPolicy
-    from automator.sprintstatus import story_status
-    from automator.verify import read_frontmatter, status_of
+    from bmad_loop.policy import DevPolicy, ReviewPolicy
+    from bmad_loop.sprintstatus import story_status
+    from bmad_loop.verify import read_frontmatter, status_of
 
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     pol = Policy(
@@ -422,9 +422,9 @@ def test_generic_reconcile_in_review_preserves_followup_review_true(project):
     the flag for a non-done spec, so the frontmatter is the only source — reconcile
     re-reads it when advancing to done, so the recommended-trigger gate still sees it
     and re-invokes bmad-dev-auto on the done spec."""
-    from automator.adapters.base import SessionResult
-    from automator.policy import DevPolicy, ReviewPolicy
-    from automator.verify import rev_parse_head
+    from bmad_loop.adapters.base import SessionResult
+    from bmad_loop.policy import DevPolicy, ReviewPolicy
+    from bmad_loop.verify import rev_parse_head
 
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
 
@@ -478,9 +478,9 @@ def test_generic_reconcile_in_review_followup_false_skips_review(project):
     """The mirror case (DW-153's actual shape): a reconciled-from-in-review spec
     with `followup_review_recommended: false` in frontmatter skips the follow-up
     review and commits with the dev session only."""
-    from automator.adapters.base import SessionResult
-    from automator.policy import DevPolicy, ReviewPolicy
-    from automator.verify import rev_parse_head
+    from bmad_loop.adapters.base import SessionResult
+    from bmad_loop.policy import DevPolicy, ReviewPolicy
+    from bmad_loop.verify import rev_parse_head
 
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
 
@@ -530,10 +530,10 @@ def test_generic_reconcile_advances_bare_null_frontmatter_status(project):
     """The skill left a bare `status:` (YAML null) but finalized in prose with real
     code. status_of would read that as "none"; the reconcile normalizes null to ""
     so it still advances to done — and the filled line is valid YAML."""
-    from automator.adapters.base import SessionResult
-    from automator.policy import DevPolicy, ReviewPolicy
-    from automator.sprintstatus import story_status
-    from automator.verify import read_frontmatter, rev_parse_head, status_of
+    from bmad_loop.adapters.base import SessionResult
+    from bmad_loop.policy import DevPolicy, ReviewPolicy
+    from bmad_loop.sprintstatus import story_status
+    from bmad_loop.verify import read_frontmatter, rev_parse_head, status_of
 
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
 
@@ -581,7 +581,7 @@ def test_generic_reconcile_skips_out_of_tree_spec(project, tmp_path):
     """Reconcile refuses to mutate a spec the session reports outside the
     orchestrator-owned roots: the file is left untouched and the skip is journaled,
     so a surprising `spec_file` can never be silently rewritten."""
-    from automator.policy import DevPolicy, ReviewPolicy
+    from bmad_loop.policy import DevPolicy, ReviewPolicy
 
     outside = tmp_path / "outside" / "spec.md"
     outside.parent.mkdir(parents=True)
@@ -611,7 +611,7 @@ def test_generic_reconcile_skips_out_of_tree_spec(project, tmp_path):
 def test_generic_reconcile_idempotent_when_already_done(project):
     """When the skill DID advance the frontmatter to done, reconcile is a no-op:
     no second write, no `spec-status-reconciled` journal entry."""
-    from automator.policy import DevPolicy, ReviewPolicy
+    from bmad_loop.policy import DevPolicy, ReviewPolicy
 
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     pol = Policy(
@@ -637,7 +637,7 @@ def test_generic_reconcile_skips_blocked_prose(project):
     """A blocked outcome (prose Status: blocked) is NEVER reconciled: the
     frontmatter stays non-terminal, no `spec-status-reconciled` is emitted, and the
     story does not falsely pass (it defers via the unfinalized-spec gate)."""
-    from automator.policy import DevPolicy, LimitsPolicy, ReviewPolicy
+    from bmad_loop.policy import DevPolicy, LimitsPolicy, ReviewPolicy
 
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     pol = Policy(
@@ -666,12 +666,12 @@ def test_generic_reconcile_does_not_bypass_no_change_gate(project):
     session that finalizes in prose (Status: done) but produced NO real code change
     is reconciled to done on disk yet still DEFERS — has_changes_since backstops it,
     so empty work cannot ride the prose marker to PROCEED."""
-    from automator.adapters.base import SessionResult
-    from automator.policy import DevPolicy, LimitsPolicy, ReviewPolicy
-    from automator.verify import rev_parse_head
+    from bmad_loop.adapters.base import SessionResult
+    from bmad_loop.policy import DevPolicy, LimitsPolicy, ReviewPolicy
+    from bmad_loop.verify import rev_parse_head
 
-    # Real projects do NOT gitignore the BMAD output tree (`bmad-auto init` only
-    # ignores .automator/runs|cache), so the spec file the skill writes is tracked.
+    # Real projects do NOT gitignore the BMAD output tree (`bmad-loop init` only
+    # ignores .bmad-loop/runs|cache), so the spec file the skill writes is tracked.
     # The proof-of-work gate excludes the orchestrator-owned artifact folders, so a
     # spec-only edit — including the reconcile rewrite — still reads as "no changes".
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
@@ -717,9 +717,9 @@ def test_generic_repair_reopens_spec_before_reinvocation(project):
     spec to "ingest as context, don't resume." So before a verify-failure repair
     re-invocation the orchestrator flips the spec back to `in-progress` — the
     repair session must SEE an open spec on entry."""
-    from automator.adapters.base import SessionResult
-    from automator.policy import DevPolicy, ReviewPolicy, VerifyPolicy
-    from automator.verify import read_frontmatter, rev_parse_head
+    from bmad_loop.adapters.base import SessionResult
+    from bmad_loop.policy import DevPolicy, ReviewPolicy, VerifyPolicy
+    from bmad_loop.verify import read_frontmatter, rev_parse_head
 
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     sp = spec_path(project, "1-1-a")
@@ -781,7 +781,7 @@ def _head_commit_message(repo: Path) -> str:
 
 
 def test_finish_kills_session_when_enabled(project, monkeypatch):
-    import automator.engine as engine_mod
+    import bmad_loop.engine as engine_mod
 
     killed: list[str] = []
     monkeypatch.setattr(engine_mod, "kill_session", lambda rid: killed.append(rid))
@@ -796,7 +796,7 @@ def test_finish_kills_session_when_enabled(project, monkeypatch):
 
 
 def test_finish_keeps_session_when_disabled(project, monkeypatch):
-    import automator.engine as engine_mod
+    import bmad_loop.engine as engine_mod
 
     killed: list[str] = []
     monkeypatch.setattr(engine_mod, "kill_session", lambda rid: killed.append(rid))
@@ -819,7 +819,7 @@ def test_finish_keeps_session_when_disabled(project, monkeypatch):
 def test_per_stage_adapter_and_model_dispatch(project):
     """Dev and review sessions go to their own adapters with per-stage models."""
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
-    run_dir = project.project / ".automator" / "runs" / "test-run"
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
     dev_mock = MockAdapter([dev_effect(project, "1-1-a")])
     review_mock = MockAdapter([review_effect(project, "1-1-a", clean=True)])
     policy = Policy(
@@ -869,7 +869,7 @@ def test_budget_exhausted_finalized_work_commits(project):
     pass keeps recommending an independent follow-up is COMMITTED when the review
     budget is exhausted — not rolled back. The lingering recommendation is
     re-filed as a fresh open deferred-work entry, and the run records the event."""
-    from automator import deferredwork
+    from bmad_loop import deferredwork
 
     write_sprint(project, {"1-1-a": "ready-for-dev"})
     engine, _ = make_engine(
@@ -1203,7 +1203,7 @@ def test_rollback_worktree_preserve_failure_journals_git_error(project, monkeypa
     def _fail(*a, **k):
         raise GitError("simulated commit-tree failure")
 
-    monkeypatch.setattr("automator.verify.snapshot_worktree", _fail)
+    monkeypatch.setattr("bmad_loop.verify.snapshot_worktree", _fail)
 
     engine._rollback_or_pause(task)  # best-effort: journals + proceeds, never raises
 
@@ -1237,7 +1237,7 @@ def test_rollback_pauses_when_preserve_fails(project, monkeypatch):
     def _fail(*a, **k):
         raise GitError("simulated branch failure")
 
-    monkeypatch.setattr("automator.verify.preserve_commits", _fail)
+    monkeypatch.setattr("bmad_loop.verify.preserve_commits", _fail)
 
     with pytest.raises(RunPaused) as paused:
         engine._rollback_or_pause(task)
@@ -1269,7 +1269,7 @@ def test_resolved_redrive_never_pauses_when_preserve_fails(project, monkeypatch)
     def _fail(*args, **kwargs):
         raise GitError("simulated branch failure")
 
-    monkeypatch.setattr("automator.verify.preserve_commits", _fail)
+    monkeypatch.setattr("bmad_loop.verify.preserve_commits", _fail)
 
     engine._rollback_or_pause(task, cause="resolved")  # must NOT raise RunPaused
 
@@ -1915,7 +1915,7 @@ def test_journal_log_position_covers_post_session_entries(project):
     [("SIGINT", signal.SIGINT), ("SIGBREAK", 21)],
 )
 def test_windows_console_ctrl_signal_is_ignored(project, monkeypatch, signal_name, fallback_signum):
-    import automator.engine as engine_mod
+    import bmad_loop.engine as engine_mod
 
     signum = getattr(signal, signal_name, fallback_signum)
     if signal_name == "SIGBREAK":
@@ -1952,7 +1952,7 @@ def test_windows_console_ctrl_signal_is_ignored(project, monkeypatch, signal_nam
 
 
 def test_non_windows_sigint_still_stops_run(project, monkeypatch):
-    import automator.engine as engine_mod
+    import bmad_loop.engine as engine_mod
 
     installed = {}
     previous = {}
@@ -1983,7 +1983,7 @@ def test_run_stopped_via_real_signal(project, monkeypatch):
     """SIGTERM unwinds the loop as RunStopped: the run is marked stopped, the
     agent session is torn down, and the prior signal handlers are restored."""
     killed = []
-    monkeypatch.setattr("automator.engine.kill_session", lambda rid: killed.append(rid))
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: killed.append(rid))
     engine, _ = make_engine(project, [])
     # raise_signal delivers an in-process, catchable SIGTERM via C raise() — the
     # portable "signal myself" primitive. os.kill(getpid(), SIGTERM) is POSIX-only
@@ -2008,7 +2008,7 @@ def test_nested_engine_reraises_runstopped(project, monkeypatch):
     RunStopped for the outer (owning) engine to record — it still tears down
     its own agent session."""
     killed = []
-    monkeypatch.setattr("automator.engine.kill_session", lambda rid: killed.append(rid))
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: killed.append(rid))
     engine, _ = make_engine(project, [])
 
     def boom():
@@ -2035,7 +2035,7 @@ def test_run_crash_records_diagnostics(project, monkeypatch):
     persisted traceback) instead of crashing the orchestrator: the orphaned
     agent session is torn down and a crashed summary is returned."""
     killed = []
-    monkeypatch.setattr("automator.engine.kill_session", lambda rid: killed.append(rid))
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: killed.append(rid))
     engine, _ = make_engine(project, [])
 
     def boom():
@@ -2067,7 +2067,7 @@ def test_nested_engine_reraises_crash(project, monkeypatch):
     exception re-raises for the outer engine to record — it still persists its
     own traceback and tears down its agent session, but records no run-crash."""
     killed = []
-    monkeypatch.setattr("automator.engine.kill_session", lambda rid: killed.append(rid))
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: killed.append(rid))
     engine, _ = make_engine(project, [])
 
     def boom():
@@ -2093,9 +2093,9 @@ def test_run_crash_after_finish_clears_finished(project, monkeypatch):
     """A post-loop step that throws after finished=True is recorded as a crash
     and the finished flag is cleared, so status classification reads CRASHED
     rather than FINISHED (which it checks first)."""
-    from automator.tui import data
+    from bmad_loop.tui import data
 
-    monkeypatch.setattr("automator.engine.kill_session", lambda rid: None)
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: None)
     engine, _ = make_engine(project, [])  # loop completes → sets finished=True
 
     def boom():
@@ -2122,7 +2122,7 @@ def test_top_level_crash_without_signal_handlers_still_records(project, monkeypa
     """A top-level engine that could not install signal handlers (e.g. off the
     main thread) is not nested, so an unexpected exception is recorded rather
     than re-raised — the crash-gap stays closed in non-CLI usage paths."""
-    monkeypatch.setattr("automator.engine.kill_session", lambda rid: None)
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: None)
     engine, _ = make_engine(project, [])
     # simulate signal.signal failing: no handlers installed, no owner, not nested
     monkeypatch.setattr(engine, "_install_stop_signals", lambda: None)
@@ -2145,7 +2145,7 @@ def test_top_level_crash_without_signal_handlers_still_records(project, monkeypa
 def test_crash_message_fallback_when_str_raises(project, monkeypatch):
     """If the exception's own __str__ raises, the fallback uses the bare type
     name (not its repr) so crash_error reads 'BadStr: BadStr', not quoted."""
-    monkeypatch.setattr("automator.engine.kill_session", lambda rid: None)
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: None)
     engine, _ = make_engine(project, [])
 
     class BadStr(Exception):

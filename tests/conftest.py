@@ -11,9 +11,9 @@ from pathlib import Path
 import pytest
 import yaml
 
-from automator.adapters.base import SessionResult, SessionSpec
-from automator.bmadconfig import ProjectPaths
-from automator.verify import rev_parse_head
+from bmad_loop.adapters.base import SessionResult, SessionSpec
+from bmad_loop.bmadconfig import ProjectPaths
+from bmad_loop.verify import rev_parse_head
 
 # The suite reads/writes UTF-8 files (specs, journals, JSON, reports). Windows'
 # default text encoding is cp1252, so a plain read_text()/open() throws
@@ -53,7 +53,7 @@ def write_script_launcher(directory: Path, name: str, body: str) -> Path:
 # re-deriving the win32 branch.
 
 _OK = "exit 0"  # cross-platform always-success verb (both `cmd /c` and `sh -c` honor it)
-_RUN = "%BMAD_AUTO_RUN_DIR%" if sys.platform == "win32" else "$BMAD_AUTO_RUN_DIR"
+_RUN = "%BMAD_LOOP_RUN_DIR%" if sys.platform == "win32" else "$BMAD_LOOP_RUN_DIR"
 
 
 def _file_exists_cmd(path) -> str:
@@ -120,7 +120,7 @@ def _project_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
     impl.mkdir(parents=True)
     plan.mkdir(parents=True)
     (root / "src.txt").write_text("original\n")
-    (root / ".gitignore").write_text(".automator/runs/\n")  # as `bmad-auto init` would
+    (root / ".gitignore").write_text(".bmad-loop/runs/\n")  # as `bmad-loop init` would
     git(root, "init", "-q", "-b", "main")
     # Local config: copies (and their worktrees) inherit it via the copied .git/config.
     git(root, "config", "user.email", "test@test")
@@ -159,7 +159,7 @@ def install_base_skills(paths: ProjectPaths, trees=(".claude/skills", ".agents/s
     """Lay down stubs of the non-bundled upstream skills the orchestrator drives
     (bmad-dev-auto + the review hunters) so the run-start preflight
     (`install.missing_base_skills`) passes."""
-    from automator.install import BASE_SKILLS
+    from bmad_loop.install import BASE_SKILLS
 
     for tree in trees:
         for skill, markers in BASE_SKILLS.items():
@@ -210,7 +210,7 @@ def dev_effect(
 ):
     """Simulate a successful bmad-dev-auto session: it self-finalizes the spec
     (no in-review handoff — always straight to ``done``) but never touches the
-    automator's sprint board (the orchestrator is the single sprint-status
+    bmad_loop's sprint board (the orchestrator is the single sprint-status
     writer). ``final_status`` lets a test leave the spec short of the success
     status to exercise the dev-verify gating. ``followup_review`` mirrors the
     skill's `followup_review_recommended` signal (PR #2505) — defaults True so
@@ -316,7 +316,7 @@ def write_ledger(paths: ProjectPaths, statuses: dict[str, str], commit: bool = T
 
 
 def mark_ledger_done(paths: ProjectPaths, dw_ids, date: str = "2026-06-11") -> None:
-    from automator import deferredwork
+    from bmad_loop import deferredwork
 
     for dw_id in dw_ids:
         deferredwork.mark_done(paths.deferred_work, dw_id, date, "built in test")
@@ -331,7 +331,7 @@ def write_legacy_ledger(paths: ProjectPaths, text: str, commit: bool = True) -> 
 
 
 def migrate_effect(paths: ProjectPaths, new_ledger_text: str, mapping):
-    """Simulate a /bmad-auto-sweep --migrate session: rewrites the ledger to
+    """Simulate a /bmad-loop-sweep --migrate session: rewrites the ledger to
     canonical DW format and reports the manifest-key -> dw_id mapping."""
 
     def effect(spec: SessionSpec) -> SessionResult:

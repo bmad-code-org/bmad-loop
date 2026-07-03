@@ -1,10 +1,10 @@
 # Authoring CLI adapters & profiles
 
-bmad-auto drives any coding CLI that fits the **tmux-injection + hook-signal**
+bmad-loop drives any coding CLI that fits the **tmux-injection + hook-signal**
 transport through one generic adapter (`adapters/generic.py`); everything
 CLI-specific lives in a declarative **TOML profile** (`adapters/profile.py`). This
 guide is the canonical home for the profile schema and the two ways to teach
-bmad-auto a new CLI:
+bmad-loop a new CLI:
 
 - **The common case — a TOML profile.** If the CLI fits tmux + hook-signal, you
   write no Python. The [Profile field reference](#profile-field-reference) is the
@@ -36,7 +36,7 @@ These are independent and abstracted separately:
   `multiplexer.py` for the contract and `tmux_backend.py` / `tmux_base.py` for the
   reference implementation. Transport is one of **four OS seams** — the others
   (process lifecycle, hook interpreter, validate preflight) are mapped in
-  [Porting bmad-auto to a new OS](porting-to-a-new-os.md).
+  [Porting bmad-loop to a new OS](porting-to-a-new-os.md).
 
 ### The transport contract (for a backend author)
 
@@ -51,14 +51,14 @@ only `shutil.which("tmux")` presence checks, never an invocation.
 To add a backend, build a `TerminalMultiplexer` (`adapters/multiplexer.py`) and
 **register** it — `register_multiplexer(name, matches, factory)`, where
 `matches(sys.platform)` decides automatic selection and `name` is the key the
-`BMAD_AUTO_MUX_BACKEND` env var forces (for tests / overrides). `get_multiplexer()`
+`BMAD_LOOP_MUX_BACKEND` env var forces (for tests / overrides). `get_multiplexer()`
 returns the first backend whose `matches` is true, with tmux as the default
 fallback. There are two build paths: extend `BaseTmuxBackend` (`adapters/tmux_base.py`)
 for a tmux-family backend — overriding only its single spawn primitive `_run()`
 plus the few divergent methods (e.g. the parked-window trailer) — or implement
 `TerminalMultiplexer` fresh for a host with no tmux-shaped CLI. The non-transport
 seams of a full OS port are in
-[Porting bmad-auto to a new OS](porting-to-a-new-os.md). The contract groups into:
+[Porting bmad-loop to a new OS](porting-to-a-new-os.md). The contract groups into:
 
 - **Sessions** — `has_session`, `new_session` (geometry is optional: agent
   sessions pin a fixed pane size because they are observed while detached; the
@@ -95,13 +95,13 @@ transcript and in what format, and the token-usage schema a `usage_parser` has t
 read. Historically the only way to get these was to hand a volunteer a manual
 recipe and ask them to sanitize the output by hand — error-prone and PII-risky.
 
-**`bmad-auto probe-adapter`** (alias `collect-adapter-data`) pulls all of that and
+**`bmad-loop probe-adapter`** (alias `collect-adapter-data`) pulls all of that and
 runs it through an audited sanitizer, so a user of any coding CLI can run one
 command and paste back a clean, content-free report.
 
 ```bash
-bmad-auto probe-adapter <cli> --project .          # default: zero-launch scan
-bmad-auto probe-adapter <cli> --probe --project .  # opt-in live capture
+bmad-loop probe-adapter <cli> --project .          # default: zero-launch scan
+bmad-loop probe-adapter <cli> --probe --project .  # opt-in live capture
 ```
 
 ---
@@ -136,7 +136,7 @@ If `tmux` or the binary is missing, probe degrades gracefully to a scan.
 ## PII safety model
 
 The report is built to be **safe to paste into an issue or PR**. A single audited
-sanitizer (`src/automator/sanitize.py`) is the only chokepoint:
+sanitizer (`src/bmad_loop/sanitize.py`) is the only chokepoint:
 
 - **numbers, booleans, and `null` pass through** — token _counts_ are not PII;
 - **dict keys are kept verbatim** — field names and casing are the whole point of
@@ -160,7 +160,7 @@ loud **"raw retained — do not share"** warning; never paste a `--keep-temp` ru
 
 ### 1. Draft a profile
 
-Drop a TOML file in `<project>/.automator/profiles/<name>.toml` with the fields
+Drop a TOML file in `<project>/.bmad-loop/profiles/<name>.toml` with the fields
 from the [Profile field reference](#profile-field-reference) below. The minimum is
 a `binary`, a `prompt_template`, bypass flags, a `[hooks]` block picking one of the
 config dialects (`claude-settings-json` / `codex-hooks-json` /
@@ -170,7 +170,7 @@ map, and a `usage_parser` (start with `"none"` until you've written one).
 ### 2. Scan
 
 ```bash
-bmad-auto probe-adapter <cli> --project .
+bmad-loop probe-adapter <cli> --project .
 ```
 
 Read three sections of the report:
@@ -186,7 +186,7 @@ Read three sections of the report:
 ### 3. Probe (confirm the live payload + dialect)
 
 ```bash
-bmad-auto probe-adapter <cli> --probe --project /tmp/scratch
+bmad-loop probe-adapter <cli> --probe --project /tmp/scratch
 ```
 
 The **Hook payload shape** section now shows, per captured event, the native→
@@ -198,7 +198,7 @@ says so (with a scrubbed log tail) instead of silently producing nothing.
 ### 4. Write the `usage_parser`
 
 Turn the report's `token_field_candidates` into a parser in
-[`src/automator/tokens.py`](../src/automator/tokens.py), following the existing
+[`src/bmad_loop/tokens.py`](../src/bmad_loop/tokens.py), following the existing
 ones (`tally` for claude, `tally_codex_rollout`, `tally_gemini_chat`) and
 registering it in `read_usage`. The report flags **per-call vs cumulative** as a
 human call — a `token_count`-style event that carries running totals (codex) is
@@ -235,7 +235,7 @@ why `probe-adapter` exists, because the as-drafted profile was wrong in ways no 
 would reveal:
 
 ```bash
-bmad-auto probe-adapter copilot --probe --project /tmp/scratch
+bmad-loop probe-adapter copilot --probe --project /tmp/scratch
 ```
 
 On Copilot CLI 1.0.63 this surfaced three corrections:
@@ -245,7 +245,7 @@ On Copilot CLI 1.0.63 this surfaced three corrections:
   as a timeout. The profile now maps `agentStop = "Stop"` (and `sessionStart` /
   `sessionEnd`; there is no `PreCompact` equivalent).
 - **Payload casing.** Keys are camelCase (`sessionId`, `transcriptPath`), not
-  snake_case — so the shared relay (`bmad_auto_hook.py`) reads both casings.
+  snake_case — so the shared relay (`bmad_loop_hook.py`) reads both casings.
 - **Token schema.** The probe located `~/.copilot/session-state/*/events.jsonl` and
   inferred its token fields (`data.modelMetrics.<model>.usage.*`), which became the
   `copilot-events` parser in `tokens.py`; the profile's `usage_parser` is now wired
@@ -258,10 +258,10 @@ Confirm the `mkdtemp` dir is gone afterward.
 ## Profile field reference
 
 A profile is the `CLIProfile` dataclass in
-[`src/automator/adapters/profile.py`](../src/automator/adapters/profile.py),
+[`src/bmad_loop/adapters/profile.py`](../src/bmad_loop/adapters/profile.py),
 loaded from TOML. **Built-ins** ship as packaged TOML
-(`automator/data/profiles/*.toml`); **project overrides** in
-`<project>/.automator/profiles/*.toml` overlay them — same `name` overrides a
+(`bmad_loop/data/profiles/*.toml`); **project overrides** in
+`<project>/.bmad-loop/profiles/*.toml` overlay them — same `name` overrides a
 built-in, a new `name` extends the set. The legacy alias `claude-code-tmux`
 resolves to `claude`.
 
@@ -272,7 +272,7 @@ resolves to `claude`.
 | `name`                             | ✅       | —                  | Profile id, also the `--cli` value and override key.                                                                                                                                                                                                                                                                                                    |
 | `binary`                           | ✅       | —                  | Executable to launch (resolved on `PATH`).                                                                                                                                                                                                                                                                                                              |
 | `[hooks]`                          | ✅       | —                  | The `HookSpec` table (see below).                                                                                                                                                                                                                                                                                                                       |
-| `skill_tree`                       |          | `.claude/skills`   | Project-relative tree this CLI reads skills from (`.agents/skills` for codex/gemini); `bmad-auto init` installs the `bmad-auto-*` skills here. Must be relative.                                                                                                                                                                                        |
+| `skill_tree`                       |          | `.claude/skills`   | Project-relative tree this CLI reads skills from (`.agents/skills` for codex/gemini); `bmad-loop init` installs the `bmad-loop-*` skills here. Must be relative.                                                                                                                                                                                        |
 | `prompt_template`                  |          | `{prompt}`         | How the canonical `/skill args` prompt is rendered. Placeholders: `{prompt}` (whole string), `{skill}` (leading slash-command name, no `/`), `{args}` (the remainder).                                                                                                                                                                                  |
 | `launch_args`                      |          | `()`               | Extra argv passed at launch, e.g. `["-i"]` to stay interactive (gemini/copilot).                                                                                                                                                                                                                                                                        |
 | `bypass_args`                      |          | `()`               | Flags that bypass permission/approval prompts for unattended runs (e.g. `--allow-all-tools`).                                                                                                                                                                                                                                                           |
@@ -318,7 +318,7 @@ config_path = ".github/copilot/settings.json"
 events = { agentStop = "Stop", sessionStart = "SessionStart", sessionEnd = "SessionEnd" }
 ```
 
-(The shipped profile under `automator/data/profiles/copilot.toml` also carries a
+(The shipped profile under `bmad_loop/data/profiles/copilot.toml` also carries a
 `prompt_template` and `first_run_note`, trimmed here for focus — read it for the
 exact shipped values.)
 
@@ -333,7 +333,7 @@ reuse `generic.py` with a [profile](#profile-field-reference) instead of
 subclassing.
 
 The contract is the `CodingCLIAdapter` ABC in
-[`src/automator/adapters/base.py`](../src/automator/adapters/base.py).
+[`src/bmad_loop/adapters/base.py`](../src/bmad_loop/adapters/base.py).
 
 ### Declare the three capability axes
 
@@ -384,9 +384,9 @@ Optional capabilities (default to "unsupported" / no-op):
 
 ### References
 
-- [`adapters/opencode_http.py`](../src/automator/adapters/opencode_http.py) — the
+- [`adapters/opencode_http.py`](../src/bmad_loop/adapters/opencode_http.py) — the
   worked **design stub** for a non-tmux (HTTP/SSE) transport.
-- [`adapters/mock.py`](../src/automator/adapters/mock.py) — the test-only reference
+- [`adapters/mock.py`](../src/bmad_loop/adapters/mock.py) — the test-only reference
   implementation.
-- [`adapters/generic.py`](../src/automator/adapters/generic.py) — the tmux +
+- [`adapters/generic.py`](../src/bmad_loop/adapters/generic.py) — the tmux +
   hook-signal adapter to reuse with a profile rather than subclass.

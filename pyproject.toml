@@ -3,7 +3,7 @@ requires = ["hatchling>=1.30"]
 build-backend = "hatchling.build"
 
 [project]
-name = "bmad-auto"
+name = "bmad-loop"
 version = "0.7.12"
 description = "Deterministic ralph-loop orchestrator for the BMAD implementation phase"
 readme = "README.md"
@@ -14,13 +14,13 @@ requires-python = ">=3.11"
 dependencies = ["pyyaml>=6.0"]
 
 [project.scripts]
-bmad-auto = "automator.cli:main"
+bmad-loop = "bmad_loop.cli:main"
 
 [project.optional-dependencies]
 tui = ["textual>=8.0,<9", "tomlkit>=0.13", "pyte>=0.8.2"]
 # Process discovery on non-Linux (no /proc): the Unity plugin's teardown lazily
 # imports psutil whenever it runs off Linux — macOS as well as a native-Windows
-# backend. The core stays dep-free; install with `pip install bmad-auto[non-linux]`
+# backend. The core stays dep-free; install with `pip install bmad-loop[non-linux]`
 # on those platforms.
 non-linux = ["psutil>=7.2.2"]
 
@@ -35,7 +35,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/automator"]
+packages = ["src/bmad_loop"]
 
 [tool.hatch.build.targets.sdist]
 # .trunk/tools holds an absolute external symlink (trunk launcher) that breaks
@@ -50,7 +50,7 @@ asyncio_mode = "auto"
 line-length = 100
 target-version = "py311"
 # skill assets contain template placeholders that are not valid Python
-extend-exclude = [".agents", ".claude", "src/automator/data/skills"]
+extend-exclude = [".agents", ".claude", "src/bmad_loop/data/skills"]
 
 [tool.black]
 line-length = 100

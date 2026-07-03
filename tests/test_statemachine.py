@@ -1,7 +1,7 @@
 import pytest
 
-from automator.model import Phase, StoryTask
-from automator.statemachine import TRANSITIONS, IllegalTransition, advance
+from bmad_loop.model import Phase, StoryTask
+from bmad_loop.statemachine import TRANSITIONS, IllegalTransition, advance
 
 
 def test_table_covers_every_phase():

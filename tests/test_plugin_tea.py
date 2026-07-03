@@ -34,14 +34,14 @@ from conftest import (
     write_sprint,
 )
 
-from automator.adapters.mock import MockAdapter
-from automator.engine import Engine
-from automator.journal import Journal
-from automator.model import RunState, TokenUsage
-from automator.plugins import PluginError, PluginRegistry, get_plugin, load_plugins
-from automator.plugins.model import PluginManifest
-from automator.policy import GatesPolicy, NotifyPolicy, PluginsPolicy, Policy
-from automator.sweep import DecisionPrompter, SweepEngine
+from bmad_loop.adapters.mock import MockAdapter
+from bmad_loop.engine import Engine
+from bmad_loop.journal import Journal
+from bmad_loop.model import RunState, TokenUsage
+from bmad_loop.plugins import PluginError, PluginRegistry, get_plugin, load_plugins
+from bmad_loop.plugins.model import PluginManifest
+from bmad_loop.policy import GatesPolicy, NotifyPolicy, PluginsPolicy, Policy
+from bmad_loop.sweep import DecisionPrompter, SweepEngine
 
 QUIET = NotifyPolicy(desktop=False, file=True)
 
@@ -116,7 +116,7 @@ def write_gate_artifact(project, gate: str, verdict: str) -> None:
 def pre_commit_ctx(project):
     """A minimal pre_commit HookContext pointing at the project tree (isolation =
     none: worktree == repo root), for unit-testing ``on_pre_commit`` directly."""
-    from automator.plugins.context import HookContext
+    from bmad_loop.plugins.context import HookContext
 
     return HookContext(
         "pre_commit",
@@ -130,7 +130,7 @@ def pre_commit_ctx(project):
 def workflow_effect(captured: list, status: str = "completed"):
     """Scripted stand-in for an injected TEA session: record the spec, return a
     status (mirrors test_plugin_workflows)."""
-    from automator.adapters.base import SessionResult
+    from bmad_loop.adapters.base import SessionResult
 
     def effect(spec):  # noqa: ANN001
         captured.append(spec)
@@ -140,7 +140,7 @@ def workflow_effect(captured: list, status: str = "completed"):
 
 
 def make_engine(project, script, registry, policy):
-    run_dir = project.project / ".automator" / "runs" / "tea-run"
+    run_dir = project.project / ".bmad-loop" / "runs" / "tea-run"
     adapter = MockAdapter(script, usage_per_session=TokenUsage(input_tokens=10, output_tokens=5))
     state = RunState(run_id="tea-run", project=str(project.project), started_at="now")
     return Engine(
@@ -155,7 +155,7 @@ def make_engine(project, script, registry, policy):
 
 
 def make_sweep(project, script, registry, policy):
-    run_dir = project.project / ".automator" / "runs" / "tea-sweep"
+    run_dir = project.project / ".bmad-loop" / "runs" / "tea-sweep"
     adapter = MockAdapter(script, usage_per_session=TokenUsage(input_tokens=10, output_tokens=5))
     state = RunState(run_id="tea-sweep", project=str(project.project), started_at="now")
     prompter = DecisionPrompter(input_fn=lambda _: "", print_fn=lambda _line: None)

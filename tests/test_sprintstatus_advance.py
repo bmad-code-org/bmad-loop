@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from automator import sprintstatus
+from bmad_loop import sprintstatus
 
 SPRINT = """\
 # Sprint status — do not hand-edit casually

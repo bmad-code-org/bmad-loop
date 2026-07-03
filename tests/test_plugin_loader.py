@@ -13,20 +13,20 @@ from pathlib import Path
 
 import pytest
 
-from automator.plugins import (
+from bmad_loop.plugins import (
     PluginError,
     PluginRegistry,
     discover,
     get_plugin,
     load_plugins,
 )
-from automator.plugins.loader import USER_PLUGINS_REL
+from bmad_loop.plugins.loader import USER_PLUGINS_REL
 
 # --------------------------------------------------------------- helpers
 
 
 def write_plugin(root: Path, name: str, body: str, *, files: dict[str, str] | None = None) -> Path:
-    """Drop a project-local plugin directory under <root>/.automator/plugins."""
+    """Drop a project-local plugin directory under <root>/.bmad-loop/plugins."""
     pdir = root / USER_PLUGINS_REL / name
     pdir.mkdir(parents=True)
     (pdir / "plugin.toml").write_text(body)
@@ -106,7 +106,7 @@ def test_get_plugin_unknown_raises():
 
 def test_packaging_smoke_plugins_dir_present():
     # the builtins dir must ship in an installed context (hatch wheel)
-    packaged = resources.files("automator.data").joinpath("plugins")
+    packaged = resources.files("bmad_loop.data").joinpath("plugins")
     assert packaged.is_dir()
     assert any(e.joinpath("plugin.toml").is_file() for e in packaged.iterdir() if e.is_dir())
 

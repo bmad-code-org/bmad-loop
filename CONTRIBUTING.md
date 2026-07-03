@@ -1,6 +1,6 @@
-# Contributing to bmad-auto
+# Contributing to bmad-loop
 
-Thank you for considering contributing! bmad-auto is part of the [BMad](https://github.com/bmad-code-org/BMAD-METHOD) ecosystem, and we believe in **Human Amplification, Not Replacement** — bringing out the best thinking in both humans and AI through guided collaboration.
+Thank you for considering contributing! bmad-loop is part of the [BMad](https://github.com/bmad-code-org/BMAD-METHOD) ecosystem, and we believe in **Human Amplification, Not Replacement** — bringing out the best thinking in both humans and AI through guided collaboration.
 
 💬 **Discord**: [Join our community](https://discord.gg/gk8jAdXWmj) for real-time discussions, questions, and collaboration.
 
@@ -14,7 +14,7 @@ Thank you for considering contributing! bmad-auto is part of the [BMad](https://
 
 ## Our Philosophy
 
-bmad-auto is a deterministic orchestrator: plain Python drives the loop while LLMs do only the creative work inside disposable coding-CLI sessions. Every contribution should keep that line clean — **no LLM in the control loop** — and answer: **"Does this make humans and AI better together?"**
+bmad-loop is a deterministic orchestrator: plain Python drives the loop while LLMs do only the creative work inside disposable coding-CLI sessions. Every contribution should keep that line clean — **no LLM in the control loop** — and answer: **"Does this make humans and AI better together?"**
 
 **✅ What we welcome:**
 
@@ -39,24 +39,24 @@ bmad-auto is a deterministic orchestrator: plain Python drives the loop while LL
 
 1. **Search existing issues** — Use the GitHub issue search to check if your bug or feature has already been reported
 2. **Search closed issues** — Your issue may have been fixed or addressed previously
-3. **Check discussions** — Some conversations happen in [GitHub Discussions](https://github.com/bmad-code-org/bmad-auto/discussions)
+3. **Check discussions** — Some conversations happen in [GitHub Discussions](https://github.com/bmad-code-org/bmad-loop/discussions)
 
 ### Bug Reports
 
-After searching, if the bug is unreported, use the [bug report template](https://github.com/bmad-code-org/bmad-auto/issues/new?template=bug-report.yaml) and include:
+After searching, if the bug is unreported, use the [bug report template](https://github.com/bmad-code-org/bmad-loop/issues/new?template=bug-report.yaml) and include:
 
 - Clear description of the problem
 - Steps to reproduce
 - Expected vs actual behavior
-- Your environment (coding CLI, OS, bmad-auto version from `bmad-auto --version`)
+- Your environment (coding CLI, OS, bmad-loop version from `bmad-loop --version`)
 - Screenshots or error messages if applicable
 
 ### Feature Requests
 
-After searching, use the [feature request template](https://github.com/bmad-code-org/bmad-auto/issues/new?template=feature-request.md) and explain:
+After searching, use the [feature request template](https://github.com/bmad-code-org/bmad-loop/issues/new?template=feature-request.md) and explain:
 
 - What the feature is
-- Why it would benefit the bmad-auto community
+- Why it would benefit the bmad-loop community
 - How it strengthens human-AI collaboration
 
 **For naming community modules or plugins**, review [TRADEMARK.md](TRADEMARK.md) for proper naming conventions (e.g., "My Plugin (BMad Community Plugin)").
@@ -74,11 +74,11 @@ After searching, use the [feature request template](https://github.com/bmad-code
 
 ## Development Setup
 
-bmad-auto is a Python project managed with [uv](https://docs.astral.sh/uv/).
+bmad-loop is a Python project managed with [uv](https://docs.astral.sh/uv/).
 
 ```bash
-git clone https://github.com/YOUR-USERNAME/bmad-auto.git
-cd bmad-auto
+git clone https://github.com/YOUR-USERNAME/bmad-loop.git
+cd bmad-loop
 uv sync --all-extras          # installs deps + the [tui] extra + dev tools (pytest, ruff)
 uv run pytest -q              # unit + adapter scenarios + tmux integration
 ```
@@ -117,7 +117,7 @@ We will reject PRs that read like raw LLM output: bulk refactors nobody asked fo
 ### New to Pull Requests?
 
 1. **Fork** the repository
-2. **Clone** your fork: `git clone https://github.com/YOUR-USERNAME/bmad-auto.git`
+2. **Clone** your fork: `git clone https://github.com/YOUR-USERNAME/bmad-loop.git`
 3. **Create a branch**: `git checkout -b fix/description` or `git checkout -b feature/description`
 4. **Make changes** — keep them focused
 5. **Verify**: `trunk check` and `uv run pytest -q` both pass
@@ -180,17 +180,17 @@ Keep messages under 72 characters. Each commit = one logical change.
 - **Keep the control loop deterministic** — orchestration logic is plain Python, never an LLM call. LLMs only run inside disposable coding-CLI sessions.
 - **Python style** is enforced by trunk (ruff, black, isort) at line-length 100 — let `trunk fmt` handle formatting.
 - **Tests** live under `tests/`; add or update them for behavior changes. The mock adapter lets most of the loop run without a live CLI.
-- **Skills** ship as markdown under `src/automator/data/skills/` (the `bmad-auto-*` automation skills).
+- **Skills** ship as markdown under `src/bmad_loop/data/skills/` (the `bmad-loop-*` automation skills).
 - **Plugins** extend the orchestrator via a `plugin.toml` manifest — see the [plugin authoring guide](docs/plugin-authoring-guide.md).
-- **New coding CLIs** are usually a TOML profile, not Python — see the CLI adapter section in the [README](README.md) and the [adapter authoring guide](docs/adapter-authoring-guide.md) (use `bmad-auto probe-adapter` to collect the hook/transcript/token data a profile needs).
+- **New coding CLIs** are usually a TOML profile, not Python — see the CLI adapter section in the [README](README.md) and the [adapter authoring guide](docs/adapter-authoring-guide.md) (use `bmad-loop probe-adapter` to collect the hook/transcript/token data a profile needs).
 
 ---
 
 ## Need Help?
 
 - 💬 **Discord**: [Join the community](https://discord.gg/gk8jAdXWmj)
-- 🐛 **Bugs**: Use the [bug report template](https://github.com/bmad-code-org/bmad-auto/issues/new?template=bug-report.yaml)
-- 💡 **Features**: Use the [feature request template](https://github.com/bmad-code-org/bmad-auto/issues/new?template=feature-request.md)
+- 🐛 **Bugs**: Use the [bug report template](https://github.com/bmad-code-org/bmad-loop/issues/new?template=bug-report.yaml)
+- 💡 **Features**: Use the [feature request template](https://github.com/bmad-code-org/bmad-loop/issues/new?template=feature-request.md)
 
 ---
 

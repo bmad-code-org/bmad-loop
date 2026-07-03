@@ -10,7 +10,7 @@ assignees: ''
 A clear and concise description of what you'd like to see added or changed.
 
 **Why is this needed?**
-Explain the problem this solves or the benefit it brings to the bmad-auto community.
+Explain the problem this solves or the benefit it brings to the bmad-loop community.
 
 **How should it work?**
 Describe your proposed solution. If you have ideas on implementation, share them here.

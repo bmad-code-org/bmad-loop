@@ -7,8 +7,8 @@ import sys
 
 import pytest
 
-from automator import process_host
-from automator.process_host import (
+from bmad_loop import process_host
+from bmad_loop.process_host import (
     PosixProcessHost,
     ProcessHostError,
     WindowsProcessHost,
@@ -140,7 +140,7 @@ def test_liveness_of_legacy_identity_degrades_to_is_alive(host, monkeypatch):
 
 
 def test_default_host_matches_platform(monkeypatch):
-    monkeypatch.delenv("BMAD_AUTO_PROCESS_HOST", raising=False)
+    monkeypatch.delenv("BMAD_LOOP_PROCESS_HOST", raising=False)
     get_process_host.cache_clear()
     expected = WindowsProcessHost if sys.platform == "win32" else PosixProcessHost
     assert isinstance(get_process_host(), expected)
@@ -149,11 +149,11 @@ def test_default_host_matches_platform(monkeypatch):
 def test_env_override_selects_by_name(monkeypatch):
     # The registry selects by name without monkeypatching sys.platform — the hook
     # PR #19's WindowsProcessHost registration relies on.
-    monkeypatch.setenv("BMAD_AUTO_PROCESS_HOST", "posix")
+    monkeypatch.setenv("BMAD_LOOP_PROCESS_HOST", "posix")
     get_process_host.cache_clear()
     assert isinstance(get_process_host(), PosixProcessHost)
 
-    monkeypatch.setenv("BMAD_AUTO_PROCESS_HOST", "windows")
+    monkeypatch.setenv("BMAD_LOOP_PROCESS_HOST", "windows")
     get_process_host.cache_clear()
     assert isinstance(get_process_host(), WindowsProcessHost)
 
@@ -161,7 +161,7 @@ def test_env_override_selects_by_name(monkeypatch):
 def test_unknown_forced_name_raises(monkeypatch):
     # An explicit but unregistered override is a misconfiguration: fail loudly rather
     # than silently fall back to POSIX (on win32 os.kill(pid, 0) is destructive).
-    monkeypatch.setenv("BMAD_AUTO_PROCESS_HOST", "bogus")
+    monkeypatch.setenv("BMAD_LOOP_PROCESS_HOST", "bogus")
     get_process_host.cache_clear()
     with pytest.raises(ProcessHostError, match="bogus"):
         get_process_host()
@@ -170,7 +170,7 @@ def test_unknown_forced_name_raises(monkeypatch):
 def test_register_invalidates_cached_selection(monkeypatch):
     # register_process_host() must clear the singleton cache so a host registered
     # after a prior get_process_host() call is honored without a manual cache_clear.
-    monkeypatch.delenv("BMAD_AUTO_PROCESS_HOST", raising=False)
+    monkeypatch.delenv("BMAD_LOOP_PROCESS_HOST", raising=False)
     saved_hosts = list(process_host._HOSTS)
     saved_loaded = process_host._BUILTINS_LOADED
     try:
@@ -212,6 +212,6 @@ def test_hook_interpreter_windows_resolves_without_project_venv():
 def test_hook_interpreter_routed_through_selected_host(monkeypatch):
     # The env override drives the prefix end-to-end, so a Windows host changes the
     # registered hook command with no `sys.platform` branch at the call site.
-    monkeypatch.setenv("BMAD_AUTO_PROCESS_HOST", "windows")
+    monkeypatch.setenv("BMAD_LOOP_PROCESS_HOST", "windows")
     get_process_host.cache_clear()
     assert get_process_host().hook_interpreter() == "uv run --no-project python"

@@ -8,9 +8,9 @@ from pathlib import Path
 
 from conftest import install_bmad_config
 
-from automator import bmadconfig
-from automator.bmadconfig import ProjectPaths
-from automator.workspace import Workspace
+from bmad_loop import bmadconfig
+from bmad_loop.bmadconfig import ProjectPaths
+from bmad_loop.workspace import Workspace
 
 
 def test_repo_root_defaults_to_project(tmp_path: Path) -> None:

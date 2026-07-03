@@ -5,8 +5,8 @@ import json
 
 import pytest
 
-from automator import cli, probe
-from automator.adapters.profile import get_profile
+from bmad_loop import cli, probe
+from bmad_loop.adapters.profile import get_profile
 
 # ----------------------------------------------------------- fixtures / helpers
 
@@ -152,11 +152,11 @@ def test_discover_location_redacts_username(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("dialect_cli", ["claude", "codex", "gemini", "copilot"])
 def test_probe_hook_registers_under_native_events(dialect_cli):
-    from automator.install import merge_hooks
+    from bmad_loop.install import merge_hooks
 
     profile = get_profile(dialect_cli)
     registrations = {
-        native: f"python3 /tmp/bmad_auto_probe_hook.py {canonical}"
+        native: f"python3 /tmp/bmad_loop_probe_hook.py {canonical}"
         for native, canonical in profile.hooks.events.items()
     }
     config, changed = merge_hooks({}, registrations, profile.hooks.dialect)
@@ -174,7 +174,7 @@ def test_scan_reports_registered_state(project):
     finding = probe.scan(cli="claude", profile=profile, project=proj, hints=probe.Hints())
     assert finding.registered is False  # nothing installed in the sandbox
     # now install hooks and re-scan
-    from automator.install import install_into
+    from bmad_loop.install import install_into
 
     install_into(proj, clis=("claude",))
     finding2 = probe.scan(cli="claude", profile=profile, project=proj, hints=probe.Hints())

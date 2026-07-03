@@ -4,7 +4,7 @@ import re
 
 import pytest
 
-from automator import sanitize
+from bmad_loop import sanitize
 
 
 @pytest.fixture

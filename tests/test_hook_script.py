@@ -5,7 +5,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-SCRIPT = Path(__file__).parent.parent / "src" / "automator" / "data" / "bmad_auto_hook.py"
+SCRIPT = Path(__file__).parent.parent / "src" / "bmad_loop" / "data" / "bmad_loop_hook.py"
 
 
 def run_hook(event: str, env: dict, payload) -> subprocess.CompletedProcess:
@@ -26,7 +26,7 @@ def test_noop_without_env(tmp_path):
 
 
 def test_writes_event_file(tmp_path):
-    env = {"BMAD_AUTO_RUN_DIR": str(tmp_path), "BMAD_AUTO_TASK_ID": "1-1-a-dev-1"}
+    env = {"BMAD_LOOP_RUN_DIR": str(tmp_path), "BMAD_LOOP_TASK_ID": "1-1-a-dev-1"}
     payload = {
         "session_id": "abc-123",
         "transcript_path": "/home/u/.claude/projects/x/abc-123.jsonl",
@@ -48,7 +48,7 @@ def test_writes_event_file(tmp_path):
 
 def test_conversation_id_fallback(tmp_path):
     """Cursor-style payloads carry conversation_id instead of session_id."""
-    env = {"BMAD_AUTO_RUN_DIR": str(tmp_path), "BMAD_AUTO_TASK_ID": "t1"}
+    env = {"BMAD_LOOP_RUN_DIR": str(tmp_path), "BMAD_LOOP_TASK_ID": "t1"}
     proc = run_hook("Stop", env, {"conversation_id": "conv-9"})
     assert proc.returncode == 0
     files = list((tmp_path / "events").glob("*.json"))
@@ -57,7 +57,7 @@ def test_conversation_id_fallback(tmp_path):
 
 def test_camelcase_payload(tmp_path):
     """Copilot payloads carry camelCase sessionId / transcriptPath."""
-    env = {"BMAD_AUTO_RUN_DIR": str(tmp_path), "BMAD_AUTO_TASK_ID": "t1"}
+    env = {"BMAD_LOOP_RUN_DIR": str(tmp_path), "BMAD_LOOP_TASK_ID": "t1"}
     payload = {
         "sessionId": "cop-7",
         "transcriptPath": "/home/u/.copilot/session-state/cop-7/events.jsonl",
@@ -71,7 +71,7 @@ def test_camelcase_payload(tmp_path):
 
 
 def test_tolerates_garbage_stdin(tmp_path):
-    env = {"BMAD_AUTO_RUN_DIR": str(tmp_path), "BMAD_AUTO_TASK_ID": "t1"}
+    env = {"BMAD_LOOP_RUN_DIR": str(tmp_path), "BMAD_LOOP_TASK_ID": "t1"}
     proc = run_hook("SessionEnd", env, None)  # empty stdin
     assert proc.returncode == 0
     files = list((tmp_path / "events").glob("*.json"))
@@ -80,8 +80,8 @@ def test_tolerates_garbage_stdin(tmp_path):
 
 
 def test_installed_copy_matches_source(tmp_path):
-    from automator.install import install_into
+    from bmad_loop.install import install_into
 
     install_into(tmp_path)
-    installed = (tmp_path / ".automator" / "bmad_auto_hook.py").read_text()
+    installed = (tmp_path / ".bmad-loop" / "bmad_loop_hook.py").read_text()
     assert installed == SCRIPT.read_text()

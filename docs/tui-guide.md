@@ -1,6 +1,6 @@
 # TUI guide
 
-`bmad-auto tui` is a live terminal dashboard for everything the orchestrator
+`bmad-loop tui` is a live terminal dashboard for everything the orchestrator
 does: watching runs, launching new ones, resuming paused ones, answering sweep
 decisions, and editing policy. This guide covers every screen, key, and
 message. For the one-page summary, see the [TUI section of the
@@ -11,7 +11,7 @@ README](../README.md#tui).
 ```bash
 uv sync --extra tui        # adds textual + tomlkit; the core stays pyyaml-only
 cd /path/to/your/bmad/project
-bmad-auto tui              # or: bmad-auto tui --project /path/to/project
+bmad-loop tui              # or: bmad-loop tui --project /path/to/project
 ```
 
 `--project` defaults to the current directory. tmux — the orchestrator's only
@@ -21,7 +21,7 @@ tmux works there unchanged; native Windows awaits a non-tmux backend.)
 
 Over a slow or high-latency link (SSH, Tailscale), a 60fps update stream can't
 drain in time and partial frames paint over old ones. Launch with
-`bmad-auto tui --low-frame-rate` to cap Textual to 15fps and disable
+`bmad-loop tui --low-frame-rate` to cap Textual to 15fps and disable
 animations (sets `TEXTUAL_FPS` / `TEXTUAL_ANIMATIONS`), or make it permanent
 with `[tui] low_frame_rate = true` in `policy.toml` (editable from the settings
 screen). An explicit `TEXTUAL_FPS` in the environment still wins.
@@ -30,19 +30,19 @@ screen). An explicit `TEXTUAL_FPS` in the environment still wins.
 
 The TUI never runs an engine in-process. The two halves:
 
-- **Launcher** — `r`, `s`, and `e` spawn detached `bmad-auto` processes as
-  windows of a dedicated tmux session, `bmad-auto-ctl`. Windows are named
+- **Launcher** — `r`, `s`, and `e` spawn detached `bmad-loop` processes as
+  windows of a dedicated tmux session, `bmad-loop-ctl`. Windows are named
   `run-<run-id>`, `sweep-<run-id>`, or `resume-<run-id>`, run the same Python
-  interpreter as the TUI (`python -m automator.cli`, immune to PATH/venv drift
+  interpreter as the TUI (`python -m bmad_loop.cli`, immune to PATH/venv drift
   inside tmux), and stay open after exit showing
-  `[bmad-auto exited <code> — press enter]` so you can inspect failures.
+  `[bmad-loop exited <code> — press enter]` so you can inspect failures.
   Quitting or crashing the TUI does not touch them. The engine each run drives
-  lives in a separate `bmad-auto-<run-id>` session; it is torn down when the run
+  lives in a separate `bmad-loop-<run-id>` session; it is torn down when the run
   finishes (unless `[adapter] cleanup_session_on_finish = false`). These parked
-  `bmad-auto-ctl` windows and any leftover `bmad-auto-<id>` sessions can be
+  `bmad-loop-ctl` windows and any leftover `bmad-loop-<id>` sessions can be
   swept with `c` (see [Cleaning up sessions](#cleaning-up-sessions-c)).
 - **Observer** — the dashboard reads only the artifacts the engine writes
-  atomically into `.automator/runs/<run-id>/`: `state.json`, `journal.jsonl`,
+  atomically into `.bmad-loop/runs/<run-id>/`: `state.json`, `journal.jsonl`,
   `logs/<task-id>.log`, `ATTENTION`, `engine.pid`. It polls the selected run
   every second (run list, sprint status, and the deferred-work ledger every 3
   seconds) with stat-gated readers, so unchanged files are never re-parsed.
@@ -55,7 +55,7 @@ captured and shown in a scrollable modal instead of spawned in tmux.
 ## Dashboard layout
 
 ```text
-┌─ bmad-auto — /path/to/project ─────────────────────────────────────────┐
+┌─ bmad-loop — /path/to/project ─────────────────────────────────────────┐
 │ st run              type │ 20260611-091500-3f2a  ▶ running             │
 │ ✔  20260610-…       story│ started 2026-06-11T09:15:00  epic 2         │
 │ ▶  20260611-…       story│ tasks 8  done 5  deferred 1  escalated 0    │
@@ -75,7 +75,7 @@ captured and shown in a scrollable modal instead of spawned in tmux.
 …and the same layout, live:
 
 <div align="center">
-<img src="images/dashboard.png" alt="The bmad-auto TUI dashboard, fully populated." width="880">
+<img src="images/dashboard.png" alt="The bmad-loop TUI dashboard, fully populated." width="880">
 </div>
 
 ### Left column
@@ -88,7 +88,7 @@ the pane recovers on the next poll once the file is readable again.
 
 #### Run list (top)
 
-One row per run dir under `.automator/runs/`, oldest first (run ids are
+One row per run dir under `.bmad-loop/runs/`, oldest first (run ids are
 `YYYYMMDD-HHMMSS-<hex>` and sort chronologically). Columns: `st` (status
 glyph, see below), `run` (the id), `type` (`story` or `sweep`). On first load
 the newest run is auto-selected; arrow keys or mouse select another. A run you
@@ -225,10 +225,10 @@ Journal kinds are styled by substring, first match wins:
 | `a` | attach to the selected run's live session or orchestrator window           |
 | `x` | stop the selected live run (confirm modal)                                 |
 | `D` | delete the selected run's directory (confirm modal)                        |
-| `A` | archive the selected run to `.automator/archive` (confirm modal)           |
+| `A` | archive the selected run to `.bmad-loop/archive` (confirm modal)           |
 | `c` | clean up tmux sessions/windows for finished & stopped runs (confirm modal) |
-| `v` | run `bmad-auto validate`, output in a modal                                |
-| `g` | settings editor for `.automator/policy.toml`                               |
+| `v` | run `bmad-loop validate`, output in a modal                                |
+| `g` | settings editor for `.bmad-loop/policy.toml`                               |
 | `M` | toggle theme (light/dark mode)                                             |
 | `y` | copy the active Log/Attention pane to the clipboard                        |
 | `q` | quit (running engines are unaffected)                                      |
@@ -260,7 +260,7 @@ Before any real launch the TUI applies the same guard as the CLI:
    modal lists it and asks before you "launch anyway" (two engines on one
    project may conflict).
 
-On success a toast names the run id and the `bmad-auto-ctl` session, and the
+On success a toast names the run id and the `bmad-loop-ctl` session, and the
 dashboard selects the new run, showing `⧗ starting…` until `state.json`
 appears.
 
@@ -276,28 +276,28 @@ this run` when the original engine still appears to be running. Heed this
   one: two engines driving one run dir corrupt each other's state. It can also
   mean the pid was recycled by another process — verify before resuming.
 
-Confirming spawns `bmad-auto resume <run-id>` detached in `bmad-auto-ctl`,
-like any other launch. Resume drops any stale `bmad-auto-<run-id>` session a
+Confirming spawns `bmad-loop resume <run-id>` detached in `bmad-loop-ctl`,
+like any other launch. Resume drops any stale `bmad-loop-<run-id>` session a
 stopped or interrupted run left behind and spins up a fresh one, so the run
 never re-attaches to a dead session.
 
 ## Cleaning up sessions (`c`)
 
 `c` removes leftover tmux artifacts for the current project in one pass, after a
-confirmation modal: every `bmad-auto-<run-id>` agent session whose run has
+confirmation modal: every `bmad-loop-<run-id>` agent session whose run has
 finished, stopped, or crashed (and any orphan whose run dir is gone), plus the
-parked `[bmad-auto exited …]` windows in `bmad-auto-ctl`. Live runs, the window
+parked `[bmad-loop exited …]` windows in `bmad-loop-ctl`. Live runs, the window
 you triggered the cleanup from, and any session or window belonging to another
 project are always spared, so it is safe to press at any time even with other
 projects' runs in flight. A toast reports how many sessions and windows were closed. The same
-sweep is available from a plain shell as `bmad-auto cleanup` (`--dry-run` to
+sweep is available from a plain shell as `bmad-loop cleanup` (`--dry-run` to
 preview). Runs already tear their own session down on finish unless you set
 `[adapter] cleanup_session_on_finish = false`; `c` is for the backlog that
 predates that, or that the flag deliberately keeps around.
 
 `c` only reaps tmux artifacts, not disk. To reclaim run-dir **disk** — worktrees a
 mid-flight stop orphaned (each holding a Unity `Library/`), and old run dirs — use
-the `bmad-auto clean` CLI command (see [`[cleanup]`](FEATURES.md#disk-reclamation-cleanup));
+the `bmad-loop clean` CLI command (see [`[cleanup]`](FEATURES.md#disk-reclamation-cleanup));
 it is intentionally not bound to a TUI key since it deletes/archives run history.
 
 ## Resolving an escalation (`R`)
@@ -308,7 +308,7 @@ refuses a run whose engine is still live. A CRITICAL escalation parks its story
 in a terminal `escalated` phase that plain `resume` skips — `R` is how you get
 it un-stuck.
 
-Confirming launches `bmad-auto resolve <run-id>` in a `bmad-auto-ctl` window and
+Confirming launches `bmad-loop resolve <run-id>` in a `bmad-loop-ctl` window and
 **attaches you to it** (the resolve agent is interactive). You converse with the
 agent — it is seeded with the escalation detail and the frozen spec — to
 disambiguate the spec. When it has recorded a resolution, the same window prompts
@@ -324,9 +324,9 @@ leaves the story escalated and the run paused — the safe default.
 `a` picks its target in this order:
 
 1. **Decision-blocked sweep, or no live agent session** → the run's
-   orchestrator window in `bmad-auto-ctl` (only exists for runs launched from
+   orchestrator window in `bmad-loop-ctl` (only exists for runs launched from
    the TUI).
-2. **Live agent session** → the per-run tmux session `bmad-auto-<run-id>`
+2. **Live agent session** → the per-run tmux session `bmad-loop-<run-id>`
    where the coding CLI is working.
 3. Neither → a warning; there is nothing to attach to (runs started outside
    the TUI between sessions, finished runs).
@@ -362,21 +362,21 @@ from — press `d`. The Deferred Work pane title shows the outstanding count
 (`Deferred Work — N to answer (d)`), and `d` walks them one modal at a time
 (question, context, and each option with its effect and the triage
 recommendation). Each answer is durable: a `close` is applied immediately, and
-a `build`/`keep-open` is saved to `.automator/decisions.json`, so the next sweep
+a `build`/`keep-open` is saved to `.bmad-loop/decisions.json`, so the next sweep
 acts on it (build → bundle, keep-open → recorded) without asking again. Skip a
 modal to leave that one for later. The same set is available on the CLI via
-`bmad-auto decisions` (`--list` to just view).
+`bmad-loop decisions` (`--list` to just view).
 
 ## Validate (`v`)
 
-Runs `bmad-auto validate --project <project>` in the background and shows the
+Runs `bmad-loop validate --project <project>` in the background and shows the
 combined output in a scrollable modal titled `validate — ok` (or
 `exit <code>`). Same preflight as the CLI: config, sprint-status, git, tmux,
 CLI binary, hooks.
 
 ## Settings editor (`g`)
 
-Edits `.automator/policy.toml` **comment-preservingly** (tomlkit): saving only
+Edits `.bmad-loop/policy.toml` **comment-preservingly** (tomlkit): saving only
 rewrites keys you actually changed; everything else — comments, order,
 formatting — stays byte-identical. A missing policy file starts from the full
 inline-documented template. The note at the top is load-bearing: **running
@@ -427,7 +427,7 @@ behavior.
 | `scm.commit_message_template`         | text                   | (built-in)         | story/bundle commit message; `{story_key}` / `{run_id}` substituted                                                                                     |
 | `scm.failed_diff_max_mb`              | int ≥ 1                | 5                  | per-file cap (MB) for untracked files in a kept-failed unit's `changes.patch`                                                                           |
 | `scm.failed_diff_unlimited`           | switch                 | off                | lift the failed-diff size cap (warns when active)                                                                                                       |
-| `cleanup.run_retention`               | int ≥ 0                | 10                 | newest concluded runs `bmad-auto clean` keeps whole; older ones trimmed/archived (0 = keep none by count)                                               |
+| `cleanup.run_retention`               | int ≥ 0                | 10                 | newest concluded runs `bmad-loop clean` keeps whole; older ones trimmed/archived (0 = keep none by count)                                               |
 | `cleanup.retention_days`              | int ≥ 0                | 0                  | 0 = off; else also keep runs newer than N days regardless of the count above                                                                            |
 | `cleanup.trim_artifacts`              | switch                 | on                 | drop the heavy `worktrees/` tree from concluded runs; the run still lists in the dashboard                                                              |
 | `cleanup.archive_old`                 | switch                 | on                 | archive (vs hard-delete) runs past the retention window                                                                                                 |
@@ -444,13 +444,13 @@ behavior.
 inert, clamped to 1, until parallel fan-out is built.)
 
 The form is **registry-driven**: the core sections above are described by
-`automator/data/settings/core.toml` (presentation only — defaults and options are
+`bmad_loop/data/settings/core.toml` (presentation only — defaults and options are
 referenced from the policy dataclasses, never duplicated), and every **enabled** plugin's
 `[[settings]]` are appended automatically under a collapsible section of their own,
 persisting to `[plugins.<name>]`. So the `plugins.unity.*` rows above only appear once
 `unity` is listed in `[plugins] enabled` — the opt-in layer for game projects that drive a
 live Editor through an MCP, off by default. A custom plugin dropped at
-`.automator/plugins/<name>/` surfaces the same way. See [Writing a bmad-auto
+`.bmad-loop/plugins/<name>/` surfaces the same way. See [Writing a bmad-loop
 plugin](plugin-authoring-guide.md) for the settings schema, [Writing a Game Engine
 plugin](game-engine-plugin-guide.md), and [Writing a plugin for a specific Editor
 MCP](game-engine-mcp-guide.md). The Unity plugin's `editor_mode` ↔ `scm.isolation`
@@ -472,9 +472,9 @@ buttons and block the save. The write itself is atomic (temp file +
 | Message                                                                             | Cause / fix                                                                                                                          |
 | ----------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
 | `tmux not found on PATH — launch/attach disabled`                                   | install tmux; the dashboard still works read-only                                                                                    |
-| `git worktree is not clean — commit or stash first`                                 | the launch guard; commit/stash and retry. `.automator/policy.toml` is exempt, so saving in the settings editor never blocks a launch |
+| `git worktree is not clean — commit or stash first`                                 | the launch guard; commit/stash and retry. `.bmad-loop/policy.toml` is exempt, so saving in the settings editor never blocks a launch |
 | `another run is live: <ids>`                                                        | a second engine on the same project may conflict — confirm only if you know they won't touch the same stories                        |
-| `launch may have failed — attach to tmux session bmad-auto-ctl`                     | no `state.json` within 10 s of launch; attach to the ctl window to read the error (the window stays open with the exit code)         |
+| `launch may have failed — attach to tmux session bmad-loop-ctl`                     | no `state.json` within 10 s of launch; attach to the ctl window to read the error (the window stays open with the exit code)         |
 | `no run selected`                                                                   | `e` / `a` need a selected run — the project has no runs yet                                                                          |
 | `state for run <id> is unreadable`                                                  | corrupt/missing `state.json`; inspect the run dir                                                                                    |
 | `run <id> already finished`                                                         | finished runs can't be resumed                                                                                                       |
@@ -482,7 +482,7 @@ buttons and block the save. The write itself is atomic (temp file +
 | `cannot suspend here — run manually: tmux attach …`                                 | the terminal can't suspend the TUI; run the printed command in another terminal                                                      |
 | `engine.pid is still alive — resuming would double-drive this run`                  | the original engine still runs (or its pid was recycled); attach and check before resuming                                           |
 | `policy.toml is not valid TOML: …`                                                  | hand-edited file is syntactically broken; fix it in an editor — the settings screen needs a parseable document to start from         |
-| sprint tree shows `sprint status unavailable`                                       | missing/invalid `_bmad/bmm/config.yaml` or sprint-status.yaml; run `bmad-auto init` / `bmad-sprint-planning`                         |
+| sprint tree shows `sprint status unavailable`                                       | missing/invalid `_bmad/bmm/config.yaml` or sprint-status.yaml; run `bmad-loop init` / `bmad-sprint-planning`                         |
 | deferred pane shows `deferred ledger unavailable`                                   | missing/unreadable `deferred-work.md`; normal until the first session defers something                                               |
 | header shows `state unavailable`                                                    | the run dir exists but `state.json` is missing or never parsed; usually transient at launch                                          |
 
