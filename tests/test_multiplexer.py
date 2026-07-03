@@ -280,12 +280,14 @@ def test_seam_honesty_holds_for_psmux_style_run_override(monkeypatch):
 
 
 class _RecordRun:
-    """Stand-in for subprocess.run that records the kwargs of the one spawn."""
+    """Stand-in for subprocess.run that records the argv and kwargs of the one spawn."""
 
     def __init__(self):
+        self.argv: list = []
         self.kwargs: dict = {}
 
     def __call__(self, argv, **kwargs):
+        self.argv = argv
         self.kwargs = kwargs
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
@@ -330,3 +332,149 @@ def test_run_custom_env_is_forwarded_without_leaking(monkeypatch):
     assert "TMUX" not in rec.kwargs["env"]
     # the scrubbed env is confined to the child spawn — this process's env is untouched
     assert dict(os.environ) == before
+
+
+# ------------------------------------------------------- shell-dialect seam
+#
+# new_window / new_parked_window keep the tmux argv construction and the
+# parked-window protocol in the base; only shell-dialect fragments route
+# through overridable hooks. Locked two ways: the POSIX output stays
+# byte-identical to the pre-seam inline code, and a leaf that overrides only
+# the hooks still gets the base's scaffolding without touching a method body.
+
+# the exact sh source the POSIX backend produced before the hooks existed
+_PARKED_SH_SOURCE = (
+    'echo hi; ec=$?; echo "[bmad-loop exited $ec — press enter]"; read -r; '
+    "ret=$(tmux show-options -wqv %3 2>/dev/null); "
+    'if [ "$ret" = "detach" ]; then tmux detach-client 2>/dev/null; '
+    'elif [ -n "$ret" ]; then '
+    'tmux switch-client -t "$ret" 2>/dev/null || tmux switch-client -l 2>/dev/null; fi'
+)
+
+
+def test_new_parked_window_posix_argv_byte_identical(monkeypatch, tmp_path):
+    rec = _RecordRun()
+    monkeypatch.setattr(tmux_base.subprocess, "run", rec)
+
+    TmuxMultiplexer().new_parked_window("s", "n", tmp_path, ["echo", "hi"], "%3")
+
+    assert rec.argv == [
+        "tmux",
+        "new-window",
+        "-d",
+        "-P",
+        "-F",
+        "#{window_id}",
+        "-t",
+        "=s:",
+        "-n",
+        "n",
+        "-c",
+        str(tmp_path),
+        "sh",
+        "-c",
+        _PARKED_SH_SOURCE,
+    ]
+
+
+def test_new_window_posix_argv_byte_identical(monkeypatch, tmp_path):
+    rec = _RecordRun()
+    monkeypatch.setattr(tmux_base.subprocess, "run", rec)
+
+    TmuxMultiplexer().new_window("s", "n", tmp_path, {"A": "1", "B": "2"}, "cmd")
+
+    assert rec.argv == [
+        "tmux",
+        "new-window",
+        "-t",
+        "=s:",
+        "-n",
+        "n",
+        "-c",
+        str(tmp_path),
+        "-P",
+        "-F",
+        "#{window_id}",
+        "-e",
+        "A=1",
+        "-e",
+        "B=2",
+        "cmd",
+    ]
+
+
+class _FakeDialect(TmuxMultiplexer):
+    """A leaf that overrides ONLY the dialect hooks — no contract method bodies."""
+
+    _EXIT_CAPTURE = "ec := EXITSTATUS"
+    _ECHO = "say"
+    _PARK = "pause"
+
+    def _join_argv(self, argv):
+        return "run " + " ".join(f"<{a}>" for a in argv)
+
+    def _source_prefix(self):
+        return "PRELUDE; "
+
+    def _shell_wrap(self, source):
+        return ["fakesh", "-enc", source]
+
+    def _parked_trailer(self, return_opt):
+        return f"TRAILER({return_opt})"
+
+    def _window_launch(self, env, command):
+        return [f"wrapped:{command}"]
+
+
+def test_dialect_leaf_parked_window_composes_from_hooks(monkeypatch, tmp_path):
+    rec = _RecordRun()
+    monkeypatch.setattr(tmux_base.subprocess, "run", rec)
+
+    _FakeDialect().new_parked_window("s", "n", tmp_path, ["echo", "hi"], "%3")
+
+    # the tmux scaffolding is the base's, unchanged
+    assert rec.argv[:12] == [
+        "tmux",
+        "new-window",
+        "-d",
+        "-P",
+        "-F",
+        "#{window_id}",
+        "-t",
+        "=s:",
+        "-n",
+        "n",
+        "-c",
+        str(tmp_path),
+    ]
+    # the shell source is composed prefix + inner + capture + banner + park + trailer
+    assert rec.argv[12:] == [
+        "fakesh",
+        "-enc",
+        "PRELUDE; run <echo> <hi>; ec := EXITSTATUS; "
+        'say "[bmad-loop exited $ec — press enter]"; '
+        "pause; TRAILER(%3)",
+    ]
+
+
+def test_dialect_leaf_new_window_routes_launch_through_hook(monkeypatch, tmp_path):
+    rec = _RecordRun()
+    monkeypatch.setattr(tmux_base.subprocess, "run", rec)
+
+    _FakeDialect().new_window("s", "n", tmp_path, {"A": "1"}, "cmd")
+
+    assert rec.argv == [
+        "tmux",
+        "new-window",
+        "-t",
+        "=s:",
+        "-n",
+        "n",
+        "-c",
+        str(tmp_path),
+        "-P",
+        "-F",
+        "#{window_id}",
+        "wrapped:cmd",
+    ]
+    assert "-e" not in rec.argv  # env strategy fully delegated to the hook

@@ -7,8 +7,10 @@ an eventual native-Windows "psmux" — can subclass :class:`BaseTmuxBackend` and
 override only the single spawn primitive :meth:`BaseTmuxBackend._run` (to tweak
 the binary or timeout — output decoding is the :attr:`BaseTmuxBackend._ENCODING`
 class attribute and a scrubbed per-call ``env`` is a ``_run`` parameter, neither
-an override) plus the few divergent methods (e.g. the
-parked-window trailer), **without editing** :mod:`.tmux_backend`.
+an override) plus the shell-dialect hooks (``_shell_wrap``, ``_join_argv``,
+``_parked_trailer``, ``_source_prefix``, ``_window_launch`` and the
+``_EXIT_CAPTURE``/``_ECHO``/``_PARK`` fragments), **without editing**
+:mod:`.tmux_backend` or any contract method body.
 
 Every method that talks to tmux funnels through :meth:`BaseTmuxBackend._run`, the
 one place a subprocess is spawned. See :mod:`.multiplexer` for the contract.
@@ -158,14 +160,74 @@ class BaseTmuxBackend(TerminalMultiplexer):
                 options[name] = value
         return options
 
+    # ------------------------------------------------- shell dialect seam
+
+    # new_window / new_parked_window own the tmux argv construction and the
+    # parked-window protocol; everything shell-*dialect* about them routes
+    # through the hooks below so a non-POSIX leaf overrides string fragments,
+    # never a contract method body. Defaults are POSIX sh, so a non-POSIX leaf
+    # must override every hook whose default emits sh syntax: the three
+    # fragments, _join_argv, _parked_trailer, and _shell_wrap.
+
+    #: Fragments of the parked recipe. The banner line reads ``$ec`` verbatim
+    #: and stays dialect-neutral only because every dialect of the family
+    #: interpolates ``$ec`` inside its double-quoted strings — so an
+    #: _EXIT_CAPTURE override MUST bind the variable ``ec``.
+    _EXIT_CAPTURE = "ec=$?"
+    _ECHO = "echo"
+    _PARK = "read -r"
+
+    def _join_argv(self, argv: list[str]) -> str:
+        """Render ``argv`` as one shell command line in this dialect."""
+        return shlex.join(argv)
+
+    def _source_prefix(self) -> str:
+        """Dialect prelude prepended to a parked window's shell source.
+
+        The recipe adds no separator, so an override must return ``""`` or a
+        self-terminating statement ending in ``"; "``.
+        """
+        return ""
+
+    def _shell_wrap(self, source: str) -> list[str]:
+        # Explicit `sh -c` (the user's login shell may be fish) — the one place
+        # a window's shell source is turned into a spawnable argv.
+        return ["sh", "-c", source]
+
+    def _parked_trailer(self, return_opt: str) -> str:
+        # After the park, switch an attached client back to its origin pane:
+        #   - return_opt == a pane id (%N): switch that client back there
+        #     (`switch-client -l` is a best-effort fallback when it is gone);
+        #   - return_opt == PARKED_RETURN_DETACH: detach the client so a blocking
+        #     `tmux attach` returns and a suspended TUI resumes;
+        #   - unset/empty: nobody attached interactively -> park as-is.
+        # The tmux verbs are protocol-identical across the family; only the
+        # surrounding control-flow syntax is dialect-specific.
+        return (
+            f"ret=$(tmux show-options -wqv {shlex.quote(return_opt)} 2>/dev/null); "
+            f'if [ "$ret" = "{PARKED_RETURN_DETACH}" ]; then tmux detach-client 2>/dev/null; '
+            'elif [ -n "$ret" ]; then '
+            'tmux switch-client -t "$ret" 2>/dev/null || tmux switch-client -l 2>/dev/null; '
+            "fi"
+        )
+
+    def _window_launch(self, env: dict[str, str], command: str) -> list[str]:
+        """Trailing ``new-window`` args: env injection plus the command itself.
+
+        Part of the dialect seam because the env-injection *strategy* is
+        dialect-coupled: bare ``-e`` flags plus the raw command here, an
+        in-source prelude for a leaf whose shell wraps the command.
+        """
+        env_args: list[str] = []
+        for key, value in env.items():
+            env_args += ["-e", f"{key}={value}"]
+        return [*env_args, command]
+
     # ------------------------------------------------------------ windows
 
     def new_window(
         self, session: str, name: str, cwd: Path, env: dict[str, str], command: str
     ) -> str:
-        env_args: list[str] = []
-        for key, value in env.items():
-            env_args += ["-e", f"{key}={value}"]
         return self._tmux(
             "new-window",
             "-t",
@@ -177,33 +239,20 @@ class BaseTmuxBackend(TerminalMultiplexer):
             "-P",
             "-F",
             "#{window_id}",
-            *env_args,
-            command,
+            *self._window_launch(env, command),
         )
 
     def new_parked_window(
         self, session: str, name: str, cwd: Path, argv: list[str], return_opt: str
     ) -> str:
-        # The window runs under explicit `sh -c` (the user's login shell may be
-        # fish); the trailing `read` keeps the exit status inspectable instead of
-        # tmux closing the window the moment the process exits. After the read the
-        # return trailer switches an attached client back to its origin pane:
-        #   - return_opt == a pane id (%N): switch that client back there
-        #     (`switch-client -l` is a best-effort fallback when it is gone);
-        #   - return_opt == PARKED_RETURN_DETACH: detach the client so a blocking
-        #     `tmux attach` returns and a suspended TUI resumes;
-        #   - unset/empty: nobody attached interactively -> park as-is.
-        return_trailer = (
-            f"ret=$(tmux show-options -wqv {shlex.quote(return_opt)} 2>/dev/null); "
-            f'if [ "$ret" = "{PARKED_RETURN_DETACH}" ]; then tmux detach-client 2>/dev/null; '
-            'elif [ -n "$ret" ]; then '
-            'tmux switch-client -t "$ret" 2>/dev/null || tmux switch-client -l 2>/dev/null; '
-            "fi"
-        )
-        inner = shlex.join(argv)
-        shell = (
-            f'{inner}; ec=$?; echo "[bmad-loop exited $ec — press enter]"; '
-            f"read -r; {return_trailer}"
+        # Run argv, then park on a blocking read so the exit status stays
+        # inspectable instead of tmux closing the window the moment the process
+        # exits; the trailer (see _parked_trailer) then returns an attached
+        # client to where it came from.
+        source = self._source_prefix() + (
+            f"{self._join_argv(argv)}; {self._EXIT_CAPTURE}; "
+            f'{self._ECHO} "[bmad-loop exited $ec — press enter]"; '
+            f"{self._PARK}; {self._parked_trailer(return_opt)}"
         )
         return self._tmux(
             "new-window",
@@ -217,9 +266,7 @@ class BaseTmuxBackend(TerminalMultiplexer):
             name,
             "-c",
             str(cwd),
-            "sh",
-            "-c",
-            shell,
+            *self._shell_wrap(source),
         )
 
     def list_window_ids(self, session: str) -> list[str]:
