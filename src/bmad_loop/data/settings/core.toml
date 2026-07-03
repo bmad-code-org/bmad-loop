@@ -257,7 +257,7 @@ kind = "int"
 minimum = 0
 default_ref = "ScmPolicy.preserve_keep"
 label = "preserve-ref retention"
-description = "attempt-preserve/* recovery branches kept at each run start · the newest by committer date survive and the tail is deleted (0 = never prune)"
+description = "attempt-preserve/* recovery branches and attempt-preserve-dirty/* worktree snapshots kept at each run start (per family) · the newest by committer date survive and the tail is deleted (0 = never prune)"
 [[section.field]]
 key = "seed_adapter_defaults"
 kind = "switch"

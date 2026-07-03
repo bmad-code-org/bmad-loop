@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -250,16 +251,76 @@ def preserve_commits(
 
 
 class PrunePreserveError(GitError):
-    """Partial :func:`prune_preserve_refs` failure. The prune is per-ref
-    best-effort, so refs may already be gone when a later one sticks — the
-    ``deleted`` list keeps that destructive half structurally auditable (a
-    caller can journal it, not just grep the message) and ``failed`` names
-    each stuck ref with its git detail."""
+    """Partial :func:`prune_preserve_refs` / :func:`prune_preserve_dirty_refs`
+    failure. The prune is per-ref best-effort, so refs may already be gone when
+    a later one sticks — the ``deleted`` list keeps that destructive half
+    structurally auditable (a caller can journal it, not just grep the message)
+    and ``failed`` names each stuck ref with its git detail."""
 
     def __init__(self, message: str, *, deleted: list[str], failed: list[str]) -> None:
         super().__init__(message)
         self.deleted = deleted
         self.failed = failed
+
+
+def _prune_refs(
+    repo: Path,
+    keep: int,
+    prefix: str,
+    *,
+    label: str,
+    strip: str,
+    delete: Callable[[str], None],
+) -> list[str]:
+    """Shared retention loop behind the per-family pruners: list the refs under
+    ``prefix``, keep the ``keep`` newest by committer date, best-effort delete
+    the tail via ``delete``, and return the deleted names. ``strip`` is removed
+    from each refname before it is deleted/reported (``refs/heads/`` for the
+    branch family, nothing for bare refs). ``keep <= 0`` means "never prune" —
+    returns ``[]`` without running git.
+
+    Raises :class:`GitError` when the listing fails, or
+    :class:`PrunePreserveError` — after attempting every tail ref — when any
+    individual delete failed. One stuck ref must not wedge the retention for
+    everything behind it, so deletes are per-ref best-effort and the error
+    carries both what was deleted and what was not."""
+    if keep <= 0:
+        return []
+    rc, out = _git(
+        repo,
+        "for-each-ref",
+        # ties on committerdate (same-second rollbacks) break by ascending
+        # refname — an explicit, observable order rather than git's implicit
+        # stable-sort fallback. Last --sort key is the primary one.
+        "--sort=refname",
+        "--sort=-committerdate",
+        # full refname, not :short — a tag or remote ref sharing the name would
+        # make :short emit an ambiguous form the deleter can't use
+        "--format=%(refname)",
+        prefix,
+    )
+    if rc != 0:
+        raise GitError(f"git for-each-ref {label} failed in {repo}: {out}")
+    refs = [line.removeprefix(strip) for line in out.splitlines() if line]
+    deleted: list[str] = []
+    failed: list[str] = []
+    for name in refs[keep:]:
+        try:
+            delete(name)
+        except Exception as exc:  # noqa: BLE001 - a git timeout/OSError on one ref
+            # must not wedge the tail behind it any more than a GitError does; the
+            # per-ref best-effort contract holds for the whole subprocess surface
+            failed.append(f"{name} ({exc})")
+            continue
+        deleted.append(name)
+    if failed:
+        raise PrunePreserveError(
+            f"{label} prune in {repo}: deleted {deleted or 'nothing'}, "
+            f"could not delete {'; '.join(failed)}",
+            deleted=deleted,
+            failed=failed,
+        )
+    return deleted
 
 
 def prune_preserve_refs(repo: Path, keep: int) -> list[str]:
@@ -276,44 +337,46 @@ def prune_preserve_refs(repo: Path, keep: int) -> list[str]:
     Raises :class:`GitError` when the listing fails, or
     :class:`PrunePreserveError` — after attempting every tail ref — when any
     individual delete failed (e.g. the ref is checked out here or in a
-    worktree). One stuck ref must not wedge the retention for everything
-    behind it, so deletes are per-ref best-effort and the error carries both
-    what was deleted and what was not."""
-    if keep <= 0:
-        return []
-    rc, out = _git(
+    worktree); see :func:`_prune_refs` for the best-effort contract."""
+    return _prune_refs(
         repo,
-        "for-each-ref",
-        # ties on committerdate (same-second rollbacks) break by ascending
-        # refname — an explicit, observable order rather than git's implicit
-        # stable-sort fallback. Last --sort key is the primary one.
-        "--sort=refname",
-        "--sort=-committerdate",
-        # full refname, not :short — a tag or remote ref sharing the name would
-        # make :short emit "heads/attempt-preserve/x", which `branch -D` can't use
-        "--format=%(refname)",
+        keep,
         "refs/heads/attempt-preserve/",
+        label="attempt-preserve",
+        strip="refs/heads/",
+        delete=lambda name: delete_branch(repo, name, force=True),
     )
-    if rc != 0:
-        raise GitError(f"git for-each-ref attempt-preserve failed in {repo}: {out}")
-    refs = [line.removeprefix("refs/heads/") for line in out.splitlines() if line]
-    deleted: list[str] = []
-    failed: list[str] = []
-    for name in refs[keep:]:
-        try:
-            delete_branch(repo, name, force=True)
-        except GitError as exc:
-            failed.append(f"{name} ({exc})")
-            continue
-        deleted.append(name)
-    if failed:
-        raise PrunePreserveError(
-            f"attempt-preserve prune in {repo}: deleted {deleted or 'nothing'}, "
-            f"could not delete {'; '.join(failed)}",
-            deleted=deleted,
-            failed=failed,
-        )
-    return deleted
+
+
+def prune_preserve_dirty_refs(repo: Path, keep: int) -> list[str]:
+    """Bounded retention for the ``refs/attempt-preserve-dirty/*`` worktree
+    snapshots that :func:`snapshot_worktree` parks before an auto-rollback
+    reset: keep the ``keep`` most recent by committer date (the snapshot
+    commit's committer date is its park time), delete the rest via
+    ``git update-ref -d``, and return the deleted names. These refs live
+    outside ``refs/heads/`` — they are not branches, so ``branch -D`` cannot
+    touch them and the reported names are full refnames (there is no
+    ``refs/heads/`` to strip). Only ``refs/attempt-preserve-dirty/`` is ever
+    listed, so branches and every other ref are untouchable by construction.
+    ``keep <= 0`` means "never prune" — returns ``[]`` without running git.
+
+    Raises :class:`GitError` when the listing fails, or
+    :class:`PrunePreserveError` on a partial delete failure; see
+    :func:`_prune_refs` for the best-effort contract."""
+
+    def _delete(refname: str) -> None:
+        rc, out = _git(repo, "update-ref", "-d", refname)
+        if rc != 0:
+            raise GitError(f"git update-ref -d {refname} failed in {repo}: {out}")
+
+    return _prune_refs(
+        repo,
+        keep,
+        "refs/attempt-preserve-dirty/",
+        label="attempt-preserve-dirty",
+        strip="",
+        delete=_delete,
+    )
 
 
 def snapshot_worktree(

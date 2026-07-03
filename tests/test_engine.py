@@ -1276,6 +1276,109 @@ def test_run_start_partial_prune_journals_deletions_and_failure(project, monkeyp
     assert engine.state.finished
 
 
+def _park_dirty_snapshots(repo, count):
+    """Write `count` refs/attempt-preserve-dirty/* snapshot refs, each on its
+    own commit so committer-date ordering is well defined."""
+    for i in range(count):
+        (repo / "impl.txt").write_text(f"snapshot {i}\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", f"snapshot {i}")
+        git(repo, "update-ref", f"refs/attempt-preserve-dirty/run-{i}", "HEAD")
+
+
+def test_run_start_prunes_excess_dirty_snapshot_refs(project):
+    """Run start with scm.preserve_keep set and more attempt-preserve-dirty
+    snapshot refs than the budget: the tail is deleted before the loop, only
+    preserve_keep refs survive, and the deletions are journalled under the
+    family's own event kind."""
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(rollback_on_failure=True, preserve_keep=2),
+    )
+    repo = project.project
+    write_sprint(project, {"epic-1": "backlog"})  # nothing actionable: run start + finish only
+    _park_dirty_snapshots(repo, 3)
+    engine, _ = make_engine(project, [], policy=policy)
+
+    engine.run()
+
+    remaining = git(
+        repo, "for-each-ref", "--format=%(refname)", "refs/attempt-preserve-dirty/"
+    ).splitlines()
+    assert len(remaining) == 2  # tail pruned down to the budget
+    entry = next(
+        e for e in engine.journal.entries() if e["kind"] == "attempt-preserve-dirty-pruned"
+    )
+    assert entry["count"] == 1
+    assert set(entry["refs"]) | set(remaining) == {
+        f"refs/attempt-preserve-dirty/run-{i}" for i in range(3)
+    }
+
+
+def test_run_start_dirty_prune_failure_journals_and_run_proceeds(project, monkeypatch):
+    """A failing dirty-snapshot prune at run start is journalled under its own
+    event kind and never blocks the run."""
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(rollback_on_failure=True, preserve_keep=2),
+    )
+    write_sprint(project, {"epic-1": "backlog"})  # nothing actionable: run start + finish only
+
+    def _fail(*a, **k):
+        raise GitError("simulated dirty for-each-ref failure")
+
+    monkeypatch.setattr("bmad_loop.verify.prune_preserve_dirty_refs", _fail)
+    engine, _ = make_engine(project, [], policy=policy)
+
+    engine.run()
+
+    entry = next(
+        e for e in engine.journal.entries() if e["kind"] == "attempt-preserve-dirty-prune-failed"
+    )
+    assert "simulated dirty for-each-ref failure" in entry["error"]
+    assert engine.state.finished  # the prune failure never blocked or crashed the run
+
+
+def test_run_start_branch_prune_failure_does_not_skip_dirty_prune(project, monkeypatch):
+    """A failing branch-family prune must not skip the dirty family: with excess
+    dirty snapshot refs present, the branch failure is journalled AND the dirty
+    tail is still pruned and journalled."""
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(rollback_on_failure=True, preserve_keep=1),
+    )
+    repo = project.project
+    write_sprint(project, {"epic-1": "backlog"})  # nothing actionable: run start + finish only
+    _park_dirty_snapshots(repo, 2)
+
+    def _fail(*a, **k):
+        raise GitError("simulated branch prune failure")
+
+    monkeypatch.setattr("bmad_loop.verify.prune_preserve_refs", _fail)
+    engine, _ = make_engine(project, [], policy=policy)
+
+    engine.run()
+
+    failed = next(
+        e for e in engine.journal.entries() if e["kind"] == "attempt-preserve-prune-failed"
+    )
+    assert "simulated branch prune failure" in failed["error"]
+    pruned = next(
+        e for e in engine.journal.entries() if e["kind"] == "attempt-preserve-dirty-pruned"
+    )
+    remaining = git(
+        repo, "for-each-ref", "--format=%(refname)", "refs/attempt-preserve-dirty/"
+    ).splitlines()
+    assert pruned["count"] == 1 and len(remaining) == 1  # pruned down to the budget
+    assert set(pruned["refs"]) | set(remaining) == {
+        f"refs/attempt-preserve-dirty/run-{i}" for i in range(2)
+    }
+    assert engine.state.finished
+
+
 def test_rollback_worktree_preserve_failure_journals_git_error(project, monkeypatch):
     """When the uncommitted-work snapshot can't be captured, the best-effort path still
     resets (rollback ON, no commits above baseline -> no pause) but journals the underlying

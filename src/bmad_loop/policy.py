@@ -255,12 +255,12 @@ class ScmPolicy:
     # attempt's source but preserves the corrected spec under the BMAD artifact
     # folders, which it treats as orchestrator-owned.
     rollback_on_failure: bool = False
-    # preserve_keep bounds the attempt-preserve/* recovery branches auto-rollback
-    # parks before its hard reset: each run start keeps only the N most recent
-    # (by committer date) and deletes the tail, so a long-lived project with
-    # rollback_on_failure on doesn't accumulate them forever. 0 = never prune
-    # (maximum safety). The refs/attempt-preserve-dirty/* worktree snapshots are
-    # never touched by this.
+    # preserve_keep bounds both recovery-ref families auto-rollback parks before
+    # its hard reset — the attempt-preserve/* branches and the
+    # refs/attempt-preserve-dirty/* worktree snapshots: each run start keeps only
+    # the N most recent per family (by committer date) and deletes the tail, so a
+    # long-lived project with rollback_on_failure on doesn't accumulate them
+    # forever. 0 = never prune (maximum safety).
     preserve_keep: int = 20
     # failed_diff_max_mb caps the per-file size (MB) of untracked files captured
     # into a kept-failed unit's forensic changes.patch, so a stray build dir or
@@ -779,7 +779,7 @@ merge_strategy = "merge"     # ff | merge | squash (worktree mode merges the uni
 delete_branch = true         # delete the unit branch after a successful merge
 keep_failed = true           # keep a failed unit's worktree+branch for inspection
 rollback_on_failure = false  # in-place (isolation="none") recovery after a failed attempt. false = never touch the tree; pause with manual recovery steps. true = auto-revert the attempt's tracked changes + remove only the untracked files this run created (WARNING: discards the attempt's uncommitted work; never a blanket git clean). Governs unattended/stopped attempts only: a resolved escalation's re-drive always auto-recovers regardless (reverts the failed source, keeps the corrected spec). Prefer isolation="worktree" to avoid touching your main checkout.
-preserve_keep = 20           # attempt-preserve/* recovery branches kept at run start, newest by committer date; the tail is deleted (0 = never prune)
+preserve_keep = 20           # attempt-preserve/* branches and attempt-preserve-dirty/* snapshots kept at run start (per family), newest by committer date; the tail is deleted (0 = never prune)
 failed_diff_max_mb = 5       # per-file size cap (MB) for untracked files in a kept-failed unit's changes.patch; oversized files are skipped with a marker
 failed_diff_unlimited = false # true = capture the failed-unit diff with no size cap (may produce very large patches; warns when active)
 # commit_message_template: when set, the commit message dev sessions use for a

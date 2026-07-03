@@ -946,6 +946,120 @@ def test_prune_preserve_refs_continues_past_undeletable_ref(project):
     assert len(excinfo.value.failed) == 1 and "run-0" in excinfo.value.failed[0]
 
 
+def _dirty_ref(repo, name):
+    """Point a refs/attempt-preserve-dirty/* snapshot ref at HEAD — the same
+    plain `update-ref` write snapshot_worktree uses (these are not branches)."""
+    git(repo, "update-ref", f"refs/attempt-preserve-dirty/{name}", "HEAD")
+
+
+def _dirty_ref_names(repo):
+    out = git(repo, "for-each-ref", "--format=%(refname)", "refs/attempt-preserve-dirty/")
+    return sorted(line for line in out.splitlines() if line)
+
+
+def test_prune_preserve_dirty_refs_deletes_oldest_beyond_keep(project):
+    """5 dirty snapshot refs, keep=3: the 2 whose commits are oldest by
+    committer date are deleted (and returned as full refnames); the 3 newest
+    survive. Dates disagree with creation order, so this proves committer-date
+    ordering. A second call at budget is then a no-op."""
+    repo = project.project
+    for i, day in ((0, 3), (1, 5), (2, 1), (3, 4), (4, 2)):
+        _dated_commit(repo, f"snapshot {i}", f"2026-01-0{day}T12:00:00")
+        _dirty_ref(repo, f"run-{i}")
+
+    deleted = verify.prune_preserve_dirty_refs(repo, keep=3)
+
+    assert sorted(deleted) == [f"refs/attempt-preserve-dirty/run-{i}" for i in (2, 4)]
+    assert _dirty_ref_names(repo) == [f"refs/attempt-preserve-dirty/run-{i}" for i in (0, 1, 3)]
+    assert verify.prune_preserve_dirty_refs(repo, keep=3) == []  # at budget now
+
+
+def test_prune_preserve_dirty_refs_keep_zero_never_runs_git(project, monkeypatch):
+    """keep=0 means "never prune" — return [] without even invoking git."""
+    repo = project.project
+    _dirty_ref(repo, "run-0")
+
+    def _boom(*a, **k):
+        raise AssertionError("git must not run when keep=0")
+
+    monkeypatch.setattr(verify, "_git", _boom)
+    assert verify.prune_preserve_dirty_refs(repo, keep=0) == []
+    monkeypatch.undo()
+    assert _dirty_ref_names(repo) == ["refs/attempt-preserve-dirty/run-0"]
+
+
+def test_prune_preserve_dirty_refs_ignores_branches_and_other_refs(project):
+    """Only refs/attempt-preserve-dirty/* is considered or deleted: user
+    branches, attempt-preserve/* branches, and tags never count against the
+    budget and are never touched, however old they are."""
+    repo = project.project
+    _dated_commit(repo, "old work", "2025-06-01T12:00:00")
+    git(repo, "branch", "-f", "feature/user-branch")
+    git(repo, "branch", "-f", "attempt-preserve/run-old")
+    git(repo, "tag", "old-tag")
+    for i in range(2):
+        _dated_commit(repo, f"snapshot {i}", f"2026-01-0{i + 1}T12:00:00")
+        _dirty_ref(repo, f"run-{i}")
+
+    deleted = verify.prune_preserve_dirty_refs(repo, keep=1)
+
+    assert deleted == ["refs/attempt-preserve-dirty/run-0"]
+    assert _dirty_ref_names(repo) == ["refs/attempt-preserve-dirty/run-1"]
+    assert git(repo, "branch", "--list", "feature/user-branch").strip() != ""
+    assert git(repo, "branch", "--list", "attempt-preserve/run-old").strip() != ""
+    assert git(repo, "tag", "--list", "old-tag").strip() != ""
+
+
+def test_prune_preserve_dirty_refs_ties_break_by_refname(project):
+    """Equal committer dates (two snapshots parked on the same commit) break by
+    ascending refname — the same repo state always prunes the same ref."""
+    repo = project.project
+    _dated_commit(repo, "tied snapshots", "2026-01-01T12:00:00")
+    _dirty_ref(repo, "tie-a")  # same commit ⇒ same date
+    _dirty_ref(repo, "tie-b")
+    _dated_commit(repo, "fresh snapshot", "2026-01-02T12:00:00")
+    _dirty_ref(repo, "newer")
+
+    deleted = verify.prune_preserve_dirty_refs(repo, keep=2)
+
+    # newest survives outright; within the tie, ascending refname wins (tie-a kept)
+    assert deleted == ["refs/attempt-preserve-dirty/tie-b"]
+    assert _dirty_ref_names(repo) == [
+        "refs/attempt-preserve-dirty/newer",
+        "refs/attempt-preserve-dirty/tie-a",
+    ]
+
+
+def test_prune_preserve_dirty_refs_continues_past_undeletable_ref(project):
+    """A tail ref that can't be deleted (here: a stale .lock blocks update-ref)
+    must not wedge the prune — the rest of the tail is still deleted, and the
+    error raised at the end names both what was deleted and what was not."""
+    repo = project.project
+    for i in range(3):
+        _dated_commit(repo, f"snapshot {i}", f"2026-01-0{i + 1}T12:00:00")
+        _dirty_ref(repo, f"run-{i}")
+    lock = repo / ".git" / "refs" / "attempt-preserve-dirty" / "run-0.lock"
+    lock.write_text("")  # stale lock: update-ref -d on run-0 now fails
+
+    try:
+        with pytest.raises(verify.GitError) as excinfo:
+            verify.prune_preserve_dirty_refs(repo, keep=1)
+    finally:
+        lock.unlink(missing_ok=True)  # let the fixture's teardown git calls run
+        # unimpeded even when the block above fails in an unexpected way
+    # run-1 (the deletable tail ref) is gone; run-0 survived only because of the
+    # lock; run-2 (newest) was kept
+    assert _dirty_ref_names(repo) == [
+        "refs/attempt-preserve-dirty/run-0",
+        "refs/attempt-preserve-dirty/run-2",
+    ]
+    assert isinstance(excinfo.value, verify.PrunePreserveError)
+    assert excinfo.value.deleted == ["refs/attempt-preserve-dirty/run-1"]
+    assert len(excinfo.value.failed) == 1 and "run-0" in excinfo.value.failed[0]
+    assert "run-1" in str(excinfo.value)  # deleted, still auditable
+    assert "run-0" in str(excinfo.value)  # the stuck ref is named
+
+
 def test_snapshot_worktree_survives_reset_and_gc(project):
     """The parked ref keeps an attempt's *uncommitted* work — both a tracked edit
     and a run-created untracked file — reachable through the exact destructive
