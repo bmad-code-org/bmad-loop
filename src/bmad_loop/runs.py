@@ -10,7 +10,7 @@ import tarfile
 import time
 from pathlib import Path
 
-from . import verify
+from . import devcontract, verify
 from .adapters.multiplexer import get_multiplexer
 from .journal import STATE_FILE, Journal, load_state, save_state
 from .model import PAUSE_ESCALATION, Phase
@@ -512,8 +512,10 @@ def rearm_escalation(run_dir: Path, story_key: str | None = None) -> str:
     PENDING — which makes `_finish_inflight` reset the tree to the story's
     baseline and re-run it (clean rebuild) against the now-corrected frozen
     spec. Deterministically sets that spec's status to `ready-for-dev` so the
-    dev session routes straight to implement. Does NOT clear the pause; the
-    caller resumes the run separately.
+    dev session routes straight to implement, and strips the escalated
+    attempt's stale `## Auto Run Result` section so the re-drive cannot read
+    as terminal from its first save. Does NOT clear the pause; the caller
+    resumes the run separately.
 
     Returns the re-armed story key. Raises RearmError when the run is not
     paused at the escalation stage or the target story is not escalated.
@@ -546,6 +548,11 @@ def rearm_escalation(run_dir: Path, story_key: str | None = None) -> str:
         # route /bmad-dev-auto to re-implement (decision table: ready-for-dev
         # -> step-03); independent of the resolve agent having set it.
         verify.set_frontmatter_status(Path(task.spec_file), "ready-for-dev")
+        # drop the stale `## Auto Run Result` section along with the status flip
+        # (mirrors engine._reset_spec_for_repair): find_result_artifact keys on
+        # that heading, so leaving it would let the re-driven session's first
+        # save of the spec parse as the prior attempt's terminal outcome.
+        devcontract.strip_auto_run_result(Path(task.spec_file))
 
     save_state(run_dir, state)
     Journal(run_dir).append("story-escalation-resolved", story_key=key)

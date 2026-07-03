@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from bmad_loop import resolve, runs, verify
+from bmad_loop import devcontract, resolve, runs, verify
 from bmad_loop.journal import load_state, save_state
 from bmad_loop.model import (
     PAUSE_ESCALATION,
@@ -146,6 +146,25 @@ def test_rearm_flips_phase_and_spec_status(tmp_path):
     assert verify.read_frontmatter(spec)["status"] == "ready-for-dev"
     # pause is NOT cleared here — resume does that
     assert state.paused_stage == PAUSE_ESCALATION
+
+
+def test_rearm_strips_stale_terminal_section(tmp_path):
+    """Re-arm must drop the escalated attempt's `## Auto Run Result` along with
+    the status flip (mirroring engine._reset_spec_for_repair): the heading is
+    what find_result_artifact keys on, so leaving it would let the re-driven
+    session's first save of the spec parse as the prior attempt's outcome."""
+    spec = tmp_path / "spec-6-4.md"
+    spec.write_text(
+        SPEC + "\n## Auto Run Result\n\nStatus: blocked\nnames not unique\n",
+        encoding="utf-8",
+    )
+    run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec))
+    runs.rearm_escalation(run_dir)
+    text = spec.read_text(encoding="utf-8")
+    assert "Auto Run Result" not in text and "names not unique" not in text
+    assert verify.read_frontmatter(spec)["status"] == "ready-for-dev"
+    assert "<frozen-after-approval>" in text  # intent body untouched
+    assert devcontract.find_result_artifact(tmp_path, since_ns=0) is None
 
 
 def test_rearm_journals_event(tmp_path):
