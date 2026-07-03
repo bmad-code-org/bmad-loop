@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -46,7 +47,11 @@ sleep 60  # stay alive like an idle interactive session
 def make_adapter(
     tmp_path, profile_name="claude", binary=None, extra_args=None, **policy_kw
 ) -> GenericTmuxAdapter:
-    run_dir = tmp_path / "run"
+    # session_name derives from run_dir.name, and the live tests all share one
+    # tmux server — a fixed "run" name races one test's kill-session teardown
+    # against another's new-window under pytest-xdist. Production run dirs are
+    # unique run ids, so unique-per-adapter matches reality.
+    run_dir = tmp_path / f"run-{uuid.uuid4().hex[:8]}"
     policy = Policy(limits=LimitsPolicy(**policy_kw) if policy_kw else LimitsPolicy())
     profile = get_profile(profile_name)
     return GenericTmuxAdapter(
