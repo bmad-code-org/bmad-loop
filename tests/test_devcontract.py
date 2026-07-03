@@ -93,6 +93,39 @@ def test_parse_detail_spans_fenced_heading_line():
     assert "pytest -q" in arr.detail and "trailing" in arr.detail
 
 
+def test_parse_ignores_heading_in_longer_outer_fence():
+    """A shorter ``` line inside a longer ```` fence does NOT close it
+    (CommonMark), so a `## Auto Run Result` after that inner line is still fenced
+    documentation. A bare line-parity count would flip on the inner ``` and wrongly
+    expose the heading as a real, terminal section."""
+    text = (
+        "## Intent\n\n"
+        "````\n"  # open a 4-backtick fence
+        "```\n"  # lone 3-backtick line — literal content, not a close
+        "## Auto Run Result\n\nStatus: done\n"
+        "````\n\nbody\n"  # the real close
+    )
+    arr = devcontract.parse_auto_run_result(text)
+    assert not arr.present and arr.status == ""
+
+
+def test_parse_ignores_heading_in_mismatched_fence_char():
+    """A ``` line inside a ~~~ fence is content (a different fence char cannot
+    close), so a `## Auto Run Result` after it stays fenced."""
+    text = "## Intent\n\n" "~~~\n" "```\n" "## Auto Run Result\n\nStatus: done\n" "~~~\n\nbody\n"
+    arr = devcontract.parse_auto_run_result(text)
+    assert not arr.present and arr.status == ""
+
+
+def test_parse_recognizes_real_heading_after_closed_longer_fence():
+    """Positive control: after a properly-closed 4-backtick fence, a real
+    `## Auto Run Result` IS recognized — the tracker must actually close, not
+    over-correct into a fence that never ends."""
+    text = "## Intent\n\n````\ncode\n````\n\n## Auto Run Result\n\nStatus: done\n"
+    arr = devcontract.parse_auto_run_result(text)
+    assert arr.present and arr.status == "done"
+
+
 # ------------------------------------------------------------- synthesize_result
 
 
@@ -221,6 +254,19 @@ def test_find_artifact_ignores_fence_quoted_heading(tmp_path):
     sp.write_text(
         "---\nstatus: in-progress\n---\n\n## Intent\n\n"
         "```md\n## Auto Run Result\n\nStatus: done\n```\n\nbody\n",
+        encoding="utf-8",
+    )
+    assert devcontract.find_result_artifact(tmp_path, since_ns=0) is None
+
+
+def test_find_artifact_ignores_heading_in_longer_outer_fence(tmp_path):
+    """A `## Auto Run Result` fenced inside a 4-backtick block (past a lone inner
+    ``` line) must not qualify the spec as a terminal artifact — the char+length
+    tracker keeps the outer fence open where line-parity would not."""
+    sp = tmp_path / "spec-1-1-a.md"
+    sp.write_text(
+        "---\nstatus: in-progress\n---\n\n## Intent\n\n"
+        "````\n```\n## Auto Run Result\n\nStatus: done\n````\n\nbody\n",
         encoding="utf-8",
     )
     assert devcontract.find_result_artifact(tmp_path, since_ns=0) is None
@@ -447,3 +493,30 @@ def test_strip_auto_run_result_skips_fenced_boundary_lines(tmp_path):
     text = sp.read_text()
     assert "Auto Run Result" not in text and "trailing stale prose" not in text
     assert "## Intent\n\nbody\n" in text
+
+
+def test_strip_auto_run_result_ignores_heading_in_longer_outer_fence(tmp_path):
+    """Destructive-op guard: a `## Auto Run Result` fenced inside a 4-backtick
+    block that contains a lone inner ``` line must be preserved (no-op). Line
+    parity would flip on the inner ``` and strip the fenced documentation."""
+    sp = tmp_path / "spec.md"
+    original = (
+        "---\nstatus: draft\n---\n\n## Intent\n\n"
+        "````\n```\n## Auto Run Result\n\nStatus: done\n````\n\nmore body\n"
+    )
+    sp.write_text(original, encoding="utf-8")
+    assert devcontract.strip_auto_run_result(sp) is False
+    assert sp.read_text() == original
+
+
+def test_strip_auto_run_result_ignores_heading_in_mismatched_fence_char(tmp_path):
+    """A ``` line inside a ~~~ fence is content, not a close — the fenced
+    `## Auto Run Result` after it is documentation and must survive."""
+    sp = tmp_path / "spec.md"
+    original = (
+        "---\nstatus: draft\n---\n\n## Intent\n\n"
+        "~~~\n```\n## Auto Run Result\n\nStatus: done\n~~~\n\nmore body\n"
+    )
+    sp.write_text(original, encoding="utf-8")
+    assert devcontract.strip_auto_run_result(sp) is False
+    assert sp.read_text() == original
