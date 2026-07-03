@@ -32,6 +32,13 @@ class SessionSpec:
     model: str = ""  # empty = CLI default
     # fallback only; real dev/review/retro sessions get limits.session_timeout_min * 60
     timeout_s: float = 90 * 60
+    # total stall wake-nudges this session may ever receive; None = unbounded
+    # (today's behavior). Unlike the adapter's refillable per-silence budget,
+    # this cap is monotonic — a session that keeps ending its turn without a
+    # result cannot re-earn nudges forever. Set for injected workflow sessions
+    # so a forgotten completion marker degrades to "stalled" instead of
+    # livelocking until timeout_s.
+    stall_nudges_cap: int | None = None
 
 
 @dataclass(frozen=True)

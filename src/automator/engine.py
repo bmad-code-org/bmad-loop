@@ -98,6 +98,35 @@ class RunSummary:
 # "-code" suffix; codex/gemini/cursor and any custom profile pass through as-is.
 _SETUP_MCP_AGENT_IDS = {"claude": "claude-code"}
 
+# Appended to every injected plugin-workflow session prompt. The dev/review
+# skills carry their own result conventions, but a workflow prompt is arbitrary
+# text from a plugin manifest — without an explicit protocol the session has to
+# *infer* the completion-marker convention, and one that finishes its work but
+# never writes the marker leaves the orchestrator waiting (a completion-signal
+# livelock, bounded only by session_timeout_min). The orchestrator's adapter
+# discovers the marker by its `bmad-dev-auto-result-` filename prefix and
+# mtime, not by exact name.
+WORKFLOW_COMPLETION_CONTRACT = """
+
+## Completion signal (required)
+
+When you have finished this workflow — fully done OR blocked and unable to
+proceed — you MUST create the file:
+
+    {marker_path}
+
+containing YAML frontmatter that declares the outcome, then end your turn:
+
+    ---
+    status: done
+    ---
+
+Use `status: blocked` (plus a short explanation in the body) if you could not
+finish. This marker is the orchestrator's only completion signal for this
+session; it is required in addition to any artifacts the workflow itself
+produces. If you end your turn without it, the session is eventually declared
+stalled and its work may be discarded."""
+
 
 def _setup_mcp_agent_id(profile_name: str) -> str:
     """Map a CLI profile name to its Unity-MCP `setup-mcp` agent id."""
@@ -1730,6 +1759,18 @@ class Engine:
                     role=role,
                 )
                 return SessionResult(status="vetoed")
+        if label is not None:
+            # Injected workflow session: spell out the completion-marker protocol
+            # and bound its stall nudges (see WORKFLOW_COMPLETION_CONTRACT).
+            # Appended after the session-gate hooks so a pre_workflow_session /
+            # pre_session prompt rewrite cannot strip it. The marker path lands in
+            # the same implementation-artifacts dir the dev adapter already
+            # searches — correct in place and under worktree isolation alike,
+            # because spec.cwd is self.workspace.root either way.
+            marker_path = (
+                self.workspace.paths.implementation_artifacts / f"bmad-dev-auto-result-{task_id}.md"
+            )
+            prompt += WORKFLOW_COMPLETION_CONTRACT.format(marker_path=marker_path)
         spec = SessionSpec(
             task_id=task_id,
             role=role,
@@ -1738,6 +1779,9 @@ class Engine:
             env=env,
             model=cfg.model,
             timeout_s=self.policy.limits.session_timeout_min * 60,
+            stall_nudges_cap=(
+                self.policy.limits.workflow_stall_nudges_cap if label is not None else None
+            ),
         )
         self.journal.set_active_log(task_id)
         self.journal.append("session-start", task_id=task_id, role=role, prompt=prompt)

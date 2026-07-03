@@ -342,6 +342,19 @@ def test_generic_dev_finds_no_spec_fallback(tmp_path):
     assert rj["escalations"][0]["type"] == "blocked"
 
 
+def test_generic_dev_fallback_done_marker_frontmatter_only(tmp_path):
+    """The workflow completion contract instructs exactly this shape: a
+    ``bmad-dev-auto-result-*.md`` with ``status: done`` frontmatter and no
+    ``## Auto Run Result`` heading. It must be located by filename prefix and
+    synthesize a done result."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    (impl / "bmad-dev-auto-result-1-1-tea.automate-1.md").write_text(
+        "---\nstatus: done\n---\n\nCompletion signal; artifacts live elsewhere.\n"
+    )
+    rj = adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True)
+    assert rj["status"] == "done"
+
+
 def test_generic_dev_ignores_pre_launch_artifact(tmp_path, monkeypatch):
     """A spec left by a prior cycle (mtime below the launch floor) is not this
     session's output and must not be read as a stale completion."""
@@ -627,6 +640,114 @@ def test_dev_stall_nudge_wakes_session_that_then_completes(tmp_path, monkeypatch
     result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
     assert result.status == "completed"
     assert sent == [generic.STALL_NUDGE_TEXT]  # one nudge was enough to wake it
+
+
+def _capped_spec(tmp_path, cap: int) -> SessionSpec:
+    """A workflow-session spec: same shape as _dev_spec but with the monotonic
+    stall-nudge cap the engine sets for injected plugin workflows."""
+    return SessionSpec(
+        task_id="3-1-dev-1",
+        role="dev",
+        prompt="/tea-automate 3-1",
+        cwd=tmp_path,
+        env={"BMAD_AUTO_STORY_KEY": "3-1"},
+        stall_nudges_cap=cap,
+    )
+
+
+def _stall_loop_adapter(tmp_path, monkeypatch):
+    """Adapter + clock + sent-nudge recorder for driving the refill loop: a
+    session that answers every wake nudge with a fresh result-less Stop."""
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    monkeypatch.setattr(generic, "RESULT_POLL_S", 0.0)
+    adapter, impl = make_dev_adapter(tmp_path)
+    adapter._stall_grace_s = 10.0
+    adapter._stall_nudges = 2
+    adapter._window_alive = lambda handle: True
+    sent: list[str] = []
+    adapter.send_text = lambda handle, text: sent.append(text)
+
+    clock = {"t": 1000.0}
+
+    class _Clock:
+        monotonic = staticmethod(lambda: clock["t"])
+        sleep = staticmethod(lambda *_: None)
+        time_ns = staticmethod(lambda: 0)
+
+    monkeypatch.setattr(generic, "time", _Clock)
+    return adapter, impl, clock, sent
+
+
+def test_workflow_cap_bounds_refilled_stall_nudges(tmp_path, monkeypatch):
+    """The completion-signal livelock: a session that answers every wake nudge
+    with a fresh result-less Stop gets its per-silence budget refilled each time
+    and can ride the loop until session timeout. A capped spec (what the engine
+    sets for injected workflow sessions) bounds the TOTAL nudges ever sent:
+    exactly cap sends, then stalled."""
+    adapter, _, clock, sent = _stall_loop_adapter(tmp_path, monkeypatch)
+
+    def advance(call_n):
+        if call_n >= 2:
+            clock["t"] += 11.0
+
+    stop = _stop_event("3-1-dev-1", "sess", "/run/events.jsonl")
+    adapter.watcher = _ScriptedWatcher(
+        # each None is an idle tick past the grace -> a nudge; each fresh Stop is
+        # the session answering result-less -> the per-silence budget refills
+        [stop, None, stop, None, stop, None],
+        on_call=advance,
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _capped_spec(tmp_path, cap=2))
+    assert result.status == "stalled"
+    assert sent == [generic.STALL_NUDGE_TEXT] * 2
+
+
+def test_uncapped_spec_keeps_refilling_nudges_past_cap(tmp_path, monkeypatch):
+    """cap=None (dev/review sessions) preserves the pre-cap behavior byte-
+    identical: every fresh Stop restores the budget and nudging continues well
+    past any workflow cap — a legitimately slow background wait (e.g. a Unity
+    PlayMode run) may need every one of them, bounded only by spec.timeout_s."""
+    adapter, _, clock, sent = _stall_loop_adapter(tmp_path, monkeypatch)
+
+    def advance(call_n):
+        if call_n >= 2:
+            clock["t"] += 11.0
+
+    stop = _stop_event("3-1-dev-1", "sess", "/run/events.jsonl")
+    adapter.watcher = _ScriptedWatcher(
+        [stop, None, stop, None, stop, None],  # then None forever
+        on_call=advance,
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert result.status == "stalled"
+    # one nudge per refilled silence cycle, then the final budget (2) drains in
+    # genuine silence: 4 total sends, strictly more than a cap of 2 would allow
+    assert sent == [generic.STALL_NUDGE_TEXT] * 4
+
+
+def test_capped_session_still_completes_when_marker_lands_late(tmp_path, monkeypatch):
+    """Exhausting the cap must not discard a session whose completion marker
+    lands afterwards: the result check runs before any stall verdict, so a
+    marker that races in wins and the session completes."""
+    adapter, impl, clock, sent = _stall_loop_adapter(tmp_path, monkeypatch)
+
+    def script(call_n):
+        if call_n >= 2:
+            clock["t"] += 11.0
+        if call_n == 4:  # after the cap was spent: the marker finally lands
+            (impl / "bmad-dev-auto-result-3-1-tea.automate-1.md").write_text(
+                "---\nstatus: done\n---\n"
+            )
+
+    stop = _stop_event("3-1-dev-1", "sess", "/run/events.jsonl")
+    adapter.watcher = _ScriptedWatcher(
+        [stop, None, stop, None],  # nudge -> answered result-less -> idle again
+        on_call=script,
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _capped_spec(tmp_path, cap=1))
+    assert result.status == "completed"
+    assert result.result_json["status"] == "done"
+    assert sent == [generic.STALL_NUDGE_TEXT]  # the cap was already exhausted
 
 
 def test_wait_for_completion_tolerates_transient_liveness_probe_failure(tmp_path, monkeypatch):

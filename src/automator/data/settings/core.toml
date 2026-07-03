@@ -82,6 +82,12 @@ minimum = 0
 default_ref = "LimitsPolicy.dev_stall_nudges"
 description = "times an idle dev session is nudged awake on grace expiry before it is called stalled (bmad-auto has no background-completion re-invocation); pane output re-arms the grace window and a fresh Stop restores the budget · 0 = stall on grace expiry"
 [[section.field]]
+key = "workflow_stall_nudges_cap"
+kind = "int"
+minimum = 0
+default_ref = "LimitsPolicy.workflow_stall_nudges_cap"
+description = "total (never-restored) stall nudges for an injected plugin-workflow session before it is called stalled; bounds a session that finished its work but never wrote its completion marker · 0 = stall on first grace expiry"
+[[section.field]]
 key = "max_tokens_per_story"
 kind = "int"
 minimum = 1

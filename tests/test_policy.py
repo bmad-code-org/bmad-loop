@@ -235,6 +235,21 @@ def test_zero_budget_rejected(tmp_path):
         policy.load(p)
 
 
+def test_workflow_stall_nudges_cap_default_parse_and_template():
+    import tomllib
+
+    assert policy.loads("").limits.workflow_stall_nudges_cap == 3
+    loaded = policy.loads("[limits]\nworkflow_stall_nudges_cap = 0\n")
+    assert loaded.limits.workflow_stall_nudges_cap == 0
+    # the emitted template documents the knob at its dataclass default
+    doc = tomllib.loads(policy.POLICY_TEMPLATE)
+    assert (
+        doc["limits"]["workflow_stall_nudges_cap"] == policy.LimitsPolicy.workflow_stall_nudges_cap
+    )
+    with pytest.raises(policy.PolicyError, match="workflow_stall_nudges_cap"):
+        policy.loads("[limits]\nworkflow_stall_nudges_cap = -1\n")
+
+
 def test_cache_read_weight_default_and_override(tmp_path):
     assert policy.load(None).limits.cache_read_weight == 0.1
     p = tmp_path / "policy.toml"

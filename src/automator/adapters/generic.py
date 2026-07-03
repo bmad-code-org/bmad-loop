@@ -189,6 +189,12 @@ class GenericAdapter(CodingCLIAdapter):
         # fresh Stop — proof it woke and acted — restores the budget; only an
         # unresponsive session burns through it. Bounded overall by spec.timeout_s.
         stall_nudges_left = self._stall_nudges
+        # monotonic total of stall nudges sent this session — never restored,
+        # unlike stall_nudges_left. When spec.stall_nudges_cap is set (injected
+        # workflow sessions), a session that keeps ending its turn without a
+        # result cannot ride the fresh-Stop refill forever: after cap total
+        # nudges it is declared stalled. cap=None (dev/review) skips the check.
+        stall_nudges_sent = 0
         # internal observability counter: counts ticks where the liveness probe
         # raised a transport error (e.g. a 30s tmux hang). It deliberately does
         # NOT escalate to "crashed" — a transient transport hiccup is not proof
@@ -259,13 +265,16 @@ class GenericAdapter(CodingCLIAdapter):
                             session_id=session_id,
                             transcript_path=transcript_path,
                         )
-                    if stall_nudges_left > 0:
+                    if stall_nudges_left > 0 and (
+                        spec.stall_nudges_cap is None or stall_nudges_sent < spec.stall_nudges_cap
+                    ):
                         # The wake nudge IS the re-invocation bmad-auto otherwise
                         # lacks: prod the idle session and re-arm. Budget is
                         # restored only by a fresh Stop (a real turn-end), so the
                         # nudge's own echoed keystrokes can't be mistaken for the
                         # agent waking; an unresponsive session keeps draining it.
                         stall_nudges_left -= 1
+                        stall_nudges_sent += 1
                         self.send_text(handle, STALL_NUDGE_TEXT)
                         stall_deadline = time.monotonic() + self._stall_grace_s
                         last_activity = self._log_activity_key(handle.task_id)

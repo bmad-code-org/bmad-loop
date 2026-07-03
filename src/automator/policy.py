@@ -62,6 +62,14 @@ class LimitsPolicy:
     # the full grace, nudge after nudge, drains the budget and stalls. 0 = stall
     # on grace expiry.
     dev_stall_nudges: int = 2
+    # monotonic cap on stall wake-nudges for injected plugin-workflow sessions
+    # (SessionSpec.stall_nudges_cap). Dev/review sessions stay uncapped: their
+    # nudge budget is deliberately restored on every fresh Stop so a session
+    # awaiting a slow background process can wait up to session_timeout_min. A
+    # workflow session that keeps ending its turn without writing its completion
+    # marker would ride that refill forever; after this many total nudges it is
+    # declared stalled instead (non-blocking workflows then advance the phase).
+    workflow_stall_nudges_cap: int = 3
     max_tokens_per_story: int = 2_000_000
     # weight of cache-read tokens in the budget check (1.0 = count raw)
     cache_read_weight: float = 0.1
@@ -453,6 +461,9 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         ),
         dev_stall_grace_s=int(limits_d.get("dev_stall_grace_s", LimitsPolicy.dev_stall_grace_s)),
         dev_stall_nudges=int(limits_d.get("dev_stall_nudges", LimitsPolicy.dev_stall_nudges)),
+        workflow_stall_nudges_cap=int(
+            limits_d.get("workflow_stall_nudges_cap", LimitsPolicy.workflow_stall_nudges_cap)
+        ),
         max_tokens_per_story=int(
             limits_d.get("max_tokens_per_story", LimitsPolicy.max_tokens_per_story)
         ),
@@ -468,6 +479,10 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         raise PolicyError(f"limits.dev_stall_grace_s must be >= 0: got {limits.dev_stall_grace_s}")
     if limits.dev_stall_nudges < 0:
         raise PolicyError(f"limits.dev_stall_nudges must be >= 0: got {limits.dev_stall_nudges}")
+    if limits.workflow_stall_nudges_cap < 0:
+        raise PolicyError(
+            f"limits.workflow_stall_nudges_cap must be >= 0: got {limits.workflow_stall_nudges_cap}"
+        )
 
     verify = VerifyPolicy(commands=tuple(str(c) for c in verify_d.get("commands", ())))
     notify = NotifyPolicy(
@@ -666,6 +681,7 @@ session_timeout_min = 90
 stop_without_result_nudges = 1
 dev_stall_grace_s = 600      # grace for a dev session that ended its turn awaiting a background process (e.g. a slow PlayMode/test run) before it is called stalled; each re-invocation resets it. 0 = fail fast on the first result-less Stop
 dev_stall_nudges = 2         # times an idle dev session is nudged awake on grace expiry before it is called stalled (bmad-auto has no background-completion re-invocation); pane output re-arms the grace window and a fresh Stop restores the budget. 0 = stall on grace expiry
+workflow_stall_nudges_cap = 3 # total (never-restored) stall nudges for an injected plugin-workflow session before it is called stalled; bounds a session that finished its work but never wrote its completion marker. 0 = stall on first grace expiry
 max_tokens_per_story = 2000000
 cache_read_weight = 0.1      # cache reads bill at ~0.1x input on all vendors; 1.0 = count raw
 

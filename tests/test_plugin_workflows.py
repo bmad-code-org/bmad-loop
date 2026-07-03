@@ -208,12 +208,48 @@ def test_workflow_injects_a_session_at_post_dev_phase(project):
     # exactly one workflow session ran, between dev and review
     assert len(captured) == 1
     spec = captured[0]
-    assert spec.prompt == "/doc 1-1-a"  # {story_key} substituted
+    assert spec.prompt.startswith("/doc 1-1-a")  # {story_key} substituted
     assert spec.task_id == "1-1-a-wf.doc-1"  # label = "<plugin>.<workflow>"
+    # the framework appends the completion contract to every workflow prompt:
+    # the absolute marker path plus the frontmatter shape to write
+    assert "bmad-dev-auto-result-1-1-a-wf.doc-1.md" in spec.prompt
+    assert "status: done" in spec.prompt
+    # and bounds its stall nudges so a forgotten marker degrades instead of
+    # livelocking until session timeout
+    assert spec.stall_nudges_cap == engine.policy.limits.workflow_stall_nudges_cap
     kinds = [e["kind"] for e in engine.journal.entries()]
     assert "workflow-start" in kinds and "workflow-end" in kinds
     starts = [e for e in engine.journal.entries() if e["kind"] == "workflow-start"]
     assert starts[0]["plugin"] == "wf" and starts[0]["workflow"] == "doc"
+
+
+def test_dev_and_review_sessions_carry_no_workflow_contract(project):
+    """The completion contract + stall-nudge cap are workflow-session-only: the
+    main dev/review sessions (their skills own their result conventions, and a
+    slow background wait may legitimately need unbounded re-nudging) must stay
+    byte-identical — no appended contract, no cap."""
+    captured: list = []
+    setup_story(project)
+
+    def capture(effect):
+        def inner(spec):
+            captured.append(spec)
+            return effect(spec)
+
+        return inner
+
+    script = [
+        capture(dev_effect(project, "1-1-a")),
+        capture(review_effect(project, "1-1-a", clean=True)),
+    ]
+    engine, _ = make_engine(project, script)
+    summary = engine.run()
+    assert summary.done == 1
+    assert len(captured) == 2
+    for spec in captured:
+        assert spec.stall_nudges_cap is None
+        assert "Completion signal" not in spec.prompt
+        assert "bmad-dev-auto-result-" not in spec.prompt
 
 
 def test_blocking_workflow_failure_defers_the_unit(project):
