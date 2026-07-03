@@ -826,25 +826,27 @@ def test_cleanup_dry_run_lists_without_pruning(tmp_path, monkeypatch, capsys):
     from automator import runs
     from automator.tui import launch
 
-    monkeypatch.setattr(runs, "prunable_sessions", lambda _proj: (["fin-1"], ["live-1"], set()))
     monkeypatch.setattr(launch, "prunable_ctl_windows", lambda _proj: ["sweep-fin-1"])
-    pruned: list[str] = []
-    monkeypatch.setattr(runs, "prune_sessions", lambda _proj: pruned.append("x") or ([], set()))
+    dry_runs: list[bool] = []
+    monkeypatch.setattr(
+        runs,
+        "prune_sessions",
+        lambda _proj, dry_run=False: dry_runs.append(dry_run) or (["fin-1"], ["live-1"], set()),
+    )
 
     assert cli.main(["cleanup", "--project", str(tmp_path), "--dry-run"]) == 0
     out = capsys.readouterr().out
     assert "would kill session bmad-auto-fin-1" in out
     assert "would close ctl window sweep-fin-1" in out
     assert "leaving 1 live session(s) untouched" in out
-    assert pruned == []  # dry-run prunes nothing
+    assert dry_runs == [True]  # one partition sample, with the kill suppressed
 
 
 def test_cleanup_prunes_sessions_and_windows(tmp_path, monkeypatch, capsys):
     from automator import runs
     from automator.tui import launch
 
-    monkeypatch.setattr(runs, "prunable_sessions", lambda _proj: (["fin-1"], [], set()))
-    monkeypatch.setattr(runs, "prune_sessions", lambda _proj: (["fin-1"], set()))
+    monkeypatch.setattr(runs, "prune_sessions", lambda _proj, dry_run=False: (["fin-1"], [], set()))
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _proj: ["sweep-fin-1"])
 
     assert cli.main(["cleanup", "--project", str(tmp_path)]) == 0
@@ -856,9 +858,8 @@ def test_cleanup_warns_per_unknown_session(tmp_path, monkeypatch, capsys):
     from automator.tui import launch
 
     monkeypatch.setattr(
-        runs, "prunable_sessions", lambda _proj: (["fin-1", "odd-1"], [], {"odd-1"})
+        runs, "prune_sessions", lambda _proj, dry_run=False: (["fin-1", "odd-1"], [], {"odd-1"})
     )
-    monkeypatch.setattr(runs, "prune_sessions", lambda _proj: (["fin-1", "odd-1"], {"odd-1"}))
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _proj: [])
 
     assert cli.main(["cleanup", "--project", str(tmp_path)]) == 0

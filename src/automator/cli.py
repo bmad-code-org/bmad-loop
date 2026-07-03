@@ -911,24 +911,26 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     from .tui import launch  # pure stdlib; no textual import
 
     project = _project(args)
-    prunable, live, unknown = runs.prunable_sessions(project)
+    # one partition sample drives the prune and every message below, so the
+    # warnings and live count always match what was actually killed/skipped
+    killed, live, unknown = runs.prune_sessions(project, dry_run=args.dry_run)
     for run_id in sorted(unknown):
         # warn-only: unknown never blocks cleanup (same wording as delete/archive).
-        # Printed for --dry-run too — it describes state, not action.
+        # Pruning kills the tmux session, never the engine pid, so the warning
+        # holds after the fact too.
         print(f"run {run_id}: engine may still be live (unverifiable pid)", file=sys.stderr)
     if args.dry_run:
         windows = launch.prunable_ctl_windows(project)
-        if not prunable and not windows:
+        if not killed and not windows:
             print("nothing to clean up")
         else:
-            for run_id in prunable:
+            for run_id in killed:
                 print(f"would kill session bmad-auto-{run_id}")
             for name in windows:
                 print(f"would close ctl window {name}")
         if live:
             print(f"leaving {len(live)} live session(s) untouched")
         return 0
-    killed, _ = runs.prune_sessions(project)
     windows = launch.prune_ctl_windows(project)
     print(f"removed {len(killed)} session(s), {len(windows)} ctl window(s)")
     if live:
