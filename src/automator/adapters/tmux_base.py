@@ -60,6 +60,8 @@ class BaseTmuxBackend(TerminalMultiplexer):
         ``env`` (keyword-only, default ``None`` → inherit the parent env) lets one
         caller spawn with a scrubbed env without mutating this process's; decoding is
         the :attr:`_ENCODING` class attr. A leaf sets those rather than overriding here.
+        Build a scrubbed env by copying the parent env and *removing* the offending
+        vars — not from scratch (on Windows the child needs ``SystemRoot`` etc.).
         """
         proc = subprocess.run(
             ["tmux", *argv],

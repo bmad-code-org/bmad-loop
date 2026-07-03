@@ -60,9 +60,11 @@ fallback, so POSIX behavior is unchanged. (The result is cached — see
 
 - **Extend `BaseTmuxBackend`** (`adapters/tmux_base.py`) for a **tmux-family**
   backend. `BaseTmuxBackend` holds every argv construction and routes every spawn
-  through one primitive, `_run(argv, *, check=...)`. A native-Windows "psmux"
-  that speaks a tmux-like CLI overrides only `_run()` (to tweak the binary,
-  decoding, or timeout) plus the few genuinely divergent methods (e.g. the
+  through one primitive, `_run(argv, *, check=..., env=...)`. A native-Windows
+  "psmux" that speaks a tmux-like CLI sets the `_ENCODING` class attribute for
+  output decoding (e.g. `"utf-8"`) and passes a per-call `env=` where needed —
+  overriding `_run()` itself only to tweak the binary or timeout — plus the few
+  genuinely divergent methods (e.g. the
   parked-window `sh -c` trailer in `new_parked_window`) — **without editing**
   `tmux_base.py` or its POSIX leaf `tmux_backend.py` (`TmuxMultiplexer`).
 - **Implement `TerminalMultiplexer` fresh** when the host has no tmux-shaped CLI

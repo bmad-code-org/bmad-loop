@@ -260,7 +260,7 @@ def test_seam_honesty_holds_for_psmux_style_run_override(monkeypatch):
     monkeypatch.setattr(tmux_base.shutil, "which", lambda _name: "/usr/bin/tmux")
 
     class PsmuxStyle(TmuxMultiplexer):
-        def _run(self, argv, *, check=True):
+        def _run(self, argv, *, check=True, env=None):
             raise subprocess.TimeoutExpired(["tmux", *argv], 30)
 
     mux = PsmuxStyle()
