@@ -63,10 +63,13 @@ fallback, so POSIX behavior is unchanged. (The result is cached — see
   through one primitive, `_run(argv, *, check=..., env=...)`. A native-Windows
   "psmux" that speaks a tmux-like CLI sets the `_ENCODING` class attribute for
   output decoding (e.g. `"utf-8"`) and passes a per-call `env=` where needed —
-  overriding `_run()` itself only to tweak the binary or timeout — plus the few
-  genuinely divergent methods (e.g. the
-  parked-window `sh -c` trailer in `new_parked_window`) — **without editing**
-  `tmux_base.py` or its POSIX leaf `tmux_backend.py` (`TmuxMultiplexer`).
+  overriding `_run()` itself only to tweak the binary or timeout — plus the
+  shell-dialect hooks that `new_window` / `new_parked_window` compose from
+  (`_shell_wrap`, `_join_argv`, `_parked_trailer`, `_source_prefix`,
+  `_window_launch` and the `_EXIT_CAPTURE`/`_ECHO`/`_PARK` fragments) —
+  **without editing** `tmux_base.py` or its POSIX leaf `tmux_backend.py`
+  (`TmuxMultiplexer`). The one method-body override left is `pipe_pane`, whose
+  POSIX `cat >>` redirection is not behind a hook.
 - **Implement `TerminalMultiplexer` fresh** when the host has no tmux-shaped CLI
   at all (e.g. a ConPTY-based window manager). You implement the full contract
   directly; `tmux_backend.py` is the reference for what each method must produce.

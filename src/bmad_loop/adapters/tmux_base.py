@@ -10,7 +10,11 @@ class attribute and a scrubbed per-call ``env`` is a ``_run`` parameter, neither
 an override) plus the shell-dialect hooks (``_shell_wrap``, ``_join_argv``,
 ``_parked_trailer``, ``_source_prefix``, ``_window_launch`` and the
 ``_EXIT_CAPTURE``/``_ECHO``/``_PARK`` fragments), **without editing**
-:mod:`.tmux_backend` or any contract method body.
+:mod:`.tmux_backend`. For :meth:`~BaseTmuxBackend.new_window` /
+:meth:`~BaseTmuxBackend.new_parked_window` the hooks replace method-body
+overrides entirely; :meth:`~BaseTmuxBackend.pipe_pane` still hands tmux a POSIX
+``cat >>`` redirection, so it remains the one contract method a non-POSIX leaf
+overrides directly.
 
 Every method that talks to tmux funnels through :meth:`BaseTmuxBackend._run`, the
 one place a subprocess is spawned. See :mod:`.multiplexer` for the contract.

@@ -55,7 +55,9 @@ To add a backend, build a `TerminalMultiplexer` (`adapters/multiplexer.py`) and
 returns the first backend whose `matches` is true, with tmux as the default
 fallback. There are two build paths: extend `BaseTmuxBackend` (`adapters/tmux_base.py`)
 for a tmux-family backend — overriding only its single spawn primitive `_run()`
-plus the few divergent methods (e.g. the parked-window trailer) — or implement
+plus the shell-dialect hooks (`_shell_wrap`, `_join_argv`, `_parked_trailer`,
+`_source_prefix`, `_window_launch` and the `_EXIT_CAPTURE`/`_ECHO`/`_PARK`
+fragments) — or implement
 `TerminalMultiplexer` fresh for a host with no tmux-shaped CLI. The non-transport
 seams of a full OS port are in
 [Porting bmad-loop to a new OS](porting-to-a-new-os.md). The contract groups into:
@@ -66,9 +68,9 @@ seams of a full OS port are in
   (read a user option across all sessions), `set_session_option`.
 - **Windows** — `new_window` (run a command in a fresh window), `new_parked_window`
   (run a command, then _park_ on a keypress so the exit status stays inspectable,
-  then return any attached client to its origin — this is where the POSIX `sh -c`
-  trailer is quarantined; a non-POSIX backend reimplements the same behavior in
-  its own terms), `list_window_ids`, `list_windows` (selected fields per window),
+  then return any attached client to its origin — the POSIX `sh -c` recipe is
+  composed from the base's overridable shell-dialect hooks, so a non-POSIX
+  backend swaps the dialect fragments, not the method body), `list_window_ids`, `list_windows` (selected fields per window),
   `window_alive`, `kill_window`, `select_window`, `set_window_option`,
   `unset_window_option`, `show_window_option`, `pipe_pane` (tee a pane to a log),
   `send_text`.
