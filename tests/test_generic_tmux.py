@@ -488,6 +488,92 @@ def test_dev_result_less_stop_awaits_reinvocation_then_completes(tmp_path, monke
     assert result.status == "completed"
 
 
+def test_dev_idle_result_is_ignored_while_window_alive(tmp_path, monkeypatch):
+    """A terminal artifact observed on an idle tick while the window is alive is
+    advisory only — the agent may still be mid-turn (returning early would let
+    run()'s finally-kill terminate it). Completion waits for the next Stop."""
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    monkeypatch.setattr(generic, "RESULT_POLL_S", 0.0)
+    adapter, impl = make_dev_adapter(tmp_path)
+    adapter._window_alive = lambda handle: True
+
+    def flush_terminal_spec(call_n):
+        if call_n == 2:  # idle tick after a result-less Stop, before final turn-end
+            (impl / "spec-3-1-foo.md").write_text(
+                "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+            )
+
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _stop_event("3-1-dev-1", "sess", "/run/events.jsonl"),  # arms the grace window
+            None,  # idle tick: artifact on disk, window alive -> must keep waiting
+            _stop_event("3-1-dev-1", "sess", "/run/events.jsonl"),  # authoritative turn-end
+        ],
+        on_call=flush_terminal_spec,
+    )
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert adapter.watcher.calls == 3  # completed on the Stop, not the idle tick
+
+
+def test_dev_grace_result_does_not_complete_while_window_alive(tmp_path, monkeypatch):
+    """Grace expiry under a live window must not upgrade to completed on artifact
+    presence — the stall verdict stands until a Stop or window death vouches."""
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    monkeypatch.setattr(generic, "RESULT_POLL_S", 0.0)
+    adapter, impl = make_dev_adapter(tmp_path)
+    adapter._stall_grace_s = 10.0
+    adapter._stall_nudges = 0
+    adapter._window_alive = lambda handle: True
+
+    clock = {"t": 1000.0}
+
+    class _Clock:  # scoped shim so we don't mutate the real time module
+        monotonic = staticmethod(lambda: clock["t"])
+        sleep = staticmethod(lambda *_: None)
+        time_ns = staticmethod(lambda: 0)
+
+    monkeypatch.setattr(generic, "time", _Clock)
+
+    def flush_terminal_spec(call_n):
+        if call_n == 2:  # artifact lands, then the grace window expires in silence
+            clock["t"] += 11.0
+            (impl / "spec-3-1-foo.md").write_text(
+                "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+            )
+
+    adapter.watcher = _ScriptedWatcher(
+        [_stop_event("3-1-dev-1", "sess", "/run/events.jsonl")],
+        on_call=flush_terminal_spec,
+    )
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "stalled"
+    assert result.result_json is None
+
+
+def test_dev_window_death_with_artifact_completes(tmp_path, monkeypatch):
+    """Window death is authoritative: a terminal artifact on disk when the window
+    is gone upgrades the crash fallback to completed."""
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    monkeypatch.setattr(generic, "RESULT_POLL_S", 0.0)
+    adapter, impl = make_dev_adapter(tmp_path)
+    adapter._window_alive = lambda handle: False
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+    )
+
+    adapter.watcher = _ScriptedWatcher([None])  # no hook event, window already gone
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert result.result_json["status"] == "done"
+
+
 def test_dev_stalls_when_grace_elapses_without_reinvocation(tmp_path, monkeypatch):
     """A result-less Stop with no re-invocation before the grace window elapses is
     a genuine stall — the grace must not hang until the session timeout."""
@@ -727,8 +813,9 @@ def test_uncapped_spec_keeps_refilling_nudges_past_cap(tmp_path, monkeypatch):
 
 def test_capped_session_still_completes_when_marker_lands_late(tmp_path, monkeypatch):
     """Exhausting the cap must not discard a session whose completion marker
-    lands afterwards: the result check runs before any stall verdict, so a
-    marker that races in wins and the session completes."""
+    lands afterwards: the marker plus its turn-end Stop still complete the
+    session (a bare marker under a live window is advisory — only the Stop,
+    the authoritative signal, seals it)."""
     adapter, impl, clock, sent = _stall_loop_adapter(tmp_path, monkeypatch)
 
     def script(call_n):
@@ -741,7 +828,7 @@ def test_capped_session_still_completes_when_marker_lands_late(tmp_path, monkeyp
 
     stop = _stop_event("3-1-dev-1", "sess", "/run/events.jsonl")
     adapter.watcher = _ScriptedWatcher(
-        [stop, None, stop, None],  # nudge -> answered result-less -> idle again
+        [stop, None, stop, stop],  # nudge -> answered result-less -> final turn-end
         on_call=script,
     )
     result = adapter.wait_for_completion(_dev_handle(), _capped_spec(tmp_path, cap=1))

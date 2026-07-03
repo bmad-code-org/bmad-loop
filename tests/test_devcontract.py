@@ -319,3 +319,89 @@ def test_reset_status_inserts_missing_line(tmp_path):
     assert "status: done\n" in text  # inserted
     assert "title: 'x'\n" in text and "baseline_revision: 'abc'\n" in text  # kept
     assert "## Intent\n\nbody\n" in text  # body untouched
+
+
+# ------------------------------------------------------- strip_auto_run_result
+
+
+def test_strip_auto_run_result_removes_trailing_section(tmp_path):
+    """The stale terminal section goes; frontmatter and body above it survive.
+    The stripped spec must no longer qualify as a result artifact even with a
+    fresh mtime — that is the whole point of stripping on re-arm."""
+    sp = tmp_path / "spec.md"
+    sp.write_text(
+        "---\nstatus: in-progress\n---\n\n## Intent\n\nbody\n\n"
+        "## Auto Run Result\n\nStatus: done\nAll done.\n",
+        encoding="utf-8",
+    )
+    assert devcontract.strip_auto_run_result(sp) is True
+    text = sp.read_text()
+    assert "Auto Run Result" not in text and "All done." not in text
+    assert "status: in-progress\n" in text and "## Intent\n\nbody\n" in text
+    assert devcontract.find_result_artifact(tmp_path, since_ns=0) is None
+
+
+def test_strip_auto_run_result_stops_at_next_heading(tmp_path):
+    """A section wedged mid-document is excised up to the next same-level
+    heading; sub-headings inside the section are removed with it."""
+    sp = tmp_path / "spec.md"
+    sp.write_text(
+        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+        "### Detail\n\nstale\n\n## Change Log\n\nkept\n",
+        encoding="utf-8",
+    )
+    assert devcontract.strip_auto_run_result(sp) is True
+    text = sp.read_text()
+    assert "Auto Run Result" not in text and "stale" not in text
+    assert "## Change Log\n\nkept\n" in text
+
+
+def test_strip_auto_run_result_noop_without_section(tmp_path):
+    sp = tmp_path / "spec.md"
+    original = "---\nstatus: draft\n---\n\n## Intent\n\nbody\n"
+    sp.write_text(original, encoding="utf-8")
+    assert devcontract.strip_auto_run_result(sp) is False
+    assert sp.read_text() == original
+
+
+def test_strip_auto_run_result_ignores_heading_quoted_in_code_fence(tmp_path):
+    """A spec whose frozen intent quotes the heading inside a fenced example must
+    not lose that content — stripping is destructive, so fenced pseudo-headings
+    are not sections."""
+    sp = tmp_path / "spec.md"
+    original = (
+        "---\nstatus: draft\n---\n\n## Intent\n\n"
+        "```md\n## Auto Run Result\n\nStatus: done\n```\n\nmore body\n"
+    )
+    sp.write_text(original, encoding="utf-8")
+    assert devcontract.strip_auto_run_result(sp) is False
+    assert sp.read_text() == original
+
+
+def test_strip_auto_run_result_ignores_heading_in_indented_fence(tmp_path):
+    """Fences may be indented up to three spaces (CommonMark) — a heading quoted
+    inside one is still fenced content, not a section."""
+    sp = tmp_path / "spec.md"
+    original = (
+        "---\nstatus: draft\n---\n\n## Intent\n\n"
+        "  ```md\n## Auto Run Result\n\nStatus: done\n  ```\n\nmore body\n"
+    )
+    sp.write_text(original, encoding="utf-8")
+    assert devcontract.strip_auto_run_result(sp) is False
+    assert sp.read_text() == original
+
+
+def test_strip_auto_run_result_skips_fenced_boundary_lines(tmp_path):
+    """Column-0 `## `/`# ` lines inside a fenced block within the section (quoted
+    shell comments, log output) are not boundaries — the whole stale section goes."""
+    sp = tmp_path / "spec.md"
+    sp.write_text(
+        "---\nstatus: done\n---\n\n## Intent\n\nbody\n\n"
+        "## Auto Run Result\n\nStatus: done\n\n"
+        "```sh\n## run tests\npytest -q\n```\n\ntrailing stale prose\n",
+        encoding="utf-8",
+    )
+    assert devcontract.strip_auto_run_result(sp) is True
+    text = sp.read_text()
+    assert "Auto Run Result" not in text and "trailing stale prose" not in text
+    assert "## Intent\n\nbody\n" in text

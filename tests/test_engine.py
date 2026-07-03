@@ -633,6 +633,29 @@ def test_generic_reconcile_idempotent_when_already_done(project):
     assert recon == []
 
 
+def test_reset_spec_for_repair_strips_stale_terminal_section(project):
+    """Re-arming a self-finalized spec must remove the stale `## Auto Run Result`
+    section along with the status flip — find_result_artifact keys on that
+    heading, so leaving it would let the re-driven session's first save of the
+    spec qualify as a terminal result mid-turn."""
+    engine, _ = make_engine(project, [])
+    spec = project.implementation_artifacts / "spec-1-1-a.md"
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    spec.write_text(
+        "---\nstatus: done\n---\n\n## Intent\n\nbody\n\n"
+        "## Auto Run Result\n\nStatus: done\nAll done.\n",
+        encoding="utf-8",
+    )
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(spec))
+
+    engine._reset_spec_for_repair(task)
+
+    text = spec.read_text(encoding="utf-8")
+    assert "status: in-progress\n" in text  # re-opened
+    assert "Auto Run Result" not in text  # stale terminal section gone
+    assert "## Intent\n\nbody\n" in text  # frozen intent untouched
+
+
 def test_generic_reconcile_skips_blocked_prose(project):
     """A blocked outcome (prose Status: blocked) is NEVER reconciled: the
     frontmatter stays non-terminal, no `spec-status-reconciled` is emitted, and the

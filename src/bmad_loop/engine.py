@@ -1850,10 +1850,14 @@ class Engine:
         "ingest as context, do not resume," so a repair must flip the frontmatter
         `status` back to `in-progress` to re-enter implement/review in place against
         the frozen intent contract. No-op when no spec is recorded yet (the prompt
-        then falls back to the story key)."""
+        then falls back to the story key). The stale terminal section is stripped
+        too: `find_result_artifact` keys on its heading, so leaving it would let
+        the re-driven session's first save of the spec read as a terminal result."""
         if not task.spec_file:
             return
-        devcontract.reset_spec_status(Path(task.spec_file), "in-progress")
+        spec_path = Path(task.spec_file)
+        devcontract.reset_spec_status(spec_path, "in-progress")
+        devcontract.strip_auto_run_result(spec_path)
 
     def _write_feedback(self, task: StoryTask, reason: str) -> Path:
         """Persist a verification failure where the next session can read it —

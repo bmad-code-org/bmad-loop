@@ -232,17 +232,13 @@ class GenericAdapter(CodingCLIAdapter):
                     # died without a SessionEnd hook (killed, crashed hard)
                     return self._final(handle, spec, "crashed", session_id, transcript_path)
                 if stall_deadline is not None:
-                    # A terminal result can land mid-grace without a fresh Stop to
-                    # wake us; check non-blocking on each idle tick so completion
-                    # isn't deferred to grace expiry (up to dev_stall_grace_s late).
-                    result_json = self._result_json(handle, spec, wait=False)
-                    if result_json is not None:
-                        return SessionResult(
-                            status="completed",
-                            result_json=result_json,
-                            session_id=session_id,
-                            transcript_path=transcript_path,
-                        )
+                    # No artifact shortcut here: the window is alive on this tick
+                    # (a dead one returned "crashed" above), and a terminal
+                    # artifact under a live window is advisory only — the agent
+                    # may still be mid-turn (or the artifact stale from a prior
+                    # drive), and run()'s finally-kill would terminate it before
+                    # its remaining work flushes. Only a Stop event or window
+                    # death completes the session.
                     # The grace window measures inactivity, not time-since-Stop:
                     # a session still streaming to the tee'd pane log (a long
                     # productive turn building a diff, a streaming subagent) is
@@ -254,17 +250,6 @@ class GenericAdapter(CodingCLIAdapter):
                         stall_deadline = time.monotonic() + self._stall_grace_s
                         continue
                 if stall_deadline is not None and time.monotonic() >= stall_deadline:
-                    # the grace window elapsed with no re-invocation; one last
-                    # non-blocking check in case the spec landed without a fresh
-                    # Stop.
-                    result_json = self._result_json(handle, spec, wait=False)
-                    if result_json is not None:
-                        return SessionResult(
-                            status="completed",
-                            result_json=result_json,
-                            session_id=session_id,
-                            transcript_path=transcript_path,
-                        )
                     if stall_nudges_left > 0 and (
                         spec.stall_nudges_cap is None or stall_nudges_sent < spec.stall_nudges_cap
                     ):
@@ -279,7 +264,12 @@ class GenericAdapter(CodingCLIAdapter):
                         stall_deadline = time.monotonic() + self._stall_grace_s
                         last_activity = self._log_activity_key(handle.task_id)
                         continue
-                    return self._final(handle, spec, "stalled", session_id, transcript_path)
+                    # The window is alive here, so an artifact on disk cannot
+                    # upgrade the stall verdict to completed — it may be stale
+                    # or mid-write; only a Stop or window death vouches for it.
+                    return self._final(
+                        handle, spec, "stalled", session_id, transcript_path, accept_result=False
+                    )
                 continue
             if (
                 event.event == "Stop"
@@ -355,10 +345,14 @@ class GenericAdapter(CodingCLIAdapter):
         fallback: str,
         session_id: str | None,
         transcript: str | None,
+        *,
+        accept_result: bool = True,
     ) -> SessionResult:
         """Session is gone or done responding: completed if the result file
-        landed anyway, otherwise the fallback status."""
-        result_json = self._result_json(handle, spec, wait=False)
+        landed anyway, otherwise the fallback status. ``accept_result=False``
+        (a stall verdict reached under a live window) pins the fallback: an
+        artifact that appeared without a Stop or window death is not trusted."""
+        result_json = self._result_json(handle, spec, wait=False) if accept_result else None
         status = "completed" if result_json is not None else fallback
         return SessionResult(
             status=status,

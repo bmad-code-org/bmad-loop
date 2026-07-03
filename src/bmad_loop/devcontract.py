@@ -263,3 +263,45 @@ def reset_spec_status(spec_path: Path, new_status: str) -> bool:
         return False
     spec_path.write_text(head + new_body + tail + text[fm.end() :], encoding="utf-8")
     return True
+
+
+def _fenced(text: str, offset: int) -> bool:
+    """True when `offset` falls inside a ``` / ~~~ fenced code block. Counting
+    fence lines before the offset suffices: an odd count means a fence is open.
+    Fences may be indented up to three spaces (CommonMark; a tab would make an
+    indented code block instead, so tabs are excluded). Deleting content is
+    destructive, so unlike the read-only heading scans (`find_result_artifact`,
+    `parse_auto_run_result`) the strip below must not mistake a fenced example
+    for a real section boundary."""
+    return sum(1 for _ in re.finditer(r"^ {0,3}(?:```|~~~)", text[:offset], re.MULTILINE)) % 2 == 1
+
+
+def strip_auto_run_result(spec_path: Path) -> bool:
+    """Remove every ``## Auto Run Result`` section from a spec, in place.
+
+    Companion to `reset_spec_status` on the re-drive path: re-opening a spec by
+    flipping only its frontmatter would leave the stale terminal section behind,
+    and `find_result_artifact` keys on that heading — the re-driven session's
+    very first save of the spec would then qualify as a terminal result. Each
+    section spans its heading to the next same-level heading (mirroring
+    `parse_auto_run_result`'s boundary) or end-of-file; headings quoted inside
+    fenced code blocks are ignored on both ends. Returns True when a section was
+    removed, False when none was present."""
+    text = spec_path.read_text(encoding="utf-8")
+    matches = [m for m in AUTO_RUN_HEADING_RE.finditer(text) if not _fenced(text, m.start())]
+    if not matches:
+        return False
+    kept: list[str] = []
+    pos = 0
+    for m in matches:
+        if m.start() < pos:
+            continue  # heading inside a section already being removed
+        kept.append(text[pos : m.start()])
+        pos = len(text)
+        for nxt in re.finditer(r"^##\s", text, re.MULTILINE):
+            if nxt.start() >= m.end() and not _fenced(text, nxt.start()):
+                pos = nxt.start()
+                break
+    kept.append(text[pos:])
+    spec_path.write_text("".join(kept), encoding="utf-8")
+    return True
