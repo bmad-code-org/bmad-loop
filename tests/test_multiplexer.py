@@ -317,11 +317,16 @@ def test_run_subclass_encoding_reaches_subprocess(monkeypatch):
 def test_run_custom_env_is_forwarded_without_leaking(monkeypatch):
     rec = _RecordRun()
     monkeypatch.setattr(tmux_base.subprocess, "run", rec)
+    monkeypatch.setenv("TMUX", "/tmp/tmux-0/default,1234,0")  # a nesting-guard var to scrub
     before = dict(os.environ)
 
-    scrubbed = {"PATH": os.environ.get("PATH", "")}  # e.g. nesting-guard vars dropped
+    # per the _run docstring: copy the parent env and REMOVE the offending var —
+    # never rebuild from scratch (Windows children need SystemRoot etc.)
+    scrubbed = dict(os.environ)
+    del scrubbed["TMUX"]
     TmuxMultiplexer()._run(["new-session"], env=scrubbed)
 
     assert rec.kwargs["env"] == scrubbed
+    assert "TMUX" not in rec.kwargs["env"]
     # the scrubbed env is confined to the child spawn — this process's env is untouched
     assert dict(os.environ) == before

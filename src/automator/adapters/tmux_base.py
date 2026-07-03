@@ -5,8 +5,9 @@ invocation and POSIX-shell trailer lives here (and in its POSIX leaf
 :mod:`.tmux_backend`). The point of the split is that a tmux-*family* backend —
 an eventual native-Windows "psmux" — can subclass :class:`BaseTmuxBackend` and
 override only the single spawn primitive :meth:`BaseTmuxBackend._run` (to tweak
-the binary or timeout — output decoding and per-call ``env`` are ``_run``
-parameters, not overrides) plus the few divergent methods (e.g. the
+the binary or timeout — output decoding is the :attr:`BaseTmuxBackend._ENCODING`
+class attribute and a scrubbed per-call ``env`` is a ``_run`` parameter, neither
+an override) plus the few divergent methods (e.g. the
 parked-window trailer), **without editing** :mod:`.tmux_backend`.
 
 Every method that talks to tmux funnels through :meth:`BaseTmuxBackend._run`, the
