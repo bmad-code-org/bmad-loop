@@ -1363,13 +1363,22 @@ class Engine:
     def _dev_phase(self, task: StoryTask, resume_result: SessionResult | None = None) -> bool:
         if self._vetoed(self._emit("pre_dev_phase", task), task):
             return False
-        task.baseline_commit = verify.rev_parse_head(self.workspace.root)
-        # snapshot untracked files now so a later rollback removes only what THIS
-        # attempt creates, never files the user already had on disk.
-        task.baseline_untracked = sorted(verify.untracked_files(self.workspace.root))
+        if resume_result is None:
+            task.baseline_commit = verify.rev_parse_head(self.workspace.root)
+            # snapshot untracked files now so a later rollback removes only what
+            # THIS attempt creates, never files the user already had on disk.
+            # A resumed result keeps the persisted baseline: re-capturing here
+            # would shift the rollback/squash reference onto the completed
+            # session's own tree.
+            task.baseline_untracked = sorted(verify.untracked_files(self.workspace.root))
         feedback: Path | None = None
         while True:
-            task.attempt += 1
+            if resume_result is None:
+                # a resumed result replays the attempt it was recorded under, so
+                # the counter (and the session task_id derived from it) must not
+                # advance; a second host death then still finds the record and
+                # re-enters this continuation instead of falling back to restart.
+                task.attempt += 1
             advance(task, Phase.DEV_RUNNING)
             self._save()
             if resume_result is not None:
@@ -1501,7 +1510,11 @@ class Engine:
         # only state the budget-exhaustion rescue below is allowed to commit.
         refileable_followup = False
         while task.review_cycle < self.policy.limits.max_review_cycles:
-            task.review_cycle += 1
+            if resume_result is None:
+                # a resumed result replays the cycle it was recorded under: the
+                # counter must not advance, or the replay burns a review-budget
+                # slot and mislabels its journal/session ids.
+                task.review_cycle += 1
             refileable_followup = False  # only a completed pass this cycle can set it
             advance(task, Phase.REVIEW_RUNNING)
             self._save()

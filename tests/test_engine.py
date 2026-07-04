@@ -1,6 +1,5 @@
 """Engine scenario tests against the mock adapter — no tmux, no LLM."""
 
-import json
 import re
 import signal
 from pathlib import Path
@@ -176,10 +175,7 @@ def test_keyboard_interrupt_records_stopped_run(project, monkeypatch):
     assert not summary.crashed
     assert not saved.crashed
     assert killed == ["test-run"]
-    entries = [
-        json.loads(line) for line in (engine.run_dir / "journal.jsonl").read_text().splitlines()
-    ]
-    stops = [e for e in entries if e["kind"] == "run-stop"]
+    stops = [e for e in engine.journal.entries() if e["kind"] == "run-stop"]
     assert stops and stops[0]["reason"] == "KeyboardInterrupt"
 
 
@@ -224,14 +220,22 @@ def test_resume_continues_from_completed_dev_session(project):
 
     assert summary.crashed
     saved = load_state(engine.run_dir)
-    assert saved.tasks["1-1-a"].phase == Phase.DEV_RUNNING
-    assert saved.tasks["1-1-a"].sessions[0].result_json is not None
+    crashed_task = saved.tasks["1-1-a"]
+    assert crashed_task.phase == Phase.DEV_RUNNING
+    assert crashed_task.sessions[0].result_json is not None
+    assert crashed_task.attempt == 1
 
     resumed, adapter = resume_engine(project, engine, [review_effect(project, "1-1-a", clean=True)])
     summary2 = resumed.run()
 
     assert summary2.done == 1 and not summary2.crashed
-    assert load_state(resumed.run_dir).tasks["1-1-a"].phase == Phase.DONE
+    final = load_state(resumed.run_dir).tasks["1-1-a"]
+    assert final.phase == Phase.DONE
+    # the replay stays the attempt it was recorded under, against the persisted
+    # baseline — re-capturing either would shift the rollback/squash reference
+    # and desync the counter from the recorded session's task_id
+    assert final.attempt == 1
+    assert final.baseline_commit == crashed_task.baseline_commit
     assert [s.role for s in adapter.sessions] == ["review"]  # dev NOT re-run
     kinds = [e["kind"] for e in resumed.journal.entries()]
     assert "resume-verify" in kinds
@@ -268,7 +272,9 @@ def test_resume_continues_from_completed_review_session(project):
     summary2 = resumed.run()
 
     assert summary2.done == 1 and not summary2.crashed
-    assert load_state(resumed.run_dir).tasks["1-1-a"].phase == Phase.DONE
+    final = load_state(resumed.run_dir).tasks["1-1-a"]
+    assert final.phase == Phase.DONE
+    assert final.review_cycle == 1  # replay does not burn a review-budget slot
     assert adapter.sessions == []  # neither dev nor review re-run
     entries = resumed.journal.entries()
     verifies = [e for e in entries if e["kind"] == "resume-verify"]
