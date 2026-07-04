@@ -273,8 +273,10 @@ def reset_spec_status(spec_path: Path, new_status: str) -> bool:
     prose body (e.g. the ``## Auto Run Result`` section). A present-but-empty status
     is filled, and a frontmatter block with NO ``status:`` line at all gets one
     inserted before the closing fence (the skill's template can leave it blank or
-    absent). Returns True on a real change, False when the spec has no frontmatter
-    block or is already at ``new_status``."""
+    absent). Returns True on a real change, False when the spec is absent, has no
+    frontmatter block, or is already at ``new_status``."""
+    if not spec_path.is_file():
+        return False
     text = spec_path.read_text(encoding="utf-8")
     fm = _FRONTMATTER_RE.match(text)
     if not fm:
@@ -325,7 +327,16 @@ def strip_auto_run_result(spec_path: Path) -> bool:
     section spans its heading to the next same-level heading (the shared
     `parse_auto_run_result` boundary) or end-of-file; headings quoted inside
     fenced code blocks are ignored on both ends. Returns True when a section was
-    removed, False when none was present."""
+    removed, False when the spec is absent or no section was present.
+
+    Only an absent spec is guarded (a clean no-op, mirroring
+    `verify.set_frontmatter_status`); a present-but-unreadable spec or a failing
+    write is left to raise. Silently skipping the strip after the caller has
+    already flipped the frontmatter status would leave the re-opened spec carrying
+    its stale terminal section — the exact state that makes the re-driven session's
+    first save read as a result — so that failure must surface, not be swallowed."""
+    if not spec_path.is_file():
+        return False
     text = spec_path.read_text(encoding="utf-8")
     matches = _section_headings(text)
     if not matches:

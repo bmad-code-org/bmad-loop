@@ -320,6 +320,14 @@ def test_reset_status_no_frontmatter(tmp_path):
     assert "status: done\n" in sp.read_text()  # body status not touched
 
 
+def test_reset_spec_status_noop_when_spec_absent(tmp_path):
+    """A re-drive against a spec that no longer exists on disk no-ops cleanly
+    rather than raising (mirrors verify.set_frontmatter_status)."""
+    sp = tmp_path / "missing.md"
+    assert not sp.exists()
+    assert devcontract.reset_spec_status(sp, "in-progress") is False
+
+
 # ----------------------------------------------------------- RECONCILABLE_FROM
 
 
@@ -450,6 +458,16 @@ def test_strip_auto_run_result_noop_without_section(tmp_path):
     sp.write_text(original, encoding="utf-8")
     assert devcontract.strip_auto_run_result(sp) is False
     assert sp.read_text() == original
+
+
+def test_strip_auto_run_result_noop_when_spec_absent(tmp_path):
+    """The re-arm path calls strip after flipping frontmatter status; if the spec
+    was removed out from under the run the strip no-ops cleanly rather than crashing
+    the re-drive (only an absent file is guarded — a present-but-unreadable spec
+    still raises so the stale section can't silently survive the re-open)."""
+    sp = tmp_path / "missing.md"
+    assert not sp.exists()
+    assert devcontract.strip_auto_run_result(sp) is False
 
 
 def test_strip_auto_run_result_ignores_heading_quoted_in_code_fence(tmp_path):
