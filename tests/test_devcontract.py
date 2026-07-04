@@ -479,6 +479,25 @@ def test_strip_auto_run_result_ignores_heading_in_indented_fence(tmp_path):
     assert sp.read_text() == original
 
 
+def test_strip_auto_run_result_ignores_list_indented_fence(tmp_path):
+    """Reviewer guard (#53): a `## Auto Run Result` quoted inside a fence nested
+    under list indentation (4+ absolute leading spaces) is co-indented with the
+    fence. `_FENCE_LINE_RE` only recognizes 0-3-space fences, so this fence is not
+    tracked — but the heading is likewise indented and can never match the
+    column-0-anchored `AUTO_RUN_HEADING_RE`, so there is nothing to strip. Locks
+    that symmetry: giving the heading regex any leading-space tolerance would
+    reopen this as a destructive false-positive on quoted spec prose."""
+    sp = tmp_path / "spec.md"
+    original = (
+        "---\nstatus: draft\n---\n\n## Intent\n\n"
+        "- outer bullet\n  - inner bullet, fenced example:\n"
+        "    ```md\n    ## Auto Run Result\n\n    Status: done\n    ```\n\nmore body\n"
+    )
+    sp.write_text(original, encoding="utf-8")
+    assert devcontract.strip_auto_run_result(sp) is False
+    assert sp.read_text() == original
+
+
 def test_strip_auto_run_result_skips_fenced_boundary_lines(tmp_path):
     """Column-0 `## `/`# ` lines inside a fenced block within the section (quoted
     shell comments, log output) are not boundaries — the whole stale section goes."""
