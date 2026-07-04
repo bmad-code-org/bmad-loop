@@ -3,6 +3,7 @@
 import json
 
 import pytest
+from conftest import git
 
 from bmad_loop import devcontract, resolve, runs, verify
 from bmad_loop.journal import load_state, save_state
@@ -172,6 +173,36 @@ def test_rearm_journals_event(tmp_path):
     runs.rearm_escalation(run_dir)
     journal = (run_dir / "journal.jsonl").read_text(encoding="utf-8")
     assert "story-escalation-resolved" in journal
+
+
+def test_rearm_advances_baseline_to_resolved_head(project):
+    # The resolve session committed work on the project branch (e.g. a fixture
+    # the human authorized). Re-arm must adopt that state as the new attempt
+    # baseline, or the redrive's reset-to-baseline parks the resolution commit
+    # on an attempt-preserve ref and re-drives against the unresolved tree.
+    root = project.project
+    old_head = git(root, "rev-parse", "HEAD")
+    run_dir, _, _ = _escalated_run(root)
+    (root / "fixture.txt").write_text("captured baseline\n", encoding="utf-8")
+    git(root, "add", "fixture.txt")
+    git(root, "commit", "-q", "-m", "resolution: capture fixture")
+    # a file the resolve session (or the user) left untracked must enter the
+    # snapshot, so the redrive reset treats it as pre-existing, not run-created
+    (root / "leftover.txt").write_text("keep me\n", encoding="utf-8")
+    runs.rearm_escalation(run_dir)
+    task = load_state(run_dir).tasks["6-4-cli-list-command"]
+    assert task.baseline_commit == git(root, "rev-parse", "HEAD")
+    assert task.baseline_commit != old_head
+    assert "leftover.txt" in task.baseline_untracked
+
+
+def test_rearm_keeps_stale_baseline_outside_a_repo(tmp_path):
+    # best-effort contract: a project dir that is not a git repo (or a broken
+    # one) must not make re-arm fail — the old baseline simply stands
+    run_dir, _, _ = _escalated_run(tmp_path)
+    runs.rearm_escalation(run_dir)
+    task = load_state(run_dir).tasks["6-4-cli-list-command"]
+    assert task.baseline_commit == "abc123"
 
 
 def test_rearm_rejects_non_escalation_stage(tmp_path):

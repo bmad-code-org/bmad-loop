@@ -511,8 +511,11 @@ def rearm_escalation(run_dir: Path, story_key: str | None = None) -> str:
     Flips the escalated task out of its terminal ESCALATED phase back to
     PENDING — which makes `_finish_inflight` reset the tree to the story's
     baseline and re-run it (clean rebuild) against the now-corrected frozen
-    spec. Deterministically sets that spec's status to `ready-for-dev` so the
-    dev session routes straight to implement, and strips the escalated
+    spec. The baseline itself is advanced to the project's current HEAD (and
+    the untracked snapshot refreshed) so commits and files the resolve session
+    produced count as the rebuild's starting point, not as attempt debris to
+    roll back. Deterministically sets that spec's status to `ready-for-dev` so
+    the dev session routes straight to implement, and strips the escalated
     attempt's stale `## Auto Run Result` section so the re-drive cannot read
     as terminal from its first save. Does NOT clear the pause; the caller
     resumes the run separately.
@@ -544,6 +547,23 @@ def rearm_escalation(run_dir: Path, story_key: str | None = None) -> str:
     task.rearmed = True  # resume-time recovery notice describes a clean rebuild,
     # not a failed attempt (engine._finish_inflight clears it once the rebuild runs)
 
+    # Advance the attempt baseline to the project's current HEAD and refresh the
+    # untracked snapshot: whatever the human-driven resolve session left on the
+    # branch (a committed fixture, a corrected ledger, ...) is authorized input
+    # for the re-drive, not failed-attempt debris. Without this, the re-drive's
+    # reset-to-baseline in engine._rollback_or_pause parks the resolution
+    # commits on an attempt-preserve ref and rebuilds against a tree that
+    # contradicts the corrected spec — the re-driven dev session then hits the
+    # very gap the human just resolved. Best-effort: on a git failure the old
+    # baseline stands (the redrive rollback path tolerates a stale baseline; it
+    # just loses this protection).
+    try:
+        repo = Path(state.project)
+        task.baseline_commit = verify.rev_parse_head(repo)
+        task.baseline_untracked = sorted(verify.untracked_files(repo))
+    except verify.GitError:
+        pass
+
     if task.spec_file:
         # route /bmad-dev-auto to re-implement (decision table: ready-for-dev
         # -> step-03); independent of the resolve agent having set it.
@@ -555,5 +575,7 @@ def rearm_escalation(run_dir: Path, story_key: str | None = None) -> str:
         devcontract.strip_auto_run_result(Path(task.spec_file))
 
     save_state(run_dir, state)
-    Journal(run_dir).append("story-escalation-resolved", story_key=key)
+    Journal(run_dir).append(
+        "story-escalation-resolved", story_key=key, baseline=task.baseline_commit or ""
+    )
     return key
