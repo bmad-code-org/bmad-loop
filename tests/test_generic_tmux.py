@@ -605,6 +605,99 @@ def test_dev_stalls_when_grace_elapses_without_reinvocation(tmp_path, monkeypatc
     assert result.status == "stalled"
 
 
+def test_dev_grace_expiry_rechecks_liveness_and_honors_just_dead_window(tmp_path, monkeypatch):
+    """A window that dies in the gap between the top-of-tick liveness probe and the
+    grace-expiry stall return must flow through the crash path — window death is
+    authoritative, so its just-flushed artifact is honored (completed), not
+    discarded by the stall's accept_result=False."""
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    monkeypatch.setattr(generic, "RESULT_POLL_S", 0.0)
+    adapter, impl = make_dev_adapter(tmp_path)
+    adapter._stall_grace_s = 10.0
+    adapter._stall_nudges = 0
+
+    # alive at the top-of-tick probe (call 1), dead at the pre-stall re-probe (call 2)
+    alive_calls = {"n": 0}
+
+    def flaky_alive(handle):
+        alive_calls["n"] += 1
+        return alive_calls["n"] == 1
+
+    adapter._window_alive = flaky_alive
+
+    clock = {"t": 1000.0}
+
+    class _Clock:  # scoped shim so we don't mutate the real time module
+        monotonic = staticmethod(lambda: clock["t"])
+        sleep = staticmethod(lambda *_: None)
+        time_ns = staticmethod(lambda: 0)
+
+    monkeypatch.setattr(generic, "time", _Clock)
+
+    def flush_terminal_spec(call_n):
+        if call_n == 2:  # artifact lands, then the grace window expires in silence
+            clock["t"] += 11.0
+            (impl / "spec-3-1-foo.md").write_text(
+                "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+            )
+
+    adapter.watcher = _ScriptedWatcher(
+        [_stop_event("3-1-dev-1", "sess", "/run/events.jsonl")],
+        on_call=flush_terminal_spec,
+    )
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert result.result_json["status"] == "done"
+    assert alive_calls["n"] == 2  # top-of-tick probe + pre-stall re-probe
+
+
+def test_dev_grace_expiry_stall_recheck_transport_error_still_stalls(tmp_path, monkeypatch):
+    """A transport error on the pre-stall liveness re-probe is not proof of death
+    (as at the top of the tick): the verdict falls through to stalled rather than
+    crashing on the hiccup."""
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    monkeypatch.setattr(generic, "RESULT_POLL_S", 0.0)
+    adapter, _ = make_dev_adapter(tmp_path)
+    adapter._stall_grace_s = 10.0
+    adapter._stall_nudges = 0
+
+    alive_calls = {"n": 0}
+
+    def flaky_alive(handle):
+        alive_calls["n"] += 1
+        if alive_calls["n"] == 1:
+            return True  # top-of-tick probe
+        raise MultiplexerError("tmux hang")  # pre-stall re-probe
+
+    adapter._window_alive = flaky_alive
+
+    clock = {"t": 1000.0}
+
+    class _Clock:  # scoped shim so we don't mutate the real time module
+        monotonic = staticmethod(lambda: clock["t"])
+        sleep = staticmethod(lambda *_: None)
+        time_ns = staticmethod(lambda: 0)
+
+    monkeypatch.setattr(generic, "time", _Clock)
+
+    def advance_past_grace(call_n):
+        if call_n == 2:
+            clock["t"] += 11.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [_stop_event("3-1-dev-1", "sess", "/run/events.jsonl")],
+        on_call=advance_past_grace,
+    )
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "stalled"
+    assert result.result_json is None
+    assert alive_calls["n"] == 2  # probe raised on the re-check, fell through to stall
+
+
 def test_dev_log_activity_keeps_grace_window_alive(tmp_path, monkeypatch):
     """A session still streaming to the tee'd pane log is working, not stalled:
     pane growth must re-arm the grace window even with no fresh Stop, so only

@@ -264,9 +264,23 @@ class GenericAdapter(CodingCLIAdapter):
                         stall_deadline = time.monotonic() + self._stall_grace_s
                         last_activity = self._log_activity_key(handle.task_id)
                         continue
-                    # The window is alive here, so an artifact on disk cannot
-                    # upgrade the stall verdict to completed — it may be stale
-                    # or mid-write; only a Stop or window death vouches for it.
+                    # Re-probe liveness before finalizing: this return exits the
+                    # loop, so a hard death (no SessionEnd) in the gap since the
+                    # top-of-tick probe would otherwise never be caught. Window
+                    # death is authoritative — a now-dead window flows through the
+                    # crash path (which honors its artifact via accept_result=True)
+                    # instead of a stall that discards a just-flushed result. A
+                    # transport error is not proof of death (as at the top of the
+                    # tick); fall through to the stall — spec.timeout_s bounds a
+                    # persistent failure.
+                    try:
+                        if not self._window_alive(handle):
+                            return self._final(handle, spec, "crashed", session_id, transcript_path)
+                    except MultiplexerError:
+                        pass
+                    # Still alive: an artifact on disk cannot upgrade the stall to
+                    # completed — it may be stale or mid-write; only a Stop or
+                    # window death vouches for it.
                     return self._final(
                         handle, spec, "stalled", session_id, transcript_path, accept_result=False
                     )
