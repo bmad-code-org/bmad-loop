@@ -314,6 +314,179 @@ def test_resume_restart_when_session_record_incomplete(project, record):
     assert "resume-verify" not in kinds
 
 
+def _final_review_cycle_policy() -> Policy:
+    # max_review_cycles=1 → the first (and only) review cycle IS the final one,
+    # so a crash in its post-session window lands the resume with
+    # review_cycle already == the budget ceiling.
+    return Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        limits=LimitsPolicy(max_review_cycles=1),
+        scm=ScmPolicy(rollback_on_failure=True),
+    )
+
+
+def test_resume_final_review_cycle_replays_clean_result(project):
+    """A host death in the post-session window of the *last* allowed review
+    cycle must still consume the durably-recorded clean pass: the resume
+    continuation enters the loop even though review_cycle already == the budget,
+    so the story reaches DONE instead of dropping a recorded clean review to
+    defer. Regression guard for the final-cycle replay edge from #62."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+        policy=_final_review_cycle_policy(),
+    )
+    post_sessions = []
+
+    def crashing_emit(stage, *args, **kwargs):
+        if stage == "post_session":
+            post_sessions.append(stage)
+            if len(post_sessions) == 2:  # the (final) review session's post_session
+                raise RuntimeError("host died in the post-session window")
+        return original_emit(stage, *args, **kwargs)
+
+    original_emit = engine._emit
+    engine._emit = crashing_emit
+    assert engine.run().crashed
+    crashed = load_state(engine.run_dir).tasks["1-1-a"]
+    assert crashed.phase == Phase.REVIEW_RUNNING
+    assert crashed.review_cycle == 1  # already at the budget ceiling
+    assert crashed.sessions[-1].result_json is not None
+
+    resumed, adapter = resume_engine(project, engine, [])
+    summary = resumed.run()
+
+    assert summary.done == 1 and summary.deferred == 0 and not summary.crashed
+    final = load_state(resumed.run_dir).tasks["1-1-a"]
+    assert final.phase == Phase.DONE
+    assert final.review_cycle == 1  # the replay did not burn an extra cycle
+    assert adapter.sessions == []  # nothing re-run — the recorded pass was replayed
+    kinds = [e["kind"] for e in resumed.journal.entries()]
+    assert "resume-verify" in kinds
+    assert "resume-restart" not in kinds
+
+
+def test_resume_final_review_cycle_dirty_replay_defers_without_extra_budget(project):
+    """The same final-cycle replay for a non-convergent review consumes the
+    recorded pass, then the loop exits on the normal budget guard — no fresh
+    session, no extra cycle — and the story defers. Proves the relaxed guard
+    burns no extra budget once the replayed result is consumed."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),
+            review_effect(project, "1-1-a", clean=False, finalized=False),
+        ],
+        policy=_final_review_cycle_policy(),
+    )
+    post_sessions = []
+
+    def crashing_emit(stage, *args, **kwargs):
+        if stage == "post_session":
+            post_sessions.append(stage)
+            if len(post_sessions) == 2:
+                raise RuntimeError("host died in the post-session window")
+        return original_emit(stage, *args, **kwargs)
+
+    original_emit = engine._emit
+    engine._emit = crashing_emit
+    assert engine.run().crashed
+    assert load_state(engine.run_dir).tasks["1-1-a"].review_cycle == 1
+
+    resumed, adapter = resume_engine(project, engine, [])
+    summary = resumed.run()
+
+    assert summary.deferred == 1 and summary.done == 0 and not summary.crashed
+    final = load_state(resumed.run_dir).tasks["1-1-a"]
+    assert final.phase == Phase.DEFERRED
+    assert final.review_cycle == 1  # replay consumed; no extra budget burned
+    assert adapter.sessions == []  # loop exited without a fresh session
+    kinds = [e["kind"] for e in resumed.journal.entries()]
+    assert "resume-verify" in kinds
+
+
+def test_reconcile_early_return_heals_stale_resumed_dict(project):
+    """On the idempotent early-return path (frontmatter already at the success
+    status), the reconcile still syncs a stale *resumed* result dict from the
+    frontmatter — a resumed record is the pre-reconcile snapshot, so without the
+    heal its `followup_review_recommended` gate would read the template default
+    and silently skip the follow-up review."""
+    engine, _ = make_engine(project, [])
+    sp = spec_path(project, "1-1-a")
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    sp.write_text(
+        "---\ntitle: 'test'\ntype: 'feature'\nstatus: 'done'\n"
+        "followup_review_recommended: true\nbaseline_commit: 'abc'\n---\n\n## Intent\n\ntest\n"
+    )
+    task = StoryTask(story_key="1-1-a", epic=1)
+    # the pre-reconcile snapshot persisted before the original run mutated its
+    # in-memory dict: frontmatter template default status, no followup key.
+    stale = {"workflow": "auto-dev", "spec_file": str(sp), "status": "in-progress"}
+    engine._reconcile_generic_terminal_status(task, stale)
+
+    assert stale["status"] == "done"  # synced from the finalized frontmatter
+    assert stale["followup_review_recommended"] is True  # folded from the frontmatter
+    # the idempotent path never rewrites the spec, so nothing is journaled
+    assert not [e for e in engine.journal.entries() if e["kind"] == "spec-status-reconciled"]
+
+
+def test_run_session_record_result_json_isolated_from_later_mutation(project):
+    """The durable SessionRecord holds a defensive copy of result_json, so the
+    in-place mutation `_reconcile_generic_terminal_status` performs on the live
+    result after the session is recorded cannot retroactively rewrite the
+    persisted snapshot."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project, [SessionResult(status="completed", result_json={"workflow": "auto-dev"})]
+    )
+    task = StoryTask(story_key="1-1-a", epic=1)
+    engine.state.tasks[task.story_key] = task
+    engine._save()
+
+    result = engine._run_session(task, role="dev", prompt="/bmad-dev-auto 1-1-a", seq=1)
+    # reconcile-style in-place mutation of the live result AFTER it was recorded
+    result.result_json["status"] = "done"
+    result.result_json["followup_review_recommended"] = True
+
+    assert task.sessions[-1].result_json == {"workflow": "auto-dev"}  # in-memory record
+    saved = load_state(engine.run_dir).tasks["1-1-a"]
+    assert saved.sessions[-1].result_json == {"workflow": "auto-dev"}  # on-disk snapshot
+
+
+def test_run_session_persists_result_json_only_for_resumable_roles(project):
+    """Only dev/review sessions (never a label) are consumed on resume, so only
+    they persist result_json; triage/sweep and labeled plugin-workflow records
+    store None — the payload would be pure state.json bloat otherwise."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [
+            SessionResult(status="completed", result_json={"role": "dev"}),
+            SessionResult(status="completed", result_json={"role": "review"}),
+            SessionResult(status="completed", result_json={"role": "triage"}),
+            SessionResult(status="completed", result_json={"role": "labeled"}),
+        ],
+    )
+    engine.adapters["triage"] = adapter  # SweepEngine registers this; wire it here
+    task = StoryTask(story_key="1-1-a", epic=1)
+    engine.state.tasks[task.story_key] = task
+    engine._save()
+
+    engine._run_session(task, role="dev", prompt="p", seq=1)
+    engine._run_session(task, role="review", prompt="p", seq=1)
+    engine._run_session(task, role="triage", prompt="p", seq=1)
+    engine._run_session(task, role="dev", prompt="p", seq=1, label="tea-trace")
+
+    by_id = {r.task_id: r.result_json for r in task.sessions}
+    assert by_id["1-1-a-dev-1"] == {"role": "dev"}  # resumable → persisted
+    assert by_id["1-1-a-review-1"] == {"role": "review"}  # resumable → persisted
+    assert by_id["1-1-a-triage-1"] is None  # role not resumable → None
+    assert by_id["1-1-a-tea-trace-1"] is None  # labeled → None
+
+
 def test_token_budget_discounts_cache_reads(project):
     """Raw totals dominated by cache reads must not trip the budget; the
     weighted total (cache reads at 0.1x) is what's checked."""

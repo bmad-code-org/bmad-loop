@@ -1509,7 +1509,13 @@ class Engine:
         # (status: done) while still recommending an independent follow-up — the
         # only state the budget-exhaustion rescue below is allowed to commit.
         refileable_followup = False
-        while task.review_cycle < self.policy.limits.max_review_cycles:
+        # A resumed result must enter the loop even when the crash landed in the
+        # post-session window of the *final* allowed cycle (review_cycle already
+        # == max_review_cycles): its recorded pass was already counted, and the
+        # replay branch below skips the re-increment, so no extra budget is
+        # burned. resume_result is nulled after it is consumed, so every later
+        # iteration falls back to the normal budget guard.
+        while resume_result is not None or task.review_cycle < self.policy.limits.max_review_cycles:
             if resume_result is None:
                 # a resumed result replays the cycle it was recorded under: the
                 # counter must not advance, or the replay burns a review-budget
@@ -1759,7 +1765,25 @@ class Engine:
         raw_status = fm.get("status")
         fm_status = "" if raw_status is None else str(raw_status).strip().lower()
         if fm_status == success_status:
-            return  # already finalized — idempotent
+            # Already finalized — idempotent for the spec. But a *resumed* result
+            # is the pre-reconcile snapshot persisted before the original run's
+            # reconcile mutated its in-memory dict (the durable record is now a
+            # defensive copy, so it never saw that mutation). Re-fold the derived
+            # keys from the frontmatter we just read so the replay's
+            # `followup_review_recommended` gate matches the finalized spec
+            # instead of the stale template default. Only fold followup when the
+            # frontmatter actually carries it: on the generic path the frontmatter
+            # is the source `devcontract.synthesize_result` already reads it from,
+            # so a present key can never disagree — but when it is absent, the
+            # value the session put in result.json is authoritative and must not
+            # be clobbered to a phantom False.
+            if isinstance(result_json, dict):
+                result_json["status"] = success_status
+                if success_status == "done" and "followup_review_recommended" in fm:
+                    result_json["followup_review_recommended"] = bool(
+                        fm.get("followup_review_recommended")
+                    )
+            return
         if fm_status not in devcontract.RECONCILABLE_FROM:
             return  # blocked / unknown custom status: never override a deliberate one
         arr = devcontract.parse_auto_run_result(spec_path.read_text(encoding="utf-8"))
@@ -1938,6 +1962,16 @@ class Engine:
         self.journal.set_active_log(task_id)
         self.journal.append("session-start", task_id=task_id, role=role, prompt=prompt)
         result = adapter.run(spec)
+        # Only dev/review sessions are resumable — `_resumable_session` matches
+        # exactly those task ids under DEV_RUNNING/REVIEW_RUNNING. For everything
+        # else (triage/sweep, labeled plugin-workflow sessions) the payload is
+        # never consumed on resume, so persisting it is pure state.json bloat.
+        # For resumable sessions, store a defensive copy: `result.result_json`
+        # is mutated in place downstream (`_reconcile_generic_terminal_status`),
+        # and the durable record must stay a stable snapshot of what the adapter
+        # returned rather than aliasing a later, half-mutated dict. Shallow is
+        # enough — reconcile only touches top-level keys.
+        resumable = label is None and role in ("dev", "review")
         task.record_session(
             SessionRecord(
                 task_id=task_id,
@@ -1945,7 +1979,11 @@ class Engine:
                 status=result.status,
                 session_id=result.session_id,
                 transcript_path=result.transcript_path,
-                result_json=result.result_json,
+                result_json=(
+                    dict(result.result_json)
+                    if resumable and result.result_json is not None
+                    else None
+                ),
             )
         )
         # Make the completed session durable before the usage read, post-session
