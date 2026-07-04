@@ -64,6 +64,19 @@ def test_parse_stops_at_next_heading():
     assert arr.status == "done" and "blocked" not in arr.detail
 
 
+def test_parse_stops_at_bare_empty_heading():
+    """Reviewer guard (#53, comment 3522512350): a bare `##` line is a valid empty
+    CommonMark ATX heading, so `_next_heading_start` (`^##\\s`) bounding the section
+    there is correct, not a premature truncation. Locks that intent: the `Status:`
+    gate is parsed above the boundary and is unaffected, and tightening `\\s` to a
+    space/tab delimiter would stop recognizing empty headings — a false-negative
+    boundary that, on the destructive strip path, deletes MORE, not less."""
+    text = "## Auto Run Result\n\nStatus: done\n\n##\n\nlater section body\n"
+    arr = devcontract.parse_auto_run_result(text)
+    assert arr.status == "done"
+    assert "later section body" not in arr.detail
+
+
 def test_parse_ignores_fence_quoted_heading():
     """A heading quoted inside a fenced example (a frozen intent showing the
     section format) is documentation, not a terminal section (#52)."""
@@ -450,6 +463,24 @@ def test_strip_auto_run_result_stops_at_next_heading(tmp_path):
     text = sp.read_text()
     assert "Auto Run Result" not in text and "stale" not in text
     assert "## Change Log\n\nkept\n" in text
+
+
+def test_strip_auto_run_result_stops_at_bare_empty_heading(tmp_path):
+    """Reviewer guard (#53, comment 3522512350): a bare `##` line is a valid empty
+    CommonMark heading, so the strip bounds the removed section there and keeps the
+    empty-heading region after it. This is the safe direction on a destructive strip
+    (truncate early -> delete less); requiring a space/tab delimiter instead of `\\s`
+    would run the strip PAST the empty heading and over-delete."""
+    sp = tmp_path / "spec.md"
+    sp.write_text(
+        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n\n"
+        "##\n\nkept after empty heading\n",
+        encoding="utf-8",
+    )
+    assert devcontract.strip_auto_run_result(sp) is True
+    text = sp.read_text()
+    assert "Auto Run Result" not in text
+    assert "##\n\nkept after empty heading\n" in text
 
 
 def test_strip_auto_run_result_noop_without_section(tmp_path):
