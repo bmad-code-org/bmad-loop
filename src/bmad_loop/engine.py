@@ -9,6 +9,7 @@ verify. All creative work happens inside disposable adapter sessions.
 from __future__ import annotations
 
 import contextlib
+import functools
 import shutil
 import signal
 import sys
@@ -245,6 +246,22 @@ class Engine:
                     raise  # nested auto-sweep: let the owner record the stop
                 self.state.stopped = True
                 self.journal.append("run-stop")
+            except KeyboardInterrupt:
+                # Some Windows console/control events can still surface as a raw
+                # KeyboardInterrupt without routing through the installed signal
+                # handler. Persist a controlled stop rather than letting the
+                # engine disappear with stale state.
+                self._stopping = True  # swallow stop signals landing mid-teardown
+                try:
+                    kill_session(self.state.run_id)
+                except (
+                    BaseException
+                ):  # noqa: BLE001  # nosec B110 - best-effort teardown; the stop must still record
+                    pass
+                if self._is_nested:
+                    raise
+                self.state.stopped = True
+                self.journal.append("run-stop", reason="KeyboardInterrupt")
             except Exception as exc:
                 # an unexpected exception escaped the loop (e.g. a transport
                 # hang that leaked past the seam). Don't let it die to the lossy
@@ -1043,6 +1060,36 @@ class Engine:
                     self._integrate_unit(task, unit)
                 else:
                     self._review_and_commit(task)
+            elif (resumable := self._resumable_session(task)) is not None:
+                # the host died inside the post-session window: the session
+                # itself completed and its recorded result is on disk, so
+                # continue into the normal verify/decide pipeline instead of
+                # rolling the finished work back through resume-restart.
+                role, result = resumable
+                self.journal.append("resume-verify", story_key=task.story_key, role=role)
+                if role == "dev":
+                    # deliberate reset like the restart arm: _dev_phase re-enters
+                    # its loop and consumes the recorded result instead of
+                    # running a session
+                    task.phase = Phase.PENDING
+                    continuation = functools.partial(self._drive_story, task, dev_resume=result)
+                else:
+                    # deliberate reset to the legal pre-review phase
+                    task.phase = Phase.DEV_VERIFY
+                    continuation = functools.partial(
+                        self._review_and_commit, task, resume_result=result
+                    )
+                if isolated:
+                    unit = self._reopen_unit(task)
+                    prev = self.workspace
+                    self.workspace = unit.workspace
+                    try:
+                        continuation()
+                    finally:
+                        self.workspace = prev
+                    self._integrate_unit(task, unit)
+                else:
+                    continuation()
             else:
                 self.journal.append(
                     "resume-restart", story_key=task.story_key, phase=str(task.phase)
@@ -1061,6 +1108,33 @@ class Engine:
                 task.phase = Phase.PENDING  # deliberate reset, not a normal transition
                 self._save()
                 self._run_story(task)
+
+    def _resumable_session(self, task: StoryTask) -> tuple[str, SessionResult] | None:
+        """The in-flight session's durably-recorded result, when complete enough
+        to act on: the task died mid-phase but its current attempt/cycle record
+        is ``completed`` and carries the parsed result. Consumes only evidence
+        the adapter vouched for at session end — no artifact re-scan, no
+        loosening of completion authority. Anything less returns None and the
+        caller falls through to resume-restart."""
+        if task.phase == Phase.DEV_RUNNING:
+            role, seq = "dev", task.attempt
+        elif task.phase == Phase.REVIEW_RUNNING:
+            role, seq = "review", task.review_cycle
+        else:
+            return None
+        task_id = f"{task.story_key}-{role}-{seq}"
+        for record in reversed(task.sessions):
+            if record.task_id != task_id:
+                continue
+            if record.status != "completed" or record.result_json is None:
+                return None
+            return role, SessionResult(
+                status="completed",
+                result_json=record.result_json,
+                session_id=record.session_id,
+                transcript_path=record.transcript_path,
+            )
+        return None
 
     # ------------------------------------------------------------- per story
 
@@ -1269,8 +1343,8 @@ class Engine:
             self._drive_story(task)
         self._emit("post_story", task)
 
-    def _drive_story(self, task: StoryTask) -> None:
-        if not self._dev_phase(task):
+    def _drive_story(self, task: StoryTask, dev_resume: SessionResult | None = None) -> None:
+        if not self._dev_phase(task, resume_result=dev_resume):
             return
         if gates.pause_after_spec(self.policy):
             gates.notify(
@@ -1286,7 +1360,7 @@ class Engine:
             )
         self._review_and_commit(task)
 
-    def _dev_phase(self, task: StoryTask) -> bool:
+    def _dev_phase(self, task: StoryTask, resume_result: SessionResult | None = None) -> bool:
         if self._vetoed(self._emit("pre_dev_phase", task), task):
             return False
         task.baseline_commit = verify.rev_parse_head(self.workspace.root)
@@ -1298,12 +1372,19 @@ class Engine:
             task.attempt += 1
             advance(task, Phase.DEV_RUNNING)
             self._save()
-            result = self._run_session(
-                task,
-                role="dev",
-                prompt=self._dev_prompt(task, feedback),
-                seq=task.attempt,
-            )
+            if resume_result is not None:
+                # the session already ran before the host died; its recorded
+                # result re-enters the verify/decide pipeline. Consumed exactly
+                # once — later iterations run sessions normally.
+                result = resume_result
+                resume_result = None
+            else:
+                result = self._run_session(
+                    task,
+                    role="dev",
+                    prompt=self._dev_prompt(task, feedback),
+                    seq=task.attempt,
+                )
             advance(task, Phase.DEV_VERIFY)
             outcome = None
             if result.status == "completed":
@@ -1384,7 +1465,9 @@ class Engine:
         if spec_path.is_file():
             task.spec_file = str(spec_path)
 
-    def _review_and_commit(self, task: StoryTask) -> None:
+    def _review_and_commit(
+        self, task: StoryTask, resume_result: SessionResult | None = None
+    ) -> None:
         if not self.policy.review.enabled:
             # review.enabled = false: the bmad-dev-auto session's own inline
             # review is the only review; verify the deterministic gates + commit.
@@ -1422,12 +1505,19 @@ class Engine:
             refileable_followup = False  # only a completed pass this cycle can set it
             advance(task, Phase.REVIEW_RUNNING)
             self._save()
-            result = self._run_session(
-                task,
-                role="review",
-                prompt=self._review_prompt(task),
-                seq=task.review_cycle,
-            )
+            if resume_result is not None:
+                # the session already ran before the host died; its recorded
+                # result re-enters the decision pipeline. Consumed exactly
+                # once — later cycles run sessions normally.
+                result = resume_result
+                resume_result = None
+            else:
+                result = self._run_session(
+                    task,
+                    role="review",
+                    prompt=self._review_prompt(task),
+                    seq=task.review_cycle,
+                )
             advance(task, Phase.REVIEW_VERIFY)
             self._save()
             self._emit(
@@ -1835,7 +1925,6 @@ class Engine:
         self.journal.set_active_log(task_id)
         self.journal.append("session-start", task_id=task_id, role=role, prompt=prompt)
         result = adapter.run(spec)
-        usage = adapter.read_usage(result)
         task.record_session(
             SessionRecord(
                 task_id=task_id,
@@ -1843,15 +1932,24 @@ class Engine:
                 status=result.status,
                 session_id=result.session_id,
                 transcript_path=result.transcript_path,
-                usage=usage,
+                result_json=result.result_json,
             )
         )
+        # Make the completed session durable before the usage read, post-session
+        # hooks, and follow-up verification. If the host kills the process in
+        # that window, the resume path can see the session instead of a stale
+        # dev-running task with no evidence; usage stays best-effort metadata,
+        # not a durability gate.
+        self._save()
+        usage = adapter.read_usage(result)
+        task.attach_session_usage(task_id, usage)
         self.journal.append(
             "session-end",
             task_id=task_id,
             status=result.status,
             tokens=usage.total if usage else None,
         )
+        self._save()
         self._emit(
             "post_session",
             task,

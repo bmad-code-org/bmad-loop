@@ -91,6 +91,9 @@ class SessionRecord:
     session_id: str | None = None
     transcript_path: str | None = None
     usage: TokenUsage | None = None
+    # the session's parsed result payload, persisted so a durably-saved
+    # completed session is actionable on resume, not just forensics
+    result_json: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -100,6 +103,7 @@ class SessionRecord:
             "session_id": self.session_id,
             "transcript_path": self.transcript_path,
             "usage": self.usage.to_dict() if self.usage else None,
+            "result_json": self.result_json,
         }
 
     @classmethod
@@ -112,6 +116,7 @@ class SessionRecord:
             session_id=d.get("session_id"),
             transcript_path=d.get("transcript_path"),
             usage=TokenUsage.from_dict(usage) if usage else None,
+            result_json=d.get("result_json"),
         )
 
 
@@ -167,6 +172,21 @@ class StoryTask:
         self.sessions.append(record)
         if record.usage:
             self.tokens.add(record.usage)
+
+    def attach_session_usage(self, task_id: str, usage: TokenUsage | None) -> None:
+        """Fold usage into the most recent session for `task_id`. Usage is
+        best-effort metadata attached after the session itself is saved, so a
+        failed usage read never costs the recorded session."""
+        if usage is None:
+            return
+        for record in reversed(self.sessions):
+            if record.task_id != task_id:
+                continue
+            if record.usage is None:
+                record.usage = usage
+                self.tokens.add(usage)
+            return
+        raise KeyError(task_id)
 
     def to_dict(self) -> dict[str, Any]:
         return {

@@ -1,5 +1,6 @@
 """Engine scenario tests against the mock adapter — no tmux, no LLM."""
 
+import json
 import re
 import signal
 from pathlib import Path
@@ -26,6 +27,7 @@ from bmad_loop.model import (
     PAUSE_SPEC_APPROVAL,
     Phase,
     RunState,
+    SessionRecord,
     StoryTask,
     TokenUsage,
 )
@@ -94,6 +96,216 @@ def resume_engine(project, engine, script, policy=None) -> tuple[Engine, MockAda
         max_stories=state.max_stories,
     )
     return new_engine, adapter
+
+
+def test_run_session_saves_completed_session_checkpoint(project):
+    """The completed session must already be on disk when post_session fires:
+    a host kill inside the hooks cannot lose it."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [SessionResult(status="completed")])
+    task = StoryTask(story_key="1-1-a", epic=1)
+    engine.state.tasks[task.story_key] = task
+    engine._save()
+
+    original_emit = engine._emit
+    on_disk_at_post_session = []
+
+    def spying_emit(stage, *args, **kwargs):
+        if stage == "post_session":
+            on_disk = load_state(engine.run_dir)
+            on_disk_at_post_session.append(bool(on_disk.tasks["1-1-a"].sessions))
+        return original_emit(stage, *args, **kwargs)
+
+    engine._emit = spying_emit
+    engine._run_session(task, role="dev", prompt="/bmad-dev-auto 1-1-a", seq=1)
+
+    saved = load_state(engine.run_dir)
+    saved_task = saved.tasks["1-1-a"]
+    assert len(saved_task.sessions) == 1
+    assert saved_task.sessions[0].status == "completed"
+    assert saved_task.sessions[0].usage is not None
+    assert saved_task.sessions[0].usage.total == 15
+    assert saved_task.tokens.total == 15
+    assert on_disk_at_post_session == [True]
+
+
+def test_run_session_persists_session_when_usage_read_raises(project):
+    """A failed usage read propagates, but the completed session is already
+    saved — usage is metadata, not a durability gate."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [SessionResult(status="completed", session_id="sess-1", transcript_path="events.jsonl")],
+    )
+    task = StoryTask(story_key="1-1-a", epic=1)
+    engine.state.tasks[task.story_key] = task
+    engine._save()
+
+    def boom(result):
+        raise RuntimeError("usage read failed")
+
+    adapter.read_usage = boom
+    with pytest.raises(RuntimeError):
+        engine._run_session(task, role="dev", prompt="/bmad-dev-auto 1-1-a", seq=1)
+
+    saved = load_state(engine.run_dir)
+    saved_task = saved.tasks["1-1-a"]
+    assert len(saved_task.sessions) == 1
+    assert saved_task.sessions[0].status == "completed"
+    assert saved_task.sessions[0].session_id == "sess-1"
+    assert saved_task.sessions[0].transcript_path == "events.jsonl"
+    assert saved_task.sessions[0].usage is None
+
+
+def test_keyboard_interrupt_records_stopped_run(project, monkeypatch):
+    """A raw KeyboardInterrupt (Windows console-ctrl bypassing the signal
+    handler) records a controlled stop, not a crash."""
+    killed = []
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: killed.append(rid))
+
+    def interrupt(_spec):
+        raise KeyboardInterrupt()
+
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [interrupt])
+
+    summary = engine.run()
+
+    saved = load_state(engine.run_dir)
+    assert saved.stopped
+    assert not summary.crashed
+    assert not saved.crashed
+    assert killed == ["test-run"]
+    entries = [
+        json.loads(line) for line in (engine.run_dir / "journal.jsonl").read_text().splitlines()
+    ]
+    stops = [e for e in entries if e["kind"] == "run-stop"]
+    assert stops and stops[0]["reason"] == "KeyboardInterrupt"
+
+
+def test_nested_engine_reraises_keyboard_interrupt(project, monkeypatch):
+    """A nested engine re-raises KeyboardInterrupt for the outer (owning)
+    engine to record — it still tears down its own agent session."""
+    killed = []
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: killed.append(rid))
+    engine, _ = make_engine(project, [])
+
+    def boom():
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(engine, "_loop", boom)
+    sentinel = object()
+    Engine._stop_signals_owner = sentinel  # pretend an outer engine owns signals
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            engine.run()
+    finally:
+        Engine._stop_signals_owner = None
+
+    assert load_state(engine.run_dir).stopped is False  # owner records it, not us
+    assert killed == ["test-run"]
+
+
+def test_resume_continues_from_completed_dev_session(project):
+    """A host kill inside the post-session window of a completed dev session
+    must not roll the work back: resume consumes the durably-recorded result
+    and drives verify/decide as if the session had just returned."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [dev_effect(project, "1-1-a")])
+
+    def crashing_emit(stage, *args, **kwargs):
+        if stage == "post_session":
+            raise RuntimeError("host died in the post-session window")
+        return original_emit(stage, *args, **kwargs)
+
+    original_emit = engine._emit
+    engine._emit = crashing_emit
+    summary = engine.run()
+
+    assert summary.crashed
+    saved = load_state(engine.run_dir)
+    assert saved.tasks["1-1-a"].phase == Phase.DEV_RUNNING
+    assert saved.tasks["1-1-a"].sessions[0].result_json is not None
+
+    resumed, adapter = resume_engine(project, engine, [review_effect(project, "1-1-a", clean=True)])
+    summary2 = resumed.run()
+
+    assert summary2.done == 1 and not summary2.crashed
+    assert load_state(resumed.run_dir).tasks["1-1-a"].phase == Phase.DONE
+    assert [s.role for s in adapter.sessions] == ["review"]  # dev NOT re-run
+    kinds = [e["kind"] for e in resumed.journal.entries()]
+    assert "resume-verify" in kinds
+    assert "resume-restart" not in kinds
+    assert not any(k.startswith("rollback") for k in kinds)
+
+
+def test_resume_continues_from_completed_review_session(project):
+    """A host kill inside the post-session window of a completed review session
+    resumes into the review decision path — the dev phase is not re-entered."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+    )
+    post_sessions = []
+
+    def crashing_emit(stage, *args, **kwargs):
+        if stage == "post_session":
+            post_sessions.append(stage)
+            if len(post_sessions) == 2:  # the review session's post_session
+                raise RuntimeError("host died in the post-session window")
+        return original_emit(stage, *args, **kwargs)
+
+    original_emit = engine._emit
+    engine._emit = crashing_emit
+    summary = engine.run()
+
+    assert summary.crashed
+    saved = load_state(engine.run_dir)
+    assert saved.tasks["1-1-a"].phase == Phase.REVIEW_RUNNING
+
+    resumed, adapter = resume_engine(project, engine, [])
+    summary2 = resumed.run()
+
+    assert summary2.done == 1 and not summary2.crashed
+    assert load_state(resumed.run_dir).tasks["1-1-a"].phase == Phase.DONE
+    assert adapter.sessions == []  # neither dev nor review re-run
+    entries = resumed.journal.entries()
+    verifies = [e for e in entries if e["kind"] == "resume-verify"]
+    assert verifies and verifies[-1]["role"] == "review"
+    kinds = [e["kind"] for e in entries]
+    assert "resume-restart" not in kinds
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        SessionRecord(task_id="1-1-a-dev-1", role="dev", status="stalled"),
+        # completed but without a recorded result (legacy state.json shape)
+        SessionRecord(task_id="1-1-a-dev-1", role="dev", status="completed"),
+    ],
+)
+def test_resume_restart_when_session_record_incomplete(project, record):
+    """A dev-running task whose current-attempt record is not a completed
+    session with a recorded result still takes today's resume-restart."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1, phase=Phase.DEV_RUNNING, attempt=1)
+    task.record_session(record)
+    engine.state.tasks[task.story_key] = task
+    engine._save()
+
+    resumed, _ = resume_engine(
+        project,
+        engine,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+    )
+    summary = resumed.run()
+
+    assert summary.done == 1
+    kinds = [e["kind"] for e in resumed.journal.entries()]
+    assert "resume-restart" in kinds
+    assert "resume-verify" not in kinds
 
 
 def test_token_budget_discounts_cache_reads(project):
