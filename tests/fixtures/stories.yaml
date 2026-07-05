@@ -1,0 +1,48 @@
+# Dogfooded Story Breakdown from BMAD-METHOD PR #2549's gist
+# (https://gist.github.com/alexeyv/0d80e3b4cd79bb4423c22846fe36f610).
+# Quoted ids, independent spec_checkpoint/done_checkpoint bools, verbatim
+# invoke_dev_with, and NO depends_on — the linear stories-mode contract.
+- id: "1"
+  title: Add story-breakdown step to bmad-spec
+  description: >-
+    Add the optional interactive breakdown step to the bmad-spec skill,
+    emitting stories.yaml per stories-schema.md with its validity
+    rules as authoring checks; the file is discovered by fixed name,
+    not referenced from frontmatter.
+  spec_checkpoint: true
+
+- id: "2"
+  title: Dispatch dev-auto by spec folder and story id
+  description: >-
+    Extend dev-auto step-01 routing to accept spec folder + story id,
+    read the entry's title and description from stories.yaml, derive the
+    slug, and create or resume the story spec at the id-keyed path.
+    Existing free-form and spec-file invocations keep working.
+  spec_checkpoint: true
+  invoke_dev_with: >-
+    The artifact under edit is bmad-dev-auto itself; keep its
+    deliberately-minimal-change tenet — routing additions only,
+    no new step files.
+
+- id: "3"
+  title: Pin write-back to the id-keyed path and honor the plan halt
+  description: >-
+    Under folder+id dispatch, every HALT writes the id-keyed story spec
+    (skeletal if pre-planning) and never the implementation_artifacts
+    fallback. Honor an invocation-prompt directive to HALT ready-for-dev
+    after planning.
+
+- id: "4"
+  title: Accumulate context from prior story records
+  description: >-
+    Under folder+id dispatch, the planning step reads all stories/*.md
+    records present regardless of status, superseding the epic-numbered
+    continuity scan for this dispatch mode.
+
+- id: "5"
+  title: End-to-end contract demonstration
+  description: >-
+    Run the breakdown on a real epic and hand-dispatch dev-auto per
+    entry, human standing in for the orchestrator, as the success-signal
+    demonstration; record outcomes in the spec folder.
+  done_checkpoint: true

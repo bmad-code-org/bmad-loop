@@ -1132,6 +1132,84 @@ def verify_dev_bundle(
     return VerifyOutcome.passed()
 
 
+def verify_dev_stories(
+    task: StoryTask,
+    paths: ProjectPaths,
+    result_json: dict[str, Any] | None,
+    *,
+    spec_folder: Path,
+    review_enabled: bool = True,
+) -> VerifyOutcome:
+    """verify_dev for stories mode: the story spec lives at the id-keyed path
+    ``<spec-folder>/stories/<id>-<slug>.md`` and there is no sprint-status entry.
+
+    Same gates as :func:`verify_dev` — workflow tag, expected frontmatter status,
+    baseline match, proof-of-work since baseline — with two differences: the spec
+    is resolved **deterministically by id** (``task.story_key``) via
+    ``stories.resolve_story_spec`` rather than trusting the session-claimed path,
+    and the sprint-status gate is dropped (stories mode has no sprint board).
+    A resolution that is pending / ambiguous / a sentinel is a retryable failure,
+    and the resolved filename's id prefix is asserted to equal the task id.
+    """
+    from . import stories
+
+    rj = result_json or {}
+    story_id = task.story_key
+    state = stories.resolve_story_spec(spec_folder, story_id)
+    if state.kind == stories.KIND_PENDING:
+        return VerifyOutcome.retry(f"no story spec found for id {story_id!r} under {spec_folder}")
+    if state.kind == stories.KIND_AMBIGUOUS:
+        names = ", ".join(p.name for p in state.paths)
+        return VerifyOutcome.retry(f"ambiguous story file match for id {story_id!r}: {names}")
+    if state.kind == stories.KIND_SENTINEL:
+        return VerifyOutcome.retry(
+            f"story {story_id!r} resolved to a {state.sentinel_kind} sentinel: {state.path}"
+        )
+    spec_path = state.path
+    # The glob is `<id>-*.md`, so this holds by construction — assert it anyway as
+    # a defensive gate against a future resolver change silently widening the match.
+    if spec_path is None or not spec_path.name.startswith(f"{story_id}-"):
+        return VerifyOutcome.retry(
+            f"resolved story spec {spec_path} does not match id {story_id!r}"
+        )
+    if not spec_path.is_file():
+        return VerifyOutcome.retry(f"claimed spec file does not exist: {spec_path}")
+
+    workflow = rj.get("workflow")
+    if workflow != DEV_WORKFLOW:
+        return VerifyOutcome.retry(
+            f"dev result.json workflow is {workflow!r}, expected {DEV_WORKFLOW!r}"
+        )
+
+    # Generic path always self-finalizes to done (no in-review handoff); the
+    # review_enabled arm mirrors verify_dev for symmetry.
+    expected = "in-review" if review_enabled else "done"
+    fm = read_frontmatter(spec_path)
+    status = status_of(fm)
+    if status != expected:
+        return VerifyOutcome.retry(f"spec status is {status!r}, expected {expected!r}: {spec_path}")
+
+    claimed_baseline = str(fm.get("baseline_commit", "")).strip()
+    if task.baseline_commit and claimed_baseline not in ("", "NO_VCS"):
+        if not same_commit(claimed_baseline, task.baseline_commit):
+            return VerifyOutcome.retry(
+                f"spec baseline_commit {claimed_baseline[:12]} does not match "
+                f"orchestrator-recorded baseline {task.baseline_commit[:12]}"
+            )
+
+    if task.baseline_commit:
+        try:
+            if not has_changes_since(
+                paths.project, task.baseline_commit, exclude=artifact_relpaths(paths)
+            ):
+                return VerifyOutcome.retry("no changes in worktree since baseline commit")
+        except GitError as e:
+            return VerifyOutcome.escalate(str(e))
+
+    task.spec_file = str(spec_path)
+    return VerifyOutcome.passed()
+
+
 @dataclass(frozen=True)
 class CommandResult:
     command: str

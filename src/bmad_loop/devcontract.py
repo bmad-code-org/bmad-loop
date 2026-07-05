@@ -43,6 +43,15 @@ STATUS_LINE_RE = re.compile(
 DONE = "done"
 BLOCKED = "blocked"
 
+# The status a plan-halt dispatch leaves behind: under folder+id dispatch a
+# `Halt after planning.` directive makes the skill HALT right after the
+# Ready-for-Development gate, at `ready-for-dev`. This is a *successful* terminal
+# outcome for that leg (the plan is done, awaiting human review / implementation)
+# — but ONLY when the caller asked for the halt. Without the directive the same
+# status is a died-mid-flight non-terminal (it stays in RECONCILABLE_FROM), so
+# the seam is gated on `plan_halt`, never on the status alone.
+PLAN_HALT_STATUS = "ready-for-dev"
+
 # Frontmatter statuses a half-finalized generic spec may be reconciled FROM when
 # its prose terminal `## Auto Run Result` Status is `done`. Deliberately an
 # allowlist: anything else (already-`done`, `blocked`, or an unknown custom token)
@@ -167,6 +176,7 @@ def synthesize_result(
     *,
     story_key: str | None,
     dw_ids: list[str] | None = None,
+    plan_halt: bool = False,
 ) -> SynthResult:
     """Build the legacy result dict from the generic skill's on-disk spec.
 
@@ -178,6 +188,19 @@ def synthesize_result(
     outcome is rendered as a single CRITICAL escalation so ``decide_dev`` PAUSEs
     unchanged — the generic skill has no severity tiers, and per the integration
     decision every block maps to PAUSE.
+
+    ``plan_halt`` is the stories-mode expected-terminal seam: on the first leg of
+    a ``spec_checkpoint`` dispatch the caller sends ``Halt after planning.`` and
+    the skill HALTs at ``ready-for-dev``. Passing ``plan_halt=True`` treats that
+    status as a *successful* terminal — the returned dict carries
+    ``status="ready-for-dev"``, no escalation, and a ``plan_halt=True`` marker so
+    verify/engine expect a planned (not implemented) spec. Without ``plan_halt``
+    the default is unchanged: ``ready-for-dev`` is non-terminal (died mid-flight)
+    and returns ``SynthResult(None, True)``. This composes with the engine's
+    ``_reconcile_generic_terminal_status`` — that path only reconciles a spec
+    whose prose ``## Auto Run Result`` says ``done`` while the frontmatter lags,
+    so a plan-halt ``ready-for-dev`` (no such prose) is never reconciled to
+    ``done`` and this leg's success outcome is not clobbered.
     """
     fm = read_frontmatter(spec_path)
     fm_status = str(fm.get("status", "")).strip().lower()
@@ -185,8 +208,9 @@ def synthesize_result(
         spec_path.read_text(encoding="utf-8") if spec_path.is_file() else ""
     )
 
+    terminal = (DONE, BLOCKED, PLAN_HALT_STATUS) if plan_halt else (DONE, BLOCKED)
     # Not terminal yet: no result section AND frontmatter not at a terminal state.
-    if not arr.present and fm_status not in (DONE, BLOCKED):
+    if not arr.present and fm_status not in terminal:
         return SynthResult(result_json=None, status_consistent=True)
 
     # Authoritative status = frontmatter (read off disk). Prose status only
@@ -218,6 +242,11 @@ def synthesize_result(
     # on a blocked exit, so only carry it through on `done`.
     if status == DONE:
         result["followup_review_recommended"] = bool(fm.get("followup_review_recommended", False))
+    # Mark the clean plan-halt success so verify/engine expect a planned spec
+    # (status ready-for-dev, no implementation work). Never marked when a block
+    # escalation is present — that routes to PAUSE, not a plan-review pause.
+    if plan_halt and status == PLAN_HALT_STATUS and not escalations:
+        result["plan_halt"] = True
     return SynthResult(result_json=result, status_consistent=consistent)
 
 

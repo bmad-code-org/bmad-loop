@@ -216,6 +216,60 @@ def test_synth_followup_review_recommended_omitted_on_blocked(tmp_path):
     assert "followup_review_recommended" not in out.result_json
 
 
+# --------------------------------------------------- plan-halt expected-terminal
+
+
+def test_synth_ready_for_dev_non_terminal_by_default(tmp_path):
+    # Without the plan-halt directive, ready-for-dev is a died-mid-flight
+    # non-terminal (still in RECONCILABLE_FROM) — nothing to translate yet.
+    sp = _spec(tmp_path / "s.md", status="ready-for-dev", auto_run=None)
+    out = devcontract.synthesize_result(sp, story_key="1")
+    assert out.result_json is None and out.status_consistent
+
+
+def test_synth_plan_halt_ready_for_dev_is_success_terminal(tmp_path):
+    sp = _spec(tmp_path / "s.md", status="ready-for-dev", auto_run=None)
+    out = devcontract.synthesize_result(sp, story_key="1", plan_halt=True)
+    rj = out.result_json
+    assert rj is not None and rj["status"] == "ready-for-dev"
+    assert rj["plan_halt"] is True
+    assert rj["escalations"] == []
+    assert "followup_review_recommended" not in rj  # only carried on a done exit
+    assert out.status_consistent
+
+
+def test_synth_plan_halt_overrun_to_done_is_plain_done(tmp_path):
+    # Plan-halt requested but the session ran on to done: treat as a normal done
+    # (no plan_halt marker), carrying the followup flag as usual.
+    sp = _spec(tmp_path / "s.md", status="done", auto_run="done", followup=True)
+    out = devcontract.synthesize_result(sp, story_key="1", plan_halt=True)
+    rj = out.result_json
+    assert rj["status"] == "done" and "plan_halt" not in rj
+    assert rj["followup_review_recommended"] is True
+
+
+def test_synth_plan_halt_blocked_still_escalates(tmp_path):
+    # A block during planning routes to PAUSE, not a plan-review pause — no marker.
+    sp = _spec(tmp_path / "s.md", status="blocked", auto_run="blocked")
+    out = devcontract.synthesize_result(sp, story_key="1", plan_halt=True)
+    rj = out.result_json
+    assert "plan_halt" not in rj
+    assert any(e["severity"] == "CRITICAL" for e in rj["escalations"])
+
+
+def test_plan_halt_composes_with_reconcile_guard(tmp_path):
+    # The engine's _reconcile_generic_terminal_status only rewrites a spec whose
+    # prose `## Auto Run Result` says done while the frontmatter lags. A plan-halt
+    # ready-for-dev spec carries no such prose, so the reconcile guard no-ops and
+    # this leg's ready-for-dev success outcome is never clobbered to done —
+    # even though ready-for-dev is (for the died-mid-flight case) reconcilable-from.
+    assert "ready-for-dev" in devcontract.RECONCILABLE_FROM
+    sp = _spec(tmp_path / "s.md", status="ready-for-dev", auto_run=None)
+    arr = devcontract.parse_auto_run_result(sp.read_text(encoding="utf-8"))
+    reconcile_would_noop = not arr.present or arr.status != devcontract.DONE
+    assert reconcile_would_noop
+
+
 # ------------------------------------------------------------ find_result_artifact
 
 
