@@ -284,8 +284,12 @@ def main():
         bmad_dir, dirs_to_check, args.skills_dir, args.verbose
     )
 
-    # Remove only the verified-redundant payload directories
-    removed, _, total_files = cleanup_directories(bmad_dir, removable, args.verbose)
+    # Remove only the verified-redundant payload directories. A removable dir can
+    # vanish between classify_dirs() and here (TOCTOU) or a nested --also-remove
+    # target can be removed with its parent earlier in this loop; surface those in
+    # directories_not_found rather than silently dropping them.
+    removed, removal_not_found, total_files = cleanup_directories(bmad_dir, removable, args.verbose)
+    not_found = not_found + removal_not_found
 
     # Build result
     result = {

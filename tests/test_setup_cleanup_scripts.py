@@ -163,6 +163,38 @@ def test_cleanup_errors_when_payload_skill_not_installed(tmp_path):
     assert "legacy-mod" in err["missing_skills"]
 
 
+def test_cleanup_reports_removable_dir_absent_at_removal_time(tmp_path):
+    """A removable dir gone by removal time must surface in directories_not_found.
+
+    Regression for bmad-loop#73 review: cleanup_directories()'s not_found used to be
+    discarded, so such a dir silently vanished from every JSON list. Exercised
+    deterministically via a nested --also-remove target whose parent is removed first.
+    """
+    bmad = _v6_bmad(tmp_path)
+    # 'legacy/' has no SKILL.md of its own; its only payload is 'legacy/child'.
+    (bmad / "legacy" / "child").mkdir(parents=True)
+    (bmad / "legacy" / "child" / "SKILL.md").write_text("# child\n")
+    skills = _skills_dir(tmp_path, "child")
+
+    result = _run_json(
+        "cleanup-legacy.py",
+        "--bmad-dir",
+        str(bmad),
+        "--module-code",
+        "legacy",
+        "--also-remove",
+        "legacy/child",  # removed together with its parent 'legacy' earlier in the run
+        "--skills-dir",
+        str(skills),
+    )
+
+    # Parent is removed; the nested child is already gone by its turn but must still
+    # be reported rather than silently dropped from all output lists.
+    assert result["directories_removed"] == ["legacy"]
+    assert "legacy/child" in result["directories_not_found"]
+    assert not (bmad / "legacy").exists()
+
+
 # ---------------------------------------------------------------- merge-config
 
 
