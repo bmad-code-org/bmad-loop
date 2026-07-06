@@ -559,9 +559,16 @@ def rearm_escalation(run_dir: Path, story_key: str | None = None) -> str:
     # just loses this protection).
     try:
         repo = Path(state.project)
-        task.baseline_commit = verify.rev_parse_head(repo)
-        task.baseline_untracked = sorted(verify.untracked_files(repo))
-    except verify.GitError:
+        head = verify.rev_parse_head(repo)
+        untracked = sorted(verify.untracked_files(repo))
+        task.baseline_commit = head
+        task.baseline_untracked = untracked
+    except Exception:  # noqa: BLE001 - best-effort: a git timeout/OSError must not
+        # leave the pair half-updated any more than a GitError does. The two
+        # locals are computed before either field is assigned, so a failure on
+        # either call can't advance baseline_commit while baseline_untracked
+        # stays stale (same broad-except-for-best-effort contract as
+        # verify._prune_refs).
         pass
 
     if task.spec_file:
