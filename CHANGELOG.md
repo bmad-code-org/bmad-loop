@@ -5,6 +5,50 @@ All notable changes to `bmad-loop` are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). While the project is pre-1.0,
 breaking changes may land in a minor release.
 
+## [0.8.1] — 2026-07-05
+
+### Fixed
+
+- **A session that finished its work but crashed before the run recorded it no longer loses that work
+  to a restart-and-rollback.** The engine now records a completed dev/review session behind a
+  durability barrier _before_ running post-session hooks (usage is folded in afterward as best-effort
+  metadata); on resume it consumes that durably-recorded result straight into verify/decide instead of
+  restarting the attempt from baseline. A raw `KeyboardInterrupt` now records a controlled stop, and
+  replay preserves the attempt/cycle/baseline. (#62, closes #57)
+- **Several narrower resume-replay edges opened by that durability work are closed.** A host death in
+  the post-session window of the _last_ allowed review cycle no longer drops a recorded clean review to
+  a defer; a reconcile early-return no longer persists a pre-reconcile dict that could silently skip a
+  recommended follow-up review; and triage/sweep and labeled plugin-workflow sessions no longer persist
+  large, never-consumed result payloads into `state.json`. (#63)
+- **A dev session is now completed only on a real Stop or window death, never on a terminal artifact
+  glimpsed while the agent window is still alive.** The idle-tick and grace-expiry shortcuts could
+  return "completed" mid-turn and let the run's cleanup kill a working agent, handing the engine
+  half-written state. Both shortcuts are removed, liveness is re-probed immediately before the
+  grace-expiry stall verdict, and a re-driven spec has its stale `## Auto Run Result` section stripped
+  on both re-arm paths so a resolved re-drive can't be misread as its own terminal result. Result scans
+  are now fence-aware, so an `## Auto Run Result` heading quoted inside a fenced code block is never
+  mistaken for a real section (nor destructively stripped). (#53, closes #48 #52)
+- **Long journal fields in the TUI now wrap with a hanging indent instead of spilling back under the
+  timestamp and kind columns.** Each row renders as a fixed-width grid whose fields cell folds within
+  its own column.
+
+### Added
+
+- **Attempt-preserve recovery refs are now bounded.** With `scm.rollback_on_failure` on, auto-rollback
+  parks a failed attempt's committed work under `attempt-preserve/*` and its dirty worktree snapshot
+  under `attempt-preserve-dirty/*`; nothing pruned them, so they grew unbounded. Run start now keeps
+  only the newest `scm.preserve_keep` (default 20, `0` = never prune) per family by committer date and
+  best-effort-deletes the tail — a stuck ref never wedges the ones behind it, and prune failures are
+  journaled but never block the run. (#50 #54, closes #32 #49)
+
+### Changed
+
+- **The adapter shell-dialect seam is now an explicit, documented contract.** `new_window` /
+  `new_parked_window` factor their shell-dialect fragments into overridable hooks (POSIX output stays
+  byte-identical), and the `command` parameter's semantics are pinned in the ABC docstring
+  (shlex-joined argv; operator handling is backend-defined). Relevant only to authors porting the
+  adapter to a non-POSIX backend. (#47 #60)
+
 ## [0.8.0] — 2026-07-03
 
 ### Changed
@@ -945,6 +989,7 @@ enforced in CI.
   implementation phase, driven by a Python control loop with hook-based session transport and
   resumable on-disk run state.
 
+[0.8.1]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.8.1
 [0.8.0]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.8.0
 [0.7.12]: https://github.com/bmad-code-org/bmad-auto/releases/tag/v0.7.12
 [0.7.11]: https://github.com/bmad-code-org/bmad-auto/releases/tag/v0.7.11

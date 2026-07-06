@@ -1,7 +1,7 @@
 code: bmad-loop
 name: BMAD Loop Skills
 description: "Automation-mode skills driven by the bmad-loop orchestrator: interactive escalation resolution (bmad-loop-resolve) and deferred-work sweep triage (bmad-loop-sweep) — the inner dev primitive (which self-reviews and commits) is the upstream bmad-dev-auto skill"
-module_version: 0.8.0
+module_version: 0.8.1
 default_selected: false
 module_greeting: >
   BMAD Loop installed — both the automation skills and the
