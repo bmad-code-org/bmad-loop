@@ -459,6 +459,12 @@ class GenericDevAdapter(GenericAdapter):
         return dirs
 
     def _result_json(self, handle: SessionHandle, spec: SessionSpec, *, wait: bool) -> dict | None:
+        # Stories mode (folder+id dispatch): the story spec lives at a
+        # deterministic id-keyed path, so resolve it directly instead of the
+        # mtime-floor scan. The engine exports BMAD_LOOP_SPEC_FOLDER only for
+        # stories runs, so sprint/sweep runs keep the scan path below unchanged.
+        if spec.env.get("BMAD_LOOP_SPEC_FOLDER"):
+            return self._stories_result_json(handle, spec, wait=wait)
         # Mirror the base _await_result poll: the skill's terminal spec may not be
         # flushed to disk the instant the Stop event fires, so briefly await it when
         # wait=True instead of reading once and mis-reporting a stall.
@@ -477,6 +483,43 @@ class GenericDevAdapter(GenericAdapter):
                     return devcontract.synthesize_result(
                         spec_path, story_key=story_key, dw_ids=dw_ids or None
                     ).result_json
+            if not wait or time.monotonic() >= deadline:
+                return None
+            time.sleep(RESULT_POLL_S)
+
+    def _stories_result_json(
+        self, handle: SessionHandle, spec: SessionSpec, *, wait: bool
+    ) -> dict | None:
+        """Deterministic stories-mode read-back: resolve ``<spec-folder>/stories/
+        <id>-*.md`` by id (never the mtime scan) and synthesize from it.
+
+        ``BMAD_LOOP_SPEC_FOLDER`` carries the project-relative (or absolute) spec
+        folder; rebase a relative one against ``spec.cwd`` exactly like
+        ``_artifact_dirs`` so worktree isolation resolves inside the live checkout.
+        A PRESENT or SENTINEL spec synthesizes (a blocked sentinel becomes a
+        CRITICAL escalation → PAUSE, same as any block); a still-PENDING or
+        AMBIGUOUS state is not-yet-terminal → keep waiting, then None (a
+        result-less Stop the dev-stall grace handles).
+
+        On a plan-halt leg (``BMAD_LOOP_PLAN_HALT`` set by the engine for a
+        spec_checkpoint story's first dispatch) the skill HALTs at
+        ``ready-for-dev``; pass ``plan_halt=True`` so synthesize treats that as a
+        successful terminal (marked ``plan_halt``) rather than died-mid-flight."""
+        from .. import stories
+
+        story_key = spec.env.get("BMAD_LOOP_STORY_KEY") or ""
+        folder = Path(spec.env["BMAD_LOOP_SPEC_FOLDER"])
+        base = folder if folder.is_absolute() else Path(spec.cwd) / folder
+        plan_halt = bool(spec.env.get("BMAD_LOOP_PLAN_HALT"))
+        deadline = time.monotonic() + RESULT_GRACE_S
+        while True:
+            state = stories.resolve_story_spec(base, story_key)
+            if state.kind in (stories.KIND_PRESENT, stories.KIND_SENTINEL) and state.path:
+                result = devcontract.synthesize_result(
+                    state.path, story_key=story_key or None, plan_halt=plan_halt
+                )
+                if result.result_json is not None:
+                    return result.result_json
             if not wait or time.monotonic() >= deadline:
                 return None
             time.sleep(RESULT_POLL_S)

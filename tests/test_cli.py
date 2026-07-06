@@ -4,10 +4,29 @@ import argparse
 import json
 
 import pytest
+import yaml
 from conftest import install_bmad_config, write_sprint
 
 from bmad_loop import cli
 from bmad_loop import policy as policy_mod
+
+STORIES_SPEC_FOLDER = "_bmad-output/epic-1"
+
+
+def _stories_entry(story_id, **over):
+    d = {"id": story_id, "title": f"Story {story_id}", "description": "does a thing"}
+    d.update(over)
+    return d
+
+
+def _setup_stories_fixture(paths, entries, *, with_spec_md=True):
+    folder = paths.project / STORIES_SPEC_FOLDER
+    (folder / "stories").mkdir(parents=True, exist_ok=True)
+    if with_spec_md:
+        (folder / "SPEC.md").write_text("# Epic 1\n", encoding="utf-8")
+    (folder / "stories.yaml").write_text(yaml.safe_dump(entries, sort_keys=False), encoding="utf-8")
+    return folder
+
 
 DUAL_CLIENT_POLICY = """\
 [adapter]
@@ -97,6 +116,92 @@ def test_dry_run_reports_targeted_not_actionable(project, capsys):
     assert cli._dry_run(project, pol, args) == 1
     err = capsys.readouterr().err
     assert "3-2 matched 3-2-foo" in err and "not actionable" in err
+
+
+# ------------------------------------------------------------ stories mode
+
+
+def test_stories_mode_forced_by_spec_flag():
+    args = argparse.Namespace(spec="_bmad-output/epic-1")
+    on, folder = cli._stories_mode(args, policy_mod.loads(""))
+    assert on is True and folder == "_bmad-output/epic-1"
+
+
+def test_stories_mode_from_policy_source():
+    pol = policy_mod.loads('[stories]\nsource = "stories"\nspec_folder = "epic-2"\n')
+    assert cli._stories_mode(argparse.Namespace(spec=None), pol) == (True, "epic-2")
+
+
+def test_stories_mode_default_off():
+    assert cli._stories_mode(argparse.Namespace(spec=None), policy_mod.loads("")) == (False, "")
+
+
+def test_stories_mode_spec_flag_overrides_policy_sprint_source():
+    # --spec forces stories mode even when policy says sprint-status
+    args = argparse.Namespace(spec="_bmad-output/epic-9")
+    on, folder = cli._stories_mode(args, policy_mod.loads(""))
+    assert on and folder == "_bmad-output/epic-9"
+
+
+def test_validate_stories_folder_ok(project):
+    _setup_stories_fixture(project, [_stories_entry("1")])
+    assert cli._validate_stories_folder(project, STORIES_SPEC_FOLDER) is None
+
+
+def test_validate_stories_folder_missing_manifest(project):
+    problem = cli._validate_stories_folder(project, STORIES_SPEC_FOLDER)
+    assert problem is not None and "no stories.yaml found" in problem
+
+
+def test_validate_stories_folder_missing_spec_md(project):
+    _setup_stories_fixture(project, [_stories_entry("1")], with_spec_md=False)
+    problem = cli._validate_stories_folder(project, STORIES_SPEC_FOLDER)
+    assert problem is not None and "SPEC.md not found" in problem
+
+
+def test_validate_stories_folder_invalid_manifest(project):
+    _setup_stories_fixture(project, [_stories_entry("3"), _stories_entry("3", title="dup")])
+    problem = cli._validate_stories_folder(project, STORIES_SPEC_FOLDER)
+    assert problem is not None and "duplicate id" in problem
+
+
+def test_dry_run_stories_prints_linear_schedule(project, capsys):
+    _setup_stories_fixture(
+        project,
+        [
+            _stories_entry("1", spec_checkpoint=True, done_checkpoint=True),
+            _stories_entry("2"),
+        ],
+    )
+    _write_policy(project.project)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    args = argparse.Namespace(spec=STORIES_SPEC_FOLDER, epic=None, story=None, max_stories=None)
+
+    assert cli._dry_run(project, pol, args, True, STORIES_SPEC_FOLDER) == 0
+    out = capsys.readouterr().out
+    assert "linear schedule" in out
+    assert "Spec folder: _bmad-output/epic-1. Story id: 1." in out
+    assert "Spec folder: _bmad-output/epic-1. Story id: 2." in out
+    assert "spec-checkpoint" in out and "done-checkpoint" in out
+    assert "BMAD_LOOP_SPEC_FOLDER=_bmad-output/epic-1" in out
+    # pending on-disk state shown for an unstarted story
+    assert "(pending)" in out
+
+
+def test_dry_run_stories_filters_by_story_id(project, capsys):
+    _setup_stories_fixture(project, [_stories_entry("1"), _stories_entry("2")])
+    pol = policy_mod.loads("")
+    args = argparse.Namespace(spec=STORIES_SPEC_FOLDER, epic=None, story="2", max_stories=None)
+    assert cli._dry_run(project, pol, args, True, STORIES_SPEC_FOLDER) == 0
+    out = capsys.readouterr().out
+    assert "Story id: 2." in out and "Story id: 1." not in out
+
+
+def test_dry_run_stories_bad_folder_errors(project, capsys):
+    pol = policy_mod.loads("")
+    args = argparse.Namespace(spec=STORIES_SPEC_FOLDER, epic=None, story=None, max_stories=None)
+    assert cli._dry_run(project, pol, args, True, STORIES_SPEC_FOLDER) == 1
+    assert "no stories.yaml found" in capsys.readouterr().err
 
 
 def _make_run_with_decision(project, run_id="20260101-000000-aaaa", dw_id="DW-1"):

@@ -335,6 +335,7 @@ def schedule(
     stories: Stories,
     states: dict[str, StoryState],
     selector: str | None = None,
+    skip: set[str] | None = None,
 ) -> Schedule:
     """Linear scheduler: the first list entry ready to (re)dispatch.
 
@@ -350,10 +351,20 @@ def schedule(
     ``selector`` restricts the scan to a single story id (raises when the id is
     unknown), for ``--story`` runs. A state missing from ``states`` is treated
     as PENDING (no spec on disk).
+
+    ``skip`` is the orchestrator's within-run memory: ids already driven to a
+    terminal phase *this run* (done, or plateau-deferred). They are passed over
+    like a ``done`` entry — the scan continues past them rather than stopping or
+    re-dispatching. This mirrors the sprint engine's ``base_skip`` and is what
+    keeps a deferred story (whose on-disk spec may still read as a resumable
+    non-terminal) from being re-picked forever within one run.
     """
+    skip = skip or set()
     entries: tuple[StoryEntry, ...]
     entries = (find_entry(stories, selector),) if selector is not None else stories.entries
     for entry in entries:
+        if entry.id in skip:
+            continue
         state = states.get(entry.id)
         if state is None:
             state = StoryState(kind=KIND_PENDING)

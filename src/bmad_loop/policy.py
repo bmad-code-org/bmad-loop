@@ -14,6 +14,11 @@ GATE_MODES = {"none", "per-epic", "per-story-spec-approval"}
 RETRO_MODES = {"never", "notify", "auto"}
 SWEEP_AUTO_MODES = {"never", "per-epic", "run-end"}
 REVIEW_TRIGGER_MODES = {"always", "recommended"}
+# Where the run gets its story queue. "sprint-status" (default) is the classic
+# flow — bmad-sprint-planning writes sprint-status.yaml from prose epics.
+# "stories" is the opt-in folder+id dispatch flow (BMAD-METHOD #2549): a typed,
+# human-reviewed stories.yaml sibling of SPEC.md drives the loop.
+STORIES_SOURCES = {"sprint-status", "stories"}
 ISOLATION_MODES = {"none", "worktree"}
 BRANCH_PER_MODES = {"story", "run"}
 MERGE_STRATEGIES = {"ff", "merge", "squash"}
@@ -105,6 +110,24 @@ class ReviewPolicy:
     # Either way the review loop is bounded by limits.max_review_cycles, which is
     # the oscillation guard for orchestrator-applied follow-up review.
     trigger: str = "recommended"
+
+
+@dataclass(frozen=True)
+class StoriesPolicy:
+    """Story-queue source selection. Default reproduces sprint mode exactly.
+
+    ``source = "stories"`` opts a run into folder+id dispatch: the loop reads a
+    typed ``stories.yaml`` (Story Breakdown output, sibling of ``SPEC.md``) under
+    ``spec_folder`` and dispatches each entry by folder+id instead of walking
+    ``sprint-status.yaml``. ``spec_folder`` is the project-relative (or absolute)
+    path to the epic's spec folder; required and must parse when
+    ``source = "stories"``. There is deliberately **no** ``continue_independent``
+    knob — the manifest is strictly serial (no ``depends_on``), so a blocked
+    story always pauses the run for resolve rather than leapfrogging to later
+    work."""
+
+    source: str = "sprint-status"
+    spec_folder: str = ""
 
 
 @dataclass(frozen=True)
@@ -321,6 +344,7 @@ class Policy:
     verify: VerifyPolicy = field(default_factory=VerifyPolicy)
     notify: NotifyPolicy = field(default_factory=NotifyPolicy)
     review: ReviewPolicy = field(default_factory=ReviewPolicy)
+    stories: StoriesPolicy = field(default_factory=StoriesPolicy)
     dev: DevPolicy = field(default_factory=DevPolicy)
     adapter: AdapterPolicy = field(default_factory=AdapterPolicy)
     sweep: SweepPolicy = field(default_factory=SweepPolicy)
@@ -436,6 +460,7 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
     verify_d = _section(doc, "verify")
     notify_d = _section(doc, "notify")
     review_d = _section(doc, "review")
+    stories_d = _section(doc, "stories")
     dev_d = _section(doc, "dev")
     adapter_d = _section(doc, "adapter")
     sweep_d = _section(doc, "sweep")
@@ -504,6 +529,19 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         raise PolicyError(
             f"review.trigger must be one of {sorted(REVIEW_TRIGGER_MODES)}: got {review.trigger!r}"
         )
+    stories = StoriesPolicy(
+        source=str(stories_d.get("source", StoriesPolicy.source)).strip(),
+        spec_folder=str(stories_d.get("spec_folder", StoriesPolicy.spec_folder)).strip(),
+    )
+    if stories.source not in STORIES_SOURCES:
+        raise PolicyError(
+            f"stories.source must be one of {sorted(STORIES_SOURCES)}: got {stories.source!r}"
+        )
+    # source="stories" needs a spec_folder to read stories.yaml from; the reverse
+    # (a spec_folder set under sprint-status mode) is a harmless leftover, ignored
+    # at run time — no error, so switching source back and forth keeps the path.
+    if stories.source == "stories" and not stories.spec_folder:
+        raise PolicyError('stories.source = "stories" requires stories.spec_folder to be set')
     dev = DevPolicy(skill=str(dev_d.get("skill", DevPolicy.skill)))
     if dev.skill not in DEV_SKILLS:
         raise PolicyError(f"dev.skill must be one of {sorted(DEV_SKILLS)}: got {dev.skill!r}")
@@ -643,6 +681,7 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         verify=verify,
         notify=notify,
         review=review,
+        stories=stories,
         dev=dev,
         adapter=adapter,
         sweep=sweep,
@@ -721,6 +760,17 @@ enabled = true
 #   "always"      -> run the second-opinion review on every story.
 # The loop is bounded by limits.max_review_cycles either way.
 trigger = "recommended"
+
+[stories]
+# Story-queue source. "sprint-status" (default) walks sprint-status.yaml written
+# by bmad-sprint-planning. "stories" opts into folder+id dispatch: the loop reads
+# a typed stories.yaml (Story Breakdown output, sibling of SPEC.md) and dispatches
+# each entry by spec-folder + story id. `bmad-loop run --spec <folder>` forces
+# stories mode for a single run regardless of this setting.
+source = "sprint-status"     # sprint-status | stories
+# Required (and must parse) when source = "stories": the project-relative path to
+# the epic's spec folder holding stories.yaml + SPEC.md. Ignored under sprint-status.
+spec_folder = ""
 
 [adapter]
 name = "claude"              # claude | codex | gemini | <custom .bmad-loop/profiles/*.toml>

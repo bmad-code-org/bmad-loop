@@ -387,6 +387,104 @@ def test_generic_dev_result_json_polls_until_artifact_flushed(tmp_path, monkeypa
     assert calls["n"] >= 3  # it polled rather than giving up on the first miss
 
 
+# ------------------------------- GenericDevAdapter stories-mode read-back
+#
+# Under folder+id dispatch (BMAD_LOOP_SPEC_FOLDER set), the adapter resolves the
+# story spec deterministically at <spec-folder>/stories/<id>-*.md instead of the
+# mtime-floor scan.
+
+
+def _stories_spec(tmp_path, story_key="1", spec_folder="epic") -> SessionSpec:
+    return SessionSpec(
+        task_id="1-dev-1",
+        role="dev",
+        prompt="/bmad-dev-auto Spec folder: epic. Story id: 1.",
+        cwd=tmp_path,
+        env={"BMAD_LOOP_STORY_KEY": story_key, "BMAD_LOOP_SPEC_FOLDER": spec_folder},
+    )
+
+
+def _write_story_spec(tmp_path, story_key, slug, body, spec_folder="epic") -> Path:
+    d = tmp_path / spec_folder / "stories"
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / f"{story_key}-{slug}.md"
+    p.write_text(body, encoding="utf-8")
+    return p
+
+
+def test_stories_readback_resolves_by_id_not_mtime_scan(tmp_path, monkeypatch):
+    adapter, impl = make_dev_adapter(tmp_path)
+    # a stray, NEWER artifact in the impl dir would win the mtime scan — the
+    # stories path must ignore it entirely (never call find_result_artifact).
+    (impl / "spec-stray.md").write_text(
+        "---\nstatus: done\nbaseline_revision: straybase\n---\n\n## Auto Run Result\n\nStatus: done\n"
+    )
+    _write_story_spec(
+        tmp_path,
+        "1",
+        "foo",
+        "---\nstatus: done\nbaseline_revision: story1base\n---\n\n"
+        "## Auto Run Result\n\nStatus: done\nImplemented.\n",
+    )
+
+    def boom(*a, **k):
+        raise AssertionError("stories mode must not call the mtime scan")
+
+    monkeypatch.setattr(generic.devcontract, "find_result_artifact", boom)
+    rj = adapter._result_json(_dev_handle(), _stories_spec(tmp_path), wait=True)
+    assert rj["status"] == "done"
+    assert rj["story_key"] == "1"
+    assert rj["baseline_commit"] == "story1base"  # the story spec, not the stray
+
+
+def test_stories_readback_sentinel_is_blocked_escalation(tmp_path):
+    adapter, _ = make_dev_adapter(tmp_path)
+    _write_story_spec(
+        tmp_path,
+        "1",
+        "unresolved",
+        "---\nstatus: blocked\n---\n\n## Auto Run Result\n\n"
+        "Status: blocked\nBlocking condition: story already blocked\n",
+    )
+    rj = adapter._result_json(_dev_handle(), _stories_spec(tmp_path), wait=True)
+    assert rj is not None and rj["status"] == "blocked"
+    crits = [e for e in rj["escalations"] if str(e.get("severity", "")).upper() == "CRITICAL"]
+    assert crits, "a blocked sentinel must synthesize a CRITICAL escalation"
+
+
+def test_stories_readback_pending_returns_none(tmp_path):
+    adapter, _ = make_dev_adapter(tmp_path)
+    # no story spec on disk yet -> not terminal
+    assert adapter._result_json(_dev_handle(), _stories_spec(tmp_path), wait=False) is None
+
+
+def test_stories_readback_non_terminal_returns_none(tmp_path):
+    adapter, _ = make_dev_adapter(tmp_path)
+    # a died-mid-flight ready-for-dev (no plan-halt) is not a terminal result
+    _write_story_spec(tmp_path, "1", "foo", "---\nstatus: ready-for-dev\n---\n\nplanned only\n")
+    assert adapter._result_json(_dev_handle(), _stories_spec(tmp_path), wait=False) is None
+
+
+def test_stories_readback_plan_halt_is_successful_terminal(tmp_path):
+    # BMAD_LOOP_PLAN_HALT flips the SAME ready-for-dev spec into a successful,
+    # plan-marked terminal (the leg-1 plan is done, awaiting implementation).
+    adapter, _ = make_dev_adapter(tmp_path)
+    _write_story_spec(
+        tmp_path,
+        "1",
+        "foo",
+        "---\nstatus: ready-for-dev\nbaseline_revision: planbase\n---\n\nplan\n",
+    )
+    spec = _stories_spec(tmp_path)
+    spec.env["BMAD_LOOP_PLAN_HALT"] = "1"
+    rj = adapter._result_json(_dev_handle(), spec, wait=True)
+    assert rj is not None
+    assert rj["status"] == "ready-for-dev"
+    assert rj["plan_halt"] is True
+    assert rj["escalations"] == []
+    assert rj["baseline_commit"] == "planbase"
+
+
 def test_generic_dev_result_json_no_wait_reads_once(tmp_path, monkeypatch):
     """wait=False keeps the read-once behavior: no polling, immediate None."""
     adapter, _ = make_dev_adapter(tmp_path)

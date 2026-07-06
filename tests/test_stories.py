@@ -341,6 +341,33 @@ def test_schedule_selector_unknown_raises():
         stories.schedule(s, {}, selector="99")
 
 
+def test_schedule_skip_passes_over_a_touched_story():
+    # story 1 was driven this run but its on-disk spec still reads resumable
+    # (e.g. it plateau-deferred). skip must pass over it, not re-pick it.
+    s = _stories("1", "2")
+    states = {"1": _present("in-progress")}
+    assert stories.schedule(s, states).entry.id == "1"  # without skip: re-picked
+    sched = stories.schedule(s, states, skip={"1"})
+    assert sched.outcome == stories.SCHEDULE_NEXT and sched.entry.id == "2"
+
+
+def test_schedule_skip_all_touched_is_complete():
+    # every story either done or already handled this run -> run finishes.
+    s = _stories("1", "2")
+    states = {"1": _present("done"), "2": _present("ready-for-dev")}
+    sched = stories.schedule(s, states, skip={"2"})
+    assert sched.is_complete
+
+
+def test_schedule_skip_does_not_leapfrog_a_blocked_story():
+    # a blocked story that is NOT in skip still stops the scan even when an
+    # earlier story was skipped.
+    s = _stories("1", "2", "3")
+    states = {"1": _present("done"), "2": _present("blocked")}
+    sched = stories.schedule(s, states, skip={"1"})
+    assert sched.is_wedged and sched.entry.id == "2"
+
+
 # --------------------------------------------------------------- resolve_story_spec
 
 

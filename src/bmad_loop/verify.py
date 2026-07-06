@@ -1169,12 +1169,12 @@ def verify_dev_stories(
     ``plan_halt`` verifies a spec_checkpoint story's plan-halt leg instead of an
     implementation: the expected status is ``ready-for-dev`` (the plan is done,
     not the code) and the proof-of-work gate is skipped — a plan writes only its
-    own spec, so requiring code changes would spuriously fail every plan leg. The
-    spec-resolution, id-prefix, workflow, and baseline gates still run, and
-    ``task.spec_file`` is still recorded. A ``plan_halt`` leg also requires the
-    ``result_json`` to carry the ``plan_halt`` marker ``devcontract`` emits on a
-    clean plan-halt, so a died-mid-flight ``ready-for-dev`` can't be mistaken for
-    a successful plan.
+    own spec, which proof-of-work already excludes, so requiring code changes
+    would spuriously fail every plan leg. The spec-resolution, id-prefix, workflow,
+    and baseline gates still run, and ``task.spec_file`` is still recorded. A
+    ``plan_halt`` leg also requires the ``result_json`` to carry the ``plan_halt``
+    marker ``devcontract`` emits on a clean plan-halt, so a died-mid-flight
+    ``ready-for-dev`` can't be mistaken for a successful plan.
     """
     # Deferred to avoid a verify<->stories import cycle: stories imports
     # read_frontmatter/status_of from this module at top level, so verify must not
@@ -1220,21 +1220,43 @@ def verify_dev_stories(
     else:
         expected = "in-review" if review_enabled else "done"
 
-    # A plan-halt leg produced only its own spec (the plan), so proof-of-work
-    # would spuriously fail; skip it (proof_exclude=None) and record the plan spec.
+    # A plan-halt leg produced only its own spec (the plan), which proof-of-work
+    # already excludes; skip it (proof_exclude=None) and record the plan spec.
+    # Otherwise proof-of-work must not count the story's own record (the id-keyed
+    # spec) or the human-authored stories.yaml as implementation work — artifact
+    # dirs are already excluded; add the spec folder's stories/ + stories.yaml for
+    # a spec folder that sits outside them (both no-ops under output_folder).
     gate = _verify_shared_gates(
         spec_path,
         rj,
         task,
         paths,
         expected_status=expected,
-        proof_exclude=None if plan_halt else artifact_relpaths(paths),
+        proof_exclude=(
+            None
+            if plan_halt
+            else artifact_relpaths(paths) + _stories_relpaths(paths.project, spec_folder)
+        ),
     )
     if gate is not None:
         return gate
 
     task.spec_file = str(spec_path)
     return VerifyOutcome.passed()
+
+
+def _stories_relpaths(project: Path, spec_folder: Path) -> tuple[str, ...]:
+    """Proof-of-work exclude prefixes for the story record + manifest: the spec
+    folder's ``stories/`` subdir and its ``stories.yaml``, project-relative. Empty
+    when the spec folder is outside the project tree (nothing to exclude there)."""
+    from .stories import STORIES_FILENAME, STORIES_SUBDIR
+
+    try:
+        rel = spec_folder.resolve().relative_to(project.resolve()).as_posix()
+    except ValueError:
+        return ()
+    base = "" if rel == "." else f"{rel}/"
+    return (f"{base}{STORIES_SUBDIR}", f"{base}{STORIES_FILENAME}")
 
 
 @dataclass(frozen=True)
@@ -1292,6 +1314,19 @@ def verify_review(task: StoryTask, paths: ProjectPaths, policy: Policy) -> Verif
             f"sprint-status for {task.story_key} is {sprint!r}, expected 'done'"
         )
 
+    return verify_commands_outcome(policy, paths.project)
+
+
+def verify_review_stories(task: StoryTask, paths: ProjectPaths, policy: Policy) -> VerifyOutcome:
+    """verify_review for stories mode: same spec-done + verify-commands gates,
+    minus the sprint-status gate (stories mode has no sprint board — the story
+    spec's own frontmatter status is authoritative). ``task.spec_file`` is the
+    id-keyed story spec ``verify_dev_stories`` recorded on the dev pass."""
+    if not task.spec_file:
+        return VerifyOutcome.retry("no spec file recorded for task")
+    status = status_of(read_frontmatter(Path(task.spec_file)))
+    if status != "done":
+        return VerifyOutcome.retry(f"spec status is {status!r}, expected 'done'")
     return verify_commands_outcome(policy, paths.project)
 
 

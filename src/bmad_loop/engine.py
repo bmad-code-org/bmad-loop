@@ -740,6 +740,7 @@ class Engine:
             self._save()
             started += 1
             self._run_story(task)
+            self._after_story(task)
 
     def _pick_next(self):
         ss = load_sprint_status(self.paths.sprint_status)
@@ -1047,19 +1048,20 @@ class Engine:
                 continue
             isolated = self._isolated and task.worktree_path
             if task.phase == Phase.DEV_VERIFY and task.spec_file:
-                # paused at the spec-approval gate: dev verified, review pending
-                self.journal.append("resume-review", story_key=task.story_key)
+                # paused at the spec-approval gate (or, in stories mode, a
+                # plan-checkpoint awaiting implementation — _resume_after_dev_verify
+                # dispatches the right leg): dev verified on disk.
                 if isolated:
                     unit = self._reopen_unit(task)
                     prev = self.workspace
                     self.workspace = unit.workspace
                     try:
-                        self._review_and_commit(task)
+                        self._resume_after_dev_verify(task)
                     finally:
                         self.workspace = prev
                     self._integrate_unit(task, unit)
                 else:
-                    self._review_and_commit(task)
+                    self._resume_after_dev_verify(task)
             elif (resumable := self._resumable_session(task)) is not None:
                 # the host died inside the post-session window: the session
                 # itself completed and its recorded result is on disk, so
@@ -1108,6 +1110,10 @@ class Engine:
                 task.phase = Phase.PENDING  # deliberate reset, not a normal transition
                 self._save()
                 self._run_story(task)
+            # a resumed story that just reached DONE gets the same post-story hook
+            # the _loop path fires (e.g. the stories-mode done_checkpoint pause),
+            # after any worktree integration above — no-op in the base engine.
+            self._after_story(task)
 
     def _resumable_session(self, task: StoryTask) -> tuple[str, SessionResult] | None:
         """The in-flight session's durably-recorded result, when complete enough
@@ -1413,7 +1419,7 @@ class Engine:
                     (result.result_json or {}).get("followup_review_recommended", False)
                 )
                 outcome = self._verify_dev_artifacts(task, result.result_json)
-                if outcome.ok:
+                if outcome.ok and self._run_verify_commands_after_dev(task, result.result_json):
                     # deterministic gates run here too: a broken build must not
                     # reach the (far more expensive) review loop
                     outcome = verify.verify_commands_outcome(self.policy, self.workspace.root)
@@ -1835,6 +1841,35 @@ class Engine:
         target = "review" if review_enabled else "done"
         sprint_advance(self.workspace.paths.sprint_status, task.story_key, target)
 
+    def _extra_session_env(self, task: StoryTask, role: str) -> dict[str, str]:
+        """Engine-variant additions to a session's environment. Base: none.
+        StoriesEngine overrides this to export BMAD_LOOP_SPEC_FOLDER for the
+        adapter's deterministic id-keyed read-back."""
+        return {}
+
+    def _run_verify_commands_after_dev(self, task: StoryTask, result_json: dict | None) -> bool:
+        """Whether the deterministic verify commands run after a completed dev
+        pass. Base: always. StoriesEngine skips them on a plan-halt leg — a plan
+        (spec at ready-for-dev) has no implementation to build/test, so a project
+        build/test gate would spuriously fail before the plan review."""
+        return True
+
+    def _resume_after_dev_verify(self, task: StoryTask) -> None:
+        """Resume a task the run paused at DEV_VERIFY (dev verified, spec on disk).
+        Base: the spec-approval-gate resume — run the review loop + commit.
+        StoriesEngine overrides this to re-drive the implement leg of a
+        plan-checkpoint-paused story (leg-2) instead."""
+        self.journal.append("resume-review", story_key=task.story_key)
+        self._review_and_commit(task)
+
+    def _after_story(self, task: StoryTask) -> None:
+        """Hook fired once a story is fully processed and (under isolation)
+        integrated — from _loop after _run_story and from _finish_inflight after a
+        resumed task completes. Base: no-op. StoriesEngine uses it for the
+        done_checkpoint pause, which must land after integration so a committed
+        unit is merged before the run stops."""
+        return
+
     def _verify_dev_artifacts(self, task: StoryTask, result_json: dict | None):
         return verify.verify_dev(
             task, self.workspace.paths, result_json, review_enabled=self._dev_review_enabled()
@@ -1903,6 +1938,10 @@ class Engine:
             "BMAD_LOOP_TASK_ID": task_id,
             "BMAD_LOOP_STORY_KEY": task.story_key,
         }
+        # engine-variant env seam: StoriesEngine adds BMAD_LOOP_SPEC_FOLDER so the
+        # dev adapter resolves the story spec deterministically by id instead of
+        # mtime-scanning. Base returns {} — sprint/sweep runs stay byte-identical.
+        env.update(self._extra_session_env(task, role))
         if task.dw_ids:
             # Deferred-work bundle: the orchestrator owns the bundle→dw-id binding
             # (the generic bmad-dev-auto primitive knows nothing of dw ids). Export

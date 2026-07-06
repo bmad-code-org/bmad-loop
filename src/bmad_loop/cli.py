@@ -23,6 +23,9 @@ from . import (
     resolve,
     runs,
     sprintstatus,
+)
+from . import stories as stories_mod
+from . import (
     verify,
 )
 from .adapters.base import CodingCLIAdapter
@@ -31,6 +34,7 @@ from .journal import Journal, load_state, save_state
 from .model import RunState
 from .process_host import ProcessHostError
 from .runs import RUNS_DIR
+from .stories_engine import StoriesEngine
 from .sweep import SweepEngine
 
 POLICY_FILE = policy_mod.POLICY_FILE
@@ -240,14 +244,18 @@ def cmd_validate(args: argparse.Namespace) -> int:
     return 1 if problems else 0
 
 
-def _require_base_skills(project: Path, pol) -> bool:
+def _require_base_skills(project: Path, pol, *, require_stories: bool = False) -> bool:
     """Preflight the upstream skills the orchestrator drives (bmad-dev-auto + the
     two adversarial review hunters it invokes inline).
 
     Returns True when everything is in place; otherwise prints the problems and
     returns False so the caller can abort before spawning any session (a missing
     skill would otherwise stall as an `Unknown command` until the run times out).
-    """
+
+    ``require_stories`` additionally content-probes bmad-dev-auto for folder+id
+    dispatch — stories mode needs a newer skill than sprint mode, so an older
+    install must fail loudly here rather than HALT `no stories.yaml`-style at
+    dispatch time."""
     from .adapters.profile import ProfileError, get_profile
 
     skill_trees = []
@@ -257,6 +265,8 @@ def _require_base_skills(project: Path, pol) -> bool:
         except ProfileError:
             continue
     problems = install.missing_base_skills(project, skill_trees)
+    if require_stories:
+        problems += install.missing_stories_support(project, skill_trees)
     if problems:
         for problem in problems:
             print(f"FAIL: {problem}", file=sys.stderr)
@@ -265,27 +275,69 @@ def _require_base_skills(project: Path, pol) -> bool:
     return True
 
 
+def _stories_mode(args: argparse.Namespace, pol) -> tuple[bool, str]:
+    """Resolve whether this run is stories mode and its spec folder.
+
+    ``run --spec <folder>`` forces stories mode (overrides policy); otherwise the
+    run follows ``[stories].source``. Returns ``(is_stories, spec_folder)`` — the
+    folder is "" in sprint mode."""
+    spec = getattr(args, "spec", None)
+    if spec:
+        return True, spec
+    if pol.stories.source == "stories":
+        return True, pol.stories.spec_folder
+    return False, ""
+
+
+def _validate_stories_folder(paths: bmadconfig.ProjectPaths, spec_folder: str) -> str | None:
+    """Preflight the stories-mode inputs: stories.yaml parses + rules pass and
+    SPEC.md (the epic spec every first dispatch loads) exists. Returns a problem
+    string to print, or None when OK."""
+    folder = Path(spec_folder)
+    if not folder.is_absolute():
+        folder = paths.project / folder
+    try:
+        story_set = stories_mod.load_stories(folder)
+    except stories_mod.StoriesError as e:
+        return f"stories mode: {e} (spec folder: {folder})"
+    if not story_set.entries:
+        return f"stories mode: stories.yaml has no entries: {folder}"
+    if not (folder / "SPEC.md").is_file():
+        return (
+            f"stories mode: {folder}/SPEC.md not found — a first dispatch loads the "
+            f"epic spec (the skill would HALT `no epic spec found`)"
+        )
+    return None
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     project = _project(args)
     paths = bmadconfig.load_paths(project)
     pol = policy_mod.load(_policy_path(project))
+    stories_on, spec_folder = _stories_mode(args, pol)
 
     if args.dry_run:
-        return _dry_run(paths, pol, args)
+        return _dry_run(paths, pol, args, stories_on, spec_folder)
 
-    try:
-        sprintstatus.select_actionable(
-            sprintstatus.load(paths.sprint_status), args.epic, args.story
-        )
-    except sprintstatus.SprintStatusError as e:
-        print(e, file=sys.stderr)
-        return 1
+    if stories_on:
+        problem = _validate_stories_folder(paths, spec_folder)
+        if problem:
+            print(problem, file=sys.stderr)
+            return 1
+    else:
+        try:
+            sprintstatus.select_actionable(
+                sprintstatus.load(paths.sprint_status), args.epic, args.story
+            )
+        except sprintstatus.SprintStatusError as e:
+            print(e, file=sys.stderr)
+            return 1
 
     if not verify.worktree_clean(paths.repo_root):
         print("git worktree is not clean — commit or stash first", file=sys.stderr)
         return 1
 
-    if not _require_base_skills(project, pol):
+    if not _require_base_skills(project, pol, require_stories=stories_on):
         return 1
 
     _reconcile_stale(project, paths, pol)
@@ -301,6 +353,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         epic_filter=args.epic,
         story_filter=args.story,
         max_stories=args.max_stories,
+        source="stories" if stories_on else "sprint-status",
+        spec_folder=spec_folder if stories_on else "",
     )
     save_state(run_dir, state)
     runs.write_pid(run_dir)
@@ -308,12 +362,13 @@ def cmd_run(args: argparse.Namespace) -> int:
     journal.append(
         "run-start",
         run_id=run_id,
+        source=state.source,
         adapter_dev=pol.adapter.resolved("dev").name,
         adapter_review=pol.adapter.resolved("review").name,
     )
     print(f"run {run_id} starting (attach: bmad-loop attach)")
 
-    engine = Engine(
+    common = dict(
         paths=paths,
         policy=pol,
         adapter=adapters["dev"],
@@ -325,6 +380,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         epic_filter=args.epic,
         story_filter=args.story,
         sweep_factory=_sweep_factory(project, paths),
+    )
+    engine: Engine = (
+        StoriesEngine(**common, spec_folder=spec_folder) if stories_on else Engine(**common)
     )
     summary = engine.run()
     print(summary.render())
@@ -348,7 +406,16 @@ def _render_invocation(pol, project: Path, role: str, prompt: str) -> str:
     return " ".join(argv)
 
 
-def _dry_run(paths: bmadconfig.ProjectPaths, pol, args: argparse.Namespace) -> int:
+def _dry_run(
+    paths: bmadconfig.ProjectPaths,
+    pol,
+    args: argparse.Namespace,
+    stories_on: bool = False,
+    spec_folder: str = "",
+) -> int:
+    if stories_on:
+        return _dry_run_stories(paths, pol, args, spec_folder)
+
     def render(role: str, prompt: str) -> str:
         return _render_invocation(pol, paths.project, role, prompt)
 
@@ -369,6 +436,54 @@ def _dry_run(paths: bmadconfig.ProjectPaths, pol, args: argparse.Namespace) -> i
         print(f"    dev:    {render('dev', f'/bmad-dev-auto {story.key}')}")
         print(f"    review: {render('review', '/bmad-dev-auto <done spec from dev>')}")
         print(f"    env:    BMAD_LOOP_MODE=1 BMAD_LOOP_STORY_KEY={story.key}")
+    return 0
+
+
+def _dry_run_stories(
+    paths: bmadconfig.ProjectPaths, pol, args: argparse.Namespace, spec_folder: str
+) -> int:
+    """Print the linear stories-mode schedule (list order, checkpoints, live
+    on-disk state) — no topo waves, one story per line, spawns nothing."""
+    folder = Path(spec_folder)
+    if not folder.is_absolute():
+        folder = paths.project / folder
+    try:
+        story_set = stories_mod.load_stories(folder)
+    except stories_mod.StoriesError as e:
+        print(f"stories mode: {e} (spec folder: {folder})", file=sys.stderr)
+        return 1
+    spec_ok = "" if (folder / "SPEC.md").is_file() else "  [!] SPEC.md missing"
+    entries = story_set.entries
+    if args.story:
+        entries = tuple(e for e in entries if e.id == args.story)
+        if not entries:
+            print(
+                f"stories mode: story id {args.story!r} not found in stories.yaml", file=sys.stderr
+            )
+            return 1
+    if args.max_stories is not None:
+        entries = entries[: args.max_stories]
+    print(
+        f"stories mode: {len(entries)} stories from {folder}/stories.yaml "
+        f"(gates={pol.gates.mode}){spec_ok}"
+    )
+    print("linear schedule (list order — no depends_on, strictly serial):")
+    for i, entry in enumerate(entries, 1):
+        state = stories_mod.resolve_story_spec(folder, entry.id)
+        marks = []
+        if entry.spec_checkpoint:
+            marks.append("spec-checkpoint")
+        if entry.done_checkpoint:
+            marks.append("done-checkpoint")
+        badge = f" [{', '.join(marks)}]" if marks else ""
+        disk = state.status if state.kind == stories_mod.KIND_PRESENT else state.kind
+        print(f"\n  {i}. {entry.id}  ({disk}){badge}  {entry.title}")
+        dispatch = f"/bmad-dev-auto Spec folder: {spec_folder}. Story id: {entry.id}."
+        print(f"    dev:    {_render_invocation(pol, paths.project, 'dev', dispatch)}")
+        print(
+            f"    env:    BMAD_LOOP_MODE=1 BMAD_LOOP_STORY_KEY={entry.id} "
+            f"BMAD_LOOP_SPEC_FOLDER={spec_folder}"
+        )
     return 0
 
 
@@ -515,7 +630,7 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
         print(f"run {run_dir.name} already finished", file=sys.stderr)
         return 1
     pol = policy_mod.load(_policy_path(project))
-    if not _require_base_skills(project, pol):
+    if not _require_base_skills(project, pol, require_stories=state.source == "stories"):
         return 1
     journal = Journal(run_dir)
     journal.append("run-resume", was_paused=state.paused_reason)
@@ -544,7 +659,7 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
             max_cycles=opts.get("max_cycles"),
         )
     else:
-        engine = Engine(
+        story_common = dict(
             paths=paths,
             policy=pol,
             adapter=adapters["dev"],
@@ -558,6 +673,13 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
             story_filter=state.story_filter,
             max_stories=state.max_stories,
             sweep_factory=_sweep_factory(project, paths),
+        )
+        # stories mode is pinned in run state at launch, so resume rebuilds the
+        # same picker (StoriesEngine) without any flag.
+        engine = (
+            StoriesEngine(**story_common, spec_folder=state.spec_folder)
+            if state.source == "stories"
+            else Engine(**story_common)
         )
     summary = engine.run()
     print(summary.render())
@@ -1253,8 +1375,18 @@ def main(argv: list[str] | None = None) -> int:
     probe_p.add_argument("--keep-temp", action="store_true", help=argparse.SUPPRESS)
 
     run_p = add("run", cmd_run, "run the orchestration loop")
-    run_p.add_argument("--epic", type=int, help="only stories from this epic")
-    run_p.add_argument("--story", help="story: E-S / E.S, a slug fragment, or full key")
+    run_p.add_argument(
+        "--spec",
+        metavar="FOLDER",
+        help="force stories mode: dispatch the epic spec folder's stories.yaml by "
+        "folder+id (overrides [stories].source)",
+    )
+    run_p.add_argument("--epic", type=int, help="only stories from this epic (sprint mode)")
+    run_p.add_argument(
+        "--story",
+        help="story: E-S / E.S, a slug fragment, or full key (sprint mode); "
+        "a story id (stories mode)",
+    )
     run_p.add_argument("--max-stories", type=int, help="stop after N stories")
     run_p.add_argument("--dry-run", action="store_true", help="print the plan, spawn nothing")
     run_p.add_argument("--run-id", help=argparse.SUPPRESS)  # pre-assigned id (used by the TUI)

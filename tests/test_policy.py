@@ -37,6 +37,36 @@ def test_review_trigger_invalid():
         policy.loads('[review]\ntrigger = "sometimes"\n')
 
 
+def test_stories_defaults():
+    pol = policy.loads("")
+    assert pol.stories.source == "sprint-status"
+    assert pol.stories.spec_folder == ""
+
+
+def test_stories_parse_and_folder():
+    pol = policy.loads('[stories]\nsource = "stories"\nspec_folder = "_bmad-output/epic-1"\n')
+    assert pol.stories.source == "stories"
+    assert pol.stories.spec_folder == "_bmad-output/epic-1"
+
+
+def test_stories_source_invalid():
+    with pytest.raises(policy.PolicyError, match="stories.source"):
+        policy.loads('[stories]\nsource = "manifest"\n')
+
+
+def test_stories_mode_requires_spec_folder():
+    with pytest.raises(policy.PolicyError, match="requires stories.spec_folder"):
+        policy.loads('[stories]\nsource = "stories"\n')
+
+
+def test_stories_spec_folder_under_sprint_mode_is_tolerated():
+    # a leftover spec_folder while source stays sprint-status is not an error —
+    # it's ignored at run time, so flipping source back and forth keeps the path.
+    pol = policy.loads('[stories]\nspec_folder = "_bmad-output/epic-1"\n')
+    assert pol.stories.source == "sprint-status"
+    assert pol.stories.spec_folder == "_bmad-output/epic-1"
+
+
 def test_cleanup_session_on_finish_default_and_override(tmp_path):
     assert policy.load(None).adapter.cleanup_session_on_finish is True
     p = tmp_path / "policy.toml"

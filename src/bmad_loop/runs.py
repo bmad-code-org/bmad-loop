@@ -520,6 +520,13 @@ def rearm_escalation(run_dir: Path, story_key: str | None = None) -> str:
     as terminal from its first save. Does NOT clear the pause; the caller
     resumes the run separately.
 
+    Stories mode: when the escalated spec is a fixed-slug sentinel
+    (`<id>-unresolved.md` / `<id>-ambiguous.md`, written by a pre-planning HALT),
+    it cannot be re-opened by a status flip — its very presence wedges the id.
+    Instead preserve a copy under `{run_dir}/sentinels/`, journal `sentinel-cleared`
+    with the blocking condition, and delete it, so the re-dispatch resolves to a
+    clean PENDING and re-plans from scratch (leg 1 again for a spec_checkpoint id).
+
     Returns the re-armed story key. Raises RearmError when the run is not
     paused at the escalation stage or the target story is not escalated.
     """
@@ -538,6 +545,7 @@ def rearm_escalation(run_dir: Path, story_key: str | None = None) -> str:
     if task.phase != Phase.ESCALATED:
         raise RearmError(f"story {key} is not escalated (phase: {task.phase})")
 
+    journal = Journal(run_dir)
     # deliberate reset, not a normal state-machine transition (mirrors
     # engine._finish_inflight): a clean re-attempt against the corrected spec.
     task.phase = Phase.PENDING
@@ -570,17 +578,50 @@ def rearm_escalation(run_dir: Path, story_key: str | None = None) -> str:
         pass
 
     if task.spec_file:
-        # route /bmad-dev-auto to re-implement (decision table: ready-for-dev
-        # -> step-03); independent of the resolve agent having set it.
-        verify.set_frontmatter_status(Path(task.spec_file), "ready-for-dev")
-        # drop the stale `## Auto Run Result` section along with the status flip
-        # (mirrors engine._reset_spec_for_repair): find_result_artifact keys on
-        # that heading, so leaving it would let the re-driven session's first
-        # save of the spec parse as the prior attempt's terminal outcome.
-        devcontract.strip_auto_run_result(Path(task.spec_file))
+        spec_path = Path(task.spec_file)
+        condition = _sentinel_condition(spec_path, key)
+        if condition is not None:
+            # a sentinel is cleared by deletion, not a status flip; drop the stale
+            # spec_file so the re-dispatch starts from PENDING (clean re-plan).
+            _clear_sentinel(run_dir, journal, spec_path, key, condition)
+            task.spec_file = None
+        else:
+            # route /bmad-dev-auto to re-implement (decision table: ready-for-dev
+            # -> step-03); independent of the resolve agent having set it.
+            verify.set_frontmatter_status(spec_path, "ready-for-dev")
+            # drop the stale `## Auto Run Result` section along with the status flip
+            # (mirrors engine._reset_spec_for_repair): find_result_artifact keys on
+            # that heading, so leaving it would let the re-driven session's first
+            # save of the spec parse as the prior attempt's terminal outcome.
+            devcontract.strip_auto_run_result(spec_path)
 
     save_state(run_dir, state)
-    Journal(run_dir).append(
-        "story-escalation-resolved", story_key=key, baseline=task.baseline_commit or ""
-    )
+    journal.append("story-escalation-resolved", story_key=key, baseline=task.baseline_commit or "")
     return key
+
+
+def _sentinel_condition(spec_path: Path, story_key: str) -> str | None:
+    """The blocking condition (``unresolved`` / ``ambiguous``) iff ``spec_path`` is
+    a fixed-slug pre-planning-halt sentinel for ``story_key``, else None."""
+    from .stories import SENTINEL_SLUGS
+
+    for slug in SENTINEL_SLUGS:
+        if spec_path.name == f"{story_key}-{slug}.md":
+            return slug
+    return None
+
+
+def _clear_sentinel(
+    run_dir: Path, journal: Journal, spec_path: Path, story_key: str, condition: str
+) -> None:
+    """Preserve a copy of the sentinel under ``{run_dir}/sentinels/`` (a write-only
+    breadcrumb of what blocked planning), journal ``sentinel-cleared`` with the
+    blocking condition, then delete the sentinel so the next dispatch is clean."""
+    dest_dir = run_dir / "sentinels"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    if spec_path.is_file():
+        shutil.copy2(spec_path, dest_dir / spec_path.name)
+        spec_path.unlink()
+    journal.append(
+        "sentinel-cleared", story_key=story_key, condition=condition, sentinel=spec_path.name
+    )

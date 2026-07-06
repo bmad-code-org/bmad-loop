@@ -472,18 +472,24 @@ def test_verify_dev_stories_no_changes(project):
     assert not out.ok and "no changes" in out.reason
 
 
-def test_verify_dev_stories_whitespace_story_key(project):
-    # A story_key with stray whitespace must resolve identically to its trimmed id:
-    # the resolver normalizes via str().strip(), and the filename-prefix check must
-    # use the same normalized id (else a spurious "does not match id" retry).
-    spec_folder = project.planning_artifacts / "epic-a"
-    task = make_stories_task(project, " 1 ")
+def test_verify_dev_stories_spec_only_change_outside_artifacts_is_not_work(project):
+    # spec folder OUTSIDE the artifact dirs: the story record + stories.yaml must
+    # still not count as implementation work (the _stories_relpaths exclusion),
+    # so a story that only wrote its spec fails proof-of-work.
+    spec_folder = project.project / "docs" / "epic-a"
+    task = make_stories_task(project, "1")
     sp = write_story(spec_folder, "1", "x", "done", task.baseline_commit)
-    (project.project / "src.txt").write_text("changed\n")
+    (spec_folder / "stories.yaml").write_text("- id: '1'\n  title: t\n  description: d\n")
     out = verify.verify_dev_stories(
         task, project, dev_result(sp), spec_folder=spec_folder, review_enabled=False
     )
-    assert out.ok and task.spec_file == str(sp)
+    assert not out.ok and "no changes" in out.reason
+    # real code alongside the spec -> proof-of-work passes
+    (project.project / "src.txt").write_text("real work\n")
+    out2 = verify.verify_dev_stories(
+        task, project, dev_result(sp), spec_folder=spec_folder, review_enabled=False
+    )
+    assert out2.ok
 
 
 def test_verify_dev_stories_plan_halt_expects_ready_for_dev(project):
@@ -543,6 +549,25 @@ def test_plan_halt_status_matches_devcontract():
     from bmad_loop import devcontract
 
     assert verify.PLAN_HALT_STATUS == devcontract.PLAN_HALT_STATUS
+
+
+def test_verify_review_stories_no_sprint_gate(project):
+    # verify_review_stories checks spec == done + verify commands, no sprint gate.
+    assert not project.sprint_status.is_file()
+    spec_folder = project.planning_artifacts / "epic-a"
+    task = make_stories_task(project, "1")
+    sp = write_story(spec_folder, "1", "x", "done", task.baseline_commit)
+    task.spec_file = str(sp)
+    assert verify.verify_review_stories(task, project, Policy()).ok
+
+
+def test_verify_review_stories_non_done_retries(project):
+    spec_folder = project.planning_artifacts / "epic-a"
+    task = make_stories_task(project, "1")
+    sp = write_story(spec_folder, "1", "x", "in-review", task.baseline_commit)
+    task.spec_file = str(sp)
+    out = verify.verify_review_stories(task, project, Policy())
+    assert not out.ok and "expected 'done'" in out.reason
 
 
 def test_verify_review_bundle_ledger_gate(project):

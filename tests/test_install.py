@@ -553,6 +553,32 @@ def test_missing_base_skills_reports_absent_and_incomplete(tmp_path):
     assert "step-04-review.md" in problems[0]
 
 
+def test_missing_stories_support_probes_step01_content(tmp_path):
+    from bmad_loop.install import (
+        STORIES_PROBE_FILE,
+        STORIES_PROBE_SKILL,
+        missing_stories_support,
+    )
+
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    step01 = tmp_path / tree / STORIES_PROBE_SKILL / STORIES_PROBE_FILE
+
+    # step-01 absent → reported (older/half install)
+    problems = missing_stories_support(tmp_path, [tree])
+    assert len(problems) == 1 and "not found" in problems[0]
+
+    # present but WITHOUT the folder+id dispatch marker (a pre-#2549 skill)
+    step01.parent.mkdir(parents=True, exist_ok=True)
+    step01.write_text("# Step 1\nold clarify-and-route, no dispatch protocol\n", encoding="utf-8")
+    problems = missing_stories_support(tmp_path, [tree])
+    assert len(problems) == 1 and "folder+id dispatch" in problems[0]
+
+    # present WITH the marker → OK
+    step01.write_text("route a **folder+id dispatch** invocation\n", encoding="utf-8")
+    assert missing_stories_support(tmp_path, [tree]) == []
+
+
 def test_provision_worktree_seeds_gitignored_config(tmp_path):
     """A gitignored config present in the main repo is copied into the worktree
     (a `git worktree add` checkout would omit it)."""

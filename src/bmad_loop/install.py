@@ -79,6 +79,44 @@ DEV_BASE_SKILLS = {
 # Every non-bundled skill that might need copying into an isolated worktree.
 BASE_SKILLS = dict(DEV_BASE_SKILLS)
 
+# Stories mode (folder+id dispatch, BMAD-METHOD #2549) needs a *newer* bmad-dev-auto
+# than sprint mode: one whose step-01 routes a spec-folder + story-id invocation.
+# File existence (missing_base_skills) can't tell the two skill versions apart, so
+# a content probe confirms the merged dispatch protocol is present. This literal is
+# stable prose in the merged step-01 ("this is a **folder+id dispatch**").
+STORIES_PROBE_SKILL = "bmad-dev-auto"
+STORIES_PROBE_FILE = "step-01-clarify-and-route.md"
+STORIES_PROBE_TEXT = "folder+id dispatch"
+
+
+def missing_stories_support(project: Path, trees: Sequence[str]) -> list[str]:
+    """Problems for stories mode's stricter bmad-dev-auto requirement.
+
+    Sprint mode drives any bmad-dev-auto; stories mode needs the folder+id
+    dispatch flow, which older skill versions lack. For each active CLI skill
+    tree, confirm ``bmad-dev-auto/step-01-clarify-and-route.md`` exists and
+    carries the dispatch-protocol marker. Returns one human-readable problem per
+    tree lacking it (empty = OK). Callers gate this on stories mode only —
+    sprint-mode runs must not require the newer skill."""
+    problems: list[str] = []
+    for tree in dict.fromkeys(trees):
+        probe = project / tree / STORIES_PROBE_SKILL / STORIES_PROBE_FILE
+        try:
+            text = probe.read_text(encoding="utf-8")
+        except OSError:
+            problems.append(
+                f"{tree}/{STORIES_PROBE_SKILL}/{STORIES_PROBE_FILE} not found — stories "
+                f"mode needs folder+id dispatch; update the BMad Method (bmm) module"
+            )
+            continue
+        if STORIES_PROBE_TEXT not in text:
+            problems.append(
+                f"{tree}/{STORIES_PROBE_SKILL} lacks folder+id dispatch (no "
+                f"{STORIES_PROBE_TEXT!r} in {STORIES_PROBE_FILE}) — stories mode needs a "
+                f"newer bmad-dev-auto; update the bmm module"
+            )
+    return problems
+
 
 def missing_base_skills(project: Path, trees: Sequence[str]) -> list[str]:
     """Problems for the upstream skills the orchestrator drives but doesn't bundle.

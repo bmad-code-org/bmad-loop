@@ -223,6 +223,61 @@ def test_rearm_keeps_stale_baseline_outside_a_repo(tmp_path):
     assert task.baseline_commit == "abc123"
 
 
+def test_rearm_clears_sentinel_preserving_a_copy(tmp_path):
+    """Stories mode: a fixed-slug sentinel (`<id>-unresolved.md`) is cleared by
+    deletion, not a status flip — re-arm preserves a copy, journals the blocking
+    condition, drops the sentinel, and unsets spec_file so the re-dispatch starts
+    clean (PENDING → re-plan from scratch)."""
+    key = "6-4-cli-list-command"
+    stories_dir = tmp_path / "stories"
+    stories_dir.mkdir(parents=True)
+    sentinel = stories_dir / f"{key}-unresolved.md"
+    sentinel.write_text(
+        "---\nstatus: blocked\n---\n\n## Auto Run Result\n\nStatus: blocked\nintent too vague\n",
+        encoding="utf-8",
+    )
+    run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(sentinel))
+
+    returned = runs.rearm_escalation(run_dir)
+    assert returned == key
+
+    # sentinel deleted from disk, a copy preserved under the run dir
+    assert not sentinel.exists()
+    preserved = run_dir / "sentinels" / f"{key}-unresolved.md"
+    assert preserved.is_file() and "intent too vague" in preserved.read_text(encoding="utf-8")
+
+    state = load_state(run_dir)
+    task = state.tasks[key]
+    assert task.phase == Phase.PENDING
+    assert task.spec_file is None  # cleared → next dispatch resolves to PENDING
+
+    journal = (run_dir / "journal.jsonl").read_text(encoding="utf-8")
+    assert "sentinel-cleared" in journal
+    cleared = [
+        json.loads(line)
+        for line in journal.splitlines()
+        if json.loads(line).get("kind") == "sentinel-cleared"
+    ]
+    assert cleared[0]["condition"] == "unresolved" and cleared[0]["story_key"] == key
+
+
+def test_rearm_non_sentinel_spec_still_flips_status(tmp_path):
+    """A blocked (non-sentinel) story spec is re-opened by the status flip, not
+    deleted — the sentinel branch must not swallow the normal re-arm path."""
+    key = "6-4-cli-list-command"
+    stories_dir = tmp_path / "stories"
+    stories_dir.mkdir(parents=True)
+    spec = stories_dir / f"{key}-slug.md"  # a real spec, not a fixed-slug sentinel
+    spec.write_text("---\nstatus: blocked\n---\n\n## Intent\n\nx\n", encoding="utf-8")
+    run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec))
+
+    runs.rearm_escalation(run_dir)
+    assert spec.is_file()  # not deleted
+    assert verify.read_frontmatter(spec)["status"] == "ready-for-dev"
+    assert load_state(run_dir).tasks[key].spec_file == str(spec)  # kept
+    assert not (run_dir / "sentinels").exists()
+
+
 def test_rearm_rejects_non_escalation_stage(tmp_path):
     run_dir = tmp_path / ".bmad-loop" / "runs" / "r1"
     save_state(
