@@ -152,6 +152,14 @@ class StoryTask:
     # tracked content, so a mid-re-drive retry/defer reset can't silently revert
     # the human correction. Survives the resume serialization round-trip.
     resolved_redrive: bool = False
+    # intent-gap patch-restore re-drive (BMAD-METHOD #2564): a repo-relative-or-
+    # absolute path to the patch file bmad-dev-auto saved of the reverted attempt.
+    # Latched by runs.rearm_escalation when the human confirms the attempted reading
+    # was correct; the engine re-applies it onto the baseline after every reset of
+    # the re-drive so the re-driven session resumes review (step-04) on the restored
+    # diff, and clears it once the corrected work commits. None = ordinary
+    # from-scratch re-drive. Survives the resume serialization round-trip.
+    restore_patch: str | None = None
     # sweep bundles only: the deferred-work ids this task closes and the
     # rendered intent file handed to dev sessions
     dw_ids: list[str] = field(default_factory=list)
@@ -203,6 +211,7 @@ class StoryTask:
             "defer_reason": self.defer_reason,
             "rearmed": self.rearmed,
             "resolved_redrive": self.resolved_redrive,
+            "restore_patch": self.restore_patch,
             "dw_ids": self.dw_ids,
             "bundle_file": self.bundle_file,
             "worktree_path": self.worktree_path,
@@ -245,6 +254,7 @@ class StoryTask:
             defer_reason=d.get("defer_reason"),
             rearmed=bool(d.get("rearmed", False)),
             resolved_redrive=bool(d.get("resolved_redrive", False)),
+            restore_patch=d.get("restore_patch"),
             dw_ids=[str(i) for i in d.get("dw_ids", [])],
             bundle_file=d.get("bundle_file"),
             worktree_path=str(d.get("worktree_path", "")),

@@ -5,6 +5,22 @@ All notable changes to `bmad-loop` are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). While the project is pre-1.0,
 breaking changes may land in a minor release.
 
+## [Unreleased]
+
+### Added
+
+- **Intent-gap patch-restore recovery.** When review halts on an `intent gap`, `bmad-dev-auto`
+  now saves the attempted change as a patch before reverting (BMAD-METHOD#2564). If the attempted
+  reading was correct, `bmad-loop resolve` re-arms the spec to `in-review` and re-applies the patch
+  onto baseline after every reset, so the re-driven session resumes review on the restored diff
+  instead of re-implementing. New `--restore-patch <path>` flag for the `--no-interactive` path; a
+  patch that fails to apply escalates instead of running on a half-restored tree.
+- **Preflight covers the inline review layers.** `bmad-loop validate` (and run-start) now require the
+  three upstream review-hunter skills `bmad-dev-auto`'s step-04 invokes — `bmad-review-adversarial-general`,
+  `bmad-review-edge-case-hunter`, and `bmad-review-verification-gap` (new in BMAD-METHOD#2550) — plus a
+  `customize.toml` in `bmad-dev-auto` (its review-layer config, BMAD-METHOD#2535/#2550). A pre-July bmm
+  install missing any is reported with remediation before a run stalls.
+
 ## [0.8.1] — 2026-07-05
 
 ### Fixed

@@ -53,9 +53,13 @@ action of a successful resolution. Schema:
   "story_key": "<key>",
   "decision": "<one or two sentences: the rule you and the human chose>",
   "spec_file": "<the spec you edited>",
-  "spec_updated": true
+  "spec_updated": true,
+  "restore_patch": "<optional: path to a saved intent-gap patch to re-apply>"
 }
 ```
+
+`restore_patch` is **optional** and used only for the intent-gap patch-restore
+case below — omit it entirely for an ordinary resolution.
 
 ## What you MUST do
 
@@ -78,6 +82,36 @@ action of a successful resolution. Schema:
    the human the resolution is recorded and they can exit this session — the
    orchestrator will offer to **re-arm the story and resume the run** (a clean
    rebuild against the corrected spec).
+
+## Special case: a review-stage `intent gap` with a saved patch
+
+When the escalation came from the **review step** halting on an `intent gap`, the
+dev session first **saved its attempted change as a patch file** (in the
+implementation-artifacts folder) before reverting the tree — the escalation
+`detail` and the spec's `## Review Triage Log` reference the patch path. That
+patch is concrete evidence: it shows exactly which reading of the intent the run
+implemented. Use it two ways:
+
+- **As evidence.** Read the patch (and the diff it represents) to see what the
+  guessed reading produced — often clearer input for writing the clarification
+  than the questions alone.
+- **When the attempted reading was actually correct.** Sometimes the run's guess
+  is the right one and only the _intent_ was silent. Present this as an explicit
+  option to the human: _"the implementation read it as X, which is in fact what we
+  want — amend the intent to say X, and resume **review** on the already-written
+  change instead of re-implementing it."_ If the human chooses this:
+  1. Still **amend the intent** in the spec so it unambiguously says X (step 4
+     above is unchanged — the frozen intent must match the restored code).
+  2. Add **`"restore_patch": "<the saved patch path>"`** to `resolution.json`
+     (copy the path verbatim from the escalation detail / triage log).
+
+  The orchestrator then re-arms the spec to `in-review`, re-applies the patch onto
+  the baseline, and re-dispatches — the session resumes at the review step on the
+  restored diff. **Do NOT `git apply` the patch yourself and do NOT set the spec
+  status** — the orchestrator does both deterministically at re-arm.
+
+If the attempted reading was wrong (the common case), omit `restore_patch`
+entirely: the orchestrator re-drives from scratch against the corrected intent.
 
 ## What you MUST NOT do
 
