@@ -50,9 +50,9 @@ See [README.md](../README.md) for the narrative overview and [setup-guide.md](se
 ### Adversarial review (review stage)
 
 - The follow-up review is a re-invocation of `bmad-dev-auto` on the `done` spec — a fresh-context session with no anchoring bias from the implementer (BMAD-METHOD#2508 routes a `done` spec to a fresh step-04 review pass), so there is no separate review skill.
-- Two parallel adversarial layers (Blind Hunter / Edge Case Hunter) → verify findings against code → triage → auto-apply patches → log → defer ambiguity → commit.
+- Parallel adversarial layers resolved from the skill's `customize.toml` (defaults: Adversarial-General, Edge-Case-Hunter, and Verification-Gap — the third added by BMAD-METHOD#2550) → verify findings against code → triage → auto-apply patches → log → defer ambiguity → commit. Each layer invokes an upstream `bmad-review-*` skill, so all three are bmm prerequisites the `bmad-loop validate` preflight checks for.
 - Bounded review loop (`limits.max_review_cycles`, default 3 cycles); done when the pass finishes `done` and no longer recommends a follow-up. This bound is also the oscillation guard for skill-recommended follow-up review.
-- Optional (`[review].enabled`, default `true`): set `false` to skip the follow-up review session. The dev pass's own inline review (same two layers, in-context) is then the only review and it finalizes the story to `done` — one session per story instead of two. Verify commands still gate the commit. Applies to story runs and deferred-work sweeps alike.
+- Optional (`[review].enabled`, default `true`): set `false` to skip the follow-up review session. The dev pass's own inline review (same layers, in-context) is then the only review and it finalizes the story to `done` — one session per story instead of two. Verify commands still gate the commit. Applies to story runs and deferred-work sweeps alike.
 - Trigger (`[review].trigger`, default `recommended`): when review is enabled, decides _when_ the follow-up pass runs. `recommended` runs it only when `bmad-dev-auto` sets `followup_review_recommended` on a `done` spec (it self-reviews inline and flags an independent pass only when its review-driven changes were significant — BMAD-METHOD#2505). `always` runs it on every story (pre-0.7.0 behavior).
 
 ### Failure handling & resilience
@@ -61,6 +61,7 @@ See [README.md](../README.md) for the narrative overview and [setup-guide.md](se
 - Plateau-defer: when review won't converge, the story is skipped, the spec stashed into the run dir, deferred-work preserved, the run continues.
 - Typed escalations: `CRITICAL` pauses the run + notifies (desktop + `ATTENTION` file); `PREFERENCE` is journaled and continues.
 - CRITICAL resolution: `bmad-loop resolve <run-id>` opens an interactive resolve agent seeded with the escalation + frozen spec; you disambiguate, it re-arms the story (`escalated → pending`, spec reset to `ready-for-dev`) and resumes. `--no-interactive` skips to re-arm if you fixed the spec yourself.
+- Intent-gap patch-restore (BMAD-METHOD#2564): when review halts on an `intent gap`, `bmad-dev-auto` saves the attempted change as a patch file (in the implementation-artifacts folder, referenced from the halt output) before reverting the tree. If the attempted reading turns out to be correct, the resolve agent adds `"restore_patch": "<path>"` to its `resolution.json`; the orchestrator then re-arms the spec to `in-review` (not `ready-for-dev`) and re-applies the patch onto the baseline after every reset, so the re-driven session resumes _review_ on the restored diff instead of re-implementing from scratch. A hand-driven `bmad-loop resolve --no-interactive --restore-patch <path>` does the same. A patch that fails to apply escalates rather than dispatching a session onto a half-restored tree.
 
 ### Git worktree isolation (opt-in)
 

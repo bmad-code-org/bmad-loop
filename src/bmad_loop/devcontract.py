@@ -57,11 +57,14 @@ PLAN_HALT_STATUS = "ready-for-dev"
 # allowlist: anything else (already-`done`, `blocked`, or an unknown custom token)
 # is left untouched, so reconciliation can never override a status the skill set on
 # purpose. `""` covers a blank or missing frontmatter `status:` — `reset_spec_status`
-# fills/inserts the line in that case. `in-review` is included because on the sole
-# (generic `bmad-dev-auto`) path it is only ever the transient marker step-04 sets at
-# its start; the skill self-finalizes to `done`. The legacy `bmad-loop-dev` fork that
-# used `in-review` as a deliberate review-handoff terminal is retired, so nothing
-# leaves `in-review` on purpose anymore.
+# fills/inserts the line in that case. `in-review` is included because step-04 sets
+# it transiently at the start of a review pass; the skill self-finalizes to `done`,
+# so a spec left AT `in-review` with a prose `done` result is a mid-review interrupt
+# safe to reconcile forward. The intent-gap patch-restore re-drive (BMAD-METHOD
+# #2564) deliberately re-arms the spec TO `in-review` before a session (so step-01
+# routes straight to step-04 on the restored diff) — but that is the pre-session
+# status the re-driven skill then advances past; it never LEAVES a spec at
+# `in-review` as a terminal, so the reconcile allowlist semantics are unchanged.
 RECONCILABLE_FROM = frozenset({"", "draft", "ready-for-dev", "in-progress", "in-review"})
 
 # The leading `---\n …frontmatter… \n---` block, captured in three parts so the

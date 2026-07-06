@@ -505,7 +505,9 @@ class RearmError(Exception):
     """The run/story is not in a re-armable escalation state."""
 
 
-def rearm_escalation(run_dir: Path, story_key: str | None = None) -> str:
+def rearm_escalation(
+    run_dir: Path, story_key: str | None = None, *, restore_patch: str | None = None
+) -> str:
     """Re-arm an escalation-paused story so the next resume re-drives it.
 
     Flips the escalated task out of its terminal ESCALATED phase back to
@@ -514,11 +516,27 @@ def rearm_escalation(run_dir: Path, story_key: str | None = None) -> str:
     spec. The baseline itself is advanced to the project's current HEAD (and
     the untracked snapshot refreshed) so commits and files the resolve session
     produced count as the rebuild's starting point, not as attempt debris to
-    roll back. Deterministically sets that spec's status to `ready-for-dev` so
-    the dev session routes straight to implement, and strips the escalated
-    attempt's stale `## Auto Run Result` section so the re-drive cannot read
-    as terminal from its first save. Does NOT clear the pause; the caller
-    resumes the run separately.
+    roll back. Strips the escalated attempt's stale `## Auto Run Result`
+    section so the re-drive cannot read as terminal from its first save, and
+    sets the spec's frontmatter status so step-01 routes to the right stage.
+    Does NOT clear the pause; the caller resumes the run separately.
+
+    Two re-drive modes, selected by `restore_patch`:
+
+    - **from-scratch** (default, ``restore_patch=None``): status → ``ready-for-dev``
+      so the dev session re-implements from a clean baseline. Assigning None also
+      clears any stale latch from a prior restore attempt the human abandoned.
+    - **patch-restore** (BMAD-METHOD #2564, ``restore_patch`` set): the human
+      confirmed the escalated attempt's reading was correct. Status → ``in-review``
+      so step-01 routes straight to step-04, and the path is latched onto the task
+      (`task.restore_patch`) so the engine re-applies the saved patch onto the
+      baseline before dispatching — the re-driven session resumes review on the
+      restored diff instead of re-implementing. The status is set here
+      deterministically; the resolve agent must NOT set it. Because the baseline
+      advances (above) while the patch was diffed from the OLD baseline, a resolve
+      session that committed changes to the patched files makes the re-drive's
+      apply fail — the engine then escalates loudly instead of dispatching on a
+      half-restored tree (see verify.apply_patch).
 
     Stories mode: when the escalated spec is a fixed-slug sentinel
     (`<id>-unresolved.md` / `<id>-ambiguous.md`, written by a pre-planning HALT),
@@ -526,6 +544,10 @@ def rearm_escalation(run_dir: Path, story_key: str | None = None) -> str:
     Instead preserve a copy under `{run_dir}/sentinels/`, journal `sentinel-cleared`
     with the blocking condition, and delete it, so the re-dispatch resolves to a
     clean PENDING and re-plans from scratch (leg 1 again for a spec_checkpoint id).
+    A patch-restore re-arm is rejected for a sentinel-wedged story: a sentinel is a
+    pre-planning halt, so there is no attempted implementation to restore and the
+    re-dispatch is a planning leg — laying implementation onto the tree before a
+    planning session is never safe.
 
     Returns the re-armed story key. Raises RearmError when the run is not
     paused at the escalation stage or the target story is not escalated.
@@ -544,6 +566,18 @@ def rearm_escalation(run_dir: Path, story_key: str | None = None) -> str:
         raise RearmError(f"run {run_dir.name} has no task for story {key}")
     if task.phase != Phase.ESCALATED:
         raise RearmError(f"story {key} is not escalated (phase: {task.phase})")
+    # T1 guard (stories × patch-restore): a sentinel-wedged story escalated BEFORE
+    # planning — there is no attempted implementation to restore, and its re-arm
+    # re-dispatches a planning leg. Keyed on the recorded detection verdict
+    # (task.sentinel_kind), not the on-disk basename, mirroring the sentinel-clear
+    # branch below. Rejected here, before any task mutation, so the escalation
+    # stays armed for a corrected resolve.
+    if restore_patch and state.source == "stories" and task.sentinel_kind:
+        raise RearmError(
+            f"story {key} is wedged on a pre-planning {task.sentinel_kind} sentinel — "
+            "there is no attempted implementation to restore, and the re-drive starts "
+            "at planning. Re-run resolve without a restore patch for a clean re-plan."
+        )
 
     journal = Journal(run_dir)
     # deliberate reset, not a normal state-machine transition (mirrors
@@ -554,6 +588,9 @@ def rearm_escalation(run_dir: Path, story_key: str | None = None) -> str:
     task.defer_reason = None
     task.rearmed = True  # resume-time recovery notice describes a clean rebuild,
     # not a failed attempt (engine._finish_inflight clears it once the rebuild runs)
+    # Always (re)assign the latch: a None restore_patch clears a stale one left by
+    # a prior restore attempt the human then chose to redo from scratch.
+    task.restore_patch = restore_patch
 
     if task.spec_file:
         spec_path = Path(task.spec_file)
@@ -576,9 +613,12 @@ def rearm_escalation(run_dir: Path, story_key: str | None = None) -> str:
             task.sentinel_kind = ""  # verdict discharged; the re-dispatch is clean
         else:
             try:
-                # route /bmad-dev-auto to re-implement (decision table: ready-for-dev
-                # -> step-03); independent of the resolve agent having set it.
-                verify.set_frontmatter_status(spec_path, "ready-for-dev")
+                # Route /bmad-dev-auto via the spec's frontmatter status (decision
+                # table): patch-restore -> in-review -> step-04 (resume review on
+                # the restored diff); from-scratch -> ready-for-dev -> step-03
+                # (re-implement). Independent of the resolve agent having set it.
+                target_status = "in-review" if restore_patch else "ready-for-dev"
+                verify.set_frontmatter_status(spec_path, target_status)
                 # drop the stale `## Auto Run Result` section along with the status flip
                 # (mirrors engine._reset_spec_for_repair): find_result_artifact keys on
                 # that heading, so leaving it would let the re-driven session's first
@@ -622,7 +662,12 @@ def rearm_escalation(run_dir: Path, story_key: str | None = None) -> str:
         pass
 
     save_state(run_dir, state)
-    journal.append("story-escalation-resolved", story_key=key, baseline=task.baseline_commit or "")
+    journal.append(
+        "story-escalation-resolved",
+        story_key=key,
+        baseline=task.baseline_commit or "",
+        restore=bool(restore_patch),
+    )
     return key
 
 

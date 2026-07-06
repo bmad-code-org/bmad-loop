@@ -971,6 +971,94 @@ def test_resolve_rearm_only_skips_resume(tmp_path, monkeypatch, capsys):
     assert "resume when ready" in capsys.readouterr().out
 
 
+def test_resolve_no_interactive_restore_patch_latches_in_review(tmp_path, monkeypatch, capsys):
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    spec = tmp_path / "spec.md"
+    spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+    patch = tmp_path / "artifacts" / "attempt.patch"
+    patch.parent.mkdir(parents=True)
+    patch.write_text("diff", encoding="utf-8")
+    run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
+
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+    rc = cli.main(
+        [
+            "resolve",
+            "--project",
+            str(tmp_path),
+            "r1",
+            "--no-interactive",
+            "--restore-patch",
+            str(patch),
+            "--resume",
+        ]
+    )
+    assert rc == 0
+    assert "restoring the attempted change" in capsys.readouterr().out
+    task = load_state(run_dir).tasks["s1"]
+    assert task.phase == Phase.PENDING
+    assert task.restore_patch == str(patch.resolve())  # validated + latched (absolute)
+    assert "in-review" in spec.read_text()  # restore mode routes step-01 -> step-04
+
+
+def test_resolve_restore_patch_missing_file_rejected(tmp_path, monkeypatch, capsys):
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    spec = tmp_path / "spec.md"
+    spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+    run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
+    called: list = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: called.append(rd) or 0)
+    rc = cli.main(
+        [
+            "resolve",
+            "--project",
+            str(tmp_path),
+            "r1",
+            "--no-interactive",
+            "--restore-patch",
+            str(tmp_path / "nope.patch"),
+            "--resume",
+        ]
+    )
+    assert rc == 1
+    assert "not a file under the project" in capsys.readouterr().err
+    assert called == []  # never resumed
+    assert load_state(run_dir).tasks["s1"].phase == Phase.ESCALATED  # not re-armed
+
+
+def test_resolve_interactive_restore_patch_from_resolution_json(tmp_path, monkeypatch):
+    from bmad_loop import resolve
+    from bmad_loop.journal import load_state
+
+    spec = tmp_path / "spec.md"
+    spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+    patch = tmp_path / "artifacts" / "attempt.patch"
+    patch.parent.mkdir(parents=True)
+    patch.write_text("diff", encoding="utf-8")
+    run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
+
+    def fake_session(adapter, project, rd, story_key, *, model=""):
+        # the resolve agent records a restore_patch in its output marker
+        marker = resolve.resolution_path(rd, story_key)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps({"restore_patch": str(patch)}), encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
+    monkeypatch.setattr(resolve, "build_context", lambda *a, **k: None)
+    monkeypatch.setattr(resolve, "run_session", fake_session)
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--resume"])
+    assert rc == 0
+    task = load_state(run_dir).tasks["s1"]
+    assert task.restore_patch == str(patch.resolve())  # picked up from resolution.json
+    assert "in-review" in spec.read_text()
+
+
 def test_sweep_command_parses_flags():
     parser_args = [
         "sweep",

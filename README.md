@@ -40,7 +40,7 @@ Inspired by the original [bmad-automator](https://github.com/bmad-code-org/bmad-
 
 - **Python 3.11+**, **tmux**, and a supported coding CLI — `claude` by default; `codex` and `gemini` via [profiles](#other-coding-clis).
 - **Linux or macOS** (or **Windows via WSL**, which _is_ Linux — it runs as-is). tmux is the one terminal-multiplexer backend today, but it now sits behind a pluggable **registry** of OS seams (transport, process lifecycle, hook interpreter), so a native-Windows backend slots in as new files + a registration line each, with no engine edits — see [Porting bmad-loop to a new OS](docs/porting-to-a-new-os.md). Native Windows is not yet shipped.
-- A **BMAD v6 project** (`_bmad/bmm/config.yaml`, a `sprint-status.yaml` from `bmad-sprint-planning`) with the upstream `bmad-dev-auto` skill and the bmad-loop skill module from this repo installed (`bmad-loop-resolve`, `bmad-loop-sweep` — see [Installing the skill module](#installing-the-skill-module)). Standard BMAD skills stay untouched.
+- A **BMAD v6 project** (`_bmad/bmm/config.yaml`, a `sprint-status.yaml` from `bmad-sprint-planning`) with the upstream `bmad-dev-auto` skill (and the three review-hunter skills its step-04 invokes inline: `bmad-review-adversarial-general`, `bmad-review-edge-case-hunter`, `bmad-review-verification-gap`) and the bmad-loop skill module from this repo installed (`bmad-loop-resolve`, `bmad-loop-sweep` — see [Installing the skill module](#installing-the-skill-module)). Standard BMAD skills stay untouched.
 
 ## Quick start
 
@@ -238,14 +238,19 @@ Bundle dev sessions can themselves append new deferred entries (split-off goals,
 
 ## Installing the skill module
 
-The orchestrator drives the upstream `bmad-dev-auto` skill as its inner dev primitive — unmodified, so there is no fork to keep in sync; it both implements and (re-invoked on the done spec) runs the follow-up review — plus its own bundled `bmad-loop-*` skills for escalation, sweep, and setup. Your standard BMAD install is never modified. The three bundled skills ship in the `bmad-loop` wheel (canonical source: `src/bmad_loop/data/skills/`, BMAD module code `bmad-loop`) so `bmad-loop init` lays them down for you; `bmad-dev-auto` is a prerequisite installed by the BMad Method (bmm) module:
+The orchestrator drives the upstream `bmad-dev-auto` skill as its inner dev primitive — unmodified, so there is no fork to keep in sync; it both implements and (re-invoked on the done spec) runs the follow-up review — plus its own bundled `bmad-loop-*` skills for escalation, sweep, and setup. Your standard BMAD install is never modified. The three bundled skills ship in the `bmad-loop` wheel (canonical source: `src/bmad_loop/data/skills/`, BMAD module code `bmad-loop`) so `bmad-loop init` lays them down for you; `bmad-dev-auto` and the three review-hunter skills its step-04 invokes inline are prerequisites installed by the BMad Method (bmm) module:
 
-| Skill               | Role                                                                                        |
-| ------------------- | ------------------------------------------------------------------------------------------- |
-| `bmad-dev-auto`     | unattended implementation + follow-up review (**upstream** — bmm prerequisite, not bundled) |
-| `bmad-loop-resolve` | interactive CRITICAL-escalation resolution (`/bmad-loop-resolve <story>`)                   |
-| `bmad-loop-sweep`   | deferred-work ledger triage (automation-only)                                               |
-| `bmad-loop-setup`   | registers the module in `_bmad/` config + help                                              |
+| Skill                             | Role                                                                                            |
+| --------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `bmad-dev-auto`                   | unattended implementation + follow-up review (**upstream** — bmm prerequisite, not bundled)     |
+| `bmad-review-adversarial-general` | inline step-04 review layer (**upstream** — bmm prerequisite, not bundled)                      |
+| `bmad-review-edge-case-hunter`    | inline step-04 review layer (**upstream** — bmm prerequisite, not bundled)                      |
+| `bmad-review-verification-gap`    | inline step-04 review layer, newest (BMAD-METHOD#2550) (**upstream** — bmm prereq, not bundled) |
+| `bmad-loop-resolve`               | interactive CRITICAL-escalation resolution (`/bmad-loop-resolve <story>`)                       |
+| `bmad-loop-sweep`                 | deferred-work ledger triage (automation-only)                                                   |
+| `bmad-loop-setup`                 | registers the module in `_bmad/` config + help                                                  |
+
+`bmad-loop validate` preflights all four upstream skills; a target project on a pre-July bmm install missing `bmad-review-verification-gap` (or a `bmad-dev-auto` without its `customize.toml` review-layer config) is reported with bmm-module remediation before any run starts.
 
 **Via uv + `bmad-loop init` (self-sufficient).** Installing the tool and running `init` is all you need — `init` installs the `bmad-loop-*` skills into `.claude/skills/` (claude) and/or `.agents/skills/` (codex/gemini) for the CLIs you select, alongside the hooks and policy:
 

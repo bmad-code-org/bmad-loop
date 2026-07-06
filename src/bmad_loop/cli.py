@@ -805,6 +805,38 @@ def _confirm(question: str) -> bool:
     return ans in ("y", "yes")
 
 
+def _resolve_restore_patch(
+    project: Path, run_dir: Path, story_key: str, args: argparse.Namespace
+) -> tuple[str | None, str | None]:
+    """Determine the intent-gap patch-restore latch (BMAD-METHOD #2564) for a re-arm.
+
+    Precedence: the explicit ``--restore-patch`` flag (hand-driven recovery) wins;
+    otherwise, on the interactive path, the resolve agent may have recorded a
+    ``restore_patch`` field in resolution.json. Returns ``(latch, error)``: a
+    validated absolute patch path to latch (None = ordinary from-scratch re-drive),
+    or an error string when a supplied path is missing / outside the project — the
+    caller aborts strictly rather than silently re-driving from scratch when the
+    operator asked to restore."""
+    raw = getattr(args, "restore_patch", None)
+    if raw is None and args.interactive:
+        doc = resolve.read_resolution(run_dir, story_key)
+        if doc is not None:
+            val = doc.get("restore_patch")
+            raw = str(val) if val else None
+    if not raw:
+        return None, None
+    patch = Path(raw)
+    if not patch.is_absolute():
+        patch = project / patch
+    patch = patch.resolve()
+    if not patch.is_file() or not patch.is_relative_to(project.resolve()):
+        return None, (
+            f"restore patch {raw!r} is not a file under the project — refusing to "
+            "re-arm (fix the path, or re-run without a restore to re-drive from scratch)"
+        )
+    return str(patch), None
+
+
 def cmd_resolve(args: argparse.Namespace) -> int:
     from .model import PAUSE_ESCALATION, Phase
 
@@ -875,16 +907,26 @@ def cmd_resolve(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
 
+    # intent-gap patch-restore latch (#2564): validate a supplied patch path before
+    # prompting, so a bad path fails loudly instead of after a confirmation.
+    restore_patch, err = _resolve_restore_patch(project, run_dir, story_key, args)
+    if err is not None:
+        print(err, file=sys.stderr)
+        return 1
+
     # confirm-then-resume (args.resume: None = ask, True = auto, False = re-arm only)
     if args.resume is None and not _confirm(f"re-arm {story_key} and resume run {args.run_id}?"):
         print("cancelled — run is still paused at the escalation")
         return 0
     try:
-        runs.rearm_escalation(run_dir, story_key)
+        runs.rearm_escalation(run_dir, story_key, restore_patch=restore_patch)
     except runs.RearmError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
-    print(f"re-armed {story_key}")
+    print(
+        f"re-armed {story_key}"
+        + (" (restoring the attempted change for review)" if restore_patch else "")
+    )
     if args.resume is False:
         print(f"resume when ready: bmad-loop resume {args.run_id}")
         return 0
@@ -1520,6 +1562,14 @@ def main(argv: list[str] | None = None) -> int:
         dest="interactive",
         action="store_false",
         help="skip the resolve agent (spec already fixed by hand); just re-arm + resume",
+    )
+    resolve_p.add_argument(
+        "--restore-patch",
+        metavar="PATH",
+        help="intent-gap patch-restore (#2564): re-arm the spec to `in-review` and "
+        "re-apply this saved patch before the re-drive, resuming review on the "
+        "attempted change instead of re-implementing (hand-driven; the interactive "
+        "agent supplies it via resolution.json)",
     )
     resolve_p.add_argument(
         "--resume",

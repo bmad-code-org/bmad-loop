@@ -988,6 +988,49 @@ def test_commit_paths_noop_when_unchanged(project):
     assert verify.commit_paths(project.project, "noop", [project.project.parent / "x"]) is None
 
 
+def test_apply_patch_replays_saved_diff(project):
+    """A patch saved off the baseline re-applies cleanly onto that same baseline —
+    tracked edits AND new (untracked) files — reproducing the reverted attempt."""
+    repo = project.project
+    baseline = verify.rev_parse_head(repo)
+    # the "attempt": edit a tracked file + add a new file, then capture the diff
+    (repo / "src.txt").write_text("original\nattempted change\n")
+    (repo / "new_module.py").write_text("print('hi')\n")
+    patch = project.implementation_artifacts / "attempt.patch"
+    # git diff HEAD includes new files with --binary-safe text; -N stages intent so
+    # untracked files appear in the diff (mirrors how the skill saves the attempt)
+    git(repo, "add", "-N", "new_module.py")
+    patch.write_text(git(repo, "diff", "HEAD") + "\n", encoding="utf-8")
+    # revert the attempt back to baseline (as the skill does before halting)
+    git(repo, "reset", "-q", "--hard", baseline)
+    (repo / "new_module.py").unlink(missing_ok=True)
+    assert (repo / "src.txt").read_text() == "original\n"
+
+    verify.apply_patch(repo, patch)
+
+    assert (repo / "src.txt").read_text() == "original\nattempted change\n"
+    assert (repo / "new_module.py").read_text() == "print('hi')\n"
+
+
+def test_apply_patch_missing_file_raises(project):
+    with pytest.raises(verify.GitError, match="restore patch not found"):
+        verify.apply_patch(project.project, project.implementation_artifacts / "nope.patch")
+
+
+def test_apply_patch_conflict_raises(project):
+    """A patch that does not apply against the current tree raises GitError with
+    git's output — the caller escalates rather than dispatch onto a broken tree."""
+    repo = project.project
+    patch = project.implementation_artifacts / "bad.patch"
+    # a diff against content the tree does not have
+    patch.write_text(
+        "--- a/src.txt\n+++ b/src.txt\n@@ -1 +1 @@\n-something-else\n+patched\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(verify.GitError, match="git apply"):
+        verify.apply_patch(repo, patch)
+
+
 def test_read_frontmatter_tolerates_garbage(project):
     p = project.project / "x.md"
     p.write_text("no frontmatter here")

@@ -874,6 +874,44 @@ class Engine:
             preserve=preserve,
         )
 
+    def _restore_patch(self, task: StoryTask) -> None:
+        """Re-apply the latched intent-gap patch (BMAD-METHOD #2564) onto the
+        baseline tree so the re-driven session resumes review (step-04) on the
+        restored diff instead of re-implementing. No-op unless a restore is latched.
+
+        Applied from inside `_dev_phase`'s loop, right before each dispatch that
+        runs against a fresh baseline (the first attempt and every non-fixable
+        rollback retry — the loop gates this on ``feedback is None``, so a
+        fixable-feedback retry that KEEPS the attempt's tree is never double-applied,
+        and the patch file's own untracked/tracked content is excluded from
+        `baseline_untracked` because that snapshot is taken before the first apply).
+        This is the plan's "apply after every baseline reset" seam, placed here
+        rather than in `_rollback_or_pause` so the patch always lands after the
+        clean baseline_untracked snapshot — avoiding a mid-re-drive reset preserving
+        the patch's own new files and then colliding with the re-apply.
+
+        On apply failure we escalate rather than dispatch a session onto a
+        half-restored tree; the task is mid-dispatch (DEV_RUNNING), so step it to
+        the escalatable DEV_VERIFY phase first (`_escalate` raises RunPaused)."""
+        if not task.restore_patch:
+            return
+        patch = Path(task.restore_patch)
+        if not patch.is_absolute():
+            patch = self.workspace.root / patch
+        try:
+            verify.apply_patch(self.workspace.root, patch)
+        except verify.GitError as e:
+            self.journal.append(
+                "attempt-restore-failed",
+                story_key=task.story_key,
+                patch=task.restore_patch,
+                error=str(e),
+            )
+            if task.phase == Phase.DEV_RUNNING:
+                advance(task, Phase.DEV_VERIFY)  # PENDING/DEV_RUNNING can't escalate directly
+            self._escalate(task, f"intent-gap restore patch failed to apply: {e}")
+        self.journal.append("attempt-restored", story_key=task.story_key, patch=task.restore_patch)
+
     def _prune_preserve_refs(self) -> None:
         """Bounded retention for both recovery-ref families at run start — the
         attempt-preserve/* branches and the refs/attempt-preserve-dirty/*
@@ -1403,6 +1441,15 @@ class Engine:
                 result = resume_result
                 resume_result = None
             else:
+                # intent-gap patch-restore (#2564): re-lay the saved attempt onto
+                # the baseline before dispatch so the re-driven session resumes
+                # review on the restored diff. `feedback is None` ⇒ the tree is at
+                # baseline (fresh attempt or a non-fixable rollback below), NOT a
+                # fixable-feedback retry that kept the attempt's tree — so this
+                # never double-applies. No-op unless a restore is latched; escalates
+                # (never dispatches) if the patch fails to apply.
+                if feedback is None:
+                    self._restore_patch(task)
                 result = self._run_session(
                     task,
                     role="dev",
@@ -1697,8 +1744,11 @@ class Engine:
             sha = verify.finalize_commit(self.workspace.root, task.baseline_commit, message)
             task.commit_sha = sha or task.baseline_commit
             # the corrected spec is now durable in HEAD; later attempts need no
-            # special preservation, so drop the re-drive latch.
+            # special preservation, so drop the re-drive latch. The restored diff
+            # is likewise committed, so clear its latch too — a subsequent re-arm
+            # (if any) decides afresh whether to restore again.
             task.resolved_redrive = False
+            task.restore_patch = None
         except verify.GitError as e:
             self._escalate(task, f"commit failed: {e}")
         advance(task, Phase.DONE)

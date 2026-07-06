@@ -38,6 +38,21 @@ def resolution_path(run_dir: Path, story_key: str) -> Path:
     return _story_dir(run_dir, story_key) / "resolution.json"
 
 
+def read_resolution(run_dir: Path, story_key: str) -> dict[str, Any] | None:
+    """Parse the resolve agent's ``resolution.json`` marker, or None when it is
+    absent or unreadable. The caller reads the optional ``restore_patch`` field
+    (the intent-gap patch-restore path, BMAD-METHOD #2564) from the returned dict;
+    it validates that path itself before acting on it."""
+    path = resolution_path(run_dir, story_key)
+    if not path.is_file():
+        return None
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
 def _gather_escalations(run_dir: Path, state: RunState, story_key: str) -> list[dict[str, Any]]:
     """The CRITICAL escalations recorded by this story's sessions, newest first.
 

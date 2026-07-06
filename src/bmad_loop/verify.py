@@ -1398,6 +1398,15 @@ def finalize_commit(repo: Path, baseline: str | None, message: str) -> str | Non
     keeping the index (`reset --soft`), then commit the accumulated index. The
     working tree is never touched, so a failure leaves the chain intact.
 
+    Residual-artifacts note (BMAD-METHOD #2563): the skill now commits every file
+    of the reviewed diff and deliberately leaves unrelated `git status` residue
+    uncommitted (files outside the change's scope). The `add -A` here sweeps that
+    residue into the story commit too — an intentional divergence from the skill's
+    scoped commit. The loop must end each story on a clean tree because story
+    N+1's step-01 HALTs on a dirty tree, so the orchestrator squashes EVERYTHING
+    since baseline (skill commits + its own bookkeeping + any residue) into the one
+    story commit rather than leaving the tree dirty for the next story to trip on.
+
     Returns the new HEAD sha, or None when there is nothing to finalize: no
     version control (`baseline` falsy or NO_VCS) or the tree already equals
     `baseline` (no skill commits and no bookkeeping delta)."""
@@ -1427,6 +1436,25 @@ def finalize_commit(repo: Path, baseline: str | None, message: str) -> str | Non
             )
         raise GitError(f"git commit failed: {out}")
     return rev_parse_head(repo)
+
+
+def apply_patch(repo: Path, patch_path: Path) -> None:
+    """Apply a saved patch to `repo`'s working tree (`git apply`), raising on failure.
+
+    The intent-gap patch-restore re-drive (BMAD-METHOD #2564) uses this to re-lay
+    the attempted change bmad-dev-auto saved before reverting: the patch is a diff
+    from the story's baseline, and the caller has just reset the tree to that same
+    baseline, so it applies cleanly by construction. New files in the patch are
+    created (they land untracked, matching how the original attempt sat before its
+    revert). A non-zero `git apply` — a conflict, a missing/corrupt patch, a tree
+    that has drifted from baseline — raises `GitError` with git's output; the caller
+    escalates rather than dispatch a session onto a half-applied tree.
+    """
+    if not patch_path.is_file():
+        raise GitError(f"restore patch not found: {patch_path}")
+    rc, out = _git(repo, "apply", str(patch_path))
+    if rc != 0:
+        raise GitError(f"git apply {patch_path} failed: {out}")
 
 
 def commit_paths(repo: Path, message: str, paths: list[Path]) -> str | None:

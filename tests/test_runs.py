@@ -530,6 +530,69 @@ def test_delete_run(tmp_path):
     assert not run_dir.exists()
 
 
+def _escalated_run(tmp_path, spec_text, *, restore_patch_stale=None):
+    from bmad_loop.model import PAUSE_ESCALATION, Phase, StoryTask
+
+    spec = tmp_path / "spec.md"
+    spec.write_text(spec_text, encoding="utf-8")
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        phase=Phase.ESCALATED,
+        attempt=2,
+        spec_file=str(spec),
+        restore_patch=restore_patch_stale,
+    )
+    run_dir = _make_state_run(
+        tmp_path,
+        "r1",
+        paused_reason="CRITICAL escalation",
+        paused_stage=PAUSE_ESCALATION,
+        paused_story_key="1-1-a",
+        tasks={"1-1-a": task},
+    )
+    return run_dir, spec
+
+
+_SPEC_WITH_ARR = (
+    "---\ntitle: t\nstatus: blocked\n---\n\n## Intent\n\nbody\n"
+    "\n## Auto Run Result\n\n- Status: blocked\n\nboom\n"
+)
+
+
+def test_rearm_restore_mode_sets_in_review_strips_arr_and_latches(tmp_path):
+    from bmad_loop.journal import Journal
+    from bmad_loop.model import Phase
+
+    run_dir, spec = _escalated_run(tmp_path, _SPEC_WITH_ARR)
+    runs.rearm_escalation(run_dir, restore_patch="artifacts/attempt.patch")
+
+    task = load_state(run_dir).tasks["1-1-a"]
+    assert task.phase == Phase.PENDING and task.attempt == 0
+    assert task.restore_patch == "artifacts/attempt.patch"
+    text = spec.read_text()
+    assert "status: in-review" in text  # in-review routes step-01 -> step-04
+    assert "## Auto Run Result" not in text  # stale terminal section stripped
+    entry = [e for e in Journal(run_dir).entries() if e["kind"] == "story-escalation-resolved"][-1]
+    assert entry["restore"] is True
+
+
+def test_rearm_plain_mode_sets_ready_for_dev_and_clears_stale_latch(tmp_path):
+    from bmad_loop.journal import Journal
+    from bmad_loop.model import Phase
+
+    # a stale latch from a prior restore attempt the human then chose to redo fresh
+    run_dir, spec = _escalated_run(tmp_path, _SPEC_WITH_ARR, restore_patch_stale="old.patch")
+    runs.rearm_escalation(run_dir)  # no restore_patch => from-scratch
+
+    task = load_state(run_dir).tasks["1-1-a"]
+    assert task.phase == Phase.PENDING
+    assert task.restore_patch is None  # stale latch cleared
+    assert "status: ready-for-dev" in spec.read_text()
+    entry = [e for e in Journal(run_dir).entries() if e["kind"] == "story-escalation-resolved"][-1]
+    assert entry["restore"] is False
+
+
 def test_archive_run(tmp_path):
     run_dir = _make_state_run(tmp_path, "20260611-100000-aaaa")
     (run_dir / "journal.jsonl").write_text('{"kind":"x"}\n')

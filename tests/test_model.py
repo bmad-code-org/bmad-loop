@@ -125,6 +125,17 @@ def test_sentinel_kind_defaults_empty_for_legacy_state():
     assert StoryTask.from_dict(doc).sentinel_kind == ""
 
 
+def test_restore_patch_round_trips():
+    task = StoryTask(story_key="1-1-a", epic=1, restore_patch="artifacts/attempt.patch")
+    assert StoryTask.from_dict(task.to_dict()).restore_patch == "artifacts/attempt.patch"
+
+
+def test_restore_patch_defaults_none_for_legacy_state():
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    del doc["restore_patch"]  # state.json from before the field existed
+    assert StoryTask.from_dict(doc).restore_patch is None
+
+
 def test_stopped_round_trips():
     state = _state(stopped=True)
     assert RunState.from_dict(state.to_dict()).stopped is True
