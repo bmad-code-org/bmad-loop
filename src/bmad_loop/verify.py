@@ -938,6 +938,35 @@ def artifact_relpaths(paths: ProjectPaths) -> tuple[str, ...]:
     return tuple(out)
 
 
+def verify_dev_exclude_relpaths(paths: ProjectPaths, spec_path: Path) -> tuple[str, ...]:
+    """Repo-relative posix paths the dev/bundle proof-of-work gate excludes from
+    `has_changes_since` — file-granularity, unlike `artifact_relpaths`' whole-folder
+    exclusion (still used as-is by `Engine._protected_relpaths` for rollback
+    protection, a different job). Deliberately does NOT exclude `output_folder`:
+    in the standard layout it is the parent directory of `implementation_artifacts`/
+    `planning_artifacts`, so excluding it as a directory prefix would swallow those
+    two folders' content right back out of view via the same git-pathspec prefix
+    match this function exists to avoid.
+
+    Excludes only what a session rewrites regardless of whether it did any real
+    work: `paths.sprint_status` (every session advances it as routine bookkeeping)
+    and the session's own claimed `spec_path` (so a bare frontmatter status flip on
+    it doesn't count). Sibling content under the implementation/planning artifact
+    dirs — the deferred-work ledger, other stories' specs — is deliberately left
+    un-excluded, so a story whose entire authorized scope is ledger/spec
+    reconciliation registers as real work instead of a permanent false "no changes
+    since baseline"."""
+    out: list[str] = []
+    for path in (paths.sprint_status, spec_path):
+        try:
+            rel = path.relative_to(paths.project).as_posix()
+        except ValueError:
+            continue  # outside the project tree; nothing to exclude here
+        if rel and rel != ".":
+            out.append(rel)
+    return tuple(out)
+
+
 def spec_within_roots(spec_path: Path, paths: ProjectPaths) -> bool:
     """True if ``spec_path`` is, or sits under, an orchestrator-owned root (the
     project root or an artifact dir). A mutating repair (the frontmatter-status
@@ -1013,7 +1042,9 @@ def verify_dev(
     if task.baseline_commit:
         try:
             if not has_changes_since(
-                paths.project, task.baseline_commit, exclude=artifact_relpaths(paths)
+                paths.project,
+                task.baseline_commit,
+                exclude=verify_dev_exclude_relpaths(paths, spec_path),
             ):
                 return VerifyOutcome.retry("no changes in worktree since baseline commit")
         except GitError as e:
@@ -1074,7 +1105,9 @@ def verify_dev_bundle(
     if task.baseline_commit:
         try:
             if not has_changes_since(
-                paths.project, task.baseline_commit, exclude=artifact_relpaths(paths)
+                paths.project,
+                task.baseline_commit,
+                exclude=verify_dev_exclude_relpaths(paths, spec_path),
             ):
                 return VerifyOutcome.retry("no changes in worktree since baseline commit")
         except GitError as e:

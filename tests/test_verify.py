@@ -329,6 +329,19 @@ def test_verify_dev_bundle_absent_dw_ids_passes(project, claim):
     assert task.spec_file == str(sp)
 
 
+def test_verify_dev_bundle_ledger_only_counts_as_real_work(project):
+    """Same false-negative as verify_dev (KNOWN-BUG-ledger-only-story-false-no-
+    changes.md), on the bundle path: a dw-bundle's entire authorized diff is
+    the ledger reconciliation itself, with no sprint-status entry to touch."""
+    task = make_bundle_task(project)
+    sp = project.implementation_artifacts / "spec-dw-test-bundle.md"
+    write_spec(sp, "in-review", task.baseline_commit)
+    bundle_ledger(project, {"DW-1": "done 2026-06-11", "DW-2": "done 2026-06-11"})
+    rj = {"workflow": "auto-dev", "spec_file": str(sp)}
+    out = verify.verify_dev_bundle(task, project, rj)
+    assert out.ok
+
+
 def test_verify_review_bundle_ledger_gate(project):
     task = make_bundle_task(project)
     sp = project.implementation_artifacts / "spec-dw-test-bundle.md"
@@ -748,6 +761,68 @@ def test_has_changes_since_excludes_artifact_only_edit(project):
         )
         is True
     )
+
+
+def test_verify_dev_exclude_relpaths_is_file_granular(project):
+    """Unlike artifact_relpaths (whole-folder), this excludes only the
+    sprint-status ledger and the session's own claimed spec file — sibling
+    artifact-folder content (deferred-work.md, other stories' specs) is left
+    un-excluded so it can register as real work."""
+    sp = spec_path(project, "1-1-a")
+    rels = verify.verify_dev_exclude_relpaths(project, sp)
+    assert "_bmad-output/implementation-artifacts/sprint-status.yaml" in rels
+    assert "_bmad-output/implementation-artifacts/spec-1-1-a.md" in rels
+    assert "_bmad-output/implementation-artifacts" not in rels
+    # output_folder itself is NOT excluded here — it is the parent dir of
+    # implementation_artifacts in the standard layout, so excluding it as a
+    # prefix would swallow the artifact dirs' content right back out of view.
+    assert "_bmad-output" not in rels
+    assert "_bmad-output/implementation-artifacts/deferred-work.md" not in rels
+
+
+def test_has_changes_since_ledger_content_counts_with_narrow_exclude(project):
+    """Reproduces KNOWN-BUG-ledger-only-story-false-no-changes.md: a story whose
+    entire authorized diff is sibling ledger content must not read as 'no
+    changes', while a bare own-spec + sprint-status bookkeeping edit still does."""
+    baseline = verify.rev_parse_head(project.project)
+    sp = spec_path(project, "1-1-a")
+    exclude = verify.verify_dev_exclude_relpaths(project, sp)
+
+    sp.write_text("bookkeeping\n")
+    project.sprint_status.write_text("bookkeeping\n")
+    assert verify.has_changes_since(project.project, baseline, exclude=exclude) is False
+
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("### DW-1: reconciled\n\nstatus: done\n")
+    assert verify.has_changes_since(project.project, baseline, exclude=exclude) is True
+
+
+def test_verify_dev_ledger_only_story_counts_as_real_work(project):
+    """A 'paper-trail reconciliation only' story (KNOWN-BUG-ledger-only-story-
+    false-no-changes.md) whose entire real diff sits under implementation_artifacts
+    (e.g. deferred-work.md) must pass, not false-negative 'no changes'."""
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("### DW-1: reconciled\n\nstatus: done\n")
+
+    out = verify.verify_dev(task, project, dev_result(sp))
+    assert out.ok
+
+
+def test_verify_dev_own_spec_status_flip_alone_is_not_real_work(project):
+    """Guards the original loophole the exclusion targets: flipping only the
+    session's own spec status (plus routine sprint-status bookkeeping) must
+    still retry as 'no changes', even with the narrower file-level exclude."""
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+
+    out = verify.verify_dev(task, project, dev_result(sp))
+    assert not out.ok and "no changes" in out.reason
 
 
 def test_spec_within_roots(project, tmp_path):
