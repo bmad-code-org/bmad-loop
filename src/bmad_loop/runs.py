@@ -557,18 +557,16 @@ def rearm_escalation(run_dir: Path, story_key: str | None = None) -> str:
     # very gap the human just resolved. Best-effort: on a git failure the old
     # baseline stands (the redrive rollback path tolerates a stale baseline; it
     # just loses this protection).
+    # The two locals are computed before either task field is assigned, so a
+    # failure on either git call can't advance baseline_commit while
+    # baseline_untracked stays stale, or vice versa.
     try:
         repo = Path(state.project)
         head = verify.rev_parse_head(repo)
         untracked = sorted(verify.untracked_files(repo))
         task.baseline_commit = head
         task.baseline_untracked = untracked
-    except Exception:  # noqa: BLE001 - best-effort: a git timeout/OSError must not
-        # leave the pair half-updated any more than a GitError does. The two
-        # locals are computed before either field is assigned, so a failure on
-        # either call can't advance baseline_commit while baseline_untracked
-        # stays stale (same broad-except-for-best-effort contract as
-        # verify._prune_refs).
+    except Exception:  # noqa: BLE001  # nosec B110 - best-effort git read, must not fail re-arm
         pass
 
     if task.spec_file:
