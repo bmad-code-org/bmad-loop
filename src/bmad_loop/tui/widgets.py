@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from rich.table import Table
 from rich.text import Text
 from textual.selection import Selection
 from textual.widgets import RichLog, Static, Tree
@@ -167,22 +168,24 @@ _JOURNAL_STYLES = (
 _JOURNAL_HIDDEN_FIELDS = ("ts", "kind", "log_task", "log_pos")
 
 
-def journal_line(entry: dict[str, Any]) -> Text:
+def journal_line(entry: dict[str, Any]) -> Table:
     kind = str(entry.get("kind", "?"))
     style = next((s for sub, s in _JOURNAL_STYLES if sub in kind), "dim")
     ts = entry.get("ts")
     clock = ""
     if isinstance(ts, (int, float)):
         clock = time.strftime("%H:%M:%S", time.localtime(ts))
-    text = Text()
-    text.append(f"{clock:8s} ", style="dim")
-    text.append(f"{kind:24s}", style=style)
     fields = "  ".join(
         f"{k}={_short(v)}" for k, v in entry.items() if k not in _JOURNAL_HIDDEN_FIELDS
     )
-    if fields:
-        text.append(" " + fields)
-    return text
+    # A grid per row so the fields cell folds within its own column (hanging
+    # indent) instead of wrapping back under the clock/kind columns.
+    grid = Table.grid(padding=(0, 1, 0, 0))
+    grid.add_column(width=8)
+    grid.add_column(width=24, overflow="fold")
+    grid.add_column(overflow="fold")
+    grid.add_row(Text(clock, style="dim"), Text(kind, style=style), Text(fields))
+    return grid
 
 
 class JournalEntryOption(Option):

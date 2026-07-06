@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 from conftest import install_bmad_config, write_sprint
+from rich.console import Console
 from rich.text import Text
 from textual.geometry import Offset
 from textual.selection import Selection
@@ -39,7 +40,12 @@ from bmad_loop.tui.screens.modals import (
     StartSweepModal,
     TextOutputModal,
 )
-from bmad_loop.tui.widgets import RunHeader, SelectableRichLog, SprintTree
+from bmad_loop.tui.widgets import (
+    RunHeader,
+    SelectableRichLog,
+    SprintTree,
+    journal_line,
+)
 
 
 def make_run(
@@ -270,7 +276,14 @@ async def test_token_weight_falls_back_to_default(project):
 
 
 def journal_rows(journal: OptionList) -> list[str]:
-    return [str(journal.get_option_at_index(i).prompt) for i in range(journal.option_count)]
+    # Journal prompts are Rich Table grids, so render them to plain text.
+    console = Console(width=400)
+    rows = []
+    for i in range(journal.option_count):
+        with console.capture() as capture:
+            console.print(journal.get_option_at_index(i).prompt)
+        rows.append(capture.get())
+    return rows
 
 
 def log_text(screen: DashboardScreen) -> str:
@@ -294,6 +307,26 @@ async def test_journal_pane_updates_after_poll(project):
 
         await until(pilot, has_entry)
         assert any("1-2-search" in row for row in journal_rows(journal))
+
+
+def test_journal_line_wraps_fields_with_hanging_indent():
+    entry = {
+        "ts": 1_750_000_000,
+        "kind": "session-start",
+        "task_id": "6-1-sound-as-information-audio-layer-dev-1",
+        "role": "dev",
+        "prompt": "/bmad-dev-auto 6-1-sound-as-information-audio-layer",
+    }
+    console = Console(width=60)
+    with console.capture() as capture:
+        console.print(journal_line(entry))
+    lines = capture.get().splitlines()
+    assert len(lines) > 1  # fields are long enough to wrap at width 60
+    assert "session-start" in lines[0]
+    # continuation lines stay in the fields column (clock 8 + pad 1 + kind 24
+    # + pad 1 = 34), never spilling back under the clock/kind columns
+    for line in lines[1:]:
+        assert line.startswith(" " * 34) and line[34] != " "
 
 
 async def test_log_pane_shows_emulated_content(project):
