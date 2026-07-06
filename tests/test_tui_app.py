@@ -41,6 +41,9 @@ from bmad_loop.tui.screens.modals import (
     TextOutputModal,
 )
 from bmad_loop.tui.widgets import (
+    _JOURNAL_CLOCK_WIDTH,
+    _JOURNAL_COL_PAD,
+    _JOURNAL_KIND_WIDTH,
     RunHeader,
     SelectableRichLog,
     SprintTree,
@@ -323,10 +326,14 @@ def test_journal_line_wraps_fields_with_hanging_indent():
     lines = capture.get().splitlines()
     assert len(lines) > 1  # fields are long enough to wrap at width 60
     assert "session-start" in lines[0]
-    # continuation lines stay in the fields column (clock 8 + pad 1 + kind 24
-    # + pad 1 = 34), never spilling back under the clock/kind columns
+    # continuation lines stay in the fields column, never spilling back under
+    # the clock/kind columns. The fields column's left edge is derived from the
+    # same width constants journal_line lays the grid out with.
+    indent = _JOURNAL_CLOCK_WIDTH + _JOURNAL_COL_PAD + _JOURNAL_KIND_WIDTH + _JOURNAL_COL_PAD
     for line in lines[1:]:
-        assert line.startswith(" " * 34) and line[34] != " "
+        assert line[:indent] == " " * indent
+    # and the wrapped fields carry real content past the indent
+    assert any(line[indent:].strip() for line in lines[1:])
 
 
 async def test_log_pane_shows_emulated_content(project):

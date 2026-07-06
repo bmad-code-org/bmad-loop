@@ -167,6 +167,14 @@ _JOURNAL_STYLES = (
 # the journal -> log jump, not the human
 _JOURNAL_HIDDEN_FIELDS = ("ts", "kind", "log_task", "log_pos")
 
+# Row-grid geometry. The fields column's left edge sits at
+# _JOURNAL_CLOCK_WIDTH + _JOURNAL_COL_PAD + _JOURNAL_KIND_WIDTH + _JOURNAL_COL_PAD;
+# the hanging-indent test derives its indent from the same constants so the two
+# can't silently drift apart.
+_JOURNAL_CLOCK_WIDTH = 8
+_JOURNAL_KIND_WIDTH = 24
+_JOURNAL_COL_PAD = 1  # per-column right pad in the row grid
+
 
 def journal_line(entry: dict[str, Any]) -> Table:
     kind = str(entry.get("kind", "?"))
@@ -179,10 +187,11 @@ def journal_line(entry: dict[str, Any]) -> Table:
         f"{k}={_short(v)}" for k, v in entry.items() if k not in _JOURNAL_HIDDEN_FIELDS
     )
     # A grid per row so the fields cell folds within its own column (hanging
-    # indent) instead of wrapping back under the clock/kind columns.
-    grid = Table.grid(padding=(0, 1, 0, 0))
-    grid.add_column(width=8)
-    grid.add_column(width=24, overflow="fold")
+    # indent) instead of wrapping back under the clock/kind columns. A long kind
+    # likewise folds within its own column rather than spilling into the fields.
+    grid = Table.grid(padding=(0, _JOURNAL_COL_PAD, 0, 0))
+    grid.add_column(width=_JOURNAL_CLOCK_WIDTH)
+    grid.add_column(width=_JOURNAL_KIND_WIDTH, overflow="fold")
     grid.add_column(overflow="fold")
     grid.add_row(Text(clock, style="dim"), Text(kind, style=style), Text(fields))
     return grid
