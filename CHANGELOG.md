@@ -5,6 +5,19 @@ All notable changes to `bmad-loop` are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). While the project is pre-1.0,
 breaking changes may land in a minor release.
 
+## [Unreleased]
+
+### Fixed
+
+- **`bmad-loop-setup` no longer deletes live core BMAD config or the installer manifest.** In a
+  multi-module BMAD v6 project the setup scripts hardcoded `core` (and `--also-remove _config`) into
+  their delete lists, destroying `_bmad/core/config.yaml`, per-module config, and the whole
+  `_bmad/_config/` manifest — breaking future `npx bmad-method install` upgrades. Cleanup now removes
+  a directory only when it is a verified-redundant skill payload (has a `SKILL.md`, carries no
+  config/manifest, and its skills are installed); live config dirs are protected and reported under
+  `directories_protected`. The merge scripts read legacy config as fallback but never delete it. Same
+  root cause as upstream `bmad-code-org/bmad-builder#96`. (closes #64)
+
 ## [0.8.1] — 2026-07-05
 
 ### Fixed
