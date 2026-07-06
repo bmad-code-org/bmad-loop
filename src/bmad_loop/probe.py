@@ -51,12 +51,16 @@ TRANSCRIPT_GLOBS = {
     "copilot-events": "~/.copilot/session-state/*/events.jsonl",
 }
 # Fallback family glob keyed by the `cli` name, so a CLI whose usage_parser is
-# still "none" (e.g. copilot, freshly added) still gets transcript discovery.
+# still "none" (e.g. antigravity, freshly added) still gets transcript discovery.
 FAMILY_GLOBS = {
     "claude": "~/.claude/projects/*/*.jsonl",
     "codex": "~/.codex/sessions/*/*/*/rollout-*.jsonl",
     "gemini": "~/.gemini/tmp/*/chats/session-*.jsonl",
     "copilot": "~/.copilot/session-state/*/events.jsonl",
+    # agy (Antigravity CLI) writes a per-conversation transcript.jsonl; this path
+    # is community-doc-sourced (agy 1.0.x) — confirm against your build with
+    # `probe-adapter antigravity --probe` before trusting auto-discovery.
+    "antigravity": "~/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl",
 }
 
 _TOKEN_KEY_RE = re.compile(
