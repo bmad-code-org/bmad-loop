@@ -168,6 +168,33 @@ def test_strip_legacy_hooks_prunes_within_matcher():
     assert [h["command"] for h in handlers] == ["python3 .bmad-loop/bmad_loop_hook.py Stop"]
 
 
+def test_strip_legacy_hooks_tolerates_non_string_command():
+    # a pre-existing handler whose "command" is a non-string (e.g. null) must not
+    # crash the legacy strip — it just isn't a bmad_auto hook, so it's kept.
+    # Guarded at both walks: the flat (copilot) entry and the nested handler.
+    flat = {"hooks": {"agentStop": [{"type": "command", "command": None}]}}
+    config, removed = strip_legacy_hooks(flat)
+    assert removed == 0
+    assert config["hooks"]["agentStop"] == [{"type": "command", "command": None}]
+
+    nested = {
+        "hooks": {
+            "Stop": [
+                {
+                    "hooks": [
+                        {"type": "command", "command": None},
+                        {"type": "command", "command": LEGACY_CMD},
+                    ]
+                }
+            ]
+        }
+    }
+    config, removed = strip_legacy_hooks(nested)
+    assert removed == 1  # only the legacy handler is pruned; the null one survives
+    handlers = config["hooks"]["Stop"][0]["hooks"]
+    assert handlers == [{"type": "command", "command": None}]
+
+
 def test_strip_legacy_hooks_noop_without_hooks():
     assert strip_legacy_hooks({}) == ({}, 0)
     assert strip_legacy_hooks({"hooks": {}})[1] == 0

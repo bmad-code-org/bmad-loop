@@ -175,8 +175,10 @@ def strip_legacy_hooks(config: dict) -> tuple[dict, int]:
             if not isinstance(entry, dict):
                 kept.append(entry)
                 continue
-            # copilot: the handler dict is the entry itself
-            if LEGACY_HOOK_MARKER in entry.get("command", ""):
+            # copilot: the handler dict is the entry itself. Guard the command
+            # against a non-string (present-but-null) value so a malformed
+            # hand-edited config can't crash the strip with a TypeError.
+            if isinstance(cmd := entry.get("command"), str) and LEGACY_HOOK_MARKER in cmd:
                 removed += 1
                 continue
             # claude/codex/gemini: handlers nest under "hooks"
@@ -185,7 +187,11 @@ def strip_legacy_hooks(config: dict) -> tuple[dict, int]:
                 pruned = [
                     h
                     for h in nested
-                    if not (isinstance(h, dict) and LEGACY_HOOK_MARKER in h.get("command", ""))
+                    if not (
+                        isinstance(h, dict)
+                        and isinstance(cmd := h.get("command"), str)
+                        and LEGACY_HOOK_MARKER in cmd
+                    )
                 ]
                 if len(pruned) != len(nested):
                     removed += len(nested) - len(pruned)
