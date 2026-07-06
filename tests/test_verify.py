@@ -780,6 +780,38 @@ def test_verify_dev_exclude_relpaths_is_file_granular(project):
     assert "_bmad-output/implementation-artifacts/deferred-work.md" not in rels
 
 
+def test_verify_dev_exclude_relpaths_normalizes_dotdot_segments(project):
+    """A spec_path with a lexical '..' hop (as an un-normalized session-reported
+    spec_file could produce) must resolve to the same exclude entry as the plain
+    path — otherwise the raw string wouldn't match git's own normalized path
+    output, silently defeating the exclude for that spec."""
+    sp = spec_path(project, "1-1-a")
+    messy = (
+        project.output_folder / "planning-artifacts" / ".." / "implementation-artifacts" / sp.name
+    )
+    assert messy != sp  # genuinely a different (messier) Path object
+    assert verify.verify_dev_exclude_relpaths(project, sp) == verify.verify_dev_exclude_relpaths(
+        project, messy
+    )
+
+
+def test_verify_dev_own_spec_status_flip_via_dotdot_path_is_not_real_work(project):
+    """End-to-end regression: a dev result.json claiming its own spec through a
+    '..'-laden path (but pointing at the same on-disk file) must not let a bare
+    status flip slip past the proof-of-work gate."""
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+    messy = (
+        project.output_folder / "planning-artifacts" / ".." / "implementation-artifacts" / sp.name
+    )
+    assert messy.is_file()  # same on-disk file as sp, reached via a messier path
+
+    out = verify.verify_dev(task, project, dev_result(messy))
+    assert not out.ok and "no changes" in out.reason
+
+
 def test_has_changes_since_ledger_content_counts_with_narrow_exclude(project):
     """Reproduces KNOWN-BUG-ledger-only-story-false-no-changes.md: a story whose
     entire authorized diff is sibling ledger content must not read as 'no

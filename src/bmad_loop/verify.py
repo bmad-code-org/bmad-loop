@@ -955,11 +955,19 @@ def verify_dev_exclude_relpaths(paths: ProjectPaths, spec_path: Path) -> tuple[s
     dirs — the deferred-work ledger, other stories' specs — is deliberately left
     un-excluded, so a story whose entire authorized scope is ledger/spec
     reconciliation registers as real work instead of a permanent false "no changes
-    since baseline"."""
+    since baseline".
+
+    `spec_path` comes from a session-reported (untrusted) `spec_file` string, so
+    it is `.resolve()`d before deriving the relpath, same as `spec_within_roots`:
+    an un-normalized `..`/`.` segment would still resolve to the real on-disk
+    file (the OS resolves it), but as a raw string it wouldn't match git's own
+    normalized path output, silently defeating this exclude and letting a bare
+    status flip on the session's own spec count as real work."""
     out: list[str] = []
+    project = paths.project.resolve()
     for path in (paths.sprint_status, spec_path):
         try:
-            rel = path.relative_to(paths.project).as_posix()
+            rel = path.resolve().relative_to(project).as_posix()
         except ValueError:
             continue  # outside the project tree; nothing to exclude here
         if rel and rel != ".":
