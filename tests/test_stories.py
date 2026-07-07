@@ -1,5 +1,6 @@
 """Tests for the stories.yaml contract layer (parse/validate + linear schedule)."""
 
+import re
 from pathlib import Path
 
 import pytest
@@ -46,7 +47,7 @@ def test_load_dogfooded_fixture():
 
 
 def test_load_missing_file_raises_pinned_message(tmp_path):
-    with pytest.raises(stories.StoriesError, match="no stories.yaml found"):
+    with pytest.raises(stories.StoriesError, match=re.escape("no stories.yaml found")):
         stories.load_stories(tmp_path)
 
 
@@ -240,7 +241,7 @@ def test_find_entry():
 
 def test_find_entry_unknown_raises_pinned_message():
     s = stories.load_stories(FIXTURES)
-    with pytest.raises(stories.StoriesError, match="story id not found in stories.yaml"):
+    with pytest.raises(stories.StoriesError, match=re.escape("story id not found in stories.yaml")):
         stories.find_entry(s, "99")
 
 
@@ -336,7 +337,7 @@ def test_schedule_selector_done_is_complete():
 
 def test_schedule_selector_unknown_raises():
     s = _stories("1")
-    with pytest.raises(stories.StoriesError, match="story id not found in stories.yaml"):
+    with pytest.raises(stories.StoriesError, match=re.escape("story id not found in stories.yaml")):
         stories.schedule(s, {}, selector="99")
 
 
@@ -377,3 +378,12 @@ def test_resolve_prefix_isolation(tmp_path):
     # id "3" must not resolve a file for id "31" — `3-*.md` doesn't match `31-*.md`.
     write_story_spec(tmp_path, "31-other.md", status="done")
     assert stories.resolve_story_spec(tmp_path, "3").kind == stories.KIND_PENDING
+
+
+@pytest.mark.parametrize("bad_id", ["1*", "1?", "1[a", "a/b", "..", ".", "3 1"])
+def test_resolve_charset_invalid_id_is_pending_not_glob(tmp_path, bad_id):
+    # A non-charset-valid id must never reach glob(): "1*" would otherwise glob
+    # `1*-*.md` and wrongly match the real `1-x.md`. The ID_RE guard makes every
+    # such id a clean PENDING ("no resolvable spec") instead of an injected match.
+    write_story_spec(tmp_path, "1-x.md", status="done")
+    assert stories.resolve_story_spec(tmp_path, bad_id).kind == stories.KIND_PENDING

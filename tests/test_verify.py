@@ -472,6 +472,54 @@ def test_verify_dev_stories_no_changes(project):
     assert not out.ok and "no changes" in out.reason
 
 
+def test_verify_dev_stories_whitespace_story_key(project):
+    # A story_key with stray whitespace must resolve identically to its trimmed id:
+    # the resolver normalizes via str().strip(), and the filename-prefix check must
+    # use the same normalized id (else a spurious "does not match id" retry).
+    spec_folder = project.planning_artifacts / "epic-a"
+    task = make_stories_task(project, " 1 ")
+    sp = write_story(spec_folder, "1", "x", "done", task.baseline_commit)
+    (project.project / "src.txt").write_text("changed\n")
+    out = verify.verify_dev_stories(
+        task, project, dev_result(sp), spec_folder=spec_folder, review_enabled=False
+    )
+    assert out.ok and task.spec_file == str(sp)
+
+
+def test_verify_dev_stories_plan_halt_expects_ready_for_dev(project):
+    # plan-halt leg: the spec is at ready-for-dev (the plan), not done, and there
+    # is NO code change — proof-of-work is skipped and the plan spec is recorded.
+    spec_folder = project.planning_artifacts / "epic-a"
+    task = make_stories_task(project, "1")
+    sp = write_story(spec_folder, "1", "x", "ready-for-dev", task.baseline_commit)
+    out = verify.verify_dev_stories(
+        task,
+        project,
+        {"workflow": "auto-dev", "plan_halt": True},
+        spec_folder=spec_folder,
+        review_enabled=False,
+        plan_halt=True,
+    )
+    assert out.ok  # no code change required for a plan
+    assert task.spec_file == str(sp)
+
+
+def test_verify_dev_stories_plan_halt_rejects_non_plan_status(project):
+    # a plan-halt leg that did not reach ready-for-dev (still draft) is a retry
+    spec_folder = project.planning_artifacts / "epic-a"
+    task = make_stories_task(project, "1")
+    write_story(spec_folder, "1", "x", "draft", task.baseline_commit)
+    out = verify.verify_dev_stories(
+        task,
+        project,
+        {"workflow": "auto-dev", "plan_halt": True},
+        spec_folder=spec_folder,
+        review_enabled=False,
+        plan_halt=True,
+    )
+    assert not out.ok and "expected 'ready-for-dev'" in out.reason
+
+
 def test_verify_review_bundle_ledger_gate(project):
     task = make_bundle_task(project)
     sp = project.implementation_artifacts / "spec-dw-test-bundle.md"

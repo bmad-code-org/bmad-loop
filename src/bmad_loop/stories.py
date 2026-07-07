@@ -278,6 +278,14 @@ def resolve_story_spec(spec_folder: Path | str, story_id: str) -> StoryState:
     silently pick one).
     """
     sid = str(story_id).strip()
+    if not ID_RE.match(sid):
+        # An id that isn't charset-valid can't name a conforming `<id>-*.md` file
+        # and must never reach glob() — a stray metacharacter (`*`, `?`, `[`) or a
+        # path separator would mis-match (or an escape). Every live caller already
+        # passes a manifest id validated by load_stories; this guards a future
+        # caller that doesn't. A clean "no resolvable spec" (PENDING) is what every
+        # caller already handles, matching the module's fail-loud-not-slip rule.
+        return StoryState(kind=KIND_PENDING)
     stories_dir = Path(spec_folder) / STORIES_SUBDIR
     matches = sorted(stories_dir.glob(f"{sid}-*.md")) if stories_dir.is_dir() else []
     if not matches:

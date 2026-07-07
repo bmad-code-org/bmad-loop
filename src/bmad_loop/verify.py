@@ -1132,6 +1132,13 @@ def verify_dev_bundle(
     return VerifyOutcome.passed()
 
 
+# A spec_checkpoint story's plan-halt leg leaves the spec at this status (the
+# skill HALTs after the Ready-for-Development gate); mirrors
+# devcontract.PLAN_HALT_STATUS, kept literal here to avoid a verify<-devcontract
+# import cycle (devcontract imports verify).
+PLAN_HALT_STATUS = "ready-for-dev"
+
+
 def verify_dev_stories(
     task: StoryTask,
     paths: ProjectPaths,
@@ -1139,6 +1146,7 @@ def verify_dev_stories(
     *,
     spec_folder: Path,
     review_enabled: bool = True,
+    plan_halt: bool = False,
 ) -> VerifyOutcome:
     """verify_dev for stories mode: the story spec lives at the id-keyed path
     ``<spec-folder>/stories/<id>-<slug>.md`` and there is no sprint-status entry.
@@ -1150,11 +1158,21 @@ def verify_dev_stories(
     and the sprint-status gate is dropped (stories mode has no sprint board).
     A resolution that is pending / ambiguous / a sentinel is a retryable failure,
     and the resolved filename's id prefix is asserted to equal the task id.
+
+    ``plan_halt`` verifies a spec_checkpoint story's plan-halt leg instead of an
+    implementation: the expected status is ``ready-for-dev`` (the plan is done,
+    not the code) and the proof-of-work gate is skipped — a plan writes only its
+    own spec, so requiring code changes would spuriously fail every plan leg. The
+    spec-resolution, id-prefix, workflow, and baseline gates still run, and
+    ``task.spec_file`` is still recorded.
     """
+    # Deferred to avoid a verify<->stories import cycle: stories imports
+    # read_frontmatter/status_of from this module at top level, so verify must not
+    # import stories at module scope (keep this local on any future refactor).
     from . import stories
 
     rj = result_json or {}
-    story_id = task.story_key
+    story_id = str(task.story_key).strip()
     state = stories.resolve_story_spec(spec_folder, story_id)
     if state.kind == stories.KIND_PENDING:
         return VerifyOutcome.retry(f"no story spec found for id {story_id!r} under {spec_folder}")
@@ -1182,8 +1200,12 @@ def verify_dev_stories(
         )
 
     # Generic path always self-finalizes to done (no in-review handoff); the
-    # review_enabled arm mirrors verify_dev for symmetry.
-    expected = "in-review" if review_enabled else "done"
+    # review_enabled arm mirrors verify_dev for symmetry. A plan-halt leg instead
+    # expects the ready-for-dev plan gate (the plan is done, not the code).
+    if plan_halt:
+        expected = PLAN_HALT_STATUS
+    else:
+        expected = "in-review" if review_enabled else "done"
     fm = read_frontmatter(spec_path)
     status = status_of(fm)
     if status != expected:
@@ -1197,7 +1219,9 @@ def verify_dev_stories(
                 f"orchestrator-recorded baseline {task.baseline_commit[:12]}"
             )
 
-    if task.baseline_commit:
+    # A plan-halt leg produced only its own spec (the plan), so proof-of-work
+    # would spuriously fail; skip it and record the plan spec.
+    if task.baseline_commit and not plan_halt:
         try:
             if not has_changes_since(
                 paths.project, task.baseline_commit, exclude=artifact_relpaths(paths)
