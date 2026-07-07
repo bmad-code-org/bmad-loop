@@ -323,6 +323,50 @@ def test_status_ambiguous_ref_errors(project, capsys):
     assert "ambiguous run ref 'aa' matches 2 runs" in capsys.readouterr().err
 
 
+def _make_stories_run(project, run_id="20260101-000000-st01"):
+    """A stories-mode run dir + state.json pinned to source=stories."""
+    run_dir = project.project / ".bmad-loop" / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "state.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "project": str(project.project),
+                "started_at": "now",
+                "source": "stories",
+                "spec_folder": STORIES_SPEC_FOLDER,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return run_dir
+
+
+def test_status_stories_mode_prints_board(project, capsys):
+    from bmad_loop.stories import STORIES_SUBDIR
+
+    _setup_stories_fixture(
+        project, [_stories_entry("1", spec_checkpoint=True), _stories_entry("2")]
+    )
+    (project.project / STORIES_SPEC_FOLDER / STORIES_SUBDIR / "1-slug.md").write_text(
+        "---\nstatus: done\n---\n", encoding="utf-8"
+    )
+    _make_stories_run(project)
+    assert cli.main(["status", "--project", str(project.project)]) == 0
+    out = capsys.readouterr().out
+    assert "stories: 1/2 done" in out
+    assert "spec-checkpoint" in out
+    # the sprint-mode backlog line must not appear for a stories run
+    assert "sprint backlog remaining" not in out
+
+
+def test_status_stories_mode_bad_manifest_is_soft(project, capsys):
+    # a stories run whose manifest is gone still prints the run header, not a crash
+    _make_stories_run(project)
+    assert cli.main(["status", "--project", str(project.project)]) == 0
+    assert "no stories.yaml found" in capsys.readouterr().out
+
+
 def test_list_shows_short_refs(project, capsys):
     _make_run_with_decision(project, run_id="20260101-000000-aaaa")
     _make_run_with_decision(project, run_id="20260102-000000-bbbb")

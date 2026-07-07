@@ -439,52 +439,66 @@ def _dry_run(
     return 0
 
 
+def _checkpoint_badge(row: stories_mod.StoryRow) -> str:
+    """`` [spec-checkpoint, done-checkpoint]`` for a story's HITL flags, or ``""``
+    when it sets neither. Shared spelling for the dry-run schedule + status."""
+    marks = []
+    if row.spec_checkpoint:
+        marks.append("spec-checkpoint")
+    if row.done_checkpoint:
+        marks.append("done-checkpoint")
+    return f" [{', '.join(marks)}]" if marks else ""
+
+
 def _dry_run_stories(
     paths: bmadconfig.ProjectPaths, pol, args: argparse.Namespace, spec_folder: str
 ) -> int:
     """Print the linear stories-mode schedule (list order, checkpoints, live
     on-disk state) — no topo waves, one story per line, spawns nothing."""
-    folder = Path(spec_folder)
-    if not folder.is_absolute():
-        folder = paths.project / folder
+    folder = stories_mod.resolve_spec_folder(paths.project, spec_folder)
     try:
-        story_set = stories_mod.load_stories(folder)
+        rows = stories_mod.story_rows(folder, selector=args.story, max_stories=args.max_stories)
     except stories_mod.StoriesError as e:
         print(f"stories mode: {e} (spec folder: {folder})", file=sys.stderr)
         return 1
+    if args.story and not rows:
+        print(f"stories mode: story id {args.story!r} not found in stories.yaml", file=sys.stderr)
+        return 1
     spec_ok = "" if (folder / "SPEC.md").is_file() else "  [!] SPEC.md missing"
-    entries = story_set.entries
-    if args.story:
-        entries = tuple(e for e in entries if e.id == args.story)
-        if not entries:
-            print(
-                f"stories mode: story id {args.story!r} not found in stories.yaml", file=sys.stderr
-            )
-            return 1
-    if args.max_stories is not None:
-        entries = entries[: args.max_stories]
     print(
-        f"stories mode: {len(entries)} stories from {folder}/stories.yaml "
+        f"stories mode: {len(rows)} stories from {folder}/stories.yaml "
         f"(gates={pol.gates.mode}){spec_ok}"
     )
     print("linear schedule (list order — no depends_on, strictly serial):")
-    for i, entry in enumerate(entries, 1):
-        state = stories_mod.resolve_story_spec(folder, entry.id)
-        marks = []
-        if entry.spec_checkpoint:
-            marks.append("spec-checkpoint")
-        if entry.done_checkpoint:
-            marks.append("done-checkpoint")
-        badge = f" [{', '.join(marks)}]" if marks else ""
-        disk = state.status if state.kind == stories_mod.KIND_PRESENT else state.kind
-        print(f"\n  {i}. {entry.id}  ({disk}){badge}  {entry.title}")
-        dispatch = f"/bmad-dev-auto Spec folder: {spec_folder}. Story id: {entry.id}."
+    for row in rows:
+        print(f"\n  {row.position}. {row.id}  ({row.label}){_checkpoint_badge(row)}  {row.title}")
+        dispatch = f"/bmad-dev-auto Spec folder: {spec_folder}. Story id: {row.id}."
         print(f"    dev:    {_render_invocation(pol, paths.project, 'dev', dispatch)}")
         print(
-            f"    env:    BMAD_LOOP_MODE=1 BMAD_LOOP_STORY_KEY={entry.id} "
+            f"    env:    BMAD_LOOP_MODE=1 BMAD_LOOP_STORY_KEY={row.id} "
             f"BMAD_LOOP_SPEC_FOLDER={spec_folder}"
         )
     return 0
+
+
+def _print_stories_status(state: RunState, project: Path) -> None:
+    """The stories-mode board for `status`: id, live on-disk state, checkpoint
+    markers and title, read from the run's pinned spec folder. Mode-aware
+    counterpart of the sprint-backlog line — the run stamped ``source`` and
+    ``spec_folder`` at start, so no flag is needed to re-derive the mode."""
+    folder = stories_mod.resolve_spec_folder(project, state.spec_folder)
+    try:
+        rows = stories_mod.story_rows(folder)
+    except stories_mod.StoriesError as e:
+        print(f"stories: {e} (spec folder: {folder})")
+        return
+    done = sum(1 for r in rows if r.label == stories_mod.DONE)
+    print(f"stories: {done}/{len(rows)} done  ({folder}/stories.yaml)")
+    for row in rows:
+        print(
+            f"  {row.position:2d}. {row.id:12s} {row.label:16s}"
+            f"{_checkpoint_badge(row)}  {row.title}"
+        )
 
 
 def _start_sweep(
@@ -891,13 +905,16 @@ def cmd_status(args: argparse.Namespace) -> int:
             f"  {key:40s} {task.phase:16s} dev×{task.attempt} review×{task.review_cycle} "
             f"{tokens} {extra}"
         )
-    try:
-        paths = bmadconfig.load_paths(project)
-        ss = sprintstatus.load(paths.sprint_status)
-        remaining = [s.key for s in ss.stories if s.status in sprintstatus.ACTIONABLE_STATUSES]
-        print(f"sprint backlog remaining: {len(remaining)}")
-    except (bmadconfig.BmadConfigError, sprintstatus.SprintStatusError):
-        pass
+    if state.source == "stories":
+        _print_stories_status(state, project)
+    else:
+        try:
+            paths = bmadconfig.load_paths(project)
+            ss = sprintstatus.load(paths.sprint_status)
+            remaining = [s.key for s in ss.stories if s.status in sprintstatus.ACTIONABLE_STATUSES]
+            print(f"sprint backlog remaining: {len(remaining)}")
+        except (bmadconfig.BmadConfigError, sprintstatus.SprintStatusError):
+            pass
     try:
         missed = decisions.pending_missed_decisions(project)
         if missed:

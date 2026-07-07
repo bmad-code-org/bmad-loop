@@ -390,3 +390,83 @@ def _classify(state: StoryState) -> str:
         return "wedged"
     # AMBIGUOUS or SENTINEL — not actionable without dispatcher/human recovery.
     return "wedged"
+
+
+# ------------------------------------------------------------ table projection
+#
+# A read-only, disk-derived view of a stories manifest shared by the CLI (`status`
+# / `run --dry-run`) and the TUI stories table, so every surface agrees on the
+# same human-facing state string. Pure: no engine or RunState coupling.
+
+
+def resolve_spec_folder(project: Path, spec_folder: str) -> Path:
+    """The absolute spec folder for ``spec_folder`` (project-relative or already
+    absolute) under ``project`` — the one place the folder anchoring lives so
+    the CLI, dry-run, preflight and TUI resolve it identically."""
+    folder = Path(spec_folder)
+    return folder if folder.is_absolute() else project / folder
+
+
+def state_label(state: StoryState) -> str:
+    """The single human-facing state string for a resolved story, matching the
+    dispatch-protocol read model: PRESENT shows its frontmatter status
+    (``draft`` / ``ready-for-dev`` / ``in-progress`` / ``in-review`` / ``done`` /
+    ``blocked``); PENDING / AMBIGUOUS show the kind; a SENTINEL shows
+    ``sentinel:<unresolved|ambiguous>`` so the recoverable-by-deletion anomaly
+    reads distinctly from a real ``ambiguous`` (two rival specs)."""
+    if state.kind == KIND_PRESENT:
+        return state.status or KIND_PRESENT
+    if state.kind == KIND_SENTINEL:
+        return f"sentinel:{state.sentinel_kind}" if state.sentinel_kind else KIND_SENTINEL
+    return state.kind  # pending / ambiguous
+
+
+@dataclass(frozen=True)
+class StoryRow:
+    """One row of a stories-mode status table: the manifest fields (id / title /
+    checkpoint flags) joined with the live on-disk state of the id-keyed story
+    spec. ``position`` is 1-based list order."""
+
+    position: int
+    id: str
+    title: str
+    spec_checkpoint: bool
+    done_checkpoint: bool
+    state: StoryState
+    label: str
+
+
+def story_rows(
+    spec_folder: Path | str,
+    *,
+    selector: str | None = None,
+    max_stories: int | None = None,
+) -> list[StoryRow]:
+    """Load ``stories.yaml`` and project every entry to a :class:`StoryRow`,
+    resolving each story's on-disk state. ``selector`` restricts to one id
+    (empty result when unknown — the caller decides how to report that);
+    ``max_stories`` truncates like the run limit. Raises :class:`StoriesError`
+    when the manifest is missing or invalid, so a caller rendering a table can
+    surface the same message the run would HALT on."""
+    folder = Path(spec_folder)
+    story_set = load_stories(folder)
+    entries = story_set.entries
+    if selector is not None:
+        entries = tuple(e for e in entries if e.id == selector)
+    if max_stories is not None:
+        entries = entries[:max_stories]
+    rows: list[StoryRow] = []
+    for position, entry in enumerate(entries, 1):
+        state = resolve_story_spec(folder, entry.id)
+        rows.append(
+            StoryRow(
+                position=position,
+                id=entry.id,
+                title=entry.title,
+                spec_checkpoint=entry.spec_checkpoint,
+                done_checkpoint=entry.done_checkpoint,
+                state=state,
+                label=state_label(state),
+            )
+        )
+    return rows

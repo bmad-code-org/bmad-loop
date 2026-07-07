@@ -748,3 +748,67 @@ def test_both_checkpoints_pause_twice(project):
     resumed2, _ = resume_engine(project, resumed, [stories_dev_effect()])
     assert not resumed2.run().paused
     assert load_state(resumed2.run_dir).tasks["2"].phase == Phase.DONE
+
+
+# ------------------------------------ blocked → resolve → re-dispatch (E2E)
+
+
+def test_blocked_resolve_rearm_then_redispatch_to_done(project):
+    """Scenario 4: a blocked story stops the run; re-arm (as `resolve
+    --no-interactive` does) flips it back to ready-for-dev + strips the stale
+    Auto Run Result, and the resumed run re-dispatches it through to done — the
+    end-to-end path the pause-only tests above leave un-stitched."""
+    from bmad_loop import runs
+
+    folder = setup_stories(project, [entry("1"), entry("2")])
+    write_spec(folder / "stories" / "1-slug.md", "blocked", rev_parse_head(project.project))
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "story 1 blocked")
+
+    engine, adapter = make_engine(project, [])
+    assert engine.run().paused
+    persisted = load_state(engine.run_dir)
+    assert persisted.paused_stage == PAUSE_ESCALATION and persisted.paused_story_key == "1"
+    assert not any(s.role == "dev" for s in adapter.sessions)  # story 2 not leapfrogged
+
+    # human fixed the frozen spec → re-arm (must run while still escalation-paused)
+    runs.rearm_escalation(engine.run_dir, "1")
+    assert status_of(read_frontmatter(story_spec(project, "1"))) == "ready-for-dev"
+
+    # resume re-drives the re-armed story, then continues the schedule to story 2
+    resumed, radapter = resume_engine(project, engine, [stories_dev_effect(), stories_dev_effect()])
+    rsummary = resumed.run()
+    assert rsummary.done == 2 and not rsummary.paused
+    assert status_of(read_frontmatter(story_spec(project, "1"))) == "done"
+    assert status_of(read_frontmatter(story_spec(project, "2"))) == "done"
+    dev_prompts = [s.prompt for s in radapter.sessions if s.role == "dev"]
+    assert dev_prompts == [
+        "/bmad-dev-auto Spec folder: _bmad-output/epic-1. Story id: 1.",
+        "/bmad-dev-auto Spec folder: _bmad-output/epic-1. Story id: 2.",
+    ]
+
+
+# ----------------------------------------------- worktree isolation (E2E)
+
+
+def test_worktree_isolation_two_stories(project):
+    """Scenario 5: StoriesEngine inherits worktree isolation unchanged — each
+    story runs in its own worktree (spec.cwd) and merges back to the target
+    branch, leaving the main checkout clean with both story specs done."""
+    from bmad_loop.verify import worktree_clean
+
+    setup_stories(project, [entry("1"), entry("2")])
+    engine, adapter = make_engine(
+        project,
+        [stories_dev_effect(), stories_dev_effect()],
+        policy=_stories_policy(scm=ScmPolicy(isolation="worktree")),
+    )
+    summary = engine.run()
+
+    assert summary.done == 2 and not summary.paused
+    assert worktree_clean(project.project)  # unit worktrees merged back + torn down
+    # sessions ran inside a worktree checkout, not the project root
+    dev = [s for s in adapter.sessions if s.role == "dev"]
+    assert dev and all(Path(s.cwd) != project.project for s in dev)
+    assert status_of(read_frontmatter(story_spec(project, "1"))) == "done"
+    assert status_of(read_frontmatter(story_spec(project, "2"))) == "done"

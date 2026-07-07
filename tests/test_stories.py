@@ -423,3 +423,66 @@ def test_resolve_charset_invalid_id_is_pending_not_glob(tmp_path, bad_id):
     # such id a clean PENDING ("no resolvable spec") instead of an injected match.
     write_story_spec(tmp_path, "1-x.md", status="done")
     assert stories.resolve_story_spec(tmp_path, bad_id).kind == stories.KIND_PENDING
+
+
+# --------------------------------------------------- state_label / table projection
+
+
+def test_state_label_present_shows_status(tmp_path):
+    write_story_spec(tmp_path, "1-slug.md", status="ready-for-dev")
+    assert stories.state_label(stories.resolve_story_spec(tmp_path, "1")) == "ready-for-dev"
+
+
+def test_state_label_pending_and_ambiguous(tmp_path):
+    assert stories.state_label(stories.resolve_story_spec(tmp_path, "1")) == "pending"
+    write_story_spec(tmp_path, "1-a.md", status="done")
+    write_story_spec(tmp_path, "1-b.md", status="done")
+    assert stories.state_label(stories.resolve_story_spec(tmp_path, "1")) == "ambiguous"
+
+
+def test_state_label_sentinel_carries_kind(tmp_path):
+    write_story_spec(tmp_path, "1-unresolved.md", status="blocked")
+    assert stories.state_label(stories.resolve_story_spec(tmp_path, "1")) == "sentinel:unresolved"
+
+
+def test_resolve_spec_folder_relative_and_absolute(tmp_path):
+    assert stories.resolve_spec_folder(tmp_path, "epic-1") == tmp_path / "epic-1"
+    abs_folder = tmp_path / "somewhere"
+    assert stories.resolve_spec_folder(tmp_path, str(abs_folder)) == abs_folder
+
+
+def test_story_rows_projects_manifest_and_disk_state(tmp_path):
+    write_stories(
+        tmp_path,
+        '- id: "1"\n  title: First\n  description: d\n  spec_checkpoint: true\n'
+        '- id: "2"\n  title: Second\n  description: d\n  done_checkpoint: true\n'
+        '- id: "3"\n  title: Third\n  description: d\n',
+    )
+    write_story_spec(tmp_path, "1-slug.md", status="done")
+    write_story_spec(tmp_path, "2-slug.md", status="in-progress")
+    rows = stories.story_rows(tmp_path)
+    assert [(r.position, r.id, r.label) for r in rows] == [
+        (1, "1", "done"),
+        (2, "2", "in-progress"),
+        (3, "3", "pending"),
+    ]
+    assert rows[0].spec_checkpoint and not rows[0].done_checkpoint
+    assert rows[1].done_checkpoint and not rows[1].spec_checkpoint
+    assert rows[0].title == "First"
+
+
+def test_story_rows_selector_and_limit(tmp_path):
+    write_stories(
+        tmp_path,
+        '- id: "1"\n  title: t\n  description: d\n'
+        '- id: "2"\n  title: t\n  description: d\n'
+        '- id: "3"\n  title: t\n  description: d\n',
+    )
+    assert [r.id for r in stories.story_rows(tmp_path, selector="2")] == ["2"]
+    assert [r.id for r in stories.story_rows(tmp_path, selector="nope")] == []
+    assert [r.id for r in stories.story_rows(tmp_path, max_stories=2)] == ["1", "2"]
+
+
+def test_story_rows_missing_manifest_raises(tmp_path):
+    with pytest.raises(stories.StoriesError, match="no stories.yaml found"):
+        stories.story_rows(tmp_path)

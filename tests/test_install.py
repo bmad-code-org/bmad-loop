@@ -579,6 +579,31 @@ def test_missing_stories_support_probes_step01_content(tmp_path):
     assert missing_stories_support(tmp_path, [tree]) == []
 
 
+def test_new_dev_auto_skill_is_additive_for_sprint_mode(tmp_path):
+    """Scenario 6 additivity: installing the *new* bmad-dev-auto (folder+id
+    dispatch present) satisfies both preflights — sprint mode's file-existence
+    check (`missing_base_skills`, which never inspects the dispatch content) and
+    stories mode's content probe (`missing_stories_support`). The new skill
+    breaks neither pipeline."""
+    from bmad_loop.install import (
+        STORIES_PROBE_FILE,
+        STORIES_PROBE_SKILL,
+        missing_stories_support,
+    )
+
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    _install_base_skills(tmp_path, tree)
+    # upgrade bmad-dev-auto in place to the folder+id dispatch version
+    step01 = tmp_path / tree / STORIES_PROBE_SKILL / STORIES_PROBE_FILE
+    step01.write_text("route a **folder+id dispatch** invocation\n", encoding="utf-8")
+
+    # sprint mode (file existence) is unaffected by the new dispatch content …
+    assert missing_base_skills(tmp_path, [tree]) == []
+    # … and stories mode now also passes its stricter content probe
+    assert missing_stories_support(tmp_path, [tree]) == []
+
+
 def test_provision_worktree_seeds_gitignored_config(tmp_path):
     """A gitignored config present in the main repo is copied into the worktree
     (a `git worktree add` checkout would omit it)."""
