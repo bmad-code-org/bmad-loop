@@ -34,7 +34,7 @@ from textual.widgets import (
 )
 from textual.widgets.option_list import Option, OptionDoesNotExist
 
-from ... import sprintstatus
+from ... import sprintstatus, stories
 from ...model import RunState
 from ...runs import RUNS_DIR
 from .. import data
@@ -44,6 +44,8 @@ from ..widgets import (
     RunHeader,
     SelectableRichLog,
     SprintTree,
+    StoriesTable,
+    pause_tag,
     status_cell,
 )
 from .modals import DeferredEntryModal
@@ -107,6 +109,8 @@ class _Snapshot:
     run_id: str = ""
     status: str = data.UNKNOWN
     state: RunState | None = None
+    stories_mode: bool = False  # selected run is stories mode (source == "stories")
+    stories: list[stories.StoryRow] | None = None  # stories board rows, when stories_mode
     new_entries: list[dict[str, Any]] = field(default_factory=list)
     log_task: str | None = None
     log_reset: bool = False
@@ -165,6 +169,9 @@ class DashboardScreen(Screen[None]):
                 tree = SprintTree("sprint", id="sprint-tree")
                 tree.border_title = "Sprint"
                 yield tree
+                stories = StoriesTable(id="stories-table")
+                stories.border_title = "Stories"
+                yield stories
                 deferred = OptionList(id="deferred")
                 deferred.border_title = "Deferred Work"
                 yield deferred
@@ -187,6 +194,10 @@ class DashboardScreen(Screen[None]):
         runs.add_column("st", key="st", width=2)
         runs.add_column("run", key="run")
         runs.add_column("type", key="type")
+        runs.add_column("note", key="note", width=6)  # pause-kind badge for paused runs
+        # the stories board shares the sprint-tree slot; hidden until a stories-mode
+        # run is selected (the poll worker toggles both by the run's source).
+        self.query_one("#stories-table", StoriesTable).display = False
         tasks = self.query_one("#tasks", DataTable)
         tasks.add_column("story", key="story", width=30)
         tasks.add_column("phase", key="phase", width=16)
@@ -375,6 +386,11 @@ class DashboardScreen(Screen[None]):
                 snap.run_id = ctx.run_dir.name
                 snap.state = ctx.watcher.state()
                 snap.status = ctx.watcher.status()
+                if snap.state is not None and snap.state.source == "stories":
+                    # per-run board: re-derived each tick (only while a stories run
+                    # is selected) so it tracks the dev sessions writing story specs.
+                    snap.stories_mode = True
+                    snap.stories = data.stories_overview(self.project, snap.state.spec_folder)
                 snap.new_entries = ctx.journal.read_new()
                 ctx.entries.extend(snap.new_entries)
                 del ctx.entries[:-_MAX_ENTRIES]
@@ -439,6 +455,7 @@ class DashboardScreen(Screen[None]):
             if snap.run_id == self._pending_run:
                 self._pending_run = None  # the engine is up
             header.show_run(snap.run_id, snap.status, snap.state, snap.decision)
+        self._apply_board(snap)
         if snap.state is not None:
             self._apply_tasks(snap.state)
         if snap.toast_decision and snap.decision is not None:
@@ -510,6 +527,7 @@ class DashboardScreen(Screen[None]):
 
     def _apply_runs(self, runs: list[data.RunInfo]) -> None:
         table = self.query_one("#runs", DataTable)
+        self._apply_attention(table, runs)
         ids = [r.run_id for r in runs]
         if not runs:
             if self._run_rows:
@@ -527,11 +545,13 @@ class DashboardScreen(Screen[None]):
         for run in runs:
             if run.run_id in self._run_rows:
                 table.update_cell(run.run_id, "st", status_cell(run.status))
+                table.update_cell(run.run_id, "note", pause_tag(run.paused_stage))
             else:
                 table.add_row(
                     status_cell(run.status),
                     run.run_id,
                     run.run_type,
+                    pause_tag(run.paused_stage),
                     key=run.run_id,
                 )
                 self._run_rows.append(run.run_id)
@@ -574,6 +594,25 @@ class DashboardScreen(Screen[None]):
             else:
                 table.add_row(key, *cells.values(), key=key)
                 self._task_rows.add(key)
+
+    def _apply_attention(self, table: DataTable, runs: list[data.RunInfo]) -> None:
+        """Global attention indicator: how many runs are paused awaiting a human.
+        Shown on the runs-table border title, consistent with the per-run pause
+        badge and the ATTENTION-file notify machinery."""
+        waiting = sum(1 for r in runs if r.status == data.PAUSED)
+        table.border_title = f"Runs — ⚑ {waiting} need attention" if waiting else "Runs"
+
+    def _apply_board(self, snap: _Snapshot) -> None:
+        """Toggle the sprint tree vs the stories board by the selected run's mode
+        and refresh whichever is live. The stories board is per-run (keyed by the
+        run's spec folder); the sprint tree is project-level and painted
+        separately on rescan."""
+        sprint_tree = self.query_one("#sprint-tree", SprintTree)
+        stories_table = self.query_one("#stories-table", StoriesTable)
+        sprint_tree.display = not snap.stories_mode
+        stories_table.display = snap.stories_mode
+        if snap.stories_mode:
+            stories_table.update_stories(snap.stories)
 
     def _apply_sprint_tree(self, ss: sprintstatus.SprintStatus | None) -> None:
         if ss is self._last_sprint:

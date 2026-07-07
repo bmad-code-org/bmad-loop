@@ -11,6 +11,8 @@ See [README.md](../README.md) for the narrative overview and [setup-guide.md](se
 | Capability                           | What it does                                                                                                                                                                         | Problem it addresses                                                                      |
 | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------- |
 | Deterministic control loop           | Story selection, retries, gates, completion checks run in plain Python                                                                                                               | LLM-as-orchestrator is nondeterministic, hard to debug, and costs tokens for control flow |
+| Dual planning pipelines              | Same loop from either `sprint-status.yaml` (sprint mode, default) or a typed `stories.yaml` dispatched by folder+id (stories mode, opt-in)                                           | Sprint boards need `bmad-sprint-planning`; a `bmad-spec` Story Breakdown has no board     |
+| Per-story human checkpoints          | Stories-mode `spec_checkpoint` pauses to review the plan before code; `done_checkpoint` pauses after the commit; both independent, both surfaced in the TUI                          | Coarse run-global gates can't ask for a plan review on _this_ story only                  |
 | Trust-nothing verification           | Checks on-disk artifacts (spec status, baseline-commit match, non-empty diff, sprint sync) + runs your test/lint commands before commit                                              | Agents claim success without working code; broken builds slip through                     |
 | Fresh-context adversarial review     | Dev and review are separate sessions; review uses 2 parallel layers (Blind Hunter / Edge Case Hunter)                                                                                | Self-review anchoring bias; implementer marks own work correct                            |
 | Hook-based transport                 | Coding-agent hooks write structured event files; skills write `result.json`                                                                                                          | Brittle terminal pane-scraping                                                            |
@@ -105,9 +107,19 @@ See [README.md](../README.md) for the narrative overview and [setup-guide.md](se
 - Repeat mode (`--repeat` / `[sweep] repeat`): re-triages after each cycle to absorb newly generated deferred work, stopping when a cycle does nothing addressable or hits `max_cycles`.
 - Sweeps are their own resumable runs (`bmad-loop resume <id>`).
 
+### Stories mode (folder+id dispatch)
+
+- Opt-in second story source (`[stories] source = "stories"` + `spec_folder`, or `bmad-loop run --spec <folder>`): drives the same loop off a typed `stories.yaml` (a `bmad-spec` Story Breakdown, sibling of `SPEC.md`) instead of `sprint-status.yaml`.
+- Dispatches each entry by **folder + id** (`/bmad-dev-auto Spec folder: <folder>. Story id: <id>.`); the story spec lands at `<folder>/stories/<id>-<slug>.md` and is read back by a deterministic id-keyed glob — no shared board to line-edit, no result-artifact mtime-scan.
+- Strictly linear schedule (list order, no `depends_on`); `done` skipped, non-terminal statuses resumed on re-dispatch, `blocked`/sentinel/ambiguous stops the run for resolve. `bmad-loop run --dry-run --spec <folder>` and `bmad-loop status` print the schedule/board (id · live disk state · checkpoint markers · title).
+- Preflight content-probe: stories mode requires a `bmad-dev-auto` new enough for folder+id dispatch, or the run aborts with remediation. Sprint mode keeps working with any installed version.
+- Sentinel recovery: a pre-planning-halt sentinel spec (`<id>-unresolved.md` / `<id>-ambiguous.md`) is auto-deleted with a preserved copy under the run dir on re-arm, matching the contract's delete-to-retry.
+
 ### Gates & human checkpoints
 
 - Gate modes (`[gates].mode`): `none` (fully unattended) / `per-epic` (pause at epic boundaries, default) / `per-story-spec-approval` (pause after each spec for approval).
+- Per-story checkpoints (stories mode): independent `spec_checkpoint` (pause before code to review the plan; approve → implement, or request a replan) and `done_checkpoint` (pause after the story commits; skipped when it is the last story). Additive to `gates.mode` — a story can pause twice.
+- Every mid-run pause is surfaced in the TUI: a per-run pause-kind badge, a global attention count, and a `p` viewer per stage (plan-checkpoint spec review, story-checkpoint summary card, escalation with story context, gate spec review) — all calling the same CLI code paths.
 - Retrospective handling (`retrospective = never | notify | auto`) and notification on epic boundaries.
 
 ### Multi-CLI / multi-agent support

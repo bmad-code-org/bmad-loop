@@ -746,6 +746,63 @@ def test_sprint_overview_unavailable(tmp_path, project):
     assert data.sprint_overview(project.project) is None
 
 
+# ------------------------------------------------- stories mode: pause + board
+
+
+def test_discover_runs_reports_pause_stage(tmp_path):
+    from bmad_loop.model import PAUSE_PLAN_CHECKPOINT
+
+    make_run(
+        tmp_path,
+        "20260101-000000-aaaa",
+        paused_reason="plan checkpoint for 1",
+        paused_stage=PAUSE_PLAN_CHECKPOINT,
+    )
+    info = data.discover_runs(tmp_path)[0]
+    assert info.status == data.PAUSED
+    assert info.paused_stage == PAUSE_PLAN_CHECKPOINT
+
+
+def test_discover_runs_pause_stage_blank_when_not_paused(tmp_path):
+    # a finished run keeps its last paused_stage in state; it must not badge.
+    make_run(tmp_path, "20260101-000000-aaaa", finished=True, paused_stage="plan-checkpoint")
+    info = data.discover_runs(tmp_path)[0]
+    assert info.status == data.FINISHED
+    assert info.paused_stage == ""
+
+
+def _write_stories(folder: Path, entries: list[dict]) -> None:
+    import yaml
+
+    (folder / "stories").mkdir(parents=True, exist_ok=True)
+    (folder / "stories.yaml").write_text(yaml.safe_dump(entries, sort_keys=False))
+
+
+def test_stories_overview_reads_board(tmp_path):
+    folder = tmp_path / "epic-1"
+    _write_stories(
+        folder,
+        [
+            {"id": "1", "title": "First", "description": "d", "spec_checkpoint": True},
+            {"id": "2", "title": "Second", "description": "d", "done_checkpoint": True},
+        ],
+    )
+    (folder / "stories" / "1-slug.md").write_text("---\nstatus: done\n---\n", encoding="utf-8")
+    rows = data.stories_overview(tmp_path, "epic-1")
+    assert rows is not None
+    assert [(r.id, r.label) for r in rows] == [("1", "done"), ("2", "pending")]
+    assert rows[0].spec_checkpoint and rows[1].done_checkpoint
+
+
+def test_stories_overview_none_when_unavailable(tmp_path):
+    assert data.stories_overview(tmp_path, "") is None  # no folder pinned
+    assert data.stories_overview(tmp_path, "missing") is None  # no stories.yaml
+    bad = tmp_path / "bad"
+    bad.mkdir()
+    (bad / "stories.yaml").write_text("not: a list\n", encoding="utf-8")
+    assert data.stories_overview(tmp_path, "bad") is None  # invalid manifest, no raise
+
+
 # ------------------------------------------------------------- deferred work
 
 

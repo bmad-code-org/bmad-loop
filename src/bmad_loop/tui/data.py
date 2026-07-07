@@ -25,7 +25,7 @@ import pyte
 from rich.style import Style
 from rich.text import Text
 
-from .. import bmadconfig, deferredwork, sprintstatus
+from .. import bmadconfig, deferredwork, sprintstatus, stories
 from ..adapters.multiplexer import MultiplexerError, get_multiplexer
 from ..gates import ATTENTION_FILE
 from ..journal import JOURNAL_FILE, LOGS_DIR, STATE_FILE, load_state
@@ -131,10 +131,12 @@ class RunInfo:
     run_type: str
     started_at: str
     status: str
+    paused_stage: str = ""  # RunState.paused_stage when PAUSED, else ""; drives the badge
 
 
-# state.json path -> (stat sig, (run_type, started_at, finished, paused, stopped, crashed))
-_header_cache: dict[Path, tuple[_StatSig, tuple[str, str, bool, bool, bool, bool]]] = {}
+# state.json path -> (stat sig, header fields tuple)
+_HeaderFields = tuple[str, str, bool, bool, bool, bool, str]
+_header_cache: dict[Path, tuple[_StatSig, _HeaderFields]] = {}
 
 
 def discover_runs(project: Path) -> list[RunInfo]:
@@ -150,7 +152,7 @@ def discover_runs(project: Path) -> list[RunInfo]:
         sig = _stat_sig(state_path)
         cached = _header_cache.get(state_path)
         if sig is not None and cached is not None and cached[0] == sig:
-            run_type, started_at, finished, paused, stopped, crashed = cached[1]
+            run_type, started_at, finished, paused, stopped, crashed, paused_stage = cached[1]
         else:
             try:
                 doc = json.loads(state_path.read_text(encoding="utf-8"))
@@ -160,16 +162,20 @@ def discover_runs(project: Path) -> list[RunInfo]:
                 paused = doc.get("paused_reason") is not None
                 stopped = bool(doc.get("stopped", False))
                 crashed = bool(doc.get("crashed", False))
+                paused_stage = str(doc.get("paused_stage") or "")
             except (OSError, json.JSONDecodeError):
                 out.append(RunInfo(run_dir.name, run_dir, "?", "", UNKNOWN))
                 continue
             if sig is not None:
                 _header_cache[state_path] = (
                     sig,
-                    (run_type, started_at, finished, paused, stopped, crashed),
+                    (run_type, started_at, finished, paused, stopped, crashed, paused_stage),
                 )
         status = _classify(finished, paused, stopped, crashed, run_dir)
-        out.append(RunInfo(run_dir.name, run_dir, run_type, started_at, status))
+        # paused_stage is advisory: only meaningful while the run is actually PAUSED
+        # (a resumed run keeps the last stage in state until it re-pauses/finishes).
+        stage = paused_stage if status == PAUSED else ""
+        out.append(RunInfo(run_dir.name, run_dir, run_type, started_at, status, stage))
     return out
 
 
@@ -693,6 +699,26 @@ def sprint_overview(project: Path) -> sprintstatus.SprintStatus | None:
             overview = None
     _sprint_cache[sprint_path] = (sig, overview)
     return overview
+
+
+def stories_overview(project: Path, spec_folder: str) -> list[stories.StoryRow] | None:
+    """The stories-mode board for a run's pinned spec folder: one StoryRow per
+    ``stories.yaml`` entry joined with the live on-disk state of its id-keyed
+    story spec. None when unavailable (no spec folder, or a missing/invalid
+    ``stories.yaml``).
+
+    Unlike :func:`sprint_overview` this is per-run (keyed by the run's
+    ``spec_folder``) and is re-derived on every call rather than stat-gated: the
+    per-story spec files under ``stories/`` change independently, so there is no
+    single file to gate on. It reads a handful of small files, called on the
+    dashboard's rescan cadence."""
+    if not spec_folder:
+        return None
+    folder = stories.resolve_spec_folder(project, spec_folder)
+    try:
+        return stories.story_rows(folder)
+    except stories.StoriesError:
+        return None
 
 
 @dataclass(frozen=True)

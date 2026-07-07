@@ -63,13 +63,13 @@ bmad-loop tui                    # …or drive everything from the dashboard
 | -------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `bmad-loop init`                                         | Install the bundled `bmad-loop-*` skills, the hook relay, `.bmad-loop/policy.toml`, and a runs-dir gitignore. `--cli <profile>` (repeatable) targets specific agents; `--no-skills` / `--force-skills` control skill copying.                                                                                                                                                                                                                                                       |
 | `bmad-loop validate`                                     | Preflight every prerequisite: BMAD config, sprint-status, git, CLI binary, hook registration, and a platform check that reports the selected multiplexer's readiness and process host.                                                                                                                                                                                                                                                                                              |
-| `bmad-loop run`                                          | Drive the dev → review → verify → commit loop. `--epic N`, `--story KEY`, `--max-stories N`, `--dry-run`.                                                                                                                                                                                                                                                                                                                                                                           |
+| `bmad-loop run`                                          | Drive the dev → review → verify → commit loop. `--epic N`, `--story KEY`, `--max-stories N`, `--dry-run`. `--spec <folder>` forces **stories mode** (folder+id dispatch off `<folder>/stories.yaml`), overriding `[stories].source`; `--story` then filters by story id.                                                                                                                                                                                                            |
 | `bmad-loop sweep`                                        | Triage + execute open `deferred-work.md` entries. `--no-prompt`, `--decisions-only`, `--max-bundles N`, `--repeat`, `--max-cycles N`, `--dry-run`.                                                                                                                                                                                                                                                                                                                                  |
 | `bmad-loop resume <run-id>`                              | Continue a run paused at a gate, escalation, or interruption.                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `bmad-loop resolve <run-id>`                             | Resolve a CRITICAL escalation: open an interactive resolve agent to fix the frozen spec, then re-arm the story and resume. `--story KEY`, `--no-interactive`, `--resume` / `--no-resume`.                                                                                                                                                                                                                                                                                           |
 | `bmad-loop decisions`                                    | Answer deferred-work decisions earlier sweeps left unanswered (skipped by `--no-prompt`, or an abandoned interactive sweep). Recorded so the next sweep acts on them without re-asking. `--list` shows them without answering.                                                                                                                                                                                                                                                      |
 | `bmad-loop list` (`ls`)                                  | List every run/sweep with its short ref, type, and status — the handle you pass to the commands below.                                                                                                                                                                                                                                                                                                                                                                              |
-| `bmad-loop status [<run-id>]`                            | Run + sprint summary with per-story token totals (plus a count of decisions awaiting an answer).                                                                                                                                                                                                                                                                                                                                                                                    |
+| `bmad-loop status [<run-id>]`                            | Run + sprint summary with per-story token totals (plus a count of decisions awaiting an answer). A stories-mode run instead prints its stories board — id, live on-disk state, checkpoint markers, title.                                                                                                                                                                                                                                                                           |
 | `bmad-loop diagnose [<run-id>]` (`diag`)                 | Emit a **sanitized** diagnostic dump of a run/sweep to hand maintainers when reporting a bug — phase/token/session histograms, escalation counts, adapter/model, env, and run-dir file sizes, with no code, spec content, prompts, transcripts, paths, or PII. Identifiers are pseudonymized to stable per-dump aliases and the output is re-scanned by a fail-closed leak check before writing. Defaults to the latest run. `--all`, `--out`, `--json`, `--max-journal-entries N`. |
 | `bmad-loop attach [<run-id>]`                            | tmux-attach to a run's live agent session.                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `bmad-loop stop <run-id>`                                | Stop a live run — the engine and its agent tmux session.                                                                                                                                                                                                                                                                                                                                                                                                                            |
@@ -99,7 +99,7 @@ A live, read-only dashboard over everything below — and a launcher for new run
 <img src="docs/images/dashboard.png" alt="Dashboard: runs table, run header with token totals, per-story phase table, sprint tree, deferred-work ledger, and the journal tab." width="880">
 </div>
 
-The left column stacks the **runs table** (newest auto-selected), an expandable **sprint tree** (epics → stories/retro, completed items checked green), and the **deferred-work ledger** (severity colour-coded). The right column shows the selected run's **header** (status, epic, task counts, cost-weighted token total), a **per-story table** (phase · dev attempts · review cycles · tokens · commit/defer info), and tabs tailing the **journal**, the active session's **pane log**, and the **ATTENTION** file.
+The left column stacks the **runs table** (newest auto-selected; a per-run pause badge tags paused runs by kind, and the title carries a global _⚑ N need attention_ count), an expandable **sprint tree** (epics → stories/retro, completed items checked green) — replaced by a **stories board** (id · live disk state · spec/done checkpoint markers · title) when the selected run is in stories mode — and the **deferred-work ledger** (severity colour-coded). The right column shows the selected run's **header** (status, epic, task counts, cost-weighted token total), a **per-story table** (phase · dev attempts · review cycles · tokens · commit/defer info), and tabs tailing the **journal**, the active session's **pane log**, and the **ATTENTION** file. On a paused run, **`p`** opens the stage-appropriate HITL viewer — a plan-checkpoint spec viewer (Approve & resume / Request replan), a story-checkpoint summary card (Continue / Stop), the escalation view with story context (Resolve / Re-arm & resume), or a gate spec viewer — each calling the exact code paths the CLI uses.
 
 ### A sweep blocked on a human decision
 
@@ -124,7 +124,7 @@ Unattended sweeps (`--no-prompt`) skip decisions, and an attended one can be aba
 <img src="docs/images/start-run-modal.png" alt="The start-run modal with epic, story, max-stories, and dry-run fields." width="430">
 </div>
 
-`enter` on any ledger row opens the full entry; `r` / `s` open modals to launch a run or sweep (epic, story, max-stories, dry-run).
+`enter` on any ledger row opens the full entry; `r` / `s` open modals to launch a run or sweep (epic, story, max-stories, dry-run). The start-run modal also carries a **source select** (sprint vs. stories mode, prefilled from `[stories]`) and a spec-folder field with a live schedule preview that validates `stories.yaml` and lists the linear schedule with checkpoint markers.
 
 ### The policy editor
 
@@ -136,26 +136,49 @@ Press **`g`** to edit `.bmad-loop/policy.toml` in a form grouped by section — 
 
 ### Key bindings
 
-| Key       | Action                                                             |
-| --------- | ------------------------------------------------------------------ |
-| `r` / `s` | start a run / sweep (modal for epic, story, max-stories, dry-run…) |
-| `e`       | resume the selected paused/interrupted run                         |
-| `R`       | resolve a run paused at an escalation (interactive, then re-arm)   |
-| `d`       | answer deferred-work decisions past sweeps left unanswered         |
-| `a`       | attach to the live agent session (or the orchestrator window)      |
-| `x`       | stop the selected live run (engine + agent session)                |
-| `D` / `A` | delete / archive the selected run (force-stops a live run first)   |
-| `c`       | clean up tmux sessions/windows for finished & stopped runs         |
-| `v`       | run `bmad-loop validate`, output in a modal                        |
-| `g`       | settings editor for `.bmad-loop/policy.toml`                       |
-| `y`       | copy the active Log/Attention pane to the clipboard                |
-| `M` / `q` | toggle theme (light/dark mode) / quit                              |
+| Key       | Action                                                                                                   |
+| --------- | -------------------------------------------------------------------------------------------------------- |
+| `r` / `s` | start a run / sweep (modal for epic, story, max-stories, dry-run…)                                       |
+| `e`       | resume the selected paused/interrupted run                                                               |
+| `p`       | review the selected paused run in the stage-appropriate viewer (plan/story checkpoint, gate, escalation) |
+| `R`       | resolve a run paused at an escalation (interactive, then re-arm)                                         |
+| `d`       | answer deferred-work decisions past sweeps left unanswered                                               |
+| `a`       | attach to the live agent session (or the orchestrator window)                                            |
+| `x`       | stop the selected live run (engine + agent session)                                                      |
+| `D` / `A` | delete / archive the selected run (force-stops a live run first)                                         |
+| `c`       | clean up tmux sessions/windows for finished & stopped runs                                               |
+| `v`       | run `bmad-loop validate`, output in a modal                                                              |
+| `g`       | settings editor for `.bmad-loop/policy.toml`                                                             |
+| `y`       | copy the active Log/Attention pane to the clipboard                                                      |
+| `M` / `q` | toggle theme (light/dark mode) / quit                                                                    |
 
 **The TUI is an observer/launcher, never the engine.** Runs started with `r`/`s` are detached `bmad-loop` processes in windows of a dedicated tmux session (`bmad-loop-ctl`), so they survive a TUI exit or crash; the dashboard watches runs purely through the run-dir artifacts the engine writes atomically, so runs started from a plain shell show up identically. Launch and attach need tmux; the dashboard itself does not. Pid-based liveness is local-only — a run whose engine died shows `interrupted` (press `e`); runs on other hosts show `unknown`.
 
 > 📖 See **[docs/tui-guide.md](docs/tui-guide.md)** for the full guide — layout, every key and modal, status glyphs, the settings field reference, and troubleshooting. Vector (SVG) versions of every screenshot live in [`docs/images/`](docs/images).
 
+## Two planning pipelines, one loop
+
+bmad-loop drives the same dev → verify → review → commit loop from **either** of two story sources — chosen per project, or per run:
+
+- **Sprint mode (default).** Stories come from `sprint-status.yaml` (written by `bmad-sprint-planning` from your PRD/epics). The loop walks the board by `ready-for-dev` status, keyed by story ref (`1-2-account-mgmt`). This is what the rest of this README describes.
+- **Stories mode (opt-in).** Stories come from a typed `stories.yaml` — the **Story Breakdown** output of `bmad-spec`, a fixed-name sibling of `SPEC.md` in the epic's spec folder. The loop dispatches each entry by **folder + id** (`/bmad-dev-auto Spec folder: <folder>. Story id: <id>.`); the dev skill creates-or-resumes the story spec at `<folder>/stories/<id>-<slug>.md`, and the orchestrator reads that id-keyed path back deterministically — no shared board to line-edit, no mtime-scan of result artifacts.
+
+Turn it on per project with `[stories] source = "stories"` + `spec_folder = "<epic folder>"`, or per run with `bmad-loop run --spec <epic folder>` (which overrides the policy). Everything downstream — dev/verify/review/commit, worktree isolation, gates, crash resume, the TUI — is identical; only the story source and the per-story controls below differ.
+
+**Per-story human checkpoints (stories mode).** Each `stories.yaml` entry carries two independent boolean flags:
+
+- **`spec_checkpoint`** — pause _before_ code, to review the plan. The dev session halts right after planning (`Halt after planning.`) with the spec at `ready-for-dev`; the run pauses at a **plan checkpoint**. Approve to resume straight to implementation, or request a replan (resets the spec to `draft` so the next dispatch re-plans).
+- **`done_checkpoint`** — pause _after_ the story commits, to review the result before the loop moves on (skipped automatically when it is the last story).
+
+A story may set both (it pauses twice); `gates.mode` pauses stack on top. A blocked story escalates exactly as in sprint mode — `bmad-loop resolve`, then re-arm + resume — now with the story's title/description and the blocking condition surfaced; a pre-planning-halt **sentinel** spec is auto-deleted (a copy preserved under the run dir) on re-arm for a clean re-dispatch.
+
+`bmad-loop run --dry-run --spec <folder>` prints the linear schedule (list order, checkpoint markers, live on-disk state); `bmad-loop status` shows the same stories board.
+
+> Stories mode requires a `bmad-dev-auto` new enough to support folder+id dispatch; the run preflight (and `bmad-loop validate`) checks for it and tells you to update the BMAD module if it is missing. Sprint mode is unaffected and remains the default indefinitely.
+
 ## How a story flows
+
+> This is sprint mode's flow. Stories mode swaps the story source (above) and adds the per-story plan/done checkpoints — the loop below is otherwise identical.
 
 ```text
 sprint-status.yaml: 1-2-account-mgmt: ready-for-dev

@@ -14,12 +14,22 @@ from typing import Any
 from rich.table import Table
 from rich.text import Text
 from textual.selection import Selection
-from textual.widgets import RichLog, Static, Tree
+from textual.widgets import DataTable, RichLog, Static, Tree
 from textual.widgets.option_list import Option
 from textual.widgets.tree import TreeNode
 
-from ..model import Phase, RunState
+from ..model import (
+    PAUSE_EPIC_BOUNDARY,
+    PAUSE_ESCALATION,
+    PAUSE_PLAN_CHECKPOINT,
+    PAUSE_SPEC_APPROVAL,
+    PAUSE_STORY_CHECKPOINT,
+    PAUSE_STORY_GATE,
+    Phase,
+    RunState,
+)
 from ..sprintstatus import SprintStatus, Story
+from ..stories import StoryRow
 from . import data
 
 STATUS_GLYPHS = {
@@ -45,6 +55,36 @@ STATUS_STYLES = {
 
 def status_cell(status: str) -> Text:
     return Text(STATUS_GLYPHS.get(status, "?"), style=STATUS_STYLES.get(status, ""))
+
+
+# ------------------------------------------------------------- pause badges
+#
+# Every mid-run pause that awaits a human maps to a visually distinct badge,
+# shown as a short tag in the runs table and a full label in the run header.
+# (short tag, full label, rich style)
+_PAUSE_BADGES: dict[str, tuple[str, str, str]] = {
+    PAUSE_PLAN_CHECKPOINT: ("plan", "plan checkpoint", "magenta"),
+    PAUSE_STORY_CHECKPOINT: ("story", "story checkpoint", "cyan"),
+    PAUSE_SPEC_APPROVAL: ("spec", "spec-approval gate", "yellow"),
+    PAUSE_EPIC_BOUNDARY: ("epic", "epic gate", "yellow"),
+    PAUSE_STORY_GATE: ("gate", "story gate", "yellow"),
+    PAUSE_ESCALATION: ("esc", "escalation", "bold red"),
+}
+
+
+def pause_tag(stage: str) -> Text:
+    """Compact colored tag for a paused run in the runs table ('' when not
+    paused / unknown stage renders the raw stage)."""
+    if not stage:
+        return Text("")
+    tag, _label, style = _PAUSE_BADGES.get(stage, (stage, stage, "yellow"))
+    return Text(tag, style=style)
+
+
+def pause_label(stage: str) -> tuple[str, str]:
+    """(full label, rich style) for a pause stage, for the run-header badge."""
+    _tag, label, style = _PAUSE_BADGES.get(stage, (stage, stage, "yellow"))
+    return label, style
 
 
 class RunHeader(Static):
@@ -115,10 +155,14 @@ class RunHeader(Static):
         if status == data.PAUSED:
             text.append("\n⏸ paused", style="bold yellow")
             if state.paused_stage:
-                text.append(f" ({state.paused_stage})", style="yellow")
+                label, badge_style = pause_label(state.paused_stage)
+                text.append("  ")
+                text.append(f"[{label}]", style=f"bold {badge_style}")
             if state.paused_reason:
                 text.append(f" — {state.paused_reason}", style="yellow")
-            text.append("  · press e to resume", style="dim")
+            # p opens the stage-appropriate review viewer; e resumes; R resolves
+            # an escalation (the header only hints the common paths).
+            text.append("\n  press p to review · e to resume", style="dim")
         elif status == data.CRASHED:
             text.append(
                 "\n✖ engine crashed — see crash.txt · press e to resume",
@@ -326,6 +370,104 @@ class SprintTree(Tree[str]):
                 for key, child_label in zip(child_keys, child_labels):
                     node.add_leaf(child_label, data=key)
                 self._epic_child_keys[num] = child_keys
+
+
+# ------------------------------------------------------------- stories table
+
+# Story on-disk state (stories.state_label) -> glyph + style. The label may be a
+# `sentinel:<kind>` composite, so lookups key on the token before ':'.
+STORY_GLYPHS = {
+    "pending": "·",
+    "draft": "◦",
+    "ready-for-dev": "○",
+    "in-progress": "▶",
+    "in-review": "◆",
+    "done": "✓",
+    "blocked": "✖",
+    "ambiguous": "⚠",
+    "sentinel": "⚠",
+}
+
+STORY_STYLES = {
+    "pending": "dim",
+    "draft": "dim",
+    "ready-for-dev": "cyan",
+    "in-progress": "cyan",
+    "in-review": "magenta",
+    "done": "green",
+    "blocked": "bold red",
+    "ambiguous": "bold red",
+    "sentinel": "bold red",
+}
+
+
+def story_state_cell(label: str) -> Text:
+    key = label.split(":", 1)[0]
+    return Text(f"{STORY_GLYPHS.get(key, '?')} {label}", style=STORY_STYLES.get(key, "dim"))
+
+
+def story_checkpoint_cell(spec_checkpoint: bool, done_checkpoint: bool) -> Text:
+    """Independent spec/done checkpoint markers as one compact cell: `S` (plan
+    review before code, magenta), `D` (review after commit, cyan), dim `·` for an
+    unset slot so the two stay positionally readable."""
+    text = Text()
+    text.append("S" if spec_checkpoint else "·", style="magenta" if spec_checkpoint else "dim")
+    text.append("D" if done_checkpoint else "·", style="cyan" if done_checkpoint else "dim")
+    return text
+
+
+class StoriesTable(DataTable):
+    """The stories-mode board — one row per stories.yaml entry with its live
+    on-disk state, replacing the sprint tree when a stories-mode run is selected.
+
+    Reconciles in place each rescan tick (stable row key = story id): the id set
+    is stable within a run, so existing rows only get cell updates, keeping the
+    cursor. Rebuilds only when the id set/order actually changes (a between-runs
+    Story Breakdown re-derive)."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.cursor_type = "row"
+        self.zebra_stripes = True
+        self._row_ids: list[str] | None = None  # None: placeholder/empty shown
+
+    def on_mount(self) -> None:
+        self.add_column("state", key="state", width=15)
+        self.add_column("id", key="id", width=8)
+        self.add_column("✓", key="chk", width=2)
+        self.add_column("title", key="title")
+
+    def _placeholder(self, label: str) -> None:
+        self.clear()
+        self.add_row(Text(label, style="dim"), "", "", "")
+        self._row_ids = None
+
+    def update_stories(self, rows: list[StoryRow] | None) -> None:
+        if rows is None:
+            self._placeholder("stories board unavailable")
+            return
+        if not rows:
+            self._placeholder("no stories")
+            return
+        ids = [r.id for r in rows]
+        if self._row_ids != ids:
+            self.clear()
+            for r in rows:
+                self.add_row(
+                    story_state_cell(r.label),
+                    r.id,
+                    story_checkpoint_cell(r.spec_checkpoint, r.done_checkpoint),
+                    _short(r.title, 48),
+                    key=r.id,
+                )
+            self._row_ids = ids
+            return
+        for r in rows:
+            self.update_cell(r.id, "state", story_state_cell(r.label))
+            self.update_cell(
+                r.id, "chk", story_checkpoint_cell(r.spec_checkpoint, r.done_checkpoint)
+            )
+            self.update_cell(r.id, "title", _short(r.title, 48))
 
 
 # ------------------------------------------------------------ deferred work
