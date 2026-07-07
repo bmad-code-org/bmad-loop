@@ -789,6 +789,39 @@ def test_blocked_resolve_rearm_then_redispatch_to_done(project):
     ]
 
 
+def test_sentinel_rearm_deletes_by_recorded_verdict_e2e(project):
+    """C2 (E2E): a pick-time sentinel wedge records task.sentinel_kind on disk; a
+    subsequent rearm clears the sentinel by that recorded verdict (not the basename)
+    — preserving a copy, deleting the sentinel, and re-dispatching clean. Proves the
+    detection→rearm path end-to-end through the engine, not just the isolated
+    runs.rearm_escalation unit test."""
+    from bmad_loop import runs
+
+    folder = setup_stories(project, [entry("1"), entry("2")])
+    sentinel = folder / "stories" / "1-unresolved.md"
+    sentinel.write_text(
+        "---\nstatus: blocked\n---\n\n## Auto Run Result\n\nStatus: blocked\nintent too vague\n",
+        encoding="utf-8",
+    )
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "sentinel")
+
+    engine, _ = make_engine(project, [])
+    assert engine.run().paused
+    assert load_state(engine.run_dir).tasks["1"].sentinel_kind == "unresolved"  # recorded
+
+    runs.rearm_escalation(engine.run_dir, "1")
+    assert not sentinel.exists()  # cleared by the recorded verdict
+    assert (engine.run_dir / "sentinels" / "1-unresolved.md").is_file()  # copy preserved
+    reloaded = load_state(engine.run_dir)
+    assert reloaded.tasks["1"].spec_file is None  # re-dispatch resolves PENDING
+    assert reloaded.tasks["1"].sentinel_kind == ""  # verdict discharged
+
+    # resumed run re-plans story 1 from scratch, then continues to story 2
+    resumed, _ = resume_engine(project, engine, [stories_dev_effect(), stories_dev_effect()])
+    assert resumed.run().done == 2
+
+
 # ----------------------------------------------- worktree isolation (E2E)
 
 
@@ -920,6 +953,9 @@ def test_sentinel_detected_journaled_at_pick(project):
     assert detected and detected[-1]["story_key"] == "1"
     assert detected[-1]["sentinel_kind"] == "unresolved"
     assert "intent too vague" in detected[-1]["condition"]
+    # C2: the pick-time wedge records the sentinel verdict on the task so a later
+    # rearm clears it by recorded kind, not by re-deriving from the basename.
+    assert load_state(engine.run_dir).tasks["1"].sentinel_kind == "unresolved"
 
 
 def test_sentinel_detected_journaled_at_readback(project):
@@ -954,6 +990,8 @@ def test_sentinel_detected_journaled_at_readback(project):
     detected = _kinds(engine.journal, "sentinel-detected")
     assert detected and detected[-1]["sentinel_kind"] == "unresolved"
     assert "too vague" in detected[-1]["condition"]
+    # C2: the post-dev read-back also records the sentinel verdict on the task.
+    assert load_state(engine.run_dir).tasks["1"].sentinel_kind == "unresolved"
 
 
 def test_entry_for_unreadable_manifest_journals_warning_once(project):

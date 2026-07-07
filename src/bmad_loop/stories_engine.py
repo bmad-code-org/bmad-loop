@@ -228,6 +228,9 @@ class StoriesEngine(Engine):
         detail = self._wedged_detail(state)
         reason = f"story {entry.id!r} needs resolution before the run can continue: {detail}"
         if state.kind == stories.KIND_SENTINEL:
+            # record the sentinel verdict on the task so rearm_escalation clears it by
+            # this recorded kind, not by re-deriving from the spec_file basename.
+            task.sentinel_kind = state.sentinel_kind
             self._journal_sentinel_detected(entry.id, state)
         self.journal.append(
             "stories-wedged",
@@ -395,6 +398,9 @@ class StoriesEngine(Engine):
         folder = self._stories_folder()
         state = stories.resolve_story_spec(folder, task.story_key)
         if state.kind == stories.KIND_SENTINEL:
+            # record the sentinel verdict on the task (mirrors _pause_wedged) so a later
+            # rearm clears it by recorded kind, not by re-deriving from the basename.
+            task.sentinel_kind = state.sentinel_kind
             self._journal_sentinel_detected(task.story_key, state)
         return verify.verify_dev_stories(
             task,

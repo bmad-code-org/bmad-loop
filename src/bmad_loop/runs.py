@@ -559,15 +559,21 @@ def rearm_escalation(run_dir: Path, story_key: str | None = None) -> str:
         spec_path = Path(task.spec_file)
         # Stories mode only: a fixed-slug pre-planning-halt sentinel
         # (`<id>-unresolved.md` / `<id>-ambiguous.md`) is cleared by deletion, not a
-        # status flip. Gate on the run source so a *sprint* spec that merely happens
-        # to be named `<key>-unresolved.md` is status-flipped like any other spec and
-        # never deleted — the sentinel filename convention exists only in stories mode.
-        sentinel_kind = _sentinel_condition(spec_path, key) if state.source == "stories" else None
-        if sentinel_kind is not None:
+        # status flip. Clear it ONLY when the run recorded this task AS a sentinel at
+        # detection time (`task.sentinel_kind`, stamped by StoriesEngine's pick-time
+        # wedge / post-dev read-back) — never by re-deriving from the basename. That
+        # keeps a real story spec that merely happens to be named `<key>-unresolved.md`,
+        # or a *non-sentinel* escalation whose spec matches the convention, on the
+        # status-flip path so it is kept, not deleted. Gate on the run source too (the
+        # convention exists only in stories mode) and defensively re-confirm the
+        # on-disk name still matches the recorded slug before deleting.
+        sentinel_kind = task.sentinel_kind if state.source == "stories" else ""
+        if sentinel_kind and _sentinel_condition(spec_path, key) == sentinel_kind:
             # a sentinel is cleared by deletion, not a status flip; drop the stale
             # spec_file so the re-dispatch starts from PENDING (clean re-plan).
             _clear_sentinel(run_dir, journal, spec_path, key, sentinel_kind)
             task.spec_file = None
+            task.sentinel_kind = ""  # verdict discharged; the re-dispatch is clean
         else:
             # route /bmad-dev-auto to re-implement (decision table: ready-for-dev
             # -> step-03); independent of the resolve agent having set it.

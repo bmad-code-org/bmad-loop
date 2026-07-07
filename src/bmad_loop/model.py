@@ -173,6 +173,14 @@ class StoryTask:
     # obligation is discharged). While set after a dev leg that did not itself pause,
     # StoriesEngine pauses before commit so the story can never commit un-reviewed.
     plan_review_owed: bool = False
+    # stories mode only: the fixed slug ("unresolved" / "ambiguous") of a pre-planning
+    # halt sentinel this task was detected as — recorded at detection time (pick-time
+    # wedge or post-dev read-back), NOT re-derived from the spec_file basename at
+    # re-arm. runs.rearm_escalation deletes a sentinel only when this is set, so a real
+    # story spec that merely happens to be named `<key>-unresolved.md`, or a
+    # non-sentinel escalation whose spec matches the convention, is status-flipped and
+    # kept, never deleted. "" = not a sentinel. Survives the round-trip.
+    sentinel_kind: str = ""
     # sweep bundles only: the deferred-work ids this task closes and the
     # rendered intent file handed to dev sessions
     dw_ids: list[str] = field(default_factory=list)
@@ -226,6 +234,7 @@ class StoryTask:
             "resolved_redrive": self.resolved_redrive,
             "plan_checkpoint_pending": self.plan_checkpoint_pending,
             "plan_review_owed": self.plan_review_owed,
+            "sentinel_kind": self.sentinel_kind,
             "dw_ids": self.dw_ids,
             "bundle_file": self.bundle_file,
             "worktree_path": self.worktree_path,
@@ -270,6 +279,7 @@ class StoryTask:
             resolved_redrive=bool(d.get("resolved_redrive", False)),
             plan_checkpoint_pending=bool(d.get("plan_checkpoint_pending", False)),
             plan_review_owed=bool(d.get("plan_review_owed", False)),
+            sentinel_kind=str(d.get("sentinel_kind", "")),
             dw_ids=[str(i) for i in d.get("dw_ids", [])],
             bundle_file=d.get("bundle_file"),
             worktree_path=str(d.get("worktree_path", "")),

@@ -114,6 +114,17 @@ def test_plan_checkpoint_pending_defaults_false_for_legacy_state():
     assert StoryTask.from_dict(doc).plan_checkpoint_pending is False
 
 
+def test_sentinel_kind_round_trips():
+    task = StoryTask(story_key="1", epic=0, sentinel_kind="unresolved")
+    assert StoryTask.from_dict(task.to_dict()).sentinel_kind == "unresolved"
+
+
+def test_sentinel_kind_defaults_empty_for_legacy_state():
+    doc = StoryTask(story_key="1", epic=0).to_dict()
+    del doc["sentinel_kind"]  # state.json from before the field existed
+    assert StoryTask.from_dict(doc).sentinel_kind == ""
+
+
 def test_stopped_round_trips():
     state = _state(stopped=True)
     assert RunState.from_dict(state.to_dict()).stopped is True

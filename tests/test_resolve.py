@@ -38,6 +38,7 @@ def _escalated_run(
     spec_file=None,
     with_session=True,
     source="sprint-status",
+    sentinel_kind="",
 ):
     task = StoryTask(
         story_key="6-4-cli-list-command",
@@ -47,6 +48,7 @@ def _escalated_run(
         review_cycle=1,
         baseline_commit="abc123",
         spec_file=spec_file,
+        sentinel_kind=sentinel_kind,
     )
     if with_session:
         task.sessions.append(
@@ -245,7 +247,11 @@ def test_rearm_clears_sentinel_preserving_a_copy(tmp_path):
         "---\nstatus: blocked\n---\n\n## Auto Run Result\n\nStatus: blocked\nintent too vague\n",
         encoding="utf-8",
     )
-    run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(sentinel), source="stories")
+    # sentinel_kind recorded at detection time (StoriesEngine stamps it on the task);
+    # re-arm clears by this recorded verdict, not the basename.
+    run_dir, _, _ = _escalated_run(
+        tmp_path, spec_file=str(sentinel), source="stories", sentinel_kind="unresolved"
+    )
 
     returned = runs.rearm_escalation(run_dir)
     assert returned == key
@@ -274,17 +280,41 @@ def test_rearm_clears_sentinel_preserving_a_copy(tmp_path):
 
 
 def test_rearm_non_sentinel_spec_still_flips_status(tmp_path):
-    """A blocked (non-sentinel) story spec is re-opened by the status flip, not
-    deleted — the sentinel branch must not swallow the normal re-arm path."""
+    """C3: a blocked (non-sentinel) story spec IN STORIES MODE is re-opened by the
+    status flip, not deleted — the sentinel branch must not swallow the normal re-arm
+    path. Runs with source="stories" (the default sprint-status source would skip the
+    sentinel branch entirely and never exercise the stories-mode logic)."""
     key = "6-4-cli-list-command"
     stories_dir = tmp_path / "stories"
     stories_dir.mkdir(parents=True)
     spec = stories_dir / f"{key}-slug.md"  # a real spec, not a fixed-slug sentinel
     spec.write_text("---\nstatus: blocked\n---\n\n## Intent\n\nx\n", encoding="utf-8")
-    run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec))
+    # source="stories" enters the sentinel-branch code; sentinel_kind="" (never
+    # detected as a sentinel) → status-flip, not delete.
+    run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec), source="stories")
 
     runs.rearm_escalation(run_dir)
     assert spec.is_file()  # not deleted
+    assert verify.read_frontmatter(spec)["status"] == "ready-for-dev"
+    assert load_state(run_dir).tasks[key].spec_file == str(spec)  # kept
+    assert not (run_dir / "sentinels").exists()
+
+
+def test_rearm_sentinel_named_spec_never_detected_is_not_deleted(tmp_path):
+    """C2: a real stories spec that merely happens to be named `<key>-unresolved.md`
+    but was NEVER detected as a sentinel (task.sentinel_kind == "") is status-flipped
+    and kept — re-arm must clear by the recorded detection verdict, not the basename,
+    so a filename collision can never turn a real spec into data loss."""
+    key = "6-4-cli-list-command"
+    stories_dir = tmp_path / "stories"
+    stories_dir.mkdir(parents=True)
+    spec = stories_dir / f"{key}-unresolved.md"  # sentinel-shaped name, but a real spec
+    spec.write_text("---\nstatus: blocked\n---\n\n## Intent\n\nreal work\n", encoding="utf-8")
+    # stories mode, but sentinel_kind unset — the run never classified it as a sentinel
+    run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec), source="stories")
+
+    runs.rearm_escalation(run_dir)
+    assert spec.is_file()  # NOT deleted despite the sentinel-shaped name
     assert verify.read_frontmatter(spec)["status"] == "ready-for-dev"
     assert load_state(run_dir).tasks[key].spec_file == str(spec)  # kept
     assert not (run_dir / "sentinels").exists()
