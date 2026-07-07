@@ -55,7 +55,7 @@ def _seed_run(root, run_id="20260627-120000-aaaa", *, extra_journal=None):
 
     task = StoryTask(
         story_key=STORY_KEY,
-        epic=1,
+        epic="1",
         phase=Phase.ESCALATED,
         attempt=2,
         review_cycle=1,

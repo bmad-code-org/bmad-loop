@@ -47,7 +47,7 @@ class GuardrailsPlugin(Plugin):
         """Validation gate: quietly skip any story in a 'parked' epic. ``skip``
         retires the unit with no human notification; switch to ``defer`` to notify
         or ``pause`` to escalate."""
-        parked = int(self.settings.get("forbid_epic") or 0)
+        parked = str(self.settings.get("forbid_epic") or "").strip()
         if parked and ctx.epic == parked:
             ctx.veto("skip", f"epic {parked} is parked by the guardrails plugin")
 

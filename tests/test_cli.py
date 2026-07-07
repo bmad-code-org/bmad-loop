@@ -71,7 +71,7 @@ def test_dry_run_renders_per_stage_commands(project, capsys):
 
 @pytest.mark.parametrize(
     "epic,story",
-    [(None, "3-1"), (None, "3.1"), (3, "1"), (None, "user-auth"), (None, "3-1-user-auth")],
+    [(None, "3-1"), (None, "3.1"), ("3", "1"), (None, "user-auth"), (None, "3-1-user-auth")],
 )
 def test_dry_run_selects_story_by_short_ref(project, capsys, epic, story):
     write_sprint(
@@ -624,7 +624,7 @@ def test_archive_refuses_live_run_without_force(tmp_path, monkeypatch, capsys):
 def _escalated_run(project, run_id="r1", *, story="s1", spec_file=None):
     from bmad_loop.model import Phase, StoryTask
 
-    task = StoryTask(story_key=story, epic=1, phase=Phase.ESCALATED, attempt=1, spec_file=spec_file)
+    task = StoryTask(story_key=story, epic="1", phase=Phase.ESCALATED, attempt=1, spec_file=spec_file)
     return _make_run_with_state(
         project,
         run_id,
@@ -923,7 +923,7 @@ def test_resume_restores_persisted_run_scope(project, monkeypatch):
     monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {r: None for r in cli.ROLES})
 
     assert cli._resume_paused_run(project.project, run_dir) == 0
-    assert captured["epic_filter"] == 9
+    assert captured["epic_filter"] == "9"
     assert captured["story_filter"] == "9-0"
     assert captured["max_stories"] == 4
 

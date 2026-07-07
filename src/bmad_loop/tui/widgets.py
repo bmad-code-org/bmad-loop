@@ -7,6 +7,7 @@ interpreted as markup.
 
 from __future__ import annotations
 
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -237,7 +238,15 @@ SPRINT_STYLES = {
 def sprint_story_label(story: Story) -> Text:
     glyph = SPRINT_GLYPHS.get(story.status, "?")
     style = SPRINT_STYLES.get(story.status, "dim")
-    return Text(f"{glyph} {story.num}-{story.slug}", style=style)
+    # Original format was "{glyph} {num}-{slug}". When the story came from a
+    # sprint / backlog with no numeric segment (e.g. bugfix-*), num is "" and
+    # the rendered label would start with "-". Drop the num segment when empty
+    # so the visible label is just "{glyph} {slug}".
+    if story.num:
+        text = f"{glyph} {story.num}-{story.slug}"
+    else:
+        text = f"{glyph} {story.slug}"
+    return Text(text, style=style)
 
 
 def sprint_retro_label(status: str) -> Text:
@@ -246,10 +255,44 @@ def sprint_retro_label(status: str) -> Text:
     return Text(f"{glyph} retrospective", style=style)
 
 
-def sprint_epic_label(num: int, status: str, done: int, total: int) -> Text:
+def _epic_id_sort_key(epic_id: str) -> tuple:
+    """Natural-order sort key for epic ids: numeric first ("1", "2", "10"),
+    then letter-suffix ("1a", "1b", "18a"), then phase-suffix ("0-p2"). Used by
+    :meth:`SprintTree.update_sprint` so the panel lists "Epic 1, 2, 3, 1a, 1b"
+    in human order rather than alphabetic order ("1, 10, 11, 1a, 1b, 2").
+    """
+    # Match "<num>[<letter>][-p<num>]" parts and use (group, num, letter, ...).
+    m = re.match(r"^(\d+)([a-z]?)(?:-p(\d+))?$", epic_id)
+    if not m:
+        return (1, 0, "", epic_id)
+    n = int(m.group(1))
+    letter = m.group(2) or ""
+    p = int(m.group(3)) if m.group(3) is not None else -1
+    return (0, n, letter, p, epic_id)
+
+
+def sprint_epic_label(epic_id: str, status: str, done: int, total: int) -> Text:
+    """Render an epic row label. ``epic_id`` is the canonical id (str):
+
+    * "1", "1a", "0-p2" → "Epic 1", "Epic 1a", "Epic 0-p2"
+    * "sprint-08" → "Sprint 08"
+    * "backlog"   → "Backlog"
+
+    Original signature took ``num: int``; we accept the str id and render
+    based on prefix so the SprintTree can group letter-suffix / sprint /
+    backlog epics alongside numeric ones.
+    """
     complete = status == "done" or (total > 0 and done == total)
     text = Text()
-    text.append(f"Epic {num}", style="green" if complete else "bold")
+    if epic_id == "backlog":
+        label = "Backlog"
+    elif epic_id.startswith("sprint-"):
+        label = f"Sprint {epic_id.removeprefix('sprint-')}"
+    elif epic_id.startswith("epic-"):
+        label = f"Epic {epic_id.removeprefix('epic-')}"
+    else:
+        label = f"Epic {epic_id}"
+    text.append(label, style="green" if complete else "bold")
     if total:
         text.append(f" · {done}/{total}", style="green" if complete else "dim")
     if complete:
@@ -285,10 +328,28 @@ class SprintTree(Tree[str]):
         if ss is None:
             self._show_placeholder("sprint status unavailable")
             return
-        stories_by_epic: dict[int, list[Story]] = {}
+        stories_by_epic: dict[str, list[Story]] = {}
         for story in ss.stories:
             stories_by_epic.setdefault(story.epic, []).append(story)
-        epic_nums = sorted(set(ss.epics) | set(stories_by_epic) | set(ss.retros))
+        # Sort: numeric epics first (natural order), then letter-suffix, then
+        # sprint-NN, then backlog last. We use a tuple sort key so the visual
+        # grouping stays stable as the YAML evolves.
+        def _sort_key(epic_id: str) -> tuple:
+            if epic_id == "backlog":
+                return (3, 0, epic_id)
+            if epic_id.startswith("sprint-"):
+                try:
+                    n = int(epic_id.removeprefix("sprint-"))
+                except ValueError:
+                    n = 0
+                return (2, n, epic_id)
+            if epic_id.startswith("epic-"):
+                return _epic_id_sort_key(epic_id.removeprefix("epic-"))
+            return _epic_id_sort_key(epic_id)
+
+        epic_nums = sorted(
+            set(ss.epics) | set(stories_by_epic) | set(ss.retros), key=_sort_key
+        )
         if not epic_nums:
             self._show_placeholder("no sprint data")
             return
@@ -309,14 +370,20 @@ class SprintTree(Tree[str]):
             )
             node = self._epic_nodes.get(num)
             if node is None:
-                node = self.root.add(label, data=f"epic-{num}")
+                # Node data is the canonical epic id; downstream code only
+                # stores it (no read-by-data consumers exist in the TUI today),
+                # so the old "epic-{num}" prefix is no longer needed.
+                node = self.root.add(label, data=num)
                 self._epic_nodes[num] = node
             else:
                 node.set_label(label)
             child_keys = tuple(s.key for s in stories)
             child_labels = [sprint_story_label(s) for s in stories]
             if retro is not None:
-                child_keys += (f"epic-{num}-retrospective",)
+                # The retrospective child node data follows the same canonical
+                # form as the YAML literal key (e.g. "1a-retrospective",
+                # "sprint-08-retrospective", "backlog-retrospective" if any).
+                child_keys += (f"{num}-retrospective",)
                 child_labels.append(sprint_retro_label(retro))
             if self._epic_child_keys.get(num) == child_keys:
                 for child, child_label in zip(node.children, child_labels):

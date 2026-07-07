@@ -231,10 +231,10 @@ def test_discover_runs_corrupt_state_is_unknown_not_crash(tmp_path):
 def test_watcher_state_keeps_last_good_parse(tmp_path):
     run_dir = make_run(tmp_path, "20260611-100000-aaaa", current_epic=1)
     watcher = data.RunWatcher(run_dir)
-    assert watcher.state().current_epic == 1
+    assert watcher.state().current_epic == "1"
 
     (run_dir / "state.json").write_text("{ mid-write garbage")
-    assert watcher.state().current_epic == 1  # last good survives
+    assert watcher.state().current_epic == "1"  # last good survives
 
     state = RunState(
         run_id=run_dir.name,
@@ -243,7 +243,7 @@ def test_watcher_state_keeps_last_good_parse(tmp_path):
         current_epic=2,
     )
     save_state(run_dir, state)
-    assert watcher.state().current_epic == 2
+    assert watcher.state().current_epic == "2"
 
 
 def test_watcher_state_none_before_first_write(tmp_path):
@@ -720,13 +720,13 @@ def test_sprint_overview(project):
         },
     )
     ss = data.sprint_overview(project.project)
-    assert ss.epics == {1: "in-progress", 2: "backlog"}
+    assert ss.epics == {"1": "in-progress", "2": "backlog"}
     assert [(s.key, s.status) for s in ss.stories] == [
         ("1-1-a", "ready-for-dev"),
         ("1-2-b", "done"),
         ("2-1-c", "backlog"),
     ]
-    assert ss.retros == {1: "optional"}
+    assert ss.retros == {"1": "optional"}
 
     # cached result (same object) until the file changes, then re-parsed
     assert data.sprint_overview(project.project) is ss

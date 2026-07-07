@@ -385,7 +385,7 @@ def test_example_plugin_veto_gate_skips_parked_epic(project):
     install_example(project)
     setup_story(project)
     # park epic 1 -> the pre_dev_phase gate skips story 1-1-a before any session
-    policy = example_policy(forbid_epic=1)
+    policy = example_policy(forbid_epic="1")
     reg = PluginRegistry.build(project.project, policy)
     engine, adapter = make_engine(project, [], reg, policy)  # empty script: no session launches
     summary = engine.run()

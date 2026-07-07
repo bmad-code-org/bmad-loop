@@ -10,7 +10,7 @@ def _state(**kw) -> RunState:
 
 
 def _task_with_session(usage: TokenUsage | None = None) -> StoryTask:
-    task = StoryTask(story_key="1-1-a", epic=1)
+    task = StoryTask(story_key="1-1-a", epic="1")
     task.record_session(
         SessionRecord(task_id="1-1-a-dev-1", role="dev", status="completed", usage=usage)
     )
@@ -63,23 +63,23 @@ def test_session_record_result_json_defaults_none_for_legacy_state():
 
 
 def test_followup_review_recommended_round_trips():
-    task = StoryTask(story_key="1-1-a", epic=1, followup_review_recommended=True)
+    task = StoryTask(story_key="1-1-a", epic="1", followup_review_recommended=True)
     assert StoryTask.from_dict(task.to_dict()).followup_review_recommended is True
 
 
 def test_followup_review_recommended_defaults_false_for_legacy_state():
-    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    doc = StoryTask(story_key="1-1-a", epic="1").to_dict()
     del doc["followup_review_recommended"]  # state.json from before the field existed
     assert StoryTask.from_dict(doc).followup_review_recommended is False
 
 
 def test_resolved_redrive_round_trips():
-    task = StoryTask(story_key="1-1-a", epic=1, resolved_redrive=True)
+    task = StoryTask(story_key="1-1-a", epic="1", resolved_redrive=True)
     assert StoryTask.from_dict(task.to_dict()).resolved_redrive is True
 
 
 def test_resolved_redrive_defaults_false_for_legacy_state():
-    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    doc = StoryTask(story_key="1-1-a", epic="1").to_dict()
     del doc["resolved_redrive"]  # state.json from before the field existed
     assert StoryTask.from_dict(doc).resolved_redrive is False
 
@@ -96,9 +96,9 @@ def test_stopped_defaults_false_for_legacy_state():
 
 
 def test_run_filters_round_trip():
-    state = _state(epic_filter=9, story_filter="9-0", max_stories=3)
+    state = _state(epic_filter="9", story_filter="9-0", max_stories=3)
     back = RunState.from_dict(state.to_dict())
-    assert (back.epic_filter, back.story_filter, back.max_stories) == (9, "9-0", 3)
+    assert (back.epic_filter, back.story_filter, back.max_stories) == ("9", "9-0", 3)
 
 
 def test_run_filters_default_none_for_legacy_state():

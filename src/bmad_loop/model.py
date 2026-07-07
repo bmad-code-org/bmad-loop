@@ -123,7 +123,10 @@ class SessionRecord:
 @dataclass
 class StoryTask:
     story_key: str
-    epic: int
+    # epic is a string id (str): "1", "1a", "sprint-08", "backlog". Was int in
+    # upstream bmad-loop; widened to str to support the project's letter-suffix
+    # + sprint + backlog conventions. See sprintstatus.py for the regex.
+    epic: str
     phase: Phase = Phase.PENDING
     attempt: int = 0
     review_cycle: int = 0
@@ -227,9 +230,12 @@ class StoryTask:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "StoryTask":
+        # Coerce epic to str for back-compat with any state.json persisted by
+        # an int-only build (current epic is always non-null for any tasked run).
+        epic_raw = d["epic"]
         return cls(
             story_key=d["story_key"],
-            epic=int(d["epic"]),
+            epic=str(epic_raw) if epic_raw is not None else "",
             phase=Phase(d["phase"]),
             attempt=int(d.get("attempt", 0)),
             review_cycle=int(d.get("review_cycle", 0)),
@@ -260,12 +266,12 @@ class RunState:
     project: str
     started_at: str
     policy_snapshot: dict[str, Any] = field(default_factory=dict)
-    current_epic: int | None = None
+    current_epic: str | None = None  # was int — accepts "1a", "sprint-08", etc.
     # the run's story scope + cap, as passed on the launching CLI (`--epic`,
     # `--story`, `--max-stories`). Persisted so `resume` rebuilds the Engine with
     # the SAME selector — otherwise a resumed `--epic N` run silently widens to
     # every epic and can jump out of its scope at the next pick.
-    epic_filter: int | None = None
+    epic_filter: str | None = None  # was int — accepts the same ids as current_epic
     story_filter: str | None = None
     max_stories: int | None = None
     paused_reason: str | None = None
@@ -354,13 +360,18 @@ class RunState:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "RunState":
+        # Coerce current_epic / epic_filter to str for back-compat with any
+        # state.json persisted by an int-only build.
+        def _coerce_str(v: Any) -> str | None:
+            return None if v is None else str(v)
+
         return cls(
             run_id=d["run_id"],
             project=d["project"],
             started_at=d["started_at"],
             policy_snapshot=d.get("policy_snapshot", {}),
-            current_epic=d.get("current_epic"),
-            epic_filter=d.get("epic_filter"),
+            current_epic=_coerce_str(d.get("current_epic")),
+            epic_filter=_coerce_str(d.get("epic_filter")),
             story_filter=d.get("story_filter"),
             max_stories=d.get("max_stories"),
             paused_reason=d.get("paused_reason"),

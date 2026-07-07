@@ -156,7 +156,7 @@ class RunDiag:
     paused: bool
     paused_stage: str | None
     paused_reason_present: bool
-    current_epic: int | None
+    current_epic: str | None  # was int — accepts "1a", "sprint-08", "backlog"
     sweep_cycle: int
     sweeps_triggered: list[str]
     plugin_shared_keys: int

@@ -1253,7 +1253,11 @@ def main(argv: list[str] | None = None) -> int:
     probe_p.add_argument("--keep-temp", action="store_true", help=argparse.SUPPRESS)
 
     run_p = add("run", cmd_run, "run the orchestration loop")
-    run_p.add_argument("--epic", type=int, help="only stories from this epic")
+    run_p.add_argument(
+        "--epic",
+        type=str,
+        help="only stories from this epic (numeric id, suffix id like '1a' or '18a', 'sprint-08', 'backlog', or full epic key)",
+    )
     run_p.add_argument("--story", help="story: E-S / E.S, a slug fragment, or full key")
     run_p.add_argument("--max-stories", type=int, help="stop after N stories")
     run_p.add_argument("--dry-run", action="store_true", help="print the plan, spawn nothing")

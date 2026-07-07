@@ -15,12 +15,31 @@ from pathlib import Path
 
 import yaml
 
-EPIC_RE = re.compile(r"^epic-(\d+)$")
-RETRO_RE = re.compile(r"^epic-(\d+)-retrospective$")
-RETRO_ITEM_RE = re.compile(r"^epic-(\d+)-retro-item-(\d+)-(.+)$")
-STORY_RE = re.compile(r"^(\d+)-(\d+)-(.+)$")
+# Sprint-status key classifiers. The original regexes only accepted pure-digit
+# epics + stories (epic-N, N-N-slug). Extended here to accept:
+#   - epic-1a, epic-18a, epic-0-p2        (letter / phase suffix on epics)
+#   - 1a-1-..., 3-3a-..., 18-0a-...       (letter suffix on story segments)
+#   - sprint-NN + sprint-NN-*             (sprint grouping container)
+#   - backlog + backlog-*                 (unscheduled work under a virtual epic)
+#   - {status: done, size: M, rationale: ...} struct values (Phase 4 entries
+#     attach size + rationale inline)
+EPIC_RE = re.compile(r"^epic-(\d+[a-z]?(?:-p\d+)?)$")
+RETRO_RE = re.compile(r"^epic-(\d+[a-z]?(?:-p\d+)?)-retrospective$")
+RETRO_ITEM_RE = re.compile(r"^epic-(\d+[a-z]?(?:-p\d+)?)-retro-item-(\d+)-(.+)$")
+STORY_RE = re.compile(r"^(\d+[a-z]?(?:-p\d+)?)-(\d+[a-z]?)-(.+)$")
+SPRINT_RE = re.compile(r"^sprint-(\d+)$")
+SPRINT_RETRO_RE = re.compile(r"^sprint-(\d+)-retrospective$")
+SPRINT_STORY_RE = re.compile(r"^sprint-(\d+)-(.+)$")
+BACKLOG_RE = re.compile(r"^backlog$")
+BACKLOG_STORY_RE = re.compile(r"^backlog-(.+)$")
 SHORT_REF_RE = re.compile(r"^(\d+)[-.](\d+)$")  # short story ref: 3-1 or 3.1
 BARE_NUM_RE = re.compile(r"^(\d+)$")  # a lone story number, needs --epic
+# Sprint/backlog story prefix detector — splits domain code, story number, slug.
+# Examples:
+#   "qua-5g1-auth-session-state-extraction" -> ("qua", "5g1", "auth-session-state-extraction")
+#   "deploy-monolith-image-go-live"         -> ("deploy", "",   "monolith-image-go-live")
+SPRINT_STORY_SPLIT_RE = re.compile(r"^([a-z]+)-(\d+[a-z]?)-(.+)$")
+SPRINT_STORY_NOSPLIT_RE = re.compile(r"^([a-z]+)-(.+)$")
 
 STORY_STATUSES = {"backlog", "ready-for-dev", "in-progress", "review", "done"}
 # Lifecycle order, earliest -> latest. `advance` never moves a story backward
@@ -37,8 +56,12 @@ class SprintStatusError(Exception):
 @dataclass(frozen=True)
 class Story:
     key: str
-    epic: int
-    num: int
+    # epic is a string id: "1", "1a", "0-p2", "sprint-08", or "backlog".
+    # Original bmad-loop typed this as int; we widen to str so the orchestrator
+    # can group letter-suffix / phase-suffix / sprint / backlog stories.
+    epic: str
+    # num is a string id: "1", "3a", "5g1", or "" when the format has no number.
+    num: str
     slug: str
     status: str
 
@@ -53,7 +76,7 @@ class RetroItem:
     """
 
     key: str
-    epic: int
+    epic: str  # was int — accepts "1", "1a", etc.
     num: int
     slug: str
     status: str
@@ -62,9 +85,11 @@ class RetroItem:
 @dataclass(frozen=True)
 class SprintStatus:
     path: Path
-    epics: dict[int, str]
+    # Keys are epic ids (str); "epic-" / "sprint-" / "backlog" prefixes live in
+    # the value-side labels, not the key (matches the YAML literal key style).
+    epics: dict[str, str]
     stories: tuple[Story, ...]
-    retros: dict[int, str]
+    retros: dict[str, str]
     retro_items: tuple[RetroItem, ...]
     unknown_keys: tuple[str, ...]
 
@@ -82,36 +107,92 @@ def load(path: Path) -> SprintStatus:
     if not isinstance(dev, dict):
         raise SprintStatusError(f"sprint status missing development_status map: {path}")
 
-    epics: dict[int, str] = {}
+    epics: dict[str, str] = {}
     stories: list[Story] = []
-    retros: dict[int, str] = {}
+    retros: dict[str, str] = {}
     retro_items: list[RetroItem] = []
     unknown: list[str] = []
     for key, raw_status in dev.items():
         key = str(key)
-        status = str(raw_status).strip()
+        # Status can be a plain string ("done") or a struct with metadata
+        # ({status: done, size: M, rationale: "...", last_updated: ...}).
+        # The project's Phase 4 entries use the struct shape to attach size +
+        # rationale inline; upstream bmad-loop treated them as plain strings.
+        if isinstance(raw_status, dict):
+            status = str(raw_status.get("status", "")).strip()
+        else:
+            status = str(raw_status).strip()
         if m := RETRO_ITEM_RE.match(key):
             retro_items.append(
                 RetroItem(
                     key=key,
-                    epic=int(m.group(1)),
+                    epic=m.group(1),  # str — was int
                     num=int(m.group(2)),
                     slug=m.group(3),
                     status=status,
                 )
             )
         elif m := RETRO_RE.match(key):
-            retros[int(m.group(1))] = status
+            retros[m.group(1)] = status  # str key — was int
         elif m := EPIC_RE.match(key):
-            epics[int(m.group(1))] = status
+            epics[m.group(1)] = status  # str key — was int
         elif m := STORY_RE.match(key):
             status = LEGACY_STORY_STATUSES.get(status, status)
             stories.append(
                 Story(
                     key=key,
-                    epic=int(m.group(1)),
-                    num=int(m.group(2)),
+                    epic=m.group(1),  # str — was int
+                    num=m.group(2),   # str — was int (preserves "3a", "5g1", etc.)
                     slug=m.group(3),
+                    status=status,
+                )
+            )
+        elif m := SPRINT_RETRO_RE.match(key):
+            retros[f"sprint-{m.group(1)}"] = status
+        elif m := SPRINT_RE.match(key):
+            epics[f"sprint-{m.group(1)}"] = status
+        elif m := SPRINT_STORY_RE.match(key):
+            status = LEGACY_STORY_STATUSES.get(status, status)
+            rest = m.group(2)
+            # Best-effort split into (domain, num, slug). Sprint story keys have
+            # inconsistent shape (e.g. "qua-5g1-auth-..." has a num, but
+            # "deploy-monolith-..." and "bugfix-..." do not), so num may be "".
+            sm = SPRINT_STORY_SPLIT_RE.match(rest)
+            if sm:
+                num = sm.group(2)
+                slug = f"{sm.group(1)}-{sm.group(3)}"
+            else:
+                # No numeric segment (e.g. "deploy-monolith-..." / "bugfix-..."):
+                # treat the entire rest as slug with empty num.
+                num = ""
+                slug = rest
+            stories.append(
+                Story(
+                    key=key,
+                    epic=f"sprint-{m.group(1)}",
+                    num=num,
+                    slug=slug,
+                    status=status,
+                )
+            )
+        elif m := BACKLOG_RE.match(key):
+            epics["backlog"] = status
+        elif m := BACKLOG_STORY_RE.match(key):
+            status = LEGACY_STORY_STATUSES.get(status, status)
+            rest = m.group(1)
+            sm = re.match(r"^([a-z]+)-(\d+)-(.+)$", rest)
+            if sm:
+                num = sm.group(2)
+                slug = f"{sm.group(1)}-{sm.group(3)}"
+            else:
+                num = ""
+                slug = rest
+            stories.append(
+                Story(
+                    key=key,
+                    epic="backlog",
+                    num=num,
+                    slug=slug,
                     status=status,
                 )
             )
@@ -129,7 +210,7 @@ def load(path: Path) -> SprintStatus:
 
 
 def next_actionable(
-    ss: SprintStatus, skip: set[str] | None = None, *, epic: int | None = None
+    ss: SprintStatus, skip: set[str] | None = None, *, epic: str | None = None
 ) -> Story | None:
     """First story in file order whose status allows starting work. When
     ``epic`` is given, only stories of that epic are considered — the caller
@@ -215,12 +296,32 @@ def advance(path: Path, story_key: str, target: str, *, now: str | None = None) 
     changed = story_changed
 
     if target == "in-progress":
-        m = STORY_RE.match(story_key)
-        if m:
-            epic_key = f"epic-{int(m.group(1))}"
+        # Derive parent epic from the story_key prefix. STORY_RE covers
+        # numeric/letter-suffix/phase-suffix epics; SPRINT_STORY_RE and
+        # BACKLOG_STORY_RE cover Phase 4 + unscheduled work.
+        #
+        # Two keys here:
+        #   - yaml_key is what `_set_mapping_value` writes to the YAML file
+        #     (literal key in the document, e.g. "epic-3" or "sprint-08").
+        #   - lookup_id is what `ss.epics` is keyed by after `load()` (no
+        #     prefix, e.g. "3" or "sprint-08" or "backlog"). The split lets
+        #     letter-suffix epics (epic-1a, epic-0-p2) round-trip cleanly.
+        yaml_key: str | None = None
+        lookup_id: str | None = None
+        if m_story := STORY_RE.match(story_key):
+            bare = m_story.group(1)
+            yaml_key = f"epic-{bare}"
+            lookup_id = bare
+        elif m_sprint := SPRINT_STORY_RE.match(story_key):
+            yaml_key = f"sprint-{m_sprint.group(1)}"
+            lookup_id = yaml_key  # sprint epics keep "sprint-NN" as their id
+        elif BACKLOG_STORY_RE.match(story_key):
+            yaml_key = "backlog"
+            lookup_id = "backlog"
+        if yaml_key is not None and lookup_id is not None:
             ss = load(path)
-            if ss.epics.get(int(m.group(1))) == "backlog":
-                changed = _set_mapping_value(lines, epic_key, "in-progress") or changed
+            if ss.epics.get(lookup_id) == "backlog":
+                changed = _set_mapping_value(lines, yaml_key, "in-progress") or changed
 
     if now is not None:
         changed = _set_mapping_value(lines, "last_updated", now) or changed
@@ -240,10 +341,12 @@ class StorySelector:
     * bare number ``1`` with ``--epic 3`` — epic 3, story 1
     * slug fragment ``user-auth`` / ``auth`` — substring of the slug (must be unique)
     * epic only (``--epic 3``, blank story) — every story in the epic
+    * Phase-4 keys: ``--epic sprint-08 --story qua-5g1-...`` or the full key
+      as a slug fragment.
     """
 
-    epic: int | None = None
-    num: int | None = None
+    epic: str | None = None
+    num: str | None = None  # str — was int; preserves "3a", "5g1", or ""
     key: str | None = None  # exact full key
     slug: str | None = None  # slug substring
 
@@ -265,7 +368,7 @@ class StorySelector:
         return True
 
 
-def parse_selector(epic: int | None, story: str | None) -> StorySelector:
+def parse_selector(epic: str | None, story: str | None) -> StorySelector:
     """Translate the ``--epic``/``--story`` pair into a :class:`StorySelector`.
 
     Raises :class:`SprintStatusError` on bad or ambiguous input.
@@ -274,18 +377,18 @@ def parse_selector(epic: int | None, story: str | None) -> StorySelector:
     if not text:
         return StorySelector(epic=epic)
 
-    def _check_epic(parsed_epic: int) -> None:
+    def _check_epic(parsed_epic: str) -> None:
         if epic is not None and epic != parsed_epic:
             raise SprintStatusError(
                 f"--epic {epic} conflicts with story '{text}' (epic {parsed_epic})"
             )
 
-    if m := STORY_RE.match(text):  # full key 3-1-slug
-        e, n = int(m.group(1)), int(m.group(2))
+    if m := STORY_RE.match(text):  # full key 3-1-slug (or 1a-1-slug, etc.)
+        e, n = m.group(1), m.group(2)  # keep as str — was int
         _check_epic(e)
         return StorySelector(epic=e, num=n, key=text)
     if m := SHORT_REF_RE.match(text):  # 3-1 / 3.1
-        e, n = int(m.group(1)), int(m.group(2))
+        e, n = m.group(1), m.group(2)  # keep as str — was int
         _check_epic(e)
         return StorySelector(epic=e, num=n)
     if m := BARE_NUM_RE.match(text):  # bare story number, needs --epic
@@ -293,11 +396,11 @@ def parse_selector(epic: int | None, story: str | None) -> StorySelector:
             raise SprintStatusError(
                 f"ambiguous story '{text}': use --epic E --story {text}, or E-{text}"
             )
-        return StorySelector(epic=epic, num=int(m.group(1)))
+        return StorySelector(epic=epic, num=m.group(1))  # str — was int
     return StorySelector(epic=epic, slug=text)  # slug fragment
 
 
-def select_actionable(ss: SprintStatus, epic: int | None, story: str | None) -> list[Story]:
+def select_actionable(ss: SprintStatus, epic: str | None, story: str | None) -> list[Story]:
     """Stories selected by ``--epic``/``--story`` that are ready to start, in
     file order. Raises :class:`SprintStatusError` with a targeted message when a
     named story is missing, ambiguous, or exists but is not actionable.

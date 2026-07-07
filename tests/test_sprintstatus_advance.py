@@ -34,7 +34,7 @@ def test_advance_to_in_progress_lifts_backlog_epic(tmp_path):
     out = sprintstatus.advance(p, "3-2-digest-delivery", "in-progress")
     assert out == "in-progress"
     assert sprintstatus.story_status(p, "3-2-digest-delivery") == "in-progress"
-    assert sprintstatus.load(p).epics[3] == "in-progress"  # epic lifted
+    assert sprintstatus.load(p).epics["3"] == "in-progress"  # epic lifted
 
 
 def test_advance_preserves_comments_and_structure(tmp_path):
@@ -87,20 +87,20 @@ def test_advance_to_review(tmp_path):
     assert out == "review"
     assert sprintstatus.story_status(p, "3-2-digest-delivery") == "review"
     # epic NOT lifted for non-in-progress targets
-    assert sprintstatus.load(p).epics[3] == "backlog"
+    assert sprintstatus.load(p).epics["3"] == "backlog"
 
 
 def test_advance_done_does_not_touch_epic(tmp_path):
     p = _write(tmp_path)
     sprintstatus.advance(p, "3-2-digest-delivery", "done")
-    assert sprintstatus.load(p).epics[3] == "backlog"
+    assert sprintstatus.load(p).epics["3"] == "backlog"
 
 
 def test_advance_epic_not_lifted_when_not_backlog(tmp_path):
     p = _write(tmp_path)
     sprintstatus.advance(p, "4-1-thing", "in-progress")  # regresses -> no-op anyway
     # epic-4 was in-progress; ensure unchanged
-    assert sprintstatus.load(p).epics[4] == "in-progress"
+    assert sprintstatus.load(p).epics["4"] == "in-progress"
 
 
 def test_advance_refreshes_last_updated(tmp_path):

@@ -148,7 +148,7 @@ class Engine:
         journal: Journal,
         state: RunState,
         max_stories: int | None = None,
-        epic_filter: int | None = None,
+        epic_filter: str | None = None,
         story_filter: str | None = None,
         review_adapter: CodingCLIAdapter | None = None,
         sweep_factory: Callable[[str], None] | None = None,
@@ -747,7 +747,7 @@ class Engine:
             self.journal.append("sprint-status-unknown-keys", keys=list(ss.unknown_keys))
         base_skip = set(self.state.tasks)  # anything this run already touched
 
-        def _first(epic: int | None):
+        def _first(epic: str | None):
             # local skip copy so selector-rejections in this pass don't leak into
             # the next one (a story rejected here may still match the fallback).
             skip = set(base_skip)
@@ -2259,10 +2259,18 @@ class Engine:
             self.journal.append("sweep-auto-failed", trigger=trigger, error=str(e))
             gates.notify(self.policy, self.run_dir, "auto sweep failed", f"{trigger}: {e}")
 
-    def _epic_boundary(self, finished_epic: int, next_epic: int) -> None:
+    def _epic_boundary(self, finished_epic: str, next_epic: str) -> None:
         self.journal.append("epic-boundary", finished=finished_epic, next=next_epic)
         self._emit("pre_epic_boundary", epic=finished_epic)
-        self._maybe_auto_sweep("per-epic", f"epic-{finished_epic}")
+        # Journal key keeps the upstream "epic-N" shape for backwards-compatible
+        # tools (TUI log filters, post-mortem scripts). For non-numeric ids we
+        # fall back to the raw id so the journal still records the boundary.
+        sweep_key = (
+            f"epic-{finished_epic}"
+            if finished_epic.isdigit()
+            else finished_epic
+        )
+        self._maybe_auto_sweep("per-epic", sweep_key)
         if self.policy.gates.retrospective != "never":
             gates.notify(
                 self.policy,

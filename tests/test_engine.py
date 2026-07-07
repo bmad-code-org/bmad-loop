@@ -102,7 +102,7 @@ def test_run_session_saves_completed_session_checkpoint(project):
     a host kill inside the hooks cannot lose it."""
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     engine, _ = make_engine(project, [SessionResult(status="completed")])
-    task = StoryTask(story_key="1-1-a", epic=1)
+    task = StoryTask(story_key="1-1-a", epic="1")
     engine.state.tasks[task.story_key] = task
     engine._save()
 
@@ -136,7 +136,7 @@ def test_run_session_persists_session_when_usage_read_raises(project):
         project,
         [SessionResult(status="completed", session_id="sess-1", transcript_path="events.jsonl")],
     )
-    task = StoryTask(story_key="1-1-a", epic=1)
+    task = StoryTask(story_key="1-1-a", epic="1")
     engine.state.tasks[task.story_key] = task
     engine._save()
 
@@ -296,7 +296,7 @@ def test_resume_restart_when_session_record_incomplete(project, record):
     session with a recorded result still takes today's resume-restart."""
     write_sprint(project, {"1-1-a": "ready-for-dev"})
     engine, _ = make_engine(project, [])
-    task = StoryTask(story_key="1-1-a", epic=1, phase=Phase.DEV_RUNNING, attempt=1)
+    task = StoryTask(story_key="1-1-a", epic="1", phase=Phase.DEV_RUNNING, attempt=1)
     task.record_session(record)
     engine.state.tasks[task.story_key] = task
     engine._save()
@@ -421,7 +421,7 @@ def test_reconcile_early_return_heals_stale_resumed_dict(project):
         "---\ntitle: 'test'\ntype: 'feature'\nstatus: 'done'\n"
         "followup_review_recommended: true\nbaseline_commit: 'abc'\n---\n\n## Intent\n\ntest\n"
     )
-    task = StoryTask(story_key="1-1-a", epic=1)
+    task = StoryTask(story_key="1-1-a", epic="1")
     # the pre-reconcile snapshot persisted before the original run mutated its
     # in-memory dict: frontmatter template default status, no followup key.
     stale = {"workflow": "auto-dev", "spec_file": str(sp), "status": "in-progress"}
@@ -442,7 +442,7 @@ def test_run_session_record_result_json_isolated_from_later_mutation(project):
     engine, _ = make_engine(
         project, [SessionResult(status="completed", result_json={"workflow": "auto-dev"})]
     )
-    task = StoryTask(story_key="1-1-a", epic=1)
+    task = StoryTask(story_key="1-1-a", epic="1")
     engine.state.tasks[task.story_key] = task
     engine._save()
 
@@ -471,7 +471,7 @@ def test_run_session_persists_result_json_only_for_resumable_roles(project):
         ],
     )
     engine.adapters["triage"] = adapter  # SweepEngine registers this; wire it here
-    task = StoryTask(story_key="1-1-a", epic=1)
+    task = StoryTask(story_key="1-1-a", epic="1")
     engine.state.tasks[task.story_key] = task
     engine._save()
 
@@ -993,7 +993,7 @@ def test_generic_reconcile_skips_out_of_tree_spec(project, tmp_path):
         scm=ScmPolicy(rollback_on_failure=True),
     )
     engine, _ = make_engine(project, [generic_dev_effect(project, "1-1-a")], policy=pol)
-    task = StoryTask(story_key="1-1-a", epic=1)
+    task = StoryTask(story_key="1-1-a", epic="1")
     engine._reconcile_generic_terminal_status(task, {"spec_file": str(outside)})
 
     assert outside.read_text() == original  # never written
@@ -1043,7 +1043,7 @@ def test_reset_spec_for_repair_strips_stale_terminal_section(project):
         "## Auto Run Result\n\nStatus: done\nAll done.\n",
         encoding="utf-8",
     )
-    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(spec))
+    task = StoryTask(story_key="1-1-a", epic="1", spec_file=str(spec))
 
     engine._reset_spec_for_repair(task)
 
@@ -1478,7 +1478,7 @@ def test_rollback_or_pause_skips_clean_tree(project):
         scm=ScmPolicy(rollback_on_failure=False),
     )
     engine, _ = make_engine(project, [], policy=policy)
-    task = StoryTask(story_key="1-1-a", epic=1)
+    task = StoryTask(story_key="1-1-a", epic="1")
     task.baseline_commit = rev_parse_head(project.project)  # clean tree at baseline
     task.baseline_untracked = []
 
@@ -1499,7 +1499,7 @@ def test_manual_recovery_wording_stopped(project):
         scm=ScmPolicy(rollback_on_failure=False),
     )
     engine, _ = make_engine(project, [], policy=policy)
-    task = StoryTask(story_key="1-1-a", epic=1)
+    task = StoryTask(story_key="1-1-a", epic="1")
     baseline = rev_parse_head(project.project)
 
     with pytest.raises(RunPaused) as stopped:
@@ -1520,7 +1520,7 @@ def test_rollback_preserves_committed_attempt_work(project):
     )
     engine, _ = make_engine(project, [], policy=policy)
     repo = project.project
-    task = StoryTask(story_key="1-1-a", epic=1)
+    task = StoryTask(story_key="1-1-a", epic="1")
     task.baseline_commit = rev_parse_head(repo)
     task.baseline_untracked = []
     (repo / "impl.txt").write_text("committed implementation\n")  # attempt commits its work
@@ -1547,7 +1547,7 @@ def test_rollback_preserves_uncommitted_attempt_worktree(project):
     )
     engine, _ = make_engine(project, [], policy=policy)
     repo = project.project
-    task = StoryTask(story_key="1-1-a", epic=1)
+    task = StoryTask(story_key="1-1-a", epic="1")
     task.baseline_commit = rev_parse_head(repo)
     task.baseline_untracked = []
     (repo / "src.txt").write_text("uncommitted tracked edit\n")  # tracked, never committed
@@ -1578,7 +1578,7 @@ def test_rollback_preserves_distinct_refs_across_repeated_dirty_rollbacks(projec
     )
     engine, _ = make_engine(project, [], policy=policy)
     repo = project.project
-    task = StoryTask(story_key="1-1-a", epic=1)
+    task = StoryTask(story_key="1-1-a", epic="1")
     task.baseline_commit = rev_parse_head(repo)
     task.baseline_untracked = []
 
@@ -1804,7 +1804,7 @@ def test_rollback_worktree_preserve_failure_journals_git_error(project, monkeypa
     )
     engine, _ = make_engine(project, [], policy=policy)
     repo = project.project
-    task = StoryTask(story_key="1-1-a", epic=1)
+    task = StoryTask(story_key="1-1-a", epic="1")
     task.baseline_commit = rev_parse_head(repo)
     task.baseline_untracked = []
     (repo / "src.txt").write_text("uncommitted edit\n")  # dirty but uncommitted; no commits
@@ -1835,7 +1835,7 @@ def test_rollback_pauses_when_preserve_fails(project, monkeypatch):
     )
     engine, _ = make_engine(project, [], policy=policy)
     repo = project.project
-    task = StoryTask(story_key="1-1-a", epic=1)
+    task = StoryTask(story_key="1-1-a", epic="1")
     task.baseline_commit = rev_parse_head(repo)
     task.baseline_untracked = []
     (repo / "impl.txt").write_text("committed work\n")
@@ -1868,7 +1868,7 @@ def test_resolved_redrive_never_pauses_when_preserve_fails(project, monkeypatch)
     )
     engine, _ = make_engine(project, [], policy=policy)
     repo = project.project
-    task = StoryTask(story_key="1-1-a", epic=1)
+    task = StoryTask(story_key="1-1-a", epic="1")
     task.baseline_commit = rev_parse_head(repo)
     task.baseline_untracked = []
     (repo / "impl.txt").write_text("failed attempt work\n")  # committed, outside artifacts
@@ -1900,7 +1900,7 @@ def test_rollback_or_pause_resolved_auto_recovers(project):
     )
     engine, _ = make_engine(project, [], policy=policy)
     repo = project.project
-    task = StoryTask(story_key="1-1-a", epic=1)
+    task = StoryTask(story_key="1-1-a", epic="1")
     task.baseline_commit = rev_parse_head(repo)
     task.baseline_untracked = []  # clean fixture at baseline
 
@@ -1930,7 +1930,7 @@ def test_resolved_redrive_preserves_spec_on_later_rollback(project):
     )
     engine, _ = make_engine(project, [], policy=policy)
     repo = project.project
-    task = StoryTask(story_key="1-1-a", epic=1)
+    task = StoryTask(story_key="1-1-a", epic="1")
     task.baseline_commit = rev_parse_head(repo)
     task.baseline_untracked = []
     task.resolved_redrive = True  # latched by _finish_inflight on the re-drive
@@ -2808,11 +2808,11 @@ def test_resume_with_epic_filter_stays_in_scoped_epic(project):
             "9-1-keystone": "ready-for-dev",
         },
     )
-    engine, _ = make_engine(project, [_escalate_blocked(project, "9-0-test-infra")], epic_filter=9)
-    engine.state.epic_filter = 9  # cmd_run persists the launch scope; mirror it here
+    engine, _ = make_engine(project, [_escalate_blocked(project, "9-0-test-infra")], epic_filter="9")
+    engine.state.epic_filter = "9"  # cmd_run persists the launch scope; mirror it here
     summary = engine.run()
     assert summary.paused and summary.escalated == 1
-    assert engine.state.current_epic == 9
+    assert engine.state.current_epic == "9"
 
     rearm_escalation(engine.run_dir)  # the resolve workflow's re-arm step
     resumed, _ = resume_engine(
@@ -2850,13 +2850,13 @@ def test_pick_next_prefers_current_epic_over_earlier_file_position(project):
         },
     )
     engine, _ = make_engine(project, [])
-    engine.state.current_epic = 9
-    engine.state.tasks["9-0-x"] = StoryTask(story_key="9-0-x", epic=9, phase=Phase.DEFERRED)
+    engine.state.current_epic = "9"
+    engine.state.tasks["9-0-x"] = StoryTask(story_key="9-0-x", epic="9", phase=Phase.DEFERRED)
 
     assert engine._pick_next().key == "9-1-y"  # stays in epic 9, not 5-1-e5
 
     # exhaust epic 9 → fallback returns the earlier-in-file epic (doc order kept)
-    engine.state.tasks["9-1-y"] = StoryTask(story_key="9-1-y", epic=9, phase=Phase.DONE)
+    engine.state.tasks["9-1-y"] = StoryTask(story_key="9-1-y", epic="9", phase=Phase.DONE)
     assert engine._pick_next().key == "5-1-e5"
 
 

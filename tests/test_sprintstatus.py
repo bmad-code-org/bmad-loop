@@ -21,14 +21,14 @@ def test_load_classifies_keys(project):
         },
     )
     ss = sprintstatus.load(project.sprint_status)
-    assert ss.epics == {1: "in-progress", 2: "backlog"}
+    assert ss.epics == {"1": "in-progress", "2": "backlog"}
     assert [s.key for s in ss.stories] == [
         "1-1-user-auth",
         "1-2-account-mgmt",
         "2-1-personality",
     ]
-    assert ss.stories[1].epic == 1 and ss.stories[1].num == 2
-    assert ss.retros == {1: "optional", 2: "optional"}
+    assert ss.stories[1].epic == "1" and ss.stories[1].num == "2"
+    assert ss.retros == {"1": "optional", "2": "optional"}
     assert ss.unknown_keys == ("weird-key",)
 
 
@@ -44,12 +44,12 @@ def test_load_classifies_retro_items(project):
     ss = sprintstatus.load(project.sprint_status)
     # retro action items are recognized, not dumped into unknown_keys
     assert ss.unknown_keys == ()
-    assert ss.retros == {1: "done"}  # plain retrospective key is unaffected
+    assert ss.retros == {"1": "done"}  # plain retrospective key is unaffected
     assert [(r.key, r.epic, r.num, r.slug, r.status) for r in ss.retro_items] == [
-        ("epic-1-retro-item-1-test-design-in-stories", 1, 1, "test-design-in-stories", "done"),
+        ("epic-1-retro-item-1-test-design-in-stories", "1", 1, "test-design-in-stories", "done"),
         (
             "epic-5-retro-item-2-singleflight-inflight-guard-helper",
-            5,
+            "5",
             2,
             "singleflight-inflight-guard-helper",
             "backlog",
@@ -91,9 +91,9 @@ def test_next_actionable_epic_filter(project):
     )
     ss = sprintstatus.load(project.sprint_status)
     assert sprintstatus.next_actionable(ss).key == "5-1-e5"  # unfiltered = file order
-    assert sprintstatus.next_actionable(ss, epic=9).key == "9-0-x"
-    assert sprintstatus.next_actionable(ss, skip={"9-0-x"}, epic=9).key == "9-1-y"
-    assert sprintstatus.next_actionable(ss, skip={"9-0-x", "9-1-y"}, epic=9) is None
+    assert sprintstatus.next_actionable(ss, epic="9").key == "9-0-x"
+    assert sprintstatus.next_actionable(ss, skip={"9-0-x"}, epic="9").key == "9-1-y"
+    assert sprintstatus.next_actionable(ss, skip={"9-0-x", "9-1-y"}, epic="9") is None
 
 
 def test_story_status_reread(project):
@@ -105,20 +105,20 @@ def test_story_status_reread(project):
 def test_parse_selector_forms():
     # full key — exact match intent
     sel = sprintstatus.parse_selector(None, "3-1-user-auth")
-    assert (sel.epic, sel.num, sel.key, sel.slug) == (3, 1, "3-1-user-auth", None)
+    assert (sel.epic, sel.num, sel.key, sel.slug) == ("3", "1", "3-1-user-auth", None)
     # short refs: hyphen and dot are equivalent
     for ref in ("3-1", "3.1"):
         sel = sprintstatus.parse_selector(None, ref)
-        assert (sel.epic, sel.num, sel.key, sel.slug) == (3, 1, None, None)
+        assert (sel.epic, sel.num, sel.key, sel.slug) == ("3", "1", None, None)
     # bare number resolves against --epic
-    sel = sprintstatus.parse_selector(3, "1")
-    assert (sel.epic, sel.num, sel.slug) == (3, 1, None)
+    sel = sprintstatus.parse_selector("3", "1")
+    assert (sel.epic, sel.num, sel.slug) == ("3", "1", None)
     # slug fragment
     sel = sprintstatus.parse_selector(None, "user-auth")
     assert (sel.epic, sel.num, sel.slug) == (None, None, "user-auth")
     # epic only — not targeted
-    sel = sprintstatus.parse_selector(3, None)
-    assert sel.epic == 3 and not sel.is_targeted
+    sel = sprintstatus.parse_selector("3", None)
+    assert sel.epic == "3" and not sel.is_targeted
 
 
 def test_parse_selector_bare_number_needs_epic():
@@ -128,9 +128,9 @@ def test_parse_selector_bare_number_needs_epic():
 
 def test_parse_selector_epic_conflict():
     with pytest.raises(sprintstatus.SprintStatusError, match="conflicts"):
-        sprintstatus.parse_selector(2, "3-1")
+        sprintstatus.parse_selector("2", "3-1")
     with pytest.raises(sprintstatus.SprintStatusError, match="conflicts"):
-        sprintstatus.parse_selector(2, "3-1-user-auth")
+        sprintstatus.parse_selector("2", "3-1-user-auth")
 
 
 def test_select_actionable_short_ref_and_epic_story(project):
@@ -139,11 +139,11 @@ def test_select_actionable_short_ref_and_epic_story(project):
         {"3-1-user-auth": "ready-for-dev", "3-2-foo": "backlog", "4-1-bar": "backlog"},
     )
     ss = sprintstatus.load(project.sprint_status)
-    for epic, story in [(None, "3-1"), (None, "3.1"), (3, "1"), (None, "user-auth")]:
+    for epic, story in [(None, "3-1"), (None, "3.1"), ("3", "1"), (None, "user-auth")]:
         got = sprintstatus.select_actionable(ss, epic, story)
         assert [s.key for s in got] == ["3-1-user-auth"]
     # epic only selects every actionable story in the epic
-    assert [s.key for s in sprintstatus.select_actionable(ss, 3, None)] == [
+    assert [s.key for s in sprintstatus.select_actionable(ss, "3", None)] == [
         "3-1-user-auth",
         "3-2-foo",
     ]
