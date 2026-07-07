@@ -380,6 +380,15 @@ def test_resolve_prefix_isolation(tmp_path):
     assert stories.resolve_story_spec(tmp_path, "3").kind == stories.KIND_PENDING
 
 
+def test_resolve_wrong_case_id_is_pending(tmp_path):
+    # Only a differently-cased file exists: resolution must be PENDING on every FS.
+    # On case-sensitive Linux the glob never matches; on a case-insensitive FS
+    # (Windows CI, macOS) the exact-case filter drops the wrong-case hit — without
+    # it this would resolve KIND_PRESENT there, making resolution OS-dependent.
+    write_story_spec(tmp_path, "AUTH-x.md", status="done")
+    assert stories.resolve_story_spec(tmp_path, "auth").kind == stories.KIND_PENDING
+
+
 @pytest.mark.parametrize("bad_id", ["1*", "1?", "1[a", "a/b", "..", ".", "3 1"])
 def test_resolve_charset_invalid_id_is_pending_not_glob(tmp_path, bad_id):
     # A non-charset-valid id must never reach glob(): "1*" would otherwise glob

@@ -276,6 +276,14 @@ def resolve_story_spec(spec_folder: Path | str, story_id: str) -> StoryState:
     its frontmatter status read off disk. More than one match =
     :data:`KIND_AMBIGUOUS` (an anomaly the dispatcher must refuse rather than
     silently pick one).
+
+    The glob result is filtered to names starting with the **exact-case**
+    ``<id>-`` prefix so resolution is deterministic across filesystems: a
+    case-insensitive FS (Windows/macOS) would otherwise let ``Auth-*.md`` also
+    match ``auth-2-slug.md``, matching what a case-sensitive FS (Linux) never
+    would. This keeps resolution in step with the exact-case sentinel comparison
+    below and verify's id-prefix gate — a wrong-case hit that resolved here would
+    only fail those and cause a spurious retry.
     """
     sid = str(story_id).strip()
     if not ID_RE.match(sid):
@@ -287,7 +295,11 @@ def resolve_story_spec(spec_folder: Path | str, story_id: str) -> StoryState:
         # caller already handles, matching the module's fail-loud-not-slip rule.
         return StoryState(kind=KIND_PENDING)
     stories_dir = Path(spec_folder) / STORIES_SUBDIR
-    matches = sorted(stories_dir.glob(f"{sid}-*.md")) if stories_dir.is_dir() else []
+    matches = (
+        sorted(m for m in stories_dir.glob(f"{sid}-*.md") if m.name.startswith(f"{sid}-"))
+        if stories_dir.is_dir()
+        else []
+    )
     if not matches:
         return StoryState(kind=KIND_PENDING)
     if len(matches) > 1:

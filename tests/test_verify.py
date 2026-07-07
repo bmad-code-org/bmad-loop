@@ -520,6 +520,31 @@ def test_verify_dev_stories_plan_halt_rejects_non_plan_status(project):
     assert not out.ok and "expected 'ready-for-dev'" in out.reason
 
 
+def test_verify_dev_stories_plan_halt_requires_marker(project):
+    # plan_halt=True but the result.json carries NO plan_halt marker: a
+    # died-mid-flight ready-for-dev must not pass as a successful plan leg.
+    spec_folder = project.planning_artifacts / "epic-a"
+    task = make_stories_task(project, "1")
+    write_story(spec_folder, "1", "x", "ready-for-dev", task.baseline_commit)
+    out = verify.verify_dev_stories(
+        task,
+        project,
+        {"workflow": "auto-dev"},  # no plan_halt marker
+        spec_folder=spec_folder,
+        review_enabled=False,
+        plan_halt=True,
+    )
+    assert not out.ok and "no plan_halt marker" in out.reason
+
+
+def test_plan_halt_status_matches_devcontract():
+    # verify keeps PLAN_HALT_STATUS as a literal to avoid a verify<-devcontract
+    # import cycle; guard the two copies from drifting.
+    from bmad_loop import devcontract
+
+    assert verify.PLAN_HALT_STATUS == devcontract.PLAN_HALT_STATUS
+
+
 def test_verify_review_bundle_ledger_gate(project):
     task = make_bundle_task(project)
     sp = project.implementation_artifacts / "spec-dw-test-bundle.md"
