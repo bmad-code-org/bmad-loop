@@ -30,7 +30,14 @@ Filter notes by workspace name.
 """
 
 
-def _escalated_run(project, run_id="20260613-111429-6a14", *, spec_file=None, with_session=True):
+def _escalated_run(
+    project,
+    run_id="20260613-111429-6a14",
+    *,
+    spec_file=None,
+    with_session=True,
+    source="sprint-status",
+):
     task = StoryTask(
         story_key="6-4-cli-list-command",
         epic=6,
@@ -54,6 +61,7 @@ def _escalated_run(project, run_id="20260613-111429-6a14", *, spec_file=None, wi
         paused_stage=PAUSE_ESCALATION,
         paused_story_key="6-4-cli-list-command",
         tasks={task.story_key: task},
+        source=source,
     )
     run_dir = project / ".bmad-loop" / "runs" / run_id
     save_state(run_dir, state)
@@ -236,7 +244,7 @@ def test_rearm_clears_sentinel_preserving_a_copy(tmp_path):
         "---\nstatus: blocked\n---\n\n## Auto Run Result\n\nStatus: blocked\nintent too vague\n",
         encoding="utf-8",
     )
-    run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(sentinel))
+    run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(sentinel), source="stories")
 
     returned = runs.rearm_escalation(run_dir)
     assert returned == key
@@ -276,6 +284,23 @@ def test_rearm_non_sentinel_spec_still_flips_status(tmp_path):
     assert verify.read_frontmatter(spec)["status"] == "ready-for-dev"
     assert load_state(run_dir).tasks[key].spec_file == str(spec)  # kept
     assert not (run_dir / "sentinels").exists()
+
+
+def test_rearm_sprint_spec_named_like_a_sentinel_is_not_deleted(tmp_path):
+    """MINOR-G: the sentinel-clear path is stories-mode-only. A *sprint* spec that
+    merely happens to be named `<key>-unresolved.md` must be status-flipped and
+    kept like any other spec — never deleted — since the fixed-slug sentinel
+    convention exists only in stories mode. (source defaults to sprint-status.)"""
+    key = "6-4-cli-list-command"
+    spec = tmp_path / f"{key}-unresolved.md"  # sentinel-shaped name, but a sprint spec
+    spec.write_text("---\nstatus: blocked\n---\n\n## Intent\n\nreal work\n", encoding="utf-8")
+    run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec))  # sprint-status source
+
+    runs.rearm_escalation(run_dir)
+    assert spec.is_file()  # NOT deleted despite the sentinel-shaped name
+    assert verify.read_frontmatter(spec)["status"] == "ready-for-dev"  # flipped like any spec
+    assert load_state(run_dir).tasks[key].spec_file == str(spec)  # kept
+    assert not (run_dir / "sentinels").exists()  # no sentinel preservation in sprint mode
 
 
 def test_rearm_rejects_non_escalation_stage(tmp_path):

@@ -555,31 +555,14 @@ def rearm_escalation(run_dir: Path, story_key: str | None = None) -> str:
     task.rearmed = True  # resume-time recovery notice describes a clean rebuild,
     # not a failed attempt (engine._finish_inflight clears it once the rebuild runs)
 
-    # Advance the attempt baseline to the project's current HEAD and refresh the
-    # untracked snapshot: whatever the human-driven resolve session left on the
-    # branch (a committed fixture, a corrected ledger, ...) is authorized input
-    # for the re-drive, not failed-attempt debris. Without this, the re-drive's
-    # reset-to-baseline in engine._rollback_or_pause parks the resolution
-    # commits on an attempt-preserve ref and rebuilds against a tree that
-    # contradicts the corrected spec — the re-driven dev session then hits the
-    # very gap the human just resolved. Best-effort: on a git failure the old
-    # baseline stands (the redrive rollback path tolerates a stale baseline; it
-    # just loses this protection).
-    # The two locals are computed before either task field is assigned, so a
-    # failure on either git call can't advance baseline_commit while
-    # baseline_untracked stays stale, or vice versa.
-    try:
-        repo = Path(state.project)
-        head = verify.rev_parse_head(repo)
-        untracked = sorted(verify.untracked_files(repo))
-        task.baseline_commit = head
-        task.baseline_untracked = untracked
-    except Exception:  # noqa: BLE001  # nosec B110 - best-effort git read, must not fail re-arm
-        pass
-
     if task.spec_file:
         spec_path = Path(task.spec_file)
-        condition = _sentinel_condition(spec_path, key)
+        # Stories mode only: a fixed-slug pre-planning-halt sentinel
+        # (`<id>-unresolved.md` / `<id>-ambiguous.md`) is cleared by deletion, not a
+        # status flip. Gate on the run source so a *sprint* spec that merely happens
+        # to be named `<key>-unresolved.md` is status-flipped like any other spec and
+        # never deleted — the sentinel filename convention exists only in stories mode.
+        condition = _sentinel_condition(spec_path, key) if state.source == "stories" else None
         if condition is not None:
             # a sentinel is cleared by deletion, not a status flip; drop the stale
             # spec_file so the re-dispatch starts from PENDING (clean re-plan).
@@ -594,6 +577,30 @@ def rearm_escalation(run_dir: Path, story_key: str | None = None) -> str:
             # that heading, so leaving it would let the re-driven session's first
             # save of the spec parse as the prior attempt's terminal outcome.
             devcontract.strip_auto_run_result(spec_path)
+
+    # Advance the attempt baseline to the project's current HEAD and refresh the
+    # untracked snapshot: whatever the human-driven resolve session left on the
+    # branch (a committed fixture, a corrected ledger, ...) is authorized input
+    # for the re-drive, not failed-attempt debris. Without this, the re-drive's
+    # reset-to-baseline in engine._rollback_or_pause parks the resolution
+    # commits on an attempt-preserve ref and rebuilds against a tree that
+    # contradicts the corrected spec — the re-driven dev session then hits the
+    # very gap the human just resolved. Best-effort: on a git failure the old
+    # baseline stands (the redrive rollback path tolerates a stale baseline; it
+    # just loses this protection).
+    # Runs AFTER the spec block so a just-cleared stories sentinel (an untracked
+    # file removed above) is not captured into baseline_untracked as a phantom
+    # pre-existing untracked file. The two locals are computed before either task
+    # field is assigned, so a failure on either git call can't advance
+    # baseline_commit while baseline_untracked stays stale, or vice versa.
+    try:
+        repo = Path(state.project)
+        head = verify.rev_parse_head(repo)
+        untracked = sorted(verify.untracked_files(repo))
+        task.baseline_commit = head
+        task.baseline_untracked = untracked
+    except Exception:  # noqa: BLE001  # nosec B110 - best-effort git read, must not fail re-arm
+        pass
 
     save_state(run_dir, state)
     journal.append("story-escalation-resolved", story_key=key, baseline=task.baseline_commit or "")
