@@ -472,9 +472,10 @@ class SpecReviewModal(BaseDialog):
 
 class StoryCheckpointModal(BaseDialog):
     """done_checkpoint summary card shown after a story commits: id/title, the
-    commit subject + short hash, the verify-command outcome and token totals.
-    Dismisses with 'continue' (resume the schedule) or 'stop' (mark the run
-    stopped), None on close/escape."""
+    commit subject + short hash, a gate line derived from real task state (the
+    verify + review gates the commit cleared, plus the follow-up review-cycle
+    count) and token totals. Dismisses with 'continue' (resume the schedule) or
+    'stop' (mark the run stopped), None on close/escape."""
 
     def __init__(
         self,

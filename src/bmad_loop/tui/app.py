@@ -534,15 +534,36 @@ class BmadLoopApp(App[None]):
         )
         self.push_screen(modal, lambda verb: self._do_resume(run_id) if verb == "resume" else None)
 
+    @staticmethod
+    def _checkpoint_gate_line(review_cycle: int) -> str:
+        """The story-checkpoint card's gate line, derived from real task state.
+
+        A done_checkpoint fires only after the story's verify + review gates
+        passed and it committed, so the pass is backed by the commit's existence
+        — but we do not persist per-command verify output, so we state the gates
+        cleared plus the follow-up review-cycle count the task actually records,
+        never a blanket hardcoded "verification passed" claim."""
+        if review_cycle == 0:
+            note = "no follow-up review cycles"
+        elif review_cycle == 1:
+            note = "1 follow-up review cycle"
+        else:
+            note = f"{review_cycle} follow-up review cycles"
+        return f"verify + review gates passed · {note}"
+
     def _review_story_checkpoint(self, run_id: str, run_dir: Path, state: RunState) -> None:
         story_key = state.paused_story_key or "?"
         task = state.tasks.get(story_key)
         commit = ""
         tokens = "-"
+        # Defensive default: a done_checkpoint implies a commit, but if none is
+        # recorded say so rather than assert a verify outcome we cannot back.
+        verify_line = "no commit recorded for this story"
         if task is not None:
             if task.commit_sha:
                 subject = self._commit_subject(task.commit_sha)
                 commit = f"{task.commit_sha[:12]} {subject}".strip()
+                verify_line = self._checkpoint_gate_line(task.review_cycle)
             weight = state.cache_read_weight()
             raw = task.tokens.total
             if raw:
@@ -551,7 +572,7 @@ class BmadLoopApp(App[None]):
             story_key=story_key,
             title=self._story_context(state, story_key)[0],
             commit=commit,
-            verify_line="✓ verification passed (story committed)",
+            verify_line=verify_line,
             tokens=tokens,
         )
 

@@ -1512,6 +1512,7 @@ def _stories_paused_run(
     spec_checkpoint: bool = True,
     done_checkpoint: bool = False,
     commit_sha: str = "",
+    review_cycle: int = 0,
     blocked_result: str = "",
     sentinel: bool = False,
 ) -> tuple[Path, Path]:
@@ -1545,6 +1546,7 @@ def _stories_paused_run(
     spec.write_text(body, encoding="utf-8")
     task = StoryTask(story_key=story_key, epic=0, phase=Phase.DEV_VERIFY)
     task.spec_file = str(spec)
+    task.review_cycle = review_cycle
     if commit_sha:
         task.commit_sha = commit_sha
     run_dir = make_run(
@@ -1643,6 +1645,37 @@ async def test_story_checkpoint_stop_marks_stopped(project, monkeypatch):
         await _open_review(app, pilot, StoryCheckpointModal)
         await pilot.click(await ready(pilot, "#act-stop"))
         await until(pilot, lambda: len(stops) == 1)
+
+
+def test_checkpoint_gate_line_pluralization():
+    # The gate line is derived, not hardcoded — and pluralizes the real cycle count.
+    f = BmadLoopApp._checkpoint_gate_line
+    assert f(0) == "verify + review gates passed · no follow-up review cycles"
+    assert f(1) == "verify + review gates passed · 1 follow-up review cycle"
+    assert f(3) == "verify + review gates passed · 3 follow-up review cycles"
+
+
+async def test_story_checkpoint_card_surfaces_real_review_cycles(project, monkeypatch):
+    # audit item 13: the card's gate line must reflect the task's real
+    # review_cycle, never the old blanket "verification passed" string.
+    monkeypatch.setattr(launch, "tmux_available", lambda: True)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    _stories_paused_run(
+        project.project,
+        stage="story-checkpoint",
+        spec_status="done",
+        spec_checkpoint=False,
+        done_checkpoint=True,
+        commit_sha="abc1234def5678",
+        review_cycle=2,
+    )
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, StoryCheckpointModal)
+        line = app.screen._verify_line
+        assert "verify + review gates passed" in line
+        assert "2 follow-up review cycles" in line
+        assert "verification passed" not in line
 
 
 async def test_escalation_rearm_resumes_when_resolution_ready(project, monkeypatch):
