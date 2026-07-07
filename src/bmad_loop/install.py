@@ -103,7 +103,11 @@ def missing_stories_support(project: Path, trees: Sequence[str]) -> list[str]:
         probe = project / tree / STORIES_PROBE_SKILL / STORIES_PROBE_FILE
         try:
             text = probe.read_text(encoding="utf-8")
-        except OSError:
+        except (OSError, UnicodeDecodeError):
+            # OSError = the probe file is absent/unreadable; UnicodeDecodeError = it
+            # exists but is binary/non-UTF-8 (a corrupted skill tree). Either way the
+            # dispatch-protocol marker can't be confirmed, so report a problem rather
+            # than letting the decode error escape and crash the whole preflight.
             problems.append(
                 f"{tree}/{STORIES_PROBE_SKILL}/{STORIES_PROBE_FILE} not found — stories "
                 f"mode needs folder+id dispatch; update the BMad Method (bmm) module"

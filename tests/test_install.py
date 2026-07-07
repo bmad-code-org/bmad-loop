@@ -579,6 +579,26 @@ def test_missing_stories_support_probes_step01_content(tmp_path):
     assert missing_stories_support(tmp_path, [tree]) == []
 
 
+def test_missing_stories_support_reports_non_utf8_probe_without_crashing(tmp_path):
+    """C1: a binary/non-UTF-8 step-01 file must be reported as a problem, not crash
+    the preflight — read_text(encoding="utf-8") raises UnicodeDecodeError (a
+    ValueError, NOT an OSError), so the content probe has to catch it explicitly."""
+    from bmad_loop.install import (
+        STORIES_PROBE_FILE,
+        STORIES_PROBE_SKILL,
+        missing_stories_support,
+    )
+
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    step01 = tmp_path / tree / STORIES_PROBE_SKILL / STORIES_PROBE_FILE
+    step01.parent.mkdir(parents=True, exist_ok=True)
+    step01.write_bytes(b"\xff\xfe\x00\x01 not utf-8 \x80\x81")  # invalid UTF-8
+
+    problems = missing_stories_support(tmp_path, [tree])
+    assert len(problems) == 1 and "not found" in problems[0]
+
+
 def test_new_dev_auto_skill_is_additive_for_sprint_mode(tmp_path):
     """Scenario 6 additivity: installing the *new* bmad-dev-auto (folder+id
     dispatch present) satisfies both preflights — sprint mode's file-existence
