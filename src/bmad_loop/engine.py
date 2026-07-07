@@ -1841,10 +1841,14 @@ class Engine:
         target = "review" if review_enabled else "done"
         sprint_advance(self.workspace.paths.sprint_status, task.story_key, target)
 
-    def _extra_session_env(self, task: StoryTask, role: str) -> dict[str, str]:
+    def _extra_session_env(
+        self, task: StoryTask, role: str, label: str | None = None
+    ) -> dict[str, str]:
         """Engine-variant additions to a session's environment. Base: none.
         StoriesEngine overrides this to export BMAD_LOOP_SPEC_FOLDER for the
-        adapter's deterministic id-keyed read-back."""
+        adapter's deterministic id-keyed read-back. ``label`` is None for the
+        primary dev/review session and set for an injected plugin-workflow session,
+        so a variant can scope its env to primary sessions only."""
         return {}
 
     def _run_verify_commands_after_dev(self, task: StoryTask, result_json: dict | None) -> bool:
@@ -1941,7 +1945,9 @@ class Engine:
         # engine-variant env seam: StoriesEngine adds BMAD_LOOP_SPEC_FOLDER so the
         # dev adapter resolves the story spec deterministically by id instead of
         # mtime-scanning. Base returns {} — sprint/sweep runs stay byte-identical.
-        env.update(self._extra_session_env(task, role))
+        # ``label`` (set only for injected plugin-workflow sessions) is passed so the
+        # variant can withhold that env from non-primary sessions.
+        env.update(self._extra_session_env(task, role, label=label))
         if task.dw_ids:
             # Deferred-work bundle: the orchestrator owns the bundle→dw-id binding
             # (the generic bmad-dev-auto primitive knows nothing of dw ids). Export

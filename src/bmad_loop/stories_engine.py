@@ -214,7 +214,19 @@ class StoriesEngine(Engine):
 
     # -------------------------------------------------------------- dispatch
 
-    def _extra_session_env(self, task: StoryTask, role: str) -> dict[str, str]:
+    def _extra_session_env(
+        self, task: StoryTask, role: str, label: str | None = None
+    ) -> dict[str, str]:
+        # Only PRIMARY dev/review sessions get the story-spec env. An injected
+        # plugin-workflow session (label set — e.g. a TEA pre_commit_gate) runs the
+        # generic adapter too; exporting BMAD_LOOP_SPEC_FOLDER would make it
+        # short-circuit to story-spec synthesis, so at pre_commit_gate (spec already
+        # `done`) a gate session that did nothing would read `completed:done` and
+        # bypass the completion-marker + monotonic stall-nudge contract (the
+        # TEA-livelock fix). Withhold the env so workflow sessions keep the marker
+        # contract; sprint-mode workflow sessions are already env-free here.
+        if label is not None:
+            return {}
         # Let the dev/review adapter resolve the story spec deterministically by
         # id (skip the mtime scan). Project-relative — the adapter rebases it
         # against spec.cwd, so it is correct in place and under worktree isolation.

@@ -21,6 +21,8 @@ from bmad_loop.model import (
     StoryTask,
     TokenUsage,
 )
+from bmad_loop.plugins import PluginRegistry
+from bmad_loop.plugins.model import LoadedPlugin, PluginManifest, WorkflowSpec
 from bmad_loop.policy import (
     GatesPolicy,
     NotifyPolicy,
@@ -412,6 +414,70 @@ def test_extra_session_env(project):
     engine, _ = make_engine(project, [])
     task = StoryTask(story_key="1", epic=0)
     assert engine._extra_session_env(task, "dev") == {"BMAD_LOOP_SPEC_FOLDER": SPEC_FOLDER}
+
+
+def test_extra_session_env_withheld_from_injected_workflow(project):
+    # MAJOR-C: a labeled (injected plugin-workflow) session must NOT get the
+    # story-spec env — only the primary dev/review session does.
+    setup_stories(project, [entry("1")])
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1", epic=0)
+    assert engine._extra_session_env(task, "review", label="tea.gate") == {}
+    assert engine._extra_session_env(task, "dev", label=None) == {
+        "BMAD_LOOP_SPEC_FOLDER": SPEC_FOLDER
+    }
+
+
+def _workflow_capture(captured: list):
+    def effect(spec) -> SessionResult:
+        captured.append(spec)
+        return SessionResult(status="completed", result_json={})
+
+    return effect
+
+
+def test_injected_workflow_session_does_not_leak_story_spec_env(project):
+    """MAJOR-C: an injected pre_commit_gate workflow session in stories mode must
+    not carry BMAD_LOOP_SPEC_FOLDER. Otherwise the generic adapter short-circuits
+    to story-spec synthesis — at pre_commit_gate the spec is already `done`, so a
+    gate session that did nothing would read `completed:done` and bypass the
+    completion-marker + monotonic stall-nudge contract (the TEA-livelock fix). The
+    primary dev session still gets the env for its id-keyed read-back."""
+    setup_stories(project, [entry("1")])
+    reg = PluginRegistry(
+        [
+            LoadedPlugin(
+                manifest=PluginManifest(
+                    name="tea",
+                    api_version=1,
+                    workflows=(
+                        WorkflowSpec(
+                            name="gate",
+                            stage="pre_commit_gate",
+                            role="review",
+                            prompt="/gate {story_key}",
+                            blocking=False,
+                        ),
+                    ),
+                )
+            )
+        ]
+    )
+    captured: list = []
+    engine, adapter = make_engine(
+        project, [stories_dev_effect(), _workflow_capture(captured)], registry=reg
+    )
+    summary = engine.run()
+    assert summary.done == 1
+
+    # the gate session ran and did NOT get the story-spec short-circuit env
+    assert len(captured) == 1
+    gate = captured[0]
+    assert "BMAD_LOOP_SPEC_FOLDER" not in gate.env
+    assert "BMAD_LOOP_PLAN_HALT" not in gate.env
+    # the primary dev session still carries it for id-keyed read-back
+    dev = next(s for s in adapter.sessions if s.role == "dev" and "gate" not in s.task_id)
+    assert dev.env["BMAD_LOOP_SPEC_FOLDER"] == SPEC_FOLDER
 
 
 def test_post_dev_state_sync_is_noop(project):
