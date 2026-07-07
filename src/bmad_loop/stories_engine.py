@@ -119,7 +119,7 @@ class StoriesEngine(Engine):
     def _compute_schedule(self) -> stories.Schedule:
         """Run the linear scheduler against fresh on-disk state, honoring the
         ``--story`` selector and the within-run skip set (stories already driven
-        to a terminal phase this run — mirrors the sprint engine's base_skip).
+        to a terminal *retirement* this run — mirrors the sprint engine's base_skip).
         Re-loads + re-validates stories.yaml every call (id-stability rule F: a
         between-runs re-derive is safe because pinned ids are stable and un-started
         ids reschedule by list order). Shared by :meth:`_pick_next` and the
@@ -131,7 +131,19 @@ class StoriesEngine(Engine):
         self._journal_validated(story_set)
         folder = self._stories_folder()
         states = {e.id: stories.resolve_story_spec(folder, e.id) for e in story_set.entries}
-        skip = set(self.state.tasks)
+        # Skip only stories retired this run — DONE (completed) or DEFERRED
+        # (plateaued). Crucially NOT ESCALATED: schedule() consults the skip set
+        # *before* classifying disk state, so skipping a wedge would let a bare
+        # `bmad-loop resume` (no resolve) leapfrog it and dispatch a later story
+        # onto a tree missing the blocked story's work — breaking the linear
+        # "a blocked story cannot be leapfrogged" invariant. Left out of the skip
+        # set, an unresolved wedge re-classifies from disk (blocked/sentinel) and
+        # re-pauses on itself; once `resolve` re-arms it to PENDING it re-dispatches.
+        skip = {
+            key
+            for key, task in self.state.tasks.items()
+            if task.phase in (Phase.DONE, Phase.DEFERRED)
+        }
         return stories.schedule(story_set, states, selector=self._story_id_filter, skip=skip)
 
     def _journal_validated(self, story_set: stories.Stories) -> None:

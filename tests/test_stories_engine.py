@@ -267,6 +267,31 @@ def test_blocked_on_disk_pauses_for_resolve(project):
     assert wedged.spec_file == str(folder / "stories" / "1-slug.md")
 
 
+def test_bare_resume_does_not_leapfrog_a_wedged_story(project):
+    """MAJOR-A: a wedge (story 1 blocked on disk → ESCALATED task persisted) must
+    not be leapfrogged by a plain `bmad-loop resume` that never resolved it. The
+    within-run skip set excludes ESCALATED tasks, so resume re-classifies story 1
+    from disk (still blocked) and re-pauses on it — story 2 never dispatches onto a
+    tree missing story 1's work, honoring the linear no-leapfrog invariant."""
+    folder = setup_stories(project, [entry("1"), entry("2")])
+    write_spec(folder / "stories" / "1-slug.md", "blocked", rev_parse_head(project.project))
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "story 1 blocked")
+
+    engine, _ = make_engine(project, [])
+    assert engine.run().paused
+    assert load_state(engine.run_dir).tasks["1"].phase == Phase.ESCALATED
+
+    # bare resume WITHOUT resolving — sessions are available but none must run
+    resumed, radapter = resume_engine(project, engine, [stories_dev_effect(), stories_dev_effect()])
+    rsummary = resumed.run()
+    assert rsummary.paused and rsummary.done == 0
+    persisted = load_state(resumed.run_dir)
+    assert persisted.paused_stage == PAUSE_ESCALATION
+    assert persisted.paused_story_key == "1"  # re-paused on the SAME story, not story 2
+    assert not any(s.role == "dev" for s in radapter.sessions)  # story 2 never dispatched
+
+
 def test_sentinel_on_disk_pauses(project):
     folder = setup_stories(project, [entry("1")])
     # a pre-planning halt left a fixed-slug sentinel with status blocked
