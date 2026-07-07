@@ -888,3 +888,27 @@ def test_run_watcher_state_refreshes_on_same_size_rewrite(tmp_path):
     assert after.st_size == pinned.st_size and after.st_mtime_ns == pinned.st_mtime_ns
 
     assert watcher.state() is not first  # re-parsed because the inode changed
+
+
+def test_rich_color_maps_pyte_names_to_valid_rich_colors():
+    # pyte emits aixterm bright names without an underscore (e.g. "brightbrown"
+    # for SGR 93). _rich_color remaps pyte's "brown"/"brightbrown" and then
+    # applies the "bright" -> "bright_" transform; the remap target must stay in
+    # pyte's underscore-free namespace or the transform doubles the underscore
+    # into an invalid "bright__yellow" and every log render raises ColorParseError.
+    from rich.color import Color
+
+    cases = {
+        "default": None,
+        "brown": "yellow",
+        "brightbrown": "bright_yellow",  # regression: was "bright__yellow"
+        "red": "red",
+        "brightred": "bright_red",
+        "brightyellow": "bright_yellow",
+        "ff00aa": "#ff00aa",
+    }
+    for pyte_name, expected in cases.items():
+        got = data._rich_color(pyte_name)
+        assert got == expected, f"{pyte_name!r} -> {got!r}, expected {expected!r}"
+        if got is not None:
+            Color.parse(got)  # must be a color rich accepts, else the TUI crashes

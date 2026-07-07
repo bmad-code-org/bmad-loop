@@ -269,8 +269,11 @@ _PANE_COLUMNS = 220
 _PANE_LINES = 50
 _HISTORY_LINES = 2000  # matches the dashboard RichLog max_lines
 
-# pyte names SGR 33 "brown"; aixterm brights carry no underscore.
-_PYTE_COLOR_FIX = {"brown": "yellow", "brightbrown": "bright_yellow"}
+# pyte names SGR 33 "brown"; aixterm brights carry no underscore. Values here
+# must stay in pyte's own (underscore-free) namespace: _rich_color re-applies
+# the "bright" -> "bright_" transform after this remap, so a "bright_"-prefixed
+# value would double up into "bright__yellow" (an invalid rich color).
+_PYTE_COLOR_FIX = {"brown": "yellow", "brightbrown": "brightyellow"}
 _HEX_DIGITS = set("0123456789abcdef")
 
 
