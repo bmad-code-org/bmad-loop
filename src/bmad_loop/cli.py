@@ -162,21 +162,14 @@ def cmd_validate(args: argparse.Namespace) -> int:
         problems.append(str(e))
         paths = None
 
-    if paths:
-        try:
-            ss = sprintstatus.load(paths.sprint_status)
-            actionable = [s for s in ss.stories if s.status in sprintstatus.ACTIONABLE_STATUSES]
-            notes.append(
-                f"sprint-status OK: {len(ss.stories)} stories, {len(actionable)} actionable"
-            )
-            if ss.unknown_keys:
-                notes.append(f"  warning: unknown keys ignored: {', '.join(ss.unknown_keys)}")
-        except sprintstatus.SprintStatusError as e:
-            problems.append(str(e))
-
+    # Policy first — its [stories].source (or a --spec override) selects which
+    # story-queue gate runs below: the sprint-status file (sprint mode) or the
+    # stories.yaml manifest (stories mode). Loaded before the queue gate so a
+    # stories-only project is not failed on a missing sprint-status.yaml.
     from .adapters.profile import ProfileError, get_profile
 
     profiles = []
+    pol = None
     try:
         pol = policy_mod.load(_policy_path(project))
         role_names = {role: pol.adapter.resolved(role).name for role in ROLES}
@@ -192,7 +185,24 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 problems.append(str(e))
     except policy_mod.PolicyError as e:
         problems.append(str(e))
-        pol = None
+
+    stories_on, spec_folder = _stories_mode(args, pol)
+    if paths:
+        if stories_on:
+            _validate_stories_queue(
+                project, paths, spec_folder, [p.skill_tree for p in profiles], notes, problems
+            )
+        else:
+            try:
+                ss = sprintstatus.load(paths.sprint_status)
+                actionable = [s for s in ss.stories if s.status in sprintstatus.ACTIONABLE_STATUSES]
+                notes.append(
+                    f"sprint-status OK: {len(ss.stories)} stories, {len(actionable)} actionable"
+                )
+                if ss.unknown_keys:
+                    notes.append(f"  warning: unknown keys ignored: {', '.join(ss.unknown_keys)}")
+            except sprintstatus.SprintStatusError as e:
+                problems.append(str(e))
 
     try:
         if not verify.worktree_clean(project):
@@ -280,22 +290,25 @@ def _stories_mode(args: argparse.Namespace, pol) -> tuple[bool, str]:
 
     ``run --spec <folder>`` forces stories mode (overrides policy); otherwise the
     run follows ``[stories].source``. Returns ``(is_stories, spec_folder)`` — the
-    folder is "" in sprint mode."""
+    folder is "" in sprint mode. ``pol`` may be None (e.g. a policy that failed to
+    load in ``validate``): then only an explicit ``--spec`` can force stories mode."""
     spec = getattr(args, "spec", None)
     if spec:
         return True, spec
-    if pol.stories.source == "stories":
+    if pol is not None and pol.stories.source == "stories":
         return True, pol.stories.spec_folder
     return False, ""
 
 
-def _validate_stories_folder(paths: bmadconfig.ProjectPaths, spec_folder: str) -> str | None:
-    """Preflight the stories-mode inputs: stories.yaml parses + rules pass and
-    SPEC.md (the epic spec every first dispatch loads) exists. Returns a problem
-    string to print, or None when OK."""
-    folder = Path(spec_folder)
-    if not folder.is_absolute():
-        folder = paths.project / folder
+def _validate_stories_folder(
+    paths: bmadconfig.ProjectPaths, spec_folder: str, *, selector: str | None = None
+) -> str | None:
+    """Preflight the stories-mode inputs: stories.yaml parses + rules pass, SPEC.md
+    (the epic spec every first dispatch loads) exists, and — when a ``--story``
+    ``selector`` is given — the id is actually in the manifest. Returns a problem
+    string to print, or None when OK. Catching an unknown ``--story`` here fails the
+    run before it starts, instead of crashing it mid-flight in the scheduler."""
+    folder = stories_mod.resolve_spec_folder(paths.project, spec_folder)
     try:
         story_set = stories_mod.load_stories(folder)
     except stories_mod.StoriesError as e:
@@ -307,7 +320,43 @@ def _validate_stories_folder(paths: bmadconfig.ProjectPaths, spec_folder: str) -
             f"stories mode: {folder}/SPEC.md not found — a first dispatch loads the "
             f"epic spec (the skill would HALT `no epic spec found`)"
         )
+    if selector is not None and story_set.get(selector) is None:
+        return (
+            f"stories mode: --story id {selector!r} is not in stories.yaml — "
+            f"pick one of: {', '.join(e.id for e in story_set.entries)}"
+        )
     return None
+
+
+def _validate_stories_queue(
+    project: Path,
+    paths: bmadconfig.ProjectPaths,
+    spec_folder: str,
+    skill_trees: list[str],
+    notes: list[str],
+    problems: list[str],
+) -> None:
+    """Stories-mode counterpart of ``cmd_validate``'s sprint-status gate: validate
+    the ``stories.yaml`` manifest + ``SPEC.md`` and confirm the installed
+    ``bmad-dev-auto`` carries the folder+id dispatch flow stories mode needs (an
+    older skill would HALT at dispatch). Appends notes/problems in place; the
+    probe carries its own remediation text ("update the bmm module")."""
+    folder = stories_mod.resolve_spec_folder(paths.project, spec_folder)
+    problem = _validate_stories_folder(paths, spec_folder)
+    if problem:
+        problems.append(problem)
+    else:
+        try:
+            count = len(stories_mod.load_stories(folder).entries)
+            notes.append(
+                f"stories mode OK: {count} stories in {folder}/stories.yaml, SPEC.md present"
+            )
+        except stories_mod.StoriesError as e:  # already validated above — defensive
+            problems.append(f"stories mode: {e} (spec folder: {folder})")
+    stories_probs = install.missing_stories_support(project, skill_trees)
+    if skill_trees and not stories_probs:
+        notes.append("bmad-dev-auto supports folder+id dispatch (stories mode)")
+    problems.extend(stories_probs)
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -320,7 +369,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         return _dry_run(paths, pol, args, stories_on, spec_folder)
 
     if stories_on:
-        problem = _validate_stories_folder(paths, spec_folder)
+        problem = _validate_stories_folder(paths, spec_folder, selector=args.story)
         if problem:
             print(problem, file=sys.stderr)
             return 1
@@ -456,6 +505,9 @@ def _dry_run_stories(
     """Print the linear stories-mode schedule (list order, checkpoints, live
     on-disk state) — no topo waves, one story per line, spawns nothing."""
     folder = stories_mod.resolve_spec_folder(paths.project, spec_folder)
+    # The real dispatch always uses the project-relative folder (the engine
+    # relativizes it); render the identical string here so dry-run and run agree.
+    rel = stories_mod.relativize_spec_folder(paths.project, spec_folder)
     try:
         rows = stories_mod.story_rows(folder, selector=args.story, max_stories=args.max_stories)
     except stories_mod.StoriesError as e:
@@ -472,12 +524,18 @@ def _dry_run_stories(
     print("linear schedule (list order — no depends_on, strictly serial):")
     for row in rows:
         print(f"\n  {row.position}. {row.id}  ({row.label}){_checkpoint_badge(row)}  {row.title}")
-        dispatch = f"/bmad-dev-auto Spec folder: {spec_folder}. Story id: {row.id}."
+        # A spec_checkpoint story whose plan is not yet on disk dispatches leg 1
+        # (Halt after planning + BMAD_LOOP_PLAN_HALT); mirror the real dispatch's
+        # markers so dry-run does not under-report what run would emit.
+        plan_halt = stories_mod.is_plan_halt_leg(row.spec_checkpoint, row.state)
+        dispatch = f"/bmad-dev-auto Spec folder: {rel}. Story id: {row.id}."
+        if plan_halt:
+            dispatch += " Halt after planning."
         print(f"    dev:    {_render_invocation(pol, paths.project, 'dev', dispatch)}")
-        print(
-            f"    env:    BMAD_LOOP_MODE=1 BMAD_LOOP_STORY_KEY={row.id} "
-            f"BMAD_LOOP_SPEC_FOLDER={spec_folder}"
-        )
+        env = f"BMAD_LOOP_MODE=1 BMAD_LOOP_STORY_KEY={row.id} BMAD_LOOP_SPEC_FOLDER={rel}"
+        if plan_halt:
+            env += " BMAD_LOOP_PLAN_HALT=1"
+        print(f"    env:    {env}")
     return 0
 
 
@@ -1359,7 +1417,13 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="overwrite bmad-loop-* skill dirs that already exist (default: skip them)",
     )
-    add("validate", cmd_validate, "preflight checks; exit non-zero on failure")
+    validate_p = add("validate", cmd_validate, "preflight checks; exit non-zero on failure")
+    validate_p.add_argument(
+        "--spec",
+        metavar="FOLDER",
+        help="validate stories mode against this epic spec folder's stories.yaml "
+        "(overrides [stories].source; skips the sprint-status gate)",
+    )
 
     probe_p = add(
         "probe-adapter",

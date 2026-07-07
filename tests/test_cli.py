@@ -1234,3 +1234,104 @@ def test_platform_preflight_reports_process_host_selection_error(monkeypatch):
     notes, problems = cli._platform_preflight()  # must not raise
     assert any("bogus" in p for p in problems)
     assert any("_FakeBackend" in n for n in notes)  # the healthy seam still reported
+
+
+# --------------- item 8/10: stories-aware validate + selector preflight -------
+
+STORIES_POLICY = '[stories]\nsource = "stories"\nspec_folder = "_bmad-output/epic-1"\n'
+
+
+def _validate_output(capsys):
+    out = capsys.readouterr()
+    return (out.out + out.err).lower()
+
+
+def test_validate_stories_mode_skips_sprint_gate(project, capsys):
+    """Item 8: a stories-mode project (no sprint-status.yaml) validates its
+    stories.yaml manifest instead of failing on the missing sprint gate."""
+    install_bmad_config(project)
+    _setup_stories_fixture(project, [_stories_entry("1")])
+    _write_policy(project.project, STORIES_POLICY)
+    args = argparse.Namespace(project=str(project.project), spec=None)
+
+    cli.cmd_validate(args)
+    text = _validate_output(capsys)
+    assert "sprint status" not in text  # the sprint gate is skipped
+    assert "stories mode ok" in text  # the manifest validated instead
+
+
+def test_validate_stories_mode_reports_missing_manifest(project, capsys):
+    """Item 8: stories mode with no stories.yaml fails validate with the pinned
+    remediation-bearing message (not the sprint-status error)."""
+    install_bmad_config(project)
+    _write_policy(project.project, STORIES_POLICY)
+    args = argparse.Namespace(project=str(project.project), spec=None)
+
+    assert cli.cmd_validate(args) == 1
+    text = _validate_output(capsys)
+    assert "no stories.yaml found" in text
+    assert "sprint status" not in text
+
+
+def test_validate_sprint_mode_still_gates_on_sprint_status(project, capsys):
+    """Item 8 regression: the default (sprint) mode still requires sprint-status."""
+    install_bmad_config(project)
+    _write_policy(project.project)  # DUAL_CLIENT_POLICY -> sprint mode (no [stories])
+    args = argparse.Namespace(project=str(project.project), spec=None)
+
+    assert cli.cmd_validate(args) == 1
+    assert "sprint" in _validate_output(capsys)
+
+
+def test_validate_spec_flag_forces_stories_mode(project, capsys):
+    """Item 8: `validate --spec <folder>` forces stories mode even under a sprint
+    policy — the sprint gate is skipped and the manifest is validated."""
+    install_bmad_config(project)
+    _setup_stories_fixture(project, [_stories_entry("1")])
+    _write_policy(project.project)  # sprint policy
+    args = argparse.Namespace(project=str(project.project), spec=STORIES_SPEC_FOLDER)
+
+    cli.cmd_validate(args)
+    text = _validate_output(capsys)
+    assert "stories mode ok" in text
+    assert "sprint status" not in text
+
+
+def test_validate_stories_folder_unknown_selector(project):
+    """Item 10: an unknown --story id is caught at preflight (fails before the run
+    starts) rather than crashing mid-flight in the scheduler."""
+    _setup_stories_fixture(project, [_stories_entry("1"), _stories_entry("2")])
+    problem = cli._validate_stories_folder(project, STORIES_SPEC_FOLDER, selector="99")
+    assert problem is not None and "'99'" in problem and "not in stories.yaml" in problem
+
+
+def test_validate_stories_folder_known_selector_ok(project):
+    _setup_stories_fixture(project, [_stories_entry("1"), _stories_entry("2")])
+    assert cli._validate_stories_folder(project, STORIES_SPEC_FOLDER, selector="2") is None
+
+
+def test_dry_run_stories_shows_plan_halt_markers(project, capsys):
+    """Item 10: dry-run mirrors the real dispatch's leg-1 markers for a pending
+    spec_checkpoint story (`Halt after planning.` + BMAD_LOOP_PLAN_HALT)."""
+    _setup_stories_fixture(project, [_stories_entry("1", spec_checkpoint=True)])
+    pol = policy_mod.loads("")
+    args = argparse.Namespace(spec=STORIES_SPEC_FOLDER, epic=None, story=None, max_stories=None)
+
+    assert cli._dry_run(project, pol, args, True, STORIES_SPEC_FOLDER) == 0
+    out = capsys.readouterr().out
+    assert "Halt after planning." in out
+    assert "BMAD_LOOP_PLAN_HALT=1" in out
+
+
+def test_dry_run_stories_relativizes_absolute_folder(project, capsys):
+    """Item 10: an absolute --spec inside the project renders the project-relative
+    folder in the dispatch/env, matching what the engine actually dispatches."""
+    _setup_stories_fixture(project, [_stories_entry("1")])
+    abs_folder = str(project.project / STORIES_SPEC_FOLDER)
+    pol = policy_mod.loads("")
+    args = argparse.Namespace(spec=abs_folder, epic=None, story=None, max_stories=None)
+
+    assert cli._dry_run(project, pol, args, True, abs_folder) == 0
+    out = capsys.readouterr().out
+    assert "Spec folder: _bmad-output/epic-1. Story id: 1." in out
+    assert f"Spec folder: {abs_folder}" not in out  # not the raw absolute path

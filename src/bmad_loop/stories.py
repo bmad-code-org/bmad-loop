@@ -49,6 +49,14 @@ RESUMABLE_STATUSES = frozenset({"draft", "ready-for-dev", "in-progress", "in-rev
 DONE = "done"
 BLOCKED = "blocked"
 
+# Statuses that prove a spec_checkpoint story's plan already exists on disk: once
+# the plan reached (or passed) the Ready-for-Development gate the halt leg is
+# spent, so a re-dispatch is the plain implement leg. PENDING / draft (plan not
+# yet produced) and sentinel/ambiguous (a failed pre-planning halt) fall through
+# to a fresh halt leg. Shared by the engine (real dispatch) and the CLI dry-run
+# so the two agree on which leg a story is on.
+PLAN_PRODUCED_STATUSES = frozenset({"ready-for-dev", "in-progress", "in-review", "done", "blocked"})
+
 # resolve_story_spec state kinds.
 KIND_PENDING = "pending"  # no story spec on disk yet
 KIND_PRESENT = "present"  # exactly one real story spec; carries .status
@@ -405,6 +413,60 @@ def resolve_spec_folder(project: Path, spec_folder: str) -> Path:
     the CLI, dry-run, preflight and TUI resolve it identically."""
     folder = Path(spec_folder)
     return folder if folder.is_absolute() else project / folder
+
+
+def relativize_spec_folder(project: Path, spec_folder: str) -> str:
+    """The project-relative posix form of ``spec_folder`` — what the orchestrator
+    actually dispatches (``BMAD_LOOP_SPEC_FOLDER`` / the ``Spec folder:`` prompt).
+
+    An absolute path inside the project tree is rebased to the project root;
+    anything else is kept verbatim (the contract allows an absolute spec folder,
+    though we never author one). The one place this lives so the engine's real
+    dispatch and the CLI dry-run render the identical folder string."""
+    raw = Path(spec_folder)
+    if raw.is_absolute():
+        try:
+            return raw.resolve().relative_to(project.resolve()).as_posix()
+        except ValueError:
+            return raw.as_posix()  # outside the project tree — leave absolute
+    return raw.as_posix()
+
+
+def is_plan_halt_leg(spec_checkpoint: bool, state: StoryState) -> bool:
+    """Whether a ``spec_checkpoint`` story's next dispatch HALTs after planning
+    (leg 1) given its resolved on-disk ``state``.
+
+    True only for a spec_checkpoint story whose plan has not yet reached
+    ``ready-for-dev`` on disk; once the plan exists (leg 2 after the plan
+    checkpoint, or a repair that reset the spec to in-progress) it is the plain
+    implement leg. Pure predicate shared by the engine's ``_plan_halt_leg`` and
+    the CLI dry-run so both key off the same on-disk state."""
+    if not spec_checkpoint:
+        return False
+    if state.kind == KIND_PRESENT and state.status in PLAN_PRODUCED_STATUSES:
+        return False
+    return True
+
+
+_AUTO_RUN_RESULT_HEADING = "## Auto Run Result"
+
+
+def recorded_blocking_condition(sentinel_text: str) -> str:
+    """The blocking condition a pre-planning-halt sentinel records under its
+    ``## Auto Run Result`` heading — the reason planning could not proceed.
+
+    Returns the block body (heading dropped, collapsed to a single line), or ""
+    when the sentinel carries no such block. A write-only breadcrumb for the
+    ``sentinel-cleared`` / ``sentinel-detected`` journal events and the resolve
+    context; never parsed back into a decision."""
+    idx = sentinel_text.find(_AUTO_RUN_RESULT_HEADING)
+    if idx == -1:
+        return ""
+    body = sentinel_text[idx + len(_AUTO_RUN_RESULT_HEADING) :]
+    next_heading = body.find("\n## ")
+    if next_heading != -1:
+        body = body[:next_heading]
+    return " ".join(body.split())
 
 
 def state_label(state: StoryState) -> str:
