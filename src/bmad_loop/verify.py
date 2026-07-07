@@ -1222,10 +1222,11 @@ def verify_dev_stories(
 
     # A plan-halt leg produced only its own spec (the plan), which proof-of-work
     # already excludes; skip it (proof_exclude=None) and record the plan spec.
-    # Otherwise proof-of-work must not count the story's own record (the id-keyed
-    # spec) or the human-authored stories.yaml as implementation work — artifact
-    # dirs are already excluded; add the spec folder's stories/ + stories.yaml for
-    # a spec folder that sits outside them (both no-ops under output_folder).
+    # Otherwise proof-of-work uses the file-granular exclude (verify_dev_exclude_
+    # relpaths, matching verify_dev post-#79: only the session's own spec + the
+    # sprint-status ledger) plus the spec folder's stories/ subdir + stories.yaml —
+    # NOT the whole-folder artifact_relpaths, so a story whose entire authorized
+    # scope is ledger/spec reconciliation doesn't register as a false "no changes".
     gate = _verify_shared_gates(
         spec_path,
         rj,
@@ -1235,7 +1236,8 @@ def verify_dev_stories(
         proof_exclude=(
             None
             if plan_halt
-            else artifact_relpaths(paths) + _stories_relpaths(paths.project, spec_folder)
+            else verify_dev_exclude_relpaths(paths, spec_path)
+            + _stories_relpaths(paths.project, spec_folder)
         ),
     )
     if gate is not None:

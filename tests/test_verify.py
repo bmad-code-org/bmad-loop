@@ -472,6 +472,27 @@ def test_verify_dev_stories_no_changes(project):
     assert not out.ok and "no changes" in out.reason
 
 
+def test_verify_dev_stories_ledger_only_counts_as_real_work(project):
+    """T3 regression: a stories-mode story whose entire authorized diff is
+    ledger/spec reconciliation under implementation_artifacts (e.g. deferred-work.md)
+    must pass proof-of-work, not false-negative "no changes". Guards the file-granular
+    exclude port off #79 — the old whole-folder `artifact_relpaths` exclusion
+    swallowed the ledger, re-introducing KNOWN-BUG-ledger-only-story-false-no-
+    changes.md in stories mode (verify_dev_exclude_relpaths excludes only the
+    session's own spec + sprint-status, so sibling ledger content counts)."""
+    spec_folder = project.planning_artifacts / "epic-a"
+    task = make_stories_task(project, "1")
+    sp = write_story(spec_folder, "1", "x", "done", task.baseline_commit)
+    # The ONLY real change since baseline is the ledger under implementation_artifacts;
+    # the story's own spec (under the spec folder's stories/) is excluded either way.
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("### DW-1: reconciled\n\nstatus: done\n")
+    out = verify.verify_dev_stories(
+        task, project, dev_result(sp), spec_folder=spec_folder, review_enabled=False
+    )
+    assert out.ok
+
+
 def test_verify_dev_stories_spec_only_change_outside_artifacts_is_not_work(project):
     # spec folder OUTSIDE the artifact dirs: the story record + stories.yaml must
     # still not count as implementation work (the _stories_relpaths exclusion),
