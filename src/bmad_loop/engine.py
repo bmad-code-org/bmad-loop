@@ -720,10 +720,9 @@ class Engine:
 
     def _loop(self) -> None:
         self._finish_inflight()
-        started = 0
         while True:
-            if self.max_stories is not None and started >= self.max_stories:
-                self.journal.append("max-stories-reached", count=started)
+            if self.max_stories is not None and self._dispatched_count() >= self.max_stories:
+                self.journal.append("max-stories-reached", count=self._dispatched_count())
                 return
             self._emit("pre_pick_next")
             story = self._pick_next()
@@ -738,9 +737,19 @@ class Engine:
             self.state.tasks[story.key] = task
             self.journal.append("story-start", story_key=story.key)
             self._save()
-            started += 1
             self._run_story(task)
             self._after_story(task)
+
+    def _dispatched_count(self) -> int:
+        """Stories this run has dispatched, counted durably from run state so the
+        ``--max-stories`` bound survives a pause/resume (a story checkpoint, an
+        escalation) — unlike a ``_loop``-local counter that resets to 0 on every
+        re-entry. Every picked story is recorded in ``state.tasks`` before its
+        session runs (and a wedge/selector pause records its task too), the same
+        "touched this run" set ``_pick_next`` keys ``base_skip`` on, so the task
+        count is the durable dispatch tally. Without this, a checkpoint pause then
+        resume would reset the counter and let the run dispatch past its cap."""
+        return len(self.state.tasks)
 
     def _pick_next(self):
         ss = load_sprint_status(self.paths.sprint_status)

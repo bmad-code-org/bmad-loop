@@ -874,6 +874,34 @@ def test_done_checkpoint_skipped_at_max_stories(project):
     assert "2" not in load_state(engine.run_dir).tasks  # capped, story 2 never dispatched
 
 
+def test_max_stories_survives_a_checkpoint_pause_resume(project):
+    """A5: with --max-stories=2 and a done_checkpoint on story 1 (below the cap), the
+    run pauses at story 1's checkpoint, then a resume dispatches ONLY story 2 — never
+    leapfrogs to story 3. The dispatch gate consults durable run state, not a
+    _loop-local counter that resets to 0 on resume (which would let the cap be
+    exceeded)."""
+    setup_stories(project, [entry("1", done_checkpoint=True), entry("2"), entry("3")])
+    engine, _ = make_engine(project, [stories_dev_effect()], max_stories=2)
+    engine.state.max_stories = 2  # cli.py persists this on RunState so resume rebuilds the cap
+
+    # run 1: story 1 dispatched + committed, then pauses at its done_checkpoint
+    # (dispatched=1 < cap=2, more stories pending → not skip-if-last)
+    assert engine.run().paused
+    assert load_state(engine.run_dir).paused_stage == PAUSE_STORY_CHECKPOINT
+    assert _kinds(engine.journal, "checkpoint-pause")
+
+    # resume: dispatch story 2 (dispatched reaches the cap), then stop — story 3
+    # must NOT be dispatched despite the resume resetting any local counter
+    resumed, _ = resume_engine(project, engine, [stories_dev_effect()])
+    summary = resumed.run()
+
+    final = load_state(resumed.run_dir)
+    assert not summary.paused
+    assert set(final.tasks) == {"1", "2"}  # story 3 never dispatched — cap honored
+    assert final.tasks["1"].phase == Phase.DONE and final.tasks["2"].phase == Phase.DONE
+    assert _kinds(resumed.journal, "max-stories-reached")
+
+
 def test_sentinel_detected_journaled_at_pick(project):
     """MINOR-6: a fixed-slug sentinel found by the pick-time read-back journals a
     distinct sentinel-detected event carrying its recorded blocking condition, not

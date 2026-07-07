@@ -582,11 +582,10 @@ class StoriesEngine(Engine):
             return False
 
     def _max_stories_reached(self) -> bool:
-        """Whether the run has committed its ``--max-stories`` allotment. Counts DONE
-        tasks durably from run state (survives a done_checkpoint pause/resume, unlike
-        the _loop-local ``started`` counter), so the done_checkpoint's skip-if-last
-        honors the same bound the loop enforces."""
+        """Whether the run has dispatched its ``--max-stories`` allotment. Consults the
+        same durable :meth:`Engine._dispatched_count` the loop's dispatch gate uses, so
+        the done_checkpoint's skip-if-last fires exactly when the loop will stop next
+        iteration — no drift between the two guards across a pause/resume."""
         if self.max_stories is None:
             return False
-        done = sum(1 for t in self.state.tasks.values() if t.phase == Phase.DONE)
-        return done >= self.max_stories
+        return self._dispatched_count() >= self.max_stories
