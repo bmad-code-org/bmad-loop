@@ -62,9 +62,25 @@ class _StoryRef:
     epic: int = 0
 
 
-class StoriesError(Exception):
+class StoriesModeError(Exception):
     """Raised when stories mode cannot proceed for a structural reason the run
-    should surface loudly (unreadable/invalid ``stories.yaml`` mid-run)."""
+    should surface loudly (unreadable/invalid ``stories.yaml`` mid-run).
+
+    Distinct from the contract-side :class:`stories.StoriesError` (the parser's
+    error) so the two seams — parse vs engine drive — never get conflated when a
+    parser error leaks through an engine catch."""
+
+
+class _UnknownSelector(StoriesModeError):
+    """The ``--story`` selector id is not (or no longer) in ``stories.yaml``.
+
+    A subclass so :meth:`StoriesEngine._pick_next` can turn it into a pause for
+    resolve (the id is recoverable — fix the typo or the manifest, then resume)
+    rather than let it crash the run like a genuinely-unreadable manifest."""
+
+    def __init__(self, selector: str):
+        super().__init__(f"--story id {selector!r} is not in stories.yaml")
+        self.selector = selector
 
 
 class StoriesEngine(Engine):
@@ -85,6 +101,9 @@ class StoriesEngine(Engine):
         self._spec_folder_rel = self._relativize(spec_folder)
         # journal `stories-validated` once per process (re-validated every pick).
         self._validated = False
+        # story keys already warned about an unreadable manifest — journal once
+        # each (``_entry_for`` is called several times per dispatch).
+        self._warned_unreadable: set[str] = set()
         # pin the resolved mode into run state so resume/resolve rebuild a
         # StoriesEngine (not the sprint Engine) without re-reading policy.
         self.state.source = "stories"
@@ -94,16 +113,10 @@ class StoriesEngine(Engine):
 
     def _relativize(self, spec_folder: str) -> str:
         """Store the spec folder project-relative when possible (we always
-        dispatch project-relative). An absolute path inside the project tree is
-        rebased to the project root; anything else is kept verbatim (the contract
-        deliberately allows an absolute spec folder, though we never author one)."""
-        raw = Path(spec_folder)
-        if raw.is_absolute():
-            try:
-                return raw.resolve().relative_to(self.paths.project.resolve()).as_posix()
-            except ValueError:
-                return raw.as_posix()  # outside the project tree — leave absolute
-        return raw.as_posix()
+        dispatch project-relative). Shared with the CLI dry-run via
+        :func:`stories.relativize_spec_folder` so both render the identical
+        folder string."""
+        return stories.relativize_spec_folder(self.paths.project, spec_folder)
 
     def _stories_folder(self) -> Path:
         """The spec folder resolved against the current workspace root (project
@@ -127,8 +140,13 @@ class StoriesEngine(Engine):
         try:
             story_set = self._load_stories()
         except stories.StoriesError as e:
-            raise StoriesError(f"stories.yaml no longer usable: {e}") from e
+            raise StoriesModeError(f"stories.yaml no longer usable: {e}") from e
         self._journal_validated(story_set)
+        # A --story id that vanished from the manifest mid-run (or slipped past
+        # preflight) must not crash the run via find_entry: raise a recoverable
+        # _UnknownSelector that _pick_next turns into a pause for resolve.
+        if self._story_id_filter is not None and story_set.get(self._story_id_filter) is None:
+            raise _UnknownSelector(self._story_id_filter)
         folder = self._stories_folder()
         states = {e.id: stories.resolve_story_spec(folder, e.id) for e in story_set.entries}
         # Skip only stories retired this run — DONE (completed) or DEFERRED
@@ -157,12 +175,34 @@ class StoriesEngine(Engine):
         self._validated = True
 
     def _pick_next(self) -> _StoryRef | None:
-        sched = self._compute_schedule()
+        try:
+            sched = self._compute_schedule()
+        except _UnknownSelector as e:
+            # A bad/removed --story id: pause for resolve (fix the manifest, then
+            # resume) rather than crash the run. Keyed on the selector id so the
+            # escalation viewer + rearm act on the same key.
+            self._pause_unknown_selector(e.selector)  # always raises RunPaused
         if sched.outcome == stories.SCHEDULE_NEXT and sched.entry is not None:
             return _StoryRef(key=sched.entry.id)
         if sched.outcome == stories.SCHEDULE_WEDGED and sched.entry is not None:
             self._pause_wedged(sched)
         return None  # SCHEDULE_COMPLETE — every story is done
+
+    def _pause_unknown_selector(self, selector: str) -> None:
+        """The ``--story`` selector resolves to no manifest entry: pause for
+        resolve keyed on the selector, the same ESCALATED shape a wedge leaves, so
+        the CLI/TUI surface + rearm handle it uniformly. Always raises."""
+        task = StoryTask(story_key=selector, epic=0)
+        task.phase = Phase.ESCALATED
+        self.state.tasks[selector] = task
+        reason = (
+            f"--story id {selector!r} is not in stories.yaml — fix the id or the "
+            f"manifest, then `bmad-loop resume {self.state.run_id}`"
+        )
+        self.journal.append("stories-selector-unknown", story_key=selector)
+        gates.notify(self.policy, self.run_dir, f"unknown --story id: {selector}", reason)
+        self._save()
+        raise RunPaused(reason, PAUSE_ESCALATION, selector)
 
     def _pause_wedged(self, sched: stories.Schedule) -> None:
         """A blocked / sentinel / ambiguous story stopped the scan before any
@@ -187,6 +227,8 @@ class StoriesEngine(Engine):
         self.state.tasks[entry.id] = task
         detail = self._wedged_detail(state)
         reason = f"story {entry.id!r} needs resolution before the run can continue: {detail}"
+        if state.kind == stories.KIND_SENTINEL:
+            self._journal_sentinel_detected(entry.id, state)
         self.journal.append(
             "stories-wedged",
             story_key=entry.id,
@@ -211,6 +253,27 @@ class StoriesEngine(Engine):
             return f"ambiguous story file match: {names}"
         # KIND_PRESENT with a blocked / unrecognized status.
         return f"story spec status {state.status!r} at {state.path}"
+
+    def _journal_sentinel_detected(self, story_key: str, state: stories.StoryState) -> None:
+        """Record that a read-back resolved a story to a fixed-slug pre-planning-halt
+        sentinel, carrying its recorded blocking condition (the reason planning
+        halted, parsed from ``## Auto Run Result``). Fires at pick-time (a sentinel
+        left by a prior run/resume) and post-dev (this run's session HALTed), so the
+        journal always has a distinct trace before the escalation/wedge event."""
+        condition = ""
+        if state.path is not None:
+            try:
+                condition = stories.recorded_blocking_condition(
+                    state.path.read_text(encoding="utf-8")
+                )
+            except OSError:
+                condition = ""
+        self.journal.append(
+            "sentinel-detected",
+            story_key=story_key,
+            sentinel_kind=state.sentinel_kind or None,
+            condition=condition,
+        )
 
     # -------------------------------------------------------------- dispatch
 
@@ -281,20 +344,20 @@ class StoriesEngine(Engine):
         not go through ``_pick_next``) still resolves ``invoke_dev_with`` / the
         checkpoint flags. None when the id is absent — a pinned id never
         disappears, so this only happens on a hand-broken manifest, where the
-        bare folder+id dispatch (title/description read by the skill) still runs."""
+        bare folder+id dispatch (title/description read by the skill) still runs.
+
+        A parse failure journals a one-time ``stories-manifest-unreadable`` warning
+        per story (this is called several times per dispatch) so the silent
+        fallback leaves a trace, then returns None."""
         try:
             return self._load_stories().get(task.story_key)
-        except stories.StoriesError:
+        except stories.StoriesError as e:
+            if task.story_key not in self._warned_unreadable:
+                self._warned_unreadable.add(task.story_key)
+                self.journal.append(
+                    "stories-manifest-unreadable", story_key=task.story_key, error=str(e)
+                )
             return None
-
-    # Statuses that prove a spec_checkpoint story's plan already exists on disk:
-    # once the plan reached (or passed) the Ready-for-Development gate the halt leg
-    # is spent, so a re-dispatch is the plain implement leg. PENDING / draft (plan
-    # not yet produced) and sentinel/ambiguous (a failed pre-planning halt) fall
-    # through to a fresh halt leg.
-    _PLAN_PRODUCED_STATUSES = frozenset(
-        {"ready-for-dev", "in-progress", "in-review", "done", "blocked"}
-    )
 
     def _plan_halt_leg(self, task: StoryTask, entry: stories.StoryEntry | None) -> bool:
         """Whether this dispatch HALTs after planning for a human plan review.
@@ -306,12 +369,10 @@ class StoriesEngine(Engine):
         implementation. Reading on-disk state (not a task flag) is what keeps the
         prompt's ``Halt after planning.`` leg and the env's ``BMAD_LOOP_PLAN_HALT``
         in lock-step: both call this before the session writes the spec."""
-        if entry is None or not entry.spec_checkpoint:
+        if entry is None:
             return False
         state = stories.resolve_story_spec(self._stories_folder(), task.story_key)
-        if state.kind == stories.KIND_PRESENT and state.status in self._PLAN_PRODUCED_STATUSES:
-            return False
-        return True
+        return stories.is_plan_halt_leg(entry.spec_checkpoint, state)
 
     # ---------------------------------------------------------- sync + verify
 
@@ -327,11 +388,19 @@ class StoriesEngine(Engine):
         # the leg-2 re-drive), and switch verify to the ready-for-dev plan gate.
         plan_halt = bool((result_json or {}).get("plan_halt"))
         task.plan_checkpoint_pending = plan_halt
+        # Read-back detection: the just-run dev session HALTed pre-planning and left
+        # a fixed-slug sentinel. Journal it (with its recorded blocking condition)
+        # before verify turns it into a retryable failure → escalation, so the
+        # sentinel has a distinct trace at read-back, not only the later escalation.
+        folder = self._stories_folder()
+        state = stories.resolve_story_spec(folder, task.story_key)
+        if state.kind == stories.KIND_SENTINEL:
+            self._journal_sentinel_detected(task.story_key, state)
         return verify.verify_dev_stories(
             task,
             self.workspace.paths,
             result_json,
-            spec_folder=self._stories_folder(),
+            spec_folder=folder,
             review_enabled=self._dev_review_enabled(),
             plan_halt=plan_halt,
         )
@@ -474,7 +543,13 @@ class StoriesEngine(Engine):
         entry = self._entry_for(task)
         if entry is None or not entry.done_checkpoint:
             return
-        if self._compute_schedule().is_complete:
+        # skip-if-last: no further story will dispatch. Either the schedule is
+        # complete OR this committed story is the run's --max-stories-th (the bound
+        # stops the loop next iteration). Honoring the cap here — durably, from
+        # committed-story count, not the resume-reset _loop counter — is what keeps
+        # a done_checkpoint pause from letting a resume leapfrog past the bound (the
+        # pause+resume would otherwise reset the local counter and dispatch more).
+        if self._schedule_complete() or self._max_stories_reached():
             self.journal.append(
                 "checkpoint-skip-last", story_key=task.story_key, checkpoint="story"
             )
@@ -494,3 +569,24 @@ class StoriesEngine(Engine):
             PAUSE_STORY_CHECKPOINT,
             task.story_key,
         )
+
+    def _schedule_complete(self) -> bool:
+        """Whether the schedule has no more actionable stories. Guarded: a manifest
+        that went unreadable (or a --story id that vanished) between the commit and
+        this skip-if-last check must not crash the after-commit path — treat an
+        error as "not complete" so the done_checkpoint still fires (the safe default
+        is to pause for review, never to silently swallow it)."""
+        try:
+            return self._compute_schedule().is_complete
+        except (StoriesModeError, stories.StoriesError):
+            return False
+
+    def _max_stories_reached(self) -> bool:
+        """Whether the run has committed its ``--max-stories`` allotment. Counts DONE
+        tasks durably from run state (survives a done_checkpoint pause/resume, unlike
+        the _loop-local ``started`` counter), so the done_checkpoint's skip-if-last
+        honors the same bound the loop enforces."""
+        if self.max_stories is None:
+            return False
+        done = sum(1 for t in self.state.tasks.values() if t.phase == Phase.DONE)
+        return done >= self.max_stories

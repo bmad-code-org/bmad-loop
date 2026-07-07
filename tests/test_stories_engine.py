@@ -15,6 +15,7 @@ from bmad_loop.journal import Journal, load_state
 from bmad_loop.model import (
     PAUSE_ESCALATION,
     PAUSE_PLAN_CHECKPOINT,
+    PAUSE_SPEC_APPROVAL,
     PAUSE_STORY_CHECKPOINT,
     Phase,
     RunState,
@@ -812,3 +813,132 @@ def test_worktree_isolation_two_stories(project):
     assert dev and all(Path(s.cwd) != project.project for s in dev)
     assert status_of(read_frontmatter(story_spec(project, "1"))) == "done"
     assert status_of(read_frontmatter(story_spec(project, "2"))) == "done"
+
+
+# ---------------------- item 10: MINOR/NOTE batch (Session 3) ----------------
+
+
+def test_gate_and_spec_checkpoint_pause_additively(project):
+    """MINOR-4: a spec_checkpoint story under gates.mode=per-story-spec-approval
+    pauses TWICE — first at the plan checkpoint (before code), then, after the
+    resumed implement leg, at the run-global spec-approval gate. The per-story
+    checkpoint does not substitute for the run-global gate; they stack."""
+    setup_stories(project, [entry("1", spec_checkpoint=True), entry("2")])
+    pol = _stories_policy(gates=GatesPolicy(mode="per-story-spec-approval"))
+    engine, _ = make_engine(project, [stories_checkpoint_effect()], policy=pol)
+
+    # pause 1: plan checkpoint (leg 1 halted after planning, no code yet)
+    assert engine.run().paused
+    assert load_state(engine.run_dir).paused_stage == PAUSE_PLAN_CHECKPOINT
+
+    # pause 2: the run-global spec-approval gate, after the implement leg
+    resumed, _ = resume_engine(project, engine, [stories_checkpoint_effect()])
+    assert resumed.run().paused
+    assert load_state(resumed.run_dir).paused_stage == PAUSE_SPEC_APPROVAL
+    assert load_state(resumed.run_dir).tasks["1"].phase != Phase.DONE  # not committed yet
+
+    # approve the spec gate → story 1 commits (story 2 then pauses at its own gate)
+    resumed2, _ = resume_engine(project, resumed, [stories_dev_effect()])
+    resumed2.run()
+    assert load_state(resumed2.run_dir).tasks["1"].phase == Phase.DONE
+    assert status_of(read_frontmatter(story_spec(project, "1"))) == "done"
+
+
+def test_unknown_story_selector_pauses_not_crashes(project):
+    """MINOR-E: a --story id absent from the manifest pauses for resolve (fix the
+    id/manifest, resume) instead of crashing the run in the scheduler."""
+    setup_stories(project, [entry("1"), entry("2")])
+    engine, adapter = make_engine(project, [], story_filter="99")
+    summary = engine.run()
+
+    assert summary.paused
+    persisted = load_state(engine.run_dir)
+    assert persisted.paused_stage == PAUSE_ESCALATION
+    assert persisted.paused_story_key == "99"
+    assert persisted.tasks["99"].phase == Phase.ESCALATED
+    assert not any(s.role == "dev" for s in adapter.sessions)  # nothing dispatched
+    assert _kinds(engine.journal, "stories-selector-unknown")
+
+
+def test_done_checkpoint_skipped_at_max_stories(project):
+    """MINOR-F: with --max-stories=1 a done_checkpoint on the only dispatched story
+    is SKIPPED (the bound ends the run here) — otherwise the pause+resume would
+    reset the loop counter and leapfrog story 2 past the cap."""
+    setup_stories(project, [entry("1", done_checkpoint=True), entry("2")])
+    engine, _ = make_engine(project, [stories_dev_effect()], max_stories=1)
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused
+    assert _kinds(engine.journal, "checkpoint-skip-last")
+    assert not _kinds(engine.journal, "checkpoint-pause")
+    assert "2" not in load_state(engine.run_dir).tasks  # capped, story 2 never dispatched
+
+
+def test_sentinel_detected_journaled_at_pick(project):
+    """MINOR-6: a fixed-slug sentinel found by the pick-time read-back journals a
+    distinct sentinel-detected event carrying its recorded blocking condition, not
+    only the later stories-wedged / escalation trace."""
+    folder = setup_stories(project, [entry("1")])
+    (folder / "stories" / "1-unresolved.md").write_text(
+        "---\nstatus: blocked\n---\n\n## Auto Run Result\n\nStatus: blocked\nintent too vague\n",
+        encoding="utf-8",
+    )
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "sentinel")
+    engine, _ = make_engine(project, [])
+    assert engine.run().paused
+
+    detected = _kinds(engine.journal, "sentinel-detected")
+    assert detected and detected[-1]["story_key"] == "1"
+    assert detected[-1]["sentinel_kind"] == "unresolved"
+    assert "intent too vague" in detected[-1]["condition"]
+
+
+def test_sentinel_detected_journaled_at_readback(project):
+    """MINOR-6: the just-run dev session HALTs pre-planning and writes a sentinel;
+    the post-dev read-back journals sentinel-detected before the escalation."""
+    setup_stories(project, [entry("1")])
+
+    def sentinel_effect(spec) -> SessionResult:
+        story_id = spec.env["BMAD_LOOP_STORY_KEY"]
+        rel = spec.env["BMAD_LOOP_SPEC_FOLDER"]
+        stories_dir = Path(spec.cwd) / rel / "stories"
+        stories_dir.mkdir(parents=True, exist_ok=True)
+        (stories_dir / f"{story_id}-unresolved.md").write_text(
+            "---\nstatus: blocked\n---\n\n## Auto Run Result\n\nStatus: blocked\ntoo vague\n",
+            encoding="utf-8",
+        )
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "auto-dev",
+                "story_key": story_id,
+                "status": "blocked",
+                "escalations": [
+                    {"type": "spec-gap", "severity": "CRITICAL", "detail": "too vague"}
+                ],
+            },
+        )
+
+    engine, _ = make_engine(project, [sentinel_effect])
+    engine.run()
+
+    detected = _kinds(engine.journal, "sentinel-detected")
+    assert detected and detected[-1]["sentinel_kind"] == "unresolved"
+    assert "too vague" in detected[-1]["condition"]
+
+
+def test_entry_for_unreadable_manifest_journals_warning_once(project):
+    """NOTE-10: _entry_for swallows a hand-broken manifest (bare dispatch still
+    runs) but now leaves a one-time stories-manifest-unreadable trace per story."""
+    setup_stories(project, [entry("1")])
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1", epic=0)
+    (project.project / SPEC_FOLDER / "stories.yaml").write_text("[unclosed", encoding="utf-8")
+
+    assert engine._entry_for(task) is None
+    warned = _kinds(engine.journal, "stories-manifest-unreadable")
+    assert warned and warned[-1]["story_key"] == "1"
+    # a second call for the same story does not re-journal (dedup per story key)
+    assert engine._entry_for(task) is None
+    assert len(_kinds(engine.journal, "stories-manifest-unreadable")) == 1
