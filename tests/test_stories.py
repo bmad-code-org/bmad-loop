@@ -113,10 +113,39 @@ def test_prefix_free_allows_numeric_neighbor(tmp_path):
     assert [e.id for e in s.entries] == ["3", "31"]
 
 
+def test_case_only_duplicate_ids_rejected(tmp_path):
+    # "Auth" and "auth" are distinct strings but identical under casefold — on a
+    # case-insensitive filesystem the `Auth-*.md` glob also matches `auth-*.md`.
+    write_stories(
+        tmp_path,
+        '- id: "Auth"\n  title: a\n  description: d\n'
+        '- id: "auth"\n  title: b\n  description: d\n',
+    )
+    with pytest.raises(stories.StoriesError, match="differ only by case"):
+        stories.load_stories(tmp_path)
+
+
+def test_case_insensitive_prefix_collision_rejected(tmp_path):
+    # "Auth" and "auth-2": on a case-insensitive filesystem the `Auth-*.md` glob
+    # for story "Auth" also matches `auth-2-*.md`, so this is a prefix collision
+    # even though the two ids never collide byte-for-byte.
+    write_stories(
+        tmp_path,
+        '- id: "Auth"\n  title: a\n  description: d\n'
+        '- id: "auth-2"\n  title: b\n  description: d\n',
+    )
+    with pytest.raises(stories.StoriesError, match="not prefix-free"):
+        stories.load_stories(tmp_path)
+
+
 def test_status_key_forbidden(tmp_path):
     write_stories(tmp_path, '- id: "1"\n  title: t\n  description: d\n  status: draft\n')
-    with pytest.raises(stories.StoriesError, match="forbidden 'status' key"):
+    with pytest.raises(stories.StoriesError, match="forbidden 'status' key") as exc:
         stories.load_stories(tmp_path)
+    # The user-facing vocabulary is "stories.yaml", not the plugin-layer word
+    # "manifest" (which names plugin.toml elsewhere in the codebase).
+    assert "manifest" not in str(exc.value)
+    assert "stories.yaml" in str(exc.value)
 
 
 def test_missing_required_field_rejected(tmp_path):

@@ -119,11 +119,24 @@ def load_stories(spec_folder: Path | str) -> Stories:
 
     entries: list[StoryEntry] = []
     seen: set[str] = set()
+    seen_folded: dict[str, str] = {}  # casefolded id -> first id that used it
     for index, raw in enumerate(doc):
         entry = _parse_entry(raw, index)
         if entry.id in seen:
             raise StoriesError(f"stories.yaml has a duplicate id {entry.id!r}")
+        # Story specs resolve by the `<id>-*.md` glob, which is case-insensitive on
+        # Windows/macOS filesystems (both in the CI matrix), so two ids that differ
+        # only by case would cross-match the same files. Reject them up front rather
+        # than let resolution become filesystem-dependent.
+        folded = entry.id.casefold()
+        if folded in seen_folded:
+            raise StoriesError(
+                f"stories.yaml ids {seen_folded[folded]!r} and {entry.id!r} differ only "
+                "by case — story specs resolve by the case-insensitive glob <id>-*.md, so "
+                "on a case-insensitive filesystem (Windows/macOS) they would cross-match"
+            )
         seen.add(entry.id)
+        seen_folded[folded] = entry.id
         entries.append(entry)
     _validate_prefix_free([e.id for e in entries])
     return Stories(path=path, entries=tuple(entries))
@@ -135,7 +148,7 @@ def _parse_entry(raw: object, index: int) -> StoryEntry:
     if "status" in raw:
         raise StoriesError(
             f"stories.yaml entry {index} has a forbidden 'status' key — a story's "
-            "status lives in its story spec, never in the manifest"
+            "status lives in its story spec, never in stories.yaml"
         )
     story_id = _parse_id(raw, index)
     return StoryEntry(
@@ -209,16 +222,23 @@ def _validate_prefix_free(ids: list[str]) -> None:
     ``3-2`` were both ids the ``3-*.md`` glob for story ``3`` would also match
     ``3-2-slug.md`` — the id would no longer resolve to a single file. ``3`` vs
     ``31`` is fine: ``3-*.md`` never matches ``31-slug.md``.
+
+    The check is case-insensitive for the same reason ``load_stories`` rejects
+    case-only duplicates: on a case-insensitive filesystem ``Auth-*.md`` also
+    matches ``auth-2-slug.md``, so ``Auth`` and ``auth-2`` collide there too.
+    Case-only duplicates (equal casefold) are caught earlier in ``load_stories``;
+    by here every id has a distinct casefold, so this map is unambiguous.
     """
-    idset = set(ids)
+    by_fold = {i.casefold(): i for i in ids}
     for story_id in ids:
-        parts = story_id.split("-")
+        parts = story_id.casefold().split("-")
         for k in range(1, len(parts)):
             prefix = "-".join(parts[:k])
-            if prefix in idset:
+            other = by_fold.get(prefix)
+            if other is not None:
                 raise StoriesError(
-                    f"stories.yaml id {story_id!r} is not prefix-free: {prefix!r} is "
-                    f"also an id, so the {prefix}-*.md glob would match both"
+                    f"stories.yaml id {story_id!r} is not prefix-free: {other!r} is "
+                    f"also an id, so the {other}-*.md glob would match both"
                 )
 
 
