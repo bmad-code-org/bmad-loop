@@ -343,6 +343,14 @@ class StoriesEngine(Engine):
         # _dev_prompt / _extra_session_env, both keyed off the same on-disk state).
         # dev_resume None means a fresh drive, not a mid-session crash replay.
         if dev_resume is None and self._plan_halt_leg(task, self._entry_for(task)):
+            # Latch the plan-review obligation BEFORE the session runs, so it
+            # survives a crash in the post-session window, a non-fixable retry that
+            # advanced the on-disk plan status, or a skill that overran the Halt
+            # directive — cases where _plan_halt_leg (on-disk-status keyed) and
+            # plan_checkpoint_pending (result keyed) both go stale. Saved eagerly so
+            # a host death before the durable session record still finds it set.
+            task.plan_review_owed = True
+            self._save()
             self.journal.append(
                 "plan-halt", story_key=task.story_key, spec_folder=self._spec_folder_rel
             )
@@ -350,6 +358,13 @@ class StoriesEngine(Engine):
             return
         if task.plan_checkpoint_pending:
             self._pause_plan_checkpoint(task)  # always raises RunPaused
+        if task.plan_review_owed:
+            # A plan review is still owed but this dev leg did NOT itself pause for
+            # it: the skill overran `Halt after planning.` and drove to done, or a
+            # crash/non-fixable-retry re-drove straight to implementation on an
+            # already-planned spec. Pause before commit so a spec_checkpoint story
+            # can never commit un-reviewed (distinct "owed but implemented" message).
+            self._pause_plan_review_owed(task)  # always raises RunPaused
         # preserve the global spec-approval gate (rarely configured in stories
         # mode, but the plan-checkpoint is not a substitute for it).
         if gates.pause_after_spec(self.policy):
@@ -371,6 +386,7 @@ class StoriesEngine(Engine):
         for human plan review. The task stays at DEV_VERIFY with
         ``plan_checkpoint_pending`` set, so on resume _finish_inflight routes it to
         :meth:`_resume_after_dev_verify` for the implement leg. Always raises."""
+        task.plan_review_owed = False  # discharged: we are pausing for the review now
         self.journal.append(
             "checkpoint-pause", story_key=task.story_key, checkpoint="plan", spec=task.spec_file
         )
@@ -384,6 +400,41 @@ class StoriesEngine(Engine):
         self._save()
         raise RunPaused(
             f"plan checkpoint for {task.story_key}: review the spec, then resume",
+            PAUSE_PLAN_CHECKPOINT,
+            task.story_key,
+        )
+
+    def _pause_plan_review_owed(self, task: StoryTask) -> None:
+        """A spec_checkpoint story reached implementation without ever pausing for
+        its plan review (the skill overran ``Halt after planning.``, or a crash /
+        non-fixable retry re-drove straight to implementation on an already-planned
+        spec). The plan review is still owed, so pause before commit — distinct from
+        :meth:`_pause_plan_checkpoint` in that the code is already written.
+
+        ``plan_checkpoint_pending`` is deliberately NOT set: on resume the story is
+        already implemented, so :meth:`_resume_after_dev_verify` proceeds to
+        review+commit (the human approved) rather than re-driving an implement leg.
+        Reuses PAUSE_PLAN_CHECKPOINT so the CLI/TUI resume handling is unchanged.
+        Always raises."""
+        task.plan_review_owed = False  # discharged: we are pausing for the review now
+        self.journal.append(
+            "checkpoint-pause",
+            story_key=task.story_key,
+            checkpoint="plan",
+            spec=task.spec_file,
+            owed_after_implement=True,
+        )
+        gates.notify(
+            self.policy,
+            self.run_dir,
+            f"plan review owed (already implemented): {task.story_key}",
+            f"the story was implemented before its plan checkpoint fired — review "
+            f"{task.spec_file}, then `bmad-loop resume {self.state.run_id}`",
+        )
+        self._save()
+        raise RunPaused(
+            f"plan review owed for {task.story_key}: the skill implemented before the "
+            f"plan checkpoint — review the spec, then resume",
             PAUSE_PLAN_CHECKPOINT,
             task.story_key,
         )

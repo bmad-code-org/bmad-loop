@@ -511,6 +511,119 @@ def test_plan_checkpoint_pause_then_resume_implements(project):
     assert "BMAD_LOOP_PLAN_HALT" not in leg2.env
 
 
+# -------- MAJOR-B: a spec_checkpoint story can never commit without a plan review
+
+
+def _write_story_spec_effect(status: str, *, touch_code: bool, result_over: dict | None = None):
+    """A dev effect that writes the id-keyed story spec at ``status`` (optionally
+    touching real code) and returns a completed result, with ``result_over`` merged
+    into result.json. Used to script the three ways a plan review gets bypassed."""
+
+    def effect(spec) -> SessionResult:
+        story_id = spec.env["BMAD_LOOP_STORY_KEY"]
+        rel = spec.env["BMAD_LOOP_SPEC_FOLDER"]
+        baseline = rev_parse_head(Path(spec.cwd))
+        stories_dir = Path(spec.cwd) / rel / "stories"
+        stories_dir.mkdir(parents=True, exist_ok=True)
+        sp = stories_dir / f"{story_id}-slug.md"
+        if touch_code:
+            src = Path(spec.cwd) / "src.txt"
+            src.write_text(src.read_text() + f"work for {story_id}\n")
+        write_spec(sp, status, baseline)
+        result = {
+            "workflow": "auto-dev",
+            "story_key": story_id,
+            "spec_file": str(sp),
+            "baseline_commit": baseline,
+            "escalations": [],
+        }
+        result.update(result_over or {})
+        return SessionResult(status="completed", result_json=result)
+
+    return effect
+
+
+def test_plan_review_owed_survives_crash_before_durable_record(project):
+    """MAJOR-B(a): the plan-halt leg wrote the plan (ready-for-dev) but the host
+    died before the durable session record. plan_review_owed is latched + saved
+    BEFORE the session runs, so it survives the crash; on resume the on-disk plan
+    makes the re-drive an implement leg, but the run pauses for the owed plan review
+    before committing instead of silently implementing past the checkpoint."""
+    setup_stories(project, [entry("1", spec_checkpoint=True)])
+
+    def plan_then_die(spec):
+        story_id = spec.env["BMAD_LOOP_STORY_KEY"]
+        rel = spec.env["BMAD_LOOP_SPEC_FOLDER"]
+        baseline = rev_parse_head(Path(spec.cwd))
+        stories_dir = Path(spec.cwd) / rel / "stories"
+        stories_dir.mkdir(parents=True, exist_ok=True)
+        write_spec(stories_dir / f"{story_id}-slug.md", "ready-for-dev", baseline)
+        raise RuntimeError("host died after the plan was written, before the durable record")
+
+    engine, _ = make_engine(project, [plan_then_die])
+    assert engine.run().crashed
+    crashed = load_state(engine.run_dir).tasks["1"]
+    assert crashed.phase == Phase.DEV_RUNNING and crashed.plan_review_owed
+    # the plan survives the crash (spec folder is under output_folder, rollback-kept)
+    assert status_of(read_frontmatter(story_spec(project, "1"))) == "ready-for-dev"
+
+    # resume: the implement leg runs (session available) but must pause, not commit
+    resumed, _ = resume_engine(project, engine, [stories_dev_effect()])
+    rsummary = resumed.run()
+    assert rsummary.paused and rsummary.done == 0
+    persisted = load_state(resumed.run_dir)
+    assert persisted.paused_stage == PAUSE_PLAN_CHECKPOINT
+    task = persisted.tasks["1"]
+    assert not task.plan_review_owed  # discharged at the pause
+    assert task.commit_sha is None  # never committed un-reviewed
+
+
+def test_plan_review_owed_after_non_fixable_retry_becomes_implement_leg(project):
+    """MAJOR-B(b): leg 1 plans (ready-for-dev) but fails verify non-fixably (wrong
+    workflow tag), so the tree resets and attempt 2 re-dispatches. The plan survived
+    (rollback-kept), so attempt 2 is an implement leg — which must still pause for
+    the owed plan review rather than drive straight to a commit."""
+    setup_stories(project, [entry("1", spec_checkpoint=True)])
+    # attempt 1: a plan-halt leg that writes the plan but claims the wrong workflow →
+    # verify_dev_stories retries (non-fixable); attempt 2: a clean implement leg.
+    attempt1 = _write_story_spec_effect(
+        "ready-for-dev", touch_code=False, result_over={"workflow": "quick-dev", "plan_halt": True}
+    )
+    attempt2 = _write_story_spec_effect("done", touch_code=True, result_over={"status": "done"})
+    engine, adapter = make_engine(project, [attempt1, attempt2])
+    summary = engine.run()
+
+    assert summary.paused and summary.done == 0
+    persisted = load_state(engine.run_dir)
+    assert persisted.paused_stage == PAUSE_PLAN_CHECKPOINT
+    assert not persisted.tasks["1"].plan_review_owed  # discharged at the pause
+    assert persisted.tasks["1"].commit_sha is None  # not committed un-reviewed
+    # attempt 2 really was an implement leg (no halt directive), yet it still paused
+    assert len([s for s in adapter.sessions if s.role == "dev"]) == 2
+    assert "Halt after planning" not in adapter.sessions[-1].prompt
+
+
+def test_plan_review_owed_when_skill_overruns_halt_to_done(project):
+    """MAJOR-B(c): the skill ignores `Halt after planning.` and drives leg 1 all the
+    way to done (result carries no plan_halt marker). The obligation latched at
+    dispatch forces a pause before commit, so the story cannot commit without the
+    human ever reviewing the plan."""
+    setup_stories(project, [entry("1", spec_checkpoint=True)])
+    overrun = _write_story_spec_effect("done", touch_code=True, result_over={"status": "done"})
+    engine, _ = make_engine(project, [overrun])
+    summary = engine.run()
+
+    assert summary.paused and summary.done == 0
+    persisted = load_state(engine.run_dir)
+    assert persisted.paused_stage == PAUSE_PLAN_CHECKPOINT
+    task = persisted.tasks["1"]
+    assert not task.plan_review_owed  # discharged at the pause
+    assert task.commit_sha is None  # not committed un-reviewed
+    # the pause is the distinct "owed after implement" variant, not the clean leg-1 halt
+    owed = [e for e in engine.journal.entries() if e.get("owed_after_implement")]
+    assert owed and owed[-1]["story_key"] == "1"
+
+
 def test_story_checkpoint_pause_after_commit(project):
     """done_checkpoint: the story commits, then the run pauses at
     PAUSE_STORY_CHECKPOINT because another story still remains to dispatch."""

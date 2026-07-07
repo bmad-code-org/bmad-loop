@@ -163,6 +163,16 @@ class StoryTask:
     # StoriesEngine._resume_after_dev_verify reads it to re-drive the implement leg
     # (rather than the base review+commit) and clears it. Survives the round-trip.
     plan_checkpoint_pending: bool = False
+    # stories mode only: the durable "a human plan review is still owed" obligation
+    # for a spec_checkpoint story. Latched at the story's first (leg-1) dispatch —
+    # BEFORE the session runs and keyed off the entry's spec_checkpoint flag, not
+    # the leg's on-disk status or result — so it survives a crash, a non-fixable
+    # retry, or a skill that overran `Halt after planning.`, none of which the
+    # on-disk-status-keyed _plan_halt_leg / result-keyed plan_checkpoint_pending
+    # carry across. Cleared ONLY when a plan-review pause actually raises (the
+    # obligation is discharged). While set after a dev leg that did not itself pause,
+    # StoriesEngine pauses before commit so the story can never commit un-reviewed.
+    plan_review_owed: bool = False
     # sweep bundles only: the deferred-work ids this task closes and the
     # rendered intent file handed to dev sessions
     dw_ids: list[str] = field(default_factory=list)
@@ -215,6 +225,7 @@ class StoryTask:
             "rearmed": self.rearmed,
             "resolved_redrive": self.resolved_redrive,
             "plan_checkpoint_pending": self.plan_checkpoint_pending,
+            "plan_review_owed": self.plan_review_owed,
             "dw_ids": self.dw_ids,
             "bundle_file": self.bundle_file,
             "worktree_path": self.worktree_path,
@@ -258,6 +269,7 @@ class StoryTask:
             rearmed=bool(d.get("rearmed", False)),
             resolved_redrive=bool(d.get("resolved_redrive", False)),
             plan_checkpoint_pending=bool(d.get("plan_checkpoint_pending", False)),
+            plan_review_owed=bool(d.get("plan_review_owed", False)),
             dw_ids=[str(i) for i in d.get("dw_ids", [])],
             bundle_file=d.get("bundle_file"),
             worktree_path=str(d.get("worktree_path", "")),
