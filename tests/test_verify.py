@@ -472,6 +472,20 @@ def test_verify_dev_stories_no_changes(project):
     assert not out.ok and "no changes" in out.reason
 
 
+def test_verify_dev_stories_whitespace_story_key(project):
+    # A story_key with stray whitespace must resolve identically to its trimmed id:
+    # the resolver normalizes via str().strip(), and the filename-prefix check must
+    # use the same normalized id (else a spurious "does not match id" retry).
+    spec_folder = project.planning_artifacts / "epic-a"
+    task = make_stories_task(project, " 1 ")
+    sp = write_story(spec_folder, "1", "x", "done", task.baseline_commit)
+    (project.project / "src.txt").write_text("changed\n")
+    out = verify.verify_dev_stories(
+        task, project, dev_result(sp), spec_folder=spec_folder, review_enabled=False
+    )
+    assert out.ok and task.spec_file == str(sp)
+
+
 def test_verify_dev_stories_ledger_only_counts_as_real_work(project):
     """T3 regression: a stories-mode story whose entire authorized diff is
     ledger/spec reconciliation under implementation_artifacts (e.g. deferred-work.md)

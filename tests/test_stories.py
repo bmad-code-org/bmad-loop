@@ -484,5 +484,5 @@ def test_story_rows_selector_and_limit(tmp_path):
 
 
 def test_story_rows_missing_manifest_raises(tmp_path):
-    with pytest.raises(stories.StoriesError, match="no stories.yaml found"):
+    with pytest.raises(stories.StoriesError, match=re.escape("no stories.yaml found")):
         stories.story_rows(tmp_path)
