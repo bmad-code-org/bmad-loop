@@ -562,11 +562,11 @@ def rearm_escalation(run_dir: Path, story_key: str | None = None) -> str:
         # status flip. Gate on the run source so a *sprint* spec that merely happens
         # to be named `<key>-unresolved.md` is status-flipped like any other spec and
         # never deleted — the sentinel filename convention exists only in stories mode.
-        condition = _sentinel_condition(spec_path, key) if state.source == "stories" else None
-        if condition is not None:
+        sentinel_kind = _sentinel_condition(spec_path, key) if state.source == "stories" else None
+        if sentinel_kind is not None:
             # a sentinel is cleared by deletion, not a status flip; drop the stale
             # spec_file so the re-dispatch starts from PENDING (clean re-plan).
-            _clear_sentinel(run_dir, journal, spec_path, key, condition)
+            _clear_sentinel(run_dir, journal, spec_path, key, sentinel_kind)
             task.spec_file = None
         else:
             # route /bmad-dev-auto to re-implement (decision table: ready-for-dev
@@ -619,16 +619,26 @@ def _sentinel_condition(spec_path: Path, story_key: str) -> str | None:
 
 
 def _clear_sentinel(
-    run_dir: Path, journal: Journal, spec_path: Path, story_key: str, condition: str
+    run_dir: Path, journal: Journal, spec_path: Path, story_key: str, sentinel_kind: str
 ) -> None:
     """Preserve a copy of the sentinel under ``{run_dir}/sentinels/`` (a write-only
-    breadcrumb of what blocked planning), journal ``sentinel-cleared`` with the
-    blocking condition, then delete the sentinel so the next dispatch is clean."""
+    breadcrumb of what blocked planning), journal ``sentinel-cleared`` — carrying
+    both the fixed slug (``sentinel_kind``) and the *recorded blocking condition*
+    parsed from the sentinel's ``## Auto Run Result`` (the reason planning halted) —
+    then delete the sentinel so the next dispatch is clean."""
+    from .stories import recorded_blocking_condition
+
     dest_dir = run_dir / "sentinels"
     dest_dir.mkdir(parents=True, exist_ok=True)
+    condition = ""
     if spec_path.is_file():
+        condition = recorded_blocking_condition(spec_path.read_text(encoding="utf-8"))
         shutil.copy2(spec_path, dest_dir / spec_path.name)
         spec_path.unlink()
     journal.append(
-        "sentinel-cleared", story_key=story_key, condition=condition, sentinel=spec_path.name
+        "sentinel-cleared",
+        story_key=story_key,
+        sentinel_kind=sentinel_kind,
+        condition=condition,
+        sentinel=spec_path.name,
     )

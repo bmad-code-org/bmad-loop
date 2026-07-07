@@ -3,6 +3,7 @@
 import json
 
 import pytest
+import yaml
 from conftest import git
 
 from bmad_loop import devcontract, resolve, runs, verify
@@ -266,7 +267,10 @@ def test_rearm_clears_sentinel_preserving_a_copy(tmp_path):
         for line in journal.splitlines()
         if json.loads(line).get("kind") == "sentinel-cleared"
     ]
-    assert cleared[0]["condition"] == "unresolved" and cleared[0]["story_key"] == key
+    # the journal carries the fixed slug (sentinel_kind) AND the recorded blocking
+    # condition parsed from the sentinel's ## Auto Run Result (not just the slug).
+    assert cleared[0]["sentinel_kind"] == "unresolved" and cleared[0]["story_key"] == key
+    assert "intent too vague" in cleared[0]["condition"]
 
 
 def test_rearm_non_sentinel_spec_still_flips_status(tmp_path):
@@ -372,3 +376,69 @@ def test_run_session_clears_stale_marker(tmp_path, monkeypatch):
         resolve.run_session(_FakeAdapter(None), tmp_path, run_dir, "6-4-cli-list-command") is False
     )
     assert not stale.exists()  # stale marker was removed, not reused
+
+
+# ---------------- item 9: build_context stories-mode enrichment --------------
+
+
+def _stories_manifest(folder, entries):
+    (folder / "stories").mkdir(parents=True, exist_ok=True)
+    (folder / "stories.yaml").write_text(yaml.safe_dump(entries, sort_keys=False), encoding="utf-8")
+
+
+def test_build_context_stories_carries_manifest_entry(tmp_path):
+    """Stories mode: context.json carries the manifest intent (spec folder + the
+    story entry's title/description/checkpoints/invoke_dev_with) for the resolver."""
+    key = "6-4-cli-list-command"
+    _stories_manifest(
+        tmp_path / "epic-1",
+        [
+            {
+                "id": key,
+                "title": "List command",
+                "description": "list notes",
+                "spec_checkpoint": True,
+                "invoke_dev_with": "use redis",
+            }
+        ],
+    )
+    run_dir, state, _ = _escalated_run(tmp_path, spec_file="/abs/spec.md", source="stories")
+    state.spec_folder = "epic-1"
+
+    ctx = json.loads(resolve.build_context(state, run_dir, key).read_text(encoding="utf-8"))
+    st = ctx["stories"]
+    assert st["spec_folder"] == "epic-1"
+    assert st["story"]["title"] == "List command"
+    assert st["story"]["spec_checkpoint"] is True
+    assert st["story"]["invoke_dev_with"] == "use redis"
+    assert "sentinel" not in st  # an ordinary escalation has no sentinel block
+
+
+def test_build_context_stories_sentinel_indicator(tmp_path):
+    """Stories mode: a sentinel-escalated story carries a sentinel indicator with
+    its kind and recorded blocking condition (so the resolver knows there is no
+    frozen spec to edit)."""
+    key = "6-4-cli-list-command"
+    folder = tmp_path / "epic-1"
+    _stories_manifest(folder, [{"id": key, "title": "t", "description": "d"}])
+    sentinel = folder / "stories" / f"{key}-unresolved.md"
+    sentinel.write_text(
+        "---\nstatus: blocked\n---\n\n## Auto Run Result\n\nStatus: blocked\nintent too vague\n",
+        encoding="utf-8",
+    )
+    run_dir, state, _ = _escalated_run(tmp_path, spec_file=str(sentinel), source="stories")
+    state.spec_folder = "epic-1"
+
+    ctx = json.loads(resolve.build_context(state, run_dir, key).read_text(encoding="utf-8"))
+    sent = ctx["stories"]["sentinel"]
+    assert sent["kind"] == "unresolved"
+    assert "intent too vague" in sent["blocking_condition"]
+
+
+def test_build_context_sprint_mode_has_no_stories_block(tmp_path):
+    """Sprint mode leaves the context contract unchanged — no stories block."""
+    run_dir, state, _ = _escalated_run(tmp_path, spec_file="/abs/spec.md")  # sprint source
+    ctx = json.loads(
+        resolve.build_context(state, run_dir, "6-4-cli-list-command").read_text(encoding="utf-8")
+    )
+    assert "stories" not in ctx

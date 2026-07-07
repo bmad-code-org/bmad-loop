@@ -77,10 +77,59 @@ def build_context(state: RunState, run_dir: Path, story_key: str) -> Path:
         # path is consumed by the agent, and Python/tools accept '/' on Windows).
         "resolution_path": resolution_path(run_dir, story_key).as_posix(),
     }
+    # Stories mode: hand the resolver the manifest intent (the story entry) and a
+    # sentinel indicator, so it sees WHAT the story is meant to do and WHETHER the
+    # frozen spec even exists yet (a sentinel has no plan to edit — resolve the
+    # underlying ambiguity instead). Sprint mode leaves the context unchanged.
+    if state.source == "stories":
+        stories_ctx = _stories_context(state, story_key)
+        if stories_ctx:
+            context["stories"] = stories_ctx
     path = context_path(run_dir, story_key)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(context, indent=2), encoding="utf-8")
     return path
+
+
+def _stories_context(state: RunState, story_key: str) -> dict[str, Any]:
+    """The stories-mode extension of the resolve context: the spec folder, the
+    manifest entry for the story (title/description/checkpoint flags/invoke_dev_with),
+    and — when the escalated spec is a fixed-slug pre-planning-halt sentinel — a
+    sentinel indicator with its kind and recorded blocking condition. Best-effort:
+    an unreadable manifest just yields the folder (resolve still runs)."""
+    from . import stories
+
+    project = Path(state.project)
+    folder = stories.resolve_spec_folder(project, state.spec_folder)
+    ctx: dict[str, Any] = {"spec_folder": state.spec_folder}
+    try:
+        entry = stories.load_stories(folder).get(story_key)
+    except stories.StoriesError:
+        entry = None
+    if entry is not None:
+        ctx["story"] = {
+            "id": entry.id,
+            "title": entry.title,
+            "description": entry.description,
+            "spec_checkpoint": entry.spec_checkpoint,
+            "done_checkpoint": entry.done_checkpoint,
+            "invoke_dev_with": entry.invoke_dev_with,
+        }
+    try:
+        st = stories.resolve_story_spec(folder, story_key)
+    except OSError:
+        st = None
+    if st is not None and st.kind == stories.KIND_SENTINEL and st.path is not None:
+        try:
+            condition = stories.recorded_blocking_condition(st.path.read_text(encoding="utf-8"))
+        except OSError:
+            condition = ""
+        ctx["sentinel"] = {
+            "kind": st.sentinel_kind,
+            "path": st.path.as_posix(),
+            "blocking_condition": condition,
+        }
+    return ctx
 
 
 def run_session(adapter, project: Path, run_dir: Path, story_key: str, *, model: str = "") -> bool:
