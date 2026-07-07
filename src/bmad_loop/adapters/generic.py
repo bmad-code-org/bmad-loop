@@ -497,9 +497,14 @@ class GenericDevAdapter(GenericAdapter):
         folder; rebase a relative one against ``spec.cwd`` exactly like
         ``_artifact_dirs`` so worktree isolation resolves inside the live checkout.
         A PRESENT or SENTINEL spec synthesizes (a blocked sentinel becomes a
-        CRITICAL escalation → PAUSE, same as any block); a still-PENDING or
-        AMBIGUOUS state is not-yet-terminal → keep waiting, then None (a
-        result-less Stop the dev-stall grace handles).
+        CRITICAL escalation → PAUSE, same as any block) — but only when the spec was
+        (re)written by THIS session: like the mtime-scan path's ``since_ns`` floor, a
+        spec whose mtime predates ``handle.launched_ns`` is a stale prior artifact
+        (e.g. the dev's ``done`` spec a follow-up review session re-opens) and must
+        not be read as this session's result. A still-PENDING spec, an AMBIGUOUS
+        match (>1 file — an anomaly no wait can collapse; ``_pick_next`` re-classifies
+        it into an actionable wedge), or a stale terminal spec → None (a result-less
+        Stop the dev-stall grace handles).
 
         On a plan-halt leg (``BMAD_LOOP_PLAN_HALT`` set by the engine for a
         spec_checkpoint story's first dispatch) the skill HALTs at
@@ -514,7 +519,16 @@ class GenericDevAdapter(GenericAdapter):
         deadline = time.monotonic() + RESULT_GRACE_S
         while True:
             state = stories.resolve_story_spec(base, story_key)
-            if state.kind in (stories.KIND_PRESENT, stories.KIND_SENTINEL) and state.path:
+            if state.kind == stories.KIND_AMBIGUOUS:
+                # >1 matching file — waiting can't make it collapse to one. Return now
+                # (don't burn the grace); the engine's next _pick_next re-classifies
+                # AMBIGUOUS and raises the actionable wedge for resolve.
+                return None
+            if (
+                state.kind in (stories.KIND_PRESENT, stories.KIND_SENTINEL)
+                and state.path
+                and self._written_this_session(state.path, handle.launched_ns)
+            ):
                 result = devcontract.synthesize_result(
                     state.path, story_key=story_key or None, plan_halt=plan_halt
                 )
@@ -523,6 +537,18 @@ class GenericDevAdapter(GenericAdapter):
             if not wait or time.monotonic() >= deadline:
                 return None
             time.sleep(RESULT_POLL_S)
+
+    @staticmethod
+    def _written_this_session(spec_path: Path, launched_ns: int) -> bool:
+        """Whether ``spec_path`` was (re)written at/after the session launched — the
+        same launch-floor guard ``devcontract.find_result_artifact`` applies on the
+        scan path, so a stale terminal spec from a prior step (a dev ``done`` a
+        follow-up review re-opens) is not mistaken for this session's output. A spec
+        that vanished between resolve and stat is treated as not-yet-written."""
+        try:
+            return spec_path.stat().st_mtime_ns >= launched_ns
+        except OSError:
+            return False
 
 
 # Back-compat alias: the adapter was ``GenericTmuxAdapter`` before tmux moved

@@ -452,6 +452,45 @@ def test_stories_readback_sentinel_is_blocked_escalation(tmp_path):
     assert crits, "a blocked sentinel must synthesize a CRITICAL escalation"
 
 
+def test_stories_readback_stale_spec_below_launch_floor_returns_none(tmp_path):
+    """A1: a terminal spec whose mtime predates the session launch is a stale prior
+    artifact (the dev's `done` a follow-up review session re-opens), not this
+    session's output — it must NOT read as completed. Mirrors the mtime-scan path's
+    `since_ns` floor. Without the floor this returns `completed:done` for a review
+    that produced nothing."""
+    adapter, _ = make_dev_adapter(tmp_path)
+    spec = _write_story_spec(
+        tmp_path, "1", "foo", "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+    )
+    # launch AFTER the spec was written → the spec is stale for this session
+    launched = spec.stat().st_mtime_ns + 1
+    handle = _dev_handle(launched_ns=launched)
+    assert adapter._result_json(handle, _stories_spec(tmp_path), wait=False) is None
+    # a re-write at/after the floor is this session's output → read normally
+    spec.write_text(
+        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\nreviewed.\n",
+        encoding="utf-8",
+    )
+    import os
+
+    os.utime(spec, ns=(launched + 1_000, launched + 1_000))
+    rj = adapter._result_json(handle, _stories_spec(tmp_path), wait=False)
+    assert rj is not None and rj["status"] == "done"
+
+
+def test_stories_readback_ambiguous_returns_none_without_waiting(tmp_path):
+    """A2: >1 file matching `<id>-*.md` is an anomaly no wait can collapse. The
+    read-back returns None promptly (rather than burning the full grace) — the
+    engine's next _pick_next re-classifies AMBIGUOUS into an actionable wedge."""
+    adapter, _ = make_dev_adapter(tmp_path)
+    _write_story_spec(tmp_path, "1", "foo", "---\nstatus: done\n---\n\ndone\n")
+    _write_story_spec(tmp_path, "1", "bar", "---\nstatus: done\n---\n\ndone\n")  # 2nd match
+    start = time.monotonic()
+    # wait=True would normally poll up to RESULT_GRACE_S; AMBIGUOUS must short-circuit
+    assert adapter._result_json(_dev_handle(), _stories_spec(tmp_path), wait=True) is None
+    assert time.monotonic() - start < generic.RESULT_GRACE_S / 2
+
+
 def test_stories_readback_pending_returns_none(tmp_path):
     adapter, _ = make_dev_adapter(tmp_path)
     # no story spec on disk yet -> not terminal
