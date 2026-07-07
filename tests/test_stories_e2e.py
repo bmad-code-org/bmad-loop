@@ -237,7 +237,11 @@ def test_e2e_spec_checkpoint_two_leg(tmp_path):
 
     run_id = _run_id(root)
     st = _run(root, "status", run_id)
-    assert "plan-checkpoint" in st.stdout.lower() or "paused" in st.stdout.lower()
+    # deterministic status line: `PAUSED (plan-checkpoint) — …` — assert BOTH the
+    # paused state and the specific stage, not either-or (a weak `or` would pass on
+    # any paused run regardless of stage).
+    out = st.stdout.lower()
+    assert "paused" in out and "plan-checkpoint" in out
 
     # leg 2: resume re-dispatches straight to implementation → done + commit
     resume = _run(root, "resume", run_id)

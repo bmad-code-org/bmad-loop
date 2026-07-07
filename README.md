@@ -385,6 +385,8 @@ low_frame_rate = false     # true = cap to 15fps + disable animations (= bmad-lo
 
 **Gate modes:** `none` runs everything unattended; `per-epic` (default) pauses at epic boundaries; `per-story-spec-approval` pauses after each spec is written so you approve it before implementation is reviewed.
 
+> In **stories mode** the `stories.yaml` list is flat — there are no epics — so the default `per-epic` gate never fires (nothing to bound). Use the per-story `spec_checkpoint` / `done_checkpoint` flags for HITL there, or `per-story-spec-approval` for a run-global spec gate. `none` and `per-story-spec-approval` behave the same as in sprint mode.
+
 **Review:** `[review].enabled = false` drops the separate fresh-context review session; the dev pass instead runs `bmad-dev-auto`'s own internal two-layer review (Blind Hunter / Edge Case Hunter) and finalizes the story straight to `done` — one session per story instead of two, verify commands still gating the commit. Governs deferred-work sweeps too. When review is enabled, `[review].trigger` decides _when_ that separate pass runs: `recommended` (default) only when the `bmad-dev-auto` session flags `followup_review_recommended` — it already triple-reviews inline and recommends an independent pass only when its changes were significant; `always` runs it every story. The follow-up loop is bounded by `limits.max_review_cycles` (default 3), which caps oscillation.
 
 `bmad-loop init` (without `--cli`) registers hooks for every CLI profile the policy references, so a dual-client setup needs no extra flags.

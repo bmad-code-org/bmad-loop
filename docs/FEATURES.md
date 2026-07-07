@@ -117,7 +117,7 @@ See [README.md](../README.md) for the narrative overview and [setup-guide.md](se
 
 ### Gates & human checkpoints
 
-- Gate modes (`[gates].mode`): `none` (fully unattended) / `per-epic` (pause at epic boundaries, default) / `per-story-spec-approval` (pause after each spec for approval).
+- Gate modes (`[gates].mode`): `none` (fully unattended) / `per-epic` (pause at epic boundaries, default) / `per-story-spec-approval` (pause after each spec for approval). Note: `per-epic` is inert in stories mode — the flat `stories.yaml` list has no epics, so the boundary never fires; use the per-story checkpoints (below) or `per-story-spec-approval` there.
 - Per-story checkpoints (stories mode): independent `spec_checkpoint` (pause before code to review the plan; approve → implement, or request a replan) and `done_checkpoint` (pause after the story commits; skipped when it is the last story). Additive to `gates.mode` — a story can pause twice.
 - Every mid-run pause is surfaced in the TUI: a per-run pause-kind badge, a global attention count, and a `p` viewer per stage (plan-checkpoint spec review, story-checkpoint summary card, escalation with story context, gate spec review) — all calling the same CLI code paths.
 - Retrospective handling (`retrospective = never | notify | auto`) and notification on epic boundaries.

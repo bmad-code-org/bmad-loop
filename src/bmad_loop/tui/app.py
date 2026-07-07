@@ -610,11 +610,28 @@ class BmadLoopApp(App[None]):
         """Request-replan: reset the planned spec to draft + strip its Auto Run
         Result, then resume — the next dispatch re-enters step-02 planning. Uses
         the same devcontract primitives the engine's repair path uses."""
+        # Guard a possibly-live engine BEFORE mutating the spec — a draft-reset +
+        # strip under a still-running session would race its writes (the rearm path
+        # already checks liveness first; match it so replan can't corrupt a live
+        # drive, and only then does _do_resume re-check before relaunching).
+        run_dir = self.project / RUNS_DIR / run_id
+        if self._resolve_blocked_by_liveness(run_id, run_dir):
+            return
         try:
-            devcontract.reset_spec_status(spec_path, "draft")
+            reset = devcontract.reset_spec_status(spec_path, "draft")
             devcontract.strip_auto_run_result(spec_path)
         except OSError as e:
             self.notify(f"replan failed: {e}", severity="error")
+            return
+        if not reset:
+            # honor the reset bool: nothing was flipped (the spec has no frontmatter
+            # status, or is already draft), so the next dispatch would NOT re-enter
+            # planning. Surface it instead of a misleading "reset" notice + resume.
+            self.notify(
+                "replan: could not reset the plan to draft (no frontmatter status?) "
+                "— not resuming",
+                severity="error",
+            )
             return
         self.notify("plan reset to draft — the next dispatch re-plans")
         self._do_resume(run_id)
@@ -674,8 +691,14 @@ class BmadLoopApp(App[None]):
     def _sentinel_kind(self, state: RunState, key: str) -> str:
         if state.source != "stories" or not state.spec_folder:
             return ""
-        folder = stories.resolve_spec_folder(self.project, state.spec_folder)
-        st = stories.resolve_story_spec(folder, key)
+        # resolve_story_spec globs + reads frontmatter; a file removed mid-scan (a
+        # re-arm clearing the sentinel while the viewer refreshes) can raise OSError.
+        # Degrade to "" rather than let a race-window read crash the render.
+        try:
+            folder = stories.resolve_spec_folder(self.project, state.spec_folder)
+            st = stories.resolve_story_spec(folder, key)
+        except OSError:
+            return ""
         return st.sentinel_kind if st.kind == stories.KIND_SENTINEL else ""
 
     @staticmethod
