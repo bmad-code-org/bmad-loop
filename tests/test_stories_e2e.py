@@ -15,10 +15,12 @@ adapter bypasses: arg parsing, prompt render, hook-signal completion, the
 stories read-back, git commit, and the resolve/resume dance.
 
 Covers, through the real binary: (1) two-story happy path, (2) `spec_checkpoint`
-two-leg plan-halt + resume, (4) blocked → resolve → re-dispatch. Scenarios
-(3) `done_checkpoint`, (5) worktree isolation, and (6) sprint-mode regression are
-covered deterministically at the engine level in test_stories_engine.py /
-test_engine.py; here we prove the end-to-end CLI stack.
+two-leg plan-halt + resume, (4) blocked → resolve → re-dispatch, and (6)
+sprint-mode regression (the new folder+id-capable dev skill installed, yet a
+plain sprint run drives dev → verify → commit → sprint-status advance untouched
+by the stories wiring). Scenarios (3) `done_checkpoint` and (5) worktree
+isolation are covered deterministically at the engine level in
+test_stories_engine.py; here we prove the end-to-end CLI stack.
 """
 
 from __future__ import annotations
@@ -48,6 +50,24 @@ ts=$(date +%s%N)
 mkdir -p "$rd/events"
 printf '{"ts": %s, "event": "SessionStart", "task_id": "%s", "session_id": "fake-1"}' \
     "$ts" "$tid" > "$rd/events/$ts-$tid-SessionStart.json"
+baseline=$(git rev-parse HEAD)
+
+# SPRINT mode (no BMAD_LOOP_SPEC_FOLDER in env): the folder+id-capable skill is
+# installed, but a plain sprint run must still work. Write the result artifact
+# the orchestrator scans by mtime under implementation-artifacts, make a real
+# code change, and Stop — the orchestrator (not the skill) advances sprint-status.
+if [ -z "$folder" ]; then
+    impl="_bmad-output/implementation-artifacts"
+    mkdir -p "$impl"
+    echo "impl for $story" >> src.txt
+    printf -- '---\ntitle: %s\nstatus: done\nbaseline_commit: %s\n---\n\n## Intent\n\nx\n\n## Auto Run Result\n\n- Status: done\n\nSummary: sprint.\n' \
+        "$story" "$baseline" > "$impl/spec-$story.md"
+    ts2=$(( ts + 1 ))
+    printf '{"ts": %s, "event": "Stop", "task_id": "%s", "session_id": "fake-1"}' \
+        "$ts2" "$tid" > "$rd/events/$ts2-$tid-Stop.json"
+    sleep 30
+    exit 0
+fi
 
 sdir="$folder/stories"
 mkdir -p "$sdir"
@@ -55,7 +75,6 @@ spec="$sdir/$story-slug.md"
 existing=$(ls "$sdir/$story"-*.md 2>/dev/null | head -1 || true)
 status=""
 [ -n "$existing" ] && status=$(sed -n 's/^status:[[:space:]]*//p' "$existing" | head -1 | tr -d "'\" ")
-baseline=$(git rev-parse HEAD)
 
 write_done() {
     echo "impl for $story" >> src.txt
@@ -176,6 +195,86 @@ def _scaffold(root: Path, entries: list[dict]) -> None:
     _git(root, "commit", "-q", "-m", "sandbox")
 
 
+def _scaffold_sprint(root: Path, story_key: str) -> None:
+    """A committed, clean SPRINT-mode sandbox carrying the SAME new folder+id-
+    capable bmad-dev-auto skill stub as `_scaffold` (with the folder+id dispatch
+    probe content) — the regression point: installing that skill must not disturb
+    the default sprint path. sprint-status.yaml holds one ready-for-dev story; the
+    policy has NO [stories] section, so the run is plain sprint mode."""
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "src.txt").write_text("original\n", encoding="utf-8")
+    (root / ".gitignore").write_text(".bmad-loop/runs/\n", encoding="utf-8")
+
+    cfg = root / "_bmad" / "bmm"
+    cfg.mkdir(parents=True)
+    (cfg / "config.yaml").write_text(
+        "implementation_artifacts: '{project-root}/_bmad-output/implementation-artifacts'\n"
+        "planning_artifacts: '{project-root}/_bmad-output/planning-artifacts'\n",
+        encoding="utf-8",
+    )
+    impl = root / "_bmad-output" / "implementation-artifacts"
+    for sub in ("implementation-artifacts", "planning-artifacts"):
+        (root / "_bmad-output" / sub).mkdir(parents=True, exist_ok=True)
+        (root / "_bmad-output" / sub / ".keep").write_text("", encoding="utf-8")
+
+    # the SAME new folder+id-capable skill stub the stories scaffold installs
+    skills = root / ".claude" / "skills"
+    dev = skills / "bmad-dev-auto"
+    dev.mkdir(parents=True)
+    (dev / "SKILL.md").write_text("# bmad-dev-auto\n", encoding="utf-8")
+    (dev / "step-04-review.md").write_text("x\n", encoding="utf-8")
+    (dev / "step-01-clarify-and-route.md").write_text(
+        "This is a **folder+id dispatch** router.\n", encoding="utf-8"
+    )
+    for hunter in ("bmad-review-adversarial-general", "bmad-review-edge-case-hunter"):
+        (skills / hunter).mkdir(parents=True)
+        (skills / hunter / "SKILL.md").write_text(f"# {hunter}\n", encoding="utf-8")
+
+    sprint = {
+        "generated": "01-06-2026 10:00",
+        "last_updated": "01-06-2026 10:00",
+        "project": "sandbox",
+        "project_key": "NOKEY",
+        "tracking_system": "file-system",
+        "development_status": {story_key: "ready-for-dev"},
+    }
+    (impl / "sprint-status.yaml").write_text(
+        yaml.safe_dump(sprint, sort_keys=False), encoding="utf-8"
+    )
+
+    fake = root / ".bmad-loop" / "fake-cli.sh"
+    fake.parent.mkdir(parents=True, exist_ok=True)
+    fake.write_text(FAKE_CLI, encoding="utf-8")
+    os.chmod(fake, 0o755)
+    profiles = root / ".bmad-loop" / "profiles"
+    profiles.mkdir(parents=True)
+    (profiles / "fakestories.toml").write_text(
+        PROFILE_TOML.format(binary=str(fake)), encoding="utf-8"
+    )
+    (root / ".bmad-loop" / "policy.toml").write_text(
+        '[adapter]\nname = "fakestories"\n\n'
+        "[review]\nenabled = false\n\n"
+        '[gates]\nmode = "none"\n',
+        encoding="utf-8",
+    )
+
+    _git(root, "init", "-q", "-b", "main")
+    _git(root, "config", "user.email", "e2e@test")
+    _git(root, "config", "user.name", "e2e")
+    _git(root, "config", "core.fsync", "none")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "sandbox")
+
+
+def _sprint_status(root: Path, story_key: str) -> str:
+    doc = yaml.safe_load(
+        (root / "_bmad-output" / "implementation-artifacts" / "sprint-status.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    return doc.get("development_status", {}).get(story_key, "?")
+
+
 def _run(root: Path, *args: str, timeout: float = 150) -> subprocess.CompletedProcess:
     return subprocess.run(
         [*CLI, args[0], "--project", str(root), *args[1:]],
@@ -276,3 +375,20 @@ def test_e2e_blocked_resolve_redispatch(tmp_path):
     assert _status(root, "1") == "done"
     assert _status(root, "2") == "done"
     assert _commit_count(root) == base + 2
+
+
+def test_e2e_sprint_mode_regression(tmp_path):
+    # Scenario 6 (audit MAJOR-2): the new folder+id-capable bmad-dev-auto skill is
+    # installed, but this is a plain SPRINT-mode run. It must drive dev → verify →
+    # commit and let the orchestrator advance sprint-status to done through the
+    # real CLI — unaffected by the stories wiring (the adapter's
+    # BMAD_LOOP_SPEC_FOLDER read-back branch, the per-session env exports, etc.).
+    root = tmp_path / "sbx"
+    story = "1-1-thing"
+    _scaffold_sprint(root, story)
+    base = _commit_count(root)
+
+    proc = _run(root, "run")
+    assert proc.returncode == 0, proc.stderr or proc.stdout
+    assert _sprint_status(root, story) == "done"
+    assert _commit_count(root) == base + 1
