@@ -365,6 +365,16 @@ def cmd_run(args: argparse.Namespace) -> int:
     pol = policy_mod.load(_policy_path(project))
     stories_on, spec_folder = _stories_mode(args, pol)
 
+    if stories_on and args.epic is not None:
+        # stories mode dispatches the manifest's single flat schedule; StoriesEngine
+        # nulls epic_filter, so --epic has no effect. Warn rather than silently drop
+        # it, so a caller who passed both (e.g. `run --spec ... --epic 3`) isn't
+        # surprised by an unfiltered run. Use --story to scope to one id.
+        print(
+            "note: --epic is ignored in stories mode; use --story to filter to one id",
+            file=sys.stderr,
+        )
+
     if args.dry_run:
         return _dry_run(paths, pol, args, stories_on, spec_folder)
 

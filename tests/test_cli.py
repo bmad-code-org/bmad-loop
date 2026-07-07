@@ -197,6 +197,30 @@ def test_dry_run_stories_filters_by_story_id(project, capsys):
     assert "Story id: 2." in out and "Story id: 1." not in out
 
 
+def test_run_warns_when_epic_passed_with_spec(project, capsys):
+    """A4: --epic has no effect in stories mode (StoriesEngine nulls epic_filter), so
+    `run --spec ... --epic N` must warn rather than silently ignore the flag. Exercised
+    through cmd_run via --dry-run (the warning fires before the dry-run branch)."""
+    install_bmad_config(project)
+    _setup_stories_fixture(project, [_stories_entry("1"), _stories_entry("2")])
+    _write_policy(project.project)
+    rc = cli.main(
+        [
+            "run",
+            "--project",
+            str(project.project),
+            "--spec",
+            STORIES_SPEC_FOLDER,
+            "--epic",
+            "3",
+            "--dry-run",
+        ]
+    )
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "--epic is ignored in stories mode" in err
+
+
 def test_dry_run_stories_bad_folder_errors(project, capsys):
     pol = policy_mod.loads("")
     args = argparse.Namespace(spec=STORIES_SPEC_FOLDER, epic=None, story=None, max_stories=None)
