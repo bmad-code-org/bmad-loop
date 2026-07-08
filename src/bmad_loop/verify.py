@@ -922,6 +922,45 @@ def set_frontmatter_status(path: Path, status: str) -> bool:
     return True
 
 
+def set_frontmatter_field(path: Path, key: str, value: str) -> bool:
+    """Rewrite (or insert) a scalar ``<key>:`` line in a spec's `---`…`---`
+    frontmatter block.
+
+    Same minimal in-place line surgery as `set_frontmatter_status` (no YAML
+    round-trip) so the spec's formatting, comments, and field order survive.
+    Unlike the status helper, a missing key is INSERTED as the block's last
+    line: callers assert a field's value whether or not the skill wrote one
+    (the patch-restore re-arm re-stamps ``baseline_revision``, which only the
+    skill's step-03 writes). Returns True when the file was rewritten; False
+    when it has no frontmatter or already carries the exact value.
+    """
+    if not path.is_file():
+        return False
+    text = path.read_text(encoding="utf-8")
+    if not text.startswith("---"):
+        return False
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return False
+    block_lines = parts[1].splitlines(keepends=True)
+    replaced = False
+    for i, line in enumerate(block_lines):
+        stripped = line.lstrip()
+        if stripped.startswith(f"{key}:"):
+            indent = line[: len(line) - len(stripped)]
+            newline = "\n" if line.endswith("\n") else ""
+            block_lines[i] = f"{indent}{key}: {value}{newline}"
+            replaced = True
+            break
+    if not replaced:
+        block_lines.append(f"{key}: {value}\n")
+    rebuilt = parts[0] + "---" + "".join(block_lines) + "---" + parts[2]
+    if rebuilt == text:  # already at the target value — idempotent no-op
+        return False
+    path.write_text(rebuilt, encoding="utf-8")
+    return True
+
+
 def artifact_relpaths(paths: ProjectPaths) -> tuple[str, ...]:
     """Repo-relative posix prefixes of the orchestrator-owned BMAD artifact
     folders (the output root and the implementation/planning artifact dirs),

@@ -100,6 +100,24 @@ def test_set_frontmatter_status_no_frontmatter(tmp_path):
     assert verify.set_frontmatter_status(spec, "ready-for-dev") is False
 
 
+def test_set_frontmatter_field_replaces_inserts_idempotent(tmp_path):
+    spec = tmp_path / "spec.md"
+    spec.write_text(SPEC, encoding="utf-8")
+    assert verify.set_frontmatter_field(spec, "owner", "winston") is True
+    assert verify.read_frontmatter(spec)["owner"] == "winston"
+    # unlike set_frontmatter_status, a missing key is INSERTED (block's last line)
+    assert verify.set_frontmatter_field(spec, "baseline_revision", "abc123") is True
+    fm = verify.read_frontmatter(spec)
+    assert fm["baseline_revision"] == "abc123"
+    assert fm["status"] == "in-review" and fm["title"] == "List command"  # untouched
+    # idempotent: already at the target value
+    assert verify.set_frontmatter_field(spec, "baseline_revision", "abc123") is False
+    # no frontmatter block -> no write
+    bare = tmp_path / "bare.md"
+    bare.write_text("# just a heading\n", encoding="utf-8")
+    assert verify.set_frontmatter_field(bare, "baseline_revision", "abc123") is False
+
+
 # ----------------------------------------------------------- build_context
 
 
@@ -383,6 +401,68 @@ def test_rearm_restore_patch_on_a_real_stories_spec_is_allowed(tmp_path):
     assert task.phase == Phase.PENDING
     assert task.restore_patch == "artifacts/attempt.patch"
     assert verify.read_frontmatter(spec)["status"] == "in-review"  # restore routing
+
+
+def _resolve_repo(tmp_path):
+    """A tiny real repo so rearm's baseline advance has a HEAD to read."""
+    git(tmp_path, "init", "-q", "-b", "main")
+    git(tmp_path, "config", "user.email", "test@test")
+    git(tmp_path, "config", "user.name", "test")
+    (tmp_path / ".gitignore").write_text(".bmad-loop/runs/\n")
+    (tmp_path / "src.txt").write_text("original\n")
+    git(tmp_path, "add", "-A")
+    git(tmp_path, "commit", "-q", "-m", "initial")
+    return git(tmp_path, "rev-parse", "HEAD")
+
+
+def test_rearm_restore_patch_restamps_spec_baseline(tmp_path):
+    """The in-review route skips step-03 — the only step that stamps
+    `baseline_revision` — so the patch-restore re-arm re-stamps it to the
+    advanced baseline itself. Otherwise the re-driven step-04 would build its
+    review diff (and, on an intent-gap/bad-spec re-triage, revert) "since" the
+    ORIGINAL pre-attempt sha, clawing back the very resolve-session commits the
+    baseline advance blesses as the re-drive's starting point."""
+    key = "6-4-cli-list-command"
+    old_head = _resolve_repo(tmp_path)
+    spec = tmp_path / "spec.md"
+    spec.write_text(
+        f"---\nstatus: blocked\nbaseline_revision: {old_head}\n---\n\n## Intent\n\nx\n",
+        encoding="utf-8",
+    )
+    run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec))
+    # the resolve session leaves a commit NOT overlapping the patch (blessed input)
+    (tmp_path / "fixture.txt").write_text("resolution fixture\n")
+    git(tmp_path, "add", "-A")
+    git(tmp_path, "commit", "-q", "-m", "resolution fixture")
+    new_head = git(tmp_path, "rev-parse", "HEAD")
+
+    runs.rearm_escalation(run_dir, restore_patch="artifacts/attempt.patch")
+
+    fm = verify.read_frontmatter(spec)
+    assert fm["baseline_revision"] == new_head  # step-04 diffs from the ADVANCED baseline
+    assert fm["status"] == "in-review"
+    assert load_state(run_dir).tasks[key].baseline_commit == new_head
+
+
+def test_rearm_from_scratch_leaves_spec_baseline_alone(tmp_path):
+    """A from-scratch re-arm routes ready-for-dev -> step-03, which re-stamps
+    `baseline_revision` itself — the re-arm must not touch it."""
+    old_head = _resolve_repo(tmp_path)
+    spec = tmp_path / "spec.md"
+    spec.write_text(
+        f"---\nstatus: blocked\nbaseline_revision: {old_head}\n---\n\n## Intent\n\nx\n",
+        encoding="utf-8",
+    )
+    run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec))
+    (tmp_path / "fixture.txt").write_text("resolution fixture\n")
+    git(tmp_path, "add", "-A")
+    git(tmp_path, "commit", "-q", "-m", "resolution fixture")
+
+    runs.rearm_escalation(run_dir)  # no restore
+
+    fm = verify.read_frontmatter(spec)
+    assert fm["baseline_revision"] == old_head  # untouched; step-03 owns the stamp
+    assert fm["status"] == "ready-for-dev"
 
 
 # -------------------------------------------------- non-UTF-8 robustness (bug class)

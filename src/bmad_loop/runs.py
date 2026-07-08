@@ -661,6 +661,25 @@ def rearm_escalation(
     except Exception:  # noqa: BLE001  # nosec B110 - best-effort git read, must not fail re-arm
         pass
 
+    # Patch-restore only: re-stamp the spec's own baseline to the advanced one.
+    # The in-review route skips step-03 — the only step that stamps
+    # `baseline_revision` — so without this the re-driven step-04 would build its
+    # review diff (and, on an intent-gap/bad-spec re-triage, revert) "since" the
+    # ORIGINAL pre-attempt sha, clawing back the very resolve-session commits the
+    # advance above just blessed as the re-drive's starting point. Loud on
+    # failure: a silently stale spec baseline is exactly the hazard being closed
+    # (the spec block above already proved the file readable, so this is remote).
+    if restore_patch and task.spec_file and task.baseline_commit:
+        try:
+            verify.set_frontmatter_field(
+                Path(task.spec_file), "baseline_revision", task.baseline_commit
+            )
+        except (OSError, UnicodeDecodeError) as e:
+            raise RearmError(
+                f"cannot re-stamp baseline_revision on {task.spec_file} "
+                f"({e.__class__.__name__}: {e}) — fix the file, then re-run resolve"
+            ) from e
+
     save_state(run_dir, state)
     journal.append(
         "story-escalation-resolved",
