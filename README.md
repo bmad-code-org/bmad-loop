@@ -39,7 +39,7 @@ Inspired by the original [bmad-automator](https://github.com/bmad-code-org/bmad-
 ## Requirements
 
 - **Python 3.11+**, **tmux**, and a supported coding CLI — `claude` by default; `codex` and `gemini` via [profiles](#other-coding-clis).
-- **Linux or macOS** (or **Windows via WSL**, which _is_ Linux — it runs as-is). tmux is the one terminal-multiplexer backend today, but it now sits behind a pluggable **registry** of OS seams (transport, process lifecycle, hook interpreter), so a native-Windows backend slots in as new files + a registration line each, with no engine edits — see [Porting bmad-loop to a new OS](docs/porting-to-a-new-os.md). Native Windows is not yet shipped.
+- **Linux or macOS**, **Windows via WSL**, or **native Windows with [`tmux-windows`](https://github.com/arndawg/tmux-windows)**. On native Windows, install tmux first (for example, `winget install --id arndawg.tmux-windows -e`) so `tmux.exe` is on PATH. The transport still sits behind a pluggable **registry** of OS seams (transport, process lifecycle, hook interpreter), so a future non-tmux native backend can slot in as new files + a registration line each, with no engine edits — see [Porting bmad-loop to a new OS](docs/porting-to-a-new-os.md).
 - A **BMAD v6 project** (`_bmad/bmm/config.yaml`, a `sprint-status.yaml` from `bmad-sprint-planning`) with the upstream `bmad-dev-auto` skill and the bmad-loop skill module from this repo installed (`bmad-loop-resolve`, `bmad-loop-sweep` — see [Installing the skill module](#installing-the-skill-module)). Standard BMAD skills stay untouched.
 
 ## Quick start

@@ -29,7 +29,11 @@ ACK = "portability:"
 # tmux/POSIX-shell knowledge, split across the shared base (where the spawn
 # primitive + argv live) and its POSIX leaf. No per-line ack needed: these files
 # *are* the sanctioned spot (their module docstrings say so).
-TMUX_BACKENDS = {"adapters/tmux_base.py", "adapters/tmux_backend.py"}
+TMUX_BACKENDS = {
+    "adapters/tmux_base.py",
+    "adapters/tmux_backend.py",
+    "adapters/tmux_windows_backend.py",
+}
 
 # Platform-guarded files that may name a bare POSIX path, each on a line carrying
 # a `# portability:` ack (and guarded by a sys.platform branch). process_host.py's

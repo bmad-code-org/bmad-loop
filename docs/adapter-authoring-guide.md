@@ -26,15 +26,15 @@ These are independent and abstracted separately:
 - **Transport axis** — `TerminalMultiplexer` (`adapters/multiplexer.py`): how
   sessions, windows, and panes are created, observed, and torn down. The generic
   adapter never shells out itself — it goes through `self.mux`, obtained from
-  `get_multiplexer()`. The one backend today is tmux: argv construction and the
-  single spawn primitive live in `BaseTmuxBackend` (`adapters/tmux_base.py`), with
-  the thin POSIX leaf `TmuxMultiplexer` (`adapters/tmux_backend.py`); together they
-  are the **only** files allowed to invoke `tmux` (and the only place POSIX-shell
-  trailers live). A future non-POSIX backend (e.g. a native-Windows "psmux")
-  registers itself via `register_multiplexer(...)` and slots in behind
+  `get_multiplexer()`. The tmux-family backends share argv construction and the
+  single spawn primitive in `BaseTmuxBackend` (`adapters/tmux_base.py`), with thin
+  leaves for POSIX tmux (`adapters/tmux_backend.py`) and tmux-windows
+  (`adapters/tmux_windows_backend.py`). Together they are the **only** files
+  allowed to invoke `tmux`. A future non-tmux backend (e.g. a native-Windows
+  "psmux") registers itself via `register_multiplexer(...)` and slots in behind
   `get_multiplexer()` with no change to the adapters. A backend author reads
-  `multiplexer.py` for the contract and `tmux_backend.py` / `tmux_base.py` for the
-  reference implementation. Transport is one of **four OS seams** — the others
+  `multiplexer.py` for the contract and the tmux-family files for reference.
+  Transport is one of **four OS seams** — the others
   (process lifecycle, hook interpreter, validate preflight) are mapped in
   [Porting bmad-loop to a new OS](porting-to-a-new-os.md).
 
@@ -45,8 +45,9 @@ through `get_multiplexer()` — not just the generic adapter but also `runs.py`
 (session listing/tagging, kill, attach argv), `tui/launch.py` (the control
 session and its parked orchestrator windows), `probe.py` (the throwaway probe
 session), and `tui/data.py` (legacy-run liveness). A grep for `"tmux"` outside the
-tmux backend (`adapters/tmux_base.py` + `adapters/tmux_backend.py`) should turn up
-only `shutil.which("tmux")` presence checks, never an invocation.
+tmux backends (`adapters/tmux_base.py`, `adapters/tmux_backend.py`, and
+`adapters/tmux_windows_backend.py`) should turn up only `shutil.which("tmux")`
+presence checks, never an invocation.
 
 To add a backend, build a `TerminalMultiplexer` (`adapters/multiplexer.py`) and
 **register** it — `register_multiplexer(name, matches, factory)`, where

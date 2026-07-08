@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from bmad_loop.adapters import tmux_base
+from bmad_loop.adapters.multiplexer import get_multiplexer
 from bmad_loop.tui import launch
 
 
@@ -40,9 +41,12 @@ class FakeRun:
 @pytest.fixture
 def fake_run(monkeypatch) -> FakeRun:
     fake = FakeRun()
+    monkeypatch.setenv("BMAD_LOOP_MUX_BACKEND", "tmux")
+    get_multiplexer.cache_clear()
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
     monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
-    return fake
+    yield fake
+    get_multiplexer.cache_clear()
 
 
 def expected_cli(*tail: str) -> str:

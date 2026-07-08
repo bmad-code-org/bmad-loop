@@ -7,9 +7,9 @@ Status legend: **planned** (agreed, not started) · **exploring** (shape still o
 
 ---
 
-## Native Windows multiplexer backend
+## Native Windows non-tmux multiplexer backend
 
-**Status:** planned · **Foundation:** the full platform-seam series landed (multiplexer registry + `BaseTmuxBackend` + `ProcessHost` + hook interpreter + validate preflight, v0.7.6; original seam v0.7.0)
+**Status:** planned · **Foundation:** the full platform-seam series landed (multiplexer registry + `BaseTmuxBackend` + `ProcessHost` + hook interpreter + validate preflight, v0.7.6; original seam v0.7.0); native Windows can currently run through the `WindowsTmuxMultiplexer` backend with `tmux-windows`.
 
 The orchestrator no longer fuses tmux into the engine. All session/window/pane operations
 go through a single `TerminalMultiplexer` ABC (`src/bmad_loop/adapters/multiplexer.py`),
@@ -28,12 +28,13 @@ host — so a new OS surfaces in preflight by registering, not by a `validate` e
 plugin's `/proc`/`/tmp`/`cp -a`/symlink primitives degrade off Linux (with `psutil` from the
 optional `non-linux` extra) and its pid lifecycle now delegates to `ProcessHost`; everything is
 held by a CI portability guard (`tests/test_portability_guard.py`). **WSL already works today**
-— it _is_ Linux, so it takes every fast path unchanged; this is purely about a future _native_
-Windows host.
+— it _is_ Linux, so it takes every fast path unchanged. Native Windows now has an interim
+tmux-family backend for `tmux-windows`; this roadmap item is about a future native host that
+does not depend on tmux.
 
 The remaining work is a real non-tmux backend (a "psmux"-style multiplexer) that implements
-the `TerminalMultiplexer` contract on native Windows and registers itself for `win32`. The
-seams are designed so this slots in as **new files + one registration line each, with no
+the `TerminalMultiplexer` contract on native Windows and can replace `windows-tmux` for `win32`
+hosts. The seams are designed so this slots in as **new files + one registration line each, with no
 change to the adapters, `runs.py`, `tui/launch.py`, `probe.py`, `tui/data.py`, or
 `cli.py`'s `validate`** (`WindowsProcessHost` and its hook interpreter are already in place
 and registered). The end-to-end port path — both build options, the test-override env vars,

@@ -11,15 +11,17 @@ import json
 import os
 import shlex
 import subprocess
+from pathlib import Path
 
 import pytest
 
-from bmad_loop.adapters import tmux_base
+from bmad_loop.adapters import tmux_base, tmux_windows_backend
 from bmad_loop.adapters.base import SessionSpec
 from bmad_loop.adapters.generic import GenericAdapter
 from bmad_loop.adapters.multiplexer import MultiplexerError, TerminalMultiplexer
 from bmad_loop.adapters.profile import get_profile
 from bmad_loop.adapters.tmux_backend import TmuxMultiplexer
+from bmad_loop.adapters.tmux_windows_backend import WindowsTmuxMultiplexer
 from bmad_loop.policy import LimitsPolicy, Policy
 
 
@@ -333,6 +335,79 @@ def test_run_custom_env_is_forwarded_without_leaking(monkeypatch):
     assert "TMUX" not in rec.kwargs["env"]
     # the scrubbed env is confined to the child spawn — this process's env is untouched
     assert dict(os.environ) == before
+
+
+def test_windows_tmux_rewrites_absolute_cwd_to_dot_and_subprocess_cwd(monkeypatch):
+    rec = _RecordRun()
+    monkeypatch.setattr(tmux_windows_backend.subprocess, "run", rec)
+
+    cwd = Path(r"C:\DevProjects\zerg")
+    WindowsTmuxMultiplexer().new_session("s", cwd, 120, 40)
+
+    assert rec.argv == [
+        "tmux",
+        "new-session",
+        "-d",
+        "-s",
+        "s",
+        "-c",
+        ".",
+        "-x",
+        "120",
+        "-y",
+        "40",
+    ]
+    assert rec.kwargs["cwd"] == str(cwd)
+
+
+def test_windows_tmux_new_window_injects_parent_path(monkeypatch):
+    rec = _RecordRun()
+    monkeypatch.setattr(tmux_windows_backend.subprocess, "run", rec)
+    monkeypatch.setenv("PATH", r"C:\tools")
+    monkeypatch.setenv("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+
+    WindowsTmuxMultiplexer().new_window(
+        "s",
+        "n",
+        Path(r"C:\DevProjects\zerg"),
+        {"BMAD_LOOP_RUN_DIR": "run-dir", "PATH": r"C:\override"},
+        "codex --version",
+    )
+
+    env_flags = [rec.argv[index + 1] for index, arg in enumerate(rec.argv) if arg == "-e"]
+    assert "PATH=C:\\override" in env_flags
+    assert "BMAD_LOOP_RUN_DIR=run-dir" in env_flags
+    assert any(flag.upper().startswith("PATHEXT=") for flag in env_flags)
+    assert rec.argv[-1] == "codex --version"
+
+
+def test_windows_tmux_parked_window_uses_powershell_dialect(monkeypatch):
+    rec = _RecordRun()
+    monkeypatch.setattr(tmux_windows_backend.subprocess, "run", rec)
+    monkeypatch.setenv("PATH", r"C:\tools")
+
+    WindowsTmuxMultiplexer().new_parked_window(
+        "s", "n", Path(r"C:\DevProjects\zerg"), ["bmad-loop", "validate"], "%3"
+    )
+
+    assert "sh" not in rec.argv
+    assert "-Command" in rec.argv
+    source = rec.argv[-1]
+    assert "$env:PATH" in source
+    assert "bmad-loop validate" in source
+    assert "[void][Console]::ReadLine()" in source
+
+
+def test_windows_tmux_pipe_pane_is_noop_to_avoid_tmux_windows_server_crash(
+    monkeypatch, tmp_path
+):
+    rec = _RecordRun()
+    monkeypatch.setattr(tmux_windows_backend.subprocess, "run", rec)
+    log_file = tmp_path / "pane.log"
+
+    WindowsTmuxMultiplexer().pipe_pane("@1", log_file)
+
+    assert rec.argv == []
 
 
 # ------------------------------------------------------- shell-dialect seam

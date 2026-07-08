@@ -5,6 +5,17 @@ All notable changes to `bmad-loop` are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). While the project is pre-1.0,
 breaking changes may land in a minor release.
 
+## [Unreleased]
+
+### Added
+
+- **Native Windows can now use `tmux-windows` through a dedicated transport backend.**
+  `WindowsTmuxMultiplexer` handles tmux-windows cwd semantics, passes inherited Windows
+  environment into agent panes so CLI binaries resolve, and uses PowerShell syntax for parked
+  windows. Pane pipe logging is a deliberate no-op on this backend because `tmux-windows`
+  can terminate the server when `pipe-pane` spawns a Windows command. POSIX tmux behavior
+  stays on the existing `TmuxMultiplexer`.
+
 ## [0.8.1] — 2026-07-05
 
 ### Fixed

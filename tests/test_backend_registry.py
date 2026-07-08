@@ -15,6 +15,7 @@ import pytest
 from bmad_loop.adapters import multiplexer as m
 from bmad_loop.adapters.multiplexer import MultiplexerError
 from bmad_loop.adapters.tmux_backend import TmuxMultiplexer
+from bmad_loop.adapters.tmux_windows_backend import WindowsTmuxMultiplexer
 
 
 @pytest.fixture
@@ -34,10 +35,18 @@ def fresh_registry(monkeypatch):
     m.get_multiplexer.cache_clear()
 
 
-def test_default_is_tmux(fresh_registry):
+def test_default_on_posix_is_tmux(fresh_registry, monkeypatch):
     """No override, POSIX host → tmux, selected via the loop's platform match (the
     builtin registers ``matches=p != 'win32'``), not just the bottom fallback."""
+    monkeypatch.setattr(sys, "platform", "linux")
     assert isinstance(fresh_registry.get_multiplexer(), TmuxMultiplexer)
+
+
+def test_default_on_windows_is_windows_tmux(fresh_registry, monkeypatch):
+    """Native Windows selects the tmux-windows backend instead of falling through
+    to the POSIX tmux backend."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    assert isinstance(fresh_registry.get_multiplexer(), WindowsTmuxMultiplexer)
 
 
 def test_env_override_selects_named_backend(fresh_registry, monkeypatch):

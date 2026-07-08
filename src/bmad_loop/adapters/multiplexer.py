@@ -229,9 +229,14 @@ def _load_builtin_backends() -> None:
     if _BUILTINS_LOADED:
         return
     from .tmux_backend import TmuxMultiplexer
+    from .tmux_windows_backend import WindowsTmuxMultiplexer
 
-    # tmux is the default everywhere except native Windows (no tmux binary there);
-    # get_multiplexer still falls back to tmux when no backend matches.
+    # tmux-windows needs a small Windows leaf; POSIX tmux remains the default
+    # elsewhere. get_multiplexer still falls back to POSIX tmux when no backend
+    # matches, preserving the old safe fallback.
+    register_multiplexer(
+        "windows-tmux", lambda platform: platform == "win32", WindowsTmuxMultiplexer
+    )
     register_multiplexer("tmux", lambda platform: platform != "win32", TmuxMultiplexer)
     _BUILTINS_LOADED = True  # set only after a successful import so a transient failure retries
 

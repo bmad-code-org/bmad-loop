@@ -60,16 +60,13 @@ fallback, so POSIX behavior is unchanged. (The result is cached — see
 
 - **Extend `BaseTmuxBackend`** (`adapters/tmux_base.py`) for a **tmux-family**
   backend. `BaseTmuxBackend` holds every argv construction and routes every spawn
-  through one primitive, `_run(argv, *, check=..., env=...)`. A native-Windows
-  "psmux" that speaks a tmux-like CLI sets the `_ENCODING` class attribute for
-  output decoding (e.g. `"utf-8"`) and passes a per-call `env=` where needed —
-  overriding `_run()` itself only to tweak the binary or timeout — plus the
-  shell-dialect hooks that `new_window` / `new_parked_window` compose from
-  (`_shell_wrap`, `_join_argv`, `_parked_trailer`, `_source_prefix`,
-  `_window_launch` and the `_EXIT_CAPTURE`/`_ECHO`/`_PARK` fragments) —
-  **without editing** `tmux_base.py` or its POSIX leaf `tmux_backend.py`
-  (`TmuxMultiplexer`). The one method-body override left is `pipe_pane`, whose
-  POSIX `cat >>` redirection is not behind a hook.
+  through one primitive, `_run(argv, *, check=..., env=...)`. The
+  `WindowsTmuxMultiplexer` leaf is the reference for a tmux-family non-POSIX
+  backend: it rewrites tmux-windows cwd arguments, injects inherited Windows env
+  into windows, uses PowerShell parked-window fragments, and deliberately no-ops
+  `pipe_pane` because tmux-windows can terminate the server when a pipe command
+  is spawned. A different tmux-like host can follow the same pattern without
+  editing `tmux_base.py` or the POSIX leaf `tmux_backend.py` (`TmuxMultiplexer`).
 - **Implement `TerminalMultiplexer` fresh** when the host has no tmux-shaped CLI
   at all (e.g. a ConPTY-based window manager). You implement the full contract
   directly; `tmux_backend.py` is the reference for what each method must produce.
