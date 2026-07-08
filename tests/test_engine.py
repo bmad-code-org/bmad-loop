@@ -2333,6 +2333,45 @@ def test_max_stories_limit(project):
     assert "1-2-b" not in engine.state.tasks
 
 
+def test_max_stories_survives_a_pause_resume(project):
+    """A5 regression on the SPRINT path: the --max-stories dispatch gate consults
+    the durable _dispatched_count(), which replaced a _loop-local counter that
+    reset to 0 on every resume (the stories-mode fix rewired the shared base
+    gate). With cap=2 and one story committed before an epic-boundary pause, a
+    resume must dispatch exactly ONE more story — never re-fill the whole cap."""
+    write_sprint(
+        project,
+        {
+            "epic-1": "backlog",
+            "1-1-a": "ready-for-dev",
+            "epic-2": "backlog",
+            "2-1-b": "ready-for-dev",
+            "2-2-c": "ready-for-dev",
+        },
+    )
+    gated = Policy(gates=GatesPolicy(mode="per-epic"), notify=QUIET)
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+        policy=gated,
+        max_stories=2,
+    )
+    engine.state.max_stories = 2  # cli.py persists this on RunState (helper gap: issue #84)
+    summary = engine.run()
+    assert summary.done == 1 and summary.paused
+    assert load_state(engine.run_dir).paused_stage == PAUSE_EPIC_BOUNDARY
+
+    resumed, _ = resume_engine(
+        project,
+        engine,
+        [dev_effect(project, "2-1-b"), review_effect(project, "2-1-b", clean=True)],
+    )
+    summary2 = resumed.run()
+    assert summary2.done == 2 and not summary2.paused
+    final = load_state(resumed.run_dir)
+    assert set(final.tasks) == {"1-1-a", "2-1-b"}  # 2-2-c never dispatched — cap durable
+
+
 def test_run_end_auto_sweep_fires_once(project):
     write_sprint(project, {"1-1-a": "ready-for-dev"})
     policy = Policy(gates=GatesPolicy(mode="none"), notify=QUIET, sweep=SweepPolicy(auto="run-end"))
