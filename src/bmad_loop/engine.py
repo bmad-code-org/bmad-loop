@@ -2122,8 +2122,22 @@ class Engine:
         `--feedback` flag: feedback is inlined as freeform intent pointing at the
         existing spec. On a repair re-invocation the spec is first re-opened
         (status → `in-progress`) so the skill's step-01 re-enters implement/review
-        on it rather than ingesting a finalized spec as mere context."""
+        on it rather than ingesting a finalized spec as mere context.
+
+        A patch-restore re-drive (#2564) must point at the spec explicitly: only
+        step-01's spec-pointer intent check EARLY EXITs on the `in-review` status
+        the re-arm set — and it exits before step-01's version-control sanity
+        check, which would otherwise HALT `blocked` on the very diff
+        `_restore_patch` just laid onto the tree. A bare story key takes the
+        freeform/epic path instead, where that dirty-tree check runs first."""
         if feedback is None:
+            if task.restore_patch and task.spec_file:
+                return (
+                    f"/bmad-dev-auto Resume review of the in-review spec at "
+                    f"`{task.spec_file}`. The attempted change was restored onto "
+                    f"the working tree after an intent-gap resolution; review it "
+                    f"against the amended spec."
+                )
             return f"/bmad-dev-auto {task.story_key}"
         self._reset_spec_for_repair(task)
         spec_ref = task.spec_file or task.story_key

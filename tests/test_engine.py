@@ -2200,6 +2200,30 @@ def test_intent_gap_restore_redrive_applies_patch_and_lands_done(project):
     assert task.restore_patch is None  # latch cleared on commit
 
 
+def test_restore_redrive_prompt_points_at_the_spec(project):
+    """The sprint-mode restore re-drive must dispatch an explicit spec-file
+    pointer: only step-01's spec-pointer intent check EARLY EXITs on the
+    `in-review` status (to step-04) BEFORE its version-control sanity check — a
+    bare story key takes the freeform/epic path, whose dirty-tree check HALTs
+    `blocked` on the very diff _restore_patch just laid onto the tree."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    patch = project.implementation_artifacts / "attempt.patch"
+    engine, _ = make_engine(project, [_escalate_with_patch(project, "1-1-a", patch)])
+    assert engine.run().escalated == 1
+
+    rearm_escalation(engine.run_dir, restore_patch=str(patch))
+    seen: list[str] = []
+    resumed, adapter = resume_engine(
+        project, engine, [_restoring_dev_effect(project, "1-1-a", seen)]
+    )
+    assert resumed.run().done == 1
+
+    prompt = adapter.sessions[0].prompt
+    spec = load_state(resumed.run_dir).tasks["1-1-a"].spec_file
+    assert spec and f"`{spec}`" in prompt  # explicit pointer -> step-01 EARLY EXIT
+    assert prompt != "/bmad-dev-auto 1-1-a"  # never the bare key on a restore
+
+
 def test_intent_gap_restore_reapplies_after_mid_redrive_rollback(project):
     """A non-fixable retry inside the restore re-drive resets to baseline (clearing
     the restored code), so the patch is re-applied before the next dispatch; the
