@@ -20,7 +20,9 @@ breaking changes may land in a minor release.
   patch that fails to apply escalates instead of running on a half-restored tree (a resolve session
   that committed over the patched lines triggers exactly this — re-resolve without a restore).
   Restore is rejected up front for worktree-isolation runs and for stories-mode pre-planning
-  sentinels, and the latched patch file itself never counts as proof-of-work.
+  sentinels, and the latched patch file itself never counts as proof-of-work. Deferred-work
+  `sweep` bundles get the same recovery — an escalated bundle re-arms to `in-review` and the
+  re-driven bundle session resumes review on the re-applied patch (#75).
 - **Preflight covers the inline review layers.** `bmad-loop validate` (and run-start) now require the
   three upstream review-hunter skills `bmad-dev-auto`'s step-04 invokes — `bmad-review-adversarial-general`,
   `bmad-review-edge-case-hunter`, and `bmad-review-verification-gap` (new in BMAD-METHOD#2550) — plus a

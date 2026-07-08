@@ -18,13 +18,16 @@ Covers, through the real binary: (1) two-story happy path, (2) `spec_checkpoint`
 two-leg plan-halt + resume, (4) blocked → resolve → re-dispatch, (6)
 sprint-mode regression (the new folder+id-capable dev skill installed, yet a
 plain sprint run drives dev → verify → commit → sprint-status advance untouched
-by the stories wiring), and (7) sprint-mode intent-gap patch-restore (halt saves
+by the stories wiring), (7) sprint-mode intent-gap patch-restore (halt saves
 the attempt as a patch → `resolve --restore-patch` re-arms to in-review +
 re-stamps the spec baseline → resume re-applies the patch and dispatches an
-explicit spec pointer, resuming review instead of re-implementing). Scenarios
-(3) `done_checkpoint` and (5) worktree isolation are covered deterministically
-at the engine level in test_stories_engine.py; here we prove the end-to-end CLI
-stack.
+explicit spec pointer, resuming review instead of re-implementing), and (8) the
+same intent-gap patch-restore for a `sweep` deferred-work bundle (#75) —
+triage → bundle halt → `resolve --restore-patch` → resume, driving the
+sweep-specific CLI resolve→resume path (SweepEngine rebuilt from sweep.json).
+Scenarios (3) `done_checkpoint` and (5) worktree isolation are covered
+deterministically at the engine level in test_stories_engine.py; here we prove
+the end-to-end CLI stack.
 """
 
 from __future__ import annotations
@@ -56,6 +59,23 @@ mkdir -p "$rd/events"
 printf '{"ts": %s, "event": "SessionStart", "task_id": "%s", "session_id": "fake-1"}' \
     "$ts" "$tid" > "$rd/events/$ts-$tid-SessionStart.json"
 baseline=$(git rev-parse HEAD)
+
+# SWEEP triage (`/bmad-loop-sweep`): the triage adapter is a plain GenericAdapter
+# that reads a real result.json (not the spec-synthesizing dev adapter), so write
+# the partition ourselves — one bundle "fix" owning the single open ledger id — and
+# Stop. Bundle dev sessions carry no BMAD_LOOP_SPEC_FOLDER and fall through to the
+# SPRINT branch below, which already drives spec-<key>.md and the intent-gap /
+# patch-restore contracts (here <key> = dw-fix, the bundle task key).
+if printf '%s' "$prompt" | grep -q "bmad-loop-sweep"; then
+    tdir="$rd/tasks/$tid"; mkdir -p "$tdir"
+    printf '%s' '{"workflow": "deferred-sweep-triage", "open_ids": ["DW-1"], "already_resolved": [], "bundles": [{"name": "fix", "dw_ids": ["DW-1"], "intent": "resolve DW-1"}], "blocked": [], "skip": [], "decisions": [], "escalations": []}' \
+        > "$tdir/result.json"
+    ts2=$(( ts + 1 ))
+    printf '{"ts": %s, "event": "Stop", "task_id": "%s", "session_id": "fake-1"}' \
+        "$ts2" "$tid" > "$rd/events/$ts2-$tid-Stop.json"
+    sleep 30
+    exit 0
+fi
 
 # SPRINT mode (no BMAD_LOOP_SPEC_FOLDER in env): the folder+id-capable skill is
 # installed, but a plain sprint run must still work. Write the result artifact
@@ -313,6 +333,93 @@ def _scaffold_sprint(root: Path, story_key: str) -> None:
     _git(root, "commit", "-q", "-m", "sandbox")
 
 
+def _scaffold_sweep(root: Path) -> None:
+    """A committed, clean SWEEP-mode sandbox: same folder+id-capable dev-skill
+    stubs as `_scaffold_sprint`, but no sprint-status — instead a canonical
+    deferred-work.md ledger with one open entry (DW-1). The policy has no
+    [stories] section; the run is a plain `bmad-loop sweep`."""
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "src.txt").write_text("original\n", encoding="utf-8")
+    (root / ".gitignore").write_text(".bmad-loop/runs/\n", encoding="utf-8")
+
+    cfg = root / "_bmad" / "bmm"
+    cfg.mkdir(parents=True)
+    (cfg / "config.yaml").write_text(
+        "implementation_artifacts: '{project-root}/_bmad-output/implementation-artifacts'\n"
+        "planning_artifacts: '{project-root}/_bmad-output/planning-artifacts'\n",
+        encoding="utf-8",
+    )
+    impl = root / "_bmad-output" / "implementation-artifacts"
+    for sub in ("implementation-artifacts", "planning-artifacts"):
+        (root / "_bmad-output" / sub).mkdir(parents=True, exist_ok=True)
+        (root / "_bmad-output" / sub / ".keep").write_text("", encoding="utf-8")
+
+    # the SAME folder+id-capable skill stubs the other scaffolds install
+    skills = root / ".claude" / "skills"
+    dev = skills / "bmad-dev-auto"
+    dev.mkdir(parents=True)
+    (dev / "SKILL.md").write_text("# bmad-dev-auto\n", encoding="utf-8")
+    (dev / "step-04-review.md").write_text("x\n", encoding="utf-8")
+    (dev / "customize.toml").write_text("# review layers\n", encoding="utf-8")
+    (dev / "step-01-clarify-and-route.md").write_text(
+        "This is a **folder+id dispatch** router.\n", encoding="utf-8"
+    )
+    for hunter in (
+        "bmad-review-adversarial-general",
+        "bmad-review-edge-case-hunter",
+        "bmad-review-verification-gap",
+    ):
+        (skills / hunter).mkdir(parents=True)
+        (skills / hunter / "SKILL.md").write_text(f"# {hunter}\n", encoding="utf-8")
+
+    # canonical DW-format ledger (no legacy content → migration is skipped)
+    (impl / "deferred-work.md").write_text(
+        "# Deferred Work\n\n"
+        "### DW-1: item DW-1\n\n"
+        "origin: test, 2026-06-01\nlocation: src.txt:1\nreason: test entry.\nstatus: open\n",
+        encoding="utf-8",
+    )
+
+    fake = root / ".bmad-loop" / "fake-cli.sh"
+    fake.parent.mkdir(parents=True, exist_ok=True)
+    fake.write_text(FAKE_CLI, encoding="utf-8")
+    os.chmod(fake, 0o755)
+    profiles = root / ".bmad-loop" / "profiles"
+    profiles.mkdir(parents=True)
+    (profiles / "fakestories.toml").write_text(
+        PROFILE_TOML.format(binary=str(fake)), encoding="utf-8"
+    )
+    (root / ".bmad-loop" / "policy.toml").write_text(
+        '[adapter]\nname = "fakestories"\n\n'
+        "[review]\nenabled = false\n\n"
+        '[gates]\nmode = "none"\n',
+        encoding="utf-8",
+    )
+
+    _git(root, "init", "-q", "-b", "main")
+    _git(root, "config", "user.email", "e2e@test")
+    _git(root, "config", "user.name", "e2e")
+    _git(root, "config", "core.fsync", "none")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "sandbox")
+
+
+def _dw_status(root: Path, dw_id: str) -> str:
+    """The status field of one deferred-work ledger entry ('' if absent)."""
+    text = (root / "_bmad-output" / "implementation-artifacts" / "deferred-work.md").read_text(
+        encoding="utf-8"
+    )
+    in_entry = False
+    for line in text.splitlines():
+        if line.startswith(f"### {dw_id}:"):
+            in_entry = True
+        elif line.startswith("### "):
+            in_entry = False
+        elif in_entry and line.startswith("status:"):
+            return line.split(":", 1)[1].strip()
+    return ""
+
+
 def _sprint_status(root: Path, story_key: str) -> str:
     doc = yaml.safe_load(
         (root / "_bmad-output" / "implementation-artifacts" / "sprint-status.yaml").read_text(
@@ -473,6 +580,59 @@ def test_e2e_sprint_intent_gap_patch_restore(tmp_path):
     src = (root / "src.txt").read_text(encoding="utf-8")
     assert src.count("attempted reading") == 1  # restored from the patch, not re-implemented
     # F1: the re-drive dispatch pointed at the spec, never the bare story key
+    run_dir = root / ".bmad-loop" / "runs" / run_id
+    prompts = [p.read_text(encoding="utf-8") for p in (run_dir / "tasks").glob("*/prompt.txt")]
+    assert any(str(spec) in p for p in prompts)
+
+
+def test_e2e_sweep_intent_gap_patch_restore(tmp_path):
+    # Scenario 8 (#75): a SWEEP deferred-work bundle hits an intent gap during its
+    # dev session — the patch is saved, the tree reverted, and the run escalates.
+    # `resolve --restore-patch` re-arms the bundle spec to in-review + re-stamps its
+    # baseline; resume re-applies the patch and dispatches an EXPLICIT spec pointer
+    # (Change A) so the bundle resumes review on the restored diff instead of
+    # re-implementing. This is the only scenario that drives the sweep-specific CLI
+    # resolve→resume path (SweepEngine rebuilt from sweep.json in _resume_paused_run).
+    root = tmp_path / "sbx"
+    _scaffold_sweep(root)
+    story = "dw-fix"  # triage names the bundle "fix" → task key dw-fix
+    (root / f".intent-gap-{story}").write_text("", encoding="utf-8")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "poison: intent gap")
+    impl = root / "_bmad-output" / "implementation-artifacts"
+    spec = impl / f"spec-{story}.md"
+    patch = impl / f"attempt-{story}.patch"
+
+    # triage → bundle dev halts on the intent gap: patch saved, tree reverted
+    proc = _run(root, "sweep", "--no-prompt")
+    assert proc.returncode == 0, proc.stderr or proc.stdout
+    assert "status: blocked" in spec.read_text(encoding="utf-8")
+    assert patch.is_file()  # the attempted change survives the revert
+    assert "attempted reading" not in (root / "src.txt").read_text(encoding="utf-8")
+    assert _dw_status(root, "DW-1").startswith("open")  # a blocked pass does not close it
+    run_id = _run_id(root)
+
+    # resolve latches the restore: bundle spec → in-review + baseline re-stamped
+    resolve = _run(
+        root, "resolve", run_id, "--no-interactive", "--no-resume", "--restore-patch", str(patch)
+    )
+    assert resolve.returncode == 0, resolve.stderr or resolve.stdout
+    text = spec.read_text(encoding="utf-8")
+    assert "status: in-review" in text  # restore routing: step-01 → step-04
+    head = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True
+    ).stdout.strip()
+    assert f"baseline_revision: {head}" in text  # F2: spec baseline re-stamped
+
+    # resume: patch re-applied, review resumed, bundle lands done + ledger closed
+    resume = _run(root, "resume", run_id)
+    assert resume.returncode == 0, resume.stderr or resume.stdout
+    final = spec.read_text(encoding="utf-8")
+    assert "status: done" in final, final  # fake blocks loudly on a broken contract
+    assert _dw_status(root, "DW-1").startswith("done")  # the bundle closed the ledger id
+    src = (root / "src.txt").read_text(encoding="utf-8")
+    assert src.count("attempted reading") == 1  # restored from the patch, not re-implemented
+    # Change A: the re-drive dispatch pointed at the bundle spec, never the intent.md
     run_dir = root / ".bmad-loop" / "runs" / run_id
     prompts = [p.read_text(encoding="utf-8") for p in (run_dir / "tasks").glob("*/prompt.txt")]
     assert any(str(spec) in p for p in prompts)
