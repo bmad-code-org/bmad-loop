@@ -385,6 +385,26 @@ def test_rearm_rejects_restore_patch_on_a_sentinel(tmp_path):
     assert not (run_dir / "journal.jsonl").exists()
 
 
+def test_rearm_rejects_restore_patch_without_a_spec_file(tmp_path):
+    """A restore only works through the spec's in-review flip, so an escalated
+    task with NO recorded spec (ambiguous two-file wedge, unknown --story
+    selector, session died before naming one) has no routing target: the latch
+    would stick, the flip would be skipped, and the engine would lay the patch
+    onto the tree before a planning leg. Rejected before any mutation."""
+    run_dir, _, _ = _escalated_run(tmp_path, spec_file=None)
+
+    with pytest.raises(runs.RearmError, match="no recorded spec file"):
+        runs.rearm_escalation(run_dir, restore_patch="artifacts/attempt.patch")
+
+    task = load_state(run_dir).tasks["6-4-cli-list-command"]
+    assert task.phase == Phase.ESCALATED  # not re-armed; the escalation stays armed
+    assert task.restore_patch is None  # no latch persisted
+    assert not (run_dir / "journal.jsonl").exists()  # nothing journaled
+
+    runs.rearm_escalation(run_dir)  # a from-scratch re-arm remains available
+    assert load_state(run_dir).tasks["6-4-cli-list-command"].phase == Phase.PENDING
+
+
 def test_rearm_restore_patch_on_a_real_stories_spec_is_allowed(tmp_path):
     """The T1 guard keys on the recorded sentinel verdict, not on stories mode:
     a review-stage intent gap on a REAL stories spec (sentinel_kind unset) is a

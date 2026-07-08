@@ -578,6 +578,18 @@ def rearm_escalation(
             "there is no attempted implementation to restore, and the re-drive starts "
             "at planning. Re-run resolve without a restore patch for a clean re-plan."
         )
+    # Same seam, broader shape: a restore only works through the spec's in-review
+    # flip below, so an escalation with NO recorded spec (an ambiguous two-file
+    # wedge, an unknown --story selector, a session that died before naming one)
+    # has no routing target — the latch would stick, the flip would be skipped,
+    # and the engine would lay the patch onto the tree before a planning leg.
+    # Rejected before any mutation, like the sentinel guard above.
+    if restore_patch and not task.spec_file:
+        raise RearmError(
+            f"story {key} has no recorded spec file, so a restored patch has no "
+            "review to resume (the re-drive starts at planning). Re-run resolve "
+            "without a restore patch for a from-scratch re-drive."
+        )
 
     journal = Journal(run_dir)
     # deliberate reset, not a normal state-machine transition (mirrors
