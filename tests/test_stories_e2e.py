@@ -15,12 +15,16 @@ adapter bypasses: arg parsing, prompt render, hook-signal completion, the
 stories read-back, git commit, and the resolve/resume dance.
 
 Covers, through the real binary: (1) two-story happy path, (2) `spec_checkpoint`
-two-leg plan-halt + resume, (4) blocked → resolve → re-dispatch, and (6)
+two-leg plan-halt + resume, (4) blocked → resolve → re-dispatch, (6)
 sprint-mode regression (the new folder+id-capable dev skill installed, yet a
 plain sprint run drives dev → verify → commit → sprint-status advance untouched
-by the stories wiring). Scenarios (3) `done_checkpoint` and (5) worktree
-isolation are covered deterministically at the engine level in
-test_stories_engine.py; here we prove the end-to-end CLI stack.
+by the stories wiring), and (7) sprint-mode intent-gap patch-restore (halt saves
+the attempt as a patch → `resolve --restore-patch` re-arms to in-review +
+re-stamps the spec baseline → resume re-applies the patch and dispatches an
+explicit spec pointer, resuming review instead of re-implementing). Scenarios
+(3) `done_checkpoint` and (5) worktree isolation are covered deterministically
+at the engine level in test_stories_engine.py; here we prove the end-to-end CLI
+stack.
 """
 
 from __future__ import annotations
@@ -46,6 +50,7 @@ FAKE_CLI = r"""#!/usr/bin/env bash
 set -e
 rd="$BMAD_LOOP_RUN_DIR"; tid="$BMAD_LOOP_TASK_ID"
 story="$BMAD_LOOP_STORY_KEY"; folder="$BMAD_LOOP_SPEC_FOLDER"
+prompt="${1:-}"
 ts=$(date +%s%N)
 mkdir -p "$rd/events"
 printf '{"ts": %s, "event": "SessionStart", "task_id": "%s", "session_id": "fake-1"}' \
@@ -56,12 +61,44 @@ baseline=$(git rev-parse HEAD)
 # installed, but a plain sprint run must still work. Write the result artifact
 # the orchestrator scans by mtime under implementation-artifacts, make a real
 # code change, and Stop — the orchestrator (not the skill) advances sprint-status.
+# Routes like step-01: an in-review spec is a patch-restore re-drive (#2564); a
+# committed `.intent-gap-<story>` marker makes the first dispatch halt the way
+# bmad-dev-auto's review does on an intent gap (save attempt as patch, revert,
+# block); otherwise a plain implement-to-done.
 if [ -z "$folder" ]; then
     impl="_bmad-output/implementation-artifacts"
     mkdir -p "$impl"
-    echo "impl for $story" >> src.txt
-    printf -- '---\ntitle: %s\nstatus: done\nbaseline_commit: %s\n---\n\n## Intent\n\nx\n\n## Auto Run Result\n\n- Status: done\n\nSummary: sprint.\n' \
-        "$story" "$baseline" > "$impl/spec-$story.md"
+    spec="$impl/spec-$story.md"
+    patch="$impl/attempt-$story.patch"
+    status=""
+    [ -f "$spec" ] && status=$(sed -n 's/^status:[[:space:]]*//p' "$spec" | head -1 | tr -d "'\" ")
+    if [ "$status" = "in-review" ]; then
+        # Patch-restore re-drive: resume REVIEW on the restored diff — never
+        # re-implement. Enforce the two orchestrator-side contracts the way the
+        # real step-01 would: the prompt must point at the spec explicitly (an
+        # in-review spec only routes to step-04 through the spec-pointer intent
+        # check), and the attempted change must already be back on the tree.
+        if ! printf '%s' "$prompt" | grep -qF "$spec"; then
+            printf -- '---\ntitle: %s\nstatus: blocked\nbaseline_commit: %s\n---\n\n## Auto Run Result\n\n- Status: blocked\n\nprompt lacks the spec pointer.\n' \
+                "$story" "$baseline" > "$spec"
+        elif ! grep -q "attempted reading" src.txt; then
+            printf -- '---\ntitle: %s\nstatus: blocked\nbaseline_commit: %s\n---\n\n## Auto Run Result\n\n- Status: blocked\n\ntree was not restored.\n' \
+                "$story" "$baseline" > "$spec"
+        else
+            printf -- '---\ntitle: %s\nstatus: done\nbaseline_commit: %s\n---\n\n## Intent\n\nx\n\n## Auto Run Result\n\n- Status: done\n\nSummary: reviewed the restored change.\n' \
+                "$story" "$baseline" > "$spec"
+        fi
+    elif [ -f ".intent-gap-$story" ] && [ ! -f "$patch" ]; then
+        echo "attempted reading for $story" >> src.txt
+        git diff HEAD > "$patch"
+        git checkout -- src.txt
+        printf -- '---\ntitle: %s\nstatus: blocked\nbaseline_commit: %s\n---\n\n## Intent\n\nx\n\n## Auto Run Result\n\n- Status: blocked\n\nintent gap; saved patch: %s\n' \
+            "$story" "$baseline" "$patch" > "$spec"
+    else
+        echo "impl for $story" >> src.txt
+        printf -- '---\ntitle: %s\nstatus: done\nbaseline_commit: %s\n---\n\n## Intent\n\nx\n\n## Auto Run Result\n\n- Status: done\n\nSummary: sprint.\n' \
+            "$story" "$baseline" > "$spec"
+    fi
     ts2=$(( ts + 1 ))
     printf '{"ts": %s, "event": "Stop", "task_id": "%s", "session_id": "fake-1"}' \
         "$ts2" "$tid" > "$rd/events/$ts2-$tid-Stop.json"
@@ -385,6 +422,60 @@ def test_e2e_blocked_resolve_redispatch(tmp_path):
     assert _status(root, "1") == "done"
     assert _status(root, "2") == "done"
     assert _commit_count(root) == base + 2
+
+
+def test_e2e_sprint_intent_gap_patch_restore(tmp_path):
+    # Scenario 7 (review F1/F2, end-to-end): a sprint-mode intent-gap halt saves
+    # the attempted change as a patch and reverts; `resolve --restore-patch`
+    # re-arms the spec to in-review and re-stamps its baseline; resume re-applies
+    # the patch onto the tree and dispatches an EXPLICIT spec pointer, so the
+    # (fake) skill resumes review on the restored diff instead of re-implementing.
+    # The fake blocks loudly if the prompt lacks the pointer or the tree was not
+    # restored, so a `done` landing proves both contracts held.
+    root = tmp_path / "sbx"
+    story = "1-1-thing"
+    _scaffold_sprint(root, story)
+    (root / f".intent-gap-{story}").write_text("", encoding="utf-8")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "poison: intent gap")
+    base = _commit_count(root)
+    impl = root / "_bmad-output" / "implementation-artifacts"
+    spec = impl / f"spec-{story}.md"
+    patch = impl / f"attempt-{story}.patch"
+
+    # leg 1: the dev session halts on the intent gap — patch saved, tree reverted
+    proc = _run(root, "run")
+    assert proc.returncode == 0, proc.stderr or proc.stdout
+    assert "status: blocked" in spec.read_text(encoding="utf-8")
+    assert patch.is_file()  # the attempted change survives the revert
+    assert "attempted reading" not in (root / "src.txt").read_text(encoding="utf-8")
+    run_id = _run_id(root)
+
+    # the human confirms the attempted reading: latch the restore
+    resolve = _run(
+        root, "resolve", run_id, "--no-interactive", "--no-resume", "--restore-patch", str(patch)
+    )
+    assert resolve.returncode == 0, resolve.stderr or resolve.stdout
+    text = spec.read_text(encoding="utf-8")
+    assert "status: in-review" in text  # restore routing: step-01 -> step-04
+    head = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True
+    ).stdout.strip()
+    assert f"baseline_revision: {head}" in text  # F2: spec baseline re-stamped
+
+    # resume: patch re-applied, review resumed, story lands done + committed
+    resume = _run(root, "resume", run_id)
+    assert resume.returncode == 0, resume.stderr or resume.stdout
+    final = spec.read_text(encoding="utf-8")
+    assert "status: done" in final, final  # fake blocks loudly on a broken contract
+    assert _sprint_status(root, story) == "done"
+    assert _commit_count(root) == base + 1
+    src = (root / "src.txt").read_text(encoding="utf-8")
+    assert src.count("attempted reading") == 1  # restored from the patch, not re-implemented
+    # F1: the re-drive dispatch pointed at the spec, never the bare story key
+    run_dir = root / ".bmad-loop" / "runs" / run_id
+    prompts = [p.read_text(encoding="utf-8") for p in (run_dir / "tasks").glob("*/prompt.txt")]
+    assert any(str(spec) in p for p in prompts)
 
 
 def test_e2e_sprint_mode_regression(tmp_path):
