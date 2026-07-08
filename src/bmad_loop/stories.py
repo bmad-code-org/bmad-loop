@@ -117,7 +117,15 @@ def load_stories(spec_folder: Path | str) -> Stories:
     if not path.is_file():
         raise StoriesError("no stories.yaml found")
     try:
-        doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+        raw = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as e:
+        # A binary/non-UTF-8 manifest raises UnicodeDecodeError (a ValueError, NOT a
+        # yaml.YAMLError), so surface it as StoriesError like every other manifest
+        # fault — every caller already catches that and prints a clean "stories mode:"
+        # error instead of crashing preflight/dry-run/status with a traceback.
+        raise StoriesError(f"stories.yaml is not valid UTF-8: {path}: {e}") from e
+    try:
+        doc = yaml.safe_load(raw)
     except yaml.YAMLError as e:
         raise StoriesError(f"stories.yaml is not valid YAML: {path}: {e}") from e
     if doc is None or (isinstance(doc, list) and not doc):
@@ -316,7 +324,15 @@ def resolve_story_spec(spec_folder: Path | str, story_id: str) -> StoryState:
     for sentinel_kind in SENTINEL_SLUGS:
         if path.name == f"{sid}-{sentinel_kind}.md":
             return StoryState(kind=KIND_SENTINEL, path=path, sentinel_kind=sentinel_kind)
-    return StoryState(kind=KIND_PRESENT, status=status_of(read_frontmatter(path)), path=path)
+    try:
+        status = status_of(read_frontmatter(path))
+    except (OSError, UnicodeDecodeError):
+        # An undecodable (binary/non-UTF-8) or mid-glob-vanished PRESENT spec has an
+        # unknown status: degrade rather than crash the scheduler / dry-run / status.
+        # status="" classifies as "wedged" (_classify) so the engine pauses for
+        # resolve — never silently skips — and state_label renders it as "present".
+        status = ""
+    return StoryState(kind=KIND_PRESENT, status=status, path=path)
 
 
 @dataclass(frozen=True)

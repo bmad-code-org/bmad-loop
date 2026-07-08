@@ -51,6 +51,22 @@ def test_load_missing_file_raises_pinned_message(tmp_path):
         stories.load_stories(tmp_path)
 
 
+# A manifest / spec is agent- or human-authored, so it can hold non-UTF-8 bytes.
+# `read_text(encoding="utf-8")` raises UnicodeDecodeError (a ValueError, NOT a
+# yaml.YAMLError), so the stories-mode reads must surface it as a clean error / degrade
+# rather than crash preflight/dry-run/status. Mirrors tests/test_resolve.py:346.
+_BAD_UTF8 = b"\xff\xfe\x00\x01 not utf-8 \x80\x81"
+
+
+def test_load_non_utf8_raises_stories_error(tmp_path):
+    # A binary/non-UTF-8 stories.yaml must become a StoriesError (which every caller
+    # catches into "stories mode: ..."), not an uncaught UnicodeDecodeError traceback.
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    (tmp_path / stories.STORIES_FILENAME).write_bytes(_BAD_UTF8)
+    with pytest.raises(stories.StoriesError, match="not valid UTF-8"):
+        stories.load_stories(tmp_path)
+
+
 def test_id_unquoted_int_normalized(tmp_path):
     # An LLM-authored file may emit `id: 1` unquoted (PyYAML -> int); we str()-normalize.
     write_stories(tmp_path, "- id: 1\n  title: t\n  description: d\n")
@@ -380,6 +396,19 @@ def test_resolve_present_reads_status(tmp_path):
     st = stories.resolve_story_spec(tmp_path, "1")
     assert st.kind == stories.KIND_PRESENT and st.status == "in-review"
     assert st.path.name == "1-user-auth.md"
+
+
+def test_resolve_non_utf8_present_degrades_to_unknown_status(tmp_path):
+    # An undecodable PRESENT spec must not raise UnicodeDecodeError out of the frontmatter
+    # read (which would crash the scheduler / dry-run / status); it degrades to an unknown
+    # status="" that _classify treats as wedged (-> pause for resolve, never silent skip).
+    d = tmp_path / stories.STORIES_SUBDIR
+    d.mkdir(parents=True)
+    (d / "1-user-auth.md").write_bytes(_BAD_UTF8)
+    st = stories.resolve_story_spec(tmp_path, "1")  # must not raise
+    assert st.kind == stories.KIND_PRESENT and st.status == ""
+    assert stories._classify(st) == "wedged"
+    assert stories.state_label(st) == "present"
 
 
 def test_resolve_ambiguous(tmp_path):

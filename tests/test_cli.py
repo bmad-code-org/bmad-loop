@@ -228,6 +228,24 @@ def test_dry_run_stories_bad_folder_errors(project, capsys):
     assert "no stories.yaml found" in capsys.readouterr().err
 
 
+def test_stories_non_utf8_manifest_clean_error_not_crash(project, capsys):
+    # A binary/non-UTF-8 stories.yaml must surface as a clean "stories mode: ... not valid
+    # UTF-8" error at both preflight and dry-run — not an uncaught UnicodeDecodeError.
+    folder = project.project / STORIES_SPEC_FOLDER
+    (folder / "stories").mkdir(parents=True, exist_ok=True)
+    (folder / "SPEC.md").write_text("# Epic 1\n", encoding="utf-8")
+    (folder / "stories.yaml").write_bytes(b"\xff\xfe\x00\x01 not utf-8 \x80\x81")
+
+    problem = cli._validate_stories_folder(project, STORIES_SPEC_FOLDER)
+    assert problem is not None and "not valid UTF-8" in problem
+
+    pol = policy_mod.loads("")
+    args = argparse.Namespace(spec=STORIES_SPEC_FOLDER, epic=None, story=None, max_stories=None)
+    assert cli._dry_run(project, pol, args, True, STORIES_SPEC_FOLDER) == 1
+    err = capsys.readouterr().err
+    assert "stories mode:" in err and "not valid UTF-8" in err
+
+
 def _make_run_with_decision(project, run_id="20260101-000000-aaaa", dw_id="DW-1"):
     run_dir = project.project / ".bmad-loop" / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
