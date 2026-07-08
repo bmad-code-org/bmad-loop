@@ -159,10 +159,15 @@ def _scaffold(root: Path, entries: list[dict]) -> None:
     dev.mkdir(parents=True)
     (dev / "SKILL.md").write_text("# bmad-dev-auto\n", encoding="utf-8")
     (dev / "step-04-review.md").write_text("x\n", encoding="utf-8")
+    (dev / "customize.toml").write_text("# review layers\n", encoding="utf-8")
     (dev / "step-01-clarify-and-route.md").write_text(
         "This is a **folder+id dispatch** router.\n", encoding="utf-8"
     )
-    for hunter in ("bmad-review-adversarial-general", "bmad-review-edge-case-hunter"):
+    for hunter in (
+        "bmad-review-adversarial-general",
+        "bmad-review-edge-case-hunter",
+        "bmad-review-verification-gap",
+    ):
         (skills / hunter).mkdir(parents=True)
         (skills / hunter / "SKILL.md").write_text(f"# {hunter}\n", encoding="utf-8")
 
@@ -223,10 +228,15 @@ def _scaffold_sprint(root: Path, story_key: str) -> None:
     dev.mkdir(parents=True)
     (dev / "SKILL.md").write_text("# bmad-dev-auto\n", encoding="utf-8")
     (dev / "step-04-review.md").write_text("x\n", encoding="utf-8")
+    (dev / "customize.toml").write_text("# review layers\n", encoding="utf-8")
     (dev / "step-01-clarify-and-route.md").write_text(
         "This is a **folder+id dispatch** router.\n", encoding="utf-8"
     )
-    for hunter in ("bmad-review-adversarial-general", "bmad-review-edge-case-hunter"):
+    for hunter in (
+        "bmad-review-adversarial-general",
+        "bmad-review-edge-case-hunter",
+        "bmad-review-verification-gap",
+    ):
         (skills / hunter).mkdir(parents=True)
         (skills / hunter / "SKILL.md").write_text(f"# {hunter}\n", encoding="utf-8")
 
