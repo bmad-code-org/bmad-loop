@@ -777,6 +777,31 @@ def test_story_checkpoint_pause_after_commit(project):
     assert load_state(resumed.run_dir).tasks["2"].phase == Phase.DONE
 
 
+def test_story_checkpoint_still_fires_when_manifest_unreadable_after_commit(project):
+    """A manifest that goes unreadable between the commit and the after-story
+    check makes the done_checkpoint flag unknowable — the conservative default is
+    to pause for review (mirroring _schedule_complete), never to silently drop a
+    checkpoint the manifest may set. The run cannot proceed past the broken
+    manifest anyway; only the human review could be lost by skipping."""
+    setup_stories(project, [entry("1", done_checkpoint=True), entry("2")])
+
+    def corrupting_effect(spec) -> SessionResult:
+        result = stories_dev_effect()(spec)
+        # the session's tree (== project: no isolation in this harness) ends up
+        # with an undecodable stories.yaml right before commit/after-story
+        (Path(spec.cwd) / SPEC_FOLDER / "stories.yaml").write_bytes(b"\xff\xfe not yaml \x80")
+        return result
+
+    engine, _ = make_engine(project, [corrupting_effect])
+    summary = engine.run()
+    assert summary.paused and summary.done == 1
+    persisted = load_state(engine.run_dir)
+    assert persisted.paused_stage == PAUSE_STORY_CHECKPOINT
+    assert persisted.paused_story_key == "1"
+    unreadable = _kinds(engine.journal, "stories-manifest-unreadable")
+    assert unreadable and unreadable[-1]["story_key"] == "1"
+
+
 def test_story_checkpoint_skipped_when_last(project):
     """done_checkpoint on the final story does NOT pause — the run ends anyway, so
     there is nothing to come back to review before."""

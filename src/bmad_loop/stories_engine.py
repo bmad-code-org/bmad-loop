@@ -578,9 +578,21 @@ class StoriesEngine(Engine):
         # both _loop and _finish_inflight, always after any worktree integration.
         if task.phase != Phase.DONE:
             return
-        entry = self._entry_for(task)
-        if entry is None or not entry.done_checkpoint:
-            return
+        try:
+            entry = self._load_stories().get(task.story_key)
+        except stories.StoriesError as e:
+            # The manifest went unreadable between the commit and this check, so
+            # the done_checkpoint flag is unknowable. Mirror _schedule_complete's
+            # conservative default: pause for review rather than silently drop a
+            # checkpoint the manifest may well set — the run cannot proceed past
+            # a broken manifest anyway (the next pick would halt on it loud), so
+            # the only thing a skip could save is the human review itself.
+            self.journal.append(
+                "stories-manifest-unreadable", story_key=task.story_key, error=str(e)
+            )
+        else:
+            if entry is None or not entry.done_checkpoint:
+                return
         # skip-if-last: no further story will dispatch. Either the schedule is
         # complete OR this committed story is the run's --max-stories-th (the bound
         # stops the loop next iteration). Honoring the cap here — durably, from
