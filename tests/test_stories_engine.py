@@ -958,6 +958,24 @@ def test_sentinel_detected_journaled_at_pick(project):
     assert load_state(engine.run_dir).tasks["1"].sentinel_kind == "unresolved"
 
 
+def test_sentinel_detected_tolerates_non_utf8_sentinel(project):
+    """Bug class: a sentinel classified by NAME can still hold non-UTF-8 bytes, so
+    _journal_sentinel_detected's blocking-condition read must tolerate a
+    UnicodeDecodeError — the engine still pauses on the wedge and records the
+    sentinel with an empty condition instead of crashing the pick."""
+    folder = setup_stories(project, [entry("1")])
+    (folder / "stories" / "1-unresolved.md").write_bytes(b"\xff\xfe\x00\x01 \x80\x81")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "sentinel")
+    engine, _ = make_engine(project, [])
+    assert engine.run().paused  # must not raise on the undecodable sentinel
+
+    detected = _kinds(engine.journal, "sentinel-detected")
+    assert detected and detected[-1]["sentinel_kind"] == "unresolved"
+    assert detected[-1]["condition"] == ""  # unreadable → empty, not a crash
+    assert load_state(engine.run_dir).tasks["1"].sentinel_kind == "unresolved"
+
+
 def test_sentinel_detected_journaled_at_readback(project):
     """MINOR-6: the just-run dev session HALTs pre-planning and writes a sentinel;
     the post-dev read-back journals sentinel-detected before the escalation."""

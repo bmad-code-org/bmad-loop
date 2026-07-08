@@ -337,6 +337,72 @@ def test_rearm_sprint_spec_named_like_a_sentinel_is_not_deleted(tmp_path):
     assert not (run_dir / "sentinels").exists()  # no sentinel preservation in sprint mode
 
 
+# -------------------------------------------------- non-UTF-8 robustness (bug class)
+# A story spec / sentinel is agent- or human-authored, so it can contain non-UTF-8
+# bytes. `read_text(encoding="utf-8")` raises UnicodeDecodeError (a ValueError, NOT an
+# OSError), so the stories-mode read paths must tolerate it rather than crash an
+# already-degraded escalation-resolution flow. Mirrors install.py's stories-support probe.
+
+_BAD_UTF8 = b"\xff\xfe\x00\x01 not utf-8 \x80\x81"
+
+
+def test_build_context_tolerates_non_utf8_present_spec(tmp_path):
+    """A non-UTF-8 PRESENT story spec makes resolve_story_spec's frontmatter read
+    raise UnicodeDecodeError; build_context must degrade to best-effort (folder-only)
+    stories context, not crash the resolve command."""
+    key = "6-4-cli-list-command"
+    stories_dir = tmp_path / "stories"
+    stories_dir.mkdir(parents=True)
+    (stories_dir / f"{key}-slug.md").write_bytes(_BAD_UTF8)  # a real spec, undecodable
+    run_dir, state, _ = _escalated_run(tmp_path, source="stories")
+
+    path = resolve.build_context(state, run_dir, key)  # must not raise
+    ctx = json.loads(path.read_text(encoding="utf-8"))
+    assert ctx["stories"]["spec_folder"] == ""  # best-effort context still produced
+    assert "sentinel" not in ctx["stories"]  # the undecodable spec yields no sentinel
+
+
+def test_build_context_tolerates_non_utf8_sentinel(tmp_path):
+    """A non-UTF-8 sentinel makes the blocking-condition read raise UnicodeDecodeError;
+    build_context still emits the sentinel indicator with an empty condition."""
+    key = "6-4-cli-list-command"
+    stories_dir = tmp_path / "stories"
+    stories_dir.mkdir(parents=True)
+    (stories_dir / f"{key}-unresolved.md").write_bytes(_BAD_UTF8)  # undecodable sentinel
+    run_dir, state, _ = _escalated_run(tmp_path, source="stories", sentinel_kind="unresolved")
+
+    path = resolve.build_context(state, run_dir, key)  # must not raise
+    ctx = json.loads(path.read_text(encoding="utf-8"))
+    assert ctx["stories"]["sentinel"]["kind"] == "unresolved"
+    assert ctx["stories"]["sentinel"]["blocking_condition"] == ""  # unreadable → empty
+
+
+def test_rearm_tolerates_non_utf8_sentinel(tmp_path):
+    """A binary/non-UTF-8 sentinel must not crash rearm_escalation: the sentinel is
+    still preserved+deleted, the run re-arms, and the journal records an empty
+    blocking condition rather than wedging the run on a decode error."""
+    key = "6-4-cli-list-command"
+    stories_dir = tmp_path / "stories"
+    stories_dir.mkdir(parents=True)
+    sentinel = stories_dir / f"{key}-unresolved.md"
+    sentinel.write_bytes(_BAD_UTF8)
+    run_dir, _, _ = _escalated_run(
+        tmp_path, spec_file=str(sentinel), source="stories", sentinel_kind="unresolved"
+    )
+
+    assert runs.rearm_escalation(run_dir) == key  # must not raise
+    assert not sentinel.exists()  # cleared by deletion
+    assert (run_dir / "sentinels" / f"{key}-unresolved.md").is_file()  # copy preserved
+    assert load_state(run_dir).tasks[key].spec_file is None  # cleared → PENDING re-dispatch
+
+    cleared = [
+        json.loads(line)
+        for line in (run_dir / "journal.jsonl").read_text(encoding="utf-8").splitlines()
+        if json.loads(line).get("kind") == "sentinel-cleared"
+    ]
+    assert cleared[0]["sentinel_kind"] == "unresolved" and cleared[0]["condition"] == ""
+
+
 def test_rearm_rejects_non_escalation_stage(tmp_path):
     run_dir = tmp_path / ".bmad-loop" / "runs" / "r1"
     save_state(

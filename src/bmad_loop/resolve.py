@@ -104,7 +104,7 @@ def _stories_context(state: RunState, story_key: str) -> dict[str, Any]:
     ctx: dict[str, Any] = {"spec_folder": state.spec_folder}
     try:
         entry = stories.load_stories(folder).get(story_key)
-    except stories.StoriesError:
+    except (stories.StoriesError, OSError, UnicodeDecodeError):
         entry = None
     if entry is not None:
         ctx["story"] = {
@@ -117,12 +117,12 @@ def _stories_context(state: RunState, story_key: str) -> dict[str, Any]:
         }
     try:
         st = stories.resolve_story_spec(folder, story_key)
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         st = None
     if st is not None and st.kind == stories.KIND_SENTINEL and st.path is not None:
         try:
             condition = stories.recorded_blocking_condition(st.path.read_text(encoding="utf-8"))
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             condition = ""
         ctx["sentinel"] = {
             "kind": st.sentinel_kind,

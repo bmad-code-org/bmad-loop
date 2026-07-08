@@ -269,7 +269,7 @@ class StoriesEngine(Engine):
                 condition = stories.recorded_blocking_condition(
                     state.path.read_text(encoding="utf-8")
                 )
-            except OSError:
+            except (OSError, UnicodeDecodeError):
                 condition = ""
         self.journal.append(
             "sentinel-detected",

@@ -638,7 +638,12 @@ def _clear_sentinel(
     dest_dir.mkdir(parents=True, exist_ok=True)
     condition = ""
     if spec_path.is_file():
-        condition = recorded_blocking_condition(spec_path.read_text(encoding="utf-8"))
+        try:
+            condition = recorded_blocking_condition(spec_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError):
+            # An unreadable/binary sentinel still gets preserved+deleted so re-arm
+            # completes; we just journal an empty blocking condition.
+            condition = ""
         shutil.copy2(spec_path, dest_dir / spec_path.name)
         spec_path.unlink()
     journal.append(
