@@ -295,6 +295,70 @@ def test_bare_resume_does_not_leapfrog_a_wedged_story(project):
     assert not any(s.role == "dev" for s in radapter.sessions)  # story 2 never dispatched
 
 
+def test_bare_resume_repauses_inrun_escalation_with_resumable_spec(project):
+    """A story that escalated AFTER a session ran (attempt > 0) can sit at a
+    resumable spec status — e.g. a CRITICAL proof-of-work GitError fires only
+    after the status gate already passed at in-review. A bare resume must
+    re-pause on it (only `resolve` discharges an in-run escalation), never
+    re-derive it from disk: the disk scan would re-dispatch a fresh StoryTask
+    over the escalated one, destroying the escalation record and its
+    resolved_redrive guard (a later exhaustion would then DEFER the
+    human-resolved work)."""
+    folder = setup_stories(project, [entry("1"), entry("2")])
+    write_spec(folder / "stories" / "1-slug.md", "in-review", rev_parse_head(project.project))
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "story 1 in-review")
+
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1", epic=0)
+    task.phase = Phase.ESCALATED
+    task.attempt = 2
+    task.resolved_redrive = True
+    task.spec_file = str(folder / "stories" / "1-slug.md")
+    engine.state.tasks["1"] = task
+    engine._save()
+
+    # bare resume WITHOUT resolving — sessions are available but none must run
+    resumed, radapter = resume_engine(project, engine, [stories_dev_effect(), stories_dev_effect()])
+    rsummary = resumed.run()
+    assert rsummary.paused and rsummary.done == 0
+    persisted = load_state(resumed.run_dir)
+    assert persisted.paused_stage == PAUSE_ESCALATION
+    assert persisted.paused_story_key == "1"
+    # the escalated task survives untouched — resolve still has its record
+    survivor = persisted.tasks["1"]
+    assert survivor.phase == Phase.ESCALATED
+    assert survivor.attempt == 2
+    assert survivor.resolved_redrive is True
+    assert not any(s.role == "dev" for s in radapter.sessions)  # nothing re-dispatched
+
+
+def test_bare_resume_does_not_leapfrog_inrun_escalation_at_done(project):
+    """With review disabled a CRITICAL verify escalation can leave the spec at
+    `done`; disk classification would count story 1 as complete and dispatch
+    story 2 straight past the unresolved escalation. The in-run guard re-pauses
+    on story 1 instead."""
+    folder = setup_stories(project, [entry("1"), entry("2")])
+    write_spec(folder / "stories" / "1-slug.md", "done", rev_parse_head(project.project))
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "story 1 done on disk, escalation unresolved")
+
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1", epic=0)
+    task.phase = Phase.ESCALATED
+    task.attempt = 1
+    engine.state.tasks["1"] = task
+    engine._save()
+
+    resumed, radapter = resume_engine(project, engine, [stories_dev_effect()])
+    rsummary = resumed.run()
+    assert rsummary.paused and rsummary.done == 0
+    persisted = load_state(resumed.run_dir)
+    assert persisted.paused_stage == PAUSE_ESCALATION
+    assert persisted.paused_story_key == "1"  # re-paused on story 1, not story 2
+    assert not any(s.role == "dev" for s in radapter.sessions)  # story 2 never dispatched
+
+
 def test_sentinel_on_disk_pauses(project):
     folder = setup_stories(project, [entry("1")])
     # a pre-planning halt left a fixed-slug sentinel with status blocked

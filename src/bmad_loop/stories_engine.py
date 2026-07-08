@@ -157,6 +157,9 @@ class StoriesEngine(Engine):
         # "a blocked story cannot be leapfrogged" invariant. Left out of the skip
         # set, an unresolved wedge re-classifies from disk (blocked/sentinel) and
         # re-pauses on itself; once `resolve` re-arms it to PENDING it re-dispatches.
+        # (Only pick-time wedge tasks reach this scan while ESCALATED: an *in-run*
+        # escalation — whose spec status proves nothing about resolution — is
+        # re-paused before scheduling by _repause_inrun_escalation.)
         skip = {
             key
             for key, task in self.state.tasks.items()
@@ -175,6 +178,7 @@ class StoriesEngine(Engine):
         self._validated = True
 
     def _pick_next(self) -> _StoryRef | None:
+        self._repause_inrun_escalation()  # raises when one is live
         try:
             sched = self._compute_schedule()
         except _UnknownSelector as e:
@@ -187,6 +191,34 @@ class StoriesEngine(Engine):
         if sched.outcome == stories.SCHEDULE_WEDGED and sched.entry is not None:
             self._pause_wedged(sched)
         return None  # SCHEDULE_COMPLETE — every story is done
+
+    def _repause_inrun_escalation(self) -> None:
+        """Re-pause on a story that escalated *after a session ran* (``attempt > 0``)
+        instead of re-deriving its fate from disk.
+
+        A pick-time wedge / unknown-selector task (attempt == 0) is a pure disk
+        projection, and re-classifying it every pick is its designed lifecycle:
+        fix the blocked spec / duplicate file / manifest by hand and a bare
+        resume proceeds. An in-run escalation is not disk-derivable — a CRITICAL
+        verify outcome (e.g. a proof-of-work GitError) or a resolved-redrive
+        exhaustion pause escalates with the spec at a *resumable or even done*
+        status, so the disk scan would silently re-dispatch the story (a fresh
+        StoryTask overwrites the escalated one, destroying its escalation record
+        and ``resolved_redrive`` guard — a later exhaustion then DEFERs the
+        human-resolved work) or, at ``done``, leapfrog the unresolved escalation
+        entirely. Only ``runs.rearm_escalation`` (`bmad-loop resolve`) discharges
+        it: the re-arm resets the task to PENDING, after which this guard no
+        longer matches and the normal re-drive proceeds. Never mutates the task —
+        the escalation context must survive for resolve to act on."""
+        for key, task in self.state.tasks.items():
+            if task.phase == Phase.ESCALATED and task.attempt > 0:
+                reason = (
+                    f"story {key!r} escalated during this run and was not resolved — "
+                    f"run `bmad-loop resolve {self.state.run_id}`, then resume"
+                )
+                self.journal.append("stories-escalation-unresolved", story_key=key)
+                gates.notify(self.policy, self.run_dir, f"unresolved escalation: {key}", reason)
+                raise RunPaused(reason, PAUSE_ESCALATION, key)
 
     def _pause_unknown_selector(self, selector: str) -> None:
         """The ``--story`` selector resolves to no manifest entry: pause for
