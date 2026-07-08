@@ -806,19 +806,26 @@ def _confirm(question: str) -> bool:
 
 
 def _resolve_restore_patch(
-    project: Path, run_dir: Path, story_key: str, args: argparse.Namespace
+    project: Path,
+    run_dir: Path,
+    story_key: str,
+    args: argparse.Namespace,
+    pol,
+    task,
 ) -> tuple[str | None, str | None]:
     """Determine the intent-gap patch-restore latch (BMAD-METHOD #2564) for a re-arm.
 
     Precedence: the explicit ``--restore-patch`` flag (hand-driven recovery) wins;
     otherwise, on the interactive path, the resolve agent may have recorded a
-    ``restore_patch`` field in resolution.json. Returns ``(latch, error)``: a
-    validated absolute patch path to latch (None = ordinary from-scratch re-drive),
-    or an error string when a supplied path is missing / outside the project, the
-    run's isolation mode can't restore in place, or the restore input itself is
-    corrupt (unreadable resolution.json, empty/non-string value) — the caller
-    aborts strictly rather than silently re-driving from scratch when a restore
-    was (or may have been) asked for."""
+    ``restore_patch`` field in resolution.json. The flag path is fully knowable
+    before the interactive session, so cmd_resolve validates it FIRST and only
+    falls back here post-session for the resolution.json read. Returns
+    ``(latch, error)``: a validated absolute patch path to latch (None = ordinary
+    from-scratch re-drive), or an error string when a supplied path is missing /
+    outside the trusted roots, the run can't restore in place, or the restore
+    input itself is corrupt (unreadable resolution.json, empty/non-string value)
+    — the caller aborts strictly rather than silently re-driving from scratch
+    when a restore was (or may have been) asked for."""
     raw = getattr(args, "restore_patch", None)
     if raw is not None and not raw.strip():
         # `--restore-patch ""` is a classic unset-shell-var slip. Treating it as
@@ -853,17 +860,21 @@ def _resolve_restore_patch(
     if not raw:
         return None, None
     # Restore is an in-place-only recovery: a worktree-isolation re-drive discards
-    # and re-mounts the unit's worktree (engine._finish_inflight), so a patch laid
-    # onto the project tree has nowhere durable to land and the engine's apply seam
-    # is never reached. Reject up front instead of latching a patch that would
-    # silently never restore.
-    pol = policy_mod.load(_policy_path(project))
-    if pol.scm.isolation == "worktree":
+    # the unit's worktree (engine._finish_inflight — taking a patch saved inside it
+    # along) and re-mounts a fresh one, so the re-apply could only fail on a
+    # destroyed patch file. Reject up front instead of latching a patch that can
+    # never restore. Checked against BOTH the recorded run state
+    # (task.worktree_path — how the escalated unit actually executed) and the live
+    # policy (how the resume will execute), so a policy edit between escalation
+    # and resolve can't skew the guard.
+    if pol.scm.isolation == "worktree" or getattr(task, "worktree_path", ""):
         return None, (
             "restore patch is unsupported for worktree-isolation runs (the re-drive "
             "discards and re-mounts the unit's worktree, so an in-place restore has "
-            "nothing durable to land on) — re-run without a restore patch for a "
-            "plain re-drive"
+            "nothing durable to land on) — re-arm from scratch instead: drop "
+            "--restore-patch, or if the resolve agent recorded the restore in "
+            "resolution.json, re-run with --no-interactive (which ignores that "
+            "marker) instead of repeating the agent session"
         )
     patch = Path(raw)
     if not patch.is_absolute():
@@ -933,11 +944,25 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         print(f"no escalated story to resolve in run {args.run_id}", file=sys.stderr)
         return 1
 
+    pol = policy_mod.load(_policy_path(project))
+
+    # intent-gap patch-restore latch (#2564), explicit-flag path: everything about
+    # it (isolation mode, path containment) is knowable NOW — validate before the
+    # interactive resolve session, not after a whole agent conversation the abort
+    # would throw away. The resolution.json path can only be validated
+    # post-session (below); build_context tells the agent up front when a restore
+    # can't be honored so it never negotiates one.
+    restore_patch: str | None = None
+    if args.restore_patch is not None:
+        restore_patch, err = _resolve_restore_patch(project, run_dir, story_key, args, pol, task)
+        if err is not None:
+            print(err, file=sys.stderr)
+            return 1
+
     if args.interactive:
-        pol = policy_mod.load(_policy_path(project))
         adapters = _make_adapters(project, run_dir, pol)
         model = pol.adapter.resolved("dev").model
-        resolve.build_context(state, run_dir, story_key)
+        resolve.build_context(state, run_dir, story_key, isolation=pol.scm.isolation)
         print(f"launching resolve agent for {story_key} — converse, fix the spec, then exit…")
         try:
             produced = resolve.run_session(
@@ -956,12 +981,13 @@ def cmd_resolve(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
 
-    # intent-gap patch-restore latch (#2564): validate a supplied patch path before
-    # prompting, so a bad path fails loudly instead of after a confirmation.
-    restore_patch, err = _resolve_restore_patch(project, run_dir, story_key, args)
-    if err is not None:
-        print(err, file=sys.stderr)
-        return 1
+    # resolution.json restore latch: only exists after the session ran, so this
+    # arm of the validation cannot be hoisted above it.
+    if args.restore_patch is None:
+        restore_patch, err = _resolve_restore_patch(project, run_dir, story_key, args, pol, task)
+        if err is not None:
+            print(err, file=sys.stderr)
+            return 1
 
     # confirm-then-resume (args.resume: None = ask, True = auto, False = re-arm only)
     if args.resume is None and not _confirm(f"re-arm {story_key} and resume run {args.run_id}?"):

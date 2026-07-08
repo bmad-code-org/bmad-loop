@@ -89,7 +89,7 @@ def _gather_escalations(run_dir: Path, state: RunState, story_key: str) -> list[
     return found
 
 
-def build_context(state: RunState, run_dir: Path, story_key: str) -> Path:
+def build_context(state: RunState, run_dir: Path, story_key: str, *, isolation: str = "") -> Path:
     """Write resolve/<story_key>/context.json for the resolve skill to read."""
     task = state.tasks.get(story_key)
     context = {
@@ -102,6 +102,12 @@ def build_context(state: RunState, run_dir: Path, story_key: str) -> Path:
         # as_posix so the context contract is the same string on every OS (the
         # path is consumed by the agent, and Python/tools accept '/' on Windows).
         "resolution_path": resolution_path(run_dir, story_key).as_posix(),
+        # Patch-restore availability (#2564): a worktree-isolation re-drive
+        # discards and re-mounts the unit's worktree, so an in-place restore can
+        # never land — the orchestrator rejects a `restore_patch` up front. Told
+        # to the agent here so it never negotiates a restore it can't honor.
+        "restore_supported": isolation != "worktree"
+        and not (task.worktree_path if task else ""),
     }
     # Stories mode: hand the resolver the manifest intent (the story entry) and a
     # sentinel indicator, so it sees WHAT the story is meant to do and WHETHER the

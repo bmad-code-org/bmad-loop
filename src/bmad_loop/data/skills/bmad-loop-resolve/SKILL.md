@@ -118,7 +118,16 @@ dev session first **saved its attempted change as a patch file** (in the
 implementation-artifacts folder) before reverting the tree — the escalation
 `detail` and the spec's `## Review Triage Log` reference the patch path. That
 patch is concrete evidence: it shows exactly which reading of the intent the run
-implemented. Use it two ways:
+implemented.
+
+**First check `restore_supported` in the context file.** When it is `false`
+(worktree-isolation runs: the re-drive discards and re-mounts the unit's
+worktree, so an in-place restore can never land), **never offer the restore
+option and never record `restore_patch`** — the orchestrator would reject the
+resolution and this whole session's negotiation would be wasted. The patch is
+still available as evidence.
+
+Use the patch two ways:
 
 - **As evidence.** Read the patch (and the diff it represents) to see what the
   guessed reading produced — often clearer input for writing the clarification

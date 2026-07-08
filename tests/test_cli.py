@@ -824,10 +824,17 @@ def _write_bmad_config(project, impl="{project-root}/artifacts"):
     )
 
 
-def _escalated_run(project, run_id="r1", *, story="s1", spec_file=None):
+def _escalated_run(project, run_id="r1", *, story="s1", spec_file=None, worktree_path=""):
     from bmad_loop.model import Phase, StoryTask
 
-    task = StoryTask(story_key=story, epic=1, phase=Phase.ESCALATED, attempt=1, spec_file=spec_file)
+    task = StoryTask(
+        story_key=story,
+        epic=1,
+        phase=Phase.ESCALATED,
+        attempt=1,
+        spec_file=spec_file,
+        worktree_path=worktree_path,
+    )
     return _make_run_with_state(
         project,
         run_id,
@@ -1154,6 +1161,74 @@ def test_resolve_restore_patch_worktree_isolation_rejected(tmp_path, monkeypatch
     task = load_state(run_dir).tasks["s1"]
     assert task.phase == Phase.ESCALATED and task.restore_patch is None  # not re-armed
     assert "status: blocked" in spec.read_text()  # spec status untouched
+
+
+def test_resolve_restore_patch_flag_rejected_before_the_session(tmp_path, monkeypatch, capsys):
+    """The explicit --restore-patch flag is fully knowable pre-session (isolation
+    mode, path containment), so on a worktree-isolation run it must be rejected
+    BEFORE launching the interactive resolve agent — not after a whole
+    conversation the abort would throw away."""
+    from bmad_loop import resolve
+
+    _write_policy(tmp_path, '[scm]\nisolation = "worktree"\n')
+    spec = tmp_path / "spec.md"
+    spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+    _write_bmad_config(tmp_path)
+    patch = tmp_path / "artifacts" / "attempt.patch"
+    patch.parent.mkdir(parents=True)
+    patch.write_text("diff", encoding="utf-8")
+    _escalated_run(tmp_path, "r1", spec_file=str(spec))
+
+    def never(*a, **k):
+        raise AssertionError("interactive resolve session launched despite a doomed restore")
+
+    monkeypatch.setattr(cli, "_make_adapters", never)
+    monkeypatch.setattr(resolve, "run_session", never)
+    # interactive is the default: no --no-interactive here
+    rc = cli.main(
+        ["resolve", "--project", str(tmp_path), "r1", "--restore-patch", str(patch), "--resume"]
+    )
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "worktree" in err
+    assert "--no-interactive" in err  # the deterministic escape is named
+
+
+def test_resolve_restore_patch_rejected_for_worktree_executed_task(tmp_path, monkeypatch, capsys):
+    """The guard keys on the recorded run state too: a task that actually
+    executed in a worktree (task.worktree_path) rejects a restore even when the
+    policy has since been flipped back to in-place — the patch was saved inside
+    the (discarded) worktree, so there is nothing durable to restore."""
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    spec = tmp_path / "spec.md"
+    spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+    _write_bmad_config(tmp_path)
+    patch = tmp_path / "artifacts" / "attempt.patch"
+    patch.parent.mkdir(parents=True)
+    patch.write_text("diff", encoding="utf-8")
+    run_dir = _escalated_run(
+        tmp_path, "r1", spec_file=str(spec), worktree_path=str(tmp_path / "wt" / "s1")
+    )
+    called: list = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: called.append(rd) or 0)
+    rc = cli.main(
+        [
+            "resolve",
+            "--project",
+            str(tmp_path),
+            "r1",
+            "--no-interactive",
+            "--restore-patch",
+            str(patch),
+            "--resume",
+        ]
+    )
+    assert rc == 1
+    assert "worktree" in capsys.readouterr().err
+    assert called == []
+    assert load_state(run_dir).tasks["s1"].phase == Phase.ESCALATED  # not re-armed
 
 
 def test_resolve_interactive_restore_patch_from_resolution_json(tmp_path, monkeypatch):

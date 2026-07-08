@@ -158,6 +158,24 @@ def test_build_context_no_session_files(tmp_path):
     assert ctx["paused_reason"].startswith("CRITICAL")
 
 
+def test_build_context_restore_supported_signal(tmp_path):
+    """The agent must know up front when a patch-restore can't be honored
+    (worktree isolation / a worktree-executed task), so it never negotiates a
+    restore the orchestrator will reject after the session."""
+    run_dir, state, task = _escalated_run(tmp_path, with_session=False)
+    key = "6-4-cli-list-command"
+
+    path = resolve.build_context(state, run_dir, key)
+    assert json.loads(path.read_text(encoding="utf-8"))["restore_supported"] is True
+
+    path = resolve.build_context(state, run_dir, key, isolation="worktree")
+    assert json.loads(path.read_text(encoding="utf-8"))["restore_supported"] is False
+
+    task.worktree_path = str(tmp_path / "wt")  # recorded worktree execution
+    path = resolve.build_context(state, run_dir, key)
+    assert json.loads(path.read_text(encoding="utf-8"))["restore_supported"] is False
+
+
 # ----------------------------------------------------------- rearm_escalation
 
 
