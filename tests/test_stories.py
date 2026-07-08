@@ -512,6 +512,31 @@ def test_story_rows_selector_and_limit(tmp_path):
     assert [r.id for r in stories.story_rows(tmp_path, max_stories=2)] == ["1", "2"]
 
 
+def test_story_rows_limit_counts_dispatchable_not_done(tmp_path):
+    """--max-stories parity with the engine: the run's durable dispatch count
+    skips already-done stories, so a preview that counted done rows against the
+    cap showed a DISJOINT story set from what the run drives (manifest [1..4]
+    with 1-2 done: dry-run said 1-2, the run dispatched 3-4). Done rows before
+    the cap stay in view as skipped context; a non-positive cap previews the
+    empty schedule the run would dispatch."""
+    write_stories(
+        tmp_path,
+        '- id: "1"\n  title: t\n  description: d\n'
+        '- id: "2"\n  title: t\n  description: d\n'
+        '- id: "3"\n  title: t\n  description: d\n'
+        '- id: "4"\n  title: t\n  description: d\n',
+    )
+    write_story_spec(tmp_path, "1-slug.md", status="done")
+    write_story_spec(tmp_path, "2-slug.md", status="done")
+    # the run with --max-stories 2 skips 1-2 (done) and drives 3 AND 4
+    assert [r.id for r in stories.story_rows(tmp_path, max_stories=2)] == ["1", "2", "3", "4"]
+    # cap 1 → drives only 3; 4 is beyond the cap
+    assert [r.id for r in stories.story_rows(tmp_path, max_stories=1)] == ["1", "2", "3"]
+    # a non-positive cap dispatches nothing
+    assert stories.story_rows(tmp_path, max_stories=0) == []
+    assert stories.story_rows(tmp_path, max_stories=-1) == []
+
+
 def test_story_rows_missing_manifest_raises(tmp_path):
     with pytest.raises(stories.StoriesError, match=re.escape("no stories.yaml found")):
         stories.story_rows(tmp_path)

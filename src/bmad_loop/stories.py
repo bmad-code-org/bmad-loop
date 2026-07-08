@@ -523,19 +523,26 @@ def story_rows(
     """Load ``stories.yaml`` and project every entry to a :class:`StoryRow`,
     resolving each story's on-disk state. ``selector`` restricts to one id
     (empty result when unknown — the caller decides how to report that);
-    ``max_stories`` truncates like the run limit. Raises :class:`StoriesError`
-    when the manifest is missing or invalid, so a caller rendering a table can
-    surface the same message the run would HALT on."""
+    ``max_stories`` truncates like the run limit: it counts only stories the run
+    would actually drive (the engine's durable dispatch count skips already-done
+    stories), so done rows before the cap stay in view as skipped context and a
+    non-positive cap previews an empty schedule, exactly like the run dispatches
+    nothing. Raises :class:`StoriesError` when the manifest is missing or
+    invalid, so a caller rendering a table can surface the same message the run
+    would HALT on."""
     folder = Path(spec_folder)
     story_set = load_stories(folder)
     entries = story_set.entries
     if selector is not None:
         entries = tuple(e for e in entries if e.id == selector)
-    if max_stories is not None:
-        entries = entries[:max_stories]
     rows: list[StoryRow] = []
+    dispatchable = 0
     for position, entry in enumerate(entries, 1):
+        if max_stories is not None and dispatchable >= max_stories:
+            break
         state = resolve_story_spec(folder, entry.id)
+        if _classify(state) != "done":
+            dispatchable += 1
         rows.append(
             StoryRow(
                 position=position,
