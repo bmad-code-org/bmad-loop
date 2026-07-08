@@ -17,7 +17,10 @@ breaking changes may land in a minor release.
   reading was correct, `bmad-loop resolve` re-arms the spec to `in-review` and re-applies the patch
   onto baseline after every reset, so the re-driven session resumes review on the restored diff
   instead of re-implementing. New `--restore-patch <path>` flag for the `--no-interactive` path; a
-  patch that fails to apply escalates instead of running on a half-restored tree.
+  patch that fails to apply escalates instead of running on a half-restored tree (a resolve session
+  that committed over the patched lines triggers exactly this — re-resolve without a restore).
+  Restore is rejected up front for worktree-isolation runs and for stories-mode pre-planning
+  sentinels, and the latched patch file itself never counts as proof-of-work.
 - **Preflight covers the inline review layers.** `bmad-loop validate` (and run-start) now require the
   three upstream review-hunter skills `bmad-dev-auto`'s step-04 invokes — `bmad-review-adversarial-general`,
   `bmad-review-edge-case-hunter`, and `bmad-review-verification-gap` (new in BMAD-METHOD#2550) — plus a
