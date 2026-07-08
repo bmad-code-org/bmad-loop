@@ -818,8 +818,7 @@ def _write_bmad_config(project, impl="{project-root}/artifacts"):
     cfg = project / "_bmad" / "bmm"
     cfg.mkdir(parents=True, exist_ok=True)
     (cfg / "config.yaml").write_text(
-        f"implementation_artifacts: '{impl}'\n"
-        "planning_artifacts: '{project-root}/planning'\n",
+        f"implementation_artifacts: '{impl}'\n" "planning_artifacts: '{project-root}/planning'\n",
         encoding="utf-8",
     )
 

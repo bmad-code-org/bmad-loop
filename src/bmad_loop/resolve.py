@@ -106,8 +106,7 @@ def build_context(state: RunState, run_dir: Path, story_key: str, *, isolation: 
         # discards and re-mounts the unit's worktree, so an in-place restore can
         # never land — the orchestrator rejects a `restore_patch` up front. Told
         # to the agent here so it never negotiates a restore it can't honor.
-        "restore_supported": isolation != "worktree"
-        and not (task.worktree_path if task else ""),
+        "restore_supported": isolation != "worktree" and not (task.worktree_path if task else ""),
     }
     # Stories mode: hand the resolver the manifest intent (the story entry) and a
     # sentinel indicator, so it sees WHAT the story is meant to do and WHETHER the
