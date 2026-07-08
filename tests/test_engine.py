@@ -2225,6 +2225,41 @@ def test_intent_gap_restore_reapplies_after_mid_redrive_rollback(project):
     assert patch.is_file()  # protected patch file survived the reset
 
 
+def test_intent_gap_restore_escalates_when_resolution_commits_overlap(project):
+    """T2 (patch-restore × #78 baseline advance): re-arm adopts the resolve
+    session's commits as the re-drive's baseline, but the saved patch was diffed
+    from the ORIGINAL baseline — so a resolution commit that rewrote the patched
+    lines makes the restore's `git apply` fail. The engine must escalate loudly
+    with no session dispatched (never silently merge the human's resolution with
+    the stale attempt), and the resolution commit must survive untouched."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    patch = project.implementation_artifacts / "attempt.patch"
+    engine, _ = make_engine(project, [_escalate_with_patch(project, "1-1-a", patch)])
+    assert engine.run().escalated == 1
+
+    # the resolve session commits its own fix REWRITING the line the patch's
+    # context expects, then the human latches the restore anyway
+    repo = project.project
+    (repo / "src.txt").write_text("corrected by resolution\n")
+    git(repo, "add", "src.txt")
+    git(repo, "commit", "-q", "-m", "resolution: overlapping fix")
+    rearm_escalation(engine.run_dir, restore_patch=str(patch))
+
+    seen: list[str] = []
+    resumed, _ = resume_engine(project, engine, [_restoring_dev_effect(project, "1-1-a", seen)])
+    summary = resumed.run()
+
+    assert summary.paused
+    assert seen == []  # no session ever dispatched onto a half-restored tree
+    kinds = [e["kind"] for e in resumed.journal.entries()]
+    assert "attempt-restore-failed" in kinds
+    assert "attempt-restored" not in kinds
+    task = load_state(resumed.run_dir).tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED  # re-escalated: the human re-resolves
+    # git apply is all-or-nothing: the overlapping resolution commit is untouched
+    assert (repo / "src.txt").read_text() == "corrected by resolution\n"
+
+
 def test_dev_stall_retries_then_succeeds(project):
     write_sprint(project, {"1-1-a": "ready-for-dev"})
     engine, adapter = make_engine(

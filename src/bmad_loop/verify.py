@@ -1442,13 +1442,21 @@ def apply_patch(repo: Path, patch_path: Path) -> None:
     """Apply a saved patch to `repo`'s working tree (`git apply`), raising on failure.
 
     The intent-gap patch-restore re-drive (BMAD-METHOD #2564) uses this to re-lay
-    the attempted change bmad-dev-auto saved before reverting: the patch is a diff
-    from the story's baseline, and the caller has just reset the tree to that same
-    baseline, so it applies cleanly by construction. New files in the patch are
-    created (they land untracked, matching how the original attempt sat before its
-    revert). A non-zero `git apply` — a conflict, a missing/corrupt patch, a tree
-    that has drifted from baseline — raises `GitError` with git's output; the caller
-    escalates rather than dispatch a session onto a half-applied tree.
+    the attempted change bmad-dev-auto saved before reverting. New files in the
+    patch are created (they land untracked, matching how the original attempt sat
+    before its revert).
+
+    A clean apply is likely but NOT guaranteed: the patch was diffed from the
+    story's ORIGINAL baseline, while re-arm advances the re-drive's baseline to the
+    project's post-resolve HEAD (runs.rearm_escalation) — so the apply holds only
+    while the resolve session left the patched files untouched. A resolve session
+    that committed changes to those files makes `git apply` fail, deliberately
+    loudly: silently merging the human's resolution with the stale attempt could
+    reproduce the very gap being resolved. A non-zero `git apply` — that overlap, a
+    missing/corrupt patch, any other drift — raises `GitError` with git's output;
+    the caller escalates rather than dispatch a session onto a half-applied tree,
+    and the human re-resolves (typically re-arming without a restore, since the
+    resolution commits already carry the overlapping work).
     """
     if not patch_path.is_file():
         raise GitError(f"restore patch not found: {patch_path}")

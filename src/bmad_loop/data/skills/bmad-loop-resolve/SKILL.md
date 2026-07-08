@@ -138,6 +138,16 @@ implemented. Use it two ways:
   restored diff. **Do NOT `git apply` the patch yourself and do NOT set the spec
   status** — the orchestrator does both deterministically at re-arm.
 
+  **The restore must not overlap resolution commits.** Re-arm advances the
+  re-drive's baseline to the branch's post-resolve HEAD, but the saved patch was
+  diffed from the ORIGINAL baseline — so if this session left commits that touch
+  the patch's own files, the restore's `git apply` fails and the story
+  re-escalates (loudly, by design: the orchestrator never silently merges the
+  resolution with the stale attempt). If the resolution work already includes or
+  supersedes the attempted change, **omit `restore_patch`** — the commits survive
+  re-arm as the re-drive's starting point, so a from-scratch re-drive builds
+  directly on them.
+
 If the attempted reading was wrong (the common case), omit `restore_patch`
 entirely: the orchestrator re-drives from scratch against the corrected intent.
 
