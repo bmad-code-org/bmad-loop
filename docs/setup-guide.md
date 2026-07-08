@@ -85,7 +85,7 @@ installs all the bundled skills together (`bmad-loop-resolve`, `bmad-loop-sweep`
 the orchestrator normalizes the ledger to. The dev primitive `bmad-dev-auto` is
 **not** bundled: it is the upstream skill the orchestrator drives (for both
 implementation and the follow-up review), installed by the BMad Method (bmm)
-module. `bmad-loop validate` checks it — plus the two adversarial review hunters it
+module. `bmad-loop validate` checks it — plus the three review hunters it
 invokes inline — are present before a run starts.
 
 ## Choosing which CLIs to drive

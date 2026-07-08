@@ -256,7 +256,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
 
 def _require_base_skills(project: Path, pol, *, require_stories: bool = False) -> bool:
     """Preflight the upstream skills the orchestrator drives (bmad-dev-auto + the
-    two adversarial review hunters it invokes inline).
+    three review hunters it invokes inline).
 
     Returns True when everything is in place; otherwise prints the problems and
     returns False so the caller can abort before spawning any session (a missing
