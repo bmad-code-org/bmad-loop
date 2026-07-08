@@ -1709,6 +1709,64 @@ async def test_escalation_rearm_resumes_when_resolution_ready(project, monkeypat
         await until(pilot, lambda: rearms == ["1"] and calls == ["20260611-100000-aaaa"])
 
 
+def test_restore_recorded_helper(tmp_path):
+    """review F8: absent marker / no restore field -> False; a recorded
+    restore_patch -> True; an UNREADABLE marker -> True (it may carry one, so
+    the warning must err toward surfacing)."""
+    from bmad_loop import resolve
+
+    assert BmadLoopApp._restore_recorded(tmp_path, "1") is False  # absent
+    marker = resolve.resolution_path(tmp_path, "1")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{}", encoding="utf-8")
+    assert BmadLoopApp._restore_recorded(tmp_path, "1") is False  # no restore field
+    marker.write_text('{"restore_patch": "artifacts/a.patch"}', encoding="utf-8")
+    assert BmadLoopApp._restore_recorded(tmp_path, "1") is True
+    marker.write_text('{"restore_patch": "artifacts/a.patch",}', encoding="utf-8")
+    assert BmadLoopApp._restore_recorded(tmp_path, "1") is True  # corrupt -> conservative
+
+
+async def test_escalation_rearm_warns_when_restore_recorded(project, monkeypatch):
+    """review F8: a resolution.json carrying restore_patch still enables Re-arm
+    (it IS a recorded resolution) but the modal flags it and the re-arm notifies
+    that the restore is NOT honored here — only `bmad-loop resolve` applies a
+    latch — so the human's confirmed decision is never dropped silently."""
+    from bmad_loop import resolve, runs
+
+    calls: list[str] = []
+    rearms: list[str] = []
+    notes: list[str] = []
+    monkeypatch.setattr(launch, "tmux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    monkeypatch.setattr(
+        runs, "rearm_escalation", lambda rd, sk: rearms.append(sk) or "ready-for-dev"
+    )
+    orig_notify = BmadLoopApp.notify
+    monkeypatch.setattr(
+        BmadLoopApp,
+        "notify",
+        lambda self, msg, **kw: notes.append(str(msg)) or orig_notify(self, msg, **kw),
+    )
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: intent gap; saved patch: artifacts/attempt.patch",
+    )
+    marker = resolve.resolution_path(run_dir, "1")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text('{"restore_patch": "artifacts/attempt.patch"}', encoding="utf-8")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, EscalationModal)
+        assert app.screen._restore_recorded is True  # the modal shows the warning hint
+        await pilot.click(await ready(pilot, "#act-rearm"))
+        await until(pilot, lambda: rearms == ["1"] and calls == ["20260611-100000-aaaa"])
+    assert any("NOT honored" in n for n in notes)  # the drop was surfaced, not silent
+
+
 async def test_escalation_rearm_disabled_without_resolution(project, monkeypatch):
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
     _stories_paused_run(

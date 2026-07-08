@@ -551,6 +551,7 @@ class EscalationModal(BaseDialog):
         sentinel_kind: str,
         resolution_ready: bool,
         engine_live: bool,
+        restore_recorded: bool = False,
     ):
         super().__init__()
         self._story_key = story_key
@@ -560,6 +561,7 @@ class EscalationModal(BaseDialog):
         self._sentinel_kind = sentinel_kind
         self._resolution_ready = resolution_ready
         self._engine_live = engine_live
+        self._restore_recorded = restore_recorded
 
     def compose(self) -> ComposeResult:
         head = Text()
@@ -588,7 +590,17 @@ class EscalationModal(BaseDialog):
                     Text("engine may still be live — stop it before resolving", style="yellow")
                 )
             hint = Text()
-            if self._resolution_ready:
+            if self._restore_recorded:
+                # honoring the latch from here would be unsafe (a stale marker is
+                # indistinguishable from a fresh one), so Re-arm stays a plain
+                # from-scratch re-drive — but never a silent drop of the decision.
+                hint.append(
+                    "⚠ the resolution records a restore patch — Re-arm here re-drives "
+                    "from scratch and drops it; run `bmad-loop resolve` to honor the "
+                    "restore",
+                    style="yellow",
+                )
+            elif self._resolution_ready:
                 hint.append("resolution recorded — re-arm & resume when ready", style="green")
             else:
                 hint.append(

@@ -588,6 +588,7 @@ class BmadLoopApp(App[None]):
         story_key = state.paused_story_key or "?"
         spec_path, spec_text = self._paused_spec(state)
         title, description = self._story_context(state, story_key)
+        restore_recorded = self._restore_recorded(run_dir, story_key)
         modal = EscalationModal(
             story_key=story_key,
             title=title,
@@ -596,6 +597,7 @@ class BmadLoopApp(App[None]):
             sentinel_kind=self._sentinel_kind(state, story_key),
             resolution_ready=resolve.resolution_path(run_dir, story_key).is_file(),
             engine_live=_engine_possibly_live(run_dir),
+            restore_recorded=restore_recorded,
         )
 
         def done(verb: str | None) -> None:
@@ -604,9 +606,24 @@ class BmadLoopApp(App[None]):
                     return
                 self._launch_resolve(run_id)
             elif verb == "rearm":
-                self._do_rearm(run_id, run_dir, story_key)
+                self._do_rearm(run_id, run_dir, story_key, restore_recorded=restore_recorded)
 
         self.push_screen(modal, done)
+
+    @staticmethod
+    def _restore_recorded(run_dir: Path, story_key: str) -> bool:
+        """True when resolution.json records — or, being unreadable, MAY record —
+        a restore_patch. The TUI re-arm path is a plain from-scratch re-drive
+        (only the CLI resolve flow honors the latch, because a stale marker is
+        indistinguishable from a fresh one here), so a recorded restore must be
+        surfaced rather than silently dropped."""
+        if not resolve.resolution_path(run_dir, story_key).is_file():
+            return False
+        try:
+            doc = resolve.read_resolution(run_dir, story_key)
+        except resolve.ResolutionError:
+            return True  # can't prove it carries no restore — surface the warning
+        return bool(doc and doc.get("restore_patch"))
 
     # --------------------------------------------------- shared pause code paths
 
@@ -657,7 +674,9 @@ class BmadLoopApp(App[None]):
         self.notify("plan reset to draft — the next dispatch re-plans")
         self._do_resume(run_id)
 
-    def _do_rearm(self, run_id: str, run_dir: Path, story_key: str) -> None:
+    def _do_rearm(
+        self, run_id: str, run_dir: Path, story_key: str, *, restore_recorded: bool = False
+    ) -> None:
         """Re-arm a resolved escalation + resume — the `resolve --no-interactive`
         path (rearm_escalation handles sentinel auto-delete-with-preservation)."""
         if self._resolve_blocked_by_liveness(run_id, run_dir):
@@ -667,6 +686,12 @@ class BmadLoopApp(App[None]):
         except RearmError as e:
             self.notify(f"re-arm failed: {e}", severity="error")
             return
+        if restore_recorded:
+            self.notify(
+                "recorded restore patch NOT honored — this re-arm re-drives from "
+                "scratch (only `bmad-loop resolve` applies a restore)",
+                severity="warning",
+            )
         self.notify(f"re-armed {story_key}")
         self._do_resume(run_id)
 
