@@ -377,6 +377,28 @@ def test_build_context_tolerates_non_utf8_sentinel(tmp_path):
     assert ctx["stories"]["sentinel"]["blocking_condition"] == ""  # unreadable → empty
 
 
+def test_rearm_non_utf8_present_spec_fails_clean_and_stays_armed(tmp_path):
+    """The non-sentinel re-arm branch re-reads the spec as UTF-8 to flip its
+    status. An undecodable PRESENT spec is a first-class escalation state
+    (resolve_story_spec degrades it to a wedge), so it can reach this flip: rearm
+    must fail with an actionable RearmError BEFORE anything is persisted — the
+    escalation stays armed for a retry once the human fixes/replaces the file —
+    never a traceback out of `bmad-loop resolve`."""
+    key = "6-4-cli-list-command"
+    stories_dir = tmp_path / "stories"
+    stories_dir.mkdir(parents=True)
+    spec = stories_dir / f"{key}-slug.md"  # a real spec, not a fixed-slug sentinel
+    spec.write_bytes(_BAD_UTF8)
+    run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec), source="stories")
+
+    with pytest.raises(runs.RearmError) as exc:
+        runs.rearm_escalation(run_dir)
+    assert "UTF-8" in str(exc.value) and "resolve" in str(exc.value)
+    assert spec.read_bytes() == _BAD_UTF8  # spec untouched
+    task = load_state(run_dir).tasks[key]
+    assert task.phase == Phase.ESCALATED  # nothing persisted; still armed for resolve
+
+
 def test_rearm_tolerates_non_utf8_sentinel(tmp_path):
     """A binary/non-UTF-8 sentinel must not crash rearm_escalation: the sentinel is
     still preserved+deleted, the run re-arms, and the journal records an empty

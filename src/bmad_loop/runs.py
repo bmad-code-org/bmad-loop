@@ -575,14 +575,27 @@ def rearm_escalation(run_dir: Path, story_key: str | None = None) -> str:
             task.spec_file = None
             task.sentinel_kind = ""  # verdict discharged; the re-dispatch is clean
         else:
-            # route /bmad-dev-auto to re-implement (decision table: ready-for-dev
-            # -> step-03); independent of the resolve agent having set it.
-            verify.set_frontmatter_status(spec_path, "ready-for-dev")
-            # drop the stale `## Auto Run Result` section along with the status flip
-            # (mirrors engine._reset_spec_for_repair): find_result_artifact keys on
-            # that heading, so leaving it would let the re-driven session's first
-            # save of the spec parse as the prior attempt's terminal outcome.
-            devcontract.strip_auto_run_result(spec_path)
+            try:
+                # route /bmad-dev-auto to re-implement (decision table: ready-for-dev
+                # -> step-03); independent of the resolve agent having set it.
+                verify.set_frontmatter_status(spec_path, "ready-for-dev")
+                # drop the stale `## Auto Run Result` section along with the status flip
+                # (mirrors engine._reset_spec_for_repair): find_result_artifact keys on
+                # that heading, so leaving it would let the re-driven session's first
+                # save of the spec parse as the prior attempt's terminal outcome.
+                devcontract.strip_auto_run_result(spec_path)
+            except (OSError, UnicodeDecodeError) as e:
+                # Both helpers re-read the spec as UTF-8; an undecodable PRESENT
+                # spec is a first-class escalation state (resolve_story_spec
+                # degrades it to a wedge), so it can reach this flip. Without the
+                # flip the re-drive would just re-wedge — abort BEFORE any state
+                # is persisted (save_state runs below) with an actionable error
+                # instead of a traceback; the escalation stays armed for a retry.
+                raise RearmError(
+                    f"cannot re-open story spec {spec_path} for the re-drive "
+                    f"({e.__class__.__name__}: {e}) — fix or replace the file "
+                    f"(it must be readable UTF-8), then re-run resolve"
+                ) from e
 
     # Advance the attempt baseline to the project's current HEAD and refresh the
     # untracked snapshot: whatever the human-driven resolve session left on the

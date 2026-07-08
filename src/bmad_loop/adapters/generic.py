@@ -529,11 +529,21 @@ class GenericDevAdapter(GenericAdapter):
                 and state.path
                 and self._written_this_session(state.path, handle.launched_ns)
             ):
-                result = devcontract.synthesize_result(
-                    state.path, story_key=story_key or None, plan_halt=plan_halt
-                )
-                if result.result_json is not None:
-                    return result.result_json
+                try:
+                    result_json = devcontract.synthesize_result(
+                        state.path, story_key=story_key or None, plan_halt=plan_halt
+                    ).result_json
+                except UnicodeDecodeError:
+                    # A non-UTF-8 read is either a torn glimpse of a spec still
+                    # being written (keep polling — a later pass sees the finished
+                    # write) or a genuinely corrupt file: then the grace expires
+                    # result-less and the next _pick_next re-classifies it as a
+                    # wedge (resolve_story_spec degrades an undecodable PRESENT
+                    # spec to status "" → pause for resolve), never a crash of
+                    # the read-back poll.
+                    result_json = None
+                if result_json is not None:
+                    return result_json
             if not wait or time.monotonic() >= deadline:
                 return None
             time.sleep(RESULT_POLL_S)

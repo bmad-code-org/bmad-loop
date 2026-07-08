@@ -854,7 +854,15 @@ def capture_diff(repo: Path, baseline: str, *, max_file_bytes: int | None = None
 def read_frontmatter(path: Path) -> dict[str, Any]:
     if not path.is_file():
         return {}
-    text = path.read_text(encoding="utf-8")
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        # A non-UTF-8 file carries no readable frontmatter — degrade exactly like
+        # unparseable YAML below. Every status gate then reads status "" and
+        # returns a clean retry/repair outcome instead of crashing mid-verify
+        # (UnicodeDecodeError is a ValueError, so it slipped past callers'
+        # except-OSError guards).
+        return {}
     if not text.startswith("---"):
         return {}
     parts = text.split("---", 2)

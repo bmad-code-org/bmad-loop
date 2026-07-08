@@ -504,6 +504,19 @@ def test_stories_readback_non_terminal_returns_none(tmp_path):
     assert adapter._result_json(_dev_handle(), _stories_spec(tmp_path), wait=False) is None
 
 
+def test_stories_readback_non_utf8_spec_returns_none(tmp_path):
+    """synthesize_result re-reads the resolved spec as UTF-8; a binary/undecodable
+    spec (or a torn glimpse of one still being written) must degrade to a
+    result-less poll, never crash the read-back. resolve_story_spec classifies it
+    PRESENT with status "" — so without the guard the poll dies on the very state
+    the engine is designed to wedge-and-pause on at the next pick."""
+    adapter, _ = make_dev_adapter(tmp_path)
+    d = tmp_path / "epic" / "stories"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "1-slug.md").write_bytes(b"\xff\xfe\x00\x01 not utf-8 \x80\x81")
+    assert adapter._result_json(_dev_handle(), _stories_spec(tmp_path), wait=False) is None
+
+
 def test_stories_readback_plan_halt_is_successful_terminal(tmp_path):
     # BMAD_LOOP_PLAN_HALT flips the SAME ready-for-dev spec into a successful,
     # plan-marked terminal (the leg-1 plan is done, awaiting implementation).

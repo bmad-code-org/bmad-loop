@@ -605,6 +605,18 @@ def test_verify_review_stories_non_done_retries(project):
     assert not out.ok and "expected 'done'" in out.reason
 
 
+def test_verify_review_stories_non_utf8_spec_retries(project):
+    """A spec that became undecodable mid-run must produce a clean retry (status
+    reads as ""), not a UnicodeDecodeError crash of review verification."""
+    spec_folder = project.planning_artifacts / "epic-a"
+    task = make_stories_task(project, "1")
+    sp = write_story(spec_folder, "1", "x", "done", task.baseline_commit)
+    sp.write_bytes(b"\xff\xfe\x00\x01 not utf-8 \x80\x81")
+    task.spec_file = str(sp)
+    out = verify.verify_review_stories(task, project, Policy())
+    assert not out.ok and "expected 'done'" in out.reason
+
+
 def test_verify_review_bundle_ledger_gate(project):
     task = make_bundle_task(project)
     sp = project.implementation_artifacts / "spec-dw-test-bundle.md"
@@ -981,6 +993,17 @@ def test_read_frontmatter_tolerates_garbage(project):
     p.write_text("no frontmatter here")
     assert verify.read_frontmatter(p) == {}
     p.write_text("---\n: : :\nbroken yaml [\n---\nbody")
+    assert verify.read_frontmatter(p) == {}
+
+
+def test_read_frontmatter_tolerates_non_utf8(project):
+    """UnicodeDecodeError is a ValueError, so it slipped past every caller's
+    except-OSError guard. An undecodable file now degrades exactly like
+    unparseable YAML — {} → status "" → the status gates return a clean retry
+    instead of crashing verify (stories dev/review gates and the pre-existing
+    sprint/bundle paths alike)."""
+    p = project.project / "x.md"
+    p.write_bytes(b"\xff\xfe\x00\x01 not utf-8 \x80\x81")
     assert verify.read_frontmatter(p) == {}
 
 
