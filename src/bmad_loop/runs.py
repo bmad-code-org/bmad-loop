@@ -566,7 +566,7 @@ def rearm_escalation(
         raise RearmError(f"run {run_dir.name} has no task for story {key}")
     if task.phase != Phase.ESCALATED:
         raise RearmError(f"story {key} is not escalated (phase: {task.phase})")
-    # T1 guard (stories × patch-restore): a sentinel-wedged story escalated BEFORE
+    # T1 guard (stories x patch-restore): a sentinel-wedged story escalated BEFORE
     # planning — there is no attempted implementation to restore, and its re-arm
     # re-dispatches a planning leg. Keyed on the recorded detection verdict
     # (task.sentinel_kind), not the on-disk basename, mirroring the sentinel-clear

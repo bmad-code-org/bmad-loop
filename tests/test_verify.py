@@ -1110,7 +1110,7 @@ def test_verify_dev_exclude_relpaths_is_file_granular(project):
 
 
 def test_verify_dev_exclude_relpaths_includes_latched_restore_patch(project):
-    """T4 (patch-restore × #79): a latched intent-gap patch file joins the
+    """T4 (patch-restore x #79): a latched intent-gap patch file joins the
     file-granular excludes — absolute or project-relative, both derive the same
     repo-relative entry; no latch leaves the excludes unchanged."""
     sp = spec_path(project, "1-1-a")
@@ -1122,7 +1122,7 @@ def test_verify_dev_exclude_relpaths_includes_latched_restore_patch(project):
 
 
 def test_verify_dev_latched_restore_patch_is_not_proof_of_work(project):
-    """T4 (patch-restore × #79): the latched patch file is untracked halt residue
+    """T4 (patch-restore x #79): the latched patch file is untracked halt residue
     under the protected artifact dirs — it survives every reset, so counting it
     would let a restore re-drive whose session produced nothing pass the
     proof-of-work gate on the patch's mere presence. The gate must key on the

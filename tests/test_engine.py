@@ -2226,7 +2226,7 @@ def test_intent_gap_restore_reapplies_after_mid_redrive_rollback(project):
 
 
 def test_intent_gap_restore_escalates_when_resolution_commits_overlap(project):
-    """T2 (patch-restore × #78 baseline advance): re-arm adopts the resolve
+    """T2 (patch-restore x #78 baseline advance): re-arm adopts the resolve
     session's commits as the re-drive's baseline, but the saved patch was diffed
     from the ORIGINAL baseline — so a resolution commit that rewrote the patched
     lines makes the restore's `git apply` fail. The engine must escalate loudly

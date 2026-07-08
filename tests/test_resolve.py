@@ -338,7 +338,7 @@ def test_rearm_sprint_spec_named_like_a_sentinel_is_not_deleted(tmp_path):
 
 
 def test_rearm_rejects_restore_patch_on_a_sentinel(tmp_path):
-    """T1 (stories × patch-restore): a sentinel-wedged story escalated BEFORE
+    """T1 (stories x patch-restore): a sentinel-wedged story escalated BEFORE
     planning — there is no attempted implementation to restore, and its re-arm
     re-dispatches a planning leg, so laying a patch onto the tree first is never
     safe. Re-arm must reject loudly BEFORE mutating anything: the sentinel stays
