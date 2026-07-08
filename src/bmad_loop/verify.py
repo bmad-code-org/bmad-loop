@@ -946,7 +946,9 @@ def artifact_relpaths(paths: ProjectPaths) -> tuple[str, ...]:
     return tuple(out)
 
 
-def verify_dev_exclude_relpaths(paths: ProjectPaths, spec_path: Path) -> tuple[str, ...]:
+def verify_dev_exclude_relpaths(
+    paths: ProjectPaths, spec_path: Path, restore_patch: str | None = None
+) -> tuple[str, ...]:
     """Repo-relative posix paths the dev/bundle proof-of-work gate excludes from
     `has_changes_since` — file-granularity, unlike `artifact_relpaths`' whole-folder
     exclusion (still used as-is by `Engine._protected_relpaths` for rollback
@@ -965,15 +967,26 @@ def verify_dev_exclude_relpaths(paths: ProjectPaths, spec_path: Path) -> tuple[s
     reconciliation registers as real work instead of a permanent false "no changes
     since baseline".
 
+    `restore_patch` (the task's latched intent-gap patch file, BMAD-METHOD #2564)
+    is excluded too when set: the patch is untracked halt residue under the
+    protected artifact dirs that survives every reset, so counting it would let a
+    restore re-drive whose session produced nothing pass the gate on the patch
+    file's mere presence — the gate must key on the APPLIED work (the tracked diff
+    from baseline), not on the orchestrator-owned patch that carried it.
+
     `spec_path` comes from a session-reported (untrusted) `spec_file` string, so
     it is `.resolve()`d before deriving the relpath, same as `spec_within_roots`:
     an un-normalized `..`/`.` segment would still resolve to the real on-disk
     file (the OS resolves it), but as a raw string it wouldn't match git's own
     normalized path output, silently defeating this exclude and letting a bare
     status flip on the session's own spec count as real work."""
+    candidates: list[Path] = [paths.sprint_status, spec_path]
+    if restore_patch:
+        p = Path(restore_patch)
+        candidates.append(p if p.is_absolute() else paths.project / p)
     out: list[str] = []
     project = paths.project.resolve()
-    for path in (paths.sprint_status, spec_path):
+    for path in candidates:
         try:
             rel = path.resolve().relative_to(project).as_posix()
         except ValueError:
@@ -1088,7 +1101,7 @@ def verify_dev(
         task,
         paths,
         expected_status="in-review" if review_enabled else "done",
-        proof_exclude=verify_dev_exclude_relpaths(paths, spec_path),
+        proof_exclude=verify_dev_exclude_relpaths(paths, spec_path, task.restore_patch),
     )
     if gate is not None:
         return gate
@@ -1131,7 +1144,7 @@ def verify_dev_bundle(
         task,
         paths,
         expected_status="in-review" if review_enabled else "done",
-        proof_exclude=verify_dev_exclude_relpaths(paths, spec_path),
+        proof_exclude=verify_dev_exclude_relpaths(paths, spec_path, task.restore_patch),
     )
     if gate is not None:
         return gate
@@ -1244,7 +1257,7 @@ def verify_dev_stories(
         proof_exclude=(
             None
             if plan_halt
-            else verify_dev_exclude_relpaths(paths, spec_path)
+            else verify_dev_exclude_relpaths(paths, spec_path, task.restore_patch)
             + _stories_relpaths(paths.project, spec_folder)
         ),
     )

@@ -1109,6 +1109,42 @@ def test_verify_dev_exclude_relpaths_is_file_granular(project):
     assert "_bmad-output/implementation-artifacts/deferred-work.md" not in rels
 
 
+def test_verify_dev_exclude_relpaths_includes_latched_restore_patch(project):
+    """T4 (patch-restore × #79): a latched intent-gap patch file joins the
+    file-granular excludes — absolute or project-relative, both derive the same
+    repo-relative entry; no latch leaves the excludes unchanged."""
+    sp = spec_path(project, "1-1-a")
+    patch = project.implementation_artifacts / "attempt.patch"
+    rel = "_bmad-output/implementation-artifacts/attempt.patch"
+    assert rel in verify.verify_dev_exclude_relpaths(project, sp, str(patch))
+    assert rel in verify.verify_dev_exclude_relpaths(project, sp, rel)
+    assert rel not in verify.verify_dev_exclude_relpaths(project, sp)
+
+
+def test_verify_dev_latched_restore_patch_is_not_proof_of_work(project):
+    """T4 (patch-restore × #79): the latched patch file is untracked halt residue
+    under the protected artifact dirs — it survives every reset, so counting it
+    would let a restore re-drive whose session produced nothing pass the
+    proof-of-work gate on the patch's mere presence. The gate must key on the
+    APPLIED work (tracked diff from baseline), not the patch that carried it."""
+    write_sprint(project, {"1-1-a": "review"})
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", "NO_VCS")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "baseline")
+    task = make_task(project)
+    patch = project.implementation_artifacts / "attempt.patch"
+    patch.write_text("stale attempt diff\n", encoding="utf-8")  # untracked residue
+
+    # control: unlatched, the residue is indistinguishable from session work and
+    # passes the gate — exactly the vacuous pass the latch exclusion prevents
+    assert verify.verify_dev(task, project, dev_result(sp)).ok
+
+    task.restore_patch = str(patch)
+    out = verify.verify_dev(task, project, dev_result(sp))
+    assert not out.ok and "no changes" in out.reason
+
+
 def test_verify_dev_exclude_relpaths_normalizes_dotdot_segments(project):
     """A spec_path with a lexical '..' hop (as an un-normalized session-reported
     spec_file could produce) must resolve to the same exclude entry as the plain
