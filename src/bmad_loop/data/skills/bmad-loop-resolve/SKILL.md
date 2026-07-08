@@ -145,6 +145,23 @@ block inside it. So for a sentinel:
   disambiguate; set `spec_file` to whatever you edited (e.g. `SPEC.md`), or omit
   it if the fix was entirely in `stories.yaml`.
 
+### Not a sentinel: more than one file matches the id
+
+Distinct from the single-file `<id>-ambiguous.md` sentinel above: when **more
+than one** file in `stories/` matches `<id>-*.md` (say `3-login.md` AND
+`3-signup.md`), the id itself is ambiguous _on disk_ and the orchestrator wedges
+the story without picking either file. You can recognize this state by the
+escalation reason (`ambiguous story file match: <names>`) and by what the
+context does NOT have: no `stories.sentinel` block and no single spec path.
+
+The auto-clear above does **not** apply — there is no sentinel to preserve and
+delete, and re-arming alone just re-wedges on the same duplicates. The
+resolution IS the cleanup: with the human, decide which file is the story's real
+spec and remove or rename the other (merge content first if both carry real
+work; renaming must move it out of the `<id>-*` pattern or to another id).
+Exactly one match re-dispatches that spec; zero matches re-plans from scratch.
+Then write the resolution marker as usual — re-arm + resume takes it from there.
+
 ## If you cannot resolve it
 
 If the human defers, the information needed is genuinely unavailable, or the
