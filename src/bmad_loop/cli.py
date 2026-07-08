@@ -869,10 +869,19 @@ def _resolve_restore_patch(
     if not patch.is_absolute():
         patch = project / patch
     patch = patch.resolve()
-    if not patch.is_file() or not patch.is_relative_to(project.resolve()):
+    # Same trusted-roots shape as the frontmatter reconcile's spec_within_roots:
+    # bmad-dev-auto saves the patch under implementation_artifacts, and artifact
+    # dirs configured OUTSIDE the project tree are a supported layout — a bare
+    # is_relative_to(project) check would reject every legitimate restore there.
+    try:
+        paths = bmadconfig.load_paths(project)
+    except bmadconfig.BmadConfigError as e:
+        return None, f"cannot validate the restore patch path against the project config: {e}"
+    if not patch.is_file() or not verify.spec_within_roots(patch, paths):
         return None, (
-            f"restore patch {raw!r} is not a file under the project — refusing to "
-            "re-arm (fix the path, or re-run without a restore to re-drive from scratch)"
+            f"restore patch {raw!r} is not a file under the project or its "
+            "configured artifact roots — refusing to re-arm (fix the path, or "
+            "re-run without a restore to re-drive from scratch)"
         )
     return str(patch), None
 

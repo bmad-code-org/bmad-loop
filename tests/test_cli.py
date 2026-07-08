@@ -812,6 +812,18 @@ def test_archive_refuses_live_run_without_force(tmp_path, monkeypatch, capsys):
     assert run_dir.exists()
 
 
+def _write_bmad_config(project, impl="{project-root}/artifacts"):
+    """Minimal _bmad/bmm/config.yaml — restore-patch validation resolves the
+    artifact roots through bmadconfig.load_paths, like every real project."""
+    cfg = project / "_bmad" / "bmm"
+    cfg.mkdir(parents=True, exist_ok=True)
+    (cfg / "config.yaml").write_text(
+        f"implementation_artifacts: '{impl}'\n"
+        "planning_artifacts: '{project-root}/planning'\n",
+        encoding="utf-8",
+    )
+
+
 def _escalated_run(project, run_id="r1", *, story="s1", spec_file=None):
     from bmad_loop.model import Phase, StoryTask
 
@@ -977,6 +989,7 @@ def test_resolve_no_interactive_restore_patch_latches_in_review(tmp_path, monkey
 
     spec = tmp_path / "spec.md"
     spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+    _write_bmad_config(tmp_path)
     patch = tmp_path / "artifacts" / "attempt.patch"
     patch.parent.mkdir(parents=True)
     patch.write_text("diff", encoding="utf-8")
@@ -1009,6 +1022,7 @@ def test_resolve_restore_patch_missing_file_rejected(tmp_path, monkeypatch, caps
 
     spec = tmp_path / "spec.md"
     spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+    _write_bmad_config(tmp_path)
     run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
     called: list = []
     monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: called.append(rd) or 0)
@@ -1039,6 +1053,7 @@ def test_resolve_restore_patch_outside_project_rejected(tmp_path, monkeypatch, c
 
     project = tmp_path / "proj"
     project.mkdir()
+    _write_bmad_config(project)
     outside = tmp_path / "outside.patch"  # a real file, wrong side of the fence
     outside.write_text("diff", encoding="utf-8")
     spec = project / "spec.md"
@@ -1063,6 +1078,46 @@ def test_resolve_restore_patch_outside_project_rejected(tmp_path, monkeypatch, c
     assert called == []  # never resumed
     task = load_state(run_dir).tasks["s1"]
     assert task.phase == Phase.ESCALATED and task.restore_patch is None  # not re-armed
+
+
+def test_resolve_restore_patch_in_outside_project_artifacts_allowed(tmp_path, monkeypatch):
+    """Artifact dirs configured OUTSIDE the project tree are a supported layout
+    (bmadconfig keeps them absolute; verify special-cases them throughout), and
+    bmad-dev-auto saves the intent-gap patch in implementation_artifacts — so a
+    patch there is a legitimate restore target: the containment check uses the
+    same trusted roots as spec_within_roots, not a bare under-project test."""
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    shared = tmp_path / "shared-artifacts"  # sibling dir, outside the project tree
+    shared.mkdir()
+    _write_bmad_config(project, impl=str(shared))
+    patch = shared / "attempt.patch"
+    patch.write_text("diff", encoding="utf-8")
+    spec = project / "spec.md"
+    spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+    run_dir = _escalated_run(project, "r1", spec_file=str(spec))
+
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+    rc = cli.main(
+        [
+            "resolve",
+            "--project",
+            str(project),
+            "r1",
+            "--no-interactive",
+            "--restore-patch",
+            str(patch),
+            "--resume",
+        ]
+    )
+    assert rc == 0
+    task = load_state(run_dir).tasks["s1"]
+    assert task.phase == Phase.PENDING
+    assert task.restore_patch == str(patch.resolve())  # latched despite being out-of-project
+    assert "in-review" in spec.read_text()
 
 
 def test_resolve_restore_patch_worktree_isolation_rejected(tmp_path, monkeypatch, capsys):
@@ -1107,6 +1162,7 @@ def test_resolve_interactive_restore_patch_from_resolution_json(tmp_path, monkey
 
     spec = tmp_path / "spec.md"
     spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+    _write_bmad_config(tmp_path)
     patch = tmp_path / "artifacts" / "attempt.patch"
     patch.parent.mkdir(parents=True)
     patch.write_text("diff", encoding="utf-8")
