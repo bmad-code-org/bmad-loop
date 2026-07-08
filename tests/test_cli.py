@@ -1030,6 +1030,77 @@ def test_resolve_restore_patch_missing_file_rejected(tmp_path, monkeypatch, caps
     assert load_state(run_dir).tasks["s1"].phase == Phase.ESCALATED  # not re-armed
 
 
+def test_resolve_restore_patch_outside_project_rejected(tmp_path, monkeypatch, capsys):
+    """A patch that EXISTS but sits outside the project root is rejected the same
+    as a missing one: an absolute path escaping the workspace must never be
+    latched (the engine would lay whatever it points at onto the tree)."""
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    outside = tmp_path / "outside.patch"  # a real file, wrong side of the fence
+    outside.write_text("diff", encoding="utf-8")
+    spec = project / "spec.md"
+    spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+    run_dir = _escalated_run(project, "r1", spec_file=str(spec))
+    called: list = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: called.append(rd) or 0)
+    rc = cli.main(
+        [
+            "resolve",
+            "--project",
+            str(project),
+            "r1",
+            "--no-interactive",
+            "--restore-patch",
+            str(outside),
+            "--resume",
+        ]
+    )
+    assert rc == 1
+    assert "not a file under the project" in capsys.readouterr().err
+    assert called == []  # never resumed
+    task = load_state(run_dir).tasks["s1"]
+    assert task.phase == Phase.ESCALATED and task.restore_patch is None  # not re-armed
+
+
+def test_resolve_restore_patch_worktree_isolation_rejected(tmp_path, monkeypatch, capsys):
+    """B4d: restore is an in-place-only recovery — a worktree-isolation re-drive
+    discards and re-mounts the unit's worktree, so a latched patch would silently
+    never restore. Rejected up front: no re-arm, no latch, spec untouched."""
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    _write_policy(tmp_path, '[scm]\nisolation = "worktree"\n')
+    spec = tmp_path / "spec.md"
+    spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+    patch = tmp_path / "artifacts" / "attempt.patch"
+    patch.parent.mkdir(parents=True)
+    patch.write_text("diff", encoding="utf-8")
+    run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
+    called: list = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: called.append(rd) or 0)
+    rc = cli.main(
+        [
+            "resolve",
+            "--project",
+            str(tmp_path),
+            "r1",
+            "--no-interactive",
+            "--restore-patch",
+            str(patch),
+            "--resume",
+        ]
+    )
+    assert rc == 1
+    assert "worktree" in capsys.readouterr().err
+    assert called == []  # never resumed
+    task = load_state(run_dir).tasks["s1"]
+    assert task.phase == Phase.ESCALATED and task.restore_patch is None  # not re-armed
+    assert "status: blocked" in spec.read_text()  # spec status untouched
+
+
 def test_resolve_interactive_restore_patch_from_resolution_json(tmp_path, monkeypatch):
     from bmad_loop import resolve
     from bmad_loop.journal import load_state

@@ -814,9 +814,10 @@ def _resolve_restore_patch(
     otherwise, on the interactive path, the resolve agent may have recorded a
     ``restore_patch`` field in resolution.json. Returns ``(latch, error)``: a
     validated absolute patch path to latch (None = ordinary from-scratch re-drive),
-    or an error string when a supplied path is missing / outside the project — the
-    caller aborts strictly rather than silently re-driving from scratch when the
-    operator asked to restore."""
+    or an error string when a supplied path is missing / outside the project, or
+    the run's isolation mode can't restore in place — the caller aborts strictly
+    rather than silently re-driving from scratch when the operator asked to
+    restore."""
     raw = getattr(args, "restore_patch", None)
     if raw is None and args.interactive:
         doc = resolve.read_resolution(run_dir, story_key)
@@ -825,6 +826,19 @@ def _resolve_restore_patch(
             raw = str(val) if val else None
     if not raw:
         return None, None
+    # Restore is an in-place-only recovery: a worktree-isolation re-drive discards
+    # and re-mounts the unit's worktree (engine._finish_inflight), so a patch laid
+    # onto the project tree has nowhere durable to land and the engine's apply seam
+    # is never reached. Reject up front instead of latching a patch that would
+    # silently never restore.
+    pol = policy_mod.load(_policy_path(project))
+    if pol.scm.isolation == "worktree":
+        return None, (
+            "restore patch is unsupported for worktree-isolation runs (the re-drive "
+            "discards and re-mounts the unit's worktree, so an in-place restore has "
+            "nothing durable to land on) — re-run without a restore patch for a "
+            "plain re-drive"
+        )
     patch = Path(raw)
     if not patch.is_absolute():
         patch = project / patch
