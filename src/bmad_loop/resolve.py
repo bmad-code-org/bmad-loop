@@ -57,7 +57,10 @@ def read_resolution(run_dir: Path, story_key: str) -> dict[str, Any] | None:
         return None
     try:
         doc = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as e:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        # UnicodeDecodeError is a ValueError, not an OSError — a non-UTF-8 marker
+        # must raise the clean ResolutionError, not crash (same class as the
+        # read_frontmatter / stories read-path hardening).
         raise ResolutionError(f"resolution marker {path} is unreadable ({e})") from e
     if not isinstance(doc, dict):
         raise ResolutionError(f"resolution marker {path} is not a JSON object")

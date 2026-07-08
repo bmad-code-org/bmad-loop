@@ -591,6 +591,17 @@ def test_rearm_tolerates_non_utf8_sentinel(tmp_path):
     assert cleared[0]["sentinel_kind"] == "unresolved" and cleared[0]["condition"] == ""
 
 
+def test_read_resolution_non_utf8_marker_is_resolution_error(tmp_path):
+    """UnicodeDecodeError is a ValueError, not an OSError — a non-UTF-8 marker
+    must surface as the clean ResolutionError every consumer handles (CLI abort,
+    TUI conservative warning), never an uncaught decode crash."""
+    marker = resolve.resolution_path(tmp_path, "6-4-cli-list-command")
+    marker.parent.mkdir(parents=True)
+    marker.write_bytes(_BAD_UTF8)
+    with pytest.raises(resolve.ResolutionError, match="unreadable"):
+        resolve.read_resolution(tmp_path, "6-4-cli-list-command")
+
+
 def test_rearm_rejects_non_escalation_stage(tmp_path):
     run_dir = tmp_path / ".bmad-loop" / "runs" / "r1"
     save_state(
