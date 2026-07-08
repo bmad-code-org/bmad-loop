@@ -337,6 +337,54 @@ def test_rearm_sprint_spec_named_like_a_sentinel_is_not_deleted(tmp_path):
     assert not (run_dir / "sentinels").exists()  # no sentinel preservation in sprint mode
 
 
+def test_rearm_rejects_restore_patch_on_a_sentinel(tmp_path):
+    """T1 (stories × patch-restore): a sentinel-wedged story escalated BEFORE
+    planning — there is no attempted implementation to restore, and its re-arm
+    re-dispatches a planning leg, so laying a patch onto the tree first is never
+    safe. Re-arm must reject loudly BEFORE mutating anything: the sentinel stays
+    on disk, the task stays ESCALATED, and no latch is persisted."""
+    key = "6-4-cli-list-command"
+    stories_dir = tmp_path / "stories"
+    stories_dir.mkdir(parents=True)
+    sentinel = stories_dir / f"{key}-unresolved.md"
+    sentinel.write_text(
+        "---\nstatus: blocked\n---\n\n## Auto Run Result\n\nStatus: blocked\nintent too vague\n",
+        encoding="utf-8",
+    )
+    run_dir, _, _ = _escalated_run(
+        tmp_path, spec_file=str(sentinel), source="stories", sentinel_kind="unresolved"
+    )
+
+    with pytest.raises(runs.RearmError, match="sentinel"):
+        runs.rearm_escalation(run_dir, restore_patch="artifacts/attempt.patch")
+
+    assert sentinel.is_file()  # nothing deleted, copy NOT preserved — no clear happened
+    task = load_state(run_dir).tasks[key]
+    assert task.phase == Phase.ESCALATED  # not re-armed; the escalation stays armed
+    assert task.restore_patch is None  # no latch persisted
+    assert task.sentinel_kind == "unresolved"  # detection verdict intact for a retry
+    # nothing was journaled at all — no sentinel-cleared, no story-escalation-resolved
+    assert not (run_dir / "journal.jsonl").exists()
+
+
+def test_rearm_restore_patch_on_a_real_stories_spec_is_allowed(tmp_path):
+    """The T1 guard keys on the recorded sentinel verdict, not on stories mode:
+    a review-stage intent gap on a REAL stories spec (sentinel_kind unset) is a
+    legitimate restore target and re-arms to in-review like sprint mode."""
+    key = "6-4-cli-list-command"
+    stories_dir = tmp_path / "stories"
+    stories_dir.mkdir(parents=True)
+    spec = stories_dir / f"{key}-slug.md"
+    spec.write_text("---\nstatus: blocked\n---\n\n## Intent\n\nx\n", encoding="utf-8")
+    run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec), source="stories")
+
+    runs.rearm_escalation(run_dir, restore_patch="artifacts/attempt.patch")
+    task = load_state(run_dir).tasks[key]
+    assert task.phase == Phase.PENDING
+    assert task.restore_patch == "artifacts/attempt.patch"
+    assert verify.read_frontmatter(spec)["status"] == "in-review"  # restore routing
+
+
 # -------------------------------------------------- non-UTF-8 robustness (bug class)
 # A story spec / sentinel is agent- or human-authored, so it can contain non-UTF-8
 # bytes. `read_text(encoding="utf-8")` raises UnicodeDecodeError (a ValueError, NOT an
