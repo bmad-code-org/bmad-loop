@@ -1130,6 +1130,98 @@ def test_resolve_interactive_restore_patch_from_resolution_json(tmp_path, monkey
     assert "in-review" in spec.read_text()
 
 
+def test_resolve_corrupt_resolution_json_aborts_loudly(tmp_path, monkeypatch, capsys):
+    """A present-but-unparseable resolution.json may carry the agent's recorded
+    restore decision, and a re-arm consumes the escalation — so corruption must
+    abort (no re-arm, no resume), never silently downgrade to a from-scratch
+    re-drive quieter than an absent marker."""
+    from bmad_loop import resolve
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    spec = tmp_path / "spec.md"
+    spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+    run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
+
+    def fake_session(adapter, project, rd, story_key, *, model=""):
+        marker = resolve.resolution_path(rd, story_key)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text('{"restore_patch": "artifacts/attempt.patch",}', encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
+    monkeypatch.setattr(resolve, "build_context", lambda *a, **k: None)
+    monkeypatch.setattr(resolve, "run_session", fake_session)
+    called: list = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: called.append(rd) or 0)
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--resume"])
+    assert rc == 1
+    assert "unreadable" in capsys.readouterr().err
+    assert called == []  # never resumed
+    task = load_state(run_dir).tasks["s1"]
+    assert task.phase == Phase.ESCALATED and task.restore_patch is None  # not re-armed
+    assert "status: blocked" in spec.read_text()  # spec untouched
+
+
+def test_resolve_empty_restore_patch_field_aborts_loudly(tmp_path, monkeypatch, capsys):
+    """`"restore_patch": ""` in resolution.json (schema says omit the field) is a
+    corrupted recorded decision, not "no restore" — abort, don't re-arm."""
+    from bmad_loop import resolve
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    spec = tmp_path / "spec.md"
+    spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+    run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
+
+    def fake_session(adapter, project, rd, story_key, *, model=""):
+        marker = resolve.resolution_path(rd, story_key)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps({"restore_patch": ""}), encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
+    monkeypatch.setattr(resolve, "build_context", lambda *a, **k: None)
+    monkeypatch.setattr(resolve, "run_session", fake_session)
+    called: list = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: called.append(rd) or 0)
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--resume"])
+    assert rc == 1
+    assert "invalid" in capsys.readouterr().err
+    assert called == []
+    assert load_state(run_dir).tasks["s1"].phase == Phase.ESCALATED  # not re-armed
+
+
+def test_resolve_empty_restore_patch_flag_aborts_loudly(tmp_path, monkeypatch, capsys):
+    """`--restore-patch ""` (unset shell variable) must abort, not silently
+    re-drive from scratch: the flag said restore, and a re-arm would consume the
+    escalation with the decision dropped."""
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    spec = tmp_path / "spec.md"
+    spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+    run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
+    called: list = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: called.append(rd) or 0)
+    rc = cli.main(
+        [
+            "resolve",
+            "--project",
+            str(tmp_path),
+            "r1",
+            "--no-interactive",
+            "--restore-patch",
+            "",
+            "--resume",
+        ]
+    )
+    assert rc == 1
+    assert "empty path" in capsys.readouterr().err
+    assert called == []
+    assert load_state(run_dir).tasks["s1"].phase == Phase.ESCALATED  # not re-armed
+
+
 def test_sweep_command_parses_flags():
     parser_args = [
         "sweep",

@@ -814,16 +814,42 @@ def _resolve_restore_patch(
     otherwise, on the interactive path, the resolve agent may have recorded a
     ``restore_patch`` field in resolution.json. Returns ``(latch, error)``: a
     validated absolute patch path to latch (None = ordinary from-scratch re-drive),
-    or an error string when a supplied path is missing / outside the project, or
-    the run's isolation mode can't restore in place — the caller aborts strictly
-    rather than silently re-driving from scratch when the operator asked to
-    restore."""
+    or an error string when a supplied path is missing / outside the project, the
+    run's isolation mode can't restore in place, or the restore input itself is
+    corrupt (unreadable resolution.json, empty/non-string value) — the caller
+    aborts strictly rather than silently re-driving from scratch when a restore
+    was (or may have been) asked for."""
     raw = getattr(args, "restore_patch", None)
+    if raw is not None and not raw.strip():
+        # `--restore-patch ""` is a classic unset-shell-var slip. Treating it as
+        # "no restore" would silently re-drive from scratch (and even mask a
+        # restore the resolve agent recorded) — and a re-arm consumes the
+        # escalation, so the dropped decision would be unrecoverable.
+        return None, (
+            "--restore-patch got an empty path (unset shell variable?) — pass the "
+            "saved patch path, or drop the flag entirely for a from-scratch re-drive"
+        )
     if raw is None and args.interactive:
-        doc = resolve.read_resolution(run_dir, story_key)
-        if doc is not None:
-            val = doc.get("restore_patch")
-            raw = str(val) if val else None
+        try:
+            doc = resolve.read_resolution(run_dir, story_key)
+        except resolve.ResolutionError as e:
+            return None, (
+                f"{e} — the recorded resolution (and any restore_patch decision in "
+                "it) cannot be read; fix or delete the file, or re-run with "
+                "--no-interactive [--restore-patch <path>] to decide by hand"
+            )
+        val = None if doc is None else doc.get("restore_patch")
+        if val is not None:
+            # the schema says omit the field for an ordinary resolution; an empty
+            # or non-string value is a corrupted recorded decision, not "none"
+            if not isinstance(val, str) or not val.strip():
+                return None, (
+                    f"resolution.json for {story_key} carries an invalid "
+                    f"restore_patch value {val!r} — expected a non-empty path (or "
+                    "the field omitted); fix the file, or re-run with "
+                    "--no-interactive [--restore-patch <path>] to decide by hand"
+                )
+            raw = val
     if not raw:
         return None, None
     # Restore is an in-place-only recovery: a worktree-isolation re-drive discards
