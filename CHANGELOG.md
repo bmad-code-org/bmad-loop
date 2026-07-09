@@ -37,7 +37,8 @@ breaking changes may land in a minor release.
   `git worktree add` with _"is not a valid branch name"_. Both segments now go through a new
   `platform_util.safe_ref_segment` — identity for clean ids, `-<hex8>` digest suffix otherwise, on
   git's alphabet rather than Windows' (`CON` is a legal ref; `a..b` is a legal filename). A
-  `git check-ref-format` oracle test pins the agreement. (closes #102)
+  `git check-ref-format` oracle test pins the agreement; the `attempt-preserve` recovery-ref slugs
+  now reuse the same sanitizer instead of their own inline one. (closes #102)
 - **The deferred-artifact stash overwrites its target atomically.** A story deferring a second time
   re-stashes the same spec filename over the previous one. `shutil.move` fell back to a non-atomic
   `copy2` there — which tears the stash on a mid-copy crash and fails outright on Windows when an

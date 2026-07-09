@@ -39,7 +39,7 @@ from .model import (
     SessionRecord,
     StoryTask,
 )
-from .platform_util import atomic_replace, retrying_unlink, safe_segment
+from .platform_util import atomic_replace, retrying_unlink, safe_ref_segment, safe_segment
 from .plugins import HookBus, HookContext, PluginRegistry
 from .policy import Policy
 from .runs import kill_session
@@ -978,11 +978,12 @@ class Engine:
         if not commits:
             return
         head = verify.rev_parse_head(self.workspace.root)  # the tip the recovery ref parks at
-        # run_id can be an arbitrary user `--run-id`; keep the ref component git-safe
-        # and length-bounded so an exotic/overlong id can't blow the ref-name limit,
-        # fail `git branch`, and drop the recovery ref (which on a re-drive would then
-        # reset past the work anyway).
-        slug = "".join(c if (c.isalnum() or c in "_-") else "-" for c in self.state.run_id)[:64]
+        # run_id can be an arbitrary user `--run-id`; ref-sanitize it (same
+        # identity-for-clean-ids / digest-for-dirty contract as the unit branches) so
+        # an exotic/overlong id can't blow the ref-name limit, fail `git branch`, and
+        # drop the recovery ref (which on a re-drive would then reset past the work
+        # anyway).
+        slug = safe_ref_segment(self.state.run_id)
         try:
             ref = verify.preserve_commits(
                 self.workspace.root,
@@ -1017,9 +1018,9 @@ class Engine:
         baseline = task.baseline_commit
         if not baseline:
             return
-        # Same git-safe, length-bounded slug as _preserve_attempt_commits so an
-        # exotic/overlong --run-id can't blow the ref-name limit and drop the ref.
-        slug = "".join(c if (c.isalnum() or c in "_-") else "-" for c in self.state.run_id)[:64]
+        # Same ref-sanitized slug as _preserve_attempt_commits so an exotic/overlong
+        # --run-id can't blow the ref-name limit and drop the ref.
+        slug = safe_ref_segment(self.state.run_id)
         # ``baseline_commit`` is fixed across the whole dev retry loop, so keying the
         # ref on the baseline alone would make a 2nd dirty rollback reuse the name and
         # orphan the 1st attempt's snapshot. ``task.attempt`` only ever increments

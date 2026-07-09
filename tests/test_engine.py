@@ -1678,6 +1678,33 @@ def test_rollback_preserves_distinct_refs_across_repeated_dirty_rollbacks(projec
     assert git(repo, "show", f"{refs[1]}:src.txt") == "attempt 1 edit"
 
 
+def test_rollback_preserve_ref_slug_survives_a_ref_illegal_run_id(project):
+    """A `--run-id` carrying ref-illegal sequences must not drop the recovery ref.
+    Characterization for the safe_ref_segment swap — the old inline alnum/`_-` slug
+    also kept the ref legal; what this pins is the invariant (real git accepts the
+    slugged ref and the snapshot stays reachable) plus the new digest-suffixed shape."""
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(rollback_on_failure=True),
+    )
+    engine, _ = make_engine(project, [], policy=policy)
+    engine.state.run_id = "story/1:2..3@{now}.lock"
+    repo = project.project
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.baseline_commit = rev_parse_head(repo)
+    task.baseline_untracked = []
+    (repo / "src.txt").write_text("uncommitted edit\n")
+
+    engine._rollback_or_pause(task)
+
+    assert rev_parse_head(repo) == task.baseline_commit  # reset happened
+    entry = next(e for e in engine.journal.entries() if e["kind"] == "attempt-worktree-preserved")
+    ref = entry["ref"]
+    assert ref.startswith("refs/attempt-preserve-dirty/story_1_2__3_{now}.lock-")
+    assert git(repo, "show", f"{ref}:src.txt") == "uncommitted edit"  # real git resolves it
+
+
 def test_run_start_prunes_excess_preserve_refs(project):
     """Run start with scm.preserve_keep set and more attempt-preserve/* refs than
     the budget: the tail is deleted before the loop, only preserve_keep refs
