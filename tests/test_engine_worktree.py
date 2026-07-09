@@ -235,6 +235,24 @@ def test_branch_per_run_naming(project):
     assert branch_exists(project.project, "bmad-loop/test-run")
 
 
+def test_dirty_unit_key_branch_is_created_by_real_git(project):
+    """#102: a unit key carrying ref-illegal sequences reached `git branch` raw and
+    blew up at worktree-mount time. `unit_branch_name` now ref-sanitizes both
+    segments, so real git accepts the name — while the worktree dir (safe_segment)
+    and the branch (safe_ref_segment) are each sanitized on their own alphabet."""
+    from bmad_loop.workspace import open_unit_workspace, unit_branch_name
+
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    key = "story/1:2..3@{now}.lock"
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    unit = open_unit_workspace(project.project, project, "test-run", key, "main", "story", run_dir)
+
+    assert unit.branch == unit_branch_name("test-run", key, "story")
+    assert unit.branch.startswith("bmad-loop/test-run/story_1_2__3_{now}.lock-")
+    assert branch_exists(project.project, unit.branch)  # real git accepted the name
+    assert unit.path.is_dir() and unit.path.name != key  # dir sanitized separately
+
+
 # ----------------------------------------------------------------- merge strategies
 
 

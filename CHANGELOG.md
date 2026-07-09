@@ -31,6 +31,19 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **Unit keys with git-ref-illegal characters no longer break worktree runs.** `unit_branch_name`
+  built `bmad-loop/<run_id>/<unit_key>` from the raw ids, so a key or `--run-id` carrying `:`, `..`,
+  `@{`, a space or a trailing `.lock` cleared the (already-sanitized) worktree dir only to die at
+  `git worktree add` with _"is not a valid branch name"_. Both segments now go through a new
+  `platform_util.safe_ref_segment` — identity for clean ids, `-<hex8>` digest suffix otherwise, on
+  git's alphabet rather than Windows' (`CON` is a legal ref; `a..b` is a legal filename). A
+  `git check-ref-format` oracle test pins the agreement. (closes #102)
+- **The deferred-artifact stash overwrites its target atomically.** A story deferring a second time
+  re-stashes the same spec filename over the previous one. `shutil.move` fell back to a non-atomic
+  `copy2` there — which tears the stash on a mid-copy crash and fails outright on Windows when an
+  AV/indexer handle turns the rename into a sharing violation. The stash now stages a copy inside the
+  destination dir and routes through `platform_util.atomic_replace`, inheriting its win32 retry.
+  (closes #101)
 - **A finished session whose final `Stop` hook was lost no longer loses its work.** A dev/review
   session that wrote its terminal spec but never delivered the `Stop` ended `stalled` — or `timeout`,
   when hooks were misconfigured and no event ever arrived — and the on-disk result was discarded.

@@ -39,7 +39,7 @@ from .model import (
     SessionRecord,
     StoryTask,
 )
-from .platform_util import safe_segment
+from .platform_util import atomic_replace, safe_segment
 from .plugins import HookBus, HookContext, PluginRegistry
 from .policy import Policy
 from .runs import kill_session
@@ -2337,7 +2337,19 @@ class Engine:
     def _stash_deferred_artifacts(self, task: StoryTask) -> None:
         """Move the deferred story's spec out of the artifacts dir into the run
         dir: a leftover in-review spec would confuse the next attempt, but the
-        work in it is worth keeping for the human."""
+        work in it is worth keeping for the human.
+
+        A story that defers twice re-stashes the same filename, so the target may
+        exist. `shutil.move` survived that on Windows only by accident: `os.rename`
+        raises FileExistsError over an existing target, `move` catches *any* OSError
+        and falls back to `copy2` + `unlink`. Two real hazards ride on that fallback
+        (#101) — it re-fails outright when an AV/indexer handle turns the rename into
+        a sharing violation (WinError 5/32) and `copy2` then cannot open the same
+        locked target, and it is non-atomic, so a crash mid-copy leaves a truncated
+        stash. Staging a copy inside `dest` and `atomic_replace`-ing it onto the
+        target overwrites in one step, carries #98's win32 retry, and — because the
+        staging copy lives in `dest` — keeps the replace same-filesystem, preserving
+        `shutil.move`'s cross-device tolerance."""
         if not task.spec_file:
             return
         spec_path = Path(task.spec_file)
@@ -2345,11 +2357,20 @@ class Engine:
             return
         dest = self.run_dir / "deferred" / safe_segment(task.story_key)
         dest.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(spec_path), str(dest / spec_path.name))
+        target = dest / spec_path.name
+        tmp = dest / (spec_path.name + ".tmp")
+        shutil.copy2(spec_path, tmp)
+        try:
+            atomic_replace(tmp, target)
+        except BaseException:
+            with contextlib.suppress(OSError):  # the copy is disposable; keep the real error
+                tmp.unlink(missing_ok=True)
+            raise
+        spec_path.unlink()
         self.journal.append(
             "deferred-artifacts-stashed",
             story_key=task.story_key,
-            stashed_to=str(dest / spec_path.name),
+            stashed_to=str(target),
         )
 
     def _escalate(self, task: StoryTask, reason: str) -> None:

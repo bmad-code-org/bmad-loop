@@ -8,6 +8,7 @@ the legacy ``platform_util`` entry points still delegate, plus the real
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 
 import pytest
@@ -197,3 +198,133 @@ def test_dirty_story_key_segment_is_creatable(tmp_path):
     d = resolve._story_dir(tmp_path, 'a<b>:c."')
     d.mkdir(parents=True)
     assert d.is_dir()
+
+
+# -------------------------------------------------------------- safe_ref_segment
+
+# Raw keys spanning every rule class, shared by the property tests and the git
+# oracle. Only the sanitizer's *output* is ever handed to git, so NUL/DEL/tab in
+# here never reach a subprocess argv.
+_REF_CORPUS = [
+    # clean — must survive the oracle byte-identical
+    "3-2-digest-delivery",
+    "epic1_story2",
+    "a.b.c",
+    "plain",
+    "CON",
+    "-leading-dash",
+    "a<b>c",
+    'a"b|c',
+    "a]b",
+    "@@",
+    "é-ünïcødé",
+    # one per coercion rule
+    "a:b",
+    "a b",
+    "a~b",
+    "a^b",
+    "a?b",
+    "a*b",
+    "a[b",
+    "a\\b",
+    "a/b",
+    "with\ttab",
+    "a\x7fb",
+    "a\x00b",
+    "a..b",
+    "a@{b",
+    ".hidden",
+    "x.",
+    "a.lock",
+    "@",
+    "",
+    "x" * 500,
+    # adversarial combinations
+    "...",
+    "....",
+    ".lock",
+    "..lock",
+    "a.lock.lock",
+    "@{u}",
+    "refs/heads/x",
+    "/lead",
+    "trail/",
+    "a//b",
+    "  ",
+    "story/1:2..3@{now}.lock",
+]
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["3-2-digest-delivery", "epic1_story2", "a.b.c", "plain", "CON", "-leading-dash", "a<b>c"],
+)
+def test_safe_ref_segment_identity_for_clean_input(value):
+    # git's alphabet is not Windows': `CON` and `a<b>c` are ref-legal (safe_segment
+    # rewrites both), and a leading `-` is legal inside the always-prefixed branch.
+    assert platform_util.safe_ref_segment(value) == value
+
+
+@pytest.mark.parametrize(
+    "value, base",
+    [
+        ("a:b", "a_b"),  # colon
+        ("a b", "a_b"),  # space
+        ("a~b", "a_b"),
+        ("a^b", "a_b"),
+        ("a?b", "a_b"),
+        ("a*b", "a_b"),
+        ("a[b", "a_b"),
+        ("a\\b", "a_b"),
+        ("a/b", "a_b"),  # would split one component into two
+        ("with\ttab", "with_tab"),  # control char
+        ("a\x7fb", "a_b"),  # DEL
+        ("a..b", "a__b"),  # ref-illegal, filename-legal
+        ("a@{b", "a_{b"),
+        (".hidden", "_hidden"),  # leading dot
+        ("x.", "x."),  # trailing dot: no rewrite, the digest suffix is the fix
+        ("a.lock", "a.lock"),  # trailing .lock: ditto
+        ("@", "_"),  # lone @
+        ("", "_"),
+    ],
+)
+def test_safe_ref_segment_coerces_and_suffixes_changed_input(value, base):
+    out = platform_util.safe_ref_segment(value)
+    assert out != value
+    assert out.startswith(base + "-")  # sanitized base + collision-suffix digest
+
+
+def test_safe_ref_segment_distinct_dirty_keys_never_collide():
+    # `a..b` and `a//b` sanitize to the same base — the digest keeps their unit
+    # branches (and so their merge targets) distinct
+    a = platform_util.safe_ref_segment("a..b")
+    b = platform_util.safe_ref_segment("a//b")
+    assert a.startswith("a__b-") and b.startswith("a__b-")
+    assert a != b
+
+
+def test_safe_ref_segment_caps_length():
+    assert len(platform_util.safe_ref_segment("x" * 500)) <= platform_util._MAX_SEGMENT
+
+
+@pytest.mark.parametrize("value", _REF_CORPUS)
+@pytest.mark.parametrize(
+    "template",
+    [
+        "bmad-loop/rid/{}",  # unit_key, branch_per=story
+        "bmad-loop/{}/1-1-a",  # run_id, branch_per=story
+        "bmad-loop/{}",  # run_id, branch_per=run
+    ],
+    ids=["unit_key", "run_id", "run_id_shared"],
+)
+def test_safe_ref_segment_output_passes_git_check_ref_format(value, template):
+    """Oracle: git itself validates every sanitized segment, in each position
+    `workspace.unit_branch_name` actually places it. Pure-Python sanitization is
+    only as good as its agreement with `git check-ref-format`."""
+    branch = template.format(platform_util.safe_ref_segment(value))
+    proc = subprocess.run(
+        ["git", "check-ref-format", "--branch", branch],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, f"{value!r} -> {branch!r}: {proc.stderr.strip()}"

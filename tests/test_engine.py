@@ -1,5 +1,6 @@
 """Engine scenario tests against the mock adapter — no tmux, no LLM."""
 
+import os
 import re
 import signal
 from pathlib import Path
@@ -2138,6 +2139,108 @@ def test_dev_escalation_records_spec_for_rearm(project):
 
     rearm_escalation(engine.run_dir)  # the resolve workflow's re-arm step
     assert read_frontmatter(sp)["status"] == "ready-for-dev"  # re-drive will not HALT
+
+
+# ------------------------------------------------------ deferred-artifact stash
+
+
+def test_stash_deferred_artifacts_moves_spec_into_run_dir(project):
+    engine, _ = make_engine(project, [])
+    task = StoryTask("1-1-a", 1)
+    sp = spec_path(project, "1-1-a")
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    sp.write_text("first attempt\n", encoding="utf-8")
+    task.spec_file = str(sp)
+
+    engine._stash_deferred_artifacts(task)
+
+    dest = engine.run_dir / "deferred" / "1-1-a"
+    assert (dest / sp.name).read_text(encoding="utf-8") == "first attempt\n"
+    assert not sp.exists()
+    stashed = [e for e in engine.journal.entries() if e["kind"] == "deferred-artifacts-stashed"]
+    assert len(stashed) == 1 and stashed[0]["stashed_to"] == str(dest / sp.name)
+
+
+def test_stash_deferred_artifacts_overwrites_a_prior_stash(project):
+    """A story that defers a second time re-stashes the same filename: the newest
+    spec wins, leaving no staging residue. Characterization — `shutil.move` also
+    overwrote here (via its copy2 fallback); the tests below pin what changed."""
+    engine, _ = make_engine(project, [])
+    task = StoryTask("1-1-a", 1)
+    sp = spec_path(project, "1-1-a")
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    sp.write_text("second attempt\n", encoding="utf-8")
+    task.spec_file = str(sp)
+
+    dest = engine.run_dir / "deferred" / "1-1-a"
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / sp.name).write_text("first attempt\n", encoding="utf-8")
+
+    engine._stash_deferred_artifacts(task)
+
+    assert (dest / sp.name).read_text(encoding="utf-8") == "second attempt\n"
+    assert not sp.exists()
+    assert list(dest.iterdir()) == [dest / sp.name]  # the staging copy is gone
+
+
+def test_stash_deferred_artifacts_survives_a_win32_sharing_violation(project, monkeypatch):
+    """The real #101 hazard: an AV/indexer handle on the destination denies the
+    rename. `shutil.move` caught that OSError and fell back to `copy2`, which opens
+    that same locked target and fails too — crashing the defer flow. Routing through
+    `atomic_replace` retries the replace until the handle clears."""
+    engine, _ = make_engine(project, [])
+    task = StoryTask("1-1-a", 1)
+    sp = spec_path(project, "1-1-a")
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    sp.write_text("second attempt\n", encoding="utf-8")
+    task.spec_file = str(sp)
+
+    dest = engine.run_dir / "deferred" / "1-1-a"
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / sp.name).write_text("first attempt\n", encoding="utf-8")
+
+    monkeypatch.setattr(platform_util.sys, "platform", "win32")
+    monkeypatch.setattr(platform_util.time, "sleep", lambda _s: None)
+    calls, real_replace = {"n": 0}, os.replace
+
+    def sharing_violation_once(src, dst):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise PermissionError(32, "The process cannot access the file")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(platform_util.os, "replace", sharing_violation_once)
+    engine._stash_deferred_artifacts(task)
+
+    assert calls["n"] == 2  # denied once, retried, landed
+    assert (dest / sp.name).read_text(encoding="utf-8") == "second attempt\n"
+    assert not sp.exists()
+    assert list(dest.iterdir()) == [dest / sp.name]
+
+
+def test_stash_deferred_artifacts_keeps_source_and_cleans_tmp_on_replace_failure(
+    project, monkeypatch
+):
+    """The replace is the only step that can fail after staging: the source spec
+    must survive it (the stash is forensic — losing the work is worse than a crash)
+    and the staging copy must not linger."""
+    engine, _ = make_engine(project, [])
+    task = StoryTask("1-1-a", 1)
+    sp = spec_path(project, "1-1-a")
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    sp.write_text("work\n", encoding="utf-8")
+    task.spec_file = str(sp)
+
+    def boom(_tmp, _target):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr("bmad_loop.engine.atomic_replace", boom)
+    with pytest.raises(PermissionError):
+        engine._stash_deferred_artifacts(task)
+
+    assert sp.read_text(encoding="utf-8") == "work\n"
+    assert list((engine.run_dir / "deferred" / "1-1-a").iterdir()) == []
+    assert "deferred-artifacts-stashed" not in [e["kind"] for e in engine.journal.entries()]
 
 
 # -------------------------------------------------- intent-gap patch-restore (#2564)

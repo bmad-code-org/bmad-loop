@@ -21,7 +21,7 @@ from pathlib import Path
 
 from . import verify
 from .bmadconfig import ProjectPaths
-from .platform_util import safe_segment
+from .platform_util import safe_ref_segment, safe_segment
 
 # Per-unit worktrees live under the run dir (.bmad-loop/runs/<run_id>/worktrees/),
 # which `bmad-loop init` already gitignores — so unit checkouts never show up as
@@ -62,10 +62,19 @@ class UnitWorkspace:
 
 def unit_branch_name(run_id: str, unit_key: str, branch_per: str) -> str:
     """branch_per=run shares one branch across the whole run; branch_per=story
-    gives each unit its own branch."""
+    gives each unit its own branch.
+
+    Both segments are ref-sanitized: `--run-id` is user-suppliable and a unit key is
+    a sprint-board / ledger id, so either can carry ref-illegal sequences (`:`, `..`,
+    `@{`, a trailing `.lock`) that git rejects at branch-creation time. Clean ids —
+    every auto-generated run id and every conventional story key — pass through
+    byte-identical. This is the single source of the name: `open_unit_workspace` is
+    the sole caller and stores the result on `task.branch`, which every consumer
+    (`_merge_local`, `discard_worktree`, `close_unit_workspace`) reuses.
+    """
     if branch_per == "run":
-        return f"bmad-loop/{run_id}"
-    return f"bmad-loop/{run_id}/{unit_key}"
+        return f"bmad-loop/{safe_ref_segment(run_id)}"
+    return f"bmad-loop/{safe_ref_segment(run_id)}/{safe_ref_segment(unit_key)}"
 
 
 def open_unit_workspace(

@@ -5,9 +5,15 @@ seam; ``terminate_pid``/``pid_alive`` remain here as thin back-compat shims that
 delegate to it. ``detach_kwargs`` stays a real implementation — it is spawn
 configuration, not a process-lifecycle primitive, so it does not belong on the
 host. On Linux/macOS — and WSL, which *is* Linux — these preserve today's exact
-behavior. The win32 file-replace and path-segment helpers below (``atomic_replace``,
-``safe_segment``) are exercised by the platform tests; the pid kill/liveness
-Windows branch degrades gracefully and is not yet exercised.
+behavior. The file-replace and segment helpers below (``atomic_replace``,
+``safe_segment``, ``safe_ref_segment``) are exercised by the platform tests; the pid
+kill/liveness Windows branch degrades gracefully and is not yet exercised.
+
+``safe_segment`` and ``safe_ref_segment`` share a contract but not a rule set: the
+first coerces a Windows *filename* segment, the second a *git ref* component, and
+neither alphabet contains the other (``CON`` is a legal ref and an illegal filename;
+``a..b`` is the reverse). Consumers that derive both a directory and a branch from
+the same key must run both.
 """
 
 from __future__ import annotations
@@ -45,6 +51,12 @@ _RESERVED_BASENAMES = frozenset(
 )
 _ILLEGAL_SEGMENT_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _MAX_SEGMENT = 120  # keep segment (incl. any collision suffix) well under the 255 limit
+
+# git-check-ref-format(1) rejects these anywhere in a ref component: ASCII control
+# chars and space (\x00-\x20), DEL, and `~ ^ : ? * [ \`. `/` is added because it
+# would split one component into two. `]`, `-`, `<`, `>`, `"` and `|` are all legal
+# in a ref and deliberately absent — this is not _ILLEGAL_SEGMENT_CHARS.
+_ILLEGAL_REF_CHARS = re.compile(r"[\x00-\x20\x7f~^:?*\[\\/]")
 
 
 def terminate_pid(pid: int) -> None:
@@ -130,6 +142,15 @@ def _is_reserved_basename(seg: str) -> bool:
     return stem.upper() in _RESERVED_BASENAMES
 
 
+def _digest_suffix(name: str) -> str:
+    """The ``-<hex8>`` collision suffix both sanitizers append to changed input."""
+    digest = hashlib.sha1(
+        name.encode("utf-8", "surrogatepass"),
+        usedforsecurity=False,  # collision-resistance suffix, not a credential
+    ).hexdigest()
+    return "-" + digest[:8]
+
+
 def safe_segment(name: str) -> str:
     """Coerce ``name`` into a single Windows-legal path segment, returning legal
     input unchanged (identity for clean keys — the common case, e.g. a story key
@@ -152,9 +173,55 @@ def safe_segment(name: str) -> str:
         cleaned = "_"
     if cleaned == name:
         return name  # already a legal segment — keep it byte-identical
-    digest = hashlib.sha1(
-        name.encode("utf-8", "surrogatepass"),
-        usedforsecurity=False,  # collision-resistance suffix, not a credential
-    ).hexdigest()
-    suffix = "-" + digest[:8]
+    suffix = _digest_suffix(name)
+    return cleaned[: _MAX_SEGMENT - len(suffix)] + suffix
+
+
+def _is_clean_ref_segment(seg: str) -> bool:
+    """True if ``seg`` already satisfies git's rules for one ref component.
+
+    Mirrors ``git check-ref-format``'s per-component checks. The length cap is
+    ours, not git's: it keeps a branch segment in lockstep with the ``safe_segment``
+    directory built from the same key."""
+    return (
+        bool(seg)
+        and len(seg) <= _MAX_SEGMENT
+        and not _ILLEGAL_REF_CHARS.search(seg)
+        and ".." not in seg
+        and "@{" not in seg
+        and seg != "@"
+        and not seg.startswith(".")
+        and not seg.endswith((".", ".lock"))
+    )
+
+
+def safe_ref_segment(name: str) -> str:
+    """Coerce ``name`` into a single git-ref-legal component, returning legal input
+    unchanged (identity for clean keys — the common case, e.g. a story key like
+    ``3-2-digest-delivery`` or an auto-generated run id).
+
+    Same contract as :func:`safe_segment` — identity for clean input, a short digest
+    of the raw name appended whenever anything changed, never raises — but git's
+    alphabet, not Windows': replaces control chars, space, DEL and ``~^:?*[\\/`` with
+    ``_``, rewrites ``..`` → ``__`` and ``@{`` → ``_{``, escapes a leading ``.``, and
+    caps the length. Trailing ``.`` and trailing ``.lock`` are ref-illegal but need no
+    rewrite: they only reach the coercion path, and the ``-<hex8>`` suffix appended
+    there is itself the fix. A lone ``@`` is coerced to ``_`` even though git only
+    forbids it as a whole ref name, so the contract holds for any caller.
+
+    A leading ``-`` is deliberately preserved: it is legal in a ref component, and
+    the git porcelain's separate "branch name must not start with ``-``" check reads
+    the whole name, which callers always prefix (``bmad-loop/<run_id>/<segment>``).
+
+    Digest collision resistance is probabilistic, and clean-key identity is the
+    stronger contract — so a clean name that happens to look sanitized-plus-digest
+    passes through verbatim."""
+    if _is_clean_ref_segment(name):
+        return name  # already a legal ref component — keep it byte-identical
+    cleaned = _ILLEGAL_REF_CHARS.sub("_", name).replace("..", "__").replace("@{", "_{")
+    if cleaned.startswith("."):
+        cleaned = "_" + cleaned[1:]
+    if not cleaned or cleaned == "@":
+        cleaned = "_"
+    suffix = _digest_suffix(name)
     return cleaned[: _MAX_SEGMENT - len(suffix)] + suffix
