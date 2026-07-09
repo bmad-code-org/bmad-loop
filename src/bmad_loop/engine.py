@@ -1510,6 +1510,7 @@ class Engine:
             # session's own tree.
             task.baseline_untracked = sorted(verify.untracked_files(self.workspace.root))
         feedback: Path | None = None
+        resume_note: str = ""
         while True:
             if resume_result is None:
                 # a resumed result replays the attempt it was recorded under, so
@@ -1538,7 +1539,7 @@ class Engine:
                 result = self._run_session(
                     task,
                     role="dev",
-                    prompt=self._dev_prompt(task, feedback),
+                    prompt=self._dev_prompt(task, feedback, resume_note=resume_note),
                     seq=task.attempt,
                 )
             advance(task, Phase.DEV_VERIFY)
@@ -1595,10 +1596,38 @@ class Engine:
                     return False
                 return True
             if decision.action == Action.RETRY:
+                resume_note = ""
                 if outcome is not None and outcome.fixable:
                     # work exists and the failure is concrete: keep the tree,
                     # hand the failing output to a repair session
                     feedback = self._write_feedback(task, decision.reason)
+                elif outcome is None and (commits := self._committed_attempt_work(task)):
+                    # the session never reached a terminal result (timeout/stalled/
+                    # crashed), so verify never ran — but it already landed real
+                    # commits above baseline. Rolling those back on a same-story
+                    # retry is pure waste: the next attempt would silently redo
+                    # work that already exists, burning the retry budget on
+                    # re-deriving it instead of finishing it (the failure mode
+                    # that orphaned story 17-3's first attempt on 2026-07-09).
+                    # Keep the tree and tell the resumed session what is already
+                    # there instead of discarding it.
+                    feedback = self._write_resume_feedback(task, result.status, commits)
+                    resume_note = (
+                        f"The previous session did not reach a terminal result "
+                        f"({result.status}), most likely because it ran out of "
+                        "time — not because its work was wrong. It already "
+                        "committed real progress; do not discard it or restart "
+                        "from scratch. Inspect the current git state, verify it "
+                        "against the story's acceptance criteria, and continue "
+                        "or finish the remaining work."
+                    )
+                    # the kept commits are now authorized input for the resumed
+                    # session, not failed-attempt debris — advance the baseline
+                    # past them (mirrors runs.rearm_escalation's re-drive baseline
+                    # advance) so verify_dev compares the next session's report
+                    # against where the tree actually is, not the pre-attempt
+                    # baseline it has already moved past.
+                    self._advance_baseline_to_head(task)
                 else:
                     feedback = None
                     self._rollback_or_pause(task)
@@ -2378,10 +2407,12 @@ class Engine:
         )
         return result
 
-    def _dev_prompt(self, task: StoryTask, feedback: Path | None) -> str:
-        return self._generic_dev_prompt(task, feedback)
+    def _dev_prompt(self, task: StoryTask, feedback: Path | None, *, resume_note: str = "") -> str:
+        return self._generic_dev_prompt(task, feedback, resume_note=resume_note)
 
-    def _generic_dev_prompt(self, task: StoryTask, feedback: Path | None) -> str:
+    def _generic_dev_prompt(
+        self, task: StoryTask, feedback: Path | None, *, resume_note: str = ""
+    ) -> str:
         """Invocation for the generic `bmad-dev-auto` dev skill, which has no
         `--feedback` flag: feedback is inlined as freeform intent pointing at the
         existing spec. On a repair re-invocation the spec is first re-opened
@@ -2393,7 +2424,13 @@ class Engine:
         the re-arm set — and it exits before step-01's version-control sanity
         check, which would otherwise HALT `blocked` on the very diff
         `_restore_patch` just laid onto the tree. A bare story key takes the
-        freeform/epic path instead, where that dirty-tree check runs first."""
+        freeform/epic path instead, where that dirty-tree check runs first.
+
+        ``resume_note`` overrides the default "failed verification, repair it"
+        framing — used when the previous session didn't fail so much as run out
+        of time after already committing real progress (see the RETRY branch in
+        ``_dev_phase``); telling that resumed session its predecessor's work
+        "failed" would mislead it into redoing good work from scratch."""
         if feedback is None:
             if task.restore_patch and task.spec_file:
                 return (
@@ -2405,12 +2442,14 @@ class Engine:
             return f"/bmad-dev-auto {task.story_key}"
         self._reset_spec_for_repair(task)
         spec_ref = task.spec_file or task.story_key
+        note = resume_note or (
+            "The previous session's work failed deterministic verification; "
+            "repair the working tree so verification passes without changing "
+            "the spec's frozen intent contract."
+        )
         return (
             f"/bmad-dev-auto Resume the autonomous dev session on the in-progress "
-            f"spec at `{spec_ref}`. The previous session's work failed deterministic "
-            f"verification; repair the working tree so verification passes without "
-            f"changing the spec's frozen intent contract. Verification evidence is "
-            f"in `{feedback}`."
+            f"spec at `{spec_ref}`. {note} Evidence is in `{feedback}`."
         )
 
     def _reset_spec_for_repair(self, task: StoryTask) -> None:
@@ -2439,6 +2478,62 @@ class Engine:
             "Repair the working tree so verification passes, without violating\n"
             "the spec's frozen intent.\n\n"
             f"```\n{reason}\n```\n",
+            encoding="utf-8",
+        )
+        return path
+
+    def _committed_attempt_work(self, task: StoryTask) -> list[str]:
+        """Commit shas this attempt already landed on top of ``task.baseline_commit``,
+        newest-reachability order per ``verify.commits_above``; ``[]`` if none, or
+        no baseline was ever recorded (nothing to compare against). Distinguishes a
+        non-completed session (timeout/stalled/crashed) that made durable progress
+        from one that made none — see the RETRY branch in ``_dev_phase``."""
+        if not task.baseline_commit:
+            return []
+        return verify.commits_above(self.workspace.root, task.baseline_commit)
+
+    def _advance_baseline_to_head(self, task: StoryTask) -> None:
+        """Advance ``task.baseline_commit``/``baseline_untracked`` to the
+        project's current HEAD. Mirrors ``runs.rearm_escalation``'s re-drive
+        baseline advance for the same reason: a kept (non-rolled-back) attempt's
+        commits are authorized input for the resumed session, not failed-attempt
+        debris, so later comparisons (verify_dev's proof-of-work check, a later
+        retry's own rollback) must anchor on them rather than the stale
+        pre-attempt baseline. The two locals are read before either task field is
+        assigned, so a failure partway through can't advance one and not the
+        other. Best-effort: on a git failure the old baseline stands — the
+        resumed session's verify_dev may then flag a baseline mismatch, which is
+        no worse than today's unconditional rollback."""
+        try:
+            repo = self.workspace.root
+            head = verify.rev_parse_head(repo)
+            untracked = sorted(verify.untracked_files(repo))
+            task.baseline_commit = head
+            task.baseline_untracked = untracked
+        except Exception:  # noqa: BLE001  # nosec B110 - best-effort git read, must not fail retry
+            pass
+
+    def _write_resume_feedback(self, task: StoryTask, status: str, commits: list[str]) -> Path:
+        """Persist a note for a resumed session after a dev session that ended
+        without a terminal result (``status``) but had already committed real
+        progress. Deliberately distinct from ``_write_feedback``: this is not a
+        verification failure (verify never ran — the session never completed), so
+        framing it as one would mislead the resumed session into distrusting or
+        redoing otherwise-good work."""
+        path = self.run_dir / "feedback" / f"{task.story_key}-{len(task.sessions)}.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shas = "\n".join(f"- {c}" for c in commits)
+        path.write_text(
+            f"# Resume after {status}: {task.story_key}\n\n"
+            f"The previous session did not reach a terminal result ({status}), "
+            "most likely because it ran out of time — not because its work was "
+            "wrong. It already committed real progress on top of baseline "
+            f"`{task.baseline_commit}`:\n\n"
+            f"{shas}\n\n"
+            "Do not restart from scratch or assume this work is broken. Inspect "
+            "the current git log/diff, verify it against the story's acceptance "
+            "criteria, and continue or finish the remaining work — only redo "
+            "what is actually missing or wrong.\n",
             encoding="utf-8",
         )
         return path

@@ -1125,10 +1125,12 @@ class SweepEngine(Engine):
 
     # ------------------------------------------------------ override seams
 
-    def _dev_prompt(self, task: StoryTask, feedback: Path | None) -> str:
-        return self._generic_bundle_prompt(task, feedback)
+    def _dev_prompt(self, task: StoryTask, feedback: Path | None, *, resume_note: str = "") -> str:
+        return self._generic_bundle_prompt(task, feedback, resume_note=resume_note)
 
-    def _generic_bundle_prompt(self, task: StoryTask, feedback: Path | None) -> str:
+    def _generic_bundle_prompt(
+        self, task: StoryTask, feedback: Path | None, *, resume_note: str = ""
+    ) -> str:
         """Bundle invocation for the generic bmad-dev-auto dev skill: the self-contained
         intent.md (intent + verbatim ledger entries) is handed over as freeform
         intent. The orchestrator owns the deferred-work ledger — the skill is told
@@ -1140,7 +1142,11 @@ class SweepEngine(Engine):
         `in-review` status the re-arm set — before step-01's version-control
         sanity check, which would otherwise HALT `blocked` on the diff
         `_restore_patch` just laid onto the tree. The freeform intent.md pointer
-        takes the path where that dirty-tree check runs first."""
+        takes the path where that dirty-tree check runs first.
+
+        ``resume_note`` overrides the default "failed verification, repair it"
+        framing — see ``Engine._generic_dev_prompt`` for why (a timed-out attempt
+        that already committed real progress isn't a verification failure)."""
         bundle_ref = task.bundle_file or task.story_key
         if feedback is None:
             if task.restore_patch and task.spec_file:
@@ -1160,13 +1166,15 @@ class SweepEngine(Engine):
             )
         self._reset_spec_for_repair(task)
         spec_ref = task.spec_file or bundle_ref
+        note = resume_note or (
+            "The previous session's work failed deterministic verification; "
+            "repair the working tree so verification passes without changing "
+            "the frozen intent contract or editing the deferred-work ledger."
+        )
         return (
             f"/bmad-dev-auto Resume the autonomous dev session on the in-progress "
-            f"spec at `{spec_ref}` for the deferred-work bundle `{bundle_ref}`. The "
-            f"previous session's work failed deterministic verification; repair the "
-            f"working tree so verification passes without changing the frozen intent "
-            f"contract or editing the deferred-work ledger. Verification evidence is "
-            f"in `{feedback}`."
+            f"spec at `{spec_ref}` for the deferred-work bundle `{bundle_ref}`. "
+            f"{note} Evidence is in `{feedback}`."
         )
 
     def _post_dev_state_sync(self, task: StoryTask, result_json: dict | None) -> None:

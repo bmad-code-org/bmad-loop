@@ -3440,6 +3440,72 @@ def test_dev_stall_retries_then_succeeds(project):
     assert engine.state.tasks["1-1-a"].attempt == 2
 
 
+def test_dev_timeout_with_committed_work_keeps_tree_and_resumes(project):
+    """The 2026-07-09 story-17-3 incident: a dev session committed real, working
+    code and then hit the wall-clock timeout 9 minutes later while still
+    mid-turn. The old unconditional rollback-on-retry discarded that commit, so
+    the retry had to re-derive the same implementation from scratch (burning
+    ~3x the tokens) before ALSO timing out. A retry after a non-completed
+    session must keep the tree when the attempt already landed commits, and
+    tell the resumed session to build on them instead of silently redoing the
+    work."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    repo = project.project
+
+    def timeout_after_committing(spec):
+        (repo / "impl.txt").write_text("committed implementation\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "attempt work")
+        return SessionResult(status="timeout")
+
+    engine, adapter = make_engine(
+        project,
+        [
+            timeout_after_committing,
+            dev_effect(project, "1-1-a"),
+            review_effect(project, "1-1-a", clean=True),
+        ],
+    )
+    summary = engine.run()
+
+    assert summary.done == 1
+    assert engine.state.tasks["1-1-a"].attempt == 2
+    assert not any(e["kind"] == "rollback-auto" for e in engine.journal.entries())
+    assert (repo / "impl.txt").read_text() == "committed implementation\n"  # never rolled back
+
+    resumed_prompt = adapter.sessions[1].prompt
+    assert resumed_prompt.startswith("/bmad-dev-auto Resume the autonomous")
+    assert "did not reach a terminal result" in resumed_prompt
+    assert "failed deterministic verification" not in resumed_prompt
+
+
+def test_dev_timeout_without_committed_work_still_rolls_back(project):
+    """A timeout that produced no durable progress (no commits above baseline)
+    must keep the old behavior: roll back to baseline rather than resuming a
+    tree with nothing but stray uncommitted noise in it."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    repo = project.project
+
+    def timeout_with_dirty_no_commit(spec):
+        (repo / "src.txt").write_text("uncommitted, never landed\n")
+        return SessionResult(status="timeout")
+
+    engine, adapter = make_engine(
+        project,
+        [
+            timeout_with_dirty_no_commit,
+            dev_effect(project, "1-1-a"),
+            review_effect(project, "1-1-a", clean=True),
+        ],
+    )
+    summary = engine.run()
+
+    assert summary.done == 1
+    assert any(e["kind"] == "rollback-auto" for e in engine.journal.entries())
+    resumed_prompt = adapter.sessions[1].prompt
+    assert resumed_prompt == "/bmad-dev-auto 1-1-a"  # plain restart, no resume framing
+
+
 def test_dev_exhausted_defers_and_run_continues(project):
     write_sprint(project, {"1-1-a": "ready-for-dev", "1-2-b": "ready-for-dev"})
     engine, adapter = make_engine(

@@ -337,10 +337,12 @@ class StoriesEngine(Engine):
             env["BMAD_LOOP_PLAN_HALT"] = "1"
         return env
 
-    def _dev_prompt(self, task: StoryTask, feedback: Path | None) -> str:
-        return self._stories_dev_prompt(task, feedback)
+    def _dev_prompt(self, task: StoryTask, feedback: Path | None, *, resume_note: str = "") -> str:
+        return self._stories_dev_prompt(task, feedback, resume_note=resume_note)
 
-    def _stories_dev_prompt(self, task: StoryTask, feedback: Path | None) -> str:
+    def _stories_dev_prompt(
+        self, task: StoryTask, feedback: Path | None, *, resume_note: str = ""
+    ) -> str:
         """Folder+id dispatch for a fresh (or resumed-to-implement) story; the
         repair leg falls back to the inherited explicit-spec-file resume.
 
@@ -351,7 +353,12 @@ class StoriesEngine(Engine):
 
         The folder is always project-relative (kills the absolute-path concern;
         the contract allows an absolute one but we never emit it). ``invoke_dev_with``
-        is appended verbatim — the single planner→dev channel, never interpreted."""
+        is appended verbatim — the single planner→dev channel, never interpreted.
+
+        ``resume_note`` overrides the repair framing for the same reason the base
+        ``Engine._generic_dev_prompt`` takes it: a timed-out attempt that already
+        committed real progress did not fail verification, and telling the resumed
+        session it did would have it redo good work."""
         if feedback is not None:
             # Deterministic-verify repair: re-open the id-keyed story spec and
             # resume on it in place. Identical to the base generic repair leg (an
@@ -359,12 +366,14 @@ class StoriesEngine(Engine):
             # is just a normal spec file.
             self._reset_spec_for_repair(task)
             spec_ref = task.spec_file or task.story_key
+            note = resume_note or (
+                "The previous session's work failed deterministic verification; "
+                "repair the working tree so verification passes without changing "
+                "the spec's frozen intent contract."
+            )
             return (
                 f"/bmad-dev-auto Resume the autonomous dev session on the in-progress "
-                f"spec at `{spec_ref}`. The previous session's work failed deterministic "
-                f"verification; repair the working tree so verification passes without "
-                f"changing the spec's frozen intent contract. Verification evidence is "
-                f"in `{feedback}`."
+                f"spec at `{spec_ref}`. {note} Evidence is in `{feedback}`."
             )
         entry = self._entry_for(task)
         prompt = f"/bmad-dev-auto Spec folder: {self._spec_folder_rel}. Story id: {task.story_key}."
