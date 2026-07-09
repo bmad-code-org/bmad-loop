@@ -2218,6 +2218,37 @@ def test_stash_deferred_artifacts_survives_a_win32_sharing_violation(project, mo
     assert list(dest.iterdir()) == [dest / sp.name]
 
 
+def test_stash_deferred_artifacts_retries_a_locked_source_spec(project, monkeypatch):
+    """Second half of the staged move. Windows denies the source *delete* against an
+    AV/indexer handle just as it denies the rename-over, and `_defer` calls this
+    before the rollback and the `story-deferred` journal append — so an unretried
+    unlink would abort the whole deferral after the stash had already landed."""
+    engine, _ = make_engine(project, [])
+    task = StoryTask("1-1-a", 1)
+    sp = spec_path(project, "1-1-a")
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    sp.write_text("work\n", encoding="utf-8")
+    task.spec_file = str(sp)
+
+    monkeypatch.setattr(platform_util.sys, "platform", "win32")
+    monkeypatch.setattr(platform_util.time, "sleep", lambda _s: None)
+    calls, real_unlink = {"n": 0}, os.unlink
+
+    def locked_once(path, **_kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise PermissionError(32, "The process cannot access the file")
+        real_unlink(path)
+
+    monkeypatch.setattr(platform_util.os, "unlink", locked_once)
+    engine._stash_deferred_artifacts(task)
+
+    assert calls["n"] == 2  # denied once, retried, removed
+    assert not sp.exists()
+    dest = engine.run_dir / "deferred" / "1-1-a"
+    assert (dest / sp.name).read_text(encoding="utf-8") == "work\n"
+
+
 def test_stash_deferred_artifacts_keeps_source_and_cleans_tmp_on_replace_failure(
     project, monkeypatch
 ):

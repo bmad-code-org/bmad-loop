@@ -42,8 +42,9 @@ breaking changes may land in a minor release.
   re-stashes the same spec filename over the previous one. `shutil.move` fell back to a non-atomic
   `copy2` there — which tears the stash on a mid-copy crash and fails outright on Windows when an
   AV/indexer handle turns the rename into a sharing violation. The stash now stages a copy inside the
-  destination dir and routes through `platform_util.atomic_replace`, inheriting its win32 retry.
-  (closes #101)
+  destination dir and routes through `platform_util.atomic_replace`, inheriting its win32 retry; the
+  source removal gets the same retry via a new `platform_util.retrying_unlink`, since Windows denies a
+  delete against an open handle exactly as it denies a rename-over. (closes #101)
 - **A finished session whose final `Stop` hook was lost no longer loses its work.** A dev/review
   session that wrote its terminal spec but never delivered the `Stop` ended `stalled` — or `timeout`,
   when hooks were misconfigured and no event ever arrived — and the on-disk result was discarded.

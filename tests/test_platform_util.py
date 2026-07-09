@@ -131,6 +131,58 @@ def test_atomic_replace_no_retry_on_posix(tmp_path, monkeypatch):
     assert sleeps == []  # zero backoff — a real POSIX error surfaces at once
 
 
+# --------------------------------------------------------------- retrying_unlink
+
+
+def test_retrying_unlink_retries_then_succeeds(tmp_path, monkeypatch):
+    # Windows denies a delete against an open handle exactly as it denies a
+    # rename-over, so the second half of a staged move needs the same backoff.
+    monkeypatch.setattr(platform_util.sys, "platform", "win32")
+    sleeps: list[float] = []
+    monkeypatch.setattr(platform_util.time, "sleep", lambda s: sleeps.append(s))
+
+    victim = tmp_path / "spec.md"
+    victim.write_text("x", encoding="utf-8")
+    calls = {"n": 0}
+    real_unlink = os.unlink
+
+    def flaky_unlink(path, **_kw):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise PermissionError(32, "The process cannot access the file")
+        real_unlink(path)
+
+    monkeypatch.setattr(platform_util.os, "unlink", flaky_unlink)
+    platform_util.retrying_unlink(victim)
+
+    assert calls["n"] == 3
+    assert len(sleeps) == 2
+    assert not victim.exists()
+
+
+def test_retrying_unlink_no_retry_on_posix(tmp_path, monkeypatch):
+    monkeypatch.setattr(platform_util.sys, "platform", "linux")
+    sleeps: list[float] = []
+    monkeypatch.setattr(platform_util.time, "sleep", lambda s: sleeps.append(s))
+
+    def denied(_path, **_kw):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(platform_util.os, "unlink", denied)
+    victim = tmp_path / "spec.md"
+    victim.write_text("x", encoding="utf-8")
+
+    with pytest.raises(PermissionError):
+        platform_util.retrying_unlink(victim)
+    assert sleeps == []  # a real POSIX error surfaces at once
+
+
+def test_retrying_unlink_propagates_missing_file(tmp_path):
+    # not a sharing violation — no retry, no swallow
+    with pytest.raises(FileNotFoundError):
+        platform_util.retrying_unlink(tmp_path / "gone.md")
+
+
 # ------------------------------------------------------------------ safe_segment
 
 

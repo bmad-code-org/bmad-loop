@@ -26,6 +26,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import Callable
 
 from .process_host import get_process_host
 
@@ -112,27 +113,43 @@ def has_parent_ref(value: str | Path) -> bool:
     return ".." in PurePosixPath(text).parts or ".." in PureWindowsPath(text).parts
 
 
-def atomic_replace(tmp: Path, target: Path) -> None:
-    """``os.replace(tmp, target)``, retried on the transient Windows sharing
-    violation a concurrent reader of ``target`` triggers (WinError 5/32). Gated to
-    win32 so a real POSIX EACCES/EPERM surfaces immediately instead of after a
-    pointless backoff. Worst-case total wait is ~5 s of jittered exponential
-    backoff before the final failure propagates."""
+def _retry_on_sharing_violation(op: Callable[[], None]) -> None:
+    """Run ``op``, retrying the transient Windows sharing violation a concurrent
+    handle on the file triggers (WinError 5/32). Gated to win32 so a real POSIX
+    EACCES/EPERM surfaces immediately instead of after a pointless backoff.
+    Worst-case total wait is ~5 s of jittered exponential backoff before the final
+    failure propagates."""
     for attempt in range(_REPLACE_ATTEMPTS):
         try:
-            os.replace(tmp, target)
+            op()
             return
         except OSError as exc:
             last = attempt == _REPLACE_ATTEMPTS - 1
-            # a retryable rename-over-open denial, not a genuine permission fault
+            # a retryable open-handle denial, not a genuine permission fault
             winerror = getattr(exc, "winerror", None)
             retryable = isinstance(exc, PermissionError) or winerror in (5, 32)
-            # portability: only Windows raises this on rename-over-open; elsewhere a
-            # permission error is real and must surface at once.
+            # portability: only Windows denies a rename/delete over an open handle;
+            # elsewhere a permission error is real and must surface at once.
             if sys.platform != "win32" or last or not retryable:
                 raise
             delay = min(_REPLACE_CAP_S, _REPLACE_BASE_S * 2**attempt)
             time.sleep(delay + random.uniform(0, _REPLACE_BASE_S))  # nosec B311 - retry jitter
+
+
+def atomic_replace(tmp: Path, target: Path) -> None:
+    """``os.replace(tmp, target)``, retried on the transient Windows sharing
+    violation a concurrent reader of ``target`` triggers."""
+    _retry_on_sharing_violation(lambda: os.replace(tmp, target))
+
+
+def retrying_unlink(path: Path) -> None:
+    """``path.unlink()`` with the same win32 retry as :func:`atomic_replace`.
+
+    Windows denies a *delete* against an open handle exactly as it denies a
+    rename-over, so the second half of a staged move is no safer than the first:
+    an AV/indexer scanning the just-written source file fails the unlink. Pair the
+    two whenever a move must not half-apply."""
+    _retry_on_sharing_violation(path.unlink)
 
 
 def _is_reserved_basename(seg: str) -> bool:

@@ -39,7 +39,7 @@ from .model import (
     SessionRecord,
     StoryTask,
 )
-from .platform_util import atomic_replace, safe_segment
+from .platform_util import atomic_replace, retrying_unlink, safe_segment
 from .plugins import HookBus, HookContext, PluginRegistry
 from .policy import Policy
 from .runs import kill_session
@@ -2349,7 +2349,14 @@ class Engine:
         stash. Staging a copy inside `dest` and `atomic_replace`-ing it onto the
         target overwrites in one step, carries #98's win32 retry, and — because the
         staging copy lives in `dest` — keeps the replace same-filesystem, preserving
-        `shutil.move`'s cross-device tolerance."""
+        `shutil.move`'s cross-device tolerance.
+
+        Both halves of the move are retried: Windows denies a delete against an open
+        handle just as it denies a rename-over, so an unretried `unlink` would fail
+        the run on the very hazard the replace now rides out. The order is
+        replace-then-unlink because `_defer` calls this before the rollback and the
+        `story-deferred` journal append — a failure here aborts the deferral, so it
+        must be able to leave a duplicate spec, never a hole where the work was."""
         if not task.spec_file:
             return
         spec_path = Path(task.spec_file)
@@ -2366,7 +2373,7 @@ class Engine:
             with contextlib.suppress(OSError):  # the copy is disposable; keep the real error
                 tmp.unlink(missing_ok=True)
             raise
-        spec_path.unlink()
+        retrying_unlink(spec_path)
         self.journal.append(
             "deferred-artifacts-stashed",
             story_key=task.story_key,
