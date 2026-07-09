@@ -902,6 +902,7 @@ def test_rich_color_maps_pyte_names_to_valid_rich_colors():
         "default": None,
         "brown": "yellow",
         "brightbrown": "bright_yellow",  # regression: was "bright__yellow"
+        "bfightmagenta": "bright_magenta",  # pyte 0.8.2 BG_AIXTERM[105] typo
         "red": "red",
         "brightred": "bright_red",
         "brightyellow": "bright_yellow",
@@ -912,3 +913,30 @@ def test_rich_color_maps_pyte_names_to_valid_rich_colors():
         assert got == expected, f"{pyte_name!r} -> {got!r}, expected {expected!r}"
         if got is not None:
             Color.parse(got)  # must be a color rich accepts, else the TUI crashes
+
+    # Exhaustive: every name the installed pyte can emit must map to something
+    # rich parses — a pyte bump that adds/renames table entries fails here, not
+    # in the dashboard's poll worker.
+    import pyte.graphics as graphics
+
+    every_pyte_name = (
+        set(graphics.FG.values())
+        | set(graphics.BG.values())
+        | set(graphics.FG_AIXTERM.values())
+        | set(graphics.BG_AIXTERM.values())
+    )
+    for pyte_name in sorted(every_pyte_name):
+        got = data._rich_color(pyte_name)
+        if got is not None:
+            Color.parse(got)
+
+
+def test_char_style_degrades_unparseable_color_instead_of_raising():
+    # Belt to the sweep test's suspenders: if a color name rich can't parse
+    # ever slips through _rich_color, the run renders uncolored instead of
+    # killing the poll worker (and, via exit_on_error, the whole app).
+    key = ("no_such_color", "default", True, False, True, False, False)
+    style = data._char_style(key)
+    assert style.color is None and style.bgcolor is None
+    assert style.bold and style.underline and not style.italic
+    assert data._char_style(key) is style  # fallback is cached like any other

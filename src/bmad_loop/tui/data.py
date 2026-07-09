@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 import pyte
+from rich.color import ColorParseError
 from rich.style import Style
 from rich.text import Text
 
@@ -273,7 +274,12 @@ _HISTORY_LINES = 2000  # matches the dashboard RichLog max_lines
 # must stay in pyte's own (underscore-free) namespace: _rich_color re-applies
 # the "bright" -> "bright_" transform after this remap, so a "bright_"-prefixed
 # value would double up into "bright__yellow" (an invalid rich color).
-_PYTE_COLOR_FIX = {"brown": "yellow", "brightbrown": "brightyellow"}
+# "bfightmagenta" is pyte 0.8.2's own BG_AIXTERM[105] typo (SGR 105).
+_PYTE_COLOR_FIX = {
+    "brown": "yellow",
+    "brightbrown": "brightyellow",
+    "bfightmagenta": "brightmagenta",
+}
 _HEX_DIGITS = set("0123456789abcdef")
 
 
@@ -297,15 +303,21 @@ def _char_style(key: tuple) -> Style:
     style = _style_cache.get(key)
     if style is None:
         fg, bg, bold, italics, underscore, strikethrough, reverse = key
-        style = _style_cache[key] = Style(
-            color=_rich_color(fg),
-            bgcolor=_rich_color(bg),
+        attrs = dict(
             bold=bold or None,
             italic=italics or None,
             underline=underscore or None,
             strike=strikethrough or None,
             reverse=reverse or None,
         )
+        try:
+            style = Style(color=_rich_color(fg), bgcolor=_rich_color(bg), **attrs)
+        except ColorParseError:
+            # A color name rich can't parse (e.g. a new pyte table entry) must
+            # degrade to an uncolored run, not kill the poll worker — and with
+            # it the app (textual workers default to exit_on_error=True).
+            style = Style(**attrs)
+        _style_cache[key] = style
     return style
 
 
