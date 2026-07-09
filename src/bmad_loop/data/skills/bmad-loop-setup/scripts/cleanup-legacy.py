@@ -6,8 +6,9 @@
 """Remove redundant legacy skill-payload directories from _bmad/ after config migration.
 
 Older BMAD installers could stage a module's skill payload *and* its config into
-_bmad/<module>/ (and _bmad/core/), duplicating skills that also live at
-.claude/skills/. This script removes only those *redundant skill-payload* trees.
+_bmad/<module>/ (and _bmad/core/), duplicating skills that also live in the CLI's
+installed-skills tree (e.g. .claude/skills/ or .agents/skills/). This script
+removes only those *redundant skill-payload* trees.
 
 A directory is removed ONLY when it is a verified-redundant skill payload:
   * it contains >=1 SKILL.md, AND
@@ -55,8 +56,9 @@ def parse_args():
     )
     parser.add_argument(
         "--skills-dir",
-        help="Path to .claude/skills/ — enables safety verification that skills "
-        "are installed before removing legacy copies",
+        help="Path to the CLI's installed-skills tree (.claude/skills/ for claude, "
+        ".agents/skills/ for codex/gemini/copilot/antigravity) — enables safety "
+        "verification that skills are installed before removing legacy copies",
     )
     parser.add_argument(
         "--verbose",
