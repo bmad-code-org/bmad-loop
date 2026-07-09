@@ -185,7 +185,7 @@ As with the merge scripts, replace `{project-root}` in the `--bmad-dir` and `--s
 python3 ./scripts/cleanup-legacy.py --bmad-dir "{project-root}/_bmad" --module-code bmad-loop --skills-dir "{project-root}/.claude/skills"
 ```
 
-A directory is removed only when it is a **verified-redundant skill payload**: it contains a `SKILL.md`, carries no live config/manifest files, and (with `--skills-dir`) its skills are verified installed at `.claude/skills/`. Live config directories (`core/`, per-module, `_config/`) are protected and reported under `directories_protected`. If the script exits non-zero, surface the error and stop. Missing directories (already cleaned by a prior run) are not errors — the script is idempotent.
+A directory is removed only when it is a **verified-redundant skill payload**: it contains a `SKILL.md`, carries no live config/manifest files anywhere in its tree (marker-named files inside a staged skill payload don't count — skills legitimately ship e.g. `assets/module-help.csv`), and (with `--skills-dir`) its skills are verified installed at `.claude/skills/`. Live config directories (per-module and nested config/manifests) are protected and reported under `directories_protected`; `core/` and `_config/` are protected by name regardless of contents. If the script exits non-zero, surface the error and stop. Missing directories (already cleaned by a prior run) are not errors — the script is idempotent.
 
 **On a rename-upgrade from bmad-auto**, if the old `_bmad/bauto/` directory holds pre-rename `bmad-auto-*` skill copies (an older payload layout), run this cleanup **without** `--skills-dir` to skip installed-skill verification (their removal is the point). It is a no-op when `_bmad/bauto/` holds only config or isn't present:
 

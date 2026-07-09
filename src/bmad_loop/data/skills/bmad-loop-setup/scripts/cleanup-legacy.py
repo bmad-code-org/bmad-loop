@@ -11,15 +11,17 @@ _bmad/<module>/ (and _bmad/core/), duplicating skills that also live at
 
 A directory is removed ONLY when it is a verified-redundant skill payload:
   * it contains >=1 SKILL.md, AND
-  * it carries no live config/manifest files (config.yaml, module-help.csv,
-    installer manifests, or the _config/ dir itself), AND
+  * it carries no live config/manifest files anywhere in its tree (config.yaml,
+    module-help.csv, installer manifests, or a _config/ dir) — marker-named files
+    inside a staged skill payload (under a SKILL.md-bearing dir) don't count, AND
   * when --skills-dir is given, every skill in it is verified installed there.
 
 Everything else is left untouched. On a modern BMAD v6 install the per-module and
 core directories hold only live config (no staged SKILL.md), and _bmad/_config/ is
 the live installer manifest — so this script is a safe no-op there and never deletes
-shared BMAD state. 'core' and '_config' are never removed. The removal decision is
-driven entirely by directory contents, so no version check is needed.
+shared BMAD state. 'core' and '_config' are never removed: both are protected by
+name regardless of contents. Every other removal decision is driven entirely by
+directory contents, so no version check is needed.
 
 Exit codes: 0=success (including nothing to remove), 1=validation error, 2=runtime error
 """
@@ -87,22 +89,50 @@ def find_skill_dirs(base_path: str) -> list:
 _CONFIG_MARKERS = ("config.yaml", "config.user.yaml", "module-help.csv", "manifest.yaml")
 
 
+def _inside_skill_payload(item: Path, root: Path) -> bool:
+    """True if item sits inside a staged skill-payload subtree of root.
+
+    A dir at or above item — strictly below root — containing a SKILL.md marks a
+    staged skill payload; marker-named files under it (e.g. a skill's own
+    assets/module-help.csv) are payload data, not live state. root itself is
+    excluded so markers at the candidate's top level always stay protective.
+    """
+    d = item.parent
+    while d != root:
+        if (d / "SKILL.md").exists():
+            return True
+        d = d.parent
+    return False
+
+
+def _is_config_marker(item: Path) -> bool:
+    return (
+        item.name in _CONFIG_MARKERS
+        or item.name.endswith("-manifest.csv")
+        or item.name == "bmad-help.csv"
+    )
+
+
 def is_config_bearing(path: Path) -> bool:
     """True if the directory holds live BMAD config or installer-manifest state.
 
     Such a directory (e.g. _bmad/core/, _bmad/<module>/, _bmad/_config/) is never a
-    redundant skill payload and must not be removed. Covers the _config/ manifest dir
-    by name, per-module/core config.yaml + module-help.csv, and installer manifests
-    (*-manifest.csv, manifest.yaml, bmad-help.csv).
+    redundant skill payload and must not be removed. 'core' and '_config' are
+    protected by name regardless of contents. Otherwise the whole tree is scanned
+    for per-module/core config.yaml + module-help.csv, installer manifests
+    (*-manifest.csv, manifest.yaml, bmad-help.csv), and nested _config/ dirs —
+    skipping markers that belong to a staged skill payload (see
+    _inside_skill_payload), which are disposable copies rather than live state.
     """
-    if path.name == "_config":
+    if path.name in ("_config", "core"):
         return True
-    for marker in _CONFIG_MARKERS:
-        if (path / marker).exists():
-            return True
-    for csv in path.glob("*.csv"):
-        if csv.name.endswith("-manifest.csv") or csv.name == "bmad-help.csv":
-            return True
+    for item in path.rglob("*"):
+        if item.is_dir() and item.name == "_config":
+            if not _inside_skill_payload(item, path):
+                return True
+        elif item.is_file() and _is_config_marker(item):
+            if not _inside_skill_payload(item, path):
+                return True
     return False
 
 
@@ -131,6 +161,12 @@ def classify_dirs(
             not_found.append(dirname)
             if verbose:
                 print(f"Not found (skipping): {target}", file=sys.stderr)
+            continue
+
+        if target.name in ("_config", "core"):
+            protected.append({"dir": dirname, "reason": "live BMAD dir (protected by name)"})
+            if verbose:
+                print(f"Protected by name, not removing: {target}", file=sys.stderr)
             continue
 
         if is_config_bearing(target):

@@ -195,6 +195,96 @@ def test_cleanup_reports_removable_dir_absent_at_removal_time(tmp_path):
     assert not (bmad / "legacy").exists()
 
 
+def test_cleanup_protects_core_by_name_even_as_pure_payload(tmp_path):
+    """core/ is never removed — even holding only a SKILL.md payload and no config.
+
+    Regression for bmad-loop#73 review: the docstring promised 'core' is never
+    removed, but only _config was protected by name; a marker-less core payload
+    slipped through the config-bearing check.
+    """
+    bmad = tmp_path / "_bmad"
+    core = bmad / "core"
+    core.mkdir(parents=True)
+    (core / "SKILL.md").write_text("# core\n")  # no config markers at all
+    skills = _skills_dir(tmp_path, "core")
+
+    result = _run_json(
+        "cleanup-legacy.py",
+        "--bmad-dir",
+        str(bmad),
+        "--module-code",
+        "core",
+        "--skills-dir",
+        str(skills),
+    )
+
+    assert result["directories_removed"] == []
+    assert (core / "SKILL.md").exists()
+    protected = {p["dir"] for p in result["directories_protected"]}
+    assert "core" in protected
+
+
+def test_cleanup_protects_dir_with_nested_live_config(tmp_path):
+    """A config marker nested below the top level still protects the whole dir.
+
+    Regression for bmad-loop#73 review: is_config_bearing() only looked at the
+    candidate's top level while skill discovery was recursive, so a dir with a
+    SKILL.md and deeper live config was misclassified as a removable payload.
+    """
+    bmad = _v6_bmad(tmp_path)
+    legacy = bmad / "legacy-mod"
+    (legacy / "sub").mkdir(parents=True)
+    (legacy / "SKILL.md").write_text("# legacy-mod\n")
+    (legacy / "sub" / "config.yaml").write_text("live: true\n")  # nested live state
+    skills = _skills_dir(tmp_path, "legacy-mod")
+
+    result = _run_json(
+        "cleanup-legacy.py",
+        "--bmad-dir",
+        str(bmad),
+        "--module-code",
+        "legacy-mod",
+        "--skills-dir",
+        str(skills),
+    )
+
+    assert result["directories_removed"] == []
+    assert (legacy / "sub" / "config.yaml").exists()
+    protected = {p["dir"] for p in result["directories_protected"]}
+    assert "legacy-mod" in protected
+
+
+def test_cleanup_removes_payload_whose_skill_ships_marker_named_assets(tmp_path):
+    """Marker-named files inside a SKILL.md-bearing subtree are payload, not live state.
+
+    Staged skill payloads legitimately ship files like assets/module-help.csv
+    (bmad-loop-setup itself does); the recursive config scan must not
+    false-protect such a dir or the documented bauto rename-cleanup would no-op.
+    """
+    bmad = _v6_bmad(tmp_path)
+    legacy = bmad / "legacy-mod"
+    foo = legacy / "skills" / "foo"
+    (foo / "assets").mkdir(parents=True)
+    (foo / "SKILL.md").write_text("# foo\n")
+    (foo / "assets" / "module-help.csv").write_text("module,skill\nfoo,x\n")
+    skills = _skills_dir(tmp_path, "foo")
+
+    result = _run_json(
+        "cleanup-legacy.py",
+        "--bmad-dir",
+        str(bmad),
+        "--module-code",
+        "legacy-mod",
+        "--skills-dir",
+        str(skills),
+    )
+
+    assert result["directories_removed"] == ["legacy-mod"]
+    assert not legacy.exists()
+    # live v6 state is untouched
+    assert (bmad / "core" / "config.yaml").exists()
+
+
 # ---------------------------------------------------------------- merge-config
 
 
