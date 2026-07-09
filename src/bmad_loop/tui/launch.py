@@ -289,11 +289,14 @@ def start_run_detached(
     project: Path,
     run_id: str,
     *,
+    spec: str | None = None,
     epic: int | None = None,
     story: str | None = None,
     max_stories: int | None = None,
 ) -> None:
     tail = ["run", "--project", str(project), "--run-id", run_id]
+    if spec:
+        tail += ["--spec", spec]  # forces stories mode (folder+id dispatch)
     if epic is not None:
         tail += ["--epic", str(epic)]
     if story:

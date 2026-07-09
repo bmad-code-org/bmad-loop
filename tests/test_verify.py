@@ -329,6 +329,294 @@ def test_verify_dev_bundle_absent_dw_ids_passes(project, claim):
     assert task.spec_file == str(sp)
 
 
+def test_verify_dev_bundle_ledger_only_counts_as_real_work(project):
+    """Same false-negative as verify_dev (KNOWN-BUG-ledger-only-story-false-no-
+    changes.md), on the bundle path: a dw-bundle's entire authorized diff is
+    the ledger reconciliation itself, with no sprint-status entry to touch."""
+    task = make_bundle_task(project)
+    sp = project.implementation_artifacts / "spec-dw-test-bundle.md"
+    write_spec(sp, "in-review", task.baseline_commit)
+    bundle_ledger(project, {"DW-1": "done 2026-06-11", "DW-2": "done 2026-06-11"})
+    rj = {"workflow": "auto-dev", "spec_file": str(sp)}
+    out = verify.verify_dev_bundle(task, project, rj)
+    assert out.ok
+
+
+# ------------------------------------------------------------ verify_dev_stories
+
+
+def make_stories_task(paths, story_key="1"):
+    task = StoryTask(story_key=story_key, epic=0)
+    task.baseline_commit = verify.rev_parse_head(paths.project)
+    return task
+
+
+def write_story(spec_folder, story_id, slug, status, baseline):
+    d = spec_folder / "stories"
+    d.mkdir(parents=True, exist_ok=True)
+    sp = d / f"{story_id}-{slug}.md"
+    write_spec(sp, status, baseline)
+    return sp
+
+
+def test_verify_dev_stories_happy_no_sprint_gate(project):
+    # No sprint-status file exists at all — stories mode has no sprint board, so
+    # the sprint-status gate that verify_dev enforces is dropped here.
+    assert not project.sprint_status.is_file()
+    spec_folder = project.planning_artifacts / "epic-a"
+    task = make_stories_task(project, "1")
+    sp = write_story(spec_folder, "1", "user-auth", "done", task.baseline_commit)
+    (project.project / "src.txt").write_text("changed\n")
+    out = verify.verify_dev_stories(
+        task, project, dev_result(sp), spec_folder=spec_folder, review_enabled=False
+    )
+    assert out.ok
+    assert task.spec_file == str(sp)  # set to the id-keyed resolution
+
+
+def test_verify_dev_stories_composite_id(project):
+    spec_folder = project.planning_artifacts / "epic-a"
+    task = make_stories_task(project, "3-2")
+    sp = write_story(spec_folder, "3-2", "user-auth", "done", task.baseline_commit)
+    (project.project / "src.txt").write_text("changed\n")
+    out = verify.verify_dev_stories(
+        task, project, dev_result(sp), spec_folder=spec_folder, review_enabled=False
+    )
+    assert out.ok and task.spec_file == str(sp)
+
+
+def test_verify_dev_stories_pending_retry(project):
+    spec_folder = project.planning_artifacts / "epic-a"
+    task = make_stories_task(project, "1")
+    out = verify.verify_dev_stories(
+        task, project, dev_result(spec_folder / "ghost.md"), spec_folder=spec_folder
+    )
+    assert not out.ok and out.retryable and "no story spec found" in out.reason
+
+
+def test_verify_dev_stories_ambiguous_retry(project):
+    spec_folder = project.planning_artifacts / "epic-a"
+    task = make_stories_task(project, "1")
+    write_story(spec_folder, "1", "one", "done", task.baseline_commit)
+    write_story(spec_folder, "1", "two", "done", task.baseline_commit)
+    out = verify.verify_dev_stories(
+        task, project, {"workflow": "auto-dev"}, spec_folder=spec_folder, review_enabled=False
+    )
+    assert not out.ok and "ambiguous story file match" in out.reason
+
+
+def test_verify_dev_stories_sentinel_retry(project):
+    spec_folder = project.planning_artifacts / "epic-a"
+    task = make_stories_task(project, "1")
+    write_story(spec_folder, "1", "unresolved", "blocked", task.baseline_commit)
+    out = verify.verify_dev_stories(
+        task, project, {"workflow": "auto-dev"}, spec_folder=spec_folder, review_enabled=False
+    )
+    assert not out.ok and "sentinel" in out.reason
+
+
+def test_verify_dev_stories_wrong_status(project):
+    spec_folder = project.planning_artifacts / "epic-a"
+    task = make_stories_task(project, "1")
+    sp = write_story(spec_folder, "1", "x", "draft", task.baseline_commit)
+    out = verify.verify_dev_stories(
+        task, project, dev_result(sp), spec_folder=spec_folder, review_enabled=False
+    )
+    assert not out.ok and "expected 'done'" in out.reason
+
+
+def test_verify_dev_stories_review_enabled_expects_in_review(project):
+    spec_folder = project.planning_artifacts / "epic-a"
+    task = make_stories_task(project, "1")
+    sp = write_story(spec_folder, "1", "x", "done", task.baseline_commit)
+    (project.project / "src.txt").write_text("changed\n")
+    out = verify.verify_dev_stories(
+        task, project, dev_result(sp), spec_folder=spec_folder, review_enabled=True
+    )
+    assert not out.ok and "expected 'in-review'" in out.reason
+
+
+def test_verify_dev_stories_wrong_workflow(project):
+    spec_folder = project.planning_artifacts / "epic-a"
+    task = make_stories_task(project, "1")
+    sp = write_story(spec_folder, "1", "x", "done", task.baseline_commit)
+    (project.project / "src.txt").write_text("changed\n")
+    rj = {"workflow": "quick-dev", "spec_file": str(sp)}
+    out = verify.verify_dev_stories(
+        task, project, rj, spec_folder=spec_folder, review_enabled=False
+    )
+    assert not out.ok and "auto-dev" in out.reason
+
+
+def test_verify_dev_stories_lying_baseline(project):
+    spec_folder = project.planning_artifacts / "epic-a"
+    task = make_stories_task(project, "1")
+    sp = write_story(spec_folder, "1", "x", "done", "deadbeef" * 5)
+    out = verify.verify_dev_stories(
+        task, project, dev_result(sp), spec_folder=spec_folder, review_enabled=False
+    )
+    assert not out.ok and "does not match" in out.reason
+
+
+def test_verify_dev_stories_no_changes(project):
+    # NO_VCS baseline skips the mismatch check; everything committed -> proof-of-
+    # work fails since there are no changes vs the orchestrator baseline.
+    spec_folder = project.planning_artifacts / "epic-a"
+    sp = write_story(spec_folder, "1", "x", "done", "NO_VCS")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "artifacts")
+    task = make_stories_task(project, "1")
+    out = verify.verify_dev_stories(
+        task, project, dev_result(sp), spec_folder=spec_folder, review_enabled=False
+    )
+    assert not out.ok and "no changes" in out.reason
+
+
+def test_verify_dev_stories_whitespace_story_key(project):
+    # A story_key with stray whitespace must resolve identically to its trimmed id:
+    # the resolver normalizes via str().strip(), and the filename-prefix check must
+    # use the same normalized id (else a spurious "does not match id" retry).
+    spec_folder = project.planning_artifacts / "epic-a"
+    task = make_stories_task(project, " 1 ")
+    sp = write_story(spec_folder, "1", "x", "done", task.baseline_commit)
+    (project.project / "src.txt").write_text("changed\n")
+    out = verify.verify_dev_stories(
+        task, project, dev_result(sp), spec_folder=spec_folder, review_enabled=False
+    )
+    assert out.ok and task.spec_file == str(sp)
+
+
+def test_verify_dev_stories_ledger_only_counts_as_real_work(project):
+    """T3 regression: a stories-mode story whose entire authorized diff is
+    ledger/spec reconciliation under implementation_artifacts (e.g. deferred-work.md)
+    must pass proof-of-work, not false-negative "no changes". Guards the file-granular
+    exclude port off #79 — the old whole-folder `artifact_relpaths` exclusion
+    swallowed the ledger, re-introducing KNOWN-BUG-ledger-only-story-false-no-
+    changes.md in stories mode (verify_dev_exclude_relpaths excludes only the
+    session's own spec + sprint-status, so sibling ledger content counts)."""
+    spec_folder = project.planning_artifacts / "epic-a"
+    task = make_stories_task(project, "1")
+    sp = write_story(spec_folder, "1", "x", "done", task.baseline_commit)
+    # The ONLY real change since baseline is the ledger under implementation_artifacts;
+    # the story's own spec (under the spec folder's stories/) is excluded either way.
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("### DW-1: reconciled\n\nstatus: done\n")
+    out = verify.verify_dev_stories(
+        task, project, dev_result(sp), spec_folder=spec_folder, review_enabled=False
+    )
+    assert out.ok
+
+
+def test_verify_dev_stories_spec_only_change_outside_artifacts_is_not_work(project):
+    # spec folder OUTSIDE the artifact dirs: the story record + stories.yaml must
+    # still not count as implementation work (the _stories_relpaths exclusion),
+    # so a story that only wrote its spec fails proof-of-work.
+    spec_folder = project.project / "docs" / "epic-a"
+    task = make_stories_task(project, "1")
+    sp = write_story(spec_folder, "1", "x", "done", task.baseline_commit)
+    (spec_folder / "stories.yaml").write_text("- id: '1'\n  title: t\n  description: d\n")
+    out = verify.verify_dev_stories(
+        task, project, dev_result(sp), spec_folder=spec_folder, review_enabled=False
+    )
+    assert not out.ok and "no changes" in out.reason
+    # real code alongside the spec -> proof-of-work passes
+    (project.project / "src.txt").write_text("real work\n")
+    out2 = verify.verify_dev_stories(
+        task, project, dev_result(sp), spec_folder=spec_folder, review_enabled=False
+    )
+    assert out2.ok
+
+
+def test_verify_dev_stories_plan_halt_expects_ready_for_dev(project):
+    # plan-halt leg: the spec is at ready-for-dev (the plan), not done, and there
+    # is NO code change — proof-of-work is skipped and the plan spec is recorded.
+    spec_folder = project.planning_artifacts / "epic-a"
+    task = make_stories_task(project, "1")
+    sp = write_story(spec_folder, "1", "x", "ready-for-dev", task.baseline_commit)
+    out = verify.verify_dev_stories(
+        task,
+        project,
+        {"workflow": "auto-dev", "plan_halt": True},
+        spec_folder=spec_folder,
+        review_enabled=False,
+        plan_halt=True,
+    )
+    assert out.ok  # no code change required for a plan
+    assert task.spec_file == str(sp)
+
+
+def test_verify_dev_stories_plan_halt_rejects_non_plan_status(project):
+    # a plan-halt leg that did not reach ready-for-dev (still draft) is a retry
+    spec_folder = project.planning_artifacts / "epic-a"
+    task = make_stories_task(project, "1")
+    write_story(spec_folder, "1", "x", "draft", task.baseline_commit)
+    out = verify.verify_dev_stories(
+        task,
+        project,
+        {"workflow": "auto-dev", "plan_halt": True},
+        spec_folder=spec_folder,
+        review_enabled=False,
+        plan_halt=True,
+    )
+    assert not out.ok and "expected 'ready-for-dev'" in out.reason
+
+
+def test_verify_dev_stories_plan_halt_requires_marker(project):
+    # plan_halt=True but the result.json carries NO plan_halt marker: a
+    # died-mid-flight ready-for-dev must not pass as a successful plan leg.
+    spec_folder = project.planning_artifacts / "epic-a"
+    task = make_stories_task(project, "1")
+    write_story(spec_folder, "1", "x", "ready-for-dev", task.baseline_commit)
+    out = verify.verify_dev_stories(
+        task,
+        project,
+        {"workflow": "auto-dev"},  # no plan_halt marker
+        spec_folder=spec_folder,
+        review_enabled=False,
+        plan_halt=True,
+    )
+    assert not out.ok and "no plan_halt marker" in out.reason
+
+
+def test_plan_halt_status_matches_devcontract():
+    # verify keeps PLAN_HALT_STATUS as a literal to avoid a verify<-devcontract
+    # import cycle; guard the two copies from drifting.
+    from bmad_loop import devcontract
+
+    assert verify.PLAN_HALT_STATUS == devcontract.PLAN_HALT_STATUS
+
+
+def test_verify_review_stories_no_sprint_gate(project):
+    # verify_review_stories checks spec == done + verify commands, no sprint gate.
+    assert not project.sprint_status.is_file()
+    spec_folder = project.planning_artifacts / "epic-a"
+    task = make_stories_task(project, "1")
+    sp = write_story(spec_folder, "1", "x", "done", task.baseline_commit)
+    task.spec_file = str(sp)
+    assert verify.verify_review_stories(task, project, Policy()).ok
+
+
+def test_verify_review_stories_non_done_retries(project):
+    spec_folder = project.planning_artifacts / "epic-a"
+    task = make_stories_task(project, "1")
+    sp = write_story(spec_folder, "1", "x", "in-review", task.baseline_commit)
+    task.spec_file = str(sp)
+    out = verify.verify_review_stories(task, project, Policy())
+    assert not out.ok and "expected 'done'" in out.reason
+
+
+def test_verify_review_stories_non_utf8_spec_retries(project):
+    """A spec that became undecodable mid-run must produce a clean retry (status
+    reads as ""), not a UnicodeDecodeError crash of review verification."""
+    spec_folder = project.planning_artifacts / "epic-a"
+    task = make_stories_task(project, "1")
+    sp = write_story(spec_folder, "1", "x", "done", task.baseline_commit)
+    sp.write_bytes(b"\xff\xfe\x00\x01 not utf-8 \x80\x81")
+    task.spec_file = str(sp)
+    out = verify.verify_review_stories(task, project, Policy())
+    assert not out.ok and "expected 'done'" in out.reason
+
+
 def test_verify_review_bundle_ledger_gate(project):
     task = make_bundle_task(project)
     sp = project.implementation_artifacts / "spec-dw-test-bundle.md"
@@ -700,11 +988,65 @@ def test_commit_paths_noop_when_unchanged(project):
     assert verify.commit_paths(project.project, "noop", [project.project.parent / "x"]) is None
 
 
+def test_apply_patch_replays_saved_diff(project):
+    """A patch saved off the baseline re-applies cleanly onto that same baseline —
+    tracked edits AND new (untracked) files — reproducing the reverted attempt."""
+    repo = project.project
+    baseline = verify.rev_parse_head(repo)
+    # the "attempt": edit a tracked file + add a new file, then capture the diff
+    (repo / "src.txt").write_text("original\nattempted change\n")
+    (repo / "new_module.py").write_text("print('hi')\n")
+    patch = project.implementation_artifacts / "attempt.patch"
+    # git diff HEAD includes new files with --binary-safe text; -N stages intent so
+    # untracked files appear in the diff (mirrors how the skill saves the attempt)
+    git(repo, "add", "-N", "new_module.py")
+    patch.write_text(git(repo, "diff", "HEAD") + "\n", encoding="utf-8")
+    # revert the attempt back to baseline (as the skill does before halting)
+    git(repo, "reset", "-q", "--hard", baseline)
+    (repo / "new_module.py").unlink(missing_ok=True)
+    assert (repo / "src.txt").read_text() == "original\n"
+
+    verify.apply_patch(repo, patch)
+
+    assert (repo / "src.txt").read_text() == "original\nattempted change\n"
+    assert (repo / "new_module.py").read_text() == "print('hi')\n"
+
+
+def test_apply_patch_missing_file_raises(project):
+    with pytest.raises(verify.GitError, match="restore patch not found"):
+        verify.apply_patch(project.project, project.implementation_artifacts / "nope.patch")
+
+
+def test_apply_patch_conflict_raises(project):
+    """A patch that does not apply against the current tree raises GitError with
+    git's output — the caller escalates rather than dispatch onto a broken tree."""
+    repo = project.project
+    patch = project.implementation_artifacts / "bad.patch"
+    # a diff against content the tree does not have
+    patch.write_text(
+        "--- a/src.txt\n+++ b/src.txt\n@@ -1 +1 @@\n-something-else\n+patched\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(verify.GitError, match="git apply"):
+        verify.apply_patch(repo, patch)
+
+
 def test_read_frontmatter_tolerates_garbage(project):
     p = project.project / "x.md"
     p.write_text("no frontmatter here")
     assert verify.read_frontmatter(p) == {}
     p.write_text("---\n: : :\nbroken yaml [\n---\nbody")
+    assert verify.read_frontmatter(p) == {}
+
+
+def test_read_frontmatter_tolerates_non_utf8(project):
+    """UnicodeDecodeError is a ValueError, so it slipped past every caller's
+    except-OSError guard. An undecodable file now degrades exactly like
+    unparseable YAML — {} → status "" → the status gates return a clean retry
+    instead of crashing verify (stories dev/review gates and the pre-existing
+    sprint/bundle paths alike)."""
+    p = project.project / "x.md"
+    p.write_bytes(b"\xff\xfe\x00\x01 not utf-8 \x80\x81")
     assert verify.read_frontmatter(p) == {}
 
 
@@ -748,6 +1090,136 @@ def test_has_changes_since_excludes_artifact_only_edit(project):
         )
         is True
     )
+
+
+def test_verify_dev_exclude_relpaths_is_file_granular(project):
+    """Unlike artifact_relpaths (whole-folder), this excludes only the
+    sprint-status ledger and the session's own claimed spec file — sibling
+    artifact-folder content (deferred-work.md, other stories' specs) is left
+    un-excluded so it can register as real work."""
+    sp = spec_path(project, "1-1-a")
+    rels = verify.verify_dev_exclude_relpaths(project, sp)
+    assert "_bmad-output/implementation-artifacts/sprint-status.yaml" in rels
+    assert "_bmad-output/implementation-artifacts/spec-1-1-a.md" in rels
+    assert "_bmad-output/implementation-artifacts" not in rels
+    # output_folder itself is NOT excluded here — it is the parent dir of
+    # implementation_artifacts in the standard layout, so excluding it as a
+    # prefix would swallow the artifact dirs' content right back out of view.
+    assert "_bmad-output" not in rels
+    assert "_bmad-output/implementation-artifacts/deferred-work.md" not in rels
+
+
+def test_verify_dev_exclude_relpaths_includes_latched_restore_patch(project):
+    """T4 (patch-restore x #79): a latched intent-gap patch file joins the
+    file-granular excludes — absolute or project-relative, both derive the same
+    repo-relative entry; no latch leaves the excludes unchanged."""
+    sp = spec_path(project, "1-1-a")
+    patch = project.implementation_artifacts / "attempt.patch"
+    rel = "_bmad-output/implementation-artifacts/attempt.patch"
+    assert rel in verify.verify_dev_exclude_relpaths(project, sp, str(patch))
+    assert rel in verify.verify_dev_exclude_relpaths(project, sp, rel)
+    assert rel not in verify.verify_dev_exclude_relpaths(project, sp)
+
+
+def test_verify_dev_latched_restore_patch_is_not_proof_of_work(project):
+    """T4 (patch-restore x #79): the latched patch file is untracked halt residue
+    under the protected artifact dirs — it survives every reset, so counting it
+    would let a restore re-drive whose session produced nothing pass the
+    proof-of-work gate on the patch's mere presence. The gate must key on the
+    APPLIED work (tracked diff from baseline), not the patch that carried it."""
+    write_sprint(project, {"1-1-a": "review"})
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", "NO_VCS")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "baseline")
+    task = make_task(project)
+    patch = project.implementation_artifacts / "attempt.patch"
+    patch.write_text("stale attempt diff\n", encoding="utf-8")  # untracked residue
+
+    # control: unlatched, the residue is indistinguishable from session work and
+    # passes the gate — exactly the vacuous pass the latch exclusion prevents
+    assert verify.verify_dev(task, project, dev_result(sp)).ok
+
+    task.restore_patch = str(patch)
+    out = verify.verify_dev(task, project, dev_result(sp))
+    assert not out.ok and "no changes" in out.reason
+
+
+def test_verify_dev_exclude_relpaths_normalizes_dotdot_segments(project):
+    """A spec_path with a lexical '..' hop (as an un-normalized session-reported
+    spec_file could produce) must resolve to the same exclude entry as the plain
+    path — otherwise the raw string wouldn't match git's own normalized path
+    output, silently defeating the exclude for that spec."""
+    sp = spec_path(project, "1-1-a")
+    messy = (
+        project.output_folder / "planning-artifacts" / ".." / "implementation-artifacts" / sp.name
+    )
+    assert messy != sp  # genuinely a different (messier) Path object
+    assert verify.verify_dev_exclude_relpaths(project, sp) == verify.verify_dev_exclude_relpaths(
+        project, messy
+    )
+
+
+def test_verify_dev_own_spec_status_flip_via_dotdot_path_is_not_real_work(project):
+    """End-to-end regression: a dev result.json claiming its own spec through a
+    '..'-laden path (but pointing at the same on-disk file) must not let a bare
+    status flip slip past the proof-of-work gate."""
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+    messy = (
+        project.output_folder / "planning-artifacts" / ".." / "implementation-artifacts" / sp.name
+    )
+    assert messy.is_file()  # same on-disk file as sp, reached via a messier path
+
+    out = verify.verify_dev(task, project, dev_result(messy))
+    assert not out.ok and "no changes" in out.reason
+
+
+def test_has_changes_since_ledger_content_counts_with_narrow_exclude(project):
+    """Reproduces KNOWN-BUG-ledger-only-story-false-no-changes.md: a story whose
+    entire authorized diff is sibling ledger content must not read as 'no
+    changes', while a bare own-spec + sprint-status bookkeeping edit still does."""
+    baseline = verify.rev_parse_head(project.project)
+    sp = spec_path(project, "1-1-a")
+    exclude = verify.verify_dev_exclude_relpaths(project, sp)
+
+    sp.write_text("bookkeeping\n")
+    project.sprint_status.write_text("bookkeeping\n")
+    assert verify.has_changes_since(project.project, baseline, exclude=exclude) is False
+
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("### DW-1: reconciled\n\nstatus: done\n")
+    assert verify.has_changes_since(project.project, baseline, exclude=exclude) is True
+
+
+def test_verify_dev_ledger_only_story_counts_as_real_work(project):
+    """A 'paper-trail reconciliation only' story (KNOWN-BUG-ledger-only-story-
+    false-no-changes.md) whose entire real diff sits under implementation_artifacts
+    (e.g. deferred-work.md) must pass, not false-negative 'no changes'."""
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("### DW-1: reconciled\n\nstatus: done\n")
+
+    out = verify.verify_dev(task, project, dev_result(sp))
+    assert out.ok
+
+
+def test_verify_dev_own_spec_status_flip_alone_is_not_real_work(project):
+    """Guards the original loophole the exclusion targets: flipping only the
+    session's own spec status (plus routine sprint-status bookkeeping) must
+    still retry as 'no changes', even with the narrower file-level exclude."""
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+
+    out = verify.verify_dev(task, project, dev_result(sp))
+    assert not out.ok and "no changes" in out.reason
 
 
 def test_spec_within_roots(project, tmp_path):

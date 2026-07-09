@@ -2067,6 +2067,223 @@ def test_dev_escalation_records_spec_for_rearm(project):
     assert read_frontmatter(sp)["status"] == "ready-for-dev"  # re-drive will not HALT
 
 
+# -------------------------------------------------- intent-gap patch-restore (#2564)
+
+
+def _escalate_with_patch(project, story_key, patch_path):
+    """A dev effect that halts on an intent gap the way bmad-dev-auto #2564 does:
+    it saves the attempted change as a patch under the protected artifacts, reverts
+    the tree, and escalates blocked."""
+
+    def effect(spec):
+        repo = project.project
+        baseline = rev_parse_head(repo)
+        src = repo / "src.txt"
+        src.write_text("original\nattempted reading\n")  # the attempted change
+        patch_path.parent.mkdir(parents=True, exist_ok=True)
+        patch_path.write_text(git(repo, "diff", "HEAD") + "\n", encoding="utf-8")  # save it
+        src.write_text("original\n")  # revert before halting (tree back at baseline)
+        sp = spec_path(project, story_key)
+        write_spec(sp, "blocked", baseline)
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "auto-dev",
+                "story_key": story_key,
+                "spec_file": str(sp),
+                "escalations": [
+                    {
+                        "type": "blocked",
+                        "severity": "CRITICAL",
+                        "detail": f"intent gap; saved patch: {patch_path}",
+                    }
+                ],
+            },
+        )
+
+    return effect
+
+
+def _restoring_dev_effect(project, story_key, seen):
+    """A re-driven dev effect that records what the tree looked like when it ran
+    (so a test can assert the restored diff was present) then finalizes to done."""
+
+    def effect(spec):
+        repo = project.project
+        seen.append((repo / "src.txt").read_text())
+        baseline = rev_parse_head(repo)
+        sp = spec_path(project, story_key)
+        write_spec(sp, "done", baseline)
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "auto-dev",
+                "story_key": story_key,
+                "spec_file": str(sp),
+                "baseline_commit": baseline,
+                "escalations": [],
+                "followup_review_recommended": False,
+            },
+        )
+
+    return effect
+
+
+def test_restore_patch_applies_onto_baseline(project):
+    """_restore_patch re-lays the saved diff onto the baseline tree and journals
+    attempt-restored, leaving the phase untouched on success."""
+    engine, _ = make_engine(project, [])
+    repo = project.project
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.baseline_commit = rev_parse_head(repo)
+    src = repo / "src.txt"
+    src.write_text("original\nattempted\n")
+    patch = project.implementation_artifacts / "attempt.patch"
+    patch.write_text(git(repo, "diff", "HEAD") + "\n", encoding="utf-8")
+    src.write_text("original\n")  # tree at baseline
+    task.restore_patch = str(patch)
+    task.phase = Phase.DEV_RUNNING
+
+    engine._restore_patch(task)
+
+    assert src.read_text() == "original\nattempted\n"
+    assert task.phase == Phase.DEV_RUNNING  # success does not advance the phase
+    assert "attempt-restored" in [e["kind"] for e in engine.journal.entries()]
+
+
+def test_restore_patch_failure_escalates_without_dispatch(project):
+    """A patch that will not apply escalates (never dispatches onto a half-restored
+    tree): the task ends ESCALATED, attempt-restore-failed is journaled, and the
+    success marker is not."""
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.baseline_commit = rev_parse_head(project.project)
+    patch = project.implementation_artifacts / "bad.patch"
+    patch.parent.mkdir(parents=True, exist_ok=True)
+    patch.write_text("--- a/src.txt\n+++ b/src.txt\n@@ -1 +1 @@\n-nope\n+x\n", encoding="utf-8")
+    task.restore_patch = str(patch)
+    task.phase = Phase.DEV_RUNNING
+
+    with pytest.raises(RunPaused):
+        engine._restore_patch(task)
+
+    assert task.phase == Phase.ESCALATED
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "attempt-restore-failed" in kinds
+    assert "attempt-restored" not in kinds
+
+
+def test_intent_gap_restore_redrive_applies_patch_and_lands_done(project):
+    """End-to-end: a resolved escalation with a restore patch re-applies the
+    attempted change onto the baseline before the re-driven session runs, so the
+    session resumes on the restored diff and the story lands done; the latch clears
+    on commit."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    patch = project.implementation_artifacts / "attempt.patch"
+    engine, _ = make_engine(project, [_escalate_with_patch(project, "1-1-a", patch)])
+    assert engine.run().escalated == 1
+
+    rearm_escalation(engine.run_dir, restore_patch=str(patch))  # human confirmed the reading
+    sp = spec_path(project, "1-1-a")
+    assert read_frontmatter(sp)["status"] == "in-review"  # routes step-01 -> step-04
+    assert load_state(engine.run_dir).tasks["1-1-a"].restore_patch == str(patch)
+
+    seen: list[str] = []
+    resumed, _ = resume_engine(project, engine, [_restoring_dev_effect(project, "1-1-a", seen)])
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.paused
+    assert seen == ["original\nattempted reading\n"]  # the session saw the RESTORED code
+    assert "attempt-restored" in [e["kind"] for e in resumed.journal.entries()]
+    task = load_state(resumed.run_dir).tasks["1-1-a"]
+    assert task.phase == Phase.DONE
+    assert task.restore_patch is None  # latch cleared on commit
+
+
+def test_restore_redrive_prompt_points_at_the_spec(project):
+    """The sprint-mode restore re-drive must dispatch an explicit spec-file
+    pointer: only step-01's spec-pointer intent check EARLY EXITs on the
+    `in-review` status (to step-04) BEFORE its version-control sanity check — a
+    bare story key takes the freeform/epic path, whose dirty-tree check HALTs
+    `blocked` on the very diff _restore_patch just laid onto the tree."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    patch = project.implementation_artifacts / "attempt.patch"
+    engine, _ = make_engine(project, [_escalate_with_patch(project, "1-1-a", patch)])
+    assert engine.run().escalated == 1
+
+    rearm_escalation(engine.run_dir, restore_patch=str(patch))
+    seen: list[str] = []
+    resumed, adapter = resume_engine(
+        project, engine, [_restoring_dev_effect(project, "1-1-a", seen)]
+    )
+    assert resumed.run().done == 1
+
+    prompt = adapter.sessions[0].prompt
+    spec = load_state(resumed.run_dir).tasks["1-1-a"].spec_file
+    assert spec and f"`{spec}`" in prompt  # explicit pointer -> step-01 EARLY EXIT
+    assert prompt != "/bmad-dev-auto 1-1-a"  # never the bare key on a restore
+
+
+def test_intent_gap_restore_reapplies_after_mid_redrive_rollback(project):
+    """A non-fixable retry inside the restore re-drive resets to baseline (clearing
+    the restored code), so the patch is re-applied before the next dispatch; the
+    saved patch file under the protected artifacts survives the reset."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    patch = project.implementation_artifacts / "attempt.patch"
+    engine, _ = make_engine(project, [_escalate_with_patch(project, "1-1-a", patch)])
+    assert engine.run().escalated == 1
+    rearm_escalation(engine.run_dir, restore_patch=str(patch))
+
+    seen: list[str] = []
+    resumed, _ = resume_engine(
+        project,
+        engine,
+        [SessionResult(status="stalled"), _restoring_dev_effect(project, "1-1-a", seen)],
+    )
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.paused
+    assert seen == ["original\nattempted reading\n"]  # the surviving retry ran on the restored tree
+    kinds = [e["kind"] for e in resumed.journal.entries()]
+    assert kinds.count("attempt-restored") == 2  # applied, rolled back on stall, re-applied
+    assert patch.is_file()  # protected patch file survived the reset
+
+
+def test_intent_gap_restore_escalates_when_resolution_commits_overlap(project):
+    """T2 (patch-restore x #78 baseline advance): re-arm adopts the resolve
+    session's commits as the re-drive's baseline, but the saved patch was diffed
+    from the ORIGINAL baseline — so a resolution commit that rewrote the patched
+    lines makes the restore's `git apply` fail. The engine must escalate loudly
+    with no session dispatched (never silently merge the human's resolution with
+    the stale attempt), and the resolution commit must survive untouched."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    patch = project.implementation_artifacts / "attempt.patch"
+    engine, _ = make_engine(project, [_escalate_with_patch(project, "1-1-a", patch)])
+    assert engine.run().escalated == 1
+
+    # the resolve session commits its own fix REWRITING the line the patch's
+    # context expects, then the human latches the restore anyway
+    repo = project.project
+    (repo / "src.txt").write_text("corrected by resolution\n")
+    git(repo, "add", "src.txt")
+    git(repo, "commit", "-q", "-m", "resolution: overlapping fix")
+    rearm_escalation(engine.run_dir, restore_patch=str(patch))
+
+    seen: list[str] = []
+    resumed, _ = resume_engine(project, engine, [_restoring_dev_effect(project, "1-1-a", seen)])
+    summary = resumed.run()
+
+    assert summary.paused
+    assert seen == []  # no session ever dispatched onto a half-restored tree
+    kinds = [e["kind"] for e in resumed.journal.entries()]
+    assert "attempt-restore-failed" in kinds
+    assert "attempt-restored" not in kinds
+    task = load_state(resumed.run_dir).tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED  # re-escalated: the human re-resolves
+    # git apply is all-or-nothing: the overlapping resolution commit is untouched
+    assert (repo / "src.txt").read_text() == "corrected by resolution\n"
+
+
 def test_dev_stall_retries_then_succeeds(project):
     write_sprint(project, {"1-1-a": "ready-for-dev"})
     engine, adapter = make_engine(
@@ -2331,6 +2548,45 @@ def test_max_stories_limit(project):
     summary = engine.run()
     assert summary.done == 1
     assert "1-2-b" not in engine.state.tasks
+
+
+def test_max_stories_survives_a_pause_resume(project):
+    """A5 regression on the SPRINT path: the --max-stories dispatch gate consults
+    the durable _dispatched_count(), which replaced a _loop-local counter that
+    reset to 0 on every resume (the stories-mode fix rewired the shared base
+    gate). With cap=2 and one story committed before an epic-boundary pause, a
+    resume must dispatch exactly ONE more story — never re-fill the whole cap."""
+    write_sprint(
+        project,
+        {
+            "epic-1": "backlog",
+            "1-1-a": "ready-for-dev",
+            "epic-2": "backlog",
+            "2-1-b": "ready-for-dev",
+            "2-2-c": "ready-for-dev",
+        },
+    )
+    gated = Policy(gates=GatesPolicy(mode="per-epic"), notify=QUIET)
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+        policy=gated,
+        max_stories=2,
+    )
+    engine.state.max_stories = 2  # cli.py persists this on RunState (helper gap: issue #84)
+    summary = engine.run()
+    assert summary.done == 1 and summary.paused
+    assert load_state(engine.run_dir).paused_stage == PAUSE_EPIC_BOUNDARY
+
+    resumed, _ = resume_engine(
+        project,
+        engine,
+        [dev_effect(project, "2-1-b"), review_effect(project, "2-1-b", clean=True)],
+    )
+    summary2 = resumed.run()
+    assert summary2.done == 2 and not summary2.paused
+    final = load_state(resumed.run_dir)
+    assert set(final.tasks) == {"1-1-a", "2-1-b"}  # 2-2-c never dispatched — cap durable
 
 
 def test_run_end_auto_sweep_fires_once(project):

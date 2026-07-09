@@ -515,7 +515,10 @@ class SweepEngine(Engine):
             self.state.tasks[key] = task
             self.journal.append("bundle-start", story_key=key, dw_ids=list(bundle.dw_ids))
         else:
-            # interrupted mid-bundle: same recovery as Engine._finish_inflight
+            # interrupted mid-bundle (or a re-armed escalation resolved via
+            # `bmad-loop resolve`): same recovery as Engine._finish_inflight,
+            # including the re-drive latch so a human-resolved escalation is
+            # protected through every reset (mirrors engine.py:1151-1157).
             self.journal.append("resume-restart", story_key=key, phase=str(task.phase))
             isolated = self._isolated and task.worktree_path
             if task.phase == Phase.DEV_VERIFY and task.spec_file:
@@ -538,7 +541,13 @@ class SweepEngine(Engine):
                 task.worktree_path = ""
                 task.branch = ""
             elif task.baseline_commit:
-                self._rollback_or_pause(task)
+                # latch resolved_redrive so the corrected spec + restored diff stay
+                # protected through every reset of this re-drive, not just this
+                # first one; cause="resolved" keeps a human-initiated re-arm
+                # pause-free regardless of scm.rollback_on_failure
+                task.resolved_redrive = task.resolved_redrive or task.rearmed
+                self._rollback_or_pause(task, cause="resolved" if task.rearmed else "stopped")
+            task.rearmed = False  # past rollback (only reached when not paused)
             task.phase = Phase.PENDING  # deliberate reset, not a normal transition
         dirname = bundle.name if cycle == 1 else f"c{cycle}-{bundle.name}"
         task.bundle_file = str(self._write_intent(bundle, dirname))
@@ -979,9 +988,25 @@ class SweepEngine(Engine):
         intent.md (intent + verbatim ledger entries) is handed over as freeform
         intent. The orchestrator owns the deferred-work ledger — the skill is told
         not to edit it — and records resolution itself in `_post_dev_state_sync`.
-        On a repair the bundle spec is re-opened first (B6) so step-01 resumes."""
+        On a repair the bundle spec is re-opened first (B6) so step-01 resumes.
+
+        A patch-restore re-drive (#2564, #75) must point at the bundle spec
+        explicitly: only step-01's spec-pointer intent check EARLY EXITs on the
+        `in-review` status the re-arm set — before step-01's version-control
+        sanity check, which would otherwise HALT `blocked` on the diff
+        `_restore_patch` just laid onto the tree. The freeform intent.md pointer
+        takes the path where that dirty-tree check runs first."""
         bundle_ref = task.bundle_file or task.story_key
         if feedback is None:
+            if task.restore_patch and task.spec_file:
+                return (
+                    f"/bmad-dev-auto Resume review of the in-review spec at "
+                    f"`{task.spec_file}` for the deferred-work bundle `{bundle_ref}`. "
+                    f"The attempted change was restored onto the working tree after "
+                    f"an intent-gap resolution; review it against the amended spec. "
+                    f"Do NOT edit the deferred-work ledger; the orchestrator records "
+                    f"resolution."
+                )
             return (
                 f"/bmad-dev-auto Implement the deferred-work bundle described in "
                 f"`{bundle_ref}` — it carries the intent and the verbatim ledger "

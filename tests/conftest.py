@@ -430,3 +430,31 @@ def bundle_review_effect(paths: ProjectPaths, name: str, clean: bool = True):
         )
 
     return effect
+
+
+def bundle_dev_escalates(paths: ProjectPaths, name: str, dw_ids, detail: str = "intent gap"):
+    """Simulate a bmad-dev-auto bundle session that hits an intent gap during its
+    inline review: it reverts its attempt, saves a patch, writes the bundle spec
+    ``blocked``, and surfaces a CRITICAL escalation naming the spec — so the run
+    pauses for `bmad-loop resolve --restore-patch`. ``spec_file`` in the result lets
+    ``_record_dev_spec`` latch ``task.spec_file`` (the restore re-arm's in-review
+    target), and the ``blocked`` status keeps the dw ids open (not synced done)."""
+
+    def effect(spec: SessionSpec) -> SessionResult:
+        sp = bundle_spec_path(paths, name)
+        baseline = rev_parse_head(paths.project)
+        write_spec(sp, "blocked", baseline)
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "auto-dev",
+                "story_key": f"dw-{name}",
+                "spec_file": str(sp),
+                "dw_ids": list(dw_ids),
+                "escalations": [
+                    {"type": "bundle-item-blocked", "severity": "CRITICAL", "detail": detail}
+                ],
+            },
+        )
+
+    return effect

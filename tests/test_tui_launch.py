@@ -118,6 +118,23 @@ def test_start_run_detached_argv(fake_run, tmp_path: Path):
     assert "detach-client" in shell
 
 
+def test_start_run_detached_argv_stories(fake_run, tmp_path: Path):
+    launch.start_run_detached(tmp_path, "RID", spec="_bmad-output/epic-1")
+    shell = fake_run.by_verb("new-window")[0][-1]
+    assert (
+        expected_cli(
+            "run",
+            "--project",
+            str(tmp_path),
+            "--run-id",
+            "RID",
+            "--spec",
+            "_bmad-output/epic-1",
+        )
+        in shell
+    )
+
+
 def test_start_run_omits_blank_filters(fake_run, tmp_path: Path):
     launch.start_run_detached(tmp_path, "RID")
     shell = fake_run.by_verb("new-window")[0][-1]

@@ -30,6 +30,12 @@ PAUSE_SPEC_APPROVAL = "spec-approval"
 PAUSE_EPIC_BOUNDARY = "epic-boundary"
 PAUSE_ESCALATION = "escalation"
 PAUSE_STORY_GATE = "story-gate"
+# stories-mode HITL checkpoints (independent per story). PLAN fires after a
+# spec_checkpoint story's plan-halt leg (ready-for-dev, awaiting human plan
+# review before implementation); STORY fires after a done_checkpoint story's
+# commit (skip-if-last). Both re-arm through the same resume path.
+PAUSE_PLAN_CHECKPOINT = "plan-checkpoint"
+PAUSE_STORY_CHECKPOINT = "story-checkpoint"
 
 
 @dataclass
@@ -152,6 +158,37 @@ class StoryTask:
     # tracked content, so a mid-re-drive retry/defer reset can't silently revert
     # the human correction. Survives the resume serialization round-trip.
     resolved_redrive: bool = False
+    # stories mode only: set when a spec_checkpoint story's plan-halt leg verified
+    # (spec at ready-for-dev) and the run paused for human plan review. On resume
+    # StoriesEngine._resume_after_dev_verify reads it to re-drive the implement leg
+    # (rather than the base review+commit) and clears it. Survives the round-trip.
+    plan_checkpoint_pending: bool = False
+    # stories mode only: the durable "a human plan review is still owed" obligation
+    # for a spec_checkpoint story. Latched at the story's first (leg-1) dispatch —
+    # BEFORE the session runs and keyed off the entry's spec_checkpoint flag, not
+    # the leg's on-disk status or result — so it survives a crash, a non-fixable
+    # retry, or a skill that overran `Halt after planning.`, none of which the
+    # on-disk-status-keyed _plan_halt_leg / result-keyed plan_checkpoint_pending
+    # carry across. Cleared ONLY when a plan-review pause actually raises (the
+    # obligation is discharged). While set after a dev leg that did not itself pause,
+    # StoriesEngine pauses before commit so the story can never commit un-reviewed.
+    plan_review_owed: bool = False
+    # stories mode only: the fixed slug ("unresolved" / "ambiguous") of a pre-planning
+    # halt sentinel this task was detected as — recorded at detection time (pick-time
+    # wedge or post-dev read-back), NOT re-derived from the spec_file basename at
+    # re-arm. runs.rearm_escalation deletes a sentinel only when this is set, so a real
+    # story spec that merely happens to be named `<key>-unresolved.md`, or a
+    # non-sentinel escalation whose spec matches the convention, is status-flipped and
+    # kept, never deleted. "" = not a sentinel. Survives the round-trip.
+    sentinel_kind: str = ""
+    # intent-gap patch-restore re-drive (BMAD-METHOD #2564): a repo-relative-or-
+    # absolute path to the patch file bmad-dev-auto saved of the reverted attempt.
+    # Latched by runs.rearm_escalation when the human confirms the attempted reading
+    # was correct; the engine re-applies it onto the baseline after every reset of
+    # the re-drive so the re-driven session resumes review (step-04) on the restored
+    # diff, and clears it once the corrected work commits. None = ordinary
+    # from-scratch re-drive. Survives the resume serialization round-trip.
+    restore_patch: str | None = None
     # sweep bundles only: the deferred-work ids this task closes and the
     # rendered intent file handed to dev sessions
     dw_ids: list[str] = field(default_factory=list)
@@ -203,6 +240,10 @@ class StoryTask:
             "defer_reason": self.defer_reason,
             "rearmed": self.rearmed,
             "resolved_redrive": self.resolved_redrive,
+            "plan_checkpoint_pending": self.plan_checkpoint_pending,
+            "plan_review_owed": self.plan_review_owed,
+            "sentinel_kind": self.sentinel_kind,
+            "restore_patch": self.restore_patch,
             "dw_ids": self.dw_ids,
             "bundle_file": self.bundle_file,
             "worktree_path": self.worktree_path,
@@ -245,6 +286,10 @@ class StoryTask:
             defer_reason=d.get("defer_reason"),
             rearmed=bool(d.get("rearmed", False)),
             resolved_redrive=bool(d.get("resolved_redrive", False)),
+            plan_checkpoint_pending=bool(d.get("plan_checkpoint_pending", False)),
+            plan_review_owed=bool(d.get("plan_review_owed", False)),
+            sentinel_kind=str(d.get("sentinel_kind", "")),
+            restore_patch=d.get("restore_patch"),
             dw_ids=[str(i) for i in d.get("dw_ids", [])],
             bundle_file=d.get("bundle_file"),
             worktree_path=str(d.get("worktree_path", "")),
@@ -282,6 +327,14 @@ class RunState:
     crashed: bool = False
     crash_error: str | None = None
     run_type: str = "story"  # "story" | "sweep" — resume/status dispatch on it
+    # story-queue source (policy.StoriesPolicy.source), pinned at run start so
+    # resume/resolve rebuild the right engine (StoriesEngine vs the sprint Engine)
+    # without re-reading policy — a policy edit mid-run must not switch a live run's
+    # mode. `run_type` stays "story" for both; `source` selects the picker.
+    source: str = "sprint-status"
+    # stories mode only: the project-relative (or absolute) spec folder holding
+    # stories.yaml + SPEC.md. Empty under sprint-status.
+    spec_folder: str = ""
     # sweep runs only: the triage->bundles cycle in progress; 1 maps to the
     # legacy (unsuffixed) artifact names so old paused runs resume unchanged
     sweep_cycle: int = 1
@@ -345,6 +398,8 @@ class RunState:
             "crashed": self.crashed,
             "crash_error": self.crash_error,
             "run_type": self.run_type,
+            "source": self.source,
+            "spec_folder": self.spec_folder,
             "sweep_cycle": self.sweep_cycle,
             "sweeps_triggered": self.sweeps_triggered,
             "target_branch": self.target_branch,
@@ -371,6 +426,8 @@ class RunState:
             crashed=bool(d.get("crashed", False)),
             crash_error=d.get("crash_error"),
             run_type=str(d.get("run_type", "story")),
+            source=str(d.get("source", "sprint-status")),
+            spec_folder=str(d.get("spec_folder", "")),
             sweep_cycle=int(d.get("sweep_cycle", 1)),
             sweeps_triggered=[str(s) for s in d.get("sweeps_triggered", [])],
             target_branch=str(d.get("target_branch", "")),

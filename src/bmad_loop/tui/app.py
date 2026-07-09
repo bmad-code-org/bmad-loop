@@ -15,24 +15,37 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
+from rich.text import Text
 from textual import work
 from textual.app import App, SuspendNotSupported
 from textual.binding import Binding
 from tomlkit.exceptions import ParseError
 
-from .. import bmadconfig, decisions, runs, verify
+from .. import bmadconfig, decisions, devcontract, policy, resolve, runs, stories, verify
 from ..journal import load_state
+from ..model import (
+    PAUSE_EPIC_BOUNDARY,
+    PAUSE_ESCALATION,
+    PAUSE_PLAN_CHECKPOINT,
+    PAUSE_SPEC_APPROVAL,
+    PAUSE_STORY_CHECKPOINT,
+    PAUSE_STORY_GATE,
+    RunState,
+)
 from ..policy import POLICY_FILE
 from ..process_host import ProcessHostError
-from ..runs import RUNS_DIR, StopRunError
+from ..runs import RUNS_DIR, RearmError, StopRunError
 from . import data, launch
 from .screens.dashboard import DashboardScreen
 from .screens.modals import (
     ConfirmModal,
     ConfirmResumeModal,
     DecisionModal,
+    EscalationModal,
+    SpecReviewModal,
     StartRunModal,
     StartSweepModal,
+    StoryCheckpointModal,
     TextOutputModal,
 )
 from .screens.settings_screen import SettingsScreen
@@ -62,11 +75,11 @@ class BmadLoopApp(App[None]):
         min-height: 4;
         border-top: solid $primary-darken-2;
     }
-    #runs, #sprint-tree, #deferred {
+    #runs, #sprint-tree, #stories-table, #deferred {
         border-title-color: $text;
         border-title-style: bold;
     }
-    #sprint-tree {
+    #sprint-tree, #stories-table {
         height: 3fr;
         min-height: 4;
         border-top: solid $primary-darken-2;
@@ -108,6 +121,7 @@ class BmadLoopApp(App[None]):
         Binding("r", "start_run", "run"),
         Binding("s", "start_sweep", "sweep"),
         Binding("e", "resume_run", "resume"),
+        Binding("p", "review_pause", "review"),
         Binding("R", "resolve_run", "resolve"),
         Binding("d", "answer_decisions", "decisions"),
         Binding("a", "attach", "attach"),
@@ -172,13 +186,33 @@ class BmadLoopApp(App[None]):
     def action_start_run(self) -> None:
         if self._tmux_missing():
             return
-        self.push_screen(StartRunModal(), self._start_run_result)
+        source, spec_folder = self._stories_defaults()
+        self.push_screen(
+            StartRunModal(self.project, default_source=source, default_spec_folder=spec_folder),
+            self._start_run_result,
+        )
+
+    def _stories_defaults(self) -> tuple[str, str]:
+        """The [stories] policy source + spec_folder to prefill the start-run
+        modal, or the sprint-mode default when policy is unreadable."""
+        try:
+            pol = policy.load(self.project / POLICY_FILE)
+        except (policy.PolicyError, OSError, ParseError):
+            return "sprint-status", ""
+        return pol.stories.source, pol.stories.spec_folder
 
     def _start_run_result(self, result: dict | None) -> None:
         if not result:
             return
+        stories_on = result["source"] == "stories"
+        spec_folder = result["spec_folder"] if stories_on else ""
+        if stories_on and not spec_folder:
+            self.notify("stories mode needs a spec folder", severity="error")
+            return
         if result["dry_run"]:
             tail = ["run", "--project", str(self.project), "--dry-run"]
+            if stories_on:
+                tail += ["--spec", spec_folder]
             if result["epic"] is not None:
                 tail += ["--epic", str(result["epic"])]
             if result["story"]:
@@ -194,6 +228,7 @@ class BmadLoopApp(App[None]):
                 launch.start_run_detached(
                     self.project,
                     run_id,
+                    spec=spec_folder or None,
                     epic=result["epic"],
                     story=result["story"],
                     max_stories=result["max_stories"],
@@ -395,23 +430,6 @@ class BmadLoopApp(App[None]):
             return
         story = state.paused_story_key or "?"
 
-        def done(ok: bool | None) -> None:
-            if not ok:
-                return
-            try:
-                win_id = launch.start_resolve_detached(self.project, run_id)
-            except launch.LaunchError as e:
-                self.notify(str(e), severity="error")
-                return
-            if not win_id:
-                self.notify(
-                    "resolve launched but its window id was not captured",
-                    severity="error",
-                )
-                return
-            launch.select_ctl_window_id(win_id)
-            self._attach_to_target(f"={launch.CTL_SESSION}", return_window=win_id)
-
         self.push_screen(
             ConfirmModal(
                 "resolve escalation",
@@ -419,8 +437,333 @@ class BmadLoopApp(App[None]):
                 "converse to fix the frozen spec, then confirm re-arm + resume in that window.",
                 confirm_label="resolve",
             ),
-            done,
+            lambda ok: self._launch_resolve(run_id) if ok else None,
         )
+
+    def _launch_resolve(self, run_id: str) -> None:
+        """Open the interactive resolve agent for run_id in a ctl window and
+        attach — the same path `bmad-loop resolve` drives. The caller has already
+        confirmed and (for the escalation viewer) gated on liveness."""
+        try:
+            win_id = launch.start_resolve_detached(self.project, run_id)
+        except launch.LaunchError as e:
+            self.notify(str(e), severity="error")
+            return
+        if not win_id:
+            self.notify("resolve launched but its window id was not captured", severity="error")
+            return
+        launch.select_ctl_window_id(win_id)
+        self._attach_to_target(f"={launch.CTL_SESSION}", return_window=win_id)
+
+    # -------------------------------------------------------- HITL pause review
+
+    def action_review_pause(self) -> None:
+        """Open the stage-appropriate review viewer for the selected paused run.
+        Each viewer's actions call the exact code paths the CLI uses (resume,
+        reset-to-draft + resume, rearm + resume, resolve, stop) — no duplicated
+        logic. Pause kind is read from RunState.paused_stage."""
+        selected = self._paused_selection()
+        if selected is None:
+            return
+        run_id, run_dir, state = selected
+        stage = state.paused_stage
+        if stage == PAUSE_PLAN_CHECKPOINT:
+            self._review_plan_checkpoint(run_id, run_dir, state)
+        elif stage == PAUSE_STORY_CHECKPOINT:
+            self._review_story_checkpoint(run_id, run_dir, state)
+        elif stage == PAUSE_ESCALATION:
+            self._review_escalation(run_id, run_dir, state)
+        elif stage in (PAUSE_SPEC_APPROVAL, PAUSE_EPIC_BOUNDARY, PAUSE_STORY_GATE):
+            self._review_gate(run_id, run_dir, state)
+        else:
+            self.notify(f"no review viewer for pause stage {stage!r}", severity="warning")
+
+    def _paused_selection(self) -> tuple[str, Path, RunState] | None:
+        run_id = self._dashboard.selected_run_id
+        if run_id is None:
+            self.notify("no run selected", severity="warning")
+            return None
+        run_dir = self.project / RUNS_DIR / run_id
+        try:
+            state = load_state(run_dir)
+        except (OSError, KeyError, ValueError):
+            self.notify(f"state for run {run_id} is unreadable", severity="error")
+            return None
+        if not state.paused:
+            self.notify("run is not paused — nothing to review", severity="warning")
+            return None
+        return run_id, run_dir, state
+
+    def _review_plan_checkpoint(self, run_id: str, run_dir: Path, state: RunState) -> None:
+        spec_path, spec_text = self._paused_spec(state)
+        modal = SpecReviewModal(
+            title="plan checkpoint — review the planned spec before implementation",
+            subtitle=self._story_subtitle(state),
+            spec_path=spec_path,
+            spec_text=spec_text,
+            actions=[
+                ("approve", "Approve & resume", "primary"),
+                ("replan", "Request replan", "warning"),
+            ],
+        )
+
+        def done(verb: str | None) -> None:
+            if verb == "approve":
+                self._do_resume(run_id)
+            elif verb == "replan":
+                if spec_path is None:
+                    self.notify("no spec file to reset for replan", severity="error")
+                    return
+                self._do_replan(run_id, spec_path)
+
+        self.push_screen(modal, done)
+
+    def _review_gate(self, run_id: str, run_dir: Path, state: RunState) -> None:
+        labels = {
+            PAUSE_SPEC_APPROVAL: "spec-approval gate",
+            PAUSE_EPIC_BOUNDARY: "epic gate",
+            PAUSE_STORY_GATE: "story gate",
+        }
+        spec_path, spec_text = self._paused_spec(state)
+        modal = SpecReviewModal(
+            title=f"{labels.get(state.paused_stage, 'gate')} — review the finalized spec",
+            subtitle=self._story_subtitle(state),
+            spec_path=spec_path,
+            spec_text=spec_text,
+            actions=[("resume", "Approve & resume", "primary")],
+        )
+        self.push_screen(modal, lambda verb: self._do_resume(run_id) if verb == "resume" else None)
+
+    @staticmethod
+    def _checkpoint_gate_line(review_cycle: int) -> str:
+        """The story-checkpoint card's gate line, derived from real task state.
+
+        A done_checkpoint fires only after the story's verify + review gates
+        passed and it committed, so the pass is backed by the commit's existence
+        — but we do not persist per-command verify output, so we state the gates
+        cleared plus the follow-up review-cycle count the task actually records,
+        never a blanket hardcoded "verification passed" claim."""
+        if review_cycle == 0:
+            note = "no follow-up review cycles"
+        elif review_cycle == 1:
+            note = "1 follow-up review cycle"
+        else:
+            note = f"{review_cycle} follow-up review cycles"
+        return f"verify + review gates passed · {note}"
+
+    def _review_story_checkpoint(self, run_id: str, run_dir: Path, state: RunState) -> None:
+        story_key = state.paused_story_key or "?"
+        task = state.tasks.get(story_key)
+        commit = ""
+        tokens = "-"
+        # Defensive default: a done_checkpoint implies a commit, but if none is
+        # recorded say so rather than assert a verify outcome we cannot back.
+        verify_line = "no commit recorded for this story"
+        if task is not None:
+            if task.commit_sha:
+                subject = self._commit_subject(task.commit_sha)
+                commit = f"{task.commit_sha[:12]} {subject}".strip()
+                verify_line = self._checkpoint_gate_line(task.review_cycle)
+            weight = state.cache_read_weight()
+            raw = task.tokens.total
+            if raw:
+                tokens = f"{task.tokens.weighted_total(weight):,} ({raw:,} raw)"
+        modal = StoryCheckpointModal(
+            story_key=story_key,
+            title=self._story_context(state, story_key)[0],
+            commit=commit,
+            verify_line=verify_line,
+            tokens=tokens,
+        )
+
+        def done(verb: str | None) -> None:
+            if verb == "continue":
+                self._do_resume(run_id)
+            elif verb == "stop":
+                self._stop_run_worker(run_id, run_dir)
+
+        self.push_screen(modal, done)
+
+    def _review_escalation(self, run_id: str, run_dir: Path, state: RunState) -> None:
+        story_key = state.paused_story_key or "?"
+        spec_path, spec_text = self._paused_spec(state)
+        title, description = self._story_context(state, story_key)
+        restore_recorded = self._restore_recorded(run_dir, story_key)
+        modal = EscalationModal(
+            story_key=story_key,
+            title=title,
+            description=description,
+            blocking=self._blocking_condition(spec_text),
+            sentinel_kind=self._sentinel_kind(state, story_key),
+            resolution_ready=resolve.resolution_path(run_dir, story_key).is_file(),
+            engine_live=_engine_possibly_live(run_dir),
+            restore_recorded=restore_recorded,
+        )
+
+        def done(verb: str | None) -> None:
+            if verb == "resolve":
+                if self._tmux_missing() or self._resolve_blocked_by_liveness(run_id, run_dir):
+                    return
+                self._launch_resolve(run_id)
+            elif verb == "rearm":
+                self._do_rearm(run_id, run_dir, story_key, restore_recorded=restore_recorded)
+
+        self.push_screen(modal, done)
+
+    @staticmethod
+    def _restore_recorded(run_dir: Path, story_key: str) -> bool:
+        """True when resolution.json records — or, being unreadable, MAY record —
+        a restore_patch. The TUI re-arm path is a plain from-scratch re-drive
+        (only the CLI resolve flow honors the latch, because a stale marker is
+        indistinguishable from a fresh one here), so a recorded restore must be
+        surfaced rather than silently dropped."""
+        if not resolve.resolution_path(run_dir, story_key).is_file():
+            return False
+        try:
+            doc = resolve.read_resolution(run_dir, story_key)
+        except resolve.ResolutionError:
+            return True  # can't prove it carries no restore — surface the warning
+        return bool(doc and doc.get("restore_patch"))
+
+    # --------------------------------------------------- shared pause code paths
+
+    def _do_resume(self, run_id: str) -> None:
+        """Resume a paused run — the `bmad-loop resume` / `e` path, minus the
+        confirm modal (the viewer was the confirmation). Guards tmux + a
+        possibly-live engine so an approve/continue can't double-drive."""
+        if self._tmux_missing():
+            return
+        run_dir = self.project / RUNS_DIR / run_id
+        if _engine_possibly_live(run_dir):
+            self.notify(f"run {run_id} may still be live — stop it first", severity="warning")
+            return
+        try:
+            launch.resume_detached(self.project, run_id)
+        except launch.LaunchError as e:
+            self.notify(str(e), severity="error")
+            return
+        self.notify(f"resume of {run_id} launched (tmux session {launch.CTL_SESSION})")
+
+    def _do_replan(self, run_id: str, spec_path: Path) -> None:
+        """Request-replan: reset the planned spec to draft + strip its Auto Run
+        Result, then resume — the next dispatch re-enters step-02 planning. Uses
+        the same devcontract primitives the engine's repair path uses."""
+        # Guard a possibly-live engine BEFORE mutating the spec — a draft-reset +
+        # strip under a still-running session would race its writes (the rearm path
+        # already checks liveness first; match it so replan can't corrupt a live
+        # drive, and only then does _do_resume re-check before relaunching).
+        run_dir = self.project / RUNS_DIR / run_id
+        if self._resolve_blocked_by_liveness(run_id, run_dir):
+            return
+        try:
+            reset = devcontract.reset_spec_status(spec_path, "draft")
+            devcontract.strip_auto_run_result(spec_path)
+        except OSError as e:
+            self.notify(f"replan failed: {e}", severity="error")
+            return
+        if not reset:
+            # honor the reset bool: nothing was flipped (the spec has no frontmatter
+            # status, or is already draft), so the next dispatch would NOT re-enter
+            # planning. Surface it instead of a misleading "reset" notice + resume.
+            self.notify(
+                "replan: could not reset the plan to draft (no frontmatter status?) "
+                "— not resuming",
+                severity="error",
+            )
+            return
+        self.notify("plan reset to draft — the next dispatch re-plans")
+        self._do_resume(run_id)
+
+    def _do_rearm(
+        self, run_id: str, run_dir: Path, story_key: str, *, restore_recorded: bool = False
+    ) -> None:
+        """Re-arm a resolved escalation + resume — the `resolve --no-interactive`
+        path (rearm_escalation handles sentinel auto-delete-with-preservation)."""
+        if self._resolve_blocked_by_liveness(run_id, run_dir):
+            return
+        try:
+            runs.rearm_escalation(run_dir, story_key)
+        except RearmError as e:
+            self.notify(f"re-arm failed: {e}", severity="error")
+            return
+        if restore_recorded:
+            self.notify(
+                "recorded restore patch NOT honored — this re-arm re-drives from "
+                "scratch (only `bmad-loop resolve` applies a restore)",
+                severity="warning",
+            )
+        self.notify(f"re-armed {story_key}")
+        self._do_resume(run_id)
+
+    def _resolve_blocked_by_liveness(self, run_id: str, run_dir: Path) -> bool:
+        if _engine_possibly_live(run_dir):
+            self.notify(f"run {run_id} may still be live — stop it first", severity="warning")
+            return True
+        return False
+
+    # ---------------------------------------------------- pause-context readers
+
+    def _paused_spec(self, state: RunState) -> tuple[Path | None, str]:
+        """(spec path, spec text) for the paused story, or (None, "") when the
+        task has no spec file (e.g. an ambiguous-match escalation)."""
+        task = state.tasks.get(state.paused_story_key) if state.paused_story_key else None
+        if task is None or not task.spec_file:
+            return None, ""
+        path = Path(task.spec_file)
+        try:
+            return path, path.read_text(encoding="utf-8")
+        except OSError:
+            return path, ""
+
+    def _story_subtitle(self, state: RunState) -> Text:
+        key = state.paused_story_key or "?"
+        title = self._story_context(state, key)[0]
+        text = Text(key, style="bold")
+        if title:
+            text.append(f" — {title}")
+        return text
+
+    def _story_context(self, state: RunState, key: str) -> tuple[str, str]:
+        """(title, description) from stories.yaml in stories mode, else ("", "")."""
+        if state.source != "stories" or not state.spec_folder:
+            return "", ""
+        try:
+            folder = stories.resolve_spec_folder(self.project, state.spec_folder)
+            entry = stories.load_stories(folder).get(key)
+        except stories.StoriesError:
+            return "", ""
+        return (entry.title, entry.description) if entry else ("", "")
+
+    def _sentinel_kind(self, state: RunState, key: str) -> str:
+        if state.source != "stories" or not state.spec_folder:
+            return ""
+        # resolve_story_spec globs + reads frontmatter; a file removed mid-scan (a
+        # re-arm clearing the sentinel while the viewer refreshes) can raise OSError.
+        # Degrade to "" rather than let a race-window read crash the render.
+        try:
+            folder = stories.resolve_spec_folder(self.project, state.spec_folder)
+            st = stories.resolve_story_spec(folder, key)
+        except OSError:
+            return ""
+        return st.sentinel_kind if st.kind == stories.KIND_SENTINEL else ""
+
+    @staticmethod
+    def _blocking_condition(spec_text: str) -> str:
+        """The `## Auto Run Result` block a blocked spec records its halt in."""
+        idx = spec_text.find("## Auto Run Result")
+        return spec_text[idx:].strip() if idx != -1 else ""
+
+    def _commit_subject(self, sha: str) -> str:
+        try:
+            proc = subprocess.run(
+                ["git", "-C", str(self.project), "log", "-1", "--format=%s", sha],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        return proc.stdout.strip() if proc.returncode == 0 else ""
 
     # ------------------------------------------------------ stop / delete / archive
 

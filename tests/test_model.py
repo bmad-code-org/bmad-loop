@@ -17,6 +17,25 @@ def _task_with_session(usage: TokenUsage | None = None) -> StoryTask:
     return task
 
 
+def test_run_state_stories_fields_default_and_round_trip():
+    default = _state()
+    assert default.source == "sprint-status"
+    assert default.spec_folder == ""
+    stories = _state(source="stories", spec_folder="_bmad-output/epic-1")
+    back = RunState.from_dict(stories.to_dict())
+    assert back.source == "stories"
+    assert back.spec_folder == "_bmad-output/epic-1"
+
+
+def test_run_state_stories_fields_default_when_absent_from_dict():
+    # a pre-stories state.json (no source/spec_folder keys) reads as sprint mode
+    d = _state().to_dict()
+    del d["source"]
+    del d["spec_folder"]
+    back = RunState.from_dict(d)
+    assert back.source == "sprint-status" and back.spec_folder == ""
+
+
 def test_attach_session_usage_folds_usage_into_record_and_totals():
     task = _task_with_session()
     task.attach_session_usage("1-1-a-dev-1", TokenUsage(input_tokens=10, output_tokens=5))
@@ -82,6 +101,39 @@ def test_resolved_redrive_defaults_false_for_legacy_state():
     doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
     del doc["resolved_redrive"]  # state.json from before the field existed
     assert StoryTask.from_dict(doc).resolved_redrive is False
+
+
+def test_plan_checkpoint_pending_round_trips():
+    task = StoryTask(story_key="1", epic=0, plan_checkpoint_pending=True)
+    assert StoryTask.from_dict(task.to_dict()).plan_checkpoint_pending is True
+
+
+def test_plan_checkpoint_pending_defaults_false_for_legacy_state():
+    doc = StoryTask(story_key="1", epic=0).to_dict()
+    del doc["plan_checkpoint_pending"]  # state.json from before the field existed
+    assert StoryTask.from_dict(doc).plan_checkpoint_pending is False
+
+
+def test_sentinel_kind_round_trips():
+    task = StoryTask(story_key="1", epic=0, sentinel_kind="unresolved")
+    assert StoryTask.from_dict(task.to_dict()).sentinel_kind == "unresolved"
+
+
+def test_sentinel_kind_defaults_empty_for_legacy_state():
+    doc = StoryTask(story_key="1", epic=0).to_dict()
+    del doc["sentinel_kind"]  # state.json from before the field existed
+    assert StoryTask.from_dict(doc).sentinel_kind == ""
+
+
+def test_restore_patch_round_trips():
+    task = StoryTask(story_key="1-1-a", epic=1, restore_patch="artifacts/attempt.patch")
+    assert StoryTask.from_dict(task.to_dict()).restore_patch == "artifacts/attempt.patch"
+
+
+def test_restore_patch_defaults_none_for_legacy_state():
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    del doc["restore_patch"]  # state.json from before the field existed
+    assert StoryTask.from_dict(doc).restore_patch is None
 
 
 def test_stopped_round_trips():

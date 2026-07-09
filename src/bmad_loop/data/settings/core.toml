@@ -47,6 +47,23 @@ label = "review trigger"
 description = "recommended: run the 2nd-opinion review only when bmad-dev-auto flags it · always: run it every story (both bounded by limits.max_review_cycles)"
 
 [[section]]
+name = "stories"
+description = "story-queue source: classic sprint board vs. folder+id dispatch"
+[[section.field]]
+key = "source"
+kind = "select"
+options_ref = "STORIES_SOURCES"
+default_ref = "StoriesPolicy.source"
+label = "story source"
+description = "sprint-status: walk sprint-status.yaml · stories: folder+id dispatch off a typed stories.yaml (needs spec_folder)"
+[[section.field]]
+key = "spec_folder"
+kind = "str"
+default_ref = "StoriesPolicy.spec_folder"
+label = "spec folder"
+description = "stories mode only: project-relative path to the epic spec folder (holds stories.yaml + SPEC.md)"
+
+[[section]]
 name = "limits"
 description = "cycle/attempt caps, timeout & token budget"
 [[section.field]]

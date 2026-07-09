@@ -5,6 +5,7 @@ import re
 
 from conftest import (
     bundle_dev_effect,
+    bundle_dev_escalates,
     bundle_review_effect,
     git,
     migrate_effect,
@@ -14,7 +15,7 @@ from conftest import (
     write_spec,
 )
 
-from bmad_loop import deferredwork
+from bmad_loop import deferredwork, runs, verify
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.journal import Journal, load_state
@@ -1023,6 +1024,132 @@ def test_escalated_bundle_resume_skips_it_and_runs_rest(project):
     # triage was NOT re-run: only the two bundle sessions
     assert len(adapter.sessions) == 2
     assert ledger_entries(project)["DW-1"].open  # escalated bundle untouched
+
+
+# ------------------------------ intent-gap patch-restore re-drive (#75)
+
+
+def _run_to_dev_escalation(project, policy=None):
+    """Drive a one-bundle sweep until its dev session escalates on an intent gap.
+    Returns the paused engine; the bundle task is ESCALATED with spec_file set and
+    DW-1 still open (blocked spec is not synced done)."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = triage_result(
+        ["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "resolve DW-1"}]
+    )
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(plan), bundle_dev_escalates(project, "fix", ["DW-1"])],
+        policy=policy,
+    )
+    summary = engine.run()
+    assert summary.paused
+    task = engine.state.tasks["dw-fix"]
+    assert task.phase == Phase.ESCALATED
+    assert task.spec_file  # latched by _record_dev_spec on the dev escalation
+    assert ledger_entries(project)["DW-1"].open  # blocked spec not synced done
+    return engine
+
+
+def test_generic_bundle_prompt_restore_branch_points_at_spec(project):
+    # T-A: the restore-aware prompt (Change A) — no run needed.
+    engine, _ = make_sweep(project, [])
+    spec = str(project.implementation_artifacts / "spec-dw-fix.md")
+    task = StoryTask(
+        story_key="dw-fix",
+        epic=0,
+        dw_ids=["DW-1"],
+        bundle_file="/run/bundles/fix/intent.md",
+        spec_file=spec,
+        restore_patch="/run/artifacts/attempt-dw-fix.patch",
+    )
+    restore_prompt = engine._generic_bundle_prompt(task, None)
+    assert "Resume review of the in-review spec" in restore_prompt
+    assert spec in restore_prompt
+    assert "Do NOT edit the deferred-work ledger" in restore_prompt
+    # without a latched patch the fresh-implement prompt is unchanged
+    task.restore_patch = None
+    fresh_prompt = engine._generic_bundle_prompt(task, None)
+    assert "Implement the deferred-work bundle" in fresh_prompt
+    assert "Resume review of the in-review spec" not in fresh_prompt
+
+
+def test_sweep_bundle_restore_redrive_reaches_done_and_clears_latch(project, monkeypatch):
+    # T-C + T-D: rearm with a restore patch, resume, land done; assert the dispatched
+    # prompt pointed at the in-review spec, the patch apply seam fired, the dw id
+    # closed, and both latches cleared on commit (inherited Engine._commit).
+    monkeypatch.setattr(verify, "apply_patch", lambda repo, patch: None)
+    engine = _run_to_dev_escalation(project)
+    patch = project.implementation_artifacts / "attempt-dw-fix.patch"
+    patch.parent.mkdir(parents=True, exist_ok=True)
+    patch.write_text("dummy\n")
+
+    runs.rearm_escalation(engine.run_dir, "dw-fix", restore_patch=str(patch))
+
+    resumed, adapter = resume_sweep(
+        project,
+        engine,
+        [bundle_dev_effect(project, "fix", ["DW-1"]), bundle_review_effect(project, "fix")],
+    )
+    summary = resumed.run()
+
+    assert not summary.paused
+    task = resumed.state.tasks["dw-fix"]
+    assert task.phase == Phase.DONE
+    # Change A: the re-drive dev session was pointed at the in-review spec
+    spec = str(project.implementation_artifacts / "spec-dw-fix.md")
+    assert "Resume review of the in-review spec" in adapter.sessions[0].prompt
+    assert spec in adapter.sessions[0].prompt
+    # the restore apply seam fired
+    assert "attempt-restored" in journal_text(resumed)
+    # latches cleared on commit
+    assert task.restore_patch is None
+    assert task.resolved_redrive is False
+    # the deferred-work id was closed
+    assert ledger_entries(project)["DW-1"].status.startswith("done")
+
+
+def test_sweep_restore_redrive_exhaustion_pauses_not_defers(project, monkeypatch):
+    # T-B (restore): a non-critical exhaustion mid-restore-re-drive must PAUSE
+    # (re-escalate for the human), not silently DEFER the resolved escalation.
+    monkeypatch.setattr(verify, "apply_patch", lambda repo, patch: None)
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(rollback_on_failure=True),
+        limits=LimitsPolicy(max_dev_attempts=1),
+    )
+    engine = _run_to_dev_escalation(project, policy=policy)
+    patch = project.implementation_artifacts / "attempt-dw-fix.patch"
+    patch.parent.mkdir(parents=True, exist_ok=True)
+    patch.write_text("dummy\n")
+    runs.rearm_escalation(engine.run_dir, "dw-fix", restore_patch=str(patch))
+
+    resumed, _ = resume_sweep(project, engine, [lambda spec: SessionResult(status="died")])
+    summary = resumed.run()
+
+    assert summary.paused
+    assert resumed.state.tasks["dw-fix"].phase == Phase.ESCALATED
+
+
+def test_sweep_from_scratch_redrive_exhaustion_pauses_not_defers(project):
+    # T-B (from-scratch twin): the resolved_redrive latch also protects a plain
+    # `resolve` re-drive (no --restore-patch) — the pre-existing sweep defer bug
+    # Change B closes. Without the fix this exhaustion would DEFER, not PAUSE.
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(rollback_on_failure=True),
+        limits=LimitsPolicy(max_dev_attempts=1),
+    )
+    engine = _run_to_dev_escalation(project, policy=policy)
+    runs.rearm_escalation(engine.run_dir, "dw-fix")  # from-scratch, no restore
+
+    resumed, _ = resume_sweep(project, engine, [lambda spec: SessionResult(status="died")])
+    summary = resumed.run()
+
+    assert summary.paused
+    assert resumed.state.tasks["dw-fix"].phase == Phase.ESCALATED
 
 
 # ----------------------------------------------------------- repeat cycles

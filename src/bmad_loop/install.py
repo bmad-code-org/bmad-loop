@@ -67,28 +67,77 @@ LEGACY_MODULE_SKILLS = (
 # BMad Method (bmm) module installs them. Each must exist in every active CLI skill
 # tree and carry its marker files (a half-installed or pre-automation skill is
 # caught by the `bmad-loop validate` preflight). `{skill: (marker-rel-path, ...)}`.
-#   - bmad-dev-auto: the inner dev primitive — always required.
-#   - the two review hunters bmad-dev-auto's step-04 invokes inline on EVERY dev
+#   - bmad-dev-auto: the inner dev primitive — always required. Markers pin BOTH a
+#     step file (catches a truncated copy) AND customize.toml, the layer/handoff
+#     config step-04 resolves review_layers from (BMAD-METHOD #2535/#2550): a
+#     pre-July bmm install predating it would let every dev run's step-04 fail.
+#   - the three review hunters bmad-dev-auto's step-04 invokes inline on EVERY dev
 #     run (and on each follow-up review re-invocation) — also always required, no
-#     longer gated on a separate review session.
+#     longer gated on a separate review session. bmad-review-verification-gap is
+#     the newest layer (BMAD-METHOD #2550): a target project missing it makes the
+#     verification-gap review layer fail on every run.
 DEV_BASE_SKILLS = {
-    "bmad-dev-auto": ("step-04-review.md",),
+    "bmad-dev-auto": ("step-04-review.md", "customize.toml"),
     "bmad-review-adversarial-general": (),
     "bmad-review-edge-case-hunter": (),
+    "bmad-review-verification-gap": (),
 }
 # Every non-bundled skill that might need copying into an isolated worktree.
 BASE_SKILLS = dict(DEV_BASE_SKILLS)
+
+# Stories mode (folder+id dispatch, BMAD-METHOD #2549) needs a *newer* bmad-dev-auto
+# than sprint mode: one whose step-01 routes a spec-folder + story-id invocation.
+# File existence (missing_base_skills) can't tell the two skill versions apart, so
+# a content probe confirms the merged dispatch protocol is present. This literal is
+# stable prose in the merged step-01 ("this is a **folder+id dispatch**").
+STORIES_PROBE_SKILL = "bmad-dev-auto"
+STORIES_PROBE_FILE = "step-01-clarify-and-route.md"
+STORIES_PROBE_TEXT = "folder+id dispatch"
+
+
+def missing_stories_support(project: Path, trees: Sequence[str]) -> list[str]:
+    """Problems for stories mode's stricter bmad-dev-auto requirement.
+
+    Sprint mode drives any bmad-dev-auto; stories mode needs the folder+id
+    dispatch flow, which older skill versions lack. For each active CLI skill
+    tree, confirm ``bmad-dev-auto/step-01-clarify-and-route.md`` exists and
+    carries the dispatch-protocol marker. Returns one human-readable problem per
+    tree lacking it (empty = OK). Callers gate this on stories mode only —
+    sprint-mode runs must not require the newer skill."""
+    problems: list[str] = []
+    for tree in dict.fromkeys(trees):
+        probe = project / tree / STORIES_PROBE_SKILL / STORIES_PROBE_FILE
+        try:
+            text = probe.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            # OSError = the probe file is absent/unreadable; UnicodeDecodeError = it
+            # exists but is binary/non-UTF-8 (a corrupted skill tree). Either way the
+            # dispatch-protocol marker can't be confirmed, so report a problem rather
+            # than letting the decode error escape and crash the whole preflight.
+            problems.append(
+                f"{tree}/{STORIES_PROBE_SKILL}/{STORIES_PROBE_FILE} not found — stories "
+                f"mode needs folder+id dispatch; update the BMad Method (bmm) module"
+            )
+            continue
+        if STORIES_PROBE_TEXT not in text:
+            problems.append(
+                f"{tree}/{STORIES_PROBE_SKILL} lacks folder+id dispatch (no "
+                f"{STORIES_PROBE_TEXT!r} in {STORIES_PROBE_FILE}) — stories mode needs a "
+                f"newer bmad-dev-auto; update the bmm module"
+            )
+    return problems
 
 
 def missing_base_skills(project: Path, trees: Sequence[str]) -> list[str]:
     """Problems for the upstream skills the orchestrator drives but doesn't bundle.
 
-    The dev primitive (bmad-dev-auto) and the two adversarial review hunters it
-    invokes inline are installed by the BMad Method module, not by `bmad-loop
-    init`. Each must exist in every active CLI skill tree and carry its marker
-    files. Returns one human-readable problem string per missing/incomplete skill;
-    empty list means OK. Run as a preflight so a missing skill fails loudly with
-    remediation instead of stalling as an `Unknown command` until the run times out.
+    The dev primitive (bmad-dev-auto) and the three review hunters it invokes
+    inline — adversarial-general, edge-case-hunter, and verification-gap — are
+    installed by the BMad Method module, not by `bmad-loop init`. Each must exist
+    in every active CLI skill tree and carry its marker files. Returns one
+    human-readable problem string per missing/incomplete skill; empty list means
+    OK. Run as a preflight so a missing skill fails loudly with remediation instead
+    of stalling as an `Unknown command` until the run times out.
     """
     required = dict(DEV_BASE_SKILLS)
     problems: list[str] = []

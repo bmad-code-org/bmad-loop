@@ -459,6 +459,12 @@ class GenericDevAdapter(GenericAdapter):
         return dirs
 
     def _result_json(self, handle: SessionHandle, spec: SessionSpec, *, wait: bool) -> dict | None:
+        # Stories mode (folder+id dispatch): the story spec lives at a
+        # deterministic id-keyed path, so resolve it directly instead of the
+        # mtime-floor scan. The engine exports BMAD_LOOP_SPEC_FOLDER only for
+        # stories runs, so sprint/sweep runs keep the scan path below unchanged.
+        if spec.env.get("BMAD_LOOP_SPEC_FOLDER"):
+            return self._stories_result_json(handle, spec, wait=wait)
         # Mirror the base _await_result poll: the skill's terminal spec may not be
         # flushed to disk the instant the Stop event fires, so briefly await it when
         # wait=True instead of reading once and mis-reporting a stall.
@@ -480,6 +486,79 @@ class GenericDevAdapter(GenericAdapter):
             if not wait or time.monotonic() >= deadline:
                 return None
             time.sleep(RESULT_POLL_S)
+
+    def _stories_result_json(
+        self, handle: SessionHandle, spec: SessionSpec, *, wait: bool
+    ) -> dict | None:
+        """Deterministic stories-mode read-back: resolve ``<spec-folder>/stories/
+        <id>-*.md`` by id (never the mtime scan) and synthesize from it.
+
+        ``BMAD_LOOP_SPEC_FOLDER`` carries the project-relative (or absolute) spec
+        folder; rebase a relative one against ``spec.cwd`` exactly like
+        ``_artifact_dirs`` so worktree isolation resolves inside the live checkout.
+        A PRESENT or SENTINEL spec synthesizes (a blocked sentinel becomes a
+        CRITICAL escalation → PAUSE, same as any block) — but only when the spec was
+        (re)written by THIS session: like the mtime-scan path's ``since_ns`` floor, a
+        spec whose mtime predates ``handle.launched_ns`` is a stale prior artifact
+        (e.g. the dev's ``done`` spec a follow-up review session re-opens) and must
+        not be read as this session's result. A still-PENDING spec, an AMBIGUOUS
+        match (>1 file — an anomaly no wait can collapse; ``_pick_next`` re-classifies
+        it into an actionable wedge), or a stale terminal spec → None (a result-less
+        Stop the dev-stall grace handles).
+
+        On a plan-halt leg (``BMAD_LOOP_PLAN_HALT`` set by the engine for a
+        spec_checkpoint story's first dispatch) the skill HALTs at
+        ``ready-for-dev``; pass ``plan_halt=True`` so synthesize treats that as a
+        successful terminal (marked ``plan_halt``) rather than died-mid-flight."""
+        from .. import stories
+
+        story_key = spec.env.get("BMAD_LOOP_STORY_KEY") or ""
+        folder = Path(spec.env["BMAD_LOOP_SPEC_FOLDER"])
+        base = folder if folder.is_absolute() else Path(spec.cwd) / folder
+        plan_halt = bool(spec.env.get("BMAD_LOOP_PLAN_HALT"))
+        deadline = time.monotonic() + RESULT_GRACE_S
+        while True:
+            state = stories.resolve_story_spec(base, story_key)
+            if state.kind == stories.KIND_AMBIGUOUS:
+                # >1 matching file — waiting can't make it collapse to one. Return now
+                # (don't burn the grace); the engine's next _pick_next re-classifies
+                # AMBIGUOUS and raises the actionable wedge for resolve.
+                return None
+            if (
+                state.kind in (stories.KIND_PRESENT, stories.KIND_SENTINEL)
+                and state.path
+                and self._written_this_session(state.path, handle.launched_ns)
+            ):
+                try:
+                    result_json = devcontract.synthesize_result(
+                        state.path, story_key=story_key or None, plan_halt=plan_halt
+                    ).result_json
+                except UnicodeDecodeError:
+                    # A non-UTF-8 read is either a torn glimpse of a spec still
+                    # being written (keep polling — a later pass sees the finished
+                    # write) or a genuinely corrupt file: then the grace expires
+                    # result-less and the next _pick_next re-classifies it as a
+                    # wedge (resolve_story_spec degrades an undecodable PRESENT
+                    # spec to status "" → pause for resolve), never a crash of
+                    # the read-back poll.
+                    result_json = None
+                if result_json is not None:
+                    return result_json
+            if not wait or time.monotonic() >= deadline:
+                return None
+            time.sleep(RESULT_POLL_S)
+
+    @staticmethod
+    def _written_this_session(spec_path: Path, launched_ns: int) -> bool:
+        """Whether ``spec_path`` was (re)written at/after the session launched — the
+        same launch-floor guard ``devcontract.find_result_artifact`` applies on the
+        scan path, so a stale terminal spec from a prior step (a dev ``done`` a
+        follow-up review re-opens) is not mistaken for this session's output. A spec
+        that vanished between resolve and stat is treated as not-yet-written."""
+        try:
+            return spec_path.stat().st_mtime_ns >= launched_ns
+        except OSError:
+            return False
 
 
 # Back-compat alias: the adapter was ``GenericTmuxAdapter`` before tmux moved

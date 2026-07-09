@@ -8,15 +8,18 @@ rich Text, never markup.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.css.query import NoMatches
 from textual.screen import ModalScreen
-from textual.widgets import Button, Checkbox, Input, Label, Static
+from textual.widgets import Button, Checkbox, Input, Label, Select, Static
 
+from ... import stories
 from ...model import RunState
 from .. import data
 
@@ -62,31 +65,130 @@ class BaseDialog(ModalScreen):
 
 
 class StartRunModal(BaseDialog):
-    """Options for `bmad-loop run` → {epic, story, max_stories, dry_run}."""
+    """Options for `bmad-loop run`.
+
+    Dual-flow: a source select (prefilled from ``[stories]``) picks sprint mode
+    vs. stories mode; the spec-folder input feeds a live schedule preview that
+    validates ``stories.yaml`` (parses + rules pass, SPEC.md present) and lists
+    the linear schedule with independent spec/done checkpoint markers — the same
+    projection `run --dry-run` prints. Returns
+    ``{source, spec_folder, epic, story, max_stories, dry_run}``."""
+
+    DEFAULT_CSS = """
+    StartRunModal #dialog {
+        height: 90%;
+    }
+    StartRunModal #fields {
+        height: 1fr;
+    }
+    StartRunModal #preview {
+        height: auto;
+        max-height: 14;
+        border: solid $primary-darken-2;
+        padding: 0 1;
+        margin-top: 1;
+    }
+    """
+
+    def __init__(
+        self,
+        project: Path,
+        *,
+        default_source: str = "sprint-status",
+        default_spec_folder: str = "",
+    ):
+        super().__init__()
+        self._project = project
+        self._default_source = default_source
+        self._default_spec_folder = default_spec_folder
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
             yield Label("start run", classes="title")
-            yield Input(
-                placeholder="epic — blank for all",
-                type="integer",
-                valid_empty=True,
-                id="epic",
-            )
-            yield Input(
-                placeholder="story — 3-1, 3.1, slug, or full key (blank for all)",
-                id="story",
-            )
-            yield Input(
-                placeholder="max stories — blank for no limit",
-                type="integer",
-                valid_empty=True,
-                id="max-stories",
-            )
-            yield Checkbox("dry run (print the plan, spawn nothing)", id="dry-run")
+            # fields scroll; the button row is docked below so it stays clickable
+            # in any terminal size (the modal is tall in stories mode).
+            with VerticalScroll(id="fields"):
+                yield Select(
+                    [
+                        ("sprint mode — sprint-status.yaml", "sprint-status"),
+                        ("stories mode — folder+id dispatch", "stories"),
+                    ],
+                    value=self._default_source,
+                    allow_blank=False,
+                    id="source",
+                )
+                yield Input(
+                    value=self._default_spec_folder,
+                    placeholder="stories mode: spec folder holding stories.yaml + SPEC.md",
+                    id="spec-folder",
+                )
+                yield Input(
+                    placeholder="epic — blank for all (sprint mode)",
+                    type="integer",
+                    valid_empty=True,
+                    id="epic",
+                )
+                yield Input(
+                    placeholder="story — 3-1 / slug / full key (sprint), or story id (stories)",
+                    id="story",
+                )
+                yield Input(
+                    placeholder="max stories — blank for no limit",
+                    type="integer",
+                    valid_empty=True,
+                    id="max-stories",
+                )
+                yield Checkbox("dry run (print the plan, spawn nothing)", id="dry-run")
+                with VerticalScroll(id="preview"):
+                    yield Static(id="preview-body")
             with Horizontal(classes="buttons"):
                 yield Button("start", variant="primary", id="ok")
                 yield Button("cancel", id="cancel")
+
+    def on_mount(self) -> None:
+        self._refresh_preview()
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        self._refresh_preview()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "spec-folder":
+            self._refresh_preview()
+
+    def _refresh_preview(self) -> None:
+        try:
+            body = self.query_one("#preview-body", Static)
+            source = self.query_one("#source", Select).value
+            spec_folder = self.query_one("#spec-folder", Input).value.strip()
+        except NoMatches:
+            return  # a Changed message during mount, before the tree is built
+        if source != "stories":
+            body.update(Text("sprint mode — walks sprint-status.yaml", style="dim"))
+            return
+        if not spec_folder:
+            body.update(
+                Text("stories mode needs a spec folder (stories.yaml + SPEC.md)", style="yellow")
+            )
+            return
+        folder = stories.resolve_spec_folder(self._project, spec_folder)
+        try:
+            rows = stories.story_rows(folder)
+        except stories.StoriesError as e:
+            body.update(Text(f"⚠ {e}", style="red"))
+            return
+        text = Text()
+        text.append(f"{len(rows)} stories · linear order", style="bold")
+        if not (folder / "SPEC.md").is_file():
+            text.append("  ⚠ SPEC.md missing", style="red")
+        for r in rows:
+            text.append(f"\n  {r.position}. {r.id} ({r.label})")
+            marks = [
+                m for m, on in (("spec", r.spec_checkpoint), ("done", r.done_checkpoint)) if on
+            ]
+            if marks:
+                text.append(f" [{'/'.join(marks)}]", style="magenta")
+            text.append(f"  {r.title}", style="dim")
+        body.update(text)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id != "ok":
@@ -94,6 +196,8 @@ class StartRunModal(BaseDialog):
             return
         self.dismiss(
             {
+                "source": self.query_one("#source", Select).value,
+                "spec_folder": self.query_one("#spec-folder", Input).value.strip(),
                 "epic": _int_or_none(self.query_one("#epic", Input).value),
                 "story": self.query_one("#story", Input).value.strip() or None,
                 "max_stories": _int_or_none(self.query_one("#max-stories", Input).value),
@@ -290,6 +394,236 @@ class DecisionModal(BaseDialog):
             self.dismiss(self._decision.option(bid[len("opt-") :]))
         else:
             self.dismiss(None)
+
+
+class SpecReviewModal(BaseDialog):
+    """Read-only story-spec viewer with a configurable action row.
+
+    Shared by the plan-checkpoint viewer (Approve & resume / Request replan) and
+    the spec-approval / epic gate viewer (Approve & resume). Dismisses with the
+    chosen action verb, or None on close/escape. The spec path is shown
+    prominently with a copy-path action; the spec body is LLM-written markdown so
+    it renders as plain Text, never markup. The modal owns no logic — the caller
+    maps each verb to the exact CLI code path (resume / reset-to-draft + resume)."""
+
+    DEFAULT_CSS = """
+    SpecReviewModal #dialog {
+        width: 100;
+        height: 85%;
+    }
+    SpecReviewModal #spec {
+        height: 1fr;
+        border: solid $primary-darken-2;
+        padding: 0 1;
+    }
+    SpecReviewModal .path {
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+    """
+
+    def __init__(
+        self,
+        *,
+        title: str,
+        subtitle: str | Text,
+        spec_path: Path | None,
+        spec_text: str,
+        actions: list[tuple[str, str, str]],
+    ):
+        super().__init__()
+        self._title = title
+        self._subtitle = subtitle if isinstance(subtitle, Text) else Text(subtitle)
+        self._spec_path = spec_path
+        self._spec_text = spec_text
+        self._actions = actions
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label(self._title, classes="title")
+            yield Static(self._subtitle)
+            path_line = Text()
+            if self._spec_path is not None:
+                path_line.append(str(self._spec_path))
+            else:
+                path_line.append("(no spec file resolved)", style="dim")
+            yield Static(path_line, classes="path")
+            with VerticalScroll(id="spec"):
+                body = self._spec_text.strip()
+                yield Static(Text(body) if body else Text("(empty spec)", style="dim"))
+            with Horizontal(classes="buttons"):
+                if self._spec_path is not None:
+                    yield Button("copy path", id="copy-path")
+                for verb, label, variant in self._actions:
+                    yield Button(label, variant=variant, id=f"act-{verb}")  # type: ignore[arg-type]
+                yield Button("close", id="cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        bid = event.button.id or ""
+        if bid == "copy-path" and self._spec_path is not None:
+            self.app.copy_to_clipboard(str(self._spec_path))
+            self.app.notify("spec path copied to clipboard")
+            return
+        if bid.startswith("act-"):
+            self.dismiss(bid[len("act-") :])
+            return
+        self.dismiss(None)
+
+
+class StoryCheckpointModal(BaseDialog):
+    """done_checkpoint summary card shown after a story commits: id/title, the
+    commit subject + short hash, a gate line derived from real task state (the
+    verify + review gates the commit cleared, plus the follow-up review-cycle
+    count) and token totals. Dismisses with 'continue' (resume the schedule) or
+    'stop' (mark the run stopped), None on close/escape."""
+
+    def __init__(
+        self,
+        *,
+        story_key: str,
+        title: str,
+        commit: str,
+        verify_line: str,
+        tokens: str,
+    ):
+        super().__init__()
+        self._story_key = story_key
+        self._title = title
+        self._commit = commit
+        self._verify_line = verify_line
+        self._tokens = tokens
+
+    def compose(self) -> ComposeResult:
+        head = Text()
+        head.append(f"story checkpoint — {self._story_key}", style="bold")
+        with Vertical(id="dialog"):
+            yield Label(head, classes="title")
+            if self._title:
+                yield Static(Text(self._title))
+            card = Text()
+            card.append("\ncommit  ", style="dim")
+            card.append(self._commit or "(none)", style="green")
+            card.append("\nverify  ", style="dim")
+            card.append(self._verify_line)
+            card.append("\ntokens  ", style="dim")
+            card.append(self._tokens, style="dim")
+            yield Static(card)
+            with Horizontal(classes="buttons"):
+                yield Button("Continue run", variant="primary", id="act-continue")
+                yield Button("Stop run", variant="warning", id="act-stop")
+                yield Button("close", id="cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        bid = event.button.id or ""
+        self.dismiss(bid[len("act-") :] if bid.startswith("act-") else None)
+
+
+class EscalationModal(BaseDialog):
+    """Blocked-story escalation view with story context: the story entry's
+    title/description (stories mode), the blocking condition parsed from the
+    spec's ``## Auto Run Result``, and a sentinel indicator when the matched spec
+    is a fixed-slug pre-planning-halt sentinel. Dismisses with 'resolve' (launch
+    the interactive resolve agent) or 'rearm' (re-arm + resume — only offered once
+    the resolution marker exists), None on close/escape."""
+
+    DEFAULT_CSS = """
+    EscalationModal #dialog {
+        width: 90;
+        height: auto;
+        max-height: 90%;
+    }
+    EscalationModal #blocking {
+        height: auto;
+        max-height: 40%;
+        margin-top: 1;
+        border: solid $primary-darken-2;
+        padding: 0 1;
+    }
+    """
+
+    def __init__(
+        self,
+        *,
+        story_key: str,
+        title: str,
+        description: str,
+        blocking: str,
+        sentinel_kind: str,
+        resolution_ready: bool,
+        engine_live: bool,
+        restore_recorded: bool = False,
+    ):
+        super().__init__()
+        self._story_key = story_key
+        self._title = title
+        self._description = description
+        self._blocking = blocking
+        self._sentinel_kind = sentinel_kind
+        self._resolution_ready = resolution_ready
+        self._engine_live = engine_live
+        self._restore_recorded = restore_recorded
+
+    def compose(self) -> ComposeResult:
+        head = Text()
+        head.append(f"escalation — {self._story_key}", style="bold red")
+        with Vertical(id="dialog"):
+            yield Label(head, classes="title")
+            if self._title:
+                yield Static(Text(self._title, style="bold"))
+            if self._description:
+                yield Static(Text(self._description, style="dim"))
+            if self._sentinel_kind:
+                yield Static(
+                    Text(
+                        f"⚠ pre-planning-halt sentinel ({self._sentinel_kind}) — "
+                        "re-arm deletes it (a copy is preserved) for a clean re-dispatch",
+                        style="yellow",
+                    )
+                )
+            with VerticalScroll(id="blocking"):
+                body = self._blocking.strip()
+                yield Static(
+                    Text(body) if body else Text("(no blocking condition recorded)", style="dim")
+                )
+            if self._engine_live:
+                yield Static(
+                    Text("engine may still be live — stop it before resolving", style="yellow")
+                )
+            hint = Text()
+            if self._restore_recorded:
+                # honoring the latch from here would be unsafe (a stale marker is
+                # indistinguishable from a fresh one), so Re-arm stays a plain
+                # from-scratch re-drive — but never a silent drop of the decision.
+                hint.append(
+                    "⚠ the resolution records a restore patch — Re-arm here re-drives "
+                    "from scratch and drops it; run `bmad-loop resolve` to honor the "
+                    "restore",
+                    style="yellow",
+                )
+            elif self._resolution_ready:
+                hint.append("resolution recorded — re-arm & resume when ready", style="green")
+            else:
+                hint.append(
+                    "resolve opens an interactive agent to fix the frozen spec; "
+                    "re-arm unlocks once it records a resolution",
+                    style="dim",
+                )
+            yield Static(hint)
+            with Horizontal(classes="buttons"):
+                yield Button(
+                    "Resolve", variant="primary", id="act-resolve", disabled=self._engine_live
+                )
+                yield Button(
+                    "Re-arm & resume",
+                    variant="warning",
+                    id="act-rearm",
+                    disabled=not self._resolution_ready or self._engine_live,
+                )
+                yield Button("close", id="cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        bid = event.button.id or ""
+        self.dismiss(bid[len("act-") :] if bid.startswith("act-") else None)
 
 
 class TextOutputModal(BaseDialog):

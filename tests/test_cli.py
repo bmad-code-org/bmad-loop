@@ -4,10 +4,29 @@ import argparse
 import json
 
 import pytest
+import yaml
 from conftest import install_bmad_config, write_sprint
 
 from bmad_loop import cli
 from bmad_loop import policy as policy_mod
+
+STORIES_SPEC_FOLDER = "_bmad-output/epic-1"
+
+
+def _stories_entry(story_id, **over):
+    d = {"id": story_id, "title": f"Story {story_id}", "description": "does a thing"}
+    d.update(over)
+    return d
+
+
+def _setup_stories_fixture(paths, entries, *, with_spec_md=True):
+    folder = paths.project / STORIES_SPEC_FOLDER
+    (folder / "stories").mkdir(parents=True, exist_ok=True)
+    if with_spec_md:
+        (folder / "SPEC.md").write_text("# Epic 1\n", encoding="utf-8")
+    (folder / "stories.yaml").write_text(yaml.safe_dump(entries, sort_keys=False), encoding="utf-8")
+    return folder
+
 
 DUAL_CLIENT_POLICY = """\
 [adapter]
@@ -97,6 +116,134 @@ def test_dry_run_reports_targeted_not_actionable(project, capsys):
     assert cli._dry_run(project, pol, args) == 1
     err = capsys.readouterr().err
     assert "3-2 matched 3-2-foo" in err and "not actionable" in err
+
+
+# ------------------------------------------------------------ stories mode
+
+
+def test_stories_mode_forced_by_spec_flag():
+    args = argparse.Namespace(spec="_bmad-output/epic-1")
+    on, folder = cli._stories_mode(args, policy_mod.loads(""))
+    assert on is True and folder == "_bmad-output/epic-1"
+
+
+def test_stories_mode_from_policy_source():
+    pol = policy_mod.loads('[stories]\nsource = "stories"\nspec_folder = "epic-2"\n')
+    assert cli._stories_mode(argparse.Namespace(spec=None), pol) == (True, "epic-2")
+
+
+def test_stories_mode_default_off():
+    assert cli._stories_mode(argparse.Namespace(spec=None), policy_mod.loads("")) == (False, "")
+
+
+def test_stories_mode_spec_flag_overrides_policy_sprint_source():
+    # --spec forces stories mode even when policy says sprint-status
+    args = argparse.Namespace(spec="_bmad-output/epic-9")
+    on, folder = cli._stories_mode(args, policy_mod.loads(""))
+    assert on and folder == "_bmad-output/epic-9"
+
+
+def test_validate_stories_folder_ok(project):
+    _setup_stories_fixture(project, [_stories_entry("1")])
+    assert cli._validate_stories_folder(project, STORIES_SPEC_FOLDER) is None
+
+
+def test_validate_stories_folder_missing_manifest(project):
+    problem = cli._validate_stories_folder(project, STORIES_SPEC_FOLDER)
+    assert problem is not None and "no stories.yaml found" in problem
+
+
+def test_validate_stories_folder_missing_spec_md(project):
+    _setup_stories_fixture(project, [_stories_entry("1")], with_spec_md=False)
+    problem = cli._validate_stories_folder(project, STORIES_SPEC_FOLDER)
+    assert problem is not None and "SPEC.md not found" in problem
+
+
+def test_validate_stories_folder_invalid_manifest(project):
+    _setup_stories_fixture(project, [_stories_entry("3"), _stories_entry("3", title="dup")])
+    problem = cli._validate_stories_folder(project, STORIES_SPEC_FOLDER)
+    assert problem is not None and "duplicate id" in problem
+
+
+def test_dry_run_stories_prints_linear_schedule(project, capsys):
+    _setup_stories_fixture(
+        project,
+        [
+            _stories_entry("1", spec_checkpoint=True, done_checkpoint=True),
+            _stories_entry("2"),
+        ],
+    )
+    _write_policy(project.project)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    args = argparse.Namespace(spec=STORIES_SPEC_FOLDER, epic=None, story=None, max_stories=None)
+
+    assert cli._dry_run(project, pol, args, True, STORIES_SPEC_FOLDER) == 0
+    out = capsys.readouterr().out
+    assert "linear schedule" in out
+    assert "Spec folder: _bmad-output/epic-1. Story id: 1." in out
+    assert "Spec folder: _bmad-output/epic-1. Story id: 2." in out
+    assert "spec-checkpoint" in out and "done-checkpoint" in out
+    assert "BMAD_LOOP_SPEC_FOLDER=_bmad-output/epic-1" in out
+    # pending on-disk state shown for an unstarted story
+    assert "(pending)" in out
+
+
+def test_dry_run_stories_filters_by_story_id(project, capsys):
+    _setup_stories_fixture(project, [_stories_entry("1"), _stories_entry("2")])
+    pol = policy_mod.loads("")
+    args = argparse.Namespace(spec=STORIES_SPEC_FOLDER, epic=None, story="2", max_stories=None)
+    assert cli._dry_run(project, pol, args, True, STORIES_SPEC_FOLDER) == 0
+    out = capsys.readouterr().out
+    assert "Story id: 2." in out and "Story id: 1." not in out
+
+
+def test_run_warns_when_epic_passed_with_spec(project, capsys):
+    """A4: --epic has no effect in stories mode (StoriesEngine nulls epic_filter), so
+    `run --spec ... --epic N` must warn rather than silently ignore the flag. Exercised
+    through cmd_run via --dry-run (the warning fires before the dry-run branch)."""
+    install_bmad_config(project)
+    _setup_stories_fixture(project, [_stories_entry("1"), _stories_entry("2")])
+    _write_policy(project.project)
+    rc = cli.main(
+        [
+            "run",
+            "--project",
+            str(project.project),
+            "--spec",
+            STORIES_SPEC_FOLDER,
+            "--epic",
+            "3",
+            "--dry-run",
+        ]
+    )
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "--epic is ignored in stories mode" in err
+
+
+def test_dry_run_stories_bad_folder_errors(project, capsys):
+    pol = policy_mod.loads("")
+    args = argparse.Namespace(spec=STORIES_SPEC_FOLDER, epic=None, story=None, max_stories=None)
+    assert cli._dry_run(project, pol, args, True, STORIES_SPEC_FOLDER) == 1
+    assert "no stories.yaml found" in capsys.readouterr().err
+
+
+def test_stories_non_utf8_manifest_clean_error_not_crash(project, capsys):
+    # A binary/non-UTF-8 stories.yaml must surface as a clean "stories mode: ... not valid
+    # UTF-8" error at both preflight and dry-run — not an uncaught UnicodeDecodeError.
+    folder = project.project / STORIES_SPEC_FOLDER
+    (folder / "stories").mkdir(parents=True, exist_ok=True)
+    (folder / "SPEC.md").write_text("# Epic 1\n", encoding="utf-8")
+    (folder / "stories.yaml").write_bytes(b"\xff\xfe\x00\x01 not utf-8 \x80\x81")
+
+    problem = cli._validate_stories_folder(project, STORIES_SPEC_FOLDER)
+    assert problem is not None and "not valid UTF-8" in problem
+
+    pol = policy_mod.loads("")
+    args = argparse.Namespace(spec=STORIES_SPEC_FOLDER, epic=None, story=None, max_stories=None)
+    assert cli._dry_run(project, pol, args, True, STORIES_SPEC_FOLDER) == 1
+    err = capsys.readouterr().err
+    assert "stories mode:" in err and "not valid UTF-8" in err
 
 
 def _make_run_with_decision(project, run_id="20260101-000000-aaaa", dw_id="DW-1"):
@@ -216,6 +363,50 @@ def test_status_ambiguous_ref_errors(project, capsys):
     _make_run_with_decision(project, run_id="20260102-000000-aa22")
     assert cli.main(["status", "--project", str(project.project), "aa"]) == 1
     assert "ambiguous run ref 'aa' matches 2 runs" in capsys.readouterr().err
+
+
+def _make_stories_run(project, run_id="20260101-000000-st01"):
+    """A stories-mode run dir + state.json pinned to source=stories."""
+    run_dir = project.project / ".bmad-loop" / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "state.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "project": str(project.project),
+                "started_at": "now",
+                "source": "stories",
+                "spec_folder": STORIES_SPEC_FOLDER,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return run_dir
+
+
+def test_status_stories_mode_prints_board(project, capsys):
+    from bmad_loop.stories import STORIES_SUBDIR
+
+    _setup_stories_fixture(
+        project, [_stories_entry("1", spec_checkpoint=True), _stories_entry("2")]
+    )
+    (project.project / STORIES_SPEC_FOLDER / STORIES_SUBDIR / "1-slug.md").write_text(
+        "---\nstatus: done\n---\n", encoding="utf-8"
+    )
+    _make_stories_run(project)
+    assert cli.main(["status", "--project", str(project.project)]) == 0
+    out = capsys.readouterr().out
+    assert "stories: 1/2 done" in out
+    assert "spec-checkpoint" in out
+    # the sprint-mode backlog line must not appear for a stories run
+    assert "sprint backlog remaining" not in out
+
+
+def test_status_stories_mode_bad_manifest_is_soft(project, capsys):
+    # a stories run whose manifest is gone still prints the run header, not a crash
+    _make_stories_run(project)
+    assert cli.main(["status", "--project", str(project.project)]) == 0
+    assert "no stories.yaml found" in capsys.readouterr().out
 
 
 def test_list_shows_short_refs(project, capsys):
@@ -621,10 +812,28 @@ def test_archive_refuses_live_run_without_force(tmp_path, monkeypatch, capsys):
     assert run_dir.exists()
 
 
-def _escalated_run(project, run_id="r1", *, story="s1", spec_file=None):
+def _write_bmad_config(project, impl="{project-root}/artifacts"):
+    """Minimal _bmad/bmm/config.yaml — restore-patch validation resolves the
+    artifact roots through bmadconfig.load_paths, like every real project."""
+    cfg = project / "_bmad" / "bmm"
+    cfg.mkdir(parents=True, exist_ok=True)
+    (cfg / "config.yaml").write_text(
+        f"implementation_artifacts: '{impl}'\n" "planning_artifacts: '{project-root}/planning'\n",
+        encoding="utf-8",
+    )
+
+
+def _escalated_run(project, run_id="r1", *, story="s1", spec_file=None, worktree_path=""):
     from bmad_loop.model import Phase, StoryTask
 
-    task = StoryTask(story_key=story, epic=1, phase=Phase.ESCALATED, attempt=1, spec_file=spec_file)
+    task = StoryTask(
+        story_key=story,
+        epic=1,
+        phase=Phase.ESCALATED,
+        attempt=1,
+        spec_file=spec_file,
+        worktree_path=worktree_path,
+    )
     return _make_run_with_state(
         project,
         run_id,
@@ -778,6 +987,369 @@ def test_resolve_rearm_only_skips_resume(tmp_path, monkeypatch, capsys):
     rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-interactive", "--no-resume"])
     assert rc == 0
     assert "resume when ready" in capsys.readouterr().out
+
+
+def test_resolve_no_interactive_restore_patch_latches_in_review(tmp_path, monkeypatch, capsys):
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    spec = tmp_path / "spec.md"
+    spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+    _write_bmad_config(tmp_path)
+    patch = tmp_path / "artifacts" / "attempt.patch"
+    patch.parent.mkdir(parents=True)
+    patch.write_text("diff", encoding="utf-8")
+    run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
+
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+    rc = cli.main(
+        [
+            "resolve",
+            "--project",
+            str(tmp_path),
+            "r1",
+            "--no-interactive",
+            "--restore-patch",
+            str(patch),
+            "--resume",
+        ]
+    )
+    assert rc == 0
+    assert "restoring the attempted change" in capsys.readouterr().out
+    task = load_state(run_dir).tasks["s1"]
+    assert task.phase == Phase.PENDING
+    assert task.restore_patch == str(patch.resolve())  # validated + latched (absolute)
+    assert "in-review" in spec.read_text()  # restore mode routes step-01 -> step-04
+
+
+def test_resolve_restore_patch_missing_file_rejected(tmp_path, monkeypatch, capsys):
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    spec = tmp_path / "spec.md"
+    spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+    _write_bmad_config(tmp_path)
+    run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
+    called: list = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: called.append(rd) or 0)
+    rc = cli.main(
+        [
+            "resolve",
+            "--project",
+            str(tmp_path),
+            "r1",
+            "--no-interactive",
+            "--restore-patch",
+            str(tmp_path / "nope.patch"),
+            "--resume",
+        ]
+    )
+    assert rc == 1
+    assert "not a file under the project" in capsys.readouterr().err
+    assert called == []  # never resumed
+    assert load_state(run_dir).tasks["s1"].phase == Phase.ESCALATED  # not re-armed
+
+
+def test_resolve_restore_patch_outside_project_rejected(tmp_path, monkeypatch, capsys):
+    """A patch that EXISTS but sits outside the project root is rejected the same
+    as a missing one: an absolute path escaping the workspace must never be
+    latched (the engine would lay whatever it points at onto the tree)."""
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    _write_bmad_config(project)
+    outside = tmp_path / "outside.patch"  # a real file, wrong side of the fence
+    outside.write_text("diff", encoding="utf-8")
+    spec = project / "spec.md"
+    spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+    run_dir = _escalated_run(project, "r1", spec_file=str(spec))
+    called: list = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: called.append(rd) or 0)
+    rc = cli.main(
+        [
+            "resolve",
+            "--project",
+            str(project),
+            "r1",
+            "--no-interactive",
+            "--restore-patch",
+            str(outside),
+            "--resume",
+        ]
+    )
+    assert rc == 1
+    assert "not a file under the project" in capsys.readouterr().err
+    assert called == []  # never resumed
+    task = load_state(run_dir).tasks["s1"]
+    assert task.phase == Phase.ESCALATED and task.restore_patch is None  # not re-armed
+
+
+def test_resolve_restore_patch_in_outside_project_artifacts_allowed(tmp_path, monkeypatch):
+    """Artifact dirs configured OUTSIDE the project tree are a supported layout
+    (bmadconfig keeps them absolute; verify special-cases them throughout), and
+    bmad-dev-auto saves the intent-gap patch in implementation_artifacts — so a
+    patch there is a legitimate restore target: the containment check uses the
+    same trusted roots as spec_within_roots, not a bare under-project test."""
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    shared = tmp_path / "shared-artifacts"  # sibling dir, outside the project tree
+    shared.mkdir()
+    _write_bmad_config(project, impl=str(shared))
+    patch = shared / "attempt.patch"
+    patch.write_text("diff", encoding="utf-8")
+    spec = project / "spec.md"
+    spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+    run_dir = _escalated_run(project, "r1", spec_file=str(spec))
+
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+    rc = cli.main(
+        [
+            "resolve",
+            "--project",
+            str(project),
+            "r1",
+            "--no-interactive",
+            "--restore-patch",
+            str(patch),
+            "--resume",
+        ]
+    )
+    assert rc == 0
+    task = load_state(run_dir).tasks["s1"]
+    assert task.phase == Phase.PENDING
+    assert task.restore_patch == str(patch.resolve())  # latched despite being out-of-project
+    assert "in-review" in spec.read_text()
+
+
+def test_resolve_restore_patch_worktree_isolation_rejected(tmp_path, monkeypatch, capsys):
+    """B4d: restore is an in-place-only recovery — a worktree-isolation re-drive
+    discards and re-mounts the unit's worktree, so a latched patch would silently
+    never restore. Rejected up front: no re-arm, no latch, spec untouched."""
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    _write_policy(tmp_path, '[scm]\nisolation = "worktree"\n')
+    spec = tmp_path / "spec.md"
+    spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+    patch = tmp_path / "artifacts" / "attempt.patch"
+    patch.parent.mkdir(parents=True)
+    patch.write_text("diff", encoding="utf-8")
+    run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
+    called: list = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: called.append(rd) or 0)
+    rc = cli.main(
+        [
+            "resolve",
+            "--project",
+            str(tmp_path),
+            "r1",
+            "--no-interactive",
+            "--restore-patch",
+            str(patch),
+            "--resume",
+        ]
+    )
+    assert rc == 1
+    assert "worktree" in capsys.readouterr().err
+    assert called == []  # never resumed
+    task = load_state(run_dir).tasks["s1"]
+    assert task.phase == Phase.ESCALATED and task.restore_patch is None  # not re-armed
+    assert "status: blocked" in spec.read_text()  # spec status untouched
+
+
+def test_resolve_restore_patch_flag_rejected_before_the_session(tmp_path, monkeypatch, capsys):
+    """The explicit --restore-patch flag is fully knowable pre-session (isolation
+    mode, path containment), so on a worktree-isolation run it must be rejected
+    BEFORE launching the interactive resolve agent — not after a whole
+    conversation the abort would throw away."""
+    from bmad_loop import resolve
+
+    _write_policy(tmp_path, '[scm]\nisolation = "worktree"\n')
+    spec = tmp_path / "spec.md"
+    spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+    _write_bmad_config(tmp_path)
+    patch = tmp_path / "artifacts" / "attempt.patch"
+    patch.parent.mkdir(parents=True)
+    patch.write_text("diff", encoding="utf-8")
+    _escalated_run(tmp_path, "r1", spec_file=str(spec))
+
+    def never(*a, **k):
+        raise AssertionError("interactive resolve session launched despite a doomed restore")
+
+    monkeypatch.setattr(cli, "_make_adapters", never)
+    monkeypatch.setattr(resolve, "run_session", never)
+    # interactive is the default: no --no-interactive here
+    rc = cli.main(
+        ["resolve", "--project", str(tmp_path), "r1", "--restore-patch", str(patch), "--resume"]
+    )
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "worktree" in err
+    assert "--no-interactive" in err  # the deterministic escape is named
+
+
+def test_resolve_restore_patch_rejected_for_worktree_executed_task(tmp_path, monkeypatch, capsys):
+    """The guard keys on the recorded run state too: a task that actually
+    executed in a worktree (task.worktree_path) rejects a restore even when the
+    policy has since been flipped back to in-place — the patch was saved inside
+    the (discarded) worktree, so there is nothing durable to restore."""
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    spec = tmp_path / "spec.md"
+    spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+    _write_bmad_config(tmp_path)
+    patch = tmp_path / "artifacts" / "attempt.patch"
+    patch.parent.mkdir(parents=True)
+    patch.write_text("diff", encoding="utf-8")
+    run_dir = _escalated_run(
+        tmp_path, "r1", spec_file=str(spec), worktree_path=str(tmp_path / "wt" / "s1")
+    )
+    called: list = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: called.append(rd) or 0)
+    rc = cli.main(
+        [
+            "resolve",
+            "--project",
+            str(tmp_path),
+            "r1",
+            "--no-interactive",
+            "--restore-patch",
+            str(patch),
+            "--resume",
+        ]
+    )
+    assert rc == 1
+    assert "worktree" in capsys.readouterr().err
+    assert called == []
+    assert load_state(run_dir).tasks["s1"].phase == Phase.ESCALATED  # not re-armed
+
+
+def test_resolve_interactive_restore_patch_from_resolution_json(tmp_path, monkeypatch):
+    from bmad_loop import resolve
+    from bmad_loop.journal import load_state
+
+    spec = tmp_path / "spec.md"
+    spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+    _write_bmad_config(tmp_path)
+    patch = tmp_path / "artifacts" / "attempt.patch"
+    patch.parent.mkdir(parents=True)
+    patch.write_text("diff", encoding="utf-8")
+    run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
+
+    def fake_session(adapter, project, rd, story_key, *, model=""):
+        # the resolve agent records a restore_patch in its output marker
+        marker = resolve.resolution_path(rd, story_key)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps({"restore_patch": str(patch)}), encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
+    monkeypatch.setattr(resolve, "build_context", lambda *a, **k: None)
+    monkeypatch.setattr(resolve, "run_session", fake_session)
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--resume"])
+    assert rc == 0
+    task = load_state(run_dir).tasks["s1"]
+    assert task.restore_patch == str(patch.resolve())  # picked up from resolution.json
+    assert "in-review" in spec.read_text()
+
+
+def test_resolve_corrupt_resolution_json_aborts_loudly(tmp_path, monkeypatch, capsys):
+    """A present-but-unparseable resolution.json may carry the agent's recorded
+    restore decision, and a re-arm consumes the escalation — so corruption must
+    abort (no re-arm, no resume), never silently downgrade to a from-scratch
+    re-drive quieter than an absent marker."""
+    from bmad_loop import resolve
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    spec = tmp_path / "spec.md"
+    spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+    run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
+
+    def fake_session(adapter, project, rd, story_key, *, model=""):
+        marker = resolve.resolution_path(rd, story_key)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text('{"restore_patch": "artifacts/attempt.patch",}', encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
+    monkeypatch.setattr(resolve, "build_context", lambda *a, **k: None)
+    monkeypatch.setattr(resolve, "run_session", fake_session)
+    called: list = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: called.append(rd) or 0)
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--resume"])
+    assert rc == 1
+    assert "unreadable" in capsys.readouterr().err
+    assert called == []  # never resumed
+    task = load_state(run_dir).tasks["s1"]
+    assert task.phase == Phase.ESCALATED and task.restore_patch is None  # not re-armed
+    assert "status: blocked" in spec.read_text()  # spec untouched
+
+
+def test_resolve_empty_restore_patch_field_aborts_loudly(tmp_path, monkeypatch, capsys):
+    """`"restore_patch": ""` in resolution.json (schema says omit the field) is a
+    corrupted recorded decision, not "no restore" — abort, don't re-arm."""
+    from bmad_loop import resolve
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    spec = tmp_path / "spec.md"
+    spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+    run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
+
+    def fake_session(adapter, project, rd, story_key, *, model=""):
+        marker = resolve.resolution_path(rd, story_key)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps({"restore_patch": ""}), encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
+    monkeypatch.setattr(resolve, "build_context", lambda *a, **k: None)
+    monkeypatch.setattr(resolve, "run_session", fake_session)
+    called: list = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: called.append(rd) or 0)
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--resume"])
+    assert rc == 1
+    assert "invalid" in capsys.readouterr().err
+    assert called == []
+    assert load_state(run_dir).tasks["s1"].phase == Phase.ESCALATED  # not re-armed
+
+
+def test_resolve_empty_restore_patch_flag_aborts_loudly(tmp_path, monkeypatch, capsys):
+    """`--restore-patch ""` (unset shell variable) must abort, not silently
+    re-drive from scratch: the flag said restore, and a re-arm would consume the
+    escalation with the decision dropped."""
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    spec = tmp_path / "spec.md"
+    spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+    run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
+    called: list = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: called.append(rd) or 0)
+    rc = cli.main(
+        [
+            "resolve",
+            "--project",
+            str(tmp_path),
+            "r1",
+            "--no-interactive",
+            "--restore-patch",
+            "",
+            "--resume",
+        ]
+    )
+    assert rc == 1
+    assert "empty path" in capsys.readouterr().err
+    assert called == []
+    assert load_state(run_dir).tasks["s1"].phase == Phase.ESCALATED  # not re-armed
 
 
 def test_sweep_command_parses_flags():
@@ -1085,3 +1657,104 @@ def test_platform_preflight_reports_process_host_selection_error(monkeypatch):
     notes, problems = cli._platform_preflight()  # must not raise
     assert any("bogus" in p for p in problems)
     assert any("_FakeBackend" in n for n in notes)  # the healthy seam still reported
+
+
+# --------------- item 8/10: stories-aware validate + selector preflight -------
+
+STORIES_POLICY = '[stories]\nsource = "stories"\nspec_folder = "_bmad-output/epic-1"\n'
+
+
+def _validate_output(capsys):
+    out = capsys.readouterr()
+    return (out.out + out.err).lower()
+
+
+def test_validate_stories_mode_skips_sprint_gate(project, capsys):
+    """Item 8: a stories-mode project (no sprint-status.yaml) validates its
+    stories.yaml manifest instead of failing on the missing sprint gate."""
+    install_bmad_config(project)
+    _setup_stories_fixture(project, [_stories_entry("1")])
+    _write_policy(project.project, STORIES_POLICY)
+    args = argparse.Namespace(project=str(project.project), spec=None)
+
+    cli.cmd_validate(args)
+    text = _validate_output(capsys)
+    assert "sprint status" not in text  # the sprint gate is skipped
+    assert "stories mode ok" in text  # the manifest validated instead
+
+
+def test_validate_stories_mode_reports_missing_manifest(project, capsys):
+    """Item 8: stories mode with no stories.yaml fails validate with the pinned
+    remediation-bearing message (not the sprint-status error)."""
+    install_bmad_config(project)
+    _write_policy(project.project, STORIES_POLICY)
+    args = argparse.Namespace(project=str(project.project), spec=None)
+
+    assert cli.cmd_validate(args) == 1
+    text = _validate_output(capsys)
+    assert "no stories.yaml found" in text
+    assert "sprint status" not in text
+
+
+def test_validate_sprint_mode_still_gates_on_sprint_status(project, capsys):
+    """Item 8 regression: the default (sprint) mode still requires sprint-status."""
+    install_bmad_config(project)
+    _write_policy(project.project)  # DUAL_CLIENT_POLICY -> sprint mode (no [stories])
+    args = argparse.Namespace(project=str(project.project), spec=None)
+
+    assert cli.cmd_validate(args) == 1
+    assert "sprint" in _validate_output(capsys)
+
+
+def test_validate_spec_flag_forces_stories_mode(project, capsys):
+    """Item 8: `validate --spec <folder>` forces stories mode even under a sprint
+    policy — the sprint gate is skipped and the manifest is validated."""
+    install_bmad_config(project)
+    _setup_stories_fixture(project, [_stories_entry("1")])
+    _write_policy(project.project)  # sprint policy
+    args = argparse.Namespace(project=str(project.project), spec=STORIES_SPEC_FOLDER)
+
+    cli.cmd_validate(args)
+    text = _validate_output(capsys)
+    assert "stories mode ok" in text
+    assert "sprint status" not in text
+
+
+def test_validate_stories_folder_unknown_selector(project):
+    """Item 10: an unknown --story id is caught at preflight (fails before the run
+    starts) rather than crashing mid-flight in the scheduler."""
+    _setup_stories_fixture(project, [_stories_entry("1"), _stories_entry("2")])
+    problem = cli._validate_stories_folder(project, STORIES_SPEC_FOLDER, selector="99")
+    assert problem is not None and "'99'" in problem and "not in stories.yaml" in problem
+
+
+def test_validate_stories_folder_known_selector_ok(project):
+    _setup_stories_fixture(project, [_stories_entry("1"), _stories_entry("2")])
+    assert cli._validate_stories_folder(project, STORIES_SPEC_FOLDER, selector="2") is None
+
+
+def test_dry_run_stories_shows_plan_halt_markers(project, capsys):
+    """Item 10: dry-run mirrors the real dispatch's leg-1 markers for a pending
+    spec_checkpoint story (`Halt after planning.` + BMAD_LOOP_PLAN_HALT)."""
+    _setup_stories_fixture(project, [_stories_entry("1", spec_checkpoint=True)])
+    pol = policy_mod.loads("")
+    args = argparse.Namespace(spec=STORIES_SPEC_FOLDER, epic=None, story=None, max_stories=None)
+
+    assert cli._dry_run(project, pol, args, True, STORIES_SPEC_FOLDER) == 0
+    out = capsys.readouterr().out
+    assert "Halt after planning." in out
+    assert "BMAD_LOOP_PLAN_HALT=1" in out
+
+
+def test_dry_run_stories_relativizes_absolute_folder(project, capsys):
+    """Item 10: an absolute --spec inside the project renders the project-relative
+    folder in the dispatch/env, matching what the engine actually dispatches."""
+    _setup_stories_fixture(project, [_stories_entry("1")])
+    abs_folder = str(project.project / STORIES_SPEC_FOLDER)
+    pol = policy_mod.loads("")
+    args = argparse.Namespace(spec=abs_folder, epic=None, story=None, max_stories=None)
+
+    assert cli._dry_run(project, pol, args, True, abs_folder) == 0
+    out = capsys.readouterr().out
+    assert "Spec folder: _bmad-output/epic-1. Story id: 1." in out
+    assert f"Spec folder: {abs_folder}" not in out  # not the raw absolute path

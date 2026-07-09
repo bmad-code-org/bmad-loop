@@ -720,10 +720,9 @@ class Engine:
 
     def _loop(self) -> None:
         self._finish_inflight()
-        started = 0
         while True:
-            if self.max_stories is not None and started >= self.max_stories:
-                self.journal.append("max-stories-reached", count=started)
+            if self.max_stories is not None and self._dispatched_count() >= self.max_stories:
+                self.journal.append("max-stories-reached", count=self._dispatched_count())
                 return
             self._emit("pre_pick_next")
             story = self._pick_next()
@@ -738,8 +737,19 @@ class Engine:
             self.state.tasks[story.key] = task
             self.journal.append("story-start", story_key=story.key)
             self._save()
-            started += 1
             self._run_story(task)
+            self._after_story(task)
+
+    def _dispatched_count(self) -> int:
+        """Stories this run has dispatched, counted durably from run state so the
+        ``--max-stories`` bound survives a pause/resume (a story checkpoint, an
+        escalation) — unlike a ``_loop``-local counter that resets to 0 on every
+        re-entry. Every picked story is recorded in ``state.tasks`` before its
+        session runs (and a wedge/selector pause records its task too), the same
+        "touched this run" set ``_pick_next`` keys ``base_skip`` on, so the task
+        count is the durable dispatch tally. Without this, a checkpoint pause then
+        resume would reset the counter and let the run dispatch past its cap."""
+        return len(self.state.tasks)
 
     def _pick_next(self):
         ss = load_sprint_status(self.paths.sprint_status)
@@ -863,6 +873,44 @@ class Engine:
             keep=(".bmad-loop", *self._protected_relpaths()),
             preserve=preserve,
         )
+
+    def _restore_patch(self, task: StoryTask) -> None:
+        """Re-apply the latched intent-gap patch (BMAD-METHOD #2564) onto the
+        baseline tree so the re-driven session resumes review (step-04) on the
+        restored diff instead of re-implementing. No-op unless a restore is latched.
+
+        Applied from inside `_dev_phase`'s loop, right before each dispatch that
+        runs against a fresh baseline (the first attempt and every non-fixable
+        rollback retry — the loop gates this on ``feedback is None``, so a
+        fixable-feedback retry that KEEPS the attempt's tree is never double-applied,
+        and the patch file's own untracked/tracked content is excluded from
+        `baseline_untracked` because that snapshot is taken before the first apply).
+        This is the plan's "apply after every baseline reset" seam, placed here
+        rather than in `_rollback_or_pause` so the patch always lands after the
+        clean baseline_untracked snapshot — avoiding a mid-re-drive reset preserving
+        the patch's own new files and then colliding with the re-apply.
+
+        On apply failure we escalate rather than dispatch a session onto a
+        half-restored tree; the task is mid-dispatch (DEV_RUNNING), so step it to
+        the escalatable DEV_VERIFY phase first (`_escalate` raises RunPaused)."""
+        if not task.restore_patch:
+            return
+        patch = Path(task.restore_patch)
+        if not patch.is_absolute():
+            patch = self.workspace.root / patch
+        try:
+            verify.apply_patch(self.workspace.root, patch)
+        except verify.GitError as e:
+            self.journal.append(
+                "attempt-restore-failed",
+                story_key=task.story_key,
+                patch=task.restore_patch,
+                error=str(e),
+            )
+            if task.phase == Phase.DEV_RUNNING:
+                advance(task, Phase.DEV_VERIFY)  # PENDING/DEV_RUNNING can't escalate directly
+            self._escalate(task, f"intent-gap restore patch failed to apply: {e}")
+        self.journal.append("attempt-restored", story_key=task.story_key, patch=task.restore_patch)
 
     def _prune_preserve_refs(self) -> None:
         """Bounded retention for both recovery-ref families at run start — the
@@ -1047,19 +1095,20 @@ class Engine:
                 continue
             isolated = self._isolated and task.worktree_path
             if task.phase == Phase.DEV_VERIFY and task.spec_file:
-                # paused at the spec-approval gate: dev verified, review pending
-                self.journal.append("resume-review", story_key=task.story_key)
+                # paused at the spec-approval gate (or, in stories mode, a
+                # plan-checkpoint awaiting implementation — _resume_after_dev_verify
+                # dispatches the right leg): dev verified on disk.
                 if isolated:
                     unit = self._reopen_unit(task)
                     prev = self.workspace
                     self.workspace = unit.workspace
                     try:
-                        self._review_and_commit(task)
+                        self._resume_after_dev_verify(task)
                     finally:
                         self.workspace = prev
                     self._integrate_unit(task, unit)
                 else:
-                    self._review_and_commit(task)
+                    self._resume_after_dev_verify(task)
             elif (resumable := self._resumable_session(task)) is not None:
                 # the host died inside the post-session window: the session
                 # itself completed and its recorded result is on disk, so
@@ -1108,6 +1157,10 @@ class Engine:
                 task.phase = Phase.PENDING  # deliberate reset, not a normal transition
                 self._save()
                 self._run_story(task)
+            # a resumed story that just reached DONE gets the same post-story hook
+            # the _loop path fires (e.g. the stories-mode done_checkpoint pause),
+            # after any worktree integration above — no-op in the base engine.
+            self._after_story(task)
 
     def _resumable_session(self, task: StoryTask) -> tuple[str, SessionResult] | None:
         """The in-flight session's durably-recorded result, when complete enough
@@ -1388,6 +1441,15 @@ class Engine:
                 result = resume_result
                 resume_result = None
             else:
+                # intent-gap patch-restore (#2564): re-lay the saved attempt onto
+                # the baseline before dispatch so the re-driven session resumes
+                # review on the restored diff. `feedback is None` ⇒ the tree is at
+                # baseline (fresh attempt or a non-fixable rollback below), NOT a
+                # fixable-feedback retry that kept the attempt's tree — so this
+                # never double-applies. No-op unless a restore is latched; escalates
+                # (never dispatches) if the patch fails to apply.
+                if feedback is None:
+                    self._restore_patch(task)
                 result = self._run_session(
                     task,
                     role="dev",
@@ -1413,7 +1475,7 @@ class Engine:
                     (result.result_json or {}).get("followup_review_recommended", False)
                 )
                 outcome = self._verify_dev_artifacts(task, result.result_json)
-                if outcome.ok:
+                if outcome.ok and self._run_verify_commands_after_dev(task, result.result_json):
                     # deterministic gates run here too: a broken build must not
                     # reach the (far more expensive) review loop
                     outcome = verify.verify_commands_outcome(self.policy, self.workspace.root)
@@ -1682,8 +1744,11 @@ class Engine:
             sha = verify.finalize_commit(self.workspace.root, task.baseline_commit, message)
             task.commit_sha = sha or task.baseline_commit
             # the corrected spec is now durable in HEAD; later attempts need no
-            # special preservation, so drop the re-drive latch.
+            # special preservation, so drop the re-drive latch. The restored diff
+            # is likewise committed, so clear its latch too — a subsequent re-arm
+            # (if any) decides afresh whether to restore again.
             task.resolved_redrive = False
+            task.restore_patch = None
         except verify.GitError as e:
             self._escalate(task, f"commit failed: {e}")
         advance(task, Phase.DONE)
@@ -1835,6 +1900,39 @@ class Engine:
         target = "review" if review_enabled else "done"
         sprint_advance(self.workspace.paths.sprint_status, task.story_key, target)
 
+    def _extra_session_env(
+        self, task: StoryTask, role: str, label: str | None = None
+    ) -> dict[str, str]:
+        """Engine-variant additions to a session's environment. Base: none.
+        StoriesEngine overrides this to export BMAD_LOOP_SPEC_FOLDER for the
+        adapter's deterministic id-keyed read-back. ``label`` is None for the
+        primary dev/review session and set for an injected plugin-workflow session,
+        so a variant can scope its env to primary sessions only."""
+        return {}
+
+    def _run_verify_commands_after_dev(self, task: StoryTask, result_json: dict | None) -> bool:
+        """Whether the deterministic verify commands run after a completed dev
+        pass. Base: always. StoriesEngine skips them on a plan-halt leg — a plan
+        (spec at ready-for-dev) has no implementation to build/test, so a project
+        build/test gate would spuriously fail before the plan review."""
+        return True
+
+    def _resume_after_dev_verify(self, task: StoryTask) -> None:
+        """Resume a task the run paused at DEV_VERIFY (dev verified, spec on disk).
+        Base: the spec-approval-gate resume — run the review loop + commit.
+        StoriesEngine overrides this to re-drive the implement leg of a
+        plan-checkpoint-paused story (leg-2) instead."""
+        self.journal.append("resume-review", story_key=task.story_key)
+        self._review_and_commit(task)
+
+    def _after_story(self, task: StoryTask) -> None:
+        """Hook fired once a story is fully processed and (under isolation)
+        integrated — from _loop after _run_story and from _finish_inflight after a
+        resumed task completes. Base: no-op. StoriesEngine uses it for the
+        done_checkpoint pause, which must land after integration so a committed
+        unit is merged before the run stops."""
+        return
+
     def _verify_dev_artifacts(self, task: StoryTask, result_json: dict | None):
         return verify.verify_dev(
             task, self.workspace.paths, result_json, review_enabled=self._dev_review_enabled()
@@ -1903,6 +2001,12 @@ class Engine:
             "BMAD_LOOP_TASK_ID": task_id,
             "BMAD_LOOP_STORY_KEY": task.story_key,
         }
+        # engine-variant env seam: StoriesEngine adds BMAD_LOOP_SPEC_FOLDER so the
+        # dev adapter resolves the story spec deterministically by id instead of
+        # mtime-scanning. Base returns {} — sprint/sweep runs stay byte-identical.
+        # ``label`` (set only for injected plugin-workflow sessions) is passed so the
+        # variant can withhold that env from non-primary sessions.
+        env.update(self._extra_session_env(task, role, label=label))
         if task.dw_ids:
             # Deferred-work bundle: the orchestrator owns the bundle→dw-id binding
             # (the generic bmad-dev-auto primitive knows nothing of dw ids). Export
@@ -2018,8 +2122,22 @@ class Engine:
         `--feedback` flag: feedback is inlined as freeform intent pointing at the
         existing spec. On a repair re-invocation the spec is first re-opened
         (status → `in-progress`) so the skill's step-01 re-enters implement/review
-        on it rather than ingesting a finalized spec as mere context."""
+        on it rather than ingesting a finalized spec as mere context.
+
+        A patch-restore re-drive (#2564) must point at the spec explicitly: only
+        step-01's spec-pointer intent check EARLY EXITs on the `in-review` status
+        the re-arm set — and it exits before step-01's version-control sanity
+        check, which would otherwise HALT `blocked` on the very diff
+        `_restore_patch` just laid onto the tree. A bare story key takes the
+        freeform/epic path instead, where that dirty-tree check runs first."""
         if feedback is None:
+            if task.restore_patch and task.spec_file:
+                return (
+                    f"/bmad-dev-auto Resume review of the in-review spec at "
+                    f"`{task.spec_file}`. The attempted change was restored onto "
+                    f"the working tree after an intent-gap resolution; review it "
+                    f"against the amended spec."
+                )
             return f"/bmad-dev-auto {task.story_key}"
         self._reset_spec_for_repair(task)
         spec_ref = task.spec_file or task.story_key

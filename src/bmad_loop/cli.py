@@ -23,6 +23,9 @@ from . import (
     resolve,
     runs,
     sprintstatus,
+)
+from . import stories as stories_mod
+from . import (
     verify,
 )
 from .adapters.base import CodingCLIAdapter
@@ -31,6 +34,7 @@ from .journal import Journal, load_state, save_state
 from .model import RunState
 from .process_host import ProcessHostError
 from .runs import RUNS_DIR
+from .stories_engine import StoriesEngine
 from .sweep import SweepEngine
 
 POLICY_FILE = policy_mod.POLICY_FILE
@@ -158,21 +162,14 @@ def cmd_validate(args: argparse.Namespace) -> int:
         problems.append(str(e))
         paths = None
 
-    if paths:
-        try:
-            ss = sprintstatus.load(paths.sprint_status)
-            actionable = [s for s in ss.stories if s.status in sprintstatus.ACTIONABLE_STATUSES]
-            notes.append(
-                f"sprint-status OK: {len(ss.stories)} stories, {len(actionable)} actionable"
-            )
-            if ss.unknown_keys:
-                notes.append(f"  warning: unknown keys ignored: {', '.join(ss.unknown_keys)}")
-        except sprintstatus.SprintStatusError as e:
-            problems.append(str(e))
-
+    # Policy first — its [stories].source (or a --spec override) selects which
+    # story-queue gate runs below: the sprint-status file (sprint mode) or the
+    # stories.yaml manifest (stories mode). Loaded before the queue gate so a
+    # stories-only project is not failed on a missing sprint-status.yaml.
     from .adapters.profile import ProfileError, get_profile
 
     profiles = []
+    pol = None
     try:
         pol = policy_mod.load(_policy_path(project))
         role_names = {role: pol.adapter.resolved(role).name for role in ROLES}
@@ -188,7 +185,24 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 problems.append(str(e))
     except policy_mod.PolicyError as e:
         problems.append(str(e))
-        pol = None
+
+    stories_on, spec_folder = _stories_mode(args, pol)
+    if paths:
+        if stories_on:
+            _validate_stories_queue(
+                project, paths, spec_folder, [p.skill_tree for p in profiles], notes, problems
+            )
+        else:
+            try:
+                ss = sprintstatus.load(paths.sprint_status)
+                actionable = [s for s in ss.stories if s.status in sprintstatus.ACTIONABLE_STATUSES]
+                notes.append(
+                    f"sprint-status OK: {len(ss.stories)} stories, {len(actionable)} actionable"
+                )
+                if ss.unknown_keys:
+                    notes.append(f"  warning: unknown keys ignored: {', '.join(ss.unknown_keys)}")
+            except sprintstatus.SprintStatusError as e:
+                problems.append(str(e))
 
     try:
         if not verify.worktree_clean(project):
@@ -240,14 +254,18 @@ def cmd_validate(args: argparse.Namespace) -> int:
     return 1 if problems else 0
 
 
-def _require_base_skills(project: Path, pol) -> bool:
+def _require_base_skills(project: Path, pol, *, require_stories: bool = False) -> bool:
     """Preflight the upstream skills the orchestrator drives (bmad-dev-auto + the
-    two adversarial review hunters it invokes inline).
+    three review hunters it invokes inline).
 
     Returns True when everything is in place; otherwise prints the problems and
     returns False so the caller can abort before spawning any session (a missing
     skill would otherwise stall as an `Unknown command` until the run times out).
-    """
+
+    ``require_stories`` additionally content-probes bmad-dev-auto for folder+id
+    dispatch — stories mode needs a newer skill than sprint mode, so an older
+    install must fail loudly here rather than HALT `no stories.yaml`-style at
+    dispatch time."""
     from .adapters.profile import ProfileError, get_profile
 
     skill_trees = []
@@ -257,6 +275,8 @@ def _require_base_skills(project: Path, pol) -> bool:
         except ProfileError:
             continue
     problems = install.missing_base_skills(project, skill_trees)
+    if require_stories:
+        problems += install.missing_stories_support(project, skill_trees)
     if problems:
         for problem in problems:
             print(f"FAIL: {problem}", file=sys.stderr)
@@ -265,27 +285,118 @@ def _require_base_skills(project: Path, pol) -> bool:
     return True
 
 
+def _stories_mode(args: argparse.Namespace, pol) -> tuple[bool, str]:
+    """Resolve whether this run is stories mode and its spec folder.
+
+    ``run --spec <folder>`` forces stories mode (overrides policy); otherwise the
+    run follows ``[stories].source``. Returns ``(is_stories, spec_folder)`` — the
+    folder is "" in sprint mode. ``pol`` may be None (e.g. a policy that failed to
+    load in ``validate``): then only an explicit ``--spec`` can force stories mode."""
+    spec = getattr(args, "spec", None)
+    if spec:
+        return True, spec
+    if pol is not None and pol.stories.source == "stories":
+        return True, pol.stories.spec_folder
+    return False, ""
+
+
+def _validate_stories_folder(
+    paths: bmadconfig.ProjectPaths, spec_folder: str, *, selector: str | None = None
+) -> str | None:
+    """Preflight the stories-mode inputs: stories.yaml parses + rules pass, SPEC.md
+    (the epic spec every first dispatch loads) exists, and — when a ``--story``
+    ``selector`` is given — the id is actually in the manifest. Returns a problem
+    string to print, or None when OK. Catching an unknown ``--story`` here fails the
+    run before it starts, instead of crashing it mid-flight in the scheduler."""
+    folder = stories_mod.resolve_spec_folder(paths.project, spec_folder)
+    try:
+        story_set = stories_mod.load_stories(folder)
+    except stories_mod.StoriesError as e:
+        return f"stories mode: {e} (spec folder: {folder})"
+    if not story_set.entries:
+        return f"stories mode: stories.yaml has no entries: {folder}"
+    if not (folder / "SPEC.md").is_file():
+        return (
+            f"stories mode: {folder}/SPEC.md not found — a first dispatch loads the "
+            f"epic spec (the skill would HALT `no epic spec found`)"
+        )
+    if selector is not None and story_set.get(selector) is None:
+        return (
+            f"stories mode: --story id {selector!r} is not in stories.yaml — "
+            f"pick one of: {', '.join(e.id for e in story_set.entries)}"
+        )
+    return None
+
+
+def _validate_stories_queue(
+    project: Path,
+    paths: bmadconfig.ProjectPaths,
+    spec_folder: str,
+    skill_trees: list[str],
+    notes: list[str],
+    problems: list[str],
+) -> None:
+    """Stories-mode counterpart of ``cmd_validate``'s sprint-status gate: validate
+    the ``stories.yaml`` manifest + ``SPEC.md`` and confirm the installed
+    ``bmad-dev-auto`` carries the folder+id dispatch flow stories mode needs (an
+    older skill would HALT at dispatch). Appends notes/problems in place; the
+    probe carries its own remediation text ("update the bmm module")."""
+    folder = stories_mod.resolve_spec_folder(paths.project, spec_folder)
+    problem = _validate_stories_folder(paths, spec_folder)
+    if problem:
+        problems.append(problem)
+    else:
+        try:
+            count = len(stories_mod.load_stories(folder).entries)
+            notes.append(
+                f"stories mode OK: {count} stories in {folder}/stories.yaml, SPEC.md present"
+            )
+        except stories_mod.StoriesError as e:  # already validated above — defensive
+            problems.append(f"stories mode: {e} (spec folder: {folder})")
+    stories_probs = install.missing_stories_support(project, skill_trees)
+    if skill_trees and not stories_probs:
+        notes.append("bmad-dev-auto supports folder+id dispatch (stories mode)")
+    problems.extend(stories_probs)
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     project = _project(args)
     paths = bmadconfig.load_paths(project)
     pol = policy_mod.load(_policy_path(project))
+    stories_on, spec_folder = _stories_mode(args, pol)
+
+    if stories_on and args.epic is not None:
+        # stories mode dispatches the manifest's single flat schedule; StoriesEngine
+        # nulls epic_filter, so --epic has no effect. Warn rather than silently drop
+        # it, so a caller who passed both (e.g. `run --spec ... --epic 3`) isn't
+        # surprised by an unfiltered run. Use --story to scope to one id.
+        print(
+            "note: --epic is ignored in stories mode; use --story to filter to one id",
+            file=sys.stderr,
+        )
 
     if args.dry_run:
-        return _dry_run(paths, pol, args)
+        return _dry_run(paths, pol, args, stories_on, spec_folder)
 
-    try:
-        sprintstatus.select_actionable(
-            sprintstatus.load(paths.sprint_status), args.epic, args.story
-        )
-    except sprintstatus.SprintStatusError as e:
-        print(e, file=sys.stderr)
-        return 1
+    if stories_on:
+        problem = _validate_stories_folder(paths, spec_folder, selector=args.story)
+        if problem:
+            print(problem, file=sys.stderr)
+            return 1
+    else:
+        try:
+            sprintstatus.select_actionable(
+                sprintstatus.load(paths.sprint_status), args.epic, args.story
+            )
+        except sprintstatus.SprintStatusError as e:
+            print(e, file=sys.stderr)
+            return 1
 
     if not verify.worktree_clean(paths.repo_root):
         print("git worktree is not clean — commit or stash first", file=sys.stderr)
         return 1
 
-    if not _require_base_skills(project, pol):
+    if not _require_base_skills(project, pol, require_stories=stories_on):
         return 1
 
     _reconcile_stale(project, paths, pol)
@@ -301,6 +412,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         epic_filter=args.epic,
         story_filter=args.story,
         max_stories=args.max_stories,
+        source="stories" if stories_on else "sprint-status",
+        spec_folder=spec_folder if stories_on else "",
     )
     save_state(run_dir, state)
     runs.write_pid(run_dir)
@@ -308,12 +421,13 @@ def cmd_run(args: argparse.Namespace) -> int:
     journal.append(
         "run-start",
         run_id=run_id,
+        source=state.source,
         adapter_dev=pol.adapter.resolved("dev").name,
         adapter_review=pol.adapter.resolved("review").name,
     )
     print(f"run {run_id} starting (attach: bmad-loop attach)")
 
-    engine = Engine(
+    common = dict(
         paths=paths,
         policy=pol,
         adapter=adapters["dev"],
@@ -325,6 +439,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         epic_filter=args.epic,
         story_filter=args.story,
         sweep_factory=_sweep_factory(project, paths),
+    )
+    engine: Engine = (
+        StoriesEngine(**common, spec_folder=spec_folder) if stories_on else Engine(**common)
     )
     summary = engine.run()
     print(summary.render())
@@ -348,7 +465,16 @@ def _render_invocation(pol, project: Path, role: str, prompt: str) -> str:
     return " ".join(argv)
 
 
-def _dry_run(paths: bmadconfig.ProjectPaths, pol, args: argparse.Namespace) -> int:
+def _dry_run(
+    paths: bmadconfig.ProjectPaths,
+    pol,
+    args: argparse.Namespace,
+    stories_on: bool = False,
+    spec_folder: str = "",
+) -> int:
+    if stories_on:
+        return _dry_run_stories(paths, pol, args, spec_folder)
+
     def render(role: str, prompt: str) -> str:
         return _render_invocation(pol, paths.project, role, prompt)
 
@@ -370,6 +496,77 @@ def _dry_run(paths: bmadconfig.ProjectPaths, pol, args: argparse.Namespace) -> i
         print(f"    review: {render('review', '/bmad-dev-auto <done spec from dev>')}")
         print(f"    env:    BMAD_LOOP_MODE=1 BMAD_LOOP_STORY_KEY={story.key}")
     return 0
+
+
+def _checkpoint_badge(row: stories_mod.StoryRow) -> str:
+    """`` [spec-checkpoint, done-checkpoint]`` for a story's HITL flags, or ``""``
+    when it sets neither. Shared spelling for the dry-run schedule + status."""
+    marks = []
+    if row.spec_checkpoint:
+        marks.append("spec-checkpoint")
+    if row.done_checkpoint:
+        marks.append("done-checkpoint")
+    return f" [{', '.join(marks)}]" if marks else ""
+
+
+def _dry_run_stories(
+    paths: bmadconfig.ProjectPaths, pol, args: argparse.Namespace, spec_folder: str
+) -> int:
+    """Print the linear stories-mode schedule (list order, checkpoints, live
+    on-disk state) — no topo waves, one story per line, spawns nothing."""
+    folder = stories_mod.resolve_spec_folder(paths.project, spec_folder)
+    # The real dispatch always uses the project-relative folder (the engine
+    # relativizes it); render the identical string here so dry-run and run agree.
+    rel = stories_mod.relativize_spec_folder(paths.project, spec_folder)
+    try:
+        rows = stories_mod.story_rows(folder, selector=args.story, max_stories=args.max_stories)
+    except stories_mod.StoriesError as e:
+        print(f"stories mode: {e} (spec folder: {folder})", file=sys.stderr)
+        return 1
+    if args.story and not rows:
+        print(f"stories mode: story id {args.story!r} not found in stories.yaml", file=sys.stderr)
+        return 1
+    spec_ok = "" if (folder / "SPEC.md").is_file() else "  [!] SPEC.md missing"
+    print(
+        f"stories mode: {len(rows)} stories from {folder}/stories.yaml "
+        f"(gates={pol.gates.mode}){spec_ok}"
+    )
+    print("linear schedule (list order — no depends_on, strictly serial):")
+    for row in rows:
+        print(f"\n  {row.position}. {row.id}  ({row.label}){_checkpoint_badge(row)}  {row.title}")
+        # A spec_checkpoint story whose plan is not yet on disk dispatches leg 1
+        # (Halt after planning + BMAD_LOOP_PLAN_HALT); mirror the real dispatch's
+        # markers so dry-run does not under-report what run would emit.
+        plan_halt = stories_mod.is_plan_halt_leg(row.spec_checkpoint, row.state)
+        dispatch = f"/bmad-dev-auto Spec folder: {rel}. Story id: {row.id}."
+        if plan_halt:
+            dispatch += " Halt after planning."
+        print(f"    dev:    {_render_invocation(pol, paths.project, 'dev', dispatch)}")
+        env = f"BMAD_LOOP_MODE=1 BMAD_LOOP_STORY_KEY={row.id} BMAD_LOOP_SPEC_FOLDER={rel}"
+        if plan_halt:
+            env += " BMAD_LOOP_PLAN_HALT=1"
+        print(f"    env:    {env}")
+    return 0
+
+
+def _print_stories_status(state: RunState, project: Path) -> None:
+    """The stories-mode board for `status`: id, live on-disk state, checkpoint
+    markers and title, read from the run's pinned spec folder. Mode-aware
+    counterpart of the sprint-backlog line — the run stamped ``source`` and
+    ``spec_folder`` at start, so no flag is needed to re-derive the mode."""
+    folder = stories_mod.resolve_spec_folder(project, state.spec_folder)
+    try:
+        rows = stories_mod.story_rows(folder)
+    except stories_mod.StoriesError as e:
+        print(f"stories: {e} (spec folder: {folder})")
+        return
+    done = sum(1 for r in rows if r.label == stories_mod.DONE)
+    print(f"stories: {done}/{len(rows)} done  ({folder}/stories.yaml)")
+    for row in rows:
+        print(
+            f"  {row.position:2d}. {row.id:12s} {row.label:16s}"
+            f"{_checkpoint_badge(row)}  {row.title}"
+        )
 
 
 def _start_sweep(
@@ -515,7 +712,7 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
         print(f"run {run_dir.name} already finished", file=sys.stderr)
         return 1
     pol = policy_mod.load(_policy_path(project))
-    if not _require_base_skills(project, pol):
+    if not _require_base_skills(project, pol, require_stories=state.source == "stories"):
         return 1
     journal = Journal(run_dir)
     journal.append("run-resume", was_paused=state.paused_reason)
@@ -544,7 +741,7 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
             max_cycles=opts.get("max_cycles"),
         )
     else:
-        engine = Engine(
+        story_common = dict(
             paths=paths,
             policy=pol,
             adapter=adapters["dev"],
@@ -558,6 +755,13 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
             story_filter=state.story_filter,
             max_stories=state.max_stories,
             sweep_factory=_sweep_factory(project, paths),
+        )
+        # stories mode is pinned in run state at launch, so resume rebuilds the
+        # same picker (StoriesEngine) without any flag.
+        engine = (
+            StoriesEngine(**story_common, spec_folder=state.spec_folder)
+            if state.source == "stories"
+            else Engine(**story_common)
         )
     summary = engine.run()
     print(summary.render())
@@ -599,6 +803,98 @@ def _confirm(question: str) -> bool:
     except EOFError:
         return False
     return ans in ("y", "yes")
+
+
+def _resolve_restore_patch(
+    project: Path,
+    run_dir: Path,
+    story_key: str,
+    args: argparse.Namespace,
+    pol,
+    task,
+) -> tuple[str | None, str | None]:
+    """Determine the intent-gap patch-restore latch (BMAD-METHOD #2564) for a re-arm.
+
+    Precedence: the explicit ``--restore-patch`` flag (hand-driven recovery) wins;
+    otherwise, on the interactive path, the resolve agent may have recorded a
+    ``restore_patch`` field in resolution.json. The flag path is fully knowable
+    before the interactive session, so cmd_resolve validates it FIRST and only
+    falls back here post-session for the resolution.json read. Returns
+    ``(latch, error)``: a validated absolute patch path to latch (None = ordinary
+    from-scratch re-drive), or an error string when a supplied path is missing /
+    outside the trusted roots, the run can't restore in place, or the restore
+    input itself is corrupt (unreadable resolution.json, empty/non-string value)
+    — the caller aborts strictly rather than silently re-driving from scratch
+    when a restore was (or may have been) asked for."""
+    raw = getattr(args, "restore_patch", None)
+    if raw is not None and not raw.strip():
+        # `--restore-patch ""` is a classic unset-shell-var slip. Treating it as
+        # "no restore" would silently re-drive from scratch (and even mask a
+        # restore the resolve agent recorded) — and a re-arm consumes the
+        # escalation, so the dropped decision would be unrecoverable.
+        return None, (
+            "--restore-patch got an empty path (unset shell variable?) — pass the "
+            "saved patch path, or drop the flag entirely for a from-scratch re-drive"
+        )
+    if raw is None and args.interactive:
+        try:
+            doc = resolve.read_resolution(run_dir, story_key)
+        except resolve.ResolutionError as e:
+            return None, (
+                f"{e} — the recorded resolution (and any restore_patch decision in "
+                "it) cannot be read; fix or delete the file, or re-run with "
+                "--no-interactive [--restore-patch <path>] to decide by hand"
+            )
+        val = None if doc is None else doc.get("restore_patch")
+        if val is not None:
+            # the schema says omit the field for an ordinary resolution; an empty
+            # or non-string value is a corrupted recorded decision, not "none"
+            if not isinstance(val, str) or not val.strip():
+                return None, (
+                    f"resolution.json for {story_key} carries an invalid "
+                    f"restore_patch value {val!r} — expected a non-empty path (or "
+                    "the field omitted); fix the file, or re-run with "
+                    "--no-interactive [--restore-patch <path>] to decide by hand"
+                )
+            raw = val
+    if not raw:
+        return None, None
+    # Restore is an in-place-only recovery: a worktree-isolation re-drive discards
+    # the unit's worktree (engine._finish_inflight — taking a patch saved inside it
+    # along) and re-mounts a fresh one, so the re-apply could only fail on a
+    # destroyed patch file. Reject up front instead of latching a patch that can
+    # never restore. Checked against BOTH the recorded run state
+    # (task.worktree_path — how the escalated unit actually executed) and the live
+    # policy (how the resume will execute), so a policy edit between escalation
+    # and resolve can't skew the guard.
+    if pol.scm.isolation == "worktree" or getattr(task, "worktree_path", ""):
+        return None, (
+            "restore patch is unsupported for worktree-isolation runs (the re-drive "
+            "discards and re-mounts the unit's worktree, so an in-place restore has "
+            "nothing durable to land on) — re-arm from scratch instead: drop "
+            "--restore-patch, or if the resolve agent recorded the restore in "
+            "resolution.json, re-run with --no-interactive (which ignores that "
+            "marker) instead of repeating the agent session"
+        )
+    patch = Path(raw)
+    if not patch.is_absolute():
+        patch = project / patch
+    patch = patch.resolve()
+    # Same trusted-roots shape as the frontmatter reconcile's spec_within_roots:
+    # bmad-dev-auto saves the patch under implementation_artifacts, and artifact
+    # dirs configured OUTSIDE the project tree are a supported layout — a bare
+    # is_relative_to(project) check would reject every legitimate restore there.
+    try:
+        paths = bmadconfig.load_paths(project)
+    except bmadconfig.BmadConfigError as e:
+        return None, f"cannot validate the restore patch path against the project config: {e}"
+    if not patch.is_file() or not verify.spec_within_roots(patch, paths):
+        return None, (
+            f"restore patch {raw!r} is not a file under the project or its "
+            "configured artifact roots — refusing to re-arm (fix the path, or "
+            "re-run without a restore to re-drive from scratch)"
+        )
+    return str(patch), None
 
 
 def cmd_resolve(args: argparse.Namespace) -> int:
@@ -648,11 +944,25 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         print(f"no escalated story to resolve in run {args.run_id}", file=sys.stderr)
         return 1
 
+    pol = policy_mod.load(_policy_path(project))
+
+    # intent-gap patch-restore latch (#2564), explicit-flag path: everything about
+    # it (isolation mode, path containment) is knowable NOW — validate before the
+    # interactive resolve session, not after a whole agent conversation the abort
+    # would throw away. The resolution.json path can only be validated
+    # post-session (below); build_context tells the agent up front when a restore
+    # can't be honored so it never negotiates one.
+    restore_patch: str | None = None
+    if args.restore_patch is not None:
+        restore_patch, err = _resolve_restore_patch(project, run_dir, story_key, args, pol, task)
+        if err is not None:
+            print(err, file=sys.stderr)
+            return 1
+
     if args.interactive:
-        pol = policy_mod.load(_policy_path(project))
         adapters = _make_adapters(project, run_dir, pol)
         model = pol.adapter.resolved("dev").model
-        resolve.build_context(state, run_dir, story_key)
+        resolve.build_context(state, run_dir, story_key, isolation=pol.scm.isolation)
         print(f"launching resolve agent for {story_key} — converse, fix the spec, then exit…")
         try:
             produced = resolve.run_session(
@@ -671,16 +981,27 @@ def cmd_resolve(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
 
+    # resolution.json restore latch: only exists after the session ran, so this
+    # arm of the validation cannot be hoisted above it.
+    if args.restore_patch is None:
+        restore_patch, err = _resolve_restore_patch(project, run_dir, story_key, args, pol, task)
+        if err is not None:
+            print(err, file=sys.stderr)
+            return 1
+
     # confirm-then-resume (args.resume: None = ask, True = auto, False = re-arm only)
     if args.resume is None and not _confirm(f"re-arm {story_key} and resume run {args.run_id}?"):
         print("cancelled — run is still paused at the escalation")
         return 0
     try:
-        runs.rearm_escalation(run_dir, story_key)
+        runs.rearm_escalation(run_dir, story_key, restore_patch=restore_patch)
     except runs.RearmError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
-    print(f"re-armed {story_key}")
+    print(
+        f"re-armed {story_key}"
+        + (" (restoring the attempted change for review)" if restore_patch else "")
+    )
     if args.resume is False:
         print(f"resume when ready: bmad-loop resume {args.run_id}")
         return 0
@@ -769,13 +1090,16 @@ def cmd_status(args: argparse.Namespace) -> int:
             f"  {key:40s} {task.phase:16s} dev×{task.attempt} review×{task.review_cycle} "
             f"{tokens} {extra}"
         )
-    try:
-        paths = bmadconfig.load_paths(project)
-        ss = sprintstatus.load(paths.sprint_status)
-        remaining = [s.key for s in ss.stories if s.status in sprintstatus.ACTIONABLE_STATUSES]
-        print(f"sprint backlog remaining: {len(remaining)}")
-    except (bmadconfig.BmadConfigError, sprintstatus.SprintStatusError):
-        pass
+    if state.source == "stories":
+        _print_stories_status(state, project)
+    else:
+        try:
+            paths = bmadconfig.load_paths(project)
+            ss = sprintstatus.load(paths.sprint_status)
+            remaining = [s.key for s in ss.stories if s.status in sprintstatus.ACTIONABLE_STATUSES]
+            print(f"sprint backlog remaining: {len(remaining)}")
+        except (bmadconfig.BmadConfigError, sprintstatus.SprintStatusError):
+            pass
     try:
         missed = decisions.pending_missed_decisions(project)
         if missed:
@@ -1220,7 +1544,13 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="overwrite bmad-loop-* skill dirs that already exist (default: skip them)",
     )
-    add("validate", cmd_validate, "preflight checks; exit non-zero on failure")
+    validate_p = add("validate", cmd_validate, "preflight checks; exit non-zero on failure")
+    validate_p.add_argument(
+        "--spec",
+        metavar="FOLDER",
+        help="validate stories mode against this epic spec folder's stories.yaml "
+        "(overrides [stories].source; skips the sprint-status gate)",
+    )
 
     probe_p = add(
         "probe-adapter",
@@ -1253,8 +1583,18 @@ def main(argv: list[str] | None = None) -> int:
     probe_p.add_argument("--keep-temp", action="store_true", help=argparse.SUPPRESS)
 
     run_p = add("run", cmd_run, "run the orchestration loop")
-    run_p.add_argument("--epic", type=int, help="only stories from this epic")
-    run_p.add_argument("--story", help="story: E-S / E.S, a slug fragment, or full key")
+    run_p.add_argument(
+        "--spec",
+        metavar="FOLDER",
+        help="force stories mode: dispatch the epic spec folder's stories.yaml by "
+        "folder+id (overrides [stories].source)",
+    )
+    run_p.add_argument("--epic", type=int, help="only stories from this epic (sprint mode)")
+    run_p.add_argument(
+        "--story",
+        help="story: E-S / E.S, a slug fragment, or full key (sprint mode); "
+        "a story id (stories mode)",
+    )
     run_p.add_argument("--max-stories", type=int, help="stop after N stories")
     run_p.add_argument("--dry-run", action="store_true", help="print the plan, spawn nothing")
     run_p.add_argument("--run-id", help=argparse.SUPPRESS)  # pre-assigned id (used by the TUI)
@@ -1297,6 +1637,14 @@ def main(argv: list[str] | None = None) -> int:
         dest="interactive",
         action="store_false",
         help="skip the resolve agent (spec already fixed by hand); just re-arm + resume",
+    )
+    resolve_p.add_argument(
+        "--restore-patch",
+        metavar="PATH",
+        help="intent-gap patch-restore (#2564): re-arm the spec to `in-review` and "
+        "re-apply this saved patch before the re-drive, resuming review on the "
+        "attempted change instead of re-implementing (hand-driven; the interactive "
+        "agent supplies it via resolution.json)",
     )
     resolve_p.add_argument(
         "--resume",

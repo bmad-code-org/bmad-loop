@@ -534,23 +534,113 @@ def test_provision_worktree_copies_base_skills_from_repo(tmp_path):
 
 def test_missing_base_skills_reports_absent_and_incomplete(tmp_path):
     claude = get_profile("claude")
-    # nothing installed → dev primitive + both inline review hunters reported
+    # nothing installed → dev primitive + all three inline review hunters reported
     # missing (the hunters are always required — bmad-dev-auto's step-04 invokes
     # them on every run, regardless of the orchestrator's follow-up review)
     problems = missing_base_skills(tmp_path, [claude.skill_tree])
-    assert len(problems) == 3
+    assert len(problems) == 4
     assert all("install the BMad Method" in p for p in problems)
 
     # install everything → no problems
     _install_base_skills(tmp_path, claude.skill_tree)
     assert missing_base_skills(tmp_path, [claude.skill_tree]) == []
 
-    # remove the dev primitive's marker → reported as incomplete
+    # remove the dev primitive's step-file marker → reported as incomplete
     (tmp_path / claude.skill_tree / "bmad-dev-auto" / "step-04-review.md").unlink()
     problems = missing_base_skills(tmp_path, [claude.skill_tree])
     assert len(problems) == 1
     assert "incomplete" in problems[0]
     assert "step-04-review.md" in problems[0]
+
+    # restore it, then drop customize.toml (the review-layer config marker,
+    # BMAD-METHOD #2535/#2550) → a pre-July bmm install is caught as incomplete
+    (tmp_path / claude.skill_tree / "bmad-dev-auto" / "step-04-review.md").write_text("x\n")
+    (tmp_path / claude.skill_tree / "bmad-dev-auto" / "customize.toml").unlink()
+    problems = missing_base_skills(tmp_path, [claude.skill_tree])
+    assert len(problems) == 1
+    assert "incomplete" in problems[0]
+    assert "customize.toml" in problems[0]
+
+    # the newest review layer (verification-gap) reported by name when absent
+    _install_base_skills(tmp_path, claude.skill_tree)  # re-complete everything
+    import shutil as _shutil
+
+    _shutil.rmtree(tmp_path / claude.skill_tree / "bmad-review-verification-gap")
+    problems = missing_base_skills(tmp_path, [claude.skill_tree])
+    assert len(problems) == 1
+    assert "bmad-review-verification-gap" in problems[0]
+    assert "install the BMad Method" in problems[0]
+
+
+def test_missing_stories_support_probes_step01_content(tmp_path):
+    from bmad_loop.install import (
+        STORIES_PROBE_FILE,
+        STORIES_PROBE_SKILL,
+        missing_stories_support,
+    )
+
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    step01 = tmp_path / tree / STORIES_PROBE_SKILL / STORIES_PROBE_FILE
+
+    # step-01 absent → reported (older/half install)
+    problems = missing_stories_support(tmp_path, [tree])
+    assert len(problems) == 1 and "not found" in problems[0]
+
+    # present but WITHOUT the folder+id dispatch marker (a pre-#2549 skill)
+    step01.parent.mkdir(parents=True, exist_ok=True)
+    step01.write_text("# Step 1\nold clarify-and-route, no dispatch protocol\n", encoding="utf-8")
+    problems = missing_stories_support(tmp_path, [tree])
+    assert len(problems) == 1 and "folder+id dispatch" in problems[0]
+
+    # present WITH the marker → OK
+    step01.write_text("route a **folder+id dispatch** invocation\n", encoding="utf-8")
+    assert missing_stories_support(tmp_path, [tree]) == []
+
+
+def test_missing_stories_support_reports_non_utf8_probe_without_crashing(tmp_path):
+    """C1: a binary/non-UTF-8 step-01 file must be reported as a problem, not crash
+    the preflight — read_text(encoding="utf-8") raises UnicodeDecodeError (a
+    ValueError, NOT an OSError), so the content probe has to catch it explicitly."""
+    from bmad_loop.install import (
+        STORIES_PROBE_FILE,
+        STORIES_PROBE_SKILL,
+        missing_stories_support,
+    )
+
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    step01 = tmp_path / tree / STORIES_PROBE_SKILL / STORIES_PROBE_FILE
+    step01.parent.mkdir(parents=True, exist_ok=True)
+    step01.write_bytes(b"\xff\xfe\x00\x01 not utf-8 \x80\x81")  # invalid UTF-8
+
+    problems = missing_stories_support(tmp_path, [tree])
+    assert len(problems) == 1 and "not found" in problems[0]
+
+
+def test_new_dev_auto_skill_is_additive_for_sprint_mode(tmp_path):
+    """Scenario 6 additivity: installing the *new* bmad-dev-auto (folder+id
+    dispatch present) satisfies both preflights — sprint mode's file-existence
+    check (`missing_base_skills`, which never inspects the dispatch content) and
+    stories mode's content probe (`missing_stories_support`). The new skill
+    breaks neither pipeline."""
+    from bmad_loop.install import (
+        STORIES_PROBE_FILE,
+        STORIES_PROBE_SKILL,
+        missing_stories_support,
+    )
+
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    _install_base_skills(tmp_path, tree)
+    # upgrade bmad-dev-auto in place to the folder+id dispatch version
+    step01 = tmp_path / tree / STORIES_PROBE_SKILL / STORIES_PROBE_FILE
+    step01.write_text("route a **folder+id dispatch** invocation\n", encoding="utf-8")
+
+    # sprint mode (file existence) is unaffected by the new dispatch content …
+    assert missing_base_skills(tmp_path, [tree]) == []
+    # … and stories mode now also passes its stricter content probe
+    assert missing_stories_support(tmp_path, [tree]) == []
 
 
 def test_provision_worktree_seeds_gitignored_config(tmp_path):

@@ -90,9 +90,12 @@ the pane recovers on the next poll once the file is readable again.
 
 One row per run dir under `.bmad-loop/runs/`, oldest first (run ids are
 `YYYYMMDD-HHMMSS-<hex>` and sort chronologically). Columns: `st` (status
-glyph, see below), `run` (the id), `type` (`story` or `sweep`). On first load
-the newest run is auto-selected; arrow keys or mouse select another. A run you
-just launched is selected immediately, before its directory even exists.
+glyph, see below), `run` (the id), `type` (`story` or `sweep`), `note` (a
+colored pause-kind badge on a paused run — `plan` / `story` / `spec` / `epic` /
+`gate` / `esc`). When any run is paused awaiting a human the pane's title shows
+a global **`⚑ N need attention`** count. On first load the newest run is
+auto-selected; arrow keys or mouse select another. A run you just launched is
+selected immediately, before its directory even exists.
 
 #### Sprint tree (middle)
 
@@ -112,6 +115,29 @@ a status glyph:
 
 Expansion state and the cursor survive the 3-second refresh — only labels are
 updated in place unless an epic's story set actually changes.
+
+#### Stories board (middle, stories mode)
+
+When the selected run is in **stories mode** (`source = "stories"`), the sprint
+tree is replaced in place by a flat **stories board** read from that run's
+`stories.yaml` + the id-keyed story specs on disk. One row per story: a state
+glyph + label, the story `id`, a two-slot checkpoint cell (`S` = `spec_checkpoint`,
+`D` = `done_checkpoint`, dim `·` for an unset slot), and the title. The state
+column reflects live disk state:
+
+| Glyph | State                                    | Color    |
+| ----- | ---------------------------------------- | -------- |
+| `✓`   | done                                     | green    |
+| `▶`   | in-progress                              | cyan     |
+| `◆`   | in-review                                | magenta  |
+| `○`   | ready-for-dev                            | cyan     |
+| `◦`   | draft                                    | dim      |
+| `·`   | pending (no spec on disk yet)            | dim      |
+| `✖`   | blocked                                  | bold red |
+| `⚠`   | ambiguous / sentinel (`sentinel:<kind>`) | bold red |
+
+Selecting a sprint-mode run swaps the sprint tree back. The board re-derives
+each poll so it tracks the dev sessions writing story specs.
 
 #### Deferred work (bottom)
 
@@ -220,6 +246,7 @@ Journal kinds are styled by substring, first match wins:
 | `r` | start a run (modal)                                                        |
 | `s` | start a sweep (modal)                                                      |
 | `e` | resume the selected paused/interrupted run (confirm modal)                 |
+| `p` | review the selected paused run in the stage-appropriate HITL viewer        |
 | `R` | resolve a run paused at an escalation (interactive, then re-arm)           |
 | `d` | answer deferred-work decisions past sweeps left unanswered (modal walk)    |
 | `a` | attach to the selected run's live session or orchestrator window           |
@@ -240,10 +267,14 @@ sections, `escape` goes back without saving. In any modal: `escape` cancels.
 
 `r` opens the **start run** modal — all fields optional:
 
-- **epic** — integer, restrict to one epic; blank = all
-- **story key** — restrict to one story; blank = all
+- **source** — `sprint mode` (walks `sprint-status.yaml`) or `stories mode` (folder+id dispatch), prefilled from `[stories]`
+- **spec folder** — stories mode only: the epic spec folder holding `stories.yaml` + `SPEC.md`; feeds a live **schedule preview** that validates the manifest and lists the linear schedule with `[spec/done]` checkpoint markers and each story's live disk state
+- **epic** — integer, restrict to one epic (sprint mode); blank = all
+- **story key** — restrict to one story; a story id in stories mode; blank = all
 - **max stories** — stop after N stories; blank = no limit
 - **dry run** — print the plan, spawn nothing (output shown in a modal)
+
+Selecting stories mode with an empty spec folder is refused with a toast; the run's preflight also validates the manifest + `SPEC.md` before spawning.
 
 `s` opens the **start sweep** modal:
 
@@ -318,6 +349,39 @@ in place — a clean rebuild against the corrected spec, then on through the res
 of the sprint. Detach (`Ctrl-b d`) to return to the dashboard, which observes the
 resumed run like any other. Exiting the agent without recording a resolution
 leaves the story escalated and the run paused — the safe default.
+
+## Reviewing a paused run (`p`)
+
+`p` opens the **stage-appropriate HITL viewer** for the selected paused run,
+dispatched on `RunState.paused_stage`. Every action calls the exact code path the
+CLI uses — no duplicated logic — and every viewer is a read-only presentation of
+artifacts the engine already wrote.
+
+- **Plan checkpoint** (`spec_checkpoint`, stories mode) — a read-only viewer of
+  the planned `ready-for-dev` spec at its id-keyed path (shown prominently, with a
+  copy-path action). **Approve & resume** resumes straight to implementation;
+  **Request replan** resets the spec to `draft` and strips its Auto Run Result
+  (via the same `devcontract` primitives the engine's repair path uses), then
+  resumes so the next dispatch re-plans. Edit the markdown in your own editor — the
+  TUI never edits specs.
+- **Story checkpoint** (`done_checkpoint`, stories mode) — a summary card for the
+  just-committed story: id/title, commit subject + short hash, verification
+  outcome, and cost-weighted + raw token totals. **Continue run** resumes the
+  schedule; **Stop run** marks the run stopped.
+- **Escalation** — the escalation view enriched with story context: the story
+  entry's title/description (from `stories.yaml`), the blocking condition parsed
+  from the spec's `## Auto Run Result`, and a sentinel indicator when the matched
+  spec is a fixed-slug pre-planning-halt sentinel. **Resolve** launches the same
+  interactive agent as `R`; **Re-arm & resume** (offered once the resolve agent has
+  recorded a resolution) re-arms and resumes — deleting a sentinel with a preserved
+  copy for a clean re-dispatch. Both refuse a still-live engine.
+- **Spec-approval / epic gate** — reuses the spec viewer (view the finalized spec,
+  then **Approve & resume**), so the pre-existing sprint-mode gates inherit the same
+  richer surface.
+
+`p` and `R` overlap for an escalation (both reach Resolve); `p` also exposes
+Re-arm & resume inline once a resolution exists. Pause badges in the run list and
+the run header name the stage so you know which viewer `p` will open.
 
 ## Attaching (`a`) and the sweep decision flow
 

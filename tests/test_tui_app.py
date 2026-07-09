@@ -17,11 +17,14 @@ from rich.text import Text
 from textual.geometry import Offset
 from textual.selection import Selection
 from textual.widgets import (
+    Button,
     Checkbox,
     DataTable,
     Input,
     OptionList,
     RichLog,
+    Select,
+    Static,
     TabbedContent,
 )
 
@@ -36,8 +39,11 @@ from bmad_loop.tui.screens.modals import (
     ConfirmResumeModal,
     DecisionModal,
     DeferredEntryModal,
+    EscalationModal,
+    SpecReviewModal,
     StartRunModal,
     StartSweepModal,
+    StoryCheckpointModal,
     TextOutputModal,
 )
 from bmad_loop.tui.widgets import (
@@ -47,7 +53,12 @@ from bmad_loop.tui.widgets import (
     RunHeader,
     SelectableRichLog,
     SprintTree,
+    StoriesTable,
     journal_line,
+    pause_label,
+    pause_tag,
+    story_checkpoint_cell,
+    story_state_cell,
 )
 
 
@@ -61,9 +72,12 @@ def make_run(
     tasks: dict[str, StoryTask] | None = None,
     paused_stage: str | None = None,
     paused_reason: str | None = None,
+    paused_story_key: str | None = None,
     crashed: bool = False,
     crash_error: str | None = None,
     policy_snapshot: dict | None = None,
+    source: str = "sprint-status",
+    spec_folder: str = "",
 ) -> Path:
     run_dir = root / RUNS_DIR / run_id
     state = RunState(
@@ -75,9 +89,12 @@ def make_run(
         tasks=tasks or {},
         paused_stage=paused_stage,
         paused_reason=paused_reason,
+        paused_story_key=paused_story_key,
         crashed=crashed,
         crash_error=crash_error,
         policy_snapshot=policy_snapshot or {},
+        source=source,
+        spec_folder=spec_folder,
     )
     save_state(run_dir, state)
     if alive:
@@ -889,8 +906,10 @@ async def test_start_run_modal_launches(project, monkeypatch):
     calls = {}
     monkeypatch.setattr(launch, "tmux_available", lambda: True)
 
-    def fake_start(proj, run_id, *, epic, story, max_stories):
-        calls.update(project=proj, run_id=run_id, epic=epic, story=story, max_stories=max_stories)
+    def fake_start(proj, run_id, *, spec=None, epic, story, max_stories):
+        calls.update(
+            project=proj, run_id=run_id, spec=spec, epic=epic, story=story, max_stories=max_stories
+        )
 
     monkeypatch.setattr(launch, "start_run_detached", fake_start)
     app = BmadLoopApp(project.project)
@@ -1396,3 +1415,472 @@ async def test_resolve_refused_when_not_escalation(project, monkeypatch):
         await pilot.press("R")
         await until(pilot, lambda: any("escalation" in m for m in notifications(app)))
     assert launched == []  # warned, never launched
+
+
+# ------------------------------------------------- stories mode: board + badges
+
+
+def test_pause_tag_and_label_render():
+    assert pause_tag("plan-checkpoint").plain == "plan"
+    assert pause_tag("story-checkpoint").plain == "story"
+    assert pause_tag("escalation").plain == "esc"
+    assert pause_tag("").plain == ""  # not paused → no tag
+    label, style = pause_label("escalation")
+    assert label == "escalation" and "red" in style
+
+
+def test_story_cells_render():
+    assert story_state_cell("done").plain == "✓ done"
+    assert story_state_cell("sentinel:unresolved").plain.startswith("⚠")
+    assert story_checkpoint_cell(True, False).plain == "S·"
+    assert story_checkpoint_cell(False, True).plain == "·D"
+    assert story_checkpoint_cell(True, True).plain == "SD"
+    assert story_checkpoint_cell(False, False).plain == "··"
+
+
+def _write_stories_fixture(root: Path) -> None:
+    import yaml
+
+    folder = root / "epic-1"
+    (folder / "stories").mkdir(parents=True)
+    (folder / "SPEC.md").write_text("# Epic 1\n", encoding="utf-8")
+    (folder / "stories.yaml").write_text(
+        yaml.safe_dump(
+            [
+                {"id": "1", "title": "First story", "description": "d", "spec_checkpoint": True},
+                {"id": "2", "title": "Second story", "description": "d"},
+            ],
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (folder / "stories" / "1-slug.md").write_text("---\nstatus: done\n---\n", encoding="utf-8")
+
+
+async def test_stories_mode_run_shows_board_and_attention(project):
+    root = project.project
+    _write_stories_fixture(root)
+    make_run(
+        root,
+        "20260611-100000-aaaa",
+        source="stories",
+        spec_folder="epic-1",
+        paused_stage="plan-checkpoint",
+        paused_reason="plan checkpoint for 2",
+    )
+    app = BmadLoopApp(root)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        screen = dashboard(app)
+        await until(pilot, lambda: screen.selected_run_id == "20260611-100000-aaaa")
+        stories_table = screen.query_one("#stories-table", StoriesTable)
+        sprint_tree = screen.query_one("#sprint-tree", SprintTree)
+        # the stories board replaces the sprint tree for a stories-mode run
+        await until(pilot, lambda: stories_table.display and not sprint_tree.display)
+        await until(pilot, lambda: stories_table.row_count == 2)
+        # global attention indicator + per-run pause badge
+        runs = screen.query_one("#runs", DataTable)
+        assert "need attention" in str(runs.border_title)
+        note = runs.get_cell("20260611-100000-aaaa", "note")
+        assert note.plain == "plan"
+
+
+async def test_sprint_mode_run_keeps_sprint_tree(project):
+    root = project.project
+    install_bmad_config(project)
+    write_sprint(project, {"epic-1": "in-progress", "1-1-a": "ready-for-dev"})
+    make_run(root, "20260611-100000-aaaa", finished=True)
+    app = BmadLoopApp(root)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        screen = dashboard(app)
+        await until(pilot, lambda: screen.selected_run_id == "20260611-100000-aaaa")
+        stories_table = screen.query_one("#stories-table", StoriesTable)
+        sprint_tree = screen.query_one("#sprint-tree", SprintTree)
+        await until(pilot, lambda: sprint_tree.display and not stories_table.display)
+
+
+# ---------------------------------------------------- HITL pause review viewers
+
+
+def _stories_paused_run(
+    root: Path,
+    *,
+    stage: str,
+    story_key: str = "1",
+    spec_status: str = "ready-for-dev",
+    spec_checkpoint: bool = True,
+    done_checkpoint: bool = False,
+    commit_sha: str = "",
+    review_cycle: int = 0,
+    blocked_result: str = "",
+    sentinel: bool = False,
+) -> tuple[Path, Path]:
+    """A stories-mode run paused at `stage`, with the id-keyed story spec on disk
+    and a StoryTask pointing at it. Returns (run_dir, spec_path)."""
+    import yaml
+
+    folder = root / "epic-1"
+    (folder / "stories").mkdir(parents=True, exist_ok=True)
+    (folder / "SPEC.md").write_text("# Epic 1\n", encoding="utf-8")
+    (folder / "stories.yaml").write_text(
+        yaml.safe_dump(
+            [
+                {
+                    "id": story_key,
+                    "title": f"Story {story_key}",
+                    "description": "does a thing",
+                    "spec_checkpoint": spec_checkpoint,
+                    "done_checkpoint": done_checkpoint,
+                }
+            ],
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    slug = "unresolved" if sentinel else "slug"
+    spec = folder / "stories" / f"{story_key}-{slug}.md"
+    body = f"---\nstatus: {spec_status}\n---\n\n# plan for {story_key}\n"
+    if blocked_result:
+        body += f"\n## Auto Run Result\n\n- Status: blocked\n\n{blocked_result}\n"
+    spec.write_text(body, encoding="utf-8")
+    task = StoryTask(story_key=story_key, epic=0, phase=Phase.DEV_VERIFY)
+    task.spec_file = str(spec)
+    task.review_cycle = review_cycle
+    if commit_sha:
+        task.commit_sha = commit_sha
+    run_dir = make_run(
+        root,
+        "20260611-100000-aaaa",
+        source="stories",
+        spec_folder="epic-1",
+        paused_stage=stage,
+        paused_reason=f"{stage} for {story_key}",
+        paused_story_key=story_key,
+        tasks={story_key: task},
+    )
+    return run_dir, spec
+
+
+async def _open_review(app, pilot, modal_type):
+    await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+    await until(pilot, lambda: dashboard(app).selected_run_id is not None)
+    await pilot.press("p")
+    await until(pilot, lambda: isinstance(app.screen, modal_type))
+
+
+async def test_plan_checkpoint_approve_resumes(project, monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(launch, "tmux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    _stories_paused_run(project.project, stage="plan-checkpoint")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+        await pilot.click(await ready(pilot, "#act-approve"))
+        await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
+
+
+async def test_plan_checkpoint_replan_resets_and_resumes(project, monkeypatch):
+    from bmad_loop import devcontract
+
+    calls: list[str] = []
+    resets: list[tuple] = []
+    strips: list[Path] = []
+    monkeypatch.setattr(launch, "tmux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    monkeypatch.setattr(
+        devcontract, "reset_spec_status", lambda p, s: resets.append((p, s)) or True
+    )
+    monkeypatch.setattr(devcontract, "strip_auto_run_result", lambda p: strips.append(p) or True)
+    _run_dir, spec = _stories_paused_run(project.project, stage="plan-checkpoint")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+        await pilot.click(await ready(pilot, "#act-replan"))
+        await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
+        assert resets == [(spec, "draft")]
+        assert strips == [spec]
+
+
+async def test_story_checkpoint_continue_resumes(project, monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(launch, "tmux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    _stories_paused_run(
+        project.project,
+        stage="story-checkpoint",
+        spec_status="done",
+        spec_checkpoint=False,
+        done_checkpoint=True,
+        commit_sha="abc1234def5678",
+    )
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, StoryCheckpointModal)
+        await pilot.click(await ready(pilot, "#act-continue"))
+        await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
+
+
+async def test_story_checkpoint_stop_marks_stopped(project, monkeypatch):
+    from bmad_loop import runs
+
+    stops: list[Path] = []
+    monkeypatch.setattr(launch, "tmux_available", lambda: True)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    monkeypatch.setattr(runs, "stop_run", lambda rd: stops.append(rd) or True)
+    monkeypatch.setattr(launch, "kill_ctl_window", lambda rid: None)
+    _stories_paused_run(
+        project.project,
+        stage="story-checkpoint",
+        spec_status="done",
+        spec_checkpoint=False,
+        done_checkpoint=True,
+    )
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, StoryCheckpointModal)
+        await pilot.click(await ready(pilot, "#act-stop"))
+        await until(pilot, lambda: len(stops) == 1)
+
+
+def test_checkpoint_gate_line_pluralization():
+    # The gate line is derived, not hardcoded — and pluralizes the real cycle count.
+    f = BmadLoopApp._checkpoint_gate_line
+    assert f(0) == "verify + review gates passed · no follow-up review cycles"
+    assert f(1) == "verify + review gates passed · 1 follow-up review cycle"
+    assert f(3) == "verify + review gates passed · 3 follow-up review cycles"
+
+
+async def test_story_checkpoint_card_surfaces_real_review_cycles(project, monkeypatch):
+    # audit item 13: the card's gate line must reflect the task's real
+    # review_cycle, never the old blanket "verification passed" string.
+    monkeypatch.setattr(launch, "tmux_available", lambda: True)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    _stories_paused_run(
+        project.project,
+        stage="story-checkpoint",
+        spec_status="done",
+        spec_checkpoint=False,
+        done_checkpoint=True,
+        commit_sha="abc1234def5678",
+        review_cycle=2,
+    )
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, StoryCheckpointModal)
+        line = app.screen._verify_line
+        assert "verify + review gates passed" in line
+        assert "2 follow-up review cycles" in line
+        assert "verification passed" not in line
+
+
+async def test_escalation_rearm_resumes_when_resolution_ready(project, monkeypatch):
+    from bmad_loop import resolve, runs
+
+    calls: list[str] = []
+    rearms: list[str] = []
+    monkeypatch.setattr(launch, "tmux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    monkeypatch.setattr(
+        runs, "rearm_escalation", lambda rd, sk: rearms.append(sk) or "ready-for-dev"
+    )
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: needs a human decision on the auth scheme.",
+    )
+    marker = resolve.resolution_path(run_dir, "1")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{}", encoding="utf-8")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, EscalationModal)
+        # story context + blocking condition were resolved from stories.yaml + the spec
+        assert app.screen._description == "does a thing"
+        assert "Auto Run Result" in app.screen._blocking
+        await pilot.click(await ready(pilot, "#act-rearm"))
+        await until(pilot, lambda: rearms == ["1"] and calls == ["20260611-100000-aaaa"])
+
+
+def test_restore_recorded_helper(tmp_path):
+    """review F8: absent marker / no restore field -> False; a recorded
+    restore_patch -> True; an UNREADABLE marker -> True (it may carry one, so
+    the warning must err toward surfacing)."""
+    from bmad_loop import resolve
+
+    assert BmadLoopApp._restore_recorded(tmp_path, "1") is False  # absent
+    marker = resolve.resolution_path(tmp_path, "1")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{}", encoding="utf-8")
+    assert BmadLoopApp._restore_recorded(tmp_path, "1") is False  # no restore field
+    marker.write_text('{"restore_patch": "artifacts/a.patch"}', encoding="utf-8")
+    assert BmadLoopApp._restore_recorded(tmp_path, "1") is True
+    marker.write_text('{"restore_patch": "artifacts/a.patch",}', encoding="utf-8")
+    assert BmadLoopApp._restore_recorded(tmp_path, "1") is True  # corrupt -> conservative
+
+
+async def test_escalation_rearm_warns_when_restore_recorded(project, monkeypatch):
+    """review F8: a resolution.json carrying restore_patch still enables Re-arm
+    (it IS a recorded resolution) but the modal flags it and the re-arm notifies
+    that the restore is NOT honored here — only `bmad-loop resolve` applies a
+    latch — so the human's confirmed decision is never dropped silently."""
+    from bmad_loop import resolve, runs
+
+    calls: list[str] = []
+    rearms: list[str] = []
+    notes: list[str] = []
+    monkeypatch.setattr(launch, "tmux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    monkeypatch.setattr(
+        runs, "rearm_escalation", lambda rd, sk: rearms.append(sk) or "ready-for-dev"
+    )
+    orig_notify = BmadLoopApp.notify
+    monkeypatch.setattr(
+        BmadLoopApp,
+        "notify",
+        lambda self, msg, **kw: notes.append(str(msg)) or orig_notify(self, msg, **kw),
+    )
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: intent gap; saved patch: artifacts/attempt.patch",
+    )
+    marker = resolve.resolution_path(run_dir, "1")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text('{"restore_patch": "artifacts/attempt.patch"}', encoding="utf-8")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, EscalationModal)
+        assert app.screen._restore_recorded is True  # the modal shows the warning hint
+        await pilot.click(await ready(pilot, "#act-rearm"))
+        await until(pilot, lambda: rearms == ["1"] and calls == ["20260611-100000-aaaa"])
+    assert any("NOT honored" in n for n in notes)  # the drop was surfaced, not silent
+
+
+async def test_escalation_rearm_disabled_without_resolution(project, monkeypatch):
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked.",
+    )
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, EscalationModal)
+        await ready(pilot, "#act-rearm")
+        assert app.screen.query_one("#act-rearm", Button).disabled
+
+
+async def test_gate_pause_resume(project, monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(launch, "tmux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    spec = project.project / "spec-1-1-a.md"
+    spec.write_text("---\nstatus: ready-for-dev\n---\n# finalized spec\n", encoding="utf-8")
+    task = StoryTask(story_key="1-1-a", epic=1, phase=Phase.DEV_VERIFY)
+    task.spec_file = str(spec)
+    make_run(
+        project.project,
+        "20260611-100000-aaaa",
+        paused_stage="spec-approval",
+        paused_reason="awaiting spec approval",
+        paused_story_key="1-1-a",
+        tasks={"1-1-a": task},
+    )
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+        await pilot.click(await ready(pilot, "#act-resume"))
+        await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
+
+
+async def test_start_run_modal_stories_source_launches(project, monkeypatch):
+    calls: dict = {}
+    monkeypatch.setattr(launch, "tmux_available", lambda: True)
+
+    def fake_start(proj, run_id, *, spec=None, epic, story, max_stories):
+        calls.update(spec=spec, epic=epic, story=story)
+
+    monkeypatch.setattr(launch, "start_run_detached", fake_start)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("r")
+        await until(pilot, lambda: isinstance(app.screen, StartRunModal))
+        await ready(pilot, "#ok")
+        app.screen.query_one("#source", Select).value = "stories"
+        app.screen.query_one("#spec-folder", Input).value = "epic-1"
+        await pilot.pause()
+        await pilot.click("#ok")
+        await until(pilot, lambda: bool(calls))
+        assert calls["spec"] == "epic-1"
+
+
+async def test_start_run_modal_stories_preview_validates(project, monkeypatch):
+    # action_start_run bails on _tmux_missing() before it can push the modal, and
+    # the Windows CI matrix has no tmux on PATH — every StartRunModal test stubs
+    # this out so the modal opens (its absence here was the all-Windows timeout).
+    monkeypatch.setattr(launch, "tmux_available", lambda: True)
+    _write_stories_fixture(project.project)  # epic-1 with two stories, 1 done
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("r")
+        await until(pilot, lambda: isinstance(app.screen, StartRunModal))
+        await ready(pilot, "#preview-body")
+        modal = app.screen
+        body = modal.query_one("#preview-body", Static)
+
+        # Switch to stories mode with a spec folder. A programmatic reactive
+        # `.value` set posts its Changed from outside the app's message pump, so
+        # invoke the same handler the framework routes to directly — the preview
+        # projection is asserted synchronously, with no dependence on async Changed
+        # delivery, and the on_input_changed/on_select_changed routing is covered.
+        modal.query_one("#source", Select).value = "stories"
+        spec_input = modal.query_one("#spec-folder", Input)
+        spec_input.value = "epic-1"
+        modal.on_input_changed(Input.Changed(spec_input, "epic-1"))
+        rendered = str(body.render())
+        assert "2 stories" in rendered
+        # checkpoint markers + live disk state surfaced in the preview
+        assert "(done)" in rendered  # story 1's on-disk spec status
+        assert "[spec]" in rendered  # story 1's spec_checkpoint marker
+
+        # a Changed from an unrelated input is ignored (route guard), and the
+        # source select drives the preview back to the sprint-mode default.
+        modal.on_input_changed(Input.Changed(modal.query_one("#epic", Input), "9"))
+        assert "2 stories" in str(body.render())
+        source = modal.query_one("#source", Select)
+        source.value = "sprint-status"
+        modal.on_select_changed(Select.Changed(source, "sprint-status"))
+        assert "sprint mode" in str(body.render())
+
+
+async def test_start_run_modal_stories_source_blank_folder_errors(project, monkeypatch):
+    calls: list = []
+    monkeypatch.setattr(launch, "tmux_available", lambda: True)
+    monkeypatch.setattr(launch, "start_run_detached", lambda *a, **kw: calls.append(a))
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("r")
+        await until(pilot, lambda: isinstance(app.screen, StartRunModal))
+        await ready(pilot, "#ok")
+        app.screen.query_one("#source", Select).value = "stories"  # no spec folder
+        await pilot.pause()
+        await pilot.click("#ok")
+        await until(pilot, lambda: any("needs a spec folder" in m for m in notifications(app)))
+        assert not calls

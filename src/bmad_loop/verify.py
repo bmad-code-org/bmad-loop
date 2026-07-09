@@ -854,7 +854,15 @@ def capture_diff(repo: Path, baseline: str, *, max_file_bytes: int | None = None
 def read_frontmatter(path: Path) -> dict[str, Any]:
     if not path.is_file():
         return {}
-    text = path.read_text(encoding="utf-8")
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        # A non-UTF-8 file carries no readable frontmatter — degrade exactly like
+        # unparseable YAML below. Every status gate then reads status "" and
+        # returns a clean retry/repair outcome instead of crashing mid-verify
+        # (UnicodeDecodeError is a ValueError, so it slipped past callers'
+        # except-OSError guards).
+        return {}
     if not text.startswith("---"):
         return {}
     parts = text.split("---", 2)
@@ -914,6 +922,45 @@ def set_frontmatter_status(path: Path, status: str) -> bool:
     return True
 
 
+def set_frontmatter_field(path: Path, key: str, value: str) -> bool:
+    """Rewrite (or insert) a scalar ``<key>:`` line in a spec's `---`…`---`
+    frontmatter block.
+
+    Same minimal in-place line surgery as `set_frontmatter_status` (no YAML
+    round-trip) so the spec's formatting, comments, and field order survive.
+    Unlike the status helper, a missing key is INSERTED as the block's last
+    line: callers assert a field's value whether or not the skill wrote one
+    (the patch-restore re-arm re-stamps ``baseline_revision``, which only the
+    skill's step-03 writes). Returns True when the file was rewritten; False
+    when it has no frontmatter or already carries the exact value.
+    """
+    if not path.is_file():
+        return False
+    text = path.read_text(encoding="utf-8")
+    if not text.startswith("---"):
+        return False
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return False
+    block_lines = parts[1].splitlines(keepends=True)
+    replaced = False
+    for i, line in enumerate(block_lines):
+        stripped = line.lstrip()
+        if stripped.startswith(f"{key}:"):
+            indent = line[: len(line) - len(stripped)]
+            newline = "\n" if line.endswith("\n") else ""
+            block_lines[i] = f"{indent}{key}: {value}{newline}"
+            replaced = True
+            break
+    if not replaced:
+        block_lines.append(f"{key}: {value}\n")
+    rebuilt = parts[0] + "---" + "".join(block_lines) + "---" + parts[2]
+    if rebuilt == text:  # already at the target value — idempotent no-op
+        return False
+    path.write_text(rebuilt, encoding="utf-8")
+    return True
+
+
 def artifact_relpaths(paths: ProjectPaths) -> tuple[str, ...]:
     """Repo-relative posix prefixes of the orchestrator-owned BMAD artifact
     folders (the output root and the implementation/planning artifact dirs),
@@ -933,6 +980,56 @@ def artifact_relpaths(paths: ProjectPaths) -> tuple[str, ...]:
             continue  # configured outside the project tree; nothing to exclude here
         # A folder == project root yields ".", which as an exclude prefix would
         # disable change detection for the whole tree — drop it.
+        if rel and rel != ".":
+            out.append(rel)
+    return tuple(out)
+
+
+def verify_dev_exclude_relpaths(
+    paths: ProjectPaths, spec_path: Path, restore_patch: str | None = None
+) -> tuple[str, ...]:
+    """Repo-relative posix paths the dev/bundle proof-of-work gate excludes from
+    `has_changes_since` — file-granularity, unlike `artifact_relpaths`' whole-folder
+    exclusion (still used as-is by `Engine._protected_relpaths` for rollback
+    protection, a different job). Deliberately does NOT exclude `output_folder`:
+    in the standard layout it is the parent directory of `implementation_artifacts`/
+    `planning_artifacts`, so excluding it as a directory prefix would swallow those
+    two folders' content right back out of view via the same git-pathspec prefix
+    match this function exists to avoid.
+
+    Excludes only what a session rewrites regardless of whether it did any real
+    work: `paths.sprint_status` (every session advances it as routine bookkeeping)
+    and the session's own claimed `spec_path` (so a bare frontmatter status flip on
+    it doesn't count). Sibling content under the implementation/planning artifact
+    dirs — the deferred-work ledger, other stories' specs — is deliberately left
+    un-excluded, so a story whose entire authorized scope is ledger/spec
+    reconciliation registers as real work instead of a permanent false "no changes
+    since baseline".
+
+    `restore_patch` (the task's latched intent-gap patch file, BMAD-METHOD #2564)
+    is excluded too when set: the patch is untracked halt residue under the
+    protected artifact dirs that survives every reset, so counting it would let a
+    restore re-drive whose session produced nothing pass the gate on the patch
+    file's mere presence — the gate must key on the APPLIED work (the tracked diff
+    from baseline), not on the orchestrator-owned patch that carried it.
+
+    `spec_path` comes from a session-reported (untrusted) `spec_file` string, so
+    it is `.resolve()`d before deriving the relpath, same as `spec_within_roots`:
+    an un-normalized `..`/`.` segment would still resolve to the real on-disk
+    file (the OS resolves it), but as a raw string it wouldn't match git's own
+    normalized path output, silently defeating this exclude and letting a bare
+    status flip on the session's own spec count as real work."""
+    candidates: list[Path] = [paths.sprint_status, spec_path]
+    if restore_patch:
+        p = Path(restore_patch)
+        candidates.append(p if p.is_absolute() else paths.project / p)
+    out: list[str] = []
+    project = paths.project.resolve()
+    for path in candidates:
+        try:
+            rel = path.resolve().relative_to(project).as_posix()
+        except ValueError:
+            continue  # outside the project tree; nothing to exclude here
         if rel and rel != ".":
             out.append(rel)
     return tuple(out)
@@ -965,6 +1062,53 @@ def resolve_spec_path(spec_file: str, paths: ProjectPaths) -> Path:
     return paths.implementation_artifacts / p
 
 
+def _verify_shared_gates(
+    spec_path: Path,
+    rj: dict[str, Any],
+    task: StoryTask,
+    paths: ProjectPaths,
+    *,
+    expected_status: str,
+    proof_exclude: tuple[str, ...] | None,
+) -> VerifyOutcome | None:
+    """The workflow-tag, expected-status, baseline-match, and proof-of-work gates
+    shared verbatim by :func:`verify_dev`, :func:`verify_dev_bundle`, and
+    :func:`verify_dev_stories` — factored out so the sprint-mode and stories-mode
+    gates can't silently drift. Reads frontmatter once (callers must not re-read
+    it). Returns a failing :class:`VerifyOutcome`, or ``None`` when every gate
+    passes and the caller may run its mode-specific tail. ``proof_exclude=None``
+    skips the proof-of-work gate (a plan-halt leg produced only its own spec)."""
+    workflow = rj.get("workflow")
+    if workflow != DEV_WORKFLOW:
+        return VerifyOutcome.retry(
+            f"dev result.json workflow is {workflow!r}, expected {DEV_WORKFLOW!r}"
+        )
+
+    fm = read_frontmatter(spec_path)
+    status = status_of(fm)
+    if status != expected_status:
+        return VerifyOutcome.retry(
+            f"spec status is {status!r}, expected {expected_status!r}: {spec_path}"
+        )
+
+    claimed_baseline = str(fm.get("baseline_commit", "")).strip()
+    if task.baseline_commit and claimed_baseline not in ("", "NO_VCS"):
+        if not same_commit(claimed_baseline, task.baseline_commit):
+            return VerifyOutcome.retry(
+                f"spec baseline_commit {claimed_baseline[:12]} does not match "
+                f"orchestrator-recorded baseline {task.baseline_commit[:12]}"
+            )
+
+    if proof_exclude is not None and task.baseline_commit:
+        try:
+            if not has_changes_since(paths.project, task.baseline_commit, exclude=proof_exclude):
+                return VerifyOutcome.retry("no changes in worktree since baseline commit")
+        except GitError as e:
+            return VerifyOutcome.escalate(str(e))
+
+    return None
+
+
 def verify_dev(
     task: StoryTask,
     paths: ProjectPaths,
@@ -988,36 +1132,18 @@ def verify_dev(
     if not spec_path.is_file():
         return VerifyOutcome.retry(f"claimed spec file does not exist: {spec_path}")
 
-    workflow = rj.get("workflow")
-    if workflow != DEV_WORKFLOW:
-        return VerifyOutcome.retry(
-            f"dev result.json workflow is {workflow!r}, expected {DEV_WORKFLOW!r}"
-        )
-
     # With review disabled, the dev session runs its own internal review and
     # finalizes straight to done; otherwise it hands off at in-review.
-    expected = "in-review" if review_enabled else "done"
-    fm = read_frontmatter(spec_path)
-    status = status_of(fm)
-    if status != expected:
-        return VerifyOutcome.retry(f"spec status is {status!r}, expected {expected!r}: {spec_path}")
-
-    claimed_baseline = str(fm.get("baseline_commit", "")).strip()
-    if task.baseline_commit and claimed_baseline not in ("", "NO_VCS"):
-        if not same_commit(claimed_baseline, task.baseline_commit):
-            return VerifyOutcome.retry(
-                f"spec baseline_commit {claimed_baseline[:12]} does not match "
-                f"orchestrator-recorded baseline {task.baseline_commit[:12]}"
-            )
-
-    if task.baseline_commit:
-        try:
-            if not has_changes_since(
-                paths.project, task.baseline_commit, exclude=artifact_relpaths(paths)
-            ):
-                return VerifyOutcome.retry("no changes in worktree since baseline commit")
-        except GitError as e:
-            return VerifyOutcome.escalate(str(e))
+    gate = _verify_shared_gates(
+        spec_path,
+        rj,
+        task,
+        paths,
+        expected_status="in-review" if review_enabled else "done",
+        proof_exclude=verify_dev_exclude_relpaths(paths, spec_path, task.restore_patch),
+    )
+    if gate is not None:
+        return gate
 
     expected_sprint = "review" if review_enabled else "done"
     sprint = story_status(paths.sprint_status, task.story_key)
@@ -1050,35 +1176,17 @@ def verify_dev_bundle(
     if not spec_path.is_file():
         return VerifyOutcome.retry(f"claimed spec file does not exist: {spec_path}")
 
-    workflow = rj.get("workflow")
-    if workflow != DEV_WORKFLOW:
-        return VerifyOutcome.retry(
-            f"dev result.json workflow is {workflow!r}, expected {DEV_WORKFLOW!r}"
-        )
-
     # With review disabled, the dev session finalizes the bundle straight to done.
-    expected = "in-review" if review_enabled else "done"
-    fm = read_frontmatter(spec_path)
-    status = status_of(fm)
-    if status != expected:
-        return VerifyOutcome.retry(f"spec status is {status!r}, expected {expected!r}: {spec_path}")
-
-    claimed_baseline = str(fm.get("baseline_commit", "")).strip()
-    if task.baseline_commit and claimed_baseline not in ("", "NO_VCS"):
-        if not same_commit(claimed_baseline, task.baseline_commit):
-            return VerifyOutcome.retry(
-                f"spec baseline_commit {claimed_baseline[:12]} does not match "
-                f"orchestrator-recorded baseline {task.baseline_commit[:12]}"
-            )
-
-    if task.baseline_commit:
-        try:
-            if not has_changes_since(
-                paths.project, task.baseline_commit, exclude=artifact_relpaths(paths)
-            ):
-                return VerifyOutcome.retry("no changes in worktree since baseline commit")
-        except GitError as e:
-            return VerifyOutcome.escalate(str(e))
+    gate = _verify_shared_gates(
+        spec_path,
+        rj,
+        task,
+        paths,
+        expected_status="in-review" if review_enabled else "done",
+        proof_exclude=verify_dev_exclude_relpaths(paths, spec_path, task.restore_patch),
+    )
+    if gate is not None:
+        return gate
 
     claimed_ids = {str(i) for i in (rj.get("dw_ids") or [])}
     if claimed_ids and claimed_ids != set(task.dw_ids):
@@ -1089,6 +1197,128 @@ def verify_dev_bundle(
 
     task.spec_file = str(spec_path)
     return VerifyOutcome.passed()
+
+
+# A spec_checkpoint story's plan-halt leg leaves the spec at this status (the
+# skill HALTs after the Ready-for-Development gate); mirrors
+# devcontract.PLAN_HALT_STATUS, kept literal here to avoid a verify<-devcontract
+# import cycle (devcontract imports verify).
+PLAN_HALT_STATUS = "ready-for-dev"
+
+
+def verify_dev_stories(
+    task: StoryTask,
+    paths: ProjectPaths,
+    result_json: dict[str, Any] | None,
+    *,
+    spec_folder: Path,
+    review_enabled: bool = True,
+    plan_halt: bool = False,
+) -> VerifyOutcome:
+    """verify_dev for stories mode: the story spec lives at the id-keyed path
+    ``<spec-folder>/stories/<id>-<slug>.md`` and there is no sprint-status entry.
+
+    Same gates as :func:`verify_dev` — workflow tag, expected frontmatter status,
+    baseline match, proof-of-work since baseline — with two differences: the spec
+    is resolved **deterministically by id** (``task.story_key``) via
+    ``stories.resolve_story_spec`` rather than trusting the session-claimed path,
+    and the sprint-status gate is dropped (stories mode has no sprint board).
+    A resolution that is pending / ambiguous / a sentinel is a retryable failure,
+    and the resolved filename's id prefix is asserted to equal the task id.
+
+    ``plan_halt`` verifies a spec_checkpoint story's plan-halt leg instead of an
+    implementation: the expected status is ``ready-for-dev`` (the plan is done,
+    not the code) and the proof-of-work gate is skipped — a plan writes only its
+    own spec, which proof-of-work already excludes, so requiring code changes
+    would spuriously fail every plan leg. The spec-resolution, id-prefix, workflow,
+    and baseline gates still run, and ``task.spec_file`` is still recorded. A
+    ``plan_halt`` leg also requires the ``result_json`` to carry the ``plan_halt``
+    marker ``devcontract`` emits on a clean plan-halt, so a died-mid-flight
+    ``ready-for-dev`` can't be mistaken for a successful plan.
+    """
+    # Deferred to avoid a verify<->stories import cycle: stories imports
+    # read_frontmatter/status_of from this module at top level, so verify must not
+    # import stories at module scope (keep this local on any future refactor).
+    from . import stories
+
+    rj = result_json or {}
+    story_id = str(task.story_key).strip()
+    state = stories.resolve_story_spec(spec_folder, story_id)
+    if state.kind == stories.KIND_PENDING:
+        return VerifyOutcome.retry(f"no story spec found for id {story_id!r} under {spec_folder}")
+    if state.kind == stories.KIND_AMBIGUOUS:
+        names = ", ".join(p.name for p in state.paths)
+        return VerifyOutcome.retry(f"ambiguous story file match for id {story_id!r}: {names}")
+    if state.kind == stories.KIND_SENTINEL:
+        return VerifyOutcome.retry(
+            f"story {story_id!r} resolved to a {state.sentinel_kind} sentinel: {state.path}"
+        )
+    spec_path = state.path
+    # The glob is `<id>-*.md`, so this holds by construction — assert it anyway as
+    # a defensive gate against a future resolver change silently widening the match.
+    if spec_path is None or not spec_path.name.startswith(f"{story_id}-"):
+        return VerifyOutcome.retry(
+            f"resolved story spec {spec_path} does not match id {story_id!r}"
+        )
+    if not spec_path.is_file():
+        return VerifyOutcome.retry(f"claimed spec file does not exist: {spec_path}")
+
+    # Generic path always self-finalizes to done (no in-review handoff); the
+    # review_enabled arm mirrors verify_dev for symmetry. A plan-halt leg instead
+    # expects the ready-for-dev plan gate (the plan is done, not the code).
+    if plan_halt:
+        # A clean plan-halt also carries devcontract's plan_halt marker; a
+        # died-mid-flight ready-for-dev (synthesized without plan_halt) never
+        # does. Cross-check the verify-side flag against the synth-side result so
+        # a caller can't unilaterally promote a mid-flight spec to a "successful
+        # plan" — mirrors the defensive id-prefix gate above.
+        if rj.get("plan_halt") is not True:
+            return VerifyOutcome.retry(
+                "plan_halt verification requested but result.json carries no plan_halt marker"
+            )
+        expected = PLAN_HALT_STATUS
+    else:
+        expected = "in-review" if review_enabled else "done"
+
+    # A plan-halt leg produced only its own spec (the plan), which proof-of-work
+    # already excludes; skip it (proof_exclude=None) and record the plan spec.
+    # Otherwise proof-of-work uses the file-granular exclude (verify_dev_exclude_
+    # relpaths, matching verify_dev post-#79: only the session's own spec + the
+    # sprint-status ledger) plus the spec folder's stories/ subdir + stories.yaml —
+    # NOT the whole-folder artifact_relpaths, so a story whose entire authorized
+    # scope is ledger/spec reconciliation doesn't register as a false "no changes".
+    gate = _verify_shared_gates(
+        spec_path,
+        rj,
+        task,
+        paths,
+        expected_status=expected,
+        proof_exclude=(
+            None
+            if plan_halt
+            else verify_dev_exclude_relpaths(paths, spec_path, task.restore_patch)
+            + _stories_relpaths(paths.project, spec_folder)
+        ),
+    )
+    if gate is not None:
+        return gate
+
+    task.spec_file = str(spec_path)
+    return VerifyOutcome.passed()
+
+
+def _stories_relpaths(project: Path, spec_folder: Path) -> tuple[str, ...]:
+    """Proof-of-work exclude prefixes for the story record + manifest: the spec
+    folder's ``stories/`` subdir and its ``stories.yaml``, project-relative. Empty
+    when the spec folder is outside the project tree (nothing to exclude there)."""
+    from .stories import STORIES_FILENAME, STORIES_SUBDIR
+
+    try:
+        rel = spec_folder.resolve().relative_to(project.resolve()).as_posix()
+    except ValueError:
+        return ()
+    base = "" if rel == "." else f"{rel}/"
+    return (f"{base}{STORIES_SUBDIR}", f"{base}{STORIES_FILENAME}")
 
 
 @dataclass(frozen=True)
@@ -1146,6 +1376,19 @@ def verify_review(task: StoryTask, paths: ProjectPaths, policy: Policy) -> Verif
             f"sprint-status for {task.story_key} is {sprint!r}, expected 'done'"
         )
 
+    return verify_commands_outcome(policy, paths.project)
+
+
+def verify_review_stories(task: StoryTask, paths: ProjectPaths, policy: Policy) -> VerifyOutcome:
+    """verify_review for stories mode: same spec-done + verify-commands gates,
+    minus the sprint-status gate (stories mode has no sprint board — the story
+    spec's own frontmatter status is authoritative). ``task.spec_file`` is the
+    id-keyed story spec ``verify_dev_stories`` recorded on the dev pass."""
+    if not task.spec_file:
+        return VerifyOutcome.retry("no spec file recorded for task")
+    status = status_of(read_frontmatter(Path(task.spec_file)))
+    if status != "done":
+        return VerifyOutcome.retry(f"spec status is {status!r}, expected 'done'")
     return verify_commands_outcome(policy, paths.project)
 
 
@@ -1207,6 +1450,15 @@ def finalize_commit(repo: Path, baseline: str | None, message: str) -> str | Non
     keeping the index (`reset --soft`), then commit the accumulated index. The
     working tree is never touched, so a failure leaves the chain intact.
 
+    Residual-artifacts note (BMAD-METHOD #2563): the skill now commits every file
+    of the reviewed diff and deliberately leaves unrelated `git status` residue
+    uncommitted (files outside the change's scope). The `add -A` here sweeps that
+    residue into the story commit too — an intentional divergence from the skill's
+    scoped commit. The loop must end each story on a clean tree because story
+    N+1's step-01 HALTs on a dirty tree, so the orchestrator squashes EVERYTHING
+    since baseline (skill commits + its own bookkeeping + any residue) into the one
+    story commit rather than leaving the tree dirty for the next story to trip on.
+
     Returns the new HEAD sha, or None when there is nothing to finalize: no
     version control (`baseline` falsy or NO_VCS) or the tree already equals
     `baseline` (no skill commits and no bookkeeping delta)."""
@@ -1236,6 +1488,33 @@ def finalize_commit(repo: Path, baseline: str | None, message: str) -> str | Non
             )
         raise GitError(f"git commit failed: {out}")
     return rev_parse_head(repo)
+
+
+def apply_patch(repo: Path, patch_path: Path) -> None:
+    """Apply a saved patch to `repo`'s working tree (`git apply`), raising on failure.
+
+    The intent-gap patch-restore re-drive (BMAD-METHOD #2564) uses this to re-lay
+    the attempted change bmad-dev-auto saved before reverting. New files in the
+    patch are created (they land untracked, matching how the original attempt sat
+    before its revert).
+
+    A clean apply is likely but NOT guaranteed: the patch was diffed from the
+    story's ORIGINAL baseline, while re-arm advances the re-drive's baseline to the
+    project's post-resolve HEAD (runs.rearm_escalation) — so the apply holds only
+    while the resolve session left the patched files untouched. A resolve session
+    that committed changes to those files makes `git apply` fail, deliberately
+    loudly: silently merging the human's resolution with the stale attempt could
+    reproduce the very gap being resolved. A non-zero `git apply` — that overlap, a
+    missing/corrupt patch, any other drift — raises `GitError` with git's output;
+    the caller escalates rather than dispatch a session onto a half-applied tree,
+    and the human re-resolves (typically re-arming without a restore, since the
+    resolution commits already carry the overlapping work).
+    """
+    if not patch_path.is_file():
+        raise GitError(f"restore patch not found: {patch_path}")
+    rc, out = _git(repo, "apply", str(patch_path))
+    if rc != 0:
+        raise GitError(f"git apply {patch_path} failed: {out}")
 
 
 def commit_paths(repo: Path, message: str, paths: list[Path]) -> str | None:
