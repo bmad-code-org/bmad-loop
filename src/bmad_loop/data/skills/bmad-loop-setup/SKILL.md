@@ -132,9 +132,9 @@ Unless the user explicitly asked to skip it (e.g. `skills only` / `--no-tool`), 
 
 3. **Bootstrap the project** — install the coding-CLI hooks, the bundled `bmad-loop-*` skills, the `.bmad-loop/policy.toml` template, and the gitignore entry (idempotent).
 
-   First decide **which coding CLI(s)** the orchestrator should drive. The supported adapters are `claude` (default), `codex`, `gemini`, `copilot`, and `antigravity` (Google's `agy`). Hooks are registered per CLI, so the choice matters — register every CLI you intend to use for dev/review/triage. Ask the user (unless they already specified it in their setup args, e.g. `cli: claude, codex`, or accepted defaults — then default to `claude` only):
+   First decide **which coding CLI(s)** the orchestrator should drive. The supported adapters are `claude` (default), `codex`, `gemini`, `copilot`, `antigravity` (Google's `agy`), and `cursor` (`cursor-agent`). Hooks are registered per CLI, so the choice matters — register every CLI you intend to use for dev/review/triage. Ask the user (unless they already specified it in their setup args, e.g. `cli: claude, codex`, or accepted defaults — then default to `claude` only):
 
-   > "Which coding CLI(s) should the orchestrator drive — `claude`, `codex`, `gemini`, `copilot`, and/or `antigravity`? You can pick more than one. [claude]"
+   > "Which coding CLI(s) should the orchestrator drive — `claude`, `codex`, `gemini`, `copilot`, `antigravity`, and/or `cursor`? You can pick more than one. [claude]"
 
    Build the command with one `--cli <name>` per selected CLI (the flag is repeatable). **On an upgrade, append `--force-skills`** so the per-project skill copies are actually refreshed — without it `init` skips every existing skill dir and the project keeps stale skills against the upgraded tool. On a fresh install, omit it.
 
@@ -149,9 +149,9 @@ Unless the user explicitly asked to skip it (e.g. `skills only` / `--no-tool`), 
    bmad-loop init --project "{project-root}" --cli claude --force-skills
    ```
 
-   Names must be exactly `claude`, `codex`, `gemini`, `copilot`, or `antigravity` — `init` errors on an unknown profile and lists the valid ones. `init` prints any one-time first-run notes per CLI (e.g. start `claude` once in the project and accept the workspace-trust + hooks-approval dialogs before `bmad-loop run` — spawned sessions can't answer first-run dialogs). Relay those notes to the user.
+   Names must be exactly `claude`, `codex`, `gemini`, `copilot`, `antigravity`, or `cursor` — `init` errors on an unknown profile and lists the valid ones. `init` prints any one-time first-run notes per CLI (e.g. start `claude` once in the project and accept the workspace-trust + hooks-approval dialogs before `bmad-loop run` — spawned sessions can't answer first-run dialogs). Relay those notes to the user.
 
-   **Skills are installed automatically:** `init` lays the bundled `bmad-loop-*` skills into the right tree for each selected CLI — `.claude/skills/` for `claude`, `.agents/skills/` for `codex`/`gemini`/`copilot`/`antigravity`. On a fresh install, existing skill dirs are left untouched; on an upgrade, `--force-skills` overwrites them with the bundled copies from the upgraded tool (use `--no-skills` to skip the step and manage skills yourself).
+   **Skills are installed automatically:** `init` lays the bundled `bmad-loop-*` skills into the right tree for each selected CLI — `.claude/skills/` for `claude`, `.agents/skills/` for `codex`/`gemini`/`copilot`/`antigravity`/`cursor`. On a fresh install, existing skill dirs are left untouched; on an upgrade, `--force-skills` overwrites them with the bundled copies from the upgraded tool (use `--no-skills` to skip the step and manage skills yourself).
 
    > **Note:** `--force-skills` also overwrites `bmad-loop-setup` itself (it ships in the same bundle). That's expected and safe — the freshly laid-down setup skill takes effect on the **next** invocation, and your `_bmad/custom/*.toml` overrides (keyed by skill directory name) are untouched.
 
@@ -179,7 +179,7 @@ Unless the user explicitly asked to skip it (e.g. `skills only` / `--no-tool`), 
 
 After both merge scripts complete successfully, remove any **redundant skill-payload** directories an older installer may have staged under `_bmad/` (past layouts duplicated skills that already live in the CLI's skill tree, e.g. `.claude/skills/`). On a modern BMAD v6 install nothing redundant is staged, so this step is a **safe no-op** — it never touches `_bmad/core/`, per-module config, or the `_bmad/_config/` manifest.
 
-As with the merge scripts, replace `{project-root}` in the `--bmad-dir` and `--skills-dir` path arguments with the actual project root before running. For `--skills-dir`, use the skill tree of a CLI registered in step 3: `.claude/skills` for `claude`, `.agents/skills` for `codex`/`gemini`/`copilot`/`antigravity`. `init` lays the bundled skills into **every** selected CLI's tree, so any registered CLI's tree verifies correctly — the command below shows the `claude` tree; substitute `.agents/skills` if only non-Claude CLIs were registered. Do **not** pass `--also-remove _config` (or any shared config/manifest dir): `_config/` is live BMAD infrastructure and the script refuses to remove it regardless.
+As with the merge scripts, replace `{project-root}` in the `--bmad-dir` and `--skills-dir` path arguments with the actual project root before running. For `--skills-dir`, use the skill tree of a CLI registered in step 3: `.claude/skills` for `claude`, `.agents/skills` for `codex`/`gemini`/`copilot`/`antigravity`/`cursor`. `init` lays the bundled skills into **every** selected CLI's tree, so any registered CLI's tree verifies correctly — the command below shows the `claude` tree; substitute `.agents/skills` if only non-Claude CLIs were registered. Do **not** pass `--also-remove _config` (or any shared config/manifest dir): `_config/` is live BMAD infrastructure and the script refuses to remove it regardless.
 
 ```bash
 python3 ./scripts/cleanup-legacy.py --bmad-dir "{project-root}/_bmad" --module-code bmad-loop --skills-dir "{project-root}/.claude/skills"

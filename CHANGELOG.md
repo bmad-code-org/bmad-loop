@@ -9,6 +9,18 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- **Cursor Agent CLI profile (`cursor`).** Built-in TOML profile for the Cursor
+  Agent CLI (`cursor-agent` / `agent`): unattended `--print` + `--force` +
+  `--trust` + `--approve-mcps` (interactive `--trust` is rejected), skills in
+  `.agents/skills/`, hooks in `.cursor/hooks.json` via the Copilot settings
+  dialect, SKILL.md-by-path prompt template (no slash expansion), and
+  `usage_parser = "none"` until transcripts expose tokens. Completion is
+  SessionEnd + window-death — `stop` is registered but was not observed in
+  E2E. Probe discovery glob:
+  `~/.cursor/projects/*/agent-transcripts/**/*.jsonl`. E2E-verified for sprint
+  runs, forced follow-up review, stop/resume, worktree isolation, and deferred
+  sweeps.
+
 - **Unity modal-dialog guards (`[plugins.unity]`).** A chronically-dirty Unity scene raises modal
   Editor dialogs ("scene changed on disk", "save changes before closing") that freeze the MCP
   dispatch loop and stall the whole run. The bundled Unity plugin now defends in depth: it seeds an

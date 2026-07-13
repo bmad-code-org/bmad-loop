@@ -57,7 +57,7 @@ def parse_args():
     parser.add_argument(
         "--skills-dir",
         help="Path to the CLI's installed-skills tree (.claude/skills/ for claude, "
-        ".agents/skills/ for codex/gemini/copilot/antigravity) — enables safety "
+        ".agents/skills/ for codex/gemini/copilot/antigravity/cursor) — enables safety "
         "verification that skills are installed before removing legacy copies",
     )
     parser.add_argument(

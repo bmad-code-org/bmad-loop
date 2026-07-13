@@ -50,9 +50,24 @@ def test_builtin_profiles_load():
     # copilot also fires agentStop for subagent turns (empty transcriptPath) — those
     # are ignored so the main session's turn-end drives completion
     assert profiles["copilot"].subagent_stop_without_transcript is True
+    # cursor: headless --print/--trust path; Copilot hook dialect; SessionEnd is
+    # the reliable completion signal (stop may not fire); no token parser yet
+    assert profiles["cursor"].binary == "cursor-agent"
+    assert profiles["cursor"].launch_args == ("--print",)
+    assert profiles["cursor"].bypass_args == ("--force", "--trust", "--approve-mcps")
+    assert profiles["cursor"].skill_tree == ".agents/skills"
+    assert profiles["cursor"].usage_parser == "none"
+    assert profiles["cursor"].hooks.dialect == "copilot-settings-json"
+    assert profiles["cursor"].hooks.config_path == ".cursor/hooks.json"
+    assert profiles["cursor"].hooks.events == {
+        "sessionStart": "SessionStart",
+        "stop": "Stop",
+        "sessionEnd": "SessionEnd",
+    }
+    assert ".cursor/hooks.json" in profiles["cursor"].seed_files
     # other built-ins keep the defaults: read usage once, inherit the global nudge
     # limit, and treat every Stop as the main turn-end (no subagent filtering)
-    for name in ("claude", "codex", "gemini"):
+    for name in ("claude", "codex", "gemini", "cursor"):
         assert profiles[name].usage_grace_s == 0.0
         assert profiles[name].stop_without_result_nudges is None
         assert profiles[name].subagent_stop_without_transcript is False
@@ -107,6 +122,11 @@ def test_render_prompt_passthrough_and_template():
     codex = get_profile("codex")
     assert codex.render_prompt("/bmad-dev-auto 1-1-a") == (
         "Use the $bmad-dev-auto skill now, and use subagents as needed: 1-1-a"
+    )
+    cursor = get_profile("cursor")
+    assert cursor.render_prompt("/bmad-dev-auto 1-1-a") == (
+        "LOAD the FULL .agents/skills/bmad-dev-auto/SKILL.md, read its entire contents "
+        "and follow its directions exactly, using subagents as needed: 1-1-a"
     )
     # non-slash prompts pass through {prompt}; {skill}/{args} degrade gracefully
     assert claude.render_prompt("just do it") == "just do it"

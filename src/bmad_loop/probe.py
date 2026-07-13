@@ -61,6 +61,9 @@ FAMILY_GLOBS = {
     # is community-doc-sourced (agy 1.0.x) — confirm against your build with
     # `probe-adapter antigravity --probe` before trusting auto-discovery.
     "antigravity": "~/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl",
+    # Cursor Agent CLI: sessionEnd.transcript_path points at a jsonl under this
+    # tree. No token fields yet (usage_parser = "none"); glob is for discovery.
+    "cursor": "~/.cursor/projects/*/agent-transcripts/**/*.jsonl",
 }
 
 _TOKEN_KEY_RE = re.compile(

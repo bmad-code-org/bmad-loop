@@ -855,7 +855,7 @@ source = "sprint-status"     # sprint-status | stories
 spec_folder = ""
 
 [adapter]
-name = "claude"              # claude | codex | gemini | <custom .bmad-loop/profiles/*.toml>
+name = "claude"              # claude | codex | gemini | copilot | antigravity | cursor | <custom .bmad-loop/profiles/*.toml>
 model = ""                   # empty = CLI default model
 cleanup_session_on_finish = true  # kill the run's tmux session when it finishes (false keeps it for inspection)
 # extra_args replaces the profile's default permission-bypass flags when set:

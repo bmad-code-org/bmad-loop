@@ -8,7 +8,7 @@ Plain Python drives the loop — **pick story → implement → adversarially re
 
 [![CI](https://github.com/bmad-code-org/bmad-loop/actions/workflows/ci.yml/badge.svg)](https://github.com/bmad-code-org/bmad-loop/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.11%E2%80%933.14-blue)
-![CLIs](https://img.shields.io/badge/agents-claude%20%C2%B7%20codex%20%C2%B7%20gemini%20%C2%B7%20copilot%20%C2%B7%20antigravity-8a2be2)
+![CLIs](https://img.shields.io/badge/agents-claude%20%C2%B7%20codex%20%C2%B7%20gemini%20%C2%B7%20copilot%20%C2%B7%20antigravity%20%C2%B7%20cursor-8a2be2)
 ![No LLM in the loop](https://img.shields.io/badge/control%20loop-deterministic-success)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 
@@ -33,12 +33,12 @@ Inspired by the original [bmad-automator](https://github.com/bmad-code-org/bmad-
 - 🔍 **Trust nothing, verify everything.** After each session the orchestrator checks artifacts on disk: spec frontmatter status, baseline-commit match (recorded independently — a cheap LLM-lie detector), non-empty diff, sprint-status sync, and _your_ test/lint commands before any commit.
 - 📒 **One source of truth.** `sprint-status.yaml` is owned by the BMAD skills; the orchestrator only ever reads it.
 - 🪟 **Fresh context per step.** Dev and review are separate sessions — review never inherits the implementer's context, so there's no anchoring bias.
-- ♻️ **Resumable & multi-agent.** Every run is a resumable state machine on disk, and a generic tmux adapter drives `claude`, `codex`, `gemini`, `copilot`, or `antigravity` (mix per stage).
+- ♻️ **Resumable & multi-agent.** Every run is a resumable state machine on disk, and a generic tmux adapter drives `claude`, `codex`, `gemini`, `copilot`, `antigravity`, or `cursor` (mix per stage).
 - 🌿 **Optional worktree isolation.** Opt in (`[scm] isolation = "worktree"`) and each story runs in its own git worktree/branch and merges back locally — your main checkout stays free while a run is in flight.
 
 ## Requirements
 
-- **Python 3.11+**, **tmux**, and a supported coding CLI — `claude` by default; `codex`, `gemini`, `copilot`, and `antigravity` (`agy`) via [profiles](#other-coding-clis).
+- **Python 3.11+**, **tmux**, and a supported coding CLI — `claude` by default; `codex`, `gemini`, `copilot`, `antigravity` (`agy`), and `cursor` (`cursor-agent`) via [profiles](#other-coding-clis).
 - **Linux or macOS** (or **Windows via WSL**, which _is_ Linux — it runs as-is). tmux is the one bundled terminal-multiplexer backend today, but it sits behind a pluggable **registry** of OS seams (transport, process lifecycle, hook interpreter) with availability-aware selection — env var → persisted `[mux] backend` choice (`bmad-loop mux set <name>`) → platform default (`psmux` on Windows, `tmux` elsewhere) → first available platform match — so a native-Windows backend slots in as new files + a registration line each, with no engine edits — see [Porting bmad-loop to a new OS](docs/porting-to-a-new-os.md). Native Windows is not yet shipped.
 - A **BMAD v6 project** (`_bmad/bmm/config.yaml`, a `sprint-status.yaml` from `bmad-sprint-planning`) with the upstream `bmad-dev-auto` skill (and the three review-hunter skills its step-04 invokes inline: `bmad-review-adversarial-general`, `bmad-review-edge-case-hunter`, `bmad-review-verification-gap`) and the bmad-loop skill module from this repo installed (`bmad-loop-resolve`, `bmad-loop-sweep` — see [Installing the skill module](#installing-the-skill-module)). Standard BMAD skills stay untouched.
 
@@ -345,7 +345,7 @@ trigger = "recommended"    # when enabled: "recommended" runs the separate revie
                            # (the loop is bounded by limits.max_review_cycles either way)
 
 [adapter]
-name = "claude"            # CLI profile: claude | codex | gemini | copilot | antigravity | custom
+name = "claude"            # CLI profile: claude | codex | gemini | copilot | antigravity | cursor | custom
 model = ""                 # empty = CLI default
 cleanup_session_on_finish = true  # kill the run's tmux session when it finishes (false keeps it for inspection)
 # extra_args replaces the profile's default bypass flags when set:
@@ -502,18 +502,17 @@ One generic driver (`adapters/generic.py`) runs any coding CLI that fits the inj
 | `gemini`      | supported, E2E-verified       | Gemini CLI ≥ 0.46 (hooks on by default since then). Launches with `-i` to stay interactive; `AfterAgent` maps to canonical Stop. Usage parser validated against real chat logs.                                                                                                                                                                                                                                                     |
 | `copilot`     | supported, E2E-verified       | GitHub Copilot **CLI** (the `copilot` binary, GA ≥ 2026-02) — _not_ the VS Code extension. Launches with `-i` to stay interactive; turn-end is `agentStop` (per response turn); `--allow-all-tools` for unattended runs. `copilot-events` usage parser reads token totals from the trailing `session.shutdown` line, so the profile waits a short grace (`usage_grace_s = 8`) before tallying. **Pin a capable model** (see below). |
 | `antigravity` | experimental — probe-required | Google **Antigravity CLI** (`agy` ≥ 1.0.16). Launches with `-i` to stay interactive; `Stop` is the turn-end event (agy has no SessionStart/SessionEnd hook). Skills and hooks live in `.agents/` (flat `Stop` handler in `.agents/hooks.json`). `usage_parser = "none"` until a token parser is written. Verify against your build with `probe-adapter antigravity`.                                                                |
+| `cursor`      | supported, E2E-verified       | Cursor **Agent CLI** (`cursor-agent` / `agent`). Unattended path is `--print` + `--force` + `--trust` + `--approve-mcps` (`--trust` is rejected without `--print`). Skills in `.agents/skills/`; hooks in `.cursor/hooks.json` via the Copilot settings dialect. `sessionStart`/`sessionEnd` fire; `stop` is registered but was not observed in E2E — completion uses SessionEnd + window-death. No slash expansion of the initial prompt — SKILL.md is loaded by path (Copilot-style). `usage_parser = "none"` (transcripts under `~/.cursor/projects/*/agent-transcripts/` have no token fields yet). |
 
 **Copilot — pin a capable model:** Copilot's free default (GPT-5 mini) is unreliable for the multi-step dev/review skills — it silently skips steps mid-workflow and fails the story. Set a capable model in policy, e.g. `[adapter] model = "claude-sonnet-4-6"` (passed through as `--model`), for end-to-end reliability. Because Copilot fires `agentStop` per response turn, a thorough multi-turn review needs more than one nudge to finish; the profile ships `stop_without_result_nudges = 5`, and you can tune it per stage (e.g. `[adapter.review] stop_without_result_nudges = …`). Both knobs are editable in the settings TUI under `[adapter]`.
 
 **On budgets:** agentic sessions are dominated by cache reads (80–90%+ of raw tokens), which every supported vendor bills at ~0.1x base input. The `max_tokens_per_story` check therefore uses a cost-weighted total — cache reads count at `limits.cache_read_weight` (default 0.1) — while displayed totals stay raw. Set the weight to 1.0 to budget raw tokens.
 
-**Shared prerequisites:** the `bmad-loop-*` skills must be present in `.agents/skills/` (codex and gemini read it; Claude Code reads `.claude/skills/`), and each CLI must have been run once interactively in the project for auth/trust — `bmad-loop init --cli codex --cli gemini` installs the skills into `.agents/skills/`, registers the hook relay, and prints the per-CLI first-run steps.
+**Shared prerequisites:** the `bmad-loop-*` skills must be present in `.agents/skills/` (codex, gemini, copilot, and cursor read it; Claude Code reads `.claude/skills/`), and each CLI must have been run once interactively in the project for auth/trust — `bmad-loop init --cli codex --cli gemini` installs the skills into `.agents/skills/`, registers the hook relay, and prints the per-CLI first-run steps.
 
 **Adding a CLI without touching Python:** drop a TOML file in `<project>/.bmad-loop/profiles/<name>.toml` with at minimum a binary, `prompt_template`, bypass flags, and a `[hooks]` block picking one of the config dialects (`claude-settings-json` / `codex-hooks-json` / `gemini-settings-json` / `copilot-settings-json` / `antigravity-hooks-json`) plus a native→canonical event map. The full profile schema — every `CLIProfile` / `HookSpec` field and its default — lives in the **[Profile field reference](docs/adapter-authoring-guide.md#profile-field-reference)** of the adapter authoring guide, the single canonical home for it. The hook relay script and orchestrator are CLI-agnostic — each registration passes the canonical event name as the script argument. A CLI whose hook config clones one of the existing dialects (the ecosystem trend) needs nothing else; a genuinely different transport gets its own adapter class instead (see [Writing a new adapter class](docs/adapter-authoring-guide.md#writing-a-new-adapter-class) and the opencode HTTP+SSE design stub in `adapters/opencode_http.py`).
 
 **Finalizing a profile:** the facts a profile needs that live in no doc — the CLI's exact hook payload shape, its transcript location/format, and the token schema a `usage_parser` reads — are collected and sanitized by `bmad-loop probe-adapter <cli>` (a zero-launch scan by default, or `--probe` for a live capture). The [adapter authoring guide](docs/adapter-authoring-guide.md) walks through using it end to end.
-
-Cursor CLI is currently blocked on two gaps, for whoever picks it up: token usage is not exposed anywhere (hooks, JSON output, or on-disk chats), and slash-command expansion of the initial prompt argument is unverified — its `sessionStart`/`stop` hooks do fire in the CLI, so a profile using the window-death fallback plus `usage_parser = "none"` is feasible.
 
 ## Development
 

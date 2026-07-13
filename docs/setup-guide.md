@@ -93,7 +93,7 @@ invokes inline — are present before a run starts.
 
 ## Choosing which CLIs to drive
 
-The supported adapters are `claude` (the default), `codex`, `gemini`, `copilot`, and
+The supported adapters are `claude` (the default), `codex`, `gemini`, `copilot`, `cursor`, and
 `antigravity` (Google's `agy`, experimental — probe before unattended use). You can pick more
 than one — register every CLI you intend to use for dev, review, or sweep triage.
 
@@ -172,7 +172,7 @@ bmad-loop init --project <project-root> --cli claude --cli codex --cli gemini
 
 Run with no `--cli` and `init` registers hooks for every CLI the `policy.toml` references,
 so a dual-client setup that's already configured in policy needs no extra flags. Names must
-be exactly `claude`, `codex`, `gemini`, `copilot`, or `antigravity` — `init` errors on an unknown profile and
+be exactly `claude`, `codex`, `gemini`, `copilot`, `antigravity`, or `cursor` — `init` errors on an unknown profile and
 lists the valid ones.
 
 ### First-run notes
@@ -198,10 +198,15 @@ them to whoever owns the machine:
   (`usage_parser = "none"`), and worktree runs use a different path than the trusted one,
   so verify during the probe whether that re-triggers a trust prompt. Requires Antigravity
   CLI (`agy` ≥ 1.0.16).
+- **cursor** — run `cursor-agent login` once. The profile launches headless with `--print`
+  + `--trust` (interactive `--trust` is rejected). Skills live in `.agents/skills/`; hooks
+  in `.cursor/hooks.json`. `sessionStart`/`sessionEnd` fire; do not rely on `stop` for
+  completion. Token usage is not captured yet (`usage_parser = "none"`). Requires the
+  Cursor Agent CLI (`cursor-agent` / `agent`).
 
 ### Skill location
 
-`claude` reads skills from `.claude/skills/`; `codex`, `gemini`, `copilot`, and `antigravity`
+`claude` reads skills from `.claude/skills/`; `codex`, `gemini`, `copilot`, `antigravity`, and `cursor`
 read from `.agents/skills/`. `init` installs the bundled `bmad-loop-*` skills into the right tree
 for each CLI you pass via `--cli`, so selecting any of the `.agents/skills/` CLIs populates it automatically. It skips skill
 dirs that already exist — pass `--force-skills` to overwrite a stale copy, or `--no-skills` to
