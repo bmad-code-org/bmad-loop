@@ -16,6 +16,12 @@
 # "none": Cursor Agent transcripts under
 # ~/.cursor/projects/*/agent-transcripts/**/*.jsonl carry no token fields yet.
 #
+# TUI Log: `--output-format stream-json --stream-partial-output` streams NDJSON
+# to the pane so pipe-pane can tee into *.log (closest parity to Claude's
+# scrollback Log tab). Attach (`a`) stays sparse by design — `--print` is not
+# an interactive TTY. Prefer Linux / WSL2 with real tmux; native Windows
+# pipe-pane/psmux often leaves the Log tab empty.
+#
 # E2E-verified: sprint-mode run, forced follow-up review, stop/resume,
 # worktree isolation + merge-back, and deferred-work sweep triage+bundle
 # (Cursor Agent CLI 2026.07.09).
@@ -23,11 +29,16 @@ name = "cursor"
 binary = "cursor-agent"
 skill_tree = ".agents/skills"
 prompt_template = 'LOAD the FULL .agents/skills/{skill}/SKILL.md, read its entire contents and follow its directions exactly, using subagents as needed: {args}'
-launch_args = ["--print"]
+launch_args = [
+  "--print",
+  "--output-format",
+  "stream-json",
+  "--stream-partial-output",
+]
 bypass_args = ["--force", "--trust", "--approve-mcps"]
 model_flag = "--model"
 usage_parser = "none"
-first_run_note = "run `cursor-agent login` once before `bmad-loop run`; profile uses --print/--trust for unattended runs (interactive --trust is rejected). Requires Cursor Agent CLI (`cursor-agent` / `agent`)"
+first_run_note = "run `cursor-agent login` once before `bmad-loop run`; profile uses --print/--trust (interactive --trust is rejected) and stream-json for the TUI Log tab. Prefer Linux/WSL2 + tmux. Requires Cursor Agent CLI (`cursor-agent` / `agent`)"
 seed_files = [".cursor/hooks.json", ".cursor/mcp.json"]
 
 [hooks]

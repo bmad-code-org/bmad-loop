@@ -199,10 +199,12 @@ them to whoever owns the machine:
   so verify during the probe whether that re-triggers a trust prompt. Requires Antigravity
   CLI (`agy` ≥ 1.0.16).
 - **cursor** — run `cursor-agent login` once. The profile launches headless with `--print`
-  + `--trust` (interactive `--trust` is rejected). Skills live in `.agents/skills/`; hooks
-  in `.cursor/hooks.json`. `sessionStart`/`sessionEnd` fire; do not rely on `stop` for
-  completion. Token usage is not captured yet (`usage_parser = "none"`). Requires the
-  Cursor Agent CLI (`cursor-agent` / `agent`).
+  + `--output-format stream-json` + `--stream-partial-output` + `--trust` (interactive
+  `--trust` is rejected). Skills live in `.agents/skills/`; hooks in `.cursor/hooks.json`.
+  `sessionStart`/`sessionEnd` fire; do not rely on `stop` for completion. Prefer
+  Linux/WSL2 + tmux so the TUI Log tab receives the stream (native Windows pipe-pane is
+  unreliable; attach stays sparse under `--print`). Token usage is not captured yet
+  (`usage_parser = "none"`). Requires the Cursor Agent CLI (`cursor-agent` / `agent`).
 
 ### Skill location
 

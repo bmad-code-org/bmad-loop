@@ -50,10 +50,16 @@ def test_builtin_profiles_load():
     # copilot also fires agentStop for subagent turns (empty transcriptPath) — those
     # are ignored so the main session's turn-end drives completion
     assert profiles["copilot"].subagent_stop_without_transcript is True
-    # cursor: headless --print/--trust path; Copilot hook dialect; SessionEnd is
-    # the reliable completion signal (stop may not fire); no token parser yet
+    # cursor: headless --print/--trust path + stream-json for TUI Log; Copilot
+    # hook dialect; SessionEnd is the reliable completion signal (stop may not
+    # fire); no token parser yet
     assert profiles["cursor"].binary == "cursor-agent"
-    assert profiles["cursor"].launch_args == ("--print",)
+    assert profiles["cursor"].launch_args == (
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--stream-partial-output",
+    )
     assert profiles["cursor"].bypass_args == ("--force", "--trust", "--approve-mcps")
     assert profiles["cursor"].skill_tree == ".agents/skills"
     assert profiles["cursor"].usage_parser == "none"
