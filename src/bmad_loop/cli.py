@@ -214,6 +214,41 @@ def _platform_preflight() -> tuple[list[str], list[str]]:
     return notes, problems
 
 
+def _run_render_probe(project: Path, tree: str) -> str | None:
+    """Execute bmad-dev-auto's render.py the way a dev session would.
+
+    The static renderer preflight can't see render-time failures — a config key
+    referenced by the skill's templates but missing from the merged central TOML,
+    or an unparseable customization layer, HALTs render.py (BMAD-METHOD #2588)
+    and every story becomes a result-less Stop. Running the real thing from the
+    project root surfaces those HALTs at validate time. Side effect (documented
+    on the flag): rewrites <project>/_bmad/render/bmad-dev-auto/, a cache the
+    skill regenerates on every entry anyway. Returns a problem string, or None
+    when the renderer printed its dispatch line.
+    """
+    script = project / tree / install.STORIES_PROBE_SKILL / "render.py"
+    # which() resolves PATHEXT shims (uv.cmd) that a bare CreateProcess argv0
+    # would miss on Windows; the static preflight already required uv on PATH.
+    uv = shutil.which("uv")
+    if uv is None:
+        return "render probe: `uv` disappeared from PATH"
+    try:
+        proc = subprocess.run(  # noqa: S603 — fixed argv, no shell
+            [uv, "run", str(script)],
+            cwd=project,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"render probe could not run `uv run {script}`: {e}"
+    out = proc.stdout.strip()
+    if proc.returncode != 0 or not out.startswith("read and follow "):
+        detail = out or proc.stderr.strip() or f"exit code {proc.returncode}"
+        return f"render probe: `uv run render.py` did not produce its dispatch line — {detail}"
+    return None
+
+
 def cmd_validate(args: argparse.Namespace) -> int:
     project = _project(args)
     problems: list[str] = []
@@ -310,6 +345,40 @@ def cmd_validate(args: argparse.Namespace) -> int:
     if profiles and not base_problems:
         notes.append("upstream skills present (bmad-dev-auto + review hunters)")
     problems.extend(base_problems)
+
+    # Renderer-era bmad-dev-auto (SKILL.md = `uv run render.py` shim): a broken
+    # render environment HALTs before the workflow's HALT protocol exists, so no
+    # spec status is ever written — catch it here instead of one result-less
+    # Stop per story. Pre-render skills get zero checks (and no note).
+    skill_trees = [p.skill_tree for p in profiles]
+    shim_trees = install.renderer_shim_trees(project, skill_trees)
+    renderer_problems = install.missing_renderer_support(project, skill_trees)
+    problems.extend(renderer_problems)
+    if shim_trees and not renderer_problems:
+        notes.append("bmad-dev-auto renderer preflight OK (render.py + uv + _bmad/config.toml)")
+    if getattr(args, "render_probe", False):
+        if not shim_trees:
+            notes.append(
+                "  warning: --render-probe skipped — installed bmad-dev-auto is pre-render"
+            )
+        elif renderer_problems:
+            notes.append(
+                "  warning: --render-probe skipped — fix the renderer failures above first"
+            )
+        else:
+            probe_problem = _run_render_probe(project, shim_trees[0])
+            if probe_problem:
+                problems.append(probe_problem)
+            else:
+                notes.append("render probe OK: render.py produced its dispatch line")
+
+    if paths:
+        parity = bmadconfig.toml_artifact_parity(project, paths)
+        if parity:
+            notes.append(f"  warning: {parity}")
+    tracked_render = install.tracked_render_warning(project)
+    if tracked_render:
+        notes.append(f"  warning: {tracked_render}")
 
     for note in notes:
         print(f"  ok: {note}")
@@ -454,6 +523,7 @@ def _require_base_skills(project: Path, pol, *, require_stories: bool = False) -
         except ProfileError:
             continue
     problems = install.missing_base_skills(project, skill_trees)
+    problems += install.missing_renderer_support(project, skill_trees)
     if require_stories:
         problems += install.missing_stories_support(project, skill_trees)
     if problems:
@@ -1784,6 +1854,13 @@ def main(argv: list[str] | None = None) -> int:
         metavar="FOLDER",
         help="validate stories mode against this epic spec folder's stories.yaml "
         "(overrides [stories].source; skips the sprint-status gate)",
+    )
+    validate_p.add_argument(
+        "--render-probe",
+        action="store_true",
+        help="also execute the renderer-era bmad-dev-auto's render.py via `uv run` "
+        "against this project, surfacing render-time config HALTs before a run "
+        "(side effect: rewrites _bmad/render/bmad-dev-auto/, a regenerated cache)",
     )
 
     mux_p = add(

@@ -9,6 +9,17 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- **Renderer-era `bmad-dev-auto` preflight (BMAD-METHOD #2587/#2588).** When the installed
+  skill's SKILL.md is the new `uv run render.py` shim, `bmad-loop validate` (and every
+  run/sweep/resume start) now requires `render.py` next to it, `uv` on PATH, and the
+  post-#2285 central config at `_bmad/config.toml` — any of these missing used to surface
+  only as a result-less Stop on every story, since the shim HALTs before the workflow's
+  HALT protocol exists. `validate --render-probe` opt-in executes the real renderer to
+  surface render-time HALTs (missing config keys, unparseable overrides) before a run;
+  validate also warns when the central TOML and the legacy `_bmad/bmm/config.yaml`
+  disagree on `implementation_artifacts`, and (once) when a project has committed
+  `_bmad/render/**`. Pre-render skill installs get zero new checks.
+
 - **Out-of-tree multiplexer backends (`bmad_loop.mux_backends` entry points).** A backend
   package installed next to bmad-loop (e.g. `uv tool install bmad-loop --with <adapter>`) now
   registers itself with no config step: before every selection, core imports each module
@@ -144,6 +155,19 @@ PATH)`, the TUI notifies `multiplexer backend unavailable — launch/attach disa
   the three `_escalated_run` fixtures collapse into one parameterized conftest builder. (closes #84)
 
 ### Fixed
+
+- **Worktree isolation survives the renderer-era `bmad-dev-auto` (BMAD-METHOD #2587).** The new
+  `render.py` anchors its project root on the first `_bmad/` dir walking UP from the session cwd —
+  and worktrees nest inside the project, so a checkout without its own `_bmad/` silently adopted the
+  MAIN checkout's: rendered workflows baked main-checkout absolute artifact paths (deferred-work
+  appends, no-spec fallback artifacts, and step-01 context all escaped the worktree) and every
+  parallel session raced on one shared `_bmad/render/`. `provision_worktree` now merge-seeds the
+  main repo's `_bmad/` config surface per-file (copy-when-absent — a committed `_bmad/` keeps every
+  tracked file; the gitignored `*.user.toml` layers, whose absence hard-HALTs render.py since
+  #2588, are filled in), never seeds the regenerated `_bmad/render/`, and always shields
+  `/_bmad/render/` from the unit's `git add -A` so session-rendered output (machine-absolute paths
+  baked in) can't be swept into story commits. `bmad-loop init` also gitignores `_bmad/render/` for
+  in-place (`isolation = "none"`) runs.
 
 - **`branch_per=run` + `keep_failed` no longer poisons a multi-story run after the first kept
   failure (#138).** The first story to end deferred under `keep_failed=true` left its worktree

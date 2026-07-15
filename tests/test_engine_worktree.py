@@ -162,6 +162,44 @@ def test_worktree_happy_path_merges_to_target(project):
     assert "worktree-opened" in kinds and "unit-merged" in kinds
 
 
+def test_worktree_renderer_bmad_seed_and_render_residue_shielded(project):
+    """Renderer-era bmad-dev-auto end-to-end (BMAD-METHOD #2587): a
+    committed-_bmad project's worktree checkout carries the tracked config but
+    not the gitignored user layer — the _bmad merge-seed fills it in before the
+    session starts — and the render output the session writes into the worktree
+    (untracked, NOT gitignored upstream) never reaches the story commit."""
+    (project.project / "_bmad").mkdir()
+    (project.project / "_bmad" / "config.toml").write_text("[core]\n", encoding="utf-8")
+    (project.project / ".gitignore").write_text("_bmad/config.user.toml\n", encoding="utf-8")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})  # add -A commits _bmad + .gitignore too
+    (project.project / "_bmad" / "config.user.toml").write_text(
+        '[core]\ncommunication_language = "English"\n', encoding="utf-8"
+    )
+
+    seen = {}
+
+    def dev(spec):
+        cwd = spec.cwd
+        seen["tracked_config"] = (cwd / "_bmad" / "config.toml").is_file()
+        seen["seeded_user_layer"] = (cwd / "_bmad" / "config.user.toml").is_file()
+        render = cwd / "_bmad" / "render" / "bmad-dev-auto"
+        render.mkdir(parents=True)
+        (render / "workflow.md").write_text("baked absolute paths\n", encoding="utf-8")
+        return wt_dev_effect(project, "1-1-a")(spec)
+
+    engine, _ = make_engine(project, [dev, wt_review_effect(project, "1-1-a", clean=True)])
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused
+    assert seen["tracked_config"]  # via the checkout (tracked)
+    assert seen["seeded_user_layer"]  # via the _bmad merge-seed (gitignored in main)
+    assert "change for 1-1-a" in (project.project / "src.txt").read_text()
+    # neither the render residue nor the seeded user layer reached the target branch
+    merged = git(project.project, "log", "--name-only", "--format=", "main")
+    assert "_bmad/render" not in merged
+    assert "_bmad/config.user.toml" not in merged
+
+
 def test_worktree_run_dir_is_outside_worktree(project):
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
     engine, _ = make_engine(

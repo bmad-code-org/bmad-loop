@@ -92,6 +92,8 @@ trunk check      # lint + format verification (what CI runs)
 
 Releases are cut by maintainers. The version field is validated in CI; if you touch it, run `uv run --no-project python scripts/sync_version.py --check`.
 
+**Dogfooding against real skills:** the orchestrator drives the _upstream_ `bmad-dev-auto` + `bmad-review-*` skills, which are installed per-project (gitignored `.claude/skills/` / `.agents/skills/`), not bundled here. Before real smoke runs, keep those installs current with upstream BMAD-METHOD — the renderer-era skill (≥ commit `1cd4a7f5`, #2587/#2588) ships `render.py` + `workflow.md` alongside SKILL.md, and `bmad-loop validate` checks its environment (`uv` on PATH, `_bmad/config.toml`).
+
 ---
 
 ## Pull Request Guidelines

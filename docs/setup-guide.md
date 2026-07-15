@@ -20,6 +20,11 @@ of the README.
 ## Platform prerequisites
 
 - **Python 3.11+** and a supported coding CLI (`claude` by default).
+- **[uv](https://docs.astral.sh/uv/)** on the login-shell PATH — the renderer-era
+  `bmad-dev-auto` (BMAD-METHOD #2587) starts every dev session with
+  `uv run render.py`, and sessions run in fresh multiplexer panes that only see the
+  login-shell PATH. A missing `uv` makes every story fail with a result-less stop;
+  `bmad-loop validate` checks for it up front (pre-render skill installs skip the check).
 - **A terminal multiplexer** — the orchestrator drives agent sessions through a terminal
   multiplexer: **tmux** is the bundled default, and additional backends install as
   separate packages that register themselves (e.g. the
@@ -222,6 +227,17 @@ bmad-loop validate --project <project-root>
 `validate` exits non-zero when the project isn't fully ready (e.g. no `sprint-status.yaml`
 yet, or `bmad-sprint-planning` hasn't run). On a fresh project that is **expected** — read its
 output as a readiness checklist, not an install failure.
+
+When the installed `bmad-dev-auto` is the renderer-era shim (BMAD-METHOD #2587), `validate`
+also checks its environment: `render.py` next to the shim, `uv` on PATH, and the post-#2285
+central config at `_bmad/config.toml`. Add `--render-probe` to go further and actually
+execute `uv run render.py` against the project — this surfaces render-time HALTs (a config
+key referenced by the skill's templates but missing from the merged config, or an
+unparseable customization override — BMAD-METHOD #2588) before a run burns a story. The
+probe rewrites `_bmad/render/bmad-dev-auto/`, a cache the skill regenerates on every entry.
+`_bmad/render/` must never be committed: `bmad-loop init` gitignores it, worktree runs
+shield it, and `validate` warns once if a project has already committed it
+(`git rm -r --cached _bmad/render` fixes that).
 
 For the dashboard itself, see [docs/tui-guide.md](tui-guide.md). For the full policy
 reference, see the [Policy section](../README.md#policy-bmad-looppolicytoml) of the README.

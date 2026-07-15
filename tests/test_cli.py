@@ -1850,6 +1850,131 @@ def test_validate_stories_folder_known_selector_ok(project):
     assert cli._validate_stories_folder(project, STORIES_SPEC_FOLDER, selector="2") is None
 
 
+# --------------- renderer-era bmad-dev-auto validate checks (#2587/#2588) ----
+
+
+def _install_renderer_env(project):
+    """Sandbox with a renderer-era bmad-dev-auto in the claude tree: shim SKILL.md
+    + render.py + the post-#2285 central config the renderer requires."""
+    from conftest import install_base_skills
+
+    install_bmad_config(project)
+    _write_policy(project.project)
+    install_base_skills(project)
+    skill = project.project / ".claude" / "skills" / "bmad-dev-auto"
+    (skill / "SKILL.md").write_text(
+        "Run `uv run {skill-root}/render.py` and follow its stdout.\n", encoding="utf-8"
+    )
+    (skill / "render.py").write_text("# renderer\n", encoding="utf-8")
+    (project.project / "_bmad" / "config.toml").write_text("[core]\n", encoding="utf-8")
+    return skill
+
+
+def _validate_args(project, **kw):
+    kw.setdefault("render_probe", False)
+    return argparse.Namespace(project=str(project.project), spec=None, **kw)
+
+
+def test_validate_renderer_checks_silent_on_pre_render_skill(project, capsys):
+    """A pre-render bmad-dev-auto gets neither renderer FAILs nor the ok-note —
+    validate output stays byte-stable for older bmm installs."""
+    from conftest import install_base_skills
+
+    install_bmad_config(project)
+    _write_policy(project.project)
+    install_base_skills(project)
+
+    cli.cmd_validate(_validate_args(project))
+    text = _validate_output(capsys)
+    assert "renderer preflight" not in text
+    assert "render probe" not in text
+
+
+def test_validate_renderer_uv_missing_fails(project, capsys, monkeypatch):
+    """Shim installed but no uv on PATH: one loud preflight FAIL instead of a
+    result-less Stop per story (the shim HALTs before the workflow's HALT
+    protocol exists, so no spec status would ever be written)."""
+    import shutil as _shutil
+
+    _install_renderer_env(project)
+    real_which = _shutil.which
+    monkeypatch.setattr(_shutil, "which", lambda c: None if c == "uv" else real_which(c))
+
+    assert cli.cmd_validate(_validate_args(project)) == 1
+    text = _validate_output(capsys)
+    assert "`uv` was not found on path" in text
+    assert "renderer preflight ok" not in text
+
+
+def test_validate_renderer_ok_note_when_shim_complete(project, capsys, monkeypatch):
+    import shutil as _shutil
+
+    _install_renderer_env(project)
+    real_which = _shutil.which
+    monkeypatch.setattr(_shutil, "which", lambda c: "/usr/bin/uv" if c == "uv" else real_which(c))
+
+    cli.cmd_validate(_validate_args(project))
+    assert "renderer preflight ok" in _validate_output(capsys)
+
+
+def _fake_uv_on_path(tmp_path, monkeypatch, body: str):
+    import os
+
+    from conftest import write_script_launcher
+
+    bin_dir = tmp_path / "fake-bin"
+    bin_dir.mkdir()
+    write_script_launcher(bin_dir, "uv", body)
+    monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ.get("PATH", ""))
+
+
+def test_validate_render_probe_ok(project, capsys, monkeypatch, tmp_path):
+    """--render-probe runs the real renderer via uv; the dispatch line on stdout
+    is the pass signal."""
+    _install_renderer_env(project)
+    _fake_uv_on_path(tmp_path, monkeypatch, 'print("read and follow /r/workflow.md")\n')
+
+    cli.cmd_validate(_validate_args(project, render_probe=True))
+    assert "render probe ok" in _validate_output(capsys)
+
+
+def test_validate_render_probe_reports_halt(project, capsys, monkeypatch, tmp_path):
+    """A render-time HALT (#2588: missing {{.var}} key, unparseable override
+    layer) fails validate with the HALT text — before a run burns a story."""
+    _install_renderer_env(project)
+    _fake_uv_on_path(
+        tmp_path,
+        monkeypatch,
+        'import sys\nprint("HALT and report to the user: config is missing '
+        '`communication_language`")\nsys.exit(1)\n',
+    )
+
+    assert cli.cmd_validate(_validate_args(project, render_probe=True)) == 1
+    text = _validate_output(capsys)
+    assert "did not produce its dispatch line" in text
+    assert "communication_language" in text
+
+
+def test_validate_toml_parity_warning_surfaces(project, capsys, monkeypatch):
+    """A custom/config*.toml artifact override desyncs the renderer's TOML view
+    from the legacy yaml the orchestrator reads — validate warns (never FAILs)."""
+    import shutil as _shutil
+
+    _install_renderer_env(project)
+    real_which = _shutil.which
+    monkeypatch.setattr(_shutil, "which", lambda c: "/usr/bin/uv" if c == "uv" else real_which(c))
+    custom = project.project / "_bmad" / "custom"
+    custom.mkdir(parents=True, exist_ok=True)
+    (custom / "config.toml").write_text(
+        '[modules.bmm]\nimplementation_artifacts = "{project-root}/elsewhere"\n',
+        encoding="utf-8",
+    )
+
+    cli.cmd_validate(_validate_args(project))
+    text = _validate_output(capsys)
+    assert "central toml config resolves implementation_artifacts" in text
+
+
 def test_dry_run_stories_shows_plan_halt_markers(project, capsys):
     """Item 10: dry-run mirrors the real dispatch's leg-1 markers for a pending
     spec_checkpoint story (`Halt after planning.` + BMAD_LOOP_PLAN_HALT)."""

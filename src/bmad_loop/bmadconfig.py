@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -65,6 +66,81 @@ class ProjectPaths:
 
 def _resolve(raw: str, project: Path) -> Path:
     return Path(raw.replace("{project-root}", str(project))).resolve()
+
+
+# The four-layer central TOML config (BMAD-METHOD #2285), lowest priority first.
+_TOML_LAYERS = (
+    ("config.toml",),
+    ("config.user.toml",),
+    ("custom", "config.toml"),
+    ("custom", "config.user.toml"),
+)
+
+
+def _toml_merge(base: object, override: object) -> object:
+    """Dict-aware deep merge, matching the renderer's central-config semantics:
+    tables deep-merge, everything else the override wins."""
+    if isinstance(base, dict) and isinstance(override, dict):
+        result = dict(base)
+        for key, value in override.items():
+            result[key] = _toml_merge(result[key], value) if key in result else value
+        return result
+    return override
+
+
+def toml_artifact_parity(project: Path, paths: ProjectPaths) -> str | None:
+    """Warn when the central TOML and the legacy yaml disagree on the artifact dir.
+
+    The renderer-era bmad-dev-auto bakes `implementation_artifacts` from the
+    four-layer `_bmad/config.toml` merge, while `load_paths` (and so the whole
+    orchestrator) reads the legacy `_bmad/bmm/config.yaml`. The installer
+    regenerates the yaml from the TOML, but a hand-added `custom/config*.toml`
+    override desyncs the two until the next install — the skill then writes
+    specs and the deferred-work ledger where the orchestrator is not looking.
+
+    Mirrors the renderer's precedence: layers deep-merge lowest-to-highest,
+    then `[modules.bmm]` beats `[core]` on collision. Returns a warning string
+    on mismatch; None when they agree, when the TOML surface is absent or
+    unparseable (the renderer preflight owns reporting that), or when the TOML
+    never sets the key. Follow-up: make load_paths read the TOML as primary
+    (issue #154) — this parity check retires with it.
+    """
+    project = project.resolve()
+    bmad_dir = project / "_bmad"
+    if not (bmad_dir / "config.toml").is_file():
+        return None
+    merged: object = {}
+    for parts in _TOML_LAYERS:
+        layer = bmad_dir.joinpath(*parts)
+        if not layer.is_file():
+            continue
+        try:
+            with layer.open("rb") as fh:
+                doc = tomllib.load(fh)
+        except (tomllib.TOMLDecodeError, OSError):
+            return None
+        merged = _toml_merge(merged, doc)
+    if not isinstance(merged, dict):
+        return None
+    modules = merged.get("modules")
+    bmm = modules.get("bmm") if isinstance(modules, dict) else None
+    raw: str | None = None
+    for section in (merged.get("core"), bmm):  # bmm wins on collision, like render.py
+        if isinstance(section, dict) and isinstance(section.get("implementation_artifacts"), str):
+            raw = section["implementation_artifacts"]
+    if raw is None:
+        return None
+    toml_resolved = _resolve(raw, project)
+    if toml_resolved == paths.implementation_artifacts:
+        return None
+    return (
+        f"central TOML config resolves implementation_artifacts to {toml_resolved}, "
+        f"but the legacy _bmad/bmm/config.yaml (which bmad-loop reads) resolves it "
+        f"to {paths.implementation_artifacts} — the renderer-era bmad-dev-auto "
+        f"follows the TOML, so specs and the deferred-work ledger would land where "
+        f"the orchestrator is not looking; re-run the BMAD installer to regenerate "
+        f"the yaml (bmad-loop will move to the TOML as primary — issue #154)"
+    )
 
 
 def load_paths(project: Path) -> ProjectPaths:

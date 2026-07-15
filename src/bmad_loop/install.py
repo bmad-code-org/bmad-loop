@@ -94,6 +94,25 @@ STORIES_PROBE_SKILL = "bmad-dev-auto"
 STORIES_PROBE_FILE = "step-01-clarify-and-route.md"
 STORIES_PROBE_TEXT = "folder+id dispatch"
 
+# Renderer-era bmad-dev-auto (BMAD-METHOD #2587): SKILL.md is a two-line shim that
+# runs `uv run {skill-root}/render.py` and follows its stdout. The shim HALTs on
+# any failure BEFORE the workflow's HALT protocol exists, so a broken environment
+# (no uv, no central config) yields a result-less Stop for every story instead of
+# one loud preflight failure. This literal is stable prose in the shim; a
+# pre-render SKILL.md never mentions it, which is what gates the checks off for
+# older installs.
+RENDERER_PROBE_TEXT = "render.py"
+
+# BMAD's config/tool dir at the project root. The renderer resolves the project
+# root by walking UP from the session cwd to the first _bmad/ directory, so an
+# isolated worktree must carry one (see _seed_bmad_tree).
+BMAD_DIR = "_bmad"
+# Top-level _bmad/ entries never seeded into worktrees: render/ is render.py's
+# regenerated-per-checkout output with absolute paths baked in — seeding the main
+# checkout's copy would carry ITS paths into the worktree (the session re-renders
+# on skill entry anyway).
+BMAD_SEED_EXCLUDES = ("render",)
+
 
 def missing_stories_support(project: Path, trees: Sequence[str]) -> list[str]:
     """Problems for stories mode's stricter bmad-dev-auto requirement.
@@ -156,6 +175,65 @@ def missing_base_skills(project: Path, trees: Sequence[str]) -> list[str]:
                     f"{tree}/{skill} is incomplete (missing {', '.join(absent)}) — "
                     f"reinstall it from the bmm module"
                 )
+    return problems
+
+
+def renderer_shim_trees(project: Path, trees: Sequence[str]) -> list[str]:
+    """The CLI skill trees whose installed bmad-dev-auto SKILL.md is the render shim.
+
+    Deduped, in first-seen order. Absent/unreadable SKILL.md never qualifies —
+    reporting that is ``missing_base_skills``' job.
+    """
+    found: list[str] = []
+    for tree in dict.fromkeys(trees):
+        probe = project / tree / STORIES_PROBE_SKILL / "SKILL.md"
+        try:
+            text = probe.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if RENDERER_PROBE_TEXT in text:
+            found.append(tree)
+    return found
+
+
+def missing_renderer_support(project: Path, trees: Sequence[str]) -> list[str]:
+    """Problems for the renderer-era bmad-dev-auto's environment requirements.
+
+    When the installed SKILL.md is the render shim (BMAD-METHOD #2587), every dev
+    session starts by running `uv run render.py`, which requires `uv` on the
+    session PATH and a post-#2285 central config at `_bmad/config.toml` — and a
+    shim without its render.py next to it can never start at all. Any of these
+    missing makes the shim HALT before the workflow's HALT protocol is loaded, so
+    no spec status or `## Auto Run Result` is ever written: every story becomes a
+    result-less Stop. Check once at preflight instead.
+
+    A pre-render SKILL.md (no ``render.py`` mention) gets zero checks — older bmm
+    installs carry their config load inside the workflow and stay self-sufficient.
+    Absent/unreadable SKILL.md is ``missing_base_skills``' job, not re-reported
+    here. Returns human-readable problem strings; empty list means OK.
+    """
+    problems: list[str] = []
+    shim_trees = renderer_shim_trees(project, trees)
+    for tree in shim_trees:
+        skill_dir = project / tree / STORIES_PROBE_SKILL
+        if not (skill_dir / "render.py").is_file():
+            problems.append(
+                f"{tree}/{STORIES_PROBE_SKILL}/SKILL.md is a render shim but render.py "
+                f"is missing next to it — reinstall the BMad Method (bmm) module"
+            )
+    if shim_trees:
+        if shutil.which("uv") is None:
+            problems.append(
+                "bmad-dev-auto now renders its workflow via `uv run render.py`; `uv` "
+                "was not found on PATH — install uv (https://docs.astral.sh/uv/) and "
+                "ensure it is on the login-shell PATH (sessions run in fresh panes)"
+            )
+        if not (project / BMAD_DIR / "config.toml").is_file():
+            problems.append(
+                f"bmad-dev-auto's render.py requires {BMAD_DIR}/config.toml (the "
+                f"post-#2285 central config) — re-run the BMAD installer to migrate "
+                f"this install"
+            )
     return problems
 
 
@@ -370,6 +448,57 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> None:
     exclude.write_text(prefix + "\n".join(new) + "\n", encoding="utf-8")
 
 
+def _seed_bmad_tree(worktree: Path, repo_root: Path) -> list[str]:
+    """Merge-copy the main repo's ``_bmad/`` config surface into a worktree.
+
+    The renderer-era bmad-dev-auto resolves the project root by walking UP from
+    the session cwd to the first ``_bmad/`` directory. Worktrees nest under
+    ``<project>/.bmad-loop/runs/…``, so a checkout without its own ``_bmad/``
+    (projects commonly gitignore it) silently adopts the MAIN checkout's: render
+    output and baked-absolute artifact paths then escape the worktree, and every
+    parallel session races on one shared ``_bmad/render/``. Even committed-_bmad
+    projects gitignore the ``*.user.toml``/``config.user.yaml`` layers, whose
+    absence hard-HALTs render.py when a referenced config key lives only there
+    (BMAD-METHOD #2588).
+
+    Per-FILE merge (not per-dir): copy-when-absent, so a checkout that carries a
+    committed ``_bmad/`` keeps every tracked file untouched and only the
+    gitignored layers are filled in. Entries under ``BMAD_SEED_EXCLUDES`` (the
+    regenerated ``render/`` output) are never seeded. Same resolve-and-contain
+    guard as the seed_files loop so a symlink can't escape either tree.
+
+    Returns the rels to shield from the unit's ``git add -A``: the single
+    ``_bmad`` root when the worktree had none (everything under it is ours), or
+    the individual seeded files when merging into an existing tree ("shield
+    exactly what we wrote").
+    """
+    src_root = repo_root / BMAD_DIR
+    if not src_root.is_dir():
+        return []
+    dst_root = worktree / BMAD_DIR
+    had_bmad = dst_root.is_dir()
+    seeded: list[str] = []
+    for src in sorted(src_root.rglob("*")):
+        if not src.is_file():
+            continue
+        rel = src.relative_to(src_root)
+        if rel.parts[0] in BMAD_SEED_EXCLUDES:
+            continue
+        dst = dst_root / rel
+        if not src.resolve().is_relative_to(repo_root) or not dst.resolve().is_relative_to(
+            worktree
+        ):
+            continue
+        if dst.exists():
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        _copy_traversable(src, dst)
+        seeded.append((Path(BMAD_DIR) / rel).as_posix())
+    if not seeded:
+        return []
+    return [BMAD_DIR] if not had_bmad else seeded
+
+
 def _copy_skills(project: Path, trees: Sequence[str], force: bool) -> bool:
     """Install the bundled bmad-loop-* skills into each project skill tree.
 
@@ -455,8 +584,14 @@ def provision_worktree(
     seed_files are copied BEFORE the hook step so a seeded settings file that is
     also a hook config_path (.claude/settings.json, .gemini/settings.json) keeps its
     real content and just gets the Stop hook merged in, rather than being created empty.
+
+    The `_bmad/` config surface is merge-seeded from the MAIN REPO too (see
+    _seed_bmad_tree): the renderer-era bmad-dev-auto walks up from the session cwd
+    to the first _bmad/ dir, so the worktree must carry its own. `_bmad/render/`
+    (session-regenerated) is additionally excluded unconditionally, so a project
+    that commits its _bmad/ never gets render output swept into a story commit.
     """
-    if not profiles and not seed_files and not seed_globs:
+    if not profiles and not seed_files and not seed_globs and not (repo_root / BMAD_DIR).is_dir():
         return
     worktree = worktree.resolve()
     repo_root = repo_root.resolve()
@@ -494,6 +629,10 @@ def provision_worktree(
             _copy_traversable(src, dst)
             # as_posix so the exclude pattern anchors on Windows too (os.sep would not)
             seeded.append(rel.as_posix())
+
+    # the _bmad/ config surface (renderer-era bmad-dev-auto anchors its project
+    # root on it; user layers are gitignored even in committed-_bmad projects)
+    seeded_bmad = _seed_bmad_tree(worktree, repo_root)
 
     # bundled skills into each CLI's skill tree (deduped: codex+gemini share one);
     # never clobber a skill the checkout already carries (tracked or pre-existing).
@@ -544,7 +683,39 @@ def provision_worktree(
     patterns = {f"/{p.skill_tree}" for p in profiles}
     patterns |= {f"/{p.hooks.config_path}" for p in profiles}
     patterns |= {f"/{rel}" for rel in seeded}
+    patterns |= {f"/{rel}" for rel in seeded_bmad}
+    # always shielded, seeded or not: the session's render.py rewrites this dir
+    # during the run, AFTER provisioning — never ours to commit
+    patterns.add(f"/{BMAD_DIR}/render/")
     _worktree_local_exclude(worktree, sorted(patterns))
+
+
+def tracked_render_warning(project: Path) -> str | None:
+    """One-time migration hint for a project that already COMMITTED _bmad/render/**.
+
+    Git excludes and .gitignore entries never affect tracked files, so the
+    renderer's delete-and-rewrite of that dir shows up as tracked modifications
+    that the unit's `git add -A` sweeps into story commits (with machine-absolute
+    paths baked in). Returns the warning text, or None when nothing is tracked
+    there. Best-effort — not a repo, or no git, means nothing to warn about.
+    """
+    try:
+        proc = subprocess.run(  # noqa: S603, S607 — fixed argv, no shell
+            ["git", "ls-files", "--", f"{BMAD_DIR}/render"],
+            cwd=project,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    return (
+        f"{BMAD_DIR}/render/ is tracked by git; bmad-dev-auto's render.py rewrites "
+        f"it on every dev session, so story commits will sweep the churn — run "
+        f"`git rm -r --cached {BMAD_DIR}/render` once and gitignore it"
+    )
 
 
 def _warn_if_policy_tracked(project: Path) -> None:
@@ -640,7 +811,14 @@ def install_into(
     have = set(existing.splitlines())
     to_add = [
         line
-        for line in (".bmad-loop/runs/", ".bmad-loop/cache/", ".bmad-loop/policy.toml")
+        for line in (
+            ".bmad-loop/runs/",
+            ".bmad-loop/cache/",
+            ".bmad-loop/policy.toml",
+            # bmad-dev-auto's render.py output: regenerated on every skill entry
+            # with machine-absolute paths baked in — never version it
+            "_bmad/render/",
+        )
         if line not in have
     ]
     if to_add:

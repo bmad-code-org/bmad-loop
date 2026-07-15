@@ -837,3 +837,221 @@ def test_copy_traversable_zip_source_copies_content(tmp_path):
     _copy_traversable(zipfile.Path(zf_path, "pkg/"), dst)
 
     assert (dst / "skill" / "SKILL.md").read_text() == "tool"
+
+
+# --------------- _bmad seed + renderer preflight (BMAD-METHOD #2587/#2588) ----
+
+RENDER_SHIM = "Run `uv run {skill-root}/render.py` and follow its stdout.\n"
+
+
+def _install_bmad_surface(repo):
+    """Lay down a main-checkout _bmad/ config surface, including the pieces a
+    worktree checkout would lack (gitignored user layers) and a render/ output
+    dir that must never be seeded."""
+    bmad = repo / "_bmad"
+    (bmad / "custom").mkdir(parents=True, exist_ok=True)
+    (bmad / "bmm").mkdir(parents=True, exist_ok=True)
+    (bmad / "scripts").mkdir(parents=True, exist_ok=True)
+    (bmad / "config.toml").write_text("[core]\n", encoding="utf-8")
+    (bmad / "config.user.toml").write_text(
+        '[core]\ncommunication_language = "English"\n', encoding="utf-8"
+    )
+    (bmad / "custom" / "config.user.toml").write_text("[core]\n", encoding="utf-8")
+    (bmad / "bmm" / "config.yaml").write_text("implementation_artifacts: x\n", encoding="utf-8")
+    (bmad / "scripts" / "resolve_customization.py").write_text("# resolver\n", encoding="utf-8")
+    render = bmad / "render" / "bmad-dev-auto"
+    render.mkdir(parents=True, exist_ok=True)
+    (render / "workflow.md").write_text("MAIN-CHECKOUT ABSOLUTE PATHS\n", encoding="utf-8")
+
+
+def _install_renderer_skill(root, tree=".claude/skills"):
+    """Upgrade the stubbed bmad-dev-auto to the renderer-era shim shape."""
+    skill = root / tree / "bmad-dev-auto"
+    skill.mkdir(parents=True, exist_ok=True)
+    (skill / "SKILL.md").write_text(RENDER_SHIM, encoding="utf-8")
+    (skill / "render.py").write_text("# renderer\n", encoding="utf-8")
+
+
+def test_provision_worktree_seeds_bmad_when_absent(tmp_path):
+    """The renderer-era bmad-dev-auto anchors its project root on the first
+    _bmad/ dir walking UP from the session cwd — and worktrees nest inside the
+    project, so a checkout without one silently adopts the MAIN checkout's
+    (baking its absolute paths into the rendered workflow). The whole config
+    surface must be seeded, except the regenerated render/ output."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    repo.mkdir()
+    _install_bmad_surface(repo)
+
+    provision_worktree(wt, [], repo)
+
+    assert (wt / "_bmad" / "config.toml").is_file()
+    assert (wt / "_bmad" / "config.user.toml").is_file()  # gitignored user layer
+    assert (wt / "_bmad" / "custom" / "config.user.toml").is_file()
+    assert (wt / "_bmad" / "bmm" / "config.yaml").is_file()  # legacy yaml (pre-render skill)
+    assert (wt / "_bmad" / "scripts" / "resolve_customization.py").is_file()
+    # render/ output is regenerated per-checkout with absolute paths — never seeded
+    assert not (wt / "_bmad" / "render").exists()
+
+
+def test_provision_worktree_bmad_merge_fills_only_missing_files(tmp_path):
+    """A committed-_bmad checkout keeps every file it carries (per-FILE merge,
+    copy-when-absent); only the gitignored layers absent from the checkout are
+    filled in."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    repo.mkdir()
+    _install_bmad_surface(repo)
+    committed = wt / "_bmad" / "config.toml"
+    committed.parent.mkdir(parents=True)
+    committed.write_text("COMMITTED", encoding="utf-8")
+
+    provision_worktree(wt, [], repo)
+
+    assert committed.read_text() == "COMMITTED"  # tracked file untouched
+    assert (wt / "_bmad" / "config.user.toml").is_file()  # missing layer filled in
+
+
+def test_provision_worktree_bmad_seed_shielded_when_worktree_lacked_bmad(project, tmp_path):
+    """Gitignored-_bmad project: the worktree checkout has no _bmad at all, so the
+    whole seeded tree is ours — one anchored /_bmad exclude keeps the unit's
+    `git add -A` away from it."""
+    repo = project.project
+    _install_bmad_surface(repo)
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    provision_worktree(wt, [get_profile("claude")], repo)
+
+    exclude = (repo / ".git" / "info" / "exclude").read_text(encoding="utf-8").splitlines()
+    assert "/_bmad" in exclude
+    assert "/_bmad/render/" in exclude
+    assert git(wt, "status", "--short", "--", "_bmad") == ""
+
+
+def test_provision_worktree_bmad_merge_shields_only_seeded_files_when_committed(project, tmp_path):
+    """Committed-_bmad project: the checkout carries the tracked files, so only
+    the individually seeded (gitignored) layers are shielded — never a blanket
+    /_bmad that would mask real changes to tracked config."""
+    repo = project.project
+    tracked = repo / "_bmad" / "config.toml"
+    tracked.parent.mkdir(parents=True)
+    tracked.write_text("[core]\n", encoding="utf-8")
+    git(repo, "add", "_bmad/config.toml")
+    git(repo, "commit", "-m", "commit bmad config")
+    (repo / "_bmad" / "config.user.toml").write_text("[core]\n", encoding="utf-8")
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    assert (wt / "_bmad" / "config.toml").is_file()  # tracked → in the checkout
+
+    provision_worktree(wt, [get_profile("claude")], repo)
+
+    exclude = (repo / ".git" / "info" / "exclude").read_text(encoding="utf-8").splitlines()
+    assert "/_bmad" not in exclude
+    assert "/_bmad/config.user.toml" in exclude
+    assert (wt / "_bmad" / "config.user.toml").is_file()
+    assert git(wt, "status", "--short", "--", "_bmad") == ""
+
+
+def test_provision_worktree_render_exclude_always_written(project, tmp_path):
+    """/_bmad/render/ is shielded even when the repo has no _bmad at all — the
+    session's render.py writes it AFTER provisioning, so it is never ours to
+    commit regardless of the seeding path."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    provision_worktree(wt, [get_profile("claude")], repo)
+
+    exclude = (repo / ".git" / "info" / "exclude").read_text(encoding="utf-8").splitlines()
+    assert "/_bmad/render/" in exclude
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_provision_worktree_bmad_seed_rejects_symlink_escape(tmp_path):
+    """A symlink inside _bmad targeting outside the repo is skipped — the seed
+    never copies content from outside the project tree into the worktree."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    (repo / "_bmad").mkdir(parents=True)
+    (tmp_path / "outside.txt").write_text("SECRET", encoding="utf-8")
+    (repo / "_bmad" / "leak.toml").symlink_to(tmp_path / "outside.txt")
+    (repo / "_bmad" / "config.toml").write_text("[core]\n", encoding="utf-8")
+
+    provision_worktree(wt, [], repo)
+
+    assert not (wt / "_bmad" / "leak.toml").exists()
+    assert (wt / "_bmad" / "config.toml").is_file()  # honest neighbours still seeded
+
+
+def test_missing_renderer_support_ignores_pre_render_skill(tmp_path, monkeypatch):
+    """A pre-render SKILL.md (no render.py mention) gets ZERO environment checks
+    — older bmm installs carry their config load inside the workflow."""
+    import shutil as _shutil
+
+    from bmad_loop.install import missing_renderer_support, renderer_shim_trees
+
+    claude = get_profile("claude")
+    _install_base_skills(tmp_path, claude.skill_tree)
+    monkeypatch.setattr(_shutil, "which", lambda _cmd: None)  # no uv anywhere
+
+    assert renderer_shim_trees(tmp_path, [claude.skill_tree]) == []
+    assert missing_renderer_support(tmp_path, [claude.skill_tree]) == []
+
+
+def test_missing_renderer_support_requirements_matrix(tmp_path, monkeypatch):
+    """Shim detected → render.py must sit next to it, uv must be on PATH, and the
+    post-#2285 central config must exist; each failure is reported once."""
+    import shutil as _shutil
+
+    from bmad_loop.install import missing_renderer_support
+
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    _install_base_skills(tmp_path, tree)
+    skill = tmp_path / tree / "bmad-dev-auto"
+    (skill / "SKILL.md").write_text(RENDER_SHIM, encoding="utf-8")
+    monkeypatch.setattr(_shutil, "which", lambda _cmd: "/usr/bin/uv")
+    (tmp_path / "_bmad").mkdir()
+    (tmp_path / "_bmad" / "config.toml").write_text("[core]\n", encoding="utf-8")
+
+    # shim without render.py → the one skill-integrity problem
+    problems = missing_renderer_support(tmp_path, [tree])
+    assert len(problems) == 1 and "render.py" in problems[0] and "reinstall" in problems[0]
+
+    # complete shim + uv + config → all green
+    (skill / "render.py").write_text("# renderer\n", encoding="utf-8")
+    assert missing_renderer_support(tmp_path, [tree]) == []
+
+    # uv gone → reported exactly once even across two shim trees
+    codex_tree = get_profile("codex").skill_tree
+    _install_base_skills(tmp_path, codex_tree)
+    _install_renderer_skill(tmp_path, codex_tree)
+    monkeypatch.setattr(_shutil, "which", lambda _cmd: None)
+    problems = missing_renderer_support(tmp_path, [tree, codex_tree])
+    assert len(problems) == 1 and "uv" in problems[0]
+
+    # config.toml gone → reported (uv restored so it is the only problem)
+    monkeypatch.setattr(_shutil, "which", lambda _cmd: "/usr/bin/uv")
+    (tmp_path / "_bmad" / "config.toml").unlink()
+    problems = missing_renderer_support(tmp_path, [tree, codex_tree])
+    assert len(problems) == 1 and "config.toml" in problems[0]
+
+
+def test_tracked_render_warning(project, tmp_path):
+    """The one-time migration hint fires only when _bmad/render/** is actually
+    tracked — excludes and .gitignore can't shield tracked files from the unit's
+    `git add -A`."""
+    from bmad_loop.install import tracked_render_warning
+
+    assert tracked_render_warning(tmp_path) is None  # not a repo → best-effort None
+
+    repo = project.project
+    assert tracked_render_warning(repo) is None  # repo, nothing tracked there
+
+    rendered = repo / "_bmad" / "render" / "bmad-dev-auto" / "workflow.md"
+    rendered.parent.mkdir(parents=True)
+    rendered.write_text("rendered\n", encoding="utf-8")
+    assert tracked_render_warning(repo) is None  # untracked residue → excludes handle it
+
+    git(repo, "add", "_bmad/render")
+    git(repo, "commit", "-m", "commit render output")
+    warning = tracked_render_warning(repo)
+    assert warning is not None and "git rm -r --cached _bmad/render" in warning
