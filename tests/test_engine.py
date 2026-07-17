@@ -3479,6 +3479,29 @@ def test_dev_timeout_with_committed_work_keeps_tree_and_resumes(project):
     assert "failed deterministic verification" not in resumed_prompt
 
 
+def test_advance_baseline_latches_only_when_the_advance_landed(monkeypatch, project):
+    """The latch is what tells verify's gate an ancestor is legitimate here, so it
+    must never outrun the advance itself: a git failure leaves the OLD baseline
+    standing, and claiming it was advanced would wave a genuinely foreign spec
+    baseline through."""
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.baseline_commit = "abc123"
+
+    def boom(repo):
+        raise verify.GitError("simulated failure")
+
+    monkeypatch.setattr(verify, "untracked_files", boom)
+    engine._advance_baseline_to_head(task)
+    assert task.baseline_commit == "abc123"
+    assert task.baseline_advanced is False
+
+    monkeypatch.undo()
+    engine._advance_baseline_to_head(task)
+    assert task.baseline_commit == verify.rev_parse_head(project.project)
+    assert task.baseline_advanced is True
+
+
 def test_dev_timeout_without_committed_work_still_rolls_back(project):
     """A timeout that produced no durable progress (no commits above baseline)
     must keep the old behavior: roll back to baseline rather than resuming a
@@ -3504,6 +3527,65 @@ def test_dev_timeout_without_committed_work_still_rolls_back(project):
     assert any(e["kind"] == "rollback-auto" for e in engine.journal.entries())
     resumed_prompt = adapter.sessions[1].prompt
     assert resumed_prompt == "/bmad-dev-auto 1-1-a"  # plain restart, no resume framing
+
+
+def test_dev_timeout_resume_keeping_the_attempts_own_spec_baseline_completes(project):
+    """md2pdf-auto run 20260716-153340-9183: dev-1 stamped the spec, committed
+    eight commits and timed out; the retry adopted them (baseline advanced), dev-2
+    finished the story — and the baseline gate then failed the whole thing on
+    `spec baseline 68eda05 does not match orchestrator-recorded baseline 1ead148`,
+    after ~83M tokens. A resumed session does NOT re-run step-03: it keeps the
+    attempt's spec (that is the point of the resume note), so its
+    `baseline_revision` stays at the pre-advance sha and exact match cannot hold.
+
+    The sibling keep-tree test passes only because `dev_effect` re-stamps the spec
+    with the current HEAD on every session — a fixture artifact no resumed
+    production session reproduces, the same masking that hid issue #89."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    repo = project.project
+    sp = spec_path(project, "1-1-a")
+    original_baseline = verify.rev_parse_head(repo)
+
+    def timeout_after_stamping_and_committing(spec):
+        write_spec(sp, "ready-for-dev", original_baseline)  # step-03's stamp
+        (repo / "impl.txt").write_text("committed implementation\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "attempt work")
+        return SessionResult(status="timeout")
+
+    def resume_finishing_without_restamping(spec):
+        (repo / "impl.txt").write_text("committed implementation\nfinished\n")
+        write_spec(sp, "done", _spec_baseline(sp))  # keeps dev-1's baseline
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "auto-dev",
+                "story_key": "1-1-a",
+                "spec_file": str(sp),
+                "tasks_total": 3,
+                "tasks_done": 3,
+                "verification": [],
+                "escalations": [],
+                "followup_review_recommended": False,
+            },
+        )
+
+    engine, _ = make_engine(
+        project,
+        [
+            timeout_after_stamping_and_committing,
+            resume_finishing_without_restamping,
+            review_effect(project, "1-1-a", clean=True),
+        ],
+    )
+    summary = engine.run()
+
+    assert summary.done == 1
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase is not Phase.ESCALATED
+    assert task.baseline_advanced  # the orchestrator moved it, so the gate relaxed
+    assert _spec_baseline(sp) == original_baseline  # and nothing re-stamped the spec
+    assert (repo / "impl.txt").read_text().endswith("finished\n")
 
 
 def test_dev_exhausted_defers_and_run_continues(project):

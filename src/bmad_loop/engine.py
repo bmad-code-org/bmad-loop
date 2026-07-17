@@ -2503,13 +2503,24 @@ class Engine:
         assigned, so a failure partway through can't advance one and not the
         other. Best-effort: on a git failure the old baseline stands — the
         resumed session's verify_dev may then flag a baseline mismatch, which is
-        no worse than today's unconditional rollback."""
+        no worse than today's unconditional rollback.
+
+        Latches ``baseline_advanced`` on success: the kept attempt already
+        stamped the spec's ``baseline_revision`` with the PRE-advance sha and
+        nothing re-stamps it (deliberately — that sha is the diff base the whole
+        story's review must span, so narrowing it to the advanced one would hide
+        the kept attempt's own work from the review). Only the flag tells verify's
+        baseline gate that the resulting spec/orchestrator split is one the
+        orchestrator caused, so it can accept an ancestor there and nowhere
+        else. Set last, and only if both git reads landed: an un-advanced
+        baseline must not claim to have been advanced."""
         try:
             repo = self.workspace.root
             head = verify.rev_parse_head(repo)
             untracked = sorted(verify.untracked_files(repo))
             task.baseline_commit = head
             task.baseline_untracked = untracked
+            task.baseline_advanced = True
         except Exception:  # noqa: BLE001  # nosec B110 - best-effort git read, must not fail retry
             pass
 

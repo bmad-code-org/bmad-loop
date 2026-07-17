@@ -1556,6 +1556,75 @@ def test_verify_dev_baseline_gate_reads_the_skills_baseline_revision_key(project
     assert verify.verify_dev(task, project, dev_result(sp)).ok
 
 
+def _advanced_baseline_incident(project, task, sp):
+    """The shape `_advance_baseline_to_head` leaves behind: a timed-out attempt
+    stamped the spec with the pre-attempt baseline and committed real work, after
+    which the orchestrator adopted those commits as the new baseline. Returns the
+    original (pre-advance) sha the spec still claims."""
+    original = task.baseline_commit
+    write_spec(sp, "in-review", original)
+    (project.project / "src.txt").write_text("work the timed-out attempt committed\n")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "kept attempt work")
+    task.baseline_commit = verify.rev_parse_head(project.project)
+    task.baseline_advanced = True
+    (project.project / "more.txt").write_text("work the resumed session added\n")
+    return original
+
+
+def test_verify_dev_advanced_baseline_accepts_the_ancestor_it_left_in_the_spec(project):
+    """The orchestrator adopts a timed-out attempt's commits as the new baseline
+    but never re-stamps the spec, so the spec keeps the older sha ON PURPOSE (it
+    is the diff base the whole story's review must span). Exact match then fails a
+    story the resumed session actually finished — the drift that discarded ~27M
+    tokens of completed work on md2pdf-auto run 20260716-153340-9183."""
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+    sp = spec_path(project, "1-1-a")
+
+    original = _advanced_baseline_incident(project, task, sp)
+    assert original != task.baseline_commit
+    assert verify.is_ancestor(project.project, original, task.baseline_commit)
+    assert verify.verify_dev(task, project, dev_result(sp)).ok
+
+
+def test_verify_dev_advanced_baseline_still_rejects_a_diverged_baseline(project):
+    """The relaxation is ancestor-only: a spec claiming a sha that is not on the
+    recorded baseline's history means the session worked against a tree the
+    orchestrator never authorized, advance latch or not."""
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+    sp = spec_path(project, "1-1-a")
+
+    _advanced_baseline_incident(project, task, sp)
+    write_spec(sp, "in-review", "0" * 40)  # foreign sha, not an ancestor
+    out = verify.verify_dev(task, project, dev_result(sp))
+    assert not out.ok and "does not match" in out.reason
+
+
+def test_verify_dev_ancestor_baseline_without_the_advance_latch_still_fails(project):
+    """Exact match stays the rule everywhere the orchestrator did NOT move the
+    baseline itself. Without the latch an ancestor is just a spec claiming a
+    baseline nobody authorized, and PR #162's bundle-mode relaxation must stay the
+    only other way past this gate."""
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+    sp = spec_path(project, "1-1-a")
+
+    _advanced_baseline_incident(project, task, sp)
+    task.baseline_advanced = False
+    out = verify.verify_dev(task, project, dev_result(sp))
+    assert not out.ok and "does not match" in out.reason
+
+
+def test_is_ancestor_reads_an_unknown_rev_as_false(project):
+    """Uncertainty keeps the gate strict: a git failure must never read as "yes,
+    that baseline is fine"."""
+    head = verify.rev_parse_head(project.project)
+    assert verify.is_ancestor(project.project, head, head) is True
+    assert verify.is_ancestor(project.project, "0" * 40, head) is False
+
+
 def test_verify_dev_exclude_relpaths_normalizes_dotdot_segments(project):
     """A spec_path with a lexical '..' hop (as an un-normalized session-reported
     spec_file could produce) must resolve to the same exclude entry as the plain

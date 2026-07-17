@@ -151,6 +151,15 @@ class StoryTask:
     # user already had on disk are never deleted. None = pre-upgrade run (no
     # snapshot); rollback then removes no untracked files at all.
     baseline_untracked: list[str] | None = None
+    # set by engine._advance_baseline_to_head: the orchestrator moved
+    # `baseline_commit` forward onto a kept attempt's commits AFTER the session
+    # that stamped the spec's own `baseline_revision` had already exited. The two
+    # then legitimately differ, so verify's baseline gate accepts a claimed
+    # baseline that is an ANCESTOR of the recorded one while this is set (a
+    # diverged baseline still fails). Never set on the ordinary path, where the
+    # session that stamps the spec and the orchestrator share one baseline and
+    # exact match still holds. Survives the round-trip.
+    baseline_advanced: bool = False
     spec_file: str | None = None
     commit_sha: str | None = None
     defer_reason: str | None = None
@@ -243,6 +252,7 @@ class StoryTask:
             "followup_review_recommended": self.followup_review_recommended,
             "baseline_commit": self.baseline_commit,
             "baseline_untracked": self.baseline_untracked,
+            "baseline_advanced": self.baseline_advanced,
             "spec_file": self._serialized_spec_file(),
             "commit_sha": self.commit_sha,
             "defer_reason": self.defer_reason,
@@ -290,6 +300,7 @@ class StoryTask:
                 if d.get("baseline_untracked") is not None
                 else None
             ),
+            baseline_advanced=bool(d.get("baseline_advanced", False)),
             spec_file=d.get("spec_file"),
             commit_sha=d.get("commit_sha"),
             defer_reason=d.get("defer_reason"),

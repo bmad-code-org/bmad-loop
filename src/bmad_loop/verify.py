@@ -149,6 +149,15 @@ def same_commit(a: str, b: str) -> bool:
     return a.startswith(b) or b.startswith(a)
 
 
+def is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
+    """True if ``ancestor`` is reachable from ``descendant`` — i.e. the two sit on
+    one history and ``ancestor`` is the older end. Any git failure (unknown sha,
+    no repo, timeout) reads as False, so uncertainty keeps a caller's gate strict
+    rather than waving work through on a bad rev."""
+    rc, _ = _git(repo, "merge-base", "--is-ancestor", ancestor, descendant)
+    return rc == 0
+
+
 def has_changes_since(
     repo: Path,
     baseline: str,
@@ -1175,7 +1184,21 @@ def _verify_shared_gates(
     # same idiom as `devcontract.synthesize_result`.
     claimed_baseline = str(fm.get("baseline_commit", fm.get("baseline_revision", ""))).strip()
     if task.baseline_commit and claimed_baseline not in ("", "NO_VCS"):
-        if not same_commit(claimed_baseline, task.baseline_commit):
+        # Exact match is the rule: the session that stamps the spec and the
+        # orchestrator normally share one baseline, and a spec claiming a
+        # different one means the session worked against a tree the orchestrator
+        # never authorized. The single exception is when the orchestrator ITSELF
+        # moved the baseline forward after that stamp (`baseline_advanced`, set
+        # by engine._advance_baseline_to_head when a kept attempt's commits are
+        # adopted): the spec then legitimately holds the older, pre-advance sha —
+        # deliberately so, since it is the diff base the whole story's review
+        # must span. Accept it only when it is an ANCESTOR of the recorded
+        # baseline, which proves the two sit on one history and the session
+        # merely started earlier; a diverged sha still fails.
+        matched = same_commit(claimed_baseline, task.baseline_commit)
+        if not matched and task.baseline_advanced:
+            matched = is_ancestor(paths.project, claimed_baseline, task.baseline_commit)
+        if not matched:
             return VerifyOutcome.retry(
                 f"spec baseline {claimed_baseline[:12]} does not match "
                 f"orchestrator-recorded baseline {task.baseline_commit[:12]}"

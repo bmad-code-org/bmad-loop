@@ -723,6 +723,12 @@ def rearm_escalation(
     task.review_cycle = 0
     task.followup_reviews_spent = 0  # human-resolved re-drive gets a fresh damping budget
     task.defer_reason = None
+    # Both re-drive routes re-establish an exact spec/orchestrator baseline match
+    # — ready-for-dev re-runs step-03, which stamps the advanced sha itself, and
+    # the patch-restore route re-stamps it below — so a latch left by a kept
+    # attempt of the PREVIOUS, escalated cycle must not survive into this one and
+    # keep the ancestor relaxation armed for work it never covered.
+    task.baseline_advanced = False
     task.rearmed = True  # resume-time recovery notice describes a clean rebuild,
     # not a failed attempt (engine._finish_inflight clears it once the rebuild runs)
     # Always (re)assign the latch: a None restore_patch clears a stale one left by

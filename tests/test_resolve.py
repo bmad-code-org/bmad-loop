@@ -259,6 +259,22 @@ def test_rearm_advances_baseline_to_resolved_head(project):
     assert "leftover.txt" in task.baseline_untracked
 
 
+def test_rearm_clears_the_baseline_advanced_latch(project):
+    """A kept attempt of the escalated cycle may have latched `baseline_advanced`
+    (engine._advance_baseline_to_head). Both re-drive routes re-establish an exact
+    spec/orchestrator match — ready-for-dev re-runs step-03, patch-restore
+    re-stamps — so the latch must not survive and leave verify's ancestor
+    relaxation armed for a cycle whose spec no longer needs it."""
+    root = project.project
+    run_dir, state, task = _escalated_run(root)
+    task.baseline_advanced = True
+    save_state(run_dir, state)
+
+    runs.rearm_escalation(run_dir)
+
+    assert load_state(run_dir).tasks["6-4-cli-list-command"].baseline_advanced is False
+
+
 def test_rearm_baseline_all_or_nothing_on_partial_git_failure(monkeypatch, project):
     """rev_parse_head succeeding but untracked_files failing must not advance
     baseline_commit while leaving baseline_untracked stale: both locals are
