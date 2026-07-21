@@ -584,6 +584,20 @@ def test_provision_worktree_lays_down_skills_and_hook(tmp_path):
     assert not (wt / ".bmad-loop").exists()
 
 
+def test_provision_worktree_hermes_preserves_project_config_yaml(tmp_path):
+    """Hermes hooks live in HERMES_HOME, never a worktree's application config."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    project_config = wt / "config.yaml"
+    project_config.parent.mkdir(parents=True)
+    project_config.write_text("app:\n  name: keep-me\n", encoding="utf-8")
+    git(wt, "init", "-q")
+
+    provision_worktree(wt, [get_profile("hermes")], repo)
+
+    assert project_config.read_text(encoding="utf-8") == "app:\n  name: keep-me\n"
+    assert "/config.yaml" not in (wt / ".git" / "info" / "exclude").read_text(encoding="utf-8")
+
+
 def test_provision_worktree_covers_multiple_profiles(tmp_path):
     """Dev=claude + review=codex provisions both skill trees (.claude/skills and
     .agents/skills) and both hook configs."""

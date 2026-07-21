@@ -642,10 +642,11 @@ def provision_worktree(
                 continue
             _copy_traversable(src, dst)
 
-    # per-CLI signal-hook registration, baked to the main repo's relay (absolute).
-    # Hookless profiles (HTTP/SSE transport) have no config to merge.
+    # Per-CLI signal-hook registration, baked to the main repo's relay (absolute).
+    # User-scoped profiles (Hermes) inherit their already-registered HERMES_HOME
+    # hook and must never treat a worktree's config.yaml as their own config.
     for profile in profiles:
-        if profile.hookless:
+        if profile.hookless or profile.hook_scope != "project":
             continue
         config_path = worktree / profile.hooks.config_path
         config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -669,9 +670,14 @@ def provision_worktree(
     # configs) from the unit's `git add -A`, in case a project doesn't gitignore
     # its tool dirs.
     patterns = {f"/{p.skill_tree}" for p in profiles}
-    # hookless profiles have no config_path — and their empty string would render
-    # as the pattern "/", git-excluding the entire worktree.
-    patterns |= {f"/{p.hooks.config_path}" for p in profiles if not p.hookless}
+    # Hookless profiles have no config_path — and their empty string would render
+    # as the pattern "/", git-excluding the entire worktree. User-scoped profiles
+    # likewise own no worktree config and must not exclude a project's config.yaml.
+    patterns |= {
+        f"/{p.hooks.config_path}"
+        for p in profiles
+        if not p.hookless and p.hook_scope == "project"
+    }
     patterns |= {f"/{rel}" for rel in seeded}
     _worktree_local_exclude(worktree, sorted(patterns))
 
