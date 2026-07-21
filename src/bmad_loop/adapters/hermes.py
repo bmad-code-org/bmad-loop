@@ -27,6 +27,13 @@ class HermesAdapter(GenericAdapter):
             argv += [self.profile.model_flag, spec.model]
         return argv
 
+    def interactive_env(self, spec: SessionSpec) -> dict[str, str]:
+        env = super().interactive_env(spec)
+        # Hermes discovers project-local skills through this explicit directory.
+        # Respect a caller override for custom shared skill layouts.
+        env.setdefault("HERMES_PROJECT_SKILLS", str((spec.cwd / self.profile.skill_tree).resolve()))
+        return env
+
     def start_session(self, spec: SessionSpec) -> SessionHandle:
         self._prepare_session(spec)
         handle = self._launch_session(spec, self.build_command(spec))

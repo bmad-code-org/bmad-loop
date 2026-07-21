@@ -22,6 +22,7 @@ class StubMux:
         self.alive = alive
         self.sessions: set[str] = set()
         self.commands: list[str] = []
+        self.envs: list[dict[str, str]] = []
         self.sent: list[tuple[str, str]] = []
 
     def has_session(self, name):
@@ -34,6 +35,7 @@ class StubMux:
         pass
 
     def new_window(self, session, name, cwd, env, command):
+        self.envs.append(env)
         self.commands.append(command)
         return "@hermes"
 
@@ -82,6 +84,36 @@ def test_hermes_start_injects_prompt_after_live_startup(tmp_path, monkeypatch):
 
     assert mux.commands == ["hermes --cli --accept-hooks --yolo --model test-model"]
     assert mux.sent == [(handle.native_id, "Use the $bmad-dev-auto skill now: todo-1")]
+
+
+def test_hermes_start_exposes_project_skill_tree_to_tmux_session(tmp_path, monkeypatch):
+    mux = StubMux(alive=True)
+    adapter = make_adapter(tmp_path, mux)
+    monkeypatch.setattr("bmad_loop.adapters.hermes.time.sleep", lambda _: None)
+
+    adapter.start_session(make_spec(tmp_path))
+
+    assert mux.envs[0]["HERMES_PROJECT_SKILLS"] == str((tmp_path / ".agents" / "skills").resolve())
+
+
+def test_hermes_start_preserves_explicit_project_skills_env(tmp_path, monkeypatch):
+    mux = StubMux(alive=True)
+    adapter = make_adapter(tmp_path, mux)
+    monkeypatch.setattr("bmad_loop.adapters.hermes.time.sleep", lambda _: None)
+    spec = make_spec(tmp_path)
+    explicit = tmp_path / "shared-skills"
+    spec = SessionSpec(
+        task_id=spec.task_id,
+        role=spec.role,
+        prompt=spec.prompt,
+        cwd=spec.cwd,
+        env={**spec.env, "HERMES_PROJECT_SKILLS": str(explicit)},
+        model=spec.model,
+    )
+
+    adapter.start_session(spec)
+
+    assert mux.envs[0]["HERMES_PROJECT_SKILLS"] == str(explicit)
 
 
 def test_hermes_start_fails_when_pane_dies_during_startup(tmp_path, monkeypatch):

@@ -301,7 +301,7 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
             self.session_name,
             spec.task_id[-40:],
             spec.cwd,
-            {**self.profile.env, **spec.env},
+            self.interactive_env(spec),
             command,
         )
         log_file = self.logs_dir / f"{spec.task_id}.log"
