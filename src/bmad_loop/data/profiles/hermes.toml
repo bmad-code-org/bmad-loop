@@ -1,0 +1,17 @@
+# Hermes Agent uses its normal interactive REPL in an attachable tmux pane.
+# The initial BMAD prompt is injected after startup rather than passed as argv.
+name = "hermes"
+binary = "hermes"
+adapter = "hermes"
+hook_scope = "user"
+prompt_template = "Use the ${skill} skill now: {args}"
+launch_args = ["--cli", "--accept-hooks", "--yolo"]
+model_flag = "--model"
+usage_parser = "none"
+skill_tree = ".agents/skills"
+first_run_note = "run `hermes --cli` once and approve the bmad-loop relay hook; spawned sessions pass --accept-hooks"
+
+[hooks]
+dialect = "hermes-config-yaml"
+config_path = "config.yaml"
+events = { post_llm_call = "Stop" }

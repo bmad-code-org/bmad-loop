@@ -283,7 +283,7 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
 
     # --------------------------------------------------------------- adapter
 
-    def start_session(self, spec: SessionSpec) -> SessionHandle:
+    def _prepare_session(self, spec: SessionSpec) -> None:
         task_dir = self.tasks_dir / spec.task_id
         task_dir.mkdir(parents=True, exist_ok=True)
         (task_dir / "prompt.txt").write_text(spec.prompt + "\n", encoding="utf-8")
@@ -291,6 +291,7 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
         # so a session that writes nothing can't be read as a stale completion.
         (task_dir / "result.json").unlink(missing_ok=True)
 
+    def _launch_session(self, spec: SessionSpec, command: str) -> SessionHandle:
         self._ensure_session(spec.cwd)
         # Stamped before launch: hook events carry wall-clock ns, and
         # wait_for_completion ignores anything older than this floor so a reused
@@ -301,7 +302,7 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
             spec.task_id[-40:],
             spec.cwd,
             {**self.profile.env, **spec.env},
-            self.build_command(spec),
+            command,
         )
         log_file = self.logs_dir / f"{spec.task_id}.log"
         # pipe_pane tolerates the window having already died (a CLI that crashes on
@@ -309,6 +310,10 @@ class GenericAdapter(_ResultFileMixin, CodingCLIAdapter):
         # reported as a crash in wait_for_completion.
         self.mux.pipe_pane(window_id, log_file)
         return SessionHandle(task_id=spec.task_id, native_id=window_id, launched_ns=launched_ns)
+
+    def start_session(self, spec: SessionSpec) -> SessionHandle:
+        self._prepare_session(spec)
+        return self._launch_session(spec, self.build_command(spec))
 
     def wait_for_completion(self, handle: SessionHandle, spec: SessionSpec) -> SessionResult:
         deadline = time.monotonic() + spec.timeout_s

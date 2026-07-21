@@ -31,7 +31,9 @@ from . import (
     verify,
 )
 from .adapters.base import CodingCLIAdapter
+from .adapters.profile import CANONICAL_EVENTS
 from .checks import Finding, ValidationReport
+from .hermes_hooks import relay_event
 
 # The --json document builders live in documents.py (the library-level projection
 # layer a non-CLI frontend imports). The schema constants are re-exported rather
@@ -199,11 +201,20 @@ def _make_adapters(project: Path, run_dir: Path, policy) -> dict[str, CodingCLIA
                     stop_without_result_nudges=cfg.stop_without_result_nudges,
                     mux=mux,
                 )
-                by_cfg[key] = (
-                    GenericDevAdapter(**common, paths=paths)
-                    if synthesizes
-                    else GenericAdapter(**common)
-                )
+                if profile.adapter == "hermes":
+                    from .adapters.hermes import HermesAdapter, HermesDevAdapter
+
+                    by_cfg[key] = (
+                        HermesDevAdapter(**common, paths=paths)
+                        if synthesizes
+                        else HermesAdapter(**common)
+                    )
+                else:
+                    by_cfg[key] = (
+                        GenericDevAdapter(**common, paths=paths)
+                        if synthesizes
+                        else GenericAdapter(**common)
+                    )
         adapters[role] = by_cfg[key]
     return adapters
 
@@ -339,8 +350,6 @@ def _platform_preflight() -> list[Finding]:
 
 
 def cmd_validate(args: argparse.Namespace) -> int:
-    from .install import relay_registered
-
     project = _project(args)
     report = ValidationReport()
 
@@ -449,20 +458,12 @@ def cmd_validate(args: argparse.Namespace) -> int:
                     {"profile": profile.name},
                 )
             continue
-        hook_config = project / profile.hooks.config_path
-        hooks_ok = False
-        if hook_config.is_file():
-            try:
-                parsed = json.loads(hook_config.read_text(encoding="utf-8"))
-                hooks_ok = isinstance(parsed, dict) and relay_registered(
-                    parsed, profile.hooks.dialect, profile.hooks.events
-                )
-            except json.JSONDecodeError:
-                report.fail(
-                    "hooks.config-parse",
-                    f"{hook_config} is not valid JSON",
-                    {"profile": profile.name, "config_path": str(hook_config)},
-                )
+        hook_config = (
+            install.hermes_config_path(os.environ)
+            if profile.hook_scope == "user"
+            else project / profile.hooks.config_path
+        )
+        hooks_ok = install.hooks_registered(project, profile)
         if hooks_ok:
             report.ok(
                 "hooks.registered",
@@ -2254,6 +2255,16 @@ def cmd_init(args: argparse.Namespace) -> int:
     return install_into(project, clis=clis, skills=args.skills, force_skills=args.force_skills)
 
 
+def cmd_relay(args: argparse.Namespace) -> int:
+    """Receive a Hermes post-turn hook payload and emit a canonical BMAD event."""
+    try:
+        payload = json.load(sys.stdin)
+    except (json.JSONDecodeError, ValueError):
+        payload = {}
+    relay_event(args.event, payload if isinstance(payload, dict) else {}, os.environ)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="bmad-loop",
@@ -2275,7 +2286,7 @@ def main(argv: list[str] | None = None) -> int:
         "--cli",
         action="append",
         metavar="PROFILE",
-        help="CLI profile(s) to register hooks for (claude | codex | gemini | copilot | "
+        help="CLI profile(s) to register hooks for (claude | codex | gemini | copilot | hermes | "
         "antigravity | opencode-http (alias: opencode) | custom; "
         "repeatable; default: profiles referenced by .bmad-loop/policy.toml, or claude)",
     )
@@ -2290,6 +2301,8 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="overwrite bmad-loop-* skill dirs that already exist (default: skip them)",
     )
+    relay_p = add("relay", cmd_relay, "write one canonical event from a coding-CLI hook payload")
+    relay_p.add_argument("event", choices=sorted(CANONICAL_EVENTS))
     validate_p = add("validate", cmd_validate, "preflight checks; exit non-zero on failure")
     validate_p.add_argument(
         "--spec",
@@ -2331,7 +2344,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     probe_p.add_argument(
         "cli",
-        help="CLI profile name (claude | codex | gemini | copilot | antigravity | custom; "
+        help="CLI profile name (claude | codex | gemini | copilot | hermes | antigravity | custom; "
         "opencode-http is HTTP-driven — nothing to probe)",
     )
     probe_p.add_argument(

@@ -12,6 +12,7 @@ from bmad_loop.install import (
     LEGACY_MODULE_SKILLS,
     MODULE_SKILLS,
     _copy_traversable,
+    hooks_registered,
     install_into,
     merge_hooks,
     missing_base_skills,
@@ -35,6 +36,38 @@ def _registrations(profile, command="python3 /x/.bmad-loop/bmad_loop_hook.py {ev
         native: command.format(event=canonical)
         for native, canonical in profile.hooks.events.items()
     }
+
+
+def test_install_hermes_registers_one_user_scoped_relay(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    config_path = hermes_home / "config.yaml"
+    config_path.write_text(
+        "hooks:\n  post_llm_call:\n    - command: unrelated-hook\n      timeout: 5\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    assert install_into(tmp_path, clis=("hermes",), skills=False) == 0
+    assert install_into(tmp_path, clis=("hermes",), skills=False) == 0
+
+    config = config_path.read_text(encoding="utf-8")
+    assert "command: unrelated-hook" in config
+    assert config.count("command: bmad-loop relay Stop") == 1
+    assert not (tmp_path / "config.yaml").exists()
+    assert not (tmp_path / ".bmad-loop" / "bmad_loop_hook.py").exists()
+
+
+def test_hermes_user_scoped_relay_registration_is_detected(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "hooks:\n  post_llm_call:\n    - command: bmad-loop relay Stop\n      timeout: 10\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    assert hooks_registered(tmp_path, get_profile("hermes")) is True
 
 
 def test_merge_hooks_adds_all_events():

@@ -58,7 +58,7 @@ from pathlib import Path
 from . import sanitize
 from .adapters.multiplexer import MultiplexerError, get_multiplexer
 from .adapters.profile import CLIProfile
-from .install import merge_hooks, relay_registered
+from .install import hooks_registered, merge_hooks
 from .process_host import get_process_host
 
 # cmd_probe catches `probe.LeakDetected` around the renderers, mirroring
@@ -404,18 +404,7 @@ def infer_token_schema(
 
 
 def _hooks_registered(project: Path, profile: CLIProfile) -> bool:
-    config_path = project / profile.hooks.config_path
-    if not config_path.is_file():
-        return False
-    import json
-
-    try:
-        config = json.loads(config_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return False
-    if not isinstance(config, dict):
-        return False
-    return relay_registered(config, profile.hooks.dialect, profile.hooks.events)
+    return hooks_registered(project, profile)
 
 
 # ----------------------------------------------------------------- SCAN mode
@@ -601,6 +590,14 @@ def probe(
         dialect=profile.hooks.dialect,
         declared_events=dict(profile.hooks.events),
     )
+    if profile.hook_scope == "user":
+        scanned = scan(cli=cli, profile=profile, project=project, hints=hints, pseudo=pseudo)
+        scanned.mode = "probe"
+        scanned.warnings.append(
+            "live probing is unavailable for user-scoped Hermes hooks; "
+            "use `hermes hooks test post_llm_call` to verify the installed relay"
+        )
+        return scanned
     finding.flags = run_version_help(binary)
 
     # The live probe launches through the selected multiplexer backend (see

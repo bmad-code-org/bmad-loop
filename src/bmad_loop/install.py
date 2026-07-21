@@ -17,14 +17,18 @@ orchestrator's signal watcher is CLI-agnostic.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from collections.abc import Iterable, Sequence
 from importlib import resources
 from pathlib import Path
 
+import yaml
+
 from .adapters.profile import ALIASES, CLIProfile, ProfileError, load_profiles
 from .checks import Finding
+from .hermes_hooks import HERMES_RELAY_COMMAND, hermes_config_path, merge_hermes_stop_hook
 from .policy import POLICY_TEMPLATE
 from .process_host import get_process_host
 
@@ -259,7 +263,34 @@ def _managed_hook_in_handlers(handlers) -> bool:
 def relay_registered(config: dict, dialect: str, events: Iterable[str]) -> bool:
     """True if the bmad-loop relay is registered for any of `events`."""
     container = hook_event_container(config, dialect)
+    if dialect == "hermes-config-yaml":
+        return any(
+            any(
+                isinstance(entry, dict) and entry.get("command") == HERMES_RELAY_COMMAND
+                for entry in container.get(event, [])
+            )
+            for event in events
+        )
     return any(_relay_in_handlers(container.get(event, [])) for event in events)
+
+
+def hooks_registered(project: Path, profile: CLIProfile) -> bool:
+    """Read the profile's hook config and report whether its managed relay exists."""
+    if profile.hook_scope == "user":
+        config_path = hermes_config_path(os.environ)
+        try:
+            config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        except (OSError, yaml.YAMLError):
+            return False
+    else:
+        config_path = project / profile.hooks.config_path
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+    return isinstance(config, dict) and relay_registered(
+        config, profile.hooks.dialect, profile.hooks.events
+    )
 
 
 def merge_hooks(config: dict, registrations: dict[str, str], dialect: str) -> tuple[dict, bool]:
@@ -380,6 +411,35 @@ def _register_hooks(project: Path, profile: CLIProfile) -> int:
         if changed:
             print(f"  hooks registered ({profile.name}): {config_path}")
     elif not removed:
+        print(f"  hooks already registered ({profile.name})")
+    return 0
+
+
+def _register_user_scoped_hooks(profile: CLIProfile) -> int:
+    """Register Hermes's managed relay without disturbing its normal config."""
+    config_path = hermes_config_path(os.environ)
+    config: dict = {}
+    if config_path.is_file():
+        try:
+            loaded = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        except yaml.YAMLError:
+            print(f"FAIL: {config_path} is not valid YAML; fix it and re-run init")
+            return 1
+        if loaded is not None:
+            if not isinstance(loaded, dict):
+                print(f"FAIL: {config_path} must contain a YAML mapping; fix it and re-run init")
+                return 1
+            config = loaded
+    try:
+        config, changed = merge_hermes_stop_hook(config)
+    except ValueError as exc:
+        print(f"FAIL: {config_path}: {exc}")
+        return 1
+    if changed:
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+        print(f"  hooks registered ({profile.name}): {config_path}")
+    else:
         print(f"  hooks already registered ({profile.name})")
     return 0
 
@@ -667,15 +727,21 @@ def install_into(
     bmad_loop_dir = project / ".bmad-loop"
     bmad_loop_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. hook relay script (shared by all CLIs)
-    script_target = project / HOOK_SCRIPT_REL
-    script_source = resources.files("bmad_loop.data").joinpath("bmad_loop_hook.py")
-    script_target.write_text(script_source.read_text(encoding="utf-8"), encoding="utf-8")
-    print(f"  hook script: {script_target}")
+    # 1. project-scoped coding CLIs share the copied hook script. Hermes uses
+    # the package-owned `bmad-loop relay` command in its user-scoped config.
+    if any(profile.hook_scope == "project" and not profile.hookless for profile in profiles):
+        script_target = project / HOOK_SCRIPT_REL
+        script_source = resources.files("bmad_loop.data").joinpath("bmad_loop_hook.py")
+        script_target.write_text(script_source.read_text(encoding="utf-8"), encoding="utf-8")
+        print(f"  hook script: {script_target}")
 
     # 2. per-CLI hook registration
     for profile in profiles:
-        if _register_hooks(project, profile) != 0:
+        if profile.hook_scope == "user":
+            status = _register_user_scoped_hooks(profile)
+        else:
+            status = _register_hooks(project, profile)
+        if status != 0:
             return 1
 
     # 3. bundled skills into each CLI's skill tree (deduped: codex+gemini share
