@@ -2242,6 +2242,25 @@ def cmd_diagnose(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_relay(args: argparse.Namespace) -> int:
+    """Write one canonical BMAD event from a coding-CLI hook payload on stdin.
+
+    The general, in-tree counterpart to ``data/bmad_loop_hook.py`` for
+    global/user-scoped-hook adapters: such an adapter points its native hook at
+    ``bmad-loop relay <Event>``, which reads the hook's JSON payload from stdin
+    and defers to :func:`bmad_loop.events.write_relay_event`. The write is
+    env-gated to the active task, so it is a no-op outside a bmad-loop session.
+    """
+    from .events import write_relay_event
+
+    try:
+        payload = json.load(sys.stdin)
+    except (json.JSONDecodeError, ValueError):
+        payload = {}
+    write_relay_event(args.event, payload if isinstance(payload, dict) else {}, os.environ)
+    return 0
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     from .install import install_into
 
@@ -2322,6 +2341,19 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="with set: persist a name not registered in this process (e.g. a plugin "
         "backend that only registers on the target machine)",
+    )
+
+    from .adapters.profile import CANONICAL_EVENTS
+
+    relay_p = add(
+        "relay",
+        cmd_relay,
+        "write one canonical event from a coding-CLI hook payload read on stdin",
+    )
+    relay_p.add_argument(
+        "event",
+        choices=sorted(CANONICAL_EVENTS),
+        help="canonical event name to record (the CLI hook maps its native event to this)",
     )
 
     probe_p = add(

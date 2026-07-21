@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """Coding-CLI hook relay for bmad-loop. Stdlib only.
 
+The event schema and its atomic write are ALSO owned by
+``bmad_loop.events.write_relay_event`` (which the ``bmad-loop relay`` CLI uses).
+This script keeps its own inlined copy on purpose: it is installed into a target
+project as a lone file (``.bmad-loop/bmad_loop_hook.py``) and run as a bare
+subprocess where the ``bmad_loop`` package need not be importable, so it can only
+depend on the stdlib. ``tests/test_relay_event.py`` pins this copy and the
+primitive to the same schema — keep the two in sync when either changes.
+
 Each CLI's hook config registers this script under its native event names
 (Claude/Codex: SessionStart/Stop/..., Gemini: AfterAgent for Stop, Copilot:
 agentStop for Stop) but always passes the CANONICAL event name as argv[1] — the
