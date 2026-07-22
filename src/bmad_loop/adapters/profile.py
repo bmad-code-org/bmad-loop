@@ -27,12 +27,15 @@ HOOK_DIALECTS = {
     "gemini-settings-json",
     "copilot-settings-json",
     "antigravity-hooks-json",
+    "hermes-config-yaml",
     # hookless: the adapter observes completion itself (HTTP/SSE transport) —
     # no hook config is ever written, so config_path/events must stay empty.
     "none",
 }
 CANONICAL_EVENTS = {"SessionStart", "Stop", "SessionEnd", "PreCompact"}
 USER_PROFILES_REL = Path(".bmad-loop") / "profiles"
+ADAPTER_KINDS = {"generic", "hermes"}
+HOOK_SCOPES = {"project", "user"}
 
 # legacy adapter names from older policy.toml files, plus friendly short names
 ALIASES = {"claude-code-tmux": "claude", "opencode": "opencode-http"}
@@ -54,6 +57,8 @@ class CLIProfile:
     name: str
     binary: str
     hooks: HookSpec
+    adapter: str = "generic"
+    hook_scope: str = "project"
     # project-relative tree this CLI reads skills from, e.g. ".claude/skills"
     # (claude) or ".agents/skills" (codex/gemini); `bmad-loop init` installs the
     # bundled bmad-loop-* skills here.
@@ -117,6 +122,17 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
     if not name or not binary:
         raise fail("'name' and 'binary' are required")
 
+    adapter = str(doc.get("adapter", "generic"))
+    if adapter not in ADAPTER_KINDS:
+        raise fail(f"adapter must be one of {sorted(ADAPTER_KINDS)}: got {adapter!r}")
+    hook_scope = str(doc.get("hook_scope", "project"))
+    if hook_scope not in HOOK_SCOPES:
+        raise fail(f"hook_scope must be one of {sorted(HOOK_SCOPES)}: got {hook_scope!r}")
+    if adapter == "hermes" and hook_scope != "user":
+        raise fail('adapter = "hermes" requires hook_scope = "user"')
+    if hook_scope == "user" and adapter != "hermes":
+        raise fail('hook_scope = "user" requires adapter = "hermes"')
+
     hooks_d = doc.get("hooks")
     if not isinstance(hooks_d, dict):
         raise fail("missing [hooks] table")
@@ -132,7 +148,13 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
         events: dict[str, str] = {}
     else:
         config_path = str(hooks_d.get("config_path", ""))
-        if not config_path or is_absolute_path(config_path) or has_parent_ref(config_path):
+        if hook_scope == "user":
+            if dialect != "hermes-config-yaml" or config_path != "config.yaml":
+                raise fail(
+                    'user-scoped hooks require dialect = "hermes-config-yaml" '
+                    'and config_path = "config.yaml"'
+                )
+        elif not config_path or is_absolute_path(config_path) or has_parent_ref(config_path):
             raise fail("hooks.config_path must be a project-relative path")
         events_d = hooks_d.get("events")
         if not isinstance(events_d, dict) or not events_d:
@@ -170,6 +192,8 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
         name=name,
         binary=binary,
         hooks=HookSpec(dialect=dialect, config_path=config_path, events=events),
+        adapter=adapter,
+        hook_scope=hook_scope,
         skill_tree=skill_tree,
         prompt_template=str(doc.get("prompt_template", "{prompt}")),
         launch_args=tuple(str(a) for a in doc.get("launch_args", ())),

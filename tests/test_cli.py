@@ -1365,6 +1365,23 @@ def test_make_adapters_review_synthesizes_from_spec(project, monkeypatch):
     assert not isinstance(adapters["triage"], GenericDevAdapter)
 
 
+def test_make_adapters_dispatches_hermes_profile(project, monkeypatch):
+    from bmad_loop.adapters.hermes import HermesAdapter, HermesDevAdapter
+
+    monkeypatch.setattr(mux_mod, "_usable", lambda mux: True)
+    install_bmad_config(project)
+    _write_policy(project.project, '[adapter]\nname = "hermes"\n')
+    adapters = cli._make_adapters(
+        project.project,
+        project.project / ".bmad-loop" / "runs" / "r",
+        policy_mod.load(project.project / ".bmad-loop" / "policy.toml"),
+    )
+
+    assert isinstance(adapters["dev"], HermesDevAdapter)
+    assert isinstance(adapters["review"], HermesDevAdapter)
+    assert isinstance(adapters["triage"], HermesAdapter)
+
+
 def test_make_adapters_hookless_synthesizing_roles_get_dev_adapter(project, monkeypatch):
     """Hookless dev/review (bmad-dev-auto roles) dispatch to OpencodeDevAdapter —
     the _DevSynthesisMixin composed over the HTTP transport — sharing one

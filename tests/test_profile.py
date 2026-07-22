@@ -90,6 +90,29 @@ def test_builtin_profiles_load():
         assert profiles[name].hookless is False
 
 
+def test_builtin_hermes_profile_uses_interactive_user_scoped_adapter():
+    profile = load_profiles()["hermes"]
+
+    assert profile.binary == "hermes"
+    assert profile.adapter == "hermes"
+    assert profile.hook_scope == "user"
+    assert profile.skill_tree == ".agents/skills"
+    assert profile.launch_args == ("--cli", "--accept-hooks", "--yolo")
+    assert profile.hooks.dialect == "hermes-config-yaml"
+    assert profile.hooks.events == {"post_llm_call": "Stop"}
+
+
+@pytest.mark.parametrize("field, value", [("adapter", "unknown"), ("hook_scope", "system")])
+def test_profile_rejects_unknown_adapter_and_hook_scope(tmp_path, field, value):
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    profile = MINIMAL_PROFILE.replace("[hooks]", f'{field} = "{value}"\n[hooks]')
+    (profiles_dir / "invalid.toml").write_text(profile, encoding="utf-8")
+
+    with pytest.raises(ProfileError):
+        load_profiles(tmp_path)
+
+
 def test_usage_grace_and_nudges_default_when_unset(tmp_path):
     # MINIMAL_PROFILE omits both -> 0.0 / None
     profiles_dir = tmp_path / ".bmad-loop" / "profiles"

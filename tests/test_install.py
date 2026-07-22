@@ -12,6 +12,7 @@ from bmad_loop.install import (
     LEGACY_MODULE_SKILLS,
     MODULE_SKILLS,
     _copy_traversable,
+    hooks_registered,
     install_into,
     merge_hooks,
     missing_base_skills,
@@ -35,6 +36,38 @@ def _registrations(profile, command="python3 /x/.bmad-loop/bmad_loop_hook.py {ev
         native: command.format(event=canonical)
         for native, canonical in profile.hooks.events.items()
     }
+
+
+def test_install_hermes_registers_one_user_scoped_relay(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    config_path = hermes_home / "config.yaml"
+    config_path.write_text(
+        "hooks:\n  post_llm_call:\n    - command: unrelated-hook\n      timeout: 5\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    assert install_into(tmp_path, clis=("hermes",), skills=False) == 0
+    assert install_into(tmp_path, clis=("hermes",), skills=False) == 0
+
+    config = config_path.read_text(encoding="utf-8")
+    assert "command: unrelated-hook" in config
+    assert config.count("command: bmad-loop relay Stop") == 1
+    assert not (tmp_path / "config.yaml").exists()
+    assert not (tmp_path / ".bmad-loop" / "bmad_loop_hook.py").exists()
+
+
+def test_hermes_user_scoped_relay_registration_is_detected(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "hooks:\n  post_llm_call:\n    - command: bmad-loop relay Stop\n      timeout: 10\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    assert hooks_registered(tmp_path, get_profile("hermes")) is True
 
 
 def test_merge_hooks_adds_all_events():
@@ -549,6 +582,20 @@ def test_provision_worktree_lays_down_skills_and_hook(tmp_path):
     cmd = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
     assert str((repo / ".bmad-loop" / "bmad_loop_hook.py")) in cmd
     assert not (wt / ".bmad-loop").exists()
+
+
+def test_provision_worktree_hermes_preserves_project_config_yaml(tmp_path):
+    """Hermes hooks live in HERMES_HOME, never a worktree's application config."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    project_config = wt / "config.yaml"
+    project_config.parent.mkdir(parents=True)
+    project_config.write_text("app:\n  name: keep-me\n", encoding="utf-8")
+    git(wt, "init", "-q")
+
+    provision_worktree(wt, [get_profile("hermes")], repo)
+
+    assert project_config.read_text(encoding="utf-8") == "app:\n  name: keep-me\n"
+    assert "/config.yaml" not in (wt / ".git" / "info" / "exclude").read_text(encoding="utf-8")
 
 
 def test_provision_worktree_covers_multiple_profiles(tmp_path):

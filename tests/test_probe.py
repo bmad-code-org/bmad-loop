@@ -57,6 +57,30 @@ GEMINI_ROWS = [
 ]
 
 
+def test_live_probe_for_user_scoped_hermes_falls_back_to_scan(tmp_path, monkeypatch):
+    profile = get_profile("hermes")
+    scanned = probe.ProfileFinding(
+        cli="hermes",
+        mode="scan",
+        known_profile=True,
+        binary="hermes",
+        parser="none",
+    )
+    monkeypatch.setattr(probe, "scan", lambda **_kwargs: scanned)
+    monkeypatch.setattr(
+        probe,
+        "merge_hooks",
+        lambda *_args: pytest.fail("a user-scoped Hermes config must not enter the JSON probe path"),
+    )
+
+    result = probe.probe(
+        cli="hermes", profile=profile, project=tmp_path, hints=probe.Hints(), timeout_s=1
+    )
+
+    assert result.mode == "probe"
+    assert any("user-scoped Hermes hooks" in warning for warning in result.warnings)
+
+
 # ----------------------------------------------------------- token inference
 
 
