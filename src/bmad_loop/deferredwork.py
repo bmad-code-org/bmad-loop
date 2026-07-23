@@ -18,8 +18,15 @@ from pathlib import Path
 
 HEADING_RE = re.compile(r"^### (DW-\d+): (.+?)\s*$", re.MULTILINE)
 ANY_HEADING_RE = re.compile(r"^#{1,6} ", re.MULTILINE)
-FLAT_ENTRY_RE = re.compile(r"^- source_spec:[ \t]", re.IGNORECASE | re.MULTILINE)
+FLAT_ENTRY_RE = re.compile(
+    r"^- source_spec:[^\r\n]*\n"
+    r"[ \t]+summary:[^\r\n]*\n"
+    r"[ \t]+evidence:[^\r\n]*(?:\n|$)",
+    re.IGNORECASE | re.MULTILINE,
+)
 STATUS_RE = re.compile(r"^status:[ \t]*(.*)$", re.MULTILINE)
+CANONICAL_STATUS_RE = re.compile(r"^(?:open|done \d{4}-\d{2}-\d{2})$")
+CANONICAL_SEVERITIES = frozenset({"critical", "high", "medium", "low"})
 
 
 @dataclass(frozen=True)
@@ -141,6 +148,11 @@ def field_line_present(body: str, field: str, value: str) -> bool:
     return re.search(rf"(?m)^{re.escape(field)}:[ \t]*`?{v}`?[ \t]*$", body) is not None
 
 
+def _require_single_line(name: str, value: str) -> None:
+    if "\r" in value or "\n" in value:
+        raise ValueError(f"{name} must be a single line")
+
+
 def append_entry(
     path: Path,
     *,
@@ -159,8 +171,21 @@ def append_entry(
     the same `origin:` marker and `source_spec:` — so re-running the same defer
     (e.g. a second sweep of the same story) never duplicates the entry. Creates
     the ledger (and parent dir) if it does not yet exist."""
-    if "\r" in location or "\n" in location:
-        raise ValueError("location must be a single line")
+    for name, value in (
+        ("title", title),
+        ("origin", origin),
+        ("source_spec", source_spec),
+        ("reason", reason),
+        ("location", location),
+        ("status", status),
+    ):
+        _require_single_line(name, value)
+    if severity is not None:
+        _require_single_line("severity", severity)
+        if severity not in CANONICAL_SEVERITIES:
+            raise ValueError("severity must be critical, high, medium, or low")
+    if CANONICAL_STATUS_RE.fullmatch(status) is None:
+        raise ValueError("status must be open or done YYYY-MM-DD")
     text = path.read_text(encoding="utf-8") if path.is_file() else ""
     for entry in parse_ledger(text):
         if (

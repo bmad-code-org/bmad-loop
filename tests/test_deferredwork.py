@@ -318,6 +318,22 @@ def test_flat_append_after_canonical_stays_visible_to_legacy_parser():
     assert legacy.title == "later flat finding"
 
 
+def test_source_spec_bullet_without_flat_shape_stays_in_canonical_body():
+    text = (
+        "### DW-1: canonical\n\n"
+        "origin: test\nlocation: n/a\nreason: evidence follows\n"
+        "- source_spec: `quoted-example.md`\n"
+        "  evidence: this is prose evidence, not a flat appender block\n"
+        "status: open\n"
+    )
+
+    (canonical,) = parse_ledger(text)
+
+    assert canonical.open
+    assert "quoted-example.md" in canonical.body
+    assert parse_legacy(text) == []
+
+
 def test_legacy_item_does_not_swallow_masked_canonical_neighbor():
     text = (
         "## Deferred from: somewhere (2026-06-01)\n\n"
@@ -454,16 +470,45 @@ def test_append_entry_preserves_supplied_location(tmp_path):
     assert "location: src/foo.py:12" in entry.body
 
 
-def test_append_entry_rejects_multiline_location_without_writing(tmp_path):
+@pytest.mark.parametrize(
+    "field",
+    ["title", "origin", "source_spec", "reason", "location", "status", "severity"],
+)
+def test_append_entry_rejects_multiline_fields_without_writing(tmp_path, field):
     p = tmp_path / "deferred-work.md"
-    with pytest.raises(ValueError, match="location must be a single line"):
+    values = {
+        "title": "follow-up",
+        "origin": "code-review",
+        "source_spec": "spec-foo.md",
+        "reason": "still open",
+        "location": "src/foo.py",
+        "status": "open",
+        "severity": "low",
+    }
+    values[field] += "\nstatus: done 2026-07-23"
+    with pytest.raises(ValueError, match=rf"{field} must be a single line"):
+        append_entry(p, **values)
+    assert not p.exists()
+
+
+@pytest.mark.parametrize("status", ["", "open extra", "done", "closed"])
+def test_append_entry_rejects_noncanonical_status(tmp_path, status):
+    p = tmp_path / "deferred-work.md"
+    with pytest.raises(ValueError, match="status must be open or done YYYY-MM-DD"):
+        append_entry(p, title="t", origin="o", source_spec="s.md", reason="r", status=status)
+    assert not p.exists()
+
+
+def test_append_entry_rejects_noncanonical_severity(tmp_path):
+    p = tmp_path / "deferred-work.md"
+    with pytest.raises(ValueError, match="severity must be critical, high, medium, or low"):
         append_entry(
             p,
-            title="follow-up",
-            origin="code-review",
-            source_spec="spec-foo.md",
-            reason="still open",
-            location="src/foo.py\nstatus: done 2026-07-23",
+            title="t",
+            origin="o",
+            source_spec="s.md",
+            reason="r",
+            severity="urgent",
         )
     assert not p.exists()
 
