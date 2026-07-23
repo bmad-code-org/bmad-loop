@@ -299,6 +299,23 @@ def test_mixed_ledger_keeps_both_views_separate():
     assert all("DW-" not in e.body for e in entries)
 
 
+def test_flat_append_after_canonical_stays_visible_to_legacy_parser():
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: canonical\n\n"
+        "origin: test\nlocation: n/a\nreason: test\nstatus: open\n\n"
+        "- source_spec: `spec-next.md`\n"
+        "  summary: later flat finding\n"
+        "  evidence: must not be swallowed by DW-1\n"
+    )
+
+    (canonical,) = parse_ledger(text)
+    (legacy,) = parse_legacy(text)
+
+    assert "later flat finding" not in canonical.body
+    assert legacy.title == "later flat finding"
+
+
 def test_legacy_item_does_not_swallow_masked_canonical_neighbor():
     text = (
         "## Deferred from: somewhere (2026-06-01)\n\n"
@@ -414,6 +431,7 @@ def test_append_entry_numbers_and_writes(tmp_path):
     assert "DW-5" in entries and entries["DW-5"].open
     body = entries["DW-5"].body
     assert "origin: review-budget-followup" in body
+    assert "location: n/a" in body
     assert "source_spec: `spec-foo.md`" in body
     assert "severity: low" in body
     assert "follow-up still recommended for dw-x" in body

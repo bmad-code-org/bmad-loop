@@ -18,6 +18,7 @@ from pathlib import Path
 
 HEADING_RE = re.compile(r"^### (DW-\d+): (.+?)\s*$", re.MULTILINE)
 ANY_HEADING_RE = re.compile(r"^#{1,6} ", re.MULTILINE)
+FLAT_ENTRY_RE = re.compile(r"^- source_spec:[ \t]", re.IGNORECASE | re.MULTILINE)
 STATUS_RE = re.compile(r"^status:[ \t]*(.*)$", re.MULTILINE)
 
 
@@ -46,6 +47,9 @@ def parse_ledger(text: str) -> list[DWEntry]:
         other = ANY_HEADING_RE.search(text, m.end(), end)
         if other:
             end = other.start()
+        flat = FLAT_ENTRY_RE.search(text, m.end(), end)
+        if flat:
+            end = flat.start()
         body = text[m.start() : end]
         status_m = STATUS_RE.search(body)
         entries.append(
@@ -144,6 +148,7 @@ def append_entry(
     origin: str,
     source_spec: str,
     reason: str,
+    location: str = "n/a",
     status: str = "open",
     severity: str | None = None,
 ) -> str | None:
@@ -163,7 +168,12 @@ def append_entry(
         ):
             return None
     dw_id = f"DW-{next_seq(text)}"
-    lines = [f"### {dw_id}: {title}", f"origin: {origin}", f"source_spec: `{source_spec}`"]
+    lines = [
+        f"### {dw_id}: {title}",
+        f"origin: {origin}",
+        f"location: {location}",
+        f"source_spec: `{source_spec}`",
+    ]
     if severity:
         lines.append(f"severity: {severity}")
     lines.append(f"reason: {reason}")
