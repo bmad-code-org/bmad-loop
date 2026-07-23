@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import pytest
+
 from bmad_loop.deferredwork import (
     append_decision,
     append_entry,
@@ -435,6 +437,35 @@ def test_append_entry_numbers_and_writes(tmp_path):
     assert "source_spec: `spec-foo.md`" in body
     assert "severity: low" in body
     assert "follow-up still recommended for dw-x" in body
+
+
+def test_append_entry_preserves_supplied_location(tmp_path):
+    p = tmp_path / "deferred-work.md"
+    new_id = append_entry(
+        p,
+        title="follow-up",
+        origin="code-review",
+        source_spec="spec-foo.md",
+        reason="still open",
+        location="src/foo.py:12",
+    )
+    assert new_id == "DW-1"
+    (entry,) = parse_ledger(p.read_text())
+    assert "location: src/foo.py:12" in entry.body
+
+
+def test_append_entry_rejects_multiline_location_without_writing(tmp_path):
+    p = tmp_path / "deferred-work.md"
+    with pytest.raises(ValueError, match="location must be a single line"):
+        append_entry(
+            p,
+            title="follow-up",
+            origin="code-review",
+            source_spec="spec-foo.md",
+            reason="still open",
+            location="src/foo.py\nstatus: done 2026-07-23",
+        )
+    assert not p.exists()
 
 
 def test_append_entry_idempotent_for_open_origin_and_spec(tmp_path):

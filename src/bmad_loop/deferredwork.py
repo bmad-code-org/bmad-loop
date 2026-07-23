@@ -159,6 +159,8 @@ def append_entry(
     the same `origin:` marker and `source_spec:` — so re-running the same defer
     (e.g. a second sweep of the same story) never duplicates the entry. Creates
     the ledger (and parent dir) if it does not yet exist."""
+    if "\r" in location or "\n" in location:
+        raise ValueError("location must be a single line")
     text = path.read_text(encoding="utf-8") if path.is_file() else ""
     for entry in parse_ledger(text):
         if (
