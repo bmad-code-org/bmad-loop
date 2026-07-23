@@ -115,6 +115,34 @@ def test_mark_done_missing_entry(tmp_path):
     assert path.read_text(encoding="utf-8") == snapshot
 
 
+@pytest.mark.parametrize(
+    ("date", "note"),
+    [
+        ("2026-06-11\n### DW-99: injected", "fixed"),
+        ("2026-06-11", "fixed\n### DW-99: injected\nstatus: open"),
+        ("2026-06-11", "fixed\u2028### DW-99: injected\u2028status: open"),
+    ],
+)
+def test_mark_done_rejects_line_breaks_without_writing(tmp_path, date, note):
+    path = write_ledger(tmp_path)
+    snapshot = path.read_text(encoding="utf-8")
+
+    with pytest.raises(ValueError, match="must be a single line"):
+        mark_done(path, "DW-1", date, note)
+
+    assert path.read_text(encoding="utf-8") == snapshot
+
+
+def test_mark_done_rejects_impossible_calendar_date_without_writing(tmp_path):
+    path = write_ledger(tmp_path)
+    snapshot = path.read_text(encoding="utf-8")
+
+    with pytest.raises(ValueError, match="date must be YYYY-MM-DD"):
+        mark_done(path, "DW-1", "2026-02-30", "fixed")
+
+    assert path.read_text(encoding="utf-8") == snapshot
+
+
 def test_append_decision(tmp_path):
     path = write_ledger(tmp_path)
     assert append_decision(path, "DW-3", "2026-06-11", "Keep cap", "frozen intent stands")
@@ -136,6 +164,35 @@ def test_append_decision_then_mark_done(tmp_path):
 def test_append_decision_missing_file(tmp_path):
     assert not append_decision(tmp_path / "nope.md", "DW-1", "2026-06-11", "x", "y")
     assert not mark_done(tmp_path / "nope.md", "DW-1", "2026-06-11", "x")
+
+
+@pytest.mark.parametrize(
+    ("date", "label", "detail"),
+    [
+        ("2026-06-11\n### DW-98: injected", "Keep", "detail"),
+        ("2026-06-11", "Keep\n### DW-98: injected", "detail"),
+        ("2026-06-11", "Keep", "detail\n### DW-98: injected\nstatus: open"),
+        ("2026-06-11", "Keep", "detail\u2028### DW-98: injected\u2028status: open"),
+    ],
+)
+def test_append_decision_rejects_line_breaks_without_writing(tmp_path, date, label, detail):
+    path = write_ledger(tmp_path)
+    snapshot = path.read_text(encoding="utf-8")
+
+    with pytest.raises(ValueError, match="must be a single line"):
+        append_decision(path, "DW-3", date, label, detail)
+
+    assert path.read_text(encoding="utf-8") == snapshot
+
+
+def test_append_decision_rejects_impossible_calendar_date_without_writing(tmp_path):
+    path = write_ledger(tmp_path)
+    snapshot = path.read_text(encoding="utf-8")
+
+    with pytest.raises(ValueError, match="date must be YYYY-MM-DD"):
+        append_decision(path, "DW-3", "2026-02-30", "Keep", "detail")
+
+    assert path.read_text(encoding="utf-8") == snapshot
 
 
 # ------------------------------------------------------------------- legacy
@@ -318,6 +375,33 @@ def test_flat_append_after_canonical_stays_visible_to_legacy_parser():
     assert legacy.title == "later flat finding"
 
 
+def test_flat_append_boundary_accepts_crlf():
+    newline = "\r\n"
+    text = newline.join(
+        [
+            "# Deferred Work",
+            "",
+            "### DW-1: canonical",
+            "",
+            "origin: test",
+            "location: n/a",
+            "reason: test",
+            "status: open",
+            "",
+            "- source_spec: `spec-next.md`",
+            "  summary: later flat finding",
+            "  evidence: must not be swallowed by DW-1",
+            "",
+        ]
+    )
+
+    (canonical,) = parse_ledger(text)
+    (legacy,) = parse_legacy(text)
+
+    assert "later flat finding" not in canonical.body
+    assert legacy.title == "later flat finding"
+
+
 def test_source_spec_bullet_without_flat_shape_stays_in_canonical_body():
     text = (
         "### DW-1: canonical\n\n"
@@ -491,11 +575,59 @@ def test_append_entry_rejects_multiline_fields_without_writing(tmp_path, field):
     assert not p.exists()
 
 
+@pytest.mark.parametrize(
+    "field",
+    ["title", "origin", "source_spec", "reason", "location", "status", "severity"],
+)
+def test_append_entry_rejects_unicode_line_separator_without_writing(tmp_path, field):
+    p = tmp_path / "deferred-work.md"
+    values = {
+        "title": "follow-up",
+        "origin": "code-review",
+        "source_spec": "spec-foo.md",
+        "reason": "still open",
+        "location": "src/foo.py",
+        "status": "open",
+        "severity": "low",
+    }
+    values[field] += "\u2028status: done 2026-07-23"
+
+    with pytest.raises(ValueError, match=rf"{field} must be a single line"):
+        append_entry(p, **values)
+
+    assert not p.exists()
+
+
+def test_append_entry_rejects_empty_title_without_writing(tmp_path):
+    p = tmp_path / "deferred-work.md"
+
+    with pytest.raises(ValueError, match="title must not be empty"):
+        append_entry(p, title="", origin="o", source_spec="s.md", reason="r")
+
+    assert not p.exists()
+
+
 @pytest.mark.parametrize("status", ["", "open extra", "done", "closed"])
 def test_append_entry_rejects_noncanonical_status(tmp_path, status):
     p = tmp_path / "deferred-work.md"
     with pytest.raises(ValueError, match="status must be open or done YYYY-MM-DD"):
         append_entry(p, title="t", origin="o", source_spec="s.md", reason="r", status=status)
+    assert not p.exists()
+
+
+def test_append_entry_rejects_impossible_done_date_without_writing(tmp_path):
+    p = tmp_path / "deferred-work.md"
+
+    with pytest.raises(ValueError, match="status must be open or done YYYY-MM-DD"):
+        append_entry(
+            p,
+            title="t",
+            origin="o",
+            source_spec="s.md",
+            reason="r",
+            status="done 2026-02-30",
+        )
+
     assert not p.exists()
 
 

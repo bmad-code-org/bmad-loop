@@ -14,19 +14,21 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass
+from datetime import date as calendar_date
 from pathlib import Path
 
 HEADING_RE = re.compile(r"^### (DW-\d+): (.+?)\s*$", re.MULTILINE)
 ANY_HEADING_RE = re.compile(r"^#{1,6} ", re.MULTILINE)
 FLAT_ENTRY_RE = re.compile(
-    r"^- source_spec:[^\r\n]*\n"
-    r"[ \t]+summary:[^\r\n]*\n"
-    r"[ \t]+evidence:[^\r\n]*(?:\n|$)",
+    r"^- source_spec:[^\r\n]*(?:\r\n|\n)"
+    r"[ \t]+summary:[^\r\n]*(?:\r\n|\n)"
+    r"[ \t]+evidence:[^\r\n]*(?:\r\n|\n|$)",
     re.IGNORECASE | re.MULTILINE,
 )
 STATUS_RE = re.compile(r"^status:[ \t]*(.*)$", re.MULTILINE)
 CANONICAL_STATUS_RE = re.compile(r"^(?:open|done \d{4}-\d{2}-\d{2})$")
 CANONICAL_SEVERITIES = frozenset({"critical", "high", "medium", "low"})
+LINE_BREAK_RE = re.compile(r"[\n\r\v\f\x1c-\x1e\x85\u2028\u2029]")
 
 
 @dataclass(frozen=True)
@@ -98,6 +100,8 @@ def mark_done(path: Path, dw_id: str, date: str, note: str) -> bool:
     Returns False (no write) when the entry is missing or already done."""
     if not path.is_file():
         return False
+    _require_iso_date("date", date)
+    _require_single_line("note", note)
     text = path.read_text(encoding="utf-8")
     entry = _find_entry(text, dw_id)
     if entry is None or not entry.open:
@@ -118,6 +122,9 @@ def append_decision(path: Path, dw_id: str, date: str, label: str, detail: str) 
     """Record a human decision on an entry without changing its status."""
     if not path.is_file():
         return False
+    _require_iso_date("date", date)
+    _require_single_line("label", label)
+    _require_single_line("detail", detail)
     text = path.read_text(encoding="utf-8")
     entry = _find_entry(text, dw_id)
     if entry is None:
@@ -149,8 +156,34 @@ def field_line_present(body: str, field: str, value: str) -> bool:
 
 
 def _require_single_line(name: str, value: str) -> None:
-    if "\r" in value or "\n" in value:
+    if LINE_BREAK_RE.search(value):
         raise ValueError(f"{name} must be a single line")
+
+
+def _require_nonempty(name: str, value: str) -> None:
+    if not value.strip():
+        raise ValueError(f"{name} must not be empty")
+
+
+def _require_iso_date(name: str, value: str) -> None:
+    _require_single_line(name, value)
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value) is None:
+        raise ValueError(f"{name} must be YYYY-MM-DD")
+    try:
+        calendar_date.fromisoformat(value)
+    except ValueError as error:
+        raise ValueError(f"{name} must be YYYY-MM-DD") from error
+
+
+def _require_canonical_status(status: str) -> None:
+    _require_single_line("status", status)
+    if CANONICAL_STATUS_RE.fullmatch(status) is None:
+        raise ValueError("status must be open or done YYYY-MM-DD")
+    if status.startswith("done "):
+        try:
+            calendar_date.fromisoformat(status.removeprefix("done "))
+        except ValueError as error:
+            raise ValueError("status must be open or done YYYY-MM-DD") from error
 
 
 def append_entry(
@@ -180,12 +213,12 @@ def append_entry(
         ("status", status),
     ):
         _require_single_line(name, value)
+    _require_nonempty("title", title)
     if severity is not None:
         _require_single_line("severity", severity)
         if severity not in CANONICAL_SEVERITIES:
             raise ValueError("severity must be critical, high, medium, or low")
-    if CANONICAL_STATUS_RE.fullmatch(status) is None:
-        raise ValueError("status must be open or done YYYY-MM-DD")
+    _require_canonical_status(status)
     text = path.read_text(encoding="utf-8") if path.is_file() else ""
     for entry in parse_ledger(text):
         if (
