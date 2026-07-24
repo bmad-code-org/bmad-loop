@@ -84,6 +84,50 @@ jobs:
       - name: Run tests
         run: uv run pytest -q -n auto --durations=15
 
+  bmad-resolver:
+    # /bmad-loop-setup writes _bmad/custom/config.toml through a surgical text edit, and
+    # the only thing that finally decides whether the module is registered is BMAD's own
+    # resolve_config.py. `_bmad/` is gitignored, so a checkout never carries one and the
+    # integration test used to skip in CI, leaving only our local re-implementation of
+    # the four-layer merge as the oracle. This job supplies the real reader.
+    #
+    # PINNED ON PURPOSE: bumping the tag below is how we opt in to a newer resolver and
+    # find out whether it still reads our registration. Do not float it to a branch.
+    name: bmad-resolver (real v6.10 oracle)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      BMAD_METHOD_TAG: v6.10.0
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.3.2
+        with:
+          enable-cache: true
+          # tomllib: the TOML branch verifies its edit before writing, so 3.11 is its floor.
+          python-version: '3.11'
+
+      - name: Install the project
+        run: uv sync --locked --all-extras
+
+      - name: Fetch BMAD's real config resolver (pinned)
+        # -f so an HTML error page can never masquerade as a resolver: a failed fetch
+        # must fail the job, otherwise this whole gate silently reverts to a skip.
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/resolve_config.py" \
+            "https://raw.githubusercontent.com/bmad-code-org/BMAD-METHOD/$BMAD_METHOD_TAG/src/scripts/resolve_config.py"
+          test -s "$RUNNER_TEMP/resolve_config.py"
+
+      - name: Registration resolves through BMAD's own resolver
+        env:
+          BMAD_RESOLVE_CONFIG: ${{ runner.temp }}/resolve_config.py
+          # Turns the test's skip into a failure, so a broken fetch cannot pass as green.
+          BMAD_REQUIRE_REAL_RESOLVER: '1'
+        run: uv run pytest -q tests/test_setup_cleanup_scripts.py -rs
+
   version-sync:
     name: version-sync
     runs-on: ubuntu-latest

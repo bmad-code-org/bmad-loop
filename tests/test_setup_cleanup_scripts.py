@@ -1237,6 +1237,14 @@ def test_registration_resolves_through_bmads_own_resolver(tmp_path):
         REPO / "_bmad" / "scripts" / "resolve_config.py"
     )
     if not Path(resolver).is_file():
+        # A test that protects an integration is worthless if the job meant to run it
+        # degrades to a skip when the fetch breaks. The CI job that supplies a pinned
+        # resolver sets this, so a missing one there fails loudly instead.
+        if os.environ.get("BMAD_REQUIRE_REAL_RESOLVER"):
+            pytest.fail(
+                f"BMAD_REQUIRE_REAL_RESOLVER is set but no resolver exists at {resolver}. "
+                "The pinned-resolver CI step did not produce one."
+            )
         pytest.skip("no BMAD resolve_config.py available (set BMAD_RESOLVE_CONFIG)")
 
     bmad = _v610_bmad(tmp_path)
@@ -1252,3 +1260,305 @@ def test_registration_resolves_through_bmads_own_resolver(tmp_path):
     # a layer it could not parse would be warned about and merged as {}
     assert "failed to parse" not in proc.stderr
     assert json.loads(proc.stdout)["modules.bmad-loop"]["version"] == "0.9.0"
+
+
+# ------------------------- the module column is found by name (#285 follow-up review)
+#
+# align_rows re-keys our rows into the target's column order by *name*, but the
+# anti-zombie filter that drops the previous run's rows still read row[0]. On any
+# catalog that puts `module` elsewhere the filter matched nothing — silently, because a
+# filter that removes nothing looks exactly like a first run — and every setup re-run
+# appended our rows again: 2, then 4, then 6.
+
+_REORDERED_CATALOG_HEADER = (
+    "skill,module,display-name,menu-code,description,action,args,phase,"
+    "preceded-by,followed-by,required,output-location,outputs"
+)
+_REORDERED_CATALOG_ROW = "bmad-help,Core,BMad Help,H,Analyze state.,,,anytime,,,false,,\n"
+
+
+def test_merge_help_toml_is_idempotent_with_the_module_column_moved(tmp_path):
+    """Three runs of the catalog merge must leave exactly one copy of our rows."""
+    bmad = _v610_bmad(tmp_path)
+    catalog = bmad / "_config" / "bmad-help.csv"
+    catalog.write_text(_REORDERED_CATALOG_HEADER + "\n" + _REORDERED_CATALOG_ROW)
+
+    first = _merge_help(bmad, "--module-code", "bmad-loop")
+    second = _merge_help(bmad, "--module-code", "bmad-loop")
+    third = _merge_help(bmad, "--module-code", "bmad-loop")
+
+    header, rows = _csv_rows(catalog)
+    idx = header.index("module")
+    ours = [row for row in rows if row[idx] == "BMAD Loop Skills"]
+    assert len(ours) == 2, f"{len(ours)} rows after three runs — the merge is not idempotent"
+    assert first["rows_removed"] == 0  # nothing of ours was there yet
+    assert second["rows_removed"] == third["rows_removed"] == 2
+    assert second["total_rows"] == third["total_rows"] == 3
+    # the catalog keeps its own header and its own row, and ours are keyed correctly
+    assert header[:2] == ["skill", "module"]
+    assert [row for row in rows if row[idx] == "Core"]
+    assert {row[header.index("skill")] for row in ours} == {"bmad-loop-setup", "bmad-loop-sweep"}
+
+
+def test_merge_help_yaml_target_is_idempotent_with_the_module_column_moved(tmp_path):
+    """The same header-keyed filter on the legacy --target branch."""
+    legacy = _v6_bmad(tmp_path)  # no config.toml, so the YAML layout
+    target = legacy / "module-help.csv"
+    target.write_text(_REORDERED_CATALOG_HEADER + "\n" + _REORDERED_CATALOG_ROW)
+
+    _merge_help(legacy, "--target", str(target))
+    result = _merge_help(legacy, "--target", str(target))
+
+    header, rows = _csv_rows(target)
+    idx = header.index("module")
+    assert len([row for row in rows if row[idx] == "BMAD Loop Skills"]) == 2
+    assert result["rows_removed"] == 2
+    assert result["total_rows"] == 3
+
+
+@pytest.mark.parametrize(
+    "header,phrase",
+    [
+        ("skill,display-name,description", "no 'module' column"),
+        ("module,skill,module,description", "2 columns named 'module'"),
+    ],
+    ids=["missing", "duplicate"],
+)
+def test_merge_help_toml_refuses_a_catalog_it_cannot_key(tmp_path, header, phrase):
+    """Without exactly one module column our rows cannot be identified, and appending
+    anyway would duplicate them on every run. Refuse, and write nothing at all."""
+    bmad = _v610_bmad(tmp_path)
+    catalog = bmad / "_config" / "bmad-help.csv"
+    catalog.write_text(header + "\n")
+    before = catalog.read_bytes()
+
+    proc = _run(
+        "merge-help-csv.py",
+        "--bmad-dir",
+        str(bmad),
+        "--source",
+        str(ASSETS / "module-help.csv"),
+        "--module-code",
+        "bmad-loop",
+    )
+
+    assert proc.returncode == 1
+    assert phrase in json.loads(proc.stdout)["error"]
+    assert catalog.read_bytes() == before
+    # the refusal lands before either output is committed
+    assert not (bmad / "bmad-loop" / "module-help.csv").exists()
+
+
+# --------------------------- verify_candidate: NaN and unwritable shapes (#285 follow-up)
+
+
+def test_merge_config_toml_tolerates_a_nan_in_a_neighbouring_table(tmp_path):
+    """`nan != nan`, so comparing two independent parses with `==` refused a valid file.
+
+    verify_candidate parses the before and after documents separately, so each `nan`
+    is a distinct float that never compares equal to its counterpart. Setup reported
+    "the edit would have changed more than the [modules.bmad-loop] table" about a file
+    it had not touched outside that table at all, and could not run on it.
+    """
+    bmad = _v610_bmad(tmp_path)
+    custom = bmad / "custom" / "config.toml"
+    custom.write_text("[tool.other]\na = nan\nb = +nan\nc = -nan\nd = inf\nxs = [1.0, nan, 2.0]\n")
+
+    result = _merge_config(bmad, _answers(tmp_path, {}))
+
+    assert result["toml_validated"] is True
+    after = tomllib.loads(custom.read_text())
+    assert after["modules"]["bmad-loop"]["version"] == "0.9.0"
+    other = after["tool"]["other"]
+    assert other["a"] != other["a"]  # still NaN, and still there
+    assert other["d"] == float("inf")
+    assert other["xs"][0] == 1.0 and other["xs"][2] == 2.0
+
+
+_UNSUPPORTED_SHAPES = {
+    # Valid TOML, but with no [modules.bmad-loop] header for the scanner to replace:
+    # appending one makes tomllib reject the duplicate declaration.
+    "dotted_key": ('modules.bmad-loop.name = "old"\n', "dotted key"),
+    "inline_table": ('[modules]\n"bmad-loop" = { name = "old" }\n', "inline table"),
+    # A header does exist, but rewriting the table wholesale would delete a subtable
+    # that may hold the user's own settings.
+    "nested_subtable": (
+        '[modules.bmad-loop]\nname = "old"\n\n[modules.bmad-loop.extra]\nmine = true\n',
+        "nested subtables",
+    ),
+    "array_of_tables": (
+        '[[modules.bmad-loop]]\nname = "a"\n\n[[modules.bmad-loop]]\nname = "b"\n',
+        "array of tables",
+    ),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_UNSUPPORTED_SHAPES))
+def test_merge_config_toml_explains_a_shape_it_cannot_rewrite(tmp_path, shape):
+    """A refusal the user can clear by hand must not read like an internal bug report.
+
+    All four shapes are valid TOML that the surgical edit cannot express, so all four
+    are still refused with the file untouched — that part is the safety net working.
+    What changed is the message: it names the shape and states the manual fix instead
+    of asking the user to report a bug they can actually solve.
+    """
+    layer, phrase = _UNSUPPORTED_SHAPES[shape]
+    bmad = _v610_bmad(tmp_path)
+    custom = bmad / "custom" / "config.toml"
+    custom.write_text(layer)
+
+    proc = _run(
+        "merge-config.py",
+        "--bmad-dir",
+        str(bmad),
+        "--module-yaml",
+        str(ASSETS / "module.yaml"),
+        "--answers",
+        str(_answers(tmp_path, {})),
+    )
+
+    assert proc.returncode == 1
+    error = json.loads(proc.stderr)["error"]
+    assert phrase in error
+    assert "Please report this" not in error
+    assert custom.read_text() == layer  # untouched
+
+
+# ------------------------------------- durable writes: symlinks + races (#285 follow-up)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks need elevation on Windows")
+def test_merge_config_toml_writes_through_a_symlinked_custom_layer(tmp_path):
+    """A symlinked config must stay a symlink, with the edit landing on its target.
+
+    os.replace swaps the *link's* own directory entry for a regular file, so the
+    shared target kept the old content while the project started reading a local copy
+    nobody meant to create: centrally managed configuration silently stops being
+    managed, and the next edit to the shared file never arrives.
+    """
+    bmad = _v610_bmad(tmp_path)
+    custom = bmad / "custom" / "config.toml"
+    shared = tmp_path / "shared" / "bmad-custom.toml"
+    shared.parent.mkdir()
+    shared.write_text(custom.read_text())
+    shared.chmod(0o640)
+    custom.unlink()
+    custom.symlink_to(shared)
+
+    result = _merge_config(bmad, _answers(tmp_path, {}))
+
+    assert result["status"] == "success"
+    assert custom.is_symlink(), "the link was replaced by a regular file"
+    assert os.path.realpath(custom) == str(shared)
+    after = tomllib.loads(shared.read_text())
+    assert after["modules"]["bmad-loop"]["version"] == "0.9.0"
+    assert after["modules"]["my-thing"]["enabled"] is True  # neighbour survived
+    assert stat.S_IMODE(shared.stat().st_mode) == 0o640  # mode carried over
+    # the temp file lives beside the real target, and is cleaned up in both places
+    assert not list(shared.parent.glob("*bmad-loop-tmp*"))
+    assert not list((bmad / "custom").glob("*bmad-loop-tmp*"))
+
+
+@pytest.mark.parametrize("script", ["merge-config.py", "merge-help-csv.py"])
+def test_atomic_write_uses_a_process_unique_temp_name(tmp_path, script, monkeypatch):
+    """A fixed sibling temp path is itself shared state.
+
+    Two concurrent runs opened the same `<name>.bmad-loop-tmp`, so one's cleanup
+    unlinked the other's file — or the loser's still-open handle wrote into the inode
+    the winner had just renamed onto the target.
+    """
+    mod = _load_script(script)
+    seen: list[str] = []
+    original = mod._atomic_replace
+    monkeypatch.setattr(
+        mod,
+        "_atomic_replace",
+        lambda tmp, target: (seen.append(Path(tmp).name), original(tmp, target))[1],
+    )
+
+    mod.atomic_write_text(tmp_path / "shared.toml", "x = 1\n")
+    mod.atomic_write_text(tmp_path / "shared.toml", "x = 2\n")
+
+    assert len(set(seen)) == 2, f"temp names collide between writes: {seen}"
+    assert all(".bmad-loop-tmp" in name and str(os.getpid()) in name for name in seen)
+
+
+@pytest.mark.parametrize("script", ["merge-config.py", "merge-help-csv.py"])
+def test_atomic_write_abandons_a_changed_target(tmp_path, script, monkeypatch):
+    """read -> derive -> verify -> replace has a window; the replace must guard it.
+
+    Two setup runs, or setup racing an editor or a BMAD installer run, otherwise both
+    derive from the same state and the loser's rename silently discards the winner's
+    change with a success exit code.
+    """
+    mod = _load_script(script)
+    target = tmp_path / "config.toml"
+    target.write_text("[keep]\nme = true\n")
+    prior = target.read_bytes()
+    target.write_text("[keep]\nme = false\n")  # somebody else got there first
+    changed = target.read_bytes()
+
+    with pytest.raises(mod.ConcurrentEdit):
+        mod.atomic_write_text(target, "[ours]\nnew = true\n", prior=prior)
+
+    assert target.read_bytes() == changed  # their change stands, ours is abandoned
+    assert not list(tmp_path.glob("*bmad-loop-tmp*"))
+
+
+@pytest.mark.parametrize("script", ["merge-config.py", "merge-help-csv.py"])
+def test_atomic_write_cleans_up_when_the_rename_fails(tmp_path, script, monkeypatch):
+    """A failure *after* the temp file exists must leave the target intact and no litter.
+
+    The read-only-directory tests fail at the open(); this forces the other window —
+    the temp file is written and fsynced, and the rename that would commit it fails.
+    Both scripts carry their own copy of the writer, so both need the coverage.
+    """
+    mod = _load_script(script)
+    target = tmp_path / "config.toml"
+    target.write_text("[keep]\nme = true\n")
+    before = target.read_bytes()
+
+    def boom(tmp, dst):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(mod, "_atomic_replace", boom)
+
+    with pytest.raises(OSError):
+        mod.atomic_write_text(target, "[clobbered]\n")
+
+    assert target.read_bytes() == before
+    assert not list(tmp_path.glob("*bmad-loop-tmp*"))
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32" or os.geteuid() == 0,
+    reason="needs POSIX directory permissions, and root ignores the write bit",
+)
+def test_merge_config_never_truncates_the_custom_layer(tmp_path):
+    """A failed config write must leave custom/config.toml byte-identical.
+
+    The mirror of test_merge_help_toml_never_truncates_the_shared_catalog for
+    merge-config.py's own copy of the writer. The two are duplicated on purpose (each
+    script ships standalone into user projects), so covering one covers neither.
+    """
+    bmad = _v610_bmad(tmp_path)
+    custom = bmad / "custom" / "config.toml"
+    before = custom.read_bytes()
+    (bmad / "custom").chmod(0o555)
+    try:
+        proc = _run(
+            "merge-config.py",
+            "--bmad-dir",
+            str(bmad),
+            "--module-yaml",
+            str(ASSETS / "module.yaml"),
+            "--answers",
+            str(_answers(tmp_path, {})),
+        )
+    finally:
+        (bmad / "custom").chmod(0o755)
+
+    assert proc.returncode == 2
+    assert json.loads(proc.stderr)["status"] == "error"
+    assert custom.read_bytes() == before
+    assert not list((bmad / "custom").glob("*bmad-loop-tmp*"))
