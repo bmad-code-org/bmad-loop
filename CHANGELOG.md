@@ -105,6 +105,7 @@ breaking changes may land in a minor release.
 
   Out of scope and still open: #259 (the scripts' `python3` invocation prefix) and #154 (the
   runtime's `_bmad/bmm/config.yaml` read, which v6.10 still generates and manifest-tracks).
+
 - **`validate` requires the review skills your `bmad-dev-auto` actually invokes (#260).** The
   preflight held every project to a fixed catalog that included `bmad-review-verification-gap`,
   which no tagged BMAD-METHOD release ships (absent from v6.10.0; on current sources only a

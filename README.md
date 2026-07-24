@@ -253,7 +253,7 @@ The orchestrator drives the upstream `bmad-dev-auto` skill as its inner dev prim
 | `bmad-review`                     | merged lens-based reviewer, supersedes the hunters (**upstream** — bmm prereq, not bundled) |
 | `bmad-loop-resolve`               | interactive CRITICAL-escalation resolution (`/bmad-loop-resolve <story>`)                   |
 | `bmad-loop-sweep`                 | deferred-work ledger triage (automation-only)                                               |
-| `bmad-loop-setup` | registers the module in `_bmad/` config + help (TOML layout on v6.10+, legacy YAML before) |
+| `bmad-loop-setup`                 | registers the module in `_bmad/` config + help (TOML layout on v6.10+, legacy YAML before)  |
 
 `bmad-loop validate` preflights `bmad-dev-auto` (always) plus the review skills that copy of the skill will actually invoke — read from its `customize.toml` review layers, or from `step-04-review.md` on releases that name their reviewers inline. So a merged-`bmad-review` install needs only `bmad-review`, a v6.10.0 install needs the two hunters it names, and a tree whose configured layers reference a skill it does not have is reported instead of failing on every dev run. Missing skills (or a `bmad-dev-auto` without its `customize.toml`) are reported with bmm-module remediation before any run starts.
 
