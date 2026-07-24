@@ -2183,7 +2183,7 @@ class Engine:
         ids += task.declared_deferred or []
         return tuple(dict.fromkeys(ids))
 
-    def _close_declared_deferred(self, task: StoryTask) -> tuple[Path, str] | None:
+    def _close_declared_deferred(self, task: StoryTask) -> tuple[Path, str, list[str]] | None:
         """At the commit boundary, flip every ledger entry the story declares via
         ``closes_deferred:`` to ``status: done <date>`` + a ``resolution:`` note
         (#234) — the regular-story counterpart of the sweep bundle close at
@@ -2219,8 +2219,8 @@ class Engine:
         after ``merge_local`` under isolation (see
         ``_flush_pending_deferred_closes``).
 
-        Returns the pre-close ledger text (with its path) when an in-repo write
-        actually marked something, else None.
+        Returns the pre-close ledger text — with its path and the ids actually
+        flipped — when an in-repo write marked something, else None.
 
         Never a gate: an unmatched or malformed id is journaled, never fatal.
         Idempotent, so the resume arm may re-drive the commit phase freely — ids
@@ -2242,9 +2242,11 @@ class Engine:
             return None
         before = ledger.read_text(encoding="utf-8") if ledger.is_file() else None
         marked = self._apply_deferred_closes(task, ids, ledger)
-        return (ledger, before) if marked and before is not None else None
+        return (ledger, before, marked) if marked and before is not None else None
 
-    def _restore_deferred_closes(self, task: StoryTask, snapshot: tuple[Path, str] | None) -> None:
+    def _restore_deferred_closes(
+        self, task: StoryTask, snapshot: tuple[Path, str, list[str]] | None
+    ) -> None:
         """Put the ledger back the way ``_close_declared_deferred`` found it, after
         the commit those closures were written for failed (#234).
 
@@ -2264,7 +2266,7 @@ class Engine:
         through ``safe_reset``, so the index is not authoritative here."""
         if snapshot is None:
             return
-        ledger, before = snapshot
+        ledger, before, marked = snapshot
         try:
             atomic_write_text(ledger, before)
         except OSError as e:
@@ -2279,7 +2281,9 @@ class Engine:
         self.journal.append(
             "deferred-close-rolled-back",
             story_key=task.story_key,
-            dw_ids=list(self._declared_deferred_ids(task)),
+            # what was actually flipped and is now un-flipped, NOT everything the
+            # story declared: an id that was already done stays done either way.
+            dw_ids=list(marked),
             ledger=str(ledger),
         )
 
