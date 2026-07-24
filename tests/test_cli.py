@@ -3214,6 +3214,31 @@ def test_platform_preflight_reports_process_host_selection_error(monkeypatch):
 STORIES_POLICY = '[stories]\nsource = "stories"\nspec_folder = "_bmad-output/epic-1"\n'
 
 
+def test_require_base_skills_warnings_do_not_block_the_run(tmp_path, monkeypatch, capsys):
+    """A review layer the preflight cannot statically resolve (a `when` gate, a
+    handoff phrasing it can't confirm, an unparseable override) is reported and then
+    stepped over. Aborting on it would be #260's false FAIL — this time on every
+    run, not just on validate — so severity decides, not emptiness."""
+    from bmad_loop import install as install_mod
+    from bmad_loop.checks import Finding
+
+    _write_policy(tmp_path)
+    pol = policy_mod.load(tmp_path / ".bmad-loop" / "policy.toml")
+    warning = Finding("skills.review-layer-unresolved", "warning", "conditional layer", {})
+    monkeypatch.setattr(install_mod, "missing_base_skills", lambda *a, **k: [warning])
+
+    assert cli._require_base_skills(tmp_path, pol) is True
+    err = capsys.readouterr().err
+    assert "conditional layer" in err
+    assert "FAIL" not in err
+
+    # ...and a real problem alongside it still aborts
+    problem = Finding("skills.review-layer-missing", "problem", "missing reviewer", {})
+    monkeypatch.setattr(install_mod, "missing_base_skills", lambda *a, **k: [warning, problem])
+    assert cli._require_base_skills(tmp_path, pol) is False
+    assert "FAIL: missing reviewer" in capsys.readouterr().err
+
+
 def _validate_output(capsys):
     out = capsys.readouterr()
     return (out.out + out.err).lower()

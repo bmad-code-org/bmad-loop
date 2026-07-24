@@ -28,11 +28,13 @@ from typing import TYPE_CHECKING, Callable, NoReturn
 from . import gates, verify
 from .install import (
     BASE_SKILLS,
+    CUSTOMIZE_DIR,
     HOOK_SCRIPT_REL,
     MODULE_SKILLS,
     _copy_traversable,
     _worktree_local_exclude,
     merge_hooks,
+    resolve_review_layers,
 )
 from .model import Phase
 from .process_host import get_process_host
@@ -81,9 +83,12 @@ def provision_worktree(
     server. Lay the bundled skills + signal hook into the worktree for the active
     CLI profiles, and copy the `seed_files` configs in from the main repo. The
     upstream skills the orchestrator drives (BASE_SKILLS: bmad-dev-auto + the review
-    hunters) are not bundled in the wheel, so they are copied from the MAIN REPO's
-    installed tree instead. Quiet (no stdout) — unlike `install_into` this runs
-    inside the engine loop under a TUI. No-op when there's nothing to do.
+    hunters, plus whatever review layers this project's own config names) are not
+    bundled in the wheel, so they are copied from the MAIN REPO's installed tree
+    instead — together with `_bmad/custom/`, the customization those layers resolve
+    through, so the isolated run resolves the same layer set the preflight
+    validated. Quiet (no stdout) — unlike `install_into` this runs inside the
+    engine loop under a TUI. No-op when there's nothing to do.
 
     seed_globs are project-relative glob patterns (e.g. ".claude/skills/*") expanded
     against the main repo; every match is copied into the worktree under the same
@@ -196,12 +201,21 @@ def provision_worktree(
             if dst.exists():
                 continue
             _copy_traversable(skills_root.joinpath(skill), dst)
-        # The orchestrator-driven upstream skills (BASE_SKILLS) are not in the
-        # wheel; copy them from the MAIN REPO's installed tree (same tree path) so
-        # an isolated worktree can still resolve /bmad-dev-auto and the review
-        # hunters. Skip silently when the main repo lacks them — the run-start
-        # preflight reports it.
-        for skill in BASE_SKILLS:
+        # The orchestrator-driven upstream skills are not in the wheel; copy them
+        # from the MAIN REPO's installed tree (same tree path) so an isolated
+        # worktree can still resolve /bmad-dev-auto and the review layers. Skip
+        # silently when the main repo lacks them — the run-start preflight reports
+        # it.
+        #
+        # BASE_SKILLS is only the floor. The review layers this project actually
+        # invokes are read from the installed bmad-dev-auto, exactly as the
+        # preflight reads them, so a reviewer named by a project override (a
+        # custom or renamed skill) is provisioned too. Validating a skill here and
+        # then not copying it is how preflight passes in the main checkout while
+        # the isolated review fails on a skill that was never there.
+        resolved = resolve_review_layers(repo_root, tree)
+        required = dict.fromkeys((*BASE_SKILLS, *(resolved.skills() if resolved else ())))
+        for skill in required:
             dst = tree_dir / skill
             if dst.exists():
                 continue
@@ -209,6 +223,33 @@ def provision_worktree(
             if not src.is_relative_to(repo_root) or not src.is_dir():
                 continue
             _copy_traversable(src, dst)
+
+    # The project's customization of those upstream skills (_bmad/custom/*.toml).
+    # The preflight resolves review layers through these files, but the run inside
+    # the worktree resolves them again from ITS OWN project root — and they are
+    # routinely absent from a fresh checkout: the upstream installer gitignores
+    # `*.user.toml`, and plenty of projects gitignore `_bmad/` whole. Without this
+    # the two disagree, and validate approves a layer set the isolated run never
+    # runs. Copy-when-absent at file granularity, so a checkout that tracks its
+    # own customization keeps every tracked file untouched.
+    #
+    # Deliberately NOT routed through seed_files: `skipped` reports user-authored
+    # `worktree_seed` entries that silently no-op, and this internal seed is not
+    # one of those — journaling it would read as a project misconfiguration.
+    customize_seeded = False
+    src_customize = (repo_root / CUSTOMIZE_DIR).resolve()
+    dst_customize = (worktree / CUSTOMIZE_DIR).resolve()
+    if (
+        src_customize.is_dir()
+        and src_customize.is_relative_to(repo_root)
+        and dst_customize.is_relative_to(worktree)
+    ):
+        if not dst_customize.exists():
+            dst_customize.parent.mkdir(parents=True, exist_ok=True)
+            _copy_traversable(src_customize, dst_customize)
+            customize_seeded = True
+        elif dst_customize.is_dir():
+            customize_seeded = _copy_traversable(src_customize, dst_customize, skip_existing=True)
 
     # per-CLI signal-hook registration, baked to the main repo's relay (absolute).
     # Hookless profiles (HTTP/SSE transport) have no config to merge.
@@ -241,6 +282,8 @@ def provision_worktree(
     # as the pattern "/", git-excluding the entire worktree.
     patterns |= {f"/{p.hooks.config_path}" for p in profiles if not p.hookless}
     patterns |= {f"/{rel}" for rel in seeded}
+    if customize_seeded:
+        patterns.add(f"/{CUSTOMIZE_DIR.as_posix()}")
     _worktree_local_exclude(worktree, sorted(patterns))
     return skipped
 

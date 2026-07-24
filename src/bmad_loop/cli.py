@@ -353,14 +353,17 @@ def cmd_validate(args: argparse.Namespace) -> int:
                     {"role": role, "model": cfg.model, "profile": prof.name},
                 )
 
-    base_problems = install.missing_base_skills(project, [p.skill_tree for p in profiles])
-    if profiles and not base_problems:
+    base_findings = install.missing_base_skills(project, [p.skill_tree for p in profiles])
+    # gated on PROBLEMS, not on any finding: an advisory review layer (a `when`
+    # gate, a phrasing this check can't confirm, a broken override) is a warning
+    # that must ride alongside the ok line rather than suppress it.
+    if profiles and not any(f.severity == "problem" for f in base_findings):
         report.ok(
             "skills.base",
-            "upstream skills present (bmad-dev-auto + review hunters)",
+            "upstream skills present (bmad-dev-auto + review layers)",
             {"trees": list(dict.fromkeys(p.skill_tree for p in profiles))},
         )
-    report.extend(base_problems)
+    report.extend(base_findings)
 
     if getattr(args, "json", False):
         # getattr, not args.json: cmd_validate is called directly by tests (and by
@@ -480,11 +483,12 @@ def _mux_set(project: Path, args: argparse.Namespace) -> int:
 
 def _require_base_skills(project: Path, pol, *, require_stories: bool = False) -> bool:
     """Preflight the upstream skills the orchestrator drives (bmad-dev-auto + the
-    three review hunters it invokes inline).
+    review layers it invokes inline).
 
     Returns True when everything is in place; otherwise prints the problems and
     returns False so the caller can abort before spawning any session (a missing
     skill would otherwise stall as an `Unknown command` until the run times out).
+    Warnings are printed but never abort — only ``problem`` findings block.
 
     ``require_stories`` additionally content-probes bmad-dev-auto for folder+id
     dispatch — stories mode needs a newer skill than sprint mode, so an older
@@ -498,9 +502,16 @@ def _require_base_skills(project: Path, pol, *, require_stories: bool = False) -
             skill_trees.append(get_profile(name, project).skill_tree)
         except ProfileError:
             continue
-    problems = install.missing_base_skills(project, skill_trees)
+    findings = install.missing_base_skills(project, skill_trees)
     if require_stories:
-        problems += install.missing_stories_support(project, skill_trees)
+        findings += install.missing_stories_support(project, skill_trees)
+    # Severity decides. A review layer we can't statically resolve (a `when` gate,
+    # an unrecognized handoff phrasing, an unparseable override) is reported and
+    # then stepped over: aborting on it would be the false FAIL of #260, only now
+    # on every run rather than only on validate.
+    problems = [f for f in findings if f.severity == "problem"]
+    for warning in (f for f in findings if f.severity != "problem"):
+        print(f"warning: {warning.message}", file=sys.stderr)
     if problems:
         for problem in problems:
             print(f"FAIL: {problem.message}", file=sys.stderr)
