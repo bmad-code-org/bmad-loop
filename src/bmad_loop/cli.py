@@ -597,7 +597,7 @@ def _validate_stories_queue(
 def _validate_closes_deferred(
     paths: bmadconfig.ProjectPaths, spec_folder: str, report: ValidationReport
 ) -> None:
-    """Warn when a story spec declares ``closes_deferred:`` ids the deferred-work
+    """Warn when a story declares ``closes_deferred:`` ids the deferred-work
     ledger does not carry (#234).
 
     At clean close the orchestrator flips each declared id to ``status: done
@@ -606,6 +606,11 @@ def _validate_closes_deferred(
     the run says so only in the journal, where nobody looks until the retro that
     the annotation exists to spare. Saying it at preflight is the whole point:
     the declaration is fixable before the run, not after.
+
+    Both declaration channels are checked, unioned per story: the ``stories.yaml``
+    entry and, once the story has a spec on disk, that spec's frontmatter. The
+    manifest half is what makes this genuinely a *pre*-flight — those ids are
+    readable before the story has ever been dispatched.
 
     Only *absent* ids warn. An id present but already ``done`` is a declaration a
     prior run already satisfied (a resume re-drives the same close), so it stays
@@ -627,15 +632,17 @@ def _validate_closes_deferred(
         return
     present = {e.id for e in deferredwork.parse_ledger(text)}
     for entry in story_set.entries:
+        declared = list(entry.closes_deferred)
         state = stories_mod.resolve_story_spec(folder, entry.id)
-        if state.kind != stories_mod.KIND_PRESENT or state.path is None:
-            continue  # never dispatched, ambiguous, or a sentinel — no spec to read
-        try:
-            declared = frontmatter.read_frontmatter(state.path).get("closes_deferred") or []
-        except OSError:
-            continue  # unreadable spec: other gates own that, this one degrades
-        ids = [str(x).strip() for x in declared] if isinstance(declared, list) else []
-        unknown = [i for i in ids if i and i not in present]
+        if state.kind == stories_mod.KIND_PRESENT and state.path is not None:
+            try:
+                raw = frontmatter.read_frontmatter(state.path).get("closes_deferred") or []
+            except OSError:
+                raw = []  # unreadable spec: other gates own that, this one degrades
+            if isinstance(raw, list):
+                declared += [str(x).strip() for x in raw]
+        ids = dict.fromkeys(i for i in declared if i)  # dedupe across both channels
+        unknown = [i for i in ids if i not in present]
         if unknown:
             report.warn(
                 "stories.closes-deferred-unknown",

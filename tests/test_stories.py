@@ -217,6 +217,41 @@ def test_invoke_dev_with_non_string_rejected(tmp_path):
         stories.load_stories(tmp_path)
 
 
+def test_closes_deferred_defaults_empty(tmp_path):
+    """The overwhelmingly common entry declares nothing — and an older manifest,
+    written before the field existed, must keep parsing unchanged (#234)."""
+    write_stories(tmp_path, '- id: "1"\n  title: t\n  description: d\n')
+    assert stories.load_stories(tmp_path).entries[0].closes_deferred == ()
+
+
+def test_closes_deferred_parses_ledger_ids(tmp_path):
+    write_stories(
+        tmp_path,
+        '- id: "1"\n  title: t\n  description: d\n  closes_deferred: [DW-5, DW-6]\n',
+    )
+    assert stories.load_stories(tmp_path).entries[0].closes_deferred == ("DW-5", "DW-6")
+
+
+def test_closes_deferred_normalizes_items(tmp_path):
+    """Items are str()-normalized, stripped, blank-dropped, and de-duplicated, the
+    same leniency ids get: an LLM-authored manifest may emit a bare `5` as an int
+    or repeat an id, and neither is a contradiction worth failing a run over."""
+    write_stories(
+        tmp_path,
+        '- id: "1"\n  title: t\n  description: d\n'
+        '  closes_deferred: ["  DW-5  ", 5, "DW-5", ""]\n',
+    )
+    assert stories.load_stories(tmp_path).entries[0].closes_deferred == ("DW-5", "5")
+
+
+def test_closes_deferred_non_list_rejected(tmp_path):
+    """Strict about the container: a bare string is a schema error, never silently
+    wrapped — a lenient reading would iterate it into single characters."""
+    write_stories(tmp_path, '- id: "1"\n  title: t\n  description: d\n  closes_deferred: DW-5\n')
+    with pytest.raises(stories.StoriesError, match="must be a list of deferred-work ids"):
+        stories.load_stories(tmp_path)
+
+
 def test_top_level_must_be_list(tmp_path):
     write_stories(tmp_path, "development_status:\n  a: b\n")
     with pytest.raises(stories.StoriesError, match="top-level list"):

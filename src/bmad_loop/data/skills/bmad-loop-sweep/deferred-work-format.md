@@ -62,8 +62,9 @@ decision: <date> <chosen option label> — <detail>
 
 ## Closure declared by a story
 
-A sweep bundle is not the only thing that closes an entry. A regular story spec
-may declare the entries its work closes, in its frontmatter:
+A sweep bundle is not the only thing that closes an entry. A regular story may
+declare the entries its work closes — on its `stories.yaml` entry (stories mode),
+or in its story spec's frontmatter. The two are unioned:
 
 ```yaml
 closes_deferred: [DW-5, DW-6] # DW-<n> ids this story closes

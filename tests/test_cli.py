@@ -3309,16 +3309,19 @@ def test_validate_silent_when_desktop_notifier_available(project, monkeypatch, c
     assert all(f["check"] != "notify.desktop-unavailable" for f in doc["findings"])
 
 
-def _declare_closes_deferred(project, declared, *, ledger_ids=("DW-1",)):
-    """Lay down a stories-mode fixture whose single story declares `declared`, over
-    a ledger holding `ledger_ids` (all open)."""
-    folder = _setup_stories_fixture(project, [_stories_entry("1")])
+def _declare_closes_deferred(project, declared, *, ledger_ids=("DW-1",), manifest=None):
+    """A stories-mode fixture for one story: `manifest` ids declared on its
+    stories.yaml entry, `declared` ids in its spec frontmatter (None writes no spec
+    at all), over a ledger holding `ledger_ids` — all open."""
+    over = {"closes_deferred": list(manifest)} if manifest is not None else {}
+    folder = _setup_stories_fixture(project, [_stories_entry("1", **over)])
     write_ledger(project, {dw: "open" for dw in ledger_ids}, commit=False)
-    (folder / "stories" / "1-slug.md").write_text(
-        f"---\ntitle: 'test'\nstatus: 'ready-for-dev'\n"
-        f"closes_deferred: [{', '.join(declared)}]\n---\n\n## Intent\n\ntest\n",
-        encoding="utf-8",
-    )
+    if declared is not None:
+        (folder / "stories" / "1-slug.md").write_text(
+            f"---\ntitle: 'test'\nstatus: 'ready-for-dev'\n"
+            f"closes_deferred: [{', '.join(declared)}]\n---\n\n## Intent\n\ntest\n",
+            encoding="utf-8",
+        )
     return folder
 
 
@@ -3357,6 +3360,35 @@ def test_validate_silent_when_closes_deferred_all_present(project, capsys):
 
     cli.cmd_validate(args)
     assert _closes_deferred_findings(capsys) == []
+
+
+def test_validate_warns_on_unknown_closes_deferred_in_the_manifest(project, capsys):
+    """The manifest channel is what makes this a genuine *pre*-flight: a stories.yaml
+    entry declares its ids before the story has ever been dispatched, so a typo is
+    caught while no spec exists yet — the frontmatter check can't see that far."""
+    install_bmad_config(project)
+    _write_policy(project.project, STORIES_POLICY)
+    _declare_closes_deferred(project, None, manifest=["DW-99"])  # no story spec on disk
+    args = argparse.Namespace(project=str(project.project), spec=None, json=True)
+
+    cli.cmd_validate(args)
+    findings = _closes_deferred_findings(capsys)
+    assert len(findings) == 1
+    assert findings[0]["detail"] == {"story": "1", "unknown_ids": ["DW-99"]}
+
+
+def test_validate_closes_deferred_dedupes_across_both_channels(project, capsys):
+    """An id declared in both the manifest and the spec is one mismatch, reported
+    once — not the same typo twice."""
+    install_bmad_config(project)
+    _write_policy(project.project, STORIES_POLICY)
+    _declare_closes_deferred(project, ["DW-99"], manifest=["DW-99"])
+    args = argparse.Namespace(project=str(project.project), spec=None, json=True)
+
+    cli.cmd_validate(args)
+    findings = _closes_deferred_findings(capsys)
+    assert len(findings) == 1
+    assert findings[0]["detail"]["unknown_ids"] == ["DW-99"]  # once, not twice
 
 
 def test_validate_closes_deferred_warning_does_not_fail_the_run(project, capsys, monkeypatch):

@@ -1322,3 +1322,58 @@ def test_stories_mode_pending_story_closes_nothing(project):
 
     assert _entries(project)["DW-1"].open
     assert not _kinds(engine.journal, "story-deferred-closed")
+
+
+def test_stories_mode_closes_ids_declared_in_the_manifest(project):
+    """The channel that makes this work unattended (#234): `bmad-dev-auto` writes
+    the story spec and knows nothing of the ledger, so a frontmatter-only
+    declaration would have to be hand-edited into every generated spec. Declaring
+    on the stories.yaml entry — authored while the ledger is in view — closes the
+    loop with no upstream change."""
+    from conftest import write_ledger
+
+    setup_stories(project, [entry("1", closes_deferred=["DW-1"])])
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    engine, _ = make_engine(project, [])
+    _declare_spec(story_spec(project, "1"), "done", None)  # spec declares nothing
+
+    engine._post_dev_state_sync(StoryTask(story_key="1", epic=0), {})
+
+    dw1 = _entries(project)["DW-1"]
+    assert dw1.status.startswith("done") and "resolution: resolved by story 1" in dw1.body
+    assert _kinds(engine.journal, "story-deferred-closed")[0]["dw_ids"] == ["DW-1"]
+
+
+def test_stories_mode_unions_manifest_and_frontmatter_declarations(project):
+    """Both channels are honored, and an id named in both is marked and reported
+    once — the natural case once a planner declares it and the spec echoes it."""
+    from conftest import write_ledger
+
+    setup_stories(project, [entry("1", closes_deferred=["DW-1", "DW-2"])])
+    write_ledger(project, {"DW-1": "open", "DW-2": "open", "DW-3": "open"}, commit=False)
+    engine, _ = make_engine(project, [])
+    _declare_spec(story_spec(project, "1"), "done", ["DW-2", "DW-3"])  # DW-2 in both
+
+    engine._post_dev_state_sync(StoryTask(story_key="1", epic=0), {})
+
+    entries = _entries(project)
+    assert all(not entries[dw].open for dw in ("DW-1", "DW-2", "DW-3"))
+    assert entries["DW-2"].body.count("resolution: resolved by story 1") == 1  # not doubled
+    closed = _kinds(engine.journal, "story-deferred-closed")
+    assert closed[0]["dw_ids"] == ["DW-2", "DW-3", "DW-1"]  # frontmatter first, deduped
+
+
+def test_stories_mode_manifest_declaration_skipped_when_story_unfinished(project):
+    """The manifest channel rides the same clean-close gate: a story parked short
+    of `done` closes nothing, however the declaration got there."""
+    from conftest import write_ledger
+
+    setup_stories(project, [entry("1", closes_deferred=["DW-1"])])
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    engine, _ = make_engine(project, [])
+    _declare_spec(story_spec(project, "1"), "in-progress", None)
+
+    engine._post_dev_state_sync(StoryTask(story_key="1", epic=0), {})
+
+    assert _entries(project)["DW-1"].open
+    assert not _kinds(engine.journal, "story-deferred-closed")

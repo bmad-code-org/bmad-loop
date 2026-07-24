@@ -19,7 +19,7 @@ import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, NoReturn
+from typing import TYPE_CHECKING, Callable, NoReturn, Sequence
 
 from . import deferredwork, devcontract, envvars, gates, verify
 from .adapters.base import CodingCLIAdapter, SessionResult, SessionSpec, SpecSnapshot
@@ -2054,11 +2054,20 @@ class Engine:
         sprint_advance(self.workspace.paths.sprint_status, task.story_key, target)
         self._close_declared_deferred(task, fm)
 
-    def _close_declared_deferred(self, task: StoryTask, fm: dict) -> None:
-        """At clean close, flip every ledger entry the spec declares via
+    def _close_declared_deferred(
+        self, task: StoryTask, fm: dict, *, extra_ids: Sequence[str] = ()
+    ) -> None:
+        """At clean close, flip every ledger entry the story declares via
         ``closes_deferred:`` to ``status: done <date>`` + a ``resolution:`` note
         (#234) — the regular-story counterpart of the sweep bundle close at
         ``SweepEngine._close_bundle_ledger_when_spec_status``.
+
+        Two declaration channels feed this, unioned: the spec's own frontmatter,
+        and ``extra_ids`` — what the caller read from a manifest that named the
+        ids up front (stories mode passes its ``stories.yaml`` entry). Both
+        matter, because they are written at different times by different authors:
+        the breakdown is authored while the ledger is in view, whereas the spec
+        is generated later by a dev skill that knows nothing of the ledger.
 
         Declaration is the only signal: closure is never inferred from a diff.
         Ids are classified against a single ledger snapshot rather than from
@@ -2073,7 +2082,12 @@ class Engine:
         annotation into the story's own commit, the same way the append hooks do.
         """
         raw = fm.get("closes_deferred") or []
-        ids = [str(x).strip() for x in raw] if isinstance(raw, list) else []
+        declared = [str(x).strip() for x in raw] if isinstance(raw, list) else []
+        declared += [str(x).strip() for x in extra_ids]
+        # Order-preserving dedupe: a story that names the same id in both channels
+        # (the natural case once a planner writes it and the spec echoes it) must
+        # mark it once and report it once, not twice.
+        ids = list(dict.fromkeys(i for i in declared if i))
         if not ids:
             return
         ledger = self.workspace.paths.deferred_work

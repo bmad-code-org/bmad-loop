@@ -425,6 +425,12 @@ class StoriesEngine(Engine):
         inert in exactly the mode whose declarations ``validate`` preflights, and
         a spec could name ids that nothing ever marks resolved (#234).
 
+        Both declaration channels are honored: the manifest entry's
+        ``closes_deferred`` and the spec's own frontmatter. The manifest is the
+        one that makes this work unattended — ``bmad-dev-auto`` writes the spec
+        and knows nothing of the ledger, so with the frontmatter alone a human
+        would have to hand-edit every generated spec.
+
         The spec is resolved by id, never from the session-claimed path — the same
         deterministic resolution ``verify_dev_stories`` performs a moment later.
         """
@@ -440,7 +446,8 @@ class StoriesEngine(Engine):
         # a failed, blocked, or plan-only session closes nothing.
         if fm is None or verify.status_of(fm) != "done":
             return
-        self._close_declared_deferred(task, fm)
+        entry = self._entry_for(task)  # None on an unreadable manifest (journaled there)
+        self._close_declared_deferred(task, fm, extra_ids=entry.closes_deferred if entry else ())
 
     def _verify_dev_artifacts(self, task: StoryTask, result_json: dict | None):
         # The adapter marks a plan-halt leg's synthesized result `plan_halt`; latch

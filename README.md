@@ -173,7 +173,18 @@ Turn it on per project with `[stories] source = "stories"` + `spec_folder = "<ep
 - **`spec_checkpoint`** — pause _before_ code, to review the plan. The dev session halts right after planning (`Halt after planning.`) with the spec at `ready-for-dev`; the run pauses at a **plan checkpoint**. Approve to resume straight to implementation, or request a replan (resets the spec to `draft` so the next dispatch re-plans).
 - **`done_checkpoint`** — pause _after_ the story commits, to review the result before the loop moves on (skipped automatically when it is the last story).
 
-A story may set both (it pauses twice); `gates.mode` pauses stack on top. A blocked story escalates exactly as in sprint mode — `bmad-loop resolve`, then re-arm + resume — now with the story's title/description and the blocking condition surfaced; a pre-planning-halt **sentinel** spec is auto-deleted (a copy preserved under the run dir) on re-arm for a clean re-dispatch.
+An entry may also carry **`closes_deferred`** — the `DW-<n>` ledger ids that story's work closes (see [Deferred-work sweeps](#deferred-work-sweeps)):
+
+```yaml
+- id: '3-2'
+  title: Export digests
+  description: …
+  closes_deferred: [DW-5, DW-6]
+```
+
+Declaring it here rather than in the story spec is what makes the annotation work unattended: `bmad-dev-auto` generates the spec and knows nothing of the ledger, whereas the breakdown is authored while the ledger is in view. A spec that _does_ carry the field in frontmatter is honored too — the two are unioned.
+
+A story may set both checkpoints (it pauses twice); `gates.mode` pauses stack on top. A blocked story escalates exactly as in sprint mode — `bmad-loop resolve`, then re-arm + resume — now with the story's title/description and the blocking condition surfaced; a pre-planning-halt **sentinel** spec is auto-deleted (a copy preserved under the run dir) on re-arm for a clean re-dispatch.
 
 `bmad-loop run --dry-run --spec <folder>` prints the linear schedule (list order, checkpoint markers, live on-disk state); `bmad-loop status` shows the same stories board.
 
@@ -240,6 +251,8 @@ bmad-loop sweep [--no-prompt] [--decisions-only] [--max-bundles N] [--repeat] [-
 ```yaml
 closes_deferred: [DW-5, DW-6] # DW-<n> ids this story closes
 ```
+
+In stories mode the same declaration can live on the `stories.yaml` entry instead (`closes_deferred: [DW-5, DW-6]`), which is where it belongs for an unattended run — the breakdown is authored while the ledger is in view, whereas the story spec is generated later by a dev skill that knows nothing of the ledger. Both channels are unioned.
 
 At clean story-close the orchestrator writes the same annotation a bundle close writes — `status: done <date>` and `resolution: resolved by story <id>` — into each declared entry, squashed into the story's own commit. Without it the ledger is one-way: entries are filed automatically but only ever marked resolved by hand, so a multi-epic run ends with entries that were satisfied epics ago still reading `open`. Closure is declared, never inferred from the diff; a story that fails or blocks closes nothing; a resume re-driving the same close is a no-op; and an id that matches no entry is journaled rather than failing the story — `bmad-loop validate` surfaces those as a warning before the run starts.
 

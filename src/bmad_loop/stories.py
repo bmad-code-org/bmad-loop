@@ -6,10 +6,10 @@ referenced from frontmatter). It is a flat list, one entry per story, in strict
 execution order — **there is no ``depends_on`` field**, so the schedule is a
 single left-to-right scan, not a DAG. Each entry pins a stable, prefix-free,
 machine-opaque ``id`` plus ``title``/``description`` and the caller-only knobs
-``spec_checkpoint`` / ``done_checkpoint`` / ``invoke_dev_with``. ``status`` is
-deliberately absent: bmad-spec is the sole writer of ``stories.yaml`` and
-bmad-dev-auto is the sole writer of each story spec's status — the orchestrator
-writes neither.
+``spec_checkpoint`` / ``done_checkpoint`` / ``invoke_dev_with`` /
+``closes_deferred``. ``status`` is deliberately absent: bmad-spec is the sole
+writer of ``stories.yaml`` and bmad-dev-auto is the sole writer of each story
+spec's status — the orchestrator writes neither.
 
 This module is the strict, typed parser the orchestrator reads it through. The
 upstream schema (validity rule 4) already says ids are quoted strings of
@@ -84,7 +84,14 @@ class StoryEntry:
     """One story in the breakdown. ``id`` is stable once its spec file exists;
     the checkpoint flags are independent (a story may set both and pause twice).
     ``invoke_dev_with`` is free text appended verbatim to the dispatch prompt —
-    the single planner->dev channel, never interpreted here."""
+    the single planner->dev channel, never interpreted here.
+
+    ``closes_deferred`` names the deferred-work ledger ids this story closes
+    (#234). It is a *declaration channel*, not a status: the orchestrator marks
+    those entries resolved at clean close, and the ids are checked against the
+    ledger at preflight. It lives here as well as in the story spec's
+    frontmatter because the breakdown is written while the ledger is in view,
+    whereas the spec is generated later by a skill that knows nothing of it."""
 
     id: str
     title: str
@@ -92,6 +99,7 @@ class StoryEntry:
     spec_checkpoint: bool = False
     done_checkpoint: bool = False
     invoke_dev_with: str = ""
+    closes_deferred: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -174,6 +182,7 @@ def _parse_entry(raw: object, index: int) -> StoryEntry:
         spec_checkpoint=_bool_field(raw, "spec_checkpoint", story_id),
         done_checkpoint=_bool_field(raw, "done_checkpoint", story_id),
         invoke_dev_with=_text_field(raw, "invoke_dev_with", story_id),
+        closes_deferred=_id_list_field(raw, "closes_deferred", story_id),
     )
 
 
@@ -229,6 +238,33 @@ def _text_field(raw: dict, key: str, story_id: str) -> str:
     if not isinstance(value, str):
         raise StoriesError(f"stories.yaml story {story_id!r} field {key!r} must be a string")
     return value
+
+
+def _id_list_field(raw: dict, key: str, story_id: str) -> tuple[str, ...]:
+    """Optional list of ledger ids, defaulting empty when missing/null (#234).
+
+    Strict about the *container*: a bare ``closes_deferred: DW-1`` is a schema
+    error, not a silently-wrapped single id — the same fail-loud rule
+    :func:`_bool_field` applies, because a string is iterable and a lenient
+    reading would quietly turn one id into a list of characters.
+
+    Lenient about each *item*, exactly as :func:`_parse_id` is: an LLM-authored
+    manifest may emit an unquoted ``DW-1`` as a string but a bare ``5`` as an
+    int, so items are ``str()``-normalized and stripped. Blanks are dropped and
+    duplicates collapse (order-preserving), since both are noise rather than a
+    contradiction. Whether an id names a real entry is *not* checked here: this
+    module never reads the ledger, and a stale reference is a `validate` warning
+    and a journaled close-time note — never a parse failure.
+    """
+    value = raw.get(key)
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise StoriesError(
+            f"stories.yaml story {story_id!r} field {key!r} must be a list of "
+            f"deferred-work ids (got {type(value).__name__})"
+        )
+    return tuple(dict.fromkeys(item for item in (str(x).strip() for x in value) if item))
 
 
 def _validate_prefix_free(ids: list[str]) -> None:
