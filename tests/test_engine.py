@@ -21,11 +21,12 @@ from conftest import (
     review_effect,
     set_sprint,
     spec_path,
+    write_ledger,
     write_spec,
     write_sprint,
 )
 
-from bmad_loop import platform_util, verify
+from bmad_loop import deferredwork, platform_util, verify
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.engine import Engine, RunPaused, RunStopped, _run_depth
@@ -1939,6 +1940,116 @@ def test_post_dev_state_sync_skips_on_unreadable_spec(project, monkeypatch):
     events = [e for e in engine.journal.entries() if e["kind"] == "spec-read-failed"]
     assert len(events) == 1 and events[0]["site"] == "post-dev-sync"
     assert events[0]["story_key"] == "1-1-a"
+
+
+# ------------------------------------------- closes_deferred auto-resolve (#234)
+
+
+def _spec_declaring(path: Path, status: str, dw_ids: list[str] | None) -> None:
+    """A bmad-dev-auto-shaped spec that optionally declares `closes_deferred:`.
+    ``None`` omits the key entirely (the overwhelmingly common spec)."""
+    declare = f"closes_deferred: [{', '.join(dw_ids)}]\n" if dw_ids is not None else ""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"---\ntitle: 'test'\ntype: 'feature'\nstatus: '{status}'\n"
+        f"baseline_revision: 'abc123'\n{declare}---\n\n## Intent\n\ntest spec\n",
+        encoding="utf-8",
+    )
+
+
+def _ledger_entries(project) -> dict:
+    return {
+        e.id: e
+        for e in deferredwork.parse_ledger(project.deferred_work.read_text(encoding="utf-8"))
+    }
+
+
+def _closes_deferred_engine(project, status: str, dw_ids: list[str] | None):
+    """Engine + a story whose spec is finalized at `status` and declares `dw_ids`,
+    over a ledger holding a single open DW-1. Uncommitted: these drive
+    `_post_dev_state_sync` directly, so no commit ever runs."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    engine, _ = make_engine(project, [])
+    sp = spec_path(project, "1-1-a")
+    _spec_declaring(sp, status, dw_ids)
+    return engine, StoryTask(story_key="1-1-a", epic=1), {"spec_file": str(sp)}
+
+
+def test_closes_deferred_marks_declared_entries_done(project):
+    """A story spec declaring `closes_deferred:` flips each referenced ledger
+    entry to `status: done <date>` + a `resolution:` note at clean close — the
+    write the loop never made, forcing retros to reconstruct closure by hand
+    (#234). Closure is declared, never inferred from the diff."""
+    engine, task, rj = _closes_deferred_engine(project, "done", ["DW-1"])
+
+    engine._post_dev_state_sync(task, rj)
+
+    entry = _ledger_entries(project)["DW-1"]
+    assert entry.status.startswith("done") and not entry.open
+    assert "resolution: resolved by story 1-1-a" in entry.body
+    closed = [e for e in engine.journal.entries() if e["kind"] == "story-deferred-closed"]
+    assert len(closed) == 1
+    assert closed[0]["dw_ids"] == ["DW-1"] and closed[0]["story_key"] == "1-1-a"
+
+
+def test_closes_deferred_idempotent_on_rerun(project):
+    """A resumed run re-drives the close for a story whose annotation already
+    landed. The second pass must write nothing and stay *silent*: an id that is
+    present-but-already-done is a satisfied declaration, not an unmatched one."""
+    engine, task, rj = _closes_deferred_engine(project, "done", ["DW-1"])
+
+    engine._post_dev_state_sync(task, rj)
+    engine._post_dev_state_sync(task, rj)
+
+    body = _ledger_entries(project)["DW-1"].body
+    assert body.count("resolution: resolved by story 1-1-a") == 1  # not doubled
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert kinds.count("story-deferred-closed") == 1  # only the first pass wrote
+    assert "deferred-close-unmatched" not in kinds  # already-done is NOT unknown
+
+
+def test_closes_deferred_warns_on_unknown_id(project):
+    """An id absent from the ledger (a typo, or an entry since reworded) is
+    journaled and dropped — never a story failure, and never a ledger write."""
+    engine, task, rj = _closes_deferred_engine(project, "done", ["DW-99"])
+    before = project.deferred_work.read_bytes()
+
+    engine._post_dev_state_sync(task, rj)
+
+    assert project.deferred_work.read_bytes() == before  # ledger untouched
+    events = [e for e in engine.journal.entries() if e["kind"] == "deferred-close-unmatched"]
+    assert len(events) == 1
+    assert events[0]["dw_ids"] == ["DW-99"] and events[0]["story_key"] == "1-1-a"
+    assert "story-deferred-closed" not in [e["kind"] for e in engine.journal.entries()]
+
+
+def test_closes_deferred_noop_when_field_absent(project):
+    """The default spec declares nothing: no ledger write and no journal noise on
+    the close path every ordinary story takes."""
+    engine, task, rj = _closes_deferred_engine(project, "done", None)
+    before = project.deferred_work.read_bytes()
+
+    engine._post_dev_state_sync(task, rj)
+
+    assert project.deferred_work.read_bytes() == before
+    kinds = {e["kind"] for e in engine.journal.entries()}
+    assert "story-deferred-closed" not in kinds and "deferred-close-unmatched" not in kinds
+
+
+def test_closes_deferred_skips_when_spec_unfinalized(project):
+    """The annotation rides the same clean-close gate as the sprint advance: a
+    session that leaves the spec short of the success status closes nothing, so a
+    failed story can never mark its declared entries resolved."""
+    engine, task, rj = _closes_deferred_engine(project, "in-progress", ["DW-1"])
+    before = project.deferred_work.read_bytes()
+
+    engine._post_dev_state_sync(task, rj)
+
+    assert project.deferred_work.read_bytes() == before
+    assert _ledger_entries(project)["DW-1"].open  # still open
+    kinds = {e["kind"] for e in engine.journal.entries()}
+    assert "story-deferred-closed" not in kinds and "deferred-close-unmatched" not in kinds
 
 
 def test_transient_spec_read_fault_does_not_crash_run(project, monkeypatch):

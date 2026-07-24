@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import re
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -402,10 +401,6 @@ class SweepEngine(Engine):
         # persistent decision item would notify once per repeat cycle
         self._skipped_decisions: set[str] = set()
         self.state.run_type = "sweep"
-
-    # the date stamped into ledger edits; isolated for tests
-    def _today(self) -> str:
-        return time.strftime("%Y-%m-%d")
 
     def _remaining_estimate(self) -> int | None:
         """Sweep override of the graceful-stop hint: how many deferred-work

@@ -1768,6 +1768,10 @@ class Engine:
             return False
         return self.policy.review.enabled
 
+    # the date stamped into ledger edits; isolated for tests
+    def _today(self) -> str:
+        return time.strftime("%Y-%m-%d")
+
     def _observed_frontmatter(self, spec_path: Path, story_key: str, site: str) -> dict | None:
         """Read a spec's frontmatter on a *bookkeeping* path, degrading an
         unreadable spec to ``None`` (journaled) instead of a whole-run crash.
@@ -2048,6 +2052,43 @@ class Engine:
             return
         target = "review" if review_enabled else "done"
         sprint_advance(self.workspace.paths.sprint_status, task.story_key, target)
+        self._close_declared_deferred(task, fm)
+
+    def _close_declared_deferred(self, task: StoryTask, fm: dict) -> None:
+        """At clean close, flip every ledger entry the spec declares via
+        ``closes_deferred:`` to ``status: done <date>`` + a ``resolution:`` note
+        (#234) — the regular-story counterpart of the sweep bundle close at
+        ``SweepEngine._close_bundle_ledger_when_spec_status``.
+
+        Declaration is the only signal: closure is never inferred from a diff.
+        Ids are classified against a single ledger snapshot rather than from
+        ``mark_done``'s return value, because that return conflates two very
+        different cases — an id already ``done`` (a *resume* re-running a close
+        that already landed, which must stay silent) and an id absent from the
+        ledger (a typo or a reworded entry, which is worth a journal warning).
+        Neither ever fails the story: the annotation is traceability, not a gate.
+
+        Called from ``_post_dev_state_sync``, i.e. *before* ``_commit`` — the
+        ledger path is rebased into the worktree, so marking here squashes the
+        annotation into the story's own commit, the same way the append hooks do.
+        """
+        raw = fm.get("closes_deferred") or []
+        ids = [str(x).strip() for x in raw] if isinstance(raw, list) else []
+        if not ids:
+            return
+        ledger = self.workspace.paths.deferred_work
+        text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
+        present = {e.id for e in deferredwork.parse_ledger(text)}
+        note = f"resolved by story {task.story_key}"
+        today = self._today()
+        marked = [i for i in ids if i in present and deferredwork.mark_done(ledger, i, today, note)]
+        unknown = [i for i in ids if i not in present]
+        if marked:
+            self.journal.append("story-deferred-closed", story_key=task.story_key, dw_ids=marked)
+        if unknown:
+            self.journal.append(
+                "deferred-close-unmatched", story_key=task.story_key, dw_ids=unknown
+            )
 
     def _extra_session_env(
         self, task: StoryTask, role: str, label: str | None = None
