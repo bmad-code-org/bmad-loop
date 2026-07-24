@@ -253,7 +253,7 @@ The orchestrator drives the upstream `bmad-dev-auto` skill as its inner dev prim
 | `bmad-review-verification-gap`    | inline step-04 review layer, newest (BMAD-METHOD#2550) (**upstream** — bmm prereq, not bundled) |
 | `bmad-loop-resolve`               | interactive CRITICAL-escalation resolution (`/bmad-loop-resolve <story>`)                       |
 | `bmad-loop-sweep`                 | deferred-work ledger triage (automation-only)                                                   |
-| `bmad-loop-setup`                 | registers the module in `_bmad/` config + help                                                  |
+| `bmad-loop-setup`                 | registers the module in `_bmad/` config + help (TOML layout on v6.10+, legacy YAML before)      |
 
 `bmad-loop validate` preflights all four upstream skills; a target project on a pre-July bmm install missing `bmad-review-verification-gap` (or a `bmad-dev-auto` without its `customize.toml` review-layer config) is reported with bmm-module remediation before any run starts.
 

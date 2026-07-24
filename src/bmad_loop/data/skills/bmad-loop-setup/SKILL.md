@@ -11,31 +11,50 @@ Installs, configures, **and upgrades** a BMad module in a project. This module i
 
 The same skill handles both first-time setup and **upgrades**. When it detects an existing bmad-loop install (or you ask it to `upgrade`), it upgrades the orchestrator tool, refreshes the per-project `bmad-loop-*` skill copies, and re-stamps config — the two-step upgrade ritual, run for you. A plain re-run on an already-installed project is treated as an upgrade.
 
-Module identity (name, code, version) comes from `./assets/module.yaml`. Collects user preferences and writes them to three files:
+Module identity (name, code, version) comes from `./assets/module.yaml`. **BMAD ships two config layouts, and the merge scripts register into whichever one the project actually uses.** You do not choose: both scripts detect it from `--bmad-dir`. The layout is TOML **iff** `{project-root}/_bmad/config.toml` exists.
+
+### TOML layout (BMAD v6.10+)
+
+The consolidated resolver (`_bmad/scripts/resolve_config.py`) reads exactly four files — `config.toml`, `config.user.toml`, `custom/config.toml`, `custom/config.user.toml` — and never `config.yaml`. `/bmad-help` reads exactly one catalog, `_bmad/_config/bmad-help.csv`, the installer's assembled concatenation of the per-module `_bmad/<module>/module-help.csv` files. So registration lands in:
+
+- **`{project-root}/_bmad/custom/config.toml`** — the `[modules.bmad-loop]` table (`name`, `description`, `version`, `default_selected`), written into the layer BMAD documents as _never touched by the installer_. It is a **surgical text edit** of that table's span only: every comment, every unrelated table, and every other byte of that human-authored file comes back untouched.
+- **`{project-root}/_bmad/bmad-loop/module-help.csv`** — the per-module help CSV, in the installer's own location. The whole file is ours, so it is overwritten outright.
+- **`{project-root}/_bmad/_config/bmad-help.csv`** — the assembled catalog `/bmad-help` reads. Shared with every other module, so our rows are merged in anti-zombie and the catalog's own header is preserved.
+
+**No core values are written on this layout** — not `user_name`, not `output_folder`, nothing. The custom layer _wins_ over the installer layer, so anything pinned there would override every future installer answer. Core config stays installer-owned. Nothing else is written either: no `config.yaml`, no `config.user.yaml`.
+
+### Legacy YAML layout (pre-6.10, no `_bmad/config.toml`)
+
+Unchanged. Collects user preferences and writes them to three files:
 
 - **`{project-root}/_bmad/config.yaml`** — shared project config: core settings at root (e.g. `output_folder`, `document_output_language`) plus a section per module with metadata and module-specific values. User-only keys (`user_name`, `communication_language`) are **never** written here.
 - **`{project-root}/_bmad/config.user.yaml`** — personal settings intended to be gitignored: `user_name`, `communication_language`, and any module variable marked `user_setting: true` in `./assets/module.yaml`. These values live exclusively here.
 - **`{project-root}/_bmad/module-help.csv`** — registers module capabilities for the help system.
 
-Both config scripts use an anti-zombie pattern — existing entries for this module are removed before writing fresh ones, so stale values never persist.
+Both config scripts use an anti-zombie pattern — existing entries for this module are removed before writing fresh ones, so stale values never persist. On the TOML layout, inert pre-6.10 leftovers sitting directly under `_bmad/` (`config.yaml`, `config.user.yaml`, `module-help.csv`) are **reported** as `orphans_detected` and never deleted — nothing reads them, but they are not ours to remove.
 
 `{project-root}` is a **literal token** in config _values_ (the data written into the files above) — never substitute it there. It signals to the consuming LLM that the value is relative to the project root, not the skill root. **This does not apply to the filesystem path _arguments_ passed to the scripts below** (the `--*-path`, `--*-dir`, and `--target` arguments): those are real paths, so you **must** resolve `{project-root}` to the actual project root before running, or the scripts will write to a literal `{project-root}/` directory under the skill folder. The scripts reject an unresolved token with an error.
 
 ## On Activation
 
 1. Read `./assets/module.yaml` for module metadata and variable definitions (the `code` field is the module identifier)
-2. Check if `{project-root}/_bmad/config.yaml` exists — if a section matching the module's code is already present, inform the user this is an update
-3. Check for per-module configuration at `{project-root}/_bmad/bmad-loop/config.yaml` and `{project-root}/_bmad/core/config.yaml`. If either file exists:
-   - If `{project-root}/_bmad/config.yaml` does **not** yet have a section for this module: this is a **fresh install**. Inform the user that installer config was detected and values will be consolidated into the new format.
-   - If `{project-root}/_bmad/config.yaml` **already** has a section for this module: this is a **legacy migration**. Inform the user that legacy per-module config was found alongside existing config, and legacy values will be used as fallback defaults.
-   - In both cases, legacy per-module config is consolidated into the new format. Live config files are **preserved** (never deleted); only genuinely redundant skill-payload directories, if any, are cleaned up after setup.
+2. **Detect the config layout, then check whether the module is already registered.** The layout is **TOML** (BMAD v6.10+) iff `{project-root}/_bmad/config.toml` exists, otherwise **legacy YAML**. The "already registered" tell follows the layout:
+   - **TOML** — a `[modules.bmad-loop]` table in `{project-root}/_bmad/custom/config.toml`.
+   - **Legacy YAML** — a section matching the module's code in `{project-root}/_bmad/config.yaml`.
+
+   Either tell means this is an update; say so. State the detected layout to the user too — it decides which files setup writes.
+
+3. Check for per-module configuration at `{project-root}/_bmad/bmad-loop/config.yaml` and `{project-root}/_bmad/core/config.yaml`. These per-module YAML files are still live and installer-written on v6.10. If either exists:
+   - If the module is **not** yet registered (step 2's tell for the detected layout): this is a **fresh install**. Inform the user that installer config was detected and values will be consolidated into the new format.
+   - If the module **is** already registered: this is a **legacy migration**. Inform the user that legacy per-module config was found alongside existing config, and legacy values will be used as fallback defaults.
+   - In both cases, legacy per-module config is consolidated into the new format. Live config files are **preserved** (never deleted); only genuinely redundant skill-payload directories, if any, are cleaned up after setup. Note that on the TOML layout there is nothing to consolidate _into_ — core config is installer-owned there (see "Collect Configuration").
 
 **Decide fresh-install vs upgrade.** This drives whether the tool is upgraded and whether the per-project skills are refreshed (see "Install the Orchestrator Tool" below). Treat it as an **upgrade** when **any** of these hold:
 
 - The user asked for one in their arguments — `upgrade`, `update`, `upgrade tool and skills`, or similar.
-- `{project-root}/_bmad/config.yaml` already has a `bmad-loop` section (step 2 above).
+- The module is already registered (step 2 above) — a `[modules.bmad-loop]` table in `{project-root}/_bmad/custom/config.toml` on the TOML layout, or a `bmad-loop` section in `{project-root}/_bmad/config.yaml` on the legacy layout.
 - The orchestrator tool is already installed under uv: run `uv tool list` and look for a `bmad-loop` entry. (A bare `bmad-loop --version` is **not** sufficient on its own — it can be satisfied by a source checkout or unrelated virtualenv; see step 1 of "Install the Orchestrator Tool".)
-- **A pre-rename install is present** — the project (or the machine) is on the old `bmad-auto`. Two tells: `{project-root}/_bmad/config.yaml` has a legacy `bauto` section, or `uv tool list` shows a `bmad-auto` entry (the tool's former name). Treat this as an **upgrade from bmad-auto (renamed to bmad-loop)** and follow "Migrating from bmad-auto (renamed)" below in addition to the normal upgrade path.
+- **A pre-rename install is present** — the project (or the machine) is on the old `bmad-auto`. The tells: a stale `[modules.bauto]` table in `{project-root}/_bmad/custom/config.toml` (TOML layout) or a legacy `bauto` section in `{project-root}/_bmad/config.yaml` (legacy layout — and on the TOML layout that same file may survive as an inert orphan still carrying one), or `uv tool list` shows a `bmad-auto` entry (the tool's former name). Treat this as an **upgrade from bmad-auto (renamed to bmad-loop)** and follow "Migrating from bmad-auto (renamed)" below in addition to the normal upgrade path.
 
 Otherwise it is a **fresh install**. State the decision to the user before proceeding — e.g. "Detected an existing bmad-loop install — running an upgrade: tool + skills + config" or "No existing install detected — running a fresh setup". When the signals conflict (e.g. config has a `bmad-loop` section but the tool isn't uv-managed), prefer the upgrade path for whatever **is** present and call out what's missing.
 
@@ -45,25 +64,29 @@ If the user provides arguments (e.g. `accept all defaults`, `--headless`, `upgra
 
 Only when you detected a **pre-rename install** ("Decide fresh-install vs upgrade" above). The project was set up under the tool's former name, `bmad-auto`. The rename was a clean break — module code `bauto` → `bmad-loop`, tool package `bmad-auto` → `bmad-loop`, state dir `.automator/` → `.bmad-loop/` — with no compatibility shims, so a few steps below need explicit handling. Do these as part of the normal upgrade:
 
-1. **Carry old config defaults over.** `merge-config.py --legacy-dir` reads `_bmad/bmad-loop/` (the new code), so it won't find the old `bauto` config on its own. Before collecting values, read the legacy `bauto:` section from `{project-root}/_bmad/config.yaml` (and, if present, the old installer file `{project-root}/_bmad/bauto/config.yaml`) and fold any keys that still match the current `module.yaml` schema into your defaults. Priority: existing `bmad-loop` values > legacy `bauto` section > legacy `_bmad/bauto/config.yaml` > `module.yaml` defaults.
+1. **Carry old config defaults over** (legacy YAML layout only — on the TOML layout there is nothing to collect, so there is nothing to carry; see "Collect Configuration"). `merge-config.py --legacy-dir` reads `_bmad/bmad-loop/` (the new code), so it won't find the old `bauto` config on its own. Before collecting values, read the legacy `bauto:` section from `{project-root}/_bmad/config.yaml` (and, if present, the old installer file `{project-root}/_bmad/bauto/config.yaml`) and fold any keys that still match the current `module.yaml` schema into your defaults. Priority: existing `bmad-loop` values > legacy `bauto` section > legacy `_bmad/bauto/config.yaml` > `module.yaml` defaults.
 2. **Reinstall the tool under its new name** — uv can't rename a package in place, so this is an uninstall + install, not an upgrade. See the renamed-tool note in "Install the Orchestrator Tool" step 2.
 3. **Run `bmad-loop init`** as usual. It handles the on-disk migration for you: strips the old `.automator/` Stop hook from each CLI's settings, removes the `bmad-auto-*` skill dirs, and carries `.automator/policy.toml` over to `.bmad-loop/policy.toml` — leaving the rest of `.automator/` (runs, archives, profiles, plugins) in place for you to delete once satisfied.
-4. **Post-merge cleanup** — the anti-zombie merges key on the **new** names, so old rows and sections survive and need explicit removal:
-   - Delete the leftover `bauto:` section from `{project-root}/_bmad/config.yaml`, plus any `bauto`-marked keys in `{project-root}/_bmad/config.user.yaml`.
-   - Delete rows from `{project-root}/_bmad/module-help.csv` whose module column (column 1) reads `BMAD Automator Skills` — `merge-help-csv.py`'s anti-zombie filter keys on the new `BMAD Loop Skills`, so it leaves the old-named rows behind.
+4. **Post-merge cleanup** — the anti-zombie merges key on the **new** names, so old rows and sections survive and need explicit removal. Which files hold them depends on the layout:
+   - **Config.** On the **TOML layout**, delete a stale `[modules.bauto]` table from `{project-root}/_bmad/custom/config.toml` (the module table is the only thing we write there). The pre-6.10 `{project-root}/_bmad/config.yaml` / `config.user.yaml` are inert on this layout — they are reported in `orphans_detected` and read by nothing, so you can leave them or delete the whole file by hand; editing out just the `bauto:` section buys nothing. On the **legacy YAML layout**, delete the leftover `bauto:` section from `{project-root}/_bmad/config.yaml`, plus any `bauto`-marked keys in `{project-root}/_bmad/config.user.yaml`.
+   - **Help rows.** `merge-help-csv.py`'s anti-zombie filter keys on the module names in the **source** CSV (`BMAD Loop Skills`), so rows whose module column (column 1) reads `BMAD Automator Skills` are never matched and **survive every merge**. Delete them by hand from `{project-root}/_bmad/_config/bmad-help.csv` (TOML layout — this is the catalog `/bmad-help` actually reads, so stale rows show up there) and from `{project-root}/_bmad/module-help.csv` (legacy layout, or as an inert orphan on TOML).
    - The legacy installer dir `_bmad/bauto/` is cleaned by the bauto cleanup step (see "Cleanup Legacy Directories") **only if** it holds redundant `bmad-auto-*` skill copies; if it holds only stale config it is preserved (harmless — remove it manually once satisfied).
 
 Then continue with the normal flow below.
 
 ## Collect Configuration
 
+**`./assets/module.yaml` declares no prompt variables** — it is metadata only (`code`, `name`, `description`, `module_version`, `default_selected`, `module_greeting`). So there is no module-specific question to ask on either layout, and **on the TOML layout there is nothing to collect at all**: the `[modules.bmad-loop]` table is built entirely from that metadata, and core config (`user_name`, `output_folder`, …) is **installer-owned** and deliberately not written by this skill. Skip straight to "Write Files" — still write the answers temp file (an empty `{"module": {}}` is fine; the script ignores it on this layout).
+
+The rest of this section applies to the **legacy YAML layout** only.
+
 Ask the user for values. Show defaults in brackets. Present all values together so the user can respond once with only the values they want to change (e.g. "change language to Swahili, rest are fine"). Never tell the user to "press enter" or "leave blank" — in a chat interface they must type something to respond.
 
 **Default priority** (highest wins): existing new config values > legacy config values > `./assets/module.yaml` defaults. When legacy configs exist, read them and use matching values as defaults instead of `module.yaml` defaults. Only keys that match the current schema are carried forward — changed or removed keys are ignored. On a **rename-upgrade from bmad-auto**, the old `bauto` section (in `_bmad/config.yaml`) and any `_bmad/bauto/config.yaml` installer file slot in below existing `bmad-loop` values and above `module.yaml` defaults — you read them yourself (see "Migrating from bmad-auto (renamed)"), since merge-config's `--legacy-dir` only looks under the new code.
 
-**Core config** (only if no core keys exist yet): `user_name` (default: BMad), `communication_language` and `document_output_language` (default: English — ask as a single language question, both keys get the same answer), `output_folder` (default: `{project-root}/_bmad-output`). Of these, `user_name` and `communication_language` are written exclusively to `config.user.yaml`. The rest go to `config.yaml` at root and are shared across all modules.
+**Core config** — **legacy YAML layout only** (only if no core keys exist yet): `user_name` (default: BMad), `communication_language` and `document_output_language` (default: English — ask as a single language question, both keys get the same answer), `output_folder` (default: `{project-root}/_bmad-output`). Of these, `user_name` and `communication_language` are written exclusively to `config.user.yaml`. The rest go to `config.yaml` at root and are shared across all modules. **Never ask these on the TOML layout** — core config there is installer-owned, and the custom layer we write wins over the installer layer, so a pinned answer would override every future installer run.
 
-**Module config**: Read each variable in `./assets/module.yaml` that has a `prompt` field. Ask using that prompt with its default value (or legacy value if available).
+**Module config**: Read each variable in `./assets/module.yaml` that has a `prompt` field. Ask using that prompt with its default value (or legacy value if available). This module currently declares none, so there is nothing to ask.
 
 ## Write Files
 
@@ -71,18 +94,24 @@ Write a temp JSON file with the collected answers structured as `{"core": {...},
 
 In the commands below, replace `{project-root}` in every path argument with the actual project root (e.g. `/home/me/myapp`) before running — these are filesystem paths, not config values.
 
+`--bmad-dir` is **required** by both scripts and is what selects the layout — pass it always. The commands below carry the legacy-layout arguments too, so a **single command line works on both layouts**: on the TOML layout `--config-path`, `--user-config-path` and `--target` are simply ignored (nothing is written to those paths), and on the legacy layout they are required.
+
 ```bash
-python3 ./scripts/merge-config.py --config-path "{project-root}/_bmad/config.yaml" --user-config-path "{project-root}/_bmad/config.user.yaml" --module-yaml ./assets/module.yaml --answers {temp-file} --legacy-dir "{project-root}/_bmad"
-python3 ./scripts/merge-help-csv.py --target "{project-root}/_bmad/module-help.csv" --source ./assets/module-help.csv --legacy-dir "{project-root}/_bmad" --module-code bmad-loop
+python3 ./scripts/merge-config.py --bmad-dir "{project-root}/_bmad" --module-yaml ./assets/module.yaml --answers {temp-file} --legacy-dir "{project-root}/_bmad" --config-path "{project-root}/_bmad/config.yaml" --user-config-path "{project-root}/_bmad/config.user.yaml"
+python3 ./scripts/merge-help-csv.py --bmad-dir "{project-root}/_bmad" --source ./assets/module-help.csv --module-code bmad-loop --legacy-dir "{project-root}/_bmad" --target "{project-root}/_bmad/module-help.csv"
 ```
 
-Both scripts output JSON to stdout with results. If either exits non-zero, surface the error and stop. The scripts automatically read legacy config values as fallback defaults. Legacy config files are **preserved, never deleted** — on BMAD v6 the per-module and core `config.yaml` / `module-help.csv` are live, manifest-tracked files (so `legacy_configs_deleted` / `legacy_csvs_deleted` are always empty).
+`--module-code` is required on the TOML layout — it names the per-module CSV directory (`_bmad/<module-code>/module-help.csv`). Each script fails loudly with the layout-specific argument it is missing.
+
+Both scripts output JSON to stdout with results. If either exits non-zero, surface the error and stop. The scripts automatically read legacy config values as fallback defaults. Legacy config files are **preserved, never deleted** — on BMAD v6 the per-module and core `config.yaml` / `module-help.csv` are live, manifest-tracked files (so `legacy_configs_deleted` / `legacy_csvs_deleted` are always empty). On the TOML layout, inert pre-6.10 files directly under `_bmad/` are likewise only **reported**, in `orphans_detected`.
 
 Run `./scripts/merge-config.py --help` or `./scripts/merge-help-csv.py --help` for full usage.
 
 ## Create Output Directories
 
-After writing config, create any output directories that were configured. For filesystem operations only (such as creating directories), resolve the `{project-root}` token to the actual project root and create each path-type value from `config.yaml` that does not yet exist — this includes `output_folder` and any module variable whose value starts with `{project-root}/`. The paths stored in the config files must continue to use the literal `{project-root}` token; only the directories on disk should use the resolved paths. Use `mkdir -p` or equivalent to create the full path.
+**TOML layout:** this skill writes no path values at all (only the `[modules.bmad-loop]` metadata table), so there is nothing new to create — `output_folder` and friends are installer-owned. Skip this step.
+
+**Legacy YAML layout:** after writing config, create any output directories that were configured. For filesystem operations only (such as creating directories), resolve the `{project-root}` token to the actual project root and create each path-type value from `config.yaml` that does not yet exist — this includes `output_folder` and any module variable whose value starts with `{project-root}/`. The paths stored in the config files must continue to use the literal `{project-root}` token; only the directories on disk should use the resolved paths. Use `mkdir -p` or equivalent to create the full path.
 
 ## Install the Orchestrator Tool
 
@@ -197,7 +226,17 @@ Check `directories_removed`, `directories_protected`, and `files_removed_count` 
 
 ## Confirm
 
-Use the script JSON output to display what was written — config values set (written to `config.yaml` at root for core, module section for module values; the `bmad-loop` section's `version` is re-stamped from `./assets/module.yaml` on every run via the anti-zombie merge), user settings written to `config.user.yaml` (`user_keys` in result), help entries added, fresh install vs upgrade.
+Use the script JSON output to display what was written. Both scripts report the detected layout in `layout` (`"toml"` or `"yaml"`) — lead with it, then report the keys for that branch.
+
+**TOML layout (`layout: "toml"`)**
+
+- From `merge-config.py`: the `[modules.bmad-loop]` table was written to `config_path` (`_bmad/custom/config.toml`) with `module_keys`; `table_replaced: true` means an existing table was refreshed in place (re-stamping `version` from `./assets/module.yaml`), `false` means it was appended. `toml_validated: true` confirms the edited file re-parses as valid TOML — if it is `false`, say so plainly: the file **was** written but could not be validated (no `tomllib`, i.e. Python < 3.11), so the user should eyeball it. Note that `core_updated` is always `false` and `user_keys` always empty here **by design** — core config is installer-owned, and the custom layer would override every future installer answer.
+- From `merge-help-csv.py`: help rows written to `module_help_path` (`_bmad/bmad-loop/module-help.csv`) and merged into `catalog_path` (`_bmad/_config/bmad-help.csv`, the catalog `/bmad-help` reads) — report `rows_added`, `rows_removed` (stale rows of ours dropped first) and `total_rows`. `catalog_existed: false` means the catalog was created from our header.
+- **Caveat to state every time:** `_config/bmad-help.csv` is a generated file. A BMAD **installer re-run regenerates it and drops our rows**, so `/bmad-help` would stop listing the bmad-loop skills. Re-run `/bmad-loop-setup` to restore them.
+
+**Legacy YAML layout (`layout: "yaml"`)** — config values set (written to `config_path` at root for core, module section for module values; the `bmad-loop` section's `version` is re-stamped from `./assets/module.yaml` on every run via the anti-zombie merge), user settings written to `user_config_path` (`user_keys` in result), help entries merged into `target_path` (`rows_added` / `rows_removed` / `total_rows`), fresh install vs upgrade.
+
+**Orphans (both scripts, TOML layout).** If `orphans_detected` is non-empty, list the paths. Explain them accurately: these are pre-6.10 files sitting directly under `_bmad/` (`config.yaml`, `config.user.yaml`, `module-help.csv`) that **nothing on this project reads** — BMAD v6.10's resolver reads only the four `*.toml` files and `/bmad-help` reads only `_config/bmad-help.csv`. They are inert leftovers and are **safe to delete by hand**; `has_module_entries: true` just means the file still carries bmad-loop (or pre-rename `bauto`) entries. **bmad-loop never deletes them** — it does not delete BMAD config it does not own. Do not offer to delete them for the user unless they explicitly ask.
 
 Report the **tool** result according to the branch taken:
 

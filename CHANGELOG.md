@@ -67,6 +67,30 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **`/bmad-loop-setup` registers into the BMAD v6.10 TOML config layout (#258).** BMAD-METHOD
+  v6.10 consolidated onto TOML: its resolver reads only `config.toml`, `config.user.toml`,
+  `custom/config.toml`, `custom/config.user.toml`, and `/bmad-help` reads only the assembled
+  `_bmad/_config/bmad-help.csv`. Setup's merge scripts still wrote the pre-6.10 root
+  `_bmad/config.yaml` + `_bmad/module-help.csv` — files v6.10 reads from nothing and does not
+  even manifest-track — so the module was registered nowhere and never appeared in `/bmad-help`.
+  Both scripts now take `--bmad-dir` and detect the layout (TOML iff `_bmad/config.toml` exists):
+  - **v6.10+** — `[modules.bmad-loop]` is written to `_bmad/custom/config.toml` (a surgical
+    text edit that preserves every comment and unrelated table in that human-authored file, then
+    validated by re-parsing), help rows to `_bmad/bmad-loop/module-help.csv`, and the same rows
+    are anti-zombie-merged into the `_bmad/_config/bmad-help.csv` catalog.
+  - **Pre-6.10** — the legacy `config.yaml` / `config.user.yaml` / `module-help.csv` behavior,
+    unchanged.
+  - **No core values** (`user_name`, `output_folder`, …) are written on the TOML layout, by
+    design: the custom layer wins over the installer layer, so pinning them there would override
+    every future installer answer. Core config stays installer-owned.
+  - Inert pre-6.10 leftovers under `_bmad/` are **reported** as `orphans_detected` and never
+    deleted (#64 doctrine); the skill tells the user they are safe to remove by hand.
+  - Caveat, now documented: `_config/bmad-help.csv` is generated, so a BMAD installer re-run
+    regenerates it and drops our rows — re-run `/bmad-loop-setup` to restore them.
+
+  Out of scope and still open: #259 (the scripts' `python3` invocation prefix) and #154 (the
+  runtime's `_bmad/bmm/config.yaml` read, which v6.10 still generates and manifest-tracks).
+
 - **`notify.desktop` works on macOS/Windows, and warns when it can't (#231).** The desktop
   notification channel was `notify-send`-only, so on macOS and Windows `notify.desktop` (default
   `true`) was silently inert — every "a human is needed" path (escalations, deferrals,

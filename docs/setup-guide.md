@@ -62,9 +62,13 @@ claude "/bmad-loop-setup accept all defaults"
 
 `/bmad-loop-setup` handles both first-time setup and later upgrades — re-run it any time. It:
 
-1. Merges the module's config into `_bmad/config.yaml` (+ personal settings into the
-   gitignored `_bmad/config.user.yaml`) and registers its help entries in
-   `_bmad/module-help.csv`.
+1. Registers the module in `_bmad/`, into whichever config layout the project uses (detected
+   by whether `_bmad/config.toml` exists). On **BMAD v6.10+** that is a `[modules.bmad-loop]`
+   table in `_bmad/custom/config.toml` plus help rows in `_bmad/bmad-loop/module-help.csv`,
+   merged into the `_bmad/_config/bmad-help.csv` catalog `/bmad-help` reads — **no core
+   values** are written, since the custom layer would override future installer answers. On
+   **pre-6.10** projects it merges into `_bmad/config.yaml` (+ personal settings into the
+   gitignored `_bmad/config.user.yaml`) and `_bmad/module-help.csv`, as before.
 2. Installs **or upgrades** the `bmad-loop` tool from Git (see
    [Installing the tool and TUI](#installing-the-tool-and-tui)). On an upgrade it runs
    `uv tool upgrade bmad-loop --reinstall`.
@@ -321,11 +325,24 @@ file is untracked — re-add it (`git add .bmad-loop/policy.toml`) only if you w
 
 ### 6. Unregister from `_bmad/` (BMAD-installer projects only)
 
-If you ran `/bmad-loop-setup`, it registered the module in your BMAD config. Remove the
-bmad-loop (`bmad-loop`) entries from:
+If you ran `/bmad-loop-setup`, it registered the module in your BMAD config. Which files hold
+the entries depends on the layout — check whether `_bmad/config.toml` exists.
+
+**BMAD v6.10+ (`_bmad/config.toml` present):**
+
+- `_bmad/custom/config.toml` — drop the `[modules.bmad-loop]` table (it is the only thing
+  setup wrote there; the rest of that file is yours)
+- `_bmad/bmad-loop/module-help.csv` — delete the file (it is entirely ours)
+- `_bmad/_config/bmad-help.csv` — drop the rows whose module column reads `BMAD Loop Skills`
+
+**Pre-6.10:**
 
 - `_bmad/config.yaml` and `_bmad/config.user.yaml` — drop the bmad-loop module config block
 - `_bmad/module-help.csv` — drop the bmad-loop help rows
+
+On a v6.10+ project a root `_bmad/config.yaml` / `config.user.yaml` / `module-help.csv` may
+still exist as an inert pre-6.10 leftover (setup reports these as `orphans_detected` and never
+touches them). Nothing reads them; delete them by hand if you want them gone.
 
 uv + `init`-only projects never write to `_bmad/` and can skip this step.
 
