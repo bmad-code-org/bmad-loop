@@ -3,12 +3,33 @@
 # requires-python = ">=3.9"
 # dependencies = ["pyyaml"]
 # ///
-"""Merge module configuration into shared _bmad/config.yaml and config.user.yaml.
+"""Register a module's configuration into a project's _bmad/ tree.
 
-Reads a module.yaml definition and a JSON answers file, then writes or updates
-the shared config.yaml (core values at root + module section) and config.user.yaml
-(user_name, communication_language, plus any module variable with user_setting: true).
-Uses an anti-zombie pattern for the module section in config.yaml.
+BMAD ships two config layouts and this script writes whichever one the project
+actually uses. --bmad-dir points at _bmad/ and decides which (see detect_layout):
+
+TOML layout (BMAD v6.10+, detected by the presence of _bmad/config.toml)
+    The consolidated resolver (_bmad/scripts/resolve_config.py) reads exactly four
+    files: config.toml, config.user.toml, custom/config.toml, custom/config.user.toml.
+    It never reads config.yaml. So the [modules.<code>] table is written into
+    _bmad/custom/config.toml — the layer BMAD documents as never touched by the
+    installer — through a surgical text edit that leaves every other byte of that
+    human-authored, comment-bearing file alone.
+
+    Core values (user_name, output_folder, ...) are deliberately NOT written on this
+    layout: the custom layer WINS over the installer layer, so pinning them here
+    would override every future installer answer. Core config stays installer-owned.
+    Nothing else is written — no config.yaml, no config.user.yaml.
+
+Legacy YAML layout (pre-6.10, no _bmad/config.toml)
+    Today's behavior, unchanged. Reads a module.yaml definition and a JSON answers
+    file, then writes or updates the shared config.yaml (core values at root + module
+    section, anti-zombie) and config.user.yaml (user_name, communication_language,
+    plus any module variable with user_setting: true). Requires --config-path and
+    --user-config-path.
+
+Inert leftovers (a root config.yaml / config.user.yaml / module-help.csv on a project
+that has moved to the TOML layout) are REPORTED as orphans_detected and never deleted.
 
 Legacy migration: when --legacy-dir is provided, reads old per-module config files
 from {legacy-dir}/{module-code}/config.yaml and {legacy-dir}/core/config.yaml.
@@ -21,7 +42,9 @@ Exit codes: 0=success, 1=validation error, 2=runtime error
 """
 
 import argparse
+import csv
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -34,12 +57,19 @@ except ImportError:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Merge module config into shared _bmad/config.yaml with anti-zombie pattern."
+        description="Register module config into a project's _bmad/ tree "
+        "(TOML layout on BMAD v6.10+, legacy per-file YAML otherwise)."
+    )
+    parser.add_argument(
+        "--bmad-dir",
+        required=True,
+        help="Path to the project's _bmad/ directory. Selects the layout: TOML when "
+        "_bmad/config.toml exists (module table goes to _bmad/custom/config.toml), "
+        "otherwise the legacy per-file YAML layout.",
     )
     parser.add_argument(
         "--config-path",
-        required=True,
-        help="Path to the target _bmad/config.yaml file",
+        help="Path to the target _bmad/config.yaml file (legacy YAML layout only)",
     )
     parser.add_argument(
         "--module-yaml",
@@ -53,8 +83,7 @@ def parse_args():
     )
     parser.add_argument(
         "--user-config-path",
-        required=True,
-        help="Path to the target _bmad/config.user.yaml file",
+        help="Path to the target _bmad/config.user.yaml file (legacy YAML layout only)",
     )
     parser.add_argument(
         "--legacy-dir",
@@ -338,6 +367,219 @@ def write_config(config: dict, config_path: str, verbose: bool = False) -> None:
         )
 
 
+def detect_layout(bmad_dir: str) -> str:
+    """Return "toml" when the project uses the BMAD v6.10+ consolidated layout.
+
+    The tell is a single file: _bmad/config.toml. Deliberately a pure existence
+    check — no parsing, no imports, so it behaves identically on every Python this
+    script may be run with.
+    """
+    return "toml" if (Path(bmad_dir) / "config.toml").exists() else "yaml"
+
+
+# --------------------------------------------------------------- TOML emission
+#
+# There is no TOML *writer* in the standard library (tomllib is read-only, 3.11+)
+# and this script must not grow a dependency, so the module table is hand-emitted.
+# The payload is a flat table of scalars, which is the trivial corner of TOML.
+
+_TOML_ESCAPES = {
+    "\\": "\\\\",
+    '"': '\\"',
+    "\b": "\\b",
+    "\t": "\\t",
+    "\n": "\\n",
+    "\f": "\\f",
+    "\r": "\\r",
+}
+
+_BARE_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _toml_escape(text: str) -> str:
+    """Escape a string for a TOML basic ("...") string."""
+    out = []
+    for ch in text:
+        if ch in _TOML_ESCAPES:
+            out.append(_TOML_ESCAPES[ch])
+        elif ch < " " or ch == "\x7f":
+            out.append("\\u%04X" % ord(ch))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _toml_key(key: str) -> str:
+    """Render a table/key name, quoting it only when it is not a bare key."""
+    return key if _BARE_KEY.match(key) else '"%s"' % _toml_escape(key)
+
+
+def _toml_value(value) -> str:
+    """Render a scalar as TOML. Anything exotic is stringified defensively."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return repr(value)
+    return '"%s"' % _toml_escape(str(value))
+
+
+def emit_module_table(module_code: str, values: dict) -> str:
+    """Emit a `[modules.<code>]` table with one `key = value` line per entry.
+
+    None values are skipped — module.yaml leaves optional metadata unset rather
+    than nulled, and TOML has no null.
+    """
+    lines = ["[modules.%s]" % _toml_key(module_code)]
+    for key, value in values.items():
+        if value is None:
+            continue
+        lines.append("%s = %s" % (_toml_key(key), _toml_value(value)))
+    return "\n".join(lines) + "\n"
+
+
+_NEXT_TABLE = re.compile(r"^[ \t]*\[", re.MULTILINE)
+
+
+def _is_blank_or_comment(line: str) -> bool:
+    stripped = line.strip()
+    return not stripped or stripped.startswith("#")
+
+
+def _module_header_pattern(module_code: str) -> "re.Pattern":
+    """Match the `[modules.<code>]` header line, bare or quoted, any spacing."""
+    forms = "|".join(
+        (
+            re.escape(module_code),
+            re.escape('"%s"' % _toml_escape(module_code)),
+        )
+    )
+    return re.compile(
+        r"^[ \t]*\[[ \t]*modules[ \t]*\.[ \t]*(?:%s)[ \t]*\][ \t]*$" % forms,
+        re.MULTILINE,
+    )
+
+
+def upsert_module_table(text: str, module_code: str, block: str) -> tuple[str, bool]:
+    """Replace (or append) the `[modules.<code>]` table in TOML source text.
+
+    A surgical text edit, not a parse-and-re-emit: _bmad/custom/config.toml is a
+    human-authored, comment-bearing file and round-tripping it through a parser
+    would destroy that. Every byte outside the replaced table comes back identical.
+
+    The table's span runs from its header line to the next top-level `[` line (or
+    EOF). Blank and comment lines immediately above that next header are the *next*
+    table's preamble in any hand-written file, so they are left in place.
+
+    Returns:
+        (new_text, replaced) — replaced is True when an existing table was
+        overwritten, False when the block was appended.
+    """
+    match = _module_header_pattern(module_code).search(text)
+
+    if match is None:
+        if not text.strip():
+            return block, False
+        new_text = text if text.endswith("\n") else text + "\n"
+        if not new_text.endswith("\n\n"):
+            new_text += "\n"
+        return new_text + block, False
+
+    header_end = match.end()
+    following = _NEXT_TABLE.search(text, header_end)
+    span_end = following.start() if following else len(text)
+
+    if following is not None:
+        body = text[header_end:span_end].splitlines(keepends=True)
+        trailing = 0
+        while body and _is_blank_or_comment(body[-1]):
+            trailing += len(body.pop())
+        span_end -= trailing
+
+    return text[: match.start()] + block + text[span_end:], True
+
+
+def validate_toml(text: str, verbose: bool = False) -> bool:
+    """Parse the emitted TOML back with tomllib, if it is available.
+
+    tomllib is stdlib only on Python 3.11+; this script declares >=3.9, so on
+    older interpreters validation is skipped rather than failing the run.
+    """
+    try:
+        import tomllib
+    except ImportError:
+        print(
+            "Note: tomllib unavailable (Python < 3.11) — skipping TOML validation",
+            file=sys.stderr,
+        )
+        return False
+
+    try:
+        tomllib.loads(text)
+    except Exception as exc:  # tomllib.TOMLDecodeError, but stay defensive
+        print(f"Warning: written TOML did not parse cleanly: {exc}", file=sys.stderr)
+        return False
+
+    if verbose:
+        print("Validated written TOML with tomllib", file=sys.stderr)
+    return True
+
+
+# ---------------------------------------------------------------- orphan report
+
+# Files that a pre-6.10 bmad-loop-setup used to write directly under _bmad/. On the
+# TOML layout nothing reads them and the installer manifest does not track them.
+_ORPHAN_FILES = ("config.yaml", "config.user.yaml", "module-help.csv")
+
+# Module display names used in help CSV column 1, current and pre-rename.
+_HELP_MODULE_NAMES = ("BMAD Loop Skills", "BMAD Automator Skills")
+
+
+def _yaml_has_module_entries(path: Path, module_code: str) -> bool:
+    """True when a legacy YAML config carries our module's section."""
+    try:
+        data = load_yaml_file(str(path))
+    except Exception:
+        return False  # malformed leftovers are still reportable orphans
+    if not isinstance(data, dict):
+        return False
+    return any(key in data for key in (module_code, "bauto"))
+
+
+def _csv_has_module_entries(path: Path) -> bool:
+    """True when a legacy help CSV carries rows for our module."""
+    try:
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            for row in csv.reader(f):
+                if row and row[0].strip() in _HELP_MODULE_NAMES:
+                    return True
+    except Exception:
+        return False
+    return False
+
+
+def detect_orphans(bmad_dir: str, module_code: str) -> list:
+    """Report inert pre-6.10 files left directly under _bmad/.
+
+    Reported, never deleted (bmad-loop#64: never delete live BMAD config, and a
+    file we do not read is not ours to judge). Reading is fully defensive — a
+    malformed orphan is still listed, just with has_module_entries: false.
+    """
+    orphans = []
+    base = Path(bmad_dir)
+    for name in _ORPHAN_FILES:
+        path = base / name
+        if not path.is_file():
+            continue
+        if name.endswith(".csv"):
+            has_entries = _csv_has_module_entries(path)
+        else:
+            has_entries = _yaml_has_module_entries(path, module_code)
+        orphans.append({"path": str(path.resolve()), "has_module_entries": has_entries})
+    return orphans
+
+
 def reject_unresolved_paths(named_paths: list[tuple[str, str]]) -> None:
     """Exit with a clear error if any path argument still contains the literal
     ``{project-root}`` token. That token is meaningful only inside config
@@ -363,25 +605,71 @@ def reject_unresolved_paths(named_paths: list[tuple[str, str]]) -> None:
             sys.exit(1)
 
 
-def main():
-    args = parse_args()
-
-    reject_unresolved_paths(
-        [
-            ("--config-path", args.config_path),
-            ("--user-config-path", args.user_config_path),
-            ("--legacy-dir", args.legacy_dir),
-        ]
+def _fail(message: str) -> None:
+    """Emit the standard error JSON on stderr and exit 1."""
+    print(
+        json.dumps({"status": "error", "error": message}, indent=2),
+        file=sys.stderr,
     )
+    sys.exit(1)
 
-    # Load inputs
-    module_yaml = load_yaml_file(args.module_yaml)
-    if not module_yaml:
-        print(
-            f"Error: Could not load module.yaml from {args.module_yaml}",
-            file=sys.stderr,
+
+def run_toml_layout(args, module_yaml: dict, module_code: str) -> dict:
+    """Register the module into _bmad/custom/config.toml (BMAD v6.10+).
+
+    Writes exactly one thing: the [modules.<code>] table. No core values — the
+    custom layer wins over the installer layer, so anything pinned here would
+    override every future installer answer.
+    """
+    values = extract_module_metadata(module_yaml)
+    block = emit_module_table(module_code, values)
+
+    config_path = Path(args.bmad_dir) / "custom" / "config.toml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    existing = config_path.read_text(encoding="utf-8") if config_path.is_file() else ""
+
+    if args.verbose:
+        print(f"TOML layout: registering [modules.{module_code}] in {config_path}", file=sys.stderr)
+
+    new_text, table_replaced = upsert_module_table(existing, module_code, block)
+    config_path.write_text(new_text, encoding="utf-8")
+
+    toml_validated = validate_toml(new_text, args.verbose)
+
+    # --legacy-dir stays read-only here: report what exists, delete nothing.
+    legacy_files_found: list = []
+    legacy_deleted: list = []
+    if args.legacy_dir:
+        _, _, legacy_files_found = load_legacy_values(
+            args.legacy_dir, module_code, module_yaml, args.verbose
         )
-        sys.exit(1)
+        legacy_deleted = cleanup_legacy_configs(args.legacy_dir, module_code, args.verbose)
+
+    return {
+        "status": "success",
+        "layout": "toml",
+        "config_path": str(config_path.resolve()),
+        "user_config_path": None,
+        "module_code": module_code,
+        "core_updated": False,
+        "module_keys": [k for k, v in values.items() if v is not None],
+        "user_keys": [],
+        "table_replaced": table_replaced,
+        "toml_validated": toml_validated,
+        "legacy_configs_found": legacy_files_found,
+        "legacy_configs_deleted": legacy_deleted,
+        "orphans_detected": detect_orphans(args.bmad_dir, module_code),
+    }
+
+
+def run_yaml_layout(args, module_yaml: dict, module_code: str) -> dict:
+    """Register the module into the legacy per-file YAML layout (pre-6.10)."""
+    if not args.config_path or not args.user_config_path:
+        _fail(
+            "The legacy YAML layout requires --config-path and --user-config-path. "
+            f"No {Path(args.bmad_dir) / 'config.toml'} was found, so this project is "
+            "not on the BMAD v6.10+ TOML layout."
+        )
 
     answers = load_json_file(args.answers)
     existing_config = load_yaml_file(args.config_path)
@@ -395,7 +683,6 @@ def main():
     # Legacy migration: read old per-module configs as fallback defaults
     legacy_files_found = []
     if args.legacy_dir:
-        module_code = module_yaml.get("code", "")
         legacy_core, legacy_module, legacy_files_found = load_legacy_values(
             args.legacy_dir, module_code, module_yaml, args.verbose
         )
@@ -419,12 +706,11 @@ def main():
     # Legacy cleanup: delete old per-module config files
     legacy_deleted = []
     if args.legacy_dir:
-        legacy_deleted = cleanup_legacy_configs(args.legacy_dir, module_yaml["code"], args.verbose)
+        legacy_deleted = cleanup_legacy_configs(args.legacy_dir, module_code, args.verbose)
 
-    # Output result summary as JSON
-    module_code = module_yaml["code"]
-    result = {
+    return {
         "status": "success",
+        "layout": "yaml",
         "config_path": str(Path(args.config_path).resolve()),
         "user_config_path": str(Path(args.user_config_path).resolve()),
         "module_code": module_code,
@@ -433,7 +719,45 @@ def main():
         "user_keys": list(user_settings.keys()),
         "legacy_configs_found": legacy_files_found,
         "legacy_configs_deleted": legacy_deleted,
+        "orphans_detected": [],
     }
+
+
+def main():
+    args = parse_args()
+
+    reject_unresolved_paths(
+        [
+            ("--bmad-dir", args.bmad_dir),
+            ("--config-path", args.config_path),
+            ("--user-config-path", args.user_config_path),
+            ("--legacy-dir", args.legacy_dir),
+        ]
+    )
+
+    # Load inputs
+    module_yaml = load_yaml_file(args.module_yaml)
+    if not module_yaml:
+        print(
+            f"Error: Could not load module.yaml from {args.module_yaml}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    module_code = module_yaml.get("code")
+    if not module_code:
+        print("Error: module.yaml must have a 'code' field", file=sys.stderr)
+        sys.exit(1)
+
+    layout = detect_layout(args.bmad_dir)
+    if args.verbose:
+        print(f"Detected {layout} config layout under {args.bmad_dir}", file=sys.stderr)
+
+    if layout == "toml":
+        result = run_toml_layout(args, module_yaml, module_code)
+    else:
+        result = run_yaml_layout(args, module_yaml, module_code)
+
     print(json.dumps(result, indent=2))
 
 
