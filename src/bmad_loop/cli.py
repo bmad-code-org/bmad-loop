@@ -642,12 +642,32 @@ def _validate_closes_deferred(
     close nothing and say nothing. Covering only two of the three left the third
     to be discovered in the journal after the run it should have preceded.
 
+    A ledger that cannot be read at all is reported as well. Staying quiet there
+    is not the same trade as staying quiet about an unparseable manifest: the
+    manifest is already reported by ``queue.stories-manifest``, while nothing
+    else in ``validate`` reads the ledger, so silence meant reporting success for
+    a preflight that checked nothing.
+
     Never a failure. The annotation is traceability, not a gate, so a stale
     reference must not be able to block a run that would otherwise start.
     """
     ledger = paths.deferred_work
     try:
         text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
+    except (OSError, UnicodeDecodeError) as e:
+        # Split from the manifest read below, which is silent for a good reason
+        # that does not apply here: nothing else in `validate` reads the ledger, so
+        # returning quietly reported success for a preflight that checked nothing,
+        # against the very file the run's closure will fail on
+        # (#284 round-5 review, finding 6).
+        report.warn(
+            "deferred.ledger-unreadable",
+            f"{ledger} cannot be read ({e}) — closes_deferred declarations were not "
+            "checked against it, and the run's own closure will fail the same way",
+            {"ledger": str(ledger), "error": str(e)},
+        )
+        return
+    try:
         sources = (
             _stories_declarations(paths, spec_folder)
             if spec_folder is not None

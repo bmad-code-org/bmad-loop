@@ -9,6 +9,7 @@ import pytest
 import yaml
 from conftest import (
     escalated_run,
+    fault_read_text,
     git,
     install_bmad_config,
     install_dev_base_skills,
@@ -3457,6 +3458,32 @@ def test_validate_warns_on_unknown_closes_deferred_in_sprint_mode(project, capsy
     assert len(findings) == 1
     assert findings[0]["severity"] == "warning"
     assert findings[0]["detail"] == {"source": "spec spec-1-1-a.md", "unknown_ids": ["DW-99"]}
+
+
+def test_validate_warns_when_the_ledger_itself_is_unreadable(project, capsys, monkeypatch):
+    """The ledger read shared a `try` with the manifest read, and that arm returns
+    silently — correctly for the manifest, which `queue.stories-manifest` already
+    reports, but nothing else in `validate` reads the ledger. So an unreadable one
+    produced no finding at all: preflight reported success for a check that
+    examined nothing, against the very file the run's closure will fail on
+    (#284 round-5 review, finding 6)."""
+    install_bmad_config(project)
+    _write_policy(project.project)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    write_spec(spec_path(project, "1-1-a"), "ready-for-dev", "abc123", closes_deferred=["DW-1"])
+    fault_read_text(monkeypatch, project.deferred_work)
+    args = argparse.Namespace(project=str(project.project), spec=None, json=True)
+
+    cli.cmd_validate(args)
+
+    doc = json.loads(capsys.readouterr().out)
+    findings = [f for f in doc["findings"] if f["check"] == "deferred.ledger-unreadable"]
+    assert len(findings) == 1
+    assert findings[0]["severity"] == "warning"  # advisory: still never a gate
+    assert findings[0]["detail"]["ledger"] == str(project.deferred_work)
+    # and the declaration checks it could not run stay quiet rather than guessing
+    assert not [f for f in doc["findings"] if f["check"] == "deferred.closes-unknown"]
 
 
 def test_validate_warns_on_a_malformed_closes_deferred_declaration(project, capsys):
