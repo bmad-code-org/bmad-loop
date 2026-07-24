@@ -69,6 +69,11 @@ claude "/bmad-loop-setup accept all defaults"
    values** are written, since the custom layer would override future installer answers. On
    **pre-6.10** projects it merges into `_bmad/config.yaml` (+ personal settings into the
    gitignored `_bmad/config.user.yaml`) and `_bmad/module-help.csv`, as before.
+   `custom/config.toml` is yours, so the edit only ever touches the `[modules.bmad-loop]`
+   table: it is checked before anything is written and refused outright if it would change
+   anything else, and every write is atomic. A non-zero exit therefore always means your
+   config was left as it was. (Verifying the edit needs `tomllib`, so the v6.10+ branch
+   requires Python 3.11+ — as BMAD's own `resolve_config.py` already does.)
 2. Installs **or upgrades** the `bmad-loop` tool from Git (see
    [Installing the tool and TUI](#installing-the-tool-and-tui)). On an upgrade it runs
    `uv tool upgrade bmad-loop --reinstall`.

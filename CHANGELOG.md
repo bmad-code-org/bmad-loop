@@ -75,9 +75,24 @@ breaking changes may land in a minor release.
   even manifest-track — so the module was registered nowhere and never appeared in `/bmad-help`.
   Both scripts now take `--bmad-dir` and detect the layout (TOML iff `_bmad/config.toml` exists):
   - **v6.10+** — `[modules.bmad-loop]` is written to `_bmad/custom/config.toml` (a surgical
-    text edit that preserves every comment and unrelated table in that human-authored file, then
-    validated by re-parsing), help rows to `_bmad/bmad-loop/module-help.csv`, and the same rows
-    are anti-zombie-merged into the `_bmad/_config/bmad-help.csv` catalog.
+    text edit that preserves every unrelated table, every comment outside our own table, and the
+    file's line endings and mode), help rows to `_bmad/bmad-loop/module-help.csv`, and the same
+    rows are anti-zombie-merged into the `_bmad/_config/bmad-help.csv` catalog — re-keyed into
+    that catalog's own column order **by name**, so a BMAD help-schema change cannot shift our
+    fields into the wrong columns.
+  - The custom-layer edit is **verified before it is written, never after**: the candidate must
+    parse and must differ from the original in nothing but `[modules.bmad-loop]`, and it is then
+    committed atomically. A refused edit writes nothing, leaves the file byte-identical and exits
+    non-zero. This is what keeps a bad edit from being silent — BMAD's resolver loads the custom
+    layer as _optional_, so an unparseable file is swallowed as a warning and merged as `{}`,
+    dropping the user's own overrides along with ours with a zero exit code all the way down. The
+    table's own body is still rewritten wholesale (the anti-zombie guarantee), so comments inside
+    it do not survive. Verification needs `tomllib`, so the TOML branch requires **Python 3.11+**
+    — as BMAD's own `resolve_config.py` already does; the legacy branch is unaffected.
+  - Every config and CSV write now goes through a temp file and one atomic rename, and both help
+    outputs are rendered in full before either is committed: the shared `_config/bmad-help.csv`
+    carries every module's rows and is not hash-tracked, so a failed run must never leave it
+    truncated.
   - **Pre-6.10** — the legacy `config.yaml` / `config.user.yaml` / `module-help.csv` behavior,
     unchanged.
   - **No core values** (`user_name`, `output_folder`, …) are written on the TOML layout, by
