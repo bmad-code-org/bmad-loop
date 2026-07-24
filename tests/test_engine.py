@@ -2170,6 +2170,169 @@ def test_closes_deferred_refuses_an_out_of_tree_spec(project, tmp_path):
     assert len(events) == 1 and events[0]["story_key"] == "1-1-a"
 
 
+def _reject_commits(project):
+    """Install a native `pre-commit` hook that rejects every commit — the
+    real-world shape of a `finalize_commit` failure (a lint/secret hook saying no)
+    that no amount of orchestrator correctness prevents."""
+    hooks = project.project / ".git" / "hooks"
+    hooks.mkdir(parents=True, exist_ok=True)
+    hook = hooks / "pre-commit"
+    hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    hook.chmod(0o755)
+    return hook
+
+
+def test_closes_deferred_rolls_back_when_the_commit_fails(project):
+    """The close is written just BEFORE `finalize_commit` so an in-repo annotation
+    rides the story's own commit — but that commit can still fail, and `_escalate`
+    unwinds nothing. Left alone the entry claims work that is in no commit, and
+    the usual recovery makes it permanent: a resolved re-drive preserves the
+    artifact folders' tracked content through `safe_reset` (#284 review, finding 1).
+    """
+    engine = _closes_deferred_run(project, ["DW-1"])
+    before = project.deferred_work.read_bytes()
+    _reject_commits(project)
+
+    summary = engine.run()
+
+    assert summary.done == 0 and summary.paused  # the commit really did fail
+    assert _ledger_entries(project)["DW-1"].open
+    assert project.deferred_work.read_bytes() == before  # byte-identical, not just re-opened
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    # the write happened and was undone: both are on the record, in that order
+    assert kinds.index("story-deferred-closed") < kinds.index("deferred-close-rolled-back")
+
+
+def test_closes_deferred_lands_once_when_a_failed_commit_is_re_driven(project):
+    """The rollback must leave the story re-drivable: once the hook is gone, the
+    resumed commit phase re-applies the close exactly once (no doubled
+    `resolution:` line) and carries it in the commit it belongs to."""
+    engine = _closes_deferred_run(project, ["DW-1"])
+    hook = _reject_commits(project)
+    engine.run()
+    hook.unlink()
+    # the resolve workflow's re-arm: a resolved re-drive, which is precisely the
+    # recovery that PRESERVES the artifact folders' tracked content through
+    # `safe_reset` — so a close left standing here would never be reverted.
+    rearm_escalation(engine.run_dir)
+
+    resumed, _ = resume_engine(
+        project,
+        engine,
+        [dev_effect(project, "1-1-a", followup_review=False, closes_deferred=["DW-1"])],
+    )
+    summary = resumed.run()
+
+    assert summary.done == 1
+    entry = _ledger_entries(project)["DW-1"]
+    assert not entry.open
+    assert entry.body.count("resolution: resolved by story 1-1-a") == 1
+    committed = git(project.project, "show", "HEAD", "--", str(project.deferred_work))
+    assert "status: done" in committed
+
+
+def _external_ledger_paths(project, tmp_path):
+    """`project` with its artifact dir configured OUTSIDE the repo — the shared,
+    uncommittable ledger configuration `ProjectPaths.rebased` leaves in place."""
+    external = tmp_path / "shared-artifacts"
+    external.mkdir(exist_ok=True)
+    return dataclasses.replace(project, implementation_artifacts=external)
+
+
+def test_closes_deferred_external_ledger_waits_for_the_commit_in_place(project, tmp_path):
+    """An out-of-repo ledger cannot ride any commit, so writing it before one buys
+    nothing and risks claiming work that never committed. In place there is no
+    integration step, so the flush happens once `finalize_commit` returns."""
+    paths = _external_ledger_paths(project, tmp_path)
+    write_sprint(paths, {"1-1-a": "ready-for-dev"})
+    write_ledger(paths, {"DW-1": "open"}, commit=False)
+    engine, _ = make_engine(
+        paths,
+        [dev_effect(paths, "1-1-a", followup_review=False, closes_deferred=["DW-1"])],
+    )
+    _reject_commits(project)
+
+    summary = engine.run()
+
+    assert summary.done == 0 and summary.paused
+    entries = {
+        e.id: e for e in deferredwork.parse_ledger(paths.deferred_work.read_text(encoding="utf-8"))
+    }
+    assert entries["DW-1"].open  # never written: the commit it waited on failed
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "deferred-close-pending-integration" in kinds
+    assert "story-deferred-closed" not in kinds
+    # the obligation survives for the re-drive rather than being silently dropped
+    assert load_state(engine.run_dir).tasks["1-1-a"].pending_deferred_closes == ["DW-1"]
+
+
+def test_closes_deferred_external_write_failure_keeps_the_obligation(project, tmp_path):
+    """Clearing `pending_deferred_closes` before the write looks harmless — the
+    flush is about to happen — but a raising write unwinds to the crash handler,
+    whose `finally: self._save()` then persists the emptied list. The failure that
+    made the retry necessary destroys the record of it (#284 review, finding 2)."""
+    paths = _external_ledger_paths(project, tmp_path)
+    write_sprint(paths, {"1-1-a": "ready-for-dev"})
+    write_ledger(paths, {"DW-1": "open"}, commit=False)
+    engine, _ = make_engine(
+        paths,
+        [dev_effect(paths, "1-1-a", followup_review=False, closes_deferred=["DW-1"])],
+    )
+    engine._apply_deferred_closes = lambda *a, **kw: (_ for _ in ()).throw(OSError("disk full"))
+
+    summary = engine.run()
+
+    assert summary.crashed
+    assert load_state(engine.run_dir).tasks["1-1-a"].pending_deferred_closes == ["DW-1"]
+
+
+def test_closes_deferred_uses_the_verified_capture_when_the_commit_read_faults(
+    project, monkeypatch
+):
+    """`_observed_frontmatter` degrades an unreadable spec to None, which at the
+    close site was indistinguishable from a spec declaring nothing: a transient
+    read fault let the story commit with its declared entry still open. The
+    declaration is captured when the dev artifacts verify instead, so the commit
+    boundary needs no spec read at all (#284 review, finding 3)."""
+    engine = _closes_deferred_run(project, ["DW-1"])
+    finalize = engine._finalize_commit_phase
+
+    def unreadable_from_the_commit_phase_on(task):
+        # the spec becomes unreadable exactly when the close needs it — the TOCTOU
+        # shape `_observed_frontmatter` exists to absorb
+        monkeypatch.setattr(engine, "_observed_frontmatter", lambda *a, **kw: None)
+        return finalize(task)
+
+    monkeypatch.setattr(engine, "_finalize_commit_phase", unreadable_from_the_commit_phase_on)
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    assert not _ledger_entries(project)["DW-1"].open
+    assert engine.state.tasks["1-1-a"].declared_deferred == ["DW-1"]
+
+
+def test_closes_deferred_reports_an_unreadable_declaration(project, monkeypatch):
+    """The fallback read — a task that reached the commit boundary with no capture
+    — is the one place a fault can still cost a closure, so it says so instead of
+    reading as "declares nothing"."""
+    write_ledger(project, {"DW-1": "open"})
+    engine, _ = make_engine(project, [])
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "done", "abc123", closes_deferred=["DW-1"])
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.spec_file = str(sp)  # no declared_deferred: a pre-capture state file
+    monkeypatch.setattr(engine, "_observed_frontmatter", lambda *a, **kw: None)
+
+    engine._close_declared_deferred(task)
+
+    assert _ledger_entries(project)["DW-1"].open
+    events = [
+        e for e in engine.journal.entries() if e["kind"] == "deferred-close-declaration-unreadable"
+    ]
+    assert len(events) == 1 and events[0]["story_key"] == "1-1-a"
+
+
 def test_transient_spec_read_fault_does_not_crash_run(project, monkeypatch):
     """Integration capstone for #97. A single transient OSError on the spec — a
     TOCTOU truncation while the dev skill rewrites the file the orchestrator is

@@ -220,15 +220,38 @@ class StoryTask:
     # rendered intent file handed to dev sessions
     dw_ids: list[str] = field(default_factory=list)
     bundle_file: str | None = None
+    # the normalized `closes_deferred:` declaration read from this story's spec
+    # frontmatter, captured when the dev artifacts VERIFIED (the last point the
+    # spec is known good) rather than re-read at the commit boundary. A transient
+    # read failure there used to be indistinguishable from "declares nothing", so
+    # the story committed with the entry still open and only a journal line to
+    # show for it; and the COMMITTING resume arm never re-verifies, so it had no
+    # other way to learn the declaration. The stories.yaml manifest channel is
+    # read from memory and needs no capture. Survives the round-trip.
+    #
+    # None means "never captured" and is NOT the same as `[]` ("captured; the spec
+    # declares nothing"): only the first may re-read the spec at the commit
+    # boundary, and conflating them re-runs — and re-journals — the read for every
+    # story that declares nothing.
+    declared_deferred: list[str] | None = None
     # deferred-work ids this story declared via `closes_deferred:` whose ledger
     # annotation could not ride the story's own commit, because the ledger is
     # configured OUTSIDE the repo (an external artifact dir is shared between
     # worktrees, so `rebased` deliberately leaves it in place and `git add -A`
-    # can never stage it). Stashed at commit and applied only once the unit's
-    # branch has merged, so an isolated story whose integration fails never
-    # claims work resolved. Empty in every in-repo configuration. Survives the
-    # resume serialization round-trip.
+    # can never stage it). Stashed at the commit boundary and applied only once
+    # the work is durably landed — after `finalize_commit` in place, after the
+    # unit's branch has merged under isolation — so a story whose commit or
+    # integration fails never claims work resolved. Empty in every in-repo
+    # configuration. Survives the resume serialization round-trip.
     pending_deferred_closes: list[str] = field(default_factory=list)
+    # worktree-isolation mode only: set once `merge_local` has put this unit's
+    # branch on the target branch, and PERSISTED before the integration
+    # bookkeeping that follows it runs. That bookkeeping (the external-ledger
+    # flush above) is not re-driven by resume — the task is already terminal, so
+    # `_finish_inflight` skips it — so a crash in that window needs durable proof
+    # the work actually landed before a later run may apply it. Survives the
+    # round-trip.
+    unit_merged: bool = False
     # worktree-isolation mode only (scm.isolation = "worktree"): the unit's
     # mounted worktree dir and branch, recorded so a paused/crashed run can
     # reconstruct or discard the in-flight worktree on resume.
@@ -283,7 +306,9 @@ class StoryTask:
             "restore_patch": self.restore_patch,
             "dw_ids": self.dw_ids,
             "bundle_file": self.bundle_file,
+            "declared_deferred": self.declared_deferred,
             "pending_deferred_closes": self.pending_deferred_closes,
+            "unit_merged": self.unit_merged,
             "worktree_path": self.worktree_path,
             "branch": self.branch,
             "sessions": [s.to_dict() for s in self.sessions],
@@ -331,7 +356,13 @@ class StoryTask:
             restore_patch=d.get("restore_patch"),
             dw_ids=[str(i) for i in d.get("dw_ids", [])],
             bundle_file=d.get("bundle_file"),
+            declared_deferred=(
+                [str(i) for i in d["declared_deferred"]]
+                if d.get("declared_deferred") is not None
+                else None
+            ),
             pending_deferred_closes=[str(i) for i in d.get("pending_deferred_closes", [])],
+            unit_merged=bool(d.get("unit_merged", False)),
             worktree_path=str(d.get("worktree_path", "")),
             branch=str(d.get("branch", "")),
             sessions=[SessionRecord.from_dict(s) for s in d.get("sessions", [])],

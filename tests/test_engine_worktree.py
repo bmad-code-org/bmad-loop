@@ -1498,3 +1498,79 @@ def test_worktree_external_ledger_closure_waits_for_integration(project, tmp_pat
     kinds = journal_kinds(engine)
     assert "deferred-close-external-ledger" in kinds  # the operator is told it is uncommitted
     assert "story-deferred-closed" in kinds
+
+
+def _external_paths(project, tmp_path):
+    """`project` with its artifact dir configured OUTSIDE the repo. The sprint
+    board lives there too and is shared with every worktree rather than committed,
+    so it is written, not committed, for these runs."""
+    import dataclasses
+
+    external = tmp_path / "shared-artifacts"
+    external.mkdir(exist_ok=True)
+    return dataclasses.replace(project, implementation_artifacts=external)
+
+
+def test_worktree_crash_after_merge_retries_the_closure_on_resume(project, tmp_path):
+    """The external-ledger flush runs AFTER the task is already DONE, so a crash
+    between `merge_local` and the flush leaves a terminal task holding an
+    unsatisfied obligation — and `_finish_inflight` skips terminal tasks, so
+    nothing ever retried it. `unit_merged` is the durable proof the work landed,
+    recorded before the bookkeeping it authorizes (#284 review, finding 2)."""
+    from conftest import write_ledger
+
+    paths = _external_paths(project, tmp_path)
+    write_sprint(paths, {"1-1-a": "ready-for-dev"})
+    write_ledger(paths, {"DW-1": "open"}, commit=False)
+    engine, _ = make_engine(
+        paths,
+        [wt_dev_effect(paths, "1-1-a", followup_review=False, closes_deferred=["DW-1"])],
+    )
+    engine._flush_pending_deferred_closes = lambda task: (_ for _ in ()).throw(OSError("host died"))
+
+    summary = engine.run()
+
+    assert summary.crashed
+    saved = load_state(engine.run_dir).tasks["1-1-a"]
+    assert saved.phase == Phase.DONE and saved.unit_merged  # the merge did land
+    assert saved.pending_deferred_closes == ["DW-1"]  # the obligation survived
+    assert _ledger_entry(paths, "DW-1").open
+
+    state = load_state(engine.run_dir)
+    state.clear_pause()
+    resumed = Engine(
+        paths=paths,
+        policy=engine.policy,
+        adapter=MockAdapter([]),
+        run_dir=engine.run_dir,
+        journal=engine.journal,
+        state=state,
+    )
+    resumed.run()
+
+    assert not _ledger_entry(paths, "DW-1").open  # reconciled, not lost
+    assert load_state(engine.run_dir).tasks["1-1-a"].pending_deferred_closes == []
+
+
+def test_worktree_pending_closure_without_a_merge_stays_open(project, tmp_path):
+    """A DONE task whose unit never reached the target branch has nothing to
+    claim. `open` is the truthful reading, so the obligation is reported rather
+    than discharged — silently applying it would close entries for work that is
+    on no branch anyone will see."""
+    from conftest import write_ledger
+
+    paths = _external_paths(project, tmp_path)
+    write_sprint(paths, {"1-1-a": "done"})
+    write_ledger(paths, {"DW-1": "open"}, commit=False)
+    engine, _ = make_engine(paths, [])
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.phase = Phase.DONE
+    task.pending_deferred_closes = ["DW-1"]
+    task.unit_merged = False  # crashed before, or during, the merge
+    engine.state.tasks["1-1-a"] = task
+
+    engine._finish_inflight()
+
+    assert _ledger_entry(paths, "DW-1").open
+    events = [e for e in engine.journal.entries() if e["kind"] == "deferred-close-abandoned"]
+    assert len(events) == 1 and events[0]["dw_ids"] == ["DW-1"]

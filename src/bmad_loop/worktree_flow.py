@@ -485,6 +485,15 @@ class WorktreeFlow:
             # out-of-repo deferred-work ledger) may safely claim it landed. A
             # merge that escalates raises out of merge_local and never reaches
             # here, leaving the shared ledger untouched (#234).
+            #
+            # Record the merge BEFORE that bookkeeping runs, and persist it. The
+            # task is already DONE, so a crash in this window is not re-driven by
+            # resume (`_finish_inflight` skips terminal tasks) — the reconcile
+            # pass that finishes the leftover bookkeeping needs durable proof the
+            # work actually landed, and "phase is DONE" is not that proof: it is
+            # stamped by the commit, before any of this.
+            task.unit_merged = True
+            self._save()
             self._on_integrated(task)
         else:  # DEFERRED — capture the diff, keep or drop per keep_failed
             patch = close_unit_workspace(
