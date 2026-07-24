@@ -14,20 +14,38 @@ breaking changes may land in a minor release.
   so a multi-epic run ended with entries satisfied epics ago still reading `open` and the retro
   reconstructing by hand which story closed what. A story spec can now declare the entries its work
   closes — `closes_deferred: [DW-5, DW-6]`, on its `stories.yaml` entry (stories mode) or in the
-  story spec's frontmatter, the two unioned — and at clean story-close the
+  story spec's frontmatter, the two unioned — and when the story commits the
   orchestrator writes the same annotation a sweep bundle writes: `status: done <date>` plus
-  `resolution: resolved by story <id>`. The write happens before the commit, so it squashes into
-  the story's own commit, and it fires in both sprint and stories mode. Closure is declared, never
-  inferred from a diff; a story that fails, blocks, or stops short of its success status closes
-  nothing; an id already `done` is a silent no-op, so a resumed run re-driving the same close
-  neither doubles the `resolution:` line nor warns; and an id matching no ledger entry is journaled
-  (`deferred-close-unmatched`) rather than failing the story. Closes are journaled as
-  `story-deferred-closed`. The `stories.yaml` channel is what makes this work unattended:
-  `bmad-dev-auto` generates the story spec and knows nothing of the ledger, whereas the Story
-  Breakdown is authored while the ledger is in view. `bmad-loop validate` adds a matching
-  pre-flight warning
-  (`stories.closes-deferred-unknown`) naming any declared id absent from the ledger — a typo or a
-  renumbered entry — before the run starts; it is a warning, so it never changes the exit code.
+  `resolution: resolved by story <id>`. It fires in both sprint and stories mode.
+
+  The write sits at the **commit boundary** — after artifact verification, the verify commands,
+  every checkpoint, the review loop and the `pre_commit` workflows, and immediately before
+  `finalize_commit` squashes the story — so a story that fails verification, is rejected by
+  review, or escalates closes nothing, and an in-repo ledger still carries the annotation in the
+  story's own commit. An artifact dir configured _outside_ the repo is shared between worktrees
+  and cannot be committed at all; an isolated run holds its closure until the story's branch has
+  merged (journaled `deferred-close-external-ledger`), so a unit whose integration fails never
+  claims its work resolved.
+
+  Closure is declared, never inferred from a diff. An id already `done` is a silent no-op, so a
+  resumed run re-driving the same close neither doubles the `resolution:` line nor warns. Nothing
+  here can fail a story: an id matching no ledger entry (`deferred-close-unmatched`), a ledger
+  entry whose `status:` reads as neither `open` nor `done` (`deferred-close-malformed`), and a
+  declaration that is not a list — a bare `closes_deferred: DW-5` — are journaled and dropped.
+  Closes are journaled as `story-deferred-closed`.
+
+  The `stories.yaml` channel is the one that avoids hand-editing each generated spec:
+  `bmad-dev-auto` writes the story spec and knows nothing of the ledger, whereas the Story
+  Breakdown is authored while the ledger is in view. Like `spec_checkpoint` / `done_checkpoint`
+  it is human-authored — no upstream skill emits it yet (BMAD-METHOD#2619 proposes the schema row
+  and the breakdown prompt), and re-deriving `stories.yaml` drops it unless the intent is logged
+  in `.memlog.md`.
+
+  `bmad-loop validate` adds matching pre-flight warnings in **both** queue modes —
+  `deferred.closes-unknown` for an id absent from the ledger (a typo or a renumbered entry) and
+  `deferred.closes-malformed` for an unreadable declaration. Stories mode reads the manifest plus
+  each id-resolved spec; sprint mode reads the story specs already on disk in the artifacts dir.
+  Both are warnings, so neither changes the exit code.
 
 - **`review.on_timeout` policy knob (#271).** A timeout-like review verdict (`timeout` /
   `stalled` / `over_budget`) previously always burned a review cycle (RETRY) until
