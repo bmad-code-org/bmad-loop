@@ -71,9 +71,13 @@ claude "/bmad-loop-setup accept all defaults"
    gitignored `_bmad/config.user.yaml`) and `_bmad/module-help.csv`, as before.
    `custom/config.toml` is yours, so the edit only ever touches the `[modules.bmad-loop]`
    table: it is checked before anything is written and refused outright if it would change
-   anything else, and every write is atomic. A non-zero exit therefore always means your
-   config was left as it was. (Verifying the edit needs `tomllib`, so the v6.10+ branch
-   requires Python 3.11+ — as BMAD's own `resolve_config.py` already does.)
+   anything else. Each file is written through a temp file and one atomic rename, so **no
+   file is ever left truncated or half-written** — but setup writes more than one file and
+   there is no whole-run rollback, so a failure part-way can leave an earlier file already
+   updated. Nothing is lost either way: every merge is idempotent, so fix the reported
+   cause and re-run. A write is also abandoned rather than committed if the file changed
+   underneath it while setup was running. (Verifying the edit needs `tomllib`, so the
+   v6.10+ branch requires Python 3.11+ — as BMAD's own `resolve_config.py` already does.)
 2. Installs **or upgrades** the `bmad-loop` tool from Git (see
    [Installing the tool and TUI](#installing-the-tool-and-tui)). On an upgrade it runs
    `uv tool upgrade bmad-loop --reinstall`.

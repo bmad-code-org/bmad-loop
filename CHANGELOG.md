@@ -92,7 +92,23 @@ breaking changes may land in a minor release.
   - Every config and CSV write now goes through a temp file and one atomic rename, and both help
     outputs are rendered in full before either is committed: the shared `_config/bmad-help.csv`
     carries every module's rows and is not hash-tracked, so a failed run must never leave it
-    truncated.
+    truncated. That is **per-file atomicity, not whole-run rollback** — setup writes several files,
+    so a later failure can leave an earlier one already committed; every merge is idempotent, so a
+    re-run finishes the job. A write is also **abandoned rather than committed** when the target
+    changed on disk after the merge was derived from it, and temp files are named per process, so
+    two concurrent runs cannot write or delete each other's.
+  - The anti-zombie filter finds the `module` column **by name**, matching the by-name re-keying:
+    it used to read column 0, so on a catalog that ordered its columns differently the filter
+    matched nothing and every re-run appended our rows again (2, then 4, then 6). A catalog with
+    no `module` column, or more than one, is now refused rather than silently duplicated.
+  - A symlinked `custom/config.toml` is written **through the link** to its real target, instead
+    of `os.replace` swapping the link for a regular file and quietly disconnecting centrally
+    managed configuration.
+  - Refusals the user can clear by hand now say how: a registration written as a dotted key, an
+    inline table, an array of tables, or one carrying nested subtables is named as such with the
+    manual fix spelled out, rather than reported as an internal bug. A valid but unrelated `nan`
+    value no longer trips the "changed more than our table" check (two independent parses never
+    compare NaN equal), which had made setup refuse to run at all on such a file.
   - **Pre-6.10** — the legacy `config.yaml` / `config.user.yaml` / `module-help.csv` behavior,
     unchanged.
   - **No core values** (`user_name`, `output_folder`, …) are written on the TOML layout, by
