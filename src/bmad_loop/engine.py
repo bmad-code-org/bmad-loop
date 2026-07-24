@@ -2481,11 +2481,33 @@ class Engine:
         the flush is about to happen — but a raising ledger write then unwinds to
         ``run()``'s crash handler, whose ``finally: self._save()`` persists the
         emptied list: the obligation is destroyed by the very failure that made it
-        worth retrying."""
+        worth retrying.
+
+        **An unavailable location is not an answer about the entries.** A read
+        that raises keeps the obligation by unwinding, but an absent file does
+        not raise: ``_apply_deferred_closes`` reads a missing ledger as empty
+        text, every id classifies as unknown, and the ids were then cleared on
+        the strength of a ledger nobody could see. That is a real risk here and
+        only here — this path exists *because* the ledger is out of the repo, so
+        it can live on a mount that is temporarily gone. The artifact directory
+        is what distinguishes the two: gone means the location is unavailable and
+        the obligation is retryable; present-but-no-ledger means there is
+        genuinely nothing to close, which is the same answer the in-repo path
+        gives and stays a discharge rather than an obligation nothing could ever
+        satisfy (#284 round-5 review, finding 4)."""
         ids = tuple(task.pending_deferred_closes)
         if not ids:
             return
         ledger = self.workspace.paths.deferred_work
+        if not ledger.parent.is_dir():
+            self.journal.append(
+                "deferred-close-ledger-unavailable",
+                story_key=task.story_key,
+                dw_ids=list(ids),
+                ledger=str(ledger),
+                note="the artifact directory is not present; the closure stays owed and is retried",
+            )
+            return
         self.journal.append(
             "deferred-close-external-ledger",
             story_key=task.story_key,

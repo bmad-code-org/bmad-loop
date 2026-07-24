@@ -2356,6 +2356,84 @@ def test_closes_deferred_external_write_failure_keeps_the_obligation(project, tm
     assert load_state(engine.run_dir).tasks["1-1-a"].pending_deferred_closes == ["DW-1"]
 
 
+def test_closes_deferred_external_ledger_unavailable_keeps_the_obligation(project, tmp_path):
+    """A read that raises keeps the obligation by unwinding, but an ABSENT ledger
+    does not raise: it reads as empty text, every id classifies as unknown, and
+    the flush cleared the parked ids on the strength of a ledger nobody could see.
+
+    That risk is specific to this path — it exists *because* the ledger is out of
+    the repo, so it can sit on a mount that is temporarily gone. The artifact
+    directory tells the two apart: gone is an unavailable location, not an answer
+    about the entries (#284 round-5 review, finding 4)."""
+    paths = _external_ledger_paths(project, tmp_path)
+    write_sprint(paths, {"1-1-a": "ready-for-dev"})
+    write_ledger(paths, {"DW-1": "open"}, commit=False)
+    engine, _ = make_engine(
+        paths,
+        [dev_effect(paths, "1-1-a", followup_review=False, closes_deferred=["DW-1"])],
+    )
+    external = paths.implementation_artifacts
+    unmounted = tmp_path / "unmounted"
+    real_flush = engine._flush_pending_deferred_closes
+
+    def flush_with_the_mount_away(task):
+        external.rename(unmounted)  # the shape of a shared mount dropping out
+        try:
+            return real_flush(task)
+        finally:
+            unmounted.rename(external)  # ...and back, so the rest of the run is normal
+
+    engine._flush_pending_deferred_closes = flush_with_the_mount_away
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    entries = {
+        e.id: e for e in deferredwork.parse_ledger(paths.deferred_work.read_text(encoding="utf-8"))
+    }
+    assert entries["DW-1"].open  # nothing was written against an invisible ledger
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "deferred-close-ledger-unavailable" in kinds
+    assert "story-deferred-closed" not in kinds
+    # owed, not discharged — and the id is not silently reported as a typo
+    assert "deferred-close-unmatched" not in kinds
+    assert load_state(engine.run_dir).tasks["1-1-a"].pending_deferred_closes == ["DW-1"]
+
+    # the mount is back: the reconcile pass a later run makes finishes the job
+    engine._flush_pending_deferred_closes = real_flush
+    engine._reconcile_pending_deferred_closes()
+
+    entries = {
+        e.id: e for e in deferredwork.parse_ledger(paths.deferred_work.read_text(encoding="utf-8"))
+    }
+    assert not entries["DW-1"].open
+    assert engine.state.tasks["1-1-a"].pending_deferred_closes == []
+
+
+def test_closes_deferred_external_ledger_absent_from_a_live_dir_still_discharges(
+    project, tmp_path
+):
+    """The other side of that discriminator. An artifact dir that IS there and
+    simply has no ledger is not an outage — there is genuinely nothing to close,
+    which is the same answer the in-repo path gives. Retaining here would leave an
+    obligation nothing could ever satisfy, re-journaled by every later resume."""
+    paths = _external_ledger_paths(project, tmp_path)
+    write_sprint(paths, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        paths,
+        [dev_effect(paths, "1-1-a", followup_review=False, closes_deferred=["DW-9"])],
+    )
+    assert not paths.deferred_work.exists()  # no ledger was ever filed
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "deferred-close-unmatched" in kinds  # reported as the stale reference it is
+    assert "deferred-close-ledger-unavailable" not in kinds
+    assert load_state(engine.run_dir).tasks["1-1-a"].pending_deferred_closes == []
+
+
 def test_closes_deferred_uses_the_verified_capture_when_the_commit_read_faults(
     project, monkeypatch
 ):
