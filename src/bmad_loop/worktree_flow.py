@@ -275,6 +275,7 @@ class WorktreeFlow:
         escalation_pause: Callable[..., NoReturn],
         workspace_get: Callable[[], Workspace],
         workspace_set: Callable[[Workspace], None],
+        on_integrated: Callable[[StoryTask], None],
     ) -> None:
         self.paths = paths
         self.policy = policy
@@ -294,6 +295,9 @@ class WorktreeFlow:
         self._pause = escalation_pause
         self._workspace_get = workspace_get
         self._workspace_set = workspace_set
+        # Late-bound like the rest: post-integration bookkeeping the engine owns
+        # (the out-of-repo deferred-work closure a unit's commit could not carry).
+        self._on_integrated = on_integrated
 
     @property
     def isolated(self) -> bool:
@@ -476,6 +480,12 @@ class WorktreeFlow:
             # ourselves by hand once the branch has landed; the orchestrator only
             # commits the worktree onto the selected target.
             self.merge_local(task, unit)
+            # The unit's work is now on the target branch — the only point at
+            # which bookkeeping that could NOT ride the unit's own commit (an
+            # out-of-repo deferred-work ledger) may safely claim it landed. A
+            # merge that escalates raises out of merge_local and never reaches
+            # here, leaving the shared ledger untouched (#234).
+            self._on_integrated(task)
         else:  # DEFERRED — capture the diff, keep or drop per keep_failed
             patch = close_unit_workspace(
                 unit,

@@ -308,15 +308,32 @@ def set_sprint(paths: ProjectPaths, key: str, status: str) -> None:
     paths.sprint_status.write_text(yaml.safe_dump(doc, sort_keys=False))
 
 
-def write_spec(path: Path, status: str, baseline: str, *, prose_status: str | None = None) -> None:
+def write_spec(
+    path: Path,
+    status: str,
+    baseline: str,
+    *,
+    prose_status: str | None = None,
+    closes_deferred: object = None,
+) -> None:
     """Write a spec the way the real bmad-dev-auto skill does. The skill's step-03
     stamps `baseline_revision` and NEVER `baseline_commit` (that name exists only
     in the orchestrator's synthesized result.json), so this fixture stamps the
     same key — a reader that only knows `baseline_commit` must fail a test here,
-    not sail through production (issue #89)."""
+    not sail through production (issue #89).
+
+    ``closes_deferred`` writes the story-declared ledger-closure field (#234): a
+    list renders as a YAML flow sequence, and a bare string renders as a scalar —
+    the wrong-container mistake whose handling must not depend on which file it
+    was made in."""
+    declare = ""
+    if isinstance(closes_deferred, list):
+        declare = f"closes_deferred: [{', '.join(closes_deferred)}]\n"
+    elif closes_deferred is not None:
+        declare = f"closes_deferred: {closes_deferred}\n"
     body = (
         f"---\ntitle: 'test'\ntype: 'feature'\nstatus: '{status}'\n"
-        f"baseline_revision: '{baseline}'\n---\n\n## Intent\n\ntest spec\n"
+        f"baseline_revision: '{baseline}'\n{declare}---\n\n## Intent\n\ntest spec\n"
     )
     if prose_status is not None:
         # mirror bmad-dev-auto's terminal finalize: it appends a `## Auto Run
@@ -387,6 +404,7 @@ def dev_effect(
     prose_status: str | None = None,
     seen: list[str] | None = None,
     write_src: bool = True,
+    closes_deferred: object = None,
 ):
     """Simulate a successful bmad-dev-auto session: it self-finalizes the spec
     (no in-review handoff — always straight to ``done``) but never touches the
@@ -414,7 +432,9 @@ def dev_effect(
         if write_src:
             source.write_text(source.read_text() + f"change for {story_key}\n")
         sp = spec_path(paths, story_key)
-        write_spec(sp, final_status, baseline, prose_status=prose_status)
+        write_spec(
+            sp, final_status, baseline, prose_status=prose_status, closes_deferred=closes_deferred
+        )
         # deliberately NO set_sprint: the dev skill does not write sprint-status
         return SessionResult(
             status="completed",
@@ -460,7 +480,9 @@ def review_effect(
         sp = spec_path(paths, story_key)
         baseline = _spec_baseline(sp)
         status = "done" if finalized else "in-progress"
-        write_spec(sp, status, baseline)
+        # A review pass rewrites the status, not the whole frontmatter — carry any
+        # `closes_deferred:` declaration through verbatim, as the real skill does.
+        write_spec(sp, status, baseline, closes_deferred=_spec_closes_deferred(sp))
         if finalized:
             set_sprint(paths, story_key, "done")
         return SessionResult(
@@ -477,6 +499,18 @@ def review_effect(
         )
 
     return effect
+
+
+def _spec_closes_deferred(path: Path) -> object:
+    """The spec's `closes_deferred:` declaration as `write_spec` would re-render
+    it — a list for a flow sequence, the raw text otherwise. None when absent."""
+    for line in path.read_text().splitlines():
+        if line.startswith("closes_deferred:"):
+            value = line.split(":", 1)[1].strip()
+            if value.startswith("[") and value.endswith("]"):
+                return [p.strip() for p in value[1:-1].split(",") if p.strip()]
+            return value
+    return None
 
 
 def _spec_baseline(path: Path) -> str:

@@ -86,7 +86,9 @@ def _make_flow(
 ):
     """Build a WorktreeFlow wired to recording stubs. The returned flow carries a
     ``.calls`` namespace tallying the injected callbacks for assertions."""
-    calls = SimpleNamespace(saves=0, emits=[], gates=[], pauses=[], workspaces=[workspace])
+    calls = SimpleNamespace(
+        saves=0, emits=[], gates=[], pauses=[], workspaces=[workspace], integrated=[]
+    )
 
     def _save() -> None:
         calls.saves += 1
@@ -132,6 +134,7 @@ def _make_flow(
         escalation_pause=_pause,
         workspace_get=lambda: calls.workspaces[-1],
         workspace_set=lambda ws: calls.workspaces.append(ws),
+        on_integrated=lambda task: calls.integrated.append(task),
     )
     flow.calls = calls
     return flow
@@ -296,6 +299,40 @@ def test_escalate_unit_marks_escalated_notifies_and_pauses(tmp_path):
     assert excinfo.value.reason == "merge blocked"
     # notify wrote a CRITICAL line to the run dir's attention file (QUIET file=True)
     assert "CRITICAL escalation: 2-3" in (tmp_path / ATTENTION_FILE).read_text()
+
+
+def test_integrate_unit_runs_post_integration_bookkeeping_after_a_merge(tmp_path):
+    """The integration chokepoint is the only safe point for bookkeeping the
+    unit's own commit could not carry (an out-of-repo deferred-work ledger, #234).
+    It fires after merge_local, so it is reached only by a unit that landed."""
+    flow = _make_flow(tmp_path, state=SimpleNamespace(target_branch="main", run_id="r", tasks={}))
+    merged = []
+    flow.merge_local = lambda task, unit: merged.append(task)
+    task = StoryTask(story_key="1-1", epic=1)
+    task.phase = Phase.DONE
+
+    flow.integrate_unit(task, unit=None)
+
+    assert merged == [task]
+    assert flow.calls.integrated == [task]
+
+
+def test_integrate_unit_skips_bookkeeping_when_the_merge_escalates(tmp_path):
+    """A merge that escalates raises out of merge_local. Nothing downstream may
+    claim the unit's work landed — a shared ledger must still read `open`."""
+    flow = _make_flow(tmp_path, state=SimpleNamespace(target_branch="main", run_id="r", tasks={}))
+
+    def boom(task, unit):
+        raise _Pause("merge blocked", task.story_key)
+
+    flow.merge_local = boom
+    task = StoryTask(story_key="1-1", epic=1)
+    task.phase = Phase.DONE
+
+    with pytest.raises(_Pause):
+        flow.integrate_unit(task, unit=None)
+
+    assert flow.calls.integrated == []
 
 
 def test_reopen_unit_escalates_when_worktree_missing(tmp_path):

@@ -1225,6 +1225,15 @@ class SweepEngine(Engine):
         success_status = "in-review" if self._dev_review_enabled() else "done"
         self._close_bundle_ledger_when_spec_status(task, str(spec_file), success_status)
 
+    def _close_declared_deferred(self, task: StoryTask) -> None:
+        """No-op: a bundle's ledger closure is owned by
+        ``_close_bundle_ledger_when_spec_status``, which runs at dev-sync time
+        because ``verify_review_bundle`` *requires* those entries closed before it
+        will pass. Letting the base class's commit-boundary hook (#234) also fire
+        here would re-derive closure for a task whose ids come from
+        ``task.dw_ids``, not from a ``closes_deferred:`` declaration."""
+        return
+
     def _close_bundle_ledger_when_spec_status(
         self,
         task: StoryTask,

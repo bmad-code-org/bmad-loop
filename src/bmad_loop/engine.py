@@ -281,6 +281,7 @@ class Engine:
             escalation_pause=self._escalation_pause,
             workspace_get=lambda: self.workspace,
             workspace_set=lambda ws: setattr(self, "workspace", ws),
+            on_integrated=lambda t: self._flush_pending_deferred_closes(t),
         )
         # Attempt rollback + recovery-ref preservation flow (issue #244 PR 2/2).
         # Same narrow-deps + engine-callbacks pattern as _worktree_flow: `emit` is
@@ -1719,6 +1720,12 @@ class Engine:
                 self._escalate(task, f"plugin {veto.plugin_id!r} vetoed pre_commit: {veto.reason}")
             if ctx.proposed_commit_message:
                 message = ctx.proposed_commit_message
+        # The success boundary for story-declared ledger closure (#234): every
+        # verify gate, checkpoint, review cycle and pre-commit workflow is behind
+        # us, and a pre_commit pause veto has already raised out of _escalate
+        # above — but finalize_commit's `git add -A` is still ahead, so an in-repo
+        # annotation lands in this story's own commit.
+        self._close_declared_deferred(task)
         try:
             # bmad-dev-auto commits its own work each iteration; the orchestrator
             # squashes that chain plus its uncommitted bookkeeping back onto the
@@ -2052,57 +2059,145 @@ class Engine:
             return
         target = "review" if review_enabled else "done"
         sprint_advance(self.workspace.paths.sprint_status, task.story_key, target)
-        self._close_declared_deferred(task, fm)
 
-    def _close_declared_deferred(
-        self, task: StoryTask, fm: dict, *, extra_ids: Sequence[str] = ()
-    ) -> None:
-        """At clean close, flip every ledger entry the story declares via
+    def _manifest_closes_deferred(self, task: StoryTask) -> tuple[str, ...]:
+        """Deferred-work ids declared for this story by a *manifest* the
+        orchestrator reads, as opposed to the story spec's own frontmatter.
+
+        Empty here: sprint mode has no manifest, so frontmatter is its only
+        channel. ``StoriesEngine`` overrides this with its ``stories.yaml``
+        entry — the channel that matters for an unattended run, since the spec is
+        generated later by a dev skill that knows nothing of the ledger."""
+        return ()
+
+    def _declared_deferred_ids(self, task: StoryTask) -> tuple[str, ...]:
+        """The ids this story declares it closes, unioned across both channels
+        and order-preserving (a story that names the same id in the manifest and
+        in its spec must be marked once and reported once).
+
+        The spec read is a *verified* one: ``task.spec_file`` is recorded only by
+        a passing ``verify_dev``/``verify_dev_stories`` gate, and stories mode
+        resolves it deterministically by id rather than trusting the session's
+        claim. Sprint mode's path still came from the session, so it is held to
+        the same root-containment rule the frontmatter-status reconcile applies —
+        a surprising absolute path must not be able to steer a ledger write.
+
+        A wrong-container declaration (``closes_deferred: DW-5``) is journaled
+        rather than silently read as empty: it names real intent that would
+        otherwise close nothing and say nothing (#234)."""
+        ids: list[str] = list(self._manifest_closes_deferred(task))
+        spec_path = Path(task.spec_file) if task.spec_file else None
+        if spec_path is not None and spec_path.is_file():
+            if not verify.spec_within_roots(spec_path, self.workspace.paths):
+                self.journal.append(
+                    "deferred-close-skipped-out-of-tree",
+                    story_key=task.story_key,
+                    spec=str(spec_path),
+                )
+            else:
+                fm = self._observed_frontmatter(spec_path, task.story_key, "deferred-close")
+                declared, error = deferredwork.parse_declaration((fm or {}).get("closes_deferred"))
+                if error:
+                    self.journal.append(
+                        "deferred-close-malformed",
+                        story_key=task.story_key,
+                        spec=str(spec_path),
+                        error=f"closes_deferred {error}",
+                    )
+                ids += declared
+        return tuple(dict.fromkeys(ids))
+
+    def _close_declared_deferred(self, task: StoryTask) -> None:
+        """At the commit boundary, flip every ledger entry the story declares via
         ``closes_deferred:`` to ``status: done <date>`` + a ``resolution:`` note
         (#234) — the regular-story counterpart of the sweep bundle close at
         ``SweepEngine._close_bundle_ledger_when_spec_status``.
 
-        Two declaration channels feed this, unioned: the spec's own frontmatter,
-        and ``extra_ids`` — what the caller read from a manifest that named the
-        ids up front (stories mode passes its ``stories.yaml`` entry). Both
-        matter, because they are written at different times by different authors:
-        the breakdown is authored while the ledger is in view, whereas the spec
-        is generated later by a dev skill that knows nothing of the ledger.
-
         Declaration is the only signal: closure is never inferred from a diff.
-        Ids are classified against a single ledger snapshot rather than from
-        ``mark_done``'s return value, because that return conflates two very
-        different cases — an id already ``done`` (a *resume* re-running a close
-        that already landed, which must stay silent) and an id absent from the
-        ledger (a typo or a reworded entry, which is worth a journal warning).
-        Neither ever fails the story: the annotation is traceability, not a gate.
 
-        Called from ``_post_dev_state_sync``, i.e. *before* ``_commit`` — the
-        ledger path is rebased into the worktree, so marking here squashes the
-        annotation into the story's own commit, the same way the append hooks do.
-        """
-        raw = fm.get("closes_deferred") or []
-        declared = [str(x).strip() for x in raw] if isinstance(raw, list) else []
-        declared += [str(x).strip() for x in extra_ids]
-        # Order-preserving dedupe: a story that names the same id in both channels
-        # (the natural case once a planner writes it and the spec echoes it) must
-        # mark it once and report it once, not twice.
-        ids = list(dict.fromkeys(i for i in declared if i))
+        **Placement is the whole safety story.** This runs from
+        ``_finalize_commit_phase`` — after artifact verification, the verify
+        commands, every checkpoint, the review loop, the ``pre_commit_gate``
+        workflows and the ``pre_commit`` veto — and still *before*
+        ``finalize_commit``, whose ``git add -A`` stages the annotation into the
+        story's own commit. Marking at dev-sync time instead (where this first
+        landed) let a story that later failed verification, was rejected by
+        review, or escalated leave the ledger permanently claiming its work
+        resolved: the in-place defer path snapshots the ledger *after* the
+        mutation and restores it over the rollback, and ``_escalate`` rolls back
+        nothing at all.
+
+        Where the write lands depends on where the ledger lives. Inside the repo
+        it rides the commit. Configured *outside* it (``ProjectPaths.rebased``
+        deliberately shares an external artifact dir between worktrees, and
+        ``add -A`` can never stage it) an isolated story stashes its ids for
+        ``_flush_pending_deferred_closes`` to apply once the branch has merged —
+        otherwise a unit whose integration fails would still have edited the
+        shared ledger. In-place there is no integration step, so it writes here.
+
+        Never a gate: an unmatched or malformed id is journaled, never fatal.
+        Idempotent, so the resume arm may re-drive the commit phase freely — ids
+        are classified against a ledger snapshot rather than from ``mark_done``'s
+        return value, which conflates "already done" (a resume re-running a close
+        that landed — must stay silent) with "absent" (a typo — worth saying)."""
+        ids = self._declared_deferred_ids(task)
         if not ids:
             return
         ledger = self.workspace.paths.deferred_work
+        if self._isolated and not ledger.is_relative_to(self.workspace.root):
+            task.pending_deferred_closes = list(ids)
+            self.journal.append(
+                "deferred-close-pending-integration",
+                story_key=task.story_key,
+                dw_ids=list(ids),
+                ledger=str(ledger),
+            )
+            return
+        self._apply_deferred_closes(task, ids, ledger)
+
+    def _apply_deferred_closes(self, task: StoryTask, ids: Sequence[str], ledger: Path) -> None:
+        """Write the closure for `ids` and journal exactly what landed."""
         text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
-        present = {e.id for e in deferredwork.parse_ledger(text)}
-        note = f"resolved by story {task.story_key}"
-        today = self._today()
-        marked = [i for i in ids if i in present and deferredwork.mark_done(ledger, i, today, note)]
-        unknown = [i for i in ids if i not in present]
+        declared = deferredwork.classify(text, ids)
+        marked = deferredwork.mark_done_many(
+            ledger, declared.open_ids, self._today(), f"resolved by story {task.story_key}"
+        )
         if marked:
             self.journal.append("story-deferred-closed", story_key=task.story_key, dw_ids=marked)
-        if unknown:
+        if declared.unknown:
             self.journal.append(
-                "deferred-close-unmatched", story_key=task.story_key, dw_ids=unknown
+                "deferred-close-unmatched", story_key=task.story_key, dw_ids=list(declared.unknown)
             )
+        if declared.malformed:
+            # Present in the ledger but carrying neither an `open` nor a `done`
+            # status: nothing was marked, and staying quiet would read to the
+            # operator exactly like a successful close.
+            self.journal.append(
+                "deferred-close-malformed",
+                story_key=task.story_key,
+                dw_ids=list(declared.malformed),
+                error="ledger entry status is neither open nor done",
+            )
+
+    def _flush_pending_deferred_closes(self, task: StoryTask) -> None:
+        """Apply closures held back for an out-of-repo ledger, once the story's
+        unit branch has merged. Called from the integration chokepoint, so a
+        story whose merge escalates never reaches it and the shared ledger keeps
+        reading ``open``. No-op in every in-repo configuration."""
+        ids = tuple(task.pending_deferred_closes)
+        if not ids:
+            return
+        task.pending_deferred_closes = []
+        ledger = self.workspace.paths.deferred_work
+        self.journal.append(
+            "deferred-close-external-ledger",
+            story_key=task.story_key,
+            dw_ids=list(ids),
+            ledger=str(ledger),
+            note="ledger is outside the repo; the annotation is not part of any commit",
+        )
+        self._apply_deferred_closes(task, ids, ledger)
+        self._save()
 
     def _extra_session_env(
         self, task: StoryTask, role: str, label: str | None = None

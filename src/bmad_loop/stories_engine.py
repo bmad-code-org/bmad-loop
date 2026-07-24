@@ -10,7 +10,7 @@ mtime-scan, no shared mutable board.
 
 Like ``SweepEngine``, this is a thin override layer over the mature story
 pipeline: only the story source (``_pick_next``), the dispatch prompt
-(``_dev_prompt``), the narrowed bookkeeping sync (``_post_dev_state_sync``), the
+(``_dev_prompt``), the (absent) bookkeeping sync (``_post_dev_state_sync``), the
 artifact verification (``_verify_dev_artifacts``), the session env
 (``_extra_session_env``), and the HITL checkpoints differ. Everything else —
 dev/verify/review/commit, crash resume, worktree isolation, gates — is inherited
@@ -413,41 +413,27 @@ class StoriesEngine(Engine):
     # ---------------------------------------------------------- sync + verify
 
     def _post_dev_state_sync(self, task: StoryTask, result_json: dict | None) -> None:
-        """Stories mode has no sprint board, so the base sync's board write has
-        nothing to do here — the dev skill stays the sole writer of each story
-        spec's status, honoring the contract's "the orchestrator writes nothing"
-        on the happy path.
+        """No-op: stories mode has no sprint board. Honors the contract's "the
+        orchestrator writes nothing" on the happy path — the dev skill is the sole
+        writer of each story spec's status.
 
-        The deferred-work ledger is a different matter. It is project-wide rather
-        than sprint-mode-specific — the inherited review-followup refiles already
-        file into it from stories runs — so a story declaring ``closes_deferred:``
-        must have those entries annotated here too. Otherwise the field would be
-        inert in exactly the mode whose declarations ``validate`` preflights, and
-        a spec could name ids that nothing ever marks resolved (#234).
+        Deferred-work closure is deliberately NOT here. It is project-wide state
+        (a story's ``closes_deferred:`` declaration applies in this mode too), but
+        it belongs at the commit boundary rather than at dev-sync time, so a story
+        that later fails verification or review never leaves the ledger claiming
+        its work resolved — see ``Engine._close_declared_deferred`` (#234)."""
+        return
 
-        Both declaration channels are honored: the manifest entry's
-        ``closes_deferred`` and the spec's own frontmatter. The manifest is the
-        one that makes this work unattended — ``bmad-dev-auto`` writes the spec
-        and knows nothing of the ledger, so with the frontmatter alone a human
-        would have to hand-edit every generated spec.
+    def _manifest_closes_deferred(self, task: StoryTask) -> tuple[str, ...]:
+        """The ``stories.yaml`` entry's ``closes_deferred`` ids.
 
-        The spec is resolved by id, never from the session-claimed path — the same
-        deterministic resolution ``verify_dev_stories`` performs a moment later.
-        """
-        if not self._generic_dev():
-            return
-        state = stories.resolve_story_spec(self._stories_folder(), task.story_key)
-        if state.kind != stories.KIND_PRESENT or state.path is None:
-            return
-        fm = self._observed_frontmatter(state.path, task.story_key, "post-dev-sync")
-        # `done` is where the generic skill self-finalizes (stories mode never hands
-        # off to `in-review`), and a plan-halt leg sits at `ready-for-dev` — so this
-        # is the same clean-close gate the sprint advance rides in the base sync:
-        # a failed, blocked, or plan-only session closes nothing.
-        if fm is None or verify.status_of(fm) != "done":
-            return
+        This is the channel that makes story-declared closure work unattended:
+        ``bmad-dev-auto`` writes the story spec and knows nothing of the ledger,
+        so with the spec frontmatter alone a human would have to hand-edit every
+        generated spec. The breakdown, by contrast, is authored while the ledger
+        is in view. Both channels compose — the base hook unions them."""
         entry = self._entry_for(task)  # None on an unreadable manifest (journaled there)
-        self._close_declared_deferred(task, fm, extra_ids=entry.closes_deferred if entry else ())
+        return entry.closes_deferred if entry else ()
 
     def _verify_dev_artifacts(self, task: StoryTask, result_json: dict | None):
         # The adapter marks a plan-halt leg's synthesized result `plan_halt`; latch

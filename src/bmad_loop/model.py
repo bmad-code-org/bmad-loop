@@ -220,6 +220,15 @@ class StoryTask:
     # rendered intent file handed to dev sessions
     dw_ids: list[str] = field(default_factory=list)
     bundle_file: str | None = None
+    # deferred-work ids this story declared via `closes_deferred:` whose ledger
+    # annotation could not ride the story's own commit, because the ledger is
+    # configured OUTSIDE the repo (an external artifact dir is shared between
+    # worktrees, so `rebased` deliberately leaves it in place and `git add -A`
+    # can never stage it). Stashed at commit and applied only once the unit's
+    # branch has merged, so an isolated story whose integration fails never
+    # claims work resolved. Empty in every in-repo configuration. Survives the
+    # resume serialization round-trip.
+    pending_deferred_closes: list[str] = field(default_factory=list)
     # worktree-isolation mode only (scm.isolation = "worktree"): the unit's
     # mounted worktree dir and branch, recorded so a paused/crashed run can
     # reconstruct or discard the in-flight worktree on resume.
@@ -274,6 +283,7 @@ class StoryTask:
             "restore_patch": self.restore_patch,
             "dw_ids": self.dw_ids,
             "bundle_file": self.bundle_file,
+            "pending_deferred_closes": self.pending_deferred_closes,
             "worktree_path": self.worktree_path,
             "branch": self.branch,
             "sessions": [s.to_dict() for s in self.sessions],
@@ -321,6 +331,7 @@ class StoryTask:
             restore_patch=d.get("restore_patch"),
             dw_ids=[str(i) for i in d.get("dw_ids", [])],
             bundle_file=d.get("bundle_file"),
+            pending_deferred_closes=[str(i) for i in d.get("pending_deferred_closes", [])],
             worktree_path=str(d.get("worktree_path", "")),
             branch=str(d.get("branch", "")),
             sessions=[SessionRecord.from_dict(s) for s in d.get("sessions", [])],
