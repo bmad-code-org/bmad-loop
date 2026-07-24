@@ -2299,6 +2299,43 @@ def test_closes_deferred_external_ledger_waits_for_the_commit_in_place(project, 
     assert load_state(engine.run_dir).tasks["1-1-a"].pending_deferred_closes == ["DW-1"]
 
 
+def test_closes_deferred_external_obligation_drops_when_the_declaration_is_withdrawn(
+    project, tmp_path
+):
+    """A parked out-of-repo obligation survives a failed commit on purpose, to be
+    retried by the re-drive — but the re-drive re-reads the declaration, and the
+    early return for "declares nothing" left the old parked ids standing while
+    every other path recomputes them wholesale. The re-drive then flushed a
+    withdrawn closure after its commit: the false close the re-read exists to
+    prevent, on the one ledger with no rollback (CodeRabbit, review round 3)."""
+    paths = _external_ledger_paths(project, tmp_path)
+    write_sprint(paths, {"1-1-a": "ready-for-dev"})
+    write_ledger(paths, {"DW-1": "open"}, commit=False)
+    engine, _ = make_engine(
+        paths, [dev_effect(paths, "1-1-a", followup_review=False, closes_deferred=["DW-1"])]
+    )
+    hook = _reject_commits(project)
+
+    engine.run()  # parks DW-1, then the commit fails
+
+    assert load_state(engine.run_dir).tasks["1-1-a"].pending_deferred_closes == ["DW-1"]
+
+    hook.unlink()
+    rearm_escalation(engine.run_dir)
+    # the re-drive's dev session writes the spec with the declaration withdrawn
+    resumed, _ = resume_engine(paths, engine, [dev_effect(paths, "1-1-a", followup_review=False)])
+    summary = resumed.run()
+
+    assert summary.done == 1  # the story itself lands
+    entries = {
+        e.id: e for e in deferredwork.parse_ledger(paths.deferred_work.read_text(encoding="utf-8"))
+    }
+    assert entries["DW-1"].open  # never closed: nothing declares it any more
+    assert load_state(resumed.run_dir).tasks["1-1-a"].pending_deferred_closes == []
+    dropped = [e for e in resumed.journal.entries() if e["kind"] == "deferred-close-withdrawn"]
+    assert len(dropped) == 1 and dropped[0]["dw_ids"] == ["DW-1"]
+
+
 def test_closes_deferred_external_write_failure_keeps_the_obligation(project, tmp_path):
     """Clearing `pending_deferred_closes` before the write looks harmless — the
     flush is about to happen — but a raising write unwinds to the crash handler,

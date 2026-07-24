@@ -632,11 +632,15 @@ def _validate_closes_deferred(
     only in stories mode left sprint-mode operators with nothing but a journal
     line after the fact.
 
-    Only *absent* ids warn. An id present but already ``done`` is a declaration a
-    prior run already satisfied (a resume re-drives the same close), so it stays
-    silent — the same classification the engine's close hook makes, for the same
-    reason. A wrong-container declaration warns separately: it names real intent
-    that would otherwise close nothing and say nothing.
+    An id present but already ``done`` is a declaration a prior run already
+    satisfied (a resume re-drives the same close), so it stays silent — the same
+    classification the engine's close hook makes, for the same reason. Everything
+    else it can journal is reported here: an absent id, an id whose ledger entry
+    carries neither an ``open`` nor a ``done`` status (nothing will be marked, and
+    the remedy is in the ledger rather than in the declaration), and a
+    wrong-container declaration, which names real intent that would otherwise
+    close nothing and say nothing. Covering only two of the three left the third
+    to be discovered in the journal after the run it should have preceded.
 
     Never a failure. The annotation is traceability, not a gate, so a stale
     reference must not be able to block a run that would otherwise start.
@@ -662,6 +666,15 @@ def _validate_closes_deferred(
                 {"source": label, "error": error},
             )
         declared = deferredwork.classify(text, ids)
+        if declared.malformed:
+            malformed = list(declared.malformed)
+            report.warn(
+                "deferred.closes-entry-unreadable",
+                f"{label} declares closes_deferred ids whose {ledger.name} entries carry "
+                f"neither an `open` nor a `done` status: {', '.join(malformed)} — nothing "
+                "will be marked resolved for them until the entry status is repaired",
+                {"source": label, "dw_ids": malformed},
+            )
         if declared.unknown:
             unknown = list(declared.unknown)
             report.warn(

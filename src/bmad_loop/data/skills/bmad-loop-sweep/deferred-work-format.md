@@ -70,9 +70,11 @@ or in its story spec's frontmatter. The two are unioned:
 closes_deferred: [DW-5, DW-6] # DW-<n> ids this story closes
 ```
 
-Both are written by a human, at breakdown time, with this file open — no
-upstream skill emits the field yet, and re-deriving `stories.yaml` will drop it
-unless the intent is recorded in `.memlog.md` first.
+Both are written by a human, and breakdown time — with this file open — is where
+it belongs, though not a deadline: the declaration is read when the story
+commits, so one added to a spec's frontmatter mid-run still counts. No upstream
+skill emits the field yet, and re-deriving `stories.yaml` will drop it unless the
+intent is recorded in `.memlog.md` first.
 
 When the story commits, the orchestrator annotates each declared id exactly as a
 bundle close does — `status: done <date>` plus a `resolution:` line naming the

@@ -2285,6 +2285,24 @@ class Engine:
         that landed — must stay silent) with "absent" (a typo — worth saying)."""
         ids = self._declared_deferred_ids(task)
         if not ids:
+            # A prior attempt may have parked ids for an out-of-repo ledger and
+            # then failed its commit; that obligation deliberately survives, to be
+            # retried by the re-drive. But the re-drive re-reads the declaration,
+            # and if it is gone the obligation goes with it — every other path
+            # recomputes the parked list wholesale from the fresh read, and
+            # flushing a withdrawn one after the commit would be exactly the false
+            # close the re-read exists to prevent, on the one ledger that has no
+            # rollback behind it. Journaled, because an unreadable spec or
+            # manifest reaches here the same way (reported by
+            # `_declared_deferred_ids`, but indistinguishable once it returns).
+            if task.pending_deferred_closes:
+                self.journal.append(
+                    "deferred-close-withdrawn",
+                    story_key=task.story_key,
+                    dw_ids=list(task.pending_deferred_closes),
+                    reason="the story no longer declares them; the parked closure is dropped",
+                )
+                task.pending_deferred_closes = []
             return None
         ledger = self.workspace.paths.deferred_work
         # Decided on RESOLVED paths. `is_relative_to` is lexical while the write

@@ -3364,6 +3364,35 @@ def test_validate_silent_when_closes_deferred_all_present(project, capsys):
     assert _closes_deferred_findings(capsys) == []
 
 
+def test_validate_warns_when_a_declared_entry_status_is_unreadable(project, capsys):
+    """A declared id can also point at an entry the ledger carries but whose
+    `status:` reads as neither `open` nor `done`. Nothing gets marked for it and
+    the close hook journals `deferred-close-malformed`, but preflight covered only
+    absent ids and unreadable declarations — leaving this third case to be found in
+    the journal after the run it should have preceded (CodeRabbit, round 3).
+
+    The remedy is in the ledger, not the declaration, so it is its own check id
+    rather than folded into `deferred.closes-unknown`."""
+    install_bmad_config(project)
+    _write_policy(project.project, STORIES_POLICY)
+    _declare_closes_deferred(project, ["DW-1"])
+    ledger = project.deferred_work
+    ledger.write_text(
+        ledger.read_text(encoding="utf-8").replace("status: open", "status: in-progress"),
+        encoding="utf-8",
+    )
+    args = argparse.Namespace(project=str(project.project), spec=None, json=True)
+
+    cli.cmd_validate(args)
+    doc = json.loads(capsys.readouterr().out)
+    findings = [f for f in doc["findings"] if f["check"] == "deferred.closes-entry-unreadable"]
+    assert len(findings) == 1
+    assert findings[0]["severity"] == "warning"  # advisory, like the rest
+    assert findings[0]["detail"] == {"source": "story 1", "dw_ids": ["DW-1"]}
+    # not misreported as a typo: the id IS in the ledger
+    assert not [f for f in doc["findings"] if f["check"] == "deferred.closes-unknown"]
+
+
 def test_validate_warns_on_unknown_closes_deferred_in_the_manifest(project, capsys):
     """The manifest channel is what makes this a genuine *pre*-flight: a stories.yaml
     entry declares its ids before the story has ever been dispatched, so a typo is
