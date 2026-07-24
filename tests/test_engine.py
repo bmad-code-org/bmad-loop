@@ -2239,6 +2239,35 @@ def _external_ledger_paths(project, tmp_path):
     return dataclasses.replace(project, implementation_artifacts=external)
 
 
+def test_closes_deferred_external_ledger_lands_after_the_commit_in_place(project, tmp_path):
+    """The other half of the parking rule: in place there is no integration step,
+    so a successful commit IS the durable landing and the held closure must
+    actually be applied — parking it and never flushing would read exactly like a
+    story that declared nothing."""
+    paths = _external_ledger_paths(project, tmp_path)
+    write_sprint(paths, {"1-1-a": "ready-for-dev"})
+    write_ledger(paths, {"DW-1": "open"}, commit=False)
+    engine, _ = make_engine(
+        paths,
+        [dev_effect(paths, "1-1-a", followup_review=False, closes_deferred=["DW-1"])],
+    )
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    entry = next(
+        e
+        for e in deferredwork.parse_ledger(paths.deferred_work.read_text(encoding="utf-8"))
+        if e.id == "DW-1"
+    )
+    assert not entry.open and "resolution: resolved by story 1-1-a" in entry.body
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    # parked at the commit boundary, applied only once the commit returned
+    assert kinds.index("deferred-close-pending-integration") < kinds.index("story-deferred-closed")
+    assert "deferred-close-external-ledger" in kinds  # the operator is told it is uncommitted
+    assert load_state(engine.run_dir).tasks["1-1-a"].pending_deferred_closes == []
+
+
 def test_closes_deferred_external_ledger_waits_for_the_commit_in_place(project, tmp_path):
     """An out-of-repo ledger cannot ride any commit, so writing it before one buys
     nothing and risks claiming work that never committed. In place there is no
