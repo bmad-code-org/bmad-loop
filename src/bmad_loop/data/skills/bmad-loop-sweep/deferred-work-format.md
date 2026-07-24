@@ -102,10 +102,16 @@ The rules that keep this safe:
 - **Idempotent.** An id already `done` is left untouched, so a resumed run
   re-driving the same close neither doubles the `resolution:` line nor warns.
 - **Never a gate.** An id that matches no entry, an entry whose `status:` reads
-  as neither `open` nor `done`, and a declaration that is not a list (a bare
-  `closes_deferred: DW-5`) are each journaled and dropped — none can fail the
-  story. `bmad-loop validate` reports the same mismatches as warnings before the
-  run starts.
+  as neither `open` nor `done`, and a story spec declaring a bare
+  `closes_deferred: DW-5` where a list belongs are each journaled and dropped —
+  none can fail the story. `bmad-loop validate` reports the same mismatches as
+  warnings before the run starts. The one exception is that same wrong container
+  in `stories.yaml`: the manifest is a schema the parser owns, so it fails to
+  load there like any other field of the wrong type — before any story runs, and
+  reported by `validate` up front.
+- **Read at the commit.** The declaration that counts is the one on disk when the
+  story commits, not the one it was implemented from — edit it late and the edit
+  is honored, in both directions.
 
 Keep the ids stable when editing this file: a reworded title is fine, but
 renumbering an entry orphans any declaration that already references it.

@@ -22,19 +22,26 @@ breaking changes may land in a minor release.
   every checkpoint, the review loop and the `pre_commit` workflows, and immediately before
   `finalize_commit` squashes the story — so a story that fails verification, is rejected by
   review, or escalates closes nothing, and an in-repo ledger still carries the annotation in the
-  story's own commit. A commit that then fails (a rejecting native `pre-commit` hook) rolls the
-  annotation back, so it never outlives the commit it was written for. An artifact dir configured
-  _outside_ the repo is shared between worktrees and cannot be committed at all; that closure is
-  held until the work is durably landed — after the commit in place, after the branch merges under
-  isolation (journaled `deferred-close-external-ledger`) — and a write that never got to happen is
-  retried on the next resume rather than being dropped.
+  story's own commit. A commit that then fails (a rejecting native `pre-commit` hook) or never
+  happens at all (a SIGTERM landing mid-commit) rolls the annotation back, so it never outlives the
+  commit it was written for. An artifact dir configured _outside_ the repo — including one reached
+  through a symlink that only looks in-repo — is shared between worktrees and cannot be committed
+  at all; that closure is held until the work is durably landed — after the commit in place, after
+  the branch merges under isolation (journaled `deferred-close-external-ledger`) — and a write that
+  never got to happen is retried on the next resume rather than being dropped.
 
-  Closure is declared, never inferred from a diff. An id already `done` is a silent no-op, so a
-  resumed run re-driving the same close neither doubles the `resolution:` line nor warns. Nothing
-  here can fail a story: an id matching no ledger entry (`deferred-close-unmatched`), a ledger
-  entry whose `status:` reads as neither `open` nor `done` (`deferred-close-malformed`), and a
-  declaration that is not a list — a bare `closes_deferred: DW-5` — are journaled and dropped.
-  Closes are journaled as `story-deferred-closed`.
+  Closure is declared, never inferred from a diff, and both channels are re-read at that boundary
+  so a declaration edited after the story was implemented is the one that counts — a withdrawn id
+  is not closed, and one added late is. A read that fails there falls back to the declaration
+  captured when the dev artifacts verified rather than to "declares nothing"
+  (`deferred-close-declaration-unreadable` when even that is unavailable). An id already `done` is
+  a silent no-op, so a resumed run re-driving the same close neither doubles the `resolution:` line
+  nor warns. Nothing at the commit boundary can fail a story: an id matching no ledger entry
+  (`deferred-close-unmatched`), a ledger entry whose `status:` reads as neither `open` nor `done`
+  (`deferred-close-malformed`), and a story spec declaring `closes_deferred: DW-5` where a list
+  belongs are journaled and dropped. The same wrong container in `stories.yaml` is a schema error
+  like any other manifest field of the wrong type — the manifest fails to load, before any story
+  runs, where `validate` has already reported it. Closes are journaled as `story-deferred-closed`.
 
   The `stories.yaml` channel is the one that avoids hand-editing each generated spec:
   `bmad-dev-auto` writes the story spec and knows nothing of the ledger, whereas the Story
@@ -45,9 +52,10 @@ breaking changes may land in a minor release.
 
   `bmad-loop validate` adds matching pre-flight warnings in **both** queue modes —
   `deferred.closes-unknown` for an id absent from the ledger (a typo or a renumbered entry) and
-  `deferred.closes-malformed` for an unreadable declaration. Stories mode reads the manifest plus
-  each id-resolved spec; sprint mode reads the story specs already on disk in the artifacts dir.
-  Both are warnings, so neither changes the exit code.
+  `deferred.closes-malformed` for a spec declaration in an unreadable shape. Stories mode reads the
+  manifest plus each id-resolved spec; sprint mode reads the story specs already on disk in the
+  artifacts dir. Both are warnings, so neither changes the exit code; a malformed declaration in
+  `stories.yaml` itself is reported by `queue.stories-manifest`, which does.
 
 - **`review.on_timeout` policy knob (#271).** A timeout-like review verdict (`timeout` /
   `stalled` / `over_budget`) previously always burned a review cycle (RETRY) until

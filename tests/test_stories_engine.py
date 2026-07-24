@@ -1360,6 +1360,49 @@ def test_stories_mode_unions_manifest_and_frontmatter_declarations(project):
     assert closed[0]["dw_ids"] == ["DW-1", "DW-2", "DW-3"]  # manifest first, deduped
 
 
+def test_stories_mode_reports_a_manifest_unreadable_at_the_commit_boundary(project, monkeypatch):
+    """The manifest half is re-read at the commit and, unlike the spec half, is
+    persisted nowhere — so a parse failure there drops a declared closure with
+    nothing to fall back on. Routing it through `_entry_for` reported that as a
+    generic `stories-manifest-unreadable` warning that is emitted at most ONCE per
+    story, so an earlier dispatch-time failure spent the one line and the lost
+    closure passed in silence (#284 follow-up review, finding 4).
+
+    The spec half is unaffected: one unreadable channel must not take the other
+    down with it."""
+    from bmad_loop import stories as stories_mod
+
+    engine = _closing_run(
+        project,
+        manifest=["DW-1"],
+        spec=["DW-2"],
+        ledger={"DW-1": "open", "DW-2": "open"},
+    )
+    finalize = engine._finalize_commit_phase
+    real_load = engine._load_stories
+
+    def unreadable(*_a, **_kw):
+        raise stories_mod.StoriesError("stories.yaml is not valid YAML")
+
+    def unreadable_from_the_commit_phase_on(task):
+        monkeypatch.setattr(engine, "_load_stories", unreadable)
+        try:
+            return finalize(task)
+        finally:
+            monkeypatch.setattr(engine, "_load_stories", real_load)
+
+    monkeypatch.setattr(engine, "_finalize_commit_phase", unreadable_from_the_commit_phase_on)
+
+    summary = engine.run()
+
+    assert summary.done == 1  # never a gate
+    entries = _entries(project)
+    assert entries["DW-1"].open  # the manifest-declared id is lost...
+    events = _kinds(engine.journal, "deferred-close-declaration-unreadable")
+    assert len(events) == 1 and events[0]["source"] == "stories.yaml"  # ...but not silently
+    assert not entries["DW-2"].open  # the spec half still closed
+
+
 def test_stories_mode_unknown_id_is_journaled_not_fatal(project):
     """An id naming no ledger entry — a typo, or an entry renumbered since the
     breakdown was written — is journaled and dropped. The annotation is

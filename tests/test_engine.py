@@ -2127,7 +2127,11 @@ def test_closes_deferred_reports_a_wrong_container_declaration(project):
     assert summary.done == 1  # still never a gate
     assert project.deferred_work.read_bytes() == before
     events = [e for e in engine.journal.entries() if e["kind"] == "deferred-close-malformed"]
-    assert len(events) == 1 and "must be a list" in events[0]["error"]
+    # once per read of the declaration — the verify-time capture and the
+    # commit-boundary re-read that supersedes it — each saying which site it is,
+    # so two lines read as two reads rather than as two closes.
+    assert [e["site"] for e in events] == ["dev-verify", "commit-boundary"]
+    assert all("must be a list" in e["error"] for e in events)
 
 
 def test_closes_deferred_noop_when_field_absent(project):
@@ -2321,8 +2325,9 @@ def test_closes_deferred_uses_the_verified_capture_when_the_commit_read_faults(
     """`_observed_frontmatter` degrades an unreadable spec to None, which at the
     close site was indistinguishable from a spec declaring nothing: a transient
     read fault let the story commit with its declared entry still open. The
-    declaration is captured when the dev artifacts verify instead, so the commit
-    boundary needs no spec read at all (#284 review, finding 3)."""
+    declaration is captured when the dev artifacts verify, and the commit
+    boundary's own re-read falls back to that capture rather than to "declares
+    nothing" (#284 review, finding 3)."""
     engine = _closes_deferred_run(project, ["DW-1"])
     finalize = engine._finalize_commit_phase
 
@@ -2342,9 +2347,10 @@ def test_closes_deferred_uses_the_verified_capture_when_the_commit_read_faults(
 
 
 def test_closes_deferred_reports_an_unreadable_declaration(project, monkeypatch):
-    """The fallback read — a task that reached the commit boundary with no capture
-    — is the one place a fault can still cost a closure, so it says so instead of
-    reading as "declares nothing"."""
+    """A commit-boundary read that faults with nothing captured to fall back on —
+    a state file written before the capture existed — is the one place a fault can
+    still cost a closure, so it says so instead of reading as "declares
+    nothing"."""
     write_ledger(project, {"DW-1": "open"})
     engine, _ = make_engine(project, [])
     sp = spec_path(project, "1-1-a")
@@ -2360,6 +2366,150 @@ def test_closes_deferred_reports_an_unreadable_declaration(project, monkeypatch)
         e for e in engine.journal.entries() if e["kind"] == "deferred-close-declaration-unreadable"
     ]
     assert len(events) == 1 and events[0]["story_key"] == "1-1-a"
+    assert events[0]["source"] == "spec"
+    assert "no captured declaration" in events[0]["note"]
+
+
+def test_closes_deferred_re_reads_the_declaration_at_the_commit_boundary(project, monkeypatch):
+    """The spec on disk at the commit is what the story declares. Closing against
+    the verify-time capture instead let an id the author had since WITHDRAWN be
+    marked resolved — a false close, the one outcome this whole path exists to
+    prevent — and dropped one added in the same edit (#284 follow-up review,
+    finding 3).
+
+    The declaration is re-read here and the capture demoted to the fallback for a
+    read that faults, so both directions follow the final spec."""
+    engine = _closes_deferred_run(project, ["DW-1"], ledger={"DW-1": "open", "DW-3": "open"})
+    sp = spec_path(project, "1-1-a")
+    finalize = engine._finalize_commit_phase
+
+    def edited_after_verification(task):
+        # the shape of a review session rewriting the frontmatter, or a human
+        # editing the spec while the review loop runs: DW-1 withdrawn, DW-3 added
+        write_spec(sp, "done", task.baseline_commit, closes_deferred=["DW-3"])
+        return finalize(task)
+
+    monkeypatch.setattr(engine, "_finalize_commit_phase", edited_after_verification)
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    entries = _ledger_entries(project)
+    assert entries["DW-1"].open  # withdrawn before the commit: never closed
+    assert not entries["DW-3"].open  # named by the final spec: closed
+    closed = [e for e in engine.journal.entries() if e["kind"] == "story-deferred-closed"]
+    assert [e["dw_ids"] for e in closed] == [["DW-3"]]
+
+
+def test_closes_deferred_capture_survives_a_committing_resume(project, monkeypatch):
+    """The COMMITTING resume arm finishes a commit WITHOUT re-verifying, so when
+    its own re-read faults the persisted capture is all that knows what the story
+    declared. Drive it through a real save/reload rather than trusting the
+    round-trip by inspection: `declared_deferred` distinguishes None (never
+    captured) from [] (captured, declares nothing), and a `to_dict`/`from_dict`
+    that flattened the two would close nothing here while every direct-hook test
+    stayed green (#284 follow-up review, finding 7)."""
+    write_ledger(project, {"DW-1": "open"})
+    engine, _ = make_engine(project, [])
+    committing_crash_state(project, engine)
+    engine.state.tasks["1-1-a"].declared_deferred = ["DW-1"]
+    engine._save()
+
+    resumed, _ = resume_engine(project, engine, [])
+    # survived state.json — the resumed engine re-read it from disk
+    assert resumed.state.tasks["1-1-a"].declared_deferred == ["DW-1"]
+    # ...and the spec the crash left behind carries no declaration to re-read,
+    # so make the re-read fault: the fallback is the only path to the close
+    monkeypatch.setattr(resumed, "_observed_frontmatter", lambda *a, **kw: None)
+
+    resumed.run()
+
+    assert not _ledger_entries(project)["DW-1"].open
+    committed = git(project.project, "show", "HEAD", "--", str(project.deferred_work))
+    assert "status: done" in committed
+
+
+def test_closes_deferred_rolls_back_when_a_signal_stops_the_commit(project, monkeypatch):
+    """A failed commit is not the only way out of the close→commit window. The
+    handler `run()` installs raises RunStopped from wherever the main thread is
+    standing, and `run()` catches it to finalize a *stopped* run — not to repair
+    bookkeeping. Left alone the ledger claims work that is in no commit, exactly
+    as a rejecting pre-commit hook did, but past `except verify.GitError`
+    (#284 follow-up review, finding 2)."""
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: None)
+    engine = _closes_deferred_run(project, ["DW-1"])
+    before = project.deferred_work.read_bytes()
+    real_finalize = verify.finalize_commit
+
+    def sigterm_mid_commit(*a, **kw):
+        # in-process, catchable, and routed through the REAL installed handler —
+        # this is the mechanism, not a stand-in for it
+        signal.raise_signal(signal.SIGTERM)
+        return real_finalize(*a, **kw)  # unreachable: the handler raises first
+
+    monkeypatch.setattr(verify, "finalize_commit", sigterm_mid_commit)
+
+    summary = engine.run()
+
+    assert summary.done == 0
+    assert load_state(engine.run_dir).stopped is True  # the stop really landed
+    assert _ledger_entries(project)["DW-1"].open
+    assert project.deferred_work.read_bytes() == before  # byte-identical
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert kinds.index("story-deferred-closed") < kinds.index("deferred-close-rolled-back")
+
+
+def test_closes_deferred_rolls_back_when_the_commit_raises_a_non_git_error(project, monkeypatch):
+    """`_run_git` translates only TimeoutExpired, so a raw OSError from the spawn
+    itself (a fork failure, git gone from PATH) reaches the commit boundary as
+    itself and slips past the GitError arm."""
+    engine = _closes_deferred_run(project, ["DW-1"])
+    before = project.deferred_work.read_bytes()
+
+    def cannot_spawn(*a, **kw):
+        raise OSError("cannot allocate memory")
+
+    monkeypatch.setattr(verify, "finalize_commit", cannot_spawn)
+
+    summary = engine.run()
+
+    assert summary.crashed  # re-raised untouched: the disposition is not ours
+    assert _ledger_entries(project)["DW-1"].open
+    assert project.deferred_work.read_bytes() == before
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_closes_deferred_parks_a_ledger_symlinked_out_of_the_repo(project, tmp_path):
+    """Locality is decided on resolved paths. `is_relative_to` is lexical while
+    the write follows symlinks, so an in-repo link pointing at a shared external
+    ledger read as committable: the external target was flipped before the commit,
+    `add -A` staged only the unchanged link, and under isolation a merge that
+    never landed left shared work marked done with nothing left to roll it back
+    (#284 follow-up review, finding 1)."""
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    external = tmp_path / "shared" / "deferred-work.md"
+    external.parent.mkdir(parents=True, exist_ok=True)
+    external.write_text(project.deferred_work.read_text(encoding="utf-8"), encoding="utf-8")
+    project.deferred_work.unlink()
+    project.deferred_work.symlink_to(external)  # in the repo by path, not by inode
+
+    engine, _ = make_engine(project, [])
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "done", "abc123", closes_deferred=["DW-1"])
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.spec_file = str(sp)
+
+    snapshot = engine._close_declared_deferred(task)
+
+    assert snapshot is None  # nothing written here that a commit could carry
+    assert "status: open" in external.read_text(encoding="utf-8")
+    assert task.pending_deferred_closes == ["DW-1"]  # held for the durable landing
+    assert "deferred-close-pending-integration" in [e["kind"] for e in engine.journal.entries()]
+
+    engine._flush_pending_deferred_closes(task)
+
+    assert "status: done" in external.read_text(encoding="utf-8")
+    assert project.deferred_work.is_symlink()  # written through, not replaced
 
 
 def test_transient_spec_read_fault_does_not_crash_run(project, monkeypatch):

@@ -785,7 +785,16 @@ class Engine:
         an unsatisfied obligation — and terminal tasks are exactly what that loop
         skips. `unit_merged` is the durable proof the work landed; without it the
         unit never reached the target branch, and the ledger reading `open` is the
-        truthful answer, so the obligation is reported rather than discharged."""
+        truthful answer, so the obligation is reported rather than discharged.
+
+        `unit_merged` is saved *after* `merge_local` returns, so a host death in
+        that one window reports a merge that did land as abandoned, and the entry
+        stays open. That direction is deliberate: the entries stay open (which a
+        sweep re-verifies against the codebase, and which `deferred-close-abandoned`
+        names for the operator), where recording the intent before the merge would
+        instead close entries for a merge that never happened. Proving it from the
+        target branch is not available as a tiebreaker either — `squash` rewrites
+        the commit, so the unit's sha is not on the target under every strategy."""
         for task in list(self.state.tasks.values()):
             if not task.pending_deferred_closes:
                 continue
@@ -1246,7 +1255,9 @@ class Engine:
                 if outcome.ok:
                     # the spec is verified and on disk: the one moment its
                     # `closes_deferred:` declaration is known readable (#234).
-                    self._capture_declared_deferred(task)
+                    # The commit boundary re-reads it — this capture is what that
+                    # read falls back on when it faults.
+                    self._capture_declared_deferred(task, site="dev-verify")
                 if outcome.ok and self._run_verify_commands_after_dev(task, result.result_json):
                     # deterministic gates run here too: a broken build must not
                     # reach the (far more expensive) review loop
@@ -1773,6 +1784,17 @@ class Engine:
         except verify.GitError as e:
             self._restore_deferred_closes(task, rollback)
             self._escalate(task, f"commit failed: {e}")
+        except BaseException:
+            # A failed commit is not the only way out of this window. The signal
+            # handler installed by `_run` raises RunStopped from wherever the main
+            # thread is standing — including inside finalize_commit — and `_run_git`
+            # translates only TimeoutExpired, so a raw OSError on spawn escapes as
+            # itself. Both leave the ledger flipped for a commit that does not
+            # exist, and nothing above unwinds it: RunStopped is caught by `run()`
+            # to finalize a *stopped* run, not to repair bookkeeping. Restore, then
+            # re-raise untouched — the caller's disposition is not ours to change.
+            self._restore_deferred_closes(task, rollback)
+            raise
         if not self._isolated:
             # An out-of-repo ledger could not ride the commit, so it was parked;
             # the commit has now landed, which in place is the whole of "durably
@@ -2110,17 +2132,27 @@ class Engine:
         generated later by a dev skill that knows nothing of the ledger."""
         return ()
 
-    def _capture_declared_deferred(self, task: StoryTask) -> bool:
-        """Latch the spec's ``closes_deferred:`` declaration onto the task, at the
-        moment the dev artifacts verified (#234).
+    def _capture_declared_deferred(self, task: StoryTask, *, site: str) -> bool:
+        """Read the spec's ``closes_deferred:`` declaration onto the task (#234).
 
-        Capturing here rather than reading at the commit boundary is the whole
-        point: ``_observed_frontmatter`` degrades an unreadable spec to None, and
-        at the close site that was indistinguishable from a spec declaring
-        nothing — so a transient read fault let the story commit with its declared
-        entry still open, leaving a journal line as the only trace. It also hands
-        the declaration to the COMMITTING resume arm, which finishes a commit
-        WITHOUT re-verifying and so has no other way to learn it.
+        Called from two sites, and which one is authoritative matters.
+
+        **The commit boundary is the authority.** What the spec says at the
+        moment of the close is what the story declares; a declaration edited
+        after the dev artifacts verified — a review session rewriting the
+        frontmatter, a human editing the spec while the review loop runs — must
+        not be closed against a stale snapshot, because the stale half of that
+        can close an entry the final spec no longer names.
+
+        **The verify-time capture is what makes re-reading safe to attempt.**
+        ``_observed_frontmatter`` degrades an unreadable spec to None, and at the
+        close site that is indistinguishable from a spec declaring nothing — so a
+        transient read fault there would let the story commit with its declared
+        entry still open, leaving a journal line as the only trace. A failed read
+        leaves the last good capture standing to be closed against instead. It is
+        the same value the COMMITTING resume arm leans on when its own re-read
+        faults; that arm finishes a commit WITHOUT re-verifying, so a persisted
+        declaration is its only other source.
 
         The path is a verified one — ``task.spec_file`` is recorded only by a
         passing ``verify_dev``/``verify_dev_stories`` gate, and stories mode
@@ -2131,12 +2163,21 @@ class Engine:
 
         A wrong-container declaration (``closes_deferred: DW-5``) is journaled
         rather than silently read as empty: it names real intent that would
-        otherwise close nothing and say nothing. A failed read leaves any earlier
-        capture standing — a later attempt's silence is not a retraction.
+        otherwise close nothing and say nothing. Both reads report it, tagged with
+        the ``site`` that found it — two lines for one mistake is the honest
+        record of two reads, and suppressing the second would need per-read error
+        state to avoid also suppressing a spec that only turned malformed after
+        verification.
 
-        False only when there IS a spec to read and reading it failed; the caller
-        decides whether that costs anything. A missing or out-of-tree spec is
-        nothing to capture, not a failure to capture."""
+        A failed read leaves any earlier capture standing — a later attempt's
+        silence is not a retraction. False only when there IS a spec to read and
+        reading it failed; the caller decides whether that costs anything. A
+        missing or out-of-tree spec is nothing to capture, not a failure to
+        capture.
+
+        The path is not re-derived here: ``task.spec_file`` is recorded only by a
+        passing verify gate, and the root-containment rule below still holds at
+        both sites."""
         spec_path = Path(task.spec_file) if task.spec_file else None
         if spec_path is None or not spec_path.is_file():
             return True
@@ -2145,9 +2186,10 @@ class Engine:
                 "deferred-close-skipped-out-of-tree",
                 story_key=task.story_key,
                 spec=str(spec_path),
+                site=site,
             )
             return True
-        fm = self._observed_frontmatter(spec_path, task.story_key, "deferred-close")
+        fm = self._observed_frontmatter(spec_path, task.story_key, f"deferred-close-{site}")
         if fm is None:
             return False
         declared, error = deferredwork.parse_declaration(fm.get("closes_deferred"))
@@ -2157,6 +2199,7 @@ class Engine:
                 story_key=task.story_key,
                 spec=str(spec_path),
                 error=f"closes_deferred {error}",
+                site=site,
             )
         task.declared_deferred = list(declared)
         return True
@@ -2166,20 +2209,33 @@ class Engine:
         and order-preserving (a story that names the same id in the manifest and
         in its spec must be marked once and reported once).
 
-        The spec half comes from the verify-time capture. The fallback read is for
-        a task that reached the commit boundary without one — a run resumed from a
-        DEV_VERIFY pause that never re-verified, or a state file written before
-        the capture existed — and it is the one place a failed read can still cost
-        a closure, so it says so (``deferred-close-declaration-unreadable``)
-        instead of reading as "declares nothing"."""
+        Both halves are re-read here, because the spec and the manifest on disk at
+        the commit are what the story declares — a declaration edited after the
+        dev artifacts verified would otherwise be closed against a snapshot the
+        final spec no longer agrees with, and closing an id the author took back
+        is the one failure this whole path exists to prevent.
+
+        A read that FAILS falls back rather than to "declares nothing": the spec
+        half to the last good capture (``StoryTask.declared_deferred``, which is
+        also all a COMMITTING resume has when its own re-read faults), the
+        manifest half to nothing at all — it is not persisted, so there is nothing
+        to fall back to. Either way the loss is the one place a failed read can
+        still cost a closure, so both say so
+        (``deferred-close-declaration-unreadable``) rather than passing in
+        silence."""
         ids: list[str] = list(self._manifest_closes_deferred(task))
-        if task.declared_deferred is None and task.spec_file:
-            if not self._capture_declared_deferred(task):
-                self.journal.append(
-                    "deferred-close-declaration-unreadable",
-                    story_key=task.story_key,
-                    spec=task.spec_file,
-                )
+        if task.spec_file and not self._capture_declared_deferred(task, site="commit-boundary"):
+            self.journal.append(
+                "deferred-close-declaration-unreadable",
+                story_key=task.story_key,
+                source="spec",
+                spec=task.spec_file,
+                note=(
+                    "closing against the last good capture"
+                    if task.declared_deferred
+                    else "no captured declaration to fall back on"
+                ),
+            )
         ids += task.declared_deferred or []
         return tuple(dict.fromkeys(ids))
 
@@ -2231,7 +2287,16 @@ class Engine:
         if not ids:
             return None
         ledger = self.workspace.paths.deferred_work
-        if not ledger.is_relative_to(self.workspace.root):
+        # Decided on RESOLVED paths. `is_relative_to` is lexical while the write
+        # below follows symlinks (`atomic_write_text` resolves first, so a
+        # symlinked ledger stays a symlink instead of being replaced by a regular
+        # file) — so an in-repo link pointing at a shared external ledger would
+        # otherwise be treated as committable: the external target gets flipped
+        # here, `add -A` stages only the unchanged link, and under isolation a
+        # merge that never lands leaves shared work marked done with nothing left
+        # to roll it back. Only the last path component can differ: ProjectPaths
+        # resolves the artifact dir at construction and again in `rebased`.
+        if not ledger.resolve().is_relative_to(self.workspace.root.resolve()):
             task.pending_deferred_closes = list(ids)
             self.journal.append(
                 "deferred-close-pending-integration",

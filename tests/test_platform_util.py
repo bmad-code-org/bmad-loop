@@ -173,6 +173,31 @@ def test_atomic_write_text_writes_through_a_symlink(tmp_path):
     assert real.read_text(encoding="utf-8") == "after"
 
 
+def test_atomic_write_text_preserves_extended_attributes(tmp_path):
+    """`os.replace` swaps a fresh inode into place, so anything carried by the old
+    inode rather than by its name is silently reset — xattrs included, which on a
+    ledger is where an SELinux label or a backup tool's marker lives. Deleting
+    `_copy_xattrs` left every other test green (#284 follow-up review, finding 8).
+
+    Skipped where the platform or filesystem has no user xattrs (Windows, macOS's
+    different API, tmpfs mounted `nouser_xattr`) — the helper is best-effort by
+    design and must stay silent there, which the write below also proves."""
+    target = tmp_path / "ledger.md"
+    target.write_text("before", encoding="utf-8")
+    setxattr = getattr(os, "setxattr", None)
+    if setxattr is None:
+        pytest.skip("no os.setxattr on this platform")
+    try:
+        setxattr(target, "user.bmad-loop-test", b"kept")
+    except OSError as e:
+        pytest.skip(f"filesystem does not support user xattrs: {e}")
+
+    platform_util.atomic_write_text(target, "after")
+
+    assert target.read_text(encoding="utf-8") == "after"
+    assert os.getxattr(target, "user.bmad-loop-test") == b"kept"
+
+
 def test_atomic_write_text_leaves_no_temp_behind(tmp_path):
     target = tmp_path / "ledger.md"
     target.write_text("before", encoding="utf-8")
