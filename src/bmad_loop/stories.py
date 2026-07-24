@@ -133,6 +133,15 @@ def load_stories(spec_folder: Path | str) -> Stories:
         # fault — every caller already catches that and prints a clean "stories mode:"
         # error instead of crashing preflight/dry-run/status with a traceback.
         raise StoriesError(f"stories.yaml is not valid UTF-8: {path}: {e}") from e
+    except OSError as e:
+        # Same rule for a manifest that is present but cannot be read (permissions,
+        # an I/O error, a dead mount). `is_file()` above only rules out absence, so
+        # this escaped as a bare OSError and crashed the run from whichever caller
+        # happened to hit it first — including the commit-boundary read of
+        # `closes_deferred`, whose whole contract is to journal an unreadable
+        # manifest and carry on with the spec channel (#284 round-5 review,
+        # finding 5).
+        raise StoriesError(f"stories.yaml could not be read: {path}: {e}") from e
     try:
         doc = yaml.safe_load(raw)
     except yaml.YAMLError as e:

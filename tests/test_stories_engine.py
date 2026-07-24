@@ -1341,6 +1341,46 @@ def test_stories_mode_closes_ids_declared_in_the_manifest(project):
     assert _kinds(engine.journal, "story-deferred-closed")[0]["dw_ids"] == ["DW-1"]
 
 
+def test_stories_mode_unreadable_manifest_at_commit_does_not_crash_the_run(project, monkeypatch):
+    """`_manifest_closes_deferred` advertises a fallback — journal the unreadable
+    manifest, carry on with the spec channel — but it catches only StoriesError,
+    and `load_stories` let an OSError from the read escape raw. A commit-time
+    permission fault therefore crashed the whole run instead of costing one
+    channel (#284 round-5 review, finding 5).
+
+    The fault is transient and scoped to the close, which is the shape that
+    matters: a manifest unreadable for the whole run is a preflight failure, not
+    this."""
+    engine = _closing_run(project, spec=["DW-1"])
+    manifest = project.project / SPEC_FOLDER / "stories.yaml"
+    real_read = Path.read_text
+    faulted = {"on": False}
+
+    def maybe_fault(self, *a, **kw):
+        if faulted["on"] and self == manifest:
+            raise PermissionError(13, "Permission denied")
+        return real_read(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "read_text", maybe_fault)
+    finalize = engine._finalize_commit_phase
+
+    def unreadable_across_the_close(task):
+        faulted["on"] = True
+        try:
+            return finalize(task)
+        finally:
+            faulted["on"] = False
+
+    monkeypatch.setattr(engine, "_finalize_commit_phase", unreadable_across_the_close)
+
+    summary = engine.run()
+
+    assert summary.done == 1  # the run survives; only the manifest channel is lost
+    assert not _entries(project)["DW-1"].open  # the spec channel still closed it
+    lost = _kinds(engine.journal, "deferred-close-declaration-unreadable")
+    assert lost and lost[-1]["source"] == "stories.yaml"
+
+
 def test_stories_mode_unions_manifest_and_frontmatter_declarations(project):
     """Both channels are honored, and an id named in both is marked and reported
     once — the natural case once a planner declares it and the spec echoes it."""

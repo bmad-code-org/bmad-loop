@@ -4,6 +4,7 @@ import re
 from pathlib import Path
 
 import pytest
+from conftest import fault_read_text
 
 from bmad_loop import stories
 
@@ -64,6 +65,19 @@ def test_load_non_utf8_raises_stories_error(tmp_path):
     tmp_path.mkdir(parents=True, exist_ok=True)
     (tmp_path / stories.STORIES_FILENAME).write_bytes(_BAD_UTF8)
     with pytest.raises(stories.StoriesError, match="not valid UTF-8"):
+        stories.load_stories(tmp_path)
+
+
+def test_load_unreadable_raises_stories_error(tmp_path, monkeypatch):
+    """A manifest that is present but unreadable — permissions, an I/O error, a
+    dead mount — must be a StoriesError like every other manifest fault. `is_file`
+    only rules out absence, so the OSError escaped raw and crashed the run from
+    whichever caller reached it first, including the commit-boundary read of
+    `closes_deferred`, whose contract is to journal and carry on
+    (#284 round-5 review, finding 5)."""
+    write_stories(tmp_path, "- id: 1\n  title: t\n  description: d\n")
+    fault_read_text(monkeypatch, tmp_path / stories.STORIES_FILENAME)
+    with pytest.raises(stories.StoriesError, match="could not be read"):
         stories.load_stories(tmp_path)
 
 
