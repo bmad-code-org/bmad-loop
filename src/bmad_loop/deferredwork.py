@@ -17,7 +17,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from .platform_util import atomic_replace
+from .platform_util import atomic_write_text
 
 HEADING_RE = re.compile(r"^### (DW-\d+): (.+?)\s*$", re.MULTILINE)
 ANY_HEADING_RE = re.compile(r"^#{1,6} ", re.MULTILINE)
@@ -182,7 +182,12 @@ def mark_done_many(path: Path, dw_ids: Sequence[str], date: str, note: str) -> l
     disk when it raises partway through several ids — a half-applied closure the
     caller never gets to journal, so the ledger claims resolutions the run has no
     record of. Here a failure writes nothing, and the returned list is exactly
-    what landed."""
+    what landed.
+
+    The write goes through :func:`~bmad_loop.platform_util.atomic_write_text`
+    rather than a bare tmp+replace: swapping a fresh inode over the ledger
+    otherwise resets its mode (a ``0600`` ledger silently becoming world-readable)
+    and turns a symlinked ledger into a regular file."""
     if not path.is_file():
         return []
     text = path.read_text(encoding="utf-8")
@@ -195,9 +200,7 @@ def mark_done_many(path: Path, dw_ids: Sequence[str], date: str, note: str) -> l
         marked.append(dw_id)
     if not marked:
         return []
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    atomic_replace(tmp, path)
+    atomic_write_text(path, text)
     return marked
 
 

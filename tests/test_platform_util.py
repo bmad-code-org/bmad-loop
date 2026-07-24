@@ -8,6 +8,7 @@ the legacy ``platform_util`` entry points still delegate, plus the real
 from __future__ import annotations
 
 import os
+import stat
 import subprocess
 import sys
 
@@ -129,6 +130,93 @@ def test_atomic_replace_no_retry_on_posix(tmp_path, monkeypatch):
     with pytest.raises(PermissionError):
         platform_util.atomic_replace(tmp_path / "s", tmp_path / "d")
     assert sleeps == []  # zero backoff — a real POSIX error surfaces at once
+
+
+# ------------------------------------------------------------- atomic_write_text
+
+
+def test_atomic_write_text_replaces_contents(tmp_path):
+    target = tmp_path / "ledger.md"
+    target.write_text("before", encoding="utf-8")
+
+    platform_util.atomic_write_text(target, "after")
+
+    assert target.read_text(encoding="utf-8") == "after"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
+def test_atomic_write_text_preserves_the_target_mode(tmp_path):
+    """`os.replace` swaps in a NEW inode, so a naive tmp-write-and-replace resets
+    the file's permissions to the umask default — silently widening a 0600 ledger
+    to world-readable, or dropping group-write on a shared artifact dir."""
+    target = tmp_path / "ledger.md"
+    target.write_text("before", encoding="utf-8")
+    target.chmod(0o600)
+
+    platform_util.atomic_write_text(target, "after")
+
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_atomic_write_text_writes_through_a_symlink(tmp_path):
+    """Replacing the LINK would turn it into a regular file and orphan the real
+    ledger, so the link is resolved first and the target is what gets rewritten."""
+    real = tmp_path / "real-ledger.md"
+    real.write_text("before", encoding="utf-8")
+    link = tmp_path / "ledger.md"
+    link.symlink_to(real)
+
+    platform_util.atomic_write_text(link, "after")
+
+    assert link.is_symlink()
+    assert real.read_text(encoding="utf-8") == "after"
+
+
+def test_atomic_write_text_leaves_no_temp_behind(tmp_path):
+    target = tmp_path / "ledger.md"
+    target.write_text("before", encoding="utf-8")
+
+    platform_util.atomic_write_text(target, "after")
+
+    assert [p.name for p in tmp_path.iterdir()] == ["ledger.md"]
+
+
+def test_atomic_write_text_cleans_up_and_keeps_the_original_on_failure(tmp_path, monkeypatch):
+    target = tmp_path / "ledger.md"
+    target.write_text("before", encoding="utf-8")
+
+    def boom(src, dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(platform_util.os, "replace", boom)
+
+    with pytest.raises(OSError):
+        platform_util.atomic_write_text(target, "after")
+
+    assert target.read_text(encoding="utf-8") == "before"
+    assert [p.name for p in tmp_path.iterdir()] == ["ledger.md"]  # no orphaned temp
+
+
+def test_atomic_write_text_temp_name_is_unique_per_call(tmp_path, monkeypatch):
+    """A fixed `<name>.tmp` sibling is a collision between two writers of the same
+    file — the second clobbers the first's staged content and one replace lands
+    a half-written mix."""
+    target = tmp_path / "ledger.md"
+    target.write_text("before", encoding="utf-8")
+    seen: list[str] = []
+    real_replace = os.replace
+
+    def record(src, dst):
+        seen.append(os.path.basename(src))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(platform_util.os, "replace", record)
+
+    platform_util.atomic_write_text(target, "a")
+    platform_util.atomic_write_text(target, "b")
+
+    assert len(set(seen)) == 2
 
 
 # --------------------------------------------------------------- retrying_unlink

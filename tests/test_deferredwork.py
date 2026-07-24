@@ -558,8 +558,8 @@ def test_mark_done_many_is_all_or_nothing_on_a_write_failure(tmp_path, monkeypat
     p.write_text(LEDGER, encoding="utf-8")
     before = p.read_bytes()
     monkeypatch.setattr(
-        "bmad_loop.deferredwork.atomic_replace",
-        lambda tmp, target: (_ for _ in ()).throw(OSError("disk full")),
+        "bmad_loop.deferredwork.atomic_write_text",
+        lambda path, text: (_ for _ in ()).throw(OSError("disk full")),
     )
 
     try:

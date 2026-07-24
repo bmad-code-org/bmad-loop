@@ -6,8 +6,9 @@ delegate to it. ``detach_kwargs`` stays a real implementation — it is spawn
 configuration, not a process-lifecycle primitive, so it does not belong on the
 host. On Linux/macOS — and WSL, which *is* Linux — these preserve today's exact
 behavior. The file-replace and segment helpers below (``atomic_replace``,
-``safe_segment``, ``safe_ref_segment``) are exercised by the platform tests; the pid
-kill/liveness Windows branch degrades gracefully and is not yet exercised.
+``atomic_write_text``, ``safe_segment``, ``safe_ref_segment``) are exercised by the
+platform tests; the pid kill/liveness Windows branch degrades gracefully and is not
+yet exercised.
 
 ``safe_segment`` and ``safe_ref_segment`` share a contract but not a rule set: the
 first coerces a Windows *filename* segment, the second a *git ref* component, and
@@ -22,10 +23,12 @@ import hashlib
 import os
 import random
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Callable, Iterator
 
@@ -141,6 +144,70 @@ def atomic_replace(tmp: Path, target: Path) -> None:
     """``os.replace(tmp, target)``, retried on the transient Windows sharing
     violation a concurrent reader of ``target`` triggers."""
     _retry_on_sharing_violation(lambda: os.replace(tmp, target))
+
+
+def _copy_xattrs(src: Path, dst: Path) -> None:
+    """Best-effort extended-attribute copy (Linux). Absent everywhere else, and
+    unsupported by many filesystems even there, so every failure is ignored: an
+    xattr we could not carry over is not worth failing a ledger write for."""
+    listxattr = getattr(os, "listxattr", None)
+    if listxattr is None:  # portability: xattr syscalls are Linux-only
+        return
+    try:
+        names = listxattr(src)
+    except OSError:
+        return
+    for name in names:
+        try:
+            os.setxattr(dst, name, os.getxattr(src, name))
+        except OSError:
+            continue
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    """Replace ``path``'s contents with ``text`` atomically, preserving what the
+    replacement would otherwise silently discard.
+
+    ``os.replace`` swaps a *new inode* into place, so a naive tmp-write-and-replace
+    quietly resets everything carried by the old file rather than by its name. This
+    restores the parts that matter:
+
+    * **Symlinks are followed.** ``path.resolve()`` first, so a ledger symlinked
+      into the repo keeps being a symlink and the real file is what gets rewritten
+      — a replace against the link itself would turn it into a regular file and
+      orphan the target.
+    * **Permission bits survive.** A ``0600`` file stays ``0600`` instead of
+      becoming ``0644 & ~umask``, which on a shared artifact dir is the difference
+      between "the group can still write this" and a silent lockout (or a
+      disclosure).
+    * **Extended attributes survive** where the platform has them (best effort).
+
+    Ownership is NOT preserved — an unprivileged process cannot chown — so a file
+    written by another user changes hands. Callers writing genuinely shared,
+    multi-user state need more than this helper. A target that does not exist yet
+    is created with ``mkstemp``'s private ``0600``, not the umask default: there is
+    no prior mode to carry over, and the restrictive choice is the safe one.
+
+    The temp file is uniquely named in the target's own directory: same filesystem
+    (``os.replace`` cannot cross one), and no fixed ``.tmp`` sibling for a
+    concurrent writer of the same file to collide with. A failure anywhere leaves
+    the original untouched and removes the temp."""
+    target = path.resolve()
+    fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=target.name + ".", suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        # newline default (translating) deliberately: matches the Path.write_text
+        # this replaced, so a ledger's line endings do not change under Windows.
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        if target.exists():
+            shutil.copymode(target, tmp)
+            _copy_xattrs(target, tmp)
+        atomic_replace(tmp, target)
+    except BaseException:
+        with suppress(OSError):
+            tmp.unlink()
+        raise
 
 
 def retrying_unlink(path: Path) -> None:
