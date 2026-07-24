@@ -307,7 +307,15 @@ def test_integrate_unit_runs_post_integration_bookkeeping_after_a_merge(tmp_path
     It fires after merge_local, so it is reached only by a unit that landed."""
     flow = _make_flow(tmp_path, state=SimpleNamespace(target_branch="main", run_id="r", tasks={}))
     merged = []
-    flow.merge_local = lambda task, unit: merged.append(task)
+
+    def merge(task, unit):
+        # the stamp lives inside merge_local, next to the merge it is proof of
+        # (see test_merge_local_persists_unit_merged_before_its_journal_tail)
+        merged.append(task)
+        task.unit_merged = True
+        flow._save()
+
+    flow.merge_local = merge
     task = StoryTask(story_key="1-1", epic=1)
     task.phase = Phase.DONE
     # capture the durable-proof flag AS the bookkeeping runs, not after it returns:
@@ -324,6 +332,34 @@ def test_integrate_unit_runs_post_integration_bookkeeping_after_a_merge(tmp_path
     assert merged == [task]
     assert flow.calls.integrated == [task]
     assert seen == [(True, 1)]  # flag set AND persisted before the callback fired
+
+
+def test_merge_local_persists_unit_merged_before_its_journal_tail(tmp_path, monkeypatch):
+    """`unit_merged` is the durable proof `_reconcile_pending_deferred_closes`
+    keys its post-crash retry on, so the merge itself must stamp it — not
+    everything that follows the merge.
+
+    The tail after `verify.merge_branch` returns (a journal append, the post_merge
+    emit, the worktree teardown) can each still raise while saying nothing about
+    whether the merge happened. Stamping after that tail left the code durably
+    merged with persisted state claiming it was not, and resume then abandoned the
+    external-ledger closure it was owed (#284 round-5 review, finding 3)."""
+    flow = _make_flow(tmp_path, state=SimpleNamespace(target_branch="main", run_id="r", tasks={}))
+    monkeypatch.setattr(verify, "clean_incoming_collisions", lambda *a, **kw: [])
+    monkeypatch.setattr(verify, "merge_branch", lambda *a, **kw: None)
+
+    def full_disk(event, **fields):
+        raise OSError("No space left on device")
+
+    flow.journal.append = full_disk  # the first fallible step after the merge
+    task = StoryTask(story_key="1-1", epic=1)
+    task.phase = Phase.DONE
+
+    with pytest.raises(OSError):
+        flow.merge_local(task, unit=SimpleNamespace(branch="unit/1-1"))
+
+    assert task.unit_merged  # the merge landed, and the proof of it survived
+    assert flow.calls.saves == 1  # persisted, not just set in memory
 
 
 def test_integrate_unit_skips_bookkeeping_when_the_merge_escalates(tmp_path):

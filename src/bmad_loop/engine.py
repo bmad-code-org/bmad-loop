@@ -787,9 +787,13 @@ class Engine:
         unit never reached the target branch, and the ledger reading `open` is the
         truthful answer, so the obligation is reported rather than discharged.
 
-        `unit_merged` is saved *after* `merge_local` returns, so a host death in
-        that one window reports a merge that did land as abandoned, and the entry
-        stays open. That direction is deliberate: the entries stay open (which a
+        `unit_merged` is saved the statement after the merge itself returns, so
+        the window in which a host death reports a merge that did land as
+        abandoned is that save alone. It used to span `merge_local`'s whole tail —
+        a journal append, the `post_merge` emit, the worktree teardown — none of
+        which is evidence about whether the merge happened.
+
+        That residual direction is deliberate: the entries stay open (which a
         sweep re-verifies against the codebase, and which `deferred-close-abandoned`
         names for the operator), where recording the intent before the merge would
         instead close entries for a merge that never happened. Proving it from the

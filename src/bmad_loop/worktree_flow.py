@@ -479,21 +479,19 @@ class WorktreeFlow:
             # Merge the unit branch into the target branch locally. We open PRs
             # ourselves by hand once the branch has landed; the orchestrator only
             # commits the worktree onto the selected target.
-            self.merge_local(task, unit)
             # The unit's work is now on the target branch — the only point at
             # which bookkeeping that could NOT ride the unit's own commit (an
             # out-of-repo deferred-work ledger) may safely claim it landed. A
             # merge that escalates raises out of merge_local and never reaches
             # here, leaving the shared ledger untouched (#234).
             #
-            # Record the merge BEFORE that bookkeeping runs, and persist it. The
-            # task is already DONE, so a crash in this window is not re-driven by
-            # resume (`_finish_inflight` skips terminal tasks) — the reconcile
-            # pass that finishes the leftover bookkeeping needs durable proof the
-            # work actually landed, and "phase is DONE" is not that proof: it is
-            # stamped by the commit, before any of this.
-            task.unit_merged = True
-            self._save()
+            # `merge_local` stamps and persists `task.unit_merged` the moment the
+            # merge itself returns — durable proof the work landed, which the
+            # reconcile pass keys its retry on. The task is already DONE, so a
+            # crash in this window is not re-driven by resume (`_finish_inflight`
+            # skips terminal tasks), and "phase is DONE" is not a substitute for
+            # that proof: it is stamped by the commit, before any of this.
+            self.merge_local(task, unit)
             self._on_integrated(task)
         else:  # DEFERRED — capture the diff, keep or drop per keep_failed
             patch = close_unit_workspace(
@@ -563,6 +561,17 @@ class WorktreeFlow:
             )
             self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
             return  # defensive: never fall through to the success teardown below
+        # The merge has landed. Stamp and persist that BEFORE the tail below,
+        # every line of which can still raise — a journal write on a full disk, a
+        # post_merge plugin, a teardown callback — while saying nothing about
+        # whether the merge happened. Stamping after the tail left the code
+        # durably merged with persisted state claiming it was not, so the resume
+        # reconcile abandoned the external-ledger closure it was owed
+        # (#284 round-5 review, finding 3). The residual window is now the merge
+        # and this save, which is the narrowest it can be: nothing but the merge
+        # itself is evidence about the merge (#234).
+        task.unit_merged = True
+        self._save()
         self.journal.append(
             "unit-merged",
             story_key=task.story_key,
