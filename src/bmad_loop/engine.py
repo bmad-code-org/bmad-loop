@@ -2182,15 +2182,31 @@ class Engine:
 
         A failed read leaves any earlier capture standing — a later attempt's
         silence is not a retraction. False only when there IS a spec to read and
-        reading it failed; the caller decides whether that costs anything. A
-        missing or out-of-tree spec is nothing to capture, not a failure to
-        capture.
+        reading it failed; the caller decides whether that costs anything.
+
+        A spec that is **gone** or has moved **out of the roots** is a different
+        answer from a spec that could not be read, and it clears the capture. Both
+        used to return success without touching it, so a `DW-1` captured at
+        dev-verify was still closed after a pre-commit workflow deleted, renamed
+        or redirected the spec — closing against a declaration no readable spec
+        makes, which is the stale half this re-read exists to eliminate. Only a
+        genuine read fault keeps the fallback standing, and the withdrawal is
+        journaled rather than inferred silently (#284 round-5 review, finding 2).
 
         The path is not re-derived here: ``task.spec_file`` is recorded only by a
         passing verify gate, and the root-containment rule below still holds at
         both sites."""
         spec_path = Path(task.spec_file) if task.spec_file else None
         if spec_path is None or not spec_path.is_file():
+            if task.declared_deferred:
+                self.journal.append(
+                    "deferred-close-declaration-absent",
+                    story_key=task.story_key,
+                    spec=str(spec_path) if spec_path else None,
+                    site=site,
+                    dw_ids=list(task.declared_deferred),
+                )
+            task.declared_deferred = []
             return True
         if not verify.spec_within_roots(spec_path, self.workspace.paths):
             self.journal.append(
@@ -2198,7 +2214,9 @@ class Engine:
                 story_key=task.story_key,
                 spec=str(spec_path),
                 site=site,
+                dw_ids=list(task.declared_deferred or []),
             )
+            task.declared_deferred = []
             return True
         fm = self._observed_frontmatter(spec_path, task.story_key, f"deferred-close-{site}")
         if fm is None:

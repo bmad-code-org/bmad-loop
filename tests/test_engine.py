@@ -2438,6 +2438,67 @@ def test_closes_deferred_re_reads_the_declaration_at_the_commit_boundary(project
     assert [e["dw_ids"] for e in closed] == [["DW-3"]]
 
 
+def test_closes_deferred_drops_the_capture_when_the_final_spec_is_gone(project, monkeypatch):
+    """A spec that is GONE at the commit is not a spec that could not be read. The
+    absent branch returned success without clearing the verify-time capture, and
+    the close then unioned it in regardless — so a pre-commit workflow that
+    archived, renamed or deleted the spec still had its ids marked resolved,
+    against a declaration no readable spec makes (#284 round-5 review, finding 2).
+
+    Withdrawal by deletion is still withdrawal: a missed close beats a false
+    one."""
+    engine = _closes_deferred_run(project, ["DW-1"])
+    sp = spec_path(project, "1-1-a")
+    finalize = engine._finalize_commit_phase
+
+    def spec_removed_before_the_commit(task):
+        assert engine.state.tasks["1-1-a"].declared_deferred == ["DW-1"]  # captured at verify
+        sp.unlink()  # the shape of a pre_commit_gate workflow archiving the spec
+        return finalize(task)
+
+    monkeypatch.setattr(engine, "_finalize_commit_phase", spec_removed_before_the_commit)
+
+    summary = engine.run()
+
+    assert summary.done == 1  # the story still commits; only the closure is dropped
+    assert _ledger_entries(project)["DW-1"].open
+    events = [
+        e for e in engine.journal.entries() if e["kind"] == "deferred-close-declaration-absent"
+    ]
+    assert len(events) == 1 and events[0]["dw_ids"] == ["DW-1"]
+    assert "story-deferred-closed" not in {e["kind"] for e in engine.journal.entries()}
+
+
+def test_closes_deferred_drops_the_capture_when_the_final_spec_leaves_the_roots(
+    project, tmp_path, monkeypatch
+):
+    """Same hole through the other early return. The root-containment guard
+    journaled and returned success while leaving the capture standing, so a spec
+    redirected out of the approved roots between verification and the commit was
+    refused a read and closed from the stale snapshot anyway — the guard reporting
+    a skip it did not perform."""
+    engine = _closes_deferred_run(project, ["DW-1"])
+    finalize = engine._finalize_commit_phase
+    outside = tmp_path / "elsewhere" / "story.md"
+    outside.parent.mkdir(parents=True, exist_ok=True)
+    outside.write_text("---\nstatus: done\ncloses_deferred: [DW-1]\n---\n", encoding="utf-8")
+
+    def spec_redirected_before_the_commit(task):
+        task.spec_file = str(outside)
+        return finalize(task)
+
+    monkeypatch.setattr(engine, "_finalize_commit_phase", spec_redirected_before_the_commit)
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    assert _ledger_entries(project)["DW-1"].open  # not closed from the stale capture
+    skipped = [
+        e for e in engine.journal.entries() if e["kind"] == "deferred-close-skipped-out-of-tree"
+    ]
+    assert skipped and skipped[-1]["dw_ids"] == ["DW-1"]
+
+
 def test_closes_deferred_capture_survives_a_committing_resume(project, monkeypatch):
     """The COMMITTING resume arm finishes a commit WITHOUT re-verifying, so when
     its own re-read faults the persisted capture is all that knows what the story
