@@ -72,13 +72,14 @@ Write a temp JSON file with the collected answers structured as `{"core": {...},
 In the commands below, replace `{project-root}` in every path argument with the actual project root (e.g. `/home/me/myapp`) before running — these are filesystem paths, not config values.
 
 ```bash
-python3 ./scripts/merge-config.py --config-path "{project-root}/_bmad/config.yaml" --user-config-path "{project-root}/_bmad/config.user.yaml" --module-yaml ./assets/module.yaml --answers {temp-file} --legacy-dir "{project-root}/_bmad"
+uv run ./scripts/merge-config.py --config-path "{project-root}/_bmad/config.yaml" --user-config-path "{project-root}/_bmad/config.user.yaml" --module-yaml ./assets/module.yaml --answers {temp-file} --legacy-dir "{project-root}/_bmad"
 python3 ./scripts/merge-help-csv.py --target "{project-root}/_bmad/module-help.csv" --source ./assets/module-help.csv --legacy-dir "{project-root}/_bmad" --module-code bmad-loop
 ```
 
 Both scripts output JSON to stdout with results. If either exits non-zero, surface the error and stop. The scripts automatically read legacy config values as fallback defaults. Legacy config files are **preserved, never deleted** — on BMAD v6 the per-module and core `config.yaml` / `module-help.csv` are live, manifest-tracked files (so `legacy_configs_deleted` / `legacy_csvs_deleted` are always empty).
 
-Run `./scripts/merge-config.py --help` or `./scripts/merge-help-csv.py --help` for full usage.
+Run `uv run ./scripts/merge-config.py --help` or
+`python3 ./scripts/merge-help-csv.py --help` for full usage.
 
 ## Create Output Directories
 

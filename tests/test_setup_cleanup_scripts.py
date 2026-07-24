@@ -20,6 +20,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 SCRIPTS = REPO / "src" / "bmad_loop" / "data" / "skills" / "bmad-loop-setup" / "scripts"
 ASSETS = REPO / "src" / "bmad_loop" / "data" / "skills" / "bmad-loop-setup" / "assets"
+SETUP_SKILL = SCRIPTS.parent / "SKILL.md"
 
 
 def _run(script: str, *args: str) -> subprocess.CompletedProcess:
@@ -286,6 +287,13 @@ def test_cleanup_removes_payload_whose_skill_ships_marker_named_assets(tmp_path)
 
 
 # ---------------------------------------------------------------- merge-config
+
+
+def test_setup_skill_uses_uv_for_dependency_bearing_merge_config():
+    skill = SETUP_SKILL.read_text()
+
+    assert skill.count("uv run ./scripts/merge-config.py") == 2
+    assert "python3 ./scripts/merge-config.py" not in skill
 
 
 def test_merge_config_preserves_legacy_configs(tmp_path):
