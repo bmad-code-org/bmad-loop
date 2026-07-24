@@ -25,7 +25,13 @@ TOML layout (BMAD v6.10+, detected by the presence of _bmad/config.toml)
 
     Both files are rendered in full before either is written, and each is committed
     through a temp file and one atomic rename: the catalog is shared state that is
-    not hash-tracked, so it must never be left truncated by a failed run.
+    not hash-tracked, so it must never be left truncated by a failed run. That is
+    per-file atomicity, not a transaction — the per-module CSV is committed before
+    the catalog, so an earlier write may already have landed when a later one fails.
+    The merge is idempotent, so a re-run finishes the job. A symlinked target is
+    written THROUGH to its real file (see resolve_for_write), and a target that
+    changed since it was read is abandoned rather than clobbered (see
+    atomic_write_text's `prior`).
 
     Caveat worth reporting to the user: the catalog is generated, so a BMAD
     installer re-run regenerates it and drops our rows. Re-running the setup skill
@@ -48,6 +54,7 @@ Exit codes: 0=success, 1=validation error, 2=runtime error
 
 import argparse
 import csv
+import itertools
 import json
 import os
 import random
@@ -57,11 +64,15 @@ import time
 from io import StringIO
 from pathlib import Path
 
+# The column every help CSV attributes a row to a module through. Located by name,
+# never by position — see module_column.
+MODULE_COLUMN = "module"
+
 # Fallback CSV header, used only when neither the target nor the source carries one.
 # Matches the columns every real BMAD CSV ships — _bmad/_config/bmad-help.csv,
 # _bmad/<module>/module-help.csv and this skill's own assets/module-help.csv.
 HEADER = [
-    "module",
+    MODULE_COLUMN,
     "skill",
     "display-name",
     "menu-code",
@@ -136,24 +147,59 @@ def read_csv_rows(path: str) -> tuple[list[str], list[list[str]]]:
     return rows[0], rows[1:]
 
 
-def extract_module_codes(rows: list[list[str]]) -> set[str]:
-    """Extract unique module codes from data rows."""
+def module_column(header: list[str], where: str) -> int:
+    """Index of the ``module`` column in ``header``, or fail loudly.
+
+    align_rows re-keys our rows into the target's column order *by name*, so the
+    anti-zombie filter has to find the module column by name too. Reading row[0]
+    silently stops matching the moment BMAD reorders the catalog — and a filter that
+    matches nothing is invisible: the merge just appends our rows again on every run,
+    growing the catalog without bound. Refuse instead of duplicating.
+    """
+    if not header:
+        return 0  # HEADER, the fallback used when nothing carries one, is module-first
+    matches = [n for n, name in enumerate(header) if name.strip() == MODULE_COLUMN]
+    if not matches:
+        _fail(
+            f"The {where} CSV has no '{MODULE_COLUMN}' column (header: "
+            f"{', '.join(header)}). Every help row is attributed to a module through that "
+            "column, so without it the anti-zombie merge cannot tell which rows are ours "
+            "and re-running would append duplicates instead of replacing them. Nothing "
+            "was written."
+        )
+    if len(matches) > 1:
+        _fail(
+            f"The {where} CSV has {len(matches)} columns named '{MODULE_COLUMN}' "
+            f"(positions {', '.join(str(n + 1) for n in matches)}), so which one attributes "
+            "a row to a module is ambiguous. The anti-zombie merge was refused rather than "
+            "guess. Nothing was written."
+        )
+    return matches[0]
+
+
+def extract_module_codes(rows: list[list[str]], module_idx: int = 0) -> set[str]:
+    """Extract unique module codes from data rows, reading the module column by index."""
     codes = set()
     for row in rows:
-        if row and row[0].strip():
-            codes.add(row[0].strip())
+        if len(row) > module_idx and row[module_idx].strip():
+            codes.add(row[module_idx].strip())
     return codes
 
 
-def filter_rows(rows: list[list[str]], module_code: str) -> list[list[str]]:
-    """Remove all rows matching the given module code."""
-    return [row for row in rows if not row or row[0].strip() != module_code]
+def filter_rows(rows: list[list[str]], module_code: str, module_idx: int = 0) -> list[list[str]]:
+    """Remove all rows whose module column matches the given module code."""
+    return [
+        row
+        for row in rows
+        if not row or len(row) <= module_idx or row[module_idx].strip() != module_code
+    ]
 
 
 def merge_rows(
     existing_rows: list[list[str]],
     source_rows: list[list[str]],
     source_codes: set,
+    target_idx: int = 0,
     verbose: bool = False,
 ) -> tuple[list[list[str]], int]:
     """Anti-zombie merge: drop every existing row for a source module code, then append.
@@ -162,6 +208,11 @@ def merge_rows(
     under a different module name (e.g. the pre-rename "BMAD Automator Skills") are
     not matched and survive — removing those is a documented manual step.
 
+    ``target_idx`` is the module column of ``existing_rows`` (and of ``source_rows``,
+    which align_rows has already re-keyed into the target's column order). It is not
+    necessarily the index the codes in ``source_codes`` were read from: those come
+    from the *source* file, in the source's own column order.
+
     Returns:
         (merged_rows, removed_count)
     """
@@ -169,7 +220,7 @@ def merge_rows(
     removed_count = 0
     for code in sorted(source_codes):
         before_count = len(filtered_rows)
-        filtered_rows = filter_rows(filtered_rows, code)
+        filtered_rows = filter_rows(filtered_rows, code, target_idx)
         removed_count += before_count - len(filtered_rows)
 
     if verbose and removed_count > 0:
@@ -262,16 +313,57 @@ def _atomic_replace(tmp: Path, target: Path) -> None:
             )
 
 
-def atomic_write_text(path: Path, text: str) -> None:
+class ConcurrentEdit(OSError):
+    """The target changed on disk between the read this write is based on and the
+    rename that would commit it. An OSError subclass so main()'s handler still
+    catches it if a new call site forgets to."""
+
+
+# Kept as a stable infix so a crashed run's leftovers stay greppable (and testable).
+_TMP_INFIX = ".bmad-loop-tmp"
+_tmp_seq = itertools.count()
+
+
+def resolve_for_write(path: Path) -> Path:
+    """The real file to write, following a symlink to its target.
+
+    os.replace would otherwise swap the *link's* directory entry for a regular file:
+    the shared target keeps the old content, the local path silently becomes a
+    disconnected copy, and centrally managed configuration stops being managed with
+    nothing to notice. Resolving first also puts the temp file on the target's own
+    filesystem, which the rename requires when the link crosses a mount point.
+    """
+    if not path.is_symlink():
+        return path
+    real = Path(os.path.realpath(path))
+    if not real.parent.is_dir():
+        raise FileNotFoundError(
+            f"{path} is a symlink to {real}, whose directory does not exist. Nothing was "
+            "written — repair or remove the link, then re-run setup."
+        )
+    return real
+
+
+def atomic_write_text(path: Path, text: str, prior: "bytes | None" = None) -> None:
     """Write ``text`` to ``path`` through a sibling temp file and one atomic rename.
 
     _bmad/_config/bmad-help.csv is shared with every other BMAD module and is not
     hash-tracked in files-manifest.csv, so a truncated write there loses every
     module's help rows with nothing to detect it. Never truncate it in place.
+
+    ``prior`` is the bytes the caller read the target as. When given, the target is
+    re-read immediately before the rename and the write is abandoned if it no longer
+    matches: the merge is a read -> derive -> replace cycle, so two concurrent runs
+    (or setup racing an editor or the BMAD installer) would otherwise both derive
+    from the same state and the loser would silently drop the winner's rows.
     """
+    path = resolve_for_write(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     mode = path.stat().st_mode if path.is_file() else None
-    tmp = path.with_name(path.name + ".bmad-loop-tmp")
+    # Unique per process: a fixed sibling temp path is itself shared state, so two
+    # concurrent runs would write the same temp file and one's cleanup would unlink
+    # the other's — or its still-open handle would write into the just-renamed inode.
+    tmp = path.with_name(f"{path.name}{_TMP_INFIX}.{os.getpid()}.{next(_tmp_seq)}")
     try:
         with open(tmp, "w", encoding="utf-8", newline="") as f:
             f.write(text)
@@ -279,18 +371,38 @@ def atomic_write_text(path: Path, text: str) -> None:
             os.fsync(f.fileno())
         if mode is not None:
             os.chmod(tmp, mode)
+        if prior is not None:
+            current = path.read_bytes() if path.is_file() else b""
+            if current != prior:
+                raise ConcurrentEdit(
+                    f"{path} changed while setup was running, so the merge was abandoned "
+                    "rather than overwrite that change. Nothing was written — re-run setup "
+                    "to merge against the new content."
+                )
         _atomic_replace(tmp, path)
     finally:
         if tmp.exists():
             tmp.unlink()
 
 
-def write_csv(path: str, header: list[str], rows: list[list[str]], verbose: bool = False) -> None:
+def read_bytes_or_empty(path: Path) -> bytes:
+    """The file's exact bytes, or b"" when it does not exist — the baseline for the
+    concurrent-change guard in atomic_write_text."""
+    return path.read_bytes() if path.is_file() else b""
+
+
+def write_csv(
+    path: str,
+    header: list[str],
+    rows: list[list[str]],
+    verbose: bool = False,
+    prior: "bytes | None" = None,
+) -> None:
     """Write header + rows to CSV file, creating parent dirs as needed."""
     if verbose:
         print(f"Writing {len(rows)} data rows to {path}", file=sys.stderr)
 
-    atomic_write_text(Path(path), render_csv(header, rows))
+    atomic_write_text(Path(path), render_csv(header, rows), prior=prior)
 
 
 def cleanup_legacy_csvs(legacy_dir: str, module_code: str, verbose: bool = False) -> list:
@@ -359,15 +471,25 @@ def _yaml_has_module_entries(path: Path, module_code: str) -> bool:
 
 
 def _csv_has_module_entries(path: Path) -> bool:
-    """True when a legacy help CSV carries rows for our module."""
+    """True when a legacy help CSV carries rows for our module.
+
+    Header-aware like the merge (the module column need not be first), but never
+    raising: this only annotates an orphan report, so an unreadable leftover is
+    reported with has_module_entries: false rather than failing the run.
+    """
     try:
         with open(path, "r", encoding="utf-8", newline="") as f:
-            for row in csv.reader(f):
-                if row and row[0].strip() in _HELP_MODULE_NAMES:
-                    return True
+            rows = list(csv.reader(f))
     except Exception:
         return False
-    return False
+    if not rows:
+        return False
+    header = [name.strip() for name in rows[0]]
+    if MODULE_COLUMN in header:
+        idx, data = header.index(MODULE_COLUMN), rows[1:]
+    else:
+        idx, data = 0, rows  # a headerless leftover: every line is a data row
+    return any(len(row) > idx and row[idx].strip() in _HELP_MODULE_NAMES for row in data)
 
 
 def detect_orphans(bmad_dir: str, module_code: str) -> list:
@@ -450,6 +572,9 @@ def run_toml_layout(
     #    and keep its own header — remapping our rows into its column order.
     catalog_path = Path(args.bmad_dir) / "_config" / "bmad-help.csv"
     catalog_existed = catalog_path.is_file()
+    # The exact bytes the merge is derived from, so the write can refuse to clobber a
+    # change that landed while we were deriving it.
+    catalog_prior = read_bytes_or_empty(catalog_path)
     catalog_header, catalog_rows = read_csv_rows(str(catalog_path))
     target_header = catalog_header if catalog_header else header
 
@@ -466,8 +591,13 @@ def run_toml_layout(
             file=sys.stderr,
         )
 
+    # The catalog owns its header, so its module column is wherever *it* puts it.
     merged_rows, removed_count = merge_rows(
-        catalog_rows, catalog_source_rows, source_codes, args.verbose
+        catalog_rows,
+        catalog_source_rows,
+        source_codes,
+        module_column(target_header, "catalog"),
+        args.verbose,
     )
 
     module_help_text = render_csv(header, source_rows)
@@ -475,8 +605,10 @@ def run_toml_layout(
 
     if args.verbose:
         print(f"TOML layout: writing per-module CSV {module_help_path}", file=sys.stderr)
+    # The per-module CSV is wholly ours and overwritten outright, so it needs no
+    # concurrent-change guard; the shared catalog is merged, so it does.
     atomic_write_text(module_help_path, module_help_text)
-    atomic_write_text(catalog_path, catalog_text)
+    atomic_write_text(catalog_path, catalog_text, prior=catalog_prior)
 
     legacy_deleted = []
     if args.legacy_dir:
@@ -510,6 +642,7 @@ def run_yaml_layout(
         )
 
     # Read existing target (may not exist)
+    target_prior = read_bytes_or_empty(Path(args.target))
     target_header, target_rows = read_csv_rows(args.target)
     target_existed = Path(args.target).exists()
 
@@ -533,9 +666,15 @@ def run_yaml_layout(
             file=sys.stderr,
         )
 
-    merged_rows, removed_count = merge_rows(target_rows, aligned_source, source_codes, args.verbose)
+    merged_rows, removed_count = merge_rows(
+        target_rows,
+        aligned_source,
+        source_codes,
+        module_column(header, "target"),
+        args.verbose,
+    )
 
-    write_csv(args.target, header, merged_rows, args.verbose)
+    write_csv(args.target, header, merged_rows, args.verbose, prior=target_prior)
 
     # Legacy cleanup: delete old per-module CSV files
     legacy_deleted = []
@@ -580,8 +719,8 @@ def main():
         print(f"Error: No data rows found in source {args.source}", file=sys.stderr)
         sys.exit(1)
 
-    # Determine module codes being merged
-    source_codes = extract_module_codes(source_rows)
+    # Determine module codes being merged, from the source's own module column
+    source_codes = extract_module_codes(source_rows, module_column(source_header, "source"))
     if not source_codes:
         print("Error: Could not determine module code from source rows", file=sys.stderr)
         sys.exit(1)
@@ -599,6 +738,11 @@ def main():
             result = run_toml_layout(args, source_header, source_rows, source_codes)
         else:
             result = run_yaml_layout(args, source_header, source_rows, source_codes)
+    except ConcurrentEdit as exc:
+        # Must precede the OSError clause it subclasses. The message already explains
+        # itself; wrapping it in "could not write" would bury the actual cause.
+        print(json.dumps({"status": "error", "error": str(exc)}, indent=2))
+        sys.exit(2)
     except OSError as exc:
         # Each write is atomic, so whatever failed here was left exactly as it was —
         # never half-written. An earlier output may already be committed, which is

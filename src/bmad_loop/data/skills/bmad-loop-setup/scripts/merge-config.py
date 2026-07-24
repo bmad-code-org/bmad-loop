@@ -27,6 +27,14 @@ TOML layout (BMAD v6.10+, detected by the presence of _bmad/config.toml)
     Verification needs tomllib, so this branch requires Python 3.11+ — as BMAD's
     own resolve_config.py already does.
 
+    The commit itself is per-file atomic, not transactional: a temp file and one
+    rename, so nothing is ever left truncated, but this script writes config.yaml
+    before config.user.yaml on the legacy branch and an earlier file may already be
+    committed when a later one fails. Both merges are idempotent, so a re-run
+    finishes the job. A symlinked target is written THROUGH to its real file (see
+    resolve_for_write), and a target that changed since it was read is abandoned
+    rather than clobbered (see atomic_write_text's `prior`).
+
     Core values (user_name, output_folder, ...) are deliberately NOT written on this
     layout: the custom layer WINS over the installer layer, so pinning them here
     would override every future installer answer. Core config stays installer-owned.
@@ -54,6 +62,7 @@ Exit codes: 0=success, 1=validation error, 2=runtime error
 
 import argparse
 import csv
+import itertools
 import json
 import os
 import random
@@ -711,6 +720,26 @@ def upsert_module_table(
     return text[:start] + block + text[span_end:], True
 
 
+def _toml_equal(a, b) -> bool:
+    """Structural equality for two *independently parsed* TOML documents.
+
+    tomllib yields a fresh float object for every `nan`, and nan != nan, so plain `==`
+    reports a perfectly valid unrelated value (`value = nan` in someone else's table)
+    as "the edit changed more than our table" and refuses to run at all. NaN compares
+    equal to NaN here: the question being asked is "is this the same document", not
+    "is this the same number".
+    """
+    if isinstance(a, dict) and isinstance(b, dict):
+        return a.keys() == b.keys() and all(_toml_equal(a[k], b[k]) for k in a)
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(_toml_equal(x, y) for x, y in zip(a, b))
+    if isinstance(a, float) and isinstance(b, float):
+        return a == b or (a != a and b != b)  # a != a is only true of NaN
+    if isinstance(a, bool) != isinstance(b, bool):
+        return False  # bool subclasses int, so `1 == True` without this guard
+    return a == b
+
+
 def verify_candidate(original: str, candidate: str, module_code: str, block: str) -> "str | None":
     """Return an error message when ``candidate`` is not a safe edit of ``original``.
 
@@ -761,11 +790,65 @@ def verify_candidate(original: str, candidate: str, module_code: str, block: str
     modules[module_code] = expected_table
     expected["modules"] = modules
 
-    if after != expected:
+    if not _toml_equal(after, expected):
         return (
             "The edit would have changed more than the [modules.%s] table, so it was "
             "refused. Nothing was written and the file is unchanged. Please report this "
             "with a copy of the file." % module_code
+        )
+    return None
+
+
+def diagnose_unsupported_shape(text: str, module_code: str, block: str) -> "str | None":
+    """Explain a refusal whose cause is a registration shape, not a scanner bug.
+
+    Called only once verify_candidate has already refused, so the happy path pays
+    nothing for it. A registration written as a dotted key or an inline table is valid
+    TOML with no `[modules.<code>]` header to replace; a nested subtable cannot be
+    rewritten without deleting config that may not be ours. Every one of these is
+    still refused — this only turns "please report this" into a procedure the user
+    can act on. Returns None when the refusal is not one of these shapes.
+    """
+    try:
+        import tomllib
+    except ImportError:
+        return None  # the tomllib message from verify_candidate is the real reason
+
+    headers = scan_table_headers(text)
+    target = ("modules", module_code)
+    has_header = any(h[2] == target for h in headers)
+    children = sorted(".".join(h[2]) for h in headers if len(h[2]) > 2 and h[2][:2] == target)
+
+    try:
+        registered = (tomllib.loads(text).get("modules") or {}) if text.strip() else {}
+    except Exception:
+        return None  # unparseable: verify_candidate already said so, and better
+    existing = registered.get(module_code) if isinstance(registered, dict) else None
+
+    if not has_header and existing is not None:
+        return (
+            f"[modules.{module_code}] is already registered, but not as a table header of "
+            f"its own — it is written either as a dotted key (modules.{module_code}.name = "
+            f"...) or inside an inline table ([modules] with {module_code} = {{ ... }}). "
+            "Both are valid TOML, but there is no header for setup to replace, and "
+            "rewriting the file around them would reformat config that is not ours. "
+            f"Nothing was written. To fix it by hand: delete the existing {module_code} "
+            "entry, then add this table at the end of the file:\n\n" + block.rstrip()
+        )
+    if has_header and isinstance(existing, list):
+        return (
+            f"[modules.{module_code}] is registered as an array of tables "
+            f"([[modules.{module_code}]]), which is not a shape setup writes or can "
+            "safely convert. Nothing was written. Remove it and re-run setup, which "
+            "will write a plain [modules.%s] table." % module_code
+        )
+    if has_header and children:
+        return (
+            f"[modules.{module_code}] has nested subtables ({', '.join(children)}) that "
+            "setup will not rewrite: the table body is replaced wholesale on every run, "
+            "and deleting subtables that may hold your own settings is not ours to do. "
+            f"Nothing was written. Move them out of [modules.{module_code}] (or remove "
+            "them) and re-run setup."
         )
     return None
 
@@ -799,7 +882,40 @@ def _atomic_replace(tmp: Path, target: Path) -> None:
             )
 
 
-def atomic_write_text(path: Path, text: str, newline: "str | None" = "") -> None:
+class ConcurrentEdit(OSError):
+    """The target changed on disk between the read this write is based on and the
+    rename that would commit it. An OSError subclass so main()'s handler still
+    catches it if a new call site forgets to."""
+
+
+# Kept as a stable infix so a crashed run's leftovers stay greppable (and testable).
+_TMP_INFIX = ".bmad-loop-tmp"
+_tmp_seq = itertools.count()
+
+
+def resolve_for_write(path: Path) -> Path:
+    """The real file to write, following a symlink to its target.
+
+    os.replace would otherwise swap the *link's* directory entry for a regular file:
+    the shared target keeps the old content, the local path silently becomes a
+    disconnected copy, and centrally managed configuration stops being managed with
+    nothing to notice. Resolving first also puts the temp file on the target's own
+    filesystem, which the rename requires when the link crosses a mount point.
+    """
+    if not path.is_symlink():
+        return path
+    real = Path(os.path.realpath(path))
+    if not real.parent.is_dir():
+        raise FileNotFoundError(
+            f"{path} is a symlink to {real}, whose directory does not exist. Nothing was "
+            "written — repair or remove the link, then re-run setup."
+        )
+    return real
+
+
+def atomic_write_text(
+    path: Path, text: str, newline: "str | None" = "", prior: "bytes | None" = None
+) -> None:
     """Write ``text`` to ``path`` through a sibling temp file and one atomic rename.
 
     An interrupted or failed write must never leave a truncated config behind —
@@ -807,10 +923,21 @@ def atomic_write_text(path: Path, text: str, newline: "str | None" = "") -> None
     is carried over, which a plain create would otherwise drop. ``newline=""``
     writes verbatim (the caller has already chosen the line ending); ``None`` keeps
     Python's default os.linesep translation, which the legacy YAML branch relies on.
+
+    ``prior`` is the bytes the caller read the target as. When given, the target is
+    re-read immediately before the rename and the write is abandoned if it no longer
+    matches: this whole script is a read -> derive -> verify -> replace cycle, so two
+    concurrent runs (or setup racing an editor or the BMAD installer) would otherwise
+    both validate against the same state and the loser would silently discard the
+    winner's change.
     """
+    path = resolve_for_write(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     mode = path.stat().st_mode if path.is_file() else None
-    tmp = path.with_name(path.name + ".bmad-loop-tmp")
+    # Unique per process: a fixed sibling temp path is itself shared state, so two
+    # concurrent runs would write the same temp file and one's cleanup would unlink
+    # the other's — or its still-open handle would write into the just-renamed inode.
+    tmp = path.with_name(f"{path.name}{_TMP_INFIX}.{os.getpid()}.{next(_tmp_seq)}")
     try:
         with open(tmp, "w", encoding="utf-8", newline=newline) as f:
             f.write(text)
@@ -818,10 +945,24 @@ def atomic_write_text(path: Path, text: str, newline: "str | None" = "") -> None
             os.fsync(f.fileno())
         if mode is not None:
             os.chmod(tmp, mode)
+        if prior is not None:
+            current = path.read_bytes() if path.is_file() else b""
+            if current != prior:
+                raise ConcurrentEdit(
+                    f"{path} changed while setup was running, so the merge was abandoned "
+                    "rather than overwrite that change. Nothing was written — re-run setup "
+                    "to merge against the new content."
+                )
         _atomic_replace(tmp, path)
     finally:
         if tmp.exists():
             tmp.unlink()
+
+
+def read_bytes_or_empty(path: Path) -> bytes:
+    """The file's exact bytes, or b"" when it does not exist — the baseline for the
+    concurrent-change guard in atomic_write_text."""
+    return path.read_bytes() if path.is_file() else b""
 
 
 def read_text_preserving_newlines(path: Path) -> "tuple[str, str]":
@@ -844,8 +985,12 @@ def read_text_preserving_newlines(path: Path) -> "tuple[str, str]":
 # TOML layout nothing reads them and the installer manifest does not track them.
 _ORPHAN_FILES = ("config.yaml", "config.user.yaml", "module-help.csv")
 
-# Module display names used in help CSV column 1, current and pre-rename.
+# Module display names used in the help CSV module column, current and pre-rename.
 _HELP_MODULE_NAMES = ("BMAD Loop Skills", "BMAD Automator Skills")
+
+# The column a help CSV attributes a row to a module through, located by name (the
+# same rule merge-help-csv.py's module_column applies).
+_MODULE_COLUMN = "module"
 
 
 def _yaml_has_module_entries(path: Path, module_code: str) -> bool:
@@ -860,15 +1005,25 @@ def _yaml_has_module_entries(path: Path, module_code: str) -> bool:
 
 
 def _csv_has_module_entries(path: Path) -> bool:
-    """True when a legacy help CSV carries rows for our module."""
+    """True when a legacy help CSV carries rows for our module.
+
+    Header-aware (the module column need not be first), but never raising: this only
+    annotates an orphan report, so an unreadable leftover is reported with
+    has_module_entries: false rather than failing the run.
+    """
     try:
         with open(path, "r", encoding="utf-8", newline="") as f:
-            for row in csv.reader(f):
-                if row and row[0].strip() in _HELP_MODULE_NAMES:
-                    return True
+            rows = list(csv.reader(f))
     except Exception:
         return False
-    return False
+    if not rows:
+        return False
+    header = [name.strip() for name in rows[0]]
+    if _MODULE_COLUMN in header:
+        idx, data = header.index(_MODULE_COLUMN), rows[1:]
+    else:
+        idx, data = 0, rows  # a headerless leftover: every line is a data row
+    return any(len(row) > idx and row[idx].strip() in _HELP_MODULE_NAMES for row in data)
 
 
 def detect_orphans(bmad_dir: str, module_code: str) -> list:
@@ -934,6 +1089,9 @@ def run_toml_layout(args, module_yaml: dict, module_code: str) -> dict:
     override every future installer answer.
     """
     config_path = Path(args.bmad_dir) / "custom" / "config.toml"
+    # The exact bytes the edit is derived from, so the write can refuse to clobber a
+    # change that landed while we were deriving it.
+    prior = read_bytes_or_empty(config_path)
     existing, newline = read_text_preserving_newlines(config_path)
 
     values = extract_module_metadata(module_yaml)
@@ -947,9 +1105,11 @@ def run_toml_layout(args, module_yaml: dict, module_code: str) -> dict:
     # Verify BEFORE touching disk: a refused edit must leave the file untouched.
     error = verify_candidate(existing, new_text, module_code, block)
     if error:
-        _fail(f"{config_path}: {error}")
+        # Prefer a shape-specific explanation when there is one — a refusal the user
+        # can resolve by hand should not read like an internal bug report.
+        _fail(f"{config_path}: {diagnose_unsupported_shape(existing, module_code, block) or error}")
 
-    atomic_write_text(config_path, new_text)
+    atomic_write_text(config_path, new_text, prior=prior)
 
     # --legacy-dir stays read-only here, and unparsed: the TOML branch discards
     # legacy *values* (core config is installer-owned), so only the paths matter.
@@ -1076,6 +1236,11 @@ def main():
             result = run_toml_layout(args, module_yaml, module_code)
         else:
             result = run_yaml_layout(args, module_yaml, module_code)
+    except ConcurrentEdit as exc:
+        # Must precede the OSError clause it subclasses. The message already explains
+        # itself; wrapping it in "could not write" would bury the actual cause.
+        print(json.dumps({"status": "error", "error": str(exc)}, indent=2), file=sys.stderr)
+        sys.exit(2)
     except OSError as exc:
         # Each write is atomic, so whatever failed here was left exactly as it was —
         # never half-written. An earlier output may already be committed, which is
