@@ -1133,8 +1133,12 @@ def test_merge_help_toml_rejects_a_multi_module_source(tmp_path):
     assert not (bmad / "bmad-loop" / "module-help.csv").exists()
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX directory permissions")
-@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores the write bit")
+# One marker, not two: stacked skipif conditions are *all* evaluated, so a separate
+# os.geteuid() marker would raise at collection time on Windows. `or` short-circuits.
+@pytest.mark.skipif(
+    sys.platform == "win32" or os.geteuid() == 0,
+    reason="needs POSIX directory permissions, and root ignores the write bit",
+)
 def test_merge_help_toml_never_truncates_the_shared_catalog(tmp_path):
     """A failed catalog write must leave the shared catalog byte-identical.
 

@@ -505,9 +505,12 @@ def _skip_string(text: str, i: int) -> int:
                 continue
             if text.startswith(delim, j):
                 j += 3
-                # TOML allows one or two extra quotes to abut the closing delimiter
-                while j < len(text) and text[j] == quote and j - (i + 3) >= 0:
+                # TOML lets one or two extra quotes abut the closing delimiter, so
+                # `"""ends with ""'''` closes at the *last* of them, not the first.
+                extra = 0
+                while j < len(text) and text[j] == quote and extra < 2:
                     j += 1
+                    extra += 1
                 return j
             j += 1
         return len(text)
