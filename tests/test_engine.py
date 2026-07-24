@@ -2515,6 +2515,72 @@ def test_closes_deferred_rolls_back_when_the_commit_raises_a_non_git_error(proje
     assert project.deferred_work.read_bytes() == before
 
 
+def test_closes_deferred_rolls_back_when_the_journal_fails_after_the_ledger_write(
+    project, monkeypatch
+):
+    """The ledger publishes atomically and the journal line recording it is
+    written *after*. A full disk between the two used to leave the entry reading
+    `done` with the rollback un-armed: the snapshot was bound from the close's
+    RETURN value, which a raise inside it never produces, so the restore had
+    nothing to work from and `finalize_commit` never ran either — a resolution
+    claimed for a commit that does not exist (#284 round-5 review, finding 1).
+
+    The snapshot is armed before the write now, so the failure unwinds whether it
+    lands in the commit or inside the close itself."""
+    engine = _closes_deferred_run(project, ["DW-1"])
+    before = project.deferred_work.read_bytes()
+    real_append = engine.journal.append
+
+    def full_disk_recording_the_close(kind, **fields):
+        # fault ONLY the close record: the rollback's own journal line has to
+        # survive, or the test could not tell a restore from a crash
+        if kind == "story-deferred-closed":
+            raise OSError("No space left on device")
+        return real_append(kind, **fields)
+
+    monkeypatch.setattr(engine.journal, "append", full_disk_recording_the_close)
+
+    summary = engine.run()
+
+    assert summary.crashed
+    assert _ledger_entries(project)["DW-1"].open
+    assert project.deferred_work.read_bytes() == before  # byte-identical
+    rolled = [e for e in engine.journal.entries() if e["kind"] == "deferred-close-rolled-back"]
+    # the ids are refined into the armed slot right after the write, so the record
+    # names what it un-flipped rather than reporting an empty rollback
+    assert len(rolled) == 1 and rolled[0]["dw_ids"] == ["DW-1"]
+
+
+def test_closes_deferred_rolls_back_when_a_signal_stops_the_close_itself(project, monkeypatch):
+    """The stop signal can land INSIDE the close, not only inside the commit: the
+    handler raises from wherever the main thread stands, and the ledger is already
+    published by the time `mark_done_many` returns. Nothing downstream runs — no
+    close record, no commit — so without an early-armed snapshot the entry stayed
+    `done` for work that never landed (#284 round-5 review, finding 1)."""
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: None)
+    engine = _closes_deferred_run(project, ["DW-1"])
+    before = project.deferred_work.read_bytes()
+    real_mark = deferredwork.mark_done_many
+
+    def sigterm_after_publication(*a, **kw):
+        marked = real_mark(*a, **kw)  # the flip is on disk now
+        signal.raise_signal(signal.SIGTERM)
+        return marked  # unreachable: the handler raises first
+
+    monkeypatch.setattr(deferredwork, "mark_done_many", sigterm_after_publication)
+
+    summary = engine.run()
+
+    assert summary.done == 0
+    assert load_state(engine.run_dir).stopped is True  # the stop really landed
+    assert _ledger_entries(project)["DW-1"].open
+    assert project.deferred_work.read_bytes() == before
+    kinds = {e["kind"] for e in engine.journal.entries()}
+    # the close never got to report itself, and the restore still happened
+    assert "story-deferred-closed" not in kinds
+    assert "deferred-close-rolled-back" in kinds
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
 def test_closes_deferred_parks_a_ledger_symlinked_out_of_the_repo(project, tmp_path):
     """Locality is decided on resolved paths. `is_relative_to` is lexical while

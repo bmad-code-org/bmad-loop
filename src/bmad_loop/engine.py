@@ -1766,9 +1766,20 @@ class Engine:
         # us, and a pre_commit pause veto has already raised out of _escalate
         # above — but finalize_commit's `git add -A` is still ahead, so an in-repo
         # annotation lands in this story's own commit. It is not final until that
-        # commit is: the snapshot below unwinds it if the commit fails.
-        rollback = self._close_declared_deferred(task)
+        # commit is: the snapshot armed below unwinds it if the commit fails.
+        #
+        # The close runs INSIDE this try, and reports its snapshot through `armed`
+        # rather than through the return value, because the window needing a
+        # rollback opens before it returns: `mark_done_many` publishes the ledger
+        # atomically and the journal append recording that publication can still
+        # raise (a full disk), as can the SIGTERM handler `run()` installed, from
+        # anywhere in between. Binding the snapshot only on return would leave
+        # every one of those raises with nothing to undo — the entry left reading
+        # `done` for a commit that never happened, the one outcome this whole
+        # path exists to prevent.
+        armed: list[tuple[Path, str, list[str]]] = []
         try:
+            self._close_declared_deferred(task, armed)
             # bmad-dev-auto commits its own work each iteration; the orchestrator
             # squashes that chain plus its uncommitted bookkeeping back onto the
             # pre-dev baseline as one commit carrying `message`. None means there
@@ -1782,7 +1793,7 @@ class Engine:
             task.resolved_redrive = False
             task.restore_patch = None
         except verify.GitError as e:
-            self._restore_deferred_closes(task, rollback)
+            self._restore_deferred_closes(task, armed[-1] if armed else None)
             self._escalate(task, f"commit failed: {e}")
         except BaseException:
             # A failed commit is not the only way out of this window. The signal
@@ -1793,7 +1804,7 @@ class Engine:
             # exist, and nothing above unwinds it: RunStopped is caught by `run()`
             # to finalize a *stopped* run, not to repair bookkeeping. Restore, then
             # re-raise untouched — the caller's disposition is not ours to change.
-            self._restore_deferred_closes(task, rollback)
+            self._restore_deferred_closes(task, armed[-1] if armed else None)
             raise
         if not self._isolated:
             # An out-of-repo ledger could not ride the commit, so it was parked;
@@ -2239,7 +2250,9 @@ class Engine:
         ids += task.declared_deferred or []
         return tuple(dict.fromkeys(ids))
 
-    def _close_declared_deferred(self, task: StoryTask) -> tuple[Path, str, list[str]] | None:
+    def _close_declared_deferred(
+        self, task: StoryTask, rollback: list[tuple[Path, str, list[str]]] | None = None
+    ) -> tuple[Path, str, list[str]] | None:
         """At the commit boundary, flip every ledger entry the story declares via
         ``closes_deferred:`` to ``status: done <date>`` + a ``resolution:`` note
         (#234) — the regular-story counterpart of the sweep bundle close at
@@ -2277,6 +2290,15 @@ class Engine:
 
         Returns the pre-close ledger text — with its path and the ids actually
         flipped — when an in-repo write marked something, else None.
+
+        ``rollback`` is the same snapshot, reported through a list the CALLER
+        owns and **before the ledger is touched**, because the return value
+        cannot cover the window that needs covering: the atomic write publishes,
+        and then the journal append recording it can raise, as can the stop
+        signal, before this function ever returns. A caller that only had the
+        return value would meet those raises holding nothing to undo. The slot is
+        cleared again when nothing was flipped — ``mark_done_many`` writes only
+        when it marks — so an empty close never arms a pointless restore.
 
         Never a gate: an unmatched or malformed id is journaled, never fatal.
         Idempotent, so the resume arm may re-drive the commit phase freely — ids
@@ -2324,8 +2346,19 @@ class Engine:
             )
             return None
         before = ledger.read_text(encoding="utf-8") if ledger.is_file() else None
-        marked = self._apply_deferred_closes(task, ids, ledger)
-        return (ledger, before, marked) if marked and before is not None else None
+        if rollback is not None and before is not None:
+            # Armed here, not on the way out. Restoring text nothing changed is a
+            # no-op rewrite, so arming early costs an over-broad window nothing,
+            # while arming late would miss the whole publication window.
+            rollback.append((ledger, before, []))
+        marked = self._apply_deferred_closes(task, ids, ledger, rollback)
+        snapshot = (ledger, before, marked) if marked and before is not None else None
+        if rollback is not None:
+            # `mark_done_many` writes only when it marks, so an empty close left
+            # the ledger byte-identical: disarm rather than record a restore that
+            # would journal a rollback of nothing.
+            rollback[:] = [snapshot] if snapshot is not None else []
+        return snapshot
 
     def _restore_deferred_closes(
         self, task: StoryTask, snapshot: tuple[Path, str, list[str]] | None
@@ -2366,20 +2399,37 @@ class Engine:
             story_key=task.story_key,
             # what was actually flipped and is now un-flipped, NOT everything the
             # story declared: an id that was already done stays done either way.
+            # Empty means the close was interrupted before it could report what it
+            # had flipped (a stop signal landing inside the write). The restore is
+            # by content, not by id, so it is complete either way — only the record
+            # of which entries it touched is missing.
             dw_ids=list(marked),
             ledger=str(ledger),
         )
 
     def _apply_deferred_closes(
-        self, task: StoryTask, ids: Sequence[str], ledger: Path
+        self,
+        task: StoryTask,
+        ids: Sequence[str],
+        ledger: Path,
+        rollback: list[tuple[Path, str, list[str]]] | None = None,
     ) -> list[str]:
         """Write the closure for `ids`, journal exactly what landed, and return
-        the ids actually flipped."""
+        the ids actually flipped.
+
+        ``rollback`` is the caller's already-armed restore slot (see
+        ``_close_declared_deferred``); the ids are written into it the moment they
+        are known, which is the statement after the write and the one before the
+        first thing here that can raise. Refining it costs a line and buys the
+        operator a rolled-back record that names entries instead of an empty
+        list."""
         text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
         declared = deferredwork.classify(text, ids)
         marked = deferredwork.mark_done_many(
             ledger, declared.open_ids, self._today(), f"resolved by story {task.story_key}"
         )
+        if rollback and marked:
+            rollback[0] = (ledger, text, marked)
         if marked:
             self.journal.append("story-deferred-closed", story_key=task.story_key, dw_ids=marked)
         if declared.unknown:
