@@ -22,10 +22,12 @@ breaking changes may land in a minor release.
   every checkpoint, the review loop and the `pre_commit` workflows, and immediately before
   `finalize_commit` squashes the story — so a story that fails verification, is rejected by
   review, or escalates closes nothing, and an in-repo ledger still carries the annotation in the
-  story's own commit. An artifact dir configured _outside_ the repo is shared between worktrees
-  and cannot be committed at all; an isolated run holds its closure until the story's branch has
-  merged (journaled `deferred-close-external-ledger`), so a unit whose integration fails never
-  claims its work resolved.
+  story's own commit. A commit that then fails (a rejecting native `pre-commit` hook) rolls the
+  annotation back, so it never outlives the commit it was written for. An artifact dir configured
+  _outside_ the repo is shared between worktrees and cannot be committed at all; that closure is
+  held until the work is durably landed — after the commit in place, after the branch merges under
+  isolation (journaled `deferred-close-external-ledger`) — and a write that never got to happen is
+  retried on the next resume rather than being dropped.
 
   Closure is declared, never inferred from a diff. An id already `done` is a silent no-op, so a
   resumed run re-driving the same close neither doubles the `resolution:` line nor warns. Nothing

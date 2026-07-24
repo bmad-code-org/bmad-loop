@@ -90,11 +90,15 @@ The rules that keep this safe:
 - **Only once the story actually lands.** The annotation is written at the
   commit boundary — after verification, the review loop and every checkpoint,
   and just before the story's commit is squashed. A story that fails, blocks, is
-  rejected by review, or escalates closes nothing.
+  rejected by review, or escalates closes nothing. If the commit itself then
+  fails — a rejecting native `pre-commit` hook, say — the annotation is rolled
+  back rather than left claiming work that is in no commit.
 - **In the story's own commit**, when this file lives inside the repo. If the
   artifacts dir is configured outside it, the file is shared between worktrees
-  and no commit can carry it; an isolated run then waits until the story's
-  branch has merged before annotating.
+  and no commit can carry it; the closure is then held until the work is durably
+  landed — after the commit in place, after the branch has merged under worktree
+  isolation — and retried on the next resume if that write did not get to
+  happen.
 - **Idempotent.** An id already `done` is left untouched, so a resumed run
   re-driving the same close neither doubles the `resolution:` line nor warns.
 - **Never a gate.** An id that matches no entry, an entry whose `status:` reads
