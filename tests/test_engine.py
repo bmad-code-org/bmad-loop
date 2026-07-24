@@ -2410,9 +2410,7 @@ def test_closes_deferred_external_ledger_unavailable_keeps_the_obligation(projec
     assert engine.state.tasks["1-1-a"].pending_deferred_closes == []
 
 
-def test_closes_deferred_external_ledger_absent_from_a_live_dir_still_discharges(
-    project, tmp_path
-):
+def test_closes_deferred_external_ledger_absent_from_a_live_dir_still_discharges(project, tmp_path):
     """The other side of that discriminator. An artifact dir that IS there and
     simply has no ledger is not an outage — there is genuinely nothing to close,
     which is the same answer the in-repo path gives. Retaining here would leave an
