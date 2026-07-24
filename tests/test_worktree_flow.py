@@ -310,11 +310,20 @@ def test_integrate_unit_runs_post_integration_bookkeeping_after_a_merge(tmp_path
     flow.merge_local = lambda task, unit: merged.append(task)
     task = StoryTask(story_key="1-1", epic=1)
     task.phase = Phase.DONE
+    # capture the durable-proof flag AS the bookkeeping runs, not after it returns:
+    # asserting `task.unit_merged` at the end passes for either ordering, and the
+    # ordering is the contract — `_reconcile_pending_deferred_closes` keys the
+    # post-crash retry on this flag, and phase DONE is not a substitute for it
+    # (the commit stamps DONE, before integration).
+    seen = []
+    inner = flow._on_integrated
+    flow._on_integrated = lambda t: (seen.append((t.unit_merged, flow.calls.saves)), inner(t))[1]
 
     flow.integrate_unit(task, unit=None)
 
     assert merged == [task]
     assert flow.calls.integrated == [task]
+    assert seen == [(True, 1)]  # flag set AND persisted before the callback fired
 
 
 def test_integrate_unit_skips_bookkeeping_when_the_merge_escalates(tmp_path):

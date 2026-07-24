@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import pytest
+
 from bmad_loop.deferredwork import (
     append_decision,
     append_entry,
@@ -562,10 +564,11 @@ def test_mark_done_many_is_all_or_nothing_on_a_write_failure(tmp_path, monkeypat
         lambda path, text: (_ for _ in ()).throw(OSError("disk full")),
     )
 
-    try:
+    # the raise must REACH the caller, not just leave the file alone: the engine's
+    # flush clears `pending_deferred_closes` only after the write returns, so a
+    # swallowed error returning [] would discharge an obligation nothing performed
+    with pytest.raises(OSError):
         mark_done_many(p, ["DW-1", "DW-3"], "2026-07-24", "note")
-    except OSError:
-        pass
 
     assert p.read_bytes() == before  # nothing partially applied
 
