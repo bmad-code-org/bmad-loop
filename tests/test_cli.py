@@ -13,6 +13,8 @@ from conftest import (
     install_bmad_config,
     install_dev_base_skills,
     machine_json,
+    mark_ledger_done,
+    write_ledger,
     write_sprint,
 )
 
@@ -3305,6 +3307,73 @@ def test_validate_silent_when_desktop_notifier_available(project, monkeypatch, c
     cli.cmd_validate(args)
     doc = json.loads(capsys.readouterr().out)
     assert all(f["check"] != "notify.desktop-unavailable" for f in doc["findings"])
+
+
+def _declare_closes_deferred(project, declared, *, ledger_ids=("DW-1",)):
+    """Lay down a stories-mode fixture whose single story declares `declared`, over
+    a ledger holding `ledger_ids` (all open)."""
+    folder = _setup_stories_fixture(project, [_stories_entry("1")])
+    write_ledger(project, {dw: "open" for dw in ledger_ids}, commit=False)
+    (folder / "stories" / "1-slug.md").write_text(
+        f"---\ntitle: 'test'\nstatus: 'ready-for-dev'\n"
+        f"closes_deferred: [{', '.join(declared)}]\n---\n\n## Intent\n\ntest\n",
+        encoding="utf-8",
+    )
+    return folder
+
+
+def _closes_deferred_findings(capsys):
+    doc = json.loads(capsys.readouterr().out)
+    return [f for f in doc["findings"] if f["check"] == "stories.closes-deferred-unknown"]
+
+
+def test_validate_warns_on_unknown_closes_deferred(project, capsys):
+    """#234: a story declaring an id the ledger doesn't carry — a typo, or an entry
+    renumbered since the spec was written — would annotate nothing at close, and
+    only the journal would say so. Preflight names it while it is still fixable."""
+    install_bmad_config(project)
+    _write_policy(project.project, STORIES_POLICY)
+    _declare_closes_deferred(project, ["DW-99"])
+    args = argparse.Namespace(project=str(project.project), spec=None, json=True)
+
+    cli.cmd_validate(args)  # rc varies by host (binary/skills) — parse the document
+    findings = _closes_deferred_findings(capsys)
+    assert len(findings) == 1
+    assert findings[0]["severity"] == "warning"  # advisory: never blocks a run
+    assert findings[0]["detail"] == {"story": "1", "unknown_ids": ["DW-99"]}
+    assert "DW-99" in findings[0]["message"]
+
+
+def test_validate_silent_when_closes_deferred_all_present(project, capsys):
+    """The mirror case: every declared id is in the ledger, so nothing is emitted.
+    A present entry an earlier run already closed is a *satisfied* declaration, not
+    a mismatch — the check keys off presence, never status, so a resumed project
+    doesn't accumulate warnings for work that landed."""
+    install_bmad_config(project)
+    _write_policy(project.project, STORIES_POLICY)
+    _declare_closes_deferred(project, ["DW-1", "DW-2"], ledger_ids=("DW-1", "DW-2"))
+    mark_ledger_done(project, ["DW-2"])  # already closed by an earlier run
+    args = argparse.Namespace(project=str(project.project), spec=None, json=True)
+
+    cli.cmd_validate(args)
+    assert _closes_deferred_findings(capsys) == []
+
+
+def test_validate_closes_deferred_warning_does_not_fail_the_run(project, capsys, monkeypatch):
+    """The warning must not flip the exit code. An otherwise-clean project carrying
+    a stale declaration still validates ok/rc 0 — a typo in a traceability field can
+    never be the thing that blocks a run from starting."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    _write_policy(project.project, CLAUDE_ONLY_POLICY + STORIES_POLICY)  # same, stories mode
+    _declare_closes_deferred(project, ["DW-99"])
+    git(project.project, "add", "-A")  # the fixture above dirties the worktree gate
+    git(project.project, "commit", "-q", "-m", "stories fixture")
+    capsys.readouterr()
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)  # rc 0
+    assert doc["ok"] is True
+    assert doc["counts"]["problem"] == 0
+    assert [f for f in doc["findings"] if f["check"] == "stories.closes-deferred-unknown"]
 
 
 OPENCODE_QUALIFIED_POLICY = '[adapter]\nname = "opencode"\nmodel = "anthropic/claude-haiku-4-5"\n'

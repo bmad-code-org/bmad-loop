@@ -1220,3 +1220,105 @@ def test_entry_for_unreadable_manifest_journals_warning_once(project):
     # a second call for the same story does not re-journal (dedup per story key)
     assert engine._entry_for(task) is None
     assert len(_kinds(engine.journal, "stories-manifest-unreadable")) == 1
+
+
+# ------------------- closes_deferred auto-resolve in stories mode (#234) ------
+
+
+def _declare_spec(path: Path, status: str, dw_ids: list[str] | None) -> None:
+    """A story spec at `status` that optionally declares `closes_deferred:`."""
+    declare = f"closes_deferred: [{', '.join(dw_ids)}]\n" if dw_ids is not None else ""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"---\ntitle: 'test'\ntype: 'feature'\nstatus: '{status}'\n"
+        f"baseline_revision: 'abc123'\n{declare}---\n\n## Intent\n\ntest spec\n",
+        encoding="utf-8",
+    )
+
+
+def _entries(project) -> dict:
+    from bmad_loop import deferredwork
+
+    text = project.deferred_work.read_text(encoding="utf-8")
+    return {e.id: e for e in deferredwork.parse_ledger(text)}
+
+
+def _closing_engine(project, status: str, dw_ids: list[str] | None):
+    """A stories-mode engine over one story whose on-disk spec sits at `status`
+    and declares `dw_ids`, against a ledger holding a single open DW-1."""
+    from conftest import write_ledger
+
+    setup_stories(project, [entry("1")])
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    engine, _ = make_engine(project, [])
+    _declare_spec(story_spec(project, "1"), status, dw_ids)
+    return engine, StoryTask(story_key="1", epic=0)
+
+
+def test_stories_mode_closes_declared_deferred_entries(project):
+    """#234: stories mode has no sprint board, but it shares the project's
+    deferred-work ledger — so a story declaring `closes_deferred:` must still get
+    those entries annotated. Without this the field is inert in exactly the mode
+    whose declarations `validate` preflights."""
+    engine, task = _closing_engine(project, "done", ["DW-1"])
+
+    engine._post_dev_state_sync(task, {"spec_file": str(story_spec(project, "1"))})
+
+    dw1 = _entries(project)["DW-1"]
+    assert dw1.status.startswith("done") and not dw1.open
+    assert "resolution: resolved by story 1" in dw1.body
+    closed = _kinds(engine.journal, "story-deferred-closed")
+    assert len(closed) == 1 and closed[0]["dw_ids"] == ["DW-1"]
+
+
+def test_stories_mode_resolves_spec_by_id_not_session_claim(project):
+    """The spec is resolved by story id, exactly as `verify_dev_stories` does —
+    never from the session-claimed path. A result_json pointing somewhere else
+    (or carrying no path at all) must not change which spec is read."""
+    engine, task = _closing_engine(project, "done", ["DW-1"])
+
+    engine._post_dev_state_sync(task, {"spec_file": "totally/wrong/path.md"})
+
+    assert not _entries(project)["DW-1"].open  # the id-keyed spec was read anyway
+
+
+def test_stories_mode_closes_nothing_when_story_unfinished(project):
+    """A session that leaves the spec short of `done` — failed, blocked, or a
+    plan-halt leg parked at ready-for-dev — closes nothing, so a story that never
+    landed can't mark its declared entries resolved."""
+    engine, task = _closing_engine(project, "ready-for-dev", ["DW-1"])
+    before = project.deferred_work.read_bytes()
+
+    engine._post_dev_state_sync(task, {"spec_file": str(story_spec(project, "1"))})
+
+    assert project.deferred_work.read_bytes() == before
+    assert _entries(project)["DW-1"].open
+    assert not _kinds(engine.journal, "story-deferred-closed")
+
+
+def test_stories_mode_close_is_silent_without_declaration(project):
+    """The ordinary story declares nothing: no ledger write, no journal noise —
+    and the sprint board stays untouched in a mode that has none."""
+    engine, task = _closing_engine(project, "done", None)
+    before = project.deferred_work.read_bytes()
+
+    engine._post_dev_state_sync(task, {"spec_file": str(story_spec(project, "1"))})
+
+    assert project.deferred_work.read_bytes() == before
+    assert not _kinds(engine.journal, "story-deferred-closed")
+    assert not _kinds(engine.journal, "deferred-close-unmatched")
+
+
+def test_stories_mode_pending_story_closes_nothing(project):
+    """No spec on disk for the id (a story that never dispatched, or a sentinel):
+    there is no frontmatter to trust, so the close is skipped rather than guessed."""
+    from conftest import write_ledger
+
+    setup_stories(project, [entry("1")])
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    engine, _ = make_engine(project, [])
+
+    engine._post_dev_state_sync(StoryTask(story_key="1", epic=0), {})
+
+    assert _entries(project)["DW-1"].open
+    assert not _kinds(engine.journal, "story-deferred-closed")

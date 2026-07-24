@@ -9,6 +9,22 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- **Stories can close deferred-work entries (#234).** The ledger was one-way: the loop reliably
+  _files_ `deferred-work.md` entries but never _marked_ one resolved when a later story closed it,
+  so a multi-epic run ended with entries satisfied epics ago still reading `open` and the retro
+  reconstructing by hand which story closed what. A story spec can now declare the entries its work
+  closes in its frontmatter — `closes_deferred: [DW-5, DW-6]` — and at clean story-close the
+  orchestrator writes the same annotation a sweep bundle writes: `status: done <date>` plus
+  `resolution: resolved by story <id>`. The write happens before the commit, so it squashes into
+  the story's own commit, and it fires in both sprint and stories mode. Closure is declared, never
+  inferred from a diff; a story that fails, blocks, or stops short of its success status closes
+  nothing; an id already `done` is a silent no-op, so a resumed run re-driving the same close
+  neither doubles the `resolution:` line nor warns; and an id matching no ledger entry is journaled
+  (`deferred-close-unmatched`) rather than failing the story. Closes are journaled as
+  `story-deferred-closed`. `bmad-loop validate` adds a matching pre-flight warning
+  (`stories.closes-deferred-unknown`) naming any declared id absent from the ledger — a typo or a
+  renumbered entry — before the run starts; it is a warning, so it never changes the exit code.
+
 - **`review.on_timeout` policy knob (#271).** A timeout-like review verdict (`timeout` /
   `stalled` / `over_budget`) previously always burned a review cycle (RETRY) until
   `max_review_cycles`, then deferred — even when the dev product was already finalized and

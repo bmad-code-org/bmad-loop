@@ -71,6 +71,7 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         "skills.stories-dispatch",
         "skills.stories-dispatch-missing",
         "skills.stories-dispatch-stale",
+        "stories.closes-deferred-unknown",
     }
 )
 

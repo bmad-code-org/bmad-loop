@@ -235,6 +235,14 @@ bmad-loop sweep [--no-prompt] [--decisions-only] [--max-bundles N] [--repeat] [-
               `status: done` in the ledger.
 ```
 
+**Closing entries from a story.** Sweeps are not the only way an entry gets closed. A story spec can declare the entries its work closes, in frontmatter:
+
+```yaml
+closes_deferred: [DW-5, DW-6] # DW-<n> ids this story closes
+```
+
+At clean story-close the orchestrator writes the same annotation a bundle close writes — `status: done <date>` and `resolution: resolved by story <id>` — into each declared entry, squashed into the story's own commit. Without it the ledger is one-way: entries are filed automatically but only ever marked resolved by hand, so a multi-epic run ends with entries that were satisfied epics ago still reading `open`. Closure is declared, never inferred from the diff; a story that fails or blocks closes nothing; a resume re-driving the same close is a no-op; and an id that matches no entry is journaled rather than failing the story — `bmad-loop validate` surfaces those as a warning before the run starts.
+
 **Answering missed decisions later.** An unattended sweep (`--no-prompt`) skips decisions, and an interactive one can be abandoned before you answer them all — those answers would otherwise be lost, since triage re-derives the decision set from the ledger every run. `bmad-loop decisions` (or press `d` in the TUI) surfaces every decision past sweeps left unanswered, reconstructed from their triage output, and lets you answer them out of band. A `close` is applied immediately; a `build`/`keep-open` is saved to `.bmad-loop/decisions.json` and consumed by the next sweep (build → bundle, keep-open → recorded) with no re-prompt. `--list` shows them without answering; `bmad-loop status` reports the outstanding count.
 
 Sweeps are their own resumable runs (`bmad-loop resume <id>`). `[sweep] auto` in the policy fires an unattended sweep automatically at epic boundaries or run end; a failed/paused child sweep never interrupts the parent run.

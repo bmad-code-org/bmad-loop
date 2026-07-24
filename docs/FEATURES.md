@@ -104,6 +104,7 @@ See [README.md](../README.md) for the narrative overview and [setup-guide.md](se
 ### Deferred-work sweeps
 
 - Skills accumulate an append-only ledger (`deferred-work.md`, `DW-<n>` entries): split-off goals, pre-existing findings, "needs human decision" items.
+- Story-declared closure (`closes_deferred: [DW-5, DW-6]` in a story spec's frontmatter): at clean story-close the orchestrator flips each declared entry to `status: done <date>` + `resolution: resolved by story <id>` — the same annotation a sweep bundle writes — so the ledger stops being one-way (filed automatically, marked resolved by hand). Declared, never inferred from a diff; skipped entirely when the story fails or blocks; idempotent across a resume; and an id matching no entry is journaled, never fatal. `bmad-loop validate` warns about such ids before the run starts.
 - `bmad-loop sweep` triages every open entry against the actual code (ledger statuses treated as unreliable) → partition: already-resolved (auto-closed with evidence) / bundles / blocked / skip / decisions.
 - Bundles run the full pipeline (dev `--dw-bundle` → review → verify → commit); the review gate checks every bundle entry is `status: done`.
 - Interactive decision walkthrough (build / close / keep-open per option, with a recommendation); answers written back as `decision:` lines. Unattended runs leave decisions open.

@@ -20,6 +20,7 @@ from . import (
     decisions,
     deferredwork,
     envvars,
+    frontmatter,
     gates,
     install,
     machine,
@@ -229,6 +230,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
             _validate_stories_queue(
                 project, paths, spec_folder, [p.skill_tree for p in profiles], report
             )
+            _validate_closes_deferred(paths, spec_folder, report)
         else:
             try:
                 ss = sprintstatus.load(paths.sprint_status)
@@ -590,6 +592,58 @@ def _validate_stories_queue(
             {"trees": list(dict.fromkeys(skill_trees))},
         )
     report.extend(stories_probs)
+
+
+def _validate_closes_deferred(
+    paths: bmadconfig.ProjectPaths, spec_folder: str, report: ValidationReport
+) -> None:
+    """Warn when a story spec declares ``closes_deferred:`` ids the deferred-work
+    ledger does not carry (#234).
+
+    At clean close the orchestrator flips each declared id to ``status: done
+    <date>`` + a ``resolution:`` line. An id that names no entry — a typo, or an
+    entry reworded/renumbered since the spec was written — annotates nothing, and
+    the run says so only in the journal, where nobody looks until the retro that
+    the annotation exists to spare. Saying it at preflight is the whole point:
+    the declaration is fixable before the run, not after.
+
+    Only *absent* ids warn. An id present but already ``done`` is a declaration a
+    prior run already satisfied (a resume re-drives the same close), so it stays
+    silent — the same present-vs-absent classification the engine's close hook
+    makes, for the same reason.
+
+    Never a failure. The annotation is traceability, not a gate, so a stale
+    reference must not be able to block a run that would otherwise start.
+    """
+    folder = stories_mod.resolve_spec_folder(paths.project, spec_folder)
+    ledger = paths.deferred_work
+    try:
+        text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
+        story_set = stories_mod.load_stories(folder)
+    except (OSError, UnicodeDecodeError, stories_mod.StoriesError):
+        # An unparseable manifest is already a `queue.stories-manifest` failure from
+        # the gate above — don't double-report it. And an advisory check must never
+        # be the thing that crashes the preflight it is advising.
+        return
+    present = {e.id for e in deferredwork.parse_ledger(text)}
+    for entry in story_set.entries:
+        state = stories_mod.resolve_story_spec(folder, entry.id)
+        if state.kind != stories_mod.KIND_PRESENT or state.path is None:
+            continue  # never dispatched, ambiguous, or a sentinel — no spec to read
+        try:
+            declared = frontmatter.read_frontmatter(state.path).get("closes_deferred") or []
+        except OSError:
+            continue  # unreadable spec: other gates own that, this one degrades
+        ids = [str(x).strip() for x in declared] if isinstance(declared, list) else []
+        unknown = [i for i in ids if i and i not in present]
+        if unknown:
+            report.warn(
+                "stories.closes-deferred-unknown",
+                f"story {entry.id} declares closes_deferred ids that are not in "
+                f"{ledger.name}: {', '.join(unknown)} — nothing will be marked "
+                f"resolved for them (typo, or a renumbered/reworded entry?)",
+                {"story": entry.id, "unknown_ids": unknown},
+            )
 
 
 def _warn_unknown_keys(ss: sprintstatus.SprintStatus) -> None:

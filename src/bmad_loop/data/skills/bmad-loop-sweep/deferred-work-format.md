@@ -59,3 +59,36 @@ decision: <date> <chosen option label> — <detail>
   writes it when closing entries triage proved already resolved.
 - `decision:` records a human's sweep-time choice on an entry. It does not by
   itself change `status:` — a `keep-open` decision leaves the entry open.
+
+## Closure declared by a story
+
+A sweep bundle is not the only thing that closes an entry. A regular story spec
+may declare the entries its work closes, in its frontmatter:
+
+```yaml
+closes_deferred: [DW-5, DW-6] # DW-<n> ids this story closes
+```
+
+At clean story-close the orchestrator annotates each declared id exactly as a
+bundle close does — `status: done <date>` plus a `resolution:` line naming the
+story:
+
+```markdown
+status: done 2026-07-23
+resolution: resolved by story 3-2-export
+```
+
+The rules that keep this safe:
+
+- **Declared, never inferred.** Closure comes only from this field; the
+  orchestrator does not guess it from a diff.
+- **Only on a clean close.** A story that fails, blocks, or ends short of its
+  success status closes nothing.
+- **Idempotent.** An id already `done` is left untouched, so a resumed run
+  re-driving the same close neither doubles the `resolution:` line nor warns.
+- **Never a gate.** An id that matches no entry is journaled and dropped —
+  it cannot fail the story. `bmad-loop validate` reports the same mismatch as a
+  warning before the run starts.
+
+Keep the ids stable when editing this file: a reworded title is fine, but
+renumbering an entry orphans any declaration that already references it.
