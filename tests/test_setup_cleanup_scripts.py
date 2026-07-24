@@ -294,6 +294,7 @@ def test_setup_skill_uses_uv_for_dependency_bearing_merge_config():
 
     assert skill.count("uv run ./scripts/merge-config.py") == 2
     assert "python3 ./scripts/merge-config.py" not in skill
+    assert skill.count("python3 ./scripts/merge-help-csv.py") == 2
 
 
 def test_merge_config_preserves_legacy_configs(tmp_path):
