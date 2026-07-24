@@ -13,12 +13,16 @@ Root cause is shared with upstream ``bmad-code-org/bmad-builder#96``.
 from __future__ import annotations
 
 import csv
+import importlib.util
 import json
+import os
+import stat
 import subprocess
 import sys
 import tomllib
 from pathlib import Path
 
+import pytest
 import yaml
 
 REPO = Path(__file__).resolve().parent.parent
@@ -137,6 +141,19 @@ def _merge_help(bmad: Path, *extra: str) -> dict:
         str(ASSETS / "module-help.csv"),
         *extra,
     )
+
+
+def _load_script(name: str):
+    """Import a hyphen-named setup script as a module, for unit-level assertions.
+
+    The scripts ship standalone into user projects, so they are not importable as
+    package modules; almost every test drives them as subprocesses instead. This is
+    for the few assertions that need a single function in isolation.
+    """
+    spec = importlib.util.spec_from_file_location(name.replace("-", "_")[:-3], SCRIPTS / name)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _csv_rows(path: Path) -> tuple[list[str], list[list[str]]]:
@@ -847,3 +864,387 @@ def test_merge_help_layout_specific_args_are_required(tmp_path):
     assert proc.returncode == 1
     assert "--target" in json.loads(proc.stdout)["error"]
     assert not (legacy / "module-help.csv").exists()
+
+
+# ------------------------------------- merge-config: TOML edit safety (PR #285 review)
+#
+# custom/config.toml is human-authored, so the module table is spliced in as a text
+# edit. Finding the table's span with a regex is not safe, and getting it wrong is
+# not a cosmetic bug: BMAD's resolve_config.py loads the custom layer as *optional*,
+# so an unparseable file is swallowed as a warning and merged as {} — our table AND
+# every override the user wrote there silently stop applying, with a zero exit code
+# all the way down. Each layer below is valid TOML that a line-oriented regex
+# mis-reads; every one of them used to come back invalid.
+
+_HOSTILE_LAYERS = {
+    # `]` is not the end of the line, so a `...\]\s*$` header match misses it and
+    # appends a second [modules.bmad-loop] — a duplicate-table parse error.
+    "inline_comment_header": '[modules.bmad-loop] # pinned by hand\nname = "old"\n',
+    # The same table, spelled with quoted key components.
+    "quoted_key_path": '["modules"."bmad-loop"]\nname = "old"\n',
+    # A `[`-leading line *inside our own* multi-line string is not the next table:
+    # cutting the span there strands the rest of the string.
+    "multiline_basic_in_ours": (
+        '[modules.bmad-loop]\nname = "old"\nnote = """\n[not a table]\nstill text\n"""\n'
+        "\n[tool.other]\nx = 1\n"
+    ),
+    "multiline_literal_in_ours": (
+        "[modules.bmad-loop]\nnote = '''\n[not a table]\n'''\n\n[tool.other]\nx = 1\n"
+    ),
+    # A header-shaped line inside someone *else's* string is not our table at all;
+    # matching it clobbers their value.
+    "our_header_inside_foreign_string": (
+        '[agents.pm]\nnotes = """\n[modules.bmad-loop]\nfake = 1\n"""\n\n[tool.other]\nx = 1\n'
+    ),
+    # `#` inside a string does not start a comment.
+    "hash_inside_string": '[tool.other]\nx = "a # b"\n\n[modules.bmad-loop]\nname = "old"\n',
+    # A multi-line array's elements can start a line with `[`.
+    "multiline_array": (
+        '[tool.other]\nm = [\n  [1, 2],\n  [3, 4],\n]\n\n[modules.bmad-loop]\nname = "old"\n'
+    ),
+    "array_of_tables": (
+        '[[bin]]\nname = "a"\n\n[[bin]]\nname = "b"\n\n[modules.bmad-loop]\nname = "old"\n'
+    ),
+    # Nothing to replace — the block is appended.
+    "no_table_yet": "# just a comment\n\n[agents.pm]\nx = 1\n",
+}
+
+
+def _expected_after(before: dict, actual: dict) -> dict:
+    """`before` with only modules.bmad-loop replaced by whatever we actually wrote.
+
+    Comparing against this is the strongest statement of the edit's contract: the
+    document may differ from the original in that one table and nowhere else.
+    """
+    expected = dict(before)
+    modules = dict(expected.get("modules") or {})
+    modules["bmad-loop"] = actual["modules"]["bmad-loop"]
+    expected["modules"] = modules
+    return expected
+
+
+@pytest.mark.parametrize("layer_name", sorted(_HOSTILE_LAYERS))
+def test_merge_config_toml_edit_never_corrupts_a_valid_layer(tmp_path, layer_name):
+    """Valid TOML in, valid TOML out — and nothing but our table changed."""
+    layer = _HOSTILE_LAYERS[layer_name]
+    before = tomllib.loads(layer)  # every fixture is valid TOML to begin with
+    bmad = _v610_bmad(tmp_path)
+    custom = bmad / "custom" / "config.toml"
+    custom.write_text(layer)
+
+    result = _merge_config(bmad, _answers(tmp_path, {}))
+
+    text = custom.read_text()
+    after = tomllib.loads(text)  # raises if the edit produced invalid TOML
+    assert after == _expected_after(before, after)
+    assert after["modules"]["bmad-loop"]["version"] == "0.9.0"
+    # exactly one *table* — counting the literal would also match the fixture that
+    # carries a header-shaped line inside a neighbour's multi-line string.
+    headers = [h[2] for h in _load_script("merge-config.py").scan_table_headers(text)]
+    assert headers.count(("modules", "bmad-loop")) == 1
+    assert result["toml_validated"] is True
+
+
+def test_merge_config_toml_preserves_footer_comments(tmp_path):
+    """A comment after our table — the last in the file — is the file's, not ours.
+
+    The trailing blank/comment back-off used to run only when another table
+    followed, so a footer comment on the final table was swallowed by the span.
+    """
+    bmad = _v610_bmad(tmp_path)
+    custom = bmad / "custom" / "config.toml"
+    custom.write_text('[modules.bmad-loop]\nname = "old"\n\n# keep this footer\n# and this line\n')
+
+    _merge_config(bmad, _answers(tmp_path, {}))
+
+    text = custom.read_text()
+    assert "# keep this footer" in text
+    assert "# and this line" in text
+    assert text.count("[modules.bmad-loop]") == 1
+
+
+@pytest.mark.parametrize("newline", ["\r\n", "\n"])
+def test_merge_config_toml_preserves_newline_convention(tmp_path, newline):
+    """A CRLF file stays CRLF (and an LF file stays LF), on every platform.
+
+    Text-mode I/O translates on the way in *and* out, so a round-trip silently
+    rewrote every line of a CRLF config — a whole-file diff for a one-table edit.
+    """
+    bmad = _v610_bmad(tmp_path)
+    custom = bmad / "custom" / "config.toml"
+    custom.write_bytes(("# head" + newline + newline + "[agents.pm]" + newline).encode())
+
+    _merge_config(bmad, _answers(tmp_path, {}))
+
+    raw = custom.read_bytes()
+    assert raw.count(b"\r\n") == (raw.count(b"\n") if newline == "\r\n" else 0)
+    assert b"[modules.bmad-loop]" in raw
+    assert tomllib.loads(custom.read_text())["modules"]["bmad-loop"]["version"] == "0.9.0"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+def test_merge_config_toml_preserves_file_mode(tmp_path):
+    """The atomic replace must carry the original mode; a fresh file would not."""
+    bmad = _v610_bmad(tmp_path)
+    custom = bmad / "custom" / "config.toml"
+    custom.chmod(0o640)
+
+    _merge_config(bmad, _answers(tmp_path, {}))
+
+    assert stat.S_IMODE(custom.stat().st_mode) == 0o640
+
+
+def test_merge_config_toml_refuses_to_edit_an_unparseable_layer(tmp_path):
+    """A config we cannot parse is a config we must not rewrite."""
+    bmad = _v610_bmad(tmp_path)
+    custom = bmad / "custom" / "config.toml"
+    broken = "[modules.bmad-loop\nname = "
+    custom.write_text(broken)
+
+    proc = _run(
+        "merge-config.py",
+        "--bmad-dir",
+        str(bmad),
+        "--module-yaml",
+        str(ASSETS / "module.yaml"),
+        "--answers",
+        str(_answers(tmp_path, {})),
+    )
+
+    assert proc.returncode == 1
+    error = json.loads(proc.stderr)
+    assert error["status"] == "error"
+    assert "not valid TOML" in error["error"]
+    assert custom.read_text() == broken  # untouched
+
+
+def test_merge_config_toml_refuses_a_candidate_that_changes_a_neighbour():
+    """The verification gate is what makes the edit trustworthy, not the scanner.
+
+    Sabotage the splice so it damages an unrelated table; the semantic diff must
+    catch it and leave the file alone even though the result still parses.
+    """
+    merge_config = _load_script("merge-config.py")
+    original = '[agents.pm]\nx = 1\n\n[modules.bmad-loop]\nname = "old"\n'
+    block = merge_config.emit_module_table("bmad-loop", {"name": "New", "version": "9.9.9"})
+    sabotaged = "[agents.pm]\nx = 2\n\n" + block  # neighbour silently rewritten
+
+    error = merge_config.verify_candidate(original, sabotaged, "bmad-loop", block)
+
+    assert error is not None
+    assert "more than the [modules.bmad-loop] table" in error
+    # ...and a faithful candidate is accepted
+    faithful, _ = merge_config.upsert_module_table(original, "bmad-loop", block)
+    assert merge_config.verify_candidate(original, faithful, "bmad-loop", block) is None
+
+
+def test_merge_config_toml_tolerates_malformed_legacy_yaml(tmp_path):
+    """The TOML branch discards legacy *values*, so it must not parse them.
+
+    It used to, after the config had already been written: a malformed leftover
+    raised, and the skill reported a failure for a registration that had succeeded.
+    """
+    bmad = _v610_bmad(tmp_path)
+    (bmad / "core" / "config.yaml").write_text("user_name: [oops\n  bad: yaml\n")
+
+    result = _merge_config(bmad, _answers(tmp_path, {}), None, "--legacy-dir", str(bmad))
+
+    assert result["status"] == "success"
+    assert str(bmad / "core" / "config.yaml") in result["legacy_configs_found"]
+    assert result["legacy_configs_deleted"] == []
+    custom = (bmad / "custom" / "config.toml").read_text()
+    assert tomllib.loads(custom)["modules"]["bmad-loop"]["version"] == "0.9.0"
+
+
+# --------------------------------- merge-help-csv: schema + commit safety (#285 review)
+
+
+def test_merge_help_toml_maps_rows_by_column_name(tmp_path):
+    """The catalog owns its header, so our rows are re-keyed into it by name.
+
+    Appending positionally is only correct while the two schemas agree. BMAD has
+    already renamed help columns once (`after`/`before` → `preceded-by`/`followed-by`),
+    and a reorder would silently file every description under `skill`.
+    """
+    bmad = _v610_bmad(tmp_path)
+    catalog = bmad / "_config" / "bmad-help.csv"
+    # same columns, different order, plus one the source does not have
+    catalog.write_text(
+        "module,description,skill,display-name,menu-code,action,args,phase,"
+        "preceded-by,followed-by,required,output-location,outputs,new-col\n"
+        "Core,Show help.,bmad-help,Help,H,,,anytime,,,false,,,X\n"
+    )
+
+    result = _merge_help(bmad, "--module-code", "bmad-loop")
+
+    header, rows = _csv_rows(catalog)
+    assert header[:3] == ["module", "description", "skill"]  # catalog header preserved
+    ours = {row[header.index("skill")]: row for row in rows if row[0] == "BMAD Loop Skills"}
+    assert set(ours) == {"bmad-loop-setup", "bmad-loop-sweep"}
+    setup_row = ours["bmad-loop-setup"]
+    assert len(setup_row) == len(header)
+    assert setup_row[header.index("display-name")] == "Setup Loop Module"
+    assert setup_row[header.index("menu-code")] == "SA"
+    assert "Install or update" in setup_row[header.index("description")]
+    assert setup_row[header.index("new-col")] == ""  # no source value for it
+    assert result["columns_dropped"] == []
+    # the pre-existing row is untouched
+    assert [r for r in rows if r[0] == "Core"][0][header.index("new-col")] == "X"
+
+
+def test_merge_help_toml_reports_columns_the_catalog_cannot_hold(tmp_path):
+    """A source column with no home in the catalog is dropped loudly, not silently."""
+    bmad = _v610_bmad(tmp_path)
+    catalog = bmad / "_config" / "bmad-help.csv"
+    catalog.write_text("module,skill,display-name\nCore,bmad-help,Help\n")
+
+    result = _merge_help(bmad, "--module-code", "bmad-loop")
+
+    assert "description" in result["columns_dropped"]
+    header, rows = _csv_rows(catalog)
+    assert header == ["module", "skill", "display-name"]
+    assert all(len(row) == 3 for row in rows)
+
+
+def test_merge_help_toml_rejects_a_multi_module_source(tmp_path):
+    """_bmad/<code>/module-help.csv is one module's file, by construction."""
+    bmad = _v610_bmad(tmp_path)
+    source = tmp_path / "mixed.csv"
+    source.write_text(
+        "module,skill,display-name,menu-code,description\n"
+        "BMAD Loop Skills,bmad-loop-sweep,Sweep,ST,Ours.\n"
+        "Some Other Module,other-skill,Other,OS,Theirs.\n"
+    )
+    catalog_before = (bmad / "_config" / "bmad-help.csv").read_text()
+
+    proc = _run(
+        "merge-help-csv.py",
+        "--bmad-dir",
+        str(bmad),
+        "--source",
+        str(source),
+        "--module-code",
+        "bmad-loop",
+    )
+
+    assert proc.returncode == 1
+    assert "more than one module" in json.loads(proc.stdout)["error"]
+    assert (bmad / "_config" / "bmad-help.csv").read_text() == catalog_before
+    assert not (bmad / "bmad-loop" / "module-help.csv").exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX directory permissions")
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores the write bit")
+def test_merge_help_toml_never_truncates_the_shared_catalog(tmp_path):
+    """A failed catalog write must leave the shared catalog byte-identical.
+
+    _config/bmad-help.csv carries every module's help rows and is not hash-tracked
+    in files-manifest.csv, so a truncating write there loses them all undetectably.
+    """
+    bmad = _v610_bmad(tmp_path)
+    catalog = bmad / "_config" / "bmad-help.csv"
+    before = catalog.read_bytes()
+    (bmad / "_config").chmod(0o555)
+    try:
+        proc = _run(
+            "merge-help-csv.py",
+            "--bmad-dir",
+            str(bmad),
+            "--source",
+            str(ASSETS / "module-help.csv"),
+            "--module-code",
+            "bmad-loop",
+        )
+    finally:
+        (bmad / "_config").chmod(0o755)
+
+    assert proc.returncode == 2
+    assert json.loads(proc.stdout)["status"] == "error"
+    assert catalog.read_bytes() == before
+    assert not list((bmad / "_config").glob("*bmad-loop-tmp*"))
+
+
+# ------------------------------------------------------- end-to-end: the real reader
+
+
+def _deep_merge(base, override):
+    """The scalar/table half of resolve_config.py's documented merge."""
+    if isinstance(base, dict) and isinstance(override, dict):
+        merged = dict(base)
+        for key, value in override.items():
+            merged[key] = _deep_merge(merged[key], value) if key in merged else value
+        return merged
+    return override
+
+
+def _resolve_layers(bmad: Path) -> dict:
+    """Resolve the four TOML layers exactly as BMAD's resolver documents them.
+
+    A local oracle so CI can assert the end-to-end result: `_bmad/` is gitignored,
+    so a checkout never carries BMAD's own resolve_config.py (the test below runs
+    the real one when a project tree happens to provide it).
+    """
+    merged: dict = {}
+    for name in (
+        "config.toml",
+        "config.user.toml",
+        "custom/config.toml",
+        "custom/config.user.toml",
+    ):
+        path = bmad / name
+        if path.is_file():
+            merged = _deep_merge(merged, tomllib.loads(path.read_text(encoding="utf-8")))
+    return merged
+
+
+def test_registration_resolves_through_the_four_layer_merge(tmp_path):
+    """What BMAD actually reads back after setup runs — twice, for idempotence."""
+    bmad = _v610_bmad(tmp_path)
+    answers = _answers(tmp_path, {})
+    custom_before = (bmad / "custom" / "config.toml").read_text()
+
+    for _ in range(2):
+        _merge_config(bmad, answers)
+        _merge_help(bmad, "--module-code", "bmad-loop")
+
+    resolved = _resolve_layers(bmad)
+    table = resolved["modules"]["bmad-loop"]
+    assert table["name"] == "BMAD Loop Skills"
+    assert table["version"] == "0.9.0"
+    assert table["default_selected"] is False
+    # the installer layer still wins where we wrote nothing
+    assert resolved["core"]["user_name"] == "BMad"
+    assert resolved["modules"]["bmm"]["name"] == "BMad Method"
+    # the human-authored layer we edited is otherwise intact
+    assert resolved["modules"]["my-thing"]["enabled"] is True
+    assert (bmad / "custom" / "config.toml").read_text().startswith(custom_before)
+
+    _, rows = _csv_rows(bmad / "_config" / "bmad-help.csv")
+    assert len([row for row in rows if row[0] == "BMAD Loop Skills"]) == 2
+
+
+def test_registration_resolves_through_bmads_own_resolver(tmp_path):
+    """Same assertion against BMAD's real resolve_config.py, when one is available.
+
+    Skipped in CI (a checkout has no `_bmad/`); set BMAD_RESOLVE_CONFIG to a real
+    installed copy to exercise the genuine reader instead of the oracle above.
+    """
+    resolver = os.environ.get("BMAD_RESOLVE_CONFIG") or str(
+        REPO / "_bmad" / "scripts" / "resolve_config.py"
+    )
+    if not Path(resolver).is_file():
+        pytest.skip("no BMAD resolve_config.py available (set BMAD_RESOLVE_CONFIG)")
+
+    bmad = _v610_bmad(tmp_path)
+    _merge_config(bmad, _answers(tmp_path, {}))
+
+    proc = subprocess.run(
+        [sys.executable, resolver, "--project-root", str(tmp_path), "--key", "modules.bmad-loop"],
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    # a layer it could not parse would be warned about and merged as {}
+    assert "failed to parse" not in proc.stderr
+    assert json.loads(proc.stdout)["modules.bmad-loop"]["version"] == "0.9.0"

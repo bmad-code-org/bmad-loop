@@ -19,7 +19,13 @@ TOML layout (BMAD v6.10+, detected by the presence of _bmad/config.toml)
       _bmad/_config/bmad-help.csv — shared with every other module, so our rows are
         merged in anti-zombie (every row whose module column matches a source module
         code is dropped first) and the catalog's own header is preserved. Created
-        from the source header when absent.
+        from the source header when absent. Because the catalog owns its header, our
+        rows are re-keyed into its column order by name (see align_rows) rather than
+        appended positionally.
+
+    Both files are rendered in full before either is written, and each is committed
+    through a temp file and one atomic rename: the catalog is shared state that is
+    not hash-tracked, so it must never be left truncated by a failed run.
 
     Caveat worth reporting to the user: the catalog is generated, so a BMAD
     installer re-run regenerates it and drops our rows. Re-running the setup skill
@@ -43,8 +49,11 @@ Exit codes: 0=success, 1=validation error, 2=runtime error
 import argparse
 import csv
 import json
+import os
+import random
 import re
 import sys
+import time
 from io import StringIO
 from pathlib import Path
 
@@ -169,19 +178,119 @@ def merge_rows(
     return filtered_rows + source_rows, removed_count
 
 
+def align_rows(
+    source_header: list[str], rows: list[list[str]], target_header: list[str]
+) -> tuple[list[list[str]], list[str]]:
+    """Re-key ``rows`` from the source column order into the target's.
+
+    The catalog keeps its own header, so appending source rows positionally is only
+    correct while the two headers happen to agree. They are not the same file and
+    not the same schema owner — BMAD reorders or extends the help columns and every
+    one of our rows silently shifts a field (a description landing under `skill`),
+    with nothing to notice it. Mapping by column *name* makes the merge independent
+    of column order; columns the target does not have are dropped and reported.
+
+    Returns:
+        (aligned_rows, dropped_columns) — dropped lists only source columns that
+        have no home in the target *and* carry a value somewhere.
+    """
+    if not target_header or source_header == target_header:
+        # Fast path: identical schemas (every current BMAD tree). Still normalise
+        # width so a short or long row can never shift the columns after it.
+        width = len(target_header or source_header)
+        if not width:
+            return [list(row) for row in rows], []
+        return [list(row[:width]) + [""] * (width - len(row)) for row in rows], []
+
+    index = {name: n for n, name in enumerate(source_header)}
+    aligned = []
+    for row in rows:
+        aligned.append(
+            [
+                row[index[col]] if col in index and index[col] < len(row) else ""
+                for col in target_header
+            ]
+        )
+
+    dropped = [
+        col
+        for col in source_header
+        if col not in target_header
+        and any(index[col] < len(row) and row[index[col]].strip() for row in rows)
+    ]
+    return aligned, dropped
+
+
+def render_csv(header: list[str], rows: list[list[str]]) -> str:
+    """Serialise header + rows to CSV text (excel dialect, CRLF terminators).
+
+    Split out from the write so both outputs can be built in full before either is
+    committed — see run_toml_layout.
+    """
+    buf = StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(header)
+    for row in rows:
+        writer.writerow(row)
+    return buf.getvalue()
+
+
+_REPLACE_ATTEMPTS = 6
+_REPLACE_BASE_S = 0.05
+_REPLACE_CAP_S = 1.5
+
+
+def _atomic_replace(tmp: Path, target: Path) -> None:
+    """``os.replace``, retried on the transient Windows sharing violation a
+    concurrent handle on ``target`` triggers (WinError 5/32). Mirrors
+    bmad_loop.platform_util.atomic_replace — duplicated, not imported, because
+    this script ships standalone into user projects.
+    """
+    for attempt in range(_REPLACE_ATTEMPTS):
+        try:
+            os.replace(tmp, target)
+            return
+        except OSError as exc:
+            last = attempt == _REPLACE_ATTEMPTS - 1
+            winerror = getattr(exc, "winerror", None)
+            retryable = isinstance(exc, PermissionError) or winerror in (5, 32)
+            if sys.platform != "win32" or last or not retryable:
+                raise
+            time.sleep(
+                min(_REPLACE_CAP_S, _REPLACE_BASE_S * 2**attempt)
+                + random.uniform(0, _REPLACE_BASE_S)  # nosec B311 - retry jitter
+            )
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` through a sibling temp file and one atomic rename.
+
+    _bmad/_config/bmad-help.csv is shared with every other BMAD module and is not
+    hash-tracked in files-manifest.csv, so a truncated write there loses every
+    module's help rows with nothing to detect it. Never truncate it in place.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mode = path.stat().st_mode if path.is_file() else None
+    tmp = path.with_name(path.name + ".bmad-loop-tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        if mode is not None:
+            os.chmod(tmp, mode)
+        _atomic_replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
 def write_csv(path: str, header: list[str], rows: list[list[str]], verbose: bool = False) -> None:
     """Write header + rows to CSV file, creating parent dirs as needed."""
-    file_path = Path(path)
-    file_path.parent.mkdir(parents=True, exist_ok=True)
-
     if verbose:
         print(f"Writing {len(rows)} data rows to {path}", file=sys.stderr)
 
-    with open(file_path, "w", encoding="utf-8", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(header)
-        for row in rows:
-            writer.writerow(row)
+    atomic_write_text(Path(path), render_csv(header, rows))
 
 
 def cleanup_legacy_csvs(legacy_dir: str, module_code: str, verbose: bool = False) -> list:
@@ -319,33 +428,55 @@ def run_toml_layout(
             f"This project is on the BMAD v6.10+ TOML layout ({Path(args.bmad_dir) / 'config.toml'} exists)."
         )
 
+    if len(source_codes) > 1:
+        _fail(
+            "The source CSV carries rows for more than one module "
+            f"({', '.join(sorted(source_codes))}), but _bmad/{args.module_code}/module-help.csv "
+            "is by definition one module's file — the installer attributes every row in it to "
+            f"'{args.module_code}'. Split the source, or run the legacy --target merge instead."
+        )
+
     header = source_header if source_header else HEADER
+
+    # Both outputs are rendered in full before either is committed, and each is
+    # committed atomically: a failure part-way must never truncate the shared
+    # catalog, and must never leave it half-merged.
 
     # 1. The per-module CSV: wholly ours, so a full overwrite. Creating it also makes
     #    _bmad/<module-code>/ config-bearing, which cleanup-legacy.py then protects.
     module_help_path = Path(args.bmad_dir) / args.module_code / "module-help.csv"
-    if args.verbose:
-        print(f"TOML layout: writing per-module CSV {module_help_path}", file=sys.stderr)
-    write_csv(str(module_help_path), header, source_rows, args.verbose)
 
     # 2. The assembled catalog: shared with every other module, so merge anti-zombie
-    #    and keep its own header.
+    #    and keep its own header — remapping our rows into its column order.
     catalog_path = Path(args.bmad_dir) / "_config" / "bmad-help.csv"
     catalog_existed = catalog_path.is_file()
     catalog_header, catalog_rows = read_csv_rows(str(catalog_path))
+    target_header = catalog_header if catalog_header else header
 
     if args.verbose:
         print(f"Catalog exists: {catalog_existed}", file=sys.stderr)
         if catalog_existed:
             print(f"Existing catalog rows: {len(catalog_rows)}", file=sys.stderr)
 
-    merged_rows, removed_count = merge_rows(catalog_rows, source_rows, source_codes, args.verbose)
-    write_csv(
-        str(catalog_path),
-        catalog_header if catalog_header else header,
-        merged_rows,
-        args.verbose,
+    catalog_source_rows, columns_dropped = align_rows(header, source_rows, target_header)
+    if columns_dropped:
+        print(
+            "Warning: the catalog header has no column for "
+            f"{', '.join(columns_dropped)} — those values were dropped from the merged rows.",
+            file=sys.stderr,
+        )
+
+    merged_rows, removed_count = merge_rows(
+        catalog_rows, catalog_source_rows, source_codes, args.verbose
     )
+
+    module_help_text = render_csv(header, source_rows)
+    catalog_text = render_csv(target_header, merged_rows)
+
+    if args.verbose:
+        print(f"TOML layout: writing per-module CSV {module_help_path}", file=sys.stderr)
+    atomic_write_text(module_help_path, module_help_text)
+    atomic_write_text(catalog_path, catalog_text)
 
     legacy_deleted = []
     if args.legacy_dir:
@@ -361,6 +492,7 @@ def run_toml_layout(
         "rows_removed": removed_count,
         "rows_added": len(source_rows),
         "total_rows": len(merged_rows),
+        "columns_dropped": columns_dropped,
         "legacy_csvs_deleted": legacy_deleted,
         "orphans_detected": detect_orphans(args.bmad_dir, args.module_code),
     }
@@ -389,7 +521,19 @@ def run_yaml_layout(
     # Use source header if target doesn't exist or has no header
     header = target_header if target_header else (source_header if source_header else HEADER)
 
-    merged_rows, removed_count = merge_rows(target_rows, source_rows, source_codes, args.verbose)
+    # Same name-keyed remap as the TOML branch: the target keeps its own header, so
+    # appending positionally is only correct while the two schemas agree.
+    aligned_source, columns_dropped = align_rows(
+        source_header if source_header else HEADER, source_rows, header
+    )
+    if columns_dropped:
+        print(
+            "Warning: the target header has no column for "
+            f"{', '.join(columns_dropped)} — those values were dropped from the merged rows.",
+            file=sys.stderr,
+        )
+
+    merged_rows, removed_count = merge_rows(target_rows, aligned_source, source_codes, args.verbose)
 
     write_csv(args.target, header, merged_rows, args.verbose)
 
@@ -413,6 +557,7 @@ def run_yaml_layout(
         "rows_removed": removed_count,
         "rows_added": len(source_rows),
         "total_rows": len(merged_rows),
+        "columns_dropped": columns_dropped,
         "legacy_csvs_deleted": legacy_deleted,
         "orphans_detected": [],
     }
@@ -449,10 +594,27 @@ def main():
     if args.verbose:
         print(f"Detected {layout} help layout under {args.bmad_dir}", file=sys.stderr)
 
-    if layout == "toml":
-        result = run_toml_layout(args, source_header, source_rows, source_codes)
-    else:
-        result = run_yaml_layout(args, source_header, source_rows, source_codes)
+    try:
+        if layout == "toml":
+            result = run_toml_layout(args, source_header, source_rows, source_codes)
+        else:
+            result = run_yaml_layout(args, source_header, source_rows, source_codes)
+    except OSError as exc:
+        # Each write is atomic, so whatever failed here was left exactly as it was —
+        # never half-written. An earlier output may already be committed, which is
+        # harmless: the merge is idempotent, so re-running finishes the job.
+        print(
+            json.dumps(
+                {
+                    "status": "error",
+                    "error": f"Could not write help entries: {exc}. Every write is atomic, so "
+                    "no CSV was left truncated; any output not yet committed is unchanged. "
+                    "Fix the cause and re-run — the merge is idempotent.",
+                },
+                indent=2,
+            )
+        )
+        sys.exit(2)
 
     print(json.dumps(result, indent=2))
 

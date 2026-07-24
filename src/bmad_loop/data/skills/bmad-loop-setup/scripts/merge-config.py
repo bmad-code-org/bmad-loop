@@ -13,8 +13,19 @@ TOML layout (BMAD v6.10+, detected by the presence of _bmad/config.toml)
     files: config.toml, config.user.toml, custom/config.toml, custom/config.user.toml.
     It never reads config.yaml. So the [modules.<code>] table is written into
     _bmad/custom/config.toml — the layer BMAD documents as never touched by the
-    installer — through a surgical text edit that leaves every other byte of that
-    human-authored, comment-bearing file alone.
+    installer — through a surgical text edit that leaves every byte outside that
+    table, and the file's own line endings and mode, exactly as they were. (The
+    table's own body is ours and is rewritten wholesale: that is the anti-zombie
+    guarantee, so comments inside it do not survive.)
+
+    The edit is verified BEFORE anything is written: the candidate must parse and
+    must differ from the original only in modules.<code> (see verify_candidate),
+    and it is then committed atomically. A refused edit writes nothing, leaves the
+    file byte-identical and exits non-zero — bmad-loop never leaves a config it
+    cannot vouch for, because BMAD's resolver treats an unparseable custom layer as
+    an empty one and would silently drop the user's own overrides along with ours.
+    Verification needs tomllib, so this branch requires Python 3.11+ — as BMAD's
+    own resolve_config.py already does.
 
     Core values (user_name, output_folder, ...) are deliberately NOT written on this
     layout: the custom layer WINS over the installer layer, so pinning them here
@@ -44,8 +55,11 @@ Exit codes: 0=success, 1=validation error, 2=runtime error
 import argparse
 import csv
 import json
+import os
+import random
 import re
 import sys
+import time
 from pathlib import Path
 
 try:
@@ -165,6 +179,22 @@ def load_legacy_values(
             print(f"Legacy module config: {list(legacy_module.keys())}", file=sys.stderr)
 
     return legacy_core, legacy_module, files_found
+
+
+def legacy_config_paths(legacy_dir: str, module_code: str) -> list:
+    """The legacy per-module/core config paths that exist, without reading them.
+
+    load_legacy_values parses these for their *values*; the TOML branch has no use
+    for the values (core config is installer-owned there) and only reports the
+    paths, so it uses this instead — a pure existence check cannot raise on a
+    malformed leftover.
+    """
+    base = Path(legacy_dir)
+    return [
+        str(path)
+        for path in (base / "core" / "config.yaml", base / module_code / "config.yaml")
+        if path.exists()
+    ]
 
 
 def apply_legacy_defaults(answers: dict, legacy_core: dict, legacy_module: dict) -> dict:
@@ -350,21 +380,27 @@ def extract_user_settings(module_yaml: dict, answers: dict) -> dict:
 
 
 def write_config(config: dict, config_path: str, verbose: bool = False) -> None:
-    """Write config dict to YAML file, creating parent dirs as needed."""
+    """Write config dict to YAML file, creating parent dirs as needed.
+
+    Committed through atomic_write_text so a failed or interrupted run cannot
+    leave a half-written config behind. newline=None keeps the platform line
+    endings the plain `open(..., "w")` this replaced produced.
+    """
     path = Path(config_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
 
     if verbose:
         print(f"Writing config to {path}", file=sys.stderr)
 
-    with open(path, "w", encoding="utf-8") as f:
+    atomic_write_text(
+        path,
         yaml.dump(
             config,
-            f,
             default_flow_style=False,
             allow_unicode=True,
             sort_keys=False,
-        )
+        ),
+        newline=None,
+    )
 
 
 def detect_layout(bmad_dir: str) -> str:
@@ -425,21 +461,202 @@ def _toml_value(value) -> str:
     return '"%s"' % _toml_escape(str(value))
 
 
-def emit_module_table(module_code: str, values: dict) -> str:
+def emit_module_table(module_code: str, values: dict, newline: str = "\n") -> str:
     """Emit a `[modules.<code>]` table with one `key = value` line per entry.
 
     None values are skipped — module.yaml leaves optional metadata unset rather
-    than nulled, and TOML has no null.
+    than nulled, and TOML has no null. ``newline`` is the target file's own line
+    ending, so a CRLF config.toml stays CRLF (see read_text_preserving_newlines).
     """
     lines = ["[modules.%s]" % _toml_key(module_code)]
     for key, value in values.items():
         if value is None:
             continue
         lines.append("%s = %s" % (_toml_key(key), _toml_value(value)))
-    return "\n".join(lines) + "\n"
+    return newline.join(lines) + newline
 
 
-_NEXT_TABLE = re.compile(r"^[ \t]*\[", re.MULTILINE)
+# ------------------------------------------------------------- TOML table scanner
+#
+# Locating a table's span with a regex is not safe: `^\s*\[` also matches a line
+# inside a multi-line string or a multi-line array, and a header line may carry a
+# trailing comment (`[modules.bmad-loop] # keep`) or quoted components
+# (`["modules"."bmad-loop"]`) that a fixed pattern misses. Either mistake lets the
+# surgical edit truncate a neighbour's value or append a duplicate table — both
+# produce invalid TOML from valid input. So the scanner below tracks string and
+# bracket state properly, and upsert_module_table works off its offsets.
+
+
+def _skip_string(text: str, i: int) -> int:
+    """Return the offset just past the string literal starting at ``text[i]``.
+
+    Handles all four TOML string forms. An unterminated literal consumes the rest
+    of the document — the candidate then fails to parse and verify_candidate
+    refuses the write, which is the correct outcome for malformed input.
+    """
+    quote = text[i]
+    triple = text[i : i + 3]
+    if triple in ('"""', "'''"):
+        delim, escaped = triple, triple == '"""'
+        j = i + 3
+        while j < len(text):
+            if escaped and text[j] == "\\":
+                j += 2
+                continue
+            if text.startswith(delim, j):
+                j += 3
+                # TOML allows one or two extra quotes to abut the closing delimiter
+                while j < len(text) and text[j] == quote and j - (i + 3) >= 0:
+                    j += 1
+                return j
+            j += 1
+        return len(text)
+
+    escaped = quote == '"'
+    j = i + 1
+    while j < len(text):
+        ch = text[j]
+        if escaped and ch == "\\":
+            j += 2
+            continue
+        if ch == quote:
+            return j + 1
+        if ch == "\n":  # a single-line string never spans a newline
+            return j
+        j += 1
+    return len(text)
+
+
+def _parse_header_keys(text: str, start: int) -> "tuple[tuple, int] | None":
+    """Parse the table header whose `[` sits at ``text[start]``.
+
+    Returns ``(key_path, end_offset)`` — the normalised dotted key as a tuple and
+    the offset just past the closing bracket — or None when this is not a
+    well-formed header (a value array, say).
+    """
+    i = start + 1
+    if text.startswith("[", i):  # [[array.of.tables]]
+        i += 1
+        closing = "]]"
+    else:
+        closing = "]"
+
+    keys: list = []
+    expect_key = True
+    while i < len(text):
+        ch = text[i]
+        if ch in " \t":
+            i += 1
+            continue
+        if ch == "\n":
+            return None  # a header never spans a line
+        if text.startswith(closing, i):
+            return (tuple(keys), i + len(closing)) if keys and not expect_key else None
+        if ch == "." and not expect_key:
+            expect_key = True
+            i += 1
+            continue
+        if not expect_key:
+            return None
+        if ch in "\"'":
+            end = _skip_string(text, i)
+            raw = text[i:end]
+            if len(raw) < 2 or raw[0] != raw[-1]:
+                return None
+            keys.append(_unescape_basic(raw[1:-1]) if ch == '"' else raw[1:-1])
+            i = end
+        else:
+            j = i
+            while j < len(text) and (text[j].isalnum() or text[j] in "_-"):
+                j += 1
+            if j == i:
+                return None
+            keys.append(text[i:j])
+            i = j
+        expect_key = False
+    return None
+
+
+_BASIC_UNESCAPES = {
+    "b": "\b",
+    "t": "\t",
+    "n": "\n",
+    "f": "\f",
+    "r": "\r",
+    '"': '"',
+    "\\": "\\",
+}
+
+
+def _unescape_basic(raw: str) -> str:
+    """Decode a TOML basic-string body so `"bmad-loop"` compares equal to a bare key."""
+    if "\\" not in raw:
+        return raw
+    out, i = [], 0
+    while i < len(raw):
+        ch = raw[i]
+        if ch != "\\" or i + 1 >= len(raw):
+            out.append(ch)
+            i += 1
+            continue
+        nxt = raw[i + 1]
+        if nxt in _BASIC_UNESCAPES:
+            out.append(_BASIC_UNESCAPES[nxt])
+            i += 2
+        elif nxt in "uU":
+            width = 4 if nxt == "u" else 8
+            try:
+                out.append(chr(int(raw[i + 2 : i + 2 + width], 16)))
+            except ValueError:
+                out.append(nxt)
+            i += 2 + width
+        else:
+            out.append(nxt)
+            i += 2
+    return "".join(out)
+
+
+def scan_table_headers(text: str) -> list:
+    """Return ``[(line_start, header_end, key_path)]`` for every real table header.
+
+    A `[` opens a table only when it is the first significant character on its
+    line *and* no array/inline-table value is still open — everything else (a `[`
+    inside a string, inside a multi-line array, or after a key) is skipped along
+    with the construct that contains it.
+    """
+    headers: list = []
+    i, line_start, depth = 0, 0, 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "\n":
+            i += 1
+            line_start = i
+            continue
+        if ch in " \t\r":
+            i += 1
+            continue
+        if ch == "#":
+            nl = text.find("\n", i)
+            i = len(text) if nl < 0 else nl
+            continue
+        if ch in "\"'":
+            i = _skip_string(text, i)
+            continue
+        if ch == "[":
+            if depth == 0 and not text[line_start:i].strip():
+                parsed = _parse_header_keys(text, i)
+                if parsed is not None:
+                    keys, end = parsed
+                    headers.append((line_start, end, keys))
+                    i = end
+                    continue
+            depth += 1
+        elif ch == "{":
+            depth += 1
+        elif ch in "]}":
+            depth = max(0, depth - 1)
+        i += 1
+    return headers
 
 
 def _is_blank_or_comment(line: str) -> bool:
@@ -447,83 +664,175 @@ def _is_blank_or_comment(line: str) -> bool:
     return not stripped or stripped.startswith("#")
 
 
-def _module_header_pattern(module_code: str) -> "re.Pattern":
-    """Match the `[modules.<code>]` header line, bare or quoted, any spacing."""
-    forms = "|".join(
-        (
-            re.escape(module_code),
-            re.escape('"%s"' % _toml_escape(module_code)),
-        )
-    )
-    return re.compile(
-        r"^[ \t]*\[[ \t]*modules[ \t]*\.[ \t]*(?:%s)[ \t]*\][ \t]*$" % forms,
-        re.MULTILINE,
-    )
-
-
-def upsert_module_table(text: str, module_code: str, block: str) -> tuple[str, bool]:
+def upsert_module_table(
+    text: str, module_code: str, block: str, newline: str = "\n"
+) -> tuple[str, bool]:
     """Replace (or append) the `[modules.<code>]` table in TOML source text.
 
     A surgical text edit, not a parse-and-re-emit: _bmad/custom/config.toml is a
     human-authored, comment-bearing file and round-tripping it through a parser
-    would destroy that. Every byte outside the replaced table comes back identical.
+    would destroy that. Every byte *outside* the `[modules.<code>]` table comes
+    back identical, and so does the file's line ending. The table's own body is
+    ours and is rewritten wholesale — that is the anti-zombie guarantee.
 
-    The table's span runs from its header line to the next top-level `[` line (or
-    EOF). Blank and comment lines immediately above that next header are the *next*
-    table's preamble in any hand-written file, so they are left in place.
+    The span runs from the header line to the next table header found by
+    scan_table_headers (or EOF). Trailing blank and comment lines are backed off
+    the span in *both* cases: before a following table they are its preamble, and
+    at EOF they are the file's footer. Neither is ours to delete.
 
     Returns:
         (new_text, replaced) — replaced is True when an existing table was
         overwritten, False when the block was appended.
     """
-    match = _module_header_pattern(module_code).search(text)
+    headers = scan_table_headers(text)
+    target = ("modules", module_code)
+    index = next((n for n, h in enumerate(headers) if h[2] == target), None)
 
-    if match is None:
+    if index is None:
         if not text.strip():
             return block, False
-        new_text = text if text.endswith("\n") else text + "\n"
-        if not new_text.endswith("\n\n"):
-            new_text += "\n"
+        new_text = text if text.endswith(("\n", "\r")) else text + newline
+        if not new_text.endswith(newline * 2):
+            new_text += newline
         return new_text + block, False
 
-    header_end = match.end()
-    following = _NEXT_TABLE.search(text, header_end)
-    span_end = following.start() if following else len(text)
+    start, header_end, _ = headers[index]
+    span_end = headers[index + 1][0] if index + 1 < len(headers) else len(text)
 
-    if following is not None:
-        body = text[header_end:span_end].splitlines(keepends=True)
-        trailing = 0
-        while body and _is_blank_or_comment(body[-1]):
-            trailing += len(body.pop())
-        span_end -= trailing
+    body = text[header_end:span_end].splitlines(keepends=True)
+    trailing = 0
+    while body and _is_blank_or_comment(body[-1]):
+        trailing += len(body.pop())
+    span_end -= trailing
 
-    return text[: match.start()] + block + text[span_end:], True
+    return text[:start] + block + text[span_end:], True
 
 
-def validate_toml(text: str, verbose: bool = False) -> bool:
-    """Parse the emitted TOML back with tomllib, if it is available.
+def verify_candidate(original: str, candidate: str, module_code: str, block: str) -> "str | None":
+    """Return an error message when ``candidate`` is not a safe edit of ``original``.
 
-    tomllib is stdlib only on Python 3.11+; this script declares >=3.9, so on
-    older interpreters validation is skipped rather than failing the run.
+    The gate that makes the surgical edit trustworthy. Rather than trusting the
+    scanner, it checks the *result*: the candidate must parse, and must be
+    semantically identical to the original except for `modules.<code>`, which must
+    equal exactly what we emitted. That single comparison catches every way the
+    edit can go wrong — a duplicated table (tomllib raises), a truncated multi-line
+    value (parse error), a clobbered neighbour (diff mismatch) — so a scanner bug
+    fails the run instead of corrupting a config. Returns None when the edit is safe.
+
+    BMAD's own resolve_config.py requires Python 3.11+ for tomllib and exits
+    without it, so a v6.10 TOML project cannot function on an older interpreter:
+    refusing to write unverified there costs nothing real.
     """
     try:
         import tomllib
     except ImportError:
-        print(
-            "Note: tomllib unavailable (Python < 3.11) — skipping TOML validation",
-            file=sys.stderr,
+        return (
+            "Cannot verify the edit: tomllib requires Python 3.11+ and this "
+            f"interpreter is {sys.version_info[0]}.{sys.version_info[1]}. BMAD v6.10's own "
+            "resolve_config.py requires 3.11+ for the same reason, so this project already "
+            "needs it. Nothing was written — re-run under Python 3.11 or newer."
         )
-        return False
 
     try:
-        tomllib.loads(text)
+        before = tomllib.loads(original) if original.strip() else {}
     except Exception as exc:  # tomllib.TOMLDecodeError, but stay defensive
-        print(f"Warning: written TOML did not parse cleanly: {exc}", file=sys.stderr)
-        return False
+        return (
+            f"The existing custom/config.toml is not valid TOML ({exc}). Nothing was "
+            "written — fix that file by hand, then re-run setup. bmad-loop will not edit "
+            "a config it cannot parse."
+        )
 
-    if verbose:
-        print("Validated written TOML with tomllib", file=sys.stderr)
-    return True
+    try:
+        after = tomllib.loads(candidate)
+        expected_table = tomllib.loads(block)["modules"][module_code]
+    except Exception as exc:
+        return (
+            f"The edited custom/config.toml would not parse ({exc}). Nothing was written "
+            "and the file is unchanged. Please report this with a copy of the file."
+        )
+
+    expected = dict(before)
+    modules = (
+        dict(expected.get("modules") or {}) if isinstance(expected.get("modules"), dict) else {}
+    )
+    modules[module_code] = expected_table
+    expected["modules"] = modules
+
+    if after != expected:
+        return (
+            "The edit would have changed more than the [modules.%s] table, so it was "
+            "refused. Nothing was written and the file is unchanged. Please report this "
+            "with a copy of the file." % module_code
+        )
+    return None
+
+
+# --------------------------------------------------------------- durable writes
+
+_REPLACE_ATTEMPTS = 6
+_REPLACE_BASE_S = 0.05
+_REPLACE_CAP_S = 1.5
+
+
+def _atomic_replace(tmp: Path, target: Path) -> None:
+    """``os.replace``, retried on the transient Windows sharing violation a
+    concurrent handle on ``target`` triggers (WinError 5/32). Mirrors
+    bmad_loop.platform_util.atomic_replace — duplicated, not imported, because
+    this script ships standalone into user projects.
+    """
+    for attempt in range(_REPLACE_ATTEMPTS):
+        try:
+            os.replace(tmp, target)
+            return
+        except OSError as exc:
+            last = attempt == _REPLACE_ATTEMPTS - 1
+            winerror = getattr(exc, "winerror", None)
+            retryable = isinstance(exc, PermissionError) or winerror in (5, 32)
+            if sys.platform != "win32" or last or not retryable:
+                raise
+            time.sleep(
+                min(_REPLACE_CAP_S, _REPLACE_BASE_S * 2**attempt)
+                + random.uniform(0, _REPLACE_BASE_S)  # nosec B311 - retry jitter
+            )
+
+
+def atomic_write_text(path: Path, text: str, newline: "str | None" = "") -> None:
+    """Write ``text`` to ``path`` through a sibling temp file and one atomic rename.
+
+    An interrupted or failed write must never leave a truncated config behind —
+    these files are shared with every other BMAD module. The existing file's mode
+    is carried over, which a plain create would otherwise drop. ``newline=""``
+    writes verbatim (the caller has already chosen the line ending); ``None`` keeps
+    Python's default os.linesep translation, which the legacy YAML branch relies on.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mode = path.stat().st_mode if path.is_file() else None
+    tmp = path.with_name(path.name + ".bmad-loop-tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8", newline=newline) as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        if mode is not None:
+            os.chmod(tmp, mode)
+        _atomic_replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
+def read_text_preserving_newlines(path: Path) -> "tuple[str, str]":
+    """Return ``(text, newline)`` with the file's own line endings left intact.
+
+    Path.read_text translates CRLF to LF on the way in and back to os.linesep on
+    the way out, so a round-trip rewrites every line of a CRLF file on POSIX. This
+    reads verbatim and reports the convention so the emitted block can match it.
+    """
+    if not path.is_file():
+        return "", "\n"
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        text = f.read()
+    return text, "\r\n" if "\r\n" in text else "\n"
 
 
 # ---------------------------------------------------------------- orphan report
@@ -621,28 +930,32 @@ def run_toml_layout(args, module_yaml: dict, module_code: str) -> dict:
     custom layer wins over the installer layer, so anything pinned here would
     override every future installer answer.
     """
-    values = extract_module_metadata(module_yaml)
-    block = emit_module_table(module_code, values)
-
     config_path = Path(args.bmad_dir) / "custom" / "config.toml"
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    existing = config_path.read_text(encoding="utf-8") if config_path.is_file() else ""
+    existing, newline = read_text_preserving_newlines(config_path)
+
+    values = extract_module_metadata(module_yaml)
+    block = emit_module_table(module_code, values, newline)
 
     if args.verbose:
         print(f"TOML layout: registering [modules.{module_code}] in {config_path}", file=sys.stderr)
 
-    new_text, table_replaced = upsert_module_table(existing, module_code, block)
-    config_path.write_text(new_text, encoding="utf-8")
+    new_text, table_replaced = upsert_module_table(existing, module_code, block, newline)
 
-    toml_validated = validate_toml(new_text, args.verbose)
+    # Verify BEFORE touching disk: a refused edit must leave the file untouched.
+    error = verify_candidate(existing, new_text, module_code, block)
+    if error:
+        _fail(f"{config_path}: {error}")
 
-    # --legacy-dir stays read-only here: report what exists, delete nothing.
+    atomic_write_text(config_path, new_text)
+
+    # --legacy-dir stays read-only here, and unparsed: the TOML branch discards
+    # legacy *values* (core config is installer-owned), so only the paths matter.
+    # Parsing them would let a malformed leftover raise — and it used to raise
+    # after the write, reporting failure for a registration that had succeeded.
     legacy_files_found: list = []
     legacy_deleted: list = []
     if args.legacy_dir:
-        _, _, legacy_files_found = load_legacy_values(
-            args.legacy_dir, module_code, module_yaml, args.verbose
-        )
+        legacy_files_found = legacy_config_paths(args.legacy_dir, module_code)
         legacy_deleted = cleanup_legacy_configs(args.legacy_dir, module_code, args.verbose)
 
     return {
@@ -655,7 +968,9 @@ def run_toml_layout(args, module_yaml: dict, module_code: str) -> dict:
         "module_keys": [k for k, v in values.items() if v is not None],
         "user_keys": [],
         "table_replaced": table_replaced,
-        "toml_validated": toml_validated,
+        # Always true on success: the edit is verified before anything is written,
+        # so an unverified file is never committed (a failure exits non-zero above).
+        "toml_validated": True,
         "legacy_configs_found": legacy_files_found,
         "legacy_configs_deleted": legacy_deleted,
         "orphans_detected": detect_orphans(args.bmad_dir, module_code),
@@ -753,10 +1068,28 @@ def main():
     if args.verbose:
         print(f"Detected {layout} config layout under {args.bmad_dir}", file=sys.stderr)
 
-    if layout == "toml":
-        result = run_toml_layout(args, module_yaml, module_code)
-    else:
-        result = run_yaml_layout(args, module_yaml, module_code)
+    try:
+        if layout == "toml":
+            result = run_toml_layout(args, module_yaml, module_code)
+        else:
+            result = run_yaml_layout(args, module_yaml, module_code)
+    except OSError as exc:
+        # Each write is atomic, so whatever failed here was left exactly as it was —
+        # never half-written. An earlier output may already be committed, which is
+        # harmless: the merge is idempotent, so re-running finishes the job.
+        print(
+            json.dumps(
+                {
+                    "status": "error",
+                    "error": f"Could not write config: {exc}. Every write is atomic, so no "
+                    "config was left truncated; any output not yet committed is unchanged. "
+                    "Fix the cause and re-run — the merge is idempotent.",
+                },
+                indent=2,
+            ),
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
     print(json.dumps(result, indent=2))
 
