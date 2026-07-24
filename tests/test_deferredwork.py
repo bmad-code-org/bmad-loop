@@ -5,12 +5,15 @@ from pathlib import Path
 from bmad_loop.deferredwork import (
     append_decision,
     append_entry,
+    classify,
     field_line_present,
     field_severity,
     has_legacy,
     mark_done,
+    mark_done_many,
     next_seq,
     open_ids,
+    parse_declaration,
     parse_ledger,
     parse_legacy,
 )
@@ -485,3 +488,97 @@ def test_field_line_present_matches_field_not_substring():
     assert not field_line_present(body, "origin", "review-budget")
     # a value that only appears incidentally inside `reason:` is not a field line
     assert not field_line_present(body, "source_spec", "spec-foobar.md")
+
+
+# ------------------------------ closes_deferred declaration primitives (#234)
+
+
+def test_parse_declaration_normalizes_items_and_dedupes():
+    """Lenient about items, exactly as the id parser is: an LLM-authored manifest
+    may emit an unquoted id as a string and a bare number as an int."""
+    ids, error = parse_declaration(["DW-1", " DW-2 ", 5, "", "DW-1"])
+    assert ids == ("DW-1", "DW-2", "5")  # stripped, blanks dropped, order-preserving dedupe
+    assert error is None
+
+
+def test_parse_declaration_defaults_empty_when_absent():
+    assert parse_declaration(None) == ((), None)
+    assert parse_declaration([]) == ((), None)
+
+
+def test_parse_declaration_rejects_a_non_list_container():
+    """A string is iterable, so a lenient reading would silently turn one id into
+    a list of characters. Callers pick the severity; the reading is shared."""
+    ids, error = parse_declaration("DW-1")
+    assert ids == ()
+    assert error is not None and "must be a list" in error and "str" in error
+
+
+def test_classify_partitions_open_done_unknown_and_malformed():
+    """Four outcomes, not two: `not open` hides a satisfied declaration (a resume
+    re-driving a landed close, which must stay silent) and an entry whose status
+    line cannot be read at all (which must not)."""
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: a\nstatus: open\n\n"
+        "### DW-2: b\nstatus: done 2026-06-01\n\n"
+        "### DW-3: c\nstatus: in-progress\n\n"
+        "### DW-4: d\nreason: no status line at all\n"
+    )
+    declared = classify(text, ["DW-1", "DW-2", "DW-3", "DW-4", "DW-99"])
+
+    assert declared.open_ids == ("DW-1",)
+    assert declared.already_done == ("DW-2",)
+    assert declared.unknown == ("DW-99",)
+    assert declared.malformed == ("DW-3", "DW-4")
+
+
+def test_mark_done_many_writes_once_and_reports_what_landed(tmp_path):
+    p = tmp_path / "deferred-work.md"
+    p.write_text(LEDGER, encoding="utf-8")
+
+    # DW-2 is already done in the fixture, DW-99 is absent — both skipped, neither
+    # an error: only the entries that were open get marked, in the order given.
+    marked = mark_done_many(
+        p, ["DW-1", "DW-3", "DW-2", "DW-99"], "2026-07-24", "resolved by story 1"
+    )
+
+    assert marked == ["DW-1", "DW-3"]
+    entries = {e.id: e for e in parse_ledger(p.read_text(encoding="utf-8"))}
+    for dw in ("DW-1", "DW-3"):
+        assert entries[dw].status == "done 2026-07-24"
+        assert "resolution: resolved by story 1" in entries[dw].body
+
+
+def test_mark_done_many_is_all_or_nothing_on_a_write_failure(tmp_path, monkeypatch):
+    """A per-id read-modify-write loop leaves earlier marks on disk when it raises
+    partway through — a half-applied closure the caller never gets to journal, so
+    the ledger claims resolutions the run has no record of."""
+    p = tmp_path / "deferred-work.md"
+    p.write_text(LEDGER, encoding="utf-8")
+    before = p.read_bytes()
+    monkeypatch.setattr(
+        "bmad_loop.deferredwork.atomic_replace",
+        lambda tmp, target: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    try:
+        mark_done_many(p, ["DW-1", "DW-3"], "2026-07-24", "note")
+    except OSError:
+        pass
+
+    assert p.read_bytes() == before  # nothing partially applied
+
+
+def test_mark_done_many_skips_an_already_done_entry(tmp_path):
+    """Idempotent for a resume that re-drives a close that already landed: no
+    second resolution line, and the id is not reported as newly marked."""
+    p = tmp_path / "deferred-work.md"
+    p.write_text(LEDGER, encoding="utf-8")
+    mark_done_many(p, ["DW-1"], "2026-07-24", "resolved by story 1")
+
+    again = mark_done_many(p, ["DW-1"], "2026-07-25", "resolved by story 1")
+
+    assert again == []
+    body = next(e for e in parse_ledger(p.read_text(encoding="utf-8")) if e.id == "DW-1").body
+    assert body.count("resolution: resolved by story 1") == 1

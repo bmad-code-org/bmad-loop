@@ -14,7 +14,9 @@ from conftest import (
     install_dev_base_skills,
     machine_json,
     mark_ledger_done,
+    spec_path,
     write_ledger,
+    write_spec,
     write_sprint,
 )
 
@@ -3327,7 +3329,7 @@ def _declare_closes_deferred(project, declared, *, ledger_ids=("DW-1",), manifes
 
 def _closes_deferred_findings(capsys):
     doc = json.loads(capsys.readouterr().out)
-    return [f for f in doc["findings"] if f["check"] == "stories.closes-deferred-unknown"]
+    return [f for f in doc["findings"] if f["check"] == "deferred.closes-unknown"]
 
 
 def test_validate_warns_on_unknown_closes_deferred(project, capsys):
@@ -3343,7 +3345,7 @@ def test_validate_warns_on_unknown_closes_deferred(project, capsys):
     findings = _closes_deferred_findings(capsys)
     assert len(findings) == 1
     assert findings[0]["severity"] == "warning"  # advisory: never blocks a run
-    assert findings[0]["detail"] == {"story": "1", "unknown_ids": ["DW-99"]}
+    assert findings[0]["detail"] == {"source": "story 1", "unknown_ids": ["DW-99"]}
     assert "DW-99" in findings[0]["message"]
 
 
@@ -3374,7 +3376,7 @@ def test_validate_warns_on_unknown_closes_deferred_in_the_manifest(project, caps
     cli.cmd_validate(args)
     findings = _closes_deferred_findings(capsys)
     assert len(findings) == 1
-    assert findings[0]["detail"] == {"story": "1", "unknown_ids": ["DW-99"]}
+    assert findings[0]["detail"] == {"source": "story 1", "unknown_ids": ["DW-99"]}
 
 
 def test_validate_closes_deferred_dedupes_across_both_channels(project, capsys):
@@ -3405,7 +3407,63 @@ def test_validate_closes_deferred_warning_does_not_fail_the_run(project, capsys,
     doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)  # rc 0
     assert doc["ok"] is True
     assert doc["counts"]["problem"] == 0
-    assert [f for f in doc["findings"] if f["check"] == "stories.closes-deferred-unknown"]
+    assert [f for f in doc["findings"] if f["check"] == "deferred.closes-unknown"]
+
+
+def test_validate_warns_on_unknown_closes_deferred_in_sprint_mode(project, capsys):
+    """The check runs in BOTH queue modes (#234 review, finding 6). Sprint mode
+    has no manifest, but `create-story` writes its story specs into the artifacts
+    dir before the run — so a typo there is caught at preflight too, rather than
+    surfacing only as a journal line nobody reads until the retro."""
+    install_bmad_config(project)
+    _write_policy(project.project)  # sprint mode: no [stories] source
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    write_spec(spec_path(project, "1-1-a"), "ready-for-dev", "abc123", closes_deferred=["DW-99"])
+    args = argparse.Namespace(project=str(project.project), spec=None, json=True)
+
+    cli.cmd_validate(args)
+
+    findings = _closes_deferred_findings(capsys)
+    assert len(findings) == 1
+    assert findings[0]["severity"] == "warning"
+    assert findings[0]["detail"] == {"source": "spec spec-1-1-a.md", "unknown_ids": ["DW-99"]}
+
+
+def test_validate_warns_on_a_malformed_closes_deferred_declaration(project, capsys):
+    """`closes_deferred: DW-1` (a scalar, not a list) declares real intent that
+    reads as empty. Silence there was indistinguishable from having no
+    declaration at all, so the same mistake meant nothing in a spec and a hard
+    schema error in stories.yaml — preflight now names it either way."""
+    install_bmad_config(project)
+    _write_policy(project.project)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    write_spec(spec_path(project, "1-1-a"), "ready-for-dev", "abc123", closes_deferred="DW-1")
+    args = argparse.Namespace(project=str(project.project), spec=None, json=True)
+
+    cli.cmd_validate(args)
+
+    doc = json.loads(capsys.readouterr().out)
+    findings = [f for f in doc["findings"] if f["check"] == "deferred.closes-malformed"]
+    assert len(findings) == 1 and findings[0]["severity"] == "warning"
+    assert "must be a list" in findings[0]["detail"]["error"]
+
+
+def test_validate_sprint_mode_silent_without_declarations(project, capsys):
+    """The ordinary sprint project declares nothing: scanning the artifacts dir
+    must add no findings at all."""
+    install_bmad_config(project)
+    _write_policy(project.project)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    write_spec(spec_path(project, "1-1-a"), "ready-for-dev", "abc123")
+    args = argparse.Namespace(project=str(project.project), spec=None, json=True)
+
+    cli.cmd_validate(args)
+
+    doc = json.loads(capsys.readouterr().out)
+    assert [f for f in doc["findings"] if f["check"].startswith("deferred.closes")] == []
 
 
 OPENCODE_QUALIFIED_POLICY = '[adapter]\nname = "opencode"\nmodel = "anthropic/claude-haiku-4-5"\n'

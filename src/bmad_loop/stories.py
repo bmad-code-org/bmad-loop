@@ -28,6 +28,7 @@ from pathlib import Path
 
 import yaml
 
+from . import deferredwork
 from .frontmatter import read_frontmatter, status_of
 
 # Fixed-name discovery, like SPEC.md / .memlog.md — never listed in companions.
@@ -243,28 +244,20 @@ def _text_field(raw: dict, key: str, story_id: str) -> str:
 def _id_list_field(raw: dict, key: str, story_id: str) -> tuple[str, ...]:
     """Optional list of ledger ids, defaulting empty when missing/null (#234).
 
-    Strict about the *container*: a bare ``closes_deferred: DW-1`` is a schema
-    error, not a silently-wrapped single id — the same fail-loud rule
-    :func:`_bool_field` applies, because a string is iterable and a lenient
-    reading would quietly turn one id into a list of characters.
+    The reading itself lives in :func:`deferredwork.parse_declaration`, shared
+    with the engine's close hook and ``validate`` so the same mistake cannot mean
+    different things in the manifest and in a story spec's frontmatter. Only the
+    *severity* differs: a manifest is a schema the parser owns, so a wrong
+    container raises here, where the engine journals and ``validate`` warns.
 
-    Lenient about each *item*, exactly as :func:`_parse_id` is: an LLM-authored
-    manifest may emit an unquoted ``DW-1`` as a string but a bare ``5`` as an
-    int, so items are ``str()``-normalized and stripped. Blanks are dropped and
-    duplicates collapse (order-preserving), since both are noise rather than a
-    contradiction. Whether an id names a real entry is *not* checked here: this
-    module never reads the ledger, and a stale reference is a `validate` warning
-    and a journaled close-time note — never a parse failure.
+    Whether an id names a real entry is not checked here: this module never reads
+    the ledger, and a stale reference is a `validate` warning and a journaled
+    close-time note — never a parse failure.
     """
-    value = raw.get(key)
-    if value is None:
-        return ()
-    if not isinstance(value, list):
-        raise StoriesError(
-            f"stories.yaml story {story_id!r} field {key!r} must be a list of "
-            f"deferred-work ids (got {type(value).__name__})"
-        )
-    return tuple(dict.fromkeys(item for item in (str(x).strip() for x in value) if item))
+    ids, error = deferredwork.parse_declaration(raw.get(key))
+    if error:
+        raise StoriesError(f"stories.yaml story {story_id!r} field {key!r} {error}")
+    return ids
 
 
 def _validate_prefix_free(ids: list[str]) -> None:
