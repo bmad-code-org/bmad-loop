@@ -198,6 +198,30 @@ def test_atomic_write_text_preserves_extended_attributes(tmp_path):
     assert os.getxattr(target, "user.bmad-loop-test") == b"kept"
 
 
+def test_atomic_write_text_fsyncs_before_it_publishes(tmp_path, monkeypatch):
+    """`os.replace` is atomic against concurrent readers, but that says nothing
+    about a machine losing power: closing the temp only hands its bytes to the
+    page cache, so the rename can be durable while the data is not, and the new
+    name comes back pointing at a zero-length file. An empty ledger *parses* — as
+    no entries — so the failure reads as every hand-written entry having vanished
+    rather than as corruption (CodeRabbit, review round 3)."""
+    order = []
+    real_fsync, real_replace = os.fsync, os.replace
+    monkeypatch.setattr(
+        platform_util.os, "fsync", lambda fd: (order.append("fsync"), real_fsync(fd))[1]
+    )
+    monkeypatch.setattr(
+        platform_util.os, "replace", lambda s, d: (order.append("replace"), real_replace(s, d))[1]
+    )
+    target = tmp_path / "ledger.md"
+    target.write_text("before", encoding="utf-8")
+
+    platform_util.atomic_write_text(target, "after")
+
+    assert order == ["fsync", "replace"]  # the sync must precede the publish
+    assert target.read_text(encoding="utf-8") == "after"
+
+
 def test_atomic_write_text_leaves_no_temp_behind(tmp_path):
     target = tmp_path / "ledger.md"
     target.write_text("before", encoding="utf-8")

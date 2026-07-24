@@ -191,7 +191,17 @@ def atomic_write_text(path: Path, text: str) -> None:
     The temp file is uniquely named in the target's own directory: same filesystem
     (``os.replace`` cannot cross one), and no fixed ``.tmp`` sibling for a
     concurrent writer of the same file to collide with. A failure anywhere leaves
-    the original untouched and removes the temp."""
+    the original untouched and removes the temp.
+
+    The contents are **fsynced before the replace publishes them**. Closing a file
+    only hands the data to the page cache, so a machine that loses power just
+    after the rename can come back with the new name pointing at blocks that were
+    never written — a zero-length or torn ledger, which parses as *no entries* and
+    so reads as the whole file's worth of hand-written work having vanished.
+    Ordering the flush before the rename means a crash yields either the old file
+    or the complete new one. The directory itself is deliberately not synced: that
+    would make the *rename* durable, and losing the rename just leaves the old
+    contents in place — stale, never corrupt."""
     target = path.resolve()
     fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=target.name + ".", suffix=".tmp")
     tmp = Path(tmp_name)
@@ -200,6 +210,8 @@ def atomic_write_text(path: Path, text: str) -> None:
         # this replaced, so a ledger's line endings do not change under Windows.
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)
+            fh.flush()  # userspace buffer -> kernel, so there is something to sync
+            os.fsync(fh.fileno())
         if target.exists():
             shutil.copymode(target, tmp)
             _copy_xattrs(target, tmp)
