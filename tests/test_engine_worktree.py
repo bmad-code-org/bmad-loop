@@ -1526,7 +1526,11 @@ def test_worktree_crash_after_merge_retries_the_closure_on_resume(project, tmp_p
         paths,
         [wt_dev_effect(paths, "1-1-a", followup_review=False, closes_deferred=["DW-1"])],
     )
-    engine._flush_pending_deferred_closes = lambda task: (_ for _ in ()).throw(OSError("host died"))
+    # patched at the guarded outer seam, which is where the process would have
+    # died: a *fault* inside the flush is deliberately caught now and no longer
+    # ends the run (see the stories-mode done_checkpoint regression), so raising
+    # from the inner method would model something else entirely.
+    engine._flush_after_integration = lambda task: (_ for _ in ()).throw(OSError("host died"))
 
     summary = engine.run()
 

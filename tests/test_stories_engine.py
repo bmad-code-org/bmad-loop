@@ -839,6 +839,50 @@ def test_story_checkpoint_pause_after_commit(project):
     assert load_state(resumed.run_dir).tasks["2"].phase == Phase.DONE
 
 
+def test_a_failed_integration_flush_cannot_skip_the_done_checkpoint(project, tmp_path, monkeypatch):
+    """The external-ledger flush runs from `integrate_unit`, after the task is
+    terminal. A raise there escaped `run_unit` and the whole story loop, so
+    `_after_story` never fired — a mandatory `done_checkpoint` silently dropped,
+    with the next story free to dispatch — and resume did not repair it either,
+    because `_finish_inflight` skips terminal tasks by design.
+
+    Everything that flush touches (the ledger read and write, the journal append,
+    the state save) lives on the shared mount that is the only reason it runs at
+    all. Trading a human review for a failed annotation is backwards, and the
+    annotation is never a gate anywhere else here (#284 round-6 review, finding 2)."""
+    import dataclasses
+
+    from conftest import write_ledger
+
+    from bmad_loop import deferredwork
+
+    paths = dataclasses.replace(project, implementation_artifacts=tmp_path / "shared-artifacts")
+    paths.implementation_artifacts.mkdir(exist_ok=True)
+    setup_stories(paths, [entry("1", closes_deferred=["DW-1"], done_checkpoint=True), entry("2")])
+    write_ledger(paths, {"DW-1": "open"}, commit=False)  # shared: never committable
+    engine, _ = make_engine(
+        paths,
+        [stories_dev_effect()],
+        policy=_stories_policy(scm=ScmPolicy(isolation="worktree")),
+    )
+
+    def the_mount_goes_away(*a, **kw):
+        raise OSError("shared artifact mount went away")
+
+    monkeypatch.setattr(deferredwork, "mark_done_many", the_mount_goes_away)
+
+    summary = engine.run()
+
+    assert summary.paused and summary.done == 1  # the checkpoint still fired
+    persisted = load_state(engine.run_dir)
+    assert persisted.paused_stage == PAUSE_STORY_CHECKPOINT
+    assert "2" not in persisted.tasks  # no story leapfrogged the human review
+    # owed, not lost: the reconcile pass retries it on the next resume
+    assert persisted.tasks["1"].pending_deferred_closes == ["DW-1"]
+    failed = [e for e in engine.journal.entries() if e["kind"] == "deferred-close-flush-failed"]
+    assert len(failed) == 1 and failed[0]["dw_ids"] == ["DW-1"]
+
+
 def test_story_checkpoint_still_fires_when_manifest_unreadable_after_commit(project):
     """A manifest that goes unreadable between the commit and the after-story
     check makes the done_checkpoint flag unknowable — the conservative default is

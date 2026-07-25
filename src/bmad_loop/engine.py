@@ -281,7 +281,7 @@ class Engine:
             escalation_pause=self._escalation_pause,
             workspace_get=lambda: self.workspace,
             workspace_set=lambda ws: setattr(self, "workspace", ws),
-            on_integrated=lambda t: self._flush_pending_deferred_closes(t),
+            on_integrated=lambda t: self._flush_after_integration(t),
         )
         # Attempt rollback + recovery-ref preservation flow (issue #244 PR 2/2).
         # Same narrow-deps + engine-callbacks pattern as _worktree_flow: `emit` is
@@ -2513,6 +2513,38 @@ class Engine:
                 error="the ledger carries more than one entry for this id; only the first was read",
             )
         return marked
+
+    def _flush_after_integration(self, task: StoryTask) -> None:
+        """The integration chokepoint's flush, which may not raise (#234).
+
+        ``WorktreeFlow.integrate_unit`` calls this after the unit has merged and
+        the task is already terminal, and a raise from here escapes ``run_unit``
+        and the whole story loop — so ``_after_story`` never fires. In stories
+        mode that is the ``done_checkpoint``: a mandatory human review silently
+        skipped, with the next story free to dispatch. Resume does not repair it
+        either, because ``_finish_inflight`` skips terminal tasks by design.
+
+        Everything this flush touches can raise OSError — the ledger read and
+        write, the journal append, the state save — and all of it lives on the
+        out-of-repo mount that is the only reason the flush does anything at all.
+        Trading a checkpoint for a failed annotation is exactly backwards, and the
+        annotation is never a gate anywhere else in this feature: journal the
+        failure, leave ``pending_deferred_closes`` standing for the reconcile pass
+        to retry, and let the story finish (#284 round-6 review, finding 2).
+
+        Only the integration call site is guarded. The in-place flush runs before
+        the DONE advance precisely so a raise there leaves the task COMMITTING for
+        the resume arm to re-drive idempotently; guarding it would discard that."""
+        try:
+            self._flush_pending_deferred_closes(task)
+        except OSError as e:
+            self.journal.append(
+                "deferred-close-flush-failed",
+                story_key=task.story_key,
+                dw_ids=list(task.pending_deferred_closes),
+                error=f"{e.__class__.__name__}: {e}",
+                note="the closure stays owed; the story's own bookkeeping continues",
+            )
 
     def _flush_pending_deferred_closes(self, task: StoryTask) -> None:
         """Apply closures held back for an out-of-repo ledger, once the story's
