@@ -1664,6 +1664,25 @@ def patch_new_files(patch_path: Path) -> set[str]:
     return new_files
 
 
+def stage_path(repo: Path, path: Path) -> bool:
+    """Stage one path so the index matches what is on disk. Returns False when the
+    path is outside `repo` or git refused; never raises.
+
+    For repairing an index a failed commit left behind. `finalize_commit` stages
+    with `add -A` *before* the commit a native hook can still reject, so undoing
+    that commit's bookkeeping in the working tree alone leaves the index holding
+    the version that was rolled back — which an operator who fixes the hook and
+    runs `git commit` by hand would then publish. Advisory by design: this runs on
+    a path that is already escalating a commit failure, and a repair that raises
+    would mask it."""
+    try:
+        rel = str(Path(path).resolve().relative_to(repo.resolve()))
+    except ValueError:
+        return False
+    rc, _ = _git(repo, "add", "--", rel)
+    return rc == 0
+
+
 def commit_paths(repo: Path, message: str, paths: list[Path]) -> str | None:
     """Commit exactly `paths` (and nothing else), leaving any unrelated working
     or staged changes untouched. Unlike commit_story's `add -A`, this is safe to

@@ -2431,10 +2431,16 @@ class Engine:
         rollback, so the false close survives the reset that would otherwise have
         reverted it.
 
-        Only the working tree is restored. The failed ``finalize_commit`` leaves
-        its ``add -A`` staged, but every path that commits again starts with
-        another ``add -A`` (restaging from the tree) and every rollback path goes
-        through ``safe_reset``, so the index is not authoritative here."""
+        The index is restored with the tree. Every path this orchestrator takes to
+        commit again begins with another ``add -A`` (restaging from the tree) and
+        every rollback path goes through ``safe_reset``, so for the loop itself
+        the index is not authoritative — but the failed ``finalize_commit`` left
+        its ``add -A`` staged, and an escalation is precisely where a human takes
+        over. Fixing the rejecting hook and running ``git commit`` by hand would
+        otherwise publish the false ``done`` this restore exists to remove
+        (#284 round-6 review, finding 3). Advisory: a refused re-stage is
+        journaled, never raised, because it must not mask the commit failure being
+        escalated."""
         if snapshot is None:
             return
         ledger, before, marked = snapshot
@@ -2449,6 +2455,13 @@ class Engine:
                 error=str(e),
             )
             return
+        if not verify.stage_path(self.workspace.root, ledger):
+            self.journal.append(
+                "deferred-close-rollback-unstaged",
+                story_key=task.story_key,
+                ledger=str(ledger),
+                note="the working tree is restored; the index still holds the rolled-back close",
+            )
         self.journal.append(
             "deferred-close-rolled-back",
             story_key=task.story_key,

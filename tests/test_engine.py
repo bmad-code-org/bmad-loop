@@ -2245,6 +2245,27 @@ def test_closes_deferred_rolls_back_when_the_commit_fails(project):
     assert kinds.index("story-deferred-closed") < kinds.index("deferred-close-rolled-back")
 
 
+def test_closes_deferred_rollback_restores_the_index_too(project):
+    """`finalize_commit` stages with `add -A` before the hook can reject, so
+    restoring only the working tree left the INDEX holding `status: done`. The
+    loop itself never reads it back — every re-commit re-adds and every rollback
+    goes through `safe_reset` — but an escalation is exactly where a human takes
+    over, and fixing the hook then running `git commit` by hand would publish the
+    close the rollback removed (#284 round-6 review, finding 3)."""
+    engine = _closes_deferred_run(project, ["DW-1"])
+    _reject_commits(project)
+
+    engine.run()
+
+    # neither view of the repo carries the annotation the commit never took
+    assert "status: done" not in git(project.project, "diff", "--", str(project.deferred_work))
+    staged = git(project.project, "diff", "--cached", "--", str(project.deferred_work))
+    assert "status: done" not in staged
+    assert "deferred-close-rollback-unstaged" not in [
+        e["kind"] for e in engine.journal.entries()
+    ]
+
+
 def test_closes_deferred_lands_once_when_a_failed_commit_is_re_driven(project):
     """The rollback must leave the story re-drivable: once the hook is gone, the
     resumed commit phase re-applies the close exactly once (no doubled
