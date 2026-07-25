@@ -2506,6 +2506,127 @@ def test_closes_deferred_external_ledger_unavailable_keeps_the_obligation(projec
     assert load_state(engine.run_dir).tasks["1-1-a"].pending_deferred_closes == []
 
 
+@pytest.mark.parametrize(
+    "ledger_bytes, label",
+    [(b"\xff\xfe not utf-8\n", "undecodable"), (None, "unreadable")],
+    ids=["undecodable", "unreadable"],
+)
+def test_closes_deferred_external_ledger_that_cannot_be_read_stays_owed(
+    project, tmp_path, monkeypatch, ledger_bytes, label
+):
+    """A ledger that is THERE but cannot be turned into text is an outage, not an
+    empty ledger — and emphatically not a crash.
+
+    Two shapes, one answer. Undecodable bytes raise `UnicodeDecodeError`, which is
+    a `ValueError` and so slipped past every `except OSError` on this path; an
+    unreadable file raises `PermissionError` from inside the close, where the
+    read used to live. Reading either as empty text would classify every declared
+    id `unknown` and discharge the obligation with a typo warning — and an empty
+    ledger PARSES, so there is nothing to make that look wrong
+    (#284 round-7 review, findings 2 and 6)."""
+    paths = _external_ledger_paths(project, tmp_path)
+    write_sprint(paths, {"1-1-a": "ready-for-dev"})
+    write_ledger(paths, {"DW-1": "open"}, commit=False)
+    if ledger_bytes is not None:
+        paths.deferred_work.write_bytes(ledger_bytes)
+    else:
+        real_read = Path.read_text
+        target = paths.deferred_work
+
+        def denied(self, *a, **kw):
+            if self == target:
+                raise PermissionError(13, "Permission denied")
+            return real_read(self, *a, **kw)
+
+        monkeypatch.setattr(Path, "read_text", denied)
+    engine, _ = make_engine(
+        paths,
+        [dev_effect(paths, "1-1-a", followup_review=False, closes_deferred=["DW-1"])],
+    )
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.crashed  # never a gate, never a crash
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "deferred-close-ledger-unavailable" in kinds
+    assert "deferred-close-unmatched" not in kinds  # an outage is not a typo
+    assert "story-deferred-closed" not in kinds
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("shape", ["dangling", "looping"])
+def test_closes_deferred_in_repo_broken_ledger_link_is_an_outage_not_a_typo(project, shape):
+    """The in-repo half of the round-6 dangling-symlink fix, which only ever
+    covered the external path.
+
+    An in-repo link pointing at a mount that went away read as an empty ledger, so
+    every declared id came back `unknown` and the story reported a typo for an
+    outage. A looping link was worse: `resolve()` raises RuntimeError on Python
+    3.11/3.12 — the requires-python floor — and that rose through the commit
+    boundary (#284 round-7 review, finding 6).
+
+    Both shapes reach the same answer on every interpreter, by different routes:
+    the loop is refused at the containment check on 3.11/3.12 and at the read on
+    3.13+, where `resolve()` returns the unresolved path instead of raising."""
+    engine = _closes_deferred_run(project, ["DW-1"])
+    ledger = project.deferred_work
+    ledger.unlink()
+    if shape == "dangling":
+        ledger.symlink_to(project.project / "gone-mount" / "deferred-work.md")
+    else:
+        other = project.project / "ledger-loop"
+        ledger.symlink_to(other)
+        other.symlink_to(ledger)
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.crashed  # the story still lands
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "deferred-close-ledger-unavailable" in kinds
+    assert "deferred-close-unmatched" not in kinds
+    assert "story-deferred-closed" not in kinds
+
+
+def test_closes_deferred_survives_a_ledger_path_it_cannot_resolve(project, monkeypatch):
+    """The containment check resolves both paths, and `resolve()` is not total —
+    RuntimeError on a symlink loop, OSError on an unreadable component. Injected
+    rather than built from a real loop because the real trigger only raises on
+    Python 3.11/3.12, so the platform decides whether the guard is exercised at
+    all; here every interpreter runs it.
+
+    Unresolvable takes the safe side of the guard it broke — not provably in the
+    repo — so the ids are parked and retried instead of crashing the commit."""
+    engine = _closes_deferred_run(project, ["DW-1"])
+    finalize = engine._finalize_commit_phase
+    real_resolve = Path.resolve
+    ledger = project.deferred_work
+    faulting: list[int] = []
+
+    def resolve_fails(self, *a, **kw):
+        # only the ledger: `finalize_commit` and the worktree machinery resolve
+        # paths of their own, and faulting those would prove something else
+        if faulting and self == ledger:
+            raise RuntimeError("Symlink loop")
+        return real_resolve(self, *a, **kw)
+
+    def commit_with_an_unresolvable_ledger(task):
+        faulting.append(1)
+        try:
+            return finalize(task)
+        finally:
+            faulting.clear()
+
+    monkeypatch.setattr(Path, "resolve", resolve_fails)
+    monkeypatch.setattr(engine, "_finalize_commit_phase", commit_with_an_unresolvable_ledger)
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.crashed
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "deferred-close-ledger-unavailable" in kinds
+    assert "story-deferred-closed" not in kinds
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
 def test_closes_deferred_owes_nothing_a_finished_run_can_no_longer_pay(project, tmp_path):
     """The other end of that promise. `resume` refuses a finished run, so an

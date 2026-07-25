@@ -2452,7 +2452,27 @@ class Engine:
         # merge that never lands leaves shared work marked done with nothing left
         # to roll it back. Only the last path component can differ: ProjectPaths
         # resolves the artifact dir at construction and again in `rebased`.
-        if not ledger.resolve().is_relative_to(self.workspace.root.resolve()):
+        try:
+            in_repo = ledger.resolve().is_relative_to(self.workspace.root.resolve())
+        except (OSError, RuntimeError):
+            # A symlink loop (`resolve()` raises RuntimeError for one under Python
+            # 3.11/3.12, the requires-python floor) or an unreadable path
+            # component. Nothing can be decided about where this ledger lives, and
+            # both answers are wrong to guess: writing it here could flip a shared
+            # external ledger no commit will carry, while parking it would write an
+            # IN-repo ledger after the commit and leave the tree dirty for story
+            # N+1's step-01 to halt on. So close nothing and say so — the entries
+            # stay open for a sweep, which is what an unreadable ledger location
+            # honestly amounts to (#284 round-7 review, finding 6).
+            self.journal.append(
+                "deferred-close-ledger-unavailable",
+                story_key=task.story_key,
+                dw_ids=list(ids),
+                ledger=str(ledger),
+                note="the ledger path could not be resolved; nothing was closed",
+            )
+            return None
+        if not in_repo:
             task.pending_deferred_closes = list(ids)
             self.journal.append(
                 "deferred-close-pending-integration",
@@ -2461,13 +2481,26 @@ class Engine:
                 ledger=str(ledger),
             )
             return None
-        before = ledger.read_text(encoding="utf-8") if ledger.is_file() else None
+        available, before = self._read_ledger(ledger)
+        if not available:
+            # In repo and yet not readable — a dangling or looping link, a
+            # permission fault. There is no park to fall back on here (an in-repo
+            # annotation exists to ride this commit), so say so and close nothing
+            # rather than read the outage as "no such entries".
+            self.journal.append(
+                "deferred-close-ledger-unavailable",
+                story_key=task.story_key,
+                dw_ids=list(ids),
+                ledger=str(ledger),
+                note="the in-repo ledger could not be read; nothing was closed",
+            )
+            return None
         if rollback is not None and before is not None:
             # Armed here, not on the way out. Restoring text nothing changed is a
             # no-op rewrite, so arming early costs an over-broad window nothing,
             # while arming late would miss the whole publication window.
             rollback.append((ledger, before, []))
-        marked = self._apply_deferred_closes(task, ids, ledger, rollback)
+        marked = self._apply_deferred_closes(task, ids, ledger, before or "", rollback)
         snapshot = (ledger, before, marked) if marked and before is not None else None
         if rollback is not None:
             # `mark_done_many` writes only when it marks, so an empty close left
@@ -2572,15 +2605,66 @@ class Engine:
             ledger=str(ledger),
         )
 
+    def _read_ledger(self, ledger: Path) -> tuple[bool, str | None]:
+        """The one place that decides whether a ledger location is answering.
+
+        Returns ``(available, text)``. ``available`` False means the location said
+        nothing — the artifact directory is gone, the link dangles, a component is
+        unreadable, the bytes are not decodable — and a caller holding an
+        obligation must keep it. ``(True, None)`` is a live location with no ledger
+        in it, which genuinely has nothing to close and discharges. ``(True, text)``
+        is the ledger.
+
+        Collapsing the probe and the read into one function is the point. They used
+        to sit in different methods — the availability test in
+        ``_flush_pending_deferred_closes``, the read in ``_apply_deferred_closes``
+        — each stat'ing the path again, so a mount that dropped between them passed
+        the test, read as empty text, classified every declared id as ``unknown``
+        and cleared the obligation with an ``unmatched`` line blaming a typo for an
+        outage (#284 round-7 review, finding 6). Here any fault raised by any step
+        lands in the same handler and answers "unavailable", which is the truthful
+        reading and the retryable one.
+
+        A ledger that is present but not decodable is unavailable too, not empty:
+        an empty ledger PARSES, so reading it as text would say every hand-written
+        entry had vanished.
+
+        Note the ORDER. The read is attempted first and the location is probed only
+        when it comes back absent, so "there is nothing to close" is never
+        concluded from a probe that succeeded a moment before the read — the very
+        ordering that made the race. Anything that drops in between now falls out
+        as unavailable, which is the retryable answer and the safe direction."""
+        try:
+            return True, ledger.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            pass  # nothing at that path — but why is decided below
+        except (OSError, UnicodeDecodeError, RuntimeError):
+            return False, None
+        try:
+            # A live artifact directory with no ledger in it has genuinely nothing
+            # to close. A directory that is gone, or a link left pointing at a
+            # mount that is, is an outage — and the link existing at all is the
+            # evidence a ledger is expected there.
+            present = ledger.parent.is_dir() and not ledger.is_symlink()
+        except OSError:
+            return False, None
+        return (True, None) if present else (False, None)
+
     def _apply_deferred_closes(
         self,
         task: StoryTask,
         ids: Sequence[str],
         ledger: Path,
+        text: str,
         rollback: list[tuple[Path, str, list[str]]] | None = None,
     ) -> list[str]:
         """Write the closure for `ids`, journal exactly what landed, and return
         the ids actually flipped.
+
+        ``text`` is the ledger snapshot the caller already read, never re-read
+        here: classification and the write have to describe the same document, and
+        a second read is a second chance for the location to have gone away
+        underneath them.
 
         ``rollback`` is the caller's already-armed restore slot (see
         ``_close_declared_deferred``); the ids are written into it the moment they
@@ -2588,7 +2672,6 @@ class Engine:
         first thing here that can raise. Refining it costs a line and buys the
         operator a rolled-back record that names entries instead of an empty
         list."""
-        text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
         declared = deferredwork.classify(text, ids)
         marked = deferredwork.mark_done_many(
             ledger, declared.open_ids, self._today(), f"resolved by story {task.story_key}"
@@ -2669,13 +2752,12 @@ class Engine:
         emptied list: the obligation is destroyed by the very failure that made it
         worth retrying.
 
-        **An unavailable location is not an answer about the entries.** A read
-        that raises keeps the obligation by unwinding, but an absent file does
-        not raise: ``_apply_deferred_closes`` reads a missing ledger as empty
-        text, every id classifies as unknown, and the ids were then cleared on
-        the strength of a ledger nobody could see. That is a real risk here and
-        only here — this path exists *because* the ledger is out of the repo, so
-        it can live on a mount that is temporarily gone. The artifact directory
+        **An unavailable location is not an answer about the entries.** An absent
+        file does not raise: it reads as empty text, every id classifies as
+        unknown, and the ids were then cleared on the strength of a ledger nobody
+        could see. That is a real risk here and only here — this path exists
+        *because* the ledger is out of the repo, so it can live on a mount that is
+        temporarily gone. The artifact directory
         is what distinguishes the two: gone means the location is unavailable and
         the obligation is retryable; present-but-no-ledger means there is
         genuinely nothing to close, which is the same answer the in-repo path
@@ -2688,12 +2770,19 @@ class Engine:
         and says no, so every id classified as unknown and the obligation was
         discharged with an ``unmatched`` line blaming a typo for an outage. The
         link existing at all is the evidence a ledger is expected there
-        (#284 round-6 review, finding 1)."""
+        (#284 round-6 review, finding 1).
+
+        Availability and content come from ONE ``_read_ledger`` call. Probing here
+        and reading again inside ``_apply_deferred_closes`` left a window for the
+        mount to drop in between: the probe passed, the read saw nothing, and the
+        obligation was discharged against a ledger that was no longer there
+        (#284 round-7 review, finding 6)."""
         ids = tuple(task.pending_deferred_closes)
         if not ids:
             return
         ledger = self.workspace.paths.deferred_work
-        if not ledger.parent.is_dir() or (ledger.is_symlink() and not ledger.exists()):
+        available, text = self._read_ledger(ledger)
+        if not available:
             self.journal.append(
                 "deferred-close-ledger-unavailable",
                 story_key=task.story_key,
@@ -2712,7 +2801,7 @@ class Engine:
             ledger=str(ledger),
             note="ledger is outside the repo; the annotation is not part of any commit",
         )
-        self._apply_deferred_closes(task, ids, ledger)
+        self._apply_deferred_closes(task, ids, ledger, text or "")
         task.pending_deferred_closes = []
         self._save()
 
