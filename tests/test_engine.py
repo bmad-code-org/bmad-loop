@@ -2497,6 +2497,45 @@ def test_closes_deferred_uses_the_verified_capture_when_the_commit_read_faults(
     assert engine.state.tasks["1-1-a"].declared_deferred == ["DW-1"]
 
 
+def test_closes_deferred_keeps_the_capture_when_the_final_spec_is_unparseable(project):
+    """The same fallback, reached through the real read rather than a patched one.
+
+    `read_frontmatter` flattens invalid YAML and non-UTF-8 to `{}`, so the close
+    site saw a spec that *parsed* and declared nothing — a retraction — and
+    cleared the verified capture for the one fault class the capture exists to
+    survive. Unreadable content is now unreadable, not empty
+    (#284 round-6 review, finding 5)."""
+    engine = _closes_deferred_run(project, ["DW-1"])
+    finalize = engine._finalize_commit_phase
+    sp = spec_path(project, "1-1-a")
+
+    def corrupt_the_spec_then_finalize(task):
+        # an unterminated flow sequence: real YAML the loader rejects, of exactly
+        # the shape a mid-run frontmatter rewrite can leave behind
+        sp.write_text(
+            "---\ntitle: t\nstatus: done\ncloses_deferred: [DW-1\n---\n\nbody\n", encoding="utf-8"
+        )
+        return finalize(task)
+
+    engine._finalize_commit_phase = corrupt_the_spec_then_finalize
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    assert not _ledger_entries(project)["DW-1"].open  # closed against the verified capture
+    assert engine.state.tasks["1-1-a"].declared_deferred == ["DW-1"]  # capture NOT retracted
+    read_failed = [
+        e
+        for e in engine.journal.entries()
+        if e["kind"] == "spec-read-failed" and e["site"] == "deferred-close-commit-boundary"
+    ]
+    assert len(read_failed) == 1 and "not parseable" in read_failed[0]["error"]
+    fell_back = [
+        e for e in engine.journal.entries() if e["kind"] == "deferred-close-declaration-unreadable"
+    ]
+    assert len(fell_back) == 1 and "last good capture" in fell_back[0]["note"]
+
+
 def test_closes_deferred_reports_an_unreadable_declaration(project, monkeypatch):
     """A commit-boundary read that faults with nothing captured to fall back on —
     a state file written before the capture existed — is the one place a fault can

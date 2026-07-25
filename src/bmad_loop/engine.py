@@ -1856,7 +1856,9 @@ class Engine:
     def _today(self) -> str:
         return time.strftime("%Y-%m-%d")
 
-    def _observed_frontmatter(self, spec_path: Path, story_key: str, site: str) -> dict | None:
+    def _observed_frontmatter(
+        self, spec_path: Path, story_key: str, site: str, *, strict: bool = False
+    ) -> dict | None:
         """Read a spec's frontmatter on a *bookkeeping* path, degrading an
         unreadable spec to ``None`` (journaled) instead of a whole-run crash.
 
@@ -1874,12 +1876,34 @@ class Engine:
         opposite and let OSError raise: silently skipping a rewrite would leave the
         spec in a state the caller believes it fixed. Observation degrades, repair
         raises.
+
+        ``strict`` extends the same degrade-to-None to a spec whose *content* is
+        unreadable — invalid YAML, non-UTF-8 — which ``read_frontmatter``
+        otherwise flattens to ``{}``. Every status gate wants that flattening (an
+        unparseable spec reads as status "" and retries or repairs), so it stays
+        the default. The deferred-work close needs the opposite: there ``{}`` says
+        the story declares nothing, which is a retraction, and reading an
+        unparseable spec as one destroyed the verified capture that exists to
+        survive precisely this (#284 round-6 review, finding 5).
         """
         try:
-            return verify.read_frontmatter(spec_path)
+            fm = (
+                verify.read_frontmatter_or_none(spec_path)
+                if strict
+                else verify.read_frontmatter(spec_path)
+            )
         except OSError as e:
             self._journal_spec_read_failed(spec_path, story_key, site, e)
             return None
+        if fm is None:  # strict only: present but unparseable
+            self.journal.append(
+                "spec-read-failed",
+                story_key=story_key,
+                spec=str(spec_path),
+                site=site,
+                error="frontmatter is not parseable (invalid YAML or non-UTF-8)",
+            )
+        return fm
 
     def _journal_spec_read_failed(
         self, spec_path: Path, story_key: str, site: str, e: OSError
@@ -2169,6 +2193,13 @@ class Engine:
         faults; that arm finishes a commit WITHOUT re-verifying, so a persisted
         declaration is its only other source.
 
+        The read is therefore ``strict``: unreadable here means the *content* too,
+        not only an OSError. ``read_frontmatter`` flattens invalid YAML and
+        non-UTF-8 to ``{}``, which every status gate wants and which this one site
+        must not have — ``{}`` is a spec declaring nothing, so the flattening
+        turned a spec nobody could parse into a retraction and cleared the very
+        capture it should have fallen back to (#284 round-6 review, finding 5).
+
         The path is a verified one — ``task.spec_file`` is recorded only by a
         passing ``verify_dev``/``verify_dev_stories`` gate, and stories mode
         resolves it by id rather than trusting the session's claim. Sprint mode's
@@ -2222,7 +2253,9 @@ class Engine:
             )
             task.declared_deferred = []
             return True
-        fm = self._observed_frontmatter(spec_path, task.story_key, f"deferred-close-{site}")
+        fm = self._observed_frontmatter(
+            spec_path, task.story_key, f"deferred-close-{site}", strict=True
+        )
         if fm is None:
             return False
         declared, error = deferredwork.parse_declaration(fm.get("closes_deferred"))

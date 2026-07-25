@@ -38,26 +38,44 @@ def _split_frontmatter(text: str) -> tuple[str, str, str] | None:
     return None
 
 
-def read_frontmatter(path: Path) -> dict[str, Any]:
+def read_frontmatter_or_none(path: Path) -> dict[str, Any] | None:
+    """Like :func:`read_frontmatter`, but distinguishes *unreadable* from *absent*:
+    ``None`` when the content exists and could not be parsed, ``{}`` when there is
+    genuinely no frontmatter (or no file) to read.
+
+    Every status gate wants the flattening — a spec that cannot be parsed reads as
+    status ``""`` and retries or repairs — so :func:`read_frontmatter` keeps it.
+    One caller needs the difference: the deferred-work close reads a declaration
+    it will otherwise fall back to a verified capture for, and ``{}`` there says
+    "this spec declares nothing", which is a *retraction*. Collapsing an
+    unparseable spec into that retraction destroyed the fallback for exactly the
+    fault class it exists to survive (#284 round-6 review, finding 5)."""
     if not path.is_file():
         return {}
     try:
         text = path.read_text(encoding="utf-8")
     except UnicodeDecodeError:
-        # A non-UTF-8 file carries no readable frontmatter — degrade exactly like
-        # unparseable YAML below. Every status gate then reads status "" and
-        # returns a clean retry/repair outcome instead of crashing mid-verify
-        # (UnicodeDecodeError is a ValueError, so it slipped past callers'
-        # except-OSError guards).
-        return {}
+        # A non-UTF-8 file carries no readable frontmatter (UnicodeDecodeError is
+        # a ValueError, so it slips past callers' except-OSError guards).
+        return None
     split = _split_frontmatter(text)
     if split is None:
-        return {}
+        return {}  # no frontmatter block is an answer, not a failure to read one
     try:
         doc = yaml.safe_load(split[1])
     except yaml.YAMLError:
-        return {}
+        return None
     return doc if isinstance(doc, dict) else {}
+
+
+def read_frontmatter(path: Path) -> dict[str, Any]:
+    """A spec's frontmatter as a dict, with anything unreadable flattened to ``{}``.
+
+    Every status gate then reads status "" and returns a clean retry/repair
+    outcome instead of crashing mid-verify. A caller that must tell an unparseable
+    spec from one carrying no such field wants
+    :func:`read_frontmatter_or_none` instead."""
+    return read_frontmatter_or_none(path) or {}
 
 
 def status_of(fm: dict[str, Any]) -> str:
