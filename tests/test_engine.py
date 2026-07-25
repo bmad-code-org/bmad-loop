@@ -91,6 +91,10 @@ def make_engine(project, script, policy=None, **kwargs) -> tuple[Engine, MockAda
 
 def resume_engine(project, engine, script, policy=None) -> tuple[Engine, MockAdapter]:
     state = load_state(engine.run_dir)
+    # `cli._resume_paused_run` refuses a finished run outright. Without the same
+    # refusal here a test can "resume" what the CLI never would, and prove a
+    # recovery path that does not exist (#284 round-6 review, finding 1).
+    assert not state.finished, "cli._resume_paused_run refuses a finished run"
     state.clear_pause()
     adapter = MockAdapter(script)
     new_engine = Engine(
@@ -2423,7 +2427,10 @@ def test_closes_deferred_external_ledger_unavailable_keeps_the_obligation(projec
     That risk is specific to this path — it exists *because* the ledger is out of
     the repo, so it can sit on a mount that is temporarily gone. The artifact
     directory tells the two apart: gone is an unavailable location, not an answer
-    about the entries (#284 round-5 review, finding 4)."""
+    about the entries (#284 round-5 review, finding 4).
+
+    Kept, and then paid: the run-end pass retries what the outage held back, so a
+    mount that comes back within the run still closes the entry."""
     paths = _external_ledger_paths(project, tmp_path)
     write_sprint(paths, {"1-1-a": "ready-for-dev"})
     write_ledger(paths, {"DW-1": "open"}, commit=False)
@@ -2434,8 +2441,12 @@ def test_closes_deferred_external_ledger_unavailable_keeps_the_obligation(projec
     external = paths.implementation_artifacts
     unmounted = tmp_path / "unmounted"
     real_flush = engine._flush_pending_deferred_closes
+    attempts: list[int] = []
 
     def flush_with_the_mount_away(task):
+        attempts.append(1)
+        if len(attempts) > 1:
+            return real_flush(task)  # the mount is back for the run-end retry
         external.rename(unmounted)  # the shape of a shared mount dropping out
         try:
             return real_flush(task)
@@ -2447,26 +2458,52 @@ def test_closes_deferred_external_ledger_unavailable_keeps_the_obligation(projec
     summary = engine.run()
 
     assert summary.done == 1
-    entries = {
-        e.id: e for e in deferredwork.parse_ledger(paths.deferred_work.read_text(encoding="utf-8"))
-    }
-    assert entries["DW-1"].open  # nothing was written against an invisible ledger
     kinds = [e["kind"] for e in engine.journal.entries()]
     assert "deferred-close-ledger-unavailable" in kinds
-    assert "story-deferred-closed" not in kinds
-    # owed, not discharged — and the id is not silently reported as a typo
+    # the id is not reported as a typo against a ledger nobody could see
     assert "deferred-close-unmatched" not in kinds
-    assert load_state(engine.run_dir).tasks["1-1-a"].pending_deferred_closes == ["DW-1"]
-
-    # the mount is back: the reconcile pass a later run makes finishes the job
-    engine._flush_pending_deferred_closes = real_flush
-    engine._reconcile_pending_deferred_closes()
-
+    # the mount came back, so the run-end pass finished the job it kept owed
     entries = {
         e.id: e for e in deferredwork.parse_ledger(paths.deferred_work.read_text(encoding="utf-8"))
     }
     assert not entries["DW-1"].open
-    assert engine.state.tasks["1-1-a"].pending_deferred_closes == []
+    assert kinds.index("deferred-close-ledger-unavailable") < kinds.index("story-deferred-closed")
+    assert load_state(engine.run_dir).tasks["1-1-a"].pending_deferred_closes == []
+
+
+def test_closes_deferred_owes_nothing_a_finished_run_can_no_longer_pay(project, tmp_path):
+    """The other end of that promise. `resume` refuses a finished run, so an
+    obligation carried past the end of a run that completed promises a retry
+    nothing can reach — the regression that missed this asserted the pending list
+    and then called the reconcile pass directly, which the CLI never would.
+
+    A dangling ledger symlink is the second shape of the same outage: the artifact
+    dir is present, so the directory test passed, `is_file()` followed the link and
+    said no, and every id was discharged as `unmatched` — a typo warning for a
+    mount that went away (#284 round-6 review, finding 1)."""
+    paths = _external_ledger_paths(project, tmp_path)
+    write_sprint(paths, {"1-1-a": "ready-for-dev"})
+    # the ledger is a link onto a mount that is not there; the link existing at all
+    # is the evidence a ledger is expected
+    paths.deferred_work.symlink_to(tmp_path / "gone-mount" / "deferred-work.md")
+    engine, _ = make_engine(
+        paths,
+        [dev_effect(paths, "1-1-a", followup_review=False, closes_deferred=["DW-1"])],
+    )
+
+    summary = engine.run()
+
+    assert summary.done == 1  # never a gate: the story still lands
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "deferred-close-ledger-unavailable" in kinds
+    assert "deferred-close-unmatched" not in kinds  # not a typo — an outage
+    assert "story-deferred-closed" not in kinds
+    abandoned = [e for e in engine.journal.entries() if e["kind"] == "deferred-close-abandoned"]
+    assert len(abandoned) == 1 and abandoned[0]["dw_ids"] == ["DW-1"]
+    assert "sweep" in abandoned[0]["reason"]  # says what will re-verify the open entry
+    persisted = load_state(engine.run_dir)
+    assert persisted.finished  # ...which is exactly why the obligation is not kept
+    assert persisted.tasks["1-1-a"].pending_deferred_closes == []
 
 
 def test_closes_deferred_external_ledger_absent_from_a_live_dir_still_discharges(project, tmp_path):

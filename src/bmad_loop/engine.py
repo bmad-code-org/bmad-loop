@@ -366,6 +366,11 @@ class Engine:
                 self._ensure_target_branch()
                 self._prune_preserve_refs()
                 self._loop()
+                # Last chance to settle an external-ledger closure held back by an
+                # unavailable location: past the line below the run is finished,
+                # and `resume` refuses a finished run, so a retained obligation
+                # would promise a retry nothing can reach (#234).
+                self._reconcile_pending_deferred_closes(final=True)
                 self.state.finished = True
                 self._gc_run_worktrees()
                 self._emit("post_run")
@@ -776,7 +781,7 @@ class Engine:
             task, baseline, preserve_failed=preserve_failed
         )
 
-    def _reconcile_pending_deferred_closes(self) -> None:
+    def _reconcile_pending_deferred_closes(self, *, final: bool = False) -> None:
         """Finish external-ledger closures a previous process left parked (#234).
 
         These sit outside the phase machine the rest of `_finish_inflight` walks:
@@ -798,21 +803,45 @@ class Engine:
         names for the operator), where recording the intent before the merge would
         instead close entries for a merge that never happened. Proving it from the
         target branch is not available as a tiebreaker either — `squash` rewrites
-        the commit, so the unit's sha is not on the target under every strategy."""
+        the commit, so the unit's sha is not on the target under every strategy.
+
+        ``final`` is the run's last pass, immediately before it is marked finished.
+        An obligation is only worth retaining while some later process can act on
+        it, and ``resume`` refuses a finished run — so one carried past this point
+        promises a retry that can never be reached. Anything still owed here is
+        reported and released: the entries stay ``open``, which is the truthful
+        reading and the one a sweep re-verifies against the codebase. Deliberately
+        NOT a reason to hold the run open — an annotation is never a gate in this
+        feature, and a mount that stays gone would make the run unfinishable
+        (#284 round-6 review, finding 1)."""
         for task in list(self.state.tasks.values()):
             if not task.pending_deferred_closes:
                 continue
             if task.phase != Phase.DONE:
                 continue  # still re-drivable; the commit phase applies it
-            if task.unit_merged or not self._isolated:
-                self._flush_pending_deferred_closes(task)
-            else:
+            if not (task.unit_merged or not self._isolated):
                 self.journal.append(
                     "deferred-close-abandoned",
                     story_key=task.story_key,
                     dw_ids=list(task.pending_deferred_closes),
                     reason="story is done but its unit never merged; entries stay open",
                 )
+                continue
+            self._flush_pending_deferred_closes(task)
+            if final and task.pending_deferred_closes:
+                # the flush kept it: the location was unavailable, and this run
+                # has no later pass — nor any resume — left to try again in.
+                self.journal.append(
+                    "deferred-close-abandoned",
+                    story_key=task.story_key,
+                    dw_ids=list(task.pending_deferred_closes),
+                    reason=(
+                        "the ledger location was still unavailable at run end; the entries "
+                        "stay open for a sweep to re-verify"
+                    ),
+                )
+                task.pending_deferred_closes = []
+                self._save()
 
     def _finish_inflight(self) -> None:
         """Complete or roll back tasks interrupted by a pause or crash."""
@@ -2583,18 +2612,29 @@ class Engine:
         the obligation is retryable; present-but-no-ledger means there is
         genuinely nothing to close, which is the same answer the in-repo path
         gives and stays a discharge rather than an obligation nothing could ever
-        satisfy (#284 round-5 review, finding 4)."""
+        satisfy (#284 round-5 review, finding 4).
+
+        A **dangling symlink** is the same outage wearing the other shape: the
+        artifact dir is present, so the directory test passes, but the ledger the
+        link names is on the mount that went away. ``is_file()`` follows the link
+        and says no, so every id classified as unknown and the obligation was
+        discharged with an ``unmatched`` line blaming a typo for an outage. The
+        link existing at all is the evidence a ledger is expected there
+        (#284 round-6 review, finding 1)."""
         ids = tuple(task.pending_deferred_closes)
         if not ids:
             return
         ledger = self.workspace.paths.deferred_work
-        if not ledger.parent.is_dir():
+        if not ledger.parent.is_dir() or (ledger.is_symlink() and not ledger.exists()):
             self.journal.append(
                 "deferred-close-ledger-unavailable",
                 story_key=task.story_key,
                 dw_ids=list(ids),
                 ledger=str(ledger),
-                note="the artifact directory is not present; the closure stays owed and is retried",
+                note=(
+                    "the ledger location is not present; the closure stays owed and is retried "
+                    "while the run is resumable"
+                ),
             )
             return
         self.journal.append(
