@@ -99,8 +99,12 @@ The rules that keep this safe:
   artifacts dir is configured outside it, the file is shared between worktrees
   and no commit can carry it; the closure is then held until the work is durably
   landed — after the commit in place, after the branch has merged under worktree
-  isolation — and retried on the next resume if that write did not get to
-  happen.
+  isolation. A write that could not happen — the location is on a mount that is
+  gone — is retried once more before the run ends, and on the next resume while
+  the run is still resumable. A run that *finishes* with the location still
+  unavailable leaves those entries `open` and says so
+  (`deferred-close-abandoned`); a sweep re-verifies them against the codebase.
+  The closure never holds a completed run open.
 - **Idempotent.** An id already `done` is left untouched, so a resumed run
   re-driving the same close neither doubles the `resolution:` line nor warns.
 - **Never a gate.** An id that matches no entry, an entry whose `status:` reads
