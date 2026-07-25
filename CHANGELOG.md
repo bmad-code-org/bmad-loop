@@ -9,6 +9,30 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- **`adapter.show_attached_ui` viewer capability.** When
+  `policy.toml` sets `show_attached_ui = true` in `[adapter]`, the opencode-http
+  adapter creates a detached tmux viewer window alongside the headless `opencode
+  serve` process. The viewer runs `opencode attach <server-url> --dir <cwd>
+  --session <session-id>` so the operator can watch the live session in the
+  dashboard Log tab, attach from the TUI (`a` / `Ctrl-A`), or use `bmad-loop
+  attach`. Key behaviors:
+  - HTTP/SSE remains authoritative; the viewer is a read-only observation path.
+  - The dashboard Log tab renders the viewer pane through the same pyte-based
+    terminal-emulator rendering (no headless server log).
+  - `bmad-loop attach` and the TUI `a` action prefer the viewer window when one
+    exists.
+  - Teardown order: stop viewer → abort server session → kill `opencode serve`.
+  - Viewer creation is idempotent: retries, interrupted runs, and resume never
+    create duplicate windows.
+  - Missing `opencode` binary or unavailable multiplexer degrades to headless
+    operation (no crash) — and says why in `<run_dir>/viewer-error.log` plus a
+    `viewer-create-failed` journal event.
+  - The viewer runs inside a parked window: if `opencode attach` dies mid-run its
+    final screen and exit banner stay visible in the dashboard, and a viewer that
+    exits within the startup grace (~1s) is reported as failed (exit status and
+    captured output land in `viewer-error.log`), never persisted as a live target.
+  - `adapter.show_attached_ui` is editable from the settings screen.
+
 - **`review.on_timeout` policy knob (#271).** A timeout-like review verdict (`timeout` /
   `stalled` / `over_budget`) previously always burned a review cycle (RETRY) until
   `max_review_cycles`, then deferred — even when the dev product was already finalized and
@@ -89,6 +113,59 @@ breaking changes may land in a minor release.
   A project still on `bmad-auto` should migrate on 0.9.0 before upgrading past it.
 
 ### Fixed
+
+- **Viewer rows align at column 0.** `capture-pane` separates rows with bare
+  `\n`; pyte keeps the cursor column across a linefeed unless linefeed-newline
+  mode is set, so every rendered viewer row started where the previous one
+  ended — a staircase. `ViewerView` now feeds pyte with LNM set. The viewer's
+  tmux session is also pinned to the same 220×50 geometry as the agent panes
+  (it was tmux's default 80×24, cramping the attached TUI's layout).
+- **The viewer fills the pane that displays it.** The dashboard now tracks the
+  Log pane's content size and resizes the viewer window (new best-effort
+  `resize_window` seam method) plus the pyte render to match, so the attached
+  TUI redraws at the size actually shown instead of floating a fixed 220×50
+  (previously 80×24) frame inside the pane. The long-dead `ViewerView.resize`
+  hook now actually adopts the new geometry.
+- **The dashboard actually renders the viewer frame.** The Log pane's rewrite
+  gate only opened on `log_reset`/`log_lines` — both set exclusively by the
+  logfile-fallback path — so a captured viewer frame was attached to every poll
+  snapshot and then never written: with a healthy viewer the Log tab rendered
+  *nothing at all*. A viewer frame now opens the rewrite gate itself.
+- **The viewer authenticates against `opencode serve`.** The adapter secures the
+  headless server with a per-session `OPENCODE_SERVER_PASSWORD`, so the attach
+  viewer 401'd on its first session fetch and exited — on every run. The
+  password now reaches `opencode attach` through the tmux *session* environment
+  (new best-effort `set_session_environment` seam method), never through the
+  window's argv or the persisted `viewer_command`, where `ps`/`viewer.json`
+  would expose it.
+- **A stop during viewer creation stops the run.** The engine's SIGTERM handler
+  raises `RunStopped` in whatever frame is running; when that landed inside the
+  viewer startup poll, the best-effort catches swallowed it — reporting it as a
+  viewer failure and permanently breaking the stop path (the handler raises only
+  once), forcing the TUI's hard-kill fallback. Control-flow exceptions now
+  propagate through viewer creation after cleaning up the half-made window.
+- **Parked windows actually park on Debian/Ubuntu.** The parked-window recipe used
+  `read -r` with no variable name — a bashism; dash (`/bin/sh` on Debian-family
+  hosts) rejects it (`read: arg count`), so every parked window (TUI-launched
+  runs, the viewer) closed the moment its command exited instead of holding the
+  exit status. Now `read -r _park`, valid in every POSIX sh.
+- **`capture_pane` captures the requested pane.** The tmux backend never passed
+  `-t <target>`, so the dashboard's viewer capture read whatever pane happened to
+  be current instead of the viewer window — the root cause of the Log tab always
+  falling back to the headless server log.
+- **Viewer creation verification no longer crashes.** The post-create existence
+  check unpacked two fields from a one-field `list-windows` row, raising
+  `ValueError` on every host with a live window; the adapter's best-effort catch
+  swallowed it, persisting an empty `viewer.json` and orphaning the freshly
+  created window. Same latent unpack bug fixed in `window_exists`.
+- **The dashboard can find `viewer.json`.** `read_viewer_config` defaulted to
+  adapter name `opencode_http` while the adapter persists `opencode-http`; the
+  dashboard (which passes no name) now matches any entry that recorded a viewer
+  window instead of a name that can drift.
+- **Viewer reuse returns a real target.** `_find_existing_viewer` returned the
+  marker option's value (`"1"`) as the window target; it now returns the
+  seam-canonical `=session:window` token. Reuse also tolerates the run session
+  already existing instead of failing on `duplicate session`.
 
 - **`validate` requires the review skills your `bmad-dev-auto` actually invokes (#260).** The
   preflight held every project to a fixed catalog that included `bmad-review-verification-gap`,

@@ -144,7 +144,7 @@ Press **`g`** to edit `.bmad-loop/policy.toml` in a form grouped by section — 
 | `p`       | review the selected paused run in the stage-appropriate viewer (plan/story checkpoint, gate, escalation) |
 | `R`       | resolve a run paused at an escalation (interactive, then re-arm)                                         |
 | `d`       | answer deferred-work decisions past sweeps left unanswered                                               |
-| `a`       | attach to the live agent session (or the orchestrator window)                                            |
+| `a`       | attach to the live agent session (or orchestrator window); prefers the viewer window when `show_attached_ui = true` |
 | `x`       | stop the selected live run immediately (engine + agent session)                                          |
 | `S`       | graceful stop: finish the in-flight item (through commit), then stop cleanly — stays resumable           |
 | `D` / `A` | delete / archive the selected run (force-stops a live run first)                                         |
@@ -357,6 +357,10 @@ trigger = "recommended"    # when enabled: "recommended" runs the separate revie
 name = "claude"            # CLI profile: claude | codex | gemini | copilot | antigravity | opencode-http (alias: opencode) | custom
 model = ""                 # empty = CLI default (opencode-http wants "provider/model")
 cleanup_session_on_finish = true  # kill the run's tmux session when it finishes (false keeps it for inspection)
+# show_attached_ui = true  # opencode-http: create a viewer tmux window running
+#             `opencode attach` so you can watch the live session.
+#             The dashboard Log tab renders the viewer pane; `attach` and `a`
+#             prefer it over the raw agent session. false by default.
 # extra_args replaces the profile's default bypass flags when set:
 # extra_args = ["--permission-mode", "bypassPermissions"]
 
