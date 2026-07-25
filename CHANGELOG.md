@@ -24,11 +24,15 @@ breaking changes may land in a minor release.
   review, or escalates closes nothing, and an in-repo ledger still carries the annotation in the
   story's own commit. A commit that then fails (a rejecting native `pre-commit` hook) or never
   happens at all (a SIGTERM landing mid-commit) rolls the annotation back, so it never outlives the
-  commit it was written for. An artifact dir configured _outside_ the repo — including one reached
+  commit it was written for; the rollback reverts only the entries that story flipped, so a hook
+  that edited the ledger before refusing the commit keeps its own edit. An artifact dir configured _outside_ the repo — including one reached
   through a symlink that only looks in-repo — is shared between worktrees and cannot be committed
   at all; that closure is held until the work is durably landed — after the commit in place, after
   the branch merges under isolation (journaled `deferred-close-external-ledger`) — and a write that
-  never got to happen is retried on the next resume rather than being dropped.
+  never got to happen is retried on the next resume rather than being dropped. A ledger location
+  that cannot be read or written at all — a dropped mount, a broken symlink, undecodable bytes — is
+  journaled and retried, never read as "no such entries" and never able to fail the story or crash
+  the run that owns it.
 
   Closure is declared, never inferred from a diff, and both channels are re-read at that boundary
   so a declaration edited after the story was implemented is the one that counts — a withdrawn id

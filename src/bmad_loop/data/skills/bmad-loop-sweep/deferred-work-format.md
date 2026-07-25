@@ -94,7 +94,9 @@ The rules that keep this safe:
   and just before the story's commit is squashed. A story that fails, blocks, is
   rejected by review, or escalates closes nothing. If the commit itself then
   fails — a rejecting native `pre-commit` hook, say — the annotation is rolled
-  back rather than left claiming work that is in no commit.
+  back rather than left claiming work that is in no commit. The rollback reverts
+  only the entries that story flipped, so a hook that edited this file before
+  refusing the commit keeps its own edit.
 - **In the story's own commit**, when this file lives inside the repo. If the
   artifacts dir is configured outside it, the file is shared between worktrees
   and no commit can carry it; the closure is then held until the work is durably
@@ -104,7 +106,9 @@ The rules that keep this safe:
   the run is still resumable. A run that _finishes_ with the location still
   unavailable leaves those entries `open` and says so
   (`deferred-close-abandoned`); a sweep re-verifies them against the codebase.
-  The closure never holds a completed run open.
+  The closure never holds a completed run open — nor crashes one: a ledger that
+  cannot be read or written is journaled and retried, never allowed to fail the
+  story or the run it belongs to.
 - **Idempotent.** An id already `done` is left untouched, so a resumed run
   re-driving the same close neither doubles the `resolution:` line nor warns.
 - **Never a gate.** An id that matches no entry, an entry whose `status:` reads
