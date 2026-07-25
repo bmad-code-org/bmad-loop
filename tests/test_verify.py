@@ -132,6 +132,79 @@ def test_configure_git_timeout_overrides_bound(project, monkeypatch):
     assert seen["timeout"] == 7
 
 
+def test_stage_path_stages_a_repo_file(project):
+    """The happy path the advisory repair exists for: a working-tree edit reaches
+    the index so a hand-run `git commit` publishes what is on disk."""
+    target = project.project / "src.txt"
+    target.write_text("staged by the repair\n")
+    assert verify.stage_path(project.project, target) is True
+    rc, out = verify._git(project.project, "diff", "--cached", "--name-only")
+    assert rc == 0 and "src.txt" in out
+
+
+def test_stage_path_refuses_a_path_outside_the_repo(project, tmp_path):
+    """Containment: a path that is not under `repo` is refused rather than staged."""
+    outside = tmp_path / "elsewhere.md"
+    outside.write_text("not ours\n")
+    assert verify.stage_path(project.project, outside) is False
+
+
+@pytest.mark.parametrize("exc", [RuntimeError("symlink loop"), OSError("stale handle")])
+def test_stage_path_returns_false_when_resolve_raises(project, monkeypatch, exc):
+    """`resolve()` is not total. It raises RuntimeError on a symlink loop and
+    OSError when a component is inaccessible, and neither is the ValueError the
+    containment check was written for — so on the paths that hit them the advisory
+    repair replaced the commit escalation it is supposed to be assisting with a
+    generic crash (#284 round-7 review, finding 4).
+
+    Injected rather than built from a real symlink loop, because the real trigger
+    is version-dependent: `resolve()` raises on Python 3.11/3.12 (the
+    requires-python floor) and returns the unresolved path on 3.13+, so a test
+    driven by an actual loop would assert a different outcome per interpreter."""
+    target = project.project / "src.txt"
+    target.write_text("changed\n")
+    monkeypatch.setattr(
+        verify.Path, "resolve", lambda self, *a, **kw: (_ for _ in ()).throw(exc)
+    )
+
+    assert verify.stage_path(project.project, target) is False
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_stage_path_survives_a_real_symlink_loop(project):
+    """The mechanism above with nothing injected. The return value is deliberately
+    not asserted — on 3.11/3.12 `resolve()` raises and this refuses, while on 3.13+
+    it resolves and git happily stages the link itself — but "never raises" holds
+    on every interpreter, and it is the half CI's 3.11 job would otherwise not
+    exercise at all."""
+    a, b = project.project / "loop-a", project.project / "loop-b"
+    a.symlink_to(b)
+    b.symlink_to(a)
+
+    assert isinstance(verify.stage_path(project.project, a), bool)
+
+
+def test_stage_path_returns_false_when_git_times_out(project, monkeypatch):
+    """`_run_git` translates TimeoutExpired to GitError, which is still an
+    exception escaping an advisory repair. Same for a raw OSError on the spawn,
+    which `_run_git` does not translate at all."""
+    target = project.project / "src.txt"
+    target.write_text("changed\n")
+    monkeypatch.setattr(verify.subprocess, "run", _timing_out_run)
+    assert verify.stage_path(project.project, target) is False
+
+
+def test_stage_path_returns_false_when_the_spawn_fails(project, monkeypatch):
+    """The untranslated half: `_run_git` re-raises anything that is not a
+    TimeoutExpired, so a fork failure or a missing git binary arrives as itself."""
+    target = project.project / "src.txt"
+    target.write_text("changed\n")
+    monkeypatch.setattr(
+        verify.subprocess, "run", lambda *a, **kw: (_ for _ in ()).throw(OSError("fork failed"))
+    )
+    assert verify.stage_path(project.project, target) is False
+
+
 def test_run_git_forces_c_locale(project, monkeypatch):
     """Every git child runs with LC_ALL=C so message text stays stable English —
     the chokepoint fix for #236 (safe_rollback's "did not match" tolerance must not

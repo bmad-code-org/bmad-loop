@@ -1674,12 +1674,25 @@ def stage_path(repo: Path, path: Path) -> bool:
     the version that was rolled back — which an operator who fixes the hook and
     runs `git commit` by hand would then publish. Advisory by design: this runs on
     a path that is already escalating a commit failure, and a repair that raises
-    would mask it."""
+    would mask it — so "never raises" has to hold against every step, not just the
+    containment check that motivated the guard.
+
+    Both halves can fail in ways that are not `ValueError`. `resolve()` raises
+    `RuntimeError` on a symlink loop under Python 3.11 and 3.12 (3.13 returns the
+    unresolved path instead, so the exposure is version-dependent and the floor is
+    the affected one), and `OSError` when a path component is inaccessible. `_git`
+    raises `GitError` on a timeout and lets a raw `OSError` from the spawn itself
+    through — `_run_git` translates only `TimeoutExpired`. Any of the three would
+    replace the commit escalation being reported with a generic crash
+    (#284 round-7 review, finding 4)."""
     try:
         rel = str(Path(path).resolve().relative_to(repo.resolve()))
-    except ValueError:
+    except (OSError, RuntimeError, ValueError):
         return False
-    rc, _ = _git(repo, "add", "--", rel)
+    try:
+        rc, _ = _git(repo, "add", "--", rel)
+    except (GitError, OSError):
+        return False
     return rc == 0
 
 
