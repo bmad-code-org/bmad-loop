@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import builtins
 import importlib
+import json
 import os
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 from conftest import install_bmad_config, write_sprint
+from rich.text import Text
 
 from bmad_loop import deferredwork, policy
 from bmad_loop.adapters import tmux_base
@@ -1244,3 +1247,167 @@ def test_char_style_degrades_unparseable_color_instead_of_raising():
     assert style.color is None and style.bgcolor is None
     assert style.bold and style.underline and not style.italic
     assert data._char_style(key) is style  # fallback is cached like any other
+
+
+# ====================================================================== viewer
+
+
+def test_read_viewer_config_returns_dict_when_file_exists(project, tmp_path):
+    """read_viewer_config returns the viewer config dict when viewer.json
+    has an entry matching the adapter name."""
+    run_dir = tmp_path / "run-abc"
+    run_dir.mkdir()
+    viewer_json = run_dir / "viewer.json"
+    viewer_json.write_text(
+        json.dumps([{"adapter": "opencode_http", "viewer_window": "=bmad-loop-abc:my-viewer"}]),
+        encoding="utf-8",
+    )
+    vc = data.read_viewer_config(run_dir, "opencode_http")
+    assert vc is not None
+    assert vc["viewer_window"] == "=bmad-loop-abc:my-viewer"
+    # Non-matching adapter returns None
+    vc2 = data.read_viewer_config(run_dir, "other")
+    assert vc2 is None
+
+
+def test_read_viewer_config_returns_none_on_missing_file(tmp_path):
+    assert data.read_viewer_config(tmp_path / "nonexistent") is None
+
+
+def test_read_viewer_config_returns_none_on_bad_json(tmp_path):
+    run_dir = tmp_path / "run-abc"
+    run_dir.mkdir()
+    (run_dir / "viewer.json").write_text("{bad json", encoding="utf-8")
+    assert data.read_viewer_config(run_dir) is None
+
+
+def test_viewer_view_renders_ansi_content(project):
+    """ViewerView captures a simulated tmux pane output and renders
+    it through pyte into a Text object with styled runs."""
+    mux = MagicMock()
+    mux.capture_pane.return_value = "\x1b[32mhello\x1b[0m\nworld\n"
+    view = data.ViewerView(target="=s:w", mux=mux, columns=40, lines=10)
+    result = view.refresh()
+    assert result is not None
+    assert isinstance(result, Text)
+    # The output should contain the plain text without raw escape sequences
+    plain = result.plain
+    assert "hello" in plain
+    assert "world" in plain
+    # No raw escape codes should be in the plain text
+    assert "\x1b" not in plain
+
+
+def test_viewer_view_rows_align_at_column_zero(project):
+    """capture-pane separates rows with bare \\n; without LNM pyte would keep
+    the column across rows and every line would start where the previous one
+    ended (staircase misalignment)."""
+    mux = MagicMock()
+    mux.capture_pane.return_value = "aaaa\nbb\ncccccc\n"
+    view = data.ViewerView(target="=s:w", mux=mux, columns=40, lines=10)
+    result = view.refresh()
+    assert result is not None
+    assert result.plain.splitlines() == ["aaaa", "bb", "cccccc"]
+
+
+def test_viewer_view_resize_adopts_new_geometry(project):
+    """resize() reports a change once per new size and re-renders at it —
+    the dashboard uses the True return to resize the tmux window to match."""
+    mux = MagicMock()
+    mux.capture_pane.return_value = "x" * 30 + "\n"
+    view = data.ViewerView(target="=s:w", mux=mux, columns=40, lines=10)
+    assert view.refresh().plain.splitlines() == ["x" * 30]  # fits at 40 cols
+
+    assert view.resize(20, 5) is True
+    assert view.resize(20, 5) is False  # unchanged size: no re-request
+    wrapped = view.refresh().plain.splitlines()
+    assert wrapped == ["x" * 20, "x" * 10]  # now renders at 20 cols
+
+    assert view.resize(40, 10) is True  # and back
+
+
+def test_viewer_view_returns_none_on_empty_capture(project):
+    mux = MagicMock()
+    mux.capture_pane.return_value = ""
+    view = data.ViewerView(target="=s:w", mux=mux, columns=40, lines=10)
+    assert view.refresh() is None
+
+
+def test_viewer_view_returns_none_on_mux_error(project):
+    mux = MagicMock()
+    mux.capture_pane.side_effect = RuntimeError("pane gone")
+    view = data.ViewerView(target="=s:w", mux=mux, columns=40, lines=10)
+    # The exception is caught and degraded to None.
+    assert view.refresh() is None
+
+
+def test_viewer_view_replaces_not_appends(project):
+    """Each refresh() replaces the screen — second output does not append
+    to the first. This mirrors the alternate-screen behavior of OpenCode's
+    fullscreen viewer."""
+    captured: list[str] = []
+
+    def capture_side_effect(target, start_line=-100, end_line=None):
+        # Return two different frames to prove replacement.
+        frame = "frame1\nline2\nline3\n"
+        if len(captured) > 0:
+            frame = "frame2\nnew\n"
+        captured.append(frame)
+        return frame
+
+    mux = MagicMock()
+    mux.capture_pane.side_effect = capture_side_effect
+    view = data.ViewerView(target="=s:w", mux=mux, columns=40, lines=10)
+    r1 = view.refresh()
+    r2 = view.refresh()
+    assert r1 is not None and r2 is not None
+    # Second render must NOT contain "frame1"
+    assert "frame1" not in r2.plain
+
+
+def test_viewer_view_strips_raw_ansi_escapes(project):
+    """ANSI styling should be converted to rich Style objects, not left
+    as raw escape codes in the plain text output."""
+    mux = MagicMock()
+    # Simulate a typical ANSI sequence — bold cyan text.
+    mux.capture_pane.return_value = "\x1b[1;36mBOLD CYAN\x1b[0m\n"
+    view = data.ViewerView(target="=s:w", mux=mux, columns=20, lines=5)
+    result = view.refresh()
+    assert result is not None
+    assert "\x1b" not in result.plain
+    # The text should not have raw escape codes as visible content
+    assert r"\x1b" not in result.plain
+
+
+def test_read_viewer_config_with_all_fields(project, tmp_path):
+    """Viewer config with full fields roundtrips correctly."""
+    run_dir = tmp_path / "run-xyz"
+    run_dir.mkdir()
+    viewer = run_dir / "viewer.json"
+    viewer.write_text(
+        json.dumps(
+            [
+                {
+                    "adapter": "opencode_http",
+                    "viewer_window": "=bmad-loop-xyz:viewer",
+                    "viewer_url": "http://127.0.0.1:8080",
+                    "viewer_session": "sess-abc",
+                    "viewer_cwd": "/home/user/project",
+                    "viewer_command": "opencode attach http://127.0.0.1:8080",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    vc = data.read_viewer_config(run_dir, "opencode_http")
+    assert vc is not None
+    assert vc["viewer_window"] == "=bmad-loop-xyz:viewer"
+    assert vc["viewer_url"] == "http://127.0.0.1:8080"
+    assert vc["viewer_session"] == "sess-abc"
+    assert vc["viewer_cwd"] == "/home/user/project"
+    assert vc["viewer_command"] == "opencode attach http://127.0.0.1:8080"
+
+
+def test_viewer_view_target_property(project):
+    view = data.ViewerView(target="=s:w", mux=MagicMock(), columns=40, lines=10)
+    assert view.target == "=s:w"

@@ -113,6 +113,8 @@ class _PollContext:
         self.journal = data.JournalTail(run_dir)
         self.entries: list[dict[str, Any]] = []
         self.log: data.LogView | None = None
+        self.viewer_view: data.ViewerView | None = None
+        self._mux: Any = None
         self.log_task: str | None = None
         self.attention_seen = 0
         self.first_poll = True
@@ -148,6 +150,9 @@ class _Snapshot:
     toast_attention: bool = False
     decision: tuple[str, str] | None = None  # (dw_id, question) awaiting a human
     toast_decision: bool = False
+    # Viewer pane (when viewer_window is recorded for this run):
+    viewer_text: Text | None = None  # rendered terminal content from capture-pane
+    viewer_available: bool = False  # a valid viewer target was found this tick
 
 
 class DashboardScreen(Screen[None]):
@@ -213,6 +218,10 @@ class DashboardScreen(Screen[None]):
         self._pin_task: str | None = None  # show this task's log instead of the active one
         self._pending_jump: tuple[str, int] | None = None  # (task_id, log_pos)
         self._log_follow_tail = True  # stick to newest log lines until a jump pins us
+        # Displayed size of the Log pane's content area, written by _apply on
+        # the UI thread and read by the poll worker: the viewer window is kept
+        # resized to it so the attached TUI draws at the size actually shown.
+        self._log_pane_dims: tuple[int, int] | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -789,20 +798,65 @@ class DashboardScreen(Screen[None]):
                         ctx.entries, snap.state.policy_snapshot if snap.state else None
                     )
                 snap.log_pinned = pin is not None
-                if task != ctx.log_task:
-                    ctx.log_task = task
-                    ctx.log = (
-                        data.LogView(ctx.run_dir / data.LOGS_DIR / f"{task}.log") if task else None
-                    )
-                    snap.log_reset = True
-                snap.log_task = task
-                if ctx.log is not None and (ctx.log.read_new() or snap.log_reset):
-                    snap.log_lines = ctx.log.render()
-                    snap.log_index = ctx.log.index()
-                if ctx.log is not None and ctx.log.altscreen_seen:
-                    snap.log_altscreen = True
-                    if snap.state is not None and task:
-                        snap.log_transcript = _transcript_for_task(snap.state, task)
+                # Read the persisted viewer config: when a viewer window was created
+                # (show_attached_ui=True), capture-pane renders the terminal instead
+                # of reading the HTTP adapter's logfile.
+                vc = data.read_viewer_config(ctx.run_dir)
+                viewer_window = ""
+                if vc is not None:
+                    viewer_window = vc.get("viewer_window") or ""
+                # Grab the multiplexer (cached process-global).
+                mux = data.get_multiplexer()
+                mux_usable = data.mux_usable(mux)
+                # Reuse an existing ViewerView when the target hasn't changed;
+                # create one on fresh selection or after the target changed.
+                need_view = bool(viewer_window) and mux_usable
+                if need_view and (
+                    ctx.viewer_view is None or ctx.viewer_view.target != viewer_window
+                ):
+                    ctx.viewer_view = data.ViewerView(target=viewer_window, mux=mux)
+                if ctx.viewer_view is not None:
+                    # Track the displayed pane: resize the viewer window (and
+                    # the pyte render) to the Log pane's content area so the
+                    # attached TUI redraws at the size actually shown, instead
+                    # of floating a fixed-geometry frame in a larger pane.
+                    dims = self._log_pane_dims
+                    if (
+                        dims is not None
+                        and dims[0] >= 40
+                        and dims[1] >= 10
+                        and ctx.viewer_view.resize(*dims)
+                    ):
+                        mux.resize_window(ctx.viewer_view.target, *dims)
+                    # Viewer capture replaces the log entirely.
+                    txt = ctx.viewer_view.refresh()
+                    if txt is not None:
+                        snap.viewer_text = txt
+                        snap.viewer_available = True
+                    else:
+                        snap.viewer_text = None
+                        snap.viewer_available = False
+                else:
+                    snap.viewer_text = None
+                    snap.viewer_available = False
+                if not snap.viewer_available:
+                    # Fallback to logfile: normal LogView incremental append.
+                    if task != ctx.log_task:
+                        ctx.log_task = task
+                        ctx.log = (
+                            data.LogView(ctx.run_dir / data.LOGS_DIR / f"{task}.log")
+                            if task
+                            else None
+                        )
+                        snap.log_reset = True
+                    snap.log_task = task
+                    if ctx.log is not None and (ctx.log.read_new() or snap.log_reset):
+                        snap.log_lines = ctx.log.render()
+                        snap.log_index = ctx.log.index()
+                    if ctx.log is not None and ctx.log.altscreen_seen:
+                        snap.log_altscreen = True
+                        if snap.state is not None and task:
+                            snap.log_transcript = _transcript_for_task(snap.state, task)
                 attention = ctx.watcher.attention()
                 if len(attention) < ctx.attention_seen:
                     snap.attention_reset = True
@@ -874,12 +928,19 @@ class DashboardScreen(Screen[None]):
                 journal.scroll_end(animate=False)
 
         log = self.query_one("#log", RichLog)
+        # Publish the pane's content size for the poll worker's viewer resize;
+        # 0x0 while the Log tab is hidden, which the reader ignores.
+        region = log.scrollable_content_region
+        self._log_pane_dims = (region.width, region.height)
         self._displayed_log_task = snap.log_task
         if snap.log_reset:
             self._log_index = None
         if snap.log_index is not None:
             self._log_index = snap.log_index
-        if snap.log_reset or snap.log_lines is not None:
+        # A viewer frame arrives on every poll (full-screen snapshot, not an
+        # append), so it opens the rewrite gate itself — log_reset/log_lines
+        # are only ever set on the logfile-fallback path.
+        if snap.log_reset or snap.log_lines is not None or snap.viewer_text is not None:
             # Cursor-up repaints rewrite earlier content, so the pane is a full
             # re-render, not an append; RichLog keeps scroll_y across the
             # clear+rewrite, so only an explicit scroll_end moves the view.
@@ -890,18 +951,25 @@ class DashboardScreen(Screen[None]):
             following = self._log_follow_tail and log.is_vertical_scroll_end
             at_end = snap.log_reset or following
             log.clear()
-            if snap.log_task:
+            if snap.viewer_available:
+                label = Text("— viewer (pane capture) —", style="dim green")
+            elif snap.log_task:
                 suffix = " (pinned — esc to follow)" if snap.log_pinned else ""
-                log.write(Text(f"— {snap.log_task}.log —{suffix}", style="dim"), scroll_end=False)
+                label = Text(f"— {snap.log_task}.log —{suffix}", style="dim")
+            else:
+                label = None
+            if label:
+                log.write(label, scroll_end=False)
             if snap.log_altscreen:
-                # A fullscreen (alt-screen) TUI repaints in place, so the emulated
-                # pane collapses to the final frame. Flag it so the partial view is
-                # not mistaken for the whole session, and point at the full record.
                 note = "⚠ fullscreen (alt-screen) session — this pane shows only the final frame"
                 if snap.log_transcript:
                     note += f"; full transcript: {snap.log_transcript}"
                 log.write(Text(note, style="yellow"), scroll_end=False)
-            if snap.log_lines is not None and snap.log_lines.plain:
+            # Render viewer text when available, otherwise fall back to logfile.
+            if snap.viewer_text is not None:
+                log.write(snap.viewer_text, scroll_end=at_end)
+                snap.viewer_text = None  # consume so next clear+rewrite only runs on refresh
+            elif snap.log_lines is not None and snap.log_lines.plain:
                 log.write(snap.log_lines, scroll_end=at_end)
         if self._pending_jump is not None:
             # _scroll_log_to owns clearing the pending jump when the scroll

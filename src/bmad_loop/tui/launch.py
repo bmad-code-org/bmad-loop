@@ -27,6 +27,25 @@ CTL_SESSION = "bmad-loop-ctl"
 _CTL_WINDOW_RE = re.compile(r"^(?:run|sweep|resume|resolve)-(.+)$")
 
 
+def _find_view_window(run_id: str) -> str | None:
+    """Find a viewer window for this run's session (set by opencode-http
+    adapters when show_attached_ui is enabled).  Returns the mux target
+    token, or None."""
+    if not mux_available():
+        return None
+    session_name = runs.session_name(run_id)
+    viewer_name = f"bmad-loop-{run_id}-viewer"
+    mux = get_multiplexer()
+    try:
+        rows = mux.list_windows(session_name, ["window_name"])
+    except MultiplexerError:
+        return None
+    for (wn,) in rows:
+        if wn == viewer_name:
+            return mux.target(session_name, wn)
+    return None
+
+
 class LaunchError(Exception):
     pass
 
@@ -167,11 +186,15 @@ def decision_pending(run_dir: Path) -> bool:
 def attach_plan(project: Path, run_id: str) -> tuple[list[str], str | None] | None:
     """Pick where an interactive attach should land for this run and which window
     (if any) to record a return target on. Shared by the CLI `attach` command and
-    mirroring the TUI's action_attach logic: prefer the orchestrator's ctl window
-    when a sweep is blocked on a decision or no agent session is live, else the
-    live agent session. Returns (tmux argv, return_window) or None when there is
-    nothing to attach to."""
+    mirroring the TUI's action_attach logic: prefer the viewer window (when one
+    exists for an HTTP adapter), then the orchestrator's ctl window when a sweep
+    is blocked on a decision or no agent session is live, else the live agent
+    session. Returns (tmux argv, return_window) or None when there is nothing
+    to attach to."""
     session = runs.session_name(run_id)
+    viewer_window = _find_view_window(run_id)
+    if viewer_window:
+        return runs.attach_target_argv(viewer_window), None
     window = ctl_window(run_id)
     agent_live = session_exists(session)
     if window is not None and (

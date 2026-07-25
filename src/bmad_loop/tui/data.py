@@ -22,12 +22,18 @@ from pathlib import Path
 from typing import Any
 
 import pyte
+from pyte import modes as pyte_modes
 from rich.color import ColorParseError
 from rich.style import Style
 from rich.text import Text
 
 from .. import bmadconfig, deferredwork, policy, sprintstatus, stories
-from ..adapters.multiplexer import MultiplexerError, get_multiplexer, mux_usable
+from ..adapters.multiplexer import (
+    MultiplexerError,
+    TerminalMultiplexer,
+    get_multiplexer,
+    mux_usable,
+)
 from ..gates import ATTENTION_FILE
 from ..journal import JOURNAL_FILE, LOGS_DIR, STATE_FILE, load_state
 from ..model import RunState
@@ -244,6 +250,47 @@ class RunWatcher:
             except OSError:
                 pass
         return self._attention
+
+
+def read_viewer_config(run_dir: Path, adapter_name: str | None = None) -> dict[str, str] | None:
+    """Read the most recent viewer config persisted to ``<run_dir>/viewer.json``.
+
+    ``adapter_name`` filters to the entry written by that adapter; ``None``
+    (the dashboard's call — it doesn't know which adapter ran) matches any
+    entry that actually recorded a viewer window, so the reader can't drift
+    from the adapter's self-reported name (e.g. ``opencode-http``).
+
+    Returns a dict with the keys ``viewer_window``, ``viewer_url``,
+    ``viewer_session``, ``viewer_cwd``, ``viewer_command`` when an entry
+    exists and is parseable; ``None`` when the file is missing or unreadable.
+    The ``viewer_window`` string is a mux target such as
+    ``=bmad-loop-abc:bmad-loop-abc-viewer``."""
+    try:
+        path = run_dir / "viewer.json"
+        if not path.is_file():
+            return None
+        entries = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(entries, list):
+            return None
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            matches = (
+                entry.get("adapter") == adapter_name
+                if adapter_name is not None
+                else bool(entry.get("viewer_window"))
+            )
+            if matches:
+                return {
+                    "viewer_window": entry.get("viewer_window") or "",
+                    "viewer_url": entry.get("viewer_url") or "",
+                    "viewer_session": entry.get("viewer_session") or "",
+                    "viewer_cwd": entry.get("viewer_cwd") or "",
+                    "viewer_command": entry.get("viewer_command") or "",
+                }
+        return None
+    except (json.JSONDecodeError, OSError, KeyError, TypeError, UnicodeDecodeError):
+        return None
 
 
 class JournalTail:
@@ -680,6 +727,85 @@ class LogView:
             screen.history.top.dropped + front_drop  # pyright: ignore[reportAttributeAccessIssue]
         )
         self._render_len = len(rows)
+        return Text("\n").join(rows)
+
+
+class ViewerView:
+    """Captures a tmux pane via ``capture-pane`` and renders it through pyte.
+
+    Unlike :class:`LogView` (incremental file stream), a viewer refresh
+    captures a full terminal screen snapshot and replaces the previous
+    content. The captured text includes raw ANSI escape sequences that the
+    pyte emulator collapses into styled rows, just like a real terminal."""
+
+    def __init__(
+        self,
+        target: str,
+        mux: TerminalMultiplexer,
+        columns: int = _PANE_COLUMNS,
+        lines: int = _PANE_LINES,
+        history: int = _HISTORY_LINES,
+        start_line: int = -100,
+    ):
+        self._target = target
+        self._mux = mux
+        self._columns, self._lines, self._history = columns, lines, history
+        self._start_line = start_line
+        self._last_dims: tuple[int, int] | None = None
+
+    @property
+    def target(self) -> str:
+        return self._target
+
+    def resize(self, cols: int, lines: int) -> bool:
+        """Adopt a new render geometry (the displayed pane's size). Returns
+        True when it differs from the previous request — the caller then
+        resizes the underlying mux window to match, so the attached TUI
+        redraws at the size actually shown."""
+        if (cols, lines) == self._last_dims:
+            return False
+        self._last_dims = (cols, lines)
+        self._columns, self._lines = cols, lines
+        return True
+
+    def refresh(self) -> Text | None:
+        """Capture the pane and re-render it. Returns a rendered :class:`Text`
+        on success, or ``None`` when the pane is dead or the backend is
+        unavailable."""
+        try:
+            raw = self._mux.capture_pane(self._target, start_line=self._start_line)
+        except (MultiplexerError, OSError, Exception):
+            # Pane may have been killed or mux transport failed.
+            return None
+        if not raw:
+            return None
+        # ByteStream expects bytes; encode the string capture to UTF-8 so
+        # pyte can parse ANSI escape sequences in the usual way.
+        if isinstance(raw, str):
+            raw_bytes = raw.encode("utf-8", errors="replace")
+        else:
+            raw_bytes = raw
+        # Full-screen viewer: each capture is a complete snapshot, so
+        # reset() the screen before feeding the new data so the output
+        # replaces the previous frame rather than appending.
+        screen = pyte.HistoryScreen(self._columns, self._lines, history=self._history)
+        screen.history = screen.history._replace(top=_CountingDeque(maxlen=self._history))
+        # capture-pane separates rows with bare \n (no \r): without
+        # linefeed-newline mode pyte keeps the column across the feed and
+        # every row starts where the previous one ended — a staircase.
+        screen.set_mode(pyte_modes.LNM)
+        stream = _TolerantByteStream(screen)
+        stream.feed(raw_bytes)
+        # Strip trailing blanks, apply history cap.
+        rows: list[Text] = []
+        for row in screen.history.top:
+            rows.append(_render_row(row))
+        for y in range(screen.lines):
+            rows.append(_render_row(screen.buffer[y]))
+        while rows and not rows[-1].plain:
+            rows.pop()
+        front_drop = max(0, len(rows) - self._history)
+        del rows[:front_drop]
         return Text("\n").join(rows)
 
 
