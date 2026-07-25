@@ -2436,9 +2436,122 @@ def test_closes_deferred_external_obligation_drops_when_the_declaration_is_withd
 
 def test_closes_deferred_external_write_failure_keeps_the_obligation(project, tmp_path):
     """Clearing `pending_deferred_closes` before the write looks harmless — the
-    flush is about to happen — but a raising write unwinds to the crash handler,
-    whose `finally: self._save()` then persists the emptied list. The failure that
-    made the retry necessary destroys the record of it (#284 review, finding 2)."""
+    flush is about to happen — but a failing write would then have destroyed the
+    record of the retry it made necessary (#284 review, finding 2).
+
+    Driven with a ONE-SHOT fault, because what proves the obligation survived is
+    that a later pass can still pay it: the run-end reconcile retries and DW-1
+    closes. Asserting a crash instead (as this did) pinned the wrong half — the
+    crash was itself the round-7 defect, not the contract."""
+    paths = _external_ledger_paths(project, tmp_path)
+    write_sprint(paths, {"1-1-a": "ready-for-dev"})
+    write_ledger(paths, {"DW-1": "open"}, commit=False)
+    engine, _ = make_engine(
+        paths,
+        [dev_effect(paths, "1-1-a", followup_review=False, closes_deferred=["DW-1"])],
+    )
+    real_apply = engine._apply_deferred_closes
+    attempts: list[int] = []
+
+    def fails_once(*a, **kw):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise OSError("disk full")
+        return real_apply(*a, **kw)
+
+    engine._apply_deferred_closes = fails_once
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.crashed
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "deferred-close-flush-failed" in kinds  # the first attempt is on the record
+    # ...and the obligation it kept was paid by the run-end pass
+    assert not _ledger_entries(paths)["DW-1"].open
+    assert load_state(engine.run_dir).tasks["1-1-a"].pending_deferred_closes == []
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        PermissionError(13, "read-only file system"),
+        RuntimeError("Symlink loop"),
+        UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
+    ],
+    ids=["oserror", "runtimeerror", "unicodedecodeerror"],
+)
+def test_closes_deferred_persistent_write_failure_never_crashes_the_run(project, tmp_path, exc):
+    """The other side of that fault, and the round-7 defect itself.
+
+    Parametrized over all three failure types the guard names, because two of them
+    are not `OSError` and that is exactly how they got past it: `atomic_write_text`
+    resolves the path first and `resolve()` raises `RuntimeError` on a symlink loop
+    under Python 3.11/3.12, while an undecodable ledger raises `UnicodeDecodeError`
+    — a `ValueError`. Whichever step inside the flush produces one, the story must
+    still land.
+
+    Round 6 guarded only the post-merge flush; the reconcile passes and the
+    in-place commit-boundary call stayed bare. A PERSISTENT failure — a read-only
+    mount, an EACCES — therefore crashed the run through an unguarded site, and
+    `resume` accepts a crashed run, so `_finish_inflight` retried at the same bare
+    call and crashed again: an unbounded loop over an advisory annotation, in a
+    feature whose stated contract is that closure is never a gate
+    (#284 round-7 review, finding 1).
+
+    The story lands, the failure is journaled, and the run-end pass releases what
+    it cannot pay — the entry stays `open` for a sweep to re-verify."""
+    paths = _external_ledger_paths(project, tmp_path)
+    write_sprint(paths, {"1-1-a": "ready-for-dev"})
+    write_ledger(paths, {"DW-1": "open"}, commit=False)
+    engine, _ = make_engine(
+        paths,
+        [dev_effect(paths, "1-1-a", followup_review=False, closes_deferred=["DW-1"])],
+    )
+    engine._apply_deferred_closes = lambda *a, **kw: (_ for _ in ()).throw(exc)
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.crashed
+    persisted = load_state(engine.run_dir)
+    assert persisted.finished  # the run completes rather than looping on the retry
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "deferred-close-flush-failed" in kinds
+    abandoned = [e for e in engine.journal.entries() if e["kind"] == "deferred-close-abandoned"]
+    assert len(abandoned) == 1 and abandoned[0]["dw_ids"] == ["DW-1"]
+    assert _ledger_entries(paths)["DW-1"].open  # truthful: nothing was closed
+    assert persisted.tasks["1-1-a"].pending_deferred_closes == []
+
+
+def test_closes_deferred_resume_reconcile_does_not_crash_on_a_dead_ledger(project, tmp_path):
+    """The half that made finding 1 unbounded. `_finish_inflight` opens with the
+    reconcile pass, and that call was bare — so a resume met the same persistent
+    failure the first run crashed on and crashed identically, before it could
+    touch anything else.
+
+    Driven through the reconcile pass directly with a task already DONE and owing,
+    which is exactly the state a resume loads."""
+    paths = _external_ledger_paths(project, tmp_path)
+    engine, _ = make_engine(paths, [])
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.phase = Phase.DONE
+    task.pending_deferred_closes = ["DW-1"]
+    engine.state.tasks["1-1-a"] = task
+    engine._apply_deferred_closes = lambda *a, **kw: (_ for _ in ()).throw(
+        PermissionError(13, "read-only file system")
+    )
+    write_ledger(paths, {"DW-1": "open"}, commit=False)
+
+    engine._reconcile_pending_deferred_closes()  # must not raise
+
+    assert task.pending_deferred_closes == ["DW-1"]  # kept: a later pass may pay it
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "deferred-close-flush-failed" in kinds
+
+
+def test_closes_deferred_flush_guard_survives_a_failing_diagnostic(project, tmp_path):
+    """The guard's own journal append can fail — it writes to the same host that
+    just refused the ledger. Reporting a failed write must not become the crash
+    the guard exists to prevent (#284 round-7 review, finding 2)."""
     paths = _external_ledger_paths(project, tmp_path)
     write_sprint(paths, {"1-1-a": "ready-for-dev"})
     write_ledger(paths, {"DW-1": "open"}, commit=False)
@@ -2447,11 +2560,18 @@ def test_closes_deferred_external_write_failure_keeps_the_obligation(project, tm
         [dev_effect(paths, "1-1-a", followup_review=False, closes_deferred=["DW-1"])],
     )
     engine._apply_deferred_closes = lambda *a, **kw: (_ for _ in ()).throw(OSError("disk full"))
+    real_append = engine.journal.append
+
+    def append_fails_for_the_diagnostic(kind, **fields):
+        if kind == "deferred-close-flush-failed":
+            raise OSError("journal is on the same dead mount")
+        return real_append(kind, **fields)
+
+    engine.journal.append = append_fails_for_the_diagnostic
 
     summary = engine.run()
 
-    assert summary.crashed
-    assert load_state(engine.run_dir).tasks["1-1-a"].pending_deferred_closes == ["DW-1"]
+    assert summary.done == 1 and not summary.crashed
 
 
 def test_closes_deferred_external_ledger_unavailable_keeps_the_obligation(project, tmp_path):
@@ -2594,8 +2714,9 @@ def test_closes_deferred_survives_a_ledger_path_it_cannot_resolve(project, monke
     Python 3.11/3.12, so the platform decides whether the guard is exercised at
     all; here every interpreter runs it.
 
-    Unresolvable takes the safe side of the guard it broke — not provably in the
-    repo — so the ids are parked and retried instead of crashing the commit."""
+    Unresolvable closes nothing and says so: neither guess is safe, since writing
+    could flip a shared external ledger no commit will carry and parking would
+    write an in-repo ledger after the commit and leave the tree dirty."""
     engine = _closes_deferred_run(project, ["DW-1"])
     finalize = engine._finalize_commit_phase
     real_resolve = Path.resolve
@@ -2687,6 +2808,44 @@ def test_closes_deferred_obligation_is_released_only_by_the_final_pass(project, 
     abandoned = [e for e in engine.journal.entries() if e["kind"] == "deferred-close-abandoned"]
     assert bool(abandoned) is final
     assert task.pending_deferred_closes == ([] if final else ["DW-1"])
+
+
+@pytest.mark.parametrize("final", [False, True], ids=["mid-run", "run-end"])
+def test_closes_deferred_unmerged_unit_is_reported_once_and_released_at_the_end(
+    project, tmp_path, final
+):
+    """A DONE task whose unit never merged holds an obligation nothing will ever
+    service — `_finish_inflight` skips terminal tasks by design, so no later pass
+    re-integrates it.
+
+    That branch journaled the abandonment and then fell through without clearing
+    and without consulting `final`, so a resumed run recorded it twice (once from
+    `_finish_inflight`, once from the run-end pass) and a finished run kept the
+    pending ids serialized forever (#284 round-7 review, finding 7)."""
+    paths = _external_ledger_paths(project, tmp_path)
+    # worktree isolation: the merge, not the commit, is what makes the work durable
+    engine, _ = make_engine(
+        paths,
+        [],
+        policy=Policy(
+            gates=GatesPolicy(mode="none"), notify=QUIET, scm=ScmPolicy(isolation="worktree")
+        ),
+    )
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.phase = Phase.DONE
+    task.unit_merged = False  # committed, never integrated
+    task.pending_deferred_closes = ["DW-1"]
+    engine.state.tasks["1-1-a"] = task
+
+    engine._reconcile_pending_deferred_closes()  # the `_finish_inflight` pass
+    engine._reconcile_pending_deferred_closes(final=final)
+
+    abandoned = [e for e in engine.journal.entries() if e["kind"] == "deferred-close-abandoned"]
+    assert len(abandoned) == 1  # one standing fact, one line — not one per pass
+    assert abandoned[0]["dw_ids"] == ["DW-1"]
+    # kept while some later pass could still act, let go once none can
+    assert task.pending_deferred_closes == ([] if final else ["DW-1"])
+    assert "story-deferred-closed" not in {e["kind"] for e in engine.journal.entries()}
 
 
 def test_closes_deferred_external_ledger_absent_from_a_live_dir_still_discharges(project, tmp_path):

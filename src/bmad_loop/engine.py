@@ -261,6 +261,11 @@ class Engine:
         # best-effort hint (None when the estimate could not be computed).
         self._graceful_stopped = False
         self._graceful_remaining: int | None = None
+        # Story keys whose parked closure has already been reported unservicable
+        # (DONE, but the unit never merged). In-memory on purpose: the point is one
+        # line per process, not one line ever — a later run that re-derives the same
+        # standing fact should say so again.
+        self._unmerged_closes_reported: set[str] = set()
         # Per-unit worktree isolation + integration flow (issue #244 F-3/F-9a).
         # Built from narrow deps + engine callbacks; the same-name Engine._* worktree
         # methods below delegate to it. `emit` is late-bound (a lambda, not the bound
@@ -821,14 +826,26 @@ class Engine:
             if task.phase != Phase.DONE:
                 continue  # still re-drivable; the commit phase applies it
             if not (task.unit_merged or not self._isolated):
-                self.journal.append(
-                    "deferred-close-abandoned",
-                    story_key=task.story_key,
-                    dw_ids=list(task.pending_deferred_closes),
-                    reason="story is done but its unit never merged; entries stay open",
-                )
+                # Reported once per process, not once per pass: a resumed run walks
+                # this loop from `_finish_inflight` and again at the end, and the
+                # condition is the same standing fact both times.
+                if task.story_key not in self._unmerged_closes_reported:
+                    self._unmerged_closes_reported.add(task.story_key)
+                    self.journal.append(
+                        "deferred-close-abandoned",
+                        story_key=task.story_key,
+                        dw_ids=list(task.pending_deferred_closes),
+                        reason="story is done but its unit never merged; entries stay open",
+                    )
+                if final:
+                    # Nothing after this point can service it either — same reason
+                    # as the release below — so it is let go rather than left
+                    # serialized on a finished run as an obligation with no owner
+                    # (#284 round-7 review, finding 7).
+                    task.pending_deferred_closes = []
+                    self._save()
                 continue
-            self._flush_pending_deferred_closes(task)
+            self._flush_after_integration(task)
             if final and task.pending_deferred_closes:
                 # the flush kept it: the location was unavailable, and this run
                 # has no later pass — nor any resume — left to try again in.
@@ -1847,7 +1864,13 @@ class Engine:
             # advance: a crash in this window leaves the task COMMITTING, which
             # the resume arm re-drives — and both finalize_commit and the close
             # are idempotent. After DONE it would be terminal, and unreachable.
-            self._flush_pending_deferred_closes(task)
+            #
+            # Guarded like every other flush: a persistent ledger failure re-drives
+            # into the same failure on every attempt, so leaving it bare traded an
+            # advisory annotation for a crash loop (#284 round-7 review, finding 1).
+            # A transient one is still retried, now by the reconcile pass rather
+            # than by re-running the commit phase.
+            self._flush_after_integration(task)
         advance(task, Phase.DONE)
         self.journal.append("story-done", story_key=task.story_key, commit=task.commit_sha)
         self._emit("post_commit", task)
@@ -2708,36 +2731,62 @@ class Engine:
         return marked
 
     def _flush_after_integration(self, task: StoryTask) -> None:
-        """The integration chokepoint's flush, which may not raise (#234).
+        """The flush every caller goes through, and which may not raise (#234).
 
-        ``WorktreeFlow.integrate_unit`` calls this after the unit has merged and
-        the task is already terminal, and a raise from here escapes ``run_unit``
-        and the whole story loop — so ``_after_story`` never fires. In stories
-        mode that is the ``done_checkpoint``: a mandatory human review silently
-        skipped, with the next story free to dispatch. Resume does not repair it
-        either, because ``_finish_inflight`` skips terminal tasks by design.
+        ``WorktreeFlow.integrate_unit`` calls it after the unit has merged and the
+        task is already terminal, and a raise from there escapes ``run_unit`` and
+        the whole story loop — so ``_after_story`` never fires. In stories mode
+        that is the ``done_checkpoint``: a mandatory human review silently skipped,
+        with the next story free to dispatch. Resume does not repair it either,
+        because ``_finish_inflight`` skips terminal tasks by design.
 
-        Everything this flush touches can raise OSError — the ledger read and
-        write, the journal append, the state save — and all of it lives on the
-        out-of-repo mount that is the only reason the flush does anything at all.
-        Trading a checkpoint for a failed annotation is exactly backwards, and the
-        annotation is never a gate anywhere else in this feature: journal the
-        failure, leave ``pending_deferred_closes`` standing for the reconcile pass
-        to retry, and let the story finish (#284 round-6 review, finding 2).
+        Everything this flush touches can fail — the ledger read and write, the
+        journal append, the state save — and all of it lives on the out-of-repo
+        mount that is the only reason the flush does anything at all. Trading a
+        checkpoint for a failed annotation is exactly backwards, and the annotation
+        is never a gate anywhere else in this feature: journal the failure, leave
+        ``pending_deferred_closes`` standing for a later pass to retry, and let the
+        story finish (#284 round-6 review, finding 2).
 
-        Only the integration call site is guarded. The in-place flush runs before
-        the DONE advance precisely so a raise there leaves the task COMMITTING for
-        the resume arm to re-drive idempotently; guarding it would discard that."""
+        **Every retry site goes through here, not just integration.** Round 6
+        guarded this one call and left the reconcile passes
+        (``_reconcile_pending_deferred_closes``, from ``_finish_inflight`` and from
+        the end of ``run()``) calling the flush bare, and the in-place
+        commit-boundary call bare as well. A *persistent* failure — a read-only
+        mount, an EACCES — then crashed the run through the unguarded site; the
+        crash handler leaves ``finished`` False, ``resume`` accepts a crashed run,
+        ``_finish_inflight`` retries at the same bare call and crashes again. An
+        unbounded crash loop over an advisory annotation, in a feature whose
+        stated contract is that closure is never a gate
+        (#284 round-7 review, finding 1).
+
+        Guarding the in-place call reverses round 6's reasoning deliberately.
+        Leaving it bare bought an idempotent COMMITTING re-drive, which is a real
+        retry for a *transient* fault and no retry at all for a persistent one —
+        just the same crash on every attempt. The reconcile passes already provide
+        the retry, and more cheaply than re-driving a whole commit phase, so the
+        story now advances to DONE holding its obligation and the run-end pass
+        retries and then releases it.
+
+        The catch names ``UnicodeDecodeError`` and ``RuntimeError`` alongside
+        ``OSError`` because neither is one: an undecodable ledger raises a
+        ``ValueError`` subclass and ``Path.resolve()`` raises ``RuntimeError`` on a
+        symlink loop under Python 3.11/3.12. It stays an explicit tuple rather than
+        ``Exception`` so a ``RunStopped`` or ``RunPaused`` still travels. And the
+        diagnostic append is itself suppressed — a journal write that fails while
+        reporting a failed write must not become the crash the guard exists to
+        prevent (#284 round-7 review, finding 2)."""
         try:
             self._flush_pending_deferred_closes(task)
-        except OSError as e:
-            self.journal.append(
-                "deferred-close-flush-failed",
-                story_key=task.story_key,
-                dw_ids=list(task.pending_deferred_closes),
-                error=f"{e.__class__.__name__}: {e}",
-                note="the closure stays owed; the story's own bookkeeping continues",
-            )
+        except (OSError, UnicodeDecodeError, RuntimeError) as e:
+            with contextlib.suppress(Exception):
+                self.journal.append(
+                    "deferred-close-flush-failed",
+                    story_key=task.story_key,
+                    dw_ids=list(task.pending_deferred_closes),
+                    error=f"{e.__class__.__name__}: {e}",
+                    note="the closure stays owed; the story's own bookkeeping continues",
+                )
 
     def _flush_pending_deferred_closes(self, task: StoryTask) -> None:
         """Apply closures held back for an out-of-repo ledger, once the story's

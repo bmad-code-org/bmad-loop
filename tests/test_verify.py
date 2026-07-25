@@ -163,9 +163,7 @@ def test_stage_path_returns_false_when_resolve_raises(project, monkeypatch, exc)
     driven by an actual loop would assert a different outcome per interpreter."""
     target = project.project / "src.txt"
     target.write_text("changed\n")
-    monkeypatch.setattr(
-        verify.Path, "resolve", lambda self, *a, **kw: (_ for _ in ()).throw(exc)
-    )
+    monkeypatch.setattr(verify.Path, "resolve", lambda self, *a, **kw: (_ for _ in ()).throw(exc))
 
     assert verify.stage_path(project.project, target) is False
 
