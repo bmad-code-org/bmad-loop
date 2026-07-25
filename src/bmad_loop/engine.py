@@ -14,6 +14,7 @@ import functools
 import hashlib
 import shutil
 import signal
+import stat as stat_mod
 import sys
 import time
 import traceback
@@ -2257,11 +2258,42 @@ class Engine:
         genuine read fault keeps the fallback standing, and the withdrawal is
         journaled rather than inferred silently (#284 round-5 review, finding 2).
 
+        Absence is therefore decided by an explicit ``stat``, not by
+        ``Path.is_file()``. That helper answers False for exactly four errnos —
+        ENOENT, ENOTDIR, EBADF, ELOOP — and *propagates* every other OSError, so it
+        gets this site wrong in both directions at once: a symlink loop or an
+        unreadable path component was reported as a confirmed withdrawal and
+        cleared the capture, while an EACCES, EIO or ESTALE — the shape of the
+        very mount outage this feature's external-ledger path exists for, and
+        `spec_file` can live on that mount — raised straight through
+        ``_declared_deferred_ids`` and ``_close_declared_deferred`` into
+        ``_finalize_commit_phase``'s ``except BaseException``, crashing the story
+        at the commit boundary with all of its work already passed
+        (#284 round-7 review, finding 5).
+
+        The split is not cosmetic, because the two answers move in opposite
+        directions. Clearing costs a closure the story really did declare — a miss,
+        which the ledger reports truthfully by staying ``open``. Falling back
+        closes against the last good capture, which is a FALSE close if the
+        declaration was genuinely withdrawn. So only a fault that says nothing
+        about whether the spec is there falls back, and anything that positively
+        establishes there is no file to read clears.
+
         The path is not re-derived here: ``task.spec_file`` is recorded only by a
         passing verify gate, and the root-containment rule below still holds at
         both sites."""
         spec_path = Path(task.spec_file) if task.spec_file else None
-        if spec_path is None or not spec_path.is_file():
+        absent = True
+        if spec_path is not None:
+            try:
+                absent = not stat_mod.S_ISREG(spec_path.stat().st_mode)
+            except (FileNotFoundError, NotADirectoryError):
+                absent = True  # nothing is at that path: a confirmed withdrawal
+            except OSError:
+                # the location said nothing about the declaration. Keep the
+                # verified capture; `_declared_deferred_ids` reports the fault.
+                return False
+        if spec_path is None or absent:
             if task.declared_deferred:
                 self.journal.append(
                     "deferred-close-declaration-absent",

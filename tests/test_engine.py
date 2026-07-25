@@ -2705,6 +2705,57 @@ def test_closes_deferred_drops_the_capture_when_the_final_spec_is_gone(project, 
     assert "story-deferred-closed" not in {e["kind"] for e in engine.journal.entries()}
 
 
+def test_closes_deferred_keeps_the_capture_when_the_spec_stat_faults(project, monkeypatch):
+    """The other side of the deletion discriminator, and the reason it cannot be
+    `Path.is_file()`.
+
+    That helper answers False for exactly ENOENT / ENOTDIR / EBADF / ELOOP and
+    PROPAGATES every other OSError, so it was wrong in both directions at this
+    site. An EACCES / EIO / ESTALE — the shape of the same mount outage the
+    external-ledger path exists for, and `spec_file` can live on that mount — rose
+    through `_declared_deferred_ids` and `_close_declared_deferred` into
+    `_finalize_commit_phase`'s `except BaseException`, which restores and
+    re-raises: the story crashed at the commit boundary with every gate already
+    passed (#284 round-7 review, finding 5).
+
+    A fault that says nothing about whether the spec is there is not a withdrawal,
+    so the verified capture stands and the closure still lands. Paired with
+    `..._when_the_final_spec_is_gone` above, which pins the opposite direction: a
+    confirmed absence must still clear."""
+    engine = _closes_deferred_run(project, ["DW-1"])
+    sp = spec_path(project, "1-1-a")
+    finalize = engine._finalize_commit_phase
+    real_stat = Path.stat
+    faulting: list[int] = []
+
+    def stat_denied_on_the_spec(self, *a, **kw):
+        if faulting and self == sp:
+            raise PermissionError(13, "Permission denied")
+        return real_stat(self, *a, **kw)
+
+    def commit_with_the_spec_unreadable(task):
+        assert engine.state.tasks["1-1-a"].declared_deferred == ["DW-1"]  # captured at verify
+        faulting.append(1)  # scoped to the commit boundary: the capture must stay good
+        try:
+            return finalize(task)
+        finally:
+            faulting.clear()
+
+    monkeypatch.setattr(Path, "stat", stat_denied_on_the_spec)
+    monkeypatch.setattr(engine, "_finalize_commit_phase", commit_with_the_spec_unreadable)
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.crashed  # never a gate, and never a crash
+    assert not _ledger_entries(project)["DW-1"].open  # closed from the verified capture
+    events = [
+        e for e in engine.journal.entries() if e["kind"] == "deferred-close-declaration-unreadable"
+    ]
+    assert len(events) == 1 and "last good capture" in events[0]["note"]
+    # an unreadable spec is not a deletion, so it must not report one
+    assert "deferred-close-declaration-absent" not in {e["kind"] for e in engine.journal.entries()}
+
+
 def test_closes_deferred_drops_the_capture_when_the_final_spec_leaves_the_roots(
     project, tmp_path, monkeypatch
 ):
