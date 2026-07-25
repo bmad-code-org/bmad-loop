@@ -2265,9 +2265,7 @@ def test_closes_deferred_rollback_restores_the_index_too(project):
     assert "status: done" not in git(project.project, "diff", "--", str(project.deferred_work))
     staged = git(project.project, "diff", "--cached", "--", str(project.deferred_work))
     assert "status: done" not in staged
-    assert "deferred-close-rollback-unstaged" not in [
-        e["kind"] for e in engine.journal.entries()
-    ]
+    assert "deferred-close-rollback-unstaged" not in [e["kind"] for e in engine.journal.entries()]
 
 
 def test_closes_deferred_lands_once_when_a_failed_commit_is_re_driven(project):

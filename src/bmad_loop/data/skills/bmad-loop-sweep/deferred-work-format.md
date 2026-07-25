@@ -101,7 +101,7 @@ The rules that keep this safe:
   landed — after the commit in place, after the branch has merged under worktree
   isolation. A write that could not happen — the location is on a mount that is
   gone — is retried once more before the run ends, and on the next resume while
-  the run is still resumable. A run that *finishes* with the location still
+  the run is still resumable. A run that _finishes_ with the location still
   unavailable leaves those entries `open` and says so
   (`deferred-close-abandoned`); a sweep re-verifies them against the codebase.
   The closure never holds a completed run open.
