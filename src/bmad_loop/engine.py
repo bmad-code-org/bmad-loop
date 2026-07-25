@@ -2501,12 +2501,37 @@ class Engine:
         otherwise publish the false ``done`` this restore exists to remove
         (#284 round-6 review, finding 3). Advisory: a refused re-stage is
         journaled, never raised, because it must not mask the commit failure being
-        escalated."""
+        escalated.
+
+        **Only the entries this story flipped are put back.** What failed the
+        commit can be a native ``pre-commit`` hook that edited this same ledger
+        before rejecting it, and rewriting the whole document takes that edit with
+        it: the restore cannot tell the story's own ``status: done`` from anybody
+        else's work, and the entry the hook appended simply disappears
+        (#284 round-7 review, finding 3). ``restore_entries`` substitutes the named
+        entries inside whatever is on disk now, which is exactly as wide as the
+        write it undoes.
+
+        The whole-document rewrite stays as the fallback for the one case with
+        nothing to target: ``marked`` is empty when a stop signal landed *inside*
+        the write, before the close could report which ids it had flipped. There
+        the restore is by content or not at all, and giving it up would hand that
+        window back its false close."""
         if snapshot is None:
             return
         ledger, before, marked = snapshot
+        text, unrestored = before, []
+        if marked:
+            try:
+                text, unrestored = deferredwork.restore_entries(
+                    ledger.read_text(encoding="utf-8"), before, marked
+                )
+            except OSError:
+                # unreadable now; the snapshot is still a better answer than a
+                # ledger left claiming work that was never committed.
+                text, unrestored = before, []
         try:
-            atomic_write_text(ledger, before)
+            atomic_write_text(ledger, text)
         except OSError as e:
             # bookkeeping repair must not mask the commit failure being escalated
             self.journal.append(
@@ -2516,6 +2541,17 @@ class Engine:
                 error=str(e),
             )
             return
+        if unrestored:
+            # the entry is not in the ledger any more, so there is no `status: done`
+            # left standing — but the operator should know the rollback found the
+            # document rearranged underneath it.
+            self.journal.append(
+                "deferred-close-rollback-partial",
+                story_key=task.story_key,
+                dw_ids=list(unrestored),
+                ledger=str(ledger),
+                note="these entries were gone from the ledger by the time the close was undone",
+            )
         if not verify.stage_path(self.workspace.root, ledger):
             self.journal.append(
                 "deferred-close-rollback-unstaged",

@@ -18,6 +18,7 @@ from bmad_loop.deferredwork import (
     parse_declaration,
     parse_ledger,
     parse_legacy,
+    restore_entries,
 )
 
 LEDGER = """\
@@ -652,3 +653,63 @@ def test_mark_done_many_skips_an_already_done_entry(tmp_path):
     assert again == []
     body = next(e for e in parse_ledger(p.read_text(encoding="utf-8")) if e.id == "DW-1").body
     assert body.count("resolution: resolved by story 1") == 1
+
+
+def test_restore_entries_reverts_only_the_named_entries():
+    """The undo half of `mark_done_many`, and deliberately no wider than the do.
+
+    A rollback runs after a commit failed, and what failed it can be a native
+    `pre-commit` hook that edited this same ledger before rejecting. Rewriting the
+    whole document from the pre-close snapshot takes that edit with it, because it
+    cannot tell the story's own flip from anybody else's work
+    (#284 round-7 review, finding 3)."""
+    before = "# Deferred Work\n\n### DW-1: one\n\nstatus: open\n\n### DW-2: two\n\nstatus: open\n"
+    current = (
+        "# Deferred Work\n\n"
+        "### DW-1: one\n\nstatus: done 2026-07-25\nresolution: resolved by story 1-1-a\n\n"
+        "### DW-2: two\n\nstatus: done 2026-07-25\nresolution: closed by hand\n\n"
+        "### DW-9: appended later\n\nstatus: open\n"
+    )
+
+    text, missing = restore_entries(current, before, ["DW-1"])
+
+    assert missing == []
+    entries = {e.id: e for e in parse_ledger(text)}
+    assert entries["DW-1"].open  # reverted
+    assert not entries["DW-2"].open  # somebody else's close, untouched
+    assert "closed by hand" in text
+    assert "DW-9" in entries  # an entry that did not exist at snapshot time survives
+
+
+def test_restore_entries_multiple_entries_keep_their_neighbours(tmp_path):
+    """Several ids at once. Each splice shifts every offset after it, so the edits
+    are applied last-first; front-first would rewrite the second entry using spans
+    measured against the pre-splice text and corrupt the document."""
+    p = tmp_path / "deferred-work.md"
+    p.write_text(LEDGER, encoding="utf-8")
+    before = LEDGER
+    marked = mark_done_many(p, ["DW-1", "DW-3"], "2026-07-25", "resolved by story 1-1-a")
+    assert marked == ["DW-1", "DW-3"]  # the fixture's DW-2 is already done
+
+    text, missing = restore_entries(p.read_text(encoding="utf-8"), before, marked)
+
+    assert missing == []
+    assert text == before  # nothing else changed, so a full revert is byte-identical
+    entries = {e.id: e for e in parse_ledger(text)}
+    assert entries["DW-1"].open and entries["DW-3"].open
+    assert "resolved by story 1-1-a" not in text
+
+
+def test_restore_entries_reports_an_id_it_cannot_put_back():
+    """Unrestorable in either direction is reported, never guessed at: an entry the
+    hook deleted outright is gone from `current`, and one absent from the snapshot
+    has no prior state to restore. Neither is resurrected — the rollback undoes a
+    status flip, it does not re-author the ledger."""
+    before = "# Deferred Work\n\n### DW-1: one\n\nstatus: open\n"
+    current = "# Deferred Work\n\n### DW-2: two\n\nstatus: open\n"
+
+    text, missing = restore_entries(current, before, ["DW-1", "DW-2"])
+
+    assert missing == ["DW-1", "DW-2"]  # gone from `current` / absent from `before`
+    assert text == current  # nothing to splice either way
+    assert "DW-1" not in text

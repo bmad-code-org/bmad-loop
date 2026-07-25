@@ -2268,6 +2268,43 @@ def test_closes_deferred_rollback_restores_the_index_too(project):
     assert "deferred-close-rollback-unstaged" not in [e["kind"] for e in engine.journal.entries()]
 
 
+def test_closes_deferred_rollback_keeps_an_edit_the_rejecting_hook_made(project):
+    """The rollback used to rewrite the whole ledger from the pre-close snapshot,
+    which cannot tell this story's `status: done` from anybody else's work.
+
+    The writer that can land inside that window is the very thing that fails the
+    commit: a native `pre-commit` hook that edits `deferred-work.md` and then
+    rejects. Its entry was silently deleted along with the close being undone —
+    synchronously, inside this story's own commit, so it is not the concurrent
+    -writer problem tracked by #286 (#284 round-7 review, finding 3)."""
+    engine = _closes_deferred_run(project, ["DW-1"])
+    ledger = project.deferred_work
+    hooks = project.project / ".git" / "hooks"
+    hooks.mkdir(parents=True, exist_ok=True)
+    hook = hooks / "pre-commit"
+    # files an entry of its own (the shape of a lint/secret hook recording what it
+    # objected to) and only then refuses the commit
+    hook.write_text(
+        "#!/bin/sh\n"
+        f"cat >> '{ledger}' <<'EOF'\n\n"
+        "### DW-9: filed by the hook\n\n"
+        "origin: hook, 2026-06-01\nlocation: src.txt:1\nreason: hook entry.\nstatus: open\n"
+        "EOF\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    hook.chmod(0o755)
+
+    summary = engine.run()
+
+    assert summary.done == 0 and summary.paused  # the commit really did fail
+    entries = _ledger_entries(project)
+    assert entries["DW-1"].open  # the story's close is undone...
+    assert "DW-9" in entries and entries["DW-9"].open  # ...and the hook's entry survives
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert kinds.index("story-deferred-closed") < kinds.index("deferred-close-rolled-back")
+
+
 def test_closes_deferred_lands_once_when_a_failed_commit_is_re_driven(project):
     """The rollback must leave the story re-drivable: once the hook is gone, the
     resumed commit phase re-applies the close exactly once (no doubled

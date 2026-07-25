@@ -229,6 +229,43 @@ def mark_done_many(path: Path, dw_ids: Sequence[str], date: str, note: str) -> l
     return marked
 
 
+def restore_entries(current: str, before: str, dw_ids: Sequence[str]) -> tuple[str, list[str]]:
+    """Put just the named entries back the way `before` had them, inside whatever
+    `current` says now. Returns the rewritten text plus the ids that could not be
+    restored, in the order given.
+
+    This is the undo half of :func:`mark_done_many`, and it is deliberately
+    narrower than "write `before` back". A rollback runs after a commit failed,
+    and the thing that failed the commit can be a native `pre-commit` hook that
+    edited this same ledger before rejecting — appending a fresh entry, say. A
+    whole-document restore silently takes that edit with it, because it cannot
+    tell the story's own `status: done` flip from anybody else's work
+    (#284 round-7 review, finding 3).
+
+    Substituting whole entry bodies rather than just the two lines the close wrote
+    keeps the undo exactly as wide as the do: :func:`_apply_done` rewrites the
+    status line and inserts a `resolution:` line, both inside the entry, so
+    replacing the entry restores precisely that and nothing else. An id missing
+    from either side is reported rather than guessed at — the caller decides
+    whether an entry the hook deleted outright is worth complaining about.
+
+    Spans are applied last-first so each splice leaves the earlier offsets valid.
+    """
+    before_by_id = {e.id: e for e in parse_ledger(before)}
+    current_by_id = {e.id: e for e in parse_ledger(current)}
+    edits: list[tuple[tuple[int, int], str]] = []
+    missing: list[str] = []
+    for dw_id in dict.fromkeys(dw_ids):
+        was, now = before_by_id.get(dw_id), current_by_id.get(dw_id)
+        if was is None or now is None:
+            missing.append(dw_id)
+            continue
+        edits.append((now.span, was.body))
+    for (start, end), body in sorted(edits, key=lambda e: e[0][0], reverse=True):
+        current = current[:start] + body + current[end:]
+    return current, missing
+
+
 def mark_done(path: Path, dw_id: str, date: str, note: str) -> bool:
     """Flip one entry to `status: done <date>` and record a resolution note.
     Returns False (no write) when the entry is missing or already done."""
