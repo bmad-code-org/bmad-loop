@@ -45,6 +45,14 @@ class MultiplexerError(Exception):
     without importing a backend."""
 
 
+# The banner a parked window prints when its command exits (followed by the
+# exit status — see :meth:`TerminalMultiplexer.new_parked_window`). Part of the
+# parked-window contract: observers (e.g. the viewer launcher) detect a died
+# command by finding this prefix in a pane capture, so every backend's parked
+# recipe must emit it verbatim.
+PARKED_EXIT_BANNER = "[bmad-loop exited"
+
+
 def parse_target(target: str) -> tuple[str, str | None] | None:
     """Decode a seam-canonical window target (see :meth:`TerminalMultiplexer.target`).
 
@@ -120,6 +128,15 @@ class TerminalMultiplexer(ABC):
     def set_session_option(self, name: str, option: str, value: str) -> None:
         """Set a user option on the named session."""
 
+    def set_session_environment(self, name: str, var: str, value: str) -> None:
+        """Add ``var=value`` to the named session's environment, inherited by
+        every process the session spawns *afterwards* (tmux ``set-environment``).
+        Used to hand a viewer window credentials (e.g. a server password)
+        without putting them in the window's argv, where ``ps`` would show
+        them. Not abstract — best-effort: the default no-op means a backend
+        without the capability degrades to an unauthenticated viewer, never a
+        crash."""
+
     # ------------------------------------------------------------ windows
 
     @abstractmethod
@@ -168,6 +185,14 @@ class TerminalMultiplexer(ABC):
         know", not "dead", and must not tear down a possibly-working session on
         it."""
 
+    def window_exists(self, session: str, window_name: str) -> bool:
+        """True iff ``window_name`` is an active window of ``session``.
+
+        Best-effort: returns ``False`` when the multiplexer is unavailable.
+        Used by viewer creation to verify a newly-created window actually
+        appeared (the ``new-window`` return value is not enough)."""
+        return False
+
     @abstractmethod
     def kill_window(self, target: str) -> None:
         """Kill the targeted window (tolerant of it already being gone, and a
@@ -180,11 +205,42 @@ class TerminalMultiplexer(ABC):
         on a transport failure). ``target`` is a :meth:`target` token or a
         backend-native window id."""
 
+    def resize_window(self, target: str, cols: int, lines: int) -> None:
+        """Resize the targeted window to ``cols`` x ``lines`` (tmux
+        ``resize-window``). Used by the dashboard to keep a detached viewer
+        window matched to the pane that displays its capture, so the attached
+        TUI redraws at the size actually shown. Not abstract — best-effort:
+        the default no-op leaves the window at its creation geometry."""
+
+    def set_viewer_option(self, window_id: str, value: str) -> None:
+        """Stash a unique marker on the viewer window so later lookups
+        (reuse, teardown, resume) find it even when auto-rename is active.
+
+        ``window_id`` is the backend-native id returned by
+        :meth:`TerminalMultiplexer.new_window`.  Best-effort: no-op when the
+        multiplexer is unavailable."""
+
     @abstractmethod
     def set_window_option(self, target: str, option: str, value: str) -> None:
         """Set a user option on the targeted window (best-effort: a no-op on a
         transport failure). ``target`` is a :meth:`target` token or a
         backend-native window id."""
+
+    def capture_pane(self, target: str, start_line: int = -100, end_line: int | None = None) -> str:
+        """Capture the contents of a pane as a text string.
+
+        Equivalent to ``tmux capture-pane -p -e -J -S <start> -E <end> -t <target>``.
+
+        Args:
+            target: pane/window session target (e.g. ``=bmad-loop-abc:viewer``).
+            start_line: first line to capture (negative = lines above the
+                visible pane; ``-100`` ≈ 100 lines of history).
+            end_line: last line to capture (``None`` = current line).
+
+        Returns the captured text (including escape sequences) or empty
+        string when the pane is missing or the backend is unavailable.
+        Callers parse the text through pyte to produce a styled render."""
+        raise NotImplementedError
 
     @abstractmethod
     def unset_window_option(self, target: str, option: str) -> None:

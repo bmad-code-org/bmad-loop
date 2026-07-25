@@ -388,12 +388,21 @@ def test_run_custom_env_is_forwarded_without_leaking(monkeypatch):
 
 # the exact sh source the POSIX backend produced before the hooks existed
 _PARKED_SH_SOURCE = (
-    'echo hi; ec=$?; echo "[bmad-loop exited $ec — press enter]"; read -r; '
+    'echo hi; ec=$?; echo "[bmad-loop exited $ec — press enter]"; read -r _park; '
     "ret=$(tmux show-options -wqv %3 2>/dev/null); "
     'if [ "$ret" = "detach" ]; then tmux detach-client 2>/dev/null; '
     'elif [ -n "$ret" ]; then '
     'tmux switch-client -t "$ret" 2>/dev/null || tmux switch-client -l 2>/dev/null; fi'
 )
+
+
+def test_resize_window_argv(monkeypatch):
+    rec = _RecordRun()
+    monkeypatch.setattr(tmux_base.subprocess, "run", rec)
+
+    TmuxMultiplexer().resize_window("=s:v", 165, 45)
+
+    assert rec.argv == ["tmux", "resize-window", "-t", "=s:v", "-x", "165", "-y", "45"]
 
 
 def test_new_parked_window_posix_argv_byte_identical(monkeypatch, tmp_path):

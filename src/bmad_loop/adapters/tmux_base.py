@@ -31,7 +31,7 @@ import sys
 import time
 from pathlib import Path
 
-from .multiplexer import MultiplexerError, TerminalMultiplexer
+from .multiplexer import PARKED_EXIT_BANNER, MultiplexerError, TerminalMultiplexer
 
 TMUX_TIMEOUT_S = 30
 # Per-window option value (vs a pane target) telling the parked trailer to detach
@@ -136,6 +136,14 @@ class BaseTmuxBackend(TerminalMultiplexer):
         # session name so plain-name targeting resolves it unambiguously.
         self._tmux("set-option", "-t", name, option, value)
 
+    def set_session_environment(self, name: str, var: str, value: str) -> None:
+        # Best-effort (see the seam contract): a failure degrades the viewer
+        # to unauthenticated, it must never break session creation.
+        try:
+            self._tmux("set-environment", "-t", f"={name}", var, value)
+        except TmuxError:
+            pass
+
     def kill_session(self, name: str) -> None:
         # Tolerant of the binary being absent / the session already gone: a
         # best-effort teardown backstop, never a hard failure.
@@ -195,7 +203,10 @@ class BaseTmuxBackend(TerminalMultiplexer):
     #: _EXIT_CAPTURE override MUST bind the variable ``ec``.
     _EXIT_CAPTURE = "ec=$?"
     _ECHO = "echo"
-    _PARK = "read -r"
+    # `read -r` NEEDS the variable name: bash defaults to REPLY without one,
+    # but POSIX requires it and dash (Debian/Ubuntu /bin/sh) errors out —
+    # which un-parks the window the instant the command exits.
+    _PARK = "read -r _park"
 
     def _join_argv(self, argv: list[str]) -> str:
         """Render ``argv`` as one shell command line in this dialect."""
@@ -275,7 +286,7 @@ class BaseTmuxBackend(TerminalMultiplexer):
         # client to where it came from.
         source = self._source_prefix() + (
             f"{self._join_argv(argv)}; {self._EXIT_CAPTURE}; "
-            f'{self._ECHO} "[bmad-loop exited $ec — press enter]"; '
+            f'{self._ECHO} "{PARKED_EXIT_BANNER} $ec — press enter]"; '
             f"{self._PARK}; {self._parked_trailer(return_opt)}"
         )
         return self._tmux(
@@ -351,6 +362,14 @@ class BaseTmuxBackend(TerminalMultiplexer):
         except (subprocess.SubprocessError, OSError, ValueError):
             return []
 
+    def window_exists(self, session: str, window_name: str) -> bool:
+        """Verify a window with the given name is live in ``session``."""
+        try:
+            rows = self.list_windows(session, ["window_name"])
+        except MultiplexerError:
+            return False
+        return any(row and row[0] == window_name for row in rows)
+
     def list_windows(self, session: str, fields: list[str]) -> list[tuple[str, ...]]:
         fmt = "\t".join(f"#{{{field}}}" for field in fields)
         try:
@@ -376,6 +395,23 @@ class BaseTmuxBackend(TerminalMultiplexer):
         except (subprocess.SubprocessError, OSError):
             pass
 
+    def resize_window(self, target: str, cols: int, lines: int) -> None:
+        # Best-effort (see the seam contract): a failure leaves the window at
+        # its creation geometry, which still renders — just letterboxed.
+        try:
+            self._run(
+                ["resize-window", "-t", target, "-x", str(cols), "-y", str(lines)],
+                check=False,
+            )
+        except (subprocess.SubprocessError, OSError):
+            pass
+
+    def set_viewer_option(self, window_id: str, value: str) -> None:
+        try:
+            self.set_window_option(window_id, value, "1")
+        except TmuxError:
+            pass
+
     def set_window_option(self, target: str, option: str, value: str) -> None:
         try:
             self._run(["set-option", "-w", "-t", target, option, value], check=False)
@@ -395,6 +431,32 @@ class BaseTmuxBackend(TerminalMultiplexer):
         except (subprocess.SubprocessError, OSError):
             return ""
         return proc.stdout.strip() if proc.returncode == 0 else ""
+
+    def capture_pane(self, target: str, start_line: int = -100, end_line: int | None = None) -> str:
+        """Return the pane contents as a text string via ``tmux capture-pane``.
+
+        Captures with -e (encoding/ANSI), -J (jump wrapping), and -S/-E
+        for the requested line range. Empty string when the pane is gone
+        or the binary is missing."""
+        try:
+            args = [
+                "capture-pane",
+                "-p",  # print to stdout
+                "-e",  # encoding (preserve ANSI)
+                "-J",  # jump wrapping (don't truncate long lines)
+                "-S",
+                str(start_line),
+                "-t",
+                target,
+            ]
+            if end_line is not None:
+                args += ["-E", str(end_line)]
+            proc = self._run(args, check=False)
+            if proc.returncode != 0:
+                return ""
+            return proc.stdout
+        except (subprocess.SubprocessError, OSError):
+            return ""
 
     # ----------------------------------------------------- client / attach
 
