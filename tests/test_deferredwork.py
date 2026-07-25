@@ -535,6 +535,73 @@ def test_classify_partitions_open_done_unknown_and_malformed():
     assert declared.malformed == ("DW-3", "DW-4")
 
 
+DUPLICATE_OPEN_FIRST = (
+    "# Deferred Work\n\n"
+    "### DW-1: the first copy\nstatus: open\n\n"
+    "### DW-1: the second copy\nstatus: done 2026-06-01\n"
+)
+DUPLICATE_DONE_FIRST = (
+    "# Deferred Work\n\n"
+    "### DW-1: the first copy\nstatus: done 2026-06-01\n\n"
+    "### DW-1: the second copy\nstatus: open\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_open", "expected_done"),
+    [
+        (DUPLICATE_OPEN_FIRST, ("DW-1",), ()),
+        (DUPLICATE_DONE_FIRST, (), ("DW-1",)),
+    ],
+    ids=["open-first", "done-first"],
+)
+def test_classify_reads_the_same_duplicate_the_mutation_writes(text, expected_open, expected_done):
+    """`classify` must name the entry `_find_entry` acts on. Indexing last-wins
+    while the mutation takes the first made them disagree, and BOTH orders then
+    closed nothing while saying nothing: done-first classified `open`, then
+    `_apply_done` refused the done copy it found first (so nothing was marked and
+    not even an unmatched warning followed); open-first classified `already_done`
+    and never attempted the write (#284 round-6 review, finding 4)."""
+    declared = classify(text, ["DW-1"])
+
+    assert declared.open_ids == expected_open
+    assert declared.already_done == expected_done
+    assert declared.unknown == ()
+    assert declared.duplicates == ("DW-1",)  # reported either way — the ledger is corrupt
+
+
+@pytest.mark.parametrize(
+    ("text", "expected", "after"),
+    [
+        (DUPLICATE_OPEN_FIRST, ["DW-1"], ["done", "done"]),
+        (DUPLICATE_DONE_FIRST, [], ["done", "open"]),
+    ],
+    ids=["open-first", "done-first"],
+)
+def test_mark_done_many_agrees_with_classify_on_a_duplicated_id(tmp_path, text, expected, after):
+    """The other half of the same contract: what `classify` calls open is exactly
+    what the write marks, so an id is never reported closed without being closed —
+    nor, as before, classified open and then silently left open.
+
+    The done-first ledger still ends with an open copy nobody touched. That is the
+    honest outcome of a corrupt ledger (#286) and it is why the close is journaled
+    as a duplicate rather than passed over."""
+    p = tmp_path / "deferred-work.md"
+    p.write_text(text, encoding="utf-8")
+    declared = classify(text, ["DW-1"])
+
+    assert list(mark_done_many(p, declared.open_ids, "2026-07-24", "note")) == expected
+
+    entries = parse_ledger(p.read_text(encoding="utf-8"))
+    assert [e.status.split()[0] for e in entries] == after
+
+
+def test_classify_reports_no_duplicates_for_a_well_formed_ledger():
+    declared = classify(LEDGER, ["DW-1", "DW-2"])
+
+    assert declared.duplicates == ()
+
+
 def test_mark_done_many_writes_once_and_reports_what_landed(tmp_path):
     p = tmp_path / "deferred-work.md"
     p.write_text(LEDGER, encoding="utf-8")

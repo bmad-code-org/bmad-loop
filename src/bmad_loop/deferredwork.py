@@ -107,12 +107,18 @@ class Declared:
     already landed — and must stay silent. ``malformed`` is an entry that exists
     but carries neither an ``open`` nor a ``done`` status: nothing can be marked,
     and saying nothing would leave the operator believing it was.
+
+    ``duplicates`` cross-cuts the other four: it names the declared ids the ledger
+    carries more than once, whichever bucket they landed in. A duplicate id is a
+    corrupt ledger (#286), and the entry this classification describes is only one
+    of them — so the close is reported, never silent.
     """
 
     open_ids: tuple[str, ...] = ()
     already_done: tuple[str, ...] = ()
     unknown: tuple[str, ...] = ()
     malformed: tuple[str, ...] = ()
+    duplicates: tuple[str, ...] = ()
 
 
 def classify(text: str, ids: Sequence[str]) -> Declared:
@@ -120,8 +126,26 @@ def classify(text: str, ids: Sequence[str]) -> Declared:
 
     Classifying from a snapshot rather than from :func:`mark_done`'s return value
     is deliberate: that return conflates "already done" with "absent from the
-    ledger", and those need opposite treatment (silence vs. a warning)."""
-    by_id = {e.id: e for e in parse_ledger(text)}
+    ledger", and those need opposite treatment (silence vs. a warning).
+
+    **The FIRST entry of a duplicated id wins**, because that is the one
+    :func:`_find_entry` — and so every mutation in this module — acts on. Indexing
+    last-wins instead made the two disagree, and a ledger carrying one `DW-1` open
+    and another done then closed nothing while saying nothing, in either order: a
+    done-first ledger classified the id `open`, sent it to
+    :func:`mark_done_many`, and had :func:`_apply_done` refuse the done copy it
+    found first (marked nothing, so not even an unmatched warning); an open-first
+    ledger classified it `already_done` and never attempted the write at all
+    (#284 round-6 review, finding 4). The duplicate itself is reported through
+    ``duplicates`` rather than swallowed — one id naming two entries is a fault
+    about the ledger, not an answer about the work."""
+    by_id: dict[str, DWEntry] = {}
+    duplicated: set[str] = set()
+    for e in parse_ledger(text):
+        if e.id in by_id:
+            duplicated.add(e.id)
+            continue  # first wins: `_find_entry` mutates that one
+        by_id[e.id] = e
     buckets: dict[str, list[str]] = {"open": [], "done": [], "unknown": [], "malformed": []}
     for dw_id in ids:
         entry = by_id.get(dw_id)
@@ -135,6 +159,7 @@ def classify(text: str, ids: Sequence[str]) -> Declared:
         already_done=tuple(buckets["done"]),
         unknown=tuple(buckets["unknown"]),
         malformed=tuple(buckets["malformed"]),
+        duplicates=tuple(dw_id for dw_id in dict.fromkeys(ids) if dw_id in duplicated),
     )
 
 

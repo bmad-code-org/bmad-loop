@@ -2114,6 +2114,44 @@ def test_closes_deferred_reports_a_malformed_ledger_entry(project):
     assert len(events) == 1 and events[0]["dw_ids"] == ["DW-1"]
 
 
+@pytest.mark.parametrize(
+    ("first", "second", "closed"),
+    [("open", "done 2026-06-01", True), ("done 2026-06-01", "open", False)],
+    ids=["open-first", "done-first"],
+)
+def test_closes_deferred_reports_a_duplicated_ledger_id(project, first, second, closed):
+    """One id, two entries: only the first is read and only the first can be
+    written, so the second is neither. Both orders used to pass in total silence —
+    `classify` indexed the LAST entry while the mutation took the first, so a
+    done-first ledger classified the id open and then marked nothing at all
+    (#284 round-6 review, finding 4).
+
+    The close itself still behaves as the first entry dictates. What changes is
+    that the operator is told the ledger names one id twice (#286)."""
+    engine = _closes_deferred_run(project, ["DW-1"])
+    project.deferred_work.write_text(
+        "# Deferred Work\n\n"
+        f"### DW-1: the first copy\nstatus: {first}\n\n"
+        f"### DW-1: the second copy\nstatus: {second}\n",
+        encoding="utf-8",
+    )
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "duplicate id")
+
+    summary = engine.run()
+
+    assert summary.done == 1  # never a gate
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    events = [e for e in engine.journal.entries() if e["kind"] == "deferred-close-duplicate-id"]
+    assert len(events) == 1 and events[0]["dw_ids"] == ["DW-1"]
+    # the first entry decides, and the close is reported only when it happened
+    assert ("story-deferred-closed" in kinds) is closed
+    parsed = deferredwork.parse_ledger(project.deferred_work.read_text(encoding="utf-8"))
+    assert [e.status.split()[0] for e in parsed] == (
+        ["done", "done"] if closed else ["done", "open"]
+    )
+
+
 def test_closes_deferred_reports_a_wrong_container_declaration(project):
     """`closes_deferred: DW-1` (a scalar, not a list) is a real declaration of
     intent. Reading it as an empty list closed nothing and said nothing, while

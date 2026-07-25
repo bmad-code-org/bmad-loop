@@ -2468,6 +2468,17 @@ class Engine:
                 dw_ids=list(declared.malformed),
                 error="ledger entry status is neither open nor done",
             )
+        if declared.duplicates:
+            # One id, two entries: only the first was classified and only the
+            # first can be marked, so whatever the second says about this work is
+            # neither read nor written. A corrupt ledger (#286) must not close
+            # quietly — the operator has to know which id to go look at.
+            self.journal.append(
+                "deferred-close-duplicate-id",
+                story_key=task.story_key,
+                dw_ids=list(declared.duplicates),
+                error="the ledger carries more than one entry for this id; only the first was read",
+            )
         return marked
 
     def _flush_pending_deferred_closes(self, task: StoryTask) -> None:
