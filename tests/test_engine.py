@@ -2469,6 +2469,7 @@ def test_closes_deferred_external_ledger_unavailable_keeps_the_obligation(projec
     assert load_state(engine.run_dir).tasks["1-1-a"].pending_deferred_closes == []
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
 def test_closes_deferred_owes_nothing_a_finished_run_can_no_longer_pay(project, tmp_path):
     """The other end of that promise. `resume` refuses a finished run, so an
     obligation carried past the end of a run that completed promises a retry
@@ -2502,6 +2503,32 @@ def test_closes_deferred_owes_nothing_a_finished_run_can_no_longer_pay(project, 
     persisted = load_state(engine.run_dir)
     assert persisted.finished  # ...which is exactly why the obligation is not kept
     assert persisted.tasks["1-1-a"].pending_deferred_closes == []
+
+
+@pytest.mark.parametrize("final", [False, True], ids=["mid-run", "run-end"])
+def test_closes_deferred_obligation_is_released_only_by_the_final_pass(project, tmp_path, final):
+    """The release semantics on their own, on every platform (the end-to-end
+    reachability test above needs a symlink, so it is POSIX-only).
+
+    Mid-run the obligation is kept: a later pass — this run's own retry, or a
+    resume — can still pay it. At run end nothing can, because `resume` refuses a
+    finished run, so keeping it would promise a retry that never comes. Released
+    means the entries stay `open` for a sweep, never that they are marked done."""
+    paths = _external_ledger_paths(project, tmp_path)
+    engine, _ = make_engine(paths, [])
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.phase = Phase.DONE
+    task.pending_deferred_closes = ["DW-1"]
+    engine.state.tasks["1-1-a"] = task
+    paths.implementation_artifacts.rename(tmp_path / "unmounted")  # the location is gone
+
+    engine._reconcile_pending_deferred_closes(final=final)
+
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "deferred-close-ledger-unavailable" in kinds  # never read as "no entries"
+    abandoned = [e for e in engine.journal.entries() if e["kind"] == "deferred-close-abandoned"]
+    assert bool(abandoned) is final
+    assert task.pending_deferred_closes == ([] if final else ["DW-1"])
 
 
 def test_closes_deferred_external_ledger_absent_from_a_live_dir_still_discharges(project, tmp_path):
