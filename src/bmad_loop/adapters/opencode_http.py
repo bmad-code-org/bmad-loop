@@ -94,7 +94,7 @@ from ..journal import LOGS_DIR
 from ..model import TokenUsage
 from ..policy import Policy
 from ..process_host import ProcessHostError, get_process_host
-from .base import CodingCLIAdapter, SessionHandle, SessionResult, SessionSpec
+from .base import CodingCLIAdapter, SessionHandle, SessionResult, SessionSpec, ViewerConfig
 from .generic import (
     BUDGET_NUDGE_TEXT,
     HEARTBEAT_INTERVAL_S,
@@ -104,6 +104,9 @@ from .generic import (
     _ResultFileMixin,
 )
 from .profile import CLIProfile
+from .viewer_launch import _is_control_flow as _viewer_control_flow
+from .viewer_launch import close_viewer_window as _close_viewer
+from .viewer_launch import ensure_viewer_window as _ensure_viewer
 
 if TYPE_CHECKING:
     from ..process_host import ProcessHost
@@ -266,6 +269,12 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self._sessions: dict[str, _ServerSession] = {}
         self._usage: dict[str, TokenUsage] = {}
+        # Viewer window config — set in start_session if show_attached_ui;
+        # the teardown path always reads it via getattr (safe even when the
+        # session crashed before start_session returned).  Persisted to
+        # viewer.json so the dashboard Log tab, attach routing, and resume
+        # can find it even when re-reading a stopped run.
+        self._viewer_config: ViewerConfig = ViewerConfig()
         # opencode serve survives parent death: sweep whatever is
         # still registered when the interpreter exits cooperatively. A hard
         # SIGKILL of the engine still leaks — documented residual risk.
@@ -432,6 +441,14 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
             self._sessions.pop(spec.task_id, None)
             self._teardown(sess)
             raise
+
+        # Viewer window: created after the session is live so the attach URL and
+        # session id are available.  Best-effort — failures degrade to headless.
+        if self.policy.adapter.show_attached_ui:
+            self._viewer_config = self._make_viewer_config(spec.task_id, sess, spec.cwd)
+        else:
+            self._viewer_config = ViewerConfig()
+
         return SessionHandle(
             task_id=spec.task_id, native_id=sess.session_id, launched_ns=launched_ns
         )
@@ -969,11 +986,131 @@ class OpencodeHttpAdapter(_ResultFileMixin, CodingCLIAdapter):
     # -------------------------------------------------------------- teardown
 
     def kill(self, handle: SessionHandle) -> None:
+        # Teardown order: viewer window → server/session → process.
+        # Idempotent — all operations tolerate being called on gone targets.
+        self._close_viewer()
         sess = self._sessions.pop(handle.task_id, None)
         if sess is None:
             return
         self._abort(sess)
         self._teardown(sess)
+
+    def _make_viewer_config(self, task_id: str, sess: "_ServerSession", cwd: Path) -> ViewerConfig:
+        """Create a viewer window after the server + session are live.
+        Best-effort — a missing opencode binary or mux failure degrades to
+        a no-op ViewerConfig (headless-only).  Persists config to disk."""
+        run_id = self.run_dir.name
+        try:
+            vc = _ensure_viewer(
+                run_id=run_id,
+                server_url=sess.base_url,
+                session_id=sess.session_id,
+                working_directory=cwd,
+                attach_binary=shutil.which("opencode") or "opencode",
+                run_dir=self.run_dir,
+                # The serve process 401s everything without its per-session
+                # password; `opencode attach` reads this var for basic auth.
+                attach_env={"OPENCODE_SERVER_PASSWORD": sess.password},
+            )
+        except Exception as exc:  # nosec B110 - best effort
+            if _viewer_control_flow(exc):
+                raise  # the engine's stop/pause landed here — never swallow it
+            vc = ViewerConfig()
+        self.viewer_config = vc
+        # Persist so the dashboard/attach/resume can read back even from
+        # a dead run dir.
+        self._persist_viewer_config(vc)
+        return vc
+
+    def _persist_viewer_config(self, vc: ViewerConfig) -> None:
+        """Write viewer metadata to <run_dir>/viewer.json (append-only
+        keyed by adapter name, so a resumed run overwrites the previous entry)."""
+        try:
+            path = self.run_dir / "viewer.json"
+            if path.is_file():
+                try:
+                    entries = json.loads(path.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, OSError):
+                    entries = []
+            else:
+                entries = []
+            entries = [e for e in entries if e.get("adapter") != self.name] + [
+                {
+                    "adapter": self.name,
+                    "task_id": getattr(self, "_current_task_id", ""),
+                    "viewer_window": vc.viewer_window or "",
+                    "viewer_url": vc.viewer_url or "",
+                    "viewer_session": vc.viewer_session or "",
+                    "viewer_cwd": vc.viewer_cwd or "",
+                    "viewer_command": vc.viewer_command or "",
+                }
+            ]
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(entries, ensure_ascii=False) + "\n", encoding="utf-8")
+            tmp.replace(path)
+        except Exception:  # nosec B110 - best attempt, never raise
+            pass
+
+    @classmethod
+    def load_viewer_config(cls, run_dir: Path, adapter_name: str) -> ViewerConfig | None:
+        """Read the most recent viewer config written by *adapter_name*.
+        Returns ``None`` when there is no recorded config or the file is unreadable."""
+        try:
+            path = run_dir / "viewer.json"
+            if not path.is_file():
+                return None
+            entries = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(entries, list):
+                return None
+            for e in entries:
+                if e.get("adapter") == adapter_name:
+                    return ViewerConfig(
+                        viewer_window=e.get("viewer_window") or None,
+                        viewer_url=e.get("viewer_url") or "",
+                        viewer_session=e.get("viewer_session") or "",
+                        viewer_cwd=e.get("viewer_cwd") or "",
+                        viewer_command=e.get("viewer_command") or "",
+                    )
+            return None
+        except Exception:  # nosec B110 - best effort read
+            return None
+
+    def _close_viewer(self) -> None:
+        """Teardown the viewer window. Idempotent: close_viewer_window
+        tolerates a missing target."""
+        wc = getattr(self, "_viewer_config", ViewerConfig())
+        _close_viewer(wc.viewer_window)
+
+    def close_viewer_window(self, target: str | None = None) -> None:
+        """Adapter-seam close — delegates to the internal path."""
+        self._close_viewer()
+
+    def ensure_viewer_window(
+        self, spec: SessionSpec, session_id: str, base_url: str
+    ) -> ViewerConfig:
+        """Adapter-seam ensure — delegates to the internal path."""
+        run_id = self.run_dir.name
+        # The viewer must authenticate against the per-session serve password;
+        # find the live session this id belongs to (absent for a foreign id —
+        # the viewer then runs unauthenticated and shows the server's 401).
+        password = next(
+            (s.password for s in self._sessions.values() if s.session_id == session_id),
+            None,
+        )
+        try:
+            return _ensure_viewer(
+                run_id=run_id,
+                server_url=base_url,
+                session_id=session_id,
+                working_directory=spec.cwd,
+                attach_binary=shutil.which("opencode") or "opencode",
+                run_dir=self.run_dir,
+                attach_env=({"OPENCODE_SERVER_PASSWORD": password} if password else None),
+            )
+        except Exception as exc:  # nosec B110 - best effort
+            if _viewer_control_flow(exc):
+                raise  # the engine's stop/pause landed here — never swallow it
+            return ViewerConfig()
 
     def _teardown(self, sess: _ServerSession) -> None:
         sess.sse_stop.set()

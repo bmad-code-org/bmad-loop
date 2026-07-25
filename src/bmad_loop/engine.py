@@ -2281,7 +2281,15 @@ class Engine:
         result: SessionResult | None = None
         ended = False
         try:
+            # Set _current_task_id so the adapter's viewer-persist writes the
+            # correct task_id (see _persist_viewer_config).
+            getattr(adapter, "_set_current_task_id", lambda tid: None)(task_id)
             result = adapter.run(spec)
+            # Persist viewer config after run() returns (the adapter writes it
+            # during start_session; this ensures the engine can surface it).
+            wc = getattr(adapter, "viewer_config", None)
+            if wc and wc.viewer_window:
+                self.journal.append("viewer-created", viewer_window=wc.viewer_window, role=role)
             # A post-kill rescue (#61) is otherwise indistinguishable from a normal
             # completion in the journal; leave a breadcrumb for forensics.
             if result.result_json is not None and result.result_json.get("post_kill_reconciled"):

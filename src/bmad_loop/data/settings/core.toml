@@ -211,6 +211,12 @@ key = "cleanup_session_on_finish"
 kind = "switch"
 default_ref = "AdapterPolicy.cleanup_session_on_finish"
 [[section.field]]
+key = "show_attached_ui"
+kind = "switch"
+default_ref = "AdapterPolicy.show_attached_ui"
+label = "show attached UI"
+description = "run the adapter's attached TUI (e.g. opencode attach) in a detached tmux viewer window so the dashboard Log tab and attach can show the live screen"
+[[section.field]]
 key = "usage_grace_s"
 kind = "float"
 minimum = 0

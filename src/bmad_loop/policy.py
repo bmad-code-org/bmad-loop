@@ -324,6 +324,10 @@ class AdapterPolicy:
     # ResolvedAdapter); a value overrides the profile's shipped default.
     usage_grace_s: float | None = None
     stop_without_result_nudges: int | None = None
+    # When True, a detached tmux viewer window is created for this adapter
+    # so the operator can attach and see the live session alongside the
+    # headless SSE server. Defaults to False for backward compatibility.
+    show_attached_ui: bool = False
     dev: StageAdapterPolicy = field(default_factory=StageAdapterPolicy)
     review: StageAdapterPolicy = field(default_factory=StageAdapterPolicy)
     triage: StageAdapterPolicy = field(default_factory=StageAdapterPolicy)
@@ -424,6 +428,9 @@ def adapter_policy_from_snapshot(snapshot: dict[str, Any] | None) -> AdapterPoli
             ),
             usage_grace_s=adapter_d.get("usage_grace_s"),
             stop_without_result_nudges=adapter_d.get("stop_without_result_nudges"),
+            show_attached_ui=bool(
+                adapter_d.get("show_attached_ui", AdapterPolicy.show_attached_ui)
+            ),
             dev=_stage_from_snapshot(adapter_d.get("dev")),
             review=_stage_from_snapshot(adapter_d.get("review")),
             triage=_stage_from_snapshot(adapter_d.get("triage")),
@@ -821,6 +828,7 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         ),
         usage_grace_s=_opt_grace(adapter_d, "adapter"),
         stop_without_result_nudges=_opt_nudges(adapter_d, "adapter"),
+        show_attached_ui=bool(adapter_d.get("show_attached_ui", AdapterPolicy.show_attached_ui)),
         dev=_stage_adapter(adapter_d, "dev"),
         review=_stage_adapter(adapter_d, "review"),
         triage=_stage_adapter(adapter_d, "triage"),
@@ -1064,6 +1072,10 @@ spec_folder = ""
 name = "claude"              # claude | codex | gemini | copilot | antigravity | opencode-http (alias: opencode) | <custom .bmad-loop/profiles/*.toml>
 model = ""                   # empty = CLI default model (opencode-http wants "provider/model")
 cleanup_session_on_finish = true  # kill the run's tmux session when it finishes (false keeps it for inspection)
+# show_attached_ui = true  # create a detached tmux viewer window running the adapter's
+#             attached TUI (e.g. opencode attach) alongside the headless server;
+#             the TUI dashboard Log tab renders the viewer pane, and `a`/`attach`
+#             prefer it over the raw agent session when available. false by default.
 # extra_args replaces the profile's default permission-bypass flags when set:
 # extra_args = ["--permission-mode", "bypassPermissions"]
 # Optional overrides of the CLI profile's own defaults (unset = inherit the

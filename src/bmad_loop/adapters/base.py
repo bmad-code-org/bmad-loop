@@ -118,11 +118,37 @@ class SessionResult:
     env_fault_evidence: str | None = None
 
 
+@dataclass(frozen=True)
+class ViewerConfig:
+    """Metadata for a detached viewer window that runs the adapter's attached
+    TUI alongside the headless server.
+
+    Persists so the dashboard Log tab can render the viewer pane, ``bmad-loop
+    attach`` and the TUI ``a`` action can prefer it, and teardown stops it
+    first.  The mux backend stamps a unique window name so the multiplexer
+    can kill / re-attach it idempotently.
+
+    Fields are best-effort: ``viewer_window`` may be ``None`` when tmux is
+    unavailable, and ``viewer_url``/``viewer_session`` come from whatever the
+    viewer needs (for OpenCode they are the server URL and session id; other
+    viewers may ignore them or use a different convention).
+    """
+
+    viewer_window: str | None = None
+    viewer_url: str = ""
+    viewer_session: str = ""
+    viewer_cwd: str = ""
+    viewer_command: str = ""
+
+
 class CodingCLIAdapter(ABC):
     name: str = "abstract"
     injection: str = ""
     observation: str = ""
     state: str = ""
+    # Optional viewer metadata, set by adapters that support `show_attached_ui`.
+    # The engine reads this to persist metadata for attach/Log-tab/teardown.
+    viewer_config: ViewerConfig = ViewerConfig()
 
     @abstractmethod
     def start_session(self, spec: SessionSpec) -> SessionHandle: ...
@@ -143,6 +169,23 @@ class CodingCLIAdapter(ABC):
     def interactive_env(self, spec: SessionSpec) -> dict[str, str]:
         """Env vars to layer onto the caller's environment for interactive_argv."""
         return dict(spec.env)
+
+    # ---------------------------------------------------------------- viewer
+
+    def ensure_viewer_window(
+        self, spec: SessionSpec, session_id: str, base_url: str
+    ) -> ViewerConfig:
+        """Create (or reuse) a detached tmux viewer window for this session.
+
+        Subclasses override to wire the correct ``opencode attach``-style
+        command.  Base behaviour: no-window (head-only).  Idempotent — a
+        second call with the same task id returns the existing config.
+        """
+        return ViewerConfig()
+
+    def close_viewer_window(self, config: ViewerConfig) -> None:
+        """Teardown the viewer window; a no-op when window is None."""
+        pass
 
     def kill(self, handle: SessionHandle) -> None:  # optional cleanup
         pass
