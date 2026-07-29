@@ -7122,6 +7122,25 @@ def test_legacy_exclude_pollution_silent_outside_a_repo(tmp_path):
     assert legacy_exclude_pollution(plain, [get_profile("claude")], []) is None
 
 
+def test_legacy_exclude_pollution_silent_when_git_never_answers(project, monkeypatch):
+    """The sibling above pins git ANSWERING "not a repo" (a non-zero rc). This pins
+    the other shape — git never answering at all, which the chokepoint raises as
+    `GitError` (a timeout) or its `GitSpawnError` subclass.
+
+    A warning-only preflight detector has no business propagating either: nothing
+    it could report is worth failing `bmad-loop validate` over.
+
+    Ablation: drop `GitError` from this helper's except tuple and this fails — the
+    fault escapes into validate."""
+
+    def unanswerable(repo, *args):
+        raise verify.GitSpawnError(f"git {args[0]} failed to spawn in {repo}")
+
+    monkeypatch.setattr(install_mod, "git_bytes", unanswerable)
+
+    assert legacy_exclude_pollution(project.project, [get_profile("claude")], []) is None
+
+
 def test_legacy_exclude_pollution_ignores_the_private_worktree_exclude(tmp_path):
     """The current shield's own file must never be reported: it is SUPPOSED to
     carry these patterns, and it dies with its worktree.

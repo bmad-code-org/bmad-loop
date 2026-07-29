@@ -2456,7 +2456,7 @@ def legacy_exclude_pollution(
     # someone to delete a line should not depend on validation happening upstream.
     candidates.discard("/")
     try:
-        answered = _shield_git(project, "rev-parse", "--git-path", "info/exclude")
+        answered = git_bytes(project, "rev-parse", "--git-path", "info/exclude")
         if answered.returncode != 0:
             return None  # not a repo, or a git too old to answer
         # fsdecode for the same reason _worktree_local_exclude uses it: a non-UTF-8
@@ -2465,7 +2465,10 @@ def legacy_exclude_pollution(
         if not exclude.is_absolute():
             exclude = project / exclude
         present = exclude.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError, subprocess.SubprocessError):
+    # GitError for the chokepoint's two raised faults (a timeout, and a spawn
+    # failure as GitSpawnError) — this is a `validate` warning, and a git that
+    # cannot answer is not a finding. OSError and UnicodeError stay for the read.
+    except (GitError, OSError, UnicodeError):
         return None
     # Set intersection IS the exact-match rule — no normalization, no strip(): a
     # leading space is a meaningful part of a gitignore pattern, so a line that
