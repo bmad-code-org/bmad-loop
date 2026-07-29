@@ -4379,13 +4379,15 @@ def test_validate_pollution_warning_prints_the_lines_in_text_mode(project, capsy
     """The remedy is manual, so the human-readable output has to carry enough to
     act on: which file, which lines, and what the symptom looks like."""
     _make_validate_pass(project, monkeypatch, capsys)
-    _pollute_exclude(project, "/.claude/skills")
+    exclude = _pollute_exclude(project, "/.claude/skills")
 
     cli.main(["validate", "--project", str(project.project)])
 
     text = _validate_output(capsys)
     assert "/.claude/skills" in text
-    assert "info/exclude" in text
+    # the file, by its real path rather than a POSIX-shaped substring: on Windows
+    # this renders with backslashes, so asserting "info/exclude" passed nowhere
+    assert str(exclude).lower() in text
     assert "git add -a" in text  # the symptom, lowercased by _validate_output
     assert "delete them by hand" in text
 
