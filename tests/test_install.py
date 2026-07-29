@@ -7048,7 +7048,7 @@ def test_hook_config_cannot_supply_its_dropped_seed_alibi(tmp_path):
 def _repo_with_exclude(tmp_path, *lines: str) -> Path:
     """A git repo whose repository-wide exclude carries exactly `lines`."""
     root = tmp_path / "repo"
-    root.mkdir()
+    root.mkdir(parents=True)
     git(root, "init", "-q")
     exclude = root / ".git" / "info" / "exclude"
     exclude.parent.mkdir(parents=True, exist_ok=True)
@@ -7142,3 +7142,17 @@ def test_legacy_exclude_pollution_ignores_the_private_worktree_exclude(tmp_path)
     assert reason is None, reason  # the private shield really was written
 
     assert legacy_exclude_pollution(wt, [claude], []) is None
+
+
+def test_legacy_exclude_pollution_never_flags_a_bare_slash(tmp_path):
+    """`scm.worktree_seed` is user-authored and unvalidated, so an empty entry
+    renders as the candidate "/". That must not match: a bare "/" is a line an
+    operator could legitimately have, and this function's output tells them to
+    delete what it names."""
+    repo = _repo_with_exclude(tmp_path, "/")
+
+    assert legacy_exclude_pollution(repo, [], [""]) is None
+    # the guard is scoped to "/" alone — a real seed rel alongside it still reports
+    repo2 = _repo_with_exclude(tmp_path / "b", "/", "/vendor/creds.json")
+    found = legacy_exclude_pollution(repo2, [], ["", "vendor/creds.json"])
+    assert found is not None and found.lines == ["/vendor/creds.json"]

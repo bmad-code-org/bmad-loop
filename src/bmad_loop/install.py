@@ -2443,6 +2443,14 @@ def legacy_exclude_pollution(
     # run seeded _bmad/custom is not knowable from here, and the pattern is ours
     # either way.
     candidates.add(f"/{CUSTOMIZE_DIR.as_posix()}")
+    # A bare "/" is never a shield pattern, and as a candidate it is the one that
+    # could do harm: it is a real (if odd) line for an operator to have written,
+    # and this function's output tells them to delete what it names. Profiles
+    # cannot produce it — `skill_tree` and `seed_files` entries are validated
+    # non-empty, and the writer skips hookless config_paths for exactly this
+    # reason — but `scm.worktree_seed` is user-authored and unvalidated, so an
+    # empty entry there renders as "/" here.
+    candidates.discard("/")
     try:
         answered = _shield_git(project, "rev-parse", "--git-path", "info/exclude")
         if answered.returncode != 0:
