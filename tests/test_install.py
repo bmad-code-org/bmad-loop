@@ -49,6 +49,7 @@ from bmad_loop.install import (
     dev_primitive_or_default,
     dev_primitive_warnings,
     install_into,
+    legacy_exclude_pollution,
     merge_hooks,
     missing_base_skills,
     missing_stories_support,
@@ -7039,3 +7040,105 @@ def test_hook_config_cannot_supply_its_dropped_seed_alibi(tmp_path):
     assert (wt / rel).is_file(), "the in-worktree link looks delivered generically"
     assert worktree_seed_undelivered(wt, repo, seed_files=[rel]) == []
     assert worktree_seed_undelivered(wt, repo, seed_files=[rel], config_paths=[rel]) == [rel]
+
+
+# ------------- #384 follow-through: legacy shared-exclude detection ------------
+
+
+def _repo_with_exclude(tmp_path, *lines: str) -> Path:
+    """A git repo whose repository-wide exclude carries exactly `lines`."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    git(root, "init", "-q")
+    exclude = root / ".git" / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    exclude.write_text("".join(f"{line}\n" for line in lines), encoding="utf-8")
+    return root
+
+
+def test_legacy_exclude_pollution_finds_the_shield_patterns(tmp_path):
+    """The residue #384 is about: patterns an older bmad-loop appended to the
+    repository-wide exclude, which nothing removes."""
+    repo = _repo_with_exclude(tmp_path, "/.claude/settings.json", "/.claude/skills")
+    claude = get_profile("claude")
+
+    found = legacy_exclude_pollution(repo, [claude], [])
+
+    assert found is not None
+    assert found.lines == ["/.claude/settings.json", "/.claude/skills"]
+    # the path is reported so the warning can name the file to hand-edit
+    assert found.path == repo / ".git" / "info" / "exclude"
+
+
+def test_legacy_exclude_pollution_covers_seed_rels_and_customize_dir(tmp_path):
+    """The candidate set mirrors provision_worktree's: seeded rels and
+    `_bmad/custom` are shield patterns too, not just the skill tree."""
+    repo = _repo_with_exclude(tmp_path, "/_bmad/custom", "/vendor/creds.json")
+
+    found = legacy_exclude_pollution(repo, [], ["vendor/creds.json"])
+
+    assert found is not None
+    assert found.lines == ["/_bmad/custom", "/vendor/creds.json"]
+
+
+def test_legacy_exclude_pollution_matches_exactly_never_by_containment(tmp_path):
+    """Authorship is ambiguous, so only a byte-identical line counts. Every line
+    here CONTAINS or is contained by `/.claude/skills`, and none of them is ours —
+    flagging any would be telling the operator to delete their own rule."""
+    repo = _repo_with_exclude(
+        tmp_path,
+        ".claude/skills",  # no leading slash: a different git pattern
+        "/.claude/skills/local",  # narrower: their own subdir rule
+        "/.claude/skills-mine",  # a sibling path that merely shares the prefix
+        " /.claude/skills",  # leading space IS part of a gitignore pattern
+        "!/.claude/skills",  # a negation, i.e. the opposite instruction
+    )
+
+    assert legacy_exclude_pollution(repo, [get_profile("claude")], []) is None
+
+
+def test_legacy_exclude_pollution_silent_without_an_exclude_file(tmp_path):
+    """A repo that has never been provisioned has nothing to report."""
+    root = tmp_path / "clean"
+    root.mkdir()
+    git(root, "init", "-q")
+    (root / ".git" / "info" / "exclude").unlink(missing_ok=True)
+
+    assert legacy_exclude_pollution(root, [get_profile("claude")], []) is None
+
+
+def test_legacy_exclude_pollution_silent_outside_a_repo(tmp_path):
+    """Preflight observation degrades: a plain directory is not a finding.
+
+    Asserted against a populated pattern set, so a None here is a real refusal and
+    not an empty candidate set trivially matching nothing. Two branches can
+    produce it — git's non-zero rc and the OSError catch — and this pins neither
+    individually; the contract it holds is the one validate needs, that running
+    outside a repo yields no finding and no exception."""
+    plain = tmp_path / "not-a-repo"
+    plain.mkdir()
+    (plain / "exclude-lookalike").write_text("/.claude/skills\n", encoding="utf-8")
+
+    assert legacy_exclude_pollution(plain, [get_profile("claude")], []) is None
+
+
+def test_legacy_exclude_pollution_ignores_the_private_worktree_exclude(tmp_path):
+    """The current shield's own file must never be reported: it is SUPPOSED to
+    carry these patterns, and it dies with its worktree.
+
+    `--git-path info/exclude` answers with the shared file from a linked worktree
+    too, so the private one is not even looked at — the assertion is that a
+    worktree whose private exclude is full of patterns still reports nothing."""
+    repo = _repo_with_exclude(tmp_path)  # shared exclude: empty
+    (repo / "f.txt").write_text("x\n", encoding="utf-8")
+    git(repo, "config", "user.email", "t@t")
+    git(repo, "config", "user.name", "t")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "init")
+    wt = tmp_path / "wt"
+    git(repo, "worktree", "add", "-q", str(wt), "-b", "wtb")
+    claude = get_profile("claude")
+    reason = _worktree_local_exclude(wt, [f"/{claude.skill_tree}"])
+    assert reason is None, reason  # the private shield really was written
+
+    assert legacy_exclude_pollution(wt, [claude], []) is None

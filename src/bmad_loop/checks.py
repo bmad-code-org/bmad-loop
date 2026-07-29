@@ -58,6 +58,7 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         "git.worktree-clean",
         "git.probe",
         "git.render-tracked",
+        "git.exclude-legacy-pollution",
         "hooks.config-parse",
         "hooks.registered",
         "mux.backend",

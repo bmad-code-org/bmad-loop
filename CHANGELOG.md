@@ -21,6 +21,12 @@ whose seams had diverged enough that several ports needed a different fix, and t
   untouched. Malformed items become one `severity: low` entry (`spec-deferrals-malformed`); a
   `spec_file` outside the orchestrator's roots is refused (`spec-deferrals-skipped-out-of-tree`).
 
+- **`validate` warns when an old bmad-loop left shield patterns in `.git/info/exclude` (#384).**
+  The writer is fixed, but nothing removes the lines already there — and they hide every new file
+  under paths like `.claude/skills` from `git add -A` in that checkout. `git.exclude-legacy-pollution`
+  names the file and the exact lines. Warn only, never auto-removed: the same line could be the
+  project's own, so only exact matches are reported and deleting them stays a manual call.
+
 - **A park travels with its story's commit, so `bmad-loop confirm` works from any clone (#356).**
   Each parked story writes one JSON record to `.bmad-loop/operator/<key>.json` inside the story's
   own commit window, so it rides the park's commit — worktree merge-back included — into every

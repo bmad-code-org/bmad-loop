@@ -208,7 +208,7 @@ def _reconcile_stale(project: Path, paths: bmadconfig.ProjectPaths, pol) -> None
 
 
 def cmd_validate(args: argparse.Namespace) -> int:
-    from .install import relay_registered
+    from .install import legacy_exclude_pollution, relay_registered
 
     project = _project(args)
     report = ValidationReport()
@@ -325,6 +325,30 @@ def cmd_validate(args: argparse.Namespace) -> int:
             )
     except verify.GitError:
         pass
+
+    # #384: an older bmad-loop wrote the worktree git-add shield's patterns into the
+    # repository-wide .git/info/exclude. The writer is fixed and never touches that
+    # file again, but nothing removes the lines it already wrote — and they name
+    # paths projects TRACK, so new files under them stay unstageable in this
+    # checkout until someone deletes them. Warn only, never repair: the file is
+    # hand-editable and its lines carry no authorship (see the helper's docstring).
+    seed_rels: list[str] = []
+    if pol is not None:
+        if pol.scm.seed_adapter_defaults:
+            for profile in profiles:
+                seed_rels.extend(profile.seed_files)
+        seed_rels.extend(pol.scm.worktree_seed)
+    pollution = legacy_exclude_pollution(project, profiles, seed_rels)
+    if pollution is not None:
+        report.warn(
+            "git.exclude-legacy-pollution",
+            f"{pollution.path} carries git-add shield patterns written by an older "
+            f"bmad-loop: {', '.join(pollution.lines)} — new files under those paths never "
+            f"appear in `git status` or `git add -A` in this checkout, however long ago the "
+            f"run that wrote them finished. bmad-loop no longer writes this file (#384); "
+            f"review those lines and delete them by hand if your project tracks those paths.",
+            {"exclude": str(pollution.path), "lines": pollution.lines},
+        )
 
     report.extend(_platform_preflight())
 

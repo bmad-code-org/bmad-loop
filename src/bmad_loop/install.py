@@ -2380,6 +2380,88 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
     return None
 
 
+class LegacyExcludePollution(NamedTuple):
+    """Where the repository-wide exclude is, and which shield patterns it carries.
+
+    Returned only when `lines` is non-empty, so a caller that has one of these has
+    something to report and a file to name in the report.
+    """
+
+    path: Path
+    lines: list[str]
+
+
+def legacy_exclude_pollution(
+    project: Path, profiles: Sequence[CLIProfile], seed_rels: Sequence[str]
+) -> LegacyExcludePollution | None:
+    """Git-add shield patterns an OLDER bmad-loop left in `.git/info/exclude`.
+
+    Read-only detection for the residue of #384. Until that fix, the worktree
+    shield appended its patterns to the repository-wide exclude — shared with the
+    main checkout, permanent, and unversioned. `_worktree_local_exclude` no longer
+    writes that file at all, but nothing removes what it already wrote, and the
+    patterns name paths projects legitimately TRACK (`.claude/skills`,
+    `.claude/settings.json`). So in a repo provisioned by an older version the
+    tracked files keep diffing normally while every NEW file under those paths
+    stays invisible to `git status` and `git add -A` — the reporter lost 51 files
+    and three whole skills that way, across two commits, with nothing in either
+    diff able to reveal the cause.
+
+    Detection only, never repair, and that is a decision rather than an omission:
+    `.git/info/exclude` is a hand-editable file whose lines carry no authorship. A
+    project that genuinely wants `/.claude/skills` ignored writes the identical
+    line, and there is no way to tell the two apart after the fact — so removing
+    one is a change only the operator can be sure is right. `validate` warns and
+    names the lines; deleting them is theirs.
+
+    EXACT matches only, for the same reason. The candidate set is rebuilt the way
+    `provision_worktree` builds it, and a line counts only if it is byte-identical
+    to a pattern that set contains. No prefix, substring or path-containment
+    matching: `/.claude/skills-of-my-own` and a bare `.claude/skills` are the
+    operator's lines, not ours, and a preflight that flagged them would be telling
+    someone to delete their own gitignore rules.
+
+    `--git-path info/exclude` names git's ONE shared exclude from either vantage:
+    a main checkout answers relative (`.git/info/exclude`), a linked worktree
+    answers with the MAIN repo's absolute path (verified, git 2.55) — which is the
+    same file, and the file #384 is about. Nothing here reads the private
+    per-worktree exclude the current shield writes; that one is supposed to carry
+    these patterns.
+
+    Silent on every fault — not a repo, git missing or too old, an unreadable or
+    undecodable exclude — because this is preflight observation, and a repo whose
+    exclude cannot be read is not thereby a repo with a problem to report.
+    """
+    # Mirror provision_worktree's pattern build (worktree_flow.py). Kept in step by
+    # construction rather than by a shared constant: the shield's set is derived
+    # per-run from what it actually wrote, and this one is a superset guess about
+    # runs that are long over.
+    candidates = {f"/{p.skill_tree}" for p in profiles}
+    candidates |= {f"/{p.hooks.config_path}" for p in profiles if not p.hookless}
+    candidates |= {f"/{rel}" for rel in seed_rels}
+    # Unconditional, unlike the writer's `if customize_seeded`: whether some past
+    # run seeded _bmad/custom is not knowable from here, and the pattern is ours
+    # either way.
+    candidates.add(f"/{CUSTOMIZE_DIR.as_posix()}")
+    try:
+        answered = _shield_git(project, "rev-parse", "--git-path", "info/exclude")
+        if answered.returncode != 0:
+            return None  # not a repo, or a git too old to answer
+        # fsdecode for the same reason _worktree_local_exclude uses it: a non-UTF-8
+        # repo path must round-trip back to the filesystem rather than fault.
+        exclude = Path(os.fsdecode(answered.stdout).strip())
+        if not exclude.is_absolute():
+            exclude = project / exclude
+        present = exclude.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError, subprocess.SubprocessError):
+        return None
+    # Set intersection IS the exact-match rule — no normalization, no strip(): a
+    # leading space is a meaningful part of a gitignore pattern, so a line that
+    # carries one is not a line this code wrote.
+    hits = sorted(candidates.intersection(present))
+    return LegacyExcludePollution(exclude, hits) if hits else None
+
+
 def _copy_skills(project: Path, trees: Sequence[str], force: bool) -> bool:
     """Install the bundled bmad-loop-* skills into each project skill tree.
 

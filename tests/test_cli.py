@@ -4340,6 +4340,78 @@ def test_dry_run_stories_relativizes_absolute_folder(project, capsys):
     assert f"Spec folder: {abs_folder}" not in out  # not the raw absolute path
 
 
+# ------------- #384: legacy shared-exclude pollution is a validate warning -----
+
+
+def _pollute_exclude(project, *lines: str):
+    """Append `lines` to the repository-wide exclude, the way a pre-#384 run did.
+
+    Called AFTER the fixture's own commit: these patterns name paths the fixture
+    tracks, and an exclude in place earlier would change what `git add -A` stages
+    — which is the very bug, and would make the fixture, not the gate, the thing
+    under test."""
+    exclude = project.project / ".git" / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    with exclude.open("a", encoding="utf-8") as fh:
+        fh.write("".join(f"{line}\n" for line in lines))
+    return exclude
+
+
+def test_validate_warns_on_legacy_shared_exclude_pollution(project, capsys, monkeypatch):
+    """#384's residue: lines an older bmad-loop left in `.git/info/exclude` hide
+    every NEW file under those paths from this checkout's `git add -A`, forever.
+    validate names the file and the exact lines."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    exclude = _pollute_exclude(project, "/.claude/skills", "/_bmad/custom")
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+
+    warned = [f for f in doc["findings"] if f["check"] == "git.exclude-legacy-pollution"]
+    assert len(warned) == 1, "the pollution gate fires exactly once"
+    assert warned[0]["severity"] == "warning"
+    assert warned[0]["detail"]["lines"] == ["/.claude/skills", "/_bmad/custom"]
+    assert warned[0]["detail"]["exclude"] == str(exclude)
+    # a warning is not a verdict: the operator is told, not blocked
+    assert doc["ok"] is True
+
+
+def test_validate_pollution_warning_prints_the_lines_in_text_mode(project, capsys, monkeypatch):
+    """The remedy is manual, so the human-readable output has to carry enough to
+    act on: which file, which lines, and what the symptom looks like."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    _pollute_exclude(project, "/.claude/skills")
+
+    cli.main(["validate", "--project", str(project.project)])
+
+    text = _validate_output(capsys)
+    assert "/.claude/skills" in text
+    assert "info/exclude" in text
+    assert "git add -a" in text  # the symptom, lowercased by _validate_output
+    assert "delete them by hand" in text
+
+
+def test_validate_does_not_flag_an_operator_authored_exclude_line(project, capsys, monkeypatch):
+    """A line for any path that is not a shield pattern is the operator's own, and
+    telling them to delete it would be wrong. Exact match only — never substring
+    or containment (ablation: widen the match and this fails)."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    _pollute_exclude(project, "/scratch", "/.claude/skills-mine", ".claude/skills")
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+
+    assert not [f for f in doc["findings"] if f["check"] == "git.exclude-legacy-pollution"]
+
+
+def test_validate_silent_when_the_exclude_file_is_absent(project, capsys, monkeypatch):
+    """A repo never provisioned by an old bmad-loop gets no warning at all."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    (project.project / ".git" / "info" / "exclude").unlink(missing_ok=True)
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+
+    assert not [f for f in doc["findings"] if f["check"] == "git.exclude-legacy-pollution"]
+
+
 # --------------- `bmad-loop mux`: backend listing + persisted choice (issue #87) ----
 
 
