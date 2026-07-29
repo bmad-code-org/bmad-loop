@@ -7145,10 +7145,14 @@ def test_legacy_exclude_pollution_ignores_the_private_worktree_exclude(tmp_path)
 
 
 def test_legacy_exclude_pollution_never_flags_a_bare_slash(tmp_path):
-    """`scm.worktree_seed` is user-authored and unvalidated, so an empty entry
-    renders as the candidate "/". That must not match: a bare "/" is a line an
-    operator could legitimately have, and this function's output tells them to
-    delete what it names."""
+    """An empty seed rel renders as the candidate "/", which must never match: a
+    bare "/" is a line an operator could legitimately have, and this function's
+    output tells them to delete what it names.
+
+    Policy now rejects an empty `scm.worktree_seed` entry at load, so no validated
+    caller reaches this. The guard is the helper's own contract — it takes
+    `seed_rels` from its caller, and a detector that instructs deletion should not
+    depend on validation having happened upstream."""
     repo = _repo_with_exclude(tmp_path, "/")
 
     assert legacy_exclude_pollution(repo, [], [""]) is None

@@ -373,6 +373,15 @@ whose seams had diverged enough that several ports needed a different fix, and t
   stale-run reconcile at every run and sweep start), and `git diff`, whose failure bypassed the
   valve that preserves a failed unit's work. Now a `GitError` like any other git failure.
 
+- **`scm.worktree_seed` entries are validated at policy load (#456, #384).** An empty entry made
+  worktree provisioning resolve its copy source to the repo **root** and its destination to the
+  worktree, both passing the loop's containment checks — so it copied the whole project, gitignored
+  and untracked files included, and since a worktree mounts under `.bmad-loop/runs/`, the copy
+  recursed into itself until the path length failed, silently. The `/` it then emitted is inert, so
+  none of that surplus was shielded from the unit's `git add -A`. Entries must be project-relative,
+  the rule adapter profiles and plugin manifests already apply to their own seed lists;
+  `worktree_seed` was the only unchecked source.
+
 - **One undecodable byte of verify output no longer crashes the run (#378).** Verify commands are
   arbitrary operator tools and their captured output was decoded strictly, so a child emitting bytes
   invalid in the run's encoding raised `UnicodeDecodeError` out of `run_verify_commands`, losing
