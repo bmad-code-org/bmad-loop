@@ -130,6 +130,32 @@ def test_cli_binary_flag_spares_a_stage_on_another_client(tmp_path):
     assert out.adapter.resolved("review") == policy_mod.ResolvedAdapter("codex", "", None)
 
 
+def test_cli_binary_flag_warns_about_a_stage_it_could_not_reach(tmp_path, capsys):
+    """A whole-run flag that silently applies to only some stages is the worst of
+    both worlds: the operator has to read a --dry-run to notice. Name the stage
+    and the way out."""
+    pol = policy_mod.loads('[adapter]\nname = "claude"\n[adapter.review]\nname = "codex"\n')
+    cli._apply_cli_overrides(pol, _cli_flags(cli_binary="cc"), tmp_path)
+    err = capsys.readouterr().err
+    assert "--cli-binary cc not applied to review (runs codex)" in err
+    assert "pass --cli to force one client" in err
+
+
+def test_cli_binary_flag_silent_when_it_reaches_every_stage(tmp_path, capsys):
+    pol = policy_mod.loads('[adapter]\nname = "claude"\n[adapter.dev]\nmodel = "opus"\n')
+    cli._apply_cli_overrides(pol, _cli_flags(cli_binary="cc"), tmp_path)
+    assert capsys.readouterr().err == ""
+
+
+def test_cli_binary_flag_silent_when_cli_forces_one_client(tmp_path, capsys):
+    # --cli collapses the heterogeneous config, so the binary now reaches
+    # everything and there is nothing to warn about
+    pol = policy_mod.loads('[adapter]\nname = "claude"\n[adapter.review]\nname = "codex"\n')
+    out = cli._apply_cli_overrides(pol, _cli_flags("codex", "/opt/work/codex"), tmp_path)
+    assert capsys.readouterr().err == ""
+    assert all(out.adapter.resolved(role).binary == "/opt/work/codex" for role in cli.ROLES)
+
+
 def test_cli_flag_forces_the_client_and_drops_stale_stage_settings(tmp_path):
     """--cli moves a stage to another client, so that stage's model/extra_args —
     chosen for the client it is leaving — must not ride along. A stage already on

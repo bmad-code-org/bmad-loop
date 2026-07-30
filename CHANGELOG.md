@@ -16,7 +16,9 @@ breaking changes may land in a minor release.
   different client drops the model and flags it had chosen for the old one, and keeps its timing
   knobs. The override is folded into the policy before the run is stamped, so `resume`,
   `status --json` and `--dry-run` all report what actually ran. An unknown `--cli` fails before
-  anything spawns.
+  anything spawns. `--cli-binary` stops at a stage pinned to another client — an executable
+  belongs to one CLI — and prints a note naming that stage rather than applying partly in
+  silence.
 
 - **`[adapter] binary` spawns a CLI under a custom name (#395).** Set `binary = "cc"` (base or
   per-stage) to drive a second subscription or a work/personal account that lives beside the

@@ -960,7 +960,7 @@ def _apply_cli_overrides(pol, args, project: Path):
             name=None if name else stage.name,
             binary=None if binary else stage.binary,
         )
-    return replace(
+    out = replace(
         pol,
         adapter=replace(
             adapter,
@@ -970,6 +970,36 @@ def _apply_cli_overrides(pol, args, project: Path):
             extra_args=None if switched else adapter.extra_args,
             **stages,
         ),
+    )
+    _warn_unapplied_binary(out, binary)
+    return out
+
+
+def _warn_unapplied_binary(pol, binary: str) -> None:
+    """Name every stage a ``--cli-binary`` did not reach, and why.
+
+    A binary only means something relative to one client — the profile decides
+    the prompt dialect, hook contract and bypass flags, so spawning a `cc` alias
+    of claude for a codex-pinned stage would hand claude codex's flags and kill
+    the session at startup. The flag therefore stops at a stage running another
+    client. That is defensible; doing it *silently* is not, since the operator
+    passed a whole-run flag and would otherwise have to read a `--dry-run` to
+    notice it was partly ignored."""
+    if not binary:
+        return
+    skipped = [
+        (role, resolved.name)
+        for role in ROLES
+        if (resolved := pol.adapter.resolved(role)).binary != binary
+    ]
+    if not skipped:
+        return
+    where = ", ".join(f"{role} (runs {client})" for role, client in skipped)
+    print(
+        f"note: --cli-binary {binary} not applied to {where} — a binary belongs to one "
+        f"client, and {pol.adapter.name} is not what these stages run; "
+        f"pass --cli to force one client for the whole run",
+        file=sys.stderr,
     )
 
 
