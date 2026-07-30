@@ -213,6 +213,11 @@ key = "model"
 kind = "str"
 placeholder = "CLI default model"
 [[section.field]]
+key = "binary"
+kind = "str"
+placeholder = "the profile's own binary"
+description = "executable to spawn — an alias or wrapper of the same CLI (e.g. `cc` for a second Claude account); the profile still supplies the hook dialect and config path"
+[[section.field]]
 key = "extra_args"
 kind = "args"
 [[section.field]]
@@ -248,6 +253,11 @@ placeholder = "inherit from [adapter]"
 key = "model"
 kind = "str"
 placeholder = "inherit / client default"
+[[section.field]]
+key = "binary"
+kind = "str"
+placeholder = "inherit / profile binary"
+description = "executable for this stage only — inherits from [adapter] when the stage runs the same client"
 [[section.field]]
 key = "extra_args"
 kind = "args"

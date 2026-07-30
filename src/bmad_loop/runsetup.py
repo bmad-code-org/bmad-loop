@@ -100,6 +100,7 @@ def make_adapters(project: Path, run_dir: Path, policy) -> dict[str, CodingCLIAd
                     run_dir=run_dir,
                     policy=policy,
                     profile=profile,
+                    binary=cfg.binary or None,
                     extra_args=cfg.extra_args,
                     usage_grace_s=cfg.usage_grace_s,
                     stop_without_result_nudges=cfg.stop_without_result_nudges,
@@ -129,10 +130,13 @@ def make_adapters(project: Path, run_dir: Path, policy) -> dict[str, CodingCLIAd
                             "missing, the version is unsupported, or a required helper is "
                             "absent (psmux needs `pwsh` on PATH); see `bmad-loop diagnose`"
                         )
+                # binary: "" means "the profile's own", which is exactly what the
+                # adapters' `binary or profile.binary` already does with None.
                 common = dict(
                     run_dir=run_dir,
                     policy=policy,
                     profile=profile,
+                    binary=cfg.binary or None,
                     extra_args=cfg.extra_args,
                     usage_grace_s=cfg.usage_grace_s,
                     stop_without_result_nudges=cfg.stop_without_result_nudges,

@@ -1510,6 +1510,34 @@ def test_make_adapters_review_synthesizes_from_spec(project, monkeypatch):
     assert not isinstance(adapters["triage"], GenericDevAdapter)
 
 
+def test_make_adapters_wires_the_policy_binary_override(project, monkeypatch):
+    """[adapter] binary reaches the adapter that spawns the session, per stage.
+    The adapters have always accepted a `binary` argument; policy is what was
+    never plumbed into it, so this is the seam the feature actually turns on."""
+    monkeypatch.setattr(mux_mod, "_usable", lambda mux: True)
+    install_bmad_config(project)
+    _write_policy(project.project, '[adapter]\nbinary = "cc"\n[adapter.triage]\nbinary = ""\n')
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    adapters = cli._make_adapters(
+        project.project, project.project / ".bmad-loop" / "runs" / "r", pol
+    )
+    assert adapters["dev"].binary == "cc"
+    assert adapters["review"].binary == "cc"
+    # an explicit empty stage value clears the override back to the profile binary
+    assert adapters["triage"].binary == "claude"
+    # differing binaries must not collapse onto one shared adapter
+    assert adapters["triage"] is not adapters["dev"]
+
+
+def test_make_adapters_without_an_override_keeps_the_profile_binary(project, monkeypatch):
+    monkeypatch.setattr(mux_mod, "_usable", lambda mux: True)
+    install_bmad_config(project)
+    adapters = cli._make_adapters(
+        project.project, project.project / ".bmad-loop" / "runs" / "r", policy_mod.load(None)
+    )
+    assert all(adapters[role].binary == "claude" for role in cli.ROLES)
+
+
 def test_make_adapters_hookless_synthesizing_roles_get_dev_adapter(project, monkeypatch):
     """Hookless dev/review (bmad-dev-auto roles) dispatch to OpencodeDevAdapter —
     the _DevSynthesisMixin composed over the HTTP transport — sharing one
@@ -3740,6 +3768,32 @@ def test_validate_model_warning_ignores_tmux_profiles(project, capsys):
 
     cli.cmd_validate(args)
     assert "is not 'provider/model'" not in _validate_output(capsys)
+
+
+def test_validate_probes_the_overridden_binary_not_the_profile_one(project, capsys, monkeypatch):
+    """The PATH probe must follow the binary the run will really spawn. Probing
+    the profile's own name would report "claude found" for a run that spawns a
+    typo'd `cc` alias and then dies at session start."""
+    install_bmad_config(project)
+    _write_policy(project.project, '[adapter]\nbinary = "cc-not-installed"\n')
+    monkeypatch.setattr(cli.shutil, "which", lambda tool: None if "cc" in tool else "/usr/bin/x")
+    args = argparse.Namespace(project=str(project.project), spec=None)
+
+    cli.cmd_validate(args)
+    text = _validate_output(capsys)
+    assert "cc-not-installed not found on path (binary override)" in text
+    assert "claude not found" not in text  # the profile binary is never probed
+
+
+def test_validate_probes_the_profile_binary_without_an_override(project, capsys, monkeypatch):
+    install_bmad_config(project)
+    monkeypatch.setattr(cli.shutil, "which", lambda tool: None)
+    args = argparse.Namespace(project=str(project.project), spec=None)
+
+    cli.cmd_validate(args)
+    text = _validate_output(capsys)
+    assert "claude not found on path" in text
+    assert "binary override" not in text
 
 
 def test_validate_stories_mode_skips_sprint_gate(project, capsys):

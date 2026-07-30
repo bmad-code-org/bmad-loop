@@ -9,6 +9,16 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- **`[adapter] binary` spawns a CLI under a custom name (#395).** Set `binary = "cc"` (base or
+  per-stage) to drive a second subscription or a work/personal account that lives beside the
+  default install, without forking the whole profile to change one field — a copy freezes its
+  `bypass_args`, `[env]`, `seed_files` and `env_fault_patterns` against upstream. Empty (the
+  default) keeps the profile's own binary, so nothing changes for existing projects. The override
+  is for an alias or wrapper of the _same_ CLI: the profile still supplies the hook dialect, config
+  path and transcript layout. Client-specific like `model`/`extra_args` — a stage that also switches
+  `name` falls back to that profile's binary. `validate` probes the effective executable (a missing
+  `cc` reports as `cc`, not as a missing `claude`) and `--dry-run` prints it.
+
 - **A park travels with its story's commit, so `bmad-loop confirm` works from any clone (#356).**
   Each parked story now writes one committed JSON record to `.bmad-loop/operator/<key>.json`, inside
   the story's own commit window, so the record rides the park's commit — through the worktree

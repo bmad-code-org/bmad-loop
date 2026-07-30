@@ -329,6 +329,9 @@ class StageAdapterPolicy:
     name: str | None = None
     model: str | None = None
     extra_args: tuple[str, ...] | None = None
+    # None = inherit from [adapter]; "" explicitly clears a base override back to
+    # the CLI profile's own binary (same empty-means-default rule as model)
+    binary: str | None = None
     # None = inherit from [adapter] (which itself falls back to the CLI profile)
     usage_grace_s: float | None = None
     stop_without_result_nudges: int | None = None
@@ -340,6 +343,11 @@ class ResolvedAdapter:
     model: str
     # None = use the profile's default bypass flags; a list replaces them
     extra_args: tuple[str, ...] | None
+    # "" = spawn the CLI profile's own binary; a value replaces it (an alias or
+    # wrapper of the SAME CLI — the profile's hook dialect, config_path and
+    # transcript layout still apply). Trails extra_args so the historical
+    # positional ResolvedAdapter(name, model, extra_args) construction still holds.
+    binary: str = ""
     # None = fall back to the CLI profile's default (usage_grace_s) / the global
     # limits.stop_without_result_nudges respectively
     usage_grace_s: float | None = None
@@ -350,6 +358,14 @@ class ResolvedAdapter:
 class AdapterPolicy:
     name: str = "claude"  # CLI profile name; "claude-code-tmux" kept as legacy alias
     model: str = ""
+    # "" = spawn the CLI profile's shipped binary. A value replaces it so a
+    # second subscription/account reachable under another name (`cc` beside
+    # `claude`) needs no forked profile — copying a packaged profile to change
+    # this one field would freeze its bypass_args/[env]/seed_files/
+    # env_fault_patterns against upstream forever. The override assumes an alias
+    # or wrapper of the SAME CLI: the profile still supplies the hook dialect,
+    # hooks.config_path and transcript layout.
+    binary: str = ""
     # None = use the profile's default bypass flags; a list replaces them
     extra_args: tuple[str, ...] | None = None
     # kill the run's bmad-loop-<id> tmux session when it finishes (False keeps
@@ -370,13 +386,16 @@ class AdapterPolicy:
                 self.name,
                 self.model,
                 self.extra_args,
-                self.usage_grace_s,
-                self.stop_without_result_nudges,
+                binary=self.binary,
+                usage_grace_s=self.usage_grace_s,
+                stop_without_result_nudges=self.stop_without_result_nudges,
             )
         name = stage.name if stage.name is not None else self.name
-        # model and extra_args are client-specific: inherit from the base only
-        # when the stage runs the same client; a client switch falls back to
-        # that profile's defaults (CLI default model, profile bypass flags).
+        # model, extra_args and binary are client-specific: inherit from the base
+        # only when the stage runs the same client; a client switch falls back to
+        # that profile's defaults (CLI default model, profile bypass flags, the
+        # profile's own binary — a `cc` alias of claude must never be spawned as
+        # the executable for a stage that switched to codex).
         same_client = name == self.name
         # usage_grace_s / stop_without_result_nudges are benign timing knobs that
         # mean "fall back to the profile default" when None, so plain stage ??
@@ -388,6 +407,9 @@ class AdapterPolicy:
                 stage.extra_args
                 if stage.extra_args is not None
                 else (self.extra_args if same_client else None)
+            ),
+            binary=(
+                stage.binary if stage.binary is not None else (self.binary if same_client else "")
             ),
             usage_grace_s=(
                 stage.usage_grace_s if stage.usage_grace_s is not None else self.usage_grace_s
@@ -416,10 +438,12 @@ def _stage_from_snapshot(raw: Any) -> StageAdapterPolicy:
         return StageAdapterPolicy()
     name = raw.get("name")
     model = raw.get("model")
+    binary = raw.get("binary")
     return StageAdapterPolicy(
         name=None if name is None else str(name),
         model=None if model is None else str(model),
         extra_args=_snapshot_extra_args(raw.get("extra_args")),
+        binary=None if binary is None else str(binary),
         usage_grace_s=raw.get("usage_grace_s"),
         stop_without_result_nudges=raw.get("stop_without_result_nudges"),
     )
@@ -454,6 +478,7 @@ def adapter_policy_from_snapshot(snapshot: dict[str, Any] | None) -> AdapterPoli
             name=name,
             model=str(adapter_d.get("model", AdapterPolicy.model)),
             extra_args=_snapshot_extra_args(adapter_d.get("extra_args")),
+            binary=str(adapter_d.get("binary", AdapterPolicy.binary)),
             cleanup_session_on_finish=bool(
                 adapter_d.get("cleanup_session_on_finish", AdapterPolicy.cleanup_session_on_finish)
             ),
@@ -608,6 +633,28 @@ def _opt_nudges(d: dict[str, Any], where: str) -> int | None:
     return value
 
 
+def _adapter_binary(d: dict[str, Any], where: str) -> str | None:
+    """An [adapter]/[adapter.<stage>] ``binary`` override. Missing -> None (the
+    caller turns that into "" for the base table and "inherit" for a stage).
+
+    Strict about the value because it becomes argv[0] of the spawned session: a
+    non-string would coerce to something unspawnable, and a blank-but-present
+    value ("   ") reads as "I set this" while behaving as unset. Both raise
+    rather than degrade. Surrounding whitespace is trimmed; interior whitespace
+    is allowed so a path like "/Applications/My Tools/cc" works — the value is a
+    single executable, not a command line (session flags belong in extra_args).
+    """
+    if "binary" not in d:
+        return None
+    raw = d["binary"]
+    if not isinstance(raw, str):
+        raise PolicyError(f"{where}.binary must be a string: got {raw!r}")
+    value = raw.strip()
+    if raw and not value:
+        raise PolicyError(f"{where}.binary must not be blank — omit it to use the profile's binary")
+    return value
+
+
 def _tui_dim(d: dict[str, Any], key: str) -> int:
     """A persisted TUI pane dimension (cells). 0 = unset; negatives are rejected.
     Strict like scm.max_parallel: a TOML bool or float would coerce silently and
@@ -629,6 +676,7 @@ def _stage_adapter(adapter_d: dict[str, Any], key: str) -> StageAdapterPolicy:
         name=None if raw.get("name") is None else str(raw["name"]),
         model=None if raw.get("model") is None else str(raw["model"]),
         extra_args=None if raw_extra is None else tuple(str(a) for a in raw_extra),
+        binary=_adapter_binary(raw, f"adapter.{key}"),
         usage_grace_s=_opt_grace(raw, f"adapter.{key}"),
         stop_without_result_nudges=_opt_nudges(raw, f"adapter.{key}"),
     )
@@ -871,6 +919,7 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         name=str(adapter_d.get("name", AdapterPolicy.name)),
         model=str(adapter_d.get("model", AdapterPolicy.model)),
         extra_args=None if raw_extra is None else tuple(str(a) for a in raw_extra),
+        binary=_adapter_binary(adapter_d, "adapter") or AdapterPolicy.binary,
         cleanup_session_on_finish=bool(
             adapter_d.get("cleanup_session_on_finish", AdapterPolicy.cleanup_session_on_finish)
         ),
@@ -1126,6 +1175,12 @@ spec_folder = ""
 [adapter]
 name = "claude"              # claude | codex | gemini | copilot | antigravity | opencode-http (alias: opencode) | <custom .bmad-loop/profiles/*.toml>
 model = ""                   # empty = CLI default model (opencode-http wants "provider/model")
+# Executable to spawn. Empty = the profile's own binary. Set it to run the same
+# CLI under another name — a second subscription or a work/personal account
+# reachable as `cc` beside `claude` — without forking the whole profile. It must
+# be an alias or wrapper of the SAME CLI: the profile still supplies the hook
+# dialect, config path and transcript layout.
+binary = ""
 cleanup_session_on_finish = true  # kill the run's tmux session when it finishes (false keeps it for inspection)
 # extra_args replaces the profile's default permission-bypass flags when set:
 # extra_args = ["--permission-mode", "bypassPermissions"]
@@ -1137,11 +1192,12 @@ cleanup_session_on_finish = true  # kill the run's tmux session when it finishes
 
 # Per-stage overrides for the dev, review and sweep-triage passes. Unset keys
 # inherit from [adapter] when the stage runs the same client; a stage that
-# switches client falls back to that profile's defaults instead (model and
-# extra_args are client-specific). Stage tables must come after the [adapter]
-# keys above.
+# switches client falls back to that profile's defaults instead (model,
+# extra_args and binary are client-specific). Stage tables must come after the
+# [adapter] keys above.
 # [adapter.dev]
 # model = "opus"
+# binary = "cc"                      # e.g. bill dev sessions to a second account
 # [adapter.review]
 # name = "codex"
 # model = "gpt-5-codex"

@@ -209,6 +209,11 @@ def cmd_validate(args: argparse.Namespace) -> int:
 
     profiles = []
     profile_by_name: dict[str, CLIProfile] = {}
+    # Effective executable -> was it an [adapter] binary override. Keyed by the
+    # binary actually spawned, not by profile: a `binary` override means the
+    # profile's own name is NOT what runs, and probing it would report "claude
+    # found" for a run that will spawn `cc`.
+    binaries: dict[str, bool] = {}
     pol = None
     try:
         pol = policy_mod.load(_policy_path(project))
@@ -227,6 +232,12 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 profile_by_name[name] = profile
             except ProfileError as e:
                 report.fail("adapter.profile", str(e), {"profile": name})
+        for role in ROLES:
+            cfg = pol.adapter.resolved(role)
+            profile = profile_by_name.get(cfg.name)
+            if profile is not None:
+                tool = cfg.binary or profile.binary
+                binaries[tool] = binaries.get(tool, False) or bool(cfg.binary)
     except policy_mod.PolicyError as e:
         report.fail("policy", str(e))
 
@@ -291,11 +302,15 @@ def cmd_validate(args: argparse.Namespace) -> int:
             {"platform": sys.platform},
         )
 
-    for tool in dict.fromkeys(p.binary for p in profiles):
+    for tool, overridden in binaries.items():
+        # Name the override in the message: a missing `cc` is a typo'd alias, not
+        # a missing Claude Code install, and the fix differs.
+        note = " (binary override)" if overridden else ""
+        detail = {"binary": tool, "override": overridden}
         if shutil.which(tool):
-            report.ok("adapter.binary", f"{tool} found", {"binary": tool})
+            report.ok("adapter.binary", f"{tool} found{note}", detail)
         else:
-            report.fail("adapter.binary", f"{tool} not found on PATH", {"binary": tool})
+            report.fail("adapter.binary", f"{tool} not found on PATH{note}", detail)
 
     for profile in profiles:
         if profile.hookless:
@@ -944,19 +959,22 @@ def _render_invocation(pol, project: Path, role: str, prompt: str) -> str:
 
     cfg = pol.adapter.resolved(role)
     profile = get_profile(cfg.name, project)
+    # The dry-run plan must name the executable the run would really spawn, so a
+    # binary override is visible before any session starts.
+    binary = cfg.binary or profile.binary
     if profile.hookless:
         # HTTP/SSE transport — there is no shell invocation to print. Render
         # the real sequence (per-session server spawn + API prompt) instead of
         # a fake argv that run would never execute.
         model = f" model={cfg.model}" if cfg.model else ""
         return (
-            f"{profile.binary} serve --hostname 127.0.0.1 --port <auto> "
+            f"{binary} serve --hostname 127.0.0.1 --port <auto> "
             f'(cwd=<worktree>) → POST /session → prompt_async "{profile.render_prompt(prompt)}"'
             f"{model}"
         )
     extra = cfg.extra_args if cfg.extra_args is not None else profile.bypass_args
     argv = [
-        profile.binary,
+        binary,
         *profile.launch_args,
         f'"{profile.render_prompt(prompt)}"',
         *extra,

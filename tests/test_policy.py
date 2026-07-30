@@ -214,6 +214,83 @@ stop_without_result_nudges = 7
     assert dev.stop_without_result_nudges is None
 
 
+def test_adapter_binary_defaults_to_the_profile_binary():
+    # unset means "" everywhere, which make_adapters turns into None so the
+    # adapters keep spawning CLIProfile.binary — the pre-feature behavior.
+    pol = policy.load(None)
+    assert pol.adapter.binary == ""
+    assert all(pol.adapter.resolved(role).binary == "" for role in ("dev", "review", "triage"))
+
+
+def test_adapter_binary_base_reaches_every_stage(tmp_path):
+    p = tmp_path / "policy.toml"
+    p.write_text("""
+[adapter]
+binary = "cc"
+""")
+    pol = policy.load(p)
+    assert pol.adapter.binary == "cc"
+    assert all(pol.adapter.resolved(role).binary == "cc" for role in ("dev", "review", "triage"))
+
+
+def test_adapter_binary_per_stage_override(tmp_path):
+    # the work account drives dev; review stays on the default `claude` install
+    p = tmp_path / "policy.toml"
+    p.write_text("""
+[adapter]
+binary = "cc"
+[adapter.review]
+binary = ""
+""")
+    pol = policy.load(p)
+    assert pol.adapter.resolved("dev").binary == "cc"
+    # an explicit empty stage value clears the base override (the model rule)
+    assert pol.adapter.resolved("review").binary == ""
+
+
+def test_stage_client_switch_drops_base_binary(tmp_path):
+    """binary is client-specific: a `cc` alias of claude must never become argv[0]
+    for a stage that switched to codex, which would spawn the wrong CLI entirely."""
+    p = tmp_path / "policy.toml"
+    p.write_text("""
+[adapter]
+name = "claude"
+binary = "cc"
+[adapter.review]
+name = "codex"
+""")
+    review = policy.load(p).adapter.resolved("review")
+    assert review == policy.ResolvedAdapter("codex", "", None, binary="")
+
+
+def test_adapter_binary_is_trimmed(tmp_path):
+    p = tmp_path / "policy.toml"
+    p.write_text('[adapter]\nbinary = "  cc  "\n')
+    assert policy.load(p).adapter.binary == "cc"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        '[adapter]\nbinary = "   "\n',  # present but blank: reads as set, behaves as unset
+        '[adapter.dev]\nbinary = "\\t"\n',
+    ],
+)
+def test_blank_adapter_binary_is_rejected(body):
+    with pytest.raises(policy.PolicyError, match="must not be blank"):
+        policy.loads(body)
+
+
+@pytest.mark.parametrize(
+    "body",
+    ["[adapter]\nbinary = 7\n", "[adapter.review]\nbinary = true\n"],
+)
+def test_non_string_adapter_binary_is_rejected(body):
+    # it becomes argv[0]; a coerced int or bool would be unspawnable
+    with pytest.raises(policy.PolicyError, match="must be a string"):
+        policy.loads(body)
+
+
 def _roundtrip_snapshot(pol):
     # RunState.policy_snapshot is the json-round-tripped asdict(Policy).
     return json.loads(json.dumps(pol.to_dict()))
@@ -229,6 +306,8 @@ def _roundtrip_snapshot(pol):
         # (c) a stage name override — the client switch resets model to ""
         '[adapter]\nname = "claude"\nmodel = "opus"\n'
         'extra_args = ["--permission-mode", "plan"]\n[adapter.review]\nname = "codex"\n',
+        # (d) a binary override, base + an explicit stage clear
+        '[adapter]\nname = "claude"\nbinary = "cc"\n[adapter.review]\nbinary = ""\n',
     ],
 )
 def test_adapter_policy_from_snapshot_roundtrips_resolved(body):
