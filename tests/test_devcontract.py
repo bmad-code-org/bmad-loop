@@ -302,11 +302,14 @@ def test_find_artifact_missing_dir(tmp_path):
     assert devcontract.find_result_artifact(tmp_path / "ghost", since_ns=0) is None
 
 
-def test_find_artifact_accepts_no_spec_fallback_prefix(tmp_path):
+@pytest.mark.parametrize("prefix", ["bmad-build-auto-result-", "bmad-dev-auto-result-"])
+def test_find_artifact_accepts_no_spec_fallback_prefix(tmp_path, prefix):
     # The no-spec fallback (intent too unclear to create a spec) carries a terminal
     # frontmatter status but NO `## Auto Run Result` heading — it is matched by its
-    # `bmad-dev-auto-result-` filename prefix instead.
-    fallback = tmp_path / "bmad-dev-auto-result-unclear-1234.md"
+    # `<skill>-result-` filename prefix instead. BOTH eras are matched: the
+    # artifact is named after whichever skill wrote it (BMAD-METHOD #2651 renamed
+    # bmad-dev-auto to bmad-build-auto), and a run can meet either.
+    fallback = tmp_path / f"{prefix}unclear-1234.md"
     fallback.write_text(
         "---\nstatus: blocked\n---\n\nBlocking condition: unclear intent\n",
         encoding="utf-8",

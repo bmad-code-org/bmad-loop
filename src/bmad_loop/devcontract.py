@@ -80,9 +80,13 @@ _FM_STATUS_RE = re.compile(
 )
 
 # The skill's no-spec fallback artifact (HALT when {spec_file} is unknown/missing):
-# `{implementation_artifacts}/bmad-dev-auto-result-<slug-or-timestamp>.md`. It
-# carries a terminal frontmatter `status:` but no `## Auto Run Result` heading.
-FALLBACK_RESULT_PREFIX = "bmad-dev-auto-result-"
+# `{implementation_artifacts}/<skill>-result-<slug-or-timestamp>.md`. It carries a
+# terminal frontmatter `status:` but no `## Auto Run Result` heading. BOTH eras are
+# listed and matched unconditionally: the artifact is named after whichever skill
+# wrote it, and a run can read an artifact left by the other era (a resume across an
+# upstream upgrade, or a project mid-migration), so this must never be keyed on the
+# skill name resolved on disk today.
+FALLBACK_RESULT_PREFIXES = ("bmad-build-auto-result-", "bmad-dev-auto-result-")
 
 
 @dataclass(frozen=True)
@@ -287,8 +291,9 @@ def find_result_artifact(impl_artifacts: Path, *, since_ns: int) -> Path | None:
     writes no result.json, so on the session's Stop event we locate the spec it
     produced. The common case is a `spec-*.md` carrying a terminal `## Auto Run
     Result` section (appended by the skill's HALT on success AND blocked, when a
-    spec exists). The skill's no-spec fallback — `bmad-dev-auto-result-*.md`,
-    written when intent was too unclear to even create a spec — carries a
+    spec exists). The skill's no-spec fallback — `bmad-build-auto-result-*.md`
+    (`bmad-dev-auto-result-*.md` pre-rename), written when intent was too unclear
+    to even create a spec — carries a
     terminal frontmatter `status:` but NO `## Auto Run Result` heading, so it is
     matched by filename instead. Scans `impl_artifacts` for the most-recently-
     modified qualifying markdown modified at/after `since_ns` (the session launch
@@ -308,7 +313,7 @@ def find_result_artifact(impl_artifacts: Path, *, since_ns: int) -> Path | None:
         # The no-spec fallback is recognized by name (it has no Auto Run Result
         # heading); every other artifact must carry a real (non-fenced) terminal
         # section — a fence-quoted example must not qualify the spec (#52).
-        if not path.name.startswith(FALLBACK_RESULT_PREFIX):
+        if not path.name.startswith(FALLBACK_RESULT_PREFIXES):
             try:
                 text = path.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):

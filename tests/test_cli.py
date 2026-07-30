@@ -3,6 +3,7 @@
 import argparse
 import io
 import json
+import shutil
 import sys
 
 import pytest
@@ -1549,9 +1550,9 @@ def test_start_rejects_invalid_run_id(project, monkeypatch, capsys, command, bad
 
 
 def test_run_aborts_when_base_skills_missing(project, monkeypatch, capsys):
-    """The orchestrator depends on the non-bundled upstream skills (bmad-dev-auto
-    + the review hunters); a run must fail loudly at preflight (not stall mid-run)
-    when they are absent."""
+    """The orchestrator depends on the non-bundled upstream skills (the dev
+    primitive + the review hunters); a run must fail loudly at preflight (not stall
+    mid-run) when they are absent."""
     from conftest import git
 
     install_bmad_config(project)
@@ -1564,7 +1565,30 @@ def test_run_aborts_when_base_skills_missing(project, monkeypatch, capsys):
 
     assert cli.main(["run", "--project", str(project.project)]) == 1
     err = capsys.readouterr().err
-    assert "bmad-dev-auto" in err
+    assert "bmad-build-auto" in err
+
+
+def test_run_aborts_when_only_the_dev_shim_is_installed(project, monkeypatch, capsys):
+    """The post-#2651 hazard: the shim IS a SKILL.md, so a run would happily
+    dispatch `/bmad-dev-auto` into an interactive migration gate and HALT having
+    written nothing. The preflight refuses it and names the rename instead."""
+    from conftest import git, install_base_skills, install_dev_shim
+
+    install_bmad_config(project)
+    install_base_skills(project)
+    for tree in (".claude/skills", ".agents/skills"):
+        shutil.rmtree(project.project / tree / "bmad-build-auto")
+        shutil.rmtree(project.project / tree / "bmad-dev-auto")
+        install_dev_shim(project.project, tree)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "setup")
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {r: None for r in cli.ROLES})
+
+    assert cli.main(["run", "--project", str(project.project)]) == 1
+    err = capsys.readouterr().err
+    assert "bmad-build-auto" in err and "HALT" in err
 
 
 def _stub_run_tui(monkeypatch):
@@ -3400,6 +3424,90 @@ def _make_validate_pass(project, monkeypatch, capsys):
         lambda: [cli.Finding("mux.backend", "ok", "multiplexer TmuxBackend available (tmux 3.4)")],
     )
     capsys.readouterr()  # drop `init`'s chatter — the next read must see only the document
+
+
+def _findings_by_check(doc):
+    return {f["check"]: f for f in doc["findings"]}
+
+
+def _render_findings(doc) -> str:
+    """Draw a document through the TUI renderer (#210) and return the text. The
+    `{'` assertion is that file's nested-dict tell: a renderer that str()s a detail
+    shape it did not model prints a Python repr."""
+    from rich.console import Console
+
+    from bmad_loop.tui import widgets
+
+    console = Console(width=96)
+    with console.capture() as capture:
+        console.print(widgets.validate_findings(doc, details=True))
+    rendered = capture.get()
+    assert "{'" not in rendered
+    return rendered
+
+
+def test_validate_names_the_resolved_dev_primitive(project, capsys, monkeypatch):
+    """`skills.base` reports which era actually resolved — on an upgraded project
+    that ok line is the operator's confirmation the rename was picked up, so it
+    must not be a hardcoded name."""
+    from conftest import install_build_auto_skill
+
+    _make_validate_pass(project, monkeypatch, capsys)  # lays down the LEGACY skill
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+    base = _findings_by_check(doc)["skills.base"]
+    assert "bmad-dev-auto" in base["message"]
+    assert base["detail"]["dev_primitive"] == ["bmad-dev-auto"]
+
+    install_build_auto_skill(project.project, ".claude/skills")
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    # rc 1 only because laying down a skill dirtied the worktree — the skills gate
+    # itself still passes, now naming the new primitive
+    base = _findings_by_check(doc)["skills.base"]
+    assert base["severity"] == "ok"
+    assert "bmad-build-auto" in base["message"] and "bmad-dev-auto" not in base["message"]
+    assert base["detail"]["dev_primitive"] == ["bmad-build-auto"]
+
+
+def test_validate_reports_the_shim_as_a_problem(project, capsys, monkeypatch):
+    from conftest import install_dev_shim
+
+    _make_validate_pass(project, monkeypatch, capsys)
+    for marker in ("step-04-review.md", "customize.toml"):
+        (project.project / ".claude/skills/bmad-dev-auto" / marker).unlink()
+    install_dev_shim(project.project, ".claude/skills")  # rewrite SKILL.md as the shim
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    shim = _findings_by_check(doc)["skills.base-shim"]
+    assert shim["severity"] == "problem"
+    assert "bmad-build-auto" in shim["message"]
+    assert "skills.base" not in _findings_by_check(doc)  # no ok line beside the failure
+    assert "skills.base-shim" in _render_findings(doc)  # new detail shape draws
+
+
+def test_validate_warns_on_a_renderer_stub_and_an_orphaned_customize_file(
+    project, capsys, monkeypatch
+):
+    """Both dev-primitive warnings are advisory: they ride along in the document
+    and must NOT flip the verdict on their own."""
+    from conftest import install_build_auto_skill
+
+    _make_validate_pass(project, monkeypatch, capsys)  # claude-only policy
+    shutil.rmtree(project.project / ".claude/skills/bmad-dev-auto")
+    install_build_auto_skill(project.project, ".claude/skills", renderer_stub=True)
+    custom = project.project / "_bmad" / "custom"
+    custom.mkdir(parents=True, exist_ok=True)
+    (custom / "bmad-dev-auto.toml").write_text("x\n", encoding="utf-8")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "upgrade to bmad-build-auto")
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+    assert doc["ok"] is True  # warnings do not fail the run
+    found = _findings_by_check(doc)
+    assert found["skills.dev-renderer"]["severity"] == "warning"
+    assert found["skills.customize-legacy"]["severity"] == "warning"
+    assert "_bmad/scripts/render_skill.py" in found["skills.dev-renderer"]["message"]
+    rendered = _render_findings(doc)  # both new detail shapes draw, plus skills.base's
+    assert "skills.dev-renderer" in rendered and "skills.customize-legacy" in rendered
 
 
 def test_validate_json_clean_project_is_a_pure_document_at_rc_0(project, capsys, monkeypatch):

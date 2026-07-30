@@ -492,14 +492,29 @@ def cmd_validate(args: argparse.Namespace) -> int:
                     {"role": role, "model": cfg.model, "profile": prof.name},
                 )
 
-    base_problems = install.missing_base_skills(project, [p.skill_tree for p in profiles])
+    base_trees = [p.skill_tree for p in profiles]
+    base_problems = install.missing_base_skills(project, base_trees)
     if profiles and not base_problems:
+        # Name the primitive that actually resolved, not a hardcoded era: on an
+        # upgraded project this is the operator's confirmation that the rename was
+        # picked up (and, across trees, that both picked up the same one).
+        resolved = list(
+            dict.fromkeys(
+                name
+                for tree in dict.fromkeys(base_trees)
+                if (name := install.resolve_dev_primitive(project, tree)) is not None
+            )
+        )
         report.ok(
             "skills.base",
-            "upstream skills present (bmad-dev-auto + review hunters)",
-            {"trees": list(dict.fromkeys(p.skill_tree for p in profiles))},
+            f"upstream skills present ({' + '.join(resolved)} + review hunters)",
+            {
+                "trees": list(dict.fromkeys(base_trees)),
+                "dev_primitive": resolved,
+            },
         )
     report.extend(base_problems)
+    report.extend(install.dev_primitive_warnings(project, base_trees))
 
     if getattr(args, "json", False):
         # getattr, not args.json: cmd_validate is called directly by tests (and by
@@ -629,16 +644,19 @@ def _mux_set(project: Path, args: argparse.Namespace) -> int:
 
 
 def _require_base_skills(project: Path, pol, *, require_stories: bool = False) -> bool:
-    """Preflight the upstream skills the orchestrator drives (bmad-dev-auto + the
-    three review hunters it invokes inline).
+    """Preflight the upstream skills the orchestrator drives (the dev primitive —
+    bmad-build-auto, or a complete pre-rename bmad-dev-auto — plus the three review
+    hunters it invokes inline).
 
     Returns True when everything is in place; otherwise prints the problems and
     returns False so the caller can abort before spawning any session (a missing
     skill would otherwise stall as an `Unknown command` until the run times out).
+    A post-rename install left with only the forwarding shim fails here too: the
+    shim's interactive migration gate would HALT the session with nothing written.
 
-    ``require_stories`` additionally content-probes bmad-dev-auto for folder+id
-    dispatch — stories mode needs a newer skill than sprint mode, so an older
-    install must fail loudly here rather than HALT `no stories.yaml`-style at
+    ``require_stories`` additionally content-probes the resolved primitive for
+    folder+id dispatch — stories mode needs a newer skill than sprint mode, so an
+    older install must fail loudly here rather than HALT `no stories.yaml`-style at
     dispatch time."""
     from .adapters.profile import ProfileError, get_profile
 
@@ -734,10 +752,16 @@ def _validate_stories_queue(
             )
     stories_probs = install.missing_stories_support(project, skill_trees)
     if skill_trees and not stories_probs:
+        probed = list(
+            dict.fromkeys(
+                install.dev_primitive_or_default(project, tree)
+                for tree in dict.fromkeys(skill_trees)
+            )
+        )
         report.ok(
             "skills.stories-dispatch",
-            "bmad-dev-auto supports folder+id dispatch (stories mode)",
-            {"trees": list(dict.fromkeys(skill_trees))},
+            f"{' + '.join(probed)} supports folder+id dispatch (stories mode)",
+            {"trees": list(dict.fromkeys(skill_trees)), "dev_primitive": probed},
         )
     report.extend(stories_probs)
 

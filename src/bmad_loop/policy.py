@@ -26,6 +26,9 @@ STORIES_SOURCES = {"sprint-status", "stories"}
 ISOLATION_MODES = {"none", "worktree"}
 BRANCH_PER_MODES = {"story", "run"}
 MERGE_STRATEGIES = {"ff", "merge", "squash"}
+# Accepted `[dev] skill` values — the adapter discriminator, not the invoked skill
+# name (see DevPolicy.skill): the post-rename "bmad-build-auto" speaks the same
+# contract and is resolved on disk, so it is deliberately NOT a separate value here.
 DEV_SKILLS = {"bmad-dev-auto"}
 
 # Backend names are registry keys (adapters/multiplexer.py), never paths or
@@ -198,6 +201,13 @@ class DevPolicy:
     # it writes no result.json — the GenericDevAdapter synthesizes one from the
     # spec the session leaves on disk. The field is retained (rather than inlined)
     # as the seam for a future alternative dev skill; see DEV_SKILLS.
+    #
+    # This value is the ADAPTER DISCRIMINATOR ("which contract does the session
+    # speak"), NOT the skill name the prompt invokes. BMAD-METHOD PR #2651 renamed
+    # the skill to "bmad-build-auto" without changing that contract, so the invoked
+    # NAME is resolved from disk per skill tree (install.resolve_dev_primitive) and
+    # the value here deliberately stays "bmad-dev-auto" — a target project must not
+    # have to edit policy.toml to survive an upstream rename.
     skill: str = "bmad-dev-auto"
 
 

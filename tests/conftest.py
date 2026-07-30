@@ -272,12 +272,87 @@ def install_dev_base_skills(root: Path, tree: str = ".claude/skills", *, folder_
 def install_base_skills(paths: ProjectPaths, trees=(".claude/skills", ".agents/skills")) -> None:
     """Stub every non-bundled upstream skill (`install.BASE_SKILLS` — a superset of
     DEV_BASE_SKILLS that also covers what a worktree mount must copy) in each of a
-    sandbox project's active CLI skill trees. Sprint mode drives any bmad-dev-auto,
-    so no folder+id probe is written."""
+    sandbox project's active CLI skill trees. Sprint mode drives any dev primitive,
+    so no folder+id probe is written.
+
+    BASE_SKILLS names BOTH primitive eras, so this lays down bmad-build-auto AND
+    bmad-dev-auto — a state no real bmm install produces, but the point of this
+    scaffold is "nothing the orchestrator may copy is absent". Resolution therefore
+    picks bmad-build-auto here; use `install_dev_base_skills` for a pre-rename
+    project and `install_dev_shim` for a post-rename one."""
     from bmad_loop.install import BASE_SKILLS
 
     for tree in trees:
         _write_skill_stubs(paths.project / tree, BASE_SKILLS)
+
+
+BUILD_AUTO_STEPS = (
+    "step-01-clarify-and-route.md",
+    "step-02-plan.md",
+    "step-03-implement.md",
+    "step-04-review.md",
+)
+# What a renderer-stub SKILL.md looks like since BMAD-METHOD #2601: it delegates to
+# the project-local render script instead of carrying the prompt inline.
+RENDERER_STUB_SKILL_MD = (
+    "# bmad-build-auto\n\nRun:\n\n```bash\nuv run _bmad/scripts/render_skill.py "
+    "bmad-build-auto\n```\n"
+)
+
+
+def install_build_auto_skill(
+    root: Path,
+    tree: str = ".claude/skills",
+    *,
+    folder_id: bool = True,
+    renderer_stub: bool = False,
+) -> Path:
+    """Lay down a realistic POST-rename dev primitive (`bmad-build-auto`) under
+    ``root/tree``: SKILL.md, all four step files, customize.toml with prompt-file
+    layers, and a review-prompts/ payload.
+
+    Richer than `_write_skill_stubs` on purpose — the marker files alone can't show
+    that a worktree mount carries a skill's *subdirectories*, and `renderer_stub`
+    needs a SKILL.md whose content is the thing under test. ``folder_id`` writes the
+    dispatch marker into step-01 (stories mode's content probe); ``renderer_stub``
+    swaps SKILL.md for the #2601 renderer stub. Returns the skill dir."""
+    from bmad_loop.install import DEV_PRIMITIVE_NEW, STORIES_PROBE_FILE, STORIES_PROBE_TEXT
+
+    skill = Path(root) / tree / DEV_PRIMITIVE_NEW
+    (skill / "review-prompts").mkdir(parents=True, exist_ok=True)
+    (skill / "SKILL.md").write_text(
+        RENDERER_STUB_SKILL_MD if renderer_stub else f"# {DEV_PRIMITIVE_NEW}\n", encoding="utf-8"
+    )
+    for step in BUILD_AUTO_STEPS:
+        body = f"# {step}\n"
+        if folder_id and step == STORIES_PROBE_FILE:
+            body = f"This is a **{STORIES_PROBE_TEXT}** router.\n"
+        (skill / step).write_text(body, encoding="utf-8")
+    (skill / "customize.toml").write_text(
+        '[[review_layers]]\nid = "adversarial"\nprompt_file = "review-prompts/adversarial.md"\n',
+        encoding="utf-8",
+    )
+    (skill / "review-prompts" / "adversarial.md").write_text("# adversarial\n", encoding="utf-8")
+    return skill
+
+
+def install_dev_shim(root: Path, tree: str = ".claude/skills") -> Path:
+    """Lay down the post-rename FORWARDING SHIM: a lone `bmad-dev-auto/SKILL.md`
+    with no step files and no customize.toml.
+
+    This is what upstream leaves behind after the bmad-build-auto rename, and its
+    migration gate is interactive — an unattended session dispatched to it HALTs
+    without writing anything. Writing only SKILL.md is the whole point: the absent
+    markers are what the shim detector keys on. Returns the shim dir."""
+    from bmad_loop.install import DEV_PRIMITIVE_LEGACY
+
+    shim = Path(root) / tree / DEV_PRIMITIVE_LEGACY
+    shim.mkdir(parents=True, exist_ok=True)
+    (shim / "SKILL.md").write_text(
+        f"# {DEV_PRIMITIVE_LEGACY}\n\nThis skill has been renamed to bmad-build-auto.\n",
+        encoding="utf-8",
+    )
+    return shim
 
 
 def fault_read_text(monkeypatch, target: Path) -> None:

@@ -1,4 +1,5 @@
 import json
+import shutil
 import sys
 import zipfile
 
@@ -600,9 +601,13 @@ def test_provision_worktree_copies_base_skills_from_repo(tmp_path):
 
 
 def test_missing_base_skills_reports_absent_and_incomplete(tmp_path):
+    """Markers are asserted on the primitive that RESOLVED. Truncating the legacy
+    name instead is a different finding (it stops resolving at all) — see
+    test_legacy_primitive_missing_a_marker_is_refused."""
+    primitive = "bmad-build-auto"
     claude = get_profile("claude")
     # nothing installed → dev primitive + all three inline review hunters reported
-    # missing (the hunters are always required — bmad-dev-auto's step-04 invokes
+    # missing (the hunters are always required — the primitive's step-04 invokes
     # them on every run, regardless of the orchestrator's follow-up review)
     problems = missing_base_skills(tmp_path, [claude.skill_tree])
     assert len(problems) == 4
@@ -612,31 +617,346 @@ def test_missing_base_skills_reports_absent_and_incomplete(tmp_path):
     _install_base_skills(tmp_path, claude.skill_tree)
     assert missing_base_skills(tmp_path, [claude.skill_tree]) == []
 
-    # remove the dev primitive's step-file marker → reported as incomplete
-    (tmp_path / claude.skill_tree / "bmad-dev-auto" / "step-04-review.md").unlink()
+    # remove the resolved primitive's step-file marker → reported as incomplete
+    (tmp_path / claude.skill_tree / primitive / "step-04-review.md").unlink()
     problems = missing_base_skills(tmp_path, [claude.skill_tree])
     assert len(problems) == 1
     assert "incomplete" in problems[0].message
     assert "step-04-review.md" in problems[0].message
+    assert problems[0].detail["skill"] == primitive
 
     # restore it, then drop customize.toml (the review-layer config marker,
     # BMAD-METHOD #2535/#2550) → a pre-July bmm install is caught as incomplete
-    (tmp_path / claude.skill_tree / "bmad-dev-auto" / "step-04-review.md").write_text("x\n")
-    (tmp_path / claude.skill_tree / "bmad-dev-auto" / "customize.toml").unlink()
+    (tmp_path / claude.skill_tree / primitive / "step-04-review.md").write_text("x\n")
+    (tmp_path / claude.skill_tree / primitive / "customize.toml").unlink()
     problems = missing_base_skills(tmp_path, [claude.skill_tree])
     assert len(problems) == 1
     assert "incomplete" in problems[0].message
     assert "customize.toml" in problems[0].message
+    assert problems[0].detail["skill"] == primitive
 
     # the newest review layer (verification-gap) reported by name when absent
     _install_base_skills(tmp_path, claude.skill_tree)  # re-complete everything
-    import shutil as _shutil
-
-    _shutil.rmtree(tmp_path / claude.skill_tree / "bmad-review-verification-gap")
+    shutil.rmtree(tmp_path / claude.skill_tree / "bmad-review-verification-gap")
     problems = missing_base_skills(tmp_path, [claude.skill_tree])
     assert len(problems) == 1
     assert "bmad-review-verification-gap" in problems[0].message
     assert "install the BMad Method" in problems[0].message
+
+
+# --- the bmad-dev-auto -> bmad-build-auto rename (BMAD-METHOD #2651) ---------
+
+
+def _install_hunters(root, tree=".claude/skills"):
+    """Just the three inline review hunters — so a resolution test's findings are
+    only ever about the dev primitive."""
+    from bmad_loop.install import REVIEW_HUNTER_SKILLS
+
+    for skill in REVIEW_HUNTER_SKILLS:
+        d = root / tree / skill
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "SKILL.md").write_text(f"# {skill}\n", encoding="utf-8")
+
+
+def _install_legacy_primitive(root, tree=".claude/skills"):
+    """A complete PRE-rename dev primitive: SKILL.md plus every marker."""
+    from bmad_loop.install import DEV_PRIMITIVE_LEGACY, DEV_PRIMITIVE_MARKERS
+
+    d = root / tree / DEV_PRIMITIVE_LEGACY
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "SKILL.md").write_text(f"# {DEV_PRIMITIVE_LEGACY}\n", encoding="utf-8")
+    for marker in DEV_PRIMITIVE_MARKERS:
+        (d / marker).write_text("x\n", encoding="utf-8")
+    return d
+
+
+def test_resolve_dev_primitive_prefers_the_new_name_over_a_complete_legacy(tmp_path):
+    """The rename's four on-disk states, resolved. The shim is the one that must
+    NOT resolve: its migration gate is interactive, so an unattended session
+    dispatched to it HALTs without writing a spec — worse than failing preflight."""
+    from conftest import install_build_auto_skill, install_dev_shim
+
+    from bmad_loop.install import resolve_dev_primitive
+
+    tree = get_profile("claude").skill_tree
+
+    # 1. nothing installed
+    assert resolve_dev_primitive(tmp_path, tree) is None
+
+    # 2. shim only → still nothing usable
+    install_dev_shim(tmp_path, tree)
+    assert resolve_dev_primitive(tmp_path, tree) is None
+
+    # 3. shim + the real new skill (what an upgraded bmm install looks like)
+    install_build_auto_skill(tmp_path, tree)
+    assert resolve_dev_primitive(tmp_path, tree) == "bmad-build-auto"
+
+    # 4. a complete legacy install alone (pre-rename project)
+    shutil.rmtree(tmp_path / tree / "bmad-build-auto")
+    shutil.rmtree(tmp_path / tree / "bmad-dev-auto")
+    _install_legacy_primitive(tmp_path, tree)
+    assert resolve_dev_primitive(tmp_path, tree) == "bmad-dev-auto"
+
+    # …and the new name wins the moment it appears beside it
+    install_build_auto_skill(tmp_path, tree)
+    assert resolve_dev_primitive(tmp_path, tree) == "bmad-build-auto"
+
+
+def test_resolve_dev_primitive_takes_the_new_name_without_its_markers(tmp_path):
+    """Resolution keys on SKILL.md alone for the new name so a truncated
+    bmad-build-auto is REPORTED (base-incomplete) rather than silently falling
+    through to a legacy install — or to the shim's misleading message."""
+    from conftest import install_build_auto_skill
+
+    from bmad_loop.install import missing_base_skills, resolve_dev_primitive
+
+    tree = get_profile("claude").skill_tree
+    _install_hunters(tmp_path, tree)
+    _install_legacy_primitive(tmp_path, tree)
+    install_build_auto_skill(tmp_path, tree)
+    (tmp_path / tree / "bmad-build-auto" / "customize.toml").unlink()
+
+    assert resolve_dev_primitive(tmp_path, tree) == "bmad-build-auto"
+    problems = missing_base_skills(tmp_path, [tree])
+    assert [f.check for f in problems] == ["skills.base-incomplete"]
+    assert problems[0].detail["skill"] == "bmad-build-auto"
+
+
+def test_shim_only_install_fails_the_preflight_with_the_rename_named(tmp_path):
+    """The headline case: a project upgraded past #2651 has ONLY the shim under the
+    old name, and v0.9.0's marker check would have called it `base-incomplete` —
+    a message pointing at the wrong remedy (reinstall) for the actual cause."""
+    from conftest import install_dev_shim
+
+    from bmad_loop.checks import VALIDATE_CHECKS
+    from bmad_loop.install import missing_base_skills
+
+    tree = get_profile("claude").skill_tree
+    _install_hunters(tmp_path, tree)
+    install_dev_shim(tmp_path, tree)
+
+    problems = missing_base_skills(tmp_path, [tree])
+    assert [f.check for f in problems] == ["skills.base-shim"]
+    assert problems[0].check in VALIDATE_CHECKS
+    assert problems[0].severity == "problem"
+    assert problems[0].detail == {
+        "tree": tree,
+        "skill": "bmad-dev-auto",
+        "expected": "bmad-build-auto",
+        "missing_markers": ["step-04-review.md", "customize.toml"],
+    }
+    assert "bmad-build-auto" in problems[0].message
+    assert "HALT" in problems[0].message  # the hazard, not just the absence
+
+
+def test_legacy_primitive_missing_a_marker_is_refused(tmp_path):
+    """A truncated legacy install is the same on-disk shape as the shim, so it
+    lands on the same finding. What must NOT happen is resolving it and driving a
+    primitive whose step-04 config is absent."""
+    from bmad_loop.install import missing_base_skills, resolve_dev_primitive
+
+    tree = get_profile("claude").skill_tree
+    _install_hunters(tmp_path, tree)
+    _install_legacy_primitive(tmp_path, tree)
+    (tmp_path / tree / "bmad-dev-auto" / "step-04-review.md").unlink()
+
+    assert resolve_dev_primitive(tmp_path, tree) is None
+    problems = missing_base_skills(tmp_path, [tree])
+    assert [f.check for f in problems] == ["skills.base-shim"]
+    assert problems[0].detail["missing_markers"] == ["step-04-review.md"]
+
+
+def test_no_primitive_at_all_names_the_current_upstream_skill(tmp_path):
+    """An empty tree is `base-missing`, not `base-shim` — and it points at the new
+    name, because that is what a fresh bmm install would lay down."""
+    from bmad_loop.install import missing_base_skills
+
+    tree = get_profile("claude").skill_tree
+    _install_hunters(tmp_path, tree)
+
+    problems = missing_base_skills(tmp_path, [tree])
+    assert [f.check for f in problems] == ["skills.base-missing"]
+    assert problems[0].detail["skill"] == "bmad-build-auto"
+    assert "bmad-dev-auto" in problems[0].message  # older installs still named
+
+
+def test_dev_primitive_or_default_is_total(tmp_path):
+    """Prompt builders need a name unconditionally. A None tree (an adapter with no
+    profile) and an unresolvable tree both fall back to the legacy name — the
+    preflight has already refused the real cases before any session is spawned."""
+    from conftest import install_build_auto_skill, install_dev_shim
+
+    from bmad_loop.install import dev_primitive_or_default
+
+    tree = get_profile("claude").skill_tree
+    assert dev_primitive_or_default(tmp_path, None) == "bmad-dev-auto"
+    assert dev_primitive_or_default(tmp_path, tree) == "bmad-dev-auto"
+    install_dev_shim(tmp_path, tree)
+    assert dev_primitive_or_default(tmp_path, tree) == "bmad-dev-auto"
+    install_build_auto_skill(tmp_path, tree)
+    assert dev_primitive_or_default(tmp_path, tree) == "bmad-build-auto"
+
+
+def test_resolution_is_per_tree(tmp_path):
+    """One run can drive two CLIs with different skill trees, and an operator can
+    upgrade bmm in one and not the other — so resolution is per tree, and both a
+    finding and a resolved name have to follow the tree they came from."""
+    from conftest import install_build_auto_skill
+
+    from bmad_loop.install import missing_base_skills, resolve_dev_primitive
+
+    claude, codex = get_profile("claude").skill_tree, get_profile("codex").skill_tree
+    assert claude != codex
+    for tree in (claude, codex):
+        _install_hunters(tmp_path, tree)
+    install_build_auto_skill(tmp_path, claude)
+    _install_legacy_primitive(tmp_path, codex)
+
+    assert resolve_dev_primitive(tmp_path, claude) == "bmad-build-auto"
+    assert resolve_dev_primitive(tmp_path, codex) == "bmad-dev-auto"
+    assert missing_base_skills(tmp_path, [claude, codex]) == []
+
+
+def test_dev_primitive_warnings_flag_a_renderer_stub_without_its_script(tmp_path):
+    """BMAD-METHOD #2601: SKILL.md became a stub that shells out to a project-local
+    render script. Missing script = the session HALTs with nothing written — but it
+    is a warning, not a FAIL: only the script's presence is probed, never uv."""
+    from conftest import install_build_auto_skill
+
+    from bmad_loop.checks import VALIDATE_CHECKS
+    from bmad_loop.install import RENDERER_SCRIPT_REL, dev_primitive_warnings
+
+    tree = get_profile("claude").skill_tree
+    # an inline (non-stub) SKILL.md never warns, script or no script
+    install_build_auto_skill(tmp_path, tree)
+    assert dev_primitive_warnings(tmp_path, [tree]) == []
+
+    install_build_auto_skill(tmp_path, tree, renderer_stub=True)
+    warnings = dev_primitive_warnings(tmp_path, [tree])
+    assert [f.check for f in warnings] == ["skills.dev-renderer"]
+    assert warnings[0].severity == "warning"
+    assert warnings[0].check in VALIDATE_CHECKS
+    assert RENDERER_SCRIPT_REL in warnings[0].message
+
+    # …and it clears once the script is there
+    script = tmp_path / RENDERER_SCRIPT_REL
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text("# renderer\n", encoding="utf-8")
+    assert dev_primitive_warnings(tmp_path, [tree]) == []
+
+
+def test_dev_primitive_warnings_flag_an_orphaned_legacy_customize_file(tmp_path):
+    """The rename does not migrate `_bmad/custom/<skill>.toml`, so an upgraded
+    project silently stops applying its overrides."""
+    from conftest import install_build_auto_skill
+
+    from bmad_loop.install import CUSTOMIZE_DIR_REL, dev_primitive_warnings
+
+    tree = get_profile("claude").skill_tree
+    custom = tmp_path / CUSTOMIZE_DIR_REL
+    custom.mkdir(parents=True, exist_ok=True)
+    (custom / "bmad-dev-auto.toml").write_text("x\n", encoding="utf-8")
+
+    # a PRE-rename project: that file is the correct one — warning here would be
+    # noise on every legacy install (ablation: drop the resolved-is-new guard)
+    _install_legacy_primitive(tmp_path, tree)
+    assert dev_primitive_warnings(tmp_path, [tree]) == []
+
+    install_build_auto_skill(tmp_path, tree)
+    warnings = dev_primitive_warnings(tmp_path, [tree])
+    assert [f.check for f in warnings] == ["skills.customize-legacy"]
+    assert warnings[0].severity == "warning"
+    assert warnings[0].detail["files"] == [f"{CUSTOMIZE_DIR_REL}/bmad-dev-auto.toml"]
+
+    # a counterpart under the new name means the operator already migrated
+    (custom / "bmad-build-auto.toml").write_text("x\n", encoding="utf-8")
+    assert dev_primitive_warnings(tmp_path, [tree]) == []
+
+    # .user.toml is tracked separately — migrating one does not cover the other
+    (custom / "bmad-dev-auto.user.toml").write_text("x\n", encoding="utf-8")
+    warnings = dev_primitive_warnings(tmp_path, [tree])
+    assert warnings[0].detail["files"] == [f"{CUSTOMIZE_DIR_REL}/bmad-dev-auto.user.toml"]
+
+
+def test_dev_primitive_warnings_are_silent_when_nothing_resolves(tmp_path):
+    """missing_base_skills owns the unresolvable story; the warnings must not pile
+    advisory noise on top of a hard preflight failure.
+
+    Both warning sites are armed here — an orphaned customize file AND a shim whose
+    SKILL.md is a renderer stub — so the silence is the resolution guard's doing and
+    not merely the absence of anything to say."""
+    from conftest import RENDERER_STUB_SKILL_MD, install_dev_shim
+
+    from bmad_loop.install import CUSTOMIZE_DIR_REL, dev_primitive_warnings
+
+    tree = get_profile("claude").skill_tree
+    custom = tmp_path / CUSTOMIZE_DIR_REL
+    custom.mkdir(parents=True, exist_ok=True)
+    (custom / "bmad-dev-auto.toml").write_text("x\n", encoding="utf-8")
+    shim = install_dev_shim(tmp_path, tree)
+    (shim / "SKILL.md").write_text(RENDERER_STUB_SKILL_MD, encoding="utf-8")
+
+    assert dev_primitive_warnings(tmp_path, [tree]) == []
+
+
+def test_customize_legacy_warning_is_emitted_once_across_trees(tmp_path):
+    """`_bmad/custom/` is project-global, so two trees resolving to the new name
+    must not double-report the same orphaned file."""
+    from conftest import install_build_auto_skill
+
+    from bmad_loop.install import CUSTOMIZE_DIR_REL, dev_primitive_warnings
+
+    claude, codex = get_profile("claude").skill_tree, get_profile("codex").skill_tree
+    custom = tmp_path / CUSTOMIZE_DIR_REL
+    custom.mkdir(parents=True, exist_ok=True)
+    (custom / "bmad-dev-auto.toml").write_text("x\n", encoding="utf-8")
+    for tree in (claude, codex):
+        install_build_auto_skill(tmp_path, tree)
+
+    warnings = dev_primitive_warnings(tmp_path, [claude, codex])
+    assert [f.check for f in warnings] == ["skills.customize-legacy"]
+
+
+def test_missing_stories_support_probes_the_resolved_primitive(tmp_path):
+    """Stories mode's content probe follows resolution: a dispatch-capable
+    bmad-build-auto satisfies it even though the constant still names the legacy
+    skill, and a legacy step-01 beside it does NOT (that skill isn't driven)."""
+    from conftest import install_build_auto_skill
+
+    from bmad_loop.install import STORIES_PROBE_FILE, STORIES_PROBE_TEXT, missing_stories_support
+
+    tree = get_profile("claude").skill_tree
+    install_build_auto_skill(tmp_path, tree, folder_id=True)
+    assert missing_stories_support(tmp_path, [tree]) == []
+
+    # strip the marker from the RESOLVED skill and hide a good one in the legacy
+    # skill: the probe must report stale, not be satisfied by the wrong skill
+    (tmp_path / tree / "bmad-build-auto" / STORIES_PROBE_FILE).write_text("old\n")
+    legacy = _install_legacy_primitive(tmp_path, tree)
+    (legacy / STORIES_PROBE_FILE).write_text(f"**{STORIES_PROBE_TEXT}**\n", encoding="utf-8")
+
+    problems = missing_stories_support(tmp_path, [tree])
+    assert [f.check for f in problems] == ["skills.stories-dispatch-stale"]
+    assert problems[0].detail["skill"] == "bmad-build-auto"
+
+
+def test_provision_worktree_carries_the_new_primitives_subdirectories(tmp_path):
+    """Adding bmad-build-auto to BASE_SKILLS is what keeps isolation working across
+    the rename. The copy is whole-dir, so review-prompts/ (which customize.toml's
+    layers point at) has to ride along — a markers-only copy would leave every
+    review layer unresolvable inside the worktree."""
+    from conftest import install_build_auto_skill
+
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    install_build_auto_skill(repo, tree)
+
+    provision_worktree(wt, [claude], repo)
+
+    assert (wt / tree / "bmad-build-auto" / "SKILL.md").is_file()
+    assert (wt / tree / "bmad-build-auto" / "customize.toml").is_file()
+    assert (wt / tree / "bmad-build-auto" / "review-prompts" / "adversarial.md").is_file()
 
 
 def test_missing_stories_support_probes_step01_content(tmp_path):
@@ -677,8 +997,10 @@ def test_missing_base_skills_findings_carry_ids_and_detail(tmp_path):
     assert {f.check for f in absent} == {"skills.base-missing"}
     assert all(f.severity == "problem" for f in absent)
     assert all(f.check in VALIDATE_CHECKS for f in absent)
+    # the primitive is reported under the CURRENT upstream name — a fresh install
+    # follows the rename, so pointing an operator at bmad-dev-auto would misdirect
     assert {f.detail["skill"] for f in absent} == {
-        "bmad-dev-auto",
+        "bmad-build-auto",
         "bmad-review-adversarial-general",
         "bmad-review-edge-case-hunter",
         "bmad-review-verification-gap",
@@ -686,8 +1008,8 @@ def test_missing_base_skills_findings_carry_ids_and_detail(tmp_path):
     assert all(f.detail["tree"] == claude.skill_tree for f in absent)
 
     _install_base_skills(tmp_path, claude.skill_tree)
-    (tmp_path / claude.skill_tree / "bmad-dev-auto" / "step-04-review.md").unlink()
-    (tmp_path / claude.skill_tree / "bmad-dev-auto" / "customize.toml").unlink()
+    (tmp_path / claude.skill_tree / "bmad-build-auto" / "step-04-review.md").unlink()
+    (tmp_path / claude.skill_tree / "bmad-build-auto" / "customize.toml").unlink()
     incomplete = missing_base_skills(tmp_path, [claude.skill_tree])
     assert len(incomplete) == 1
     assert incomplete[0].check == "skills.base-incomplete"
@@ -749,23 +1071,26 @@ def test_missing_stories_support_reports_non_utf8_probe_without_crashing(tmp_pat
     assert len(problems) == 1 and "not found" in problems[0].message
 
 
-def test_new_dev_auto_skill_is_additive_for_sprint_mode(tmp_path):
-    """Scenario 6 additivity: installing the *new* bmad-dev-auto (folder+id
+@pytest.mark.parametrize("primitive", ["bmad-build-auto", "bmad-dev-auto"])
+def test_new_dev_auto_skill_is_additive_for_sprint_mode(tmp_path, primitive):
+    """Scenario 6 additivity: installing the *new* dev primitive (folder+id
     dispatch present) satisfies both preflights — sprint mode's file-existence
     check (`missing_base_skills`, which never inspects the dispatch content) and
     stories mode's content probe (`missing_stories_support`). The new skill
-    breaks neither pipeline."""
-    from bmad_loop.install import (
-        STORIES_PROBE_FILE,
-        STORIES_PROBE_SKILL,
-        missing_stories_support,
-    )
+    breaks neither pipeline.
+
+    Parametrized over both upstream names because the stories probe reads the
+    RESOLVED primitive: writing the dispatch marker into the skill that did not
+    resolve must not satisfy it (and does not — the other leg would fail)."""
+    from bmad_loop.install import STORIES_PROBE_FILE, missing_stories_support
 
     claude = get_profile("claude")
     tree = claude.skill_tree
     _install_base_skills(tmp_path, tree)
-    # upgrade bmad-dev-auto in place to the folder+id dispatch version
-    step01 = tmp_path / tree / STORIES_PROBE_SKILL / STORIES_PROBE_FILE
+    if primitive == "bmad-dev-auto":
+        shutil.rmtree(tmp_path / tree / "bmad-build-auto")  # pre-rename project
+    # upgrade the resolved primitive in place to the folder+id dispatch version
+    step01 = tmp_path / tree / primitive / STORIES_PROBE_FILE
     step01.write_text("route a **folder+id dispatch** invocation\n", encoding="utf-8")
 
     # sprint mode (file existence) is unaffected by the new dispatch content …
