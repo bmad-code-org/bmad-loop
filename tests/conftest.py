@@ -399,15 +399,70 @@ def set_sprint(paths: ProjectPaths, key: str, status: str) -> None:
     paths.sprint_status.write_text(yaml.safe_dump(doc, sort_keys=False))
 
 
-def write_spec(path: Path, status: str, baseline: str, *, prose_status: str | None = None) -> None:
+def render_deferred(items) -> str:
+    """Render a frontmatter `deferred:` block the way bmad-build-auto's step-04
+    writes one (BMAD-METHOD #2640): a YAML list whose free-form values are block
+    scalars — `>-` folds the single-line summary/location, `|-` keeps evidence
+    verbatim — so a `:`, `#`, quote, or line break inside a finding stays data.
+
+    Rendering the real block scalars (rather than plain `key: value`) is the
+    point: the harvest reads through `verify.read_frontmatter`, and a fixture
+    that quoted its values would prove only that YAML parses quoted strings.
+
+    A dict item renders that shape, omitting keys it does not carry — so
+    `{"evidence": ...}` alone is the missing-summary malformed case. A plain
+    string item renders as a bare scalar list entry: the not-a-mapping malformed
+    case. Both exist so a test can put malformed items NEXT TO good ones."""
+    if not items:
+        return "deferred: []\n"
+    lines = ["deferred:"]
+    for item in items:
+        if not isinstance(item, dict):
+            lines.append(f"  - {item}")
+            continue
+        rendered = False
+        for key in ("summary", "evidence", "location", "severity"):
+            if key not in item:
+                continue
+            lead = "    " if rendered else "  - "
+            rendered = True
+            text = str(item[key])
+            if not text:
+                lines.append(f"{lead}{key}: ''")  # a block scalar cannot be empty
+                continue
+            if key == "severity":
+                lines.append(f"{lead}{key}: {text}")  # a plain enum token upstream
+                continue
+            lines.append(f"{lead}{key}: {'|-' if key == 'evidence' else '>-'}")
+            lines += [f"      {ln}" for ln in text.splitlines()]
+        if not rendered:
+            lines.append("  - {}")
+    return "\n".join(lines) + "\n"
+
+
+def write_spec(
+    path: Path,
+    status: str,
+    baseline: str,
+    *,
+    prose_status: str | None = None,
+    deferred=None,
+) -> None:
     """Write a spec the way the real bmad-dev-auto skill does. The skill's step-03
     stamps `baseline_revision` and NEVER `baseline_commit` (that name exists only
     in the orchestrator's synthesized result.json), so this fixture stamps the
     same key — a reader that only knows `baseline_commit` must fail a test here,
-    not sail through production (issue #89)."""
+    not sail through production (issue #89).
+
+    ``deferred`` adds the post-#2640 frontmatter `deferred:` list (see
+    `render_deferred`); ``None`` — the default — omits the field entirely, which
+    is both the pre-#2640 spec shape and the overwhelmingly common post-#2640 one
+    (nothing was deferred). Pass ``[]`` for an explicitly empty list."""
     body = (
         f"---\ntitle: 'test'\ntype: 'feature'\nstatus: '{status}'\n"
-        f"baseline_revision: '{baseline}'\n---\n\n## Intent\n\ntest spec\n"
+        f"baseline_revision: '{baseline}'\n"
+        f"{render_deferred(deferred) if deferred is not None else ''}"
+        f"---\n\n## Intent\n\ntest spec\n"
     )
     if prose_status is not None:
         # mirror bmad-dev-auto's terminal finalize: it appends a `## Auto Run
@@ -478,6 +533,7 @@ def dev_effect(
     prose_status: str | None = None,
     seen: list[str] | None = None,
     write_src: bool = True,
+    deferred=None,
 ):
     """Simulate a successful bmad-dev-auto session: it self-finalizes the spec
     (no in-review handoff — always straight to ``done``) but never touches the
@@ -495,7 +551,11 @@ def dev_effect(
     patch-restore tests assert the re-driven session ran against the RESTORED diff.
     ``write_src=False`` then keeps the session from appending its own line, so what
     lands in the tree is exactly what the restore laid down (the applied patch is
-    the session's proof of work; a second edit would muddy the assertion)."""
+    the session's proof of work; a second edit would muddy the assertion).
+
+    ``deferred`` records review findings in the spec's frontmatter the way the
+    post-#2640 skill does (the orchestrator harvests them into the ledger); the
+    session still never touches `deferred-work.md` itself."""
 
     def effect(spec: SessionSpec) -> SessionResult:
         baseline = rev_parse_head(paths.project)
@@ -505,7 +565,7 @@ def dev_effect(
         if write_src:
             source.write_text(source.read_text() + f"change for {story_key}\n")
         sp = spec_path(paths, story_key)
-        write_spec(sp, final_status, baseline, prose_status=prose_status)
+        write_spec(sp, final_status, baseline, prose_status=prose_status, deferred=deferred)
         # deliberately NO set_sprint: the dev skill does not write sprint-status
         return SessionResult(
             status="completed",
@@ -652,6 +712,7 @@ def bundle_dev_effect(
     followup_review: bool = True,
     final_status: str = "done",
     prose_status: str | None = None,
+    deferred=None,
 ):
     """Simulate a bmad-dev-auto bundle dev session: edits code and self-finalizes
     the bundle spec to ``done`` (no in-review handoff). On the decoupled path the
@@ -659,8 +720,9 @@ def bundle_dev_effect(
     ``mark_ledger=True`` is kept only for the legacy-marking path in older tests.
     ``followup_review`` mirrors `followup_review_recommended` — defaults True so
     the bundle review runs under the default trigger = "recommended". ``final_status``
-    / ``prose_status`` mirror ``dev_effect``: pair a non-terminal ``final_status``
-    with ``prose_status="done"`` to reproduce the skill finalizing in prose only."""
+    / ``prose_status`` / ``deferred`` mirror ``dev_effect``: pair a non-terminal
+    ``final_status`` with ``prose_status="done"`` to reproduce the skill finalizing
+    in prose only; ``deferred`` records post-#2640 frontmatter findings."""
 
     def effect(spec: SessionSpec) -> SessionResult:
         baseline = rev_parse_head(paths.project)
@@ -668,7 +730,7 @@ def bundle_dev_effect(
         source.write_text(source.read_text() + f"change for dw-{name}\n")
         sp = bundle_spec_path(paths, name)
         # mirror the skill: always self-finalize the bundle spec straight to done
-        write_spec(sp, final_status, baseline, prose_status=prose_status)
+        write_spec(sp, final_status, baseline, prose_status=prose_status, deferred=deferred)
         if mark_ledger:
             mark_ledger_done(paths, dw_ids)
         return SessionResult(

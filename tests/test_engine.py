@@ -5580,3 +5580,333 @@ def test_review_prompt_resolves_through_the_review_adapters_own_tree(project):
         ".claude/skills": "bmad-build-auto",
         ".agents/skills": "bmad-dev-auto",
     }
+
+
+# ------------------------- frontmatter `deferred:` harvest (BMAD-METHOD #2640)
+#
+# Upstream moved the dev primitive's `defer`-triaged review findings out of
+# deferred-work.md and into the spec's own frontmatter. The orchestrator harvests
+# them into the ledger, or the sweep pipeline silently starves. Gated on content +
+# the generic-dev seam, never on which skill era is installed.
+
+HARVEST_A = {
+    "summary": "Retry loop has no ceiling",
+    "evidence": "the backoff doubles forever: no cap",
+    "location": "src/retry.py:88",
+    "severity": "medium",
+}
+HARVEST_B = {
+    "summary": "Timeout is not configurable",
+    "evidence": "hardcoded 30s",
+    "location": "src/net.py:12",
+    "severity": "low",
+}
+
+
+def _harvest_policy(review: bool = False):
+    from bmad_loop.policy import DevPolicy, ReviewPolicy
+
+    return Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=review, trigger="always"),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        scm=ScmPolicy(rollback_on_failure=True),
+    )
+
+
+def _ledger_entries(project):
+    from bmad_loop import deferredwork
+
+    text = (
+        project.deferred_work.read_text(encoding="utf-8") if project.deferred_work.is_file() else ""
+    )
+    return deferredwork.parse_ledger(text)
+
+
+def test_spec_frontmatter_deferrals_harvested_into_ledger(project):
+    """The happy path: a dev session that recorded a finding in its spec
+    frontmatter leaves an open, canonically-shaped ledger entry behind — with the
+    fingerprinted `origin:` marker later harvests dedup on."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", deferred=[HARVEST_A])],
+        policy=_harvest_policy(),
+    )
+    summary = engine.run()
+
+    assert summary.done == 1 and summary.deferred == 0
+    entries = _ledger_entries(project)
+    assert len(entries) == 1
+    body = entries[0].body
+    assert entries[0].title == "Retry loop has no ceiling"
+    assert entries[0].open
+    assert re.search(r"^origin: spec-deferred [0-9a-f]{12}$", body, re.M)
+    assert "source_spec: `spec-1-1-a.md`" in body
+    assert "location: src/retry.py:88" in body
+    assert "severity: medium" in body
+    assert "reason: the backoff doubles forever: no cap" in body
+    events = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert len(events) == 1
+    assert events[0]["dw_ids"] == [entries[0].id]
+    assert events[0]["deduped"] == 0 and events[0]["malformed"] == 0
+    assert events[0]["spec"] == "spec-1-1-a.md"
+
+
+def test_spec_deferrals_harvested_before_the_dev_decision(project):
+    """Ordering contract: the harvest runs inside the dev pass, ahead of the
+    verify/decide step — so a story that then defers rolls the ledger edit back
+    with the work it describes, and a story that proceeds carries it into the
+    squashed commit."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", deferred=[HARVEST_A])],
+        policy=_harvest_policy(),
+    )
+    engine.run()
+
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert kinds.index("spec-deferrals-harvested") < kinds.index("dev-decision")
+
+
+def test_spec_deferrals_land_in_the_squashed_story_commit(project):
+    """The ledger edit must be part of the story's one commit, not left dirty for
+    the next story's step-01 to HALT on."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", deferred=[HARVEST_A])],
+        policy=_harvest_policy(),
+    )
+    engine.run()
+
+    sha = engine.state.tasks["1-1-a"].commit_sha
+    files = git(project.project, "show", "--name-only", "--pretty=format:", sha).split()
+    assert "_bmad-output/implementation-artifacts/deferred-work.md" in files
+    assert worktree_clean(project.project)
+
+
+def test_spec_deferrals_multiple_findings_file_one_entry_each(project):
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", deferred=[HARVEST_A, HARVEST_B])],
+        policy=_harvest_policy(),
+    )
+    engine.run()
+
+    entries = _ledger_entries(project)
+    assert [e.title for e in entries] == [
+        "Retry loop has no ceiling",
+        "Timeout is not configurable",
+    ]
+    assert {e.id for e in entries} == {"DW-1", "DW-2"}
+
+
+def test_spec_deferrals_absent_field_writes_no_ledger(project):
+    """A pre-#2640 spec (no `deferred:` key) must not so much as create the
+    ledger file — an empty deferred-work.md would read as "swept clean"."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [dev_effect(project, "1-1-a")], policy=_harvest_policy())
+    engine.run()
+
+    assert not project.deferred_work.exists()
+    assert not [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+
+
+def test_spec_deferrals_replay_does_not_double_append(project):
+    """Crash-replay re-enters the dev pass with the same recorded result. The
+    fingerprinted origin makes a second harvest of the same spec a no-op."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", deferred=[HARVEST_A])],
+        policy=_harvest_policy(),
+    )
+    engine.run()
+    task = engine.state.tasks["1-1-a"]
+    rj = task.sessions[0].result_json
+
+    engine._harvest_spec_deferrals(task, rj)
+
+    assert len(_ledger_entries(project)) == 1
+    events = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert [e["deduped"] for e in events] == [0, 1]
+    assert events[1]["dw_ids"] == []
+
+
+def test_spec_deferrals_dedup_sees_already_done_entries(project):
+    """The dedup pre-scan matches entries of EVERY status. append_entry's own
+    guard is open-only by design (a human reopening a topic should be able to
+    re-file), which is exactly wrong here: a harvest replayed after the entry was
+    swept done would file the identical finding a second time, forever."""
+    from bmad_loop import deferredwork
+
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", deferred=[HARVEST_A])],
+        policy=_harvest_policy(),
+    )
+    engine.run()
+    task = engine.state.tasks["1-1-a"]
+    entry = _ledger_entries(project)[0]
+    # the sweep resolved it in a later run
+    assert deferredwork.mark_done(project.deferred_work, entry.id, "2026-07-30", "fixed")
+
+    engine._harvest_spec_deferrals(task, task.sessions[0].result_json)
+
+    entries = _ledger_entries(project)
+    assert len(entries) == 1
+    assert entries[0].status.startswith("done")
+
+
+def test_spec_deferrals_not_harvested_when_spec_not_at_success_status(project):
+    """Append-on-success, mirroring the ledger semantics the old step-04 had: a
+    session that left the spec short of `done` gets rolled back, so its findings
+    would describe code that no longer exists. They stay in the frontmatter and
+    harvest on the eventual successful re-drive."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    pol = dataclasses.replace(_harvest_policy(), limits=LimitsPolicy(max_dev_attempts=1))
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", final_status="blocked", deferred=[HARVEST_A])],
+        policy=pol,
+    )
+    summary = engine.run()
+
+    assert summary.done == 0
+    assert not project.deferred_work.exists()
+    assert not [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+
+
+def test_review_pass_deferrals_harvested_and_deduped_across_both_sites(project):
+    """A review pass is another full dev-primitive run, so it defers into the same
+    frontmatter list. The dev leg's finding A must not be re-filed by the review
+    leg, and the review's new finding B must be filed exactly once."""
+
+    def review_with_b(spec):
+        sp = spec_path(project, "1-1-a")
+        write_spec(sp, "done", _spec_baseline(sp), deferred=[HARVEST_A, HARVEST_B])
+        set_sprint(project, "1-1-a", "done")
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "auto-dev",
+                "story_key": "1-1-a",
+                "spec_file": str(sp),
+                "status": "done",
+                "followup_review_recommended": False,
+                "escalations": [],
+            },
+        )
+
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", deferred=[HARVEST_A]), review_with_b],
+        policy=_harvest_policy(review=True),
+    )
+    summary = engine.run()
+
+    assert summary.done == 1
+    assert [s.role for s in adapter.sessions] == ["dev", "review"]
+    entries = _ledger_entries(project)
+    assert [e.title for e in entries] == [
+        "Retry loop has no ceiling",
+        "Timeout is not configurable",
+    ]
+    events = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert len(events) == 2
+    assert events[0]["dw_ids"] == ["DW-1"] and events[0]["deduped"] == 0
+    assert events[1]["dw_ids"] == ["DW-2"] and events[1]["deduped"] == 1
+
+
+def test_spec_deferrals_malformed_items_file_one_aggregated_entry(project):
+    """A mangled item is a real loss of recorded work. Its well-formed siblings
+    still file normally, and the loss itself reaches the human on the same
+    channel — one meta-entry per spec, not one per bad item."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            dev_effect(
+                project,
+                "1-1-a",
+                deferred=[HARVEST_A, "a bare string", {"evidence": "no summary"}],
+            )
+        ],
+        policy=_harvest_policy(),
+    )
+    engine.run()
+
+    entries = _ledger_entries(project)
+    assert len(entries) == 2
+    assert entries[0].title == "Retry loop has no ceiling"
+    meta = entries[1]
+    assert meta.title == "Unreadable `deferred:` items in spec-1-1-a.md"
+    assert meta.open
+    assert re.search(r"^origin: spec-deferred-malformed [0-9a-f]{12}$", meta.body, re.M)
+    assert "item 2" in meta.body and "item 3" in meta.body
+    bad = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-malformed"]
+    assert len(bad) == 1 and len(bad[0]["items"]) == 2
+    harvested = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert harvested[0]["malformed"] == 2
+
+
+def test_spec_deferrals_malformed_meta_entry_not_duplicated_on_replay(project):
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", deferred=["a bare string"])],
+        policy=_harvest_policy(),
+    )
+    engine.run()
+    task = engine.state.tasks["1-1-a"]
+
+    engine._harvest_spec_deferrals(task, task.sessions[0].result_json)
+
+    assert len(_ledger_entries(project)) == 1
+
+
+def test_spec_deferrals_unreadable_spec_degrades_without_harvest(project, monkeypatch):
+    """Observation degrades: an unreadable spec journals `spec-read-failed` at the
+    harvest site and files nothing — never a crash, and never a guess."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    sp = spec_path(project, "1-1-a")
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    write_spec(sp, "done", "abc123", deferred=[HARVEST_A])
+    fault_read_text(monkeypatch, sp)
+    task = StoryTask(story_key="1-1-a", epic=1)
+
+    engine._harvest_spec_deferrals(task, {"spec_file": str(sp)})
+
+    assert not project.deferred_work.exists()
+    fails = [e for e in engine.journal.entries() if e["kind"] == "spec-read-failed"]
+    assert len(fails) == 1 and fails[0]["site"] == "spec-deferrals"
+
+
+def test_spec_deferrals_ledger_write_fault_crashes_the_run(project, monkeypatch):
+    """Repair writes raise. A ledger append that fails must reach run()'s crash
+    recorder — swallowing it would drop findings the session recorded and report
+    the story as clean."""
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: None)
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+
+    def boom(*a, **kw):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr("bmad_loop.deferredwork.append_entry", boom)
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", deferred=[HARVEST_A])],
+        policy=_harvest_policy(),
+    )
+    summary = engine.run()
+
+    assert summary.crashed is True
+    assert load_state(engine.run_dir).crash_error.startswith("PermissionError")
+    assert "run-crash" in (engine.run_dir / "journal.jsonl").read_text()

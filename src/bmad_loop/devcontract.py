@@ -20,11 +20,13 @@ match) still runs in verify.py against actual on-disk state.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import deferredwork
 from .verify import DEV_WORKFLOW, read_frontmatter
 
 # The section the skill appends on EVERY terminal path (success and blocked),
@@ -166,6 +168,112 @@ def parse_auto_run_result(text: str) -> AutoRunResult:
     status_m = STATUS_LINE_RE.search(body)
     status = status_m.group(1).strip().lower() if status_m else ""
     return AutoRunResult(present=True, status=status, detail=body.strip())
+
+
+# ------------------------------------------------ deferred review findings
+#
+# Since BMAD-METHOD #2640 the dev primitive records the findings its review
+# triaged as `defer` in the spec's OWN frontmatter (a `deferred:` list) instead
+# of appending them to `deferred-work.md`: the worker owns its spec artifact,
+# the orchestrator owns the human-facing ledger. Each item carries a required
+# `summary` plus an `evidence` line and optional `location` / `severity`,
+# serialized as YAML block scalars (`>-` / `|-`) so `:`, `#`, quotes and line
+# breaks stay data rather than structure.
+#
+# The harvest is keyed on the FIELD BEING PRESENT, never on which skill era is
+# installed on disk: a pre-#2640 primitive simply never writes the field (absent
+# → nothing to harvest, the flat `deferred-work.md` appender still applies), and
+# a spec left by a newer primitive is harvested even when today's resolved skill
+# is the older one — the case a resume across an upstream upgrade produces.
+DEFERRED_FIELD = "deferred"
+# Ledger field lines are single-line and human-scannable, and the summary becomes
+# a `### DW-<seq>: <title>` heading — so every harvested value is flattened to one
+# line and clamped. Clamping happens BEFORE fingerprinting so the identity of a
+# finding is exactly what the ledger can hold: a change past the clamp point
+# cannot mint a second entry that renders identically to the first.
+_SUMMARY_LIMIT = 200
+_EVIDENCE_LIMIT = 1000
+_LOCATION_LIMIT = 200
+
+
+@dataclass(frozen=True)
+class DeferredFinding:
+    """One well-formed `deferred:` item, flattened and clamped for the ledger.
+
+    ``evidence``/``location``/``severity`` are "" when the item omitted them (or
+    named a severity outside the ledger's vocabulary); ``summary`` is never "" —
+    an item without one is malformed, not a finding."""
+
+    summary: str
+    evidence: str
+    location: str
+    severity: str
+    fingerprint: str
+
+
+def harvest_fingerprint(*parts: str) -> str:
+    """Stable short identity for a harvested item, joined NUL-separated so no
+    part can impersonate a boundary. Not a credential — it is the dedup key the
+    ledger carries in its `origin:` line, which is why it must be derived only
+    from values the ledger itself preserves."""
+    return hashlib.sha1(
+        "\0".join(parts).encode("utf-8"),
+        usedforsecurity=False,
+    ).hexdigest()[:12]
+
+
+def _flatten(value: Any, limit: int) -> str:
+    """Collapse one frontmatter scalar to a single clamped line. YAML hands back
+    whatever type the block scalar produced (str, int, bool, None), so coerce
+    before splitting; None becomes "" rather than the string "None"."""
+    if value is None:
+        return ""
+    return " ".join(str(value).split())[:limit]
+
+
+def parse_deferred_findings(fm: dict[str, Any]) -> tuple[list[DeferredFinding], list[str]]:
+    """Read a spec's frontmatter `deferred:` list into findings + malformed notes.
+
+    Absent, null, or `[]` → ``([], [])``: nothing was deferred, which is the
+    overwhelmingly common case and must be indistinguishable from a pre-#2640
+    spec. A non-list value, a non-mapping item, or an item with no usable
+    ``summary`` is reported in the second list (a one-line note per problem) and
+    its WELL-FORMED SIBLINGS are still harvested — a single mangled item must not
+    silently swallow the rest of the pass's deferred work.
+
+    Never raises: this runs on the observation path, over LLM-written YAML.
+    """
+    raw = fm.get(DEFERRED_FIELD)
+    if raw is None:
+        return [], []
+    if not isinstance(raw, list):
+        return [], [f"`{DEFERRED_FIELD}:` is not a list (got {type(raw).__name__})"]
+    findings: list[DeferredFinding] = []
+    malformed: list[str] = []
+    for i, item in enumerate(raw, start=1):
+        if not isinstance(item, dict):
+            malformed.append(f"item {i}: not a mapping (got {type(item).__name__})")
+            continue
+        summary = _flatten(item.get("summary"), _SUMMARY_LIMIT)
+        if not summary:
+            malformed.append(f"item {i}: no usable `summary`")
+            continue
+        location = _flatten(item.get("location"), _LOCATION_LIMIT)
+        findings.append(
+            DeferredFinding(
+                summary=summary,
+                evidence=_flatten(item.get("evidence"), _EVIDENCE_LIMIT),
+                location=location,
+                # An unrecognized (or absent) severity yields "" — the ledger
+                # format's documented "unspecified", written as no field line at
+                # all rather than as a token no reader knows.
+                severity=deferredwork.SEVERITY_ALIASES.get(
+                    str(item.get("severity", "")).strip().lower(), ""
+                ),
+                fingerprint=harvest_fingerprint(summary, location),
+            )
+        )
+    return findings, malformed
 
 
 @dataclass(frozen=True)

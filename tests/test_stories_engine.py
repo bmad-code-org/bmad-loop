@@ -63,7 +63,11 @@ def setup_stories(paths, entries: list[dict], *, spec_folder: str = SPEC_FOLDER)
 
 
 def stories_dev_effect(
-    *, final_status: str = "done", followup_review: bool = False, prose_status: str | None = None
+    *,
+    final_status: str = "done",
+    followup_review: bool = False,
+    prose_status: str | None = None,
+    deferred=None,
 ):
     """Simulate a bmad-dev-auto folder+id dispatch: read the story id + spec
     folder from the session env (as the real adapter does), write the id-keyed
@@ -78,7 +82,7 @@ def stories_dev_effect(
         sp = stories_dir / f"{story_id}-slug.md"
         src = Path(spec.cwd) / "src.txt"
         src.write_text(src.read_text() + f"work for {story_id}\n")
-        write_spec(sp, final_status, baseline, prose_status=prose_status)
+        write_spec(sp, final_status, baseline, prose_status=prose_status, deferred=deferred)
         return SessionResult(
             status="completed",
             result_json={
@@ -97,7 +101,7 @@ def stories_dev_effect(
     return effect
 
 
-def stories_checkpoint_effect():
+def stories_checkpoint_effect(*, deferred=None):
     """Simulate bmad-dev-auto honoring `Halt after planning.`: on a plan-halt leg
     (BMAD_LOOP_PLAN_HALT set by the engine) write the id-keyed spec at
     ready-for-dev with NO code change — the plan is just the spec — and mark the
@@ -120,14 +124,14 @@ def stories_checkpoint_effect():
             "escalations": [],
         }
         if spec.env.get("BMAD_LOOP_PLAN_HALT"):
-            write_spec(sp, "ready-for-dev", baseline)
+            write_spec(sp, "ready-for-dev", baseline, deferred=deferred)
             return SessionResult(
                 status="completed",
                 result_json={**common, "status": "ready-for-dev", "plan_halt": True},
             )
         src = Path(spec.cwd) / "src.txt"
         src.write_text(src.read_text() + f"work for {story_id}\n")
-        write_spec(sp, "done", baseline)
+        write_spec(sp, "done", baseline, deferred=deferred)
         return SessionResult(
             status="completed",
             result_json={**common, "status": "done", "followup_review_recommended": False},
@@ -1241,3 +1245,63 @@ def test_dev_prompt_spells_the_post_rename_primitive(project):
     assert engine._dev_prompt(task, feedback).startswith(
         "/bmad-build-auto Resume the autonomous dev session"
     )
+
+
+# ---------------- frontmatter `deferred:` harvest parity (BMAD-METHOD #2640)
+
+
+STORY_FINDING = {
+    "summary": "The id-keyed spec loader rescans on every call",
+    "evidence": "resolve_story_spec globs the folder each time",
+    "location": "src/bmad_loop/stories.py:120",
+    "severity": "low",
+}
+
+
+def test_stories_mode_harvests_spec_deferrals_into_the_ledger(project):
+    """Stories mode overrides `_post_dev_state_sync` to a no-op (no sprint board,
+    no bundle ledger to flip) — but the harvest is its own call in the shared dev
+    phase, so a folder+id story's deferred findings reach the ledger exactly like
+    a sprint story's. Without that, stories-mode runs would starve the sweep."""
+    from bmad_loop import deferredwork
+
+    setup_stories(project, [entry("1")])
+    engine, _ = make_engine(project, [stories_dev_effect(deferred=[STORY_FINDING])])
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused
+    entries = deferredwork.parse_ledger(project.deferred_work.read_text(encoding="utf-8"))
+    assert len(entries) == 1
+    assert entries[0].title == "The id-keyed spec loader rescans on every call"
+    assert entries[0].open
+    assert "source_spec: `1-slug.md`" in entries[0].body
+    assert "location: src/bmad_loop/stories.py:120" in entries[0].body
+    harvested = _kinds(engine.journal, "spec-deferrals-harvested")
+    assert len(harvested) == 1 and harvested[0]["dw_ids"] == ["DW-1"]
+
+
+def test_plan_halt_leg_does_not_harvest_then_implement_leg_does(project):
+    """A plan-halt leg leaves the spec at `ready-for-dev` — a successful terminal
+    for that leg, but NOT the success status the harvest gates on. Its findings
+    stay in frontmatter until the implement leg finalizes the story, so a plan a
+    human might still reject cannot seed the ledger."""
+    from bmad_loop import deferredwork
+
+    setup_stories(project, [entry("1", spec_checkpoint=True)])
+    engine, _ = make_engine(project, [stories_checkpoint_effect(deferred=[STORY_FINDING])])
+    summary = engine.run()
+
+    assert summary.paused and summary.done == 0
+    assert status_of(read_frontmatter(story_spec(project, "1"))) == "ready-for-dev"
+    assert not project.deferred_work.exists()
+    assert not _kinds(engine.journal, "spec-deferrals-harvested")
+
+    resumed, _ = resume_engine(
+        project, engine, [stories_checkpoint_effect(deferred=[STORY_FINDING])]
+    )
+    rsummary = resumed.run()
+
+    assert rsummary.done == 1
+    entries = deferredwork.parse_ledger(project.deferred_work.read_text(encoding="utf-8"))
+    assert len(entries) == 1 and entries[0].open
+    assert _kinds(resumed.journal, "spec-deferrals-harvested")[0]["dw_ids"] == ["DW-1"]

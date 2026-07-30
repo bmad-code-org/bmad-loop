@@ -2334,3 +2334,62 @@ def test_generic_bundle_prompt_spells_the_post_rename_primitive(project):
     assert engine._generic_bundle_prompt(task, feedback).startswith(
         "/bmad-build-auto Resume the autonomous dev session"
     )
+
+
+def test_generic_bundle_harvests_spec_deferrals_alongside_its_closures(project):
+    """A bundle session can defer NEW findings while resolving the ones it owns
+    (BMAD-METHOD #2640 puts both in the bundle spec's frontmatter). Both ledger
+    writes must land: the bundle's own dw ids close, the new finding opens as a
+    fresh entry — and `verify_review_bundle` stays green, because it gates on the
+    bundle's own ids, not on the ledger having no open entries at all."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    plan = triage_result(
+        ["DW-1", "DW-2"],
+        bundles=[{"name": "fix-things", "dw_ids": ["DW-1", "DW-2"], "intent": "fix both"}],
+    )
+    pol = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=False),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        scm=ScmPolicy(rollback_on_failure=True),
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(
+                project,
+                "fix-things",
+                ["DW-1", "DW-2"],
+                mark_ledger=False,
+                deferred=[
+                    {
+                        "summary": "The retry cap should be configurable",
+                        "evidence": "hardcoded while fixing DW-1",
+                        "location": "src/retry.py:88",
+                        "severity": "low",
+                    }
+                ],
+            ),
+        ],
+        policy=pol,
+    )
+    summary = engine.run()
+
+    assert not summary.paused
+    assert engine.state.tasks["dw-fix-things"].phase == Phase.DONE
+    entries = ledger_entries(project)
+    assert entries["DW-1"].status.startswith("done")
+    assert entries["DW-2"].status.startswith("done")
+    assert entries["DW-3"].open
+    assert entries["DW-3"].title == "The retry cap should be configurable"
+    assert "origin: spec-deferred " in entries["DW-3"].body
+    assert "source_spec: `spec-dw-fix-things.md`" in entries["DW-3"].body
+    assert "location: src/retry.py:88" in entries["DW-3"].body
+    # the task's bundle binding is untouched — verify_dev_bundle/verify_review_bundle
+    # compare dw_ids for equality, so a harvested id leaking in would fail both gates
+    assert engine.state.tasks["dw-fix-things"].dw_ids == ["DW-1", "DW-2"]
+    harvested = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert len(harvested) == 1 and harvested[0]["dw_ids"] == ["DW-3"]
+    assert worktree_clean(project.project)

@@ -450,6 +450,44 @@ def test_append_entry_not_blocked_when_prior_is_done(tmp_path):
     assert new_id == "DW-2"  # prior entry is done, not open → re-file allowed
 
 
+def test_append_entry_writes_location_between_source_spec_and_severity(tmp_path):
+    """`location:` is the canonical format's third field (origin → location →
+    severity → reason → status), so the harvested file:line lands where every
+    existing reader — the format doc, the TUI, sweep triage — expects it, not
+    appended wherever it happened to be convenient."""
+    p = tmp_path / "deferred-work.md"
+    new_id = append_entry(
+        p,
+        title="Retry loop can spin",
+        origin="spec-deferred abc123abc123",
+        source_spec="spec-1-1-a.md",
+        reason="the backoff has no ceiling",
+        location="src/retry.py:88",
+        severity="medium",
+    )
+    lines = [ln for ln in parse_ledger(p.read_text())[0].body.splitlines() if ln.strip()]
+    assert new_id == "DW-1"
+    assert lines == [
+        "### DW-1: Retry loop can spin",
+        "origin: spec-deferred abc123abc123",
+        "source_spec: `spec-1-1-a.md`",
+        "location: src/retry.py:88",
+        "severity: medium",
+        "reason: the backoff has no ceiling",
+        "status: open",
+    ]
+    assert field_line_present(parse_ledger(p.read_text())[0].body, "location", "src/retry.py:88")
+
+
+def test_append_entry_omits_location_when_absent(tmp_path):
+    """An entry with no location carries no `location:` line at all. Writing a
+    placeholder would assert the finding *has* no location, which is a different
+    claim from the skill simply not recording one."""
+    p = tmp_path / "deferred-work.md"
+    append_entry(p, title="t", origin="o", source_spec="s.md", reason="r")
+    assert "location:" not in p.read_text()
+
+
 def test_append_entry_creates_missing_ledger(tmp_path):
     p = tmp_path / "sub" / "deferred-work.md"
     new_id = append_entry(p, title="t", origin="o", source_spec="s.md", reason="r")

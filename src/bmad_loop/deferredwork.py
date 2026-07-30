@@ -146,6 +146,7 @@ def append_entry(
     reason: str,
     status: str = "open",
     severity: str | None = None,
+    location: str | None = None,
 ) -> str | None:
     """Append a new canonical `### DW-<seq>` entry numbered past the highest
     existing DW id, returning the new id (e.g. "DW-42").
@@ -153,7 +154,14 @@ def append_entry(
     Idempotent: returns None without writing when an open entry already carries
     the same `origin:` marker and `source_spec:` — so re-running the same defer
     (e.g. a second sweep of the same story) never duplicates the entry. Creates
-    the ledger (and parent dir) if it does not yet exist."""
+    the ledger (and parent dir) if it does not yet exist.
+
+    `location` is the format's optional file:line/component field (documented in
+    deferred-work-format.md, already read by the TUI and the sweep triage); it is
+    written directly after `source_spec:` so the emitted order matches the
+    canonical origin → location → severity → reason → status shape. Omitted
+    entirely when empty — a `location: n/a` line would read as an assertion the
+    finding has no location, which is not what an absent field means."""
     text = path.read_text(encoding="utf-8") if path.is_file() else ""
     for entry in parse_ledger(text):
         if (
@@ -164,6 +172,8 @@ def append_entry(
             return None
     dw_id = f"DW-{next_seq(text)}"
     lines = [f"### {dw_id}: {title}", f"origin: {origin}", f"source_spec: `{source_spec}`"]
+    if location:
+        lines.append(f"location: {location}")
     if severity:
         lines.append(f"severity: {severity}")
     lines.append(f"reason: {reason}")

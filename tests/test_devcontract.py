@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from bmad_loop import devcontract
+from bmad_loop.verify import read_frontmatter
 
 
 def _spec(
@@ -718,3 +719,212 @@ def test_strip_auto_run_result_ignores_heading_in_mismatched_fence_char(tmp_path
     sp.write_text(original, encoding="utf-8")
     assert devcontract.strip_auto_run_result(sp) is False
     assert sp.read_text() == original
+
+
+# ---------------------------------------- frontmatter `deferred:` harvest (#2640)
+#
+# Every case reads through the REAL `verify.read_frontmatter` the orchestrator
+# uses, over a spec written by the real `conftest.render_deferred` block-scalar
+# renderer. Parsing a hand-built dict instead would prove only that Python
+# dictionaries have keys — the contract under test is that upstream's `>-`/`|-`
+# serialization survives YAML into flat, ledger-shaped values.
+
+
+def _deferred_spec(path: Path, items, status: str = "done") -> dict:
+    from conftest import write_spec
+
+    write_spec(path, status, "abc123", deferred=items)
+    return read_frontmatter(path)
+
+
+def test_parse_deferred_findings_absent_field_is_empty(tmp_path):
+    """A pre-#2640 spec has no `deferred:` key at all. Indistinguishable from
+    "nothing was deferred" on purpose — the harvest is keyed on content, never on
+    which skill era wrote the spec."""
+    from conftest import write_spec
+
+    sp = tmp_path / "spec.md"
+    write_spec(sp, "done", "abc123")
+    assert "deferred" not in read_frontmatter(sp)
+    assert devcontract.parse_deferred_findings(read_frontmatter(sp)) == ([], [])
+
+
+def test_parse_deferred_findings_empty_and_null_lists_are_empty(tmp_path):
+    """`deferred: []` (the spec template's default) and an explicit YAML null are
+    both "nothing deferred", not malformed input."""
+    assert devcontract.parse_deferred_findings(_deferred_spec(tmp_path / "a.md", [])) == ([], [])
+    assert devcontract.parse_deferred_findings({"deferred": None}) == ([], [])
+
+
+def test_parse_deferred_findings_single_item_full_shape(tmp_path):
+    fm = _deferred_spec(
+        tmp_path / "spec.md",
+        [
+            {
+                "summary": "Retry loop can spin: no ceiling # really",
+                "evidence": "the backoff doubles forever",
+                "location": "src/retry.py:88",
+                "severity": "medium",
+            }
+        ],
+    )
+    findings, malformed = devcontract.parse_deferred_findings(fm)
+    assert malformed == []
+    assert len(findings) == 1
+    f = findings[0]
+    # the block scalar kept `:` and `#` as data — they are not YAML structure
+    assert f.summary == "Retry loop can spin: no ceiling # really"
+    assert f.evidence == "the backoff doubles forever"
+    assert f.location == "src/retry.py:88"
+    assert f.severity == "medium"
+    assert len(f.fingerprint) == 12
+
+
+def test_parse_deferred_findings_multiple_items_keep_order(tmp_path):
+    fm = _deferred_spec(
+        tmp_path / "spec.md",
+        [
+            {"summary": "first", "evidence": "e1"},
+            {"summary": "second", "evidence": "e2"},
+            {"summary": "third", "evidence": "e3"},
+        ],
+    )
+    findings, malformed = devcontract.parse_deferred_findings(fm)
+    assert malformed == []
+    assert [f.summary for f in findings] == ["first", "second", "third"]
+    # distinct summaries ⇒ distinct identities, so three ledger entries
+    assert len({f.fingerprint for f in findings}) == 3
+
+
+def test_parse_deferred_findings_flattens_multiline_block_scalars(tmp_path):
+    """`|-` keeps newlines, which a single ledger field line cannot. Flatten to
+    one whitespace-collapsed line: a raw newline inside `reason:` would end the
+    field as far as every ledger reader is concerned."""
+    fm = _deferred_spec(
+        tmp_path / "spec.md",
+        [{"summary": "summary line", "evidence": "first line\nsecond line\n\nfourth"}],
+    )
+    findings, _ = devcontract.parse_deferred_findings(fm)
+    assert findings[0].evidence == "first line second line fourth"
+    assert "\n" not in findings[0].evidence
+
+
+def test_parse_deferred_findings_optional_fields_default_empty(tmp_path):
+    fm = _deferred_spec(tmp_path / "spec.md", [{"summary": "only a summary"}])
+    findings, malformed = devcontract.parse_deferred_findings(fm)
+    assert malformed == []
+    assert findings[0].evidence == "" and findings[0].location == ""
+    assert findings[0].severity == ""
+
+
+def test_parse_deferred_findings_normalizes_and_drops_severity(tmp_path):
+    """Severity goes through the ledger's own alias table, so `blocker`/`Major`
+    normalize and a token no ledger reader knows becomes "" (the format doc's
+    documented "unspecified") rather than being written through verbatim."""
+    fm = _deferred_spec(
+        tmp_path / "spec.md",
+        [
+            {"summary": "a", "severity": "blocker"},
+            {"summary": "b", "severity": "Major"},
+            {"summary": "c", "severity": "spicy"},
+        ],
+    )
+    findings, malformed = devcontract.parse_deferred_findings(fm)
+    assert malformed == []
+    assert [f.severity for f in findings] == ["critical", "high", ""]
+
+
+def test_parse_deferred_findings_isolates_malformed_items(tmp_path):
+    """A mangled item must cost only itself. Its well-formed siblings on BOTH
+    sides still parse — the whole point of reporting malformed items separately
+    instead of failing the list."""
+    fm = _deferred_spec(
+        tmp_path / "spec.md",
+        [
+            {"summary": "good one", "evidence": "e"},
+            "a bare string, not a mapping",
+            {"evidence": "an item with no summary"},
+            {"summary": "   ", "evidence": "whitespace-only summary"},
+            {"summary": "good two", "evidence": "e"},
+        ],
+    )
+    findings, malformed = devcontract.parse_deferred_findings(fm)
+    assert [f.summary for f in findings] == ["good one", "good two"]
+    assert len(malformed) == 3
+    assert "item 2" in malformed[0] and "not a mapping" in malformed[0]
+    assert "item 3" in malformed[1] and "summary" in malformed[1]
+    assert "item 4" in malformed[2]
+
+
+def test_parse_deferred_findings_non_list_value_is_malformed(tmp_path):
+    """The skill wrote a scalar (or a mapping) where the contract says list.
+    Nothing is harvestable, but the loss must be reported, not silently zero."""
+    findings, malformed = devcontract.parse_deferred_findings({"deferred": "one finding"})
+    assert findings == []
+    assert len(malformed) == 1 and "not a list" in malformed[0]
+    assert devcontract.parse_deferred_findings({"deferred": {"summary": "x"}})[1] != []
+
+
+def test_parse_deferred_findings_clamps_long_values(tmp_path):
+    """The summary becomes a `### DW-n:` heading and the rest become field
+    lines, so every value is bounded. Clamping happens before fingerprinting —
+    see the stability test below."""
+    fm = _deferred_spec(
+        tmp_path / "spec.md",
+        [{"summary": "s" * 500, "evidence": "e" * 4000, "location": "l" * 500}],
+    )
+    findings, _ = devcontract.parse_deferred_findings(fm)
+    assert len(findings[0].summary) == 200
+    assert len(findings[0].evidence) == 1000
+    assert len(findings[0].location) == 200
+
+
+def test_deferred_fingerprint_stable_across_reparse_and_evidence_edits(tmp_path):
+    """The fingerprint is the ledger's dedup key, so it must be reproducible from
+    a re-read of the same spec — and must NOT move when only the evidence prose
+    changes, or a review pass rewording its own justification would re-file the
+    same finding as a second entry."""
+    first, _ = devcontract.parse_deferred_findings(
+        _deferred_spec(
+            tmp_path / "a.md", [{"summary": "same finding", "evidence": "e1", "location": "f.py:1"}]
+        )
+    )
+    again, _ = devcontract.parse_deferred_findings(
+        _deferred_spec(
+            tmp_path / "b.md", [{"summary": "same finding", "evidence": "e1", "location": "f.py:1"}]
+        )
+    )
+    reworded, _ = devcontract.parse_deferred_findings(
+        _deferred_spec(
+            tmp_path / "c.md",
+            [{"summary": "same finding", "evidence": "REWORDED", "location": "f.py:1"}],
+        )
+    )
+    moved, _ = devcontract.parse_deferred_findings(
+        _deferred_spec(
+            tmp_path / "d.md", [{"summary": "same finding", "evidence": "e1", "location": "f.py:2"}]
+        )
+    )
+    assert first[0].fingerprint == again[0].fingerprint == reworded[0].fingerprint
+    # location is part of the identity: the same complaint about a different site
+    # is a different piece of work
+    assert moved[0].fingerprint != first[0].fingerprint
+
+
+def test_deferred_fingerprint_clamped_summaries_do_not_collide_by_accident(tmp_path):
+    """Two summaries that differ only past the clamp point render as the SAME
+    ledger entry, so they must share one identity — otherwise the ledger grows a
+    fresh visually-identical entry on every harvest."""
+    long_a = {"summary": "x" * 300 + "AAA"}
+    long_b = {"summary": "x" * 300 + "BBB"}
+    a, _ = devcontract.parse_deferred_findings(_deferred_spec(tmp_path / "a.md", [long_a]))
+    b, _ = devcontract.parse_deferred_findings(_deferred_spec(tmp_path / "b.md", [long_b]))
+    assert a[0].summary == b[0].summary
+    assert a[0].fingerprint == b[0].fingerprint
+
+
+def test_harvest_fingerprint_is_nul_joined(tmp_path):
+    """Parts are NUL-separated so no part can impersonate a boundary: ("ab","c")
+    and ("a","bc") are different identities."""
+    assert devcontract.harvest_fingerprint("ab", "c") != devcontract.harvest_fingerprint("a", "bc")
+    assert devcontract.harvest_fingerprint("a", "b") == devcontract.harvest_fingerprint("a", "b")
