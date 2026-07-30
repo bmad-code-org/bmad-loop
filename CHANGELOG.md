@@ -5,6 +5,55 @@ All notable changes to `bmad-loop` are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). While the project is pre-1.0,
 breaking changes may land in a minor release.
 
+## [0.9.1] — 2026-07-30
+
+Compatibility hotfix for the BMad Method's `bmad-dev-auto` → `bmad-build-auto` rename
+(BMAD-METHOD#2651, first shipped in bmad-method 6.10.1-next.33) and the two upstream changes
+that rode the same window. Both skill eras are supported; nothing in `policy.toml` needs
+editing.
+
+### Added
+
+- **Two validate warnings for post-rename installs (#405).** `skills.dev-renderer` fires when
+  the resolved `SKILL.md` is the new renderer stub (BMAD-METHOD#2601) but
+  `_bmad/scripts/render_skill.py` is missing — that session would HALT without writing a spec.
+  `skills.customize-legacy` fires when a tree resolved to `bmad-build-auto` while an override
+  still sits at `_bmad/custom/bmad-dev-auto[.user].toml`, where it no longer applies.
+
+### Fixed
+
+- **The dev primitive is now resolved on disk, so the upstream rename no longer breaks a
+  project (#405).** `bmad-build-auto` is preferred and a marker-complete `bmad-dev-auto` is
+  accepted, so `validate`/`run`/`sweep`/`resume` pass on either era. The forwarding shim
+  upstream left behind is refused by a new `skills.base-shim` check — its migration prompt is
+  interactive and would HALT an unattended session with nothing written to disk. The ok line
+  and `validate --json` name the primitive that actually resolved, and worktree isolation
+  copies the new skill directory. `[dev] skill` stays `bmad-dev-auto`: it is the adapter
+  discriminator, not the invoked name.
+
+- **Every session prompt spells the resolved primitive (#405).** Dev, review, repair, restore,
+  stories dispatch and all three sweep bundle legs hardcoded `/bmad-dev-auto`, which
+  post-rename dispatches the shim. The name is resolved per skill tree, so a run mixing
+  `.claude/skills` and `.agents/skills` gets the right one per role, and the no-spec fallback
+  result marker is read under both the `bmad-build-auto-result-*` and legacy prefixes.
+
+- **`--dry-run` says when its preview is not runnable (#405).** `run`, `sweep` and stories dry
+  runs returned before their own skill preflight, so a broken install still got a
+  plausible-looking schedule — and post-rename the previewed `/bmad-dev-auto` is a _valid_
+  command that would HALT on the shim. The preflight failures now print to stderr under a "NOT
+  runnable as-is" banner. Exit code stays 0 and stdout is untouched: a dry run is a diagnostic,
+  and rc 0 has always meant "the preview rendered", not "the project is ready".
+
+- **Deferred review findings are harvested out of the spec's frontmatter (#405).**
+  BMAD-METHOD#2640 moved `defer`-triaged findings from `deferred-work.md` into the spec's own
+  `deferred:` list, silently starving the sweep pipeline. A successful dev or review session
+  now files each finding into the ledger with its `location` and `severity`, journals
+  `spec-deferrals-harvested`, and dedups on a fingerprint of the summary and location so a retry,
+  a resume replay or a second review pass never re-files one — including after a sweep has
+  already marked it done. Malformed items do not block their well-formed siblings: the loss is
+  journaled and filed as one aggregated ledger entry. The spec's frontmatter is never rewritten,
+  and the harvest keys on content rather than the installed skill name, so it works on both eras.
+
 ## [0.9.0] — 2026-07-21
 
 ### Added
@@ -1691,6 +1740,7 @@ enforced in CI.
   implementation phase, driven by a Python control loop with hook-based session transport and
   resumable on-disk run state.
 
+[0.9.1]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.9.1
 [0.9.0]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.9.0
 [0.8.1]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.8.1
 [0.8.0]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.8.0
