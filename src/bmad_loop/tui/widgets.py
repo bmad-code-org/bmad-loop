@@ -101,12 +101,20 @@ def stopping_tag() -> Text:
     return Text("⏹ stop", style=STATUS_STYLES[data.STOPPED])
 
 
-def agent_label(name: str, model: str) -> str:
+def agent_label(name: str, model: str, binary: str = "") -> str:
     """Compact ``name·model`` label for a resolved adapter (e.g. "claude·opus"),
     or just the name when no explicit model is recorded (``model == ""`` means the
     session ran the CLI profile's default). Shared by the header's agent line and
-    the tasks table's agent cell so the two never drift."""
-    return f"{name}·{model}" if model else name
+    the tasks table's agent cell so the two never drift.
+
+    A binary override renders as ``name(binary)·model`` — "claude(cc-work)·opus".
+    Both facts are load-bearing and neither substitutes for the other: the profile
+    explains the session's behavior (hook dialect, prompt template, bypass flags),
+    the binary explains which install/account it billed. ``binary == ""`` means
+    the profile's own executable, so an un-overridden run renders exactly as it
+    did before the field existed."""
+    head = f"{name}({binary})" if binary else name
+    return f"{head}·{model}" if model else head
 
 
 class RunHeader(Static):
@@ -185,7 +193,11 @@ class RunHeader(Static):
         if agent is not None:
             # A session is open: show the live agent, its model and stage role.
             text.append("\nagent ", style="dim")
-            text.append(agent.name, style="bold cyan")
+            # name(binary) stays one bold token: the executable is part of the
+            # agent's identity, not a separate attribute like model or role.
+            text.append(
+                f"{agent.name}({agent.binary})" if agent.binary else agent.name, style="bold cyan"
+            )
             if agent.model:
                 text.append(f" · {agent.model}", style="cyan")
             if agent.role:
@@ -198,15 +210,15 @@ class RunHeader(Static):
             if rebuilt is not None:
                 dev = rebuilt.resolved("dev")
                 review = rebuilt.resolved("review")
-                dev_label = agent_label(dev.name, dev.model)
-                review_label = agent_label(review.name, review.model)
+                dev_label = agent_label(dev.name, dev.model, dev.binary)
+                review_label = agent_label(review.name, review.model, review.binary)
                 if dev_label == review_label:
                     line = f"\nagents {dev_label}"  # dev and review resolve alike
                 else:
                     line = f"\nagents dev {dev_label} review {review_label}"
                 if state.run_type == "sweep":
                     triage = rebuilt.resolved("triage")
-                    line += f" triage {agent_label(triage.name, triage.model)}"
+                    line += f" triage {agent_label(triage.name, triage.model, triage.binary)}"
                 text.append(line, style="dim")
 
         if stopping:

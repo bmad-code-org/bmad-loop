@@ -9,6 +9,17 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- **The spawned binary is part of a session's adapter identity (#395).** `SessionRecord`, the
+  journal's `session-start` entry, the TUI agent label and the `status --json` `adapters` /
+  `adapters_used` projections all carry it, so a run billed to a second account stays
+  identifiable while it runs and after it finishes — reporting the profile alone said `claude`
+  for a run that spawned `cc-work`. The TUI renders `profile(binary)·model`, e.g.
+  `claude(cc-work)·opus`; both facts matter and neither substitutes for the other, since the
+  profile explains the session's behavior and the binary which install it billed. The `--json`
+  addition is additive: `binary` is `""` for the profile's own executable, which is also what
+  every run predating the field reports, so a consumer that ignores the key reads what it read
+  before. An un-overridden run renders exactly as it did.
+
 - **`[adapter] binary` spawns a CLI under a custom name (#395).** Set `binary = "cc"` (base or
   per-stage) to drive a second subscription or a work/personal account that lives beside the
   default install, without forking the whole profile to change one field — a copy freezes its

@@ -247,8 +247,8 @@ def status_document(state: RunState, *, graceful_stop_pending: bool = False) -> 
       that predates adapter stamping) — distinct from an all-``claude`` default.
     - Per-task ``adapters_used`` is the *actually-recorded* identity: the last
       stamped :class:`~bmad_loop.model.SessionRecord` per role in the task's
-      sessions, ``{role: {"name", "model"}}``. ``{}`` for a task whose sessions
-      predate stamping (``adapter == ""``). Configured need not equal used — a
+      sessions, ``{role: {"name", "model", "binary"}}``. ``{}`` for a task whose
+      sessions predate stamping (``adapter == ""``). Configured need not equal used — a
       policy edited mid-run, or a role that never ran, diverge.
     """
     raw_total, weighted_total, weight = run_token_totals(state)
@@ -258,7 +258,14 @@ def status_document(state: RunState, *, graceful_stop_pending: bool = False) -> 
         adapters = {}
         for role in ("dev", "review", "triage"):
             resolved = adapter_policy.resolved(role)
-            adapters[role] = {"name": resolved.name, "model": resolved.model}
+            # `binary` is additive (#395): "" means the profile's own executable,
+            # which is also what every run predating the field reports — so a
+            # consumer that ignores the key reads exactly what it read before.
+            adapters[role] = {
+                "name": resolved.name,
+                "model": resolved.model,
+                "binary": resolved.binary,
+            }
     if state.finished:
         status = "finished"
     elif state.paused:
@@ -279,7 +286,11 @@ def status_document(state: RunState, *, graceful_stop_pending: bool = False) -> 
         adapters_used: dict[str, dict[str, str]] = {}
         for record in task.sessions:
             if record.adapter:
-                adapters_used[record.role] = {"name": record.adapter, "model": record.model}
+                adapters_used[record.role] = {
+                    "name": record.adapter,
+                    "model": record.model,
+                    "binary": record.binary,
+                }
         tasks.append(
             {
                 "story_key": key,

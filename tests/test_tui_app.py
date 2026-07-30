@@ -2321,6 +2321,20 @@ def test_agent_label():
     assert agent_label("codex", "gpt-5") == "codex·gpt-5"
 
 
+def test_agent_label_binary_override():
+    """A binary override renders as name(binary): the profile explains the
+    session's behavior, the binary which install billed it — neither substitutes
+    for the other, so both are shown."""
+    assert agent_label("claude", "opus", "cc-work") == "claude(cc-work)·opus"
+    assert agent_label("claude", "", "cc-work") == "claude(cc-work)"
+
+
+def test_agent_label_unchanged_without_an_override():
+    # "" = the profile's own binary, which is also what every pre-#395 record
+    # reports — so an un-overridden run renders exactly as it did before
+    assert agent_label("claude", "opus", "") == agent_label("claude", "opus") == "claude·opus"
+
+
 def test_sprint_story_label_split_suffix():
     # split halves (issue #144) must render distinctly: 6a-… / 6b-…, not both 6-…
     from bmad_loop.sprintstatus import Story

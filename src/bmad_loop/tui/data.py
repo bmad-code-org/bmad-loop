@@ -722,13 +722,16 @@ def active_task_id(run_dir: Path, journal_entries: list[dict[str, Any]]) -> str 
 class ActiveAgent:
     """Identity of the agent currently driving a run, derived from the open
     session-start journal entry: the task/story it is working, the stage role,
-    and the resolved adapter name + model."""
+    and the resolved adapter name + model + binary."""
 
     task_id: str
     story_key: str
     role: str
     name: str
     model: str
+    # the executable the session spawned; "" = the CLI profile's own (#395), and
+    # also what an entry stamped before the field existed reports
+    binary: str = ""
 
 
 def _story_key_from_task_id(task_id: str, role: str) -> str:
@@ -769,15 +772,18 @@ def active_agent(
         if "adapter" in entry:
             name = str(entry.get("adapter", ""))
             model = str(entry.get("model", ""))
+            binary = str(entry.get("binary", ""))
         else:
             rebuilt = policy.adapter_policy_from_snapshot(policy_snapshot)
             if rebuilt is None:
                 return None
             resolved = rebuilt.resolved(role)
-            name, model = resolved.name, resolved.model
+            name, model, binary = resolved.name, resolved.model, resolved.binary
         story_raw = entry.get("story_key")
         story_key = str(story_raw) if story_raw else _story_key_from_task_id(task_id, role)
-        return ActiveAgent(task_id=task_id, story_key=story_key, role=role, name=name, model=model)
+        return ActiveAgent(
+            task_id=task_id, story_key=story_key, role=role, name=name, model=model, binary=binary
+        )
     except Exception:
         return None
 

@@ -2861,6 +2861,7 @@ class Engine:
             role=role,
             adapter=cfg.name,
             model=cfg.model,
+            binary=cfg.binary,
             story_key=task.story_key,
             prompt=prompt,
         )
@@ -2907,6 +2908,7 @@ class Engine:
                     status=result.status,
                     adapter=cfg.name,
                     model=cfg.model,
+                    binary=cfg.binary,
                     session_id=result.session_id,
                     transcript_path=result.transcript_path,
                     result_json=(

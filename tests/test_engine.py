@@ -6752,6 +6752,38 @@ def test_sessions_stamp_resolved_adapter_identity(project):
     assert (records["review"].adapter, records["review"].model) == ("gemini", "")
 
 
+def test_session_identity_stamps_the_binary_override(project):
+    """The binary is part of a session's adapter identity, so both the journal
+    session-start and the SessionRecord carry it. Without it a run on `cc-work`
+    is indistinguishable after the fact from one on the default `claude`."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(rollback_on_failure=True),
+        adapter=AdapterPolicy(
+            name="claude",
+            binary="cc-work",
+            review=StageAdapterPolicy(name="gemini"),
+        ),
+    )
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+        policy=policy,
+    )
+    engine.run()
+
+    starts = {e["role"]: e for e in engine.journal.entries() if e["kind"] == "session-start"}
+    assert starts["dev"]["binary"] == "cc-work"
+    # binary is client-specific: the gemini review stage gets gemini's own
+    assert starts["review"]["binary"] == ""
+
+    records = {r.role: r for r in load_state(engine.run_dir).tasks["1-1-a"].sessions}
+    assert records["dev"].binary == "cc-work"
+    assert records["review"].binary == ""
+
+
 def test_journal_stamps_log_position(tmp_path):
     journal = Journal(tmp_path)
     journal.append("run-start")

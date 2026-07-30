@@ -969,21 +969,68 @@ def test_status_json_exposes_adapter_identity(project, capsys):
         role: {
             "name": pol.adapter.resolved(role).name,
             "model": pol.adapter.resolved(role).model,
+            "binary": pol.adapter.resolved(role).binary,
         }
         for role in ("dev", "review", "triage")
     }
     # Concretely: dev/triage inherit claude/opus; the review client switch to codex
-    # resets the model to "".
-    assert doc["adapters"]["dev"] == {"name": "claude", "model": "opus"}
-    assert doc["adapters"]["review"] == {"name": "codex", "model": ""}
-    assert doc["adapters"]["triage"] == {"name": "claude", "model": "opus"}
+    # resets the model to "". No [adapter] binary is set, so every role reports ""
+    # — the profile's own executable (#395).
+    assert doc["adapters"]["dev"] == {"name": "claude", "model": "opus", "binary": ""}
+    assert doc["adapters"]["review"] == {"name": "codex", "model": "", "binary": ""}
+    assert doc["adapters"]["triage"] == {"name": "claude", "model": "opus", "binary": ""}
     # Per-task used identity: the last dev session (opus, not the earlier sonnet)
     # and the one review session.
     (entry,) = doc["tasks"]
     assert entry["adapters_used"] == {
-        "dev": {"name": "claude", "model": "opus"},
-        "review": {"name": "codex", "model": ""},
+        "dev": {"name": "claude", "model": "opus", "binary": ""},
+        "review": {"name": "codex", "model": "", "binary": ""},
     }
+
+
+def test_status_json_carries_the_binary_override(project, capsys):
+    """A run on an overridden executable must be identifiable as such after the
+    fact — reporting the profile's name alone would say `claude` for a run that
+    spawned `cc-work`, the same blind spot validate had."""
+    import json
+
+    from bmad_loop import policy
+    from bmad_loop.journal import save_state
+    from bmad_loop.model import Phase, RunState, SessionRecord, StoryTask, TokenUsage
+
+    pol = policy.loads(
+        "[limits]\ncache_read_weight = 0.5\n"
+        '[adapter]\nname = "claude"\nbinary = "cc-work"\n'
+        '[adapter.review]\nname = "codex"\n'
+    )
+    task = StoryTask(story_key="1-1-login", epic=1, phase=Phase.DONE)
+    task.tokens = TokenUsage(input_tokens=10)
+    task.sessions = [
+        SessionRecord(task_id="t", role="dev", status="ok", adapter="claude", binary="cc-work"),
+        SessionRecord(task_id="t", role="review", status="ok", adapter="codex"),
+    ]
+    run_id = "20260101-000000-bbbb"
+    run_dir = project.project / ".bmad-loop" / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    save_state(
+        run_dir,
+        RunState(
+            run_id=run_id,
+            project=str(project.project),
+            started_at="2026-01-01T00:00:00",
+            finished=True,
+            tasks={"1-1-login": task},
+            policy_snapshot=json.loads(json.dumps(pol.to_dict())),
+        ),
+    )
+
+    doc = _status_json(project, capsys)
+    assert doc["adapters"]["dev"]["binary"] == "cc-work"
+    # the codex review stage keeps codex's own executable: binary is client-specific
+    assert doc["adapters"]["review"] == {"name": "codex", "model": "", "binary": ""}
+    (entry,) = doc["tasks"]
+    assert entry["adapters_used"]["dev"]["binary"] == "cc-work"
+    assert entry["adapters_used"]["review"]["binary"] == ""
 
 
 def test_status_json_adapter_identity_absent_for_pre_upgrade_runs(project, capsys):

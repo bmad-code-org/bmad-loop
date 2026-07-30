@@ -921,6 +921,49 @@ def test_active_agent_labeled_session_peels_story_key():
     assert (agent.name, agent.model) == ("codex", "gpt-5")
 
 
+def test_active_agent_reads_the_stamped_binary():
+    entries = [
+        {
+            "kind": "session-start",
+            "task_id": "2-3-beta-dev-1",
+            "role": "dev",
+            "adapter": "claude",
+            "model": "opus",
+            "binary": "cc-work",
+        }
+    ]
+    agent = data.active_agent(entries, None)
+    assert agent is not None
+    assert (agent.name, agent.model, agent.binary) == ("claude", "opus", "cc-work")
+
+
+def test_active_agent_binary_empty_for_a_pre_395_stamp():
+    """A session stamped between #153 and #395 carries adapter/model but no
+    binary. It must read as "" (the profile's own executable) — which is what
+    that session actually ran — not as a missing-agent None."""
+    entries = [
+        {
+            "kind": "session-start",
+            "task_id": "2-3-beta-dev-1",
+            "role": "dev",
+            "adapter": "claude",
+            "model": "opus",
+        }
+    ]
+    agent = data.active_agent(entries, None)
+    assert agent is not None
+    assert agent.binary == ""
+
+
+def test_active_agent_binary_from_the_snapshot_when_unstamped():
+    # unstamped entry: the identity is rebuilt from the run's policy snapshot,
+    # which carries the binary since #395
+    entries = [{"kind": "session-start", "task_id": "2-3-beta-dev-1", "role": "dev"}]
+    agent = data.active_agent(entries, {"adapter": {"name": "claude", "binary": "cc-work"}})
+    assert agent is not None
+    assert (agent.name, agent.binary) == ("claude", "cc-work")
+
+
 def test_active_agent_none_without_resolvable_snapshot():
     # Unstamped entry + no trustworthy snapshot: an all-"claude" reconstruction
     # would mislabel a run that predates stamping, so the agent is unknown.

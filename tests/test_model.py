@@ -94,6 +94,25 @@ def test_session_record_adapter_identity_round_trips():
     assert back.model == "opus"
 
 
+def test_session_record_binary_round_trips():
+    record = SessionRecord(
+        task_id="1-1-a-dev-1",
+        role="dev",
+        status="completed",
+        adapter="claude",
+        binary="cc-work",
+    )
+    assert SessionRecord.from_dict(record.to_dict()).binary == "cc-work"
+
+
+def test_session_record_binary_defaults_empty_for_legacy_state():
+    """A state.json written before the field existed reads as "" — the profile's
+    own executable, which is what that session actually ran."""
+    doc = SessionRecord(task_id="1-1-a-dev-1", role="dev", status="completed").to_dict()
+    del doc["binary"]
+    assert SessionRecord.from_dict(doc).binary == ""
+
+
 def test_session_record_adapter_identity_defaults_for_legacy_state():
     # a state.json from before #153 has no adapter/model keys — it must load with
     # "" defaults (adapter "" flags a record that predates identity stamping)
