@@ -103,8 +103,8 @@ def test_dry_run_renders_per_stage_commands(project, capsys):
     assert "--model gpt-5-codex" in review_line
 
 
-def _cli_flags(cli_name=None, cli_binary=None):
-    return argparse.Namespace(cli=cli_name, cli_binary=cli_binary)
+def _cli_flags(cli=None, cli_binary=None):
+    return argparse.Namespace(cli=cli, cli_binary=cli_binary)
 
 
 def test_cli_overrides_absent_leave_the_policy_untouched(tmp_path):
@@ -138,7 +138,7 @@ def test_cli_flag_forces_the_client_and_drops_stale_stage_settings(tmp_path):
         '[adapter]\nname = "claude"\nmodel = "opus"\nextra_args = ["--x"]\n'
         '[adapter.review]\nname = "codex"\nmodel = "gpt-5-codex"\n'
     )
-    out = cli._apply_cli_overrides(pol, _cli_flags(cli_name="codex"), tmp_path)
+    out = cli._apply_cli_overrides(pol, _cli_flags(cli="codex"), tmp_path)
     dev = out.adapter.resolved("dev")
     assert dev.name == "codex"
     assert dev.model == "" and dev.extra_args is None  # claude's opus/--x dropped
@@ -150,14 +150,31 @@ def test_cli_flag_keeps_stage_timing_knobs_across_a_client_switch(tmp_path):
     # usage_grace_s / stop_without_result_nudges mean "fall back to the profile
     # default" — they are not client-specific, so a switch must not clear them
     pol = policy_mod.loads('[adapter]\nname = "claude"\n[adapter.dev]\nusage_grace_s = 3.5\n')
-    out = cli._apply_cli_overrides(pol, _cli_flags(cli_name="codex"), tmp_path)
+    out = cli._apply_cli_overrides(pol, _cli_flags(cli="codex"), tmp_path)
     assert out.adapter.resolved("dev").usage_grace_s == 3.5
+
+
+@pytest.mark.parametrize("flag", ["cli", "cli_binary"])
+def test_blank_cli_flag_is_rejected(tmp_path, flag):
+    """The flags get policy.toml's own blank rule. Without it `--cli-binary "  "`
+    read as unset while `--cli-binary "  cc "` became a whitespace-padded argv[0]
+    that dies at spawn with an unrecognizable error."""
+    pol = policy_mod.loads("[adapter]\n")
+    with pytest.raises(SystemExit, match="must not be blank"):
+        cli._apply_cli_overrides(pol, _cli_flags(**{flag: "   "}), tmp_path)
+
+
+def test_cli_flags_are_trimmed(tmp_path):
+    pol = policy_mod.loads("[adapter]\n")
+    out = cli._apply_cli_overrides(pol, _cli_flags("  codex ", "  cc  "), tmp_path)
+    assert out.adapter.name == "codex"
+    assert out.adapter.binary == "cc"
 
 
 def test_unknown_cli_flag_fails_before_anything_spawns(tmp_path):
     pol = policy_mod.loads("[adapter]\n")
     with pytest.raises(SystemExit, match="unknown CLI profile: 'nope'"):
-        cli._apply_cli_overrides(pol, _cli_flags(cli_name="nope"), tmp_path)
+        cli._apply_cli_overrides(pol, _cli_flags(cli="nope"), tmp_path)
 
 
 def test_run_dry_run_renders_the_flag_overrides(project, capsys):

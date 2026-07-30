@@ -921,6 +921,13 @@ def _apply_cli_overrides(pol, args, project: Path):
     from .adapters.profile import ProfileError, get_profile
 
     name, binary = getattr(args, "cli", None), getattr(args, "cli_binary", None)
+    # The same normalization policy.toml gets: trim, and refuse a present-but-
+    # blank value rather than letting it read as unset (or, worse, become a
+    # whitespace argv[0] that fails at spawn with an unrecognizable error).
+    for flag, raw in (("--cli", name), ("--cli-binary", binary)):
+        if raw is not None and not raw.strip():
+            raise SystemExit(f"error: {flag} must not be blank")
+    name, binary = (name or "").strip(), (binary or "").strip()
     if not name and not binary:
         return pol
     if name:
