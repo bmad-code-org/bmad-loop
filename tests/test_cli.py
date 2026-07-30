@@ -3988,3 +3988,79 @@ def test_dry_run_stories_previews_the_resolved_primitive(project, capsys):
     out = capsys.readouterr().out
     assert "/bmad-build-auto Spec folder: _bmad-output/epic-1. Story id: 1." in out
     assert "/bmad-dev-auto Spec folder:" not in out
+
+
+def _shim_only(paths) -> None:
+    """Post-rename install left with nothing but the forwarding shim, in every
+    tree the dual-client policy reads."""
+    from conftest import install_base_skills, install_dev_shim
+
+    install_base_skills(paths)
+    for tree in (".claude/skills", ".agents/skills"):
+        shutil.rmtree(paths.project / tree / "bmad-build-auto")
+        shutil.rmtree(paths.project / tree / "bmad-dev-auto")
+        install_dev_shim(paths.project, tree)
+
+
+def test_dry_run_warns_when_preflight_would_abort(project, capsys):
+    """#405: `--dry-run` returns before `_require_base_skills`, so a broken install
+    still renders a plausible preview. On a shim-only project that preview is a lie
+    the operator cannot see through — the shim IS a valid slash command, so
+    `/bmad-dev-auto ...` reads fine and would HALT the session. Say so.
+
+    stdout keeps the schedule (a diagnostic must not withhold what was asked for)
+    and the exit code stays 0; the banner is stderr-only."""
+    _shim_only(project)
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    _write_policy(project.project)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    args = argparse.Namespace(epic=None, story=None, max_stories=None)
+
+    assert cli._dry_run(project, pol, args) == 0
+    out, err = capsys.readouterr()
+    assert "NOT runnable" in err and "bmad-build-auto" in err
+    assert "run `bmad-loop validate` for details" in err
+    assert "1-1-a" in out  # the schedule itself still rendered
+
+
+def test_dry_run_stories_warns_when_preflight_would_abort(project, capsys):
+    """Same banner on the stories preview, which additionally probes folder+id
+    dispatch support on the resolved primitive."""
+    _shim_only(project)
+    _setup_stories_fixture(project, [_stories_entry("1")])
+    _write_policy(project.project)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    args = argparse.Namespace(spec=STORIES_SPEC_FOLDER, epic=None, story=None, max_stories=None)
+
+    assert cli._dry_run(project, pol, args, True, STORIES_SPEC_FOLDER) == 0
+    out, err = capsys.readouterr()
+    assert "NOT runnable" in err and "bmad-build-auto" in err
+    assert "Story id: 1." in out
+
+
+def test_sweep_dry_run_warns_when_preflight_would_abort(project, capsys):
+    """`cmd_sweep` has the same shape — dry-run returns before its preflight."""
+    _shim_only(project)
+    _write_policy(project.project)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+
+    assert cli._sweep_dry_run(project, pol) == 0
+    assert "NOT runnable" in capsys.readouterr().err
+
+
+def test_dry_run_is_silent_when_preflight_would_pass(project, capsys):
+    """The banner must be evidence, not decoration: a complete install prints
+    nothing to stderr. Without this the warning could be unconditional and every
+    assertion above would still pass."""
+    from conftest import install_base_skills
+
+    install_base_skills(project)
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    _write_policy(project.project)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    args = argparse.Namespace(epic=None, story=None, max_stories=None)
+
+    assert cli._dry_run(project, pol, args) == 0
+    out, err = capsys.readouterr()
+    assert err == ""
+    assert "/bmad-build-auto 1-1-a" in out

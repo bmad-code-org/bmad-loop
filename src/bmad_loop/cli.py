@@ -643,6 +643,53 @@ def _mux_set(project: Path, args: argparse.Namespace) -> int:
     return 0
 
 
+def _skill_trees(project: Path, pol) -> list[str]:
+    """The skill trees this run's adapters read, one per distinct adapter name.
+
+    Shared by the real preflight and the dry-run banner so the two cannot drift:
+    a preview that claims "run would abort" has to key on exactly what makes run
+    abort. Profiles that fail to load are skipped rather than raising — an
+    unknown adapter name is the policy loader's problem, not the skill probe's."""
+    from .adapters.profile import ProfileError, get_profile
+
+    trees = []
+    for name in dict.fromkeys(pol.adapter.resolved(role).name for role in ROLES):
+        try:
+            trees.append(get_profile(name, project).skill_tree)
+        except ProfileError:
+            continue
+    return trees
+
+
+def _warn_preflight_would_abort(project: Path, pol, *, require_stories: bool = False) -> None:
+    """Dry-run honesty banner: say so when the real command would refuse to run.
+
+    ``--dry-run`` returns before `_require_base_skills` (cmd_run/cmd_sweep), so a
+    project whose skills are broken still gets a plausible-looking preview. Since
+    the upstream rename that preview is actively misleading rather than merely
+    incomplete: the forwarding shim IS a valid slash command, so a previewed
+    ``/bmad-dev-auto`` reads fine and would HALT an unattended session on the
+    shim's interactive migration gate.
+
+    The exit code deliberately stays 0. A dry-run is a diagnostic — refusing to
+    print the schedule would withhold the very thing the operator asked for, and
+    every existing caller reads rc 0 as "the preview rendered", not as "the
+    project is ready". The banner goes to stderr so stdout stays the preview."""
+    trees = _skill_trees(project, pol)
+    problems = install.missing_base_skills(project, trees)
+    if require_stories:
+        problems += install.missing_stories_support(project, trees)
+    if not problems:
+        return
+    print(
+        "note: this preview is NOT runnable as-is — the real command aborts at preflight:",
+        file=sys.stderr,
+    )
+    for problem in problems:
+        print(f"  FAIL: {problem.message}", file=sys.stderr)
+    print("run `bmad-loop validate` for details", file=sys.stderr)
+
+
 def _require_base_skills(project: Path, pol, *, require_stories: bool = False) -> bool:
     """Preflight the upstream skills the orchestrator drives (the dev primitive —
     bmad-build-auto, or a complete pre-rename bmad-dev-auto — plus the three review
@@ -658,14 +705,7 @@ def _require_base_skills(project: Path, pol, *, require_stories: bool = False) -
     folder+id dispatch — stories mode needs a newer skill than sprint mode, so an
     older install must fail loudly here rather than HALT `no stories.yaml`-style at
     dispatch time."""
-    from .adapters.profile import ProfileError, get_profile
-
-    skill_trees = []
-    for name in dict.fromkeys(pol.adapter.resolved(role).name for role in ROLES):
-        try:
-            skill_trees.append(get_profile(name, project).skill_tree)
-        except ProfileError:
-            continue
+    skill_trees = _skill_trees(project, pol)
     problems = install.missing_base_skills(project, skill_trees)
     if require_stories:
         problems += install.missing_stories_support(project, skill_trees)
@@ -922,6 +962,8 @@ def _dry_run(
     if stories_on:
         return _dry_run_stories(paths, pol, args, spec_folder)
 
+    _warn_preflight_would_abort(paths.project, pol)
+
     def render(role: str, prompt: str) -> str:
         return _render_invocation(pol, paths.project, role, prompt)
 
@@ -964,6 +1006,7 @@ def _dry_run_stories(
 ) -> int:
     """Print the linear stories-mode schedule (list order, checkpoints, live
     on-disk state) — no topo waves, one story per line, spawns nothing."""
+    _warn_preflight_would_abort(paths.project, pol, require_stories=True)
     folder = stories_mod.resolve_spec_folder(paths.project, spec_folder)
     # The real dispatch always uses the project-relative folder (the engine
     # relativizes it); render the identical string here so dry-run and run agree.
@@ -1130,6 +1173,7 @@ def cmd_sweep(args: argparse.Namespace) -> int:
 
 
 def _sweep_dry_run(paths: bmadconfig.ProjectPaths, pol) -> int:
+    _warn_preflight_would_abort(paths.project, pol)
     ledger = paths.deferred_work
     if not ledger.is_file():
         print(f"no deferred-work ledger at {ledger}")
