@@ -103,6 +103,103 @@ def test_dry_run_renders_per_stage_commands(project, capsys):
     assert "--model gpt-5-codex" in review_line
 
 
+def _cli_flags(cli_name=None, cli_binary=None):
+    return argparse.Namespace(cli=cli_name, cli_binary=cli_binary)
+
+
+def test_cli_overrides_absent_leave_the_policy_untouched(tmp_path):
+    pol = policy_mod.loads('[adapter]\nname = "claude"\nmodel = "opus"\n')
+    assert cli._apply_cli_overrides(pol, _cli_flags(), tmp_path) is pol
+
+
+def test_cli_binary_flag_reaches_every_stage(tmp_path):
+    """A flag is a whole-run choice, so it beats a per-stage binary rather than
+    only the base — forcing an account and silently leaving one stage on another
+    would defeat the point of passing it."""
+    pol = policy_mod.loads('[adapter]\nbinary = "old"\n[adapter.dev]\nbinary = "older"\n')
+    out = cli._apply_cli_overrides(pol, _cli_flags(cli_binary="cc"), tmp_path)
+    assert all(out.adapter.resolved(role).binary == "cc" for role in cli.ROLES)
+
+
+def test_cli_binary_flag_spares_a_stage_on_another_client(tmp_path):
+    """binary stays client-specific under a flag: a `cc` alias of claude must not
+    become argv[0] for a review stage pinned to codex."""
+    pol = policy_mod.loads('[adapter]\nname = "claude"\n[adapter.review]\nname = "codex"\n')
+    out = cli._apply_cli_overrides(pol, _cli_flags(cli_binary="cc"), tmp_path)
+    assert out.adapter.resolved("dev").binary == "cc"
+    assert out.adapter.resolved("review") == policy_mod.ResolvedAdapter("codex", "", None)
+
+
+def test_cli_flag_forces_the_client_and_drops_stale_stage_settings(tmp_path):
+    """--cli moves a stage to another client, so that stage's model/extra_args —
+    chosen for the client it is leaving — must not ride along. A stage already on
+    the forced client keeps its own settings."""
+    pol = policy_mod.loads(
+        '[adapter]\nname = "claude"\nmodel = "opus"\nextra_args = ["--x"]\n'
+        '[adapter.review]\nname = "codex"\nmodel = "gpt-5-codex"\n'
+    )
+    out = cli._apply_cli_overrides(pol, _cli_flags(cli_name="codex"), tmp_path)
+    dev = out.adapter.resolved("dev")
+    assert dev.name == "codex"
+    assert dev.model == "" and dev.extra_args is None  # claude's opus/--x dropped
+    review = out.adapter.resolved("review")
+    assert review.name == "codex" and review.model == "gpt-5-codex"  # already codex
+
+
+def test_cli_flag_keeps_stage_timing_knobs_across_a_client_switch(tmp_path):
+    # usage_grace_s / stop_without_result_nudges mean "fall back to the profile
+    # default" — they are not client-specific, so a switch must not clear them
+    pol = policy_mod.loads('[adapter]\nname = "claude"\n[adapter.dev]\nusage_grace_s = 3.5\n')
+    out = cli._apply_cli_overrides(pol, _cli_flags(cli_name="codex"), tmp_path)
+    assert out.adapter.resolved("dev").usage_grace_s == 3.5
+
+
+def test_unknown_cli_flag_fails_before_anything_spawns(tmp_path):
+    pol = policy_mod.loads("[adapter]\n")
+    with pytest.raises(SystemExit, match="unknown CLI profile: 'nope'"):
+        cli._apply_cli_overrides(pol, _cli_flags(cli_name="nope"), tmp_path)
+
+
+def test_run_dry_run_renders_the_flag_overrides(project, capsys):
+    """End-to-end through cmd_run: the plan names the executable and client the
+    run would really spawn, so the flags are verifiable before any session."""
+    install_bmad_config(project)
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    _write_policy(project.project)  # DUAL_CLIENT_POLICY: claude dev, codex review
+    argv = ["run", "--project", str(project.project), "--dry-run"]
+    assert cli.main([*argv, "--cli", "claude", "--cli-binary", "cc"]) == 0
+    out = capsys.readouterr().out
+    dev_line = next(line for line in out.splitlines() if "dev:" in line)
+    review_line = next(line for line in out.splitlines() if "review:" in line)
+    # --cli claude pulls the codex review stage onto claude, and --cli-binary
+    # then applies to it too
+    assert dev_line.split("dev:")[1].strip().startswith("cc ")
+    assert review_line.split("review:")[1].strip().startswith("cc ")
+    assert "gpt-5-codex" not in out  # codex-specific model dropped with the client
+
+
+def test_sweep_applies_the_same_flags(project, monkeypatch):
+    """Both run types take the override, so an unattended sweep can be billed to
+    the same account as the run that deferred the work."""
+    install_bmad_config(project)
+    seen = {}
+
+    def fake_start(project, paths, pol, **kw):
+        seen["pol"] = pol
+        return 0
+
+    monkeypatch.setattr(cli, "_start_sweep", fake_start)
+    monkeypatch.setattr(cli, "_require_base_skills", lambda *a, **k: True)
+    monkeypatch.setattr(cli, "_reconcile_stale", lambda *a, **k: None)
+    monkeypatch.setattr(cli.verify, "worktree_clean", lambda repo: True)
+    assert (
+        cli.main(["sweep", "--project", str(project.project), "--cli-binary", "cc", "--no-prompt"])
+        == 0
+    )
+    assert seen["pol"].adapter.binary == "cc"
+    assert all(seen["pol"].adapter.resolved(role).binary == "cc" for role in cli.ROLES)
+
+
 @pytest.mark.parametrize(
     "epic,story",
     [(None, "3-1"), (None, "3.1"), (3, "1"), (None, "user-auth"), (None, "3-1-user-auth")],

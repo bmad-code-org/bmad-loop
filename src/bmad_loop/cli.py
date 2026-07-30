@@ -885,12 +885,89 @@ def _warn_unknown_keys(ss: sprintstatus.SprintStatus) -> None:
         )
 
 
+def _add_cli_override_flags(parser: argparse.ArgumentParser) -> None:
+    """Per-run coding-CLI selection, shared by `run` and `sweep`. Named after
+    `probe-adapter`'s existing vocabulary: `cli` is the profile, `binary` the
+    executable, so one word means one thing across the CLI surface."""
+    parser.add_argument(
+        "--cli", metavar="PROFILE", help="override [adapter] name for this run (e.g. codex)"
+    )
+    parser.add_argument(
+        "--cli-binary",
+        metavar="EXECUTABLE",
+        help="override [adapter] binary for this run: spawn the same CLI under "
+        "another name, e.g. a second account reachable as `cc`",
+    )
+
+
+def _apply_cli_overrides(pol, args, project: Path):
+    """Fold ``--cli`` / ``--cli-binary`` into the policy, returning a new Policy.
+
+    Applied to the *policy object* before the run composes, not threaded into the
+    engine, so the RunState snapshot records what actually ran: `resume`, the
+    ``--json`` adapter projection, per-task adapter stamping and the dry-run
+    render all follow with no further wiring.
+
+    A flag is a whole-run choice, so it wins over the per-stage tables rather
+    than only the base: forcing a client or a binary and then silently keeping a
+    stage pinned to another one would defeat the point of passing it. Clearing is
+    surgical, and mirrors ``AdapterPolicy.resolved``'s own client-switch rule — a
+    stage whose effective client the flag changes drops its client-specific
+    fields (model, extra_args, binary) and keeps its timing knobs; a stage that
+    already ran the forced client keeps everything but its now-redundant name.
+    """
+    from dataclasses import replace
+
+    from .adapters.profile import ProfileError, get_profile
+
+    name, binary = getattr(args, "cli", None), getattr(args, "cli_binary", None)
+    if not name and not binary:
+        return pol
+    if name:
+        # Fail here rather than at session spawn: the dry-run render resolves the
+        # profile too, and an unknown name should not surface as a traceback.
+        try:
+            get_profile(name, project)
+        except ProfileError as e:
+            raise SystemExit(f"error: {e}") from e
+    adapter = pol.adapter
+    stages = {}
+    for role in ROLES:
+        stage = getattr(adapter, role)
+        if name and (stage.name or adapter.name) != name:
+            # the client changed under this stage: its model/extra_args/binary
+            # were chosen for the old one and must not be carried over
+            stages[role] = policy_mod.StageAdapterPolicy(
+                usage_grace_s=stage.usage_grace_s,
+                stop_without_result_nudges=stage.stop_without_result_nudges,
+            )
+            continue
+        stages[role] = replace(
+            stage,
+            name=None if name else stage.name,
+            binary=None if binary else stage.binary,
+        )
+    return replace(
+        pol,
+        adapter=replace(
+            adapter,
+            name=name or adapter.name,
+            binary=binary or adapter.binary,
+            # a forced client falls back to that CLI's own default model/flags,
+            # the same reset a stage client switch performs
+            model="" if name and name != adapter.name else adapter.model,
+            extra_args=None if name and name != adapter.name else adapter.extra_args,
+            **stages,
+        ),
+    )
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     if (rc := _reject_bad_run_id(args.run_id)) is not None:
         return rc
     project = _project(args)
     paths = bmadconfig.load_paths(project)
-    pol = policy_mod.load(_policy_path(project))
+    pol = _apply_cli_overrides(policy_mod.load(_policy_path(project)), args, project)
     stories_on, spec_folder = _stories_mode(args, pol)
 
     if stories_on and args.epic is not None:
@@ -1150,7 +1227,7 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         return rc
     project = _project(args)
     paths = bmadconfig.load_paths(project)
-    pol = policy_mod.load(_policy_path(project))
+    pol = _apply_cli_overrides(policy_mod.load(_policy_path(project)), args, project)
 
     if args.dry_run:
         return _sweep_dry_run(paths, pol)
@@ -2770,6 +2847,7 @@ def main(argv: list[str] | None = None) -> int:
         "or full key (sprint mode); a story id (stories mode)",
     )
     run_p.add_argument("--max-stories", type=int, help="stop after N stories")
+    _add_cli_override_flags(run_p)
     run_p.add_argument("--dry-run", action="store_true", help="print the plan, spawn nothing")
     run_p.add_argument("--run-id", help=argparse.SUPPRESS)  # pre-assigned id (used by the TUI)
 
@@ -2785,6 +2863,7 @@ def main(argv: list[str] | None = None) -> int:
         help="triage + answer decisions + record them; run no bundles",
     )
     sweep_p.add_argument("--max-bundles", type=int, help="override [sweep] max_bundles")
+    _add_cli_override_flags(sweep_p)
     sweep_p.add_argument(
         "--repeat",
         action=argparse.BooleanOptionalAction,

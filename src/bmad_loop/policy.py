@@ -1179,7 +1179,7 @@ model = ""                   # empty = CLI default model (opencode-http wants "p
 # CLI under another name — a second subscription or a work/personal account
 # reachable as `cc` beside `claude` — without forking the whole profile. It must
 # be an alias or wrapper of the SAME CLI: the profile still supplies the hook
-# dialect, config path and transcript layout.
+# dialect, config path and transcript layout. Per run: `--cli-binary cc`.
 binary = ""
 cleanup_session_on_finish = true  # kill the run's tmux session when it finishes (false keeps it for inspection)
 # extra_args replaces the profile's default permission-bypass flags when set:

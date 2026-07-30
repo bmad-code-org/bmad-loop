@@ -9,6 +9,15 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- **`run`/`sweep` take `--cli` and `--cli-binary` (#395).** Pick the coding CLI or the executable
+  for one run without editing `policy.toml` — `bmad-loop run --cli-binary cc` bills a run to a
+  second account, `--cli codex` moves it to another client. A flag is a whole-run choice, so it
+  beats the per-stage `[adapter.<stage>]` tables as well as the base; a stage the flag moves to a
+  different client drops the model and flags it had chosen for the old one, and keeps its timing
+  knobs. The override is folded into the policy before the run is stamped, so `resume`,
+  `status --json` and `--dry-run` all report what actually ran. An unknown `--cli` fails before
+  anything spawns.
+
 - **`[adapter] binary` spawns a CLI under a custom name (#395).** Set `binary = "cc"` (base or
   per-stage) to drive a second subscription or a work/personal account that lives beside the
   default install, without forking the whole profile to change one field — a copy freezes its
