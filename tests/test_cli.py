@@ -3947,3 +3947,44 @@ def test_platform_preflight_notes_forced_selection_provenance(mux_registry, monk
     mux_registry.get_multiplexer.cache_clear()
     notes, problems = _preflight_notes_problems()
     assert any("forced by BMAD_LOOP_MUX_BACKEND" in n for n in notes)
+
+
+def test_dry_run_previews_the_disk_resolved_primitive_per_role(project, capsys):
+    """#405: the preview must spell what `run` would actually dispatch, resolved
+    per role from that adapter's skill tree. dev=claude reads .claude/skills
+    (post-rename here) and review=codex reads .agents/skills (still pre-rename),
+    so one honest preview shows both eras side by side. The all-legacy default is
+    pinned by test_dry_run_renders_per_stage_commands, which installs no skills."""
+    from conftest import install_build_auto_skill, install_dev_base_skills
+
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    install_build_auto_skill(project.project, ".claude/skills")
+    install_dev_base_skills(project.project, ".agents/skills", folder_id=False)
+    _write_policy(project.project)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    args = argparse.Namespace(epic=None, story=None, max_stories=None)
+
+    assert cli._dry_run(project, pol, args) == 0
+    out = capsys.readouterr().out
+    dev_line = next(line for line in out.splitlines() if "dev:" in line)
+    review_line = next(line for line in out.splitlines() if "review:" in line)
+    assert "/bmad-build-auto 1-1-a" in dev_line
+    # codex's prompt_template rewrites "/skill args" into "$skill ... args"
+    assert "$bmad-dev-auto" in review_line and "<done spec from dev>" in review_line
+    assert "bmad-build-auto" not in review_line
+
+
+def test_dry_run_stories_previews_the_resolved_primitive(project, capsys):
+    """The folder+id dispatch preview follows the same resolution."""
+    from conftest import install_build_auto_skill
+
+    _setup_stories_fixture(project, [_stories_entry("1")])
+    install_build_auto_skill(project.project, ".claude/skills")
+    _write_policy(project.project)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    args = argparse.Namespace(spec=STORIES_SPEC_FOLDER, epic=None, story=None, max_stories=None)
+
+    assert cli._dry_run(project, pol, args, True, STORIES_SPEC_FOLDER) == 0
+    out = capsys.readouterr().out
+    assert "/bmad-build-auto Spec folder: _bmad-output/epic-1. Story id: 1." in out
+    assert "/bmad-dev-auto Spec folder:" not in out

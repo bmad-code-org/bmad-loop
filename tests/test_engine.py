@@ -5497,3 +5497,86 @@ def test_graceful_stop_on_resume_finishes_inflight_then_stops(project, monkeypat
     assert [s.role for s in adapter.sessions] == ["review"]  # only the in-flight review ran
     stops = [e for e in resumed.journal.entries() if e["kind"] == "run-stop"]
     assert stops and stops[-1]["graceful"] is True
+
+
+# ============================================ dev-primitive name resolution (#405)
+# Upstream BMAD-METHOD #2651 renamed the dev primitive `bmad-dev-auto` →
+# `bmad-build-auto`, leaving a forwarding shim behind. The orchestrator therefore
+# spells the invoked name from what is on disk (Engine._dev_skill) instead of
+# hardcoding it, and must keep working against BOTH eras.
+
+
+def _prompt_task(project, **kw) -> StoryTask:
+    return StoryTask(story_key="1-1-a", epic=1, **kw)
+
+
+def test_dev_prompts_spell_the_post_rename_primitive(project):
+    """Every generic-dev leg (fresh, restore, repair) invokes the name resolved
+    from the dev adapter's skill tree — here the post-rename bmad-build-auto."""
+    from conftest import attach_profile, install_build_auto_skill
+
+    install_build_auto_skill(project.project, ".claude/skills")
+    engine, adapter = make_engine(project, [])
+    attach_profile(adapter)
+
+    fresh = engine._generic_dev_prompt(_prompt_task(project), None)
+    assert fresh == "/bmad-build-auto 1-1-a"
+
+    spec = str(project.implementation_artifacts / "spec-1-1-a.md")
+    restore = engine._generic_dev_prompt(
+        _prompt_task(project, spec_file=spec, restore_patch="/run/attempt.patch"), None
+    )
+    assert restore.startswith("/bmad-build-auto Resume review of the in-review spec")
+
+    feedback = project.implementation_artifacts / "feedback.md"
+    repair = engine._generic_dev_prompt(_prompt_task(project), feedback)
+    assert repair.startswith("/bmad-build-auto Resume the autonomous dev session")
+
+
+def test_dev_prompt_falls_back_to_the_legacy_name_without_a_profile(project):
+    """The no-profile shape (test fakes, and any adapter that carries no skill
+    tree) resolves to the pre-rename name. Pinned rather than incidental: it is
+    what keeps the rest of this suite — and a pre-rename target project whose
+    resolution fails open — dispatching a name that exists."""
+    from conftest import install_build_auto_skill
+
+    install_build_auto_skill(project.project, ".claude/skills")  # present but unreachable
+    engine, adapter = make_engine(project, [])
+    assert getattr(adapter, "profile", None) is None
+
+    assert engine._generic_dev_prompt(_prompt_task(project), None) == "/bmad-dev-auto 1-1-a"
+
+
+def test_review_prompt_resolves_through_the_review_adapters_own_tree(project):
+    """A run can mix skill trees (dev=claude → .claude/skills, review=gemini →
+    .agents/skills) and the two trees can sit on different upstream eras. Each
+    prompt must spell the primitive ITS adapter would actually find, so the
+    per-role lookup and the per-tree memo are both load-bearing."""
+    from conftest import attach_profile, install_build_auto_skill, install_dev_base_skills
+
+    install_build_auto_skill(project.project, ".claude/skills")
+    install_dev_base_skills(project.project, ".agents/skills", folder_id=False)
+
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    dev = attach_profile(MockAdapter([]), "claude")
+    review = attach_profile(MockAdapter([]), "gemini")
+    engine = Engine(
+        paths=project,
+        policy=Policy(gates=GatesPolicy(mode="none"), notify=QUIET),
+        adapter=dev,
+        review_adapter=review,
+        run_dir=run_dir,
+        journal=Journal(run_dir),
+        state=RunState(run_id="test-run", project=str(project.project), started_at="now"),
+    )
+    spec = str(project.implementation_artifacts / "spec-1-1-a.md")
+
+    assert engine._generic_dev_prompt(_prompt_task(project), None) == "/bmad-build-auto 1-1-a"
+    assert engine._review_prompt(_prompt_task(project, spec_file=spec)).startswith(
+        f"/bmad-dev-auto {spec} —"
+    )
+    # both trees resolved independently and each was stat'd once
+    assert engine._dev_skill_cache == {
+        ".claude/skills": "bmad-build-auto",
+        ".agents/skills": "bmad-dev-auto",
+    }

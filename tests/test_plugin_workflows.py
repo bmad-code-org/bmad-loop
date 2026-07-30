@@ -440,3 +440,29 @@ def test_example_plugin_inert_until_enabled(project):
     assert gr is not None and gr.instance is None and gr.trusted is False
     # its workflow is declared but inert (the plugin is not active)
     assert reg.workflows_for("post_dev_phase") == []
+
+
+def test_workflow_marker_path_follows_the_resolved_dev_primitive(project):
+    """#405: the completion-contract marker filename carries the dev primitive's
+    name as its prefix, and that name is disk-resolved like every other prompt
+    site — a post-rename project gets `bmad-build-auto-result-*`. The adapter
+    matches the prefix (devcontract.FALLBACK_RESULT_PREFIXES accepts both
+    spellings), so this is about the two halves agreeing, not about the name."""
+    from conftest import attach_profile, install_build_auto_skill
+
+    captured: list = []
+    setup_story(project)
+    install_build_auto_skill(project.project, ".claude/skills")
+    reg = PluginRegistry([LoadedPlugin(manifest=wf_manifest("wf"))])
+    script = [
+        dev_effect(project, "1-1-a"),
+        workflow_effect(captured),
+        review_effect(project, "1-1-a", clean=True),
+    ]
+    engine, adapter = make_engine(project, script, reg)
+    attach_profile(adapter)
+
+    assert engine.run().done == 1
+    assert len(captured) == 1
+    assert "bmad-build-auto-result-1-1-a-wf.doc-1.md" in captured[0].prompt
+    assert "bmad-dev-auto-result-" not in captured[0].prompt

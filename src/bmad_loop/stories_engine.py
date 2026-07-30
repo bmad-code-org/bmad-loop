@@ -346,7 +346,8 @@ class StoriesEngine(Engine):
         repair leg falls back to the inherited explicit-spec-file resume.
 
         Fresh dispatch:
-            ``/bmad-dev-auto Spec folder: <rel>. Story id: <id>.``
+            ``/<dev primitive> Spec folder: <rel>. Story id: <id>.``
+              (the primitive is disk-resolved — see ``Engine._dev_skill``)
             + (plan-halt leg) `` Halt after planning.``
             + (when ``invoke_dev_with`` non-empty) a newline then its verbatim text.
 
@@ -361,14 +362,17 @@ class StoriesEngine(Engine):
             self._reset_spec_for_repair(task)
             spec_ref = task.spec_file or task.story_key
             return (
-                f"/bmad-dev-auto Resume the autonomous dev session on the in-progress "
+                f"/{self._dev_skill()} Resume the autonomous dev session on the in-progress "
                 f"spec at `{spec_ref}`. The previous session's work failed deterministic "
                 f"verification; repair the working tree so verification passes without "
                 f"changing the spec's frozen intent contract. Verification evidence is "
                 f"in `{feedback}`."
             )
         entry = self._entry_for(task)
-        prompt = f"/bmad-dev-auto Spec folder: {self._spec_folder_rel}. Story id: {task.story_key}."
+        prompt = (
+            f"/{self._dev_skill()} Spec folder: {self._spec_folder_rel}. "
+            f"Story id: {task.story_key}."
+        )
         if self._plan_halt_leg(task, entry):
             prompt += " Halt after planning."
         if entry is not None and entry.invoke_dev_with:

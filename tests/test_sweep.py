@@ -2303,3 +2303,34 @@ def test_graceful_stop_between_cycles_skips_next_triage(project):
     entries = ledger_entries(project)
     assert entries["DW-1"].status.startswith("done") and entries["DW-2"].open
     assert stops[-1]["remaining"] == 1  # DW-2, generated in cycle 1, still open
+
+
+def test_generic_bundle_prompt_spells_the_post_rename_primitive(project):
+    """#405: all three bundle legs (restore, fresh implement, repair) invoke the
+    primitive resolved from the dev adapter's skill tree, not a hardcoded name."""
+    from conftest import attach_profile, install_build_auto_skill
+
+    install_build_auto_skill(project.project, ".claude/skills")
+    engine, adapter = make_sweep(project, [])
+    attach_profile(adapter)
+    spec = str(project.implementation_artifacts / "spec-dw-fix.md")
+    task = StoryTask(
+        story_key="dw-fix",
+        epic=0,
+        dw_ids=["DW-1"],
+        bundle_file="/run/bundles/fix/intent.md",
+        spec_file=spec,
+        restore_patch="/run/artifacts/attempt-dw-fix.patch",
+    )
+
+    assert engine._generic_bundle_prompt(task, None).startswith(
+        "/bmad-build-auto Resume review of the in-review spec"
+    )
+    task.restore_patch = None
+    assert engine._generic_bundle_prompt(task, None).startswith(
+        "/bmad-build-auto Implement the deferred-work bundle"
+    )
+    feedback = project.implementation_artifacts / "feedback.md"
+    assert engine._generic_bundle_prompt(task, feedback).startswith(
+        "/bmad-build-auto Resume the autonomous dev session"
+    )

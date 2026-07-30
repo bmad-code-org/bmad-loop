@@ -1172,7 +1172,7 @@ class SweepEngine(Engine):
         if feedback is None:
             if task.restore_patch and task.spec_file:
                 return (
-                    f"/bmad-dev-auto Resume review of the in-review spec at "
+                    f"/{self._dev_skill()} Resume review of the in-review spec at "
                     f"`{task.spec_file}` for the deferred-work bundle `{bundle_ref}`. "
                     f"The attempted change was restored onto the working tree after "
                     f"an intent-gap resolution; review it against the amended spec. "
@@ -1180,7 +1180,7 @@ class SweepEngine(Engine):
                     f"resolution."
                 )
             return (
-                f"/bmad-dev-auto Implement the deferred-work bundle described in "
+                f"/{self._dev_skill()} Implement the deferred-work bundle described in "
                 f"`{bundle_ref}` — it carries the intent and the verbatim ledger "
                 f"entries to resolve. Do NOT edit the deferred-work ledger; the "
                 f"orchestrator records resolution."
@@ -1188,7 +1188,7 @@ class SweepEngine(Engine):
         self._reset_spec_for_repair(task)
         spec_ref = task.spec_file or bundle_ref
         return (
-            f"/bmad-dev-auto Resume the autonomous dev session on the in-progress "
+            f"/{self._dev_skill()} Resume the autonomous dev session on the in-progress "
             f"spec at `{spec_ref}` for the deferred-work bundle `{bundle_ref}`. The "
             f"previous session's work failed deterministic verification; repair the "
             f"working tree so verification passes without changing the frozen intent "

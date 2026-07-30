@@ -1220,3 +1220,24 @@ def test_entry_for_unreadable_manifest_journals_warning_once(project):
     # a second call for the same story does not re-journal (dedup per story key)
     assert engine._entry_for(task) is None
     assert len(_kinds(engine.journal, "stories-manifest-unreadable")) == 1
+
+
+def test_dev_prompt_spells_the_post_rename_primitive(project):
+    """#405: folder+id dispatch invokes the primitive resolved from the dev
+    adapter's skill tree — both the fresh leg and the inherited repair leg."""
+    from conftest import attach_profile, install_build_auto_skill
+
+    setup_stories(project, [entry("1")])
+    install_build_auto_skill(project.project, ".claude/skills")
+    engine, adapter = make_engine(project, [])
+    attach_profile(adapter)
+    task = StoryTask(story_key="1", epic=0)
+
+    assert (
+        engine._dev_prompt(task, None)
+        == "/bmad-build-auto Spec folder: _bmad-output/epic-1. Story id: 1."
+    )
+    feedback = project.implementation_artifacts / "feedback.md"
+    assert engine._dev_prompt(task, feedback).startswith(
+        "/bmad-build-auto Resume the autonomous dev session"
+    )

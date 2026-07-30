@@ -355,6 +355,22 @@ def install_dev_shim(root: Path, tree: str = ".claude/skills") -> Path:
     return shim
 
 
+def attach_profile(adapter, name: str = "claude", project: Path | None = None):
+    """Give a scripted adapter the ``profile`` a real CLI adapter carries, so the
+    seams that read ``adapter.profile.skill_tree`` — chiefly ``Engine._dev_skill``,
+    which resolves the invoked dev-primitive NAME off disk — see a real skill tree.
+
+    `MockAdapter` deliberately has no `profile` at all, and that is not an
+    oversight to paper over globally: the profile-less shape IS the None-tree
+    fallback path (legacy name), so it stays the default and gets pinned by its
+    own test. Attach only where the resolved name is what's under test. Returns
+    the adapter for chaining."""
+    from bmad_loop.adapters.profile import get_profile
+
+    adapter.profile = get_profile(name, project)
+    return adapter
+
+
 def fault_read_text(monkeypatch, target: Path) -> None:
     """Make exactly ``target``'s ``read_text`` raise PermissionError; every other
     path still reads normally. A selective monkeypatch rather than chmod: chmod is a
