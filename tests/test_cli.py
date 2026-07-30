@@ -146,6 +146,30 @@ def test_cli_flag_forces_the_client_and_drops_stale_stage_settings(tmp_path):
     assert review.name == "codex" and review.model == "gpt-5-codex"  # already codex
 
 
+def test_cli_flag_drops_a_base_binary_belonging_to_the_old_client(tmp_path):
+    """A `cc` alias of claude left standing under `--cli codex` would spawn claude
+    with codex's prompt template and bypass flags. The base table gets the same
+    client-switch reset as the stages."""
+    pol = policy_mod.loads('[adapter]\nname = "claude"\nbinary = "cc-work"\n')
+    out = cli._apply_cli_overrides(pol, _cli_flags(cli="codex"), tmp_path)
+    assert out.adapter.binary == ""
+    assert all(out.adapter.resolved(role).binary == "" for role in cli.ROLES)
+
+
+def test_cli_binary_flag_survives_a_client_switch(tmp_path):
+    # the reset is a fallback, not a veto: an explicit binary still wins
+    pol = policy_mod.loads('[adapter]\nname = "claude"\nbinary = "cc-work"\n')
+    out = cli._apply_cli_overrides(pol, _cli_flags("codex", "/opt/work/codex"), tmp_path)
+    assert all(out.adapter.resolved(role).binary == "/opt/work/codex" for role in cli.ROLES)
+
+
+def test_cli_flag_keeps_a_base_binary_when_the_client_is_unchanged(tmp_path):
+    # forcing the client you already run is not a switch — the alias stays
+    pol = policy_mod.loads('[adapter]\nname = "claude"\nbinary = "cc-work"\n')
+    out = cli._apply_cli_overrides(pol, _cli_flags(cli="claude"), tmp_path)
+    assert out.adapter.resolved("dev").binary == "cc-work"
+
+
 def test_cli_flag_keeps_stage_timing_knobs_across_a_client_switch(tmp_path):
     # usage_grace_s / stop_without_result_nudges mean "fall back to the profile
     # default" — they are not client-specific, so a switch must not clear them

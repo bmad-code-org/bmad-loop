@@ -938,6 +938,12 @@ def _apply_cli_overrides(pol, args, project: Path):
         except ProfileError as e:
             raise SystemExit(f"error: {e}") from e
     adapter = pol.adapter
+    # A forced client resets the base's client-specific fields to that CLI's own
+    # defaults, the same reset the stage loop below performs — binary included: a
+    # `cc` alias of claude left standing under `--cli codex` would spawn claude
+    # with codex's prompt template and bypass flags. An explicit --cli-binary
+    # still wins over the reset.
+    switched = bool(name) and name != adapter.name
     stages = {}
     for role in ROLES:
         stage = getattr(adapter, role)
@@ -959,11 +965,9 @@ def _apply_cli_overrides(pol, args, project: Path):
         adapter=replace(
             adapter,
             name=name or adapter.name,
-            binary=binary or adapter.binary,
-            # a forced client falls back to that CLI's own default model/flags,
-            # the same reset a stage client switch performs
-            model="" if name and name != adapter.name else adapter.model,
-            extra_args=None if name and name != adapter.name else adapter.extra_args,
+            binary=binary or ("" if switched else adapter.binary),
+            model="" if switched else adapter.model,
+            extra_args=None if switched else adapter.extra_args,
             **stages,
         ),
     )
