@@ -21,7 +21,7 @@ import shutil
 import subprocess
 from collections.abc import Iterable, Sequence
 from importlib import resources
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from .adapters.profile import ALIASES, CLIProfile, ProfileError, load_profiles
 from .checks import Finding
@@ -90,18 +90,31 @@ DEV_PRIMITIVE_NEW = "bmad-build-auto"
 DEV_PRIMITIVE_LEGACY = "bmad-dev-auto"
 DEV_PRIMITIVE_MARKERS = ("step-04-review.md", "customize.toml")
 
+# BMAD's config/tool dir at the project root. Everything the renderer reads hangs
+# off it, and the renderer takes the project root as an argument and hard-fails when
+# `<project-root>/_bmad` is absent — there is no walk-up — so an isolated worktree
+# must carry its own (see _seed_bmad_tree).
+BMAD_DIR = "_bmad"
+
 # Since BMAD-METHOD PR #2601 a skill's SKILL.md can be a renderer *stub* that shells
 # out (via uv) to this project-local script to compose the real prompt. When the
 # script is absent the session HALTs without writing anything, so validate warns —
 # advisory, not a FAIL: only the script's presence is probed, never uv on PATH.
-RENDERER_SCRIPT_REL = "_bmad/scripts/render_skill.py"
+RENDERER_SCRIPT_REL = f"{BMAD_DIR}/scripts/render_skill.py"
 RENDERER_SCRIPT_MARKER = "render_skill.py"
+
+# Top-level _bmad/ entries never seeded into a worktree. render/ is the renderer's
+# published output: it is regenerated on skill entry, and every snapshot dir name is
+# keyed on a hash of the project root's absolute path, so seeding the main
+# checkout's copy would carry ITS paths into the worktree and make every parallel
+# session race on one shared tree.
+BMAD_SEED_EXCLUDES = ("render",)
 
 # Upstream per-skill customization overrides live here, named after the skill. The
 # rename does NOT migrate them, so a project upgraded to bmad-build-auto silently
 # stops applying its bmad-dev-auto.toml — validate warns (v0.9.0's orchestrator has
 # no customize read site of its own, so this is purely an operator heads-up).
-CUSTOMIZE_DIR_REL = "_bmad/custom"
+CUSTOMIZE_DIR_REL = f"{BMAD_DIR}/custom"
 
 # The three review hunters the dev primitive's step-04 invokes inline on EVERY dev
 # run (and on each follow-up review re-invocation) — always required, no longer
@@ -640,6 +653,104 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> None:
     exclude.write_text(prefix + "\n".join(new) + "\n", encoding="utf-8")
 
 
+def _is_under_bmad(rel: str) -> bool:
+    """True when a user-authored seed rel names ``_bmad`` or something inside it.
+    Normalized so ``_bmad``, ``_bmad/``, ``./_bmad/custom`` and a Windows-authored
+    ``_bmad\\custom`` all answer the same."""
+    parts = PurePosixPath(rel.replace("\\", "/")).parts
+    return bool(parts) and parts[0] == BMAD_DIR
+
+
+def _seed_bmad_tree(worktree: Path, repo_root: Path) -> list[str]:
+    """Merge-copy the main repo's ``_bmad/`` config surface into a worktree.
+
+    Sessions run with the worktree as their cwd, and the renderer-era dev
+    primitive (BMAD-METHOD #2601) shells out to ``_bmad/scripts/render_skill.py``
+    with a project root that must contain a ``_bmad/`` directory: the renderer
+    hard-fails when it does not, and it does **not** walk up. Projects commonly
+    gitignore ``_bmad/`` (this repo does) and a worktree checks out tracked files
+    only, so under ``isolation = "worktree"`` the checkout has none — the stub
+    then HALTs before the workflow's own HALT protocol is loaded and every story
+    becomes a result-less Stop.
+
+    Whole-directory per-FILE merge, never a curated file list: ``render_skill.py``
+    bare-imports its sibling ``config_utils`` off ``sys.path[0]``, so
+    ``_bmad/scripts/`` is one multi-file unit and a partial seed raises a bare
+    ``ModuleNotFoundError`` above the renderer's own try/except — losing even the
+    ``HALT: <error>`` contract line. The central config is a four-layer stack
+    (``config.toml`` plus the usually-gitignored ``config.user.toml`` and
+    ``custom/`` layers) for the same reason.
+
+    Copy-when-absent, so a checkout that commits its ``_bmad/`` keeps every
+    tracked file untouched and only the missing (gitignored) layers are filled in
+    — nothing new is ever merged back. :data:`BMAD_SEED_EXCLUDES` entries are
+    skipped *before* descending. The resolve-and-contain guard is the seed_files
+    loop's, so neither a symlink nor a ``..`` component can read outside the repo
+    or write outside the worktree.
+
+    Returns the rels to shield from the unit's ``git add -A``: the single
+    ``_bmad`` root when the worktree had none (everything under it is ours), or
+    the individual seeded files when merging into a checkout that already had one
+    — shield exactly what we wrote.
+    """
+    src_root = repo_root / BMAD_DIR
+    if not src_root.is_dir():
+        return []
+    dst_root = worktree / BMAD_DIR
+    had_bmad = dst_root.is_dir()
+    seeded: list[str] = []
+    for top in sorted(src_root.iterdir()):
+        if top.name in BMAD_SEED_EXCLUDES:
+            continue
+        for src in [top] if top.is_file() else sorted(top.rglob("*")):
+            if not src.is_file():
+                continue
+            rel = src.relative_to(src_root)
+            dst = dst_root / rel
+            if not src.resolve().is_relative_to(repo_root) or not dst.resolve().is_relative_to(
+                worktree
+            ):
+                continue
+            if dst.exists():
+                continue
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            _copy_traversable(src, dst)
+            seeded.append((Path(BMAD_DIR) / rel).as_posix())
+    if not seeded:
+        return []
+    return [BMAD_DIR] if not had_bmad else seeded
+
+
+def _bmad_scripts_seed_incomplete(worktree: Path, repo_root: Path) -> bool:
+    """True when the repo carries the renderer but the worktree's ``_bmad/scripts/``
+    is missing at least one file the repo's has.
+
+    That seed is the only thing between a renderer-era install and a result-less
+    Stop, and it can come up short *without failing*. The realistic trigger is a
+    **symlinked** ``_bmad/`` or ``_bmad/scripts/`` — how a shared BMAD install is
+    wired. Measured: a symlinked dir IS walked when it is the rglob root (which it
+    is in :func:`_seed_bmad_tree`), so every file under it reaches the
+    resolve-and-contain guard and, resolving outside ``repo_root``, is dropped
+    one by one. The destination lands empty while provisioning otherwise reports
+    success — a partial ``_bmad/scripts/`` is worse than none, because the bare
+    ``config_utils`` import fails above the renderer's try/except and even the
+    ``HALT:`` line is lost.
+
+    Reported through :func:`provision_worktree`'s existing skipped-seed return
+    channel (the caller journals ``worktree-seed-skipped``) rather than raising:
+    an incomplete seed is a degraded provision, not a failed one, and that channel
+    needs no engine or journal-schema change.
+    """
+    if not (repo_root / RENDERER_SCRIPT_REL).is_file():
+        return False
+    scripts = repo_root / BMAD_DIR / "scripts"
+    dst_scripts = worktree / BMAD_DIR / "scripts"
+    return any(
+        src.is_file() and not (dst_scripts / src.relative_to(scripts)).is_file()
+        for src in scripts.rglob("*")
+    )
+
+
 def _copy_skills(project: Path, trees: Sequence[str], force: bool) -> bool:
     """Install the bundled bmad-loop-* skills into each project skill tree.
 
@@ -726,12 +837,21 @@ def provision_worktree(
     also a hook config_path (.claude/settings.json, .gemini/settings.json) keeps its
     real content and just gets the Stop hook merged in, rather than being created empty.
 
+    The `_bmad/` config surface is merge-seeded from the MAIN REPO too (see
+    _seed_bmad_tree): the renderer-era dev primitive is handed the worktree as its
+    project root and hard-fails when that root has no _bmad/, so a project that
+    gitignores it (most do) would HALT every session. `_bmad/render/` is never
+    seeded and is additionally excluded whenever the worktree has a _bmad/ at all,
+    so the renderer's in-session rewrite of it can't be swept into a story commit.
+
     Returns the `seed_files` entries that existed in the repo but were skipped
     because the destination already existed — copy-when-absent turned them into
     no-ops. The caller journals them: a user-authored `worktree_seed` entry that
-    silently copies nothing reads as applied configuration and is not.
+    silently copies nothing reads as applied configuration and is not. The same
+    channel also reports an INCOMPLETE `_bmad/scripts/` seed (see
+    _bmad_scripts_seed_incomplete), which is likewise silent otherwise.
     """
-    if not profiles and not seed_files and not seed_globs:
+    if not profiles and not seed_files and not seed_globs and not (repo_root / BMAD_DIR).is_dir():
         return []
     worktree = worktree.resolve()
     repo_root = repo_root.resolve()
@@ -781,6 +901,18 @@ def provision_worktree(
             _copy_traversable(src, dst)
             # as_posix so the exclude pattern anchors on Windows too (os.sep would not)
             seeded.append(rel.as_posix())
+
+    # The _bmad/ config surface, merged in AFTER the explicit seed loops: a
+    # user-authored seed_files entry is explicit intent and wins on any collision,
+    # and `had_bmad` must be read once those loops have had their say.
+    seeded_bmad = _seed_bmad_tree(worktree, repo_root)
+    if seeded_bmad:
+        # 0.9.0 documented `worktree_seed = ["_bmad"]` as the workaround for exactly
+        # this gap. That entry is now a no-op *because the merge already covered it*,
+        # so reporting it would journal worktree-seed-skipped for a seed that applied.
+        skipped = [rel for rel in skipped if not _is_under_bmad(rel)]
+    if _bmad_scripts_seed_incomplete(worktree, repo_root):
+        skipped.append(f"{BMAD_DIR}/scripts")
 
     # bundled skills into each CLI's skill tree (deduped: codex+gemini share one);
     # never clobber a skill the checkout already carries (tracked or pre-existing).
@@ -836,6 +968,14 @@ def provision_worktree(
     # as the pattern "/", git-excluding the entire worktree.
     patterns |= {f"/{p.hooks.config_path}" for p in profiles if not p.hookless}
     patterns |= {f"/{rel}" for rel in seeded}
+    patterns |= {f"/{rel}" for rel in seeded_bmad}
+    if (worktree / BMAD_DIR).is_dir():
+        # Shielded whether we seeded it or not: the renderer rewrites this dir
+        # DURING the session, long after provisioning. Gated on the worktree
+        # actually having a _bmad/ because .git/info/exclude is the COMMON git dir,
+        # shared with the main checkout — a line for a dir this worktree can never
+        # grow is pollution in the operator's own repo.
+        patterns.add(f"/{BMAD_DIR}/render/")
     _worktree_local_exclude(worktree, sorted(patterns))
     return skipped
 
@@ -933,7 +1073,16 @@ def install_into(
     have = set(existing.splitlines())
     to_add = [
         line
-        for line in (".bmad-loop/runs/", ".bmad-loop/cache/", ".bmad-loop/policy.toml")
+        for line in (
+            ".bmad-loop/runs/",
+            ".bmad-loop/cache/",
+            ".bmad-loop/policy.toml",
+            # the renderer's published output: regenerated on every skill entry,
+            # keyed on this machine's absolute project root. Under isolation =
+            # "none" (the default) this line is the only thing keeping it out of
+            # story commits — worktrees get a git exclude instead.
+            f"{BMAD_DIR}/render/",
+        )
         if line not in have
     ]
     if to_add:

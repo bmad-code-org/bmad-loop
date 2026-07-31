@@ -670,6 +670,58 @@ def test_isolation_none_leaves_no_worktrees(project):
     assert "worktree-opened" not in journal_kinds(engine)
 
 
+def test_worktree_run_carries_bmad_surface_and_never_commits_it(project):
+    """End-to-end: an UNTRACKED `_bmad/` in the main repo (what a project that
+    gitignores it has — and a worktree checks out tracked files only, so the
+    checkout has none) reaches the worktree the session actually runs in. The
+    renderer is handed that worktree as its project root and hard-fails when the
+    root has no `_bmad/`.
+
+    Deliberately not gitignored: that keeps the second half load-bearing. The
+    worktree's local git exclude is then the ONLY thing stopping the seed — and the
+    render output the session writes on top of it — from being swept into the story
+    commit by the unit's `git add -A`."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    bmad = project.project / "_bmad"
+    (bmad / "scripts").mkdir(parents=True)
+    (bmad / "config.toml").write_text("[core]\n", encoding="utf-8")
+    (bmad / "scripts" / "render_skill.py").write_text("# render", encoding="utf-8")
+    (bmad / "scripts" / "config_utils.py").write_text("# config", encoding="utf-8")
+
+    head_before = rev_parse_head(project.project)
+    seen: list[list[str]] = []
+    dev = wt_dev_effect(project, "1-1-a")
+
+    def dev_and_probe(spec):
+        wt = spec.cwd
+        seen.append(
+            [
+                rel
+                for rel in ("config.toml", "scripts/render_skill.py", "scripts/config_utils.py")
+                if (wt / "_bmad" / rel).is_file()
+            ]
+        )
+        # what the renderer writes mid-session, AFTER provisioning shielded the dir
+        out = wt / "_bmad" / "render" / "bmad-build-auto" / "sandbox-abc" / "gen"
+        out.mkdir(parents=True)
+        (out / "workflow.md").write_text("rendered", encoding="utf-8")
+        return dev(spec)
+
+    engine, _ = make_engine(
+        project, [dev_and_probe, wt_review_effect(project, "1-1-a", clean=True)]
+    )
+    summary = engine.run()
+
+    assert summary.done == 1
+    assert seen == [["config.toml", "scripts/render_skill.py", "scripts/config_utils.py"]]
+    # every commit the run landed carries the code change and no _bmad/ path at all
+    files = git(
+        project.project, "log", "--pretty=format:", "--name-only", f"{head_before}..HEAD"
+    ).splitlines()
+    assert "src.txt" in files
+    assert not [f for f in files if f.startswith("_bmad/")]
+
+
 # ----------------------------------------------------------------- new guards (review hardening)
 
 

@@ -417,6 +417,9 @@ def test_install_into_full(tmp_path):
     assert ".bmad-loop/runs/" in gitignore
     assert ".bmad-loop/cache/" in gitignore  # engine plugins' rebuildable caches
     assert ".bmad-loop/policy.toml" in gitignore  # per-machine config ([mux] backend)
+    # the renderer's output: machine-absolute, rewritten every session. Under
+    # isolation = "none" (the default) this line is its only protection.
+    assert "_bmad/render/" in gitignore
 
     # all bundled skills land in claude's tree, with nested files intact
     skills_dir = tmp_path / ".claude" / "skills"
@@ -432,6 +435,7 @@ def test_install_into_full(tmp_path):
     assert final_gitignore.count(".bmad-loop/runs/") == 1
     assert final_gitignore.count(".bmad-loop/cache/") == 1
     assert final_gitignore.count(".bmad-loop/policy.toml") == 1
+    assert final_gitignore.count("_bmad/render/") == 1
 
 
 def test_install_into_warns_when_policy_is_tracked(tmp_path, capsys):
@@ -1144,15 +1148,20 @@ def test_provision_worktree_reports_seed_skipped_as_noop(tmp_path):
 def test_provision_worktree_reports_seed_dir_skipped_whole(tmp_path):
     """The case that motivated the report: a worktree checks out tracked files, so a
     seed DIRECTORY with any tracked child already exists and the whole entry is
-    skipped — including children that are absent and would clobber nothing."""
-    wt, repo = tmp_path / "wt", tmp_path / "repo"
-    (repo / "_bmad" / "custom").mkdir(parents=True)  # tracked child
-    (repo / "_bmad" / "bmm").mkdir()  # gitignored sibling, absent from the checkout
-    (repo / "_bmad" / "bmm" / "config.yaml").write_text("SEED ME", encoding="utf-8")
-    (wt / "_bmad" / "custom").mkdir(parents=True)  # what `git worktree add` lays down
+    skipped — including children that are absent and would clobber nothing.
 
-    assert provision_worktree(wt, [], repo, seed_files=["_bmad"]) == ["_bmad"]
-    assert not (wt / "_bmad" / "bmm").exists()  # documents today's behaviour
+    Anchored on a NEUTRAL directory: this pins the generic `seed_files` contract,
+    which is unchanged. `_bmad` used to stand in for it and no longer can — that
+    one entry now gets a per-file merge of its own (see the _bmad seeding tests),
+    which is exactly the behaviour this test would otherwise be asserting away."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    (repo / "vendor" / "bin").mkdir(parents=True)  # tracked child
+    (repo / "vendor" / "conf").mkdir()  # gitignored sibling, absent from the checkout
+    (repo / "vendor" / "conf" / "tool.yaml").write_text("SEED ME", encoding="utf-8")
+    (wt / "vendor" / "bin").mkdir(parents=True)  # what `git worktree add` lays down
+
+    assert provision_worktree(wt, [], repo, seed_files=["vendor"]) == ["vendor"]
+    assert not (wt / "vendor" / "conf").exists()  # documents today's behaviour
 
 
 def test_provision_worktree_reports_nothing_when_seeding_succeeds(tmp_path):
@@ -1307,6 +1316,200 @@ def test_provision_worktree_seed_globs_shielded_in_local_exclude(project, tmp_pa
     exclude = (repo / ".git" / "info" / "exclude").read_text(encoding="utf-8").splitlines()
     assert "/.claude/skills/tests-run" in exclude
     assert git(wt, "status", "--short", "--", ".claude/skills/tests-run") == ""
+
+
+# ----------------------------------------------------------------- _bmad/ config surface
+
+
+def _write_bmad_surface(repo):
+    """The minimum renderer-era `_bmad/` a project carries: the central config plus
+    the two-file script unit (render_skill.py bare-imports config_utils off
+    sys.path[0], so a partial seed loses even the `HALT:` contract line)."""
+    (repo / "_bmad" / "scripts").mkdir(parents=True)
+    (repo / "_bmad" / "config.toml").write_text("[core]\n", encoding="utf-8")
+    (repo / "_bmad" / "scripts" / "render_skill.py").write_text("# render", encoding="utf-8")
+    (repo / "_bmad" / "scripts" / "config_utils.py").write_text("# config", encoding="utf-8")
+
+
+def test_provision_worktree_seeds_bmad_when_absent(tmp_path):
+    """A worktree checks out tracked files only, so a gitignored `_bmad/` is missing
+    from it — and the renderer is handed the worktree as its project root and hard
+    fails when that root has no `_bmad/`. Seed the whole surface in."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    _write_bmad_surface(repo)
+    (repo / "_bmad" / "custom" / "nested").mkdir(parents=True)
+    (repo / "_bmad" / "custom" / "nested" / "over.toml").write_text("x", encoding="utf-8")
+
+    assert provision_worktree(wt, [], repo) == []
+
+    assert (wt / "_bmad" / "config.toml").read_text() == "[core]\n"
+    # the whole scripts unit, not a curated file: the sibling import must resolve
+    assert (wt / "_bmad" / "scripts" / "render_skill.py").is_file()
+    assert (wt / "_bmad" / "scripts" / "config_utils.py").is_file()
+    assert (wt / "_bmad" / "custom" / "nested" / "over.toml").read_text() == "x"
+
+
+def test_provision_worktree_bmad_merge_fills_only_missing_files(tmp_path):
+    """Per-FILE merge into a checkout that COMMITS its `_bmad/`: the tracked files
+    are left byte-identical (nothing new merges back) and only the gitignored
+    layers are filled in. A whole-dir copy-when-absent would skip the lot."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    _write_bmad_surface(repo)
+    (repo / "_bmad" / "config.user.toml").write_text("USER_LAYER", encoding="utf-8")
+    # what `git worktree add` lays down: the tracked half only
+    (wt / "_bmad" / "scripts").mkdir(parents=True)
+    (wt / "_bmad" / "config.toml").write_text("COMMITTED", encoding="utf-8")
+    (wt / "_bmad" / "scripts" / "render_skill.py").write_text("COMMITTED", encoding="utf-8")
+
+    provision_worktree(wt, [], repo)
+
+    assert (wt / "_bmad" / "config.toml").read_text() == "COMMITTED"
+    assert (wt / "_bmad" / "scripts" / "render_skill.py").read_text() == "COMMITTED"
+    # the gitignored layer + the untracked sibling script were filled in
+    assert (wt / "_bmad" / "config.user.toml").read_text() == "USER_LAYER"
+    assert (wt / "_bmad" / "scripts" / "config_utils.py").read_text() == "# config"
+
+
+def test_provision_worktree_never_seeds_render_output(tmp_path):
+    """`_bmad/render/` is the renderer's published output, keyed on a hash of the
+    project root's absolute path — seeding the main checkout's copy would carry ITS
+    paths in. Excluded before descending, so a huge render/ is never even walked."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    _write_bmad_surface(repo)
+    snapshot = repo / "_bmad" / "render" / "bmad-build-auto" / "repo-abc123" / "deadbeef"
+    snapshot.mkdir(parents=True)
+    (snapshot / "workflow.md").write_text("STALE", encoding="utf-8")
+
+    provision_worktree(wt, [], repo)
+
+    assert (wt / "_bmad" / "config.toml").is_file()  # the rest still seeded
+    assert not (wt / "_bmad" / "render").exists()
+
+
+def test_provision_worktree_shields_whole_bmad_when_worktree_lacked_it(project, tmp_path):
+    """The worktree had no `_bmad/`, so everything under it is ours: shield the ROOT
+    with one `/_bmad` line rather than each seeded file.
+
+    Asserting the exact line matters — `git status` comes back clean either way
+    (per-file lines cover today's files), but the root line is what also shields the
+    files a session's renderer/config writes create AFTER provisioning."""
+    repo = project.project
+    _write_bmad_surface(repo)
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    provision_worktree(wt, [get_profile("claude")], repo)
+
+    exclude = (repo / ".git" / "info" / "exclude").read_text(encoding="utf-8").splitlines()
+    assert "/_bmad" in exclude
+    assert not [line for line in exclude if line.startswith("/_bmad/scripts")]
+    assert git(wt, "status", "--short", "--", "_bmad") == ""
+
+
+def test_provision_worktree_shields_only_seeded_files_when_bmad_committed(project, tmp_path):
+    """A checkout that COMMITS its `_bmad/` gets the individual seeded rels — shield
+    exactly what we wrote. A blanket `/_bmad` would hide the project's own tracked
+    config surface from the unit's `git add -A` for the rest of the run."""
+    repo = project.project
+    _write_bmad_surface(repo)
+    (repo / "_bmad" / "config.user.toml").write_text("USER_LAYER", encoding="utf-8")
+    git(repo, "add", "-A", "--", "_bmad/config.toml", "_bmad/scripts")
+    git(repo, "commit", "-q", "-m", "commit the _bmad surface")
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    provision_worktree(wt, [get_profile("claude")], repo)
+
+    exclude = (repo / ".git" / "info" / "exclude").read_text(encoding="utf-8").splitlines()
+    assert "/_bmad/config.user.toml" in exclude
+    assert "/_bmad" not in exclude
+    assert git(wt, "status", "--short", "--", "_bmad") == ""
+
+
+def test_provision_worktree_render_shield_only_when_bmad_present(project, tmp_path):
+    """`/_bmad/render/` is shielded whenever the worktree has a `_bmad/` — the
+    renderer rewrites that dir mid-session, long after provisioning. It is NOT
+    written when there is no `_bmad/` at all: `.git/info/exclude` is the COMMON git
+    dir, shared with the main checkout, so an ungated line is pollution there."""
+    repo = project.project
+    wt_bare = tmp_path / "wt-bare"
+    verify.worktree_add(repo, wt_bare, "bare", "main")
+
+    provision_worktree(wt_bare, [get_profile("claude")], repo)
+
+    exclude_path = repo / ".git" / "info" / "exclude"
+    assert "/_bmad/render/" not in exclude_path.read_text(encoding="utf-8").splitlines()
+
+    _write_bmad_surface(repo)
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    provision_worktree(wt, [get_profile("claude")], repo)
+
+    assert "/_bmad/render/" in exclude_path.read_text(encoding="utf-8").splitlines()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_provision_worktree_bmad_seed_rejects_symlink_escape(tmp_path):
+    """A `_bmad/` entry resolving outside the repo is never copied in — the same
+    resolve-and-contain guard the seed_files loop uses. Whole-tree seeding is
+    exactly where an unguarded walk would drag a shared install's files across."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    _write_bmad_surface(repo)
+    (tmp_path / "outside").mkdir()
+    (tmp_path / "outside" / "secret.toml").write_text("SECRET", encoding="utf-8")
+    (repo / "_bmad" / "escape.toml").symlink_to(tmp_path / "outside" / "secret.toml")
+
+    provision_worktree(wt, [], repo)
+
+    assert (wt / "_bmad" / "config.toml").is_file()  # the contained files still seeded
+    assert not (wt / "_bmad" / "escape.toml").exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_provision_worktree_reports_bmad_scripts_not_seeded(tmp_path):
+    """A SYMLINKED `_bmad/scripts/` (how a shared BMAD install is wired) resolves
+    outside the repo, so the contain guard drops every file under it and the dir
+    lands EMPTY while provisioning otherwise reports success. The post-seed
+    completeness guard turns that into a reported skip the caller journals."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    shared = tmp_path / "shared-bmad" / "scripts"
+    shared.mkdir(parents=True)
+    (shared / "render_skill.py").write_text("# render", encoding="utf-8")
+    (shared / "config_utils.py").write_text("# config", encoding="utf-8")
+    (repo / "_bmad").mkdir(parents=True)
+    (repo / "_bmad" / "config.toml").write_text("[core]\n", encoding="utf-8")
+    (repo / "_bmad" / "scripts").symlink_to(shared, target_is_directory=True)
+
+    skipped = provision_worktree(wt, [], repo)
+
+    assert skipped == ["_bmad/scripts"]
+    assert (wt / "_bmad" / "config.toml").is_file()  # the rest looked like success
+    assert not (wt / "_bmad" / "scripts" / "render_skill.py").exists()
+
+
+def test_provision_worktree_bmad_merge_unreports_the_documented_seed_workaround(tmp_path):
+    """0.9.0 documented `worktree_seed = ["_bmad"]` as the workaround for this gap.
+    That entry is now a no-op BECAUSE the merge already covered it, so reporting it
+    would journal worktree-seed-skipped for a seed that did apply."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    _write_bmad_surface(repo)
+    (wt / "_bmad").mkdir(parents=True)  # tracked child makes the whole entry a no-op
+
+    assert provision_worktree(wt, [], repo, seed_files=["_bmad", ".mcp.json"]) == []
+    assert (wt / "_bmad" / "scripts" / "config_utils.py").is_file()
+
+
+def test_provision_worktree_empty_profiles_still_seeds_bmad(tmp_path):
+    """The early return has to let a repo with a `_bmad/` through even when nothing
+    else is configured: a plugin-free, seed-free project on the renderer-era
+    primitive is exactly the cohort this fixes."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    _write_bmad_surface(repo)
+
+    provision_worktree(wt, [], repo)
+
+    assert (wt / "_bmad" / "scripts" / "render_skill.py").is_file()
 
 
 # ----------------------------------------------------------------- seed file modes (issue #126)
