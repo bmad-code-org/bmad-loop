@@ -5681,9 +5681,12 @@ def test_spec_deferrals_harvested_before_the_dev_decision(project):
     """Ordering contract: the harvest runs inside the dev pass, ahead of the
     verify/decide step — so a story that proceeds carries the ledger edit into
     its squashed commit, and a story that RETRIES reverts it with the work it
-    describes and re-harvests on the next attempt. A DEFER is the asymmetric
-    case: `_defer` restores the ledger after its reset and deliberately keeps
-    the entry — see test_defer_keeps_the_harvested_entry_after_rollback."""
+    describes and re-harvests on the next attempt. The retry half is the reset
+    plus an explicit restore, because the reset alone leaves a ledger the harvest
+    created (see test_harvest_untracked_ledger_reverted_on_non_fixable_retry). A
+    DEFER is the asymmetric case: `_defer` restores the ledger after its reset and
+    deliberately keeps the entry — see
+    test_defer_keeps_the_harvested_entry_after_rollback."""
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     engine, _ = make_engine(
         project,
@@ -5733,6 +5736,182 @@ def test_defer_keeps_the_harvested_entry_after_rollback(project):
     assert [e.title for e in entries] == ["Retry loop has no ceiling"]
     assert entries[0].open
     assert re.search(r"^origin: spec-deferred [0-9a-f]{12}$", entries[0].body, re.M)
+
+
+# A well-formed sha that is not any commit in the sandbox repo: the dev-artifact
+# gate compares it against the orchestrator's own baseline and retries NON-fixably.
+LYING_BASELINE = "deadbeef" * 5
+
+
+def _baseline_liar_effect(project, story_key: str = "1-1-a", *, deferred=None):
+    """A dev session that COMPLETES, does real work and finalizes its spec to
+    `done` — so the harvest fires — but stamps a baseline that is not the
+    orchestrator's. `_verify_dev_artifacts` then returns a retry with
+    ``fixable=False``, which is the branch that rolls the attempt back. (A
+    *fixable* failure — a failing verify command — keeps the attempt's tree
+    instead and never reaches `_rollback_or_pause`.)"""
+
+    def effect(spec):
+        source = project.project / "src.txt"
+        source.write_text(source.read_text() + f"change for {story_key}\n")
+        sp = spec_path(project, story_key)
+        write_spec(sp, "done", LYING_BASELINE, deferred=deferred)
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "auto-dev",
+                "story_key": story_key,
+                "spec_file": str(sp),
+                "baseline_commit": LYING_BASELINE,
+                "tasks_total": 3,
+                "tasks_done": 3,
+                "verification": [],
+                "escalations": [],
+                "followup_review_recommended": False,
+            },
+        )
+
+    return effect
+
+
+def test_harvest_untracked_ledger_reverted_on_non_fixable_retry(project):
+    """#405: the harvest fires on the SPEC's status, ahead of the artifact gate
+    that can still send the attempt back — and the reset that discards the attempt
+    does not take the harvest with it. The ledger the harvest created is untracked,
+    and `_safe_reset`'s `keep` carries the artifact folders, so `safe_rollback`
+    computes it into `created` and then deliberately skips it. Left alone the entry
+    outlives the code it describes and rides into the story's squashed commit."""
+    assert not project.deferred_work.exists()  # so the harvest CREATES it, untracked
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    pol = dataclasses.replace(_harvest_policy(), limits=LimitsPolicy(max_dev_attempts=2))
+    engine, _ = make_engine(
+        project,
+        [
+            # attempt 1: harvests HARVEST_A, then fails the baseline gate
+            _baseline_liar_effect(project, deferred=[HARVEST_A]),
+            # attempt 2: an honest session, so the run terminates cleanly
+            dev_effect(project, "1-1-a", followup_review=False),
+        ],
+        policy=pol,
+    )
+    summary = engine.run()
+
+    # the scenario really is a non-fixable retry that rolled back …
+    decisions = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert decisions[0]["action"] == "retry" and "does not match" in decisions[0]["reason"]
+    assert "rollback-auto" in [e["kind"] for e in engine.journal.entries()]
+    # … and attempt 1 did file the entry (attempt 2's spec carries no `deferred:`,
+    # so exactly one harvest ever fired — nothing here is a re-harvest)
+    harvests = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert len(harvests) == 1 and harvests[0]["dw_ids"] == ["DW-1"]
+
+    assert summary.done == 1
+    assert "change for 1-1-a" in (project.project / "src.txt").read_text()  # attempt 2's
+    assert not project.deferred_work.exists()
+    sha = engine.state.tasks["1-1-a"].commit_sha
+    files = git(project.project, "show", "--name-only", "--pretty=format:", sha).split()
+    assert "_bmad-output/implementation-artifacts/deferred-work.md" not in files
+
+
+def test_harvest_tracked_ledger_still_reverted_on_retry(project):
+    """Control for the case that already worked: a ledger tracked at the attempt
+    baseline is reverted by the reset itself, and the restore writes back the same
+    bytes. The fix must not resurrect the harvest here (nor rewrite a file the
+    reset already put right)."""
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "seed deferred-work")
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    pol = dataclasses.replace(_harvest_policy(), limits=LimitsPolicy(max_dev_attempts=2))
+    engine, _ = make_engine(
+        project,
+        [
+            _baseline_liar_effect(project, deferred=[HARVEST_A]),
+            dev_effect(project, "1-1-a", followup_review=False),
+        ],
+        policy=pol,
+    )
+    summary = engine.run()
+
+    assert summary.done == 1
+    assert [e["action"] for e in engine.journal.entries() if e["kind"] == "dev-decision"][0] == (
+        "retry"
+    )
+    assert project.deferred_work.read_text(encoding="utf-8") == "# Deferred Work\n"
+    assert _ledger_entries(project) == []
+
+
+def test_harvest_retry_reharvests_after_the_rollback(project):
+    """The revert must lose nothing, and must not reach onto the fixable branch.
+
+    Attempt 1 harvests and is rolled back — the entry goes with it. Attempt 2
+    re-harvests from the frontmatter the harvest never mutates (proving the revert
+    is not a lost finding), then fails a FIXABLE gate, which keeps its tree: its
+    ledger entry has to stay, because attempt 3's repair spec no longer lists the
+    finding and nothing would re-file it. One entry at the end, filed once."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    marker = project.project / "fixed.marker"
+    pol = dataclasses.replace(
+        _harvest_policy(),
+        limits=LimitsPolicy(max_dev_attempts=3),
+        verify=VerifyPolicy(commands=(_file_exists_cmd(marker),)),
+    )
+
+    def repairing_dev(spec):
+        marker.write_text("ok\n")  # the fixable failure is fixed; no `deferred:`
+        return dev_effect(project, "1-1-a", followup_review=False)(spec)
+
+    engine, _ = make_engine(
+        project,
+        [
+            _baseline_liar_effect(project, deferred=[HARVEST_A]),
+            dev_effect(project, "1-1-a", followup_review=False, deferred=[HARVEST_A]),
+            repairing_dev,
+        ],
+        policy=pol,
+    )
+    summary = engine.run()
+
+    assert summary.done == 1
+    actions = [e["action"] for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert actions == ["retry", "retry", "proceed"]
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert kinds.count("rollback-auto") == 1  # attempt 2's fixable retry kept its tree
+    harvests = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert len(harvests) == 2  # attempt 1's (reverted) and attempt 2's (kept)
+    assert [e.title for e in _ledger_entries(project)] == ["Retry loop has no ceiling"]
+    sha = engine.state.tasks["1-1-a"].commit_sha
+    files = git(project.project, "show", "--name-only", "--pretty=format:", sha).split()
+    assert "_bmad-output/implementation-artifacts/deferred-work.md" in files
+
+
+def test_harvest_reverted_when_rollback_pauses(project):
+    """`scm.rollback_on_failure` OFF is the DEFAULT, and it does not reset at all:
+    it prints manual-recovery instructions and raises out of
+    `_pause_for_manual_recovery`. So the restore has to sit in a `finally` to run
+    there — and it has to run, because the `git reset --hard` that notice prints
+    would leave the untracked ledger behind and the operator would resume onto a
+    finding about work they just discarded."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    pol = dataclasses.replace(
+        _harvest_policy(),
+        scm=ScmPolicy(rollback_on_failure=False),
+        limits=LimitsPolicy(max_dev_attempts=2),
+    )
+    engine, _ = make_engine(
+        project, [_baseline_liar_effect(project, deferred=[HARVEST_A])], policy=pol
+    )
+    summary = engine.run()
+
+    assert summary.paused
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "rollback-manual-required" in kinds and "rollback-auto" not in kinds
+    # the pause path leaves the tree untouched — nothing was reset out from under
+    # the ledger, so only the restore can account for its absence
+    assert "change for 1-1-a" in (project.project / "src.txt").read_text()
+    assert [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert not project.deferred_work.exists()
 
 
 def test_spec_deferrals_land_in_the_squashed_story_commit(project):

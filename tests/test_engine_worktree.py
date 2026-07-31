@@ -722,6 +722,70 @@ def test_worktree_run_carries_bmad_surface_and_never_commits_it(project):
     assert not [f for f in files if f.startswith("_bmad/")]
 
 
+def test_harvest_reverted_on_retry_under_isolation(project):
+    """#405, workspace-scoped: the pre-harvest snapshot and its restore read the
+    UNIT WORKTREE's ledger — the same tree `_rollback_or_pause` resets — so a
+    harvested finding about work the rollback discarded never reaches the unit's
+    merge. Isolation is not assumed to follow from the in-place case: the ledger
+    path comes from `workspace.paths`, which differs between them."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    finding = {
+        "summary": "Retry loop has no ceiling",
+        "evidence": "the backoff doubles forever: no cap",
+        "location": "src/retry.py:88",
+        "severity": "medium",
+    }
+
+    def deferring_liar(spec):
+        # completes and finalizes (the harvest fires) but claims a foreign
+        # baseline — the non-fixable retry that routes through _rollback_or_pause
+        cwd = spec.cwd
+        wt = project.rebased(cwd)
+        src = cwd / "src.txt"
+        src.write_text(src.read_text() + "bad attempt\n")
+        sp = wt.implementation_artifacts / "spec-1-1-a.md"
+        write_spec(sp, "done", "0" * 40, deferred=[finding])
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "auto-dev",
+                "story_key": "1-1-a",
+                "spec_file": str(sp),
+                "baseline_commit": "0" * 40,
+                "escalations": [],
+                "followup_review_recommended": False,
+            },
+        )
+
+    seen: list[bool] = []
+
+    def probing_dev(spec):
+        # attempt 2 opens on the reverted worktree: the harvest's ledger is gone
+        seen.append(project.rebased(spec.cwd).deferred_work.exists())
+        return wt_dev_effect(project, "1-1-a", followup_review=False)(spec)
+
+    head_before = rev_parse_head(project.project)
+    engine, _ = make_engine(
+        project,
+        [deferring_liar, probing_dev],
+        policy=wt_policy(limits=LimitsPolicy(max_dev_attempts=2)),
+    )
+    summary = engine.run()
+
+    assert summary.done == 1
+    kinds = journal_kinds(engine)
+    assert "rollback-auto" in kinds
+    harvests = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert len(harvests) == 1 and harvests[0]["dw_ids"] == ["DW-1"]
+    assert seen == [False]
+    files = git(
+        project.project, "log", "--pretty=format:", "--name-only", f"{head_before}..HEAD"
+    ).split()
+    assert "src.txt" in files
+    assert not [f for f in files if f.endswith("deferred-work.md")]
+    assert not project.deferred_work.exists()
+
+
 # ----------------------------------------------------------------- new guards (review hardening)
 
 

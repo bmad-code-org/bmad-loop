@@ -1726,6 +1726,14 @@ class Engine:
             task.baseline_untracked = sorted(verify.untracked_files(self.workspace.root))
         feedback: Path | None = None
         while True:
+            # Pre-harvest ledger snapshot for the non-fixable-RETRY revert below,
+            # re-armed every attempt. The flag is separate from the text on
+            # purpose: `ledger_before is None` means the ledger did NOT EXIST when
+            # the snapshot was taken (the first-ever harvest creates it, and the
+            # restore then has to unlink), which is a different state from "no
+            # snapshot was taken at all" (nothing to restore, hands off).
+            ledger_before: str | None = None
+            ledger_snapshotted = False
             if resume_result is None:
                 # a resumed result replays the attempt it was recorded under, so
                 # the counter (and the session task_id derived from it) must not
@@ -1773,7 +1781,13 @@ class Engine:
                 # into the ledger BEFORE _verify_dev_artifacts, so the edit is in
                 # the tree the story commit squashes — a ledger entry recording
                 # work deferred by an attempt that is later rolled back would be a
-                # claim about code that no longer exists.
+                # claim about code that no longer exists. Placement gets the commit
+                # half only: the harvest fires on the spec's status, before the
+                # artifact gate that can still send this attempt back. Snapshot the
+                # ledger here so the rollback half is enforced explicitly, at the
+                # RETRY branch below.
+                ledger_before = self._ledger_text()
+                ledger_snapshotted = True
                 self._harvest_spec_deferrals(task, result.result_json)
                 # carry the skill's follow-up-review recommendation (PR #2505)
                 # onto the task so _review_and_commit can gate the review loop.
@@ -1822,7 +1836,22 @@ class Engine:
                     feedback = self._write_feedback(task, decision.reason)
                 else:
                     feedback = None
-                    self._rollback_or_pause(task)
+                    try:
+                        self._rollback_or_pause(task)
+                    finally:
+                        # The reset discards the attempt but NOT its harvest: the
+                        # ledger lives under a protected artifact folder, so
+                        # `_safe_reset`'s `keep` shields it from the untracked-file
+                        # cleanup and a ledger this attempt CREATED outlives the
+                        # work it describes (#405). Put it back by hand. `finally`,
+                        # not a plain call after: rollback_on_failure OFF (the
+                        # default) raises out of `_pause_for_manual_recovery`, and
+                        # the manual `reset --hard` it prints would not remove an
+                        # untracked ledger either. Lossless because the harvest
+                        # never mutates the spec's `deferred:` frontmatter — the
+                        # next attempt re-harvests from it.
+                        if ledger_snapshotted:
+                            self._restore_ledger(ledger_before)
                 continue
             if decision.action == Action.DEFER:
                 self._record_dev_spec(task, result.result_json)
@@ -2458,8 +2487,11 @@ class Engine:
         Gated on the spec having reached the success status, mirroring the
         append-on-success semantics the old step-04 ledger writer had: a blocked
         spec keeps its findings in frontmatter and harvests them on the eventual
-        successful re-drive, so a story that never lands cannot seed the ledger
-        with findings about work that was rolled back.
+        successful re-drive. That gate is only half of "a story that never lands
+        cannot seed the ledger with findings about work that was rolled back" —
+        it reads the SPEC's status, not whether the attempt's artifacts verified,
+        and a session can finalize its spec and still fail the artifact gate. The
+        rollback contract below carries the other half.
 
         Idempotent across retries, crash-replay, and the dev→review double call:
         each entry's `origin:` carries the finding's fingerprint, and the pre-scan
@@ -2473,10 +2505,16 @@ class Engine:
         fingerprinted `origin:` above already watermarks the ledger side.
 
         Rollback is asymmetric between the two failure paths, and deliberately so.
-        A RETRY reset (`_rollback_or_pause`, no restore) reverts the ledger edit
-        along with the work it describes, and the next attempt re-harvests from
-        the untouched frontmatter. A DEFER does NOT: `_defer` snapshots the ledger
-        and writes it back after the reset, keeping harvested entries. It has to —
+        A non-fixable RETRY reverts the ledger edit along with the work it
+        describes, and the next attempt re-harvests from the untouched
+        frontmatter. The reset does not achieve that by itself: the ledger sits
+        under a protected artifact folder, so `_safe_reset`'s `keep` shields it
+        from `safe_rollback`'s untracked cleanup and a ledger this harvest CREATED
+        would survive (#405). `_dev_phase` therefore snapshots the ledger
+        immediately before this call and restores it around `_rollback_or_pause`
+        — that restore, not the reset, is what makes the revert unconditional.
+        A DEFER does NOT revert: `_defer` snapshots the ledger and writes it back
+        after the reset, keeping harvested entries. It has to —
         `_stash_deferred_artifacts` moves the spec out of the artifacts dir first,
         so after a defer the frontmatter is no longer where a re-drive would find
         it, and the ledger entry is the finding's only surviving record.
@@ -3186,6 +3224,40 @@ class Engine:
             reason,
         )
         self._save()
+
+    def _ledger_text(self) -> str | None:
+        """The deferred-work ledger's current text, or ``None`` when the file does
+        not exist. Workspace-scoped, so an isolated run reads the unit worktree's
+        own ledger — the same one `_rollback_or_pause` resets around."""
+        ledger = self.workspace.paths.deferred_work
+        return ledger.read_text(encoding="utf-8") if ledger.is_file() else None
+
+    def _restore_ledger(self, snapshot: str | None) -> None:
+        """Put the deferred-work ledger back to a pre-harvest ``_ledger_text()``
+        snapshot — `_defer`'s own snapshot/restore run in the opposite direction,
+        and for the opposite reason.
+
+        A ``None`` snapshot means the ledger did not exist yet, so the restore is
+        an unlink: the first harvest of a project CREATES `deferred-work.md`, which
+        is both the common case and the one the reset cannot undo (untracked, and
+        `keep`-shielded from `safe_rollback`'s cleanup). Skipping it would leave
+        the whole point of the revert unfixed.
+
+        Empty parent dirs are deliberately not pruned: the artifacts dir is
+        orchestrator-owned, an empty one is harmless, and removing a directory the
+        session may still hold open is a worse trade than leaving it.
+
+        Writes raise, like every other ledger write — a failure here would silently
+        leave a stale finding pointing at code that was just discarded."""
+        ledger = self.workspace.paths.deferred_work
+        current = self._ledger_text()
+        if current == snapshot:
+            return
+        if snapshot is None:
+            ledger.unlink(missing_ok=True)
+            return
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        ledger.write_text(snapshot, encoding="utf-8")
 
     def _stash_deferred_artifacts(self, task: StoryTask) -> None:
         """Move the deferred story's spec out of the artifacts dir into the run
