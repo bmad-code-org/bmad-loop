@@ -3487,8 +3487,12 @@ def test_validate_reports_the_shim_as_a_problem(project, capsys, monkeypatch):
 def test_validate_warns_on_a_renderer_stub_and_an_orphaned_customize_file(
     project, capsys, monkeypatch
 ):
-    """Both dev-primitive warnings are advisory: they ride along in the document
-    and must NOT flip the verdict on their own."""
+    """All three dev-primitive warnings are advisory: they ride along in the
+    document and must NOT flip the verdict on their own.
+
+    This is also the only end-to-end proof that each id clears
+    `ValidationReport.add`'s registry assert — `_make_validate_pass` installs no
+    renderer stub, so the every-id-registered test never reaches these sites."""
     from conftest import install_build_auto_skill
 
     _make_validate_pass(project, monkeypatch, capsys)  # claude-only policy
@@ -3504,10 +3508,12 @@ def test_validate_warns_on_a_renderer_stub_and_an_orphaned_customize_file(
     assert doc["ok"] is True  # warnings do not fail the run
     found = _findings_by_check(doc)
     assert found["skills.dev-renderer"]["severity"] == "warning"
+    assert found["skills.dev-renderer-config"]["severity"] == "warning"  # no _bmad/config.toml
     assert found["skills.customize-legacy"]["severity"] == "warning"
     assert "_bmad/scripts/render_skill.py" in found["skills.dev-renderer"]["message"]
-    rendered = _render_findings(doc)  # both new detail shapes draw, plus skills.base's
+    rendered = _render_findings(doc)  # every new detail shape draws, plus skills.base's
     assert "skills.dev-renderer" in rendered and "skills.customize-legacy" in rendered
+    assert "skills.dev-renderer-config" in rendered
 
 
 def test_validate_json_clean_project_is_a_pure_document_at_rc_0(project, capsys, monkeypatch):

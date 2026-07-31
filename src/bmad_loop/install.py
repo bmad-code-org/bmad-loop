@@ -103,6 +103,14 @@ BMAD_DIR = "_bmad"
 RENDERER_SCRIPT_REL = f"{BMAD_DIR}/scripts/render_skill.py"
 RENDERER_SCRIPT_MARKER = "render_skill.py"
 
+# The bottom layer of the renderer's four-layer central config, and the only
+# REQUIRED one (`config_utils.load_central_config` passes required=True; the
+# .user/custom layers above it are all optional). Absent, the renderer raises
+# before it composes anything, so the stub's `uv run` exits with `HALT:` and the
+# session Stops having written no spec — the same result-less failure
+# RENDERER_SCRIPT_REL guards, one file further in. Project-global, not per tree.
+CENTRAL_CONFIG_REL = f"{BMAD_DIR}/config.toml"
+
 # Top-level _bmad/ entries never seeded into a worktree. render/ is the renderer's
 # published output: it is regenerated on skill entry, and every snapshot dir name is
 # keyed on a hash of the project root's absolute path, so seeding the main
@@ -364,21 +372,34 @@ def missing_base_skills(project: Path, trees: Sequence[str]) -> list[Finding]:
 def dev_primitive_warnings(project: Path, trees: Sequence[str]) -> list[Finding]:
     """Advisory findings about a resolved dev primitive — validate-only, never a gate.
 
-    Both conditions are things a run can survive but an operator wants named:
+    All three conditions are things a run can survive but an operator wants named:
 
     - ``skills.dev-renderer``: SKILL.md is a renderer stub (BMAD-METHOD #2601) but
       the project has no ``_bmad/scripts/render_skill.py``. The session would HALT
       before writing anything. Only the script's presence is probed — not uv on
       PATH — so this stays a warning rather than a FAIL.
+    - ``skills.dev-renderer-config``: a stub resolved somewhere but the project has
+      no ``_bmad/config.toml``, the renderer's one required config layer. Same
+      result-less HALT, one file further in — and no other check sees it, because
+      the failure is a ``ConfigError`` inside a subprocess the orchestrator only
+      observes as a Stop with no artifacts. Emitted once per project (the central
+      config is project-global, not per tree) and gated on a stub having resolved,
+      which keeps the check era-agnostic: a pre-#2601 inline SKILL.md never reads
+      the file, so its absence is not a finding to make about that project.
     - ``skills.customize-legacy``: the tree resolved to the NEW name while a
       customization override still sits under the OLD one with no counterpart, i.e.
       the rename silently orphaned it. Emitted once per project (the override files
       are project-global, not per tree).
 
+    Script-missing and config-missing are deliberately NOT suppressed against each
+    other: different files, different remediations, and a wholly-absent ``_bmad/``
+    legitimately earns both lines.
+
     Returns [] when nothing resolves — :func:`missing_base_skills` owns that story.
     """
     findings: list[Finding] = []
     resolved_new = False
+    resolved_stub = False
     for tree in dict.fromkeys(trees):
         resolved = resolve_dev_primitive(project, tree)
         if resolved is None:
@@ -390,7 +411,10 @@ def dev_primitive_warnings(project: Path, trees: Sequence[str]) -> list[Finding]
             # An unreadable/binary SKILL.md cannot be shown to be a renderer stub;
             # missing_base_skills has already spoken about this tree's health.
             continue
-        if RENDERER_SCRIPT_MARKER in skill_md and not (project / RENDERER_SCRIPT_REL).is_file():
+        if RENDERER_SCRIPT_MARKER not in skill_md:
+            continue
+        resolved_stub = True
+        if not (project / RENDERER_SCRIPT_REL).is_file():
             findings.append(
                 Finding(
                     "skills.dev-renderer",
@@ -401,6 +425,17 @@ def dev_primitive_warnings(project: Path, trees: Sequence[str]) -> list[Finding]
                     {"tree": tree, "skill": resolved, "script": RENDERER_SCRIPT_REL},
                 )
             )
+    if resolved_stub and not (project / CENTRAL_CONFIG_REL).is_file():
+        findings.append(
+            Finding(
+                "skills.dev-renderer-config",
+                "warning",
+                f"the dev primitive renders via {RENDERER_SCRIPT_MARKER} but "
+                f"{CENTRAL_CONFIG_REL} is missing — the renderer requires that layer and "
+                f"would HALT without writing a spec; reinstall the BMad Method (bmm) module",
+                {"config": CENTRAL_CONFIG_REL},
+            )
+        )
     if resolved_new:
         orphaned = [
             f"{CUSTOMIZE_DIR_REL}/{DEV_PRIMITIVE_LEGACY}{suffix}"
