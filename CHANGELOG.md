@@ -14,11 +14,15 @@ editing.
 
 ### Added
 
-- **Two validate warnings for post-rename installs (#405).** `skills.dev-renderer` fires when
+- **Three validate warnings for post-rename installs (#405).** `skills.dev-renderer` fires when
   the resolved `SKILL.md` is the new renderer stub (BMAD-METHOD#2601) but
   `_bmad/scripts/render_skill.py` is missing — that session would HALT without writing a spec.
-  `skills.customize-legacy` fires when a tree resolved to `bmad-build-auto` while an override
-  still sits at `_bmad/custom/bmad-dev-auto[.user].toml`, where it no longer applies.
+  `skills.dev-renderer-config` fires when a stub resolved but `_bmad/config.toml` — the
+  renderer's one required config layer — is absent: the same result-less HALT, one file further
+  in, and no other check sees it. It is emitted once per project and only when a stub actually
+  resolved, so a pre-renderer install stays silent. `skills.customize-legacy` fires when a tree
+  resolved to `bmad-build-auto` while an override still sits at
+  `_bmad/custom/bmad-dev-auto[.user].toml`, where it no longer applies.
 
 ### Fixed
 
@@ -44,6 +48,19 @@ editing.
   runnable as-is" banner. Exit code stays 0 and stdout is untouched: a dry run is a diagnostic,
   and rc 0 has always meant "the preview rendered", not "the project is ready".
 
+- **Worktree isolation carries the `_bmad/` config surface (#405).** The renderer-era primitive
+  is handed the worktree as its project root and hard-fails when that root has no `_bmad/` —
+  there is no walk-up — so on a project that gitignores it (most do, this one included) every
+  isolated session HALTed with nothing written. `provision_worktree` now merge-copies the repo's
+  `_bmad/` per file, copy-when-absent, so a checkout that commits it keeps every tracked file and
+  only the gitignored layers are filled in. `_bmad/scripts/` is seeded whole rather than curated
+  because `render_skill.py` bare-imports its sibling `config_utils`, and a seed that comes up
+  short — the realistic trigger is a symlinked `_bmad/`, how a shared BMad install is wired — is
+  reported through the existing `worktree-seed-skipped` journal event instead of passing as
+  success. `_bmad/render/` is never seeded and is git-excluded inside the worktree, so the
+  renderer's in-session rewrite of it cannot be swept into a story commit; `init` now gitignores
+  it as well, which is the only protection under the default `isolation = "none"`.
+
 - **Deferred review findings are harvested out of the spec's frontmatter (#405).**
   BMAD-METHOD#2640 moved `defer`-triaged findings from `deferred-work.md` into the spec's own
   `deferred:` list, silently starving the sweep pipeline. A successful dev or review session
@@ -53,6 +70,23 @@ editing.
   already marked it done. Malformed items do not block their well-formed siblings: the loss is
   journaled and filed as one aggregated ledger entry. The spec's frontmatter is never rewritten,
   and the harvest keys on content rather than the installed skill name, so it works on both eras.
+  The review prompt no longer also asks the session to file the finding itself: that produced two
+  entries per finding which could never dedup, since an agent-written one carries neither the
+  fingerprinted `origin:` nor a `source_spec:` line. It stays neutral rather than banning ledger
+  edits outright — on a pre-BMAD-METHOD#2640 skill there is no frontmatter to harvest and the
+  session's own append is the finding's only record — and still forbids rewriting existing entries.
+
+- **A harvested deferral is reverted when its attempt rolls back (#405).** The harvest keys on
+  the spec's status and runs before the artifact gate, so a session that finalized its spec and
+  then failed a non-fixable check (a `baseline_revision` mismatch is the canonical trigger) left
+  its ledger entry behind, describing code the rollback had just discarded. The reset alone does
+  not remove it: the ledger sits under a protected artifact folder, which `_safe_reset`'s `keep`
+  shields from the untracked-file cleanup. The dev phase now snapshots the ledger before the
+  harvest and restores it around the rollback — unlinking the file when the harvest created it,
+  and on the stop-and-wait path too, which raises. Lossless, because the spec's `deferred:`
+  frontmatter is never mutated and the next attempt re-harvests from it. A defer still keeps its
+  harvested entries: `_stash_deferred_artifacts` has already moved the spec out of the artifacts
+  dir, so there the ledger entry is the finding's only surviving record.
 
 ## [0.9.0] — 2026-07-21
 
