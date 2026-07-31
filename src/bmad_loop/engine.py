@@ -1764,6 +1764,7 @@ class Engine:
             # snapshot was taken at all" (nothing to restore, hands off).
             ledger_before: str | None = None
             ledger_snapshotted = False
+            replayed = resume_result is not None
             if resume_result is None:
                 # a resumed result replays the attempt it was recorded under, so
                 # the counter (and the session task_id derived from it) must not
@@ -1816,8 +1817,16 @@ class Engine:
                 # artifact gate that can still send this attempt back. Snapshot the
                 # ledger here so the rollback half is enforced explicitly, at the
                 # RETRY branch below.
-                ledger_before = self._ledger_text()
-                ledger_snapshotted = True
+                #
+                # NOT on a replayed attempt: the host died somewhere between the
+                # dead process's harvest and its rollback, so what is on disk now is
+                # already POST-harvest and snapshotting it would restore the very
+                # edit the rollback is meant to undo — worse than not restoring, on
+                # a tracked ledger, because the reset alone would have reverted it.
+                # The `finally` recovers the attempt baseline instead.
+                if not replayed:
+                    ledger_before = self._ledger_text()
+                    ledger_snapshotted = True
                 self._harvest_spec_deferrals(task, result.result_json)
                 # carry the skill's follow-up-review recommendation (PR #2505)
                 # onto the task so _review_and_commit can gate the review loop.
@@ -1880,8 +1889,17 @@ class Engine:
                         # untracked ledger either. Lossless because the harvest
                         # never mutates the spec's `deferred:` frontmatter — the
                         # next attempt re-harvests from it.
+                        #
+                        # Two paths because the snapshot is a plain local and a host
+                        # death loses it: a live attempt restores its own snapshot; a
+                        # REPLAYED one recovers the attempt baseline from persisted
+                        # state instead. Restoring a freshly-read snapshot there would
+                        # write the dead attempt's harvest back — see
+                        # _drop_ledger_created_since_baseline.
                         if ledger_snapshotted:
                             self._restore_ledger(ledger_before)
+                        elif replayed:
+                            self._drop_ledger_created_since_baseline(task)
                 continue
             if decision.action == Action.DEFER:
                 self._record_dev_spec(task, result.result_json)
@@ -2543,6 +2561,11 @@ class Engine:
         would survive (#405). `_dev_phase` therefore snapshots the ledger
         immediately before this call and restores it around `_rollback_or_pause`
         — that restore, not the reset, is what makes the revert unconditional.
+        On a REPLAYED attempt that snapshot no longer exists (it is a local, and the
+        host died holding it), so the revert falls back to recovering the attempt
+        baseline from persisted state — see
+        `_drop_ledger_created_since_baseline`, which also documents the one case
+        that stays unrecoverable and is therefore left alone.
         A DEFER does NOT revert: `_defer` snapshots the ledger and writes it back
         after the reset, keeping harvested entries. It has to —
         `_stash_deferred_artifacts` moves the spec out of the artifacts dir first,
@@ -3288,6 +3311,58 @@ class Engine:
             return
         ledger.parent.mkdir(parents=True, exist_ok=True)
         ledger.write_text(snapshot, encoding="utf-8")
+
+    def _drop_ledger_created_since_baseline(self, task: StoryTask) -> None:
+        """Revert a harvest whose in-process snapshot died with the host.
+
+        A crash between `_harvest_spec_deferrals` and the non-fixable RETRY rollback
+        leaves the attempt resumable: `_resumable_session` replays the recorded
+        result and `_dev_phase` re-enters its loop from the top. The pre-harvest
+        snapshot is a plain local, so it is gone — but the attempt *baseline* is
+        persisted (`baseline_commit`, `baseline_untracked`) and is deliberately not
+        re-captured on a replay, which is enough to recover the ledger's state at the
+        start of this attempt without persisting the ledger text itself:
+
+        - listed in ``baseline_untracked`` — untracked and PRESENT at the baseline.
+          Its pre-harvest content is genuinely unrecoverable, so hands off rather
+          than guess; the harvest's own fingerprint dedup keeps a re-harvest quiet.
+        - untracked NOW and absent from ``baseline_untracked`` — this attempt created
+          it (the first-ever harvest does exactly this), so unlink.
+        - neither — tracked, and `_rollback_or_pause`'s `reset --hard` has already
+          reverted the harvest edit. Touching it would put the edit BACK.
+
+        The last case is why the replayed path cannot simply reuse `_restore_ledger`
+        with a freshly-read snapshot: on a tracked ledger that would re-create the
+        very edit the reset just undid.
+
+        One asymmetry, deliberate: under the default ``scm.rollback_on_failure = off``
+        no reset runs at all, so a *tracked* ledger keeps its harvest edit here where
+        the non-crash path would have restored pre-harvest text. The run is paused and
+        the operator's own `reset --hard` reverts it; inventing a checkout of the
+        baseline blob inside a `finally` that is already unwinding a pause is the
+        worse trade.
+
+        The untracked probe is an OBSERVATION and degrades: it runs inside a
+        ``finally`` that is usually propagating `RunPaused` out of
+        `_pause_for_manual_recovery`, and a `GitError` raised here would replace that
+        pause with a git failure. The unlink itself still raises, like every other
+        ledger write."""
+        ledger = self.workspace.paths.deferred_work
+        try:
+            rel = ledger.relative_to(self.workspace.root).as_posix()
+        except ValueError:
+            return  # ledger configured outside the workspace: not ours to reason about
+        if rel in (task.baseline_untracked or ()):
+            return
+        try:
+            untracked = verify.untracked_files(self.workspace.root)
+        except verify.GitError as e:
+            self.journal.append(
+                "ledger-baseline-probe-failed", story_key=task.story_key, error=str(e)
+            )
+            return
+        if rel in untracked:
+            ledger.unlink(missing_ok=True)
 
     def _stash_deferred_artifacts(self, task: StoryTask) -> None:
         """Move the deferred story's spec out of the artifacts dir into the run
