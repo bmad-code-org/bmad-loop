@@ -5582,6 +5582,29 @@ def test_review_prompt_resolves_through_the_review_adapters_own_tree(project):
     }
 
 
+def test_review_prompt_never_asks_the_session_to_file_its_own_deferrals(project):
+    """Post-BMAD-METHOD#2640 the primitive records its `defer` findings in the
+    spec's frontmatter and `_harvest_spec_deferrals` files them; an affirmative
+    "append them to the ledger" here would file each finding a SECOND time,
+    with no possible dedup (`append_entry` matches on `origin:` + `source_spec:`
+    and an agent-written entry carries neither).
+
+    The prohibition on rewriting EXISTING entries stays — it is the prevention
+    side of SweepEngine._verify_review's reclose. And the prompt goes NEUTRAL
+    rather than adopting the sweep prompts' outright ban: on a pre-#2640 skill
+    there is no frontmatter to harvest, so the session's own flat append is the
+    only record and banning it would lose findings."""
+    engine, _ = make_engine(project, [])
+    spec = str(project.implementation_artifacts / "spec-1-1-a.md")
+
+    prompt = engine._review_prompt(_prompt_task(project, spec_file=spec))
+
+    assert prompt.startswith(f"/bmad-dev-auto {spec} —")
+    assert "append" not in prompt.lower()  # no affirmative file-it-yourself clause
+    assert "do NOT modify, re-open, or rewrite existing deferred-work ledger" in prompt
+    assert "the orchestrator owns their status and resolution" in prompt
+
+
 # ------------------------- frontmatter `deferred:` harvest (BMAD-METHOD #2640)
 #
 # Upstream moved the dev primitive's `defer`-triaged review findings out of

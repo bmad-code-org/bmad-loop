@@ -2619,14 +2619,20 @@ class Engine:
         # separate review skill. task.spec_file is set by verify_dev on success.
         # The ledger instruction is the prevention side of the reclose in
         # SweepEngine._verify_review: a review that rewrites deferred-work.md
-        # from a stale snapshot clobbers orchestrator-recorded closures. The
-        # ledger is append-only for sessions — new findings are fine, existing
-        # entries are orchestrator-owned.
+        # from a stale snapshot clobbers orchestrator-recorded closures.
+        # Existing entries are orchestrator-owned; NEW ones are simply not asked
+        # for. Post-BMAD-METHOD#2640 the primitive records its own `defer`
+        # findings in the spec's frontmatter and `_harvest_spec_deferrals` files
+        # them, so an affirmative "append them" here files each finding twice:
+        # `append_entry`'s dedup is exact-match on `origin:` + `source_spec:` and
+        # an agent-written entry carries neither, so the pair can never collapse.
+        # Deliberately neutral rather than the sweep prompts' outright ban — on a
+        # pre-#2640 skill there is no frontmatter to harvest and the session's own
+        # flat append is the only record, so forbidding it would lose findings.
         return (
-            f"/{self._dev_skill('review')} {task.spec_file} — If this review defers new "
-            f"findings, append them to the deferred-work ledger as NEW entries "
-            f"only; do NOT modify, re-open, or rewrite existing ledger entries — "
-            f"the orchestrator owns their status and resolution."
+            f"/{self._dev_skill('review')} {task.spec_file} — do NOT modify, "
+            f"re-open, or rewrite existing deferred-work ledger entries; the "
+            f"orchestrator owns their status and resolution."
         )
 
     def _render_commit_template(self, task: StoryTask) -> str | None:
