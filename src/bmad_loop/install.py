@@ -98,8 +98,11 @@ BMAD_DIR = "_bmad"
 
 # Since BMAD-METHOD PR #2601 a skill's SKILL.md can be a renderer *stub* that shells
 # out (via uv) to this project-local script to compose the real prompt. When the
-# script is absent the session HALTs without writing anything, so validate warns —
-# advisory, not a FAIL: only the script's presence is probed, never uv on PATH.
+# script is absent the session HALTs without writing anything, so this is a preflight
+# FAIL: absence is SUFFICIENT for the HALT, which is the only question a gate asks.
+# That the probe is not sufficient for success (uv on PATH is never checked, nor is
+# the config's contents — see #407) argues against trusting a green, not against
+# blocking on a red.
 RENDERER_SCRIPT_REL = f"{BMAD_DIR}/scripts/render_skill.py"
 RENDERER_SCRIPT_MARKER = "render_skill.py"
 
@@ -108,7 +111,8 @@ RENDERER_SCRIPT_MARKER = "render_skill.py"
 # .user/custom layers above it are all optional). Absent, the renderer raises
 # before it composes anything, so the stub's `uv run` exits with `HALT:` and the
 # session Stops having written no spec — the same result-less failure
-# RENDERER_SCRIPT_REL guards, one file further in. Project-global, not per tree.
+# RENDERER_SCRIPT_REL guards, one file further in, and blocking for the same
+# reason. Project-global, not per tree.
 CENTRAL_CONFIG_REL = f"{BMAD_DIR}/config.toml"
 
 # Top-level _bmad/ entries never seeded into a worktree. render/ is the renderer's
@@ -199,6 +203,22 @@ def _is_dev_primitive_shim(project: Path, tree: str) -> bool:
     if not (legacy / "SKILL.md").is_file():
         return False
     return any(not (legacy / marker).is_file() for marker in DEV_PRIMITIVE_MARKERS)
+
+
+def _is_renderer_stub(skill_dir: Path) -> bool:
+    """True when ``skill_dir``'s SKILL.md is a renderer stub (BMAD-METHOD #2601) —
+    i.e. it shells out to ``render_skill.py`` rather than carrying the prompt inline.
+
+    Keyed on content, never on the installed skill name, so it answers the same for
+    both eras. An unreadable or binary SKILL.md cannot be *shown* to be a stub, so it
+    reads False: :func:`missing_base_skills`' marker checks have already spoken about
+    that tree's health, and inventing a renderer FAIL out of a read fault would blame
+    the wrong file."""
+    try:
+        skill_md = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+    return RENDERER_SCRIPT_MARKER in skill_md
 
 
 def dev_primitive_or_default(project: Path, tree: str | None) -> str:
@@ -293,8 +313,25 @@ def missing_base_skills(project: Path, trees: Sequence[str]) -> list[Finding]:
     ``skills.base-incomplete`` carries ``missing_markers`` as a list — the message
     joins it with ", " for the human line, which a consumer would otherwise have to
     split back apart on a separator the message is free to change.
+
+    A resolved *renderer stub* (BMAD-METHOD #2601) is probed two files further in,
+    because a stub whose script or required config layer is absent is the same
+    result-less HALT as the shim above and must fail the same gate:
+
+    - ``skills.dev-renderer`` — the stub is there, ``_bmad/scripts/render_skill.py``
+      is not. Per tree, since the primitive resolves per tree.
+    - ``skills.dev-renderer-config`` — a stub resolved *somewhere* and the project has
+      no ``_bmad/config.toml``. Once per project (the central config is
+      project-global), and gated on a stub having resolved so the check stays
+      era-agnostic: a pre-#2601 inline SKILL.md never reads the file, so its absence
+      is not a finding to make about that project.
+
+    Both are emitted independently of the marker check above them — different files,
+    different remediations, and a wholly-absent ``_bmad/`` legitimately earns both
+    lines beside a truncated skill.
     """
     problems: list[Finding] = []
+    resolved_stub = False
     for tree in dict.fromkeys(trees):
         resolved = resolve_dev_primitive(project, tree)
         if resolved is None and _is_dev_primitive_shim(project, tree):
@@ -342,6 +379,19 @@ def missing_base_skills(project: Path, trees: Sequence[str]) -> list[Finding]:
                         {"tree": tree, "skill": resolved, "missing_markers": absent},
                     )
                 )
+            if _is_renderer_stub(skill_dir):
+                resolved_stub = True
+                if not (project / RENDERER_SCRIPT_REL).is_file():
+                    problems.append(
+                        Finding(
+                            "skills.dev-renderer",
+                            "problem",
+                            f"{tree}/{resolved}/SKILL.md renders via {RENDERER_SCRIPT_MARKER} "
+                            f"but {RENDERER_SCRIPT_REL} is missing — the session would HALT "
+                            f"without writing a spec; reinstall the BMad Method (bmm) module",
+                            {"tree": tree, "skill": resolved, "script": RENDERER_SCRIPT_REL},
+                        )
+                    )
         for skill, markers in REVIEW_HUNTER_SKILLS.items():
             skill_dir = project / tree / skill
             if not (skill_dir / "SKILL.md").is_file():
@@ -366,76 +416,44 @@ def missing_base_skills(project: Path, trees: Sequence[str]) -> list[Finding]:
                         {"tree": tree, "skill": skill, "missing_markers": absent},
                     )
                 )
-    return problems
-
-
-def dev_primitive_warnings(project: Path, trees: Sequence[str]) -> list[Finding]:
-    """Advisory findings about a resolved dev primitive — validate-only, never a gate.
-
-    All three conditions are things a run can survive but an operator wants named:
-
-    - ``skills.dev-renderer``: SKILL.md is a renderer stub (BMAD-METHOD #2601) but
-      the project has no ``_bmad/scripts/render_skill.py``. The session would HALT
-      before writing anything. Only the script's presence is probed — not uv on
-      PATH — so this stays a warning rather than a FAIL.
-    - ``skills.dev-renderer-config``: a stub resolved somewhere but the project has
-      no ``_bmad/config.toml``, the renderer's one required config layer. Same
-      result-less HALT, one file further in — and no other check sees it, because
-      the failure is a ``ConfigError`` inside a subprocess the orchestrator only
-      observes as a Stop with no artifacts. Emitted once per project (the central
-      config is project-global, not per tree) and gated on a stub having resolved,
-      which keeps the check era-agnostic: a pre-#2601 inline SKILL.md never reads
-      the file, so its absence is not a finding to make about that project.
-    - ``skills.customize-legacy``: the tree resolved to the NEW name while a
-      customization override still sits under the OLD one with no counterpart, i.e.
-      the rename silently orphaned it. Emitted once per project (the override files
-      are project-global, not per tree).
-
-    Script-missing and config-missing are deliberately NOT suppressed against each
-    other: different files, different remediations, and a wholly-absent ``_bmad/``
-    legitimately earns both lines.
-
-    Returns [] when nothing resolves — :func:`missing_base_skills` owns that story.
-    """
-    findings: list[Finding] = []
-    resolved_new = False
-    resolved_stub = False
-    for tree in dict.fromkeys(trees):
-        resolved = resolve_dev_primitive(project, tree)
-        if resolved is None:
-            continue
-        resolved_new = resolved_new or resolved == DEV_PRIMITIVE_NEW
-        try:
-            skill_md = (project / tree / resolved / "SKILL.md").read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            # An unreadable/binary SKILL.md cannot be shown to be a renderer stub;
-            # missing_base_skills has already spoken about this tree's health.
-            continue
-        if RENDERER_SCRIPT_MARKER not in skill_md:
-            continue
-        resolved_stub = True
-        if not (project / RENDERER_SCRIPT_REL).is_file():
-            findings.append(
-                Finding(
-                    "skills.dev-renderer",
-                    "warning",
-                    f"{tree}/{resolved}/SKILL.md renders via {RENDERER_SCRIPT_MARKER} but "
-                    f"{RENDERER_SCRIPT_REL} is missing — the session would HALT without "
-                    f"writing a spec; reinstall the BMad Method (bmm) module",
-                    {"tree": tree, "skill": resolved, "script": RENDERER_SCRIPT_REL},
-                )
-            )
     if resolved_stub and not (project / CENTRAL_CONFIG_REL).is_file():
-        findings.append(
+        problems.append(
             Finding(
                 "skills.dev-renderer-config",
-                "warning",
+                "problem",
                 f"the dev primitive renders via {RENDERER_SCRIPT_MARKER} but "
                 f"{CENTRAL_CONFIG_REL} is missing — the renderer requires that layer and "
                 f"would HALT without writing a spec; reinstall the BMad Method (bmm) module",
                 {"config": CENTRAL_CONFIG_REL},
             )
         )
+    return problems
+
+
+def dev_primitive_warnings(project: Path, trees: Sequence[str]) -> list[Finding]:
+    """Advisory findings about a resolved dev primitive — validate-only, never a gate.
+
+    One condition, and it is genuinely survivable — which is what keeps it out of
+    :func:`missing_base_skills`:
+
+    - ``skills.customize-legacy``: the tree resolved to the NEW name while a
+      customization override still sits under the OLD one with no counterpart, i.e.
+      the rename silently orphaned it. Emitted once per project (the override files
+      are project-global, not per tree). The session still runs; it just runs
+      unstyled, so naming it is an operator heads-up rather than a gate.
+
+    The two renderer conditions this used to carry (``skills.dev-renderer``,
+    ``skills.dev-renderer-config``) moved into :func:`missing_base_skills` as
+    problems: each is a deterministic HALT-without-writing-a-spec, the same failure
+    the shim check already blocks on, so previewing a run that cannot possibly
+    produce one was the wrong service to offer.
+
+    Returns [] when nothing resolves — :func:`missing_base_skills` owns that story.
+    """
+    findings: list[Finding] = []
+    resolved_new = any(
+        resolve_dev_primitive(project, tree) == DEV_PRIMITIVE_NEW for tree in dict.fromkeys(trees)
+    )
     if resolved_new:
         orphaned = [
             f"{CUSTOMIZE_DIR_REL}/{DEV_PRIMITIVE_LEGACY}{suffix}"

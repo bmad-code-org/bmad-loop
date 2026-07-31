@@ -1591,6 +1591,65 @@ def test_run_aborts_when_only_the_dev_shim_is_installed(project, monkeypatch, ca
     assert "bmad-build-auto" in err and "HALT" in err
 
 
+def _install_renderer_stub_project(project, monkeypatch, *, script: bool, config: bool):
+    """A project whose resolved primitive is a #2601 renderer stub in every tree.
+    `script`/`config` choose which of the two renderer prerequisites exist, so each
+    caller isolates one absence. Everything is laid down before the commit — the
+    preflight runs behind a clean-worktree gate."""
+    from conftest import git, install_base_skills, install_build_auto_skill
+
+    install_bmad_config(project)
+    install_base_skills(project)
+    for tree in (".claude/skills", ".agents/skills"):
+        shutil.rmtree(project.project / tree / "bmad-dev-auto")
+        install_build_auto_skill(project.project, tree, renderer_stub=True)
+    if script:
+        rendered = project.project / "_bmad" / "scripts" / "render_skill.py"
+        rendered.parent.mkdir(parents=True, exist_ok=True)
+        rendered.write_text("# renderer\n", encoding="utf-8")
+    if config:
+        central = project.project / "_bmad" / "config.toml"
+        central.parent.mkdir(parents=True, exist_ok=True)
+        central.write_text("[core]\nx = 1\n", encoding="utf-8")
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "setup")
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {r: None for r in cli.ROLES})
+
+
+def test_run_aborts_when_the_renderer_script_is_missing(project, monkeypatch, capsys):
+    """A renderer stub with no `_bmad/scripts/render_skill.py` HALTs every single
+    unattended session with nothing written, so the preflight refuses the run rather
+    than burning the whole budget on guaranteed result-less Stops."""
+    _install_renderer_stub_project(project, monkeypatch, script=False, config=True)
+
+    assert cli.main(["run", "--project", str(project.project)]) == 1
+    err = capsys.readouterr().err
+    assert "_bmad/scripts/render_skill.py" in err and "HALT" in err
+
+
+def test_run_aborts_when_the_renderer_central_config_is_missing(project, monkeypatch, capsys):
+    """One file further in: the script is there but `_bmad/config.toml` — the
+    renderer's one required layer — is not, so `uv run` raises before composing and
+    exits `HALT:`. Same result-less Stop, same refusal."""
+    _install_renderer_stub_project(project, monkeypatch, script=True, config=False)
+
+    assert cli.main(["run", "--project", str(project.project)]) == 1
+    err = capsys.readouterr().err
+    assert "_bmad/config.toml" in err and "HALT" in err
+
+
+def test_run_proceeds_once_the_renderer_files_are_present(project, monkeypatch, capsys):
+    """The clearing leg. Without it, ablating either `is_file()` predicate away
+    leaves both aborts above passing — the run would refuse a healthy stub project
+    and no test would notice."""
+    _install_renderer_stub_project(project, monkeypatch, script=True, config=True)
+
+    assert cli.main(["run", "--project", str(project.project)]) == 0
+    assert "render_skill.py" not in capsys.readouterr().err
+
+
 def _stub_run_tui(monkeypatch):
     import bmad_loop.tui.app as tui_app
 
@@ -3484,11 +3543,12 @@ def test_validate_reports_the_shim_as_a_problem(project, capsys, monkeypatch):
     assert "skills.base-shim" in _render_findings(doc)  # new detail shape draws
 
 
-def test_validate_warns_on_a_renderer_stub_and_an_orphaned_customize_file(
+def test_validate_fails_on_a_renderer_stub_and_warns_on_an_orphaned_customize_file(
     project, capsys, monkeypatch
 ):
-    """All three dev-primitive warnings are advisory: they ride along in the
-    document and must NOT flip the verdict on their own.
+    """The two renderer findings are preflight problems and DO flip the verdict —
+    each is a deterministic HALT-without-a-spec on every story. The customize
+    orphan beside them is advisory and would not have.
 
     This is also the only end-to-end proof that each id clears
     `ValidationReport.add`'s registry assert — `_make_validate_pass` installs no
@@ -3504,16 +3564,43 @@ def test_validate_warns_on_a_renderer_stub_and_an_orphaned_customize_file(
     git(project.project, "add", "-A")
     git(project.project, "commit", "-q", "-m", "upgrade to bmad-build-auto")
 
-    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
-    assert doc["ok"] is True  # warnings do not fail the run
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    assert doc["ok"] is False  # the renderer problems fail the run
     found = _findings_by_check(doc)
-    assert found["skills.dev-renderer"]["severity"] == "warning"
-    assert found["skills.dev-renderer-config"]["severity"] == "warning"  # no _bmad/config.toml
+    assert found["skills.dev-renderer"]["severity"] == "problem"
+    assert found["skills.dev-renderer-config"]["severity"] == "problem"  # no _bmad/config.toml
     assert found["skills.customize-legacy"]["severity"] == "warning"
     assert "_bmad/scripts/render_skill.py" in found["skills.dev-renderer"]["message"]
     rendered = _render_findings(doc)  # every new detail shape draws, plus skills.base's
     assert "skills.dev-renderer" in rendered and "skills.customize-legacy" in rendered
     assert "skills.dev-renderer-config" in rendered
+
+
+def test_validate_stays_ok_when_only_the_customize_orphan_fires(project, capsys, monkeypatch):
+    """The advisory half, isolated: with the renderer's script and central config
+    both present, the orphaned override is the only finding and the verdict stays
+    ok. Without this leg the split above cannot show that `skills.customize-legacy`
+    is still a warning rather than riding the renderer problems' rc."""
+    from conftest import install_build_auto_skill
+
+    _make_validate_pass(project, monkeypatch, capsys)  # claude-only policy
+    shutil.rmtree(project.project / ".claude/skills/bmad-dev-auto")
+    install_build_auto_skill(project.project, ".claude/skills", renderer_stub=True)
+    script = project.project / "_bmad" / "scripts" / "render_skill.py"
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text("# renderer\n", encoding="utf-8")
+    (project.project / "_bmad" / "config.toml").write_text("[core]\nx = 1\n", encoding="utf-8")
+    custom = project.project / "_bmad" / "custom"
+    custom.mkdir(parents=True, exist_ok=True)
+    (custom / "bmad-dev-auto.toml").write_text("x\n", encoding="utf-8")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "upgrade to bmad-build-auto")
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+    assert doc["ok"] is True  # a warning does not fail the run
+    found = _findings_by_check(doc)
+    assert "skills.dev-renderer" not in found and "skills.dev-renderer-config" not in found
+    assert found["skills.customize-legacy"]["severity"] == "warning"
 
 
 def test_validate_json_clean_project_is_a_pure_document_at_rc_0(project, capsys, monkeypatch):
@@ -4052,6 +4139,29 @@ def test_sweep_dry_run_warns_when_preflight_would_abort(project, capsys):
 
     assert cli._sweep_dry_run(project, pol) == 0
     assert "NOT runnable" in capsys.readouterr().err
+
+
+def test_dry_run_warns_when_the_renderer_files_are_missing(project, capsys):
+    """The banner mirrors `_require_base_skills` by reading the same list, so
+    promoting the renderer checks to problems covered the preview too. Without this
+    the preview would print a `/bmad-build-auto` schedule for a project whose every
+    session HALTs — the exact lie the banner exists to stop."""
+    from conftest import install_base_skills, install_build_auto_skill
+
+    install_base_skills(project)
+    for tree in (".claude/skills", ".agents/skills"):
+        shutil.rmtree(project.project / tree / "bmad-dev-auto")
+        install_build_auto_skill(project.project, tree, renderer_stub=True)
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    _write_policy(project.project)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    args = argparse.Namespace(epic=None, story=None, max_stories=None)
+
+    assert cli._dry_run(project, pol, args) == 0
+    out, err = capsys.readouterr()
+    assert "NOT runnable" in err
+    assert "_bmad/scripts/render_skill.py" in err and "_bmad/config.toml" in err
+    assert "1-1-a" in out  # the schedule itself still rendered
 
 
 def test_dry_run_is_silent_when_preflight_would_pass(project, capsys):

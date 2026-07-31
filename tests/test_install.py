@@ -821,55 +821,60 @@ def test_resolution_is_per_tree(tmp_path):
     assert missing_base_skills(tmp_path, [claude, codex]) == []
 
 
-def test_dev_primitive_warnings_flag_a_renderer_stub_without_its_script(tmp_path):
+def test_renderer_stub_without_its_script_fails_the_preflight(tmp_path):
     """BMAD-METHOD #2601: SKILL.md became a stub that shells out to a project-local
-    render script. Missing script = the session HALTs with nothing written — but it
-    is a warning, not a FAIL: only the script's presence is probed, never uv."""
+    render script. Missing script = the session HALTs with nothing written on EVERY
+    story, so it is a preflight problem, not an advisory warning — the same failure
+    shape `skills.base-shim` already blocks on. That the probe is not sufficient for
+    success (uv on PATH is never checked) argues against trusting a green, not
+    against blocking on a red."""
     from conftest import install_build_auto_skill
 
     from bmad_loop.checks import VALIDATE_CHECKS
-    from bmad_loop.install import CENTRAL_CONFIG_REL, RENDERER_SCRIPT_REL, dev_primitive_warnings
+    from bmad_loop.install import CENTRAL_CONFIG_REL, RENDERER_SCRIPT_REL, missing_base_skills
 
     tree = get_profile("claude").skill_tree
+    _install_hunters(tmp_path, tree)
     # the OTHER renderer prerequisite, so this test speaks only about the script
     config = tmp_path / CENTRAL_CONFIG_REL
     config.parent.mkdir(parents=True, exist_ok=True)
     config.write_text('[core]\nname = "x"\n', encoding="utf-8")
-    # an inline (non-stub) SKILL.md never warns, script or no script
+    # an inline (non-stub) SKILL.md never fires, script or no script
     install_build_auto_skill(tmp_path, tree)
-    assert dev_primitive_warnings(tmp_path, [tree]) == []
+    assert missing_base_skills(tmp_path, [tree]) == []
 
     install_build_auto_skill(tmp_path, tree, renderer_stub=True)
-    warnings = dev_primitive_warnings(tmp_path, [tree])
-    assert [f.check for f in warnings] == ["skills.dev-renderer"]
-    assert warnings[0].severity == "warning"
-    assert warnings[0].check in VALIDATE_CHECKS
-    assert RENDERER_SCRIPT_REL in warnings[0].message
+    problems = missing_base_skills(tmp_path, [tree])
+    assert [f.check for f in problems] == ["skills.dev-renderer"]
+    assert problems[0].severity == "problem"
+    assert problems[0].check in VALIDATE_CHECKS
+    assert RENDERER_SCRIPT_REL in problems[0].message
 
     # …and it clears once the script is there
     script = tmp_path / RENDERER_SCRIPT_REL
     script.parent.mkdir(parents=True, exist_ok=True)
     script.write_text("# renderer\n", encoding="utf-8")
-    assert dev_primitive_warnings(tmp_path, [tree]) == []
+    assert missing_base_skills(tmp_path, [tree]) == []
 
 
-def test_dev_primitive_warnings_config_warning_when_central_toml_absent(tmp_path):
+def test_renderer_stub_without_central_config_fails_the_preflight(tmp_path):
     """`_bmad/config.toml` is the renderer's one REQUIRED config layer
     (`config_utils.load_central_config` passes required=True). Absent, the stub's
     `uv run` raises before composing anything and exits `HALT:` — the same
-    result-less Stop the missing-script warning guards, one file further in, and
+    result-less Stop the missing-script problem guards, one file further in, and
     one no other check sees."""
     from conftest import install_build_auto_skill
 
     from bmad_loop.checks import VALIDATE_CHECKS
-    from bmad_loop.install import CENTRAL_CONFIG_REL, RENDERER_SCRIPT_REL, dev_primitive_warnings
+    from bmad_loop.install import CENTRAL_CONFIG_REL, RENDERER_SCRIPT_REL, missing_base_skills
 
     tree = get_profile("claude").skill_tree
+    _install_hunters(tmp_path, tree)
     install_build_auto_skill(tmp_path, tree, renderer_stub=True)
 
     # a wholly-absent _bmad/ earns BOTH lines — different files, different
     # remediations, so neither is suppressed against the other
-    assert [f.check for f in dev_primitive_warnings(tmp_path, [tree])] == [
+    assert [f.check for f in missing_base_skills(tmp_path, [tree])] == [
         "skills.dev-renderer",
         "skills.dev-renderer-config",
     ]
@@ -877,52 +882,93 @@ def test_dev_primitive_warnings_config_warning_when_central_toml_absent(tmp_path
     script = tmp_path / RENDERER_SCRIPT_REL
     script.parent.mkdir(parents=True, exist_ok=True)
     script.write_text("# renderer\n", encoding="utf-8")
-    warnings = dev_primitive_warnings(tmp_path, [tree])
-    assert [f.check for f in warnings] == ["skills.dev-renderer-config"]
-    assert warnings[0].severity == "warning"
-    assert warnings[0].check in VALIDATE_CHECKS
-    assert CENTRAL_CONFIG_REL in warnings[0].message
-    assert warnings[0].detail["config"] == CENTRAL_CONFIG_REL
+    problems = missing_base_skills(tmp_path, [tree])
+    assert [f.check for f in problems] == ["skills.dev-renderer-config"]
+    assert problems[0].severity == "problem"
+    assert problems[0].check in VALIDATE_CHECKS
+    assert CENTRAL_CONFIG_REL in problems[0].message
+    assert problems[0].detail["config"] == CENTRAL_CONFIG_REL
 
-    # …and it clears once the layer is there (ablation: drop the is_file predicate)
+    # …and it clears once the layer is there (ablation: drop the is_file predicate —
+    # invisible to the assert above, which keeps passing with the predicate gone)
     (tmp_path / CENTRAL_CONFIG_REL).write_text('[core]\nname = "x"\n', encoding="utf-8")
-    assert dev_primitive_warnings(tmp_path, [tree]) == []
+    assert missing_base_skills(tmp_path, [tree]) == []
 
 
-def test_dev_primitive_warnings_config_silent_for_pre_render_skill(tmp_path):
+def test_renderer_checks_silent_for_pre_render_skill(tmp_path):
     """Era-agnostic refusal: a pre-#2601 inline SKILL.md never reads the central
     config, so its absence is not a finding to make about that project. The gate is
     the resolved skill's own content — never a bare "`_bmad/config.toml` missing"
     (ablation: hoist the check out of the stub gate)."""
     from conftest import install_build_auto_skill
 
-    from bmad_loop.install import CENTRAL_CONFIG_REL, dev_primitive_warnings
+    from bmad_loop.install import CENTRAL_CONFIG_REL, missing_base_skills
 
     claude, codex = get_profile("claude").skill_tree, get_profile("codex").skill_tree
+    for tree in (claude, codex):
+        _install_hunters(tmp_path, tree)
     install_build_auto_skill(tmp_path, claude)  # inline SKILL.md, post-rename name
     _install_legacy_primitive(tmp_path, codex)  # inline SKILL.md, pre-rename name
 
     assert not (tmp_path / CENTRAL_CONFIG_REL).exists()
-    assert dev_primitive_warnings(tmp_path, [claude, codex]) == []
+    assert missing_base_skills(tmp_path, [claude, codex]) == []
 
 
-def test_dev_primitive_warnings_config_emitted_once_across_two_trees(tmp_path):
+def test_renderer_config_problem_emitted_once_across_two_trees(tmp_path):
     """`_bmad/config.toml` is project-global like `_bmad/custom/`, so two stub trees
     are one finding (ablation: emit inside the per-tree loop). The script is present
     so the per-tree `skills.dev-renderer` cannot stand in for the once-ness."""
     from conftest import install_build_auto_skill
 
-    from bmad_loop.install import RENDERER_SCRIPT_REL, dev_primitive_warnings
+    from bmad_loop.install import RENDERER_SCRIPT_REL, missing_base_skills
 
     claude, codex = get_profile("claude").skill_tree, get_profile("codex").skill_tree
     script = tmp_path / RENDERER_SCRIPT_REL
     script.parent.mkdir(parents=True, exist_ok=True)
     script.write_text("# renderer\n", encoding="utf-8")
     for tree in (claude, codex):
+        _install_hunters(tmp_path, tree)
         install_build_auto_skill(tmp_path, tree, renderer_stub=True)
 
-    warnings = dev_primitive_warnings(tmp_path, [claude, codex])
-    assert [f.check for f in warnings] == ["skills.dev-renderer-config"]
+    problems = missing_base_skills(tmp_path, [claude, codex])
+    assert [f.check for f in problems] == ["skills.dev-renderer-config"]
+
+
+def test_renderer_checks_reported_beside_a_truncated_primitive(tmp_path):
+    """The renderer probes are independent of the marker check: a stub that is BOTH
+    truncated and missing its script earns both lines. Different files, different
+    remediations (ablation: put the renderer probe in an elif)."""
+    from conftest import install_build_auto_skill
+
+    from bmad_loop.install import missing_base_skills
+
+    tree = get_profile("claude").skill_tree
+    _install_hunters(tmp_path, tree)
+    skill = install_build_auto_skill(tmp_path, tree, renderer_stub=True)
+    (skill / "step-04-review.md").unlink()
+
+    assert [f.check for f in missing_base_skills(tmp_path, [tree])] == [
+        "skills.base-incomplete",
+        "skills.dev-renderer",
+        "skills.dev-renderer-config",
+    ]
+
+
+def test_renderer_checks_are_silent_when_nothing_resolves(tmp_path):
+    """A shim whose SKILL.md is a renderer stub reports `skills.base-shim` and
+    NOTHING else: the renderer probes hang off the resolved branch, so an
+    unresolvable tree cannot pile a second remediation on top of the first
+    (ablation: hoist the stub probe above the resolution split)."""
+    from conftest import RENDERER_STUB_SKILL_MD, install_dev_shim
+
+    from bmad_loop.install import missing_base_skills
+
+    tree = get_profile("claude").skill_tree
+    _install_hunters(tmp_path, tree)
+    shim = install_dev_shim(tmp_path, tree)
+    (shim / "SKILL.md").write_text(RENDERER_STUB_SKILL_MD, encoding="utf-8")
+
+    assert [f.check for f in missing_base_skills(tmp_path, [tree])] == ["skills.base-shim"]
 
 
 def test_dev_primitive_warnings_flag_an_orphaned_legacy_customize_file(tmp_path):
@@ -959,12 +1005,14 @@ def test_dev_primitive_warnings_flag_an_orphaned_legacy_customize_file(tmp_path)
 
 
 def test_dev_primitive_warnings_are_silent_when_nothing_resolves(tmp_path):
-    """missing_base_skills owns the unresolvable story; the warnings must not pile
+    """missing_base_skills owns the unresolvable story; the warning must not pile
     advisory noise on top of a hard preflight failure.
 
-    Both warning sites are armed here — an orphaned customize file AND a shim whose
-    SKILL.md is a renderer stub — so the silence is the resolution guard's doing and
-    not merely the absence of anything to say."""
+    The customize site is armed here — an orphaned `bmad-dev-auto.toml` beside a shim
+    — so the silence is the resolution guard's doing and not merely the absence of
+    anything to say. The shim's SKILL.md is also a renderer stub, which pins that the
+    renderer probes moved out of this function entirely rather than merely going
+    quiet here (see test_renderer_checks_are_silent_when_nothing_resolves)."""
     from conftest import RENDERER_STUB_SKILL_MD, install_dev_shim
 
     from bmad_loop.install import CUSTOMIZE_DIR_REL, dev_primitive_warnings
