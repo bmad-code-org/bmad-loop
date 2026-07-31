@@ -1777,6 +1777,16 @@ class Engine:
             # would shift the rollback/squash reference onto the completed
             # session's own tree.
             task.baseline_untracked = sorted(verify.untracked_files(self.workspace.root))
+            # ...and whether the deferred-work ledger itself was on disk. Deliberately
+            # NOT a git question: the ledger is commonly gitignored, and both git-side
+            # signals above exclude ignored paths, so for exactly that layout a
+            # gitignored ledger reads as BOTH "absent at the baseline" and "not created
+            # by this attempt" — and the crash-replay revert below then leaves the dead
+            # attempt's finding behind. Widening the NOW probe alone would be worse: an
+            # ignored ledger the operator already had would classify as attempt-created
+            # and get deleted. This bit is the symmetric half, and it is captured with
+            # the other two so all three always describe the same moment.
+            task.baseline_ledger_present = self.workspace.paths.deferred_work.is_file()
         feedback: Path | None = None
         while True:
             # Pre-harvest ledger snapshot for the non-fixable-RETRY revert below,
@@ -1920,7 +1930,7 @@ class Engine:
                         # write the dead attempt's harvest back — see
                         # _drop_ledger_created_since_baseline.
                         if ledger_snapshotted:
-                            self._restore_ledger(ledger_before)
+                            self._restore_ledger(task, ledger_before)
                         elif replayed:
                             self._drop_ledger_created_since_baseline(task)
                 continue
@@ -3308,7 +3318,38 @@ class Engine:
         ledger = self.workspace.paths.deferred_work
         return ledger.read_text(encoding="utf-8") if ledger.is_file() else None
 
-    def _restore_ledger(self, snapshot: str | None) -> None:
+    def _ledger_is_gits_to_restore(self, task: StoryTask) -> bool:
+        """True when git owns the deferred-work ledger — it has an index entry, so
+        `_rollback_or_pause`'s `reset --hard` has already put it right and unlinking
+        it by hand would turn a reverted EDIT into a deleted FILE, which the next
+        attempt's `add -A` would then commit.
+
+        Asked with `verify.path_tracked` rather than `untracked_files`, because the
+        two are not complements: a GITIGNORED ledger is absent from the untracked set
+        as well, so reading "not untracked" as "tracked" silently files every ignored
+        ledger under "the reset already handled it" — and the reset never touches an
+        ignored path (#405).
+
+        Degrades to True. It runs inside a ``finally`` that is usually propagating
+        `RunPaused` out of `_pause_for_manual_recovery`, so a `GitError` raised here
+        would replace that pause with a git failure; and every caller uses the answer
+        to authorize a DELETE, so uncertainty has to mean "leave it alone"."""
+        ledger = self.workspace.paths.deferred_work
+        try:
+            rel = ledger.relative_to(self.workspace.root).as_posix()
+        except ValueError:
+            # configured outside the workspace: shared with other checkouts, and no
+            # rollback of ours is scoped to it. Not ours to delete either way.
+            return True
+        try:
+            return verify.path_tracked(self.workspace.root, rel)
+        except verify.GitError as e:
+            self.journal.append(
+                "ledger-tracked-probe-failed", story_key=task.story_key, error=str(e)
+            )
+            return True
+
+    def _restore_ledger(self, task: StoryTask, snapshot: str | None) -> None:
         """Put the deferred-work ledger back to a pre-harvest ``_ledger_text()``
         snapshot — `_defer`'s own snapshot/restore run in the opposite direction,
         and for the opposite reason.
@@ -3318,6 +3359,15 @@ class Engine:
         is both the common case and the one the reset cannot undo (untracked, and
         `keep`-shielded from `safe_rollback`'s cleanup). Skipping it would leave
         the whole point of the revert unfixed.
+
+        ...unless git owns the path. "Absent when the snapshot was taken" is a
+        CREATION for an untracked or ignored ledger, but only a modification for a
+        tracked one the operator had deleted from the worktree without committing:
+        the harvest re-creates it, the reset restores the committed bytes, and an
+        unconditional unlink here would delete a tracked file that no rollback asked
+        to lose. Under `rollback_on_failure = off` no reset runs and the harvest's
+        file simply stays until the operator's own `reset --hard`, which lands in the
+        same place — so leaving it alone converges either way.
 
         Empty parent dirs are deliberately not pruned: the artifacts dir is
         orchestrator-owned, an empty one is harmless, and removing a directory the
@@ -3330,7 +3380,8 @@ class Engine:
         if current == snapshot:
             return
         if snapshot is None:
-            ledger.unlink(missing_ok=True)
+            if not self._ledger_is_gits_to_restore(task):
+                ledger.unlink(missing_ok=True)
             return
         ledger.parent.mkdir(parents=True, exist_ok=True)
         ledger.write_text(snapshot, encoding="utf-8")
@@ -3341,22 +3392,40 @@ class Engine:
         A crash between `_harvest_spec_deferrals` and the non-fixable RETRY rollback
         leaves the attempt resumable: `_resumable_session` replays the recorded
         result and `_dev_phase` re-enters its loop from the top. The pre-harvest
-        snapshot is a plain local, so it is gone — but the attempt *baseline* is
-        persisted (`baseline_commit`, `baseline_untracked`) and is deliberately not
-        re-captured on a replay, which is enough to recover the ledger's state at the
-        start of this attempt without persisting the ledger text itself:
+        snapshot is a plain local, so it is gone — but ``baseline_ledger_present`` is
+        persisted with the rest of the attempt baseline and deliberately not
+        re-captured on a replay, so it still answers the only question that matters:
 
-        - listed in ``baseline_untracked`` — untracked and PRESENT at the baseline.
-          Its pre-harvest content is genuinely unrecoverable, so hands off rather
-          than guess; the harvest's own fingerprint dedup keeps a re-harvest quiet.
-        - untracked NOW and absent from ``baseline_untracked`` — this attempt created
+        - PRESENT at the baseline — the harvest appended to a ledger that was already
+          there. Its pre-harvest content is genuinely unrecoverable, so hands off
+          rather than guess; the harvest's own fingerprint dedup keeps a re-harvest
+          quiet. Covers a tracked, an untracked and an ignored ledger alike, which is
+          the point: only the filesystem can speak for all three.
+        - ABSENT at the baseline, and git does not own the path — this attempt created
           it (the first-ever harvest does exactly this), so unlink.
-        - neither — tracked, and `_rollback_or_pause`'s `reset --hard` has already
-          reverted the harvest edit. Touching it would put the edit BACK.
+        - ABSENT at the baseline, but TRACKED — the operator had deleted a committed
+          ledger without committing that; `_rollback_or_pause`'s `reset --hard` has
+          restored it and deleting it here would lose a file no rollback asked to lose.
+          See `_ledger_is_gits_to_restore`.
+        - ``None`` — a task persisted before the bit existed. Released 0.9.1 carried
+          the harvest with no revert at all, so doing nothing is exactly what that run
+          would have done; refusing to guess also matches `safe_rollback`, which
+          removes nothing when `baseline_untracked` is None. Journalled, not silent.
 
-        The last case is why the replayed path cannot simply reuse `_restore_ledger`
-        with a freshly-read snapshot: on a tracked ledger that would re-create the
-        very edit the reset just undid.
+        Why a persisted filesystem bit rather than git: `baseline_untracked` and
+        `verify.untracked_files` both come from `git ls-files --others
+        --exclude-standard`, so a GITIGNORED ledger is missing from both and git keeps
+        no record of an ignored file's prior existence at all. Classifying on those two
+        put every ignored ledger in the "tracked ⇒ the reset already reverted it"
+        bucket, where nothing reverts it — the reset skips ignored paths, this module
+        never runs `git clean`, and `_safe_reset`'s `keep` shields the artifacts dir
+        besides. Making only the NOW probe ignore-aware would have been worse: an
+        ignored ledger the operator already had would have classified as
+        attempt-created and been deleted.
+
+        The tracked case is also why the replayed path cannot simply reuse
+        `_restore_ledger` with a freshly-read snapshot: on a tracked ledger that would
+        re-create the very edit the reset just undid.
 
         One asymmetry, deliberate: under the default ``scm.rollback_on_failure = off``
         no reset runs at all, so a *tracked* ledger keeps its harvest edit here where
@@ -3365,27 +3434,25 @@ class Engine:
         baseline blob inside a `finally` that is already unwinding a pause is the
         worse trade.
 
-        The untracked probe is an OBSERVATION and degrades: it runs inside a
-        ``finally`` that is usually propagating `RunPaused` out of
-        `_pause_for_manual_recovery`, and a `GitError` raised here would replace that
-        pause with a git failure. The unlink itself still raises, like every other
-        ledger write."""
+        A second, inherited from keying on the attempt baseline rather than on the
+        pre-harvest moment: a ledger the dev SESSION wrote during this attempt is
+        dropped too, where the non-crash path would have kept it. That is the same
+        reference `baseline_untracked` and `baseline_commit` use, and the whole attempt
+        is being discarded — `safe_rollback` deletes every other file the session
+        created, and the ledger survives only because its folder is `keep`-shielded.
+
+        The tracked probe is an OBSERVATION and degrades toward leaving the file alone;
+        the unlink itself raises, like every other ledger write."""
+        if task.baseline_ledger_present is not False:
+            if task.baseline_ledger_present is None:
+                self.journal.append("ledger-baseline-unknown", story_key=task.story_key)
+            return
         ledger = self.workspace.paths.deferred_work
-        try:
-            rel = ledger.relative_to(self.workspace.root).as_posix()
-        except ValueError:
-            return  # ledger configured outside the workspace: not ours to reason about
-        if rel in (task.baseline_untracked or ()):
+        if not ledger.is_file():
+            return  # nothing to revert
+        if self._ledger_is_gits_to_restore(task):
             return
-        try:
-            untracked = verify.untracked_files(self.workspace.root)
-        except verify.GitError as e:
-            self.journal.append(
-                "ledger-baseline-probe-failed", story_key=task.story_key, error=str(e)
-            )
-            return
-        if rel in untracked:
-            ledger.unlink(missing_ok=True)
+        ledger.unlink(missing_ok=True)
 
     def _stash_deferred_artifacts(self, task: StoryTask) -> None:
         """Move the deferred story's spec out of the artifacts dir into the run

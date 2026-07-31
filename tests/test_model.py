@@ -160,6 +160,25 @@ def test_sentinel_kind_defaults_empty_for_legacy_state():
     assert StoryTask.from_dict(doc).sentinel_kind == ""
 
 
+def test_baseline_ledger_present_round_trips():
+    """All three states, and the False leg is not decorative: a truthiness
+    deserializer (`bool(d.get(k))`) turns a persisted `false` back into "unknown",
+    which silently disables the crash-replay revert it exists to drive."""
+    for value in (True, False, None):
+        task = StoryTask(story_key="1-1-a", epic=1, baseline_ledger_present=value)
+        assert StoryTask.from_dict(task.to_dict()).baseline_ledger_present is value
+
+
+def test_baseline_ledger_present_defaults_none_for_legacy_state():
+    """None, NOT False — the one place the neighbours' `bool(d.get(k, False))` idiom
+    is wrong. False is the only value that authorizes deleting the ledger, so a task
+    persisted before this field existed would have its ledger unlinked on the first
+    crash-replay after upgrade."""
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    del doc["baseline_ledger_present"]  # state.json from before the field existed
+    assert StoryTask.from_dict(doc).baseline_ledger_present is None
+
+
 def test_restore_patch_round_trips():
     task = StoryTask(story_key="1-1-a", epic=1, restore_patch="artifacts/attempt.patch")
     assert StoryTask.from_dict(task.to_dict()).restore_patch == "artifacts/attempt.patch"

@@ -279,6 +279,33 @@ def untracked_files(repo: Path) -> set[str]:
     return {line.strip() for line in out.splitlines() if line.strip()}
 
 
+def path_tracked(repo: Path, rel: str) -> bool:
+    """True when repo-relative posix ``rel`` has an index entry — i.e. git OWNS the
+    path, so a `reset --hard` restores it and no caller should delete it by hand.
+
+    The single-path complement of :func:`untracked_files`, and the pair is what makes
+    the third state legible: neither tracked nor in that set means IGNORED, which no
+    rollback step touches at all (`reset --hard` skips it, and this module never runs
+    `git clean`). A caller that reasons only over "tracked vs untracked" silently
+    files every ignored path under whichever branch it wrote last.
+
+    Only the output's EMPTINESS is read, never its text: `core.quotePath` mangles
+    non-ASCII names, and a tracked-but-deleted-from-the-worktree path still lists (the
+    index entry outlives the file), which is exactly the state a caller must not
+    mistake for "not git's". Not `--error-unmatch`, which reports "not tracked" and
+    "git blew up" with the same non-zero rc; not `check-ignore`, which answers whether
+    a RULE matches rather than whether git owns the path — a `git add -f`'d file under
+    an ignore rule has to read tracked here.
+
+    Raises GitError like every other probe in this module. Callers inside a rollback
+    `finally` catch it and degrade toward leaving the file alone: uncertainty must
+    never authorize a delete."""
+    rc, out = _git(repo, "ls-files", "--", rel)
+    if rc != 0:
+        raise GitError(f"git ls-files -- {rel} failed in {repo}: {out}")
+    return bool(out)
+
+
 def commits_above(repo: Path, baseline: str) -> list[str]:
     """Commit shas reachable from HEAD but not from ``baseline`` — the commits an
     attempt added on top of its pre-attempt baseline, in ``git rev-list`` order (do

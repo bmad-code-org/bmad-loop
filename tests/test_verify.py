@@ -913,6 +913,37 @@ def test_verify_review_bundle_ledger_oserror_degrades_to_retry(project, monkeypa
     assert "DW-1" not in out.reason  # not the "entries not marked done" verdict
 
 
+def test_path_tracked_separates_tracked_untracked_and_ignored(project):
+    """The three states a rollback has to tell apart, plus the one that reads wrong
+    if you probe the filesystem instead of the index.
+
+    `untracked_files` alone cannot do this: it answers False for an ignored path AND
+    for a tracked one, so a caller reasoning over it in isolation files every ignored
+    path under whichever branch it wrote last — which is exactly how a gitignored
+    deferred-work ledger came to be treated as "already reverted by the reset" (#405).
+    """
+    repo = project.project
+    (repo / ".gitignore").write_text(".bmad-loop/runs/\nblind/\n", encoding="utf-8")
+    (repo / "blind").mkdir()
+    (repo / "blind" / "note.md").write_text("ignored\n", encoding="utf-8")
+    (repo / "loose.txt").write_text("untracked\n", encoding="utf-8")
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-q", "-m", "ignore rules")
+
+    assert verify.path_tracked(repo, "src.txt")  # committed by the fixture
+    assert not verify.path_tracked(repo, "loose.txt")
+    assert not verify.path_tracked(repo, "blind/note.md")
+    assert not verify.path_tracked(repo, "never/existed.md")
+    # ignored is invisible to the untracked probe too — neither signal alone is enough
+    assert "blind/note.md" not in verify.untracked_files(repo)
+    assert "loose.txt" in verify.untracked_files(repo)
+
+    # the state a plain `Path.exists()` gets backwards: the index entry outlives the
+    # file, and `reset --hard` is what puts it back — so it is still git's to restore.
+    (repo / "src.txt").unlink()
+    assert verify.path_tracked(repo, "src.txt")
+
+
 def test_safe_rollback_reverts_tracked_and_removes_run_created(project):
     repo = project.project
     baseline = verify.rev_parse_head(repo)

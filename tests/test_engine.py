@@ -5842,6 +5842,30 @@ def test_harvest_tracked_ledger_still_reverted_on_retry(project):
     assert _ledger_entries(project) == []
 
 
+def _gitignore_the_ledger(project) -> str:
+    """Make the deferred-work ledger IGNORED, commit the rule, and prove it took.
+
+    Committed on purpose: an uncommitted `.gitignore` edit is a tracked
+    modification, so the rollback's own `reset --hard baseline` reverts it — and by
+    the time the classifier runs, the ledger is plain-untracked again. The test would
+    then pass on the BUGGY build for entirely the wrong reason.
+
+    Ignoring the one file rather than the whole output folder keeps the spec and the
+    sprint board out of the rule; the code under test only ever asks about this one
+    path, so the two are equivalent here and the narrow rule has no collateral.
+
+    Returns the ledger's repo-relative POSIX rel — never `str()`: git speaks posix
+    rels, and a native-separator spelling silently misses every set membership on
+    Windows (see the sibling precondition below)."""
+    rel = project.deferred_work.relative_to(project.project).as_posix()
+    gitignore = project.project / ".gitignore"
+    gitignore.write_text(gitignore.read_text(encoding="utf-8") + rel + "\n", encoding="utf-8")
+    git(project.project, "add", ".gitignore")
+    git(project.project, "commit", "-q", "-m", "gitignore the deferred-work ledger")
+    assert git(project.project, "check-ignore", rel).strip() == rel
+    return rel
+
+
 def _crash_at_post_dev_verify(engine):
     """Kill the host in the window Codex's crash-replay finding names: AFTER
     `_harvest_spec_deferrals` has written the ledger and BEFORE `decide_dev` /
@@ -5980,6 +6004,213 @@ def test_crash_replay_never_unlinks_a_ledger_untracked_at_the_baseline(project):
     titles = [e.title for e in _ledger_entries(project)]
     assert "Operator's own note" in titles  # the whole point
     assert HARVEST_A["summary"] in titles  # documented, not accidental
+
+
+def test_crash_replay_drops_a_gitignored_ledger_the_harvest_created(project):
+    """The fourth state, and the one git cannot describe: a GITIGNORED ledger.
+
+    `baseline_untracked` and `verify.untracked_files` both come from
+    `git ls-files --others --exclude-standard`, so an ignored ledger is missing from
+    BOTH. Classifying on those two alone drops it into the "neither ⇒ tracked ⇒ the
+    reset already reverted it" bucket — and that premise is false: `reset --hard`
+    does not touch ignored files, `safe_rollback` runs no `git clean`, and the
+    artifacts dir is `keep`-shielded besides. Nothing reverts the harvest and the
+    dead attempt's finding outlives the code it describes.
+
+    Not a hypothetical layout: the ledger lives under `output_folder`, and
+    gitignoring that folder is common (this repo does it) — `init` simply never
+    writes the rule itself, which is why the plain-untracked variant above was the
+    only one anyone modelled."""
+    ledger_rel = _gitignore_the_ledger(project)
+    assert not project.deferred_work.exists()  # so the harvest CREATES it
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    pol = dataclasses.replace(_harvest_policy(), limits=LimitsPolicy(max_dev_attempts=2))
+    engine, _ = make_engine(
+        project, [_baseline_liar_effect(project, deferred=[HARVEST_A])], policy=pol
+    )
+    _crash_at_post_dev_verify(engine)
+    assert engine.run().crashed
+
+    # Three preconditions, all load-bearing, all asserted only once the file exists.
+    # Without the last two a silently-failed ignore rule leaves the ledger
+    # plain-untracked, the untracked branch unlinks it, and this test goes green on
+    # the buggy build having proved nothing at all.
+    assert _ledger_entries(project), "the dead attempt really did harvest"
+    assert ledger_rel not in verify.untracked_files(project.project)
+    assert not verify.path_tracked(project.project, ledger_rel)
+
+    resumed, _ = resume_engine(
+        project, engine, [dev_effect(project, "1-1-a", followup_review=False)], policy=pol
+    )
+    summary = resumed.run()
+
+    assert summary.done == 1
+    assert "resume-verify" in [e["kind"] for e in resumed.journal.entries()]
+    assert _ledger_entries(project) == []
+    assert not project.deferred_work.exists()
+
+
+def test_crash_replay_never_unlinks_a_gitignored_ledger_present_at_the_baseline(project):
+    """Regression guard, not a bug repro — it passes on the unfixed build, and it is
+    here to fail against the WRONG fix.
+
+    Teaching the classifier to see ignored files without also fixing the baseline
+    record would delete this ledger: an ignored ledger the operator already had is
+    absent from `baseline_untracked` exactly like a harvest-created one, so the two
+    are indistinguishable from git alone. That is why the baseline record is a plain
+    `Path.is_file()` and not a widened git probe. Do not delete this as redundant with
+    the untracked-at-the-baseline sibling: that one is shielded by
+    `baseline_untracked`, and this one is invisible to it."""
+    from bmad_loop import deferredwork
+
+    ledger_rel = _gitignore_the_ledger(project)
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    deferredwork.append_entry(
+        project.deferred_work,
+        title="Operator's own note",
+        origin="a human",
+        source_spec="specs/older.md",
+        reason="never committed, never swept — and gitignored besides",
+    )
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    # ...and it really is invisible to git, not merely uncommitted: without this the
+    # test would "pass" through the plain-untracked shield and prove nothing new.
+    assert ledger_rel not in verify.untracked_files(project.project)
+    assert not verify.path_tracked(project.project, ledger_rel)
+
+    pol = dataclasses.replace(_harvest_policy(), limits=LimitsPolicy(max_dev_attempts=2))
+    engine, _ = make_engine(
+        project, [_baseline_liar_effect(project, deferred=[HARVEST_A])], policy=pol
+    )
+    _crash_at_post_dev_verify(engine)
+    assert engine.run().crashed
+
+    resumed, _ = resume_engine(
+        project, engine, [dev_effect(project, "1-1-a", followup_review=False)], policy=pol
+    )
+    assert resumed.run().done == 1
+
+    titles = [e.title for e in _ledger_entries(project)]
+    assert "Operator's own note" in titles  # the whole point
+    assert HARVEST_A["summary"] in titles  # documented cost, not an accident
+
+
+def test_crash_replay_keeps_a_tracked_ledger_the_reset_restored(project):
+    """The tracked guard's only ablation: a COMMITTED ledger the operator deleted
+    from the worktree without committing the deletion.
+
+    "Absent at the baseline" is a creation for an untracked or ignored ledger, but
+    only a modification for this one — the harvest re-creates it, `reset --hard`
+    restores the committed bytes, and unlinking it here would turn a reverted edit
+    into a deleted file that the next attempt's `add -A` commits. Without the guard
+    the fix for the gitignored case would trade a stale entry for lost content."""
+    from bmad_loop import deferredwork
+
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    deferredwork.append_entry(
+        project.deferred_work,
+        title="Committed note",
+        origin="an earlier sweep",
+        source_spec="specs/older.md",
+        reason="tracked, then deleted from the worktree",
+    )
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "seed deferred-work")
+    before = project.deferred_work.read_text(encoding="utf-8")
+    ledger_rel = project.deferred_work.relative_to(project.project).as_posix()
+    project.deferred_work.unlink()  # the uncommitted deletion
+    assert verify.path_tracked(project.project, ledger_rel)  # git still owns it
+
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    pol = dataclasses.replace(_harvest_policy(), limits=LimitsPolicy(max_dev_attempts=2))
+    engine, _ = make_engine(
+        project, [_baseline_liar_effect(project, deferred=[HARVEST_A])], policy=pol
+    )
+    _crash_at_post_dev_verify(engine)
+    assert engine.run().crashed
+    assert HARVEST_A["summary"] in project.deferred_work.read_text(encoding="utf-8")
+
+    resumed, _ = resume_engine(
+        project, engine, [dev_effect(project, "1-1-a", followup_review=False)], policy=pol
+    )
+    assert resumed.run().done == 1
+    assert project.deferred_work.read_text(encoding="utf-8") == before
+
+
+def test_restore_ledger_keeps_a_tracked_ledger_the_reset_restored(project):
+    """The same trap on the LIVE path, which needs no crash and so is the more
+    reachable of the two: the pre-harvest snapshot is `None` because the tracked
+    ledger was deleted from the worktree, and an unconditional "None means unlink"
+    deletes the file `reset --hard` just restored."""
+    from bmad_loop import deferredwork
+
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    deferredwork.append_entry(
+        project.deferred_work,
+        title="Committed note",
+        origin="an earlier sweep",
+        source_spec="specs/older.md",
+        reason="tracked, then deleted from the worktree",
+    )
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "seed deferred-work")
+    before = project.deferred_work.read_text(encoding="utf-8")
+    project.deferred_work.unlink()
+
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    pol = dataclasses.replace(_harvest_policy(), limits=LimitsPolicy(max_dev_attempts=2))
+    engine, _ = make_engine(
+        project,
+        [
+            _baseline_liar_effect(project, deferred=[HARVEST_A]),
+            dev_effect(project, "1-1-a", followup_review=False),
+        ],
+        policy=pol,
+    )
+    summary = engine.run()
+
+    assert summary.done == 1
+    assert [e["action"] for e in engine.journal.entries() if e["kind"] == "dev-decision"][0] == (
+        "retry"
+    )
+    assert project.deferred_work.read_text(encoding="utf-8") == before
+
+
+def test_crash_replay_leaves_the_ledger_alone_on_a_pre_upgrade_task(project):
+    """A task persisted before `baseline_ledger_present` existed rehydrates to None,
+    and None must not be read as "absent at the baseline".
+
+    Released 0.9.1 shipped the harvest with no revert at all, so hands-off is exactly
+    what that run would have done — where guessing False would delete an operator's
+    ledger on the first crash-replay after upgrade. Deliberately the plain-untracked
+    layout, so the None path is isolated from the ignore path. The state doc is
+    round-tripped through `to_dict`/`from_dict` rather than poked on the instance:
+    the deserializer is where the one-token mistake lives."""
+    from bmad_loop import deferredwork
+    from bmad_loop.model import StoryTask
+
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    pol = dataclasses.replace(_harvest_policy(), limits=LimitsPolicy(max_dev_attempts=2))
+    engine, _ = make_engine(
+        project, [_baseline_liar_effect(project, deferred=[HARVEST_A])], policy=pol
+    )
+    _crash_at_post_dev_verify(engine)
+    assert engine.run().crashed
+    assert _ledger_entries(project), "the dead attempt really did harvest"
+
+    resumed, _ = resume_engine(
+        project, engine, [dev_effect(project, "1-1-a", followup_review=False)], policy=pol
+    )
+    doc = resumed.state.tasks["1-1-a"].to_dict()
+    del doc["baseline_ledger_present"]  # state.json as released 0.9.1 wrote it
+    resumed.state.tasks["1-1-a"] = StoryTask.from_dict(doc)
+    assert resumed.run().done == 1
+
+    # the harvest survives — the acknowledged cost of refusing to guess — and the
+    # skip is journalled rather than silent, so it is not mistaken for a no-op
+    assert [e.title for e in _ledger_entries(project)] == [HARVEST_A["summary"]]
+    assert "ledger-baseline-unknown" in [e["kind"] for e in resumed.journal.entries()]
+    assert isinstance(deferredwork.parse_ledger(""), list)  # ledger stayed parseable
 
 
 def test_harvest_retry_reharvests_after_the_rollback(project):

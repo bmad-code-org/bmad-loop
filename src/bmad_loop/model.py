@@ -160,6 +160,20 @@ class StoryTask:
     # user already had on disk are never deleted. None = pre-upgrade run (no
     # snapshot); rollback then removes no untracked files at all.
     baseline_untracked: list[str] | None = None
+    # was the deferred-work ledger on disk when this attempt's baseline was captured?
+    # A plain `Path.is_file()`, never a git query — and that is the whole point. The
+    # ledger is commonly GITIGNORED (it lives under `output_folder`, which many
+    # projects ignore; `init` does not add that line but plenty of repos do, this one
+    # included), and every git-side signal here is ignore-blind: `baseline_untracked`
+    # and `verify.untracked_files` both come from `git ls-files --others
+    # --exclude-standard`. So in exactly the configuration where the question matters,
+    # git cannot answer it — an ignored ledger reads as BOTH "absent at the baseline"
+    # and "not created by this attempt". Read only by the crash-replay revert
+    # (`_drop_ledger_created_since_baseline`), where False is the ONLY value that
+    # authorizes deleting the ledger — so a task persisted before this field existed
+    # must rehydrate to None, never False (see from_dict). Scoped to the `_dev_phase`
+    # ENTRY, so attempts 2..N share it, exactly like baseline_commit.
+    baseline_ledger_present: bool | None = None
     spec_file: str | None = None
     commit_sha: str | None = None
     defer_reason: str | None = None
@@ -252,6 +266,7 @@ class StoryTask:
             "followup_review_recommended": self.followup_review_recommended,
             "baseline_commit": self.baseline_commit,
             "baseline_untracked": self.baseline_untracked,
+            "baseline_ledger_present": self.baseline_ledger_present,
             "spec_file": self._serialized_spec_file(),
             "commit_sha": self.commit_sha,
             "defer_reason": self.defer_reason,
@@ -297,6 +312,18 @@ class StoryTask:
             baseline_untracked=(
                 [str(p) for p in d["baseline_untracked"]]
                 if d.get("baseline_untracked") is not None
+                else None
+            ),
+            # `is not None`, NOT the `bool(d.get(k, False))` idiom the neighbours use:
+            # a missing key has to stay None. Collapsing it to False would tell the
+            # crash-replay revert "this attempt created the ledger" for every task
+            # persisted before the field existed, and it would delete an operator's
+            # ledger on the first replay after upgrade. The explicit None test also
+            # keeps a persisted literal `false` as False, where a truthiness test
+            # would silently promote it back to "unknown".
+            baseline_ledger_present=(
+                bool(d["baseline_ledger_present"])
+                if d.get("baseline_ledger_present") is not None
                 else None
             ),
             spec_file=d.get("spec_file"),
