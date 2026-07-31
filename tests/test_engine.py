@@ -5959,7 +5959,10 @@ def test_crash_replay_never_unlinks_a_ledger_untracked_at_the_baseline(project):
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     git(project.project, "add", str(project.sprint_status.relative_to(project.project)))
     git(project.project, "commit", "-q", "-m", "board only — the ledger stays untracked")
-    ledger_rel = str(project.deferred_work.relative_to(project.project))
+    # as_posix, not str: `untracked_files` returns git's posix rels, so on Windows a
+    # native-separator rel is never in that set and the precondition self-fails —
+    # exactly what `_drop_ledger_created_since_baseline` uses `.as_posix()` for.
+    ledger_rel = project.deferred_work.relative_to(project.project).as_posix()
     assert ledger_rel in verify.untracked_files(project.project)
 
     pol = dataclasses.replace(_harvest_policy(), limits=LimitsPolicy(max_dev_attempts=2))
