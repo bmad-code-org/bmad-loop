@@ -549,7 +549,12 @@ class Engine:
     def _worktree_profiles(self):
         """The distinct CLI profiles of the dev + review adapters, for provisioning
         their skills/hooks into a worktree. Adapters without a `profile` (e.g. test
-        fakes) contribute nothing, so provisioning is a no-op for them."""
+        fakes) contribute nothing, so provisioning is a no-op for them.
+
+        Deliberately the same roles as :data:`install.DEV_PRIMITIVE_ROLES`, which is
+        what the skills preflight gates — one decision read from opposite ends. This
+        side stays keyed on the adapters actually constructed rather than on role
+        names, since a test fake has no profile to provision either way."""
         seen: dict[str, object] = {}
         for adapter in (self.adapters["dev"], self.adapters["review"]):
             profile = getattr(adapter, "profile", None)

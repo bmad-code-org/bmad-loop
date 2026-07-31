@@ -90,6 +90,22 @@ DEV_PRIMITIVE_NEW = "bmad-build-auto"
 DEV_PRIMITIVE_LEGACY = "bmad-dev-auto"
 DEV_PRIMITIVE_MARKERS = ("step-04-review.md", "customize.toml")
 
+# The adapter roles whose skill tree is asked for the dev primitive, the review
+# hunters that primitive invokes inline, and the renderer unit behind a stub SKILL.md
+# — i.e. every question this module's skill checks ask. Triage is deliberately absent:
+# its only prompt is `/bmad-loop-sweep`, which is in MODULE_SKILLS and is laid into
+# that tree by `bmad-loop init`, so a triage-only CLI never needs one byte of the bmm
+# module. Gating it anyway made `[adapter.triage] name = "gemini"` under a claude
+# dev/review pair demand the whole module in `.agents/skills` — a hard preflight FAIL
+# since the renderer checks became problems rather than warnings.
+#
+# This must stay the same set `Engine._worktree_profiles` provisions. A tree gated here
+# that no worktree carries refuses runs over a skill no session will ever read; a tree
+# provisioned but not gated ships a session into the `Unknown command` stall the
+# preflight exists to catch. Neither has a defensible reading, so the two move together
+# or not at all.
+DEV_PRIMITIVE_ROLES: tuple[str, ...] = ("dev", "review")
+
 # BMAD's config/tool dir at the project root. Everything the renderer reads hangs
 # off it, and the renderer takes the project root as an argument and hard-fails when
 # `<project-root>/_bmad` is absent — there is no walk-up — so an isolated worktree
@@ -176,9 +192,12 @@ REVIEW_HUNTER_SKILLS: dict[str, tuple[str, ...]] = {
 }
 
 # Upstream skills the orchestrator invokes but does NOT bundle in the wheel — the
-# BMad Method (bmm) module installs them. Each must exist in every active CLI skill
-# tree and carry its marker files (a half-installed or pre-automation skill is
-# caught by the `bmad-loop validate` preflight). `{skill: (marker-rel-path, ...)}`.
+# BMad Method (bmm) module installs them. Each must exist in every `trees` entry —
+# callers pass the DEV_PRIMITIVE_ROLES trees, since only a dev or review session ever
+# dispatches one of these — and carry its marker files (a half-installed or
+# pre-automation skill is caught by the `bmad-loop validate` preflight). A tree only a
+# triage adapter reads is never asked: nothing here is in its dispatch path.
+# `{skill: (marker-rel-path, ...)}`.
 # The dev-primitive entry is keyed on the LEGACY name because this map is also the
 # "lay down a pre-rename install" catalog; missing_base_skills does not walk it for
 # the primitive — it resolves the installed name per tree first.
@@ -330,11 +349,13 @@ def missing_stories_support(project: Path, trees: Sequence[str]) -> list[Finding
     """Problems for stories mode's stricter dev-primitive requirement.
 
     Sprint mode drives any dev primitive; stories mode needs the folder+id
-    dispatch flow, which older skill versions lack. For each active CLI skill
-    tree, confirm ``<resolved-primitive>/step-01-clarify-and-route.md`` exists and
-    carries the dispatch-protocol marker. Returns one problem :class:`Finding`
-    per tree lacking it (empty = OK). Callers gate this on stories mode only —
-    sprint-mode runs must not require the newer skill.
+    dispatch flow, which older skill versions lack. For every ``trees`` entry —
+    callers pass the :data:`DEV_PRIMITIVE_ROLES` trees, since only a dev or review
+    session ever dispatches one of these — confirm
+    ``<resolved-primitive>/step-01-clarify-and-route.md`` exists and carries the
+    dispatch-protocol marker. Returns one problem :class:`Finding` per tree lacking
+    it (empty = OK). Callers gate this on stories mode only — sprint-mode runs must
+    not require the newer skill.
 
     The two failures are separate check ids because they are separate conditions
     with separate remediations: ``-missing`` is a half install (reinstall the
@@ -381,11 +402,12 @@ def missing_base_skills(project: Path, trees: Sequence[str]) -> list[Finding]:
     The dev primitive (bmad-build-auto, or a complete pre-rename bmad-dev-auto) and
     the three review hunters it invokes inline — adversarial-general,
     edge-case-hunter, and verification-gap — are installed by the BMad Method
-    module, not by `bmad-loop init`. Each must exist in every active CLI skill tree
-    and carry its marker files. Returns one problem :class:`Finding` per
-    missing/incomplete skill; empty list means OK. Run as a preflight so a missing
-    skill fails loudly with remediation instead of stalling as an `Unknown command`
-    until the run times out.
+    module, not by `bmad-loop init`. Each must exist in every ``trees`` entry —
+    callers pass the :data:`DEV_PRIMITIVE_ROLES` trees, since only a dev or review
+    session ever dispatches one of these — and carry its marker files. Returns one
+    problem :class:`Finding` per missing/incomplete skill; empty list means OK. Run
+    as a preflight so a missing skill fails loudly with remediation instead of
+    stalling as an `Unknown command` until the run times out.
 
     The primitive is resolved per tree (:func:`resolve_dev_primitive`) before any
     marker check, so the markers are asserted against the skill this run would

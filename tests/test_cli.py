@@ -48,6 +48,18 @@ name = "codex"
 model = "gpt-5-codex"
 """
 
+# A third CLI for triage only, with dev+review sharing the default. The triage adapter
+# must differ by *name* rather than by model: `skill_tree` is a property of the profile,
+# and only two distinct values ship (claude/opencode-http -> `.claude/skills`;
+# codex/gemini/copilot/antigravity -> `.agents/skills`), so a same-name triage adapter
+# would read the very tree dev already reads and could not tell the two apart.
+TRIAGE_SPLIT_POLICY = """\
+[adapter]
+name = "claude"
+[adapter.triage]
+name = "gemini"
+"""
+
 
 def _write_policy(project, text=DUAL_CLIENT_POLICY) -> None:
     bmad_loop_dir = project / ".bmad-loop"
@@ -3491,14 +3503,18 @@ def test_validate_stories_folder_known_selector_ok(project):
 CLAUDE_ONLY_POLICY = '[adapter]\nname = "claude"\nmodel = "opus"\n'
 
 
-def _make_validate_pass(project, monkeypatch, capsys):
+def _make_validate_pass(project, monkeypatch, capsys, *, policy_text=CLAUDE_ONLY_POLICY):
     """Set a project up so every validate gate passes, and pin the two gates whose
     outcome is a property of the *host* rather than of the project: whether the CLI
     binary is on PATH and whether a multiplexer is installed. Without those pins the
     rc-0 leg would pass or fail by machine, which is exactly the kind of green that
-    means nothing."""
+    means nothing.
+
+    ``policy_text`` is keyword-only with the single-CLI default, so every existing
+    caller is unchanged. It is written *before* the `init` below, because `cmd_init`
+    derives the CLI list it installs skills and hooks into from the policy."""
     install_bmad_config(project)
-    _write_policy(project.project, CLAUDE_ONLY_POLICY)
+    _write_policy(project.project, policy_text)
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     install_dev_base_skills(project.project, folder_id=True)
     assert cli.main(["init", "--project", str(project.project)]) == 0  # registers the hooks
@@ -3553,6 +3569,92 @@ def test_validate_names_the_resolved_dev_primitive(project, capsys, monkeypatch)
     assert base["severity"] == "ok"
     assert "bmad-build-auto" in base["message"] and "bmad-dev-auto" not in base["message"]
     assert base["detail"]["dev_primitive"] == ["bmad-build-auto"]
+
+
+def test_validate_skills_gates_ignore_a_triage_only_tree(project, capsys, monkeypatch):
+    """#405: every `skills.*` check asks a dev-primitive question — which primitive
+    resolves, whether the review hunters it invokes inline are there, whether a
+    renderer stub's script unit is whole. `cmd_validate` built its tree list from all
+    three adapter roles, so a third CLI used only for triage had the whole bmm module
+    demanded of a tree whose only prompt (`/bmad-loop-sweep`) ships in this wheel.
+
+    The triage tree here carries exactly what the un-narrowed gate choked on: a
+    RESOLVED renderer stub — resolution is what arms the renderer checks, so a merely
+    absent tree could not reproduce this — with no `_bmad/scripts/` and no
+    `_bmad/config.toml`, plus a legacy customization override the rename orphaned."""
+    from conftest import install_build_auto_skill
+
+    _make_validate_pass(project, monkeypatch, capsys, policy_text=TRIAGE_SPLIT_POLICY)
+    install_build_auto_skill(project.project, ".agents/skills", renderer_stub=True)
+    custom = project.project / "_bmad" / "custom"
+    custom.mkdir(parents=True, exist_ok=True)
+    (custom / "bmad-dev-auto.toml").write_text('[core]\nx = "y"\n', encoding="utf-8")
+    # `_make_validate_pass` commits internally, and validate gates on a clean worktree.
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "triage-only tree")
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+    assert doc["ok"] is True
+    checks = _findings_by_check(doc)
+    for absent in (
+        "skills.dev-renderer",
+        "skills.dev-renderer-config",
+        "skills.base-missing",
+        "skills.customize-legacy",
+    ):
+        assert absent not in checks, f"{absent} fired on a tree no dev session reads"
+    assert checks["skills.base"]["detail"]["trees"] == [".claude/skills"]
+    assert checks["skills.base"]["detail"]["dev_primitive"] == ["bmad-dev-auto"]
+    # The triage tree is live, not absent: `init` laid this wheel's own sweep skill
+    # into it, which is precisely why it needs nothing from the bmm module.
+    assert (project.project / ".agents/skills/bmad-loop-sweep/SKILL.md").is_file()
+
+
+def test_validate_stories_dispatch_ignores_a_triage_only_tree(project, capsys):
+    """The same narrowing on the stories-mode leg, which `cmd_validate` fed from its
+    own all-role list. The triage tree's primitive has step-01 present but without the
+    dispatch marker, so an un-narrowed probe reports `-stale` — a finding only a tree
+    that actually resolved can produce."""
+    from conftest import install_build_auto_skill
+
+    install_bmad_config(project)
+    _setup_stories_fixture(project, [_stories_entry("1")])
+    _write_policy(project.project, TRIAGE_SPLIT_POLICY + STORIES_POLICY)
+    install_dev_base_skills(project.project, ".claude/skills", folder_id=True)
+    install_build_auto_skill(project.project, ".agents/skills", folder_id=False)
+
+    # rc 1 (the fixture leaves the worktree dirty); `--json` never calls report.render,
+    # so stderr stays empty and the document is still owed in full.
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    checks = _findings_by_check(doc)
+    assert "skills.stories-dispatch-stale" not in checks
+    assert checks["skills.stories-dispatch"]["detail"]["trees"] == [".claude/skills"]
+
+
+def test_validate_skills_ok_line_needs_a_dev_tree_not_just_a_profile(project, capsys):
+    """The `skills.base` ok line gates on the dev+review trees, not on `profiles`.
+    Policy never validates an adapter *name* — the first test is `get_profile` — so an
+    unknown dev CLI beside a loadable triage one leaves `profiles` non-empty while
+    nothing dev-side resolved. Gating on `profiles` there printed "upstream skills
+    present ( + review hunters)": a green sentence assembled from an empty probe.
+
+    The triage tree is deliberately given a COMPLETE base install. Leave it empty and
+    the ok line is suppressed by `base_problems` instead — the gate is never reached,
+    and the test passes with the gate reverted."""
+    install_bmad_config(project)
+    install_dev_base_skills(project.project, ".agents/skills", folder_id=False)
+    _write_policy(
+        project.project, '[adapter]\nname = "nosuchcli"\n[adapter.triage]\nname = "gemini"\n'
+    )
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    checks = _findings_by_check(doc)
+    assert checks["adapter.profile"]["severity"] == "problem"
+    assert "nosuchcli" in checks["adapter.profile"]["message"]
+    # Triage's profile DID load, so `profiles` is non-empty — the old gate's input.
+    assert checks["adapter.binary"]["detail"]["binary"] == "gemini"
+    # ...yet nothing resolved to probe, so the line must not be emitted at all.
+    assert "skills.base" not in checks
 
 
 def test_validate_reports_the_shim_as_a_problem(project, capsys, monkeypatch):
@@ -4109,6 +4211,67 @@ def test_dry_run_stories_previews_the_resolved_primitive(project, capsys):
     out = capsys.readouterr().out
     assert "/bmad-build-auto Spec folder: _bmad-output/epic-1. Story id: 1." in out
     assert "/bmad-dev-auto Spec folder:" not in out
+
+
+def test_skill_trees_skips_the_triage_only_tree(project):
+    """#405: the trees the skills preflight probes are the dev+review ones. Triage's
+    entire prompt surface is `/bmad-loop-sweep`, which this wheel bundles and
+    `bmad-loop init` lays into that tree, so a triage-only CLI never needs one byte of
+    the bmm module — and the set gated here has to stay the set
+    `Engine._worktree_profiles` provisions."""
+    _write_policy(project.project, TRIAGE_SPLIT_POLICY)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+
+    assert cli._skill_trees(project.project, pol) == [".claude/skills"]
+
+
+def test_skill_trees_still_covers_a_split_dev_review_pair(project):
+    """Control for the narrowing: a dev/review split across two CLIs still yields
+    BOTH trees. Kills any "fix" that collapses to the dev adapter's tree alone —
+    the review session dispatches the very same primitive."""
+    _write_policy(project.project, DUAL_CLIENT_POLICY)  # dev=claude, review=codex
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+
+    assert cli._skill_trees(project.project, pol) == [".claude/skills", ".agents/skills"]
+
+
+def _triage_tree_renderer_stub(paths, stub_tree: str) -> None:
+    """A healthy INLINE dev primitive plus its review hunters in `.claude/skills`
+    (what dev+review actually dispatch), and a resolved #2601 renderer stub in
+    ``stub_tree`` with no `_bmad/` beside it to satisfy it.
+
+    `stub_tree` is the whole experiment: `.agents/skills` puts the broken stub where
+    only the triage adapter of TRIAGE_SPLIT_POLICY reads, `.claude/skills` puts the
+    identical bytes in the dev tree."""
+    from conftest import install_build_auto_skill
+
+    install_dev_base_skills(paths.project, ".claude/skills", folder_id=False)
+    install_build_auto_skill(paths.project, stub_tree, renderer_stub=True)
+
+
+def test_require_base_skills_ignores_a_broken_triage_only_tree(project, capsys):
+    """A renderer stub in a tree only triage reads must not abort run/sweep/resume.
+    Before this, `[adapter.triage] name = "gemini"` under a claude dev/review pair was
+    a hard preflight FAIL — the renderer checks are problems, not warnings, so a
+    config 0.9.0 merely nagged about became unrunnable on 0.9.1."""
+    _triage_tree_renderer_stub(project, ".agents/skills")
+    _write_policy(project.project, TRIAGE_SPLIT_POLICY)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+
+    assert cli._require_base_skills(project.project, pol) is True
+    assert capsys.readouterr().err == ""  # a passing gate is silent
+
+
+def test_require_base_skills_still_fails_on_a_dev_tree_renderer_stub(project, capsys):
+    """Control: the identical stub in the DEV tree still refuses the run. Without it,
+    deleting the renderer checks outright would pass the test above."""
+    _triage_tree_renderer_stub(project, ".claude/skills")
+    _write_policy(project.project, TRIAGE_SPLIT_POLICY)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+
+    assert cli._require_base_skills(project.project, pol) is False
+    err = capsys.readouterr().err
+    assert "_bmad/scripts/render_skill.py" in err and "_bmad/config.toml" in err
 
 
 def _shim_only(paths) -> None:

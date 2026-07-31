@@ -36,6 +36,20 @@ editing.
   runnable as-is" banner. Exit code stays 0 and stdout is untouched: a dry run is a diagnostic,
   and rc 0 has always meant "the preview rendered", not "the project is ready".
 
+- **The skills preflight no longer gates a triage-only CLI's skill tree (#405).** Every
+  `skills.*` check asks a dev-primitive question — which primitive resolves, whether the three
+  review hunters it invokes inline are installed, whether a renderer stub's script unit is
+  whole — yet the tree list was built from all three adapter roles. So a `[adapter.triage]` of
+  `gemini` beside a claude dev/review pair demanded the whole BMad Method module in
+  `.agents/skills`, a tree whose only prompt (`/bmad-loop-sweep`) ships in this wheel and is
+  laid down by `bmad-loop init`. The over-breadth is pre-existing, but the renderer checks
+  above are problems rather than warnings, so a config 0.9.0 merely nagged about became a hard
+  block on 0.9.1. The probe — and `validate`'s own copy of it, which had the same defect twice
+  — is now scoped to the dev and review roles, the same set `Engine._worktree_profiles`
+  provisions into a worktree, and the `skills.base` and `skills.stories-dispatch` ok lines
+  report that narrower `trees` list. Single-CLI projects and dev/review splits across two CLIs
+  are unaffected.
+
 - **A renderer stub that cannot compose a prompt fails the preflight (#405).** Two new checks
   block `validate`/`run`/`sweep`/`resume`: `skills.dev-renderer`, when the resolved `SKILL.md`
   is the new renderer stub (BMAD-METHOD#2601) but its script unit is not whole —

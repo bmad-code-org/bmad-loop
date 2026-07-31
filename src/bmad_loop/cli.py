@@ -119,6 +119,10 @@ def _reconcile_stale(project: Path, paths: bmadconfig.ProjectPaths, pol) -> None
         print(f"reclaimed {len(freed)} stale worktree(s) from prior runs")
 
 
+# Every adapter role the orchestrator constructs. NOT the set the skills preflight
+# gates — that is install.DEV_PRIMITIVE_ROLES (dev+review), because triage's only
+# prompt ships in this wheel. Widening a skill probe back to ROLES re-breaks a
+# triage-only third CLI; see _skill_trees.
 ROLES = ("dev", "review", "triage")
 
 
@@ -384,12 +388,18 @@ def cmd_validate(args: argparse.Namespace) -> int:
     except policy_mod.PolicyError as e:
         report.fail("policy", str(e))
 
+    # Built exactly the way run/sweep's real preflight builds it, so validate's verdict
+    # and their abort cannot disagree. Deliberately NOT `[p.skill_tree for p in
+    # profiles]`: that carries triage's tree, and every skills check below asks a
+    # dev-primitive question. The `pol is not None` guard is load-bearing — `resolved`
+    # never raises, so the except above fires only on a policy that failed to load, and
+    # an unguarded call would crash validate instead of reporting the parse failure.
+    dev_trees = _skill_trees(project, pol) if pol is not None else []
+
     stories_on, spec_folder = _stories_mode(args, pol)
     if paths:
         if stories_on:
-            _validate_stories_queue(
-                project, paths, spec_folder, [p.skill_tree for p in profiles], report
-            )
+            _validate_stories_queue(project, paths, spec_folder, dev_trees, report)
         else:
             try:
                 ss = sprintstatus.load(paths.sprint_status)
@@ -492,16 +502,20 @@ def cmd_validate(args: argparse.Namespace) -> int:
                     {"role": role, "model": cfg.model, "profile": prof.name},
                 )
 
-    base_trees = [p.skill_tree for p in profiles]
-    base_problems = install.missing_base_skills(project, base_trees)
-    if profiles and not base_problems:
+    base_problems = install.missing_base_skills(project, dev_trees)
+    # Gate on `dev_trees`, not `profiles`: policy never validates an adapter name (the
+    # first test is `get_profile`), so `[adapter] name = "nosuchcli"` beside a loadable
+    # `[adapter.triage]` leaves `profiles` non-empty while nothing dev-side resolved —
+    # and the ok line below would then be a green sentence assembled from an empty
+    # probe. Can only tighten: `dev_trees` truthy implies `profiles` truthy.
+    if dev_trees and not base_problems:
         # Name the primitive that actually resolved, not a hardcoded era: on an
         # upgraded project this is the operator's confirmation that the rename was
         # picked up (and, across trees, that both picked up the same one).
         resolved = list(
             dict.fromkeys(
                 name
-                for tree in dict.fromkeys(base_trees)
+                for tree in dict.fromkeys(dev_trees)
                 if (name := install.resolve_dev_primitive(project, tree)) is not None
             )
         )
@@ -509,12 +523,12 @@ def cmd_validate(args: argparse.Namespace) -> int:
             "skills.base",
             f"upstream skills present ({' + '.join(resolved)} + review hunters)",
             {
-                "trees": list(dict.fromkeys(base_trees)),
+                "trees": list(dict.fromkeys(dev_trees)),
                 "dev_primitive": resolved,
             },
         )
     report.extend(base_problems)
-    report.extend(install.dev_primitive_warnings(project, base_trees))
+    report.extend(install.dev_primitive_warnings(project, dev_trees))
 
     if getattr(args, "json", False):
         # getattr, not args.json: cmd_validate is called directly by tests (and by
@@ -644,16 +658,25 @@ def _mux_set(project: Path, args: argparse.Namespace) -> int:
 
 
 def _skill_trees(project: Path, pol) -> list[str]:
-    """The skill trees this run's adapters read, one per distinct adapter name.
+    """The skill trees this run's dev-primitive adapters read, one per distinct name.
 
-    Shared by the real preflight and the dry-run banner so the two cannot drift:
-    a preview that claims "run would abort" has to key on exactly what makes run
-    abort. Profiles that fail to load are skipped rather than raising — an
-    unknown adapter name is the policy loader's problem, not the skill probe's."""
+    Shared by the real preflight, the dry-run banner and `cmd_validate` so the
+    three cannot drift: a preview that claims "run would abort" has to key on
+    exactly what makes run abort, and validate's verdict has to key on the same
+    thing again. Profiles that fail to load are skipped rather than raising — an
+    unknown adapter name is the policy loader's problem, not the skill probe's.
+
+    Scoped to :data:`install.DEV_PRIMITIVE_ROLES`, not :data:`ROLES`: every skill
+    these trees are asked about is one only a dev or review session dispatches, and
+    triage's whole prompt surface ships in this wheel. It is also the set
+    `Engine._worktree_profiles` provisions, so what is gated and what is carried
+    into a worktree stay one decision."""
     from .adapters.profile import ProfileError, get_profile
 
     trees = []
-    for name in dict.fromkeys(pol.adapter.resolved(role).name for role in ROLES):
+    for name in dict.fromkeys(
+        pol.adapter.resolved(role).name for role in install.DEV_PRIMITIVE_ROLES
+    ):
         try:
             trees.append(get_profile(name, project).skill_tree)
         except ProfileError:
@@ -768,10 +791,14 @@ def _validate_stories_queue(
     report: ValidationReport,
 ) -> None:
     """Stories-mode counterpart of ``cmd_validate``'s sprint-status gate: validate
-    the ``stories.yaml`` manifest + ``SPEC.md`` and confirm the installed
-    ``bmad-dev-auto`` carries the folder+id dispatch flow stories mode needs (an
-    older skill would HALT at dispatch). Appends findings to ``report`` in place;
-    the probe carries its own remediation text ("update the bmm module")."""
+    the ``stories.yaml`` manifest + ``SPEC.md`` and confirm the installed dev
+    primitive carries the folder+id dispatch flow stories mode needs (an older
+    skill would HALT at dispatch). Appends findings to ``report`` in place;
+    the probe carries its own remediation text ("update the bmm module").
+
+    ``skill_trees`` is the dev+review subset :func:`_skill_trees` returns, not every
+    profile's tree: dispatch is a dev-primitive question, so a triage-only tree has
+    no say in it."""
     folder = stories_mod.resolve_spec_folder(paths.project, spec_folder)
     problem = _validate_stories_folder(paths, spec_folder)
     if problem:
