@@ -116,9 +116,10 @@ editing.
   BMAD-METHOD#2640 moved `defer`-triaged findings from `deferred-work.md` into the spec's own
   `deferred:` list, silently starving the sweep pipeline. A successful dev or review session
   now files each finding into the ledger with its `location` and `severity`, journals
-  `spec-deferrals-harvested`, and dedups on a fingerprint of the summary and location so a retry,
-  a resume replay or a second review pass never re-files one — including after a sweep has
-  already marked it done. Malformed items do not block their well-formed siblings: the loss is
+  `spec-deferrals-harvested`, and dedups on a fingerprint of the summary and location so a
+  _fixable_ retry, a resume replay or a second review pass never re-files one — including after a
+  sweep has already marked it done. (A NON-fixable retry re-files deliberately: the bullet below
+  reverts its entry along with the attempt, and the next attempt harvests it fresh.) Malformed items do not block their well-formed siblings: the loss is
   journaled and filed as one aggregated ledger entry. The spec's frontmatter is never rewritten,
   and the harvest keys on content rather than the installed skill name, so it works on both eras.
   The review prompt no longer also asks the session to file the finding itself: that produced two
@@ -135,19 +136,23 @@ editing.
   shields from the untracked-file cleanup. The dev phase now snapshots the ledger before the
   harvest and restores it around the rollback — unlinking the file when the harvest created it,
   and on the stop-and-wait path too, which raises. Lossless, because the spec's `deferred:`
-  frontmatter is never mutated and the next attempt re-harvests from it. That snapshot is
-  in-process, so a host death between the harvest and the rollback loses it; the replayed
-  attempt recovers the ledger's pre-harvest state from the persisted baseline instead —
-  deleting the file when the attempt created it, and leaving a tracked one to the reset, which
-  would otherwise be handed the dead attempt's harvest straight back. That baseline is a plain
-  filesystem check recorded with the attempt's baseline commit, not a git query: a _gitignored_
-  ledger — what a project that ignores `_bmad-output/` has, this one included — is absent from
-  `git ls-files --others --exclude-standard` whether the attempt created it or not, so a
-  git-derived baseline read it as tracked and left the dead attempt's finding behind. Neither
-  path unlinks a ledger git tracks, on the same reasoning: that one is the reset's to restore,
-  and deleting it would hand the next attempt's `git add -A` a deletion to commit. A defer still
-  keeps its harvested entries: `_stash_deferred_artifacts` has already moved the spec out of
-  the artifacts dir, so there the ledger entry is the finding's only surviving record.
+  frontmatter is never mutated and the next attempt re-harvests from it. The snapshot is taken
+  ahead of the orchestrator's own ledger writes too, so a sweep bundle's `status: done` closes
+  revert along with the code they claimed to resolve — a surviving close is worse than a
+  surviving finding, since `open_ids` only ever re-bundles open entries and no later sweep would
+  look at that id again. And it is persisted with the attempt rather than held in a local, so a
+  host death between the harvest and the rollback no longer loses it: the replayed attempt
+  writes back the same bytes the live path would have. That replaces a presence bit which could
+  only say whether a ledger existed at the attempt baseline — enough to delete one the harvest
+  had created, never enough to restore one that was already there, so a pre-existing _untracked_
+  or _gitignored_ ledger kept the dead attempt's finding for good. Nothing else reverts one:
+  `reset --hard` skips ignored paths, there is no `git clean`, and the artifacts dir is
+  `keep`-shielded besides. The restore never unlinks a ledger git tracks — that one is the reset's
+  to restore, and deleting it would hand the next attempt's `git add -A` a deletion to commit. The
+  snapshot is armed at the attempt's pre-harvest save and cleared once that attempt's decision is
+  acted on, so a finished story carries no copy of the ledger in `state.json`. A defer still
+  keeps its harvested entries: on the in-place path `_stash_deferred_artifacts` has already moved
+  the spec out of the artifacts dir, so the ledger entry is the finding's only surviving record.
 
 ## [0.9.0] — 2026-07-21
 

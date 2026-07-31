@@ -1815,6 +1815,16 @@ class Engine:
         self._review_and_commit(task)
 
     def _dev_phase(self, task: StoryTask, resume_result: SessionResult | None = None) -> bool:
+        if resume_result is None:
+            # Ledger-snapshot clear site 0, and deliberately ABOVE the veto check:
+            # `_vetoed` drives the task terminal and saves, so a veto below this
+            # would persist a dead task still carrying a copy of the ledger. A fresh
+            # (non-replayed) entry owes nothing to a previous invocation, and one
+            # real hole needs closing: a completed session record with `result_json
+            # is None` refuses replay (see `_resumable_session`), so the resume
+            # RESTARTS the story and re-enters here still carrying the dead
+            # invocation's armed snapshot. Disarming here makes that unreachable.
+            self._disarm_ledger_snapshot(task)
         if self._vetoed(self._emit("pre_dev_phase", task), task):
             return False
         if resume_result is None:
@@ -1825,26 +1835,8 @@ class Engine:
             # would shift the rollback/squash reference onto the completed
             # session's own tree.
             task.baseline_untracked = sorted(verify.untracked_files(self.workspace.root))
-            # ...and whether the deferred-work ledger itself was on disk. Deliberately
-            # NOT a git question: the ledger is commonly gitignored, and both git-side
-            # signals above exclude ignored paths, so for exactly that layout a
-            # gitignored ledger reads as BOTH "absent at the baseline" and "not created
-            # by this attempt" — and the crash-replay revert below then leaves the dead
-            # attempt's finding behind. Widening the NOW probe alone would be worse: an
-            # ignored ledger the operator already had would classify as attempt-created
-            # and get deleted. This bit is the symmetric half, and it is captured with
-            # the other two so all three always describe the same moment.
-            task.baseline_ledger_present = self.workspace.paths.deferred_work.is_file()
         feedback: Path | None = None
         while True:
-            # Pre-harvest ledger snapshot for the non-fixable-RETRY revert below,
-            # re-armed every attempt. The flag is separate from the text on
-            # purpose: `ledger_before is None` means the ledger did NOT EXIST when
-            # the snapshot was taken (the first-ever harvest creates it, and the
-            # restore then has to unlink), which is a different state from "no
-            # snapshot was taken at all" (nothing to restore, hands off).
-            ledger_before: str | None = None
-            ledger_snapshotted = False
             replayed = resume_result is not None
             if resume_result is None:
                 # a resumed result replays the attempt it was recorded under, so
@@ -1879,6 +1871,33 @@ class Engine:
             advance(task, Phase.DEV_VERIFY)
             outcome = None
             if result.status == "completed":
+                # Arm the pre-harvest ledger snapshot for the non-fixable-RETRY revert
+                # below. PERSISTED, with a `_save()`, so a host death anywhere between
+                # here and the rollback cannot lose it: the replayed attempt writes
+                # back the very bytes the live path would have.
+                #
+                # The position is the design. It is AFTER the session process ended
+                # (`_run_session` returns only once the adapter has reaped it), so
+                # anything the SESSION wrote to the ledger is inside the snapshot and
+                # survives the revert; and BEFORE every ENGINE-side ledger write of
+                # this attempt — `_post_dev_state_sync`, where the sweep engine closes
+                # the bundle's entries `status: done`, as well as
+                # `_harvest_spec_deferrals`. Both of those describe work the rollback
+                # is about to discard, and a close is the more expensive of the two to
+                # get wrong: `deferredwork.open_ids` only ever re-bundles `open`
+                # entries, so a close that outlives its code hides the work from every
+                # future sweep. Snapshotting after the sync would write that close
+                # back on top of a `reset --hard` that had just correctly reverted it.
+                #
+                # NOT on a replayed attempt: the host died somewhere between the dead
+                # process's writes and its rollback, so what is on disk now is already
+                # post-harvest and re-arming would restore the very edits the rollback
+                # exists to undo. The dead attempt's persisted snapshot is what the
+                # replay restores instead.
+                if not replayed:
+                    task.pre_harvest_ledger = self._ledger_text()
+                    task.pre_harvest_ledger_captured = True
+                    self._save()
                 # bmad-dev-auto sometimes finalizes the spec in prose (## Auto Run
                 # Result: Status done) but leaves the frontmatter status at the
                 # template default. Repair it BEFORE any frontmatter reader runs —
@@ -1895,19 +1914,9 @@ class Engine:
                 # work deferred by an attempt that is later rolled back would be a
                 # claim about code that no longer exists. Placement gets the commit
                 # half only: the harvest fires on the spec's status, before the
-                # artifact gate that can still send this attempt back. Snapshot the
-                # ledger here so the rollback half is enforced explicitly, at the
-                # RETRY branch below.
-                #
-                # NOT on a replayed attempt: the host died somewhere between the
-                # dead process's harvest and its rollback, so what is on disk now is
-                # already POST-harvest and snapshotting it would restore the very
-                # edit the rollback is meant to undo — worse than not restoring, on
-                # a tracked ledger, because the reset alone would have reverted it.
-                # The `finally` recovers the attempt baseline instead.
-                if not replayed:
-                    ledger_before = self._ledger_text()
-                    ledger_snapshotted = True
+                # artifact gate that can still send this attempt back. The rollback
+                # half is enforced explicitly, by the snapshot armed above and the
+                # restore at the RETRY branch below.
                 self._harvest_spec_deferrals(task, result.result_json)
                 # carry the skill's follow-up-review recommendation (PR #2505)
                 # onto the task so _review_and_commit can gate the review loop.
@@ -1945,6 +1954,11 @@ class Engine:
             )
             self._save()
             if decision.action == Action.PROCEED:
+                # Clear site 1. Nothing downstream can consume the snapshot — the
+                # phase returns and never re-enters this attempt — but without the
+                # clear a story that goes on to finish would carry a copy of the
+                # ledger in state.json for the rest of the run.
+                self._disarm_ledger_snapshot(task)
                 self._emit("post_dev_phase", task)
                 if self._run_workflows("post_dev_phase", task, task.attempt):
                     return False
@@ -1959,29 +1973,40 @@ class Engine:
                     try:
                         self._rollback_or_pause(task)
                     finally:
-                        # The reset discards the attempt but NOT its harvest: the
-                        # ledger lives under a protected artifact folder, so
-                        # `_safe_reset`'s `keep` shields it from the untracked-file
-                        # cleanup and a ledger this attempt CREATED outlives the
-                        # work it describes (#405). Put it back by hand. `finally`,
-                        # not a plain call after: rollback_on_failure OFF (the
-                        # default) raises out of `_pause_for_manual_recovery`, and
-                        # the manual `reset --hard` it prints would not remove an
-                        # untracked ledger either. Lossless because the harvest
-                        # never mutates the spec's `deferred:` frontmatter — the
-                        # next attempt re-harvests from it.
+                        # The reset discards the attempt but NOT what this phase
+                        # wrote to the deferred-work ledger: the ledger lives under a
+                        # protected artifact folder, so `_safe_reset`'s `keep`
+                        # shields it from the untracked-file cleanup and a ledger
+                        # this attempt CREATED outlives the work it describes (#405).
+                        # Put it back by hand. `finally`, not a plain call after:
+                        # rollback_on_failure OFF (the default) raises out of
+                        # `_pause_for_manual_recovery`, and the manual `reset --hard`
+                        # it prints would not remove an untracked ledger either.
+                        # Lossless because the harvest never mutates the spec's
+                        # `deferred:` frontmatter and the next attempt re-runs
+                        # `_post_dev_state_sync` as well, so both reverted writes are
+                        # simply re-made by whichever attempt survives.
                         #
-                        # Two paths because the snapshot is a plain local and a host
-                        # death loses it: a live attempt restores its own snapshot; a
-                        # REPLAYED one recovers the attempt baseline from persisted
-                        # state instead. Restoring a freshly-read snapshot there would
-                        # write the dead attempt's harvest back — see
-                        # _drop_ledger_created_since_baseline.
-                        if ledger_snapshotted:
-                            self._restore_ledger(task, ledger_before)
-                        elif replayed:
-                            self._drop_ledger_created_since_baseline(task)
+                        # ONE snapshot, the same bytes either way: the live path and
+                        # the crash-REPLAY path both restore the text persisted
+                        # before the harvest, so a host death in that window costs
+                        # nothing. No-op when this attempt armed nothing.
+                        self._restore_persisted_ledger(task, replayed=replayed)
+                # Clear site 2, for BOTH retry legs and deliberately OUTSIDE the
+                # `finally`. A fixable retry keeps its tree and its harvest on
+                # purpose, so a stale arm would let attempt N+1's replay delete them;
+                # and when `_rollback_or_pause` RAISES (the `rollback_on_failure =
+                # off` default) control never reaches here — correctly, because the
+                # pause's own resume replays this same attempt and still needs the
+                # snapshot. Moving this into the `finally` breaks exactly that.
+                self._disarm_ledger_snapshot(task)
                 continue
+            # Clear site 3, covering DEFER and the PAUSE/escalate fall-through alike.
+            # Neither reverts: `_defer` snapshots the ledger around its own reset and
+            # writes the harvested entries back, and an escalation preserves the tree
+            # for the human. Both `_save()` immediately below, so the snapshot dies
+            # here rather than riding a paused or terminal task in state.json.
+            self._disarm_ledger_snapshot(task)
             if decision.action == Action.DEFER:
                 self._record_dev_spec(task, result.result_json)
                 self._defer(task, decision.reason)
@@ -2639,14 +2664,13 @@ class Engine:
         frontmatter. The reset does not achieve that by itself: the ledger sits
         under a protected artifact folder, so `_safe_reset`'s `keep` shields it
         from `safe_rollback`'s untracked cleanup and a ledger this harvest CREATED
-        would survive (#405). `_dev_phase` therefore snapshots the ledger
-        immediately before this call and restores it around `_rollback_or_pause`
-        — that restore, not the reset, is what makes the revert unconditional.
-        On a REPLAYED attempt that snapshot no longer exists (it is a local, and the
-        host died holding it), so the revert falls back to recovering the attempt
-        baseline from persisted state — see
-        `_drop_ledger_created_since_baseline`, which also documents the one case
-        that stays unrecoverable and is therefore left alone.
+        would survive (#405). `_dev_phase` therefore snapshots the ledger ahead of
+        this call — ahead of `_post_dev_state_sync` too, so a sweep bundle's
+        `status: done` closes revert with the code they claim to resolve — and
+        restores it around `_rollback_or_pause`; that restore, not the reset, is
+        what makes the revert unconditional. The snapshot is persisted with the
+        attempt, so a REPLAYED one restores the same bytes rather than guessing;
+        see `_restore_persisted_ledger`.
         A DEFER does NOT revert: `_defer` snapshots the ledger and writes it back
         after the reset, keeping harvested entries. It has to —
         `_stash_deferred_artifacts` moves the spec out of the artifacts dir first,
@@ -3434,73 +3458,64 @@ class Engine:
         ledger.parent.mkdir(parents=True, exist_ok=True)
         ledger.write_text(snapshot, encoding="utf-8")
 
-    def _drop_ledger_created_since_baseline(self, task: StoryTask) -> None:
-        """Revert a harvest whose in-process snapshot died with the host.
+    def _restore_persisted_ledger(self, task: StoryTask, *, replayed: bool) -> None:
+        """Put the deferred-work ledger back to the snapshot `_dev_phase` armed
+        before this attempt's engine-side ledger writes — if it armed one.
 
-        A crash between `_harvest_spec_deferrals` and the non-fixable RETRY rollback
-        leaves the attempt resumable: `_resumable_session` replays the recorded
-        result and `_dev_phase` re-enters its loop from the top. The pre-harvest
-        snapshot is a plain local, so it is gone — but ``baseline_ledger_present`` is
-        persisted with the rest of the attempt baseline and deliberately not
-        re-captured on a replay, so it still answers the only question that matters:
+        The snapshot is PERSISTED rather than held in a local, and that is the whole
+        point: a host death between `_harvest_spec_deferrals` and
+        `_rollback_or_pause` used to lose the local, leaving the dead attempt's
+        finding (and, for a sweep bundle, its `status: done` closes) behind for the
+        successful retry to commit. `_resumable_session` replays the recorded result
+        and `_dev_phase` re-enters its loop from the top, so the replay reaches this
+        call with the dead attempt's own bytes still on the task.
 
-        - PRESENT at the baseline — the harvest appended to a ledger that was already
-          there. Its pre-harvest content is genuinely unrecoverable, so hands off
-          rather than guess; the harvest's own fingerprint dedup keeps a re-harvest
-          quiet. Covers a tracked, an untracked and an ignored ledger alike, which is
-          the point: only the filesystem can speak for all three.
-        - ABSENT at the baseline, and git does not own the path — this attempt created
-          it (the first-ever harvest does exactly this), so unlink.
-        - ABSENT at the baseline, but TRACKED — the operator had deleted a committed
-          ledger without committing that; `_rollback_or_pause`'s `reset --hard` has
-          restored it and deleting it here would lose a file no rollback asked to lose.
-          See `_ledger_is_gits_to_restore`.
-        - ``None`` — a task persisted before the bit existed. Released 0.9.1 carried
-          the harvest with no revert at all, so doing nothing is exactly what that run
-          would have done; refusing to guess also matches `safe_rollback`, which
-          removes nothing when `baseline_untracked` is None. Journalled, not silent.
+        ``pre_harvest_ledger_captured`` is the gate, NOT ``pre_harvest_ledger is not
+        None``. The text's ``None`` is a real value meaning "no ledger existed when
+        the snapshot was taken, so the restore is an unlink" (see `_restore_ledger`),
+        and that is the commonest case of all — the first harvest of a project
+        CREATES `deferred-work.md`. Collapsing the two states would turn exactly the
+        case the revert exists for into a no-op.
 
-        Why a persisted filesystem bit rather than git: `baseline_untracked` and
-        `verify.untracked_files` both come from `git ls-files --others
-        --exclude-standard`, so a GITIGNORED ledger is missing from both and git keeps
-        no record of an ignored file's prior existence at all. Classifying on those two
-        put every ignored ledger in the "tracked ⇒ the reset already reverted it"
-        bucket, where nothing reverts it — the reset skips ignored paths, this module
-        never runs `git clean`, and `_safe_reset`'s `keep` shields the artifacts dir
-        besides. Making only the NOW probe ignore-aware would have been worse: an
-        ignored ledger the operator already had would have classified as
-        attempt-created and been deleted.
+        No-op when nothing was armed, silently on a live attempt and journalled on a
+        replayed one. Live: a non-``completed`` session never reaches the arm, and an
+        attempt with nothing to say about the ledger must not touch it — an
+        unconditional restore here would unlink an operator's pre-existing ledger.
+        Replayed: the arm is unreachable by construction (`_resumable_session` only
+        ever hands back a ``completed`` record), so an unarmed replay means the host
+        died upstream of the pre-harvest save, or the task predates these fields.
+        Hands off either way, but worth a journal line — that is a real, if narrow,
+        window in which a harvest survives its attempt.
 
-        The tracked case is also why the replayed path cannot simply reuse
-        `_restore_ledger` with a freshly-read snapshot: on a tracked ledger that would
-        re-create the very edit the reset just undid.
-
-        One asymmetry, deliberate: under the default ``scm.rollback_on_failure = off``
-        no reset runs at all, so a *tracked* ledger keeps its harvest edit here where
-        the non-crash path would have restored pre-harvest text. The run is paused and
-        the operator's own `reset --hard` reverts it; inventing a checkout of the
-        baseline blob inside a `finally` that is already unwinding a pause is the
-        worse trade.
-
-        A second, inherited from keying on the attempt baseline rather than on the
-        pre-harvest moment: a ledger the dev SESSION wrote during this attempt is
-        dropped too, where the non-crash path would have kept it. That is the same
-        reference `baseline_untracked` and `baseline_commit` use, and the whole attempt
-        is being discarded — `safe_rollback` deletes every other file the session
-        created, and the ledger survives only because its folder is `keep`-shielded.
-
-        The tracked probe is an OBSERVATION and degrades toward leaving the file alone;
-        the unlink itself raises, like every other ledger write."""
-        if task.baseline_ledger_present is not False:
-            if task.baseline_ledger_present is None:
-                self.journal.append("ledger-baseline-unknown", story_key=task.story_key)
+        Why the snapshot is a filesystem read and never a git query: the ledger is
+        commonly GITIGNORED (it sits under `output_folder`, which many projects
+        ignore — this one included), and every git-side signal is ignore-blind.
+        `baseline_untracked` and `verify.untracked_files` both come from
+        `git ls-files --others --exclude-standard`, so an ignored ledger is absent
+        from them whether the attempt created it or not; `reset --hard` never touches
+        an ignored path; this module never runs `git clean`; and `_safe_reset`'s
+        `keep` shields the artifacts dir besides. Only the bytes speak for tracked,
+        untracked and ignored ledgers alike."""
+        if not task.pre_harvest_ledger_captured:
+            if replayed:
+                self.journal.append("ledger-snapshot-missing", story_key=task.story_key)
             return
-        ledger = self.workspace.paths.deferred_work
-        if not ledger.is_file():
-            return  # nothing to revert
-        if self._ledger_is_gits_to_restore(task):
-            return
-        ledger.unlink(missing_ok=True)
+        self._restore_ledger(task, task.pre_harvest_ledger)
+
+    def _disarm_ledger_snapshot(self, task: StoryTask) -> None:
+        """Drop the armed pre-harvest ledger snapshot.
+
+        Armed from an attempt's pre-harvest `_save()` until its decision is acted on,
+        so the residency in state.json is bounded to an in-flight or paused attempt
+        rather than accumulating one ledger copy per finished story.
+
+        Deliberately NOT followed by a `_save()`, at any call site. Between a disarm
+        and the next ambient save the on-disk value is still armed, and a death in
+        that window replays *that same attempt* — which still wants the snapshot, so
+        the stale-looking persisted value is the correct one. Saving here would
+        convert a correct recovery into a hands-off one."""
+        task.pre_harvest_ledger = None
+        task.pre_harvest_ledger_captured = False
 
     def _stash_deferred_artifacts(self, task: StoryTask) -> None:
         """Move the deferred story's spec out of the artifacts dir into the run

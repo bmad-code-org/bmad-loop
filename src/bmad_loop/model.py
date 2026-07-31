@@ -160,20 +160,24 @@ class StoryTask:
     # user already had on disk are never deleted. None = pre-upgrade run (no
     # snapshot); rollback then removes no untracked files at all.
     baseline_untracked: list[str] | None = None
-    # was the deferred-work ledger on disk when this attempt's baseline was captured?
-    # A plain `Path.is_file()`, never a git query — and that is the whole point. The
-    # ledger is commonly GITIGNORED (it lives under `output_folder`, which many
-    # projects ignore; `init` does not add that line but plenty of repos do, this one
-    # included), and every git-side signal here is ignore-blind: `baseline_untracked`
-    # and `verify.untracked_files` both come from `git ls-files --others
-    # --exclude-standard`. So in exactly the configuration where the question matters,
-    # git cannot answer it — an ignored ledger reads as BOTH "absent at the baseline"
-    # and "not created by this attempt". Read only by the crash-replay revert
-    # (`_drop_ledger_created_since_baseline`), where False is the ONLY value that
-    # authorizes deleting the ledger — so a task persisted before this field existed
-    # must rehydrate to None, never False (see from_dict). Scoped to the `_dev_phase`
-    # ENTRY, so attempts 2..N share it, exactly like baseline_commit.
-    baseline_ledger_present: bool | None = None
+    # the deferred-work ledger's text as of THIS attempt's pre-harvest moment,
+    # persisted so a host death between `_harvest_spec_deferrals` and the
+    # non-fixable-RETRY rollback cannot lose it: the replayed attempt writes these
+    # bytes back rather than guessing from a presence bit. Scoped to the attempt,
+    # not to the `_dev_phase` entry — re-armed every attempt, unlike
+    # baseline_commit/baseline_untracked.
+    #
+    # The split is load-bearing. A `None` TEXT means the ledger did NOT EXIST when
+    # the snapshot was taken, so the restore has to UNLINK (the first-ever harvest
+    # of a project creates the file); that is a different state from "no snapshot
+    # was taken at all, hands off", which the flag below carries. One nullable
+    # field cannot express both.
+    #
+    # Armed at the pre-harvest `_save()` and cleared once the attempt's decision is
+    # acted on (`Engine._disarm_ledger_snapshot`), so a finished story carries no
+    # ledger copy and no later attempt's replay can consume a stale one.
+    pre_harvest_ledger: str | None = None
+    pre_harvest_ledger_captured: bool = False
     spec_file: str | None = None
     commit_sha: str | None = None
     defer_reason: str | None = None
@@ -266,7 +270,8 @@ class StoryTask:
             "followup_review_recommended": self.followup_review_recommended,
             "baseline_commit": self.baseline_commit,
             "baseline_untracked": self.baseline_untracked,
-            "baseline_ledger_present": self.baseline_ledger_present,
+            "pre_harvest_ledger": self.pre_harvest_ledger,
+            "pre_harvest_ledger_captured": self.pre_harvest_ledger_captured,
             "spec_file": self._serialized_spec_file(),
             "commit_sha": self.commit_sha,
             "defer_reason": self.defer_reason,
@@ -314,18 +319,20 @@ class StoryTask:
                 if d.get("baseline_untracked") is not None
                 else None
             ),
-            # `is not None`, NOT the `bool(d.get(k, False))` idiom the neighbours use:
-            # a missing key has to stay None. Collapsing it to False would tell the
-            # crash-replay revert "this attempt created the ledger" for every task
-            # persisted before the field existed, and it would delete an operator's
-            # ledger on the first replay after upgrade. The explicit None test also
-            # keeps a persisted literal `false` as False, where a truthiness test
-            # would silently promote it back to "unknown".
-            baseline_ledger_present=(
-                bool(d["baseline_ledger_present"])
-                if d.get("baseline_ledger_present") is not None
-                else None
+            # `is not None`, NOT the natural `str(d.get(k, "")) or None`: a persisted
+            # EMPTY string means "the ledger existed and was empty", and it has to
+            # rehydrate as "" — `None` means "no file at all" and would turn the
+            # replay's restore into an UNLINK of a ledger that was there.
+            #
+            # The flag beside it takes the ordinary `bool(d.get(k, False))`, which is
+            # right here and was wrong for the presence bit this pair replaces: there
+            # a missing key had to become a third "unknown" state, here it means "no
+            # snapshot was captured", and hands-off is exactly the safe default for a
+            # task persisted before these fields existed.
+            pre_harvest_ledger=(
+                str(d["pre_harvest_ledger"]) if d.get("pre_harvest_ledger") is not None else None
             ),
+            pre_harvest_ledger_captured=bool(d.get("pre_harvest_ledger_captured", False)),
             spec_file=d.get("spec_file"),
             commit_sha=d.get("commit_sha"),
             defer_reason=d.get("defer_reason"),

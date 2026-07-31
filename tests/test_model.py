@@ -160,23 +160,41 @@ def test_sentinel_kind_defaults_empty_for_legacy_state():
     assert StoryTask.from_dict(doc).sentinel_kind == ""
 
 
-def test_baseline_ledger_present_round_trips():
-    """All three states, and the False leg is not decorative: a truthiness
-    deserializer (`bool(d.get(k))`) turns a persisted `false` back into "unknown",
-    which silently disables the crash-replay revert it exists to drive."""
-    for value in (True, False, None):
-        task = StoryTask(story_key="1-1-a", epic=1, baseline_ledger_present=value)
-        assert StoryTask.from_dict(task.to_dict()).baseline_ledger_present is value
+def test_pre_harvest_ledger_round_trips():
+    """Three text states, and the `""` one is load-bearing rather than decorative:
+    the natural deserializer (`str(d.get(k, "")) or None`) collapses a persisted
+    EMPTY snapshot — the ledger existed and was empty — into None, and None is the
+    engine's instruction to UNLINK. That spelling would delete a file the snapshot
+    says was there."""
+    for value in ("# Deferred Work\n\n### DW-1: something\n", "", None):
+        task = StoryTask(story_key="1-1-a", epic=1, pre_harvest_ledger=value)
+        restored = StoryTask.from_dict(task.to_dict()).pre_harvest_ledger
+        assert restored == value
+        assert (restored is None) is (value is None)
 
 
-def test_baseline_ledger_present_defaults_none_for_legacy_state():
-    """None, NOT False — the one place the neighbours' `bool(d.get(k, False))` idiom
-    is wrong. False is the only value that authorizes deleting the ledger, so a task
-    persisted before this field existed would have its ledger unlinked on the first
-    crash-replay after upgrade."""
+def test_pre_harvest_ledger_captured_round_trips():
+    """The companion flag is what separates "no ledger existed" from "no snapshot was
+    taken"; a round-trip that lost the False would leave a disarmed task looking armed
+    with a None text, i.e. armed to unlink."""
+    for value in (True, False):
+        task = StoryTask(story_key="1-1-a", epic=1, pre_harvest_ledger_captured=value)
+        assert StoryTask.from_dict(task.to_dict()).pre_harvest_ledger_captured is value
+
+
+def test_pre_harvest_ledger_defaults_disarmed_for_legacy_state():
+    """Both keys absent ⇒ nothing armed, which is the hands-off default: a task
+    persisted before the fields existed makes the replay's restore a no-op rather
+    than an unlink of a ledger it knows nothing about. This is the plain
+    `bool(d.get(k, False))` idiom, and here — unlike the presence bit this pair
+    replaces — it is the correct one, because "missing" and "nothing captured" mean
+    the same thing."""
     doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
-    del doc["baseline_ledger_present"]  # state.json from before the field existed
-    assert StoryTask.from_dict(doc).baseline_ledger_present is None
+    del doc["pre_harvest_ledger"]  # state.json from before the fields existed
+    del doc["pre_harvest_ledger_captured"]
+    task = StoryTask.from_dict(doc)
+    assert task.pre_harvest_ledger is None
+    assert task.pre_harvest_ledger_captured is False
 
 
 def test_restore_patch_round_trips():
