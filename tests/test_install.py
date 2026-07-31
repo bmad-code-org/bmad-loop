@@ -10,13 +10,18 @@ from bmad_loop import verify
 from bmad_loop.adapters.profile import get_profile
 from bmad_loop.install import (
     BASE_SKILLS,
+    DEV_BASE_SKILLS,
+    DEV_PRIMITIVE_LEGACY,
+    DEV_PRIMITIVE_NEW,
     LEGACY_MODULE_SKILLS,
     MODULE_SKILLS,
     _copy_traversable,
+    base_skills_seed_incomplete,
     install_into,
     merge_hooks,
     missing_base_skills,
     provision_worktree,
+    resolve_dev_primitive,
     strip_legacy_hooks,
 )
 
@@ -602,6 +607,71 @@ def test_provision_worktree_copies_base_skills_from_repo(tmp_path):
         assert (wt / claude.skill_tree / skill / "SKILL.md").is_file()
     # the dev primitive's marker file came along too
     assert (wt / claude.skill_tree / "bmad-dev-auto" / "step-04-review.md").is_file()
+
+
+def _seed_pair(tmp_path, skills, tree=".claude/skills"):
+    """A repo carrying ``skills`` and a worktree carrying the same — the state
+    `provision_worktree` produces when every copy lands. Callers then delete from the
+    worktree to model whatever the containment guard dropped, which is all
+    `base_skills_seed_incomplete` reads (it asks `is_dir()`, never how it got that way).
+    """
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    for root in (repo, wt):
+        for skill, markers in skills.items():
+            d = root / tree / skill
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "SKILL.md").write_text(f"# {skill}\n", encoding="utf-8")
+            for marker in markers:
+                (d / marker).write_text("x\n", encoding="utf-8")
+    return wt, repo, tree
+
+
+def test_base_skills_seed_incomplete_ignores_the_unused_primitive_era(tmp_path):
+    """BASE_SKILLS names both eras because copy-if-present makes naming both free; that
+    does NOT make both required. With bmad-build-auto resolved every prompt spells it,
+    so a dropped bmad-dev-auto leftover cannot stall a session — and the caller's
+    response to any rel here is a CRITICAL escalation that halts the whole run."""
+    wt, repo, tree = _seed_pair(tmp_path, BASE_SKILLS)
+    shutil.rmtree(wt / tree / DEV_PRIMITIVE_LEGACY)
+
+    assert resolve_dev_primitive(repo, tree) == DEV_PRIMITIVE_NEW
+    assert base_skills_seed_incomplete(wt, repo, [tree]) == []
+
+
+def test_base_skills_seed_incomplete_ignores_an_unresolvable_new_primitive_dir(tmp_path):
+    """The same over-breadth in the other direction, and invisible to the preflight: a
+    `SKILL.md`-less bmad-build-auto dir (an aborted install) is not resolvable and is
+    never stat'ed once the legacy name resolves — but `is_dir()` is all the gate asks."""
+    wt, repo, tree = _seed_pair(tmp_path, DEV_BASE_SKILLS)
+    (repo / tree / DEV_PRIMITIVE_NEW).mkdir()
+
+    assert resolve_dev_primitive(repo, tree) == DEV_PRIMITIVE_LEGACY
+    assert missing_base_skills(repo, [tree]) == []
+    assert base_skills_seed_incomplete(wt, repo, [tree]) == []
+
+
+def test_base_skills_seed_incomplete_reports_a_dropped_legacy_primitive(tmp_path):
+    """The bound on the narrowing above: scoping to the RESOLVED primitive is not
+    scoping to the new name. A pre-rename project drives bmad-dev-auto, so a worktree
+    that lost it stalls exactly as hard and must still pause."""
+    wt, repo, tree = _seed_pair(tmp_path, DEV_BASE_SKILLS)
+    shutil.rmtree(wt / tree / DEV_PRIMITIVE_LEGACY)
+
+    assert resolve_dev_primitive(repo, tree) == DEV_PRIMITIVE_LEGACY
+    assert base_skills_seed_incomplete(wt, repo, [tree]) == [f"{tree}/{DEV_PRIMITIVE_LEGACY}"]
+
+
+def test_base_skills_seed_incomplete_reports_a_dropped_bmad_review(tmp_path):
+    """bmad-review is deliberately outside the preflight so pre-merge bmm installs keep
+    validating — but on a merged-lens install the three hunter ids are thin forwarders
+    to it, so a worktree that lacks one the repo HAS breaks those forwards. Preflight-
+    optional is not the same question as seeded-or-not, and the repo-has-it conjunct
+    already keeps the pre-merge case silent."""
+    wt, repo, tree = _seed_pair(tmp_path, BASE_SKILLS)
+    shutil.rmtree(wt / tree / "bmad-review")
+
+    assert missing_base_skills(repo, [tree]) == []  # the preflight never asks for it
+    assert base_skills_seed_incomplete(wt, repo, [tree]) == [f"{tree}/bmad-review"]
 
 
 def test_missing_base_skills_reports_absent_and_incomplete(tmp_path):

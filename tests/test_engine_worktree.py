@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import shutil
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
@@ -793,24 +794,50 @@ def test_incomplete_bmad_scripts_seed_pauses_before_dispatch(project, tmp_path):
     assert not (Path(task.worktree_path) / "_bmad" / "scripts" / "render_skill.py").exists()
 
 
+def _real_skill_dirs(project, *skills: str, tree: str = ".claude/skills") -> None:
+    """Lay skills down as ORDINARY in-repo dirs — the half `_symlink_skill_tree` cannot
+    express, and what the primitive-era gate needs to be visible at all.
+
+    A tree symlinked out WHOLE drops every skill at once, so the resolved primitive is
+    always among the casualties and the gate is right to pause. Only the MIXED shape
+    separates the two questions: the skill this run dispatches seeds normally, and the
+    one it never names does not."""
+    from bmad_loop.install import DEV_PRIMITIVE_MARKERS
+
+    for skill in skills:
+        real = project.project / tree / skill
+        real.mkdir(parents=True, exist_ok=True)
+        (real / "SKILL.md").write_text(f"# {skill}\n", encoding="utf-8")
+        for marker in DEV_PRIMITIVE_MARKERS:
+            (real / marker).write_text("x\n", encoding="utf-8")
+
+
 def _symlink_skill_tree(
-    project, shared: Path, tree: str = ".claude/skills", *, renderer_stub: bool = False
+    project,
+    shared: Path,
+    tree: str = ".claude/skills",
+    *,
+    renderer_stub: bool = False,
+    skills: Sequence[str] | None = None,
 ) -> None:
-    """Point every upstream skill in ``tree`` at a shared install OUTSIDE the repo —
-    how a machine-wide BMad install is wired, and the one shape provisioning cannot
-    follow.
+    """Point upstream skills in ``tree`` at a shared install OUTSIDE the repo — how a
+    machine-wide BMad install is wired, and the one shape provisioning cannot follow.
 
     The tree must be GITIGNORED (and so untracked) for this to bite: a committed
     symlink is checked out into the worktree as a symlink and resolves there just
     fine. It is the untracked case that provisioning has to copy, and the copy is
-    what the containment guard refuses."""
+    what the containment guard refuses.
+
+    ``skills`` defaults to everything a session dispatches. Pass an explicit list to
+    symlink out ONE skill beside real dirs (see :func:`_real_skill_dirs`); the default
+    cannot express that, which is why the era over-breadth shipped green."""
     from conftest import RENDERER_STUB_SKILL_MD
 
     from bmad_loop.install import DEV_PRIMITIVE_MARKERS, DEV_PRIMITIVE_NEW, REVIEW_HUNTER_SKILLS
 
     tree_dir = project.project / tree
     tree_dir.mkdir(parents=True, exist_ok=True)
-    for skill in (DEV_PRIMITIVE_NEW, *REVIEW_HUNTER_SKILLS):
+    for skill in skills if skills is not None else (DEV_PRIMITIVE_NEW, *REVIEW_HUNTER_SKILLS):
         real = shared / skill
         real.mkdir(parents=True, exist_ok=True)
         stub = renderer_stub and skill == DEV_PRIMITIVE_NEW
@@ -915,7 +942,56 @@ def test_a_dropped_skill_seed_pauses_an_inline_primitive_too(project, tmp_path):
 
     assert summary.paused and summary.escalated == 1
     escalated = [e for e in Journal(engine.run_dir).entries() if e["kind"] == "story-escalated"]
-    assert escalated and ".claude/skills/" in escalated[0]["reason"]
+    # names the PRIMITIVE, not just the tree: the three hunters are dropped here too, so
+    # a bare `.claude/skills/` substring passes even when the primitive stopped being
+    # checked at all — which is how this assert survived an ablation of that very leg
+    assert escalated and ".claude/skills/bmad-build-auto" in escalated[0]["reason"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
+def test_an_unused_primitive_era_dropped_by_the_seed_does_not_pause(project, tmp_path):
+    """The other boundary, and the one the gate overran when it shipped: BASE_SKILLS is
+    a copy-if-PRESENT catalog listing both primitive eras, so reading it as a
+    requirement set pauses a run over a skill nothing dispatches.
+
+    Here every skill a session names — the resolved `bmad-build-auto`, the three inline
+    hunters, the merged `bmad-review` — is an ordinary in-repo dir that seeds normally.
+    Only the leftover `bmad-dev-auto` shim is symlinked to a shared install and dropped,
+    and post-rename no prompt ever spells it (`Engine._dev_skill` resolves the name from
+    disk). Nothing can stall, so nothing may pause: this project passed the preflight
+    and is not broken.
+
+    The two tests above cannot see this — `_symlink_skill_tree` drops the whole
+    dispatched set at once, so the resolved primitive is always among the casualties."""
+    from conftest import attach_profile
+
+    from bmad_loop import install
+
+    (project.project / ".gitignore").write_text(".bmad-loop/runs/\n.claude/\n", encoding="utf-8")
+    _real_skill_dirs(
+        project, install.DEV_PRIMITIVE_NEW, *install.REVIEW_HUNTER_SKILLS, "bmad-review"
+    )
+    # the ONE skill outside the repo is the era this run will never invoke — and it is
+    # marker-COMPLETE, so it is a skill that would resolve if anything asked for it
+    _symlink_skill_tree(
+        project, tmp_path / "shared-bmad-install", skills=[install.DEV_PRIMITIVE_LEGACY]
+    )
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    tree = ".claude/skills"
+    # the name every prompt spells, resolved the way the engine resolves it
+    assert install.dev_primitive_or_default(project.project, tree) == install.DEV_PRIMITIVE_NEW
+    assert install.missing_base_skills(project.project, [tree]) == []
+
+    engine, adapter = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
+    )
+    attach_profile(adapter)
+    summary = engine.run()
+
+    assert not summary.paused and summary.escalated == 0
+    assert engine.state.tasks["1-1-a"].phase == Phase.DONE
+    assert "story-escalated" not in [e["kind"] for e in Journal(engine.run_dir).entries()]
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")

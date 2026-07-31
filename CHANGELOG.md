@@ -59,10 +59,13 @@ editing.
   now reports the skills it could not deliver through the existing `worktree-seed-skipped`
   journal channel, and the engine escalates and pauses before dispatch, naming them — the same
   environment-fault treatment the renderer surface already got, since the seed reads the same
-  repo for every story. Unlike the renderer legs this carries no era condition: a missing skill
-  stalls a session whether its `SKILL.md` renders or is inline. A skill tree that is committed
-  (symlink and all) is checked out into the worktree normally and is unaffected. Pre-existing
-  since 0.6.5; found while reviewing this release.
+  repo for every story. Unlike the renderer legs this carries no _renderer_-era condition: a
+  missing skill stalls a session whether its `SKILL.md` renders or is inline. It is scoped to the
+  primitive era the run actually dispatches, though — the skills list it reads names both eras
+  because copying one that isn't there is free, but a leftover `bmad-dev-auto` shim no prompt
+  spells is not a stall to pause over. A skill tree that is committed (symlink and all) is
+  checked out into the worktree normally and is unaffected. Pre-existing since 0.6.5; found while
+  reviewing this release.
 
 - **A renderer stub that cannot compose a prompt fails the preflight (#405).** Two new checks
   block `validate`/`run`/`sweep`/`resume`: `skills.dev-renderer`, when the resolved `SKILL.md`

@@ -639,9 +639,11 @@ class Engine:
             self.journal.append(
                 "worktree-seed-skipped", story_key=task.story_key, entries=skipped_seeds
             )
-        # The skills half of the same fault, and it needs no era gate: a worktree
-        # missing the dev primitive or a review hunter stalls the session on `Unknown
-        # command` whether that SKILL.md renders or is inline. Re-probed rather than
+        # The skills half of the same fault, and it needs no RENDERER-era gate: a
+        # worktree missing the dev primitive or a review hunter stalls the session on
+        # `Unknown command` whether that SKILL.md renders or is inline. It does carry a
+        # PRIMITIVE-era one, inside the predicate: the era this run will not dispatch is
+        # not a stall to pause over. Re-probed rather than
         # read out of `skipped_seeds`, so a user `worktree_seed` entry spelling a skill
         # rel cannot forge a pause. Checked BEFORE the renderer branch: a worktree with
         # no dev primitive at all has nothing for a renderer surface to be short FOR,

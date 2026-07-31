@@ -964,9 +964,10 @@ def base_skills_seed_incomplete(worktree: Path, repo_root: Path, trees: Sequence
 
     The session then dispatches a skill its worktree does not have — the `Unknown
     command` stall the preflight exists to prevent, reached anyway by a project that
-    passed it. Unlike the renderer sentinels this needs no era gate: an absent dev
-    primitive or review hunter stalls a session whether its SKILL.md renders or is
-    inline, so the answer is the same question at both layers.
+    passed it. Unlike the renderer sentinels this needs no RENDERER-era gate: an absent
+    dev primitive or review hunter stalls a session whether its SKILL.md renders or is
+    inline, so the answer is the same question at both layers. (The PRIMITIVE-era gate
+    below is a different axis — which of the two skill names this run dispatches.)
 
     Gated on the REPO having the skill so a project that legitimately lacks one is not
     reported twice, and on the WORKTREE lacking it so a tracked skill the checkout
@@ -974,10 +975,40 @@ def base_skills_seed_incomplete(worktree: Path, repo_root: Path, trees: Sequence
     reported at all. Returns the rels rather than a bool so the journal and the
     escalation reason can name which skill went missing — a run pointed at
     ``_bmad/scripts`` when a review hunter is what vanished is the drift the shared
-    constants exist to prevent."""
+    constants exist to prevent.
+
+    Third gate, and the one :data:`BASE_SKILLS` cannot supply: the primitive era this
+    run will not invoke. That map is a copy-if-*present* catalog ("every non-bundled
+    skill that MIGHT need copying") listing both era names, because naming both is free
+    when the answer to each is only "copy it if it is there". Read as a requirement set
+    it demands one skill too many: with `bmad-build-auto` installed, every prompt spells
+    it (:func:`dev_primitive_or_default`, the same call `Engine._dev_skill` makes) and a
+    leftover `bmad-dev-auto` shim is never dispatched — so dropping the shim is not a
+    stall, and pausing the whole run over it refuses a project nothing is wrong with.
+    Measured both directions: a repo whose `bmad-build-auto` is a real dir beside a
+    symlinked-out `bmad-dev-auto` passes the preflight, seeds the worktree with every
+    skill a session names, and was still escalated; so was a resolved *legacy* install
+    beside a `SKILL.md`-less `bmad-build-auto` dir, which nothing can resolve and the
+    preflight never stats. Resolving here rather than filtering the caller's list keeps
+    the engine's re-probe a pure function of disk. (It resolves against ``repo_root``
+    while the engine spells the prompt from ``paths.project``; those are the same path
+    unless a project overrides it — tracked as #414.)
+
+    The other two non-preflight entries stay gated on purpose. ``bmad-review`` is absent
+    from :data:`DEV_BASE_SKILLS` so a pre-merge bmm install keeps validating, but on a
+    merged-lens install the three hunter ids are thin forwarders to it: a worktree that
+    lacks it breaks those forwards, and the repo-has-it conjunct already keeps the
+    pre-merge case silent."""
     missing: list[str] = []
     for tree in dict.fromkeys(trees):
+        # Total form: an unresolvable tree yields the legacy name, which the preflight
+        # has already refused the run over — never a second, quieter answer here.
+        unused_era = {DEV_PRIMITIVE_NEW, DEV_PRIMITIVE_LEGACY} - {
+            dev_primitive_or_default(repo_root, tree)
+        }
         for skill in BASE_SKILLS:
+            if skill in unused_era:
+                continue
             if (repo_root / tree / skill).is_dir() and not (worktree / tree / skill).is_dir():
                 missing.append(f"{tree}/{skill}")
     return missing
