@@ -798,11 +798,12 @@ def _bmad_scripts_seed_incomplete(worktree: Path, repo_root: Path) -> bool:
 
     Reported through :func:`provision_worktree`'s existing skipped-seed return
     channel, as the :data:`BMAD_SCRIPTS_SEED_REL` entry, rather than raising —
-    provisioning has no failure path of its own and inventing one here would put a
-    policy decision inside a quiet, TUI-hosted helper. The *engine* reads that
-    entry back and escalates: this is not a degraded provision the run can carry,
-    it is an environment fault identical for every story, so dispatching would burn
-    the whole backlog on result-less Stops.
+    provisioning has no failure vocabulary of its own (every containment violation
+    is a bare ``continue``), and the decision this drives is escalate-vs-defer plus
+    notify and pause, which belongs to the caller that owns the state machine and
+    the journal. The *engine* reads the entry back and escalates: this is not a
+    degraded provision the run can carry, it is an environment fault identical for
+    every story, so dispatching would burn the whole backlog on result-less Stops.
     """
     if not (repo_root / RENDERER_SCRIPT_REL).is_file():
         return False
