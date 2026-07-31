@@ -575,8 +575,12 @@ def test_provision_worktree_covers_multiple_profiles(tmp_path):
 
 
 def test_provision_worktree_does_not_clobber_existing_skill(tmp_path):
-    """A skill the checkout already carries (project commits its own skill tree)
-    is left untouched, so no diff is merged back."""
+    """A FILE the checkout already carries (project commits its own skill tree) is
+    left untouched, so no diff is merged back. Copy-when-absent is asked per file,
+    not per directory: the dir-level skip it replaces was silent and TOTAL — one
+    tracked SKILL.md made the whole dir "already there" and every sibling the skill
+    reads stayed at zero bytes, in a dir that then passes a directory-granular
+    completeness check."""
     wt, repo = tmp_path / "wt", tmp_path / "repo"
     claude = get_profile("claude")
     existing = wt / claude.skill_tree / "bmad-loop-sweep" / "SKILL.md"
@@ -584,7 +588,9 @@ def test_provision_worktree_does_not_clobber_existing_skill(tmp_path):
     existing.write_text("COMMITTED", encoding="utf-8")
 
     provision_worktree(wt, [claude], repo)
-    assert existing.read_text() == "COMMITTED"
+    assert existing.read_text(encoding="utf-8") == "COMMITTED"
+    # …while the siblings of that one carried file are filled in
+    assert (wt / claude.skill_tree / "bmad-loop-sweep" / "deferred-work-format.md").is_file()
     # a skill that was absent is still laid down
     assert (wt / claude.skill_tree / "bmad-loop-resolve" / "SKILL.md").is_file()
 
@@ -609,11 +615,114 @@ def test_provision_worktree_copies_base_skills_from_repo(tmp_path):
     assert (wt / claude.skill_tree / "bmad-dev-auto" / "step-04-review.md").is_file()
 
 
+def test_provision_worktree_fills_in_a_partial_base_skill(tmp_path):
+    """A checkout that carries ONE file of a skill dir — a project that commits its
+    SKILL.md, a `worktree_seed` entry naming a file inside one — used to make the whole
+    dir "already there" and receive zero bytes of the rest. That skips silently and
+    totally: the session dispatches a primitive whose step files and review-prompts/
+    are absent, and provisioning reports success. Filling the absent siblings in is
+    what the per-FILE merge buys, and the empty return is the other half — a dir the
+    merge completed is not a skip to journal."""
+    from conftest import install_build_auto_skill
+
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    install_build_auto_skill(repo, tree)
+    carried = wt / tree / DEV_PRIMITIVE_NEW / "SKILL.md"
+    carried.parent.mkdir(parents=True)
+    carried.write_text("# bmad-build-auto\n", encoding="utf-8")
+
+    skipped = provision_worktree(wt, [claude], repo)
+
+    skill = wt / tree / DEV_PRIMITIVE_NEW
+    assert (skill / "step-04-review.md").is_file()
+    assert (skill / "customize.toml").is_file()
+    assert (skill / "review-prompts" / "adversarial.md").is_file()
+    assert skipped == []
+
+
+def test_provision_worktree_merge_keeps_the_bytes_the_checkout_carries(tmp_path):
+    """The bound on the fill-in above: per-file copy-when-ABSENT must not drift into
+    copy-over. A project that customizes a skill in-tree has those bytes tracked, and
+    overwriting them puts the upstream copy into the unit's `git add -A` commit — the
+    diff isolation exists to prevent."""
+    from conftest import install_build_auto_skill
+
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    install_build_auto_skill(repo, tree)
+    carried = wt / tree / DEV_PRIMITIVE_NEW / "SKILL.md"
+    carried.parent.mkdir(parents=True)
+    carried.write_text("COMMITTED", encoding="utf-8")
+
+    provision_worktree(wt, [claude], repo)
+
+    assert carried.read_text(encoding="utf-8") == "COMMITTED"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_provision_worktree_reports_a_symlinked_out_skill_child(tmp_path):
+    """Per-file granularity splits the containment guard per child, so the failure it
+    guards against is no longer whole-or-nothing: a skill dir whose customize.toml
+    alone points at a shared install outside the repo lands SHORT while every sibling
+    copies fine. The repo-side preflight stats through the link and passes, so nothing
+    upstream says a word — without a per-file report the run dispatches a step-04 whose
+    layer config was never delivered, on every story."""
+    from conftest import install_build_auto_skill
+
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    install_build_auto_skill(repo, tree)
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    (shared / "customize.toml").write_text("[[review_layers]]\n", encoding="utf-8")
+    marker = repo / tree / DEV_PRIMITIVE_NEW / "customize.toml"
+    marker.unlink()
+    marker.symlink_to(shared / "customize.toml")
+    assert marker.is_file()  # the preflight follows the link, which is why it passed
+
+    skipped = provision_worktree(wt, [claude], repo)
+
+    assert skipped == [f"{tree}/{DEV_PRIMITIVE_NEW}/customize.toml"]
+    assert (wt / tree / DEV_PRIMITIVE_NEW / "SKILL.md").is_file()  # the rest landed
+    assert not (wt / tree / DEV_PRIMITIVE_NEW / "customize.toml").exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_provision_worktree_merge_refuses_to_write_outside_the_worktree(tmp_path):
+    """The destination half of the containment guard, which only the merge needs: the
+    dir-level skip never reached a per-file destination at all. A symlink in the
+    CHECKOUT pointing out of the worktree is a path `_copy_traversable` would follow
+    and write THROUGH, landing the wheel's bytes somewhere no teardown ever cleans.
+    Refusing leaves the worktree without a readable SKILL.md, which the gate then
+    reports coarsely — the whole dir is what a session cannot dispatch."""
+    from conftest import install_build_auto_skill
+
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    install_build_auto_skill(repo, tree)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    escape = wt / tree / DEV_PRIMITIVE_NEW / "SKILL.md"
+    escape.parent.mkdir(parents=True)
+    escape.symlink_to(outside / "escaped.md")  # dangling on purpose
+
+    skipped = provision_worktree(wt, [claude], repo)
+
+    assert not (outside / "escaped.md").exists()
+    assert skipped == [f"{tree}/{DEV_PRIMITIVE_NEW}"]
+
+
 def _seed_pair(tmp_path, skills, tree=".claude/skills"):
     """A repo carrying ``skills`` and a worktree carrying the same — the state
     `provision_worktree` produces when every copy lands. Callers then delete from the
     worktree to model whatever the containment guard dropped, which is all
-    `base_skills_seed_incomplete` reads (it asks `is_dir()`, never how it got that way).
+    `base_skills_seed_incomplete` reads: it asks per required FILE behind a `SKILL.md`
+    precondition, never how the worktree's copy of one got there.
     """
     wt, repo = tmp_path / "wt", tmp_path / "repo"
     for root in (repo, wt):
@@ -672,6 +781,103 @@ def test_base_skills_seed_incomplete_reports_a_dropped_bmad_review(tmp_path):
 
     assert missing_base_skills(repo, [tree]) == []  # the preflight never asks for it
     assert base_skills_seed_incomplete(wt, repo, [tree]) == [f"{tree}/bmad-review"]
+
+
+def test_base_skills_seed_incomplete_reports_a_short_skill_dir(tmp_path):
+    """The dir is PRESENT and dispatchable — SKILL.md is right there — and one required
+    file inside it is not. A directory-granular gate calls that complete, so the run
+    proceeds and every dev session's step-04 resolves its review layers from a
+    customize.toml that was never delivered. The rel has to name the file: a rel the
+    operator falsifies with one `ls` teaches them to stop reading the gate.
+
+    The destination is a DIRECTORY rather than simply absent, which is also the shape
+    that separates `is_file` from `exists` (see the sibling test below)."""
+    wt, repo, tree = _seed_pair(tmp_path, BASE_SKILLS)
+    short = wt / tree / DEV_PRIMITIVE_NEW / "customize.toml"
+    short.unlink()
+    short.mkdir()
+
+    assert base_skills_seed_incomplete(wt, repo, [tree]) == [
+        f"{tree}/{DEV_PRIMITIVE_NEW}/customize.toml"
+    ]
+
+
+def test_base_skills_seed_incomplete_asks_is_file_not_exists(tmp_path):
+    """The leg that fixture arms, asserted for its own sake: a destination occupied by
+    a DIRECTORY is not the file the skill needs. `exists()` answers True for it, so the
+    dir would be called complete and the session dispatched against a customize.toml
+    the renderer cannot read — the same result-less Stop, reached by a path the absent
+    case never visits."""
+    wt, repo, tree = _seed_pair(tmp_path, BASE_SKILLS)
+    occupied = wt / tree / DEV_PRIMITIVE_NEW / "customize.toml"
+    occupied.unlink()
+    occupied.mkdir()
+
+    assert base_skills_seed_incomplete(wt, repo, [tree]) == [
+        f"{tree}/{DEV_PRIMITIVE_NEW}/customize.toml"
+    ]
+
+
+def test_base_skills_seed_incomplete_cannot_demand_what_the_repo_lacks(tmp_path):
+    """Every required file is conjuncted on the REPO's copy having it, so an install
+    predating a marker is never asked for something no copy could have delivered.
+    Provisioning cannot seed a file that does not exist upstream, so a report here
+    would be a CRITICAL escalation on every story with no remedy the operator can
+    apply — and the preflight, which owns "your install is truncated", already said so
+    once at run start."""
+    wt, repo, tree = _seed_pair(tmp_path, BASE_SKILLS)
+    for root in (repo, wt):
+        (root / tree / DEV_PRIMITIVE_NEW / "customize.toml").unlink()
+
+    assert base_skills_seed_incomplete(wt, repo, [tree]) == []
+
+
+def test_base_skills_seed_incomplete_ignores_a_file_no_layer_requires(tmp_path):
+    """What rejects rglob-parity-with-the-repo as this gate's surface. Parity is right
+    for `_bmad/scripts/`, which has no named surface, but a skill dir has one — and it
+    is the surface the preflight already asserts, so the two layers demand the same set
+    and a worktree the preflight called healthy is never refused here. Parity instead
+    would halt the whole backlog over a repo-only README.md no session reads, with no
+    remedy available to the operator."""
+    wt, repo, tree = _seed_pair(tmp_path, BASE_SKILLS)
+    repo_skill = repo / tree / DEV_PRIMITIVE_NEW
+    (repo_skill / "README.md").write_text("# local notes\n", encoding="utf-8")
+    (repo_skill / "scripts").mkdir()
+    (repo_skill / "scripts" / "helper.pyc").write_bytes(b"\x00\x01")
+
+    assert base_skills_seed_incomplete(wt, repo, [tree]) == []
+
+
+def test_base_skills_seed_incomplete_ignores_a_repo_dir_with_no_skill_md(tmp_path):
+    """The precondition is `SKILL.md`, not `is_dir()`: a repo dir with no SKILL.md is
+    not a dispatchable skill — nothing spells it — so its absence downstream stalls
+    nothing, and pausing over it refuses a run nothing is wrong with. The preflight
+    already owns that report, and does make it, so narrowing here loses no coverage.
+
+    A review hunter rather than the dev primitive: a SKILL.md-less bmad-build-auto
+    falls into the unused-era skip one branch earlier and would prove nothing."""
+    hunter = "bmad-review-verification-gap"
+    wt, repo, tree = _seed_pair(tmp_path, BASE_SKILLS)
+    shutil.rmtree(wt / tree / hunter)
+    (repo / tree / hunter / "SKILL.md").unlink()
+
+    problems = missing_base_skills(repo, [tree])
+    assert [f.check for f in problems] == ["skills.base-missing"]
+    assert problems[0].detail["skill"] == hunter
+    assert base_skills_seed_incomplete(wt, repo, [tree]) == []
+
+
+def test_base_skills_seed_incomplete_ignores_a_short_dir_in_the_unused_era(tmp_path):
+    """Composition of the two narrowings: per-FILE granularity must not re-widen the
+    era gate. With bmad-build-auto resolved every prompt spells it, so a leftover
+    bmad-dev-auto shim is never dispatched and a SHORT copy of it stalls exactly as
+    much as an absent one — nothing. The finer rels make this the easier mistake to
+    make, since the skill now fails the check on a file rather than on its whole dir."""
+    wt, repo, tree = _seed_pair(tmp_path, BASE_SKILLS)
+    (wt / tree / DEV_PRIMITIVE_LEGACY / "customize.toml").unlink()
+
+    assert resolve_dev_primitive(repo, tree) == DEV_PRIMITIVE_NEW
+    assert base_skills_seed_incomplete(wt, repo, [tree]) == []
 
 
 def test_missing_base_skills_reports_absent_and_incomplete(tmp_path):
@@ -1253,9 +1459,10 @@ def test_missing_stories_support_probes_the_resolved_primitive(tmp_path):
 
 def test_provision_worktree_carries_the_new_primitives_subdirectories(tmp_path):
     """Adding bmad-build-auto to BASE_SKILLS is what keeps isolation working across
-    the rename. The copy is whole-dir, so review-prompts/ (which customize.toml's
-    layers point at) has to ride along — a markers-only copy would leave every
-    review layer unresolvable inside the worktree."""
+    the rename. The copy is a per-FILE merge that still walks into subdirectories, so
+    review-prompts/ (which customize.toml's layers point at) rides along — a
+    markers-only copy would leave every review layer unresolvable inside the
+    worktree."""
     from conftest import install_build_auto_skill
 
     wt, repo = tmp_path / "wt", tmp_path / "repo"

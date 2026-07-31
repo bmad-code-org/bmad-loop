@@ -63,9 +63,14 @@ editing.
   missing skill stalls a session whether its `SKILL.md` renders or is inline. It is scoped to the
   primitive era the run actually dispatches, though — the skills list it reads names both eras
   because copying one that isn't there is free, but a leftover `bmad-dev-auto` shim no prompt
-  spells is not a stall to pause over. A skill tree that is committed (symlink and all) is
-  checked out into the worktree normally and is unaffected. Pre-existing since 0.6.5; found while
-  reviewing this release.
+  spells is not a stall to pause over. The copy itself now merges per _file_, so a worktree that
+  already holds part of a skill directory is completed rather than skipped whole, and the
+  completeness check compares the same required files the run-start preflight does — naming the
+  one that is missing instead of the directory. Containment is per file too, so a single skill
+  file symlinked out of the repo is reported like a symlinked tree instead of being followed
+  silently. A skill tree that is committed (symlink and all)
+  is checked out into the worktree normally and is unaffected. Pre-existing since 0.6.5; found
+  while reviewing this release.
 
 - **A renderer stub that cannot compose a prompt fails the preflight (#405).** Two new checks
   block `validate`/`run`/`sweep`/`resume`: `skills.dev-renderer`, when the resolved `SKILL.md`

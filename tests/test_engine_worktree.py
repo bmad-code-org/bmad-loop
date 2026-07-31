@@ -849,6 +849,36 @@ def _symlink_skill_tree(
         (tree_dir / skill).symlink_to(real, target_is_directory=True)
 
 
+def _symlink_skill_file(
+    project,
+    shared: Path,
+    skill: str,
+    filename: str,
+    tree: str = ".claude/skills",
+) -> None:
+    """Replace ONE CHILD FILE of an already-real skill dir with a symlink to a file
+    outside the repo — the shape neither sibling helper can express.
+
+    :func:`_real_skill_dirs` lays a skill down whole and :func:`_symlink_skill_tree`
+    points the WHOLE dir out of the repo, so between them a skill is either seeded
+    completely or dropped completely. Neither can produce the state in between: a
+    worktree skill dir that is PRESENT and resolvable but SHORT of one required file,
+    because the per-file containment guard drops exactly the symlinked child and
+    copies every sibling. That is the shape a DIRECTORY-granular check calls complete
+    — the dir exists, so nothing is reported — and then dispatches a session whose
+    step-04 has no customization to read.
+
+    The target file is created, so the link is LIVE: the repo-side preflight stats
+    through it and passes, which is what makes the worktree the only short half.
+    """
+    target = shared / skill / filename
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("x\n", encoding="utf-8")
+    link = project.project / tree / skill / filename
+    link.unlink(missing_ok=True)
+    link.symlink_to(target)
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
 def test_a_dropped_skill_seed_pauses_before_dispatch(project, tmp_path):
     """The skills half of the same fault the renderer sentinels catch, and the leg
@@ -1022,6 +1052,143 @@ def test_a_tracked_symlinked_skill_tree_does_not_pause(project, tmp_path):
     kinds = [e["kind"] for e in Journal(engine.run_dir).entries()]
     assert "story-escalated" not in kinds
     assert "worktree-seed-skipped" not in kinds
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
+def test_a_short_skill_dir_pauses_before_dispatch(project, tmp_path):
+    """The granularity leg: the worktree HAS the dev primitive's directory, and it is
+    still unusable. Only `customize.toml` is symlinked to a shared install outside the
+    repo, so the per-file containment guard drops that one child and copies SKILL.md
+    and the step files normally.
+
+    A directory-granular seed (skip the whole dir when the destination exists) and a
+    directory-granular gate (ask only whether the dir is there) both call that state
+    complete, so the session dispatches and stalls INSIDE the workflow rather than on
+    `Unknown command` — having written nothing, on this story and, since the seed
+    reads the same repo every time, on every story after it. Same environment-fault
+    shape as the whole-skill case, one layer down.
+
+    The repo passes its own preflight — it stats through the link — which is the whole
+    reason the run reaches provisioning. And `_bmad/` is absent entirely, so no
+    renderer leg can be what fired."""
+    from conftest import attach_profile
+
+    from bmad_loop import install
+    from bmad_loop.install import base_skills_seed_incomplete
+
+    # gitignored skill tree = the normal shape, and the only one provisioning copies:
+    # a tracked tree is checked out and there is nothing for the guard to drop
+    (project.project / ".gitignore").write_text(".bmad-loop/runs/\n.claude/\n", encoding="utf-8")
+    _real_skill_dirs(project, install.DEV_PRIMITIVE_NEW, *install.REVIEW_HUNTER_SKILLS)
+    # ...then swap exactly ONE required file of the resolved primitive for a link out
+    _symlink_skill_file(
+        project, tmp_path / "shared-bmad-install", install.DEV_PRIMITIVE_NEW, "customize.toml"
+    )
+    commit_sprint(project, {"1-1-a": "ready-for-dev", "1-1-b": "ready-for-dev"})
+    # the repo-side preflight follows the link and is HAPPY — that is the point: the
+    # repo passes and the worktree does not
+    assert install.missing_base_skills(project.project, [".claude/skills"]) == []
+    assert install.resolve_dev_primitive(project.project, ".claude/skills") is not None
+    # nothing renderer-era anywhere, so this is unambiguously the skills gate
+    assert not renderer_stub_resolved(project.project, [".claude/skills"])
+
+    dispatched: list[str] = []
+
+    def never(spec):
+        dispatched.append(spec.cwd.name)
+        raise AssertionError("dispatched into a worktree whose primitive dir is short")
+
+    engine, adapter = make_engine(project, [never, never])
+    attach_profile(adapter)
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1
+    assert dispatched == []
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED
+    # the pause stopped the loop rather than walking the backlog into the same stall
+    assert "1-1-b" not in engine.state.tasks
+    entries = Journal(engine.run_dir).entries()
+    assert "story-escalated" in [e["kind"] for e in entries]
+    escalated = [e for e in entries if e["kind"] == "story-escalated"]
+    # the FULL rel, including the file. A bare `.claude/skills/bmad-build-auto` is the
+    # COARSE rel this same gate emits for a wholly-absent skill, so asserting only that
+    # would survive an ablation back to directory granularity — which is precisely the
+    # bug this test exists for.
+    assert ".claude/skills/bmad-build-auto/customize.toml" in escalated[0]["reason"]
+    # re-probe the predicate against the still-mounted worktree with an exact ==, so
+    # extra rels (a second dropped file, the coarse rel alongside the fine one) cannot
+    # hide behind a substring match on the prose above
+    assert base_skills_seed_incomplete(
+        Path(task.worktree_path), project.project, [".claude/skills"]
+    ) == [".claude/skills/bmad-build-auto/customize.toml"]
+    # ...and the rest of the dir really did arrive: this is a SHORT skill dir, not an
+    # absent one, which is the only thing that makes the granularity the subject
+    primitive = Path(task.worktree_path) / ".claude" / "skills" / "bmad-build-auto"
+    assert (primitive / "SKILL.md").is_file()
+    assert (primitive / "step-04-review.md").is_file()
+
+
+def test_a_partially_tracked_skill_dir_is_repaired_not_escalated(project):
+    """The clearing leg for the granularity fix, and the proof it needs BOTH layers:
+    half of it — the per-file gate without the per-file merge — would pause a worktree
+    that provisioning is perfectly able to repair.
+
+    No symlinks anywhere (so this runs on Windows too). `.claude/` is deliberately NOT
+    gitignored and `customize.toml` is deliberately NOT committed, which is the
+    ordinary shape of a project that tracks its skill tree but keeps one generated or
+    machine-local layer out of git. The worktree checks out every tracked file of
+    `bmad-build-auto` and none of that one — a destination directory that EXISTS while
+    being short, i.e. exactly what the old dir-level `if dst.exists(): continue` skipped
+    whole. Per-FILE merge fills the hole, the gate finds nothing missing, and the run
+    completes.
+
+    Second half: the file provisioning just wrote is untracked and un-gitignored, so
+    the unit's `git add -A` would sweep it into the story commit — the worktree's local
+    git exclude is the only thing stopping a tool file the repo deliberately does not
+    track from being committed back to the target branch."""
+    from conftest import attach_profile, install_build_auto_skill
+
+    from bmad_loop import install
+
+    # `.claude/` NOT ignored: the skill dir has to be TRACKABLE for the checkout to
+    # carry half of it, which is the whole premise
+    (project.project / ".gitignore").write_text(".bmad-loop/runs/\n", encoding="utf-8")
+    skill = install_build_auto_skill(project.project, ".claude/skills")
+    _real_skill_dirs(project, *install.REVIEW_HUNTER_SKILLS)
+    (skill / "customize.toml").unlink()
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})  # tracks everything BUT that file
+    # ...and back it comes: present in the repo, untracked, not gitignored
+    (skill / "customize.toml").write_text(
+        '[[review_layers]]\nid = "adversarial"\nprompt_file = "review-prompts/adversarial.md"\n',
+        encoding="utf-8",
+    )
+    # the fixture's own premise, asserted rather than assumed: a tracked file here
+    # would be checked out and there would be nothing to repair
+    assert ".claude/skills/bmad-build-auto/customize.toml" in git(
+        project.project, "status", "--porcelain"
+    )
+    # the repo passes its preflight, so a pause below could only be provisioning's
+    assert install.missing_base_skills(project.project, [".claude/skills"]) == []
+
+    head_before = rev_parse_head(project.project)
+    engine, adapter = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
+    )
+    attach_profile(adapter)
+    summary = engine.run()
+
+    assert not summary.paused and summary.escalated == 0
+    assert engine.state.tasks["1-1-a"].phase == Phase.DONE
+    assert "story-escalated" not in [e["kind"] for e in Journal(engine.run_dir).entries()]
+    # ...and the repair stayed in the worktree: every commit the run landed carries the
+    # code change and not one path under the skill tree
+    files = git(
+        project.project, "log", "--pretty=format:", "--name-only", f"{head_before}..HEAD"
+    ).splitlines()
+    assert "src.txt" in files
+    assert not [f for f in files if f.startswith(".claude/skills")]
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")

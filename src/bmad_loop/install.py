@@ -804,6 +804,36 @@ def _copy_traversable(src, dst: Path) -> None:
         dst.write_bytes(src.read_bytes())
 
 
+def _merge_traversable(src, dst: Path, worktree: Path, repo_root: Path | None = None) -> None:
+    """Recursively copy a resource tree into a worktree, copy-when-absent per FILE.
+
+    The merge half of :func:`_copy_traversable`, and the same reason
+    :func:`_seed_bmad_tree` merges rather than replaces: a skill dir is one
+    multi-file unit, so a DIRECTORY-level skip is silent and total — a checkout
+    carrying one file of that dir would receive zero bytes of the rest, pass a
+    directory-granular completeness check, and dispatch a session whose step files
+    are absent. Walks ``.iterdir()`` rather than ``rglob`` so a zip-imported wheel
+    works, and creates parents lazily at the leaf so an empty source dir is not
+    recreated.
+
+    ``dst`` containment is always checked: a symlink in the CHECKOUT pointing out of
+    the worktree must not be written *through*. ``repo_root`` is passed only for
+    real-filesystem sources, where a child symlinked to a shared install outside the
+    repo must not be read through — wheel package data has no such leg to check, and
+    is not a ``Path`` to resolve in the first place.
+    """
+    if src.is_dir():
+        for child in src.iterdir():
+            _merge_traversable(child, dst / child.name, worktree, repo_root)
+        return
+    if repo_root is not None and not Path(str(src)).resolve().is_relative_to(repo_root):
+        return
+    if not dst.resolve().is_relative_to(worktree) or dst.exists():
+        return
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    _copy_traversable(src, dst)
+
+
 def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> None:
     """Add anchored ignore patterns to the worktree's local git exclude so the
     provisioned tool files are never staged by the unit's `git add -A`. Uses
@@ -945,8 +975,37 @@ def _bmad_scripts_seed_incomplete(worktree: Path, repo_root: Path) -> bool:
     )
 
 
+def _absent_skill_files(
+    repo_skill: Path, worktree_skill: Path, markers: Sequence[str]
+) -> list[str]:
+    """The REQUIRED files of one skill dir the repo has and the worktree does not.
+
+    The required surface is the one :func:`missing_base_skills` already asserts at
+    run start — ``SKILL.md`` plus the skill's :data:`BASE_SKILLS` markers — so the
+    two layers demand the same set and a worktree the preflight calls healthy is
+    never refused here. Deliberately *not* rglob parity with the repo's dir: that is
+    right for ``_bmad/scripts/`` (see :func:`_bmad_scripts_seed_incomplete`) precisely
+    because it has no named surface, but a skill dir does, and parity would halt the
+    whole backlog over a repo-only ``README.md`` no session reads, with no remedy
+    available to the operator. The bounded blind spot is an undeliverable
+    *non-required* file, reported by neither layer; the remedy for one that turns out
+    to matter is to add it to the marker tuple, where both layers pick it up at once.
+
+    Each leg is conjuncted on the REPO's copy having the file, so a project whose
+    install predates a marker is not asked for something no copy could have delivered.
+    ``is_file`` rather than ``exists`` throughout: a destination occupied by a
+    directory is not the file the skill needs.
+    """
+    return [
+        rel
+        for rel in ("SKILL.md", *markers)
+        if (repo_skill / rel).is_file() and not (worktree_skill / rel).is_file()
+    ]
+
+
 def base_skills_seed_incomplete(worktree: Path, repo_root: Path, trees: Sequence[str]) -> list[str]:
-    """The ``<tree>/<skill>`` rels the repo resolves but the worktree does not carry.
+    """The rels the repo resolves but the worktree does not carry — a whole skill dir,
+    or a required file inside one.
 
     The skills half of the same shape :func:`_bmad_scripts_seed_incomplete` reports for
     the renderer, and the one containment leg nothing covered. `provision_worktree`
@@ -977,6 +1036,23 @@ def base_skills_seed_incomplete(worktree: Path, repo_root: Path, trees: Sequence
     ``_bmad/scripts`` when a review hunter is what vanished is the drift the shared
     constants exist to prevent.
 
+    Asked per FILE, not per directory (:func:`_absent_skill_files`): a worktree can
+    hold a SHORT skill dir, and a directory-granular check calls that complete and
+    dispatches a session whose step-04 has nothing to read. The precondition is
+    ``SKILL.md`` rather than ``is_dir()`` for the same reason in the other direction —
+    a repo dir with no ``SKILL.md`` is not a dispatchable skill (nothing spells it,
+    :func:`resolve_dev_primitive` returns None), so its absence downstream stalls
+    nothing and pausing over it refuses a healthy run. Both legs still stat *through*
+    a symlink, which is the whole reason the gate exists.
+
+    Rel granularity follows the cause: the coarse ``<tree>/<skill>`` when the worktree
+    lacks ``SKILL.md``, because then everything under the dir is missing and three rels
+    for one cause is noise; the fine ``<tree>/<skill>/<file>`` otherwise, because
+    naming a directory the operator falsifies with one ``ls`` teaches them to stop
+    reading the gate. Every consumer treats a rel as an opaque string (an exact-match
+    sentinel filter, an ``_is_under_bmad`` prefix test, a join into a message), so the
+    extra segment splits nothing.
+
     Third gate, and the one :data:`BASE_SKILLS` cannot supply: the primitive era this
     run will not invoke. That map is a copy-if-*present* catalog ("every non-bundled
     skill that MIGHT need copying") listing both era names, because naming both is free
@@ -1006,11 +1082,20 @@ def base_skills_seed_incomplete(worktree: Path, repo_root: Path, trees: Sequence
         unused_era = {DEV_PRIMITIVE_NEW, DEV_PRIMITIVE_LEGACY} - {
             dev_primitive_or_default(repo_root, tree)
         }
-        for skill in BASE_SKILLS:
+        for skill, markers in BASE_SKILLS.items():
             if skill in unused_era:
                 continue
-            if (repo_root / tree / skill).is_dir() and not (worktree / tree / skill).is_dir():
+            repo_skill = repo_root / tree / skill
+            worktree_skill = worktree / tree / skill
+            if not (repo_skill / "SKILL.md").is_file():
+                continue
+            if not (worktree_skill / "SKILL.md").is_file():
                 missing.append(f"{tree}/{skill}")
+                continue
+            missing += [
+                f"{tree}/{skill}/{rel}"
+                for rel in _absent_skill_files(repo_skill, worktree_skill, markers)
+            ]
     return missing
 
 
@@ -1113,7 +1198,10 @@ def provision_worktree(
 
     Kept safe against the unit's eventual `git add -A` commit:
     - skills + seed files are copied only when ABSENT, so a project that commits its
-      own skill tree (e.g. .agents/) or config keeps it untouched (no diff merged back);
+      own skill tree (e.g. .agents/) or config keeps it untouched (no diff merged back).
+      Skill trees are merged per FILE, not per directory: a checkout carrying part of
+      a skill dir keeps every file it has and gets the rest filled in, rather than
+      being skipped whole and dispatched short (see _merge_traversable);
     - the hook points at the MAIN repo's already-installed relay via an absolute
       path (the relay locates the run dir from $BMAD_LOOP_RUN_DIR, not its own
       location), so nothing is written into the worktree's .bmad-loop/;
@@ -1219,34 +1307,37 @@ def provision_worktree(
         skipped.append(CENTRAL_CONFIG_REL)
 
     # bundled skills into each CLI's skill tree (deduped: codex+gemini share one);
-    # never clobber a skill the checkout already carries (tracked or pre-existing).
+    # never clobber a FILE the checkout already carries (tracked or pre-existing).
     for tree in dict.fromkeys(p.skill_tree for p in profiles):
         tree_dir = worktree / tree
         for skill in MODULE_SKILLS:
-            dst = tree_dir / skill
-            if dst.exists():
-                continue
-            _copy_traversable(skills_root.joinpath(skill), dst)
+            _merge_traversable(skills_root.joinpath(skill), tree_dir / skill, worktree)
         # The orchestrator-driven upstream skills (BASE_SKILLS) are not in the
         # wheel; copy them from the MAIN REPO's installed tree (same tree path) so
         # an isolated worktree can still resolve the dev primitive (under EITHER
         # name — BASE_SKILLS lists both eras) and the review hunters.
         #
-        # Two legs, and only one of them is safe to skip silently. `not src.is_dir()`
+        # Three legs, and only one of them is safe to skip silently. `not is_dir()`
         # means the repo genuinely lacks the skill, which the run-start preflight
         # already refused. A containment failure does NOT: the skill is there, as a
         # symlink to a shared install outside the repo, and the preflight stats
-        # through the link and passes. That leg is reported below via
-        # `base_skills_seed_incomplete`, which re-asks the question of the result
-        # rather than trusting this loop's bookkeeping.
+        # through the link and passes. Nor does a destination that already holds SOME
+        # of the dir — which is why this merges per FILE rather than skipping on the
+        # directory: a checkout carrying one tracked child of a skill tree, or a
+        # `worktree_seed` entry naming a file inside one, would otherwise leave the
+        # rest at zero bytes. Both reported below via `base_skills_seed_incomplete`,
+        # which re-asks the question of the result rather than trusting this loop's
+        # bookkeeping. The per-file skips are deliberately NOT reported: the
+        # `seed_files` report exists because a USER-AUTHORED entry that copies nothing
+        # reads as applied configuration, and because a directory entry's no-op is
+        # total — the merge is precisely what removes that total-skip hazard, and
+        # naming every already-present file would put hundreds of rels per story into
+        # the channel the renderer sentinels share.
         for skill in BASE_SKILLS:
-            dst = tree_dir / skill
-            if dst.exists():
+            src_root = repo_root / tree / skill
+            if not src_root.resolve().is_relative_to(repo_root) or not src_root.is_dir():
                 continue
-            src = (repo_root / tree / skill).resolve()
-            if not src.is_relative_to(repo_root) or not src.is_dir():
-                continue
-            _copy_traversable(src, dst)
+            _merge_traversable(src_root, tree_dir / skill, worktree, repo_root)
 
     # Report whatever the skills copy above could not deliver. Asked of the RESULT,
     # not accumulated inside the loop, so a skill dropped by any future path is caught
