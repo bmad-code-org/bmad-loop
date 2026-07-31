@@ -115,6 +115,13 @@ RENDERER_SCRIPT_MARKER = "render_skill.py"
 # reason. Project-global, not per tree.
 CENTRAL_CONFIG_REL = f"{BMAD_DIR}/config.toml"
 
+# The one `provision_worktree` skipped-seed entry that is NOT informational: it says
+# the worktree's renderer support came up SHORT, not that a seed was a no-op. Shared
+# with the engine, which escalates on it — a magic string on either side would let the
+# two drift silently apart, and the failure mode of that drift is a run that dispatches
+# into guaranteed result-less Stops. See _bmad_scripts_seed_incomplete.
+BMAD_SCRIPTS_SEED_REL = f"{BMAD_DIR}/scripts"
+
 # Top-level _bmad/ entries never seeded into a worktree. render/ is the renderer's
 # published output: it is regenerated on skill entry, and every snapshot dir name is
 # keyed on a hash of the project root's absolute path, so seeding the main
@@ -790,9 +797,12 @@ def _bmad_scripts_seed_incomplete(worktree: Path, repo_root: Path) -> bool:
     ``HALT:`` line is lost.
 
     Reported through :func:`provision_worktree`'s existing skipped-seed return
-    channel (the caller journals ``worktree-seed-skipped``) rather than raising:
-    an incomplete seed is a degraded provision, not a failed one, and that channel
-    needs no engine or journal-schema change.
+    channel, as the :data:`BMAD_SCRIPTS_SEED_REL` entry, rather than raising —
+    provisioning has no failure path of its own and inventing one here would put a
+    policy decision inside a quiet, TUI-hosted helper. The *engine* reads that
+    entry back and escalates: this is not a degraded provision the run can carry,
+    it is an environment fault identical for every story, so dispatching would burn
+    the whole backlog on result-less Stops.
     """
     if not (repo_root / RENDERER_SCRIPT_REL).is_file():
         return False
@@ -965,7 +975,7 @@ def provision_worktree(
         # so reporting it would journal worktree-seed-skipped for a seed that applied.
         skipped = [rel for rel in skipped if not _is_under_bmad(rel)]
     if _bmad_scripts_seed_incomplete(worktree, repo_root):
-        skipped.append(f"{BMAD_DIR}/scripts")
+        skipped.append(BMAD_SCRIPTS_SEED_REL)
 
     # bundled skills into each CLI's skill tree (deduped: codex+gemini share one);
     # never clobber a skill the checkout already carries (tracked or pre-existing).

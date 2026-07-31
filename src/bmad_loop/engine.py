@@ -30,7 +30,7 @@ from .escalation import (
     decide_review_session,
     preference_escalations,
 )
-from .install import dev_primitive_or_default, provision_worktree
+from .install import BMAD_SCRIPTS_SEED_REL, dev_primitive_or_default, provision_worktree
 from .journal import Journal, save_state
 from .model import (
     PAUSE_EPIC_BOUNDARY,
@@ -627,6 +627,36 @@ class Engine:
             self.journal.append(
                 "worktree-seed-skipped", story_key=task.story_key, entries=skipped_seeds
             )
+        if BMAD_SCRIPTS_SEED_REL in skipped_seeds:
+            # ...with exactly one exception, and it is not informational: the
+            # worktree's `_bmad/scripts/` came up SHORT of the repo's. The renderer
+            # stub would run without `render_skill.py`/`config_utils.py` and Stop
+            # having written nothing — on THIS story and, since the seed reads the
+            # same repo every time, on every story after it. That is the env-fault
+            # shape `VerifyOutcome.env_fault` names: no repair session can fix it and
+            # no other story escapes it, so pause the run instead of walking the whole
+            # backlog into it. Escalate rather than defer for the same reason.
+            #
+            # Raised BEFORE the workspace swaps to the unit below, so the half-seeded
+            # worktree stays mounted for the operator to inspect — the same courtesy
+            # _run_isolated's docstring promises a RunPaused out of `drive`. The phase
+            # is set directly: PENDING has no legal move to ESCALATED (see the
+            # worktree-open-failed branch above, which sets DEFERRED the same way).
+            reason = (
+                f"{BMAD_SCRIPTS_SEED_REL} is incomplete in the worktree — the renderer "
+                f"would HALT without writing a spec. The usual cause is a symlinked "
+                f"_bmad/ pointing outside the repo, which worktree seeding cannot follow"
+            )
+            task.phase = Phase.ESCALATED
+            self.journal.append("story-escalated", story_key=task.story_key, reason=reason)
+            gates.notify(
+                self.policy,
+                self.run_dir,
+                f"CRITICAL escalation: {task.story_key}",
+                f"{reason} — resolve, then `bmad-loop resume {self.state.run_id}`",
+            )
+            self._save()
+            raise RunPaused(reason, PAUSE_ESCALATION, task.story_key)
         self.journal.append(
             "worktree-opened", story_key=task.story_key, branch=unit.branch, path=str(unit.path)
         )

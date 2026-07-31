@@ -8,8 +8,11 @@ adapter (no tmux, no LLM).
 
 from __future__ import annotations
 
+import os
 import shutil
+from pathlib import Path
 
+import pytest
 from conftest import (
     _OK,
     _exists_run,
@@ -720,6 +723,90 @@ def test_worktree_run_carries_bmad_surface_and_never_commits_it(project):
     ).splitlines()
     assert "src.txt" in files
     assert not [f for f in files if f.startswith("_bmad/")]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
+def test_incomplete_bmad_scripts_seed_pauses_before_dispatch(project, tmp_path):
+    """A shared BMad install wired as a symlink out of the repo: the seed's
+    resolve-and-contain guard drops every file under `_bmad/scripts/`, so the
+    worktree gets `config.toml` and no renderer at all.
+
+    That is an ENVIRONMENT fault, not this story's: the seed reads the same repo for
+    every unit, so dispatching would walk the whole backlog into result-less Stops
+    one story at a time. The run pauses before `drive` is ever entered, and the
+    half-seeded worktree stays mounted for inspection."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev", "1-1-b": "ready-for-dev"})
+    shared = tmp_path / "shared-bmad-scripts"
+    shared.mkdir()
+    (shared / "render_skill.py").write_text("# render", encoding="utf-8")
+    (shared / "config_utils.py").write_text("# config", encoding="utf-8")
+    bmad = project.project / "_bmad"
+    bmad.mkdir(parents=True)
+    (bmad / "config.toml").write_text("[core]\n", encoding="utf-8")
+    (bmad / "scripts").symlink_to(shared, target_is_directory=True)
+    # the repo-side probe still sees the renderer through the symlink
+    assert (bmad / "scripts" / "render_skill.py").is_file()
+
+    dispatched: list[str] = []
+
+    def never(spec):
+        dispatched.append(spec.cwd.name)
+        raise AssertionError("dispatched into a worktree with no renderer")
+
+    engine, _ = make_engine(project, [never, never])
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1
+    assert dispatched == []
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED
+    # the sibling never ran: a pause stops the loop, it does not walk the backlog
+    # one result-less Stop at a time (tasks are created on dispatch, so an absent
+    # key IS the proof the loop stopped)
+    assert "1-1-b" not in engine.state.tasks
+    kinds = [e["kind"] for e in Journal(engine.run_dir).entries()]
+    assert "story-escalated" in kinds
+    # the seed's own report still went out, so the escalation reads as an
+    # ESCALATION of that report rather than replacing it
+    assert "worktree-seed-skipped" in kinds
+    # the worktree the operator has to inspect is still mounted, and it is the
+    # renderer half that is short — config.toml made it in, so "seeding ran"
+    assert (Path(task.worktree_path) / "_bmad" / "config.toml").is_file()
+    assert not (Path(task.worktree_path) / "_bmad" / "scripts" / "render_skill.py").exists()
+
+
+def test_a_benign_skipped_seed_does_not_pause(project):
+    """The clearing leg for the gate above, and it has to arm a NON-EMPTY
+    `skipped_seeds` to earn its keep: a `worktree_seed` dir the checkout already
+    carries is reported skipped, which is the ordinary informational case that has
+    always ridden this channel. Escalating on it would pause every run that has a
+    no-op seed entry.
+
+    Ablation this catches and a bare happy-path cannot: widening the gate from the
+    `_bmad/scripts` sentinel to `if skipped_seeds:`."""
+    bmad = project.project / "_bmad"
+    (bmad / "scripts").mkdir(parents=True)
+    (bmad / "config.toml").write_text("[core]\n", encoding="utf-8")
+    (bmad / "scripts" / "render_skill.py").write_text("# render", encoding="utf-8")
+    (bmad / "scripts" / "config_utils.py").write_text("# config", encoding="utf-8")
+    # tracked, so the worktree checks it out and copy-when-absent makes the seed a
+    # no-op — provision_worktree reports it, and it must stay informational
+    vendor = project.project / "vendor"
+    vendor.mkdir()
+    (vendor / "conf.txt").write_text("x\n", encoding="utf-8")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+
+    engine, _ = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
+        policy=wt_policy(worktree_seed=("vendor",)),
+    )
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused
+    kinds = journal_kinds(engine)
+    assert "worktree-seed-skipped" in kinds  # the channel really did fire
+    assert "story-escalated" not in kinds
 
 
 def test_harvest_reverted_on_retry_under_isolation(project):
