@@ -255,6 +255,127 @@ def test_merge_hooks_antigravity_preserves_other_groups():
     assert settings["bmad-loop"]["Stop"][0]["command"].endswith("bmad_loop_hook.py Stop")
 
 
+def test_merge_hooks_vibe_entry_shape():
+    # vibe's .vibe/hooks.toml is a FLAT array: entries carry their own event in a
+    # `type` field rather than being keyed by it, and each needs a unique `name`.
+    profile = get_profile("mistral-vibe")
+    config, _ = merge_hooks({}, _registrations(profile), profile.hooks.dialect)
+    (entry,) = config["hooks"]
+    assert entry["name"] == "bmad-loop-stop"
+    assert entry["type"] == "post_agent"  # the only turn-end event vibe has
+    assert entry["timeout"] == 60  # vibe hook timeouts are seconds
+    # registered under the native event but relaying the canonical name
+    assert entry["command"].endswith("bmad_loop_hook.py Stop")
+
+
+def test_merge_hooks_vibe_idempotent():
+    profile = get_profile("mistral-vibe")
+    config, _ = merge_hooks({}, _registrations(profile), profile.hooks.dialect)
+    again, changed = merge_hooks(config, _registrations(profile), profile.hooks.dialect)
+    assert not changed
+    assert len(again["hooks"]) == 1
+
+
+def test_merge_hooks_vibe_preserves_user_hooks():
+    # every vibe hook shares ONE array, so an unrelated user hook is not merely
+    # in a sibling group — it is in the same list we append to.
+    profile = get_profile("mistral-vibe")
+    mine = {"name": "guard-bash", "type": "pre_tool", "match": "bash", "command": "echo mine"}
+    config, changed = merge_hooks({"hooks": [mine]}, _registrations(profile), profile.hooks.dialect)
+    assert changed
+    assert config["hooks"][0] == mine
+    assert len(config["hooks"]) == 2
+
+
+def test_merge_hooks_vibe_unrelated_bmad_loop_path_does_not_suppress_relay():
+    # the #159 guarantee through the flat-array dedup branch.
+    profile = get_profile("mistral-vibe")
+    existing = {
+        "hooks": [
+            {"name": "mine", "type": "post_agent", "command": "python ~/bmad_loop_fork/notify.py"}
+        ]
+    }
+    config, changed = merge_hooks(existing, _registrations(profile), profile.hooks.dialect)
+    assert changed
+    commands = [h["command"] for h in config["hooks"]]
+    assert "python ~/bmad_loop_fork/notify.py" in commands
+    assert any("bmad_loop_hook" in c for c in commands)
+
+
+def test_merge_hooks_vibe_rejects_malformed_shape():
+    import pytest
+
+    from bmad_loop.adapters.profile import ProfileError
+
+    profile = get_profile("mistral-vibe")
+    with pytest.raises(ProfileError):
+        merge_hooks({"hooks": "oops"}, _registrations(profile), profile.hooks.dialect)
+
+
+def test_dump_vibe_hooks_round_trips_through_tomllib():
+    # the hand-rolled emitter is only trustworthy if a real TOML parser reads back
+    # exactly what went in — especially commands carrying quotes and backslashes
+    # (Windows paths), which are what naive string interpolation corrupts.
+    import tomllib
+
+    from bmad_loop.install import dump_hook_config
+
+    config = {
+        "hooks": [
+            {
+                "name": "guard",
+                "type": "pre_tool",
+                "match": "bash",
+                "strict": True,
+                "timeout": 12.5,
+                "description": None,  # TOML has no null: the key is dropped
+            },
+            {
+                "name": "bmad-loop-stop",
+                "type": "post_agent",
+                "command": 'C:\\Py\\python.exe "C:\\proj dir\\hook.py"\tStop',
+                "timeout": 60,
+            },
+        ]
+    }
+    text = dump_hook_config(config, "vibe-hooks-toml")
+    parsed = tomllib.loads(text)
+    assert parsed["hooks"][1] == config["hooks"][1]
+    assert parsed["hooks"][0] == {k: v for k, v in config["hooks"][0].items() if v is not None}
+
+
+def test_dump_vibe_hooks_refuses_non_scalar():
+    # fail loud at the boundary rather than emitting TOML that vibe will reject
+    # (or, worse, silently misparse) at hook-load time.
+    import pytest
+
+    from bmad_loop.adapters.profile import ProfileError
+    from bmad_loop.install import dump_hook_config
+
+    with pytest.raises(ProfileError):
+        dump_hook_config({"hooks": [{"name": "x", "env": {"A": "1"}}]}, "vibe-hooks-toml")
+
+
+def test_install_into_vibe(tmp_path):
+    import tomllib
+
+    assert install_into(tmp_path, clis=("mistral-vibe",)) == 0
+    config = tomllib.loads((tmp_path / ".vibe" / "hooks.toml").read_text())
+    (entry,) = config["hooks"]
+    assert entry["type"] == "post_agent"
+    # absolute path baked in (vibe has no $CLAUDE_PROJECT_DIR equivalent)
+    cmd = entry["command"]
+    assert str(tmp_path.resolve()) in cmd and cmd.endswith(" Stop")
+    # skills land in the shared .agents/skills tree
+    for skill in MODULE_SKILLS:
+        assert (tmp_path / ".agents" / "skills" / skill / "SKILL.md").is_file()
+
+    # idempotent re-run does not duplicate the entry
+    assert install_into(tmp_path, clis=("mistral-vibe",)) == 0
+    again = tomllib.loads((tmp_path / ".vibe" / "hooks.toml").read_text())
+    assert len(again["hooks"]) == 1
+
+
 def test_install_does_not_clobber_existing_policy(tmp_path):
     """An existing .bmad-loop/policy.toml is per-machine state: init must leave it
     alone rather than resetting it to the template."""

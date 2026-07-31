@@ -57,8 +57,8 @@ from pathlib import Path
 
 from . import sanitize
 from .adapters.multiplexer import MultiplexerError, get_multiplexer
-from .adapters.profile import CLIProfile
-from .install import merge_hooks, relay_registered
+from .adapters.profile import CLIProfile, ProfileError
+from .install import dump_hook_config, load_hook_config, merge_hooks, relay_registered
 from .process_host import get_process_host
 
 # cmd_probe catches `probe.LeakDetected` around the renderers, mirroring
@@ -97,6 +97,12 @@ FAMILY_GLOBS = {
     "antigravity": (
         "~/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript_full.jsonl"
     ),
+    # vibe writes one directory per session under its session-log root, named
+    # session_<YYYYmmdd_HHMMSS>_<short-session-id>, holding messages.jsonl plus a
+    # meta.json. Rooted at $VIBE_HOME (default ~/.vibe), so a VIBE_HOME override
+    # moves it and this glob misses — the hook payload's transcript_path is
+    # authoritative and --probe prefers it.
+    "mistral-vibe": "~/.vibe/logs/session/*/messages.jsonl",
 }
 
 _TOKEN_KEY_RE = re.compile(
@@ -407,13 +413,9 @@ def _hooks_registered(project: Path, profile: CLIProfile) -> bool:
     config_path = project / profile.hooks.config_path
     if not config_path.is_file():
         return False
-    import json
-
     try:
-        config = json.loads(config_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return False
-    if not isinstance(config, dict):
+        config = load_hook_config(config_path.read_text(encoding="utf-8"), profile.hooks.dialect)
+    except (ProfileError, OSError):
         return False
     return relay_registered(config, profile.hooks.dialect, profile.hooks.events)
 
@@ -587,7 +589,6 @@ def probe(
     keep_temp: bool = False,
     pseudo: sanitize.Pseudonymizer | None = None,
 ) -> ProfileFinding:
-    import json
 
     aliases = {orig: alias for _ns, orig, alias in pseudo.entries()} if pseudo else None
     binary = hints.binary or profile.binary
@@ -641,7 +642,7 @@ def probe(
         config, _ = merge_hooks({}, registrations, profile.hooks.dialect)
         config_path = tmpdir / profile.hooks.config_path
         config_path.parent.mkdir(parents=True, exist_ok=True)
-        config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+        config_path.write_text(dump_hook_config(config, profile.hooks.dialect), encoding="utf-8")
 
         # 2. launch one trivial content-free turn in a fresh tmux window
         argv = _probe_argv(profile, binary, hints)

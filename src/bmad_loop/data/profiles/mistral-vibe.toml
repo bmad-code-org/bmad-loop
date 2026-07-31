@@ -1,0 +1,43 @@
+# Mistral Vibe CLI (`vibe`), verified against 2.23.2.
+#
+# TRUST IS LOAD-BEARING. vibe reads <project>/.vibe/hooks.toml only when the
+# working directory is trusted; an untrusted cwd silently yields zero hooks, so
+# no Stop ever arrives and every session reads as a timeout. `--trust` trusts the
+# directory for THIS invocation only (not persisted to trusted_folders.toml),
+# which is exactly what an unattended spawn wants — and, unlike antigravity's
+# exact-path trust store, it means isolation = "worktree" works: each worktree is
+# trusted by the same flag on launch.
+#
+# ONE TURN-END EVENT. vibe's hook types are post_agent / pre_tool / post_tool —
+# there is no SessionStart, SessionEnd or PreCompact analogue. post_agent fires
+# once per TURN (after the agent finishes responding with no pending tool calls),
+# not once per session, so stop_without_result_nudges is raised the way copilot's
+# per-turn agentStop required. Payload keys are snake_case (session_id,
+# transcript_path, cwd, parent_session_id), which the shared relay already reads.
+#
+# NO --model FLAG. vibe takes its model from config (`active_model`) or the
+# VIBE_ACTIVE_MODEL env var. Leave `[adapter] model` EMPTY in policy.toml —
+# model_flag below is inert only while it stays empty, and setting it would pass
+# an argument vibe's parser rejects.
+#
+# usage_parser = "none" pending a probe of ~/.vibe/logs/session/*/messages.jsonl.
+name = "mistral-vibe"
+binary = "vibe"
+prompt_template = "{prompt}"
+launch_args = ["--trust"]
+bypass_args = ["--auto-approve"]
+model_flag = "--model"
+usage_parser = "none"
+stop_without_result_nudges = 5  # post_agent fires per response turn
+first_run_note = "run `vibe --setup` once and authenticate (Mistral API key) before `bmad-loop run` — spawned sessions can't answer the setup prompt, and a pending one reads as a session timeout. Leave `[adapter] model` empty: vibe has no --model flag, so set the model via VIBE_ACTIVE_MODEL or vibe's own config. Requires Mistral Vibe >= 2.23."
+skill_tree = ".agents/skills"
+# .vibe/config.toml holds project MCP servers and the active-model setting; it is
+# gitignored-by-convention and a `git worktree add` checkout omits it, so seed it
+# into isolated dev/review worktrees. (.vibe/hooks.toml is the config_path — the
+# worktree flow merges the Stop hook into it separately.)
+seed_files = [".vibe/config.toml"]
+
+[hooks]
+dialect = "vibe-hooks-toml"
+config_path = ".vibe/hooks.toml"
+events = { post_agent = "Stop" }

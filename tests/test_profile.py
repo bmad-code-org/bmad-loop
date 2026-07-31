@@ -79,8 +79,20 @@ def test_builtin_profiles_load():
     # (the "API Error … connection cause" signature); every other built-in ships
     # none, so classification stays inert until a project overlay adds patterns
     assert profiles["claude"].env_fault_patterns  # non-empty
-    for name in ("codex", "gemini", "copilot", "antigravity", "opencode-http"):
+    for name in ("codex", "gemini", "copilot", "antigravity", "opencode-http", "mistral-vibe"):
         assert profiles[name].env_fault_patterns == ()
+    # mistral-vibe: post_agent is the only turn-end event vibe exposes (no
+    # SessionStart/SessionEnd/PreCompact analogue) and it fires per response turn,
+    # so the nudge floor is raised the way copilot's agentStop required. --trust is
+    # mandatory: without it vibe never reads .vibe/hooks.toml and no Stop arrives.
+    vibe = profiles["mistral-vibe"]
+    assert vibe.hooks.dialect == "vibe-hooks-toml"
+    assert vibe.hooks.config_path == ".vibe/hooks.toml"
+    assert vibe.hooks.events == {"post_agent": "Stop"}
+    assert "--trust" in vibe.launch_args
+    assert vibe.stop_without_result_nudges == 5
+    assert vibe.skill_tree == ".agents/skills"
+    assert vibe.usage_parser == "none"
     # opencode-http is hookless (HTTP/SSE transport): no hook dialect surfaces,
     # skills read from the claude tree, usage comes over HTTP (no transcript parser)
     opencode = profiles["opencode-http"]

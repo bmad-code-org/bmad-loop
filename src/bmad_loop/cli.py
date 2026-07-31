@@ -185,7 +185,7 @@ def _reconcile_stale(project: Path, paths: bmadconfig.ProjectPaths, pol) -> None
 
 
 def cmd_validate(args: argparse.Namespace) -> int:
-    from .install import relay_registered
+    from .install import load_hook_config, relay_registered
 
     project = _project(args)
     report = ValidationReport()
@@ -324,14 +324,14 @@ def cmd_validate(args: argparse.Namespace) -> int:
         hooks_ok = False
         if hook_config.is_file():
             try:
-                parsed = json.loads(hook_config.read_text(encoding="utf-8"))
-                hooks_ok = isinstance(parsed, dict) and relay_registered(
-                    parsed, profile.hooks.dialect, profile.hooks.events
+                parsed = load_hook_config(
+                    hook_config.read_text(encoding="utf-8"), profile.hooks.dialect
                 )
-            except json.JSONDecodeError:
+                hooks_ok = relay_registered(parsed, profile.hooks.dialect, profile.hooks.events)
+            except ProfileError as exc:
                 report.fail(
                     "hooks.config-parse",
-                    f"{hook_config} is not valid JSON",
+                    f"{hook_config} is {exc}",
                     {"profile": profile.name, "config_path": str(hook_config)},
                 )
         if hooks_ok:
@@ -2656,7 +2656,7 @@ def main(argv: list[str] | None = None) -> int:
         action="append",
         metavar="PROFILE",
         help="CLI profile(s) to register hooks for (claude | codex | gemini | copilot | "
-        "antigravity | opencode-http (alias: opencode) | custom; "
+        "antigravity | mistral-vibe (alias: vibe) | opencode-http (alias: opencode) | custom; "
         "repeatable; default: profiles referenced by .bmad-loop/policy.toml, or claude)",
     )
     init_p.add_argument(
@@ -2711,7 +2711,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     probe_p.add_argument(
         "cli",
-        help="CLI profile name (claude | codex | gemini | copilot | antigravity | custom; "
+        help="CLI profile name (claude | codex | gemini | copilot | antigravity | mistral-vibe | custom; "
         "opencode-http is HTTP-driven — nothing to probe)",
     )
     probe_p.add_argument(

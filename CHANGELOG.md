@@ -9,6 +9,20 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- **Mistral Vibe adapter profile (`mistral-vibe`, alias `vibe`), experimental.** Drives
+  Mistral's `vibe` CLI (≥ 2.23) through the generic tmux + hook-signal transport. Adds the
+  first non-JSON hook dialect, `vibe-hooks-toml`: `.vibe/hooks.toml` is a flat
+  `hooks = [...]` array of tables whose entries name their own event in a `type` field
+  rather than being keyed by it. Hook-config read/write now goes through a dialect-aware
+  `load_hook_config` / `dump_hook_config` seam in `install.py`; every JSON dialect emits
+  byte-identical output as before. `post_agent` is vibe's only turn-end event (no
+  SessionStart/SessionEnd/PreCompact) and fires per response turn, so the profile ships
+  `stop_without_result_nudges = 5`. Launches with `--trust`, which is mandatory — vibe
+  reads project hooks only in a trusted directory — and, being per-invocation rather than
+  an exact-path store, leaves `isolation = "worktree"` working. vibe exposes no `--model`
+  flag: leave `[adapter] model` empty and select the model via `VIBE_ACTIVE_MODEL`.
+  `usage_parser = "none"` pending a probe of `~/.vibe/logs/session/*/messages.jsonl`.
+
 - **A park travels with its story's commit, so `bmad-loop confirm` works from any clone (#356).**
   Each parked story now writes one committed JSON record to `.bmad-loop/operator/<key>.json`, inside
   the story's own commit window, so the record rides the park's commit — through the worktree
