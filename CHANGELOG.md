@@ -58,12 +58,14 @@ editing.
   only the gitignored layers are filled in. `_bmad/scripts/` is seeded whole rather than curated
   because `render_skill.py` bare-imports its sibling `config_utils`, and a seed that comes up
   short — the realistic trigger is a symlinked `_bmad/`, how a shared BMad install is wired —
-  pauses the run. Every story would drive the same incomplete seed into the same result-less
-  Stop, so it escalates once with the worktree left mounted for inspection, rather than
-  dispatching the whole backlog and reporting `0 done`. `_bmad/render/` is never seeded and is
-  git-excluded inside the worktree, so the renderer's in-session rewrite of it cannot be swept
-  into a story commit; `init` now gitignores it as well, which is the only protection under the
-  default `isolation = "none"`.
+  pauses the run _when the resolved dev primitive is a renderer stub_. Every story would drive
+  the same incomplete seed into the same result-less Stop, so it escalates once with the
+  worktree left mounted for inspection, rather than dispatching the whole backlog and reporting
+  `0 done`. On a pre-BMAD-METHOD#2601 inline `SKILL.md` nothing reads `_bmad/scripts/` at all,
+  so the short seed costs the run nothing and stays an ordinary journaled report.
+  `_bmad/render/` is never seeded and is git-excluded inside the worktree, so the renderer's
+  in-session rewrite of it cannot be swept into a story commit; `init` now gitignores it as
+  well, which is the only protection under the default `isolation = "none"`.
 
 - **Deferred review findings are harvested out of the spec's frontmatter (#405).**
   BMAD-METHOD#2640 moved `defer`-triaged findings from `deferred-work.md` into the spec's own
@@ -92,9 +94,15 @@ editing.
   in-process, so a host death between the harvest and the rollback loses it; the replayed
   attempt recovers the ledger's pre-harvest state from the persisted baseline instead —
   deleting the file when the attempt created it, and leaving a tracked one to the reset, which
-  would otherwise be handed the dead attempt's harvest straight back. A defer still keeps its
-  harvested entries: `_stash_deferred_artifacts` has already moved the spec out of the artifacts
-  dir, so there the ledger entry is the finding's only surviving record.
+  would otherwise be handed the dead attempt's harvest straight back. That baseline is a plain
+  filesystem check recorded with the attempt's baseline commit, not a git query: a _gitignored_
+  ledger — what a project that ignores `_bmad-output/` has, this one included — is absent from
+  `git ls-files --others --exclude-standard` whether the attempt created it or not, so a
+  git-derived baseline read it as tracked and left the dead attempt's finding behind. Neither
+  path unlinks a ledger git tracks, on the same reasoning: that one is the reset's to restore,
+  and deleting it would hand the next attempt's `git add -A` a deletion to commit. A defer still
+  keeps its harvested entries: `_stash_deferred_artifacts` has already moved the spec out of
+  the artifacts dir, so there the ledger entry is the finding's only surviving record.
 
 ## [0.9.0] — 2026-07-21
 
