@@ -30,7 +30,13 @@ from .escalation import (
     decide_review_session,
     preference_escalations,
 )
-from .install import BMAD_SCRIPTS_SEED_REL, dev_primitive_or_default, provision_worktree
+from .install import (
+    BMAD_SCRIPTS_SEED_REL,
+    RENDERER_SCRIPT_MARKER,
+    dev_primitive_or_default,
+    provision_worktree,
+    renderer_stub_resolved,
+)
 from .journal import Journal, save_state
 from .model import (
     PAUSE_EPIC_BOUNDARY,
@@ -627,15 +633,31 @@ class Engine:
             self.journal.append(
                 "worktree-seed-skipped", story_key=task.story_key, entries=skipped_seeds
             )
-        if BMAD_SCRIPTS_SEED_REL in skipped_seeds:
-            # ...with exactly one exception, and it is not informational: the
-            # worktree's `_bmad/scripts/` came up SHORT of the repo's. The renderer
-            # stub would run without `render_skill.py`/`config_utils.py` and Stop
-            # having written nothing — on THIS story and, since the seed reads the
-            # same repo every time, on every story after it. That is the env-fault
-            # shape `VerifyOutcome.env_fault` names: no repair session can fix it and
-            # no other story escapes it, so pause the run instead of walking the whole
-            # backlog into it. Escalate rather than defer for the same reason.
+        if BMAD_SCRIPTS_SEED_REL in skipped_seeds and renderer_stub_resolved(
+            self.paths.project, [p.skill_tree for p in profiles]
+        ):
+            # ...with exactly one exception, and only for a project whose sessions
+            # actually render: the worktree's `_bmad/scripts/` came up SHORT of the
+            # repo's. A renderer stub would then run without
+            # `render_skill.py`/`config_utils.py` and Stop having written nothing — on
+            # THIS story and, since the seed reads the same repo every time, on every
+            # story after it. That is the env-fault shape `VerifyOutcome.env_fault`
+            # names: no repair session can fix it and no other story escapes it, so
+            # pause the run instead of walking the whole backlog into it. Escalate
+            # rather than defer for the same reason.
+            #
+            # The renderer conjunct is what keeps this era-agnostic, and it is not
+            # optional: `_bmad_scripts_seed_incomplete` can only see the REPO (it fires
+            # on any repo carrying a renderer-era `_bmad/scripts/` the seed cannot
+            # follow — a shared install wired as a symlink is the canonical shape),
+            # while whether that matters depends on the resolved primitive's content.
+            # On a pre-#2601 inline SKILL.md nothing reads `_bmad/scripts/` at all, so
+            # the short seed costs the run nothing and stays an ordinary
+            # `worktree-seed-skipped` line. This is the worktree continuation of the
+            # `skills.dev-renderer` preflight, which asked the same content question of
+            # the main checkout and passed — only the worktree's copy is short. ANY
+            # over the dev+review trees, since resolution is per tree and either
+            # session kind needing the renderer is enough.
             #
             # Raised BEFORE the workspace swaps to the unit below, so the half-seeded
             # worktree stays mounted for the operator to inspect — the same courtesy
@@ -643,7 +665,8 @@ class Engine:
             # is set directly: PENDING has no legal move to ESCALATED (see the
             # worktree-open-failed branch above, which sets DEFERRED the same way).
             reason = (
-                f"{BMAD_SCRIPTS_SEED_REL} is incomplete in the worktree — the renderer "
+                f"the dev primitive renders via {RENDERER_SCRIPT_MARKER} but "
+                f"{BMAD_SCRIPTS_SEED_REL} is incomplete in the worktree — the session "
                 f"would HALT without writing a spec. The usual cause is a symlinked "
                 f"_bmad/ pointing outside the repo, which worktree seeding cannot follow"
             )

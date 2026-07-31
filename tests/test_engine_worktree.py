@@ -29,6 +29,7 @@ from bmad_loop import verify
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.engine import Engine
+from bmad_loop.install import BMAD_SCRIPTS_SEED_REL, renderer_stub_resolved
 from bmad_loop.journal import Journal, load_state
 from bmad_loop.model import Phase, RunState, SessionRecord, StoryTask, TokenUsage
 from bmad_loop.policy import GatesPolicy, LimitsPolicy, NotifyPolicy, Policy, ScmPolicy
@@ -734,7 +735,15 @@ def test_incomplete_bmad_scripts_seed_pauses_before_dispatch(project, tmp_path):
     That is an ENVIRONMENT fault, not this story's: the seed reads the same repo for
     every unit, so dispatching would walk the whole backlog into result-less Stops
     one story at a time. The run pauses before `drive` is ever entered, and the
-    half-seeded worktree stays mounted for inspection."""
+    half-seeded worktree stays mounted for inspection.
+
+    The #2601 renderer stub is installed on purpose: the gate is conditional on the
+    resolved primitive actually rendering, so without a stub on disk this environment
+    costs the run nothing and must NOT pause — see the inline sibling below."""
+    from conftest import attach_profile, install_build_auto_skill
+
+    # before commit_sprint, so the tree is tracked and the worktree checks it out
+    install_build_auto_skill(project.project, ".claude/skills", renderer_stub=True)
     commit_sprint(project, {"1-1-a": "ready-for-dev", "1-1-b": "ready-for-dev"})
     shared = tmp_path / "shared-bmad-scripts"
     shared.mkdir()
@@ -753,7 +762,8 @@ def test_incomplete_bmad_scripts_seed_pauses_before_dispatch(project, tmp_path):
         dispatched.append(spec.cwd.name)
         raise AssertionError("dispatched into a worktree with no renderer")
 
-    engine, _ = make_engine(project, [never, never])
+    engine, adapter = make_engine(project, [never, never])
+    attach_profile(adapter)  # one call arms dev AND review: they share the adapter
     summary = engine.run()
 
     assert summary.paused and summary.escalated == 1
@@ -764,8 +774,12 @@ def test_incomplete_bmad_scripts_seed_pauses_before_dispatch(project, tmp_path):
     # one result-less Stop at a time (tasks are created on dispatch, so an absent
     # key IS the proof the loop stopped)
     assert "1-1-b" not in engine.state.tasks
-    kinds = [e["kind"] for e in Journal(engine.run_dir).entries()]
+    entries = Journal(engine.run_dir).entries()
+    kinds = [e["kind"] for e in entries]
     assert "story-escalated" in kinds
+    # the reason names the renderer, which is the evidence the gate now actually has
+    escalated = [e for e in entries if e["kind"] == "story-escalated"]
+    assert "render_skill.py" in escalated[0]["reason"]
     # the seed's own report still went out, so the escalation reads as an
     # ESCALATION of that report rather than replacing it
     assert "worktree-seed-skipped" in kinds
@@ -773,6 +787,130 @@ def test_incomplete_bmad_scripts_seed_pauses_before_dispatch(project, tmp_path):
     # renderer half that is short — config.toml made it in, so "seeding ran"
     assert (Path(task.worktree_path) / "_bmad" / "config.toml").is_file()
     assert not (Path(task.worktree_path) / "_bmad" / "scripts" / "render_skill.py").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
+def test_a_short_scripts_seed_does_not_pause_an_inline_primitive(project, tmp_path):
+    """The ERA discriminator for the gate above. Same symlinked `_bmad/scripts/`,
+    same dropped files, same `worktree-seed-skipped` report — the single delta is
+    that the resolved dev primitive is a pre-#2601 INLINE SKILL.md.
+
+    Nothing in such a project ever shells out to `render_skill.py`, so a short
+    `_bmad/scripts/` seed costs the run nothing and the whole backlog must run to
+    completion. `_bmad_scripts_seed_incomplete` cannot tell the two apart — it only
+    ever sees the REPO, which carries a renderer-era `_bmad/scripts/` in both — so
+    this is the leg that pins the discrimination onto the engine's gate.
+
+    Fails three independent ways on the un-gated build (`if BMAD_SCRIPTS_SEED_REL in
+    skipped_seeds` alone): the run pauses, story 1 escalates, and story 2 is never
+    dispatched."""
+    from conftest import attach_profile, install_build_auto_skill
+
+    # the ONLY delta from the sibling above (which installs the same skill with
+    # renderer_stub=True): an inline SKILL.md, no render_skill.py reference in it
+    install_build_auto_skill(project.project, ".claude/skills", renderer_stub=False)
+    commit_sprint(project, {"1-1-a": "ready-for-dev", "1-1-b": "ready-for-dev"})
+    shared = tmp_path / "shared-bmad-scripts"
+    shared.mkdir()
+    (shared / "render_skill.py").write_text("# render", encoding="utf-8")
+    (shared / "config_utils.py").write_text("# config", encoding="utf-8")
+    bmad = project.project / "_bmad"
+    bmad.mkdir(parents=True)
+    (bmad / "config.toml").write_text("[core]\n", encoding="utf-8")
+    (bmad / "scripts").symlink_to(shared, target_is_directory=True)
+    # the repo-side half of the trigger is armed exactly as in the sibling: the
+    # probe sees the renderer through the symlink, and the seed cannot follow it
+    assert (bmad / "scripts" / "render_skill.py").is_file()
+    assert not renderer_stub_resolved(project.project, [".claude/skills"])
+
+    # what the worktree the session is actually handed looked like — the run
+    # completing is only meaningful if it completed over a SHORT seed
+    seen: list[tuple[bool, bool]] = []
+    dev_a = wt_dev_effect(project, "1-1-a")
+
+    def dev_and_probe(spec):
+        wt_bmad = spec.cwd / "_bmad"
+        seen.append(
+            (
+                (wt_bmad / "config.toml").is_file(),
+                (wt_bmad / "scripts" / "render_skill.py").is_file(),
+            )
+        )
+        return dev_a(spec)
+
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_and_probe,
+            wt_review_effect(project, "1-1-a", clean=True),
+            wt_dev_effect(project, "1-1-b"),
+            wt_review_effect(project, "1-1-b", clean=True),
+        ],
+    )
+    attach_profile(adapter)  # one call arms dev AND review: they share the adapter
+    summary = engine.run()
+
+    # not just story 1: the whole backlog, which is what the escalation would cost
+    assert summary.done == 2 and not summary.paused
+    entries = Journal(engine.run_dir).entries()
+    kinds = [e["kind"] for e in entries]
+    assert "story-escalated" not in kinds
+    # ...and the report itself is byte-identical to the escalating sibling's.
+    # provision_worktree stayed a pure reporter, so the sentinel really did ride
+    # the channel — the engine's gate is what declined to act on it, which is the
+    # only way this can be a discrimination rather than a silenced signal.
+    skipped = [e for e in entries if e["kind"] == "worktree-seed-skipped"]
+    assert skipped and any(BMAD_SCRIPTS_SEED_REL in e["entries"] for e in skipped)
+    # seeding ran (config.toml made it in) and the renderer half really was short,
+    # so the run completed over exactly the environment the sibling pauses on
+    assert seen == [(True, False)]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
+def test_a_stub_in_the_review_tree_alone_still_pauses(project, tmp_path):
+    """A run can mix skill trees (dev=claude → .claude/skills, review=gemini →
+    .agents/skills) and the two can sit on different upstream eras. The gate asks
+    ANY over both, because either session kind reaching a renderer that is not
+    there is one result-less Stop per story just the same.
+
+    Here the DEV tree is inline and only the REVIEW tree is a #2601 stub. It is the
+    one ablation that catches implementing the gate against `self._dev_skill()` or
+    the dev adapter's tree alone: every other test in this family passes under that
+    bug, because in every other one the dev tree answers for both."""
+    from conftest import attach_profile, install_build_auto_skill
+
+    install_build_auto_skill(project.project, ".claude/skills", renderer_stub=False)
+    install_build_auto_skill(project.project, ".agents/skills", renderer_stub=True)
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    shared = tmp_path / "shared-bmad-scripts"
+    shared.mkdir()
+    (shared / "render_skill.py").write_text("# render", encoding="utf-8")
+    (shared / "config_utils.py").write_text("# config", encoding="utf-8")
+    bmad = project.project / "_bmad"
+    bmad.mkdir(parents=True)
+    (bmad / "config.toml").write_text("[core]\n", encoding="utf-8")
+    (bmad / "scripts").symlink_to(shared, target_is_directory=True)
+    # the premise, asserted rather than assumed: two trees, two eras. Without this
+    # the test would still pass with BOTH trees stubbed, proving nothing per-role.
+    assert not renderer_stub_resolved(project.project, [".claude/skills"])
+    assert renderer_stub_resolved(project.project, [".agents/skills"])
+
+    dispatched: list[str] = []
+
+    def never(spec):
+        dispatched.append(spec.cwd.name)
+        raise AssertionError("dispatched into a worktree with no renderer")
+
+    engine, dev = make_engine(
+        project, [never], review_adapter=attach_profile(MockAdapter([never]), "gemini")
+    )
+    attach_profile(dev, "claude")
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1
+    assert dispatched == []
+    assert engine.state.tasks["1-1-a"].phase == Phase.ESCALATED
+    assert "story-escalated" in journal_kinds(engine)
 
 
 def test_a_benign_skipped_seed_does_not_pause(project):

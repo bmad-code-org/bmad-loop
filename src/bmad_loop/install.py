@@ -115,11 +115,15 @@ RENDERER_SCRIPT_MARKER = "render_skill.py"
 # reason. Project-global, not per tree.
 CENTRAL_CONFIG_REL = f"{BMAD_DIR}/config.toml"
 
-# The one `provision_worktree` skipped-seed entry that is NOT informational: it says
-# the worktree's renderer support came up SHORT, not that a seed was a no-op. Shared
-# with the engine, which escalates on it — a magic string on either side would let the
-# two drift silently apart, and the failure mode of that drift is a run that dispatches
-# into guaranteed result-less Stops. See _bmad_scripts_seed_incomplete.
+# The `provision_worktree` skipped-seed entry that reports the worktree's renderer
+# support came up SHORT, rather than a seed that turned out to be a no-op. Shared with
+# the engine because the entry is only half the story: whether a short seed matters at
+# all depends on the resolved dev primitive being a renderer STUB, and provisioning is
+# handed CLI profiles and a repo root — not the project root the primitive resolves
+# against — so the engine owns the escalate-or-not decision and reads this sentinel back
+# to make it. A magic string on either side would let the two drift silently apart, and
+# the failure mode of that drift is a run that dispatches into guaranteed result-less
+# Stops. See _bmad_scripts_seed_incomplete and Engine._run_isolated.
 BMAD_SCRIPTS_SEED_REL = f"{BMAD_DIR}/scripts"
 
 # Top-level _bmad/ entries never seeded into a worktree. render/ is the renderer's
@@ -226,6 +230,36 @@ def _is_renderer_stub(skill_dir: Path) -> bool:
     except (OSError, UnicodeDecodeError):
         return False
     return RENDERER_SCRIPT_MARKER in skill_md
+
+
+def renderer_stub_resolved(project: Path, trees: Sequence[str]) -> bool:
+    """True when the dev primitive ANY active tree resolves to is a renderer stub
+    (BMAD-METHOD #2601) — i.e. some session this run spawns will compose its prompt by
+    shelling out to ``_bmad/scripts/render_skill.py`` instead of reading it inline.
+
+    The public form of the ``resolved_stub`` flag :func:`missing_base_skills` folds
+    into ``skills.dev-renderer``/``skills.dev-renderer-config``, lifted out for the
+    caller that needs the answer without the findings: ``Engine._run_isolated``, which
+    asks of a WORKTREE's seeded ``_bmad/`` the question the preflight already asked of
+    the main checkout. Sharing the predicate rather than restating the marker test is
+    what keeps the run-time gate era-agnostic in the same way the preflight is — on a
+    pre-#2601 inline SKILL.md nothing ever reads ``_bmad/scripts/``, so a missing
+    renderer is not a finding to make about that project, at either layer.
+
+    ANY over the trees, deduped exactly like :func:`missing_base_skills`: resolution is
+    per tree (one run can mix ``.claude/skills`` and ``.agents/skills``, and an operator
+    can upgrade the bmm module in one and not the other), and a single stubbed tree is
+    enough for one of the run's sessions to need the renderer.
+
+    False when nothing resolves. An unresolvable tree is :func:`missing_base_skills`'
+    story (``skills.base-missing``/``skills.base-shim``) and has already refused the run
+    at preflight, so no caller here invents a second answer for it; an empty ``trees``
+    (an adapter with no profile) has no tree to shell out from at all."""
+    for tree in dict.fromkeys(trees):
+        resolved = resolve_dev_primitive(project, tree)
+        if resolved is not None and _is_renderer_stub(project / tree / resolved):
+            return True
+    return False
 
 
 def dev_primitive_or_default(project: Path, tree: str | None) -> str:
@@ -338,6 +372,9 @@ def missing_base_skills(project: Path, trees: Sequence[str]) -> list[Finding]:
     lines beside a truncated skill.
     """
     problems: list[Finding] = []
+    # Same predicate as :func:`renderer_stub_resolved`, kept inline here rather than
+    # delegated: this loop needs the per-tree `resolved`/`skill_dir` to attribute the
+    # `skills.dev-renderer` finding to a tree, which a bare any() discards.
     resolved_stub = False
     for tree in dict.fromkeys(trees):
         resolved = resolve_dev_primitive(project, tree)
@@ -801,8 +838,16 @@ def _bmad_scripts_seed_incomplete(worktree: Path, repo_root: Path) -> bool:
     provisioning has no failure vocabulary of its own (every containment violation
     is a bare ``continue``), and the decision this drives is escalate-vs-defer plus
     notify and pause, which belongs to the caller that owns the state machine and
-    the journal. The *engine* reads the entry back and escalates: this is not a
-    degraded provision the run can carry, it is an environment fault identical for
+    the journal.
+
+    This answers only whether the seed came up SHORT — never whether that matters.
+    It cannot tell: the repo-side ``render_skill.py`` probe fires for any project
+    carrying a renderer-era ``_bmad/scripts/``, including one whose resolved dev
+    primitive is a pre-#2601 INLINE ``SKILL.md`` that never reads the renderer at all.
+    So the engine escalates only when :func:`renderer_stub_resolved` also holds; on an
+    inline primitive the short seed is journaled as an ordinary
+    ``worktree-seed-skipped`` and the run proceeds. Where it does hold, this is not a
+    degraded provision the run can carry — it is an environment fault identical for
     every story, so dispatching would burn the whole backlog on result-less Stops.
     """
     if not (repo_root / RENDERER_SCRIPT_REL).is_file():
@@ -913,7 +958,10 @@ def provision_worktree(
     no-ops. The caller journals them: a user-authored `worktree_seed` entry that
     silently copies nothing reads as applied configuration and is not. The same
     channel also reports an INCOMPLETE `_bmad/scripts/` seed (see
-    _bmad_scripts_seed_incomplete), which is likewise silent otherwise.
+    _bmad_scripts_seed_incomplete), which is likewise silent otherwise. Whether THAT
+    one is fatal depends on the resolved primitive's era, which provisioning cannot
+    see from a repo root and a list of CLI profiles — the caller decides (see
+    BMAD_SCRIPTS_SEED_REL).
     """
     if not profiles and not seed_files and not seed_globs and not (repo_root / BMAD_DIR).is_dir():
         return []

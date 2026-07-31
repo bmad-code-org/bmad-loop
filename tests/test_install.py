@@ -914,6 +914,42 @@ def test_renderer_checks_silent_for_pre_render_skill(tmp_path):
     assert missing_base_skills(tmp_path, [claude, codex]) == []
 
 
+def test_renderer_stub_resolved_is_per_tree_and_keyed_on_content(tmp_path):
+    """The predicate the worktree seed gate escalates on, lifted out of
+    `missing_base_skills` so the run-time gate and the preflight cannot drift apart.
+
+    Content-keyed, never name-keyed — the legacy leg is the one that proves it, and
+    nothing else in the suite covers `_is_renderer_stub` against a `bmad-dev-auto`
+    directory. ANY over trees, because one run can mix `.claude/skills` and
+    `.agents/skills` on different upstream eras."""
+    from conftest import RENDERER_STUB_SKILL_MD, install_build_auto_skill
+
+    from bmad_loop.install import DEV_PRIMITIVE_LEGACY, renderer_stub_resolved
+
+    claude, codex = get_profile("claude").skill_tree, get_profile("codex").skill_tree
+
+    assert renderer_stub_resolved(tmp_path, []) is False  # no tree, nothing to resolve
+    assert renderer_stub_resolved(tmp_path, [claude]) is False  # nothing installed
+
+    install_build_auto_skill(tmp_path, claude)  # inline SKILL.md
+    assert renderer_stub_resolved(tmp_path, [claude]) is False
+
+    install_build_auto_skill(tmp_path, codex, renderer_stub=True)
+    assert renderer_stub_resolved(tmp_path, [codex]) is True
+    assert renderer_stub_resolved(tmp_path, [claude, codex]) is True  # ANY, not ALL
+    assert renderer_stub_resolved(tmp_path, [claude, claude]) is False  # dedupe is inert
+
+    # …and the era-agnosticism leg: a LEGACY-named primitive carrying stub content is
+    # just as much a renderer as the renamed one. Keyed on the SKILL.md, not the dir.
+    legacy_tree = ".legacy/skills"  # a third tree, so the codex stub above cannot answer for it
+    _install_legacy_primitive(tmp_path, legacy_tree)
+    assert renderer_stub_resolved(tmp_path, [legacy_tree]) is False
+    (tmp_path / legacy_tree / DEV_PRIMITIVE_LEGACY / "SKILL.md").write_text(
+        RENDERER_STUB_SKILL_MD, encoding="utf-8"
+    )
+    assert renderer_stub_resolved(tmp_path, [legacy_tree]) is True
+
+
 def test_renderer_config_problem_emitted_once_across_two_trees(tmp_path):
     """`_bmad/config.toml` is project-global like `_bmad/custom/`, so two stub trees
     are one finding (ablation: emit inside the per-tree loop). The script is present
