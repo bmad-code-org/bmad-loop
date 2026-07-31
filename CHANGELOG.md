@@ -12,18 +12,6 @@ Compatibility hotfix for the BMad Method's `bmad-dev-auto` → `bmad-build-auto`
 that rode the same window. Both skill eras are supported; nothing in `policy.toml` needs
 editing.
 
-### Added
-
-- **Three validate warnings for post-rename installs (#405).** `skills.dev-renderer` fires when
-  the resolved `SKILL.md` is the new renderer stub (BMAD-METHOD#2601) but
-  `_bmad/scripts/render_skill.py` is missing — that session would HALT without writing a spec.
-  `skills.dev-renderer-config` fires when a stub resolved but `_bmad/config.toml` — the
-  renderer's one required config layer — is absent: the same result-less HALT, one file further
-  in, and no other check sees it. It is emitted once per project and only when a stub actually
-  resolved, so a pre-renderer install stays silent. `skills.customize-legacy` fires when a tree
-  resolved to `bmad-build-auto` while an override still sits at
-  `_bmad/custom/bmad-dev-auto[.user].toml`, where it no longer applies.
-
 ### Fixed
 
 - **The dev primitive is now resolved on disk, so the upstream rename no longer breaks a
@@ -48,6 +36,20 @@ editing.
   runnable as-is" banner. Exit code stays 0 and stdout is untouched: a dry run is a diagnostic,
   and rc 0 has always meant "the preview rendered", not "the project is ready".
 
+- **A renderer stub that cannot compose a prompt fails the preflight (#405).** Two new checks
+  block `validate`/`run`/`sweep`/`resume`: `skills.dev-renderer`, when the resolved `SKILL.md`
+  is the new renderer stub (BMAD-METHOD#2601) but `_bmad/scripts/render_skill.py` is missing,
+  and `skills.dev-renderer-config`, when a stub resolved but `_bmad/config.toml` — the
+  renderer's one required config layer — is absent. Either way the stub's `uv run` exits `HALT:`
+  and the session Stops having written no spec; both files are project-global, so every story
+  after it does the same. They block rather than warn because only a green is untrustworthy here
+  (uv on PATH is never probed) — a red is conclusive. The config check is emitted once per
+  project and only when a stub actually resolved, so a pre-renderer install stays silent, and
+  `--dry-run` names both under its "NOT runnable as-is" banner. A third check,
+  `skills.customize-legacy`, is a warning: it fires when a tree resolved to `bmad-build-auto`
+  while an override still sits at `_bmad/custom/bmad-dev-auto[.user].toml`, where it no longer
+  applies — the session still runs, just unstyled.
+
 - **Worktree isolation carries the `_bmad/` config surface (#405).** The renderer-era primitive
   is handed the worktree as its project root and hard-fails when that root has no `_bmad/` —
   there is no walk-up — so on a project that gitignores it (most do, this one included) every
@@ -55,11 +57,13 @@ editing.
   `_bmad/` per file, copy-when-absent, so a checkout that commits it keeps every tracked file and
   only the gitignored layers are filled in. `_bmad/scripts/` is seeded whole rather than curated
   because `render_skill.py` bare-imports its sibling `config_utils`, and a seed that comes up
-  short — the realistic trigger is a symlinked `_bmad/`, how a shared BMad install is wired — is
-  reported through the existing `worktree-seed-skipped` journal event instead of passing as
-  success. `_bmad/render/` is never seeded and is git-excluded inside the worktree, so the
-  renderer's in-session rewrite of it cannot be swept into a story commit; `init` now gitignores
-  it as well, which is the only protection under the default `isolation = "none"`.
+  short — the realistic trigger is a symlinked `_bmad/`, how a shared BMad install is wired —
+  pauses the run. Every story would drive the same incomplete seed into the same result-less
+  Stop, so it escalates once with the worktree left mounted for inspection, rather than
+  dispatching the whole backlog and reporting `0 done`. `_bmad/render/` is never seeded and is
+  git-excluded inside the worktree, so the renderer's in-session rewrite of it cannot be swept
+  into a story commit; `init` now gitignores it as well, which is the only protection under the
+  default `isolation = "none"`.
 
 - **Deferred review findings are harvested out of the spec's frontmatter (#405).**
   BMAD-METHOD#2640 moved `defer`-triaged findings from `deferred-work.md` into the spec's own
@@ -84,7 +88,11 @@ editing.
   shields from the untracked-file cleanup. The dev phase now snapshots the ledger before the
   harvest and restores it around the rollback — unlinking the file when the harvest created it,
   and on the stop-and-wait path too, which raises. Lossless, because the spec's `deferred:`
-  frontmatter is never mutated and the next attempt re-harvests from it. A defer still keeps its
+  frontmatter is never mutated and the next attempt re-harvests from it. That snapshot is
+  in-process, so a host death between the harvest and the rollback loses it; the replayed
+  attempt recovers the ledger's pre-harvest state from the persisted baseline instead —
+  deleting the file when the attempt created it, and leaving a tracked one to the reset, which
+  would otherwise be handed the dead attempt's harvest straight back. A defer still keeps its
   harvested entries: `_stash_deferred_artifacts` has already moved the spec out of the artifacts
   dir, so there the ledger entry is the finding's only surviving record.
 
