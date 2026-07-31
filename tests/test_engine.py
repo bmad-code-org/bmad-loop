@@ -5679,9 +5679,11 @@ def test_spec_frontmatter_deferrals_harvested_into_ledger(project):
 
 def test_spec_deferrals_harvested_before_the_dev_decision(project):
     """Ordering contract: the harvest runs inside the dev pass, ahead of the
-    verify/decide step — so a story that then defers rolls the ledger edit back
-    with the work it describes, and a story that proceeds carries it into the
-    squashed commit."""
+    verify/decide step — so a story that proceeds carries the ledger edit into
+    its squashed commit, and a story that RETRIES reverts it with the work it
+    describes and re-harvests on the next attempt. A DEFER is the asymmetric
+    case: `_defer` restores the ledger after its reset and deliberately keeps
+    the entry — see test_defer_keeps_the_harvested_entry_after_rollback."""
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     engine, _ = make_engine(
         project,
@@ -5692,6 +5694,45 @@ def test_spec_deferrals_harvested_before_the_dev_decision(project):
 
     kinds = [e["kind"] for e in engine.journal.entries()]
     assert kinds.index("spec-deferrals-harvested") < kinds.index("dev-decision")
+
+
+def test_defer_keeps_the_harvested_entry_after_rollback(project):
+    """The other half of the ordering contract, and the one that is NOT a
+    rollback: a story that harvests and then defers loses its code change to the
+    reset but keeps the ledger entry, because `_defer` restores the ledger it
+    snapshotted. That asymmetry is required — `_stash_deferred_artifacts` runs
+    first and moves the spec out of the artifacts dir, so after a defer the
+    `deferred:` frontmatter is no longer where a re-drive would re-harvest it and
+    the ledger entry is the finding's only surviving record."""
+    # committed, so the defer's `git reset --hard` genuinely reverts the harvest's
+    # edit and the restore is what puts the entry back (an untracked ledger would
+    # survive the reset on its own and prove nothing).
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "seed deferred-work")
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", deferred=[HARVEST_A])]
+        # never finalizes ⇒ the review budget runs out on a non-convergent story
+        # and the post-loop _verify_review gate defers instead of committing
+        + [review_effect(project, "1-1-a", clean=False, finalized=False) for _ in range(3)],
+        policy=_harvest_policy(review=True),
+    )
+    summary = engine.run()
+
+    assert summary.deferred == 1
+    # the work the finding describes is gone …
+    assert "change for 1-1-a" not in (project.project / "src.txt").read_text()
+    # … and the spec carrying the frontmatter is no longer harvestable
+    assert not (project.implementation_artifacts / "spec-1-1-a.md").exists()
+    # … but the harvested entry survived the reset
+    entries = _ledger_entries(project)
+    assert [e.title for e in entries] == ["Retry loop has no ceiling"]
+    assert entries[0].open
+    assert re.search(r"^origin: spec-deferred [0-9a-f]{12}$", entries[0].body, re.M)
 
 
 def test_spec_deferrals_land_in_the_squashed_story_commit(project):

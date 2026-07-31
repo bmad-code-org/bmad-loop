@@ -2469,11 +2469,21 @@ class Engine:
         after the entry was swept done would file it a second time.
 
         The frontmatter is deliberately never mutated: block-scalar surgery on a
-        `deferred:` list is the frontmatter-edit trap in a nastier form, and a
-        ledger-side watermark rolls back atomically with the entries it guards
-        (`git reset` on a defer takes both, or neither). Ledger writes are
-        UNGUARDED — observation degrades, repair raises — so a write fault reaches
-        run()'s crash recorder instead of silently dropping the findings.
+        `deferred:` list is the frontmatter-edit trap in a nastier form, and the
+        fingerprinted `origin:` above already watermarks the ledger side.
+
+        Rollback is asymmetric between the two failure paths, and deliberately so.
+        A RETRY reset (`_rollback_or_pause`, no restore) reverts the ledger edit
+        along with the work it describes, and the next attempt re-harvests from
+        the untouched frontmatter. A DEFER does NOT: `_defer` snapshots the ledger
+        and writes it back after the reset, keeping harvested entries. It has to —
+        `_stash_deferred_artifacts` moves the spec out of the artifacts dir first,
+        so after a defer the frontmatter is no longer where a re-drive would find
+        it, and the ledger entry is the finding's only surviving record.
+
+        Ledger writes are UNGUARDED — observation degrades, repair raises — so a
+        write fault reaches run()'s crash recorder instead of silently dropping
+        the findings.
         """
         if not self._generic_dev():
             return
