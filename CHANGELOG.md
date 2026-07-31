@@ -38,11 +38,15 @@ editing.
 
 - **A renderer stub that cannot compose a prompt fails the preflight (#405).** Two new checks
   block `validate`/`run`/`sweep`/`resume`: `skills.dev-renderer`, when the resolved `SKILL.md`
-  is the new renderer stub (BMAD-METHOD#2601) but `_bmad/scripts/render_skill.py` is missing,
-  and `skills.dev-renderer-config`, when a stub resolved but `_bmad/config.toml` — the
-  renderer's one required config layer — is absent. Either way the stub's `uv run` exits `HALT:`
-  and the session Stops having written no spec; both files are project-global, so every story
-  after it does the same. They block rather than warn because only a green is untrustworthy here
+  is the new renderer stub (BMAD-METHOD#2601) but its script unit is not whole —
+  `_bmad/scripts/render_skill.py` or the `_bmad/scripts/config_utils.py` it imports at module
+  scope — and `skills.dev-renderer-config`, when a stub resolved but `_bmad/config.toml` — the
+  renderer's one required config layer — is absent. Every route ends in a session that Stops
+  having written no spec; all three files are project-global, so every story after it does the
+  same. A missing script or config exits `HALT:`; a missing sibling raises `ModuleNotFoundError`
+  above the renderer's own guard and loses even that line. The sibling is required only when the
+  installed `render_skill.py` actually imports it, so a later renderer that inlines or renames
+  the helper is not refused. They block rather than warn because only a green is untrustworthy
   (uv on PATH is never probed) — a red is conclusive. The config check is emitted once per
   project and only when a stub actually resolved, so a pre-renderer install stays silent, and
   `--dry-run` names both under its "NOT runnable as-is" banner. A third check,
@@ -61,8 +65,13 @@ editing.
   pauses the run _when the resolved dev primitive is a renderer stub_. Every story would drive
   the same incomplete seed into the same result-less Stop, so it escalates once with the
   worktree left mounted for inspection, rather than dispatching the whole backlog and reporting
-  `0 done`. On a pre-BMAD-METHOD#2601 inline `SKILL.md` nothing reads `_bmad/scripts/` at all,
-  so the short seed costs the run nothing and stays an ordinary journaled report.
+  `0 done`. `_bmad/config.toml` is checked the same way and named separately in the escalation:
+  a repo that centralises only that file behind a symlink seeds a complete `_bmad/scripts/` and
+  no config at all, which was silent from every angle — the repo-side preflight follows the
+  symlink and passes. On a pre-BMAD-METHOD#2601 inline `SKILL.md` nothing reads either path,
+  so the short seed costs the run nothing and stays an ordinary journaled report. Neither
+  sentinel can be forged: a `worktree_seed` entry spelling one is dropped rather than reported,
+  so a checkout that commits its whole `_bmad/` is never paused on a healthy worktree.
   `_bmad/render/` is never seeded and is git-excluded inside the worktree, so the renderer's
   in-session rewrite of it cannot be swept into a story commit; `init` now gitignores it as
   well, which is the only protection under the default `isolation = "none"`.
