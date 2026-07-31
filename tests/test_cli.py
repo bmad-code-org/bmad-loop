@@ -1591,12 +1591,23 @@ def test_run_aborts_when_only_the_dev_shim_is_installed(project, monkeypatch, ca
     assert "bmad-build-auto" in err and "HALT" in err
 
 
-def _install_renderer_stub_project(project, monkeypatch, *, script: bool, config: bool):
+def _install_renderer_stub_project(
+    project, monkeypatch, *, script: bool, utils: bool, config: bool
+):
     """A project whose resolved primitive is a #2601 renderer stub in every tree.
-    `script`/`config` choose which of the two renderer prerequisites exist, so each
-    caller isolates one absence. Everything is laid down before the commit — the
-    preflight runs behind a clean-worktree gate."""
-    from conftest import git, install_base_skills, install_build_auto_skill
+    `script`/`utils`/`config` choose which of the three renderer prerequisites exist,
+    so each caller isolates one absence. Everything is laid down before the commit —
+    the preflight runs behind a clean-worktree gate.
+
+    The script it writes is the REAL upstream shape (a module-scope
+    `from config_utils import ...`), because the sibling's requirement is keyed on
+    that text; `utils` has no default so every caller must say which era it means."""
+    from conftest import (
+        RENDERER_SCRIPT_IMPORTING_SIBLING,
+        git,
+        install_base_skills,
+        install_build_auto_skill,
+    )
 
     install_bmad_config(project)
     install_base_skills(project)
@@ -1606,7 +1617,11 @@ def _install_renderer_stub_project(project, monkeypatch, *, script: bool, config
     if script:
         rendered = project.project / "_bmad" / "scripts" / "render_skill.py"
         rendered.parent.mkdir(parents=True, exist_ok=True)
-        rendered.write_text("# renderer\n", encoding="utf-8")
+        rendered.write_text(RENDERER_SCRIPT_IMPORTING_SIBLING, encoding="utf-8")
+    if utils:
+        helper = project.project / "_bmad" / "scripts" / "config_utils.py"
+        helper.parent.mkdir(parents=True, exist_ok=True)
+        helper.write_text("# helper\n", encoding="utf-8")
     if config:
         central = project.project / "_bmad" / "config.toml"
         central.parent.mkdir(parents=True, exist_ok=True)
@@ -1622,18 +1637,31 @@ def test_run_aborts_when_the_renderer_script_is_missing(project, monkeypatch, ca
     """A renderer stub with no `_bmad/scripts/render_skill.py` HALTs every single
     unattended session with nothing written, so the preflight refuses the run rather
     than burning the whole budget on guaranteed result-less Stops."""
-    _install_renderer_stub_project(project, monkeypatch, script=False, config=True)
+    _install_renderer_stub_project(project, monkeypatch, script=False, utils=False, config=True)
 
     assert cli.main(["run", "--project", str(project.project)]) == 1
     err = capsys.readouterr().err
     assert "_bmad/scripts/render_skill.py" in err and "HALT" in err
 
 
+def test_run_aborts_when_the_renderer_config_utils_is_missing(project, monkeypatch, capsys):
+    """The script's own sibling. `render_skill.py` imports `config_utils` at module
+    scope off sys.path[0], above its try/except, so a half-present unit dies on a
+    bare ModuleNotFoundError — the same result-less Stop, with the structured
+    `HALT: <error>` line replaced by a raw traceback. `_require_base_skills` has no
+    severity filter, so the run is refused here exactly like the other two."""
+    _install_renderer_stub_project(project, monkeypatch, script=True, utils=False, config=True)
+
+    assert cli.main(["run", "--project", str(project.project)]) == 1
+    err = capsys.readouterr().err
+    assert "_bmad/scripts/config_utils.py" in err and "HALT" in err
+
+
 def test_run_aborts_when_the_renderer_central_config_is_missing(project, monkeypatch, capsys):
-    """One file further in: the script is there but `_bmad/config.toml` — the
+    """One file further in: the script unit is whole but `_bmad/config.toml` — the
     renderer's one required layer — is not, so `uv run` raises before composing and
     exits `HALT:`. Same result-less Stop, same refusal."""
-    _install_renderer_stub_project(project, monkeypatch, script=True, config=False)
+    _install_renderer_stub_project(project, monkeypatch, script=True, utils=True, config=False)
 
     assert cli.main(["run", "--project", str(project.project)]) == 1
     err = capsys.readouterr().err
@@ -1641,10 +1669,10 @@ def test_run_aborts_when_the_renderer_central_config_is_missing(project, monkeyp
 
 
 def test_run_proceeds_once_the_renderer_files_are_present(project, monkeypatch, capsys):
-    """The clearing leg. Without it, ablating either `is_file()` predicate away
-    leaves both aborts above passing — the run would refuse a healthy stub project
-    and no test would notice."""
-    _install_renderer_stub_project(project, monkeypatch, script=True, config=True)
+    """The clearing leg. Without it, ablating any of the three `is_file()` predicates
+    away leaves all three aborts above passing — the run would refuse a healthy stub
+    project and no test would notice."""
+    _install_renderer_stub_project(project, monkeypatch, script=True, utils=True, config=True)
 
     assert cli.main(["run", "--project", str(project.project)]) == 0
     assert "render_skill.py" not in capsys.readouterr().err

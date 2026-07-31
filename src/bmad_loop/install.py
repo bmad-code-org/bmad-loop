@@ -106,11 +106,27 @@ BMAD_DIR = "_bmad"
 RENDERER_SCRIPT_REL = f"{BMAD_DIR}/scripts/render_skill.py"
 RENDERER_SCRIPT_MARKER = "render_skill.py"
 
+# render_skill.py's sibling helper, and the second half of the same unit: upstream
+# imports it at module scope off `sys.path[0]` with no try and no path fixup, so its
+# absence is a bare ModuleNotFoundError raised ABOVE the renderer's own
+# `except (ConfigError, RenderError, OSError, UnicodeError, ValueError)` guard.
+# Measured: the real script alone in an empty dir exits non-zero with a traceback and
+# NO `HALT: <error>` line. The stub's SKILL.md tells the agent to report the command
+# output and halt either way, so what is actually lost is the structured diagnosis —
+# the result-less Stop is identical, which is what makes this the same finding as an
+# absent script rather than a new one. Required only when the INSTALLED script
+# actually imports it (see _renderer_unit_required): both files are one commit old
+# upstream (c2530ea5, BMAD-METHOD #2601), and this gate has no --force.
+RENDERER_CONFIG_UTILS_REL = f"{BMAD_DIR}/scripts/config_utils.py"
+RENDERER_CONFIG_UTILS_MARKER = "config_utils"
+# The renderer's per-project script unit, in the order a finding should list it.
+RENDERER_SCRIPT_UNIT_REL: tuple[str, ...] = (RENDERER_SCRIPT_REL, RENDERER_CONFIG_UTILS_REL)
+
 # The bottom layer of the renderer's four-layer central config, and the only
-# REQUIRED one (`config_utils.load_central_config` passes required=True; the
-# .user/custom layers above it are all optional). Absent, the renderer raises
-# before it composes anything, so the stub's `uv run` exits with `HALT:` and the
-# session Stops having written no spec — the same result-less failure
+# REQUIRED one (`config_utils.load_central_config` passes the required=True flag to
+# its inner load_toml; the .user/custom layers above it are all optional). Absent,
+# the renderer raises before it composes anything, so the stub's `uv run` exits with
+# `HALT:` and the session Stops having written no spec — the same result-less failure
 # RENDERER_SCRIPT_REL guards, one file further in, and blocking for the same
 # reason. Project-global, not per tree.
 CENTRAL_CONFIG_REL = f"{BMAD_DIR}/config.toml"
@@ -125,6 +141,15 @@ CENTRAL_CONFIG_REL = f"{BMAD_DIR}/config.toml"
 # the failure mode of that drift is a run that dispatches into guaranteed result-less
 # Stops. See _bmad_scripts_seed_incomplete and Engine._run_isolated.
 BMAD_SCRIPTS_SEED_REL = f"{BMAD_DIR}/scripts"
+
+# Every sentinel above, i.e. the whole project-global surface the renderer needs to
+# have REACHED THE WORKTREE. The engine intersects this rather than testing one
+# constant, and names whichever member fired in the escalation reason — sending an
+# operator to `_bmad/scripts` when the config is what went missing is exactly the
+# drift the shared constants exist to prevent. The tuple is also the forgery filter
+# in provision_worktree: these strings are reserved for the completeness checks, so a
+# user `worktree_seed` entry that happens to spell one cannot pause a healthy run.
+RENDERER_SEED_SENTINELS: tuple[str, ...] = (BMAD_SCRIPTS_SEED_REL, CENTRAL_CONFIG_REL)
 
 # Top-level _bmad/ entries never seeded into a worktree. render/ is the renderer's
 # published output: it is regenerated on skill entry, and every snapshot dir name is
@@ -230,6 +255,32 @@ def _is_renderer_stub(skill_dir: Path) -> bool:
     except (OSError, UnicodeDecodeError):
         return False
     return RENDERER_SCRIPT_MARKER in skill_md
+
+
+def _renderer_unit_required(project: Path, rel: str) -> bool:
+    """True when the renderer INSTALLED in ``project`` actually needs unit member ``rel``.
+
+    ``render_skill.py`` is the entry point and is unconditional. Its sibling is
+    content-keyed on the script that would import it, the same way
+    :func:`_is_renderer_stub` keys on SKILL.md: the import is a plain
+    ``from config_utils import ...`` at module scope, so the script's own text is the
+    only honest source of truth for whether the helper is load-bearing here.
+
+    Why key it at all, when upstream's script does import it: this feeds a preflight
+    with no severity filter and no ``--force`` — a false positive REFUSES every run
+    with a remediation that cannot fix it. Both files are one commit old upstream, so
+    if a later bmm inlines or renames the helper the import simply disappears and this
+    gate goes quiet instead. Unreadable or absent script ⇒ False, fail-open for the
+    same reason :func:`_is_renderer_stub` does: the script's own absence is already a
+    finding, and blaming a sibling for a read fault names the wrong file.
+    """
+    if rel != RENDERER_CONFIG_UTILS_REL:
+        return True
+    try:
+        script = (project / RENDERER_SCRIPT_REL).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+    return RENDERER_CONFIG_UTILS_MARKER in script
 
 
 def renderer_stub_resolved(project: Path, trees: Sequence[str]) -> bool:
@@ -359,8 +410,14 @@ def missing_base_skills(project: Path, trees: Sequence[str]) -> list[Finding]:
     because a stub whose script or required config layer is absent is the same
     result-less HALT as the shim above and must fail the same gate:
 
-    - ``skills.dev-renderer`` — the stub is there, ``_bmad/scripts/render_skill.py``
-      is not. Per tree, since the primitive resolves per tree.
+    - ``skills.dev-renderer`` — the stub is there, at least one member of the
+      renderer's script unit (:data:`RENDERER_SCRIPT_UNIT_REL`) is not. Per tree,
+      since the primitive resolves per tree. ONE id for both members: a missing entry
+      point and a missing sibling are the same result-less Stop with the same
+      remediation, and ``checks.py`` splits ids only where the two outcomes are
+      genuinely different findings. Which ones are absent is the ``missing_scripts``
+      detail — project-relative rels, hence not the skill-relative ``missing_markers``
+      key above.
     - ``skills.dev-renderer-config`` — a stub resolved *somewhere* and the project has
       no ``_bmad/config.toml``. Once per project (the central config is
       project-global), and gated on a stub having resolved so the check stays
@@ -425,15 +482,21 @@ def missing_base_skills(project: Path, trees: Sequence[str]) -> list[Finding]:
                 )
             if _is_renderer_stub(skill_dir):
                 resolved_stub = True
-                if not (project / RENDERER_SCRIPT_REL).is_file():
+                absent_scripts = [
+                    rel
+                    for rel in RENDERER_SCRIPT_UNIT_REL
+                    if _renderer_unit_required(project, rel) and not (project / rel).is_file()
+                ]
+                if absent_scripts:
                     problems.append(
                         Finding(
                             "skills.dev-renderer",
                             "problem",
                             f"{tree}/{resolved}/SKILL.md renders via {RENDERER_SCRIPT_MARKER} "
-                            f"but {RENDERER_SCRIPT_REL} is missing — the session would HALT "
-                            f"without writing a spec; reinstall the BMad Method (bmm) module",
-                            {"tree": tree, "skill": resolved, "script": RENDERER_SCRIPT_REL},
+                            f"but the renderer script unit is incomplete (missing "
+                            f"{', '.join(absent_scripts)}) — the session would HALT without "
+                            f"writing a spec; reinstall the BMad Method (bmm) module",
+                            {"tree": tree, "skill": resolved, "missing_scripts": absent_scripts},
                         )
                     )
         for skill, markers in REVIEW_HUNTER_SKILLS.items():
@@ -860,6 +923,31 @@ def _bmad_scripts_seed_incomplete(worktree: Path, repo_root: Path) -> bool:
     )
 
 
+def _central_config_seed_incomplete(worktree: Path, repo_root: Path) -> bool:
+    """True when the repo has ``_bmad/config.toml`` but the worktree did not get one.
+
+    The other half of the surface :func:`_bmad_scripts_seed_incomplete` guards, and
+    silent in exactly the same way: the seed's resolve-and-contain guard drops a file
+    that resolves outside ``repo_root`` with a bare ``continue``, so a *symlinked*
+    ``_bmad/config.toml`` — a real BMAD install shared across checkouts, with the
+    scripts dir a real directory — is never copied, never reported, and the
+    ``_seed_bmad_tree`` return still claims the whole tree was seeded. The repo-side
+    preflight follows the symlink and passes. Measured: no journal line at all.
+
+    ``load_central_config`` reads this layer with ``required=True``, so a worktree
+    without it HALTs before composing anything, on every story.
+
+    Deliberately NOT gated on the renderer era, unlike the scripts predicate: that
+    one gates to bound an rglob and to assert "this is a renderer-era scripts dir",
+    whereas the premise here is one named file's presence in the repo. Provisioning
+    is a pure reporter; :func:`renderer_stub_resolved` in the engine decides era for
+    both sentinels in one place.
+    """
+    return (repo_root / CENTRAL_CONFIG_REL).is_file() and not (
+        worktree / CENTRAL_CONFIG_REL
+    ).is_file()
+
+
 def _copy_skills(project: Path, trees: Sequence[str], force: bool) -> bool:
     """Install the bundled bmad-loop-* skills into each project skill tree.
 
@@ -957,11 +1045,14 @@ def provision_worktree(
     because the destination already existed — copy-when-absent turned them into
     no-ops. The caller journals them: a user-authored `worktree_seed` entry that
     silently copies nothing reads as applied configuration and is not. The same
-    channel also reports an INCOMPLETE `_bmad/scripts/` seed (see
-    _bmad_scripts_seed_incomplete), which is likewise silent otherwise. Whether THAT
-    one is fatal depends on the resolved primitive's era, which provisioning cannot
-    see from a repo root and a list of CLI profiles — the caller decides (see
-    BMAD_SCRIPTS_SEED_REL).
+    channel also reports a renderer surface that reached the worktree SHORT — an
+    incomplete `_bmad/scripts/` or an absent `_bmad/config.toml` (see
+    _bmad_scripts_seed_incomplete, _central_config_seed_incomplete) — which is
+    likewise silent otherwise. Those two entries are RENDERER_SEED_SENTINELS and are
+    reserved: a `seed_files` entry spelling one is dropped rather than passed through,
+    so only the checks above can emit them. Whether either is fatal depends on the
+    resolved primitive's era, which provisioning cannot see from a repo root and a
+    list of CLI profiles — the caller decides (see RENDERER_SEED_SENTINELS).
     """
     if not profiles and not seed_files and not seed_globs and not (repo_root / BMAD_DIR).is_dir():
         return []
@@ -1023,8 +1114,18 @@ def provision_worktree(
         # this gap. That entry is now a no-op *because the merge already covered it*,
         # so reporting it would journal worktree-seed-skipped for a seed that applied.
         skipped = [rel for rel in skipped if not _is_under_bmad(rel)]
+    # The sentinels are ours to emit, never a user's to forge. A `worktree_seed` entry
+    # spelling one exactly ("_bmad/scripts", "_bmad/config.toml" — both natural things
+    # to write) lands in `skipped` the moment the checkout already carries it, and the
+    # strip above is conditional on the merge having seeded SOMETHING, so a repo that
+    # commits its whole `_bmad/` skips it. The engine reads these by exact membership,
+    # so an exact-string reservation is exactly as strong as the read it protects:
+    # what follows is then the only thing that can put one back.
+    skipped = [rel for rel in skipped if rel not in RENDERER_SEED_SENTINELS]
     if _bmad_scripts_seed_incomplete(worktree, repo_root):
         skipped.append(BMAD_SCRIPTS_SEED_REL)
+    if _central_config_seed_incomplete(worktree, repo_root):
+        skipped.append(CENTRAL_CONFIG_REL)
 
     # bundled skills into each CLI's skill tree (deduped: codex+gemini share one);
     # never clobber a skill the checkout already carries (tracked or pre-existing).

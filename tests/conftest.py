@@ -298,6 +298,15 @@ RENDERER_STUB_SKILL_MD = (
     "# bmad-build-auto\n\nRun:\n\n```bash\nuv run _bmad/scripts/render_skill.py "
     "bmad-build-auto\n```\n"
 )
+# How upstream's render_skill.py actually opens: a plain module-scope import of its
+# sibling off sys.path[0] — no try, no path fixup — so the helper's absence is a bare
+# ModuleNotFoundError. The preflight keys the sibling's requirement on this text, so a
+# scaffold wanting the REAL two-file unit must carry it; a bare "# renderer" body
+# models the other era, a renderer with no sibling to lose.
+RENDERER_SCRIPT_IMPORTING_SIBLING = (
+    "from config_utils import ConfigError, load_central_config\n\n\ndef main():\n"
+    "    load_central_config('.')\n"
+)
 
 
 def install_build_auto_skill(

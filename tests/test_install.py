@@ -857,6 +857,83 @@ def test_renderer_stub_without_its_script_fails_the_preflight(tmp_path):
     assert missing_base_skills(tmp_path, [tree]) == []
 
 
+def test_renderer_stub_without_config_utils_fails_the_preflight(tmp_path):
+    """The renderer is a TWO-file unit: `render_skill.py` imports `config_utils` at
+    module scope off sys.path[0], above its own try/except, so the sibling's absence
+    is a bare ModuleNotFoundError — the same result-less Stop, minus even the
+    structured `HALT: <error>` line. One check id for both members: same finding,
+    same remediation; `missing_scripts` says which.
+
+    Both files are written BY NAME rather than through a helper keyed on
+    RENDERER_SCRIPT_UNIT_REL — a constant-keyed helper is self-satisfying under the
+    ablation this test exists for ("drop the sibling from the unit tuple")."""
+    from conftest import RENDERER_SCRIPT_IMPORTING_SIBLING, install_build_auto_skill
+
+    from bmad_loop.checks import VALIDATE_CHECKS
+    from bmad_loop.install import (
+        CENTRAL_CONFIG_REL,
+        RENDERER_CONFIG_UTILS_REL,
+        RENDERER_SCRIPT_REL,
+        missing_base_skills,
+    )
+
+    tree = get_profile("claude").skill_tree
+    _install_hunters(tmp_path, tree)
+    install_build_auto_skill(tmp_path, tree, renderer_stub=True)
+    # the other two prerequisites, so this test speaks only about the sibling
+    config = tmp_path / CENTRAL_CONFIG_REL
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text('[core]\nname = "x"\n', encoding="utf-8")
+    script = tmp_path / RENDERER_SCRIPT_REL
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text(RENDERER_SCRIPT_IMPORTING_SIBLING, encoding="utf-8")
+
+    problems = missing_base_skills(tmp_path, [tree])
+    assert [f.check for f in problems] == ["skills.dev-renderer"]
+    assert problems[0].severity == "problem"
+    assert problems[0].check in VALIDATE_CHECKS
+    assert problems[0].detail["missing_scripts"] == [RENDERER_CONFIG_UTILS_REL]
+    assert RENDERER_CONFIG_UTILS_REL in problems[0].message
+    # the entry point is present, so it is NOT reported alongside
+    assert RENDERER_SCRIPT_REL not in problems[0].detail["missing_scripts"]
+
+    # …and it clears once the sibling is there
+    (tmp_path / RENDERER_CONFIG_UTILS_REL).write_text("# helper\n", encoding="utf-8")
+    assert missing_base_skills(tmp_path, [tree]) == []
+
+
+def test_a_renderer_that_does_not_import_the_helper_is_not_gated(tmp_path):
+    """The far side of the content key. This gate is a hard block with no severity
+    filter and no `--force`, shipping against a file one commit old upstream: if a
+    later bmm inlines or renames the helper, the import disappears and the gate must
+    go QUIET rather than refuse every run with a remediation that cannot fix it.
+
+    Same layout as the test above, one byte different — the installed script never
+    says `config_utils` — so this is the discrimination itself, not a second absence
+    case (ablation: make `_renderer_unit_required` unconditional)."""
+    from conftest import install_build_auto_skill
+
+    from bmad_loop.install import (
+        CENTRAL_CONFIG_REL,
+        RENDERER_CONFIG_UTILS_REL,
+        RENDERER_SCRIPT_REL,
+        missing_base_skills,
+    )
+
+    tree = get_profile("claude").skill_tree
+    _install_hunters(tmp_path, tree)
+    install_build_auto_skill(tmp_path, tree, renderer_stub=True)
+    config = tmp_path / CENTRAL_CONFIG_REL
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text('[core]\nname = "x"\n', encoding="utf-8")
+    script = tmp_path / RENDERER_SCRIPT_REL
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text("# a renderer that carries its own config loading\n", encoding="utf-8")
+
+    assert not (tmp_path / RENDERER_CONFIG_UTILS_REL).exists()
+    assert missing_base_skills(tmp_path, [tree]) == []
+
+
 def test_renderer_stub_without_central_config_fails_the_preflight(tmp_path):
     """`_bmad/config.toml` is the renderer's one REQUIRED config layer
     (`config_utils.load_central_config` passes required=True). Absent, the stub's
@@ -1646,6 +1723,76 @@ def test_provision_worktree_reports_bmad_scripts_not_seeded(tmp_path):
     assert skipped == ["_bmad/scripts"]
     assert (wt / "_bmad" / "config.toml").is_file()  # the rest looked like success
     assert not (wt / "_bmad" / "scripts" / "render_skill.py").exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_provision_worktree_reports_a_dropped_central_config(tmp_path):
+    """The config leg of the same completeness check, and the case the scripts leg
+    cannot reach: `_bmad/scripts/` is a REAL directory and seeds whole, while
+    `_bmad/config.toml` alone is symlinked out of the repo (a shared BMAD install
+    where only the config is centralised). The contain guard drops it with a bare
+    `continue`, `_seed_bmad_tree` still returns "the whole tree is ours", and the
+    repo-side preflight follows the symlink and passes — so without this leg the
+    run is 100% silent and burns the entire backlog on result-less Stops."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    shared = tmp_path / "shared-bmad"
+    shared.mkdir()
+    (shared / "config.toml").write_text("[core]\n", encoding="utf-8")
+    (repo / "_bmad" / "scripts").mkdir(parents=True)
+    (repo / "_bmad" / "scripts" / "render_skill.py").write_text("# render", encoding="utf-8")
+    (repo / "_bmad" / "scripts" / "config_utils.py").write_text("# config", encoding="utf-8")
+    (repo / "_bmad" / "config.toml").symlink_to(shared / "config.toml")
+    # the repo-side probe follows the symlink, which is why the preflight passed
+    assert (repo / "_bmad" / "config.toml").is_file()
+
+    skipped = provision_worktree(wt, [], repo)
+
+    assert skipped == ["_bmad/config.toml"]
+    assert not (wt / "_bmad" / "config.toml").exists()
+    # …while the scripts unit landed whole, so the scripts leg says nothing
+    assert (wt / "_bmad" / "scripts" / "render_skill.py").is_file()
+    assert (wt / "_bmad" / "scripts" / "config_utils.py").is_file()
+
+
+def test_provision_worktree_central_config_check_asks_is_file_not_exists(tmp_path):
+    """The same leg, armed symlink-free so it runs on WINDOWS — where the sentinel
+    path has never executed once, and where this PR already shipped a
+    POSIX-invisible bug. Copy-when-absent only asks `dst.exists()`, so a destination
+    occupied by anything that is not a file leaves the worktree without a readable
+    config while the seed reports success. Also pins the worktree probe to
+    `is_file()`: relaxing it to `exists()` would call this worktree healthy."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    _write_bmad_surface(repo)
+    (wt / "_bmad" / "config.toml").mkdir(parents=True)
+
+    assert provision_worktree(wt, [], repo) == ["_bmad/config.toml"]
+
+    # …and it clears the moment the worktree really carries the file
+    wt2 = tmp_path / "wt2"
+    assert provision_worktree(wt2, [], repo) == []
+    assert (wt2 / "_bmad" / "config.toml").is_file()
+
+
+def test_provision_worktree_never_lets_a_seed_entry_forge_a_sentinel(tmp_path):
+    """`RENDERER_SEED_SENTINELS` are the completeness checks' to emit, never a
+    user's to forge. A `worktree_seed` entry spelling one exactly — both are natural
+    things to write, and 0.9.0's docs taught the `_bmad` family — lands in `skipped`
+    the moment the checkout already carries the path, and the `_is_under_bmad` strip
+    above is conditional on the merge having seeded SOMETHING, which a checkout that
+    commits its whole `_bmad/` never does. The engine would then read a forged
+    sentinel and CRITICAL-escalate a completely healthy worktree."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    _write_bmad_surface(repo)
+    _write_bmad_surface(wt)  # a checkout that commits its whole _bmad/: merge is a no-op
+
+    skipped = provision_worktree(
+        wt, [], repo, seed_files=["_bmad/scripts", "_bmad/config.toml", "vendor"]
+    )
+
+    assert skipped == []
+    # the worktree really is healthy — neither check has anything to say about it
+    assert (wt / "_bmad" / "config.toml").is_file()
+    assert (wt / "_bmad" / "scripts" / "config_utils.py").is_file()
 
 
 def test_provision_worktree_bmad_merge_unreports_the_documented_seed_workaround(tmp_path):

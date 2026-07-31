@@ -29,7 +29,7 @@ from bmad_loop import verify
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.engine import Engine
-from bmad_loop.install import BMAD_SCRIPTS_SEED_REL, renderer_stub_resolved
+from bmad_loop.install import BMAD_SCRIPTS_SEED_REL, CENTRAL_CONFIG_REL, renderer_stub_resolved
 from bmad_loop.journal import Journal, load_state
 from bmad_loop.model import Phase, RunState, SessionRecord, StoryTask, TokenUsage
 from bmad_loop.policy import GatesPolicy, LimitsPolicy, NotifyPolicy, Policy, ScmPolicy
@@ -780,6 +780,10 @@ def test_incomplete_bmad_scripts_seed_pauses_before_dispatch(project, tmp_path):
     # the reason names the renderer, which is the evidence the gate now actually has
     escalated = [e for e in entries if e["kind"] == "story-escalated"]
     assert "render_skill.py" in escalated[0]["reason"]
+    # …and names the leg that actually fired, not the whole sentinel tuple: the
+    # config landed, so sending the operator to look for it would be a lie
+    assert BMAD_SCRIPTS_SEED_REL in escalated[0]["reason"]
+    assert CENTRAL_CONFIG_REL not in escalated[0]["reason"]
     # the seed's own report still went out, so the escalation reads as an
     # ESCALATION of that report rather than replacing it
     assert "worktree-seed-skipped" in kinds
@@ -787,6 +791,58 @@ def test_incomplete_bmad_scripts_seed_pauses_before_dispatch(project, tmp_path):
     # renderer half that is short — config.toml made it in, so "seeding ran"
     assert (Path(task.worktree_path) / "_bmad" / "config.toml").is_file()
     assert not (Path(task.worktree_path) / "_bmad" / "scripts" / "render_skill.py").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
+def test_a_dropped_central_config_seed_pauses_before_dispatch(project, tmp_path):
+    """The other leg of the same gate, and the one nothing above can reach: here
+    `_bmad/scripts/` is a real directory that seeds WHOLE, and only
+    `_bmad/config.toml` is symlinked out of the repo. The scripts check is therefore
+    silent, `_seed_bmad_tree` reports the whole tree as seeded, and the repo-side
+    preflight follows the symlink and passes — so before this leg existed the run
+    dispatched into a worktree whose every session HALTs in `load_central_config`.
+
+    The reason must name the CONFIG and not the scripts dir: the two have different
+    remediations, and sending an operator to `_bmad/scripts` when it is intact is
+    exactly the drift the shared sentinel tuple exists to prevent."""
+    from conftest import attach_profile, install_build_auto_skill
+
+    install_build_auto_skill(project.project, ".claude/skills", renderer_stub=True)
+    commit_sprint(project, {"1-1-a": "ready-for-dev", "1-1-b": "ready-for-dev"})
+    shared = tmp_path / "shared-bmad"
+    shared.mkdir()
+    (shared / "config.toml").write_text("[core]\n", encoding="utf-8")
+    bmad = project.project / "_bmad"
+    (bmad / "scripts").mkdir(parents=True)
+    (bmad / "scripts" / "render_skill.py").write_text("# render", encoding="utf-8")
+    (bmad / "scripts" / "config_utils.py").write_text("# config", encoding="utf-8")
+    (bmad / "config.toml").symlink_to(shared / "config.toml")
+    # the repo-side probe follows the symlink, which is why the preflight passed
+    assert (bmad / "config.toml").is_file()
+
+    dispatched: list[str] = []
+
+    def never(spec):
+        dispatched.append(spec.cwd.name)
+        raise AssertionError("dispatched into a worktree with no central config")
+
+    engine, adapter = make_engine(project, [never, never])
+    attach_profile(adapter)
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1
+    assert dispatched == []
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED
+    assert "1-1-b" not in engine.state.tasks
+    entries = Journal(engine.run_dir).entries()
+    escalated = [e for e in entries if e["kind"] == "story-escalated"]
+    assert escalated
+    assert CENTRAL_CONFIG_REL in escalated[0]["reason"]
+    assert BMAD_SCRIPTS_SEED_REL not in escalated[0]["reason"]
+    # the worktree stays mounted, and it is the CONFIG half that is short
+    assert not (Path(task.worktree_path) / "_bmad" / "config.toml").exists()
+    assert (Path(task.worktree_path) / "_bmad" / "scripts" / "render_skill.py").is_file()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
