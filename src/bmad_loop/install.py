@@ -945,6 +945,44 @@ def _bmad_scripts_seed_incomplete(worktree: Path, repo_root: Path) -> bool:
     )
 
 
+def base_skills_seed_incomplete(worktree: Path, repo_root: Path, trees: Sequence[str]) -> list[str]:
+    """The ``<tree>/<skill>`` rels the repo resolves but the worktree does not carry.
+
+    The skills half of the same shape :func:`_bmad_scripts_seed_incomplete` reports for
+    the renderer, and the one containment leg nothing covered. `provision_worktree`
+    copies BASE_SKILLS from the main repo's tree behind a
+    ``src.resolve().is_relative_to(repo_root)`` guard whose two legs are not alike:
+
+    - the skill is genuinely absent from the repo — the run-start preflight
+      (:func:`missing_base_skills`) already refused the run, so skipping is right;
+    - the skill IS there but is a **symlink to a shared install outside the repo** —
+      how a shared BMad install is wired, and the same trigger as the ``_bmad/`` case.
+      Then the guard drops it while the preflight, which stats through the link,
+      passes. Measured: a symlinked `.claude/skills/bmad-build-auto` leaves
+      `missing_base_skills` empty and `resolve_dev_primitive` naming the primitive,
+      while the worktree receives NOTHING and provisioning reports success.
+
+    The session then dispatches a skill its worktree does not have — the `Unknown
+    command` stall the preflight exists to prevent, reached anyway by a project that
+    passed it. Unlike the renderer sentinels this needs no era gate: an absent dev
+    primitive or review hunter stalls a session whether its SKILL.md renders or is
+    inline, so the answer is the same question at both layers.
+
+    Gated on the REPO having the skill so a project that legitimately lacks one is not
+    reported twice, and on the WORKTREE lacking it so a tracked skill the checkout
+    already carries (which `provision_worktree` deliberately never clobbers) is not
+    reported at all. Returns the rels rather than a bool so the journal and the
+    escalation reason can name which skill went missing — a run pointed at
+    ``_bmad/scripts`` when a review hunter is what vanished is the drift the shared
+    constants exist to prevent."""
+    missing: list[str] = []
+    for tree in dict.fromkeys(trees):
+        for skill in BASE_SKILLS:
+            if (repo_root / tree / skill).is_dir() and not (worktree / tree / skill).is_dir():
+                missing.append(f"{tree}/{skill}")
+    return missing
+
+
 def _central_config_seed_incomplete(worktree: Path, repo_root: Path) -> bool:
     """True when the repo has ``_bmad/config.toml`` but the worktree did not get one.
 
@@ -1161,8 +1199,15 @@ def provision_worktree(
         # The orchestrator-driven upstream skills (BASE_SKILLS) are not in the
         # wheel; copy them from the MAIN REPO's installed tree (same tree path) so
         # an isolated worktree can still resolve the dev primitive (under EITHER
-        # name — BASE_SKILLS lists both eras) and the review hunters. Skip silently
-        # when the main repo lacks them — the run-start preflight reports it.
+        # name — BASE_SKILLS lists both eras) and the review hunters.
+        #
+        # Two legs, and only one of them is safe to skip silently. `not src.is_dir()`
+        # means the repo genuinely lacks the skill, which the run-start preflight
+        # already refused. A containment failure does NOT: the skill is there, as a
+        # symlink to a shared install outside the repo, and the preflight stats
+        # through the link and passes. That leg is reported below via
+        # `base_skills_seed_incomplete`, which re-asks the question of the result
+        # rather than trusting this loop's bookkeeping.
         for skill in BASE_SKILLS:
             dst = tree_dir / skill
             if dst.exists():
@@ -1171,6 +1216,14 @@ def provision_worktree(
             if not src.is_relative_to(repo_root) or not src.is_dir():
                 continue
             _copy_traversable(src, dst)
+
+    # Report whatever the skills copy above could not deliver. Asked of the RESULT,
+    # not accumulated inside the loop, so a skill dropped by any future path is caught
+    # the same way — and so a user `worktree_seed` entry that happens to spell a skill
+    # rel cannot forge one: the engine re-runs this predicate rather than reading these
+    # strings back (the reason RENDERER_SEED_SENTINELS needs its filter above and this
+    # does not).
+    skipped += base_skills_seed_incomplete(worktree, repo_root, [p.skill_tree for p in profiles])
 
     # per-CLI signal-hook registration, baked to the main repo's relay (absolute).
     # Hookless profiles (HTTP/SSE transport) have no config to merge.

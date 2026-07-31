@@ -50,6 +50,20 @@ editing.
   report that narrower `trees` list. Single-CLI projects and dev/review splits across two CLIs
   are unaffected.
 
+- **A worktree that could not be given its upstream skills now pauses instead of stalling
+  (#405).** `provision_worktree` copies the BMad Method skills from the main repo behind a
+  containment guard, and skipped anything resolving outside the repo — which is exactly what a
+  skill tree symlinked to a shared machine-wide BMad install does. The run-start preflight stats
+  through that symlink and passes, so an isolated run dispatched into a worktree holding none of
+  its skills and every session stalled on `Unknown command` having written nothing. Provisioning
+  now reports the skills it could not deliver through the existing `worktree-seed-skipped`
+  journal channel, and the engine escalates and pauses before dispatch, naming them — the same
+  environment-fault treatment the renderer surface already got, since the seed reads the same
+  repo for every story. Unlike the renderer legs this carries no era condition: a missing skill
+  stalls a session whether its `SKILL.md` renders or is inline. A skill tree that is committed
+  (symlink and all) is checked out into the worktree normally and is unaffected. Pre-existing
+  since 0.6.5; found while reviewing this release.
+
 - **A renderer stub that cannot compose a prompt fails the preflight (#405).** Two new checks
   block `validate`/`run`/`sweep`/`resume`: `skills.dev-renderer`, when the resolved `SKILL.md`
   is the new renderer stub (BMAD-METHOD#2601) but its script unit is not whole —

@@ -33,6 +33,7 @@ from .escalation import (
 from .install import (
     RENDERER_SCRIPT_MARKER,
     RENDERER_SEED_SENTINELS,
+    base_skills_seed_incomplete,
     dev_primitive_or_default,
     provision_worktree,
     renderer_stub_resolved,
@@ -638,6 +639,34 @@ class Engine:
             self.journal.append(
                 "worktree-seed-skipped", story_key=task.story_key, entries=skipped_seeds
             )
+        # The skills half of the same fault, and it needs no era gate: a worktree
+        # missing the dev primitive or a review hunter stalls the session on `Unknown
+        # command` whether that SKILL.md renders or is inline. Re-probed rather than
+        # read out of `skipped_seeds`, so a user `worktree_seed` entry spelling a skill
+        # rel cannot forge a pause. Checked BEFORE the renderer branch: a worktree with
+        # no dev primitive at all has nothing for a renderer surface to be short FOR,
+        # so naming the renderer there would send the operator to the wrong file.
+        absent_skills = base_skills_seed_incomplete(
+            unit.path, self.paths.repo_root, [p.skill_tree for p in profiles]
+        )
+        if absent_skills:
+            reason = (
+                f"the worktree is missing upstream skills the repo has "
+                f"({', '.join(absent_skills)}) — the session would stall on `Unknown "
+                f"command` having written nothing. The usual cause is a skill tree "
+                f"symlinked to a shared BMad install outside the repo, which worktree "
+                f"seeding cannot follow"
+            )
+            task.phase = Phase.ESCALATED
+            self.journal.append("story-escalated", story_key=task.story_key, reason=reason)
+            gates.notify(
+                self.policy,
+                self.run_dir,
+                f"CRITICAL escalation: {task.story_key}",
+                f"{reason} — resolve, then `bmad-loop resume {self.state.run_id}`",
+            )
+            self._save()
+            raise RunPaused(reason, PAUSE_ESCALATION, task.story_key)
         short_surface = [rel for rel in RENDERER_SEED_SENTINELS if rel in skipped_seeds]
         if short_surface and renderer_stub_resolved(
             self.paths.project, [p.skill_tree for p in profiles]

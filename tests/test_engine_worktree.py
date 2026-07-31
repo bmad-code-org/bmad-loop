@@ -793,6 +793,161 @@ def test_incomplete_bmad_scripts_seed_pauses_before_dispatch(project, tmp_path):
     assert not (Path(task.worktree_path) / "_bmad" / "scripts" / "render_skill.py").exists()
 
 
+def _symlink_skill_tree(
+    project, shared: Path, tree: str = ".claude/skills", *, renderer_stub: bool = False
+) -> None:
+    """Point every upstream skill in ``tree`` at a shared install OUTSIDE the repo —
+    how a machine-wide BMad install is wired, and the one shape provisioning cannot
+    follow.
+
+    The tree must be GITIGNORED (and so untracked) for this to bite: a committed
+    symlink is checked out into the worktree as a symlink and resolves there just
+    fine. It is the untracked case that provisioning has to copy, and the copy is
+    what the containment guard refuses."""
+    from conftest import RENDERER_STUB_SKILL_MD
+
+    from bmad_loop.install import DEV_PRIMITIVE_MARKERS, DEV_PRIMITIVE_NEW, REVIEW_HUNTER_SKILLS
+
+    tree_dir = project.project / tree
+    tree_dir.mkdir(parents=True, exist_ok=True)
+    for skill in (DEV_PRIMITIVE_NEW, *REVIEW_HUNTER_SKILLS):
+        real = shared / skill
+        real.mkdir(parents=True, exist_ok=True)
+        stub = renderer_stub and skill == DEV_PRIMITIVE_NEW
+        (real / "SKILL.md").write_text(
+            RENDERER_STUB_SKILL_MD if stub else f"# {skill}\n", encoding="utf-8"
+        )
+        for marker in DEV_PRIMITIVE_MARKERS:
+            (real / marker).write_text("x\n", encoding="utf-8")
+        (tree_dir / skill).symlink_to(real, target_is_directory=True)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
+def test_a_dropped_skill_seed_pauses_before_dispatch(project, tmp_path):
+    """The skills half of the same fault the renderer sentinels catch, and the leg
+    nothing covered: `provision_worktree` copies BASE_SKILLS from the main repo behind
+    a containment guard, and a skill tree symlinked to a shared install outside the
+    repo resolves out of `repo_root` and is dropped — silently, because that guard's
+    only stated justification ("the run-start preflight reports it") is true of the
+    skill-genuinely-absent leg and FALSE of this one. The preflight stats through the
+    link and passes.
+
+    So a project that passed preflight dispatched into a worktree holding none of its
+    skills, and every session stalled on `Unknown command` having written nothing —
+    the exact failure `missing_base_skills` exists to prevent, reached anyway. Same
+    environment-fault shape as the renderer legs: the seed reads the same repo for
+    every unit, so no repair session fixes it and no later story escapes it."""
+    from conftest import attach_profile
+
+    from bmad_loop import install
+
+    # gitignored skill tree = the normal shape, and the one that bites (see helper)
+    (project.project / ".gitignore").write_text(".bmad-loop/runs/\n.claude/\n", encoding="utf-8")
+    # A COMPLETE renderer surface, deliberately: it keeps the renderer legs silent, so
+    # the escalation below can only have come from the skills probe — and it is what
+    # lets the era-gate ablation discriminate this test from its inline sibling.
+    bmad = project.project / "_bmad" / "scripts"
+    bmad.mkdir(parents=True)
+    (bmad / "render_skill.py").write_text("# render", encoding="utf-8")
+    (bmad / "config_utils.py").write_text("# config", encoding="utf-8")
+    (project.project / "_bmad" / "config.toml").write_text("[core]\n", encoding="utf-8")
+    commit_sprint(project, {"1-1-a": "ready-for-dev", "1-1-b": "ready-for-dev"})
+    _symlink_skill_tree(project, tmp_path / "shared-bmad-install", renderer_stub=True)
+    # the repo-side preflight follows the symlinks and passes — which is exactly why
+    # the run reaches provisioning at all
+    assert install.missing_base_skills(project.project, [".claude/skills"]) == []
+    assert install.resolve_dev_primitive(project.project, ".claude/skills") is not None
+
+    dispatched: list[str] = []
+
+    def never(spec):
+        dispatched.append(spec.cwd.name)
+        raise AssertionError("dispatched into a worktree carrying no upstream skills")
+
+    engine, adapter = make_engine(project, [never, never])
+    attach_profile(adapter)
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1
+    assert dispatched == []
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED
+    # the pause stopped the loop rather than walking the backlog into the same stall
+    assert "1-1-b" not in engine.state.tasks
+    entries = Journal(engine.run_dir).entries()
+    kinds = [e["kind"] for e in entries]
+    assert "story-escalated" in kinds
+    escalated = [e for e in entries if e["kind"] == "story-escalated"]
+    # names the skills that actually went missing, not the renderer surface: the two
+    # have different remediations, and _bmad/ is intact here
+    assert ".claude/skills/bmad-build-auto" in escalated[0]["reason"]
+    assert BMAD_SCRIPTS_SEED_REL not in escalated[0]["reason"]
+    assert CENTRAL_CONFIG_REL not in escalated[0]["reason"]
+    # the seed's own report still went out, so the escalation reads as an ESCALATION
+    # of that report rather than a replacement for it
+    assert "worktree-seed-skipped" in kinds
+    # the worktree stays mounted for inspection, and it really is empty of skills
+    assert not (Path(task.worktree_path) / ".claude" / "skills" / "bmad-build-auto").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
+def test_a_dropped_skill_seed_pauses_an_inline_primitive_too(project, tmp_path):
+    """The delta from the renderer legs, and the thing most likely to be got wrong by
+    copying them: this gate carries NO era condition. `_bmad/` is absent entirely, so
+    `renderer_stub_resolved` is False and the renderer branch cannot fire — yet an
+    inline `SKILL.md` the worktree does not have stalls a session exactly as hard as a
+    renderer stub it does not have. Gating this on the renderer, as the sentinel legs
+    are, would let the whole pre-#2601 world dispatch into the stall."""
+    from conftest import attach_profile
+
+    (project.project / ".gitignore").write_text(".bmad-loop/runs/\n.claude/\n", encoding="utf-8")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    _symlink_skill_tree(project, tmp_path / "shared-bmad-install")
+    assert not (project.project / "_bmad").exists()  # nothing renderer-era anywhere
+    assert not renderer_stub_resolved(project.project, [".claude/skills"])
+
+    def never(spec):
+        raise AssertionError("dispatched into a worktree carrying no upstream skills")
+
+    engine, adapter = make_engine(project, [never, never])
+    attach_profile(adapter)
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1
+    escalated = [e for e in Journal(engine.run_dir).entries() if e["kind"] == "story-escalated"]
+    assert escalated and ".claude/skills/" in escalated[0]["reason"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
+def test_a_tracked_symlinked_skill_tree_does_not_pause(project, tmp_path):
+    """Control, and the boundary the gate must not overrun: the identical symlinks,
+    COMMITTED. Git stores a symlink as a symlink, so the worktree checks it out and
+    the skill resolves there — nothing was dropped and the run must proceed.
+
+    Without this, a gate that simply refused every symlinked tree would pass the two
+    tests above while breaking every project that commits one."""
+    from conftest import attach_profile
+
+    _symlink_skill_tree(project, tmp_path / "shared-bmad-install")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})  # tracks the symlinks
+
+    engine, adapter = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
+    )
+    attach_profile(adapter)
+    summary = engine.run()
+
+    assert not summary.paused and summary.escalated == 0
+    assert engine.state.tasks["1-1-a"].phase == Phase.DONE
+    # nothing was reported short, which is the gate's own evidence that the worktree
+    # resolved the skill through the checked-out symlink (a successful run tears its
+    # worktree down, so the tree itself is gone by now — the journal is the record)
+    kinds = [e["kind"] for e in Journal(engine.run_dir).entries()]
+    assert "story-escalated" not in kinds
+    assert "worktree-seed-skipped" not in kinds
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
 def test_a_dropped_central_config_seed_pauses_before_dispatch(project, tmp_path):
     """The other leg of the same gate, and the one nothing above can reach: here
