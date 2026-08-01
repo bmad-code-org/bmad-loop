@@ -1938,20 +1938,43 @@ class Engine:
                 # suite green. The boundary is defensive positioning for the next
                 # write to grow inside either sync, not an observable property.
                 #
-                # NOT on a replayed attempt: the host died somewhere between the dead
-                # process's writes and its rollback, so what is on disk now is already
-                # post-harvest and re-arming would restore the very edits the rollback
-                # exists to undo. The dead attempt's persisted snapshot is what the
-                # replay restores instead.
+                # NOT on a replayed attempt that still HAS a snapshot: the host died
+                # somewhere between the dead process's writes and its rollback, so what
+                # is on disk now is already post-harvest and re-arming would restore the
+                # very edits the rollback exists to undo. The dead attempt's persisted
+                # snapshot is what the replay restores instead.
+                #
+                # A replay with NOTHING armed is the opposite case and re-arms (#405).
+                # It means the previous pass through here already spent its snapshot —
+                # the `rollback_on_failure = off` pause disarms in its `finally`, so the
+                # ledger on disk is pre-harvest bytes plus whatever the operator wrote
+                # during the pause, which is exactly what this attempt should be able to
+                # revert to. Without the re-arm the resumed attempt runs its harvest with
+                # no snapshot at all and a second failure leaves that harvest behind.
+                # (The pre-existing `ledger-snapshot-missing` states are unaffected: they
+                # are replays that never reached the arm, and they still find nothing
+                # armed — but they now re-arm from disk rather than proceeding blind,
+                # which is strictly more recoverable.)
+                #
+                # Same site, same reason — but deliberately its OWN guard, and NOT
+                # the relaxed one below. Everything under this line that touches the
+                # ledger is the ORCHESTRATOR writing, not the session, so the flag is
+                # cleared here for each attempt to answer for itself; and NEVER on a
+                # replay, because the dead attempt's harvest is still in the tree
+                # while the replayed harvest dedupes to nothing, so its True has to
+                # survive (see the field's comment and `_harvest_gate_exclude`).
+                # Sharing the arm's guard would couple the two: the relaxation below
+                # fires on a replay that has nothing armed, which would clear the
+                # flag on exactly the replay whose only diff IS the dead attempt's
+                # harvest — handing the proof-of-work gate the orchestrator's own
+                # write, the hazard this flag exists to prevent (#405).
                 if not replayed:
+                    task.harvest_wrote_ledger = False
+                if not replayed or not task.pre_harvest_ledger_captured:
                     task.pre_harvest_ledger = self._ledger_text()
                     task.pre_harvest_ledger_captured = True
-                    # Same block, same reason: everything below this line that
-                    # touches the ledger is the ORCHESTRATOR writing, not the
-                    # session. Cleared here so each attempt answers for itself,
-                    # and NOT on a replay — the dead attempt's harvest is still in
-                    # the tree, so its True must survive (see the field's comment).
-                    task.harvest_wrote_ledger = False
+                    # persists the clear above as well: `not replayed` implies this
+                    # condition, so every pass that clears the flag saves here.
                     self._save()
                 # bmad-dev-auto sometimes finalizes the spec in prose (## Auto Run
                 # Result: Status done) but leaves the frontmatter status at the
@@ -2040,8 +2063,19 @@ class Engine:
                     feedback = self._write_feedback(task, decision.reason)
                 else:
                     feedback = None
+                    paused = False
                     try:
                         self._rollback_or_pause(task)
+                    except RunPaused:
+                        # `rollback_on_failure = off` (the DEFAULT) does not roll
+                        # back at all: it hands the tree to a human and raises. The
+                        # gap that opens is not a crash window measured in
+                        # milliseconds but a HUMAN-scale one — the operator reads the
+                        # notice, inspects the tree, and may well append to the
+                        # deferred-work ledger before typing `resume`. Latch it here
+                        # so the `finally` below can tell that leg apart (#405).
+                        paused = True
+                        raise
                     finally:
                         # The reset discards the attempt but NOT what this phase
                         # wrote to the deferred-work ledger: the ledger lives under a
@@ -2062,6 +2096,29 @@ class Engine:
                         # before the harvest, so a host death in that window costs
                         # nothing. No-op when this attempt armed nothing.
                         self._restore_persisted_ledger(task, replayed=replayed)
+                        if paused:
+                            # The restore above has just put the ledger back to this
+                            # attempt's pre-harvest bytes, which is correct and is the
+                            # last thing this snapshot is good for. Spend it HERE
+                            # rather than letting it ride the pause: clear site 2
+                            # below is unreachable on this leg (the raise skips it),
+                            # so without this the copy stays armed in state.json
+                            # across a pause of arbitrary length, and the resume —
+                            # which replays this same attempt — writes those stale
+                            # bytes back over whatever the operator did in the
+                            # meantime. Every ledger state loses work that way, not
+                            # just the created-by-the-harvest one: the overwrite arm
+                            # has no `_ledger_is_gits_to_restore` guard, so a TRACKED
+                            # ledger is rewritten too, and the arm is never spent, so
+                            # it happens again on every subsequent resume.
+                            #
+                            # `_save()` immediately, because the whole point is that
+                            # the value the RESUME reads off disk is the disarmed one.
+                            # The re-arm then happens at the arm site from the tree as
+                            # the operator left it — see its relaxed guard, which is
+                            # what makes "nothing armed" mean "arm from disk" there.
+                            self._disarm_ledger_snapshot(task)
+                            self._save()
                 # Clear site 2, for BOTH retry legs and deliberately OUTSIDE the
                 # `finally`. A fixable retry keeps its tree and its harvest on
                 # purpose, so a stale arm would let attempt N+1's replay delete them;

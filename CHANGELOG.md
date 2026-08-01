@@ -267,9 +267,24 @@ editing.
   PROCEED path persists immediately, because a hard kill there resumes straight into the review
   leg and would otherwise strand that copy on a task that is already terminal; the retry site
   deliberately does not, since the same kill replays that attempt and it still wants the
-  snapshot. A defer still
+  snapshot — except when that retry pauses, which the next bullet covers. A defer still
   keeps its harvested entries: on the in-place path `_stash_deferred_artifacts` has already moved
   the spec out of the artifacts dir, so the ledger entry is the finding's only surviving record.
+
+- **The pre-harvest snapshot is spent by a stop-and-wait pause instead of riding it (#405).**
+  `rollback_on_failure = off` is the default and does not roll back: it hands the tree to a human
+  and raises. The window that opens is not a crash window but a human-scale one — the operator
+  reads the notice, inspects the tree, and may well append to the deferred-work ledger before
+  typing `resume`. The armed snapshot used to survive that wait in `state.json`, and the resume,
+  which replays the same attempt, wrote those stale bytes back over whatever the operator had
+  done: an unlink when no ledger existed at the attempt baseline, and otherwise an overwrite,
+  which has no tracked-file guard, so a committed ledger was rewritten too. Nothing spent the arm
+  either, so it happened again on every subsequent resume. The pause leg now disarms in the same
+  `finally` that restores, strictly after it, and persists that immediately — the point is the
+  value the resume reads off disk. The replayed attempt then re-arms from the tree as the
+  operator left it, so its own harvest has something to revert to if it fails in turn. Replays
+  that never reached the arm re-arm the same way rather than proceeding blind, which retires the
+  `ledger-snapshot-missing` journal line for that case.
 
 - **The harvest's own ledger write is no longer the session's proof of work (#405).** The harvest
   runs four statements above the dev artifact gate, and that gate deliberately does not exclude

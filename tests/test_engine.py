@@ -6181,15 +6181,21 @@ def test_restore_ledger_keeps_a_tracked_ledger_the_reset_restored(project):
 
 
 def test_crash_replay_leaves_the_ledger_alone_when_no_snapshot_was_persisted(project):
-    """A replay that finds nothing armed must keep its hands off entirely.
+    """A replay that finds nothing armed must not touch the ledger it did not see.
 
     Two ways in, wanting the same answer: a task persisted before the fields existed,
     and a host that died upstream of the pre-harvest save. Both leave the replay with
-    no idea what the ledger looked like, and both readings of a guess are worse than
-    inaction — `pre_harvest_ledger` is None there, and None means "unlink", so a
-    restore gated on the TEXT instead of the FLAG would delete an operator's ledger
-    on the first replay after upgrade. The harvest surviving is the honest cost of
-    the one window that remains, and the skip is journalled rather than silent.
+    no idea what the ledger looked like *at the dead attempt's baseline*, and a guess
+    is worse than inaction — `pre_harvest_ledger` is None there, and None means
+    "unlink", so a restore gated on the TEXT instead of the FLAG would delete an
+    operator's ledger on the first replay after upgrade.
+
+    The unarmed replay now RE-ARMS from disk instead of proceeding blind (#405), so
+    `ledger-snapshot-missing` is no longer the observable — the ledger's contents are.
+    The outcome is identical for this case (the re-armed snapshot is the current text,
+    so the restore is a no-op) and strictly better if the replayed attempt fails in
+    turn: its own harvest then has something to revert to. What must NOT change is the
+    line below it: nothing here deletes or rewrites a ledger this run never snapshotted.
 
     The state doc is round-tripped through `to_dict`/`from_dict` rather than poked on
     the instance: the deserializer is where the one-token mistake lives."""
@@ -6214,8 +6220,10 @@ def test_crash_replay_leaves_the_ledger_alone_when_no_snapshot_was_persisted(pro
     resumed.state.tasks["1-1-a"] = StoryTask.from_dict(doc)
     assert resumed.run().done == 1
 
+    # THE assertion: the replay left the dead attempt's harvest exactly as it found it
     assert [e.title for e in _ledger_entries(project)] == [HARVEST_A["summary"]]
-    assert "ledger-snapshot-missing" in [e["kind"] for e in resumed.journal.entries()]
+    # ...by re-arming from disk rather than reporting a miss and running blind
+    assert "ledger-snapshot-missing" not in [e["kind"] for e in resumed.journal.entries()]
     assert isinstance(deferredwork.parse_ledger(""), list)  # ledger stayed parseable
 
 
@@ -6301,7 +6309,13 @@ def test_a_replay_never_restores_an_earlier_attempts_snapshot(project):
     reaches its own arm. If attempt 1's snapshot were still armed, the replay would
     read it as "there was no ledger" and delete a file attempt 1 never saw — content
     no reset would have touched and no commit can restore. Disarming at the decision
-    makes the stale snapshot unreachable, and the replay correctly finds nothing."""
+    makes the stale snapshot unreachable.
+
+    The replay then re-arms from disk rather than running with nothing armed (#405),
+    so what pins the behaviour is the surviving entry, not the
+    `ledger-snapshot-missing` line that used to stand in for it: the re-armed snapshot
+    IS "Session's own note", so any later restore on this attempt writes that back
+    rather than attempt 1's None."""
     assert not project.deferred_work.exists()
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     pol = dataclasses.replace(_harvest_policy(), limits=LimitsPolicy(max_dev_attempts=3))
@@ -6326,7 +6340,8 @@ def test_a_replay_never_restores_an_earlier_attempts_snapshot(project):
 
     kinds = [e["kind"] for e in resumed.journal.entries()]
     assert "resume-verify" in kinds  # it really was a replay, not a restart
-    assert "ledger-snapshot-missing" in kinds  # ...and it found nothing armed
+    assert "ledger-snapshot-missing" not in kinds  # ...and it re-armed rather than ran blind
+    # THE assertion: attempt 1's stale `None` never reached this file
     assert [e.title for e in _ledger_entries(project)] == ["Session's own note"]
 
 
@@ -6842,6 +6857,271 @@ def test_spec_deferrals_ledger_write_fault_crashes_the_run(project, monkeypatch)
     assert summary.crashed is True
     assert load_state(engine.run_dir).crash_error.startswith("PermissionError")
     assert "run-crash" in (engine.run_dir / "journal.jsonl").read_text()
+
+
+# --- the pre-harvest snapshot must not ride a human-scale pause ---
+#
+# `rollback_on_failure = off` is the PRODUCTION DEFAULT, and it does not roll back: it
+# leaves the tree for the operator and raises `RunPaused` out of
+# `_pause_for_manual_recovery`. That raise skips clear site 2, so before #405 the
+# attempt's pre-harvest snapshot stayed armed in `state.json` for however long the human
+# took — and `resume`, which replays that same attempt, wrote those stale bytes back over
+# whatever the operator had done in the meantime. Every ledger state loses work that way:
+# the `snapshot is None` arm UNLINKS, and the `snapshot is not None` arm OVERWRITES with
+# no `_ledger_is_gits_to_restore` guard at all, so even a TRACKED ledger is rewritten.
+#
+# Fixture values that are load-bearing here, each verified rather than assumed:
+#   * `_baseline_liar_effect`, not a failing verify command — only a NON-fixable outcome
+#     reaches `_rollback_or_pause`; a fixable one keeps the tree and never gets there.
+#   * the pause-window write must DIFFER from the snapshot, or `_restore_ledger`'s
+#     `current == snapshot` short-circuit returns early and the test passes either way.
+#   * assert raw `read_text()`, not `_ledger_entries` titles: the parse would hide a
+#     malformed or truncated restore, and an operator's note is not a `### DW-n` entry.
+
+
+def _pause_policy(attempts: int = 2):
+    """`_harvest_policy` with auto-rollback OFF — the production default, and the only
+    dev leg that hands the tree to a human and raises instead of resetting."""
+    return dataclasses.replace(
+        _harvest_policy(),
+        scm=ScmPolicy(rollback_on_failure=False),
+        limits=LimitsPolicy(max_dev_attempts=attempts),
+    )
+
+
+def _run_to_pause(project, *, attempts: int = 2):
+    """Drive one attempt that completes, harvests HARVEST_A, then fails the artifact
+    gate non-fixably — so the run pauses with the tree untouched."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [_baseline_liar_effect(project, deferred=[HARVEST_A])],
+        policy=_pause_policy(attempts),
+    )
+    summary = engine.run()
+    assert summary.paused, "the fixture must reach the manual-recovery pause"
+    return engine
+
+
+def _resume_once(project, engine):
+    """Resume the paused run. `resume_engine` reloads state from DISK, which is the
+    point: it reads whatever the pause persisted, so a disarm that was not `_save()`d
+    would still be armed here."""
+    resumed, _ = resume_engine(
+        project, engine, [_baseline_liar_effect(project, deferred=[HARVEST_A])]
+    )
+    resumed.run()
+    return resumed
+
+
+OPERATOR_NOTE = "\n## operator's own note, written while the run was paused\n"
+
+
+def test_an_operator_ledger_written_during_the_pause_survives_resume(project):
+    """T1a. The commonest shape: no ledger existed at the attempt's baseline, so the
+    snapshot is `None` — and `None` means UNLINK. The operator reads the pause notice,
+    starts a ledger of their own, and resumes; the stale snapshot deleted the file."""
+    assert not project.deferred_work.exists()
+    engine = _run_to_pause(project)
+    # the pause reverted the harvest, as it should — that is not what is under test
+    assert not project.deferred_work.exists()
+
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text(OPERATOR_NOTE, encoding="utf-8")
+
+    _resume_once(project, engine)
+
+    assert project.deferred_work.is_file(), "resume deleted the operator's ledger"
+    assert project.deferred_work.read_text(encoding="utf-8") == OPERATOR_NOTE
+
+
+def test_an_operator_append_to_a_pre_existing_ledger_survives_resume(project):
+    """T1b. A ledger that already existed, so the snapshot is TEXT and the stale-arm
+    failure is an overwrite rather than an unlink — the operator's append is dropped
+    and the file silently reverts to its pre-pause bytes."""
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("### DW-0: pre-existing\nstatus: open\n", encoding="utf-8")
+    before = project.deferred_work.read_text(encoding="utf-8")
+
+    engine = _run_to_pause(project)
+    project.deferred_work.write_text(before + OPERATOR_NOTE, encoding="utf-8")
+
+    _resume_once(project, engine)
+
+    assert project.deferred_work.read_text(encoding="utf-8") == before + OPERATOR_NOTE
+
+
+def test_an_operator_append_to_a_TRACKED_ledger_survives_resume(project):
+    """T1c, and the state the old guard never covered. `_ledger_is_gits_to_restore`
+    gates only the `snapshot is None` UNLINK; the overwrite arm has no such check, so a
+    ledger git tracks was rewritten from the stale snapshot just like an untracked one.
+    Committing it is the whole fixture — without the commit this is T1b again."""
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("### DW-0: committed\nstatus: open\n", encoding="utf-8")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "track the ledger")
+    rel = project.deferred_work.relative_to(project.project).as_posix()
+    assert verify.path_tracked(project.project, rel), "the fixture must really be tracked"
+    before = project.deferred_work.read_text(encoding="utf-8")
+
+    engine = _run_to_pause(project)
+    project.deferred_work.write_text(before + OPERATOR_NOTE, encoding="utf-8")
+
+    _resume_once(project, engine)
+
+    assert project.deferred_work.read_text(encoding="utf-8") == before + OPERATOR_NOTE
+
+
+def test_an_operator_append_to_a_gitignored_ledger_survives_resume(project):
+    """T1d. A gitignored ledger is the case every git-side signal is blind to — it is
+    absent from `untracked_files` and `reset --hard` never touches it — so only the
+    snapshot logic can lose it, and it did."""
+    _gitignore_the_ledger(project)
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("### DW-0: ignored\nstatus: open\n", encoding="utf-8")
+    before = project.deferred_work.read_text(encoding="utf-8")
+
+    engine = _run_to_pause(project)
+    project.deferred_work.write_text(before + OPERATOR_NOTE, encoding="utf-8")
+
+    _resume_once(project, engine)
+
+    assert project.deferred_work.read_text(encoding="utf-8") == before + OPERATOR_NOTE
+
+
+def test_the_arm_is_spent_by_the_pause_and_not_re_used_by_later_resumes(project):
+    """T1e, the stickiness case. The old arm was never SPENT: nothing on the pause leg
+    cleared it, so the same stale bytes were written back on every resume, not just the
+    first. Three consecutive resumes, each with a fresh operator edit, each of which
+    must survive — one is not enough to catch a re-arm that latches."""
+    assert not project.deferred_work.exists()
+    engine = _run_to_pause(project, attempts=6)
+
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    current = engine
+    for i in range(3):
+        text = f"{OPERATOR_NOTE}round {i}\n"
+        project.deferred_work.write_text(text, encoding="utf-8")
+        current = _resume_once(project, current)
+        assert project.deferred_work.is_file(), f"resume {i} deleted the operator's ledger"
+        assert project.deferred_work.read_text(encoding="utf-8") == text, f"resume {i} lost it"
+
+
+def test_a_pause_with_no_harvest_at_all_still_leaves_the_ledger_alone(project):
+    """T1f. The arm is gated on `result.status == "completed"` and nothing else — not on
+    the harvest having anything to file — so a session with no `deferred:` findings arms
+    a snapshot too, and on the default in-place project that is EVERY paused attempt.
+    No harvest is required to reach the data loss; this is the widest shape of all."""
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("### DW-0: untouched by this run\n", encoding="utf-8")
+    before = project.deferred_work.read_text(encoding="utf-8")
+
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [_baseline_liar_effect(project)],  # completes, NO deferred: findings
+        policy=_pause_policy(),
+    )
+    assert engine.run().paused
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "spec-deferrals-harvested" not in kinds, "nothing was harvested"
+
+    project.deferred_work.write_text(before + OPERATOR_NOTE, encoding="utf-8")
+    resumed, _ = resume_engine(project, engine, [_baseline_liar_effect(project)])
+    resumed.run()
+
+    assert project.deferred_work.read_text(encoding="utf-8") == before + OPERATOR_NOTE
+
+
+def test_the_disarm_is_on_disk_before_the_run_even_records_the_pause(project):
+    """T1i. The disarm's own `_save()`, pinned the way the arm's already is.
+
+    `run()`'s `finally: self._save()` re-persists the whole state on the way out of
+    the pause handler, so deleting the `_save()` beside the disarm leaves every test
+    above green — the resume reads a disarmed state.json either way. Only a hard kill
+    in that window would notice, and no in-process fixture can inject one. So read
+    state.json off disk at the first thing that happens after `_dev_phase` re-raises:
+    the run-level `run-paused` journal line, which is written before that ambient save.
+
+    `(False, None)` and not merely `False`: `_disarm_ledger_snapshot` drops the TEXT
+    as well, and a disarm that left the bytes behind would keep a full ledger copy in
+    state.json for the whole life of the pause."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [_baseline_liar_effect(project, deferred=[HARVEST_A])],
+        policy=_pause_policy(),
+    )
+    seen = []
+    original_append = engine.journal.append
+
+    def probing_append(kind, **fields):
+        if kind == "run-paused":
+            persisted = load_state(engine.run_dir).tasks["1-1-a"]
+            seen.append((persisted.pre_harvest_ledger_captured, persisted.pre_harvest_ledger))
+        return original_append(kind, **fields)
+
+    engine.journal.append = probing_append
+    assert engine.run().paused
+    assert seen == [(False, None)], "the pause left the snapshot armed on disk"
+
+
+def test_an_unarmed_replay_still_refuses_the_dead_attempts_harvest_as_work(project):
+    """T1h, and the one place the two commits of #405 touch the same `if`.
+
+    The arm above re-arms a replay that has nothing armed. `harvest_wrote_ledger`'s
+    per-attempt clear sits at the same site and must NOT ride that relaxation: this
+    replay's ledger diff is entirely the DEAD attempt's harvest, and its harvest
+    dedupes to nothing, so clearing the flag here hands the proof-of-work gate the
+    orchestrator's own write — the exact hazard the flag exists to refuse.
+
+    Same fixture as `test_a_replayed_harvest_that_deduped_still_excludes_the_ledger`
+    with one change: the two snapshot keys are dropped from the persisted doc, so the
+    replay arrives unarmed and the relaxed condition is `False or True` rather than
+    `False or False`. That single difference is why the sibling test cannot see this.
+
+    Neither existing crash-replay test can either, for two independent reasons — both
+    of the other unarmed-replay tests run `_baseline_liar_effect`, which writes
+    `src.txt`, so real work exists regardless; and the baseline-mismatch check returns
+    before the has-changes probe is ever reached. Hence `write_src=False` plus a
+    truthful baseline here."""
+    from bmad_loop.model import StoryTask
+
+    assert not project.deferred_work.exists()
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    pol = dataclasses.replace(_harvest_policy(), limits=LimitsPolicy(max_dev_attempts=2))
+    engine, _ = make_engine(
+        project,
+        [
+            dev_effect(
+                project, "1-1-a", followup_review=False, write_src=False, deferred=[HARVEST_A]
+            )
+        ],
+        policy=pol,
+    )
+    _crash_at_post_dev_verify(engine)
+    assert engine.run().crashed
+    assert _ledger_entries(project), "the dead attempt really did harvest"
+
+    resumed, _ = resume_engine(
+        project, engine, [dev_effect(project, "1-1-a", followup_review=False)], policy=pol
+    )
+    doc = resumed.state.tasks["1-1-a"].to_dict()
+    assert doc["harvest_wrote_ledger"] is True, "the dead attempt's flag must be persisted"
+    del doc["pre_harvest_ledger"]  # host died upstream of the pre-harvest save
+    del doc["pre_harvest_ledger_captured"]
+    resumed.state.tasks["1-1-a"] = StoryTask.from_dict(doc)
+    summary = resumed.run()
+
+    kinds = [e["kind"] for e in resumed.journal.entries()]
+    assert "resume-verify" in kinds  # it really was a replay, not a restart
+    harvests = [e for e in resumed.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert len(harvests) == 2 and harvests[-1]["dw_ids"] == []  # the replay filed nothing
+    # THE assertion: the gate still saw no work, on a replay that re-armed its snapshot
+    decisions = [e for e in resumed.journal.entries() if e["kind"] == "dev-decision"]
+    assert decisions[0]["action"] == "retry"
+    assert "no changes" in decisions[0]["reason"]
+    assert summary.done == 1  # attempt 2 did real work
 
 
 # --- the harvest's own ledger write must not satisfy the dev proof-of-work gate ---
