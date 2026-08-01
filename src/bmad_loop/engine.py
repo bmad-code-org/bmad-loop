@@ -640,8 +640,8 @@ class Engine:
                 "worktree-seed-skipped", story_key=task.story_key, entries=skipped_seeds
             )
         # The skills half of the same fault, and it needs no RENDERER-era gate: a
-        # worktree missing the dev primitive or a review hunter — or a required file
-        # inside one — stalls the session whether that SKILL.md renders or is inline,
+        # worktree missing the dev primitive or a review hunter — or any file inside one
+        # the repo carries — stalls the session whether that SKILL.md renders or is inline,
         # and the seed reads the same repo on every story. It does carry a
         # PRIMITIVE-era one, inside the predicate: the era this run will not dispatch is
         # not a stall to pause over. Re-probed rather than
@@ -658,10 +658,10 @@ class Engine:
                 f"({', '.join(absent_skills)}) — the session would stall having "
                 f"written nothing: on `Unknown command` when the whole skill is "
                 f"absent, inside the workflow when the dir is there but short of a "
-                f"required file. The usual cause is a skill directory, or one file "
-                f"inside one, symlinked to a shared BMad install outside the repo, "
-                f"which worktree seeding cannot follow; a checked-out symlink whose "
-                f"target does not exist on this machine reads the same way"
+                f"file the repo carries. The usual cause is a skill directory — or one "
+                f"file or sub-directory inside one — symlinked to a shared BMad install "
+                f"outside the repo, which worktree seeding cannot follow; a checked-out "
+                f"symlink whose target does not exist on this machine reads the same way"
             )
             task.phase = Phase.ESCALATED
             self.journal.append("story-escalated", story_key=task.story_key, reason=reason)

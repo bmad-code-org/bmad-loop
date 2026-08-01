@@ -307,6 +307,18 @@ RENDERER_SCRIPT_IMPORTING_SIBLING = (
     "from config_utils import ConfigError, load_central_config\n\n\ndef main():\n"
     "    load_central_config('.')\n"
 )
+# The renderer's ENTRY document, the half a stub SKILL.md does not carry: since #2601
+# `render_skill.py` composes the real prompt from `workflow.md` and hard-fails when it
+# is absent (`render entry is missing`) or when a `[[bmad-snapshot:…]]` token names a
+# file outside the skill's own source set (`snapshot reference targets undeclared
+# source`) — both printed as `HALT:`, i.e. a result-less Stop on every story.
+#
+# The token names `step-04-review.md` deliberately: it is a DEV_PRIMITIVE_MARKER, so
+# every fixture that lays down a renderer-era stub already carries the target and stays
+# a HEALTHY install. A fixture modelling a BROKEN one writes its own body.
+RENDERER_WORKFLOW_MD = (
+    "# bmad-build-auto\n\nRead fully and follow: [[bmad-snapshot:step-04-review.md]]\n"
+)
 
 
 def install_build_auto_skill(
@@ -324,7 +336,10 @@ def install_build_auto_skill(
     that a worktree mount carries a skill's *subdirectories*, and `renderer_stub`
     needs a SKILL.md whose content is the thing under test. ``folder_id`` writes the
     dispatch marker into step-01 (stories mode's content probe); ``renderer_stub``
-    swaps SKILL.md for the #2601 renderer stub. Returns the skill dir."""
+    swaps SKILL.md for the #2601 renderer stub AND adds the `workflow.md` entry that
+    stub composes from — the two are one era, and an install with the stub but no entry
+    is a broken one, not a variant. Which makes ``renderer_stub=False`` the pre-#2601
+    INLINE era and this fixture its own era control. Returns the skill dir."""
     from bmad_loop.install import DEV_PRIMITIVE_NEW, STORIES_PROBE_FILE, STORIES_PROBE_TEXT
 
     skill = Path(root) / tree / DEV_PRIMITIVE_NEW
@@ -332,6 +347,8 @@ def install_build_auto_skill(
     (skill / "SKILL.md").write_text(
         RENDERER_STUB_SKILL_MD if renderer_stub else f"# {DEV_PRIMITIVE_NEW}\n", encoding="utf-8"
     )
+    if renderer_stub:
+        (skill / "workflow.md").write_text(RENDERER_WORKFLOW_MD, encoding="utf-8")
     for step in BUILD_AUTO_STEPS:
         body = f"# {step}\n"
         if folder_id and step == STORIES_PROBE_FILE:

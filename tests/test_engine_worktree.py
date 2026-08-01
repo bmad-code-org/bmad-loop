@@ -831,7 +831,7 @@ def _symlink_skill_tree(
     ``skills`` defaults to everything a session dispatches. Pass an explicit list to
     symlink out ONE skill beside real dirs (see :func:`_real_skill_dirs`); the default
     cannot express that, which is why the era over-breadth shipped green."""
-    from conftest import RENDERER_STUB_SKILL_MD
+    from conftest import RENDERER_STUB_SKILL_MD, RENDERER_WORKFLOW_MD
 
     from bmad_loop.install import DEV_PRIMITIVE_MARKERS, DEV_PRIMITIVE_NEW, REVIEW_HUNTER_SKILLS
 
@@ -844,6 +844,10 @@ def _symlink_skill_tree(
         (real / "SKILL.md").write_text(
             RENDERER_STUB_SKILL_MD if stub else f"# {skill}\n", encoding="utf-8"
         )
+        if stub:
+            # same pairing as `install_build_auto_skill`: a #2601 stub without the
+            # `workflow.md` it composes from is a BROKEN install, not a leaner one
+            (real / "workflow.md").write_text(RENDERER_WORKFLOW_MD, encoding="utf-8")
         for marker in DEV_PRIMITIVE_MARKERS:
             (real / marker).write_text("x\n", encoding="utf-8")
         (tree_dir / skill).symlink_to(real, target_is_directory=True)
@@ -862,11 +866,16 @@ def _symlink_skill_file(
     :func:`_real_skill_dirs` lays a skill down whole and :func:`_symlink_skill_tree`
     points the WHOLE dir out of the repo, so between them a skill is either seeded
     completely or dropped completely. Neither can produce the state in between: a
-    worktree skill dir that is PRESENT and resolvable but SHORT of one required file,
-    because the per-file containment guard drops exactly the symlinked child and
-    copies every sibling. That is the shape a DIRECTORY-granular check calls complete
-    — the dir exists, so nothing is reported — and then dispatches a session whose
-    step-04 has no customization to read.
+    worktree skill dir that is PRESENT and resolvable but SHORT of one file the repo
+    carries, because the per-file containment guard drops exactly the symlinked child
+    and copies every sibling. That is the shape a DIRECTORY-granular check calls
+    complete — the dir exists, so nothing is reported — and then dispatches a session
+    whose step-04 has no customization to read.
+
+    ``filename`` is deliberately free rather than a marker: since the seed gate asks
+    walk PARITY with the repo instead of a named required set, this helper has to be
+    able to drop a NON-marker child too (a step file, the renderer's `workflow.md`) —
+    the half the old surface could not see at all.
 
     The target file is created, so the link is LIVE: the repo-side preflight stats
     through it and passes, which is what makes the worktree the only short half.
@@ -877,6 +886,36 @@ def _symlink_skill_file(
     link = project.project / tree / skill / filename
     link.unlink(missing_ok=True)
     link.symlink_to(target)
+
+
+def _symlink_skill_subdir(
+    project,
+    shared: Path,
+    skill: str,
+    subdir: str,
+    *files: str,
+    tree: str = ".claude/skills",
+) -> None:
+    """Replace one SUB-DIRECTORY of an already-real skill dir with a symlink to a
+    populated directory outside the repo.
+
+    The shape that separates a shared walk from a mirrored one, and the only helper
+    that can build it. ``iterdir()`` + ``is_dir()`` descends a symlinked sub-directory;
+    ``Path.rglob``/``**`` does not. So the copier walks INTO this dir and drops every
+    child on containment, while a parity check spelled as ``repo_skill.rglob("*")``
+    enumerates nothing under it and calls the worktree complete.
+
+    :func:`_symlink_skill_file` cannot stand in: a TOP-LEVEL symlinked file is
+    enumerated fine by rglob, so it stays green under exactly that ablation.
+    """
+    target = shared / skill / subdir
+    target.mkdir(parents=True, exist_ok=True)
+    for name in files:
+        (target / name).write_text("x\n", encoding="utf-8")
+    link = project.project / tree / skill / subdir
+    if link.is_dir() and not link.is_symlink():
+        shutil.rmtree(link)
+    link.symlink_to(target, target_is_directory=True)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
@@ -1127,6 +1166,134 @@ def test_a_short_skill_dir_pauses_before_dispatch(project, tmp_path):
     primitive = Path(task.worktree_path) / ".claude" / "skills" / "bmad-build-auto"
     assert (primitive / "SKILL.md").is_file()
     assert (primitive / "step-04-review.md").is_file()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
+def test_a_dropped_non_marker_file_pauses_before_dispatch(project, tmp_path):
+    """The nine-twelfths the old required set could not see. `step-01-clarify-and-route
+    .md` is not a :data:`DEV_PRIMITIVE_MARKER`, so a gate asking for `SKILL.md` plus the
+    two markers finds this dir complete and dispatches — the sibling test above passes
+    unchanged under that gate because `customize.toml` happens to be a marker.
+
+    The dropped file is not inert. It is the primitive's routing step: under a #2601
+    stub `workflow.md` names it as a `[[bmad-snapshot:…]]` source and `render_skill.py`
+    prints `HALT:` for an undeclared one; under an inline `SKILL.md` the session just
+    reads a step that is not there. Either way the story Stops having written nothing,
+    and since the seed reads the same repo every time, so does every story after it.
+
+    Walk parity with the copier covers all twelve files and cannot fall behind an
+    upstream that renames a step — which is the argument for the reversal, made
+    executable."""
+    from conftest import attach_profile, install_build_auto_skill
+
+    from bmad_loop import install
+    from bmad_loop.install import base_skills_seed_incomplete
+
+    dropped = "step-01-clarify-and-route.md"
+    # the whole premise: the old surface was SKILL.md + these two, and this is neither
+    assert dropped not in install.DEV_PRIMITIVE_MARKERS
+
+    (project.project / ".gitignore").write_text(".bmad-loop/runs/\n.claude/\n", encoding="utf-8")
+    # the real 12-file primitive, INLINE era, so no renderer leg can be what fires
+    install_build_auto_skill(project.project)
+    _real_skill_dirs(project, *install.REVIEW_HUNTER_SKILLS)
+    _symlink_skill_file(
+        project, tmp_path / "shared-bmad-install", install.DEV_PRIMITIVE_NEW, dropped
+    )
+    commit_sprint(project, {"1-1-a": "ready-for-dev", "1-1-b": "ready-for-dev"})
+    # the repo passes its own preflight — it stats through the link
+    assert install.missing_base_skills(project.project, [".claude/skills"]) == []
+    assert not renderer_stub_resolved(project.project, [".claude/skills"])
+
+    dispatched: list[str] = []
+
+    def never(spec):
+        dispatched.append(spec.cwd.name)
+        raise AssertionError("dispatched into a worktree missing the primitive's step-01")
+
+    engine, adapter = make_engine(project, [never, never])
+    attach_profile(adapter)
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1
+    assert dispatched == []
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED
+    assert "1-1-b" not in engine.state.tasks
+    escalated = [e for e in Journal(engine.run_dir).entries() if e["kind"] == "story-escalated"]
+    assert escalated and f".claude/skills/bmad-build-auto/{dropped}" in escalated[0]["reason"]
+    # exact ==, so the coarse rel or a second casualty cannot hide behind the substring
+    assert base_skills_seed_incomplete(
+        Path(task.worktree_path), project.project, [".claude/skills"]
+    ) == [f".claude/skills/bmad-build-auto/{dropped}"]
+    # a SHORT dir, not an absent one: every sibling — markers and non-markers alike —
+    # landed, which is what makes the dropped NON-marker the subject
+    primitive = Path(task.worktree_path) / ".claude" / "skills" / "bmad-build-auto"
+    assert (primitive / "SKILL.md").is_file()
+    assert (primitive / "step-04-review.md").is_file()
+    assert (primitive / "step-02-plan.md").is_file()
+    assert (primitive / "review-prompts" / "adversarial.md").is_file()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
+def test_a_symlinked_out_skill_subdir_pauses_before_dispatch(project, tmp_path):
+    """The discriminator between a SHARED walk and a mirrored one, and the reason the
+    gate calls the copier's own generator instead of restating it as an `rglob`.
+
+    `iterdir()` + `is_dir()` descends a symlinked sub-directory; `Path.rglob`/`**` does
+    not, on any supported Python. So the copier walks INTO `review-prompts/`, drops
+    every child on containment, and an rglob-spelled parity check enumerates nothing
+    under it and reports a complete worktree — dispatching a step-04 whose review
+    prompts were never delivered. A shared install wired as a symlinked sub-tree is the
+    ordinary shape of this, not a contrived one.
+
+    ⚠️ NO Windows analogue exists: a symlinked sub-directory cannot be built on Windows
+    CI, so ablation A2 (walk → rglob) has no witness there. Stating the gap rather than
+    leaving it implicit — `test_a_dropped_nested_file_is_reported_with_a_posix_rel` in
+    test_install.py is the symlink-free Windows witness for the SEPARATOR ablation, and
+    covers nothing about this one."""
+    from conftest import attach_profile, install_build_auto_skill
+
+    from bmad_loop import install
+    from bmad_loop.install import base_skills_seed_incomplete
+
+    (project.project / ".gitignore").write_text(".bmad-loop/runs/\n.claude/\n", encoding="utf-8")
+    install_build_auto_skill(project.project)
+    _real_skill_dirs(project, *install.REVIEW_HUNTER_SKILLS)
+    _symlink_skill_subdir(
+        project,
+        tmp_path / "shared-bmad-install",
+        install.DEV_PRIMITIVE_NEW,
+        "review-prompts",
+        "adversarial.md",
+        "edge-case.md",
+    )
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    assert install.missing_base_skills(project.project, [".claude/skills"]) == []
+
+    def never(spec):
+        raise AssertionError("dispatched into a worktree missing the primitive's review prompts")
+
+    engine, adapter = make_engine(project, [never, never])
+    attach_profile(adapter)
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1
+    task = engine.state.tasks["1-1-a"]
+    escalated = [e for e in Journal(engine.run_dir).entries() if e["kind"] == "story-escalated"]
+    assert escalated
+    # both children of the symlinked dir, each as its own nested rel
+    assert base_skills_seed_incomplete(
+        Path(task.worktree_path), project.project, [".claude/skills"]
+    ) == [
+        ".claude/skills/bmad-build-auto/review-prompts/adversarial.md",
+        ".claude/skills/bmad-build-auto/review-prompts/edge-case.md",
+    ]
+    # the rest of the dir arrived: the sub-directory is the only casualty
+    primitive = Path(task.worktree_path) / ".claude" / "skills" / "bmad-build-auto"
+    assert (primitive / "SKILL.md").is_file()
+    assert (primitive / "customize.toml").is_file()
+    assert not (primitive / "review-prompts").exists()
 
 
 def test_a_partially_tracked_skill_dir_is_repaired_not_escalated(project):

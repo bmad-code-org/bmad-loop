@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from importlib import resources
 from pathlib import Path, PurePosixPath
 
@@ -86,6 +86,12 @@ LEGACY_MODULE_SKILLS = (
 # Markers pin BOTH a step file (catches a truncated copy) AND customize.toml, the
 # layer/handoff config step-04 resolves review_layers from (BMAD-METHOD #2535/#2550):
 # a pre-July bmm install predating it would let every dev run's step-04 fail.
+#
+# REPO-side surface only: the shim detector, and what missing_base_skills demands of an
+# install. The worktree seed gate stopped sharing it — two markers are 3 of the 12 files
+# a real bmad-build-auto carries, so it asks walk parity with the repo instead
+# (_absent_skill_files). A named tuple can be a floor for "is this install real"; it
+# cannot be the answer to "did the copy deliver everything".
 DEV_PRIMITIVE_NEW = "bmad-build-auto"
 DEV_PRIMITIVE_LEGACY = "bmad-dev-auto"
 DEV_PRIMITIVE_MARKERS = ("step-04-review.md", "customize.toml")
@@ -804,17 +810,63 @@ def _copy_traversable(src, dst: Path) -> None:
         dst.write_bytes(src.read_bytes())
 
 
+def _walk_traversable_files(src, rel: str = "") -> Iterator[tuple[str, object]]:
+    """Yield ``(rel, traversable)`` for every non-directory entry under ``src``.
+
+    The one walk both halves of the skills seed share: :func:`_merge_traversable`
+    copies what this yields and :func:`_absent_skill_files` asks the worktree for the
+    same rels. Sharing is the whole point, not tidiness. ``Path.rglob``/``**`` does
+    **not** descend a symlinked sub-directory while ``iterdir()`` + ``is_dir()``
+    does, so a parity check that merely *mirrored* the copier with an rglob would
+    walk straight past a ``review-prompts/`` symlinked to a shared install — the
+    exact drop the gate exists to report. Any future edit to how the copier
+    recurses is therefore an edit to what the gate asks for, by construction.
+
+    Traversal only: every containment decision stays with the caller, so this needs
+    no ``repo_root`` and answers the same for wheel package data as for a filesystem
+    tree (``.iterdir()``/``.is_dir()`` are the Traversable API, so a zip-imported
+    package walks too). Sorted per level, so a copy order and a report order are
+    both deterministic.
+
+    ``rel`` is built by concatenation and is POSIX on every platform — never
+    ``relative_to``, whose separator is the host's, which would make the reported
+    rels (and the exclude patterns keyed off them) diverge on Windows. Map back with
+    ``joinpath(*rel.split("/"))``; a file source yields ``""``, and
+    ``joinpath("")`` is a no-op, so it still names ``dst`` itself.
+
+    An entry that is neither file nor directory — a dangling symlink — is yielded
+    like any other leaf, so the caller's guards see exactly what the old recursion
+    handed them. By the same rule an ABSENT ``src`` yields one ``("", src)`` pair
+    rather than nothing: "not a directory" is the only question asked, and a file
+    source has to yield itself for :func:`_merge_traversable` to copy it. Callers
+    that might be handed a path with no dir behind it must say so themselves —
+    :func:`base_skills_seed_incomplete` behind its ``SKILL.md`` precondition and the
+    ``BASE_SKILLS`` copy loop behind ``src_root.is_dir()`` both do. Ablating either
+    guard turns that pair into a bogus empty rel, which is what makes them
+    load-bearing well beyond the one case each was written for.
+
+    Lazy by construction and it must stay that way: an ``iterdir()``
+    ``PermissionError`` surfaces mid-walk where it does today rather than at the
+    first ``next()``.
+    """
+    if src.is_dir():
+        for child in sorted(src.iterdir(), key=lambda entry: entry.name):
+            yield from _walk_traversable_files(child, f"{rel}/{child.name}" if rel else child.name)
+        return
+    yield rel, src
+
+
 def _merge_traversable(src, dst: Path, worktree: Path, repo_root: Path | None = None) -> None:
-    """Recursively copy a resource tree into a worktree, copy-when-absent per FILE.
+    """Copy a resource tree into a worktree, copy-when-absent per FILE.
 
     The merge half of :func:`_copy_traversable`, and the same reason
     :func:`_seed_bmad_tree` merges rather than replaces: a skill dir is one
     multi-file unit, so a DIRECTORY-level skip is silent and total — a checkout
     carrying one file of that dir would receive zero bytes of the rest, pass a
     directory-granular completeness check, and dispatch a session whose step files
-    are absent. Walks ``.iterdir()`` rather than ``rglob`` so a zip-imported wheel
-    works, and creates parents lazily at the leaf so an empty source dir is not
-    recreated.
+    are absent. Walks :func:`_walk_traversable_files` rather than ``rglob`` so a
+    zip-imported wheel works, and creates parents lazily at the leaf so an empty
+    source dir is not recreated.
 
     ``dst`` containment is always checked: a symlink in the CHECKOUT pointing out of
     the worktree must not be written *through*. ``repo_root`` is passed only for
@@ -822,16 +874,14 @@ def _merge_traversable(src, dst: Path, worktree: Path, repo_root: Path | None = 
     repo must not be read through — wheel package data has no such leg to check, and
     is not a ``Path`` to resolve in the first place.
     """
-    if src.is_dir():
-        for child in src.iterdir():
-            _merge_traversable(child, dst / child.name, worktree, repo_root)
-        return
-    if repo_root is not None and not Path(str(src)).resolve().is_relative_to(repo_root):
-        return
-    if not dst.resolve().is_relative_to(worktree) or dst.exists():
-        return
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    _copy_traversable(src, dst)
+    for rel, child in _walk_traversable_files(src):
+        target = dst.joinpath(*rel.split("/"))
+        if repo_root is not None and not Path(str(child)).resolve().is_relative_to(repo_root):
+            continue
+        if not target.resolve().is_relative_to(worktree) or target.exists():
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        _copy_traversable(child, target)
 
 
 def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> None:
@@ -975,31 +1025,48 @@ def _bmad_scripts_seed_incomplete(worktree: Path, repo_root: Path) -> bool:
     )
 
 
-def _absent_skill_files(
-    repo_skill: Path, worktree_skill: Path, markers: Sequence[str]
-) -> list[str]:
-    """The REQUIRED files of one skill dir the repo has and the worktree does not.
+def _absent_skill_files(repo_skill: Path, worktree_skill: Path) -> list[str]:
+    """Every file of one repo skill dir that did not reach the worktree, as POSIX rels.
 
-    The required surface is the one :func:`missing_base_skills` already asserts at
-    run start — ``SKILL.md`` plus the skill's :data:`BASE_SKILLS` markers — so the
-    two layers demand the same set and a worktree the preflight calls healthy is
-    never refused here. Deliberately *not* rglob parity with the repo's dir: that is
-    right for ``_bmad/scripts/`` (see :func:`_bmad_scripts_seed_incomplete`) precisely
-    because it has no named surface, but a skill dir does, and parity would halt the
-    whole backlog over a repo-only ``README.md`` no session reads, with no remedy
-    available to the operator. The bounded blind spot is an undeliverable
-    *non-required* file, reported by neither layer; the remedy for one that turns out
-    to matter is to add it to the marker tuple, where both layers pick it up at once.
+    Parity with the COPIER, over the copier's own :func:`_walk_traversable_files` —
+    the question is "did the seed deliver what the repo has", not "does the worktree
+    carry a named list". Asking the shared walk rather than an rglob mirror of it is
+    load-bearing, not stylistic: rglob does not descend a symlinked sub-directory, so
+    a ``review-prompts/`` pointed at a shared install would be dropped by the copy and
+    invisible to the check at once.
 
-    Each leg is conjuncted on the REPO's copy having the file, so a project whose
-    install predates a marker is not asked for something no copy could have delivered.
-    ``is_file`` rather than ``exists`` throughout: a destination occupied by a
-    directory is not the file the skill needs.
+    **This reverses the rationale this function used to carry**, which rejected parity
+    because it "would halt the whole backlog over a repo-only ``README.md`` no session
+    reads, with no remedy available to the operator". That objection was retired by the
+    per-FILE merge in the same commit that stated it: :func:`_merge_traversable` filters
+    nothing by name, so a repo-only ``README.md`` is *delivered* like everything else
+    and parity stays silent about it. What parity can flag is exactly the set of files
+    the seed FAILED to deliver — a source symlinked out of the repo, a destination
+    symlink escaping the worktree, a destination occupied by a directory — and every
+    one of those has an operator remedy.
+
+    The old named surface (``SKILL.md`` plus the :data:`BASE_SKILLS` markers) was 3 of
+    the 12 files a real ``bmad-build-auto`` install carries, and the other nine are not
+    inert: since BMAD-METHOD #2601 ``workflow.md`` is the renderer's entry point and
+    names its step files as ``[[bmad-snapshot:…]]`` sources, so a dropped one makes
+    ``render_skill.py`` print ``HALT:`` and the session Stop having written nothing —
+    on every story, which is the environment-fault shape this gate reports. Keeping the
+    surface in sync by hand-extending a marker tuple was the maintenance debt; the walk
+    has no list to fall behind.
+
+    :data:`DEV_PRIMITIVE_MARKERS` is untouched by the reversal — it is still the shim
+    detector and still what :func:`missing_base_skills` demands of the repo. Only the
+    worktree gate's question changed.
+
+    The repo-has-it conjunct is now STRUCTURAL: the walk enumerates the repo, so a
+    project whose install predates a file is never asked for something no copy could
+    have delivered. ``is_file`` rather than ``exists`` on the destination: a slot
+    occupied by a directory is not the file the skill needs.
     """
     return [
         rel
-        for rel in ("SKILL.md", *markers)
-        if (repo_skill / rel).is_file() and not (worktree_skill / rel).is_file()
+        for rel, _ in _walk_traversable_files(repo_skill)
+        if not worktree_skill.joinpath(*rel.split("/")).is_file()
     ]
 
 
@@ -1038,8 +1105,12 @@ def base_skills_seed_incomplete(worktree: Path, repo_root: Path, trees: Sequence
 
     Asked per FILE, not per directory (:func:`_absent_skill_files`): a worktree can
     hold a SHORT skill dir, and a directory-granular check calls that complete and
-    dispatches a session whose step-04 has nothing to read. The precondition is
-    ``SKILL.md`` rather than ``is_dir()`` for the same reason in the other direction —
+    dispatches a session whose step-04 has nothing to read. The per-file question is
+    walk PARITY with the copier, not a named required set — the seed delivers every
+    file the repo has, so the only thing parity can report is a file the seed dropped,
+    and a named list would go stale against upstream every time a step file is renamed
+    (see :func:`_absent_skill_files` for the rationale this reverses). The precondition
+    is ``SKILL.md`` rather than ``is_dir()`` for the same reason in the other direction —
     a repo dir with no ``SKILL.md`` is not a dispatchable skill (nothing spells it,
     :func:`resolve_dev_primitive` returns None), so its absence downstream stalls
     nothing and pausing over it refuses a healthy run. Both legs still stat *through*
@@ -1082,7 +1153,7 @@ def base_skills_seed_incomplete(worktree: Path, repo_root: Path, trees: Sequence
         unused_era = {DEV_PRIMITIVE_NEW, DEV_PRIMITIVE_LEGACY} - {
             dev_primitive_or_default(repo_root, tree)
         }
-        for skill, markers in BASE_SKILLS.items():
+        for skill in BASE_SKILLS:
             if skill in unused_era:
                 continue
             repo_skill = repo_root / tree / skill
@@ -1093,8 +1164,7 @@ def base_skills_seed_incomplete(worktree: Path, repo_root: Path, trees: Sequence
                 missing.append(f"{tree}/{skill}")
                 continue
             missing += [
-                f"{tree}/{skill}/{rel}"
-                for rel in _absent_skill_files(repo_skill, worktree_skill, markers)
+                f"{tree}/{skill}/{rel}" for rel in _absent_skill_files(repo_skill, worktree_skill)
             ]
     return missing
 
@@ -1327,7 +1397,9 @@ def provision_worktree(
         # `worktree_seed` entry naming a file inside one, would otherwise leave the
         # rest at zero bytes. Both reported below via `base_skills_seed_incomplete`,
         # which re-asks the question of the result rather than trusting this loop's
-        # bookkeeping. The per-file skips are deliberately NOT reported: the
+        # bookkeeping — and asks it of every file the repo carries, walking exactly the
+        # way this loop does, so a containment drop is reported whichever child it hits
+        # rather than only the two marker files. The per-file skips are NOT reported: the
         # `seed_files` report exists because a USER-AUTHORED entry that copies nothing
         # reads as applied configuration, and because a directory entry's no-op is
         # total — the merge is precisely what removes that total-skip hazard, and

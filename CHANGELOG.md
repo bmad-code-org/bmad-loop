@@ -65,10 +65,13 @@ editing.
   because copying one that isn't there is free, but a leftover `bmad-dev-auto` shim no prompt
   spells is not a stall to pause over. The copy itself now merges per _file_, so a worktree that
   already holds part of a skill directory is completed rather than skipped whole, and the
-  completeness check compares the same required files the run-start preflight does — naming the
-  one that is missing instead of the directory. Containment is per file too, so a single skill
-  file symlinked out of the repo is reported like a symlinked tree instead of being followed
-  silently. A skill tree that is committed (symlink and all)
+  completeness check walks the repo's skill directory exactly the way the copy walks it,
+  reporting every file the seed could not deliver and naming it instead of the directory. A
+  fixed list of required files would have covered three of the twelve a real `bmad-build-auto`
+  install carries — and would go stale the next time upstream renames a step file. Containment
+  is checked per file too, so one skill file, or one whole sub-directory, symlinked to a shared
+  install outside the repo is refused rather than read through, and reported rather than
+  silently missing. A skill tree that is committed (symlink and all)
   is checked out into the worktree normally and is unaffected. Pre-existing since 0.6.5; found
   while reviewing this release.
 

@@ -721,8 +721,12 @@ def _seed_pair(tmp_path, skills, tree=".claude/skills"):
     """A repo carrying ``skills`` and a worktree carrying the same — the state
     `provision_worktree` produces when every copy lands. Callers then delete from the
     worktree to model whatever the containment guard dropped, which is all
-    `base_skills_seed_incomplete` reads: it asks per required FILE behind a `SKILL.md`
-    precondition, never how the worktree's copy of one got there.
+    `base_skills_seed_incomplete` reads: it walks the REPO's dir and asks the worktree
+    for each rel behind a `SKILL.md` precondition, never how the worktree's copy of one
+    got there.
+
+    Writing the same set to both roots is what keeps this fixture silent under walk
+    parity — a rel only appears when a caller deletes it from ``wt``.
     """
     wt, repo = tmp_path / "wt", tmp_path / "repo"
     for root in (repo, wt):
@@ -819,12 +823,15 @@ def test_base_skills_seed_incomplete_asks_is_file_not_exists(tmp_path):
 
 
 def test_base_skills_seed_incomplete_cannot_demand_what_the_repo_lacks(tmp_path):
-    """Every required file is conjuncted on the REPO's copy having it, so an install
-    predating a marker is never asked for something no copy could have delivered.
-    Provisioning cannot seed a file that does not exist upstream, so a report here
-    would be a CRITICAL escalation on every story with no remedy the operator can
-    apply — and the preflight, which owns "your install is truncated", already said so
-    once at run start."""
+    """The repo-has-it conjunct, which walk parity makes STRUCTURAL rather than a leg:
+    the walk enumerates the repo, so an install predating a file is never asked for
+    something no copy could have delivered. Provisioning cannot seed a file that does
+    not exist upstream, so a report here would be a CRITICAL escalation on every story
+    with no remedy the operator can apply — and the preflight, which owns "your install
+    is truncated", already said so once at run start.
+
+    Kept for its regression value; it no longer has ablation value, because there is no
+    longer a conjunct to delete — only a walk that cannot yield an absent file."""
     wt, repo, tree = _seed_pair(tmp_path, BASE_SKILLS)
     for root in (repo, wt):
         (root / tree / DEV_PRIMITIVE_NEW / "customize.toml").unlink()
@@ -832,20 +839,67 @@ def test_base_skills_seed_incomplete_cannot_demand_what_the_repo_lacks(tmp_path)
     assert base_skills_seed_incomplete(wt, repo, [tree]) == []
 
 
-def test_base_skills_seed_incomplete_ignores_a_file_no_layer_requires(tmp_path):
-    """What rejects rglob-parity-with-the-repo as this gate's surface. Parity is right
-    for `_bmad/scripts/`, which has no named surface, but a skill dir has one — and it
-    is the surface the preflight already asserts, so the two layers demand the same set
-    and a worktree the preflight called healthy is never refused here. Parity instead
-    would halt the whole backlog over a repo-only README.md no session reads, with no
-    remedy available to the operator."""
-    wt, repo, tree = _seed_pair(tmp_path, BASE_SKILLS)
-    repo_skill = repo / tree / DEV_PRIMITIVE_NEW
+def test_a_repo_only_file_is_delivered_so_parity_stays_silent(tmp_path):
+    """What makes walk parity safe — and the rewrite of the test that pinned the
+    opposite policy.
+
+    The old gate asked for `SKILL.md` plus the two markers, and argued that parity
+    "would halt the whole backlog over a repo-only README.md no session reads, with no
+    remedy available to the operator". The per-FILE merge landed in the same commit as
+    that argument and retired it: the copier filters nothing by name, so a repo-only
+    `README.md` — and a nested `scripts/helper.pyc` — are DELIVERED like every other
+    file, and parity has nothing to say about them. The only thing parity can report is
+    a file the seed FAILED to deliver, and every one of those has an operator remedy.
+
+    Driven through the real `provision_worktree` rather than a hand-built pair, which
+    is the substantive change: the old test wrote both sides itself, so it asserted a
+    policy the copier never had a say in.
+
+    The worktree carries ONE file of the dir on purpose. That is what discriminates —
+    against an EMPTY destination even a directory-granular merge copies everything and
+    this passes without the per-file half (ablation A15)."""
+    from conftest import install_build_auto_skill
+
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    repo_skill = install_build_auto_skill(repo, tree)
     (repo_skill / "README.md").write_text("# local notes\n", encoding="utf-8")
     (repo_skill / "scripts").mkdir()
     (repo_skill / "scripts" / "helper.pyc").write_bytes(b"\x00\x01")
+    # the partially-carried checkout: a dir-granular merge calls this "already there"
+    carried = wt / tree / DEV_PRIMITIVE_NEW / "SKILL.md"
+    carried.parent.mkdir(parents=True)
+    carried.write_text("# bmad-build-auto\n", encoding="utf-8")
 
+    skipped = provision_worktree(wt, [claude], repo)
+
+    wt_skill = wt / tree / DEV_PRIMITIVE_NEW
+    assert (wt_skill / "README.md").is_file()
+    assert (wt_skill / "scripts" / "helper.pyc").is_file()
+    assert skipped == []
     assert base_skills_seed_incomplete(wt, repo, [tree]) == []
+
+
+def test_a_dropped_nested_file_is_reported_with_a_posix_rel(tmp_path):
+    """The rel a NESTED casualty reports, and this file's sole Windows witness.
+
+    The walk builds rels by concatenation, never `relative_to`, whose separator is the
+    host's. On Linux `os.sep == "/"` makes the two spellings identical, so a
+    `relative_to` regression is invisible here by construction and only a Windows job
+    can catch it — which is why this test is symlink-free and carries NO skipif.
+
+    A backslash rel does not crash: every consumer treats it as an opaque string (the
+    escalation message, the `/`-anchored git exclude patterns, the exact-match sentinel
+    filter), so it quietly stops matching. That is the failure mode that ships."""
+    wt, repo, tree = _seed_pair(tmp_path, BASE_SKILLS)
+    nested = repo / tree / DEV_PRIMITIVE_NEW / "review-prompts"
+    nested.mkdir()
+    (nested / "adversarial.md").write_text("# adversarial\n", encoding="utf-8")
+
+    assert base_skills_seed_incomplete(wt, repo, [tree]) == [
+        f"{tree}/{DEV_PRIMITIVE_NEW}/review-prompts/adversarial.md"
+    ]
 
 
 def test_base_skills_seed_incomplete_ignores_a_repo_dir_with_no_skill_md(tmp_path):
