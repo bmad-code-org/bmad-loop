@@ -6180,6 +6180,124 @@ def test_restore_ledger_keeps_a_tracked_ledger_the_reset_restored(project):
     assert project.deferred_work.read_text(encoding="utf-8") == before
 
 
+def _external_artifacts(project, tmp_path):
+    """`project`, with `implementation_artifacts` moved OUT of the repo.
+
+    A supported shape, not a contrived one: `_resolve` takes an absolute
+    `implementation_artifacts` verbatim, `ProjectPaths.rebased` deliberately leaves
+    an out-of-tree artifacts dir where it is ("shared, not per-checkout"), and both
+    `_protected_relpaths` and `_harvest_gate_exclude` carry an explicit branch for
+    it. Only the artifacts dir moves — `output_folder` and `repo_root` survive
+    `replace` untouched, which is the operator edit this models.
+
+    The dir is created here because `write_sprint` writes straight into it."""
+    paths = dataclasses.replace(
+        project, implementation_artifacts=tmp_path / "shared-impl" / "implementation-artifacts"
+    )
+    paths.implementation_artifacts.mkdir(parents=True)
+    return paths
+
+
+def test_harvest_reverted_when_the_ledger_lives_outside_the_repo(project, tmp_path):
+    """The revert has to fire for an out-of-tree ledger too — and it is exactly the
+    case where the reset provably did nothing.
+
+    `_ledger_is_gits_to_restore` read "outside `workspace.root`" as "git's, leave it
+    alone", which is backwards: the reset runs IN `workspace.root` and cannot reach a
+    path outside it, so there is no reverted EDIT to protect and the harvest's file is
+    a creation of ours. Under the old reading every harvest revert on such a project
+    was a silent no-op, and the entry outlived the code it describes — open in the
+    shared ledger, and swept later as if the work still existed.
+
+    Not worktree-only: this run is `isolation = "none"`, where `workspace.root` is the
+    repo and the artifacts dir alone is out of tree."""
+    paths = _external_artifacts(project, tmp_path)
+    # both halves of the premise, or the test proves nothing: the ledger is really
+    # outside the repo, and really absent, so the harvest CREATES it and the
+    # snapshot is the `None` that means "unlink".
+    assert not paths.deferred_work.is_relative_to(paths.project)
+    assert not paths.deferred_work.exists()
+
+    write_sprint(paths, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    pol = dataclasses.replace(_harvest_policy(), limits=LimitsPolicy(max_dev_attempts=2))
+    engine, _ = make_engine(
+        paths,
+        [
+            # attempt 1: harvests HARVEST_A, then fails the baseline gate
+            _baseline_liar_effect(paths, deferred=[HARVEST_A]),
+            # attempt 2: an honest session, so the run terminates cleanly
+            dev_effect(paths, "1-1-a", followup_review=False),
+        ],
+        policy=pol,
+    )
+    summary = engine.run()
+
+    # the scenario really is a non-fixable retry that rolled back, and attempt 1
+    # really did file the entry (attempt 2's spec carries no `deferred:`)
+    decisions = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert decisions[0]["action"] == "retry" and "does not match" in decisions[0]["reason"]
+    assert "rollback-auto" in [e["kind"] for e in engine.journal.entries()]
+    harvests = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert len(harvests) == 1 and harvests[0]["dw_ids"] == ["DW-1"]
+
+    assert summary.done == 1
+    assert _ledger_entries(paths) == []
+    assert not paths.deferred_work.exists()
+
+
+def test_ledger_outside_the_workspace_is_not_gits(project, tmp_path):
+    """The classifier's out-of-tree row, isolated from the run that reaches it."""
+    paths = _external_artifacts(project, tmp_path)
+    engine, _ = make_engine(paths, [], policy=_harvest_policy())
+
+    assert engine._ledger_is_gits_to_restore(StoryTask(story_key="1-1-a", epic=1)) is False
+
+
+def test_ledger_tracked_inside_the_workspace_is_gits(project):
+    """The control for the row above: same question, in-tree and tracked, still True.
+
+    Without it the fix reads as "always False" — this is the assertion that dies if
+    the containment branch is widened past the out-of-tree case."""
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "seed deferred-work")
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+
+    assert engine._ledger_is_gits_to_restore(StoryTask(story_key="1-1-a", epic=1)) is True
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinked repo roots are POSIX-shaped")
+def test_a_lexically_outside_ledger_is_re_asked_with_both_sides_resolved(project, tmp_path):
+    """A workspace root reached through a SYMLINK is not lexically a prefix of the
+    ledger's real path, so `relative_to` raises for a ledger that is plainly inside.
+
+    While "outside" meant "leave it alone" that false positive cost nothing. Now that
+    it authorizes a delete, taking it at face value would unlink a TRACKED in-tree
+    ledger that no rollback asked to lose — so the containment test is re-asked with
+    both sides resolved, exactly as `_harvest_gate_exclude` already does.
+
+    Every production construction site resolves both sides today
+    (`load_paths`, `ProjectPaths.rebased`, `open_unit_workspace`); this pins the
+    behaviour rather than the reachability."""
+    from bmad_loop.workspace import Workspace
+
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "seed deferred-work")
+
+    linked_root = tmp_path / "via-symlink"
+    linked_root.symlink_to(project.project, target_is_directory=True)
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    engine.workspace = Workspace(root=linked_root, paths=project)
+    # the premise: lexically outside, actually inside
+    with pytest.raises(ValueError):
+        project.deferred_work.relative_to(linked_root)
+
+    assert engine._ledger_is_gits_to_restore(StoryTask(story_key="1-1-a", epic=1)) is True
+
+
 def test_crash_replay_leaves_the_ledger_alone_when_no_snapshot_was_persisted(project):
     """A replay that finds nothing armed must not touch the ledger it did not see.
 

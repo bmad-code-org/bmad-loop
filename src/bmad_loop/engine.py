@@ -3646,17 +3646,46 @@ class Engine:
         ledger under "the reset already handled it" — and the reset never touches an
         ignored path (#405).
 
+        A ledger OUTSIDE `workspace.root` reads False, not True. That reset runs in
+        `workspace.root` and cannot reach a path outside it, so it restored nothing
+        and there is no reverted EDIT to protect — which makes "outside" the one
+        containment answer that positively RULES OUT the hazard this method exists
+        for. `implementation_artifacts` configured out of tree is a supported shape
+        (`ProjectPaths.rebased` keeps it put; `_protected_relpaths` and
+        `_harvest_gate_exclude` both budget for it), so the earlier "shared with
+        other checkouts, not ours to delete" reading turned every harvest revert
+        into a silent no-op for those projects: a finding about code the rollback
+        just discarded stayed open in the ledger and was later swept. Nor was that
+        reading honoured anyway — `_restore_ledger`'s non-`None` arm rewrites an
+        external ledger wholesale with no ownership guard at all. A `None` snapshot
+        for an external ledger means THIS harvest created the file, and inside the
+        arm→restore window (see `_dev_phase`) nothing else writes it.
+
+        The containment test is re-asked with both sides RESOLVED before that False
+        is returned, mirroring `_harvest_gate_exclude`. `relative_to` is purely
+        lexical, and while "outside" was a no-op a false positive cost nothing;
+        now that it authorizes a delete, one would delete a tracked in-workspace
+        ledger. Nested rather than unconditional so the syscall stays off the
+        common path.
+
         Degrades to True. It runs inside a ``finally`` that is usually propagating
-        `RunPaused` out of `_pause_for_manual_recovery`, so a `GitError` raised here
-        would replace that pause with a git failure; and every caller uses the answer
-        to authorize a DELETE, so uncertainty has to mean "leave it alone"."""
+        `RunPaused` out of `_pause_for_manual_recovery`, so a `GitError` — or an
+        `OSError` out of `resolve()` — raised here would replace that pause with a
+        filesystem failure; and every caller uses the answer to authorize a DELETE,
+        so uncertainty has to mean "leave it alone"."""
         ledger = self.workspace.paths.deferred_work
         try:
             rel = ledger.relative_to(self.workspace.root).as_posix()
         except ValueError:
-            # configured outside the workspace: shared with other checkouts, and no
-            # rollback of ours is scoped to it. Not ours to delete either way.
-            return True
+            try:
+                rel = ledger.resolve().relative_to(self.workspace.root.resolve()).as_posix()
+            except OSError as e:
+                self.journal.append(
+                    "ledger-scope-probe-failed", story_key=task.story_key, error=str(e)
+                )
+                return True
+            except ValueError:
+                return False  # genuinely outside: our reset never touched it
         try:
             return verify.path_tracked(self.workspace.root, rel)
         except verify.GitError as e:

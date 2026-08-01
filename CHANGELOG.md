@@ -314,6 +314,19 @@ that rode the same window. Both skill eras are supported; the rename itself need
   that never reached the arm re-arm the same way rather than proceeding blind, which retires the
   `ledger-snapshot-missing` journal line for that case.
 
+- **A harvest is reverted even when the ledger lives outside the repo (#405).**
+  `implementation_artifacts` may be configured out of tree — `ProjectPaths.rebased` keeps such a
+  dir put on purpose, as shared rather than per-checkout. The restore classified any ledger
+  outside the workspace as git's and left it alone, which is backwards: `reset --hard` runs in
+  the workspace and cannot reach a path outside it, so it restored nothing and the harvest's file
+  is a creation of the orchestrator's own. Every harvest revert on such a project was therefore a
+  silent no-op, and the entry outlived the code it described — open in the shared ledger, and
+  swept later as if that work still existed. It now reads as "not git's", on both retry legs and
+  under either isolation mode. The containment test is re-asked with both sides resolved before
+  that answer authorizes a delete, since a workspace root reached through a symlink is not
+  lexically a prefix of the ledger's real path; an `OSError` there degrades to leaving the file
+  alone, like every other probe in that `finally`.
+
 - **The harvest's own ledger write is no longer the session's proof of work (#405).** The harvest
   runs four statements above the dev artifact gate, and that gate deliberately does not exclude
   the ledger — a story whose whole authorized scope is ledger reconciliation has to register as
