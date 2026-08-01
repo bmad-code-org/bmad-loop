@@ -16,6 +16,7 @@ orchestrator's signal watcher is CLI-agnostic.
 
 from __future__ import annotations
 
+import errno
 import json
 import re
 import shutil
@@ -89,8 +90,8 @@ LEGACY_MODULE_SKILLS = (
 # a pre-July bmm install predating it would let every dev run's step-04 fail.
 #
 # REPO-side surface only: the shim detector, and what missing_base_skills demands of an
-# install. The worktree seed gate stopped sharing it — two markers are 3 of the 13 files
-# a real bmad-build-auto carries, so it asks walk parity with the repo instead
+# install. The worktree seed gate stopped sharing it — these two markers plus SKILL.md are
+# 3 of the 13 files a real bmad-build-auto carries, so it asks walk parity with the repo instead
 # (_absent_skill_files). A named tuple can be a floor for "is this install real"; it
 # cannot be the answer to "did the copy deliver everything".
 DEV_PRIMITIVE_NEW = "bmad-build-auto"
@@ -263,12 +264,23 @@ def resolve_dev_primitive(project: Path, tree: str) -> str | None:
     :func:`missing_base_skills` against the resolved dir. Requiring markers here
     instead would make a truncated bmad-build-auto silently resolve to a legacy
     install (or to the shim's failure message), hiding the real problem.
+
+    Every probe is the TOTAL :func:`_is_file` rather than ``Path.is_file()``, because
+    this is not preflight-only: :func:`base_skills_seed_incomplete` resolves the era
+    through :func:`dev_primitive_or_default` on every provision, so a raise here is a
+    raise out of ``Engine._run_isolated`` — the one thing provisioning must never do
+    (see :func:`_merge_traversable`). Measured: with a bare ``is_file()`` an unreadable
+    ``bmad-build-auto`` dir in the repo took ``provision_worktree`` down with
+    ``PermissionError`` through 3.13 while 3.14 answered ``False``. Falling through to
+    the legacy name on a read fault is what 3.14 already did, and it is the right
+    answer: a complete legacy install is dispatchable and the run drives it; when
+    there is no usable legacy either, this returns None and the preflight refuses.
     """
-    if (project / tree / DEV_PRIMITIVE_NEW / "SKILL.md").is_file():
+    if _is_file(project / tree / DEV_PRIMITIVE_NEW / "SKILL.md"):
         return DEV_PRIMITIVE_NEW
     legacy = project / tree / DEV_PRIMITIVE_LEGACY
-    if (legacy / "SKILL.md").is_file() and all(
-        (legacy / marker).is_file() for marker in DEV_PRIMITIVE_MARKERS
+    if _is_file(legacy / "SKILL.md") and all(
+        _is_file(legacy / marker) for marker in DEV_PRIMITIVE_MARKERS
     ):
         return DEV_PRIMITIVE_LEGACY
     return None
@@ -934,8 +946,11 @@ def _copy_traversable(src, dst: Path) -> None:
         dst.write_bytes(src.read_bytes())
 
 
-def _walk_traversable_files(src, rel: str = "") -> Iterator[tuple[str, object]]:
-    """Yield ``(rel, traversable)`` for every non-directory entry under ``src``.
+def _walk_traversable_files(
+    src, rel: str = "", _seen: frozenset[str] = frozenset()
+) -> Iterator[tuple[str, object]]:
+    """Yield ``(rel, traversable)`` for the leaves of ``src``: every entry this walk
+    neither descends into nor has already covered under another rel.
 
     The one walk both halves of the skills seed share: :func:`_merge_traversable`
     copies what this yields and :func:`_absent_skill_files` asks the worktree for the
@@ -958,26 +973,230 @@ def _walk_traversable_files(src, rel: str = "") -> Iterator[tuple[str, object]]:
     ``joinpath(*rel.split("/"))``; a file source yields ``""``, and
     ``joinpath("")`` is a no-op, so it still names ``dst`` itself.
 
-    An entry that is neither file nor directory — a dangling symlink — is yielded
-    like any other leaf, so the caller's guards see exactly what the old recursion
-    handed them. By the same rule an ABSENT ``src`` yields one ``("", src)`` pair
-    rather than nothing: "not a directory" is the only question asked, and a file
-    source has to yield itself for :func:`_merge_traversable` to copy it. Callers
-    that might be handed a path with no dir behind it must say so themselves —
-    :func:`base_skills_seed_incomplete` behind its ``SKILL.md`` precondition and the
-    ``BASE_SKILLS`` copy loop behind ``src_root.is_dir()`` both do. Ablating either
-    guard turns that pair into a bogus empty rel, which is what makes them
-    load-bearing well beyond the one case each was written for.
+    An entry that is neither file nor directory — a dangling symlink, a FIFO — is
+    yielded like any other leaf, so the caller's guards see exactly what the old
+    recursion handed them. By the same rule an ABSENT ``src`` yields one ``("", src)``
+    pair rather than nothing: "not a directory" is the only question asked, and a file
+    source has to yield itself for :func:`_merge_traversable` to copy it. That pair
+    used to need a guard in front of every caller to keep it from becoming a bogus
+    ``""`` rel; it no longer does, because the consumers grew their own
+    ``_is_file``/``_is_dir`` filters and an absent path answers False to both. Measured
+    (A18): deleting the ``BASE_SKILLS`` loop's ``src_root`` dir-guard now reddens
+    NOTHING — it bounds the walk and nothing more, which is the whole reason it is
+    still safe to keep. ⚠️ Do not read the same of
+    :func:`base_skills_seed_incomplete`'s ``SKILL.md`` precondition, which this walk is
+    now called on BOTH sides of: deleting it reddens 16 tests that predate this phase,
+    because it is the absent-from-the-repo branch itself and not a guard on the walk.
 
-    Lazy by construction and it must stay that way: an ``iterdir()``
-    ``PermissionError`` surfaces mid-walk where it does today rather than at the
-    first ``next()``.
+    An entry the walk cannot see INSIDE is yielded as a LEAF rather than raising, and
+    that single choice is what makes an unreadable subtree reportable instead of fatal.
+    Two faults reach it, and :func:`_is_dir` is what folds them into one case: a
+    directory that cannot be listed (``iterdir`` raises), and an entry that cannot be
+    CLASSIFIED at all, which is what a directory readable-but-not-searchable (mode
+    ``0o444``) makes of every child — ``iterdir`` succeeds and then each child's own
+    ``stat`` is refused. The consumers then split on one predicate: the copier takes
+    ``_is_file`` alone (nothing it cannot confirm is deliverable content), the gates
+    take ``_is_file or _is_dir``, and the only yielded entry that answers the second
+    alone is one of those two — a descendable directory is recursed into, and a cycle
+    repeat is dropped with no rel at all, its content having already been yielded under
+    the ancestor that closed the loop. So the seed skips it and the gate names it.
+    ⚠️ Raising instead takes an unreadable repo skill out through
+    :meth:`Engine._run_isolated`, which has no ``try`` around provisioning, killing the
+    whole RUN rather than pausing on one story's named escalation (measured:
+    ``crash.txt`` + ``state.crashed``).
+
+    ``_seen`` carries the resolved real path of every directory on the CURRENT branch
+    so a symlink CYCLE terminates. ``rglob`` needs no such guard because it does not
+    descend child symlinks; descending them is this walk's whole reason to exist, and
+    it makes ``_bmad/scripts/loop -> ..`` unbounded. Measured before the guard, on the
+    fixture the cycle test still carries: 42 files, every one passing containment
+    because ``resolve()`` collapses the loop back inside the repo, terminating only by
+    accident when the kernel's ``ELOOP`` made ``is_dir()`` answer False — at a depth
+    that moves with the absolute path, which is what the limit actually bounds. Branch-local, not global: two sibling symlinks pointing at one shared
+    install are not a cycle, and one set shared across the whole walk would silently
+    drop the second one's rels from both the copy and the gate.  Real paths only for
+    ``Path`` sources — a zip-imported Traversable has no ``resolve()`` and no way to
+    make a cycle.
+
+    Lazy across levels and it must stay that way, so a caller that stops early does not
+    pay for the rest of the tree. (Within one level ``sorted()`` has always been eager;
+    ``Path.iterdir()`` is a generator over ``os.listdir`` through 3.12, deferring the
+    read to the first ``next()``, and performs an eager ``os.scandir`` from 3.13 —
+    wrapping it in ``sorted()`` makes that difference invisible.)
     """
-    if src.is_dir():
-        for child in sorted(src.iterdir(), key=lambda entry: entry.name):
-            yield from _walk_traversable_files(child, f"{rel}/{child.name}" if rel else child.name)
+    if _is_dir(src):
+        real = str(src.resolve()) if isinstance(src, Path) else None
+        if real is not None and real in _seen:
+            return
+        try:
+            children = sorted(src.iterdir(), key=lambda entry: entry.name)
+        except OSError:
+            yield rel, src
+            return
+        inner = _seen if real is None else _seen | {real}
+        for child in children:
+            yield from _walk_traversable_files(
+                child, f"{rel}/{child.name}" if rel else child.name, inner
+            )
         return
     yield rel, src
+
+
+def _is_file(path) -> bool:
+    """``Path.is_file()`` made TOTAL: False rather than an exception on an IO fault.
+
+    ``Path.is_file()`` is not total, and not even consistently non-total across the
+    interpreters this project supports. Measured on 3.11/3.12/3.13/3.14: probing a file
+    whose PARENT directory is not searchable **raises** ``PermissionError`` through 3.13
+    — ``pathlib``'s ``_IGNORED_ERRNOS`` is ``(ENOENT, ENOTDIR, EBADF, ELOOP)`` and
+    ``EACCES`` is not in it — while 3.14 routes through ``os.path.isfile`` and answers
+    ``False``. Both readings are wrong here in different ways, and a check that crashes
+    on three of the four supported interpreters and goes quiet on the fourth is worse
+    than either.
+
+    Answers the caller's question, not the filesystem's: **nothing we cannot confirm is
+    a usable file**. That is true whether the file is absent, is a directory, or sits
+    behind a door we cannot open, and all three are the same fact for the session that
+    has to read it — and for the copier, which has no bytes it can promise to deliver.
+    Its sibling :func:`_is_dir` folds the same fault the other way for the same reason;
+    together they are the rule that when a probe cannot answer, the seed stays cautious
+    and the gate stays loud.
+
+    Where the REPO side is probed this way the reading is deliberate rather than
+    incidental, because there False can mean "the project legitimately lacks this" and
+    must not swallow an unreadable install: :func:`resolve_dev_primitive` picks a name
+    and a raise from it lands in a provision; :func:`_bmad_scripts_seed_incomplete` and
+    :func:`_central_config_seed_incomplete` go quiet on a ``_bmad/`` that cannot be read
+    only because the run-start preflight has already refused it (see
+    :func:`_seed_bmad_tree`); and :func:`base_skills_seed_incomplete` splits the two
+    apart explicitly rather than letting False stand for both.
+
+    ⚠️ Only the ≤3.13 lanes exercise the ``except``. On 3.14 the wrapped call is already
+    total, so ablating this wrapper reddens nothing there — measured, 6 reds on 3.13 and
+    0 on 3.14, so the CI matrix and not the local suite is what covers both readings.
+    That is safe HERE only because both readings answer False; :func:`_is_dir` needed
+    more than a wrapper precisely because its two do not agree. Unannotated for the same
+    reason
+    :func:`_copy_traversable` is: the walk yields wheel Traversables as well as Paths.
+    """
+    try:
+        return path.is_file()
+    except OSError:
+        return False
+
+
+def _is_dir(path) -> bool:
+    """``Path.is_dir()`` made TOTAL — and True, not False, when it cannot answer.
+
+    The opposite fallback to :func:`_is_file`, because it answers the opposite
+    question: not "can this be delivered" but **"is there something here the walk has
+    not seen inside"**. An entry whose ``stat`` is refused might hold a whole subtree;
+    calling it False would make it indistinguishable from an absent path, and that
+    collapse is the exact silent failure the completeness gate exists to prevent (see
+    :func:`base_skills_seed_incomplete`). Calling it True costs one ``iterdir`` that
+    then fails into the walk's own ``except`` and yields the entry as a leaf — so every
+    unclassifiable entry arrives at the consumers in the shape they already handle, and
+    the gate names it.
+
+    The fault is not exotic. A directory readable but NOT searchable — mode ``0o444``,
+    or ``chmod -R a-x`` — lets ``iterdir()`` succeed and then refuses the ``stat`` on
+    every child; measured, that took ``provision_worktree`` down with ``PermissionError``
+    on 3.11/3.12/3.13 while 3.14 answered False and dropped the subtree silently. Mode
+    ``0o555`` is unaffected, and the suite carries a witness for each so the two are not
+    confused again.
+
+    What the report can say degrades with what the filesystem allows, which is honest in
+    both directions: a directory that cannot be LISTED is named as one rel, because
+    nobody can say which files are short; one that can be listed but not stat'd through
+    is named file by file, because ``iterdir`` did give up the names.
+
+    ⚠️ Unlike :func:`_is_file` this CANNOT be a bare ``try``/``except``, because the two
+    interpreter readings do not agree on which answer is the safe one: ≤3.13 raises
+    where 3.14 returns ``False``, and here ``False`` IS the silent collapse rather than
+    the cautious reading. Measured on the wrapper alone, both ``0o444`` witnesses passed
+    on 3.11/3.12/3.13 and FAILED on 3.14 — the seed dropped the subtree and the gate
+    reported nothing, which is the pre-fix 3.14 behaviour with the ``except`` merely
+    made unreachable. :func:`_probe_refused` is what makes the four lanes agree.
+    """
+    try:
+        if path.is_dir():
+            return True
+    except OSError:
+        return True
+    return _probe_refused(path)
+
+
+# What ``pathlib`` itself reads as "this path is simply not there" when a probe fails.
+# A local copy of its ``_IGNORED_ERRNOS``, which is private and moved in 3.13. Anything
+# outside it — ``EACCES`` above all — is the filesystem REFUSING to answer, which is a
+# different fact and the one :func:`_is_dir` must not swallow.
+_ABSENCE_ERRNOS = (errno.ENOENT, errno.ENOTDIR, errno.EBADF, errno.ELOOP)
+
+
+def _probe_refused(path) -> bool:
+    """True when a ``False`` out of ``is_dir()`` means REFUSED rather than ABSENT.
+
+    3.14 made ``is_dir()``/``is_file()``/``exists()`` total by answering ``False`` for
+    a fault the older interpreters raise on, which collapses "there is nothing here"
+    into "we were not allowed to look" — and :func:`_is_dir` exists precisely to keep
+    those two apart. ``stat()`` is the probe that still tells them apart on every
+    supported version: measured on 3.11/3.12/3.13/3.14, ``Path.stat()`` raises
+    ``PermissionError`` on an entry whose parent is unsearchable while 3.14's
+    ``is_dir()`` answers ``False``, so re-asking a ``False`` of ``stat()`` recovers the
+    distinction without special-casing the version.
+
+    Only real ``Path`` sources are re-asked. The walk yields wheel Traversables too;
+    a zip-imported tree has no ``stat`` and no permission fault to find (the same
+    reason its cycle guard skips them — see :func:`_walk_traversable_files`).
+    """
+    if not isinstance(path, Path):
+        return False
+    try:
+        path.stat()
+    except OSError as exc:
+        return exc.errno not in _ABSENCE_ERRNOS
+    except ValueError:
+        # An invalid path (embedded null): `is_dir()` swallows it on every lane, and so
+        # does this. Not a refusal, and re-raising would take provisioning out by the
+        # one door it must not use.
+        return False
+    return False
+
+
+def _occupied(path: Path) -> bool:
+    """True when ``path``'s slot is taken by ANYTHING — including a dangling symlink.
+
+    ``Path.exists()`` follows symlinks, so a dangling one answers False while the name
+    is very much taken. Writing anyway does one of two measured things, neither of them
+    the intended copy: when the link resolves to a nonexistent path INSIDE the worktree
+    ``shutil.copy2`` follows it and lands the bytes at the link's target instead of at
+    the slot, leaving an untracked file for the unit's ``git add -A`` to commit while
+    the completeness gate reads green through the now-live link; when the dangling link
+    is an intermediate DIRECTORY component instead, ``mkdir(parents=True,
+    exist_ok=True)`` raises ``FileExistsError`` (its recovery is ``if not exist_ok or
+    not self.is_dir(): raise``, and ``is_dir()`` is False on a dangling link).
+
+    Treating it as occupied keeps provisioning's one promise — never clobber what the
+    checkout carries — for a committed symlink whose target does not exist on this
+    machine, which is a thing git stores and checks out happily. The gates then name
+    the rel, because ``is_file()`` is False through a dangling link too, and the
+    escalation prose already reaches for that exact cause.
+
+    What the ``try`` buys is TOTALITY, not the answer inside it: ``exists()`` raises on
+    an unreadable parent through 3.13 (3.14 answers False — see :func:`_is_file`), and
+    that raise would leave provisioning by the one door it must not use. Answering
+    ``True`` there is the conservative reading — a slot we cannot even stat is not one
+    to write through, and skipping something writable costs a reported rel where writing
+    through something we misread costs a file — but it is not observably different from
+    ``False`` through any caller: the write that would follow is into the very directory
+    that could not be stat'd, so it fails into the caller's leaf ``except`` and the gate
+    names the same rel either way. The witnesses assert that outcome rather than this
+    return value, which is also why they hold on 3.14, where the ``except`` is dead.
+    """
+    try:
+        return path.exists() or path.is_symlink()
+    except OSError:
+        return True
 
 
 def _merge_traversable(src, dst: Path, worktree: Path, repo_root: Path | None = None) -> None:
@@ -997,15 +1216,54 @@ def _merge_traversable(src, dst: Path, worktree: Path, repo_root: Path | None = 
     real-filesystem sources, where a child symlinked to a shared install outside the
     repo must not be read through — wheel package data has no such leg to check, and
     is not a ``Path`` to resolve in the first place.
+
+    **Every reason one file cannot land is a per-file ``continue``, never a raise.**
+    Provisioning has no failure vocabulary of its own; the honesty comes from
+    :func:`base_skills_seed_incomplete` re-asking the RESULT afterwards, which the
+    engine turns into a named CRITICAL escalation — ``Phase.ESCALATED`` plus notify
+    plus ``RunPaused``, unconditionally, with every rel in the reason line. A raise
+    bypasses all of it: measured, an ``OSError`` here escapes ``Engine._run_isolated``
+    uncaught (the one ``try`` above the provision catches ``verify.GitError``), past
+    the completeness gate that would have named the file, and ends the whole run with
+    ``crash.txt`` and a half-provisioned worktree. The pause is resumable and says what
+    to fix; the crash is neither. Three legs enforce that, and they fail at three
+    different calls:
+
+    - :func:`_is_file` — a source that is not a confirmed regular file has no bytes to
+      deliver. A dangling symlink raises ``FileNotFoundError`` out of ``shutil.copy2``;
+      a FIFO raises ``SpecialFileError`` (``copyfile`` stats both ends before opening
+      either, so this is a crash, not the unbounded read a FIFO causes where something
+      calls ``read_text`` on it).
+    - :func:`_occupied` — the destination slot is taken, dangling symlinks included.
+    - ``try/except OSError`` around the write — an unreadable source file, an
+      unwritable destination, an intermediate dangling-symlink directory, a source
+      that vanished mid-walk. This one is not redundant with the other two: measured,
+      ``target.is_symlink()`` is False when it is the target's PARENT that dangles, so
+      the ``mkdir`` still raises and only the ``except`` catches it.
+
+    The asymmetry with the gate is deliberate and is exactly one predicate wide. This
+    filters :func:`_is_file`; :func:`_absent_skill_files` filters ``_is_file or
+    _is_dir``. The difference is a directory the walk could not see inside: not
+    deliverable, so the copier skips it, and genuinely missing from the worktree, so
+    the gate names it.
+
+    ⚠️ Bounded: only the ``BASE_SKILLS`` caller has a completeness gate behind it. A
+    per-file skip on the ``MODULE_SKILLS`` (wheel) leg is not reported by anything —
+    pre-existing, and the reporting channel belongs to the phase that owns ``skipped``.
     """
     for rel, child in _walk_traversable_files(src):
+        if not _is_file(child):
+            continue
         target = dst.joinpath(*rel.split("/"))
         if repo_root is not None and not Path(str(child)).resolve().is_relative_to(repo_root):
             continue
-        if not target.resolve().is_relative_to(worktree) or target.exists():
+        if not target.resolve().is_relative_to(worktree) or _occupied(target):
             continue
-        target.parent.mkdir(parents=True, exist_ok=True)
-        _copy_traversable(child, target)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _copy_traversable(child, target)
+        except OSError:
+            continue
 
 
 def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> None:
@@ -1074,34 +1332,81 @@ def _seed_bmad_tree(worktree: Path, repo_root: Path) -> list[str]:
     loop's, so neither a symlink nor a ``..`` component can read outside the repo
     or write outside the worktree.
 
+    Walks the skills copier's :func:`_walk_traversable_files` rather than ``rglob``, so
+    ``_bmad/`` gets the seed semantics the skill trees already have. ``rglob`` does not
+    descend a symlinked SUB-directory, which is how a shared BMAD install is commonly
+    wired one level in (``_bmad/scripts/lib -> /opt/...``): measured, the whole subtree
+    was copied as nothing while :func:`_bmad_scripts_seed_incomplete` — mirroring the
+    same rglob — agreed that nothing was missing. The under-seed and its own detector
+    were wrong together, which is why both moved to the shared walk in one change and
+    not one at a time. A sub-directory symlinked to a real dir INSIDE the repo is now
+    genuinely seeded; one pointing outside is still dropped file-by-file by the
+    containment guard, but the gates can now SEE it — ⚠️ which is the whole reporting
+    surface for ``_bmad/``, and it is two rels wide: :data:`RENDERER_SEED_SENTINELS` is
+    ``scripts`` and ``config.toml``. A symlinked-out or unreadable ``_bmad/<anything
+    else>/`` is walked and dropped exactly as before, and nothing names it.
+
+    The per-level ``iterdir()`` here is the walker's, so an unreadable ``_bmad/`` root
+    is the one ``iterdir`` left outside it — hence its own ``try``. Returning ``[]``
+    rather than raising is the same doctrine as the leaf below, and in the renderer era
+    no run reaches provisioning with a ``_bmad/`` it cannot read: the run-start
+    preflight sees the same fault two files in, since ``render_skill.py`` is then not a
+    readable file either. ⚠️ Measured, it says so in two different shapes — on 3.14
+    ``missing_base_skills`` returns ``skills.dev-renderer`` + ``-config`` and refuses;
+    through 3.13 its own bare ``is_file()`` probes raise ``PermissionError`` out of
+    ``validate``/``run`` instead. Loud either way, so nothing proceeds, but the
+    traceback lane is a finding wearing the wrong clothes; :func:`_is_file` is the fix
+    and this phase applied it only where a raise would have escaped *provisioning*.
+    ⚠️ Both preflight legs are era-gated on :func:`_is_renderer_stub`, so a pre-#2601
+    INLINE primitive passes them and reaches provisioning with an unreadable ``_bmad/``
+    — where this returns ``[]`` and both sentinel predicates go quiet. Harmless in that
+    era, which never reads the tree, but it is why the safety here is the era's and not
+    the function's.
+
+    Ordering is by entry NAME at every level, the walker's key. The old code sorted
+    ``Path`` objects at BOTH levels (``sorted(src_root.iterdir())`` over
+    ``sorted(top.rglob("*"))``), so the two levels agreed with each other and disagreed
+    with the rest of the seed: ``Path`` ordering is case-INSENSITIVE on Windows and a
+    bare name sort is not, and a flat ``rglob`` sort interleaves depths besides. This
+    now orders every level the way the skills walk does. Nothing in production reads
+    the order — the sole call site's two consumers are a truthiness test and a set
+    union that is re-``sorted`` before use — but a report should not be sorted two ways
+    in one list.
+
     Returns the rels to shield from the unit's ``git add -A``: the single
     ``_bmad`` root when the worktree had none (everything under it is ours), or
     the individual seeded files when merging into a checkout that already had one
     — shield exactly what we wrote.
     """
     src_root = repo_root / BMAD_DIR
-    if not src_root.is_dir():
+    if not _is_dir(src_root):
         return []
     dst_root = worktree / BMAD_DIR
-    had_bmad = dst_root.is_dir()
+    had_bmad = _is_dir(dst_root)
     seeded: list[str] = []
-    for top in sorted(src_root.iterdir()):
+    try:
+        tops = sorted(src_root.iterdir(), key=lambda entry: entry.name)
+    except OSError:
+        return []
+    for top in tops:
         if top.name in BMAD_SEED_EXCLUDES:
             continue
-        for src in [top] if top.is_file() else sorted(top.rglob("*")):
-            if not src.is_file():
+        for rel, src in _walk_traversable_files(top, top.name):
+            if not _is_file(src):
                 continue
-            rel = src.relative_to(src_root)
-            dst = dst_root / rel
+            dst = dst_root.joinpath(*rel.split("/"))
             if not src.resolve().is_relative_to(repo_root) or not dst.resolve().is_relative_to(
                 worktree
             ):
                 continue
-            if dst.exists():
+            if _occupied(dst):
                 continue
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            _copy_traversable(src, dst)
-            seeded.append((Path(BMAD_DIR) / rel).as_posix())
+            try:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                _copy_traversable(src, dst)
+            except OSError:
+                continue
+            seeded.append(f"{BMAD_DIR}/{rel}")
     if not seeded:
         return []
     return [BMAD_DIR] if not had_bmad else seeded
@@ -1114,20 +1419,31 @@ def _bmad_scripts_seed_incomplete(worktree: Path, repo_root: Path) -> bool:
     That seed is the only thing between a renderer-era install and a result-less
     Stop, and it can come up short *without failing*. The realistic trigger is a
     **symlinked** ``_bmad/`` or ``_bmad/scripts/`` — how a shared BMAD install is
-    wired. Measured: a symlinked dir IS walked when it is the rglob root (which it
-    is in :func:`_seed_bmad_tree`), so every file under it reaches the
-    resolve-and-contain guard and, resolving outside ``repo_root``, is dropped
-    one by one. The destination lands empty while provisioning otherwise reports
-    success — a partial ``_bmad/scripts/`` is worse than none, because the bare
-    ``config_utils`` import fails above the renderer's try/except and even the
-    ``HALT:`` line is lost.
+    wired. A symlinked ``scripts`` dir is walked when it is the walk's root, so every
+    file under it reaches the resolve-and-contain guard and, resolving outside
+    ``repo_root``, is dropped one by one. The destination lands empty while
+    provisioning otherwise reports success — a partial ``_bmad/scripts/`` is worse than
+    none, because the bare ``config_utils`` import fails above the renderer's
+    try/except and even the ``HALT:`` line is lost.
+
+    Asks :func:`_walk_traversable_files`, the same walk :func:`_seed_bmad_tree` now
+    copies with, for the same reason :func:`_absent_skill_files` shares the skills
+    copier's: a detector that merely *mirrors* the seed with its own traversal can be
+    wrong in the seed's own direction and confirm it. Measured before the change, with
+    both halves on ``rglob``: ``_bmad/scripts/lib`` symlinked to a shared install, or
+    simply unreadable, was copied as nothing AND reported as complete. Two rglobs
+    agreeing is not a check.
+
+    Filters ``_is_file or _is_dir`` where the seed filters :func:`_is_file` alone — the
+    walker's contract, and the one predicate of difference is a directory the walk
+    could not see inside: the seed cannot deliver it and this must not stay quiet
+    about it.
 
     Reported through :func:`provision_worktree`'s existing skipped-seed return
     channel, as the :data:`BMAD_SCRIPTS_SEED_REL` entry, rather than raising —
     provisioning has no failure vocabulary of its own (every containment violation
-    is a bare ``continue``), and the decision this drives is escalate-vs-defer plus
-    notify and pause, which belongs to the caller that owns the state machine and
-    the journal.
+    is a bare ``continue``), and the decision this drives is escalate-and-pause plus
+    notify, which belongs to the caller that owns the state machine and the journal.
 
     This answers only whether the seed came up SHORT — never whether that matters.
     It cannot tell: the repo-side ``render_skill.py`` probe fires for any project
@@ -1139,13 +1455,13 @@ def _bmad_scripts_seed_incomplete(worktree: Path, repo_root: Path) -> bool:
     degraded provision the run can carry — it is an environment fault identical for
     every story, so dispatching would burn the whole backlog on result-less Stops.
     """
-    if not (repo_root / RENDERER_SCRIPT_REL).is_file():
+    if not _is_file(repo_root / RENDERER_SCRIPT_REL):
         return False
     scripts = repo_root / BMAD_DIR / "scripts"
     dst_scripts = worktree / BMAD_DIR / "scripts"
     return any(
-        src.is_file() and not (dst_scripts / src.relative_to(scripts)).is_file()
-        for src in scripts.rglob("*")
+        (_is_file(src) or _is_dir(src)) and not _is_file(dst_scripts.joinpath(*rel.split("/")))
+        for rel, src in _walk_traversable_files(scripts)
     )
 
 
@@ -1185,12 +1501,38 @@ def _absent_skill_files(repo_skill: Path, worktree_skill: Path) -> list[str]:
     The repo-has-it conjunct is now STRUCTURAL: the walk enumerates the repo, so a
     project whose install predates a file is never asked for something no copy could
     have delivered. ``is_file`` rather than ``exists`` on the destination: a slot
-    occupied by a directory is not the file the skill needs.
+    occupied by a directory is not the file the skill needs, and a slot occupied by a
+    DANGLING symlink is not either — ``is_file()`` is False through one, which is what
+    lets :func:`_merge_traversable` decline to write through it and this name the rel.
+
+    The source filter is ``_is_file or _is_dir`` — the copier's :func:`_is_file` plus
+    exactly one more case, and the ONLY yielded entry that can answer the second alone
+    is a directory :func:`_walk_traversable_files` could not see inside (a descendable
+    one is recursed into; a cycle repeat is dropped with no rel). That one predicate is
+    the whole difference between the two halves of the seed, and it is the right
+    difference in both directions:
+
+    - a dangling symlink or a FIFO in the repo is dropped by BOTH, so a broken link the
+      copy could never have followed does not halt the backlog. What the repo's own
+      CONTENT should be is :func:`missing_base_skills`' question at run start
+      (``skills.base-missing``/``-incomplete``/``-shim``, ``skills.dev-renderer-sources``
+      — deliberately un-counted here, since a new check id must not stale this line);
+      this one asks only whether the copy delivered what the repo has.
+    - a directory the walk could not see inside is dropped by the copier and named
+      here, because the repo does have content there and the worktree did not get it.
+      When it could not be LISTED the rel names the directory, which is all anyone
+      honestly knows; when it could be listed but not stat'd through (mode ``0o444``)
+      the rels name the individual children, because ``iterdir`` did give up the names.
+
+    Every probe is total — :func:`_is_file`/:func:`_is_dir` rather than the raw calls —
+    on both sides: the worktree slot can be unreadable, and so can the repo entry the
+    walk just handed back (see :func:`_is_dir`).
     """
     return [
         rel
-        for rel, _ in _walk_traversable_files(repo_skill)
-        if not worktree_skill.joinpath(*rel.split("/")).is_file()
+        for rel, src in _walk_traversable_files(repo_skill)
+        if (_is_file(src) or _is_dir(src))
+        and not _is_file(worktree_skill.joinpath(*rel.split("/")))
     ]
 
 
@@ -1240,6 +1582,36 @@ def base_skills_seed_incomplete(worktree: Path, repo_root: Path, trees: Sequence
     nothing and pausing over it refuses a healthy run. Both legs still stat *through*
     a symlink, which is the whole reason the gate exists.
 
+    That precondition is where an UNREADABLE repo skill would otherwise be lost, and
+    losing it is worse than crashing on it: it reads as the benign leg — "this project
+    does not have that skill" — and the run walks on into a worktree that has none of
+    it either. So the two are separated explicitly, and the answer is the same on every
+    supported interpreter, which a bare ``is_file()`` is not: measured, that call
+    RAISES ``PermissionError`` through 3.13 and answers ``False`` on 3.14, so this gate
+    would have crashed on every ≤3.13 lane and gone quiet on the two 3.14 lanes (see
+    :func:`_is_file`). ⚠️ The split is reachable for the review HUNTERS; for the dev
+    primitive an unreadable dir resolves the era away from itself one branch above
+    (:func:`resolve_dev_primitive` → None → the legacy default), so the unused-era skip
+    takes it first and this branch never sees it. That is the right answer where a
+    legacy install is dispatchable, and where it is not the preflight refuses — but it
+    is the era filter doing the work there, not this.
+
+    The era resolution above carried the same hazard and is fixed at its source rather
+    than here: :func:`dev_primitive_or_default` runs on every provision, so a bare probe
+    inside :func:`resolve_dev_primitive` made an unreadable ``bmad-build-auto`` dir
+    raise out of ``provision_worktree`` itself (measured, through 3.13). With that probe
+    total, an unreadable NEW dir falls through to a complete LEGACY install — which is
+    dispatchable, so its era is the used one and the unreadable dir is rightly never
+    asked about — or, with no usable legacy, resolves to None and the preflight refuses.
+    ⚠️ The rest of the run-start preflight keeps its bare probes and this phase did not
+    change them. Measured, that is now narrower than it sounds: the dev-primitive lane
+    answers ``skills.base-missing`` on 3.14 AND through 3.13, because the probe above is
+    total. What still raises out of ``validate``/``run`` on ≤3.13 is an unreadable
+    review-HUNTER dir, at :func:`missing_base_skills`' own bare ``SKILL.md`` probe —
+    loud, so no run proceeds on a bad read, but with a traceback where a finding
+    belongs. Nothing on that surface can reach a session; every path that could reach
+    one is total, walk and probes alike (see :func:`_is_dir`).
+
     Rel granularity follows the cause: the coarse ``<tree>/<skill>`` when the worktree
     lacks ``SKILL.md``, because then everything under the dir is missing and three rels
     for one cause is noise; the fine ``<tree>/<skill>/<file>`` otherwise, because
@@ -1282,9 +1654,18 @@ def base_skills_seed_incomplete(worktree: Path, repo_root: Path, trees: Sequence
                 continue
             repo_skill = repo_root / tree / skill
             worktree_skill = worktree / tree / skill
-            if not (repo_skill / "SKILL.md").is_file():
+            if not _is_file(repo_skill / "SKILL.md"):
+                # Absent from the repo, or there and unreadable — and the two must not
+                # collapse. False here means "this project legitimately lacks the
+                # skill", so answering it for a dir we merely cannot open would turn an
+                # unreadable install into silence. Only the walk can tell them apart:
+                # a directory it could not see inside is the one thing it yields as a
+                # leaf, while an absent path yields one ("", src) pair too — but that
+                # pair answers _is_dir False, so `any` is False and the skip stands.
+                if any(_is_dir(src) for _, src in _walk_traversable_files(repo_skill)):
+                    missing.append(f"{tree}/{skill}")
                 continue
-            if not (worktree_skill / "SKILL.md").is_file():
+            if not _is_file(worktree_skill / "SKILL.md"):
                 missing.append(f"{tree}/{skill}")
                 continue
             missing += [
@@ -1312,10 +1693,18 @@ def _central_config_seed_incomplete(worktree: Path, repo_root: Path) -> bool:
     whereas the premise here is one named file's presence in the repo. Provisioning
     is a pure reporter; :func:`renderer_stub_resolved` in the engine decides era for
     both sentinels in one place.
+
+    Both probes are the total :func:`_is_file`, and the repo-side one is why: an
+    unreadable ``_bmad/`` root is exactly the fault :func:`_seed_bmad_tree` degrades
+    over, and a bare ``is_file()`` here raised ``PermissionError`` straight back out of
+    ``provision_worktree`` through 3.13 (measured) — the crash the whole cluster exists
+    to prevent, reached two calls after the ``try`` that prevented it. Answering False
+    matches the sibling scripts predicate, which goes quiet on the same fault because
+    ``render_skill.py`` is not a readable file either, and neither silence hides a run:
+    a project whose ``_bmad/`` cannot be read fails the run-start preflight (see
+    :func:`_seed_bmad_tree`).
     """
-    return (repo_root / CENTRAL_CONFIG_REL).is_file() and not (
-        worktree / CENTRAL_CONFIG_REL
-    ).is_file()
+    return _is_file(repo_root / CENTRAL_CONFIG_REL) and not _is_file(worktree / CENTRAL_CONFIG_REL)
 
 
 def _copy_skills(project: Path, trees: Sequence[str], force: bool) -> bool:
@@ -1483,9 +1872,11 @@ def provision_worktree(
     # and `had_bmad` must be read once those loops have had their say.
     seeded_bmad = _seed_bmad_tree(worktree, repo_root)
     if seeded_bmad:
-        # 0.9.0 documented `worktree_seed = ["_bmad"]` as the workaround for exactly
-        # this gap. That entry is now a no-op *because the merge already covered it*,
-        # so reporting it would journal worktree-seed-skipped for a seed that applied.
+        # 0.9.0 named `worktree_seed = ["_bmad"]` only to document that it COPIES
+        # NOTHING once any child is tracked (#230) — it was the broken example, never
+        # the workaround. That entry is now a no-op *because the merge already covered
+        # it*, so reporting it would journal worktree-seed-skipped for a seed that
+        # applied.
         skipped = [rel for rel in skipped if not _is_under_bmad(rel)]
     # The sentinels are ours to emit, never a user's to forge. A `worktree_seed` entry
     # spelling one exactly ("_bmad/scripts", "_bmad/config.toml" — both natural things
@@ -1531,7 +1922,7 @@ def provision_worktree(
         # the channel the renderer sentinels share.
         for skill in BASE_SKILLS:
             src_root = repo_root / tree / skill
-            if not src_root.resolve().is_relative_to(repo_root) or not src_root.is_dir():
+            if not src_root.resolve().is_relative_to(repo_root) or not _is_dir(src_root):
                 continue
             _merge_traversable(src_root, tree_dir / skill, worktree, repo_root)
 

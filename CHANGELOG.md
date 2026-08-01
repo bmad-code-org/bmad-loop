@@ -42,9 +42,10 @@ editing.
   whole — yet the tree list was built from all three adapter roles. So a `[adapter.triage]` of
   `gemini` beside a claude dev/review pair demanded the whole BMad Method module in
   `.agents/skills`, a tree whose only prompt (`/bmad-loop-sweep`) ships in this wheel and is
-  laid down by `bmad-loop init`. The over-breadth is pre-existing, but the renderer checks
-  above are problems rather than warnings, so a config 0.9.0 merely nagged about became a hard
-  block on 0.9.1. The probe — and `validate`'s own copy of it, which had the same defect twice
+  laid down by `bmad-loop init`. The over-breadth is pre-existing and was already a hard block —
+  0.9.0 emitted `skills.base-missing` as a problem over the same over-broad tree list and its run
+  preflight refused on it — but the renderer checks above route through the same list, so 0.9.1
+  added new ways for one to fire. The probe — and `validate`'s own copy of it, which had the same defect twice
   — is now scoped to the dev and review roles, the same set `Engine._worktree_profiles`
   provisions into a worktree, and the `skills.base` and `skills.stories-dispatch` ok lines
   report that narrower `trees` list. Single-CLI projects and dev/review splits across two CLIs
@@ -121,6 +122,35 @@ editing.
   `_bmad/render/` is never seeded and is git-excluded inside the worktree, so the renderer's
   in-session rewrite of it cannot be swept into a story commit; `init` now gitignores it as
   well, which is the only protection under the default `isolation = "none"`.
+
+- **Worktree provisioning survives a filesystem it cannot fully read (#405).** The `_bmad/` seed
+  and the detector that checks it now share the skill seed's walk: `rglob` does not descend a
+  symlinked _sub_-directory and the detector mirrored the same `rglob`, so a symlinked
+  `_bmad/scripts/lib` one level in was seeded as nothing and reported as complete — the
+  under-seed and the check that should have caught it were wrong together. Pointing inside the
+  repo it is now seeded; pointing outside it is still dropped by the containment guard, but the
+  gate can see it.
+  That walk descends symlinks, so it carries a branch-local cycle guard — without one,
+  `_bmad/scripts/loop -> ..` is copied at every depth until the kernel's `ELOOP` stops it, a risk
+  the old `rglob` never ran because it refused the descent to begin with. Per file, a source the
+  walk cannot see inside, an occupied destination and a failed read or write are each a skip the
+  skills gate then names — a source that could never be delivered at all, a dangling link or a
+  FIFO, is still dropped by both halves in silence, and `_bmad/`'s own report stays the two
+  renderer sentinels — rather than an exception out of the seed: `provision_worktree` runs inside
+  `Engine._run_isolated` with no `try` around it, so one unreadable skill file ended the whole run
+  with a crash dump where a named, resumable escalation belonged. A dangling _destination_ symlink
+  now counts as occupied: writing through one landed the bytes at the link's target and left the
+  gate reading green through the now-live link. Every probe the skills and `_bmad/` seeds make is
+  now total — and, the part a `try` alone does not buy, reads the same on every supported
+  interpreter. `is_file()`/`exists()`/`is_dir()` raise on an unsearchable parent through 3.13 and
+  answer `False` on 3.14, where `False` is the silent drop and not the cautious reading, so a
+  `False` from `is_dir()` is re-asked of `stat()`, which still raises there. Two faults reach that
+  split: a directory readable but _not searchable_ (mode `0o444`, where listing succeeds and
+  stat-ing each child does not) and an unreadable skill tree one level above the walk's own root.
+  What the report can say degrades with what the filesystem gives up: a directory that cannot be
+  listed is named once, and one that can be listed but not stat'd through is named file by file.
+  The eager copies are unchanged and can still raise — user-authored `worktree_seed`, the
+  adapter-default and plugin seeds beside it, and the per-CLI hook-config write.
 
 - **Deferred review findings are harvested out of the spec's frontmatter (#405).**
   BMAD-METHOD#2640 moved `defer`-triaged findings from `deferred-work.md` into the spec's own

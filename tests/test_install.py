@@ -717,6 +717,416 @@ def test_provision_worktree_merge_refuses_to_write_outside_the_worktree(tmp_path
     assert skipped == [f"{tree}/{DEV_PRIMITIVE_NEW}"]
 
 
+# --------------------------------------------------------------- the shared walk itself
+#
+# ⚠️ Every test from here to `_seed_pair` needs a symlink or a permission bit to arm,
+# so NONE of them can have a Windows witness — the conjuncts they pin are covered by
+# the POSIX lanes alone. The designated symlink-free Windows witnesses for this file
+# are `test_a_dropped_nested_file_is_reported_with_a_posix_rel`,
+# `test_a_nested_snapshot_target_is_keyed_by_its_posix_rel` and
+# `test_provision_worktree_central_config_check_asks_is_file_not_exists`; they stay
+# unguarded on purpose and none of the fixtures below may be pushed into them.
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+def test_the_walk_does_not_raise_on_an_undescendable_directory(tmp_path):
+    """The fail-soft `iterdir`, asked only for the half that must never regress: the
+    walk RETURNS on a directory it cannot list.
+
+    Raising instead takes an unreadable repo skill out through `Engine._run_isolated`,
+    which has no `try` around provisioning: measured, the run ends with `crash.txt` and
+    `state.crashed`, leaving a worktree whose Stop hook was never registered — where
+    the same fault, degraded, is one story's escalation naming one rel.
+
+    Split from the sibling test on purpose, because the two ablations are different
+    edits: deleting the `try` reddens both, while swallowing the entry (`except OSError:
+    return`) reddens only the sibling. POSIX-only, non-root runner (root reads through
+    mode 000)."""
+    from bmad_loop.install import _walk_traversable_files
+
+    root = tmp_path / "tree"
+    (root / "locked").mkdir(parents=True)
+    (root / "locked" / "deep.md").write_text("# deep\n", encoding="utf-8")
+    (root / "a.md").write_text("# a\n", encoding="utf-8")
+    (root / "locked").chmod(0o000)
+    try:
+        rels = [rel for rel, _ in _walk_traversable_files(root)]
+    finally:
+        (root / "locked").chmod(0o755)
+
+    assert "a.md" in rels
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+def test_an_undescendable_directory_is_yielded_as_a_leaf(tmp_path):
+    """The other half: it is not merely survived, it is NAMED.
+
+    Swallowing it — `except OSError: return` — is the tempting one-word variant and it
+    is the failure this whole cluster exists to prevent: the copier delivers nothing
+    from that subtree and the gate, walking the same yield, has nothing to report, so
+    an unreadable skill dir reads as a healthy one. Yielding the directory as a leaf is
+    what lets the two halves split on one predicate — the copier's `_is_file` drops it
+    as undeliverable, the gates' `_is_file or _is_dir` names it as missing.
+
+    The rel names a DIRECTORY, which is the honest granularity: nobody can say which
+    files are short when the directory cannot be listed. POSIX-only, non-root runner."""
+    from bmad_loop.install import _walk_traversable_files
+
+    root = tmp_path / "tree"
+    (root / "locked").mkdir(parents=True)
+    (root / "locked" / "deep.md").write_text("# deep\n", encoding="utf-8")
+    (root / "a.md").write_text("# a\n", encoding="utf-8")
+    (root / "locked").chmod(0o000)
+    try:
+        walked = dict(_walk_traversable_files(root))
+    finally:
+        (root / "locked").chmod(0o755)
+
+    assert sorted(walked) == ["a.md", "locked"]
+    assert walked["locked"].is_dir()  # a directory, handed back as a leaf
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+def test_the_walk_names_the_children_of_an_unsearchable_directory(tmp_path):
+    """The OTHER unreadable-directory mode, and the one that hid a crash: readable but
+    NOT searchable (`0o444`, or `chmod -R a-x`).
+
+    `iterdir()` needs `r` and succeeds, so the walk gets the child NAMES; stat-ing a
+    child needs `x` on the directory and is refused, so `is_dir()` raises on every one
+    of them. That is a different fault from the sibling above, where `iterdir()` itself
+    fails and the directory is yielded whole — and it went unseen because every
+    unreadable-directory fixture in this file used `0o000`. Measured before `_is_dir`:
+    `PermissionError` out of `provision_worktree` on 3.11/3.12/3.13, while 3.14 answered
+    False and dropped the subtree in silence.
+
+    The children are named INDIVIDUALLY rather than the directory being named once,
+    which is the honest granularity in the other direction from the sibling: `iterdir`
+    did give up the names, so a rel per name is exactly what is known. POSIX-only,
+    non-root runner."""
+    from bmad_loop.install import _walk_traversable_files
+
+    root = tmp_path / "tree"
+    (root / "listable").mkdir(parents=True)
+    (root / "listable" / "deep.md").write_text("# deep\n", encoding="utf-8")
+    (root / "a.md").write_text("# a\n", encoding="utf-8")
+    (root / "listable").chmod(0o444)
+    try:
+        rels = sorted(rel for rel, _ in _walk_traversable_files(root))
+    finally:
+        (root / "listable").chmod(0o755)
+
+    assert rels == ["a.md", "listable/deep.md"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+def test_is_dir_reads_a_refused_probe_as_a_directory_on_every_interpreter(tmp_path, monkeypatch):
+    """The version split `_is_dir` has to close, pinned WITHOUT depending on which
+    version is running it.
+
+    The witnesses either side of this one exercise only the reading the LOCAL
+    interpreter produces: through 3.13 `is_dir()` raises and `_is_dir`'s `except`
+    answers, while on 3.14 it returns False and `_probe_refused` is the only thing
+    between an unreadable subtree and a silent drop. Measured with the `except` alone,
+    both `0o444` witnesses passed on 3.11/3.12/3.13 and FAILED on 3.14 — a green local
+    suite and a red CI lane, which is exactly the shape a local-only ablation cannot
+    see. Patching `is_dir` to answer False emulates 3.14's reading on any lane, so both
+    branches are covered wherever this runs. `stat()` is untouched by the patch, and
+    measured on all four it still raises `EACCES` here.
+
+    The ABSENT case is what keeps the loud fallback honest: a path that simply is not
+    there must stay False, or every leaf the walk yields would be re-descended and
+    named missing. `EACCES` is refusal; `ENOENT` is absence."""
+    from pathlib import Path
+
+    from bmad_loop.install import _is_dir, _probe_refused
+
+    child = tmp_path / "unsearchable" / "child.md"
+    child.parent.mkdir()
+    child.write_text("x\n", encoding="utf-8")
+    child.parent.chmod(0o444)
+    try:
+        assert _is_dir(child) is True  # this lane's own reading, whichever it is
+        monkeypatch.setattr(Path, "is_dir", lambda self, **kw: False)  # the 3.14 one
+        assert _is_dir(child) is True  # ... and it survives that reading too
+        assert _is_dir(tmp_path / "nope") is False  # absent stays absent under it
+    finally:
+        child.parent.chmod(0o755)
+
+    # A wheel Traversable has no `stat` and no permission fault to find; re-asking is
+    # scoped to real Paths, and anything else keeps whatever `is_dir()` said.
+    assert _probe_refused(object()) is False
+
+    # An invalid path is the one fault where `stat()` is LESS total than `is_dir()`:
+    # measured on 3.11 and 3.14, `is_dir()` answers False and `stat()` raises
+    # `ValueError`. Re-asking without catching it would add a raise to the very
+    # function whose contract is that provisioning has none.
+    assert _is_dir(Path("a\0b")) is False
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_the_walk_terminates_on_a_symlink_cycle(tmp_path):
+    """`rglob` needs no cycle guard because it refuses to descend child symlinks at
+    all. Descending them is this walk's whole reason to exist, and it is what makes
+    `_bmad/scripts/loop -> ..` unbounded.
+
+    Measured before the guard, on this very fixture: 42 files, every one passing the
+    resolve-and-contain check because `resolve()` collapses the loop back inside the
+    repo — so they were COPIED, not skipped — terminating only by accident when the
+    kernel's `ELOOP` finally made `is_dir()` answer False. Where that lands is not a
+    property of the fixture: the limit applies to the ABSOLUTE path, so re-measuring it
+    from a shallower tmpdir moves the depth (82 components against the 85 first seen)
+    while the file count holds. A hostile tree is not the
+    scenario; a shared BMAD install wired with a convenience symlink is."""
+    from bmad_loop.install import _walk_traversable_files
+
+    root = tmp_path / "tree"
+    (root / "scripts").mkdir(parents=True)
+    (root / "scripts" / "render_skill.py").write_text("# render", encoding="utf-8")
+    (root / "scripts" / "loop").symlink_to(root, target_is_directory=True)
+
+    assert [rel for rel, _ in _walk_traversable_files(root)] == ["scripts/render_skill.py"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_two_sibling_symlinks_to_one_install_are_not_a_cycle(tmp_path):
+    """The cycle guard is BRANCH-local, and this is the rejected design it is measured
+    against: one global `seen` set terminates the loop above just as well and silently
+    drops the second sibling's rels from the copy AND the gate.
+
+    Two skill subdirectories pointed at one shared install is not a cycle — it is how a
+    shared install gets wired — and each of them has to be seeded on its own account.
+    A global set would make the ablation of this test the *quiet* kind: files missing
+    from the worktree with nothing reporting them."""
+    from bmad_loop.install import _walk_traversable_files
+
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    (shared / "tool.py").write_text("# tool", encoding="utf-8")
+    root = tmp_path / "tree"
+    root.mkdir()
+    (root / "a_lib").symlink_to(shared, target_is_directory=True)
+    (root / "b_lib").symlink_to(shared, target_is_directory=True)
+
+    assert [rel for rel, _ in _walk_traversable_files(root)] == [
+        "a_lib/tool.py",
+        "b_lib/tool.py",
+    ]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_provision_worktree_never_writes_through_a_dangling_dst_symlink(tmp_path):
+    """A committed symlink whose target does not exist on this machine — a thing git
+    stores and checks out happily — occupies the slot, and `exists()` says it does not.
+
+    Measured: writing anyway lands the bytes at the LINK'S TARGET, not at the slot, so
+    the unit's `git add -A` picks up an untracked file the session never asked for while
+    the completeness gate reads green through the now-live link. Distinct from
+    `test_provision_worktree_merge_refuses_to_write_outside_the_worktree`, whose link
+    escapes the worktree and dies on containment: this one resolves INSIDE, so
+    containment passes and only `_occupied` stands between the copy and the wrong file.
+    """
+    from conftest import install_build_auto_skill
+
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    install_build_auto_skill(repo, tree)
+    slot = wt / tree / DEV_PRIMITIVE_NEW / "customize.toml"
+    slot.parent.mkdir(parents=True)
+    elsewhere = wt / tree / DEV_PRIMITIVE_NEW / "not-checked-out.toml"
+    slot.symlink_to(elsewhere)  # dangling, but resolving INSIDE the worktree
+
+    skipped = provision_worktree(wt, [claude], repo)
+
+    assert not elsewhere.exists()  # the bytes never landed at the link's target
+    assert skipped == [f"{tree}/{DEV_PRIMITIVE_NEW}/customize.toml"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_provision_worktree_survives_a_dangling_symlink_directory_component(tmp_path):
+    """The `mkdir` crash site, and the proof that the leaf `try` is not redundant with
+    `_occupied`: measured, `target.is_symlink()` is FALSE when it is the target's PARENT
+    that dangles, so `_occupied` waves this through and `mkdir(parents=True,
+    exist_ok=True)` raises `FileExistsError` (its recovery is `if not exist_ok or not
+    self.is_dir(): raise`, and `is_dir()` is False on a dangling link).
+
+    Unguarded that leaves provisioning by the one door the doctrine forbids. Degraded,
+    it is one rel in `skipped` and every sibling file still lands."""
+    from conftest import install_build_auto_skill
+
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    install_build_auto_skill(repo, tree)
+    stand_in = wt / tree / DEV_PRIMITIVE_NEW / "review-prompts"
+    stand_in.parent.mkdir(parents=True)
+    stand_in.symlink_to(wt / tree / DEV_PRIMITIVE_NEW / "not-checked-out")
+
+    skipped = provision_worktree(wt, [claude], repo)
+
+    assert skipped == [f"{tree}/{DEV_PRIMITIVE_NEW}/review-prompts/adversarial.md"]
+    assert (wt / tree / DEV_PRIMITIVE_NEW / "SKILL.md").is_file()  # the rest landed
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+def test_provision_worktree_survives_an_unreadable_source_file(tmp_path):
+    """The other crash site the same `try` covers, and it fails at a different CALL —
+    `shutil.copy2`, not `mkdir`. Two witnesses because deleting either half of the
+    two-statement body leaves the other one's test green.
+
+    A chmod-000 source passes `is_file()` (its parent is readable, so the stat works)
+    and then raises `PermissionError` on the read. Nothing lands at the destination:
+    `copyfile` opens the source before the destination, so there is no truncated file to
+    mistake for a delivery. POSIX-only, non-root runner."""
+    from conftest import install_build_auto_skill
+
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    install_build_auto_skill(repo, tree)
+    locked = repo / tree / DEV_PRIMITIVE_NEW / "customize.toml"
+    locked.chmod(0o000)
+    try:
+        skipped = provision_worktree(wt, [claude], repo)
+    finally:
+        locked.chmod(0o644)
+
+    assert skipped == [f"{tree}/{DEV_PRIMITIVE_NEW}/customize.toml"]
+    assert not (wt / tree / DEV_PRIMITIVE_NEW / "customize.toml").exists()
+    assert (wt / tree / DEV_PRIMITIVE_NEW / "SKILL.md").is_file()  # the rest landed
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+def test_provision_worktree_does_not_materialize_an_undescendable_source_dir(tmp_path):
+    """What the copier's `is_file()` filter buys once the leaf `try` is there to catch
+    the crash: the destination is not littered with directories the copy can never fill.
+
+    Without it `_copy_traversable` takes the directory branch, `mkdir`s the destination,
+    and only THEN fails listing the source — so the worktree ends up carrying an empty
+    `review-prompts/` that no file will ever arrive in. The rel is still reported either
+    way, which is exactly why this asserts the directory's absence rather than
+    `skipped`: that half is the gate's witness, not this one's. POSIX-only, non-root."""
+    from conftest import install_build_auto_skill
+
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    install_build_auto_skill(repo, tree)
+    locked = repo / tree / DEV_PRIMITIVE_NEW / "review-prompts"
+    locked.chmod(0o000)
+    try:
+        provision_worktree(wt, [claude], repo)
+    finally:
+        locked.chmod(0o755)
+
+    assert not (wt / tree / DEV_PRIMITIVE_NEW / "review-prompts").exists()
+    assert (wt / tree / DEV_PRIMITIVE_NEW / "SKILL.md").is_file()  # the rest landed
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+def test_provision_worktree_reports_the_children_of_an_unsearchable_source_dir(tmp_path):
+    """The same doctrine end to end for the `0o444` fault, and the finer report it
+    earns: the sibling above names one DIRECTORY rel because nothing could be listed,
+    this names the FILE because `iterdir` gave up the name and only the stat was
+    refused.
+
+    Ablating the walk's recursion probe back to the raw call reddens this on
+    3.11/3.12/3.13, where it raises `PermissionError` straight out of
+    `provision_worktree` — the crash this cluster exists to prevent, at the one call the
+    phase's first pass left bare. Measured, that same ablation is GREEN on 3.14 (0 reds,
+    whole suite): the raw call answers False there and the walk yields the identical
+    leaf. What the 3.14 lane depends on instead is `_is_dir`'s re-ask — ablating THAT
+    reddens 3 on 3.14 against 1 on 3.13, and this test is one of the two extra. The two
+    ablations are therefore not interchangeable, and neither lane's local suite covers
+    both readings on its own.
+
+    The destination is not littered either: the copier's `_is_file` is False for an
+    entry it cannot classify, so no empty `review-prompts/` is created for a file that
+    will never arrive. POSIX-only, non-root runner."""
+    from conftest import install_build_auto_skill
+
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    install_build_auto_skill(repo, tree)
+    listable = repo / tree / DEV_PRIMITIVE_NEW / "review-prompts"
+    listable.chmod(0o444)
+    try:
+        skipped = provision_worktree(wt, [claude], repo)
+    finally:
+        listable.chmod(0o755)
+
+    assert skipped == [f"{tree}/{DEV_PRIMITIVE_NEW}/review-prompts/adversarial.md"]
+    assert not (wt / tree / DEV_PRIMITIVE_NEW / "review-prompts").exists()
+    assert (wt / tree / DEV_PRIMITIVE_NEW / "SKILL.md").is_file()  # the rest landed
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+def test_provision_worktree_seeds_a_read_only_source_dir_without_reporting_it(tmp_path):
+    """The false-positive guard for the pair above, and the reason `0o444` and `0o555`
+    must never be conflated: `0o555` is read-only but still SEARCHABLE, so every stat
+    succeeds and there is no fault at all.
+
+    `_is_dir` answers True on a probe it cannot complete, which is deliberately the
+    loud direction — so the thing to prove is that it is not loud on a directory that
+    merely cannot be written to. A read-only skill tree is an ordinary thing to have;
+    if this reported, every such project would take a CRITICAL escalation on every
+    story.
+
+    ⚠️ What it pins is the NARROWNESS of that loud reading rather than any one guard, so
+    reverting the guards around it leaves it green — that is the property a
+    false-positive control must have, and also what makes it look inert next to rows
+    that name their reds. It is not inert. It reddens on a `_is_dir` that widens past
+    the exception it exists for, and each of its two assertions catches a different
+    widening: a constant-True `_is_dir` fails `skipped == []` with four spurious rels,
+    and an `os.access(W_OK)`-based one — the tempting "can we actually use this
+    directory" reading — fails the delivery assert, because a read-only source stops
+    being copied at all. POSIX-only, non-root runner."""
+    from conftest import install_build_auto_skill
+
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    install_build_auto_skill(repo, tree)
+    read_only = repo / tree / DEV_PRIMITIVE_NEW / "review-prompts"
+    read_only.chmod(0o555)
+    try:
+        skipped = provision_worktree(wt, [claude], repo)
+    finally:
+        read_only.chmod(0o755)
+
+    assert skipped == []
+    assert (wt / tree / DEV_PRIMITIVE_NEW / "review-prompts" / "adversarial.md").is_file()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_a_dangling_repo_symlink_is_dropped_by_the_copier_and_the_gate(tmp_path):
+    """The direction the gate's source filter has to get right in reverse: a broken
+    link the copy could never have followed must NOT halt the backlog.
+
+    A dangling symlink is neither file nor directory, so both halves drop it — the
+    copier has no bytes to deliver and the gate has nothing to demand. Without the
+    filter every such link becomes a CRITICAL escalation on every story, over a file the
+    operator's own repo cannot produce either. What the repo's own content should be is
+    the run-start preflight's question (`skills.base-missing`/`-incomplete`/`-shim`,
+    `skills.dev-renderer-sources`); this one asks only whether the copy delivered what
+    the repo has."""
+    from conftest import install_build_auto_skill
+
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    install_build_auto_skill(repo, tree)
+    broken = repo / tree / DEV_PRIMITIVE_NEW / "notes.md"
+    broken.symlink_to(repo / tree / DEV_PRIMITIVE_NEW / "not-installed.md")
+
+    skipped = provision_worktree(wt, [claude], repo)
+
+    assert skipped == []
+    assert not (wt / tree / DEV_PRIMITIVE_NEW / "notes.md").exists()
+    assert (wt / tree / DEV_PRIMITIVE_NEW / "SKILL.md").is_file()  # the rest landed
+
+
 def _seed_pair(tmp_path, skills, tree=".claude/skills"):
     """A repo carrying ``skills`` and a worktree carrying the same — the state
     `provision_worktree` produces when every copy lands. Callers then delete from the
@@ -932,6 +1342,152 @@ def test_base_skills_seed_incomplete_ignores_a_short_dir_in_the_unused_era(tmp_p
 
     assert resolve_dev_primitive(repo, tree) == DEV_PRIMITIVE_NEW
     assert base_skills_seed_incomplete(wt, repo, [tree]) == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+def test_base_skills_seed_incomplete_splits_unreadable_from_absent(tmp_path):
+    """The `SKILL.md` precondition answers False for two unlike facts, and collapsing
+    them is the quiet failure: "this project legitimately lacks that skill" is benign
+    and the run walks on, while "the skill is there and we cannot open it" means the
+    worktree has none of it either and every session that reaches for it stalls.
+
+    Only the walk can tell them apart. An undescendable directory is the one thing it
+    yields as a leaf; an absent path is neither file nor directory, so there is nothing
+    to see. Both shapes are armed in one test because the split is the claim — either
+    one alone passes under an ablation that answers the same for both.
+
+    A review hunter rather than the dev primitive: an unreadable `bmad-build-auto` falls
+    into the unused-era skip one branch earlier (see the sibling test) and would prove
+    nothing here. POSIX-only, and it assumes a non-root runner."""
+    unreadable = "bmad-review-verification-gap"
+    absent = "bmad-review-edge-case-hunter"
+    wt, repo, tree = _seed_pair(tmp_path, BASE_SKILLS)
+    for root in (repo, wt):
+        shutil.rmtree(root / tree / absent)
+    shutil.rmtree(wt / tree / unreadable)
+    (repo / tree / unreadable).chmod(0o000)
+    try:
+        assert base_skills_seed_incomplete(wt, repo, [tree]) == [f"{tree}/{unreadable}"]
+    finally:
+        (repo / tree / unreadable).chmod(0o755)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+def test_base_skills_seed_incomplete_names_an_unreadable_repo_subdir(tmp_path):
+    """The gate's source filter is `_is_file or _is_dir` where the copier's is
+    `_is_file` alone, and the only yielded entry that answers the second alone is a
+    directory the walk could not see inside — a descendable one is recursed into, and a
+    cycle repeat is dropped with no rel.
+
+    That single predicate is the whole difference between the two halves of the seed,
+    and dropping the `_is_dir` half restores the exact pairing this cluster exists to
+    end: an unreadable subtree copied as nothing and reported as complete. The rel names
+    the directory because that is all anyone honestly knows about it — where a dir that
+    can be LISTED but not stat'd through names its children instead (see the `0o444`
+    witnesses). POSIX-only, non-root runner."""
+    wt, repo, tree = _seed_pair(tmp_path, BASE_SKILLS)
+    locked = repo / tree / DEV_PRIMITIVE_NEW / "review-prompts"
+    locked.mkdir()
+    (locked / "adversarial.md").write_text("# adversarial\n", encoding="utf-8")
+    locked.chmod(0o000)
+    try:
+        assert base_skills_seed_incomplete(wt, repo, [tree]) == [
+            f"{tree}/{DEV_PRIMITIVE_NEW}/review-prompts"
+        ]
+    finally:
+        locked.chmod(0o755)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+def test_provision_worktree_survives_an_unreadable_dev_primitive_dir(tmp_path):
+    """`resolve_dev_primitive` is not a preflight-only resolver: this gate asks it, on
+    every provision, through `dev_primitive_or_default`. Measured with its bare
+    `is_file()` probes, an unreadable `bmad-build-auto` dir in the repo took
+    `provision_worktree` itself down with `PermissionError` through 3.13 — a raise out
+    of `Engine._run_isolated` from the function whose whole contract is never to raise —
+    while 3.14 answered False and fell through.
+
+    Total probes make both lanes do what 3.14 did: fall through to the complete LEGACY
+    install, which is dispatchable, so its era is the used one and the unreadable dir is
+    rightly never asked about. The silence is the correct answer here; what was wrong
+    was the crash. POSIX-only, non-root runner."""
+    wt, repo, tree = _seed_pair(tmp_path, BASE_SKILLS)
+    claude = get_profile("claude")
+    locked = repo / tree / DEV_PRIMITIVE_NEW
+    locked.chmod(0o000)
+    try:
+        skipped = provision_worktree(wt, [claude], repo)
+        assert resolve_dev_primitive(repo, tree) == DEV_PRIMITIVE_LEGACY
+    finally:
+        locked.chmod(0o755)
+
+    assert skipped == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+def test_provision_worktree_survives_an_unreadable_skill_tree(tmp_path):
+    """One level above every other fixture here: not a skill dir the walk cannot read,
+    but the TREE that holds them — so the walk root's own parent is unsearchable and
+    even `is_dir()` on the root raises.
+
+    Probes stacked behind probes, and each only became reachable once the one in front
+    of it was fixed — the same shape as the phase's earlier findings. Measured on
+    3.11/3.12/3.13, one raw probe at a time, in the order they surface: the `BASE_SKILLS`
+    copy loop's own `src_root` guard; then the walk's root probe, reached from the copy
+    that guard admits (`provision_worktree` -> `_merge_traversable` ->
+    `_walk_traversable_files`) and NOT from the gate; then, inside the gate itself,
+    `resolve_dev_primitive`'s `SKILL.md` probes (via `dev_primitive_or_default`), the
+    gate's own `SKILL.md` precondition, and last its absent-vs-unreadable split. Five,
+    not two — each verified by reverting exactly that one call and reading the frame the
+    `PermissionError` comes out of; the order is the frame order in `provision_worktree`
+    itself.
+
+    Every skill is named, and naming them is the point: nothing can be confirmed
+    delivered when the repo side cannot be read at all, and the benign reading — "this
+    project has no skills" — is the silence the split exists to refuse. The worktree
+    here HAS every skill, which is what makes the assertion mean something: the report
+    is about what could be verified, not about what happens to be on disk. The dev
+    primitive is absent from the list because the era resolves away from it one branch
+    earlier (see the sibling test). POSIX-only, non-root runner."""
+    wt, repo, tree = _seed_pair(tmp_path, BASE_SKILLS)
+    claude = get_profile("claude")
+    (repo / tree).chmod(0o000)
+    try:
+        skipped = provision_worktree(wt, [claude], repo)
+    finally:
+        (repo / tree).chmod(0o755)
+
+    assert skipped == [f"{tree}/{skill}" for skill in BASE_SKILLS if skill != DEV_PRIMITIVE_NEW]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+def test_provision_worktree_survives_an_unwritable_destination_dir(tmp_path):
+    """The destination half of the same doctrine: a skill directory in the CHECKOUT
+    that cannot be written into, or even stat'd through.
+
+    Through 3.13 `_occupied`'s `exists()` raises on it and totality is what keeps that
+    inside the loop; on 3.14 it answers False and the write fails into the leaf `except`
+    instead. Two paths, one outcome — nothing written, the whole dir named — which is
+    what this asserts, because a return-value assertion would pin one interpreter's
+    reading and redden on the other (`_occupied` is True on 3.11/3.12/3.13 and False on
+    3.14). The rel is coarse because the worktree's `SKILL.md` is
+    unreadable too: nothing under that dir is dispatchable. POSIX-only, non-root."""
+    from conftest import install_build_auto_skill
+
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    install_build_auto_skill(repo, tree)
+    locked = wt / tree / DEV_PRIMITIVE_NEW
+    locked.mkdir(parents=True)
+    locked.chmod(0o000)
+    try:
+        skipped = provision_worktree(wt, [claude], repo)
+    finally:
+        locked.chmod(0o755)
+
+    assert skipped == [f"{tree}/{DEV_PRIMITIVE_NEW}"]
+    assert list(locked.iterdir()) == []
 
 
 def test_missing_base_skills_reports_absent_and_incomplete(tmp_path):
@@ -2275,6 +2831,154 @@ def test_provision_worktree_bmad_merge_fills_only_missing_files(tmp_path):
     # the gitignored layer + the untracked sibling script were filled in
     assert (wt / "_bmad" / "config.user.toml").read_text() == "USER_LAYER"
     assert (wt / "_bmad" / "scripts" / "config_utils.py").read_text() == "# config"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_provision_worktree_seeds_a_symlinked_bmad_subdir(tmp_path):
+    """F2: `_bmad/` gets the skill trees' walk semantics. `rglob` does not descend a
+    symlinked SUB-directory, which is how a shared BMAD install is commonly wired one
+    level in (`_bmad/scripts/lib -> …`), so the whole subtree was copied as nothing —
+    and `_bmad_scripts_seed_incomplete`, mirroring the same rglob, agreed nothing was
+    missing. The under-seed and its own detector were wrong together, which is why both
+    moved to the shared walk in one change rather than one at a time.
+
+    The link points INSIDE the repo, which is the case the change actually reverses:
+    one pointing out is still dropped file-by-file by the containment guard — but the
+    gate can now SEE it, which the sibling test pins."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    _write_bmad_surface(repo)
+    real = repo / "shared-lib"
+    real.mkdir()
+    (real / "helper.py").write_text("# helper", encoding="utf-8")
+    (repo / "_bmad" / "scripts" / "lib").symlink_to(real, target_is_directory=True)
+
+    assert provision_worktree(wt, [], repo) == []
+
+    assert (wt / "_bmad" / "scripts" / "lib" / "helper.py").read_text() == "# helper"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_provision_worktree_reports_a_symlinked_out_scripts_subdir(tmp_path):
+    """The detector half of the same change. A `_bmad/scripts/lib` pointed at a shared
+    install outside the repo is dropped file-by-file by the containment guard, exactly
+    as before — what changes is that the gate now walks the same way the seed does and
+    can see the files that were dropped.
+
+    Under the old rglob mirror the directory was yielded but never descended, so its
+    `is_file()` was False, the filter dropped it, and two rglobs agreed the seed was
+    complete. Two rglobs agreeing is not a check. A partial `_bmad/scripts/` is worse
+    than none: the bare `config_utils` import fails above the renderer's try/except and
+    even the `HALT:` line is lost."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    _write_bmad_surface(repo)
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    (shared / "helper.py").write_text("# helper", encoding="utf-8")
+    (repo / "_bmad" / "scripts" / "lib").symlink_to(shared, target_is_directory=True)
+
+    skipped = provision_worktree(wt, [], repo)
+
+    assert skipped == ["_bmad/scripts"]
+    assert not (wt / "_bmad" / "scripts" / "lib").exists()
+    assert (wt / "_bmad" / "scripts" / "render_skill.py").is_file()  # the rest landed
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+def test_provision_worktree_reports_an_unreadable_scripts_subdir(tmp_path):
+    """The `is_dir()` half of the scripts gate's source filter — the same predicate
+    `_absent_skill_files` carries, on the other seed leg.
+
+    C4, the silent one: a repo `_bmad/scripts/lib` that is simply unreadable was copied
+    as nothing AND reported complete, both halves on `rglob`, wrong together. The seed
+    cannot deliver a directory it cannot list, and this must not stay quiet about it.
+    POSIX-only, and it assumes a non-root runner."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    _write_bmad_surface(repo)
+    locked = repo / "_bmad" / "scripts" / "lib"
+    locked.mkdir()
+    (locked / "helper.py").write_text("# helper", encoding="utf-8")
+    locked.chmod(0o000)
+    try:
+        skipped = provision_worktree(wt, [], repo)
+    finally:
+        locked.chmod(0o755)
+
+    assert skipped == ["_bmad/scripts"]
+    assert not (wt / "_bmad" / "scripts" / "lib").exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+def test_provision_worktree_survives_an_unreadable_bmad_root(tmp_path):
+    """The one `iterdir` the shared walk does not own — `_seed_bmad_tree` lists the
+    `_bmad/` root itself, before the walk starts, to apply `BMAD_SEED_EXCLUDES` — so it
+    needs its own `try`.
+
+    Returning `[]` is the same doctrine as the leaf below it, and safe for the same
+    reason the sibling scripts predicate goes quiet on this fault: no run reaches
+    provisioning with a `_bmad/` it cannot read, because the run-start preflight sees it
+    two files in (`render_skill.py` is not a readable file either). ⚠️ Measured, the
+    preflight says so in two shapes — `skills.dev-renderer` + `-config` on 3.14, a
+    traceback out of `validate`/`run` through 3.13. Loud either way; only provisioning
+    had to be made total, and this pins that it is.
+
+    The central-config predicate is in the blast radius and is asserted here rather than
+    separately: its bare `is_file()` raised straight back out of `provision_worktree`
+    two calls after the `try` that prevented the same crash. POSIX-only, non-root."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    _write_bmad_surface(repo)
+    (repo / "_bmad").chmod(0o000)
+    try:
+        skipped = provision_worktree(wt, [], repo)
+    finally:
+        (repo / "_bmad").chmod(0o755)
+
+    assert skipped == []
+    assert not (wt / "_bmad").exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+def test_provision_worktree_survives_an_unreadable_bmad_file(tmp_path):
+    """The leaf `try` on this leg: one unreadable file under `_bmad/` is a per-file
+    skip, not the end of the run — and every sibling still lands.
+
+    The file is reported through the channel that already existed for it, so the
+    degradation is visible: `_central_config_seed_incomplete` re-asks the RESULT and
+    finds the worktree without a `config.toml`, which is a `required=True` layer for
+    `load_central_config` and would HALT every story. POSIX-only, non-root runner."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    _write_bmad_surface(repo)
+    locked = repo / "_bmad" / "config.toml"
+    locked.chmod(0o000)
+    try:
+        skipped = provision_worktree(wt, [], repo)
+    finally:
+        locked.chmod(0o644)
+
+    assert skipped == ["_bmad/config.toml"]
+    assert not (wt / "_bmad" / "config.toml").exists()
+    assert (wt / "_bmad" / "scripts" / "render_skill.py").is_file()  # the rest landed
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_provision_worktree_never_writes_through_a_dangling_bmad_symlink(tmp_path):
+    """`_occupied` on the `_bmad/` leg, where the checkout genuinely commits its
+    `_bmad/` surface and can therefore check out a symlink whose target this machine
+    does not have.
+
+    Writing through it lands `config.toml`'s bytes at the link's target and leaves the
+    completeness gate reading green through the now-live link — a false green on the one
+    file `load_central_config` requires. Skipping turns that into an honest
+    `_bmad/config.toml` in `skipped`, which the engine already knows how to escalate."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    _write_bmad_surface(repo)
+    (wt / "_bmad").mkdir(parents=True)
+    elsewhere = wt / "_bmad" / "not-checked-out.toml"
+    (wt / "_bmad" / "config.toml").symlink_to(elsewhere)
+
+    skipped = provision_worktree(wt, [], repo)
+
+    assert not elsewhere.exists()  # the bytes never landed at the link's target
+    assert skipped == ["_bmad/config.toml"]
 
 
 def test_provision_worktree_never_seeds_render_output(tmp_path):
