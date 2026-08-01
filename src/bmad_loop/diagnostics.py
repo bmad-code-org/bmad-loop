@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import platform
+import re
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -80,17 +81,50 @@ _JOURNAL_ALIAS_FIELDS = {
     "baseline": "commit",
     # A spec name IS the customer's feature name — `Pseudonymizer`'s own docstring
     # has always listed "spec filenames" among what it exists to alias, so the
-    # omission here was a routing gap, not a policy. `spec-*` journal kinds pass a
-    # bare basename (engine.py's harvest events), which `looks_like_identifier`
-    # waves through verbatim on the scrub_json fallback — and the egress backstop
-    # cannot rescue it, because it only repairs values already in the legend, so
-    # it happens to catch `1.2-Acme….md` (the story key is in there) and misses
-    # `AcmeVaultRotation.md` entirely. Its OWN namespace, not "story": the epic
-    # lookup below is keyed on ns == "story", so a filename aliased there would
-    # render as an epic-less `story-<hex>` — indistinguishable from a story key
-    # whose epic could not be resolved.
+    # omission here was a routing gap, not a policy. The harvest events pass a
+    # bare basename, which `looks_like_identifier` waves through verbatim on the
+    # scrub_json fallback — and the egress backstop cannot rescue it, because it
+    # only repairs values already in the legend, so it happens to catch
+    # `1.2-Acme….md` (the story key is in there) and misses `AcmeVaultRotation.md`
+    # entirely. Its OWN namespace, not "story": the epic lookup below is keyed on
+    # ns == "story", so a filename aliased there would render as an epic-less
+    # `story-<hex>` — indistinguishable from a story key whose epic could not be
+    # resolved. See `_JOURNAL_BASENAME_NAMESPACES` for why the value is
+    # normalized first: the producers do NOT agree on a bare basename.
     "spec": "spec",
 }
+# Namespaces whose journalled value arrives in more than one shape and must be
+# reduced to its basename before it is aliased. `spec` is one: engine.py's
+# harvest kinds journal `spec_path.name`, its reconcile kinds journal
+# `str(spec_path)` (absolute — `verify.resolve_spec_path` returns an absolute
+# path), and stories_engine journals `task.spec_file`. Aliasing the raw string
+# would give ONE spec TWO aliases in a single dump, defeating the correlation
+# these fields are aliased rather than dropped to preserve, and would park an
+# absolute home path in the local `--legend` file (before `spec` was routed such
+# a value died at `scrub_json` and never entered the map at all).
+#
+# Split on BOTH separators rather than using `PurePath(...).name`: a journal
+# written on Windows is routinely diagnosed on POSIX, where `PurePath` treats a
+# backslash as an ordinary character and would keep the whole path. The cost is
+# that a POSIX filename containing a literal backslash aliases on its tail —
+# a pathological name, and the consequence is a shorter legend entry, never a
+# leak, since the alias is still stable and the raw value still never ships.
+_JOURNAL_BASENAME_NAMESPACES = frozenset({"spec"})
+_PATH_SEP_RE = re.compile(r"[\\/]")
+
+
+def _alias_input(value: Any, ns: str) -> Any:
+    """The string an alias is computed over: the basename for the path-shaped
+    namespaces, the value unchanged for every other one (and for any non-string,
+    which :meth:`Pseudonymizer.alias` handles itself)."""
+    if ns not in _JOURNAL_BASENAME_NAMESPACES or not isinstance(value, str):
+        return value
+    # `or value`: a value ending in a separator splits to an empty tail, and an
+    # empty string is the one input `alias()` passes through unaliased — so it
+    # would render as `""` and lose the event's only reference to the spec.
+    return _PATH_SEP_RE.split(value)[-1] or value
+
+
 # Journal fields that carry free text (LLM/merge prose, prompts, errors). Never
 # emitted — replaced with a boolean presence marker so a maintainer still learns
 # the field was set without seeing it.
@@ -373,6 +407,7 @@ def _scrub_entry(
             out[k] = [pseudo.alias(x, ns=ns, epic=epic_by_key.get(str(x))) for x in v]
         elif k in _JOURNAL_ALIAS_FIELDS:
             ns = _JOURNAL_ALIAS_FIELDS[k]
+            v = _alias_input(v, ns)
             epic = epic_by_key.get(str(v)) if ns == "story" else None
             out[k] = pseudo.alias(v, ns=ns, epic=epic)
         else:

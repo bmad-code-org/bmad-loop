@@ -602,17 +602,19 @@ def test_append_entry_strips_a_location_before_deciding_it_is_empty(tmp_path):
     """The value is stripped: a blank one reads as absent, a padded one is written
     clean. Both are the same one-line guard, so this is its sole witness.
 
-    The two halves are NOT equally reachable, and saying so is the point. A
-    whitespace-ONLY location cannot arrive from the harvest — `devcontract._flatten`
-    collapses runs and yields "" for a blank scalar, and the caller maps "" to None
-    — so that half is a promise `append_entry` makes about its own `str | None`
-    signature, not a shape upstream can produce. The TRAILING-space half is
-    reachable today: `_flatten` clamps to `_LOCATION_LIMIT` *after* joining, so a
-    value whose cut lands on a join space keeps that space (measured: a 200-char
-    clamp can end in " "), and the entry would carry a `location:` line with
-    trailing whitespace no other line in the format has. `field_line_present`
-    tolerates that padding, which is exactly why the second half asserts the raw
-    text instead of going through it."""
+    NEITHER half is reachable from the harvest, and saying so is the point —
+    this guard is a promise `append_entry` makes about its own `str | None`
+    signature, kept because it has two callers and one of them is not the
+    harvest. `devcontract._flatten` collapses runs and yields "" for a blank
+    scalar (and its caller maps "" to None), and since
+    `test_flatten_leaves_no_trailing_space_when_the_clamp_lands_on_one` it also
+    strips after clamping — the route that once made the trailing-space half
+    reachable. It was closed at the source deliberately: `location` feeds the
+    ledger AND `harvest_fingerprint`, so cleaning it only here would have left
+    the entry's `origin:` key underivable from the entry's own `location:`.
+
+    `field_line_present` tolerates padding around a value, which is exactly why
+    the second half asserts the raw text instead of going through it."""
     p = tmp_path / "deferred-work.md"
     append_entry(p, title="t", origin="o", source_spec="s.md", reason="r", location="  \t ")
     assert field_line_present(parse_ledger(p.read_text())[0].body, "location", "n/a")

@@ -507,7 +507,10 @@ def test_workflow_marker_path_follows_its_own_roles_tree(project):
     assert len(captured) == 1
     assert "bmad-dev-auto-result-1-1-a-wf.doc-1.md" in captured[0].prompt
     assert "bmad-build-auto-result-" not in captured[0].prompt
-    # both trees really were resolved independently — not one name reused twice
+    # Fixture provenance, NOT a second witness: this assert stays GREEN when the
+    # marker path's `role` argument is ablated away (measured), because the
+    # `.agents/skills` cache entry is populated by the review PROMPT site, which
+    # this change did not touch. The two asserts above carry the whole signal.
     assert engine._dev_skill_cache == {
         ".claude/skills": "bmad-build-auto",
         ".agents/skills": "bmad-dev-auto",

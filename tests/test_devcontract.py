@@ -809,6 +809,64 @@ def test_parse_deferred_findings_flattens_multiline_block_scalars(tmp_path):
     assert "\n" not in findings[0].evidence
 
 
+def test_every_dev_primitive_has_a_fallback_result_prefix():
+    """The name the orchestrator WRITES a completion marker under and the set of
+    names it will MATCH are independent literals in two modules. Nothing derived
+    one from the other until this test.
+
+    The failure this prevents is silent and total: `engine` names the marker
+    `f"{resolved_primitive}-result-{task_id}.md"`, and `find_result_artifact`
+    only looks at names starting with one of these prefixes. A marker outside the
+    set is not merely unmatched — it falls through to the `## Auto Run Result`
+    heading branch, which the workflow-completion contract never writes, so the
+    marker is invisible and every plugin workflow livelocks to
+    `session_timeout_min` with no error anywhere.
+
+    Subset, not equality, and the direction is the whole point: a primitive with
+    no prefix is the unreadable-marker bug, while a prefix with no primitive is a
+    RETIRED era deliberately kept matchable — the comment on
+    `FALLBACK_RESULT_PREFIXES` asks for exactly that, so a resume can read an
+    artifact written before an upstream upgrade.
+
+    Reading the constants off the module rather than restating them is what makes
+    this hold: a third `DEV_PRIMITIVE_*` name added tomorrow is enforced without
+    anyone remembering this file exists."""
+    from bmad_loop import install
+
+    primitives = {
+        v for n, v in vars(install).items() if n.startswith("DEV_PRIMITIVE_") and isinstance(v, str)
+    }
+    assert primitives, "no DEV_PRIMITIVE_* string constants found — has the naming changed?"
+    missing = {f"{p}-result-" for p in primitives} - set(devcontract.FALLBACK_RESULT_PREFIXES)
+    assert not missing, f"dev primitives whose completion marker cannot be read back: {missing}"
+
+
+def test_flatten_leaves_no_trailing_space_when_the_clamp_lands_on_one(tmp_path):
+    """The clamp runs after the join, so the cut can land on a join space — the
+    one way a "collapsed single line" comes back with trailing whitespace.
+
+    This is not cosmetic, and it is not the ledger writer's problem to mop up:
+    `location` is consumed TWICE from here — `harvest_fingerprint(summary,
+    location)` becomes the entry's `origin:` dedup key, and the same value is
+    written as the entry's `location:` line. `append_entry` strips what it
+    writes, so cleaning it only there would leave the key derived from a string
+    the ledger no longer contains — a fingerprint no reader of the entry could
+    reproduce. Stripping at the source keeps both consumers on one value.
+
+    The fixture has to build the collision by hand: it takes a value longer than
+    `_LOCATION_LIMIT` whose 200th character is a join space, which no short
+    location can express."""
+    padded = " ".join(["a" * 9] * 30)  # 30 words -> the 200-char cut lands on a space
+    assert devcontract._flatten(padded, devcontract._LOCATION_LIMIT) == padded[:200].strip()
+    assert padded[:200].endswith(" "), "fixture no longer builds the failing shape"
+
+    fm = _deferred_spec(tmp_path / "spec.md", [{"summary": "s", "location": padded}])
+    findings, _ = devcontract.parse_deferred_findings(fm)
+    assert not findings[0].location.endswith(" ")
+    # the two consumers agree: the key is derivable from the value the ledger keeps
+    assert findings[0].fingerprint == devcontract.harvest_fingerprint("s", findings[0].location)
+
+
 def test_parse_deferred_findings_optional_fields_default_empty(tmp_path):
     fm = _deferred_spec(tmp_path / "spec.md", [{"summary": "only a summary"}])
     findings, malformed = devcontract.parse_deferred_findings(fm)

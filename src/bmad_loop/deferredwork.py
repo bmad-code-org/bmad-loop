@@ -207,18 +207,25 @@ def append_entry(
     The line is written ALWAYS, with `n/a` standing in for an empty (or
     whitespace-only) value, because that is what the format has always specified:
     deferred-work-format.md gives `location:` as `<file:line or component, or
-    "n/a" for deferred goals>` and marks only `severity:` optional, and
-    migration-mode.md tells the migrating session to write `n/a` when it can
-    extract nothing. Omitting the line instead made this writer the one producer
-    disagreeing with its own spec. The reader that cares is an LLM — the sweep
-    skill's triage step ("Read its `location:` (file/component) in the current
-    tree") — and `n/a` tells it there is nothing to open, where an absent line
-    leaves it inferring that from a gap. `severity:` keeps the opposite treatment
-    on purpose: the format says in as many words that a missing severity is fine.
+    "n/a" for deferred goals>` — unchanged in every revision of the file since the
+    repo's first commit — and migration-mode.md tells the migrating session to
+    write `n/a` when it can extract nothing. Omitting the line instead made this
+    writer the one producer disagreeing with its own spec. The reader that cares
+    is an LLM — the sweep skill's triage step ("Read its `location:`
+    (file/component) in the current tree") — and `n/a` tells it there is nothing
+    to open, where an absent line leaves it inferring that from a gap.
 
-    Nothing in Python parses the field — `parse_ledger` does not extract it and
-    the TUI renders the entry body verbatim — so entries already on disk without
-    the line stay valid, and readers must treat an absent `location:` as `n/a`."""
+    `severity:` keeps the opposite treatment on purpose: of the fields an entry
+    is CREATED with, it is the only one the format calls optional, and it says in
+    as many words that a missing one is fine. (`resolution:` and `decision:` are
+    also called optional, but they are sweep annotations added to an entry that
+    already exists, so this writer never emits them.)
+
+    Nothing in Python parses THIS field — `parse_ledger` extracts only the
+    heading and `status:`, and the one field the TUI pulls out of an entry body
+    is `severity:` (`tui/data.py`, for row colouring); the body itself reaches the
+    entry modal verbatim. So entries already on disk without the line stay valid,
+    and readers must treat an absent `location:` as `n/a`."""
     text = path.read_text(encoding="utf-8") if path.is_file() else ""
     for entry in parse_ledger(text):
         if (

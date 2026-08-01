@@ -225,10 +225,19 @@ def harvest_fingerprint(*parts: str) -> str:
 def _flatten(value: Any, limit: int) -> str:
     """Collapse one frontmatter scalar to a single clamped line. YAML hands back
     whatever type the block scalar produced (str, int, bool, None), so coerce
-    before splitting; None becomes "" rather than the string "None"."""
+    before splitting; None becomes "" rather than the string "None".
+
+    The clamp is applied to the joined line and the result stripped again,
+    because the cut can land on a join space and leave a trailing one — a line
+    that is not "collapsed" in the sense this function promises. Stripping HERE
+    rather than at each consumer is what keeps the two consumers agreeing:
+    `location` feeds both :func:`harvest_fingerprint` (the ledger's `origin:`
+    dedup key) and the ledger's own `location:` line, and a value cleaned on only
+    one of those paths makes the key underivable from the entry that carries it.
+    """
     if value is None:
         return ""
-    return " ".join(str(value).split())[:limit]
+    return " ".join(str(value).split())[:limit].strip()
 
 
 def parse_deferred_findings(fm: dict[str, Any]) -> tuple[list[DeferredFinding], list[str]]:

@@ -35,9 +35,18 @@ reason: <why this was deferred rather than done now, one or two sentences>
 status: open
 ```
 
-`location:` is always written — use `n/a` when the item is a goal rather than a
-place in the code. Entries written before this rule was enforced may omit the
-line entirely; read an absent `location:` as `n/a`, never as "not yet known".
+`location:` is always written. Use `n/a` whenever there is nothing to open — a
+deferred goal, but equally a finding whose reporter simply recorded no place.
+The field says "no location was recorded", not "this item has none": a reader
+who finds `n/a` should fall back to `reason:`, which often names the file even
+when `location:` is empty. Entries written before this rule was enforced may
+omit the line entirely; read an absent `location:` as `n/a`, never as "not yet
+known".
+
+Entries the orchestrator files carry one extra line, `source_spec:`, directly
+after `origin:` — the spec the deferral was harvested from. It is half the
+dedupe key (with `origin:`), so never edit or drop it when you touch an entry;
+entries you write by hand do not need it.
 
 `severity:` is optional — entries written before this field existed have none
 and that is fine; readers must treat a missing or unrecognized value as
