@@ -1774,10 +1774,13 @@ def worktree_seed_undelivered(
     ``_is_file(x) or _is_dir(x)`` on both sides, because a ``seed_files`` entry may name
     a directory (``vendor``) as readily as a file — unlike :func:`_absent_skill_files`,
     whose rels always come from a walk and are always files. What that filter excludes
-    is the decision the copier already made: a dangling symlink and a FIFO are neither
-    file nor directory, so both halves drop them in silence (see
+    is the decision the copier already made: a dangling symlink is neither file nor
+    directory, so both halves drop it in silence (see
     ``test_a_dangling_repo_symlink_is_dropped_by_the_copier_and_the_gate``) — a broken
-    link the copy could never have followed is not a report. An *unreadable* source is
+    link the copy could never have followed is not a report. A FIFO is filtered out here
+    too, but the copier does NOT drop it: the two loops gate on ``src.exists()``, which a
+    FIFO passes, so ``shutil.copy2`` reaches it and raises — the loud case the warning
+    below covers, not a silent one. An *unreadable* source is
     the other way: :func:`_is_dir` answers True for a refused probe, so it is carried,
     and it is named. Absent-from-the-repo and unreadable-in-the-repo must not collapse
     into one silence, the same split :func:`base_skills_seed_incomplete` makes.
@@ -1950,8 +1953,9 @@ def provision_worktree(
     _seed_bmad_tree): the renderer-era dev primitive is handed the worktree as its
     project root and hard-fails when that root has no _bmad/, so a project that
     gitignores it (most do) would HALT every session. `_bmad/render/` is never
-    seeded and is additionally excluded whenever the worktree has a _bmad/ at all,
-    so the renderer's in-session rewrite of it can't be swept into a story commit.
+    seeded, and it gets its own exclude line only when the blanket `/_bmad` one is
+    not going in — either line alone keeps the renderer's in-session rewrite of it
+    from being swept into a story commit.
 
     Returns the `seed_files` entries that existed in the repo but were skipped
     because the destination already existed — copy-when-absent turned them into

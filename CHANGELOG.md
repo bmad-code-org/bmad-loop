@@ -5,12 +5,12 @@ All notable changes to `bmad-loop` are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). While the project is pre-1.0,
 breaking changes may land in a minor release.
 
-## [0.9.1] — 2026-07-30
+## [0.9.1] — 2026-08-01
 
 Compatibility hotfix for the BMad Method's `bmad-dev-auto` → `bmad-build-auto` rename
 (BMAD-METHOD#2651, first shipped in bmad-method 6.10.1-next.33) and the two upstream changes
-that rode the same window. Both skill eras are supported; nothing in `policy.toml` needs
-editing.
+that rode the same window. Both skill eras are supported; the rename itself needs no
+`policy.toml` edit.
 
 ### Fixed
 
@@ -44,7 +44,7 @@ editing.
   `.agents/skills`, a tree whose only prompt (`/bmad-loop-sweep`) ships in this wheel and is
   laid down by `bmad-loop init`. The over-breadth is pre-existing and was already a hard block —
   0.9.0 emitted `skills.base-missing` as a problem over the same over-broad tree list and its run
-  preflight refused on it — but the renderer checks above route through the same list, so 0.9.1
+  preflight refused on it — but the new renderer checks route through the same list, so 0.9.1
   added new ways for one to fire. The probe — and `validate`'s own copy of it, which had the same defect twice
   — is now scoped to the dev and review roles, the same set `Engine._worktree_profiles`
   provisions into a worktree, and the `skills.base` and `skills.stories-dispatch` ok lines
@@ -92,7 +92,8 @@ editing.
   that line — `uv` fails before the renderer runs, or `ModuleNotFoundError` fires above its own
   guard — leaving only the stub's own instruction to report the output and halt. The sibling is
   required only when the installed `render_skill.py` actually imports it, and the source check
-  asks only what the install itself declares, so a later renderer that inlines the helper or
+  asks what the install itself declares — save the `workflow.md` entry name, which upstream
+  hardcodes too — so a later renderer that inlines the helper or
   reorganizes its step files is not refused. They block rather than warn because only a green is
   untrustworthy (uv on PATH is never probed) — a red is conclusive. The config check is emitted
   once per project and only when a stub actually resolved, so a pre-renderer install stays
@@ -152,8 +153,8 @@ editing.
   The eager copies are unchanged and can still raise — user-authored `worktree_seed`, the
   adapter-default and plugin seeds beside it, and the per-CLI hook-config write.
 
-- **A seed the worktree never got is now reported, and the shared exclude gets one line fewer
-  (#405).** The two explicit seed loops drop an entry with a bare `continue` when the
+- **A seed the worktree never got is now reported, and the `_bmad/` shield writes one exclude line,
+  not two (#405).** The two explicit seed loops drop an entry with a bare `continue` when the
   resolve-and-contain guard refuses it, so a config the repo carries as a symlink _out_ of itself —
   a dotfile-managed `.claude/settings.json`, a shared MCP config — delivered nothing and said
   nothing: `worktree-seed-skipped` reports only the opposite case, an entry whose destination
@@ -163,12 +164,13 @@ editing.
   `_bmad/` and skills gates beside it: those name files the orchestrator dispatches or the renderer
   HALTs on, while a seed entry is arbitrary user config whose canonical trigger is an ordinary
   working setup, so pausing would refuse every run of such a project over a guard doing its job. A
-  broken link or a FIFO stays silent in both halves, as it already does for the skills gate, and
-  the eager copies are still unchanged: a copy that _fails_ raises rather than landing here.
-  `/_bmad/render/` is no longer written into `.git/info/exclude` beside a blanket `/_bmad` — that
-  file lives under the git common dir a linked worktree shares with the main checkout and nothing
-  here ever prunes it, and `/_bmad` prunes the directory before git descends, so the sibling line
-  was permanent state in the operator's own repo that git never consults. `worktree-opened` is
+  broken link stays silent in both halves, as it already does for the skills gate; a FIFO does
+  not — these loops gate on `exists()`, so the copy reaches it and raises. The eager copies are
+  still unchanged: a copy that _fails_ raises rather than landing here.
+  `/_bmad/render/` goes into `.git/info/exclude` only when the blanket `/_bmad` this release also
+  adds is not — that file lives under the git common dir a linked worktree shares with the main
+  checkout and nothing here ever prunes it, and `/_bmad` prunes the directory before git descends,
+  so a sibling line would be permanent state in the operator's own repo that git never consults. `worktree-opened` is
   journaled as soon as the worktree is mounted rather than after every provisioning gate has
   passed, so the escalations that leave a half-provisioned worktree mounted for inspection now say
   where it is.
@@ -233,8 +235,9 @@ editing.
   an ok (#409). All three sites now spell the path from one `install.RENDER_DIR_REL`, so the
   probe cannot drift away from the shields it reports on.
 
-- **`verify`'s two emptiness probes no longer read their answer out of git's stderr (#405).**
-  `path_tracked` and `worktree_clean` both tested stdout and stderr merged, but `ls-files` and
+- **`verify`'s emptiness probes no longer read their answer out of git's stderr (#405).**
+  `worktree_clean` — and `path_tracked`, added earlier in this release — tested stdout and stderr
+  merged, but `ls-files` and
   `status` exit 0 while still writing to stderr — a `core.fsmonitor` hook that cannot exec, an
   unknown `core.fsyncMethod` — and that chatter is indistinguishable from an index entry or a
   porcelain line. Both answers were silently inverted: the new `git.render-tracked` check would
@@ -247,9 +250,9 @@ editing.
   `ValueError`, not an `OSError` — so it escaped every `except (PolicyError, OSError)` handler in
   the codebase, which are precisely the ones whose job is to degrade to defaults. The TUI could
   not open its dashboard, and `_configure_mux` runs before argument dispatch on every command, so
-  the CLI died at startup with a bare traceback instead of any of its named findings. `policy.load`
-  and `bmadconfig.load_paths` now convert it to their own typed errors, which fixes every caller at
-  once; `validate` reports the file by name.
+  the CLI died at startup on the raw codec message its catch-all prints, naming no file, instead
+  of any of its named findings. `policy.load` and `bmadconfig.load_paths` now convert it to their
+  own typed errors, which fixes every caller at once; `validate` reports the file by name.
 
 - **Deferred review findings are harvested out of the spec's frontmatter (#405).**
   BMAD-METHOD#2640 moved `defer`-triaged findings from `deferred-work.md` into the spec's own
@@ -330,7 +333,8 @@ editing.
   orchestrator marks a bundle's deferred-work ids `done` itself, and did so above the artifact
   gate — so an attempt that finalized its spec and then failed a non-fixable check was discarded
   with the ledger already claiming its work resolved. A surviving close is worse than a surviving
-  finding: `open_ids` only ever re-bundles open entries and there is no reopen primitive, so no
+  finding: `open_ids` only ever re-bundles open entries, and the one reopen — `mark_open`, which
+  undoes only a close its own caller wrote — is not a general one, so no
   later sweep looks at that id again and the work is silently lost rather than mis-recorded. On
   the retry leg the dev phase's ledger snapshot reverted it; on the DEFER terminus nothing in the
   dev phase could, because `_defer` takes its own snapshot after the close and writes it back

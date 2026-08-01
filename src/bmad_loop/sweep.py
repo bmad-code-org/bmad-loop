@@ -1221,9 +1221,11 @@ class SweepEngine(Engine):
 
         Below the artifact gate, not above it, and that is the whole design (#405).
         A close is the most expensive engine-side ledger write to leave behind:
-        `deferredwork.open_ids` re-bundles only `open` entries and the module has no
-        reopen primitive, so a `done` id whose code was discarded is invisible to
-        every future sweep — the work is lost, not merely mis-recorded. Written
+        `deferredwork.open_ids` re-bundles only `open` entries, and the module's one
+        reopen — `mark_open`, driven by `_reopen_ledger_after_defer` below — undoes
+        only a close its own caller wrote, so a `done` id whose code was discarded is
+        invisible to every future sweep unless this same run takes it back: the work
+        is lost, not merely mis-recorded. Written
         above the gate it outlived its attempt on two legs. The non-fixable RETRY
         was covered by `_dev_phase`'s pre-harvest ledger snapshot; the DEFER
         terminus was not, and no snapshot in `_dev_phase` could have covered it,
