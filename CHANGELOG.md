@@ -305,6 +305,22 @@ editing.
   stop-and-wait path (`rollback_on_failure = off` keeps the tree, so there is nothing to undo)
   and under worktree isolation (those closes live in the unit's own worktree, dropped unmerged).
 
+- **Three small contracts brought back into line (#405).** A ledger entry filed with no file:line
+  now carries `location: n/a` rather than no `location:` line: `deferred-work-format.md` has
+  always specified that value and marks only `severity:` optional, so the orchestrator's own
+  writer was the one producer disagreeing with the format the sweep skill reads. The value is
+  stripped before it is judged empty, so the harvest's 200-character clamp landing on a word
+  break no longer leaves a `location:` line with trailing whitespace; entries already on disk
+  without the line stay valid — read an absent `location:` as `n/a`. A plugin workflow's
+  completion-marker filename is now resolved on the skill tree of the adapter its own `role`
+  runs on, not always
+  the dev one, so a run mixing `.claude/skills` and `.agents/skills` at different upstream eras
+  no longer hands a review session a filename spelling a primitive only the dev tree carries
+  (read-back was never at risk — both prefixes are matched unconditionally). And `diagnose` now
+  pseudonymizes the `spec` journal field: the deferral-harvest events journal a bare spec
+  basename, which is identifier-shaped and therefore shipped verbatim, and the egress backstop
+  could only ever rescue the ones that happened to embed the story key.
+
 ## [0.9.0] — 2026-07-21
 
 ### Added

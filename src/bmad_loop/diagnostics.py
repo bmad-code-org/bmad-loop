@@ -78,6 +78,18 @@ _JOURNAL_ALIAS_FIELDS = {
     "target_branch": "branch",
     "commit": "commit",
     "baseline": "commit",
+    # A spec name IS the customer's feature name — `Pseudonymizer`'s own docstring
+    # has always listed "spec filenames" among what it exists to alias, so the
+    # omission here was a routing gap, not a policy. `spec-*` journal kinds pass a
+    # bare basename (engine.py's harvest events), which `looks_like_identifier`
+    # waves through verbatim on the scrub_json fallback — and the egress backstop
+    # cannot rescue it, because it only repairs values already in the legend, so
+    # it happens to catch `1.2-Acme….md` (the story key is in there) and misses
+    # `AcmeVaultRotation.md` entirely. Its OWN namespace, not "story": the epic
+    # lookup below is keyed on ns == "story", so a filename aliased there would
+    # render as an epic-less `story-<hex>` — indistinguishable from a story key
+    # whose epic could not be resolved.
+    "spec": "spec",
 }
 # Journal fields that carry free text (LLM/merge prose, prompts, errors). Never
 # emitted — replaced with a boolean presence marker so a maintainer still learns

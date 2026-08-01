@@ -35,6 +35,10 @@ reason: <why this was deferred rather than done now, one or two sentences>
 status: open
 ```
 
+`location:` is always written — use `n/a` when the item is a goal rather than a
+place in the code. Entries written before this rule was enforced may omit the
+line entirely; read an absent `location:` as `n/a`, never as "not yet known".
+
 `severity:` is optional — entries written before this field existed have none
 and that is fine; readers must treat a missing or unrecognized value as
 "unspecified". Use `critical` for correctness/security issues, `high` for

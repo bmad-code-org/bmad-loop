@@ -3061,9 +3061,17 @@ class Engine:
             # the same implementation-artifacts dir the dev adapter already
             # searches — correct in place and under worktree isolation alike,
             # because spec.cwd is self.workspace.root either way.
+            # ``role``, not the default: a workflow declares its own role
+            # (WORKFLOW_ROLES = dev | review) and runs on THAT adapter, whose
+            # skill tree can be a different one at a different era — dev=claude
+            # on .claude/skills post-rename, review=codex on .agents/skills
+            # pre-rename. Resolving off the dev tree would name the session a
+            # primitive its own tree does not carry. Discovery survives either
+            # spelling (FALLBACK_RESULT_PREFIXES matches both unconditionally),
+            # so this is the two halves agreeing, not a broken read-back.
             marker_path = (
                 self.workspace.paths.implementation_artifacts
-                / f"{self._dev_skill()}-result-{task_id}.md"
+                / f"{self._dev_skill(role)}-result-{task_id}.md"
             )
             prompt += WORKFLOW_COMPLETION_CONTRACT.format(marker_path=marker_path)
         spec = SessionSpec(

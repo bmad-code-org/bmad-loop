@@ -578,13 +578,49 @@ def test_append_entry_writes_location_between_source_spec_and_severity(tmp_path)
     assert field_line_present(parse_ledger(p.read_text())[0].body, "location", "src/retry.py:88")
 
 
-def test_append_entry_omits_location_when_absent(tmp_path):
-    """An entry with no location carries no `location:` line at all. Writing a
-    placeholder would assert the finding *has* no location, which is a different
-    claim from the skill simply not recording one."""
+def test_append_entry_writes_n_a_when_location_is_absent(tmp_path):
+    """An entry with no location still carries a `location:` line, holding `n/a`.
+    deferred-work-format.md specifies exactly that value for an item with no
+    file:line, and marks only `severity:` optional — so omitting the line made
+    this writer the one producer disagreeing with the format the sweep skill
+    reads. The whole line list is asserted so the placeholder is pinned in the
+    canonical position, not merely present somewhere."""
     p = tmp_path / "deferred-work.md"
     append_entry(p, title="t", origin="o", source_spec="s.md", reason="r")
-    assert "location:" not in p.read_text()
+    lines = [ln for ln in parse_ledger(p.read_text())[0].body.splitlines() if ln.strip()]
+    assert lines == [
+        "### DW-1: t",
+        "origin: o",
+        "source_spec: `s.md`",
+        "location: n/a",
+        "reason: r",
+        "status: open",
+    ]
+
+
+def test_append_entry_strips_a_location_before_deciding_it_is_empty(tmp_path):
+    """The value is stripped: a blank one reads as absent, a padded one is written
+    clean. Both are the same one-line guard, so this is its sole witness.
+
+    The two halves are NOT equally reachable, and saying so is the point. A
+    whitespace-ONLY location cannot arrive from the harvest — `devcontract._flatten`
+    collapses runs and yields "" for a blank scalar, and the caller maps "" to None
+    — so that half is a promise `append_entry` makes about its own `str | None`
+    signature, not a shape upstream can produce. The TRAILING-space half is
+    reachable today: `_flatten` clamps to `_LOCATION_LIMIT` *after* joining, so a
+    value whose cut lands on a join space keeps that space (measured: a 200-char
+    clamp can end in " "), and the entry would carry a `location:` line with
+    trailing whitespace no other line in the format has. `field_line_present`
+    tolerates that padding, which is exactly why the second half asserts the raw
+    text instead of going through it."""
+    p = tmp_path / "deferred-work.md"
+    append_entry(p, title="t", origin="o", source_spec="s.md", reason="r", location="  \t ")
+    assert field_line_present(parse_ledger(p.read_text())[0].body, "location", "n/a")
+
+    # a separate ledger: same origin + source_spec would hit the idempotency guard
+    q = tmp_path / "clamped.md"
+    append_entry(q, title="t", origin="o", source_spec="s.md", reason="r", location="src/a.py:1 ")
+    assert "location: src/a.py:1\n" in q.read_text()
 
 
 def test_append_entry_creates_missing_ledger(tmp_path):

@@ -200,12 +200,25 @@ def append_entry(
     (e.g. a second sweep of the same story) never duplicates the entry. Creates
     the ledger (and parent dir) if it does not yet exist.
 
-    `location` is the format's optional file:line/component field (documented in
-    deferred-work-format.md, already read by the TUI and the sweep triage); it is
-    written directly after `source_spec:` so the emitted order matches the
-    canonical origin → location → severity → reason → status shape. Omitted
-    entirely when empty — a `location: n/a` line would read as an assertion the
-    finding has no location, which is not what an absent field means."""
+    `location` is the format's file:line/component field; it is written directly
+    after `source_spec:` so the emitted order matches the canonical
+    origin → location → severity → reason → status shape.
+
+    The line is written ALWAYS, with `n/a` standing in for an empty (or
+    whitespace-only) value, because that is what the format has always specified:
+    deferred-work-format.md gives `location:` as `<file:line or component, or
+    "n/a" for deferred goals>` and marks only `severity:` optional, and
+    migration-mode.md tells the migrating session to write `n/a` when it can
+    extract nothing. Omitting the line instead made this writer the one producer
+    disagreeing with its own spec. The reader that cares is an LLM — the sweep
+    skill's triage step ("Read its `location:` (file/component) in the current
+    tree") — and `n/a` tells it there is nothing to open, where an absent line
+    leaves it inferring that from a gap. `severity:` keeps the opposite treatment
+    on purpose: the format says in as many words that a missing severity is fine.
+
+    Nothing in Python parses the field — `parse_ledger` does not extract it and
+    the TUI renders the entry body verbatim — so entries already on disk without
+    the line stay valid, and readers must treat an absent `location:` as `n/a`."""
     text = path.read_text(encoding="utf-8") if path.is_file() else ""
     for entry in parse_ledger(text):
         if (
@@ -216,8 +229,7 @@ def append_entry(
             return None
     dw_id = f"DW-{next_seq(text)}"
     lines = [f"### {dw_id}: {title}", f"origin: {origin}", f"source_spec: `{source_spec}`"]
-    if location:
-        lines.append(f"location: {location}")
+    lines.append(f"location: {(location or '').strip() or 'n/a'}")
     if severity:
         lines.append(f"severity: {severity}")
     lines.append(f"reason: {reason}")

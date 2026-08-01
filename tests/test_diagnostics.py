@@ -27,6 +27,13 @@ SECRET_AWS = "AKIACANARY0123456789"
 HOME_PATH = "/home/canaryuser/secret/proj"
 CODE = "def steal_creds(token): return token"
 SHA = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
+# Deliberately does NOT embed STORY_KEY: the harvest events journal a bare
+# `spec_path.name`, and a spec is free to be named after the feature rather than
+# the story. Such a name is identifier-shaped, so the scrub_json fallback emits
+# it verbatim, and the egress backstop cannot repair what was never aliased —
+# only per-field routing can. A name like `1.2-Acme….md` would be rescued by the
+# story key inside it and would prove nothing.
+SPEC_NAME = "AcmeVaultRotation.md"
 
 CANARIES = [
     EMAIL,
@@ -48,6 +55,7 @@ CANARIES = [
     "CANARY_FEEDBACK",
     "CANARY_PATCH",
     SHA,
+    "AcmeVaultRotation",
 ]
 
 
@@ -128,6 +136,7 @@ def _seed_run(root, run_id="20260627-120000-aaaa", *, extra_journal=None, sweeps
     )
     j.append("story-done", story_key=STORY_KEY, commit=SHA)
     j.append("sprint-status-unknown-keys", keys=[STORY_KEY, "9.9-OtherSecret"])
+    j.append("spec-deferrals-harvested", story_key=STORY_KEY, spec=SPEC_NAME)
     for kind, fields in extra_journal or []:
         j.append(kind, **fields)
 
@@ -185,6 +194,23 @@ def test_pseudonymization_is_stable_and_correlates(project):
     # the same alias appears in the per-task journal event counts (correlation)
     assert alias in run.journal.per_alias_event_counts
     assert alias in combined
+
+
+def test_spec_name_is_aliased_in_its_own_namespace(project):
+    """The `spec-*` journal kinds carry a bare spec basename, which is the
+    customer's feature name. `test_no_canary_leaks_anywhere` already proves it
+    does not ship; this pins HOW — a per-field alias in a `spec` namespace of its
+    own, so the value stays correlatable across events and never renders in the
+    epic-less `story-<hex>` shape a reused "story" namespace would give a
+    filename. Nothing else can cover it: the value is not in the legend until it
+    is routed, so the egress backstop has no alias to substitute."""
+    run_dir = _seed_run(project.project)
+    diag, pseudo, combined = _render_all([run_dir])
+    alias = next(a for _ns, orig, a in pseudo.entries() if orig == SPEC_NAME)
+    assert re.fullmatch(r"spec-[0-9a-f]{12}", alias), alias
+    assert alias in combined
+    # distinct from the story alias, and not wearing its shape
+    assert alias != diag.runs[0].tasks[0].alias
 
 
 def test_structure_is_preserved(project):
