@@ -178,6 +178,20 @@ class StoryTask:
     # ledger copy and no later attempt's replay can consume a stale one.
     pre_harvest_ledger: str | None = None
     pre_harvest_ledger_captured: bool = False
+    # This attempt's harvest actually FILED an entry, so the ledger's post-baseline
+    # diff is partly the orchestrator's own writing and must not count as the
+    # session's proof of work (`Engine._harvest_gate_exclude`, #405).
+    #
+    # PERSISTED, and that is the whole point: a crash replay re-runs the harvest,
+    # which dedupes against the entries the dead attempt already wrote, so `filed`
+    # comes back EMPTY while those entries are still sitting in the tree. Derived
+    # fresh from `filed` on the replay it would read False and the gate would pass
+    # on the orchestrator's write after all. Read from disk it stays True.
+    #
+    # Set-only within an attempt (`if filed:`), cleared in the same `if not
+    # replayed:` block that arms the snapshot above — which a replay skips, on
+    # purpose, and a fresh RETRY iteration re-enters.
+    harvest_wrote_ledger: bool = False
     spec_file: str | None = None
     commit_sha: str | None = None
     defer_reason: str | None = None
@@ -272,6 +286,7 @@ class StoryTask:
             "baseline_untracked": self.baseline_untracked,
             "pre_harvest_ledger": self.pre_harvest_ledger,
             "pre_harvest_ledger_captured": self.pre_harvest_ledger_captured,
+            "harvest_wrote_ledger": self.harvest_wrote_ledger,
             "spec_file": self._serialized_spec_file(),
             "commit_sha": self.commit_sha,
             "defer_reason": self.defer_reason,
@@ -333,6 +348,7 @@ class StoryTask:
                 str(d["pre_harvest_ledger"]) if d.get("pre_harvest_ledger") is not None else None
             ),
             pre_harvest_ledger_captured=bool(d.get("pre_harvest_ledger_captured", False)),
+            harvest_wrote_ledger=bool(d.get("harvest_wrote_ledger", False)),
             spec_file=d.get("spec_file"),
             commit_sha=d.get("commit_sha"),
             defer_reason=d.get("defer_reason"),

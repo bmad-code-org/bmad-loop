@@ -6842,3 +6842,209 @@ def test_spec_deferrals_ledger_write_fault_crashes_the_run(project, monkeypatch)
     assert summary.crashed is True
     assert load_state(engine.run_dir).crash_error.startswith("PermissionError")
     assert "run-crash" in (engine.run_dir / "journal.jsonl").read_text()
+
+
+# --- the harvest's own ledger write must not satisfy the dev proof-of-work gate ---
+#
+# `_harvest_spec_deferrals` runs four statements above `_verify_dev_artifacts`, and
+# `verify_dev_exclude_relpaths` deliberately leaves the ledger un-excluded (a story whose
+# whole authorized scope is ledger reconciliation must register as real work — see
+# `test_verify.py`'s KNOWN-BUG pair). Without `Engine._harvest_gate_exclude` the gate
+# cannot tell the ORCHESTRATOR's write from the SESSION's, and a session that finalized
+# its spec and changed no code proceeds to done on the strength of the harvest alone.
+
+
+def _session_authored_ledger_effect(project, title: str, story_key: str = "1-1-a"):
+    """An HONEST dev session whose entire diff is a ledger entry it wrote ITSELF, with
+    no `deferred:` frontmatter and no source edit — the ledger-only story shape that
+    `verify_dev_exclude_relpaths` refuses to exclude on purpose. The mirror image of the
+    harvest: same file, same attempt window, different author."""
+    inner = dev_effect(project, story_key, followup_review=False, write_src=False)
+
+    def effect(spec):
+        from bmad_loop import deferredwork
+
+        project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+        deferredwork.append_entry(
+            project.deferred_work,
+            title=title,
+            origin="the session itself",
+            source_spec="specs/older.md",
+            reason="filed by the session, not by the harvest",
+        )
+        return inner(spec)
+
+    return effect
+
+
+def test_harvest_alone_is_not_proof_of_work(project):
+    """T2a. A session that finalized its spec, changed no code, and recorded one
+    `deferred:` finding must RETRY — the only post-baseline diff is the ledger line the
+    ORCHESTRATOR's harvest wrote four statements above the gate.
+
+    Both fixture values are load-bearing and neither alone reddens: without
+    `write_src=False` there is real work and the gate passes for the right reason;
+    without `deferred=` nothing writes the ledger and the gate fails for the right
+    reason. Only the pair puts the orchestrator's own write in front of the gate."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    pol = dataclasses.replace(_harvest_policy(), limits=LimitsPolicy(max_dev_attempts=2))
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(
+                project, "1-1-a", followup_review=False, write_src=False, deferred=[HARVEST_A]
+            ),
+            dev_effect(project, "1-1-a", followup_review=False),
+        ],
+        policy=pol,
+    )
+    summary = engine.run()
+
+    decisions = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert [d["action"] for d in decisions] == ["retry", "proceed"]
+    assert "no changes" in decisions[0]["reason"]
+    # the harvest really did fire on the refused attempt — the exclusion is what the
+    # gate answered on, not an absent ledger
+    harvests = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert harvests[0]["dw_ids"] == ["DW-1"]
+    assert [s.role for s in adapter.sessions] == ["dev", "dev"]
+    assert summary.done == 1
+
+
+def test_no_code_and_no_deferrals_still_retries(project):
+    """T2b, control. The same empty session WITHOUT a `deferred:` finding — nothing
+    writes the ledger, so this reddens on a build with no exclusion at all. It pins the
+    half of T2a's fixture that is not about the harvest."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    pol = dataclasses.replace(_harvest_policy(), limits=LimitsPolicy(max_dev_attempts=2))
+    engine, _ = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a", followup_review=False, write_src=False),
+            dev_effect(project, "1-1-a", followup_review=False),
+        ],
+        policy=pol,
+    )
+    summary = engine.run()
+
+    decisions = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert [d["action"] for d in decisions] == ["retry", "proceed"]
+    assert "no changes" in decisions[0]["reason"]
+    assert summary.done == 1
+    assert not _ledger_entries(project)
+
+
+def test_real_work_plus_a_harvest_still_proceeds(project):
+    """T2c, the over-exclusion guard. The exclusion is one path wide: a session that
+    harvested AND changed code passes on the code. An exclude that swallowed the diff —
+    a whole-folder pattern, say — would redden here and nowhere else."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", followup_review=False, deferred=[HARVEST_A])],
+        policy=_harvest_policy(),
+    )
+    summary = engine.run()
+
+    decisions = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert [d["action"] for d in decisions] == ["proceed"]
+    assert summary.done == 1
+    assert [s.role for s in adapter.sessions] == ["dev"]
+    assert [e.title for e in _ledger_entries(project)] == [HARVEST_A["summary"]]
+
+
+def test_a_session_authored_ledger_entry_is_still_proof_of_work(project):
+    """T2f, the KNOWN-BUG control, and the reason the exclusion keys on a flag rather
+    than on the ledger's path. This session wrote the ledger itself and touched nothing
+    else; it must PROCEED. Excluding the ledger unconditionally would re-introduce
+    `KNOWN-BUG-ledger-only-story-false-no-changes.md`, the exact false "no changes"
+    `verify_dev_exclude_relpaths` refuses to create."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [_session_authored_ledger_effect(project, "Session's own note")],
+        policy=_harvest_policy(),
+    )
+    summary = engine.run()
+
+    decisions = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert [d["action"] for d in decisions] == ["proceed"]
+    assert summary.done == 1
+    assert [s.role for s in adapter.sessions] == ["dev"]
+    assert [e.title for e in _ledger_entries(project)] == ["Session's own note"]
+
+
+def test_a_later_attempt_that_did_not_harvest_gets_no_exclusion(project):
+    """T2g, and the whole reason the flag is cleared per attempt rather than latched.
+
+    Attempt 1 harvests and is rolled back. Attempt 2 is a ledger-only story of the T2f
+    kind — no `deferred:` frontmatter, so nothing of the orchestrator's is in its diff —
+    and must PROCEED on its own ledger write. A flag that survived attempt 1 would
+    exclude attempt 2's honest work and defer the story."""
+    assert not project.deferred_work.exists()
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    pol = dataclasses.replace(_harvest_policy(), limits=LimitsPolicy(max_dev_attempts=2))
+    engine, _ = make_engine(
+        project,
+        [
+            # attempt 1: harvests HARVEST_A, then fails the baseline gate non-fixably
+            _baseline_liar_effect(project, deferred=[HARVEST_A]),
+            # attempt 2: no frontmatter findings, no source edit, one ledger entry
+            _session_authored_ledger_effect(project, "Session's own note"),
+        ],
+        policy=pol,
+    )
+    summary = engine.run()
+
+    decisions = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert [d["action"] for d in decisions] == ["retry", "proceed"]
+    assert summary.done == 1
+    # attempt 1's harvest really did fire and really was reverted, so the only entry
+    # left is attempt 2's own
+    harvests = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert len(harvests) == 1 and harvests[0]["dw_ids"] == ["DW-1"]
+    assert [e.title for e in _ledger_entries(project)] == ["Session's own note"]
+
+
+def test_a_replayed_harvest_that_deduped_still_excludes_the_ledger(project):
+    """T2e, and the reason the flag is PERSISTED rather than derived from the harvest's
+    own `filed` list.
+
+    The dead attempt harvested; the crash left those entries in the tree. The replay
+    re-runs the harvest, which dedupes every one of them against what is already on
+    disk, so `filed` comes back EMPTY while the ledger diff the gate sees is entirely
+    the orchestrator's. A flag recomputed from `filed` reads False there and the gate
+    passes on the engine's own write; read back off disk it stays True."""
+    assert not project.deferred_work.exists()
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    pol = dataclasses.replace(_harvest_policy(), limits=LimitsPolicy(max_dev_attempts=2))
+    engine, _ = make_engine(
+        project,
+        [
+            dev_effect(
+                project, "1-1-a", followup_review=False, write_src=False, deferred=[HARVEST_A]
+            )
+        ],
+        policy=pol,
+    )
+    _crash_at_post_dev_verify(engine)
+    assert engine.run().crashed
+    assert _ledger_entries(project), "the dead attempt really did harvest"
+
+    resumed, _ = resume_engine(
+        project, engine, [dev_effect(project, "1-1-a", followup_review=False)], policy=pol
+    )
+    summary = resumed.run()
+
+    kinds = [e["kind"] for e in resumed.journal.entries()]
+    assert "resume-verify" in kinds  # it really was a replay, not a restart
+    # the replayed harvest filed NOTHING and the gate still refused the attempt. The
+    # journal is shared across the resume, so the dead attempt's own harvest is entry 0
+    # and the replay's is the last one.
+    harvests = [e for e in resumed.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert len(harvests) == 2 and harvests[0]["dw_ids"] == ["DW-1"]
+    assert harvests[-1]["dw_ids"] == [] and harvests[-1]["deduped"] == 1
+    decisions = [e for e in resumed.journal.entries() if e["kind"] == "dev-decision"]
+    assert decisions[0]["action"] == "retry"
+    assert "no changes" in decisions[0]["reason"]
+    assert summary.done == 1

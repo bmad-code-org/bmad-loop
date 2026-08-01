@@ -271,6 +271,21 @@ editing.
   keeps its harvested entries: on the in-place path `_stash_deferred_artifacts` has already moved
   the spec out of the artifacts dir, so the ledger entry is the finding's only surviving record.
 
+- **The harvest's own ledger write is no longer the session's proof of work (#405).** The harvest
+  runs four statements above the dev artifact gate, and that gate deliberately does not exclude
+  the ledger — a story whose whole authorized scope is ledger reconciliation has to register as
+  real work. So the gate could not tell the orchestrator's write from the session's: a session
+  that finalized its spec, changed no code and recorded one `deferred:` finding proceeded to done
+  on the strength of the line the engine had just written for it. The gate now excludes the ledger
+  on exactly the attempts whose harvest filed into it, keyed on a flag persisted with the attempt
+  rather than re-derived — a crash replay re-runs the harvest, which dedupes against the dead
+  attempt's entries and so reports filing nothing while those entries are still in the tree.
+  Narrow by construction: a session's own ledger edit still counts as work on every attempt that
+  did not harvest, and the flag is cleared per attempt, so a later attempt is never charged for an
+  earlier one's harvest. All three dev legs pass it through — sprint story, sweep bundle, and
+  folder+id stories. The bundle leg is the costlier one, since an attempt let through there marks
+  real ids `done` and `open_ids` re-bundles only `open` entries.
+
 - **A sweep bundle's ledger closes are withheld until its attempt is accepted (#405).** The
   orchestrator marks a bundle's deferred-work ids `done` itself, and did so above the artifact
   gate — so an attempt that finalized its spec and then failed a non-fixable check was discarded

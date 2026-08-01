@@ -197,6 +197,24 @@ def test_pre_harvest_ledger_defaults_disarmed_for_legacy_state():
     assert task.pre_harvest_ledger_captured is False
 
 
+def test_harvest_wrote_ledger_round_trips():
+    """Persistence is the whole point of this flag, not an incidental property of
+    living on the task: a crash replay re-runs the harvest, which dedupes against the
+    dead attempt's entries and reports filing nothing, so the only honest answer to
+    "did the orchestrator write this ledger?" is the one that came off disk."""
+    for value in (True, False):
+        task = StoryTask(story_key="1-1-a", epic=1, harvest_wrote_ledger=value)
+        assert StoryTask.from_dict(task.to_dict()).harvest_wrote_ledger is value
+
+
+def test_harvest_wrote_ledger_defaults_false_for_legacy_state():
+    """Absent ⇒ nothing of ours is in the diff, which is the conservative default: the
+    gate then counts the ledger as the session's work, the pre-#405 behaviour."""
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    del doc["harvest_wrote_ledger"]  # state.json from before the field existed
+    assert StoryTask.from_dict(doc).harvest_wrote_ledger is False
+
+
 def test_restore_patch_round_trips():
     task = StoryTask(story_key="1-1-a", epic=1, restore_patch="artifacts/attempt.patch")
     assert StoryTask.from_dict(task.to_dict()).restore_patch == "artifacts/attempt.patch"

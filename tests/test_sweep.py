@@ -2659,3 +2659,65 @@ def test_generic_bundle_harvests_spec_deferrals_alongside_its_closures(project):
     harvested = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
     assert len(harvested) == 1 and harvested[0]["dw_ids"] == ["DW-3"]
     assert worktree_clean(project.project)
+
+
+def test_bundle_harvest_alone_is_not_proof_of_work(project):
+    """T2d. The bundle leg of the same hazard, and the costlier one: a close marks real
+    dw ids `done`, `deferredwork.open_ids` re-bundles only `open` entries, so a bundle
+    accepted on the orchestrator's own ledger write takes its ids out of every future
+    sweep with no code behind them.
+
+    The session finalizes its spec, changes no code and records one new finding. The
+    only post-baseline diff is the line the harvest wrote above the gate, so the attempt
+    must be refused — DW-1 stays `open` and no close is journalled. `max_dev_attempts=1`
+    turns the refusal straight into the terminal deferral rather than a retry."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = triage_result(
+        ["DW-1"],
+        bundles=[{"name": "fix-things", "dw_ids": ["DW-1"], "intent": "fix it"}],
+    )
+    pol = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=False),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        limits=LimitsPolicy(max_dev_attempts=1),
+        scm=ScmPolicy(rollback_on_failure=True),
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(
+                project,
+                "fix-things",
+                ["DW-1"],
+                mark_ledger=False,
+                write_src=False,
+                deferred=[
+                    {
+                        "summary": "The retry cap should be configurable",
+                        "evidence": "hardcoded while fixing DW-1",
+                        "location": "src/retry.py:88",
+                        "severity": "low",
+                    }
+                ],
+            ),
+        ],
+        policy=pol,
+    )
+    summary = engine.run()
+
+    decisions = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert [d["action"] for d in decisions] == ["defer"]
+    assert "no changes" in decisions[0]["reason"]
+    # done == 1 is the `sweep-triage` task, which always lands; the BUNDLE deferred
+    assert summary.deferred == 1
+    assert engine.state.tasks["dw-fix-things"].phase == Phase.DEFERRED
+    # the harvest really did fire — the gate answered on the exclusion, not on an
+    # untouched ledger …
+    harvested = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert len(harvested) == 1 and harvested[0]["dw_ids"] == ["DW-2"]
+    # … and the bundle's own id was never closed, so a later sweep can still re-bundle it
+    assert ledger_entries(project)["DW-1"].open
+    assert "sweep-bundle-closed" not in {e["kind"] for e in engine.journal.entries()}

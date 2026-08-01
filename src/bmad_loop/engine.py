@@ -1946,6 +1946,12 @@ class Engine:
                 if not replayed:
                     task.pre_harvest_ledger = self._ledger_text()
                     task.pre_harvest_ledger_captured = True
+                    # Same block, same reason: everything below this line that
+                    # touches the ledger is the ORCHESTRATOR writing, not the
+                    # session. Cleared here so each attempt answers for itself,
+                    # and NOT on a replay — the dead attempt's harvest is still in
+                    # the tree, so its True must survive (see the field's comment).
+                    task.harvest_wrote_ledger = False
                     self._save()
                 # bmad-dev-auto sometimes finalizes the spec in prose (## Auto Run
                 # Result: Status done) but leaves the frontmatter status at the
@@ -2859,6 +2865,13 @@ class Engine:
                 deduped += 1
             else:
                 filed.append(dw_id)
+        # Set-only, never cleared here. A replay re-runs this harvest and dedupes
+        # every entry the dead attempt wrote, so `filed` comes back empty while
+        # those entries are still on disk — clearing on that would hand the gate
+        # below the orchestrator's own write. The per-attempt clear lives at the
+        # arm site.
+        if filed:
+            task.harvest_wrote_ledger = True
         self.journal.append(
             "spec-deferrals-harvested",
             story_key=task.story_key,
@@ -2901,9 +2914,41 @@ class Engine:
         unit is merged before the run stops."""
         return
 
+    def _harvest_gate_exclude(self, task: StoryTask) -> tuple[str, ...]:
+        """The deferred-work ledger's project-relative path, when THIS attempt's
+        harvest filed into it — and `()` otherwise.
+
+        `_harvest_spec_deferrals` runs four statements above the artifact gate, and
+        `verify_dev_exclude_relpaths` deliberately does NOT exclude the ledger (a
+        story whose whole authorized scope is ledger reconciliation must register as
+        real work — `KNOWN-BUG-ledger-only-story-false-no-changes.md`). So without
+        this the gate cannot tell the orchestrator's write from the session's, and a
+        session that finalized its spec and changed no code PROCEEDs on the strength
+        of the harvest alone. That is the exact hazard `sweep.py`'s close was moved
+        below the gate to retire; moving the close audited only the write it moved.
+
+        Keyed on the persisted flag rather than re-derived, because a replay's
+        harvest dedupes to nothing while the dead attempt's entries remain in the
+        tree. Narrow by construction: it excludes the ledger only on the attempts
+        that actually wrote it, so a session's OWN ledger edit still counts as work
+        on every other attempt. The residual is a session that edits the ledger on
+        an attempt that also harvests — false-negatived, which is the safe
+        direction for a proof-of-work gate."""
+        if not task.harvest_wrote_ledger:
+            return ()
+        paths = self.workspace.paths
+        try:
+            return (paths.deferred_work.resolve().relative_to(paths.project.resolve()).as_posix(),)
+        except ValueError:
+            return ()  # ledger outside the project tree; nothing to exclude here
+
     def _verify_dev_artifacts(self, task: StoryTask, result_json: dict | None):
         return verify.verify_dev(
-            task, self.workspace.paths, result_json, review_enabled=self._dev_review_enabled()
+            task,
+            self.workspace.paths,
+            result_json,
+            review_enabled=self._dev_review_enabled(),
+            engine_written=self._harvest_gate_exclude(task),
         )
 
     def _verify_review(self, task: StoryTask):

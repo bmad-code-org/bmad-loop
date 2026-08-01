@@ -1303,7 +1303,11 @@ class SweepEngine(Engine):
 
     def _verify_dev_artifacts(self, task: StoryTask, result_json: dict | None):
         return verify.verify_dev_bundle(
-            task, self.workspace.paths, result_json, review_enabled=self._dev_review_enabled()
+            task,
+            self.workspace.paths,
+            result_json,
+            review_enabled=self._dev_review_enabled(),
+            engine_written=self._harvest_gate_exclude(task),
         )
 
     def _verify_review(self, task: StoryTask):

@@ -761,6 +761,7 @@ def bundle_dev_effect(
     final_status: str = "done",
     prose_status: str | None = None,
     deferred=None,
+    write_src: bool = True,
 ):
     """Simulate a bmad-dev-auto bundle dev session: edits code and self-finalizes
     the bundle spec to ``done`` (no in-review handoff). On the decoupled path the
@@ -768,14 +769,18 @@ def bundle_dev_effect(
     ``mark_ledger=True`` is kept only for the legacy-marking path in older tests.
     ``followup_review`` mirrors `followup_review_recommended` — defaults True so
     the bundle review runs under the default trigger = "recommended". ``final_status``
-    / ``prose_status`` / ``deferred`` mirror ``dev_effect``: pair a non-terminal
-    ``final_status`` with ``prose_status="done"`` to reproduce the skill finalizing
-    in prose only; ``deferred`` records post-#2640 frontmatter findings."""
+    / ``prose_status`` / ``deferred`` / ``write_src`` mirror ``dev_effect``: pair a
+    non-terminal ``final_status`` with ``prose_status="done"`` to reproduce the skill
+    finalizing in prose only; ``deferred`` records post-#2640 frontmatter findings;
+    ``write_src=False`` keeps the session from touching code at all, which is the only
+    way to express a bundle session whose whole post-baseline diff belongs to the
+    orchestrator (the harvest, or the ledger close) rather than to the session."""
 
     def effect(spec: SessionSpec) -> SessionResult:
         baseline = rev_parse_head(paths.project)
         source = paths.project / "src.txt"
-        source.write_text(source.read_text() + f"change for dw-{name}\n")
+        if write_src:
+            source.write_text(source.read_text() + f"change for dw-{name}\n")
         sp = bundle_spec_path(paths, name)
         # mirror the skill: always self-finalize the bundle spec straight to done
         write_spec(sp, final_status, baseline, prose_status=prose_status, deferred=deferred)

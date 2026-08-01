@@ -68,10 +68,15 @@ def stories_dev_effect(
     followup_review: bool = False,
     prose_status: str | None = None,
     deferred=None,
+    write_src: bool = True,
 ):
     """Simulate a bmad-dev-auto folder+id dispatch: read the story id + spec
     folder from the session env (as the real adapter does), write the id-keyed
-    story spec, and touch real code so proof-of-work passes."""
+    story spec, and touch real code so proof-of-work passes.
+
+    ``write_src=False`` mirrors `conftest.dev_effect`'s knob of the same name: it
+    keeps the session from touching code at all, the only way to express a stories
+    session whose whole post-baseline diff belongs to the ORCHESTRATOR."""
 
     def effect(spec) -> SessionResult:
         story_id = spec.env["BMAD_LOOP_STORY_KEY"]
@@ -81,7 +86,8 @@ def stories_dev_effect(
         stories_dir.mkdir(parents=True, exist_ok=True)
         sp = stories_dir / f"{story_id}-slug.md"
         src = Path(spec.cwd) / "src.txt"
-        src.write_text(src.read_text() + f"work for {story_id}\n")
+        if write_src:
+            src.write_text(src.read_text() + f"work for {story_id}\n")
         write_spec(sp, final_status, baseline, prose_status=prose_status, deferred=deferred)
         return SessionResult(
             status="completed",
@@ -1305,3 +1311,36 @@ def test_plan_halt_leg_does_not_harvest_then_implement_leg_does(project):
     entries = deferredwork.parse_ledger(project.deferred_work.read_text(encoding="utf-8"))
     assert len(entries) == 1 and entries[0].open
     assert _kinds(resumed.journal, "spec-deferrals-harvested")[0]["dw_ids"] == ["DW-1"]
+
+
+def test_stories_harvest_alone_is_not_proof_of_work(project):
+    """T2j, the stories leg of the harvest-vs-proof-of-work hazard, and the third
+    `_verify_dev_artifacts` override that has to pass `engine_written` through.
+
+    Stories mode already excludes `stories/` and `stories.yaml` from proof-of-work
+    (`verify._stories_relpaths`), but the ledger lives under implementation-artifacts
+    — a different subtree — so the harvest's own write lands squarely in the diff the
+    gate reads. Attempt 1 finalizes its spec, changes no code and records one
+    `deferred:` finding, so its entire post-baseline diff is the line the ORCHESTRATOR
+    wrote: it must RETRY. Attempt 2 does real work and proceeds.
+
+    `entry("1")` and not `spec_checkpoint=True` is load-bearing: a plan-halt leg
+    passes `extra_exclude=None`, which skips the proof-of-work gate outright, and the
+    test would pass on any build."""
+    setup_stories(project, [entry("1")])
+    engine, _ = make_engine(
+        project,
+        [
+            stories_dev_effect(write_src=False, deferred=[STORY_FINDING]),
+            stories_dev_effect(),
+        ],
+    )
+    summary = engine.run()
+
+    decisions = _kinds(engine.journal, "dev-decision")
+    assert [d["action"] for d in decisions] == ["retry", "proceed"]
+    assert "no changes" in decisions[0]["reason"]
+    # the harvest really did fire on the refused attempt — the exclusion is what the
+    # gate answered on, not an absent ledger
+    assert _kinds(engine.journal, "spec-deferrals-harvested")[0]["dw_ids"] == ["DW-1"]
+    assert summary.done == 1

@@ -446,6 +446,7 @@ class StoriesEngine(Engine):
             spec_folder=folder,
             review_enabled=self._dev_review_enabled(),
             plan_halt=plan_halt,
+            engine_written=self._harvest_gate_exclude(task),
         )
 
     def _run_verify_commands_after_dev(self, task: StoryTask, result_json: dict | None) -> bool:
