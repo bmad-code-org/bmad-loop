@@ -670,8 +670,19 @@ class Engine:
         # whether the session needs it — while the trigger is an ordinary healthy setup
         # (a dotfile-managed `.claude/settings.json`, a shared MCP config), so pausing
         # would refuse every run of such a project over a guard doing its job.
+        #
+        # The hook configs are named separately because the step BELOW provisioning
+        # writes them itself, so their presence in the worktree proves nothing about
+        # the seed — and every one of them is also a profile seed entry, the sole one
+        # for gemini/copilot/antigravity. Hookless profiles are excluded here for the
+        # same reason the exclude patterns exclude them: they have no `config_path`,
+        # and their empty string would name the worktree root.
         undelivered_seeds = worktree_seed_undelivered(
-            unit.path, self.paths.repo_root, seed_files=seed_files, seed_globs=seed_globs
+            unit.path,
+            self.paths.repo_root,
+            seed_files=seed_files,
+            seed_globs=seed_globs,
+            config_paths=[p.hooks.config_path for p in profiles if not p.hookless],
         )
         if undelivered_seeds:
             self.journal.append(

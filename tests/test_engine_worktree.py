@@ -1613,6 +1613,62 @@ def test_a_dropped_seed_is_journalled_and_does_not_pause(project, tmp_path):
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
+def test_a_dropped_hook_config_is_journalled_and_does_not_pause(project, tmp_path):
+    """The one seed rel whose destination cannot answer for it (#405), and this is the
+    ENGINE's witness that the call site says so.
+
+    `.claude/settings.json` is claude's `hooks.config_path` as well as one of its
+    default seed entries, and here the repo carries it as a symlink to a dotfile
+    checkout — the same ordinary healthy setup the sibling above uses for `.mcp.json`,
+    and the trigger the gate's own docstring names. The seed loop's source-containment
+    guard drops it; the hook-registration step below provisioning then writes that exact
+    path with a hooks-only config, so the destination probe stats a real file and reads
+    the rel as delivered. Nothing is short at a path anyone can see, and the operator's
+    own `env` block never reaches the session.
+
+    At the engine and not only in `test_install.py` because passing the rels is the
+    CALL SITE's half: `config_paths` defaults to `()`, so a fix that never reaches this
+    call is byte-identical to no fix and invisible to every unit test of the gate.
+
+    `attach_profile` is what makes the fault expressible at all, and both halves of it
+    are the profile's: with no `profile` on the adapter `_worktree_profiles()` is empty,
+    so `.claude/settings.json` is not a seed entry AND the hook step never writes it.
+    The near-miss shape to avoid is naming the rel in `worktree_seed` instead — a
+    profile-less run then leaves the destination genuinely absent, the ordinary probe
+    reports it, and the test passes on the unfixed build."""
+    from conftest import attach_profile
+
+    from bmad_loop import install
+
+    # gitignored `.claude/` is the shape that bites, and the reason the settings file
+    # is a seed entry at all: a worktree checks out tracked files only
+    (project.project / ".gitignore").write_text(".bmad-loop/runs/\n.claude/\n", encoding="utf-8")
+    # ordinary in-repo skills, so the skills gate stays silent and the escalation
+    # assertion below can only be about this fix
+    _real_skill_dirs(
+        project, install.DEV_PRIMITIVE_NEW, *install.REVIEW_HUNTER_SKILLS, "bmad-review"
+    )
+    shared = tmp_path / "dotfiles" / "settings.json"
+    shared.parent.mkdir(parents=True)
+    shared.write_text('{"env": {"FROM_THE_REPO": "1"}}', encoding="utf-8")
+    (project.project / ".claude" / "settings.json").symlink_to(shared)
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+
+    engine, adapter = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
+    )
+    attach_profile(adapter)  # without this the hook step never runs — see the docstring
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused
+    entries = Journal(engine.run_dir).entries()
+    assert "story-escalated" not in [e["kind"] for e in entries]
+    dropped = [e for e in entries if e["kind"] == "worktree-seed-dropped"]
+    assert dropped and dropped[0]["entries"] == [".claude/settings.json"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
 def test_an_escalating_provision_still_journals_the_worktree_it_mounted(project, tmp_path):
     """Both provisioning escalations promise the half-provisioned worktree "stays
     mounted for the operator to inspect", and the journal was the one place that never

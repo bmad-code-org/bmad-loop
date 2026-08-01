@@ -717,6 +717,35 @@ def test_provision_worktree_merge_refuses_to_write_outside_the_worktree(tmp_path
     assert skipped == [f"{tree}/{DEV_PRIMITIVE_NEW}"]
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_provision_worktree_merge_refuses_a_symlinked_out_skill_tree(tmp_path):
+    """The containment clause of that same guard, on its own — and until this test no
+    row in the suite moved when it was deleted (#405).
+
+    The sibling above arms `_occupied` as well, because its escape is a DANGLING leaf
+    and a dangling symlink is occupied by definition; `or _occupied(target)` answers
+    first and the containment clause never has to. Here the link is the skill TREE and
+    it is LIVE, so every target beneath it is absent and unoccupied and containment is
+    the only thing left between the wheel's bundled skills and a directory outside the
+    worktree that no teardown ever cleans.
+
+    `skipped` stays empty on purpose: this repo carries no `BASE_SKILLS` for
+    `base_skills_seed_incomplete` to find short, so the filesystem is the whole
+    assertion — which is exactly the shape that makes an unguarded write invisible."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    repo.mkdir()
+    claude = get_profile("claude")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (wt / claude.skill_tree).parent.mkdir(parents=True)
+    (wt / claude.skill_tree).symlink_to(outside, target_is_directory=True)
+
+    skipped = provision_worktree(wt, [claude], repo)
+
+    assert list(outside.iterdir()) == []  # the wheel's skills went nowhere
+    assert skipped == []
+
+
 # --------------------------------------------------------------- the shared walk itself
 #
 # ⚠️ Every test from here to `_seed_pair` needs a symlink or a permission bit to arm,
@@ -2781,6 +2810,110 @@ def test_provision_worktree_seed_globs_shielded_in_local_exclude(project, tmp_pa
     assert git(wt, "status", "--short", "--", ".claude/skills/tests-run") == ""
 
 
+# --------------------------------------------- seeding never writes through a link
+#
+# Both seed loops resolved the destination and then used the RESOLVED path for the
+# occupancy probe, the mkdir and the copy. `resolve()` is non-strict, so it follows a
+# dangling link to the path it names: the probe asks about the TARGET (absent ⇒ "free"),
+# and the copy then lands at a path nobody asked for. Measured on the two sibling
+# copiers' own guard: `_occupied(raw)` is True, `_occupied(raw.resolve())` is False —
+# which is why wiring `_occupied` in against the resolved path would have been a no-op
+# and the load-bearing change is splitting `raw` from `dst`.
+#
+# The refusal is a bare `continue`, matching both loops' existing contract: what was
+# dropped is named afterwards by `worktree_seed_undelivered`, which is also why these
+# tests assert the gate and not only the filesystem.
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_provision_worktree_seed_never_writes_through_a_dangling_dst_symlink(tmp_path):
+    """T6a — the direct slot. `git worktree add` checks out a tracked symlink whose
+    target is untracked, so the worktree's `.mcp.json` IS a dangling link on the first
+    story of a project that keeps its configs that way. The seed then wrote the repo's
+    bytes to the link's target, an unrequested path inside the worktree that the
+    exclude does not name and `git add -A` would stage into the story branch."""
+    from bmad_loop.install import worktree_seed_undelivered
+
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".mcp.json").write_text("FROM_REPO", encoding="utf-8")
+    wt.mkdir()
+    stray = wt / "stray.json"  # inside the worktree, so containment cannot refuse it
+    (wt / ".mcp.json").symlink_to(stray)
+    assert not stray.exists(), "the fixture must be DANGLING, not merely a symlink"
+
+    skipped = provision_worktree(wt, [], repo, seed_files=[".mcp.json"])
+
+    assert not stray.exists(), "seeded through the dangling link"
+    assert skipped == []  # not a skip: the destination never existed
+    assert worktree_seed_undelivered(wt, repo, seed_files=[".mcp.json"]) == [".mcp.json"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_provision_worktree_seed_never_writes_through_a_dangling_parent(tmp_path):
+    """T6d — the other leg, and the reason the guard is `dst != raw` rather than
+    `_occupied(raw)`: here the leaf is not a link at all and does not exist, so
+    `_occupied` answers False. The DIRECTORY component is the dangling one, and
+    `mkdir(parents=True)` on the resolved path creates the target tree before the copy
+    lands in it."""
+    from bmad_loop.install import worktree_seed_undelivered
+
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    (repo / "vendor").mkdir(parents=True)
+    (repo / "vendor" / "conf.json").write_text("FROM_REPO", encoding="utf-8")
+    wt.mkdir()
+    stray_dir = wt / "elsewhere"
+    (wt / "vendor").symlink_to(stray_dir)
+    assert not stray_dir.exists()
+
+    provision_worktree(wt, [], repo, seed_files=["vendor/conf.json"])
+
+    assert not stray_dir.exists(), "mkdir + copy went through the dangling parent"
+    assert worktree_seed_undelivered(wt, repo, seed_files=["vendor/conf.json"]) == [
+        "vendor/conf.json"
+    ]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_provision_worktree_seed_globs_never_write_through_a_dangling_dst_symlink(tmp_path):
+    """T6b — the glob loop carries the same fault and needs its own guard: it computes
+    its own `dst` from its own `rel` and shares no code with the `seed_files` loop."""
+    from bmad_loop.install import worktree_seed_undelivered
+
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    plugins = repo / "plugins"
+    plugins.mkdir(parents=True)
+    (plugins / "a.json").write_text("FROM_REPO", encoding="utf-8")
+    (wt / "plugins").mkdir(parents=True)
+    stray = wt / "stray.json"
+    (wt / "plugins" / "a.json").symlink_to(stray)
+    assert not stray.exists()
+
+    provision_worktree(wt, [], repo, seed_globs=["plugins/*.json"])
+
+    assert not stray.exists(), "the glob loop seeded through the dangling link"
+    assert worktree_seed_undelivered(wt, repo, seed_globs=["plugins/*.json"]) == ["plugins/a.json"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_a_live_symlinked_seed_destination_is_still_reported_as_skipped(tmp_path):
+    """T6ctrl, and the ORDERING constraint in one test. A worktree slot that is a link
+    to something real is an ordinary copy-when-absent no-op and belongs in `skipped`.
+    The refusal subsumes that case — every symlinked destination has `dst != raw`,
+    live or dangling — so placing it above the `dst.exists()` arm would convert the
+    whole no-op report into a silent drop. It goes strictly after."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".mcp.json").write_text("FROM_REPO", encoding="utf-8")
+    wt.mkdir()
+    real = wt / "real.json"
+    real.write_text("IN_WORKTREE", encoding="utf-8")
+    (wt / ".mcp.json").symlink_to(real)
+
+    assert provision_worktree(wt, [], repo, seed_files=[".mcp.json"]) == [".mcp.json"]
+    assert real.read_text(encoding="utf-8") == "IN_WORKTREE"  # and nothing clobbered it
+
+
 # ----------------------------------------------------------------- dropped seeds (#415)
 
 
@@ -2995,6 +3128,157 @@ def test_worktree_seed_undelivered_reports_a_doubly_reachable_rel_once(tmp_path)
     assert undelivered == ["vendor/conf.toml"]
 
 
+# ------------------------------------------------- dropped seeds: the hook configs (#405)
+#
+# The destination probe answers for every seed rel EXCEPT the one the hook-registration
+# step writes itself. That step runs after both seed loops and creates
+# `profile.hooks.config_path` unconditionally, so for that rel a present destination is
+# the hook's own bytes and says nothing about the seed. Every hook config is also a
+# profile seed entry — and for gemini, copilot and antigravity it is the profile's SOLE
+# default seed, so the silence is the gate's entire answer for those CLIs.
+#
+# Measured end to end through the real `provision_worktree` before these were written:
+# with the repo's `.claude/settings.json` symlinked out, `skipped == []`, the worktree's
+# copy exists and carries hook keys but not the repo's, and the gate returned `[]`.
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("profile_name", ["claude", "gemini"])
+def test_worktree_seed_undelivered_names_a_symlinked_out_hook_config(tmp_path, profile_name):
+    """T8a — the headline false green. The repo carries its CLI settings as a symlink to
+    a dotfile checkout outside itself, so the seed loop's source-containment guard drops
+    it; the hook step then writes that same path with a hooks-only config, and the
+    destination probe reads that as delivered.
+
+    Parametrized because the fault is not claude-shaped: gemini's `config_path` IS its
+    only default seed entry, so for it the gate goes from "reports nothing about this
+    rel" to "reports nothing at all"."""
+    from bmad_loop.install import worktree_seed_undelivered
+
+    profile = get_profile(profile_name)
+    rel = profile.hooks.config_path
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    (repo / rel).parent.mkdir(parents=True)
+    shared = tmp_path / "dotfiles" / "settings.json"
+    shared.parent.mkdir()
+    shared.write_text('{"env": {"FROM_THE_REPO": "1"}}', encoding="utf-8")
+    (repo / rel).symlink_to(shared)
+    wt.mkdir()
+
+    skipped = provision_worktree(wt, [profile], repo, seed_files=[rel])
+
+    # the seed delivered nothing and said nothing; the hook step wrote the path anyway
+    assert skipped == []
+    assert (wt / rel).is_file()
+    assert "FROM_THE_REPO" not in (wt / rel).read_text(encoding="utf-8")
+    # ...which is exactly what blinds the destination probe when it is not told
+    assert worktree_seed_undelivered(wt, repo, seed_files=[rel]) == []
+    assert worktree_seed_undelivered(wt, repo, seed_files=[rel], config_paths=[rel]) == [rel]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_worktree_seed_undelivered_names_a_hook_config_written_through_a_link(tmp_path):
+    """T8c — the other leg, and the one the source arm cannot reach: the SOURCE is an
+    ordinary contained file and the worktree's slot is a dangling symlink (a tracked
+    link whose target is untracked, so `git worktree add` lays it down broken). The seed
+    loop now refuses to write through it; the hook step has no such guard and
+    materialises the target, so the probe stats a real file through the link."""
+    from bmad_loop.install import worktree_seed_undelivered
+
+    profile = get_profile("claude")
+    rel = profile.hooks.config_path
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    (repo / rel).parent.mkdir(parents=True)
+    (repo / rel).write_text('{"env": {"FROM_THE_REPO": "1"}}', encoding="utf-8")
+    (wt / ".claude").mkdir(parents=True)
+    stray = wt / "stray.json"  # inside the worktree, so containment cannot refuse it
+    (wt / rel).symlink_to(stray)
+    assert not stray.exists(), "the fixture must be DANGLING, not merely a symlink"
+
+    provision_worktree(wt, [profile], repo, seed_files=[rel])
+
+    assert stray.is_file(), "the hook step is expected to write through — that is the point"
+    assert "FROM_THE_REPO" not in stray.read_text(encoding="utf-8")
+    assert worktree_seed_undelivered(wt, repo, seed_files=[rel]) == []
+    assert worktree_seed_undelivered(wt, repo, seed_files=[rel], config_paths=[rel]) == [rel]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_a_hook_config_symlinked_out_of_the_worktree_is_named_once(tmp_path):
+    """T8b — the branch REPLACES the destination probe rather than adding to it. This
+    destination trips both halves at once (it is a symlink AND it resolves outside), so
+    a branch that fell through to the probe would earn the rel a second entry. One fact,
+    one journal line — the contract
+    `test_worktree_seed_undelivered_reports_a_doubly_reachable_rel_once` sets."""
+    from bmad_loop.install import worktree_seed_undelivered
+
+    profile = get_profile("claude")
+    rel = profile.hooks.config_path
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    (repo / rel).parent.mkdir(parents=True)
+    (repo / rel).write_text('{"env": {"FROM_THE_REPO": "1"}}', encoding="utf-8")
+    (wt / ".claude").mkdir(parents=True)
+    outside = tmp_path / "elsewhere.json"
+    (wt / rel).symlink_to(outside)
+
+    provision_worktree(wt, [profile], repo, seed_files=[rel])
+
+    assert outside.is_file()  # the hook step wrote clean out of the worktree
+    assert worktree_seed_undelivered(wt, repo, seed_files=[rel], config_paths=[rel]) == [rel]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_a_hook_config_under_a_symlinked_out_parent_is_still_named(tmp_path):
+    """T8f — the containment arm, and why the branch keeps one rather than asking
+    `is_symlink()` alone. Here `.claude/` is the link and it points out of the worktree,
+    so the LEAF is not a symlink and the source is perfectly contained: both of the
+    other arms answer "delivered". The ordinary probe already named this case, so
+    dropping containment when the branch took over would have been a regression, not a
+    gap — which is why this test is GREEN on the unfixed build."""
+    from bmad_loop.install import worktree_seed_undelivered
+
+    profile = get_profile("claude")
+    rel = profile.hooks.config_path
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    (repo / rel).parent.mkdir(parents=True)
+    (repo / rel).write_text('{"env": {"FROM_THE_REPO": "1"}}', encoding="utf-8")
+    outdir = tmp_path / "outdir"
+    outdir.mkdir()
+    wt.mkdir()
+    (wt / ".claude").symlink_to(outdir, target_is_directory=True)
+
+    provision_worktree(wt, [profile], repo, seed_files=[rel])
+
+    assert (outdir / "settings.json").is_file()
+    assert not (wt / rel).is_symlink()  # the leaf is a real file; only the parent links
+    assert worktree_seed_undelivered(wt, repo, seed_files=[rel], config_paths=[rel]) == [rel]
+
+
+def test_worktree_seed_undelivered_is_silent_on_hook_configs_that_are_fine(tmp_path):
+    """T8ctrl — the no-false-positive control for the branch, both ways a hook config can
+    be legitimately quiet: claude's is delivered by the seed and then merged into, and
+    gemini's was already in the checkout so the entry was a no-op that belongs to
+    `skipped` alone. Reporting either would put a line per story into the channel for
+    every project that seeds its CLI settings, which is how a report stops being read."""
+    from bmad_loop.install import worktree_seed_undelivered
+
+    claude, gemini = get_profile("claude"), get_profile("gemini")
+    rels = [claude.hooks.config_path, gemini.hooks.config_path]
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    for rel in rels:
+        (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+        (repo / rel).write_text('{"env": {"FROM_THE_REPO": "1"}}', encoding="utf-8")
+    (wt / rels[1]).parent.mkdir(parents=True)
+    (wt / rels[1]).write_text('{"env": {"FROM_THE_CHECKOUT": "1"}}', encoding="utf-8")
+
+    skipped = provision_worktree(wt, [claude, gemini], repo, seed_files=rels)
+
+    assert skipped == [rels[1]]
+    assert "FROM_THE_REPO" in (wt / rels[0]).read_text(encoding="utf-8")
+    assert "FROM_THE_CHECKOUT" in (wt / rels[1]).read_text(encoding="utf-8")
+    assert worktree_seed_undelivered(wt, repo, seed_files=rels, config_paths=rels) == []
+
+
 # ----------------------------------------------------------------- _bmad/ config surface
 
 
@@ -3193,6 +3477,38 @@ def test_provision_worktree_never_writes_through_a_dangling_bmad_symlink(tmp_pat
 
     assert not elsewhere.exists()  # the bytes never landed at the link's target
     assert skipped == ["_bmad/config.toml"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_provision_worktree_bmad_merge_refuses_a_symlinked_out_destination(tmp_path):
+    """The DESTINATION containment half of the `_bmad/` merge, alone — and until this
+    test it was carried by no row in the suite (#405).
+
+    Its two siblings each arm a different clause: the escape test above arms the
+    SOURCE guard, and the dangling-link test arms `_occupied`, because a dangling
+    symlink is occupied by definition. Neither can reach destination containment, so
+    deleting that clause left both of them green.
+
+    This link is at the `_bmad/` root and it is LIVE, which is the combination that
+    isolates the clause: every target beneath it is absent and unoccupied, and the
+    source is an ordinary in-repo file. The merge walks the repo's whole surface, so
+    without containment it writes the project's central config and its renderer scripts
+    into a directory outside the worktree — one nothing here created, nothing excludes,
+    and no teardown ever cleans.
+
+    The refusal is reported, not silent: the worktree's `_bmad/` is then short of both
+    renderer sentinels, and the completeness checks name them."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    _write_bmad_surface(repo)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    wt.mkdir()
+    (wt / "_bmad").symlink_to(outside, target_is_directory=True)
+
+    skipped = provision_worktree(wt, [], repo)
+
+    assert list(outside.iterdir()) == []  # the repo's `_bmad/` went nowhere
+    assert skipped == ["_bmad/scripts", "_bmad/config.toml"]
 
 
 def test_provision_worktree_never_seeds_render_output(tmp_path):

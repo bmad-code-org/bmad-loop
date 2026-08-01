@@ -173,6 +173,31 @@ editing.
   passed, so the escalations that leave a half-provisioned worktree mounted for inspection now say
   where it is.
 
+- **Seeding never writes _through_ a symlink, and a hook config is no longer its own alibi
+  (#405).** Both explicit seed loops resolved the destination and then used the resolved path for
+  the occupancy probe, the `mkdir` and the copy. `Path.resolve()` is non-strict, so a dangling
+  link answers for its target: `exists()` reported the slot free and the copy landed at the link's
+  target instead — an unrequested path inside the worktree that the exclude does not name and the
+  unit's `git add -A` would stage into the story branch. `git worktree add` produces exactly that
+  state for a tracked symlink whose target is untracked, so it arrives on a project's _first_
+  story. Both loops now compare the raw destination against the resolved one and refuse when they
+  differ, each with its own guard — they share no code — and strictly _after_ the
+  copy-when-absent skip arm, since a live symlinked destination differs too and hoisting the
+  refusal would turn that ordinary no-op into a silent drop. What is refused is named afterwards
+  by `worktree-seed-dropped`, as every other refusal in those loops already is. The drop report in
+  turn stops trusting the destination for the one rel that cannot answer for itself: the per-CLI
+  hook step writes `profile.hooks.config_path` after both seed loops, so a config the loops
+  dropped is answered for by the hook's own bytes — and for gemini, copilot and antigravity that
+  path is the profile's _only_ default seed, so the false green was the gate's entire answer.
+  Those rels are now asked whether the source escapes the repo, the destination is a symlink, or
+  the destination escapes the worktree, replacing the existence probe rather than adding to it so
+  a destination that trips two of them is still named once. A live symlinked destination for a
+  hook config is consequently named here as well as in `worktree-seed-skipped`; both facts are
+  true at once and this channel journals rather than pauses. Two destination-containment guards —
+  the `_bmad/` merge's and the skill merge's — also gain their first tests: their existing
+  siblings arm the source guard and the occupancy check instead, so a live symlinked _directory_
+  left them unwitnessed.
+
 - **`isolation = "worktree"` is refused when `repo_root` is overridden (#405).** A project whose
   `_bmad/bmm/config.yaml` sets `repo_root` decouples the git root from the project dir — the
   documented monorepo knob — but worktree provisioning reads `repo_root` for every surface it

@@ -1742,6 +1742,7 @@ def worktree_seed_undelivered(
     repo_root: Path,
     seed_files: Sequence[str] = (),
     seed_globs: Sequence[str] = (),
+    config_paths: Sequence[str] = (),
 ) -> list[str]:
     """The seed rels the repo carries that never reached the worktree (#415).
 
@@ -1787,6 +1788,34 @@ def worktree_seed_undelivered(
     :func:`_seed_bmad_tree` — so this gate never runs for that fault rather than
     reporting it. Loud, not silent, and unchanged here.
 
+    ⚠️ ``config_paths`` names the rels the per-CLI hook step writes ITSELF
+    (``profile.hooks.config_path`` for every non-hookless profile), and for those the
+    destination probe cannot be the question. That step runs after the seed loops and
+    creates the path unconditionally, so a config the loop dropped is answered for by
+    the hook's own bytes and reads as delivered. Every hook config is also a profile
+    seed entry, and for gemini, copilot and antigravity it is the profile's SOLE
+    default seed — so there the false green is the gate's ENTIRE answer. Asked instead
+    of the two things the hook step cannot fake:
+
+    - the SOURCE resolves out of ``repo_root`` — the seed loop's own refusal, and the
+      canonical trigger (a dotfile-managed ``.claude/settings.json``);
+    - the DESTINATION is a symlink, or resolves out of the worktree — the loop refused
+      to write *through* it (see ``provision_worktree``) and the hook step then wrote
+      through it anyway, materialising a dangling target or a file outside the tree.
+
+    The containment half is KEPT rather than replaced: it is not subsumed by
+    ``is_symlink()``. Measured — a worktree whose ``.claude/`` is a live symlink out of
+    the tree leaves a leaf that is not a link and a source that is perfectly contained,
+    and the ordinary probe below already names it. What the branch drops is the
+    EXISTENCE half, the only half the hook write invalidates. The branch REPLACES the
+    probe rather than adding to it, so a destination that escapes containment is not
+    counted twice.
+
+    ⚠️ A LIVE symlinked destination is therefore named here as well as in ``skipped``.
+    Both facts are true at once — the entry no-op'd, and the repo's bytes are not at
+    the named path — and this channel journals rather than pauses, so the cost of
+    saying both is one line.
+
     ⚠️ This is NOT the ``skipped``/:data:`RENDERER_SEED_SENTINELS` channel and cannot
     reach the renderer escalation, which reads that list by exact membership. Reported
     separately because the two facts have different remediations: a *skip* means the
@@ -1804,12 +1833,24 @@ def worktree_seed_undelivered(
         # never descends a symlinked sub-directory, which is the same match set the
         # seed loop saw.
         rels += [m.relative_to(repo_root).as_posix() for m in sorted(repo_root.glob(pattern))]
+    # `Path`, not the raw string: rels are echoed in the CALLER's spelling (a
+    # Windows-authored `.claude\settings.json` included) while a profile's
+    # `config_path` is always POSIX, and the two name the same file.
+    hook_configs = {Path(rel) for rel in config_paths}
     undelivered: list[str] = []
     for rel in dict.fromkeys(rels):
         src = repo_root / rel
         if not (_is_file(src) or _is_dir(src)):
             continue
         dst = worktree / rel
+        if Path(rel) in hook_configs:
+            if (
+                not src.resolve().is_relative_to(repo_root)
+                or not dst.resolve().is_relative_to(worktree)
+                or dst.is_symlink()
+            ):
+                undelivered.append(rel)
+            continue
         if dst.resolve().is_relative_to(worktree) and (_is_file(dst) or _is_dir(dst)):
             continue
         undelivered.append(rel)
@@ -1955,13 +1996,34 @@ def provision_worktree(
     skipped: list[str] = []
     for rel in seed_files:
         src = (repo_root / rel).resolve()
-        dst = (worktree / rel).resolve()
+        raw = worktree / rel
+        dst = raw.resolve()
         if not src.is_relative_to(repo_root) or not dst.is_relative_to(worktree):
             continue
         if not src.exists():
             continue
         if dst.exists():
             skipped.append(str(rel))
+            continue
+        # Never write THROUGH a link (#405). `dst` is resolved, and non-strict
+        # `resolve()` follows a dangling one, so the `exists()` above asked about the
+        # TARGET and answered "free" — the mkdir and the copy then land at a path
+        # nobody named, inside the worktree, which the exclude below does not cover
+        # and `git add -A` would stage into the story branch. One comparison covers
+        # both legs: a dangling leaf AND a dangling directory component, which
+        # `_occupied(raw)` would miss (the leaf there is neither link nor file).
+        # Sufficient, not necessary: an entry spelling an internal `..` (`a/../b`)
+        # also differs, since PurePath does not normalize `..` and `resolve()` does.
+        # That entry is refused here and NAMED afterwards by the gate, which is the
+        # right answer for a rel that is not a name for the path it appears to be.
+        #
+        # Strictly AFTER the skip arm, not before: `dst != raw` is true of every
+        # symlinked destination, live ones included, so hoisting it would turn the
+        # ordinary copy-when-absent no-op into a silent drop and empty `skipped`.
+        # Refused with a bare `continue` like the guards above, and named afterwards
+        # by `worktree_seed_undelivered` — the link stays dangling, so the gate's
+        # destination probe reports it.
+        if dst != raw:
             continue
         dst.parent.mkdir(parents=True, exist_ok=True)
         _copy_traversable(src, dst)
@@ -1975,10 +2037,15 @@ def provision_worktree(
         for match in sorted(repo_root.glob(pattern)):
             rel = match.relative_to(repo_root)
             src = match.resolve()
-            dst = (worktree / rel).resolve()
+            raw = worktree / rel
+            dst = raw.resolve()
             if not src.is_relative_to(repo_root) or not dst.is_relative_to(worktree):
                 continue
             if not src.exists() or dst.exists():
+                continue
+            # same write-through refusal as the loop above, and it needs its own: this
+            # loop builds its own `dst` from its own `rel` and shares no code with it
+            if dst != raw:
                 continue
             dst.parent.mkdir(parents=True, exist_ok=True)
             _copy_traversable(src, dst)
