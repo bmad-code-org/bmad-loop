@@ -1403,9 +1403,9 @@ def test_renderer_checks_reported_beside_a_truncated_primitive(tmp_path):
     target. The overlap is the fixture's, not a coupling in the code: the sources
     check knows nothing of the marker tuple, and suppressing one against the other
     would reintroduce exactly the named-list dependency the walk-parity reversal
-    removed. Two findings, and they say different things — "this install is
-    truncated" and "the prompt it would render references a file that is not
-    there"."""
+    removed. Two of the four ids below are that pair, and they say different
+    things — "this install is truncated" and "the prompt it would render
+    references a file that is not there"."""
     from conftest import install_build_auto_skill
 
     from bmad_loop.install import missing_base_skills
@@ -1448,7 +1448,7 @@ def test_renderer_stub_without_its_workflow_entry_fails_the_preflight(tmp_path):
     `render entry is missing` when it is absent — printed as `HALT:`, i.e. a
     result-less Stop on EVERY story, the same environment fault the script and config
     checks already refuse. The marker pair could not see this: two files answered for
-    the twelve a real `bmad-build-auto` carries, so a truncated repo-side install
+    the thirteen a real `bmad-build-auto` carries, so a truncated repo-side install
     passed `validate` and then HALTed every session."""
     from conftest import install_build_auto_skill
 
@@ -1493,6 +1493,15 @@ def test_a_snapshot_token_naming_an_absent_source_fails_the_preflight(tmp_path):
 
     problems = missing_base_skills(tmp_path, [tree])
     assert [f.check for f in problems] == ["skills.dev-renderer-sources"]
+    assert problems[0].detail["missing_sources"] == ["step-09-ship.md"]
+
+    # One entry, not three: the real install names `step-02-plan.md` four times from
+    # step-01 alone, so without the dedupe a single dropped file would repeat itself
+    # four times in the detail AND in the operator's message line
+    (skill / RENDERER_ENTRY_REL).write_text(
+        "[[bmad-snapshot:step-09-ship.md]] " * 3, encoding="utf-8"
+    )
+    problems = missing_base_skills(tmp_path, [tree])
     assert problems[0].detail["missing_sources"] == ["step-09-ship.md"]
 
     # …and it clears once the source the prompt names is actually there
@@ -1543,6 +1552,16 @@ def test_a_snapshot_token_naming_skill_md_is_reported(tmp_path):
     problems = missing_base_skills(tmp_path, [tree])
     assert [f.check for f in problems] == ["skills.dev-renderer-sources"]
     assert problems[0].detail["missing_sources"] == ["SKILL.md"]
+
+    # …"at any depth" is upstream's rule too — it keys the skip on the file's NAME,
+    # not its rel — so a nested one is no more targetable than the top-level one
+    (skill / "sub").mkdir()
+    (skill / "sub" / "SKILL.md").write_text("# nested\n", encoding="utf-8")
+    (skill / RENDERER_ENTRY_REL).write_text(
+        "Read fully and follow: [[bmad-snapshot:sub/SKILL.md]]\n", encoding="utf-8"
+    )
+    problems = missing_base_skills(tmp_path, [tree])
+    assert problems[0].detail["missing_sources"] == ["sub/SKILL.md"]
 
 
 def test_the_inline_era_is_never_asked_for_render_sources(tmp_path):
@@ -1619,7 +1638,9 @@ def test_a_nested_snapshot_target_is_keyed_by_its_posix_rel(tmp_path):
     )
     assert missing_base_skills(tmp_path, [tree]) == []
 
-    # …and the rel that gets REPORTED is the same POSIX one, on either platform
+    # The REPORTED rel is echoed from the token's own text, not derived from the
+    # source key, so it is POSIX on either platform under every ablation — this half
+    # pins the report's shape, not `as_posix()`. The assert above is the discriminator.
     (skill / "phases" / "plan.md").unlink()
     problems = missing_base_skills(tmp_path, [tree])
     assert [f.check for f in problems] == ["skills.dev-renderer-sources"]
@@ -1652,6 +1673,83 @@ def test_an_undecodable_source_does_not_crash_the_preflight(tmp_path):
     (skill / RENDERER_ENTRY_REL).write_text(
         "Read fully and follow: [[bmad-snapshot:binary.md]]\n", encoding="utf-8"
     )
+    assert missing_base_skills(tmp_path, [tree]) == []
+
+
+def test_a_source_that_is_not_a_readable_file_is_not_a_source(tmp_path):
+    """Upstream requires each candidate to BE a file (`render source is missing or not
+    a file`) and this mirrors that, which is what keeps three failure shapes out at
+    once. A `workflow.md` that is a directory — the portable case, so Windows CI
+    witnesses it — HALTs upstream and must not read as present here.
+
+    The same conjunct is what stops a FIFO in the tree from blocking `read_text`
+    forever. That one has no test: making a preflight hang is a poor thing to ask CI
+    to reproduce, and `os.mkfifo` does not exist on Windows. It is named in the
+    helper's docstring instead, because an unbounded hang is the one failure mode
+    that is neither a false green nor a false refusal."""
+    from conftest import install_build_auto_skill
+
+    from bmad_loop.install import RENDERER_ENTRY_REL, missing_base_skills
+
+    tree = get_profile("claude").skill_tree
+    _install_hunters(tmp_path, tree)
+    _install_renderer_surface(tmp_path)
+    skill = install_build_auto_skill(tmp_path, tree, renderer_stub=True)
+    (skill / RENDERER_ENTRY_REL).unlink()
+    (skill / RENDERER_ENTRY_REL).mkdir()
+
+    problems = missing_base_skills(tmp_path, [tree])
+    assert [f.check for f in problems] == ["skills.dev-renderer-sources"]
+    assert problems[0].detail["missing_sources"] == [RENDERER_ENTRY_REL]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+def test_an_unreadable_source_does_not_crash_the_preflight(tmp_path):
+    """The `OSError` half of the read guard, which the undecodable-bytes test cannot
+    reach — that one only ever raises `UnicodeDecodeError`. A chmod-000 `.md` passes
+    `is_file()` and then raises `PermissionError` from `read_text`; unguarded it
+    escapes into `missing_base_skills` and `validate` tracebacks instead of reporting,
+    which is strictly worse than the finding it replaced. POSIX-only, and it assumes
+    a non-root runner (root reads through mode 000)."""
+    from conftest import install_build_auto_skill
+
+    from bmad_loop.install import missing_base_skills
+
+    tree = get_profile("claude").skill_tree
+    _install_hunters(tmp_path, tree)
+    _install_renderer_surface(tmp_path)
+    skill = install_build_auto_skill(tmp_path, tree, renderer_stub=True)
+    locked = skill / "locked.md"
+    locked.write_text("# locked\n", encoding="utf-8")
+    locked.chmod(0o000)
+    try:
+        assert missing_base_skills(tmp_path, [tree]) == []
+    finally:
+        locked.chmod(0o644)
+
+
+def test_customization_prose_is_never_mined_for_snapshot_tokens(tmp_path):
+    """Upstream loads only `*.md` as sources and says so where it substitutes
+    ("Inserted paths and customization prose are never scanned as source tokens"), so
+    a token quoted inside `customize.toml`'s `instruction` blocks is left as literal
+    text and renders fine. Widening the source glob past `*.md` would mine that prose
+    and refuse every run of a healthy project — the same false positive a looser token
+    regex would cause, on a gate with no `--force`."""
+    from conftest import install_build_auto_skill
+
+    from bmad_loop.install import missing_base_skills
+
+    tree = get_profile("claude").skill_tree
+    _install_hunters(tmp_path, tree)
+    _install_renderer_surface(tmp_path)
+    skill = install_build_auto_skill(tmp_path, tree, renderer_stub=True)
+    (skill / "customize.toml").write_text(
+        '[[review_layers]]\nid = "adversarial"\ninstruction = """\n'
+        "Do not read [[bmad-snapshot:step-99-not-a-source.md]] directly.\n"
+        '"""\n',
+        encoding="utf-8",
+    )
+
     assert missing_base_skills(tmp_path, [tree]) == []
 
 

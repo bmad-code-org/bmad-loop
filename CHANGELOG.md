@@ -83,7 +83,8 @@ editing.
   scope; `skills.dev-renderer-config`, when a stub resolved but `_bmad/config.toml` — the
   renderer's one required config layer — is absent; and `skills.dev-renderer-sources`, when the
   skill's own render sources are short: no `workflow.md` for the renderer to compose from, or a
-  `[[bmad-snapshot:…]]` token naming a file the skill does not carry. Every route ends in a
+  `[[bmad-snapshot:…]]` token naming something the renderer will not load as a source. Every
+  route ends in a
   session that Stops having written no spec, and every one of them is a fact about the install
   rather than the story, so every story after it does the same. A missing config exits `HALT:`;
   a missing entry document or snapshot target does too. A missing script or sibling loses even

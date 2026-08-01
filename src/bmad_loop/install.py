@@ -329,10 +329,11 @@ def _renderer_unit_required(project: Path, rel: str) -> bool:
 def _absent_renderer_sources(skill_dir: Path) -> list[str]:
     """Render sources ``skill_dir`` needs and does not carry, as POSIX rels.
 
-    Two questions, and only two, because both are a deterministic ``HALT:`` from
-    ``render_skill.py`` and therefore a result-less Stop on EVERY story — the same
-    environment fault ``skills.dev-renderer`` and ``skills.dev-renderer-config``
-    already block on, one layer further in:
+    Two questions. They are not the whole set of ways ``render_skill.py`` can
+    ``HALT:`` — a ``{{config.…}}`` naming a missing key is another (#407) — but both
+    of these are answerable from the install alone, and each is a result-less Stop on
+    EVERY story: the same environment fault ``skills.dev-renderer`` and
+    ``skills.dev-renderer-config`` already block on, one layer further in:
 
     - :data:`RENDERER_ENTRY_REL` is a source (``render entry is missing``);
     - every ``[[bmad-snapshot:…]]`` target in any source is itself a source
@@ -359,26 +360,40 @@ def _absent_renderer_sources(skill_dir: Path) -> list[str]:
     ``SKILL.md`` is excluded at any depth, as upstream excludes it — a token naming it
     HALTs there and must be reported here.
 
-    Deliberately NOT a fixed renderer-era file list. This gate has no severity filter
-    and no ``--force``, so a false positive refuses every run with a remediation that
-    cannot fix it; asking only what the install itself DECLARES cannot refuse an
-    upstream that renames or reorganizes its step files. Every source is scanned, not
-    just the entry, because upstream substitutes tokens across all of them.
+    Deliberately not a fixed renderer-era file list — with ONE exception, named
+    because it is one. The gate has no severity filter and no ``--force``, so a false
+    positive refuses every run with a remediation that cannot fix it; asking only what
+    the install DECLARES cannot refuse an upstream that renames or reorganizes its
+    step files. :data:`RENDERER_ENTRY_REL` is the exception: upstream hardcodes that
+    name too (``if "workflow.md" not in sources``), so mirroring it is exactly as
+    stale-proof as upstream is — and no more.
 
-    Bounded blind spots, both in the safe direction (a false green, never a false
-    refusal): an unreadable or undecodable source is skipped rather than reported —
-    it is a HALT upstream, but a different one, with a different remediation, and
-    fail-open on a read fault is the same doctrine :func:`_is_renderer_stub` and
-    :func:`_renderer_unit_required` follow. The ``*.md`` filter likewise mirrors
-    upstream without being independently observable: the token pattern requires a
-    ``.md`` suffix, so nothing else could be a target.
+    Every source is scanned, not just the entry, because upstream substitutes tokens
+    across all of them. ``customize.toml`` is not, because upstream never loads it as
+    a source and its ``instruction`` prose would otherwise be mined for tokens the
+    renderer leaves as literal text — that is what the ``*.md`` filter is for. (Its
+    other half, that a non-``.md`` file could never be a token TARGET, is a tautology
+    of the token pattern rather than a guard.)
+
+    Fidelity is bounded, and this is the whole boundary. Upstream additionally
+    ``resolve(strict=True)``s each candidate and refuses one escaping the skill dir;
+    this does not, so a source symlinked out of the skill directory reads as present
+    here and ``HALT:``s there. That is a false GREEN — the safe direction for a gate
+    with no ``--force`` — and it is the only one left. The ``is_file()`` conjunct is
+    what keeps the rest out: without it a ``workflow.md`` that is a directory or a
+    dangling symlink reads as a source (both a ``HALT:`` upstream), and a FIFO
+    anywhere in the tree would block ``read_text`` forever — an unbounded hang in a
+    preflight, which is neither a green nor a refusal. An unreadable source is
+    likewise skipped rather than reported: also a HALT upstream, but a different one
+    with a different remediation, and fail-open on a read fault is the doctrine
+    :func:`_is_renderer_stub` and :func:`_renderer_unit_required` already follow.
     """
     if not _is_renderer_stub(skill_dir):
         return []
     sources = {
         path.relative_to(skill_dir).as_posix(): path
         for path in skill_dir.rglob("*.md")
-        if path.name != "SKILL.md"
+        if path.name != "SKILL.md" and path.is_file()
     }
     absent = [] if RENDERER_ENTRY_REL in sources else [RENDERER_ENTRY_REL]
     for path in sources.values():
@@ -534,8 +549,9 @@ def missing_base_skills(project: Path, trees: Sequence[str]) -> list[Finding]:
       era-agnostic: a pre-#2601 inline SKILL.md never reads the file, so its absence
       is not a finding to make about that project.
     - ``skills.dev-renderer-sources`` — a stub resolved and the SKILL's own render
-      sources are short: no ``workflow.md`` entry, or a
-      ``[[bmad-snapshot:…]]`` token naming a file the skill does not carry
+      sources are short: no ``workflow.md`` entry, or a ``[[bmad-snapshot:…]]`` token
+      naming something the renderer will not load as a source — usually an absent
+      file, but ``SKILL.md`` and a directory named ``*.md`` count too
       (:func:`_absent_renderer_sources`). Per tree, and era-gated inside the helper.
       Without it the marker pair answered for thirteen files: a truncated repo-side
       install passed ``validate`` and then HALTed every session. ``missing_sources``
@@ -617,9 +633,11 @@ def missing_base_skills(project: Path, trees: Sequence[str]) -> list[Finding]:
                             {"tree": tree, "skill": resolved, "missing_scripts": absent_scripts},
                         )
                     )
-            # Unconditional: the renderer-era question lives inside the helper, so a
-            # future edit to the era test is one line in one place rather than a
-            # condition here that can drift out of step with the one above.
+            # Unconditional: the era question lives inside the helper, so this leg
+            # cannot be short-circuited by the one above it and a future edit to the
+            # era test has one place to go rather than a condition here to keep in
+            # step. (The `if _is_renderer_stub` above is that test's other reader —
+            # they are two call sites of one predicate, not two predicates.)
             absent_sources = _absent_renderer_sources(skill_dir)
             if absent_sources:
                 problems.append(
@@ -627,7 +645,7 @@ def missing_base_skills(project: Path, trees: Sequence[str]) -> list[Finding]:
                         "skills.dev-renderer-sources",
                         "problem",
                         f"{tree}/{resolved} renders via {RENDERER_SCRIPT_MARKER} but its "
-                        f"render sources are incomplete (missing "
+                        f"render sources are incomplete (unresolved: "
                         f"{', '.join(absent_sources)}) — the session would HALT without "
                         f"writing a spec; reinstall the BMad Method (bmm) module",
                         {"tree": tree, "skill": resolved, "missing_sources": absent_sources},
