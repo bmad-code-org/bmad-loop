@@ -62,6 +62,7 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         "skills.base-shim",
         "skills.dev-renderer",
         "skills.dev-renderer-config",
+        "skills.dev-renderer-sources",
         "skills.customize-legacy",
         "skills.stories-dispatch",
         "skills.stories-dispatch-missing",

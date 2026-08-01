@@ -66,29 +66,35 @@ editing.
   spells is not a stall to pause over. The copy itself now merges per _file_, so a worktree that
   already holds part of a skill directory is completed rather than skipped whole, and the
   completeness check walks the repo's skill directory exactly the way the copy walks it,
-  reporting every file the seed could not deliver and naming it instead of the directory. A
-  fixed list of required files would have covered three of the twelve a real `bmad-build-auto`
+  reporting every file the seed could not deliver, naming the file rather than the directory
+  whenever the directory itself arrived (a wholly-absent skill still reports the coarse rel). A
+  fixed list of required files would have covered three of the thirteen a real `bmad-build-auto`
   install carries — and would go stale the next time upstream renames a step file. Containment
   is checked per file too, so one skill file, or one whole sub-directory, symlinked to a shared
   install outside the repo is refused rather than read through, and reported rather than
   silently missing. A skill tree that is committed (symlink and all)
-  is checked out into the worktree normally and is unaffected. Pre-existing since 0.6.5; found
-  while reviewing this release.
+  is checked out into the worktree normally and is unaffected. Pre-existing since 0.7.0, which
+  is where the containment-guarded seed loop first shipped; found while reviewing this release.
 
-- **A renderer stub that cannot compose a prompt fails the preflight (#405).** Two new checks
+- **A renderer stub that cannot compose a prompt fails the preflight (#405).** Three new checks
   block `validate`/`run`/`sweep`/`resume`: `skills.dev-renderer`, when the resolved `SKILL.md`
   is the new renderer stub (BMAD-METHOD#2601) but its script unit is not whole —
   `_bmad/scripts/render_skill.py` or the `_bmad/scripts/config_utils.py` it imports at module
-  scope — and `skills.dev-renderer-config`, when a stub resolved but `_bmad/config.toml` — the
-  renderer's one required config layer — is absent. Every route ends in a session that Stops
-  having written no spec; all three files are project-global, so every story after it does the
-  same. A missing script or config exits `HALT:`; a missing sibling raises `ModuleNotFoundError`
-  above the renderer's own guard and loses even that line. The sibling is required only when the
-  installed `render_skill.py` actually imports it, so a later renderer that inlines or renames
-  the helper is not refused. They block rather than warn because only a green is untrustworthy
-  (uv on PATH is never probed) — a red is conclusive. The config check is emitted once per
-  project and only when a stub actually resolved, so a pre-renderer install stays silent, and
-  `--dry-run` names both under its "NOT runnable as-is" banner. A third check,
+  scope; `skills.dev-renderer-config`, when a stub resolved but `_bmad/config.toml` — the
+  renderer's one required config layer — is absent; and `skills.dev-renderer-sources`, when the
+  skill's own render sources are short: no `workflow.md` for the renderer to compose from, or a
+  `[[bmad-snapshot:…]]` token naming a file the skill does not carry. Every route ends in a
+  session that Stops having written no spec, and every one of them is a fact about the install
+  rather than the story, so every story after it does the same. A missing config exits `HALT:`;
+  a missing entry document or snapshot target does too. A missing script or sibling loses even
+  that line — `uv` fails before the renderer runs, or `ModuleNotFoundError` fires above its own
+  guard — leaving only the stub's own instruction to report the output and halt. The sibling is
+  required only when the installed `render_skill.py` actually imports it, and the source check
+  asks only what the install itself declares, so a later renderer that inlines the helper or
+  reorganizes its step files is not refused. They block rather than warn because only a green is
+  untrustworthy (uv on PATH is never probed) — a red is conclusive. The config check is emitted
+  once per project and only when a stub actually resolved, so a pre-renderer install stays
+  silent, and `--dry-run` names all three under its "NOT runnable as-is" banner. A fourth check,
   `skills.customize-legacy`, is a warning: it fires when a tree resolved to `bmad-build-auto`
   while an override still sits at `_bmad/custom/bmad-dev-auto[.user].toml`, where it no longer
   applies — the session still runs, just unstyled.

@@ -1680,6 +1680,28 @@ def test_run_aborts_when_the_renderer_central_config_is_missing(project, monkeyp
     assert "_bmad/config.toml" in err and "HALT" in err
 
 
+def test_run_aborts_when_the_renderer_entry_document_is_missing(project, monkeypatch, capsys):
+    """One layer further in again: the project-global script unit and config are all
+    present, and the skill's OWN `workflow.md` — the document `render_skill.py`
+    composes from — is not. `render entry is missing` exits `HALT:` on every story,
+    so the run is refused for the same reason as the three above.
+
+    The re-commit matters: `run`'s preflight is behind a clean-worktree gate, so
+    deleting a tracked file without staging it would abort for the wrong reason and
+    the test would pass with the gate reverted."""
+    from bmad_loop.install import RENDERER_ENTRY_REL
+
+    _install_renderer_stub_project(project, monkeypatch, script=True, utils=True, config=True)
+    for tree in (".claude/skills", ".agents/skills"):
+        (project.project / tree / "bmad-build-auto" / RENDERER_ENTRY_REL).unlink()
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "truncated renderer install")
+
+    assert cli.main(["run", "--project", str(project.project)]) == 1
+    err = capsys.readouterr().err
+    assert RENDERER_ENTRY_REL in err and "HALT" in err
+
+
 def test_run_proceeds_once_the_renderer_files_are_present(project, monkeypatch, capsys):
     """The clearing leg. Without it, ablating any of the three `is_file()` predicates
     away leaves all three aborts above passing — the run would refuse a healthy stub

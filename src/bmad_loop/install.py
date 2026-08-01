@@ -17,6 +17,7 @@ orchestrator's signal watcher is CLI-agnostic.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from collections.abc import Iterable, Iterator, Sequence
@@ -88,7 +89,7 @@ LEGACY_MODULE_SKILLS = (
 # a pre-July bmm install predating it would let every dev run's step-04 fail.
 #
 # REPO-side surface only: the shim detector, and what missing_base_skills demands of an
-# install. The worktree seed gate stopped sharing it — two markers are 3 of the 12 files
+# install. The worktree seed gate stopped sharing it — two markers are 3 of the 13 files
 # a real bmad-build-auto carries, so it asks walk parity with the repo instead
 # (_absent_skill_files). A named tuple can be a floor for "is this install real"; it
 # cannot be the answer to "did the copy deliver everything".
@@ -172,6 +173,23 @@ BMAD_SCRIPTS_SEED_REL = f"{BMAD_DIR}/scripts"
 # in provision_worktree: these strings are reserved for the completeness checks, so a
 # user `worktree_seed` entry that happens to spell one cannot pause a healthy run.
 RENDERER_SEED_SENTINELS: tuple[str, ...] = (BMAD_SCRIPTS_SEED_REL, CENTRAL_CONFIG_REL)
+
+# The SKILL-relative half of the renderer's surface — everything above is
+# project-global. Since BMAD-METHOD #2601 `render_skill.py` composes the real prompt
+# from `<skill>/workflow.md` and refuses to start without it (`render entry is
+# missing`), then rewrites every `[[bmad-snapshot:<rel>]]` token into a path under the
+# generation dir, raising `snapshot reference targets undeclared source` when the
+# target is not one of that skill's OWN sources. Both exit `HALT:` — the same
+# result-less Stop on every story that RENDERER_SCRIPT_REL and CENTRAL_CONFIG_REL
+# guard, one layer further in. See _absent_renderer_sources.
+RENDERER_ENTRY_REL = "workflow.md"
+# A byte-for-byte mirror of the renderer's own `_SNAPSHOT_TOKEN`. Mirroring is the
+# contract, not a convenience: a LOOSER pattern reports a token the renderer ignores
+# outright — a false positive this gate cannot be talked out of, having no severity
+# filter and no `--force` — and a STRICTER one misses a real HALT. Note the `.md`
+# suffix is part of the pattern upstream, so a token naming anything else is not a
+# snapshot reference at all and is left in the prompt as literal text.
+SNAPSHOT_TOKEN_RE = re.compile(r"\[\[bmad-snapshot:([A-Za-z0-9_./-]+\.md)\]\]")
 
 # Top-level _bmad/ entries never seeded into a worktree. render/ is the renderer's
 # published output: it is regenerated on skill entry, and every snapshot dir name is
@@ -306,6 +324,70 @@ def _renderer_unit_required(project: Path, rel: str) -> bool:
     except (OSError, UnicodeDecodeError):
         return False
     return RENDERER_CONFIG_UTILS_MARKER in script
+
+
+def _absent_renderer_sources(skill_dir: Path) -> list[str]:
+    """Render sources ``skill_dir`` needs and does not carry, as POSIX rels.
+
+    Two questions, and only two, because both are a deterministic ``HALT:`` from
+    ``render_skill.py`` and therefore a result-less Stop on EVERY story — the same
+    environment fault ``skills.dev-renderer`` and ``skills.dev-renderer-config``
+    already block on, one layer further in:
+
+    - :data:`RENDERER_ENTRY_REL` is a source (``render entry is missing``);
+    - every ``[[bmad-snapshot:…]]`` target in any source is itself a source
+      (``snapshot reference targets undeclared source``).
+
+    The era conjunct is the first line of THIS function rather than a condition at
+    the call site: a pre-#2601 inline ``SKILL.md`` legitimately has no ``workflow.md``
+    and no step files, so asking it these questions refuses a healthy install. Kept
+    inside so it is one deletable line no neighbouring leg can short-circuit.
+
+    **The source set mirrors the RENDERER's enumeration, deliberately not the
+    copier's** :func:`_walk_traversable_files`. The two disagree exactly where it
+    matters: ``rglob`` does not descend a symlinked sub-directory and ``iterdir()``
+    recursion does, so a ``review-prompts/`` pointed out of the repo holds files the
+    copier would carry but the renderer will never see. This gate asks what
+    ``render_skill.py`` will SEE, so borrowing the copier's walk here would invent
+    sources the renderer does not have and turn a guaranteed HALT into a green.
+    (:func:`_absent_skill_files` asks the other question — did the seed deliver what
+    the repo has — and shares the copier's walk for the same reason.)
+
+    Keyed by POSIX rel because upstream keys by ``relative_to(skill_dir).as_posix()``:
+    a nested source is referenced as ``phases/plan.md``, never by its bare name, and a
+    native-separator key would report every nested target as undeclared on Windows.
+    ``SKILL.md`` is excluded at any depth, as upstream excludes it — a token naming it
+    HALTs there and must be reported here.
+
+    Deliberately NOT a fixed renderer-era file list. This gate has no severity filter
+    and no ``--force``, so a false positive refuses every run with a remediation that
+    cannot fix it; asking only what the install itself DECLARES cannot refuse an
+    upstream that renames or reorganizes its step files. Every source is scanned, not
+    just the entry, because upstream substitutes tokens across all of them.
+
+    Bounded blind spots, both in the safe direction (a false green, never a false
+    refusal): an unreadable or undecodable source is skipped rather than reported —
+    it is a HALT upstream, but a different one, with a different remediation, and
+    fail-open on a read fault is the same doctrine :func:`_is_renderer_stub` and
+    :func:`_renderer_unit_required` follow. The ``*.md`` filter likewise mirrors
+    upstream without being independently observable: the token pattern requires a
+    ``.md`` suffix, so nothing else could be a target.
+    """
+    if not _is_renderer_stub(skill_dir):
+        return []
+    sources = {
+        path.relative_to(skill_dir).as_posix(): path
+        for path in skill_dir.rglob("*.md")
+        if path.name != "SKILL.md"
+    }
+    absent = [] if RENDERER_ENTRY_REL in sources else [RENDERER_ENTRY_REL]
+    for path in sources.values():
+        try:
+            body = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        absent.extend(t for t in SNAPSHOT_TOKEN_RE.findall(body) if t not in sources)
+    return sorted(set(absent))
 
 
 def renderer_stub_resolved(project: Path, trees: Sequence[str]) -> bool:
@@ -451,10 +533,18 @@ def missing_base_skills(project: Path, trees: Sequence[str]) -> list[Finding]:
       project-global), and gated on a stub having resolved so the check stays
       era-agnostic: a pre-#2601 inline SKILL.md never reads the file, so its absence
       is not a finding to make about that project.
+    - ``skills.dev-renderer-sources`` — a stub resolved and the SKILL's own render
+      sources are short: no ``workflow.md`` entry, or a
+      ``[[bmad-snapshot:…]]`` token naming a file the skill does not carry
+      (:func:`_absent_renderer_sources`). Per tree, and era-gated inside the helper.
+      Without it the marker pair answered for thirteen files: a truncated repo-side
+      install passed ``validate`` and then HALTed every session. ``missing_sources``
+      carries the rels, SKILL-relative like ``missing_markers`` — not
+      ``missing_scripts``, which is project-relative because its files are.
 
-    Both are emitted independently of the marker check above them — different files,
-    different remediations, and a wholly-absent ``_bmad/`` legitimately earns both
-    lines beside a truncated skill.
+    All three are emitted independently of the marker check above them — different
+    files, different remediations, and a wholly-absent ``_bmad/`` legitimately earns
+    both project-global lines beside a truncated skill.
     """
     problems: list[Finding] = []
     # Same predicate as :func:`renderer_stub_resolved`, kept inline here rather than
@@ -527,6 +617,22 @@ def missing_base_skills(project: Path, trees: Sequence[str]) -> list[Finding]:
                             {"tree": tree, "skill": resolved, "missing_scripts": absent_scripts},
                         )
                     )
+            # Unconditional: the renderer-era question lives inside the helper, so a
+            # future edit to the era test is one line in one place rather than a
+            # condition here that can drift out of step with the one above.
+            absent_sources = _absent_renderer_sources(skill_dir)
+            if absent_sources:
+                problems.append(
+                    Finding(
+                        "skills.dev-renderer-sources",
+                        "problem",
+                        f"{tree}/{resolved} renders via {RENDERER_SCRIPT_MARKER} but its "
+                        f"render sources are incomplete (missing "
+                        f"{', '.join(absent_sources)}) — the session would HALT without "
+                        f"writing a spec; reinstall the BMad Method (bmm) module",
+                        {"tree": tree, "skill": resolved, "missing_sources": absent_sources},
+                    )
+                )
         for skill, markers in REVIEW_HUNTER_SKILLS.items():
             skill_dir = project / tree / skill
             if not (skill_dir / "SKILL.md").is_file():
@@ -1046,7 +1152,7 @@ def _absent_skill_files(repo_skill: Path, worktree_skill: Path) -> list[str]:
     one of those has an operator remedy.
 
     The old named surface (``SKILL.md`` plus the :data:`BASE_SKILLS` markers) was 3 of
-    the 12 files a real ``bmad-build-auto`` install carries, and the other nine are not
+    the 13 files a real ``bmad-build-auto`` install carries, and the other ten are not
     inert: since BMAD-METHOD #2601 ``workflow.md`` is the renderer's entry point and
     names its step files as ``[[bmad-snapshot:…]]`` sources, so a dropped one makes
     ``render_skill.py`` print ``HALT:`` and the session Stop having written nothing —

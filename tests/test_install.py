@@ -992,6 +992,21 @@ def _install_hunters(root, tree=".claude/skills"):
         (d / "SKILL.md").write_text(f"# {skill}\n", encoding="utf-8")
 
 
+def _install_renderer_surface(root):
+    """The PROJECT-global half of a renderer-era install: the script and the central
+    config layer. Lets a test about a skill's own render SOURCES speak only about
+    those — without it every such test also carries `skills.dev-renderer` and
+    `skills.dev-renderer-config`, and an assert on the check list stops discriminating.
+    The script body deliberately does not import `config_utils`, so the sibling is not
+    required (see `_renderer_unit_required`) and one file is enough."""
+    from bmad_loop.install import CENTRAL_CONFIG_REL, RENDERER_SCRIPT_REL
+
+    script = root / RENDERER_SCRIPT_REL
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text("# renderer\n", encoding="utf-8")
+    (root / CENTRAL_CONFIG_REL).write_text('[core]\nname = "x"\n', encoding="utf-8")
+
+
 def _install_legacy_primitive(root, tree=".claude/skills"):
     """A complete PRE-rename dev primitive: SKILL.md plus every marker."""
     from bmad_loop.install import DEV_PRIMITIVE_LEGACY, DEV_PRIMITIVE_MARKERS
@@ -1379,8 +1394,18 @@ def test_renderer_config_problem_emitted_once_across_two_trees(tmp_path):
 
 def test_renderer_checks_reported_beside_a_truncated_primitive(tmp_path):
     """The renderer probes are independent of the marker check: a stub that is BOTH
-    truncated and missing its script earns both lines. Different files, different
-    remediations (ablation: put the renderer probe in an elif)."""
+    truncated and missing its script earns every line. Different files, different
+    remediations (ablation: put the renderer probe in an elif).
+
+    `skills.dev-renderer-sources` joins them because the deleted file is *also* the
+    one `RENDERER_WORKFLOW_MD` names — the conftest fixture points its token at a
+    DEV_PRIMITIVE_MARKER on purpose, so a healthy stub install always carries its own
+    target. The overlap is the fixture's, not a coupling in the code: the sources
+    check knows nothing of the marker tuple, and suppressing one against the other
+    would reintroduce exactly the named-list dependency the walk-parity reversal
+    removed. Two findings, and they say different things — "this install is
+    truncated" and "the prompt it would render references a file that is not
+    there"."""
     from conftest import install_build_auto_skill
 
     from bmad_loop.install import missing_base_skills
@@ -1393,6 +1418,7 @@ def test_renderer_checks_reported_beside_a_truncated_primitive(tmp_path):
     assert [f.check for f in missing_base_skills(tmp_path, [tree])] == [
         "skills.base-incomplete",
         "skills.dev-renderer",
+        "skills.dev-renderer-sources",
         "skills.dev-renderer-config",
     ]
 
@@ -1412,6 +1438,221 @@ def test_renderer_checks_are_silent_when_nothing_resolves(tmp_path):
     (shim / "SKILL.md").write_text(RENDERER_STUB_SKILL_MD, encoding="utf-8")
 
     assert [f.check for f in missing_base_skills(tmp_path, [tree])] == ["skills.base-shim"]
+
+
+# --- the renderer's own source set (BMAD-METHOD #2601) -----------------------
+
+
+def test_renderer_stub_without_its_workflow_entry_fails_the_preflight(tmp_path):
+    """`render_skill.py` composes the prompt from `<skill>/workflow.md` and raises
+    `render entry is missing` when it is absent — printed as `HALT:`, i.e. a
+    result-less Stop on EVERY story, the same environment fault the script and config
+    checks already refuse. The marker pair could not see this: two files answered for
+    the twelve a real `bmad-build-auto` carries, so a truncated repo-side install
+    passed `validate` and then HALTed every session."""
+    from conftest import install_build_auto_skill
+
+    from bmad_loop.checks import VALIDATE_CHECKS
+    from bmad_loop.install import RENDERER_ENTRY_REL, missing_base_skills
+
+    tree = get_profile("claude").skill_tree
+    _install_hunters(tmp_path, tree)
+    _install_renderer_surface(tmp_path)
+    skill = install_build_auto_skill(tmp_path, tree, renderer_stub=True)
+    assert missing_base_skills(tmp_path, [tree]) == []  # the fixture is a WHOLE install
+
+    (skill / RENDERER_ENTRY_REL).unlink()
+    problems = missing_base_skills(tmp_path, [tree])
+    assert [f.check for f in problems] == ["skills.dev-renderer-sources"]
+    assert problems[0].severity == "problem"
+    assert problems[0].check in VALIDATE_CHECKS
+    assert RENDERER_ENTRY_REL in problems[0].message and "HALT" in problems[0].message
+    assert problems[0].detail == {
+        "tree": tree,
+        "skill": DEV_PRIMITIVE_NEW,
+        "missing_sources": [RENDERER_ENTRY_REL],
+    }
+
+
+def test_a_snapshot_token_naming_an_absent_source_fails_the_preflight(tmp_path):
+    """The other half of the same HALT: a `[[bmad-snapshot:…]]` target that is not one
+    of the skill's own sources raises `snapshot reference targets undeclared source`.
+    The entry leg cannot stand in for it — `workflow.md` is present here — which is
+    why the two are separate lines in the helper."""
+    from conftest import install_build_auto_skill
+
+    from bmad_loop.install import RENDERER_ENTRY_REL, missing_base_skills
+
+    tree = get_profile("claude").skill_tree
+    _install_hunters(tmp_path, tree)
+    _install_renderer_surface(tmp_path)
+    skill = install_build_auto_skill(tmp_path, tree, renderer_stub=True)
+    (skill / RENDERER_ENTRY_REL).write_text(
+        "Read fully and follow: [[bmad-snapshot:step-09-ship.md]]\n", encoding="utf-8"
+    )
+
+    problems = missing_base_skills(tmp_path, [tree])
+    assert [f.check for f in problems] == ["skills.dev-renderer-sources"]
+    assert problems[0].detail["missing_sources"] == ["step-09-ship.md"]
+
+    # …and it clears once the source the prompt names is actually there
+    (skill / "step-09-ship.md").write_text("# ship\n", encoding="utf-8")
+    assert missing_base_skills(tmp_path, [tree]) == []
+
+
+def test_a_token_in_a_non_entry_source_is_scanned_too(tmp_path):
+    """Upstream substitutes tokens across every source it loaded, not just the entry,
+    so one undeclared reference anywhere in the tree fails the whole render. A gate
+    that read only `workflow.md` would call this install healthy and hand every story
+    to the same HALT."""
+    from conftest import install_build_auto_skill
+
+    from bmad_loop.install import missing_base_skills
+
+    tree = get_profile("claude").skill_tree
+    _install_hunters(tmp_path, tree)
+    _install_renderer_surface(tmp_path)
+    skill = install_build_auto_skill(tmp_path, tree, renderer_stub=True)
+    # the ENTRY stays healthy — its own token names a file the fixture carries
+    (skill / "step-02-plan.md").write_text(
+        "then read [[bmad-snapshot:step-99-nope.md]]\n", encoding="utf-8"
+    )
+
+    problems = missing_base_skills(tmp_path, [tree])
+    assert [f.check for f in problems] == ["skills.dev-renderer-sources"]
+    assert problems[0].detail["missing_sources"] == ["step-99-nope.md"]
+
+
+def test_a_snapshot_token_naming_skill_md_is_reported(tmp_path):
+    """`SKILL.md` is the one file that is present on disk and still not a source:
+    upstream skips it by NAME, at any depth, when it collects the set a token may
+    target. So a prompt pointing at it HALTs exactly like a pointer at a file that
+    does not exist, and the gate has to answer the same way."""
+    from conftest import install_build_auto_skill
+
+    from bmad_loop.install import RENDERER_ENTRY_REL, missing_base_skills
+
+    tree = get_profile("claude").skill_tree
+    _install_hunters(tmp_path, tree)
+    _install_renderer_surface(tmp_path)
+    skill = install_build_auto_skill(tmp_path, tree, renderer_stub=True)
+    (skill / RENDERER_ENTRY_REL).write_text(
+        "Read fully and follow: [[bmad-snapshot:SKILL.md]]\n", encoding="utf-8"
+    )
+
+    problems = missing_base_skills(tmp_path, [tree])
+    assert [f.check for f in problems] == ["skills.dev-renderer-sources"]
+    assert problems[0].detail["missing_sources"] == ["SKILL.md"]
+
+
+def test_the_inline_era_is_never_asked_for_render_sources(tmp_path):
+    """A pre-BMAD-METHOD#2601 `SKILL.md` carries its prompt inline: it has no
+    `workflow.md`, declares nothing, and renders nothing. Asking it the renderer's
+    questions would refuse every legitimate pre-renderer install on a check with no
+    severity filter and no `--force`.
+
+    The second half is what makes this a discriminator rather than an empty
+    observation: the very same directory, with ONLY `SKILL.md` swapped for the stub,
+    is reported. The silence upstream is the era, not an absence of anything to say."""
+    from conftest import RENDERER_STUB_SKILL_MD, install_build_auto_skill
+
+    from bmad_loop.install import missing_base_skills
+
+    tree = get_profile("claude").skill_tree
+    _install_hunters(tmp_path, tree)
+    _install_renderer_surface(tmp_path)
+    skill = install_build_auto_skill(tmp_path, tree)  # inline era: no workflow.md
+    assert missing_base_skills(tmp_path, [tree]) == []
+
+    (skill / "SKILL.md").write_text(RENDERER_STUB_SKILL_MD, encoding="utf-8")
+    assert [f.check for f in missing_base_skills(tmp_path, [tree])] == [
+        "skills.dev-renderer-sources"
+    ]
+
+
+def test_a_reorganized_renderer_install_is_not_refused(tmp_path):
+    """The gate asks what the install DECLARES — never a fixed renderer-era file
+    list. Nothing here is named `step-*` and no marker is in sight, yet the render
+    graph is closed, so there is nothing to report. A hardcoded list would refuse
+    this project on every run with a remediation that could not fix it, which is the
+    failure mode a `--force`-less preflight cannot afford.
+
+    Flat by design: the nested case is a separate test, because the source key's
+    `as_posix()` is invisible on POSIX and this one must not depend on it."""
+    from conftest import RENDERER_STUB_SKILL_MD
+
+    from bmad_loop.install import RENDERER_ENTRY_REL, _absent_renderer_sources
+
+    skill = tmp_path / DEV_PRIMITIVE_NEW
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(RENDERER_STUB_SKILL_MD, encoding="utf-8")
+    (skill / RENDERER_ENTRY_REL).write_text(
+        "run [[bmad-snapshot:clarify.md]] then [[bmad-snapshot:plan.md]]\n", encoding="utf-8"
+    )
+    (skill / "clarify.md").write_text("# clarify\n", encoding="utf-8")
+    (skill / "plan.md").write_text("# plan\n", encoding="utf-8")
+
+    assert _absent_renderer_sources(skill) == []
+
+
+def test_a_nested_snapshot_target_is_keyed_by_its_posix_rel(tmp_path):
+    """Upstream keys a source by `relative_to(skill_dir).as_posix()`, so a nested
+    source is referenced as `phases/plan.md` and never by its bare name.
+
+    Deliberately symlink-free and UNGUARDED: this is the suite's only witness for the
+    `as_posix()` on the source key, and that ablation is invisible on Linux by
+    construction (`os.sep == "/"`). Windows CI is the oracle — keyed with the native
+    separator the source becomes `phases\\plan.md`, the prompt's `phases/plan.md`
+    reads undeclared, and a healthy install is refused on every story."""
+    from conftest import install_build_auto_skill
+
+    from bmad_loop.install import RENDERER_ENTRY_REL, missing_base_skills
+
+    tree = get_profile("claude").skill_tree
+    _install_hunters(tmp_path, tree)
+    _install_renderer_surface(tmp_path)
+    skill = install_build_auto_skill(tmp_path, tree, renderer_stub=True)
+    (skill / "phases").mkdir()
+    (skill / "phases" / "plan.md").write_text("# plan\n", encoding="utf-8")
+    (skill / RENDERER_ENTRY_REL).write_text(
+        "Read fully and follow: [[bmad-snapshot:phases/plan.md]]\n", encoding="utf-8"
+    )
+    assert missing_base_skills(tmp_path, [tree]) == []
+
+    # …and the rel that gets REPORTED is the same POSIX one, on either platform
+    (skill / "phases" / "plan.md").unlink()
+    problems = missing_base_skills(tmp_path, [tree])
+    assert [f.check for f in problems] == ["skills.dev-renderer-sources"]
+    assert problems[0].detail["missing_sources"] == ["phases/plan.md"]
+
+
+def test_an_undecodable_source_does_not_crash_the_preflight(tmp_path):
+    """A `.md` that is not UTF-8 is a HALT upstream too, but a different one
+    (`failed to read render source`) with a different remediation — so this gate
+    skips it rather than blaming it for an undeclared reference, the same fail-open
+    doctrine `_is_renderer_stub` and `_renderer_unit_required` follow.
+
+    What must not happen is the `UnicodeDecodeError` escaping into
+    `missing_base_skills`: a crashed `validate` names no file at all, which is
+    strictly worse than the finding it replaced. Cross-platform on purpose — no
+    chmod, so the Windows lane runs it too."""
+    from conftest import install_build_auto_skill
+
+    from bmad_loop.install import RENDERER_ENTRY_REL, missing_base_skills
+
+    tree = get_profile("claude").skill_tree
+    _install_hunters(tmp_path, tree)
+    _install_renderer_surface(tmp_path)
+    skill = install_build_auto_skill(tmp_path, tree, renderer_stub=True)
+    (skill / "binary.md").write_bytes(b"\xff\xfe not utf-8\n")
+    assert missing_base_skills(tmp_path, [tree]) == []
+
+    # …and it is still a DECLARED source: the name is readable even when the bytes
+    # are not, so a prompt naming it is not reported as pointing at nothing
+    (skill / RENDERER_ENTRY_REL).write_text(
+        "Read fully and follow: [[bmad-snapshot:binary.md]]\n", encoding="utf-8"
+    )
+    assert missing_base_skills(tmp_path, [tree]) == []
 
 
 def test_dev_primitive_warnings_flag_an_orphaned_legacy_customize_file(tmp_path):

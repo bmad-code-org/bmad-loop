@@ -1181,7 +1181,7 @@ def test_a_dropped_non_marker_file_pauses_before_dispatch(project, tmp_path):
     reads a step that is not there. Either way the story Stops having written nothing,
     and since the seed reads the same repo every time, so does every story after it.
 
-    Walk parity with the copier covers all twelve files and cannot fall behind an
+    Walk parity with the copier covers all thirteen files and cannot fall behind an
     upstream that renames a step — which is the argument for the reversal, made
     executable."""
     from conftest import attach_profile, install_build_auto_skill
