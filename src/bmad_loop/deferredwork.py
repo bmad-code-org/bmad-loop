@@ -118,9 +118,14 @@ def mark_open(path: Path, dw_id: str, note: str) -> bool:
     by a caller that did not write it. The ledger has no field that could say who
     reopened what after the fact, so the check has to happen here.
 
-    The round trip is byte-exact — `mark_done` writes its resolution on the line
-    directly after the status line, and this removes exactly that line — which is
-    what lets a caller undo a close without having snapshotted the file."""
+    The round trip restores the text `mark_done` changed, character for character,
+    because that call writes its resolution on the line directly below the status and
+    this removes exactly that line — which is what lets a caller undo a close without
+    having snapshotted the file. Character for character as `read_text` sees it, NOT
+    byte for byte: `mark_done` rewrites the whole file through `write_text`, so a
+    ledger stored CRLF is normalised to the platform's line ending by the close and
+    the reopen cannot put that back. Pre-existing, and invisible to git on a repo with
+    the usual `text=auto` handling."""
     if not path.is_file():
         return False
     text = path.read_text(encoding="utf-8")
@@ -129,6 +134,9 @@ def mark_open(path: Path, dw_id: str, note: str) -> bool:
         return False
     status_m = STATUS_RE.search(entry.body)
     if status_m is None:
+        # `parse_ledger` tolerates an entry with no status line (it reads as not
+        # open, hence not caught above), and this runs from `_defer` — where an
+        # AttributeError would replace a deferral with a crash.
         return False
     res_m = _MARK_DONE_TAIL_RE.match(entry.body, status_m.end())
     if res_m is None or res_m.group(1).strip() != note:

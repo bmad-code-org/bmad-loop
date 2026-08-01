@@ -1232,12 +1232,16 @@ class SweepEngine(Engine):
         Gating on the accepted decision retires both legs at once and needs no
         revert on any of them.
 
-        Nothing between the old position and this one reads the ledger:
-        `verify_dev_bundle` gates on the spec path, `_verify_shared_gates` and an
+        Nothing between the old position and this one GATES on the ledger:
+        `verify_dev_bundle` reads the spec path, `_verify_shared_gates` and an
         in-memory `dw_ids` cross-check, and `[verify] commands` is operator shell.
-        `verify_review_bundle` DOES require these entries `done`, and it runs later
-        still — with `_verify_review` re-closing immediately ahead of it anyway, for
-        the case where a review session rewrote the ledger.
+        `_harvest_spec_deferrals` is in that span and does read the file, but is
+        insensitive to the reorder: its pre-scan matches the fingerprinted `origin:`
+        across entries of EVERY status, so a status flip cannot change what it files,
+        and `append_entry`'s open-only dedup only ever fires against rows that same
+        harvest just wrote. `verify_review_bundle` DOES require these entries `done`,
+        and it runs later still — with `_verify_review` re-closing immediately ahead
+        of it anyway, for the case where a review session rewrote the ledger.
 
         One deliberate consequence: the close no longer contributes to the artifact
         gate's proof-of-work diff (`verify_dev_exclude_relpaths` does not exclude the
@@ -1282,7 +1286,10 @@ class SweepEngine(Engine):
         is "undo my own close", not "reopen this id". A close written by an earlier
         sweep, by a human, or by the legacy path where the session edits the ledger
         itself is left standing — none of them is this run's to revoke, and the
-        ledger has no field that could record who reopened what.
+        ledger has no field that could record who reopened what. That note check is
+        also why this has no `_generic_dev()` guard, unlike `_post_dev_accepted_sync`
+        and `_verify_review`'s reclose: those two WRITE, so they need to know which
+        path owns the ledger, while this one only ever undoes a note it recognises.
 
         Idempotent by construction: a second call finds the entries already `open`
         and writes nothing, so a resume that re-drives a deferred bundle cannot

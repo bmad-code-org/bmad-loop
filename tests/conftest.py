@@ -109,6 +109,28 @@ def _exists_run(marker: str) -> str:
     return f'test -f "{_RUN}/{marker}"'
 
 
+def passes_once(marker) -> str:
+    """Shell verify command exiting 0 the FIRST time it runs and 1 every time after,
+    by latching `marker` — the only way to make one `[verify] commands` gate pass at
+    dev time and fail at review time, which is what separates the two gates within a
+    single run.
+
+    Takes an absolute path rather than the `$BMAD_LOOP_RUN_DIR` its neighbours above
+    use: `verify.run_verify_commands` passes no env to the subprocess, so that
+    variable is unset here and the command would latch at the filesystem root. Pass
+    something outside the worktree, or a rollback's untracked cleanup will eat the
+    marker between the two runs and the command passes twice.
+
+    Written for cmd as well as sh for the same reason as its neighbours: CI runs the
+    whole suite on windows-latest, where `shell=True` is `cmd.exe /c`, and a POSIX
+    `test`/`$(…)` command there is silently MIS-PARSED into a constant exit code
+    rather than rejected — so the test fails on the lane no one runs locally."""
+    if sys.platform == "win32":
+        win = str(marker).replace("/", "\\")
+        return f'if exist "{win}" (exit 1) else (type nul > "{win}")'
+    return f'test ! -f "{marker}" && touch "{marker}"'
+
+
 def _seeded_then_touch(rel: str, marker: str) -> str:
     if sys.platform == "win32":
         norm_rel = rel.replace("/", "\\")

@@ -169,6 +169,37 @@ def test_mark_open_refuses_an_entry_that_is_still_open(tmp_path):
     assert path.read_text(encoding="utf-8") == snapshot
 
 
+def test_mark_open_refuses_an_entry_with_no_status_line(tmp_path):
+    """`parse_ledger` tolerates a status-less entry (it reads as not open, so the
+    guard above does not catch it) and `mark_open` runs from `_defer`, where an
+    AttributeError on `status_m` would replace a deferral with a crashed run."""
+    path = tmp_path / "dw.md"
+    path.write_text(
+        "# Deferred Work\n\n### DW-1: no status at all\n\n"
+        "origin: a session, 2026-06-01\nresolution: by dw-a\n",
+        encoding="utf-8",
+    )
+    snapshot = path.read_text(encoding="utf-8")
+    assert not mark_open(path, "DW-1", "by dw-a")
+    assert path.read_text(encoding="utf-8") == snapshot
+
+
+def test_mark_open_tolerates_reformatted_whitespace_around_the_note(tmp_path):
+    """The note is compared stripped, so a ledger a session reformatted — trailing
+    whitespace on the resolution line — is still recognised as this caller's own
+    close rather than silently treated as someone else's."""
+    path = tmp_path / "dw.md"
+    path.write_text(
+        "# Deferred Work\n\n### DW-1: closed then reflowed\n\n"
+        "origin: a session, 2026-06-01\nstatus: done 2026-06-11\n"
+        "resolution:   by dw-a  \n",
+        encoding="utf-8",
+    )
+    assert mark_open(path, "DW-1", "by dw-a")
+    entries = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}
+    assert entries["DW-1"].open and "resolution:" not in entries["DW-1"].body
+
+
 def test_mark_open_noop_on_open_and_missing_entries(tmp_path):
     """Idempotent, so a resume that re-drives a deferred bundle cannot double-undo."""
     path = write_ledger(tmp_path)

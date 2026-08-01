@@ -1889,9 +1889,19 @@ class Engine:
                 #
                 # The other engine-side ledger write — the sweep engine's `status:
                 # done` bundle closes — is deliberately NOT in this window: it sits
-                # below the artifact gate, in `_post_dev_accepted_sync`, so no revert
-                # of it is needed at all. See that method for why a snapshot could
-                # never have covered it on the DEFER leg (#405).
+                # below the artifact gate, in `_post_dev_accepted_sync`, so no
+                # snapshot of THIS phase's making has to cover it. (A blocking
+                # `post_dev_phase` workflow can still defer an accepted attempt after
+                # that close; `_reopen_ledger_after_defer` is what covers that, and
+                # every other post-acceptance defer.) See that method for why a
+                # snapshot here could never have covered the DEFER leg (#405).
+                #
+                # NOT pinned by a test, and said on measurement rather than
+                # assertion: with the sweep close moved out there is no engine-side
+                # ledger write left between the arm and `_harvest_spec_deferrals`, so
+                # sliding the arm down to just above the harvest leaves the whole
+                # suite green. The boundary is defensive positioning for the next
+                # write to grow inside either sync, not an observable property.
                 #
                 # NOT on a replayed attempt: the host died somewhere between the dead
                 # process's writes and its rollback, so what is on disk now is already
@@ -2657,8 +2667,11 @@ class Engine:
         above the gate every terminus that discards the attempt has to be taught to
         undo the write — and one of them, ``_defer``, does the exact opposite on
         purpose (it snapshots the ledger around its own ``reset --hard`` and writes
-        those bytes back, so review-found deferrals survive). A single accepted-only
-        call site needs no undo on any leg.
+        those bytes back, so review-found deferrals survive). One accepted-only call
+        site collapses all of that into a single undo, `_reopen_ledger_after_defer`,
+        on the one leg that still needs one: a defer AFTER the attempt was accepted,
+        whether it comes from the review loop or from a blocking `post_dev_phase`
+        workflow.
 
         Called after ``decide_dev`` returns PROCEED rather than on ``outcome.ok``, so
         two more discards are excluded for free: a CRITICAL escalation in the result
@@ -3449,8 +3462,8 @@ class Engine:
         — `verify_review_bundle` requires it — and only the later review failure makes
         it wrong (#405).
 
-        Runs only where a reset actually happened: inside the `baseline_commit`
-        branch, after the restore, and unreached when `_rollback_or_pause` raises —
+        Runs on the branch where a reset was attempted: inside `baseline_commit`,
+        after the restore, and unreached when `_rollback_or_pause` raises —
         the `rollback_on_failure = off` stop-and-wait path keeps the tree, so there is
         nothing to undo. The isolated branch returns earlier still: its closes were
         written in the unit's own worktree, which `_integrate_unit` drops unmerged.

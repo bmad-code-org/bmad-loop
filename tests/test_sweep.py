@@ -12,6 +12,7 @@ from conftest import (
     fault_read_text,
     git,
     migrate_effect,
+    passes_once,
     triage_effect,
     write_ledger,
     write_legacy_ledger,
@@ -589,7 +590,11 @@ def test_bundle_ledger_close_withheld_when_a_completed_attempt_defers(project):
     assert "resolved by sweep bundle dw-fix" not in text
     assert deferredwork.open_ids(text) == {"DW-1"}
     assert "change for dw-fix" not in (project.project / "src.txt").read_text()
-    assert "sweep-bundle-closed" not in {e["kind"] for e in engine.journal.entries()}
+    kinds = {e["kind"] for e in engine.journal.entries()}
+    assert "sweep-bundle-closed" not in kinds
+    # ...and the defer's own reopen stayed silent rather than journalling an empty
+    # list: withholding the close is what fixes this leg, not undoing one
+    assert "sweep-bundle-reopened" not in kinds
 
 
 def test_bundle_ledger_close_withheld_when_a_critical_escalation_preempts_the_gate(project):
@@ -692,27 +697,28 @@ def test_bundle_ledger_close_reopened_when_the_review_leg_defers(project):
     assert worktree_clean(project.project)
 
 
-def test_bundle_ledger_close_reopened_when_review_disabled_defers_at_the_gate(project):
+def test_bundle_ledger_close_reopened_when_review_disabled_defers_at_the_gate(project, tmp_path):
     """The second route into the same `_defer`: with `review.enabled = false` there is
     no review session to decide anything, and `_skip_review_and_commit` defers
     directly when its own verify fails.
 
-    The verify command passes once and fails once, so it is GREEN at the dev gate —
-    letting the attempt be accepted and the ids closed — and RED at the review gate.
-    Nothing else can produce that ordering: every other input to `verify_review_bundle`
-    is already satisfied by the accepted dev attempt."""
+    `passes_once` is GREEN at the dev gate — letting the attempt be accepted and the
+    ids closed — and RED at the review gate. Nothing else can produce that ordering:
+    every other input to `verify_review_bundle` is already satisfied by the accepted
+    dev attempt. It latches in the run dir and is written for cmd as well as sh,
+    because the Windows CI lane runs this test too and mis-PARSES a POSIX command
+    rather than failing on it."""
     write_ledger(project, {"DW-1": "open"})
     plan = triage_result(
         ["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "resolve DW-1"}]
     )
-    once = "n=$(cat CNT 2>/dev/null || echo 0); n=$((n+1)); echo $n > CNT; test $n -lt 2"
     pol = Policy(
         gates=GatesPolicy(mode="none"),
         notify=QUIET,
         review=ReviewPolicy(enabled=False),
         dev=DevPolicy(skill="bmad-dev-auto"),
         scm=ScmPolicy(rollback_on_failure=True),
-        verify=VerifyPolicy(commands=(once,)),
+        verify=VerifyPolicy(commands=(passes_once(tmp_path / "verify-ran"),)),
         # no dev budget left for `_skip_review_and_commit`'s repair phase, so the
         # fixable verify failure goes straight to the defer this test is about
         limits=LimitsPolicy(max_dev_attempts=1),
