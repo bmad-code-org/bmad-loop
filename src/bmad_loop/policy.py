@@ -603,11 +603,22 @@ def _validate_plugin_settings(name: str, raw: dict[str, Any], specs: Any) -> Non
 
 
 def load(path: Path | None) -> Policy:
-    """Load policy from a TOML file; a missing file yields all defaults."""
+    """Load policy from a TOML file; a missing file yields all defaults.
+
+    An undecodable file is a `PolicyError` like a malformed one. `read_text` raises
+    `UnicodeDecodeError`, which is a `ValueError` and not an `OSError`, so left raw it
+    escapes every `except (PolicyError, OSError)` handler in the codebase — and those
+    handlers are the ones whose whole job is to degrade to defaults rather than take
+    the process down. Converting here fixes them all at once instead of asking each
+    to name a second exception type it has no other reason to know about."""
     if path is None or not path.is_file():
         return loads("")
     try:
-        return loads(path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as e:
+        raise PolicyError(f"{path}: not valid UTF-8: {e}") from e
+    try:
+        return loads(text)
     except PolicyError as e:
         raise PolicyError(f"{path}: {e}") from e
 

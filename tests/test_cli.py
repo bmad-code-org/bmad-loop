@@ -19,6 +19,7 @@ from conftest import (
 
 from bmad_loop import cli
 from bmad_loop import policy as policy_mod
+from bmad_loop import verify
 from bmad_loop.adapters import multiplexer as mux_mod
 
 STORIES_SPEC_FOLDER = "_bmad-output/epic-1"
@@ -4393,3 +4394,306 @@ def test_dry_run_is_silent_when_preflight_would_pass(project, capsys):
     out, err = capsys.readouterr()
     assert err == ""
     assert "/bmad-build-auto 1-1-a" in out
+
+
+# ---- #414: worktree isolation is refused under a repo_root override ----------
+
+ISOLATION_WORKTREE_POLICY = (
+    '[adapter]\nname = "claude"\nmodel = "opus"\n\n[scm]\nisolation = "worktree"\n'
+)
+NO_ISOLATION_POLICY = '[adapter]\nname = "claude"\nmodel = "opus"\n\n[scm]\nisolation = "none"\n'
+REFUSAL = 'isolation = "worktree" is not supported'
+
+
+def _override_repo_root(paths, rel="git-root"):
+    """Point `repo_root` away from the project — #414's monorepo layout, minus the
+    monorepo. The target has no `_bmad/`, which is the shape the issue reports, but
+    it DOES exist: `cmd_run`/`cmd_sweep` probe `verify.worktree_clean(repo_root)`,
+    and against a missing dir that raises `GitError` instead of answering, which
+    would make every "the isolation gate spoke first" assertion below unfalsifiable
+    — the later gate would crash rather than print the message it is asserted not to
+    print."""
+    (paths.project / rel).mkdir(exist_ok=True)
+    cfg = paths.project / "_bmad" / "bmm" / "config.yaml"
+    cfg.write_text(cfg.read_text() + f"repo_root: '{{project-root}}/{rel}'\n", encoding="utf-8")
+
+
+def test_validate_refuses_worktree_isolation_under_a_repo_root_override(
+    project, monkeypatch, capsys
+):
+    """#414: provisioning seeds every non-git surface from `repo_root` while every
+    gate validate runs probes `project`, so a split pair makes validate approve a
+    surface the isolated run never receives. A `problem`, so the rc flips — and the
+    fixture is committed first, so the rc-1 is this gate and not a dirty tree."""
+    _make_validate_pass(project, monkeypatch, capsys, policy_text=ISOLATION_WORKTREE_POLICY)
+    _override_repo_root(project)
+    git(project.project, "commit", "-qam", "repo_root override")
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    finding = _findings_by_check(doc)["policy.isolation-repo-root"]
+    assert finding["severity"] == "problem"
+    # Both remediations named, and only remediations that exist on this line: fix-1
+    # (plumbing `project` through provisioning) is a main-line option, so the message
+    # must not gesture at a flag or a version that would make the pair work.
+    assert "Remove the `repo_root` key" in finding["message"]
+    assert '`isolation = "none"`' in finding["message"]
+    assert finding["detail"] == {
+        "repo_root": str(project.project / "git-root"),
+        "project": str(project.project),
+    }
+    _render_findings(doc)  # the detail shape draws in the TUI modal
+
+
+@pytest.mark.parametrize(
+    "override,policy_text",
+    [(True, NO_ISOLATION_POLICY), (False, ISOLATION_WORKTREE_POLICY)],
+    ids=["override-without-worktree", "worktree-without-override"],
+)
+def test_validate_isolation_gate_needs_both_halves(
+    project, monkeypatch, capsys, override, policy_text
+):
+    """Either half alone is a configuration this release supports and documents: a
+    `repo_root` override under `isolation = "none"` is the monorepo knob (README:446),
+    and worktree isolation without an override is the ordinary isolated setup. The
+    gate stays silent on both, and validate still passes — the green rc is the second
+    witness, since a gate that fired would take the whole verdict with it."""
+    from bmad_loop import bmadconfig
+
+    _make_validate_pass(project, monkeypatch, capsys, policy_text=policy_text)
+    if override:
+        _override_repo_root(project)
+        git(project.project, "commit", "-qam", "repo_root override")
+
+    # The fixture can express the failing value: each leg really does carry exactly
+    # one half of it, so neither silence is the silence of a setup that never landed.
+    loaded = bmadconfig.load_paths(project.project)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    assert (loaded.repo_root != loaded.project) is override
+    assert (pol.scm.isolation == "worktree") is not override
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+    assert "policy.isolation-repo-root" not in _findings_by_check(doc)
+
+
+def _split_root_project(project, *, policy_text=ISOLATION_WORKTREE_POLICY):
+    install_bmad_config(project)
+    _override_repo_root(project)
+    _write_policy(project.project, policy_text)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    # `worktree_clean` scopes `git status` to `-- .` inside the dir it is handed, so
+    # only dirt UNDER repo_root can make the next gate speak. Without this the
+    # ordering assertion below passes no matter where the gate sits.
+    (project.project / "git-root" / "dirty.txt").write_text("uncommitted\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize("command", ["run", "sweep"])
+def test_start_refuses_worktree_isolation_under_a_repo_root_override(
+    project, monkeypatch, capsys, command
+):
+    """The refusal validate reports is also the one the real command makes, and it is
+    the FIRST one: `repo_root` is left genuinely dirty, so a gate ordered after
+    `worktree_clean` would answer "commit or stash first" instead — a message that
+    sends the operator to fix something that is not the problem. Both halves of that
+    are load-bearing: the probe reads `repo_root`, not `project`, so dirtying the
+    project would prove nothing."""
+    _split_root_project(project)
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {r: None for r in cli.ROLES})
+
+    assert cli.main([command, "--project", str(project.project)]) == 1
+    err = capsys.readouterr().err
+    assert REFUSAL in err
+    assert "not clean" not in err
+
+
+def test_resume_refuses_worktree_isolation_under_a_repo_root_override(project, monkeypatch, capsys):
+    """Resume re-reads config.yaml and policy.toml off disk, so it is a second
+    entrypoint into the same provisioning: a run whose config grew the override
+    mid-flight must not finish its remaining stories through worktrees the preflight
+    would now refuse. Refused before the `run-resume` entry, so the journal does not
+    record a resume that never happened."""
+    run_dir = _paused_run_for_resume(project, monkeypatch)
+    _write_policy(project.project, RESUME_POLICY + '\n[scm]\nisolation = "worktree"\n')
+    _override_repo_root(project)
+    monkeypatch.setattr(cli, "Engine", lambda **kw: pytest.fail("engine constructed"))
+
+    assert cli._resume_paused_run(project.project, run_dir) == 1
+    assert REFUSAL in capsys.readouterr().err
+    assert _resume_entries(run_dir) == []
+
+
+def test_auto_sweep_refuses_worktree_isolation_under_a_repo_root_override(project, monkeypatch):
+    """The child sweep an engine auto-triggers is the one caller that reloads
+    policy.toml while reusing the parent's already-loaded paths — so it is the only
+    way a mid-run flip to `isolation = "worktree"` reaches provisioning under a split
+    the parent's own start was allowed not to check.
+
+    It RAISES rather than returning, which is the whole point: `_maybe_auto_sweep`
+    has already journaled `sweep-auto-trigger` and latched the trigger by the time it
+    calls the factory, and it reads a plain return as success — so a quiet decline is
+    recorded as `sweep-auto-finished`, a child sweep that ran and finished when none
+    was launched. Raising lands on the `sweep-auto-failed` + notify path instead,
+    which is the same one an unparseable policy.toml already takes, and the parent
+    run is still unaffected (`_maybe_auto_sweep` swallows it)."""
+    from bmad_loop import bmadconfig
+
+    _split_root_project(project)
+    started = []
+    monkeypatch.setattr(cli, "_start_sweep", lambda *a, **kw: started.append(kw) or 0)
+
+    factory = cli._sweep_factory(project.project, bmadconfig.load_paths(project.project))
+    with pytest.raises(RuntimeError, match=REFUSAL):
+        factory("epic-boundary")
+    assert started == []
+
+
+def test_dry_run_banner_names_the_isolation_refusal_first(project, capsys):
+    """The preview keeps rc 0 and still renders the schedule, but the banner has to
+    name every refusal the dry-run's early return skips past — and in the order the
+    real command makes them. (Not every refusal there is: the dirty-tree, queue and
+    run-id gates are not part of this banner.) This
+    project is short of base skills too, so the ordering is observable: the isolation
+    refusal aborts before `_require_base_skills`, so it heads the list."""
+    import dataclasses
+
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    _write_policy(project.project, ISOLATION_WORKTREE_POLICY)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    paths = dataclasses.replace(project, repo_root=project.project / "git-root")
+    args = argparse.Namespace(epic=None, story=None, max_stories=None)
+
+    assert cli._dry_run(paths, pol, args) == 0
+    out, err = capsys.readouterr()
+    fails = [line for line in err.splitlines() if line.startswith("  FAIL:")]
+    assert REFUSAL in fails[0]
+    assert len(fails) > 1, "the base-skill problems the banner already reported"
+    assert "1-1-a" in out  # the schedule itself still rendered
+
+
+def test_validate_reports_an_undecodable_policy_instead_of_crashing(project, capsys):
+    """`read_text` raises `UnicodeDecodeError` on a policy.toml saved as UTF-16 or
+    latin-1 — a ValueError, not an OSError, so it used to escape every
+    `except (PolicyError, OSError)` in the codebase, including `_configure_mux`,
+    which runs before argument dispatch on EVERY command. The result was a bare
+    traceback at startup in place of the named findings validate exists to print.
+    `policy.load` converts it, so the file is reported like any other bad policy."""
+    _write_policy(project.project, "")
+    (project.project / ".bmad-loop" / "policy.toml").write_bytes(b'[scm]\nisolation = "\xff\xfe"\n')
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    finding = _findings_by_check(doc)["policy"]
+    assert finding["severity"] == "problem"
+    assert "not valid UTF-8" in finding["message"]
+
+
+def test_validate_reports_an_undecodable_bmad_config_instead_of_crashing(project, capsys):
+    """The `config.yaml` half of the same conversion. Separate from the policy leg
+    because they are separate loaders with separate typed errors, and the TUI guard
+    that first exposed this calls BOTH — a fix to one would leave the other raising a
+    raw ValueError straight through the handler."""
+    _write_policy(project.project, CLAUDE_ONLY_POLICY)
+    cfg = project.project / "_bmad" / "bmm"
+    cfg.mkdir(parents=True, exist_ok=True)
+    (cfg / "config.yaml").write_bytes(b"implementation_artifacts: '\xff\xfe'\n")
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    finding = _findings_by_check(doc)["bmad-config"]
+    assert finding["severity"] == "problem"
+    assert "not valid UTF-8" in finding["message"]
+
+
+# ---- #409: a tracked _bmad/render/ keeps churning through both shields -------
+
+
+def _committed_render_snapshot(project, *, track: bool):
+    """A renderer output tree at the depth and location `render_skill.py` publishes
+    to (the two hash segments are stand-ins, not real digests). `track` forces it past
+    the `_bmad/render/` line `init` just wrote into .gitignore — which is the state
+    #409 is about: an ignore rule does not untrack anything."""
+    snapshot = project.project / "_bmad" / "render" / "bmad-build-auto" / "sk-a1b2c3" / "d4e5f6"
+    snapshot.mkdir(parents=True)
+    (snapshot / "SKILL.md").write_text("# rendered\n", encoding="utf-8")
+    if track:
+        git(project.project, "add", "-f", "_bmad/render")
+        git(project.project, "commit", "-q", "-m", "committed render output")
+    return snapshot
+
+
+def test_validate_warns_when_rendered_output_is_tracked(project, monkeypatch, capsys):
+    """#409: a tracked path ignores .gitignore and info/exclude entirely, so both
+    shields 0.9.1 added miss the projects that already committed the renderer's
+    output — and those keep gaining a snapshot dir per machine, per checkout path
+    and per renderer bump. A warning, not a problem: nothing here stops a session,
+    so `ok` and the exit code both stay green."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    _committed_render_snapshot(project, track=True)
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+    finding = _findings_by_check(doc)["git.render-tracked"]
+    assert finding["severity"] == "warning"
+    assert "git rm -r --cached _bmad/render" in finding["message"]
+    assert doc["ok"] is True and doc["counts"]["problem"] == 0
+    _render_findings(doc)  # the detail shape draws in the TUI modal
+
+
+def test_validate_render_tracked_is_silent_when_the_output_is_only_on_disk(
+    project, monkeypatch, capsys
+):
+    """The control that pins WHICH state the probe reads. Every project that has run
+    a renderer has a `_bmad/render/` full of files; only the index distinguishes the
+    one that needs the warning. Same tree as above, never added — so a probe that
+    stat'ed the filesystem would fire here, on essentially every install."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    snapshot = _committed_render_snapshot(project, track=False)
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+    assert (snapshot / "SKILL.md").is_file(), "the tree the probe declined to warn about"
+    assert "git.render-tracked" not in _findings_by_check(doc)
+
+
+def test_validate_render_tracked_ignores_rc_zero_git_chatter(project, monkeypatch, capsys):
+    """`git ls-files` exits 0 while still writing to stderr — here a `core.fsmonitor`
+    hook that cannot exec, the Windows-first perf knob whose usual failure this is.
+    Read off a stdout+stderr merge that chatter is indistinguishable from an index
+    entry, so the warning fires at a project that tracks nothing and sends the
+    operator to `git rm -r --cached` a path git has never heard of. Nothing is added
+    here, so the only thing that can make the probe answer True is the noise.
+
+    `worktree_clean` reads the same stream off the same repo, so the green rc is the
+    second witness: it is the sibling that turns the identical chatter into "git
+    worktree is not clean" for a checkout with nothing in it."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    _committed_render_snapshot(project, track=False)
+    git(project.project, "config", "core.fsmonitor", ".git/hooks/absent-fsmonitor-hook")
+    assert verify.path_tracked(project.project, "_bmad/render") is False
+    assert verify.worktree_clean(project.project) is True
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+    findings = _findings_by_check(doc)
+    assert "git.render-tracked" not in findings
+    assert findings["git.worktree-clean"]["severity"] == "ok"
+
+
+def test_validate_render_tracked_degrades_quietly_outside_a_git_repo(tmp_path, capsys):
+    """No repo means no index, and a check that could not ask its question must not
+    answer it — neither a warning nor a fabricated `ok`.
+
+    It also records what #409's own premise gets wrong: validate does NOT pass
+    outside a repo on this line. `worktree_clean` raises first and `git.probe` fails
+    the run, which is asserted here so the silence above cannot be mistaken for
+    "validate is fine outside a repo". Skipping is still right — a second finding
+    saying the same thing helps nobody."""
+    cfg = tmp_path / "_bmad" / "bmm"
+    cfg.mkdir(parents=True)
+    (cfg / "config.yaml").write_text(
+        "implementation_artifacts: '{project-root}/impl'\n"
+        "planning_artifacts: '{project-root}/plan'\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "_bmad" / "render").mkdir()
+    _write_policy(tmp_path, CLAUDE_ONLY_POLICY)
+
+    doc = machine_json(["validate", "--project", str(tmp_path), "--json"], capsys, rc=1)
+    findings = _findings_by_check(doc)
+    assert "git.render-tracked" not in findings
+    assert findings["git.probe"]["severity"] == "problem"

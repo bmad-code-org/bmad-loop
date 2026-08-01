@@ -107,6 +107,29 @@ def _reject_bad_run_id(run_id: str | None) -> int | None:
     return None
 
 
+def _reject_isolation_conflict(paths: bmadconfig.ProjectPaths, pol) -> int | None:
+    """Refuse `isolation = "worktree"` under a `repo_root` override (#414). Returns
+    1 to abort, None to proceed — the `_reject_bad_run_id` shape.
+
+    Called from the three :class:`~engine.Engine` construction sites that return an
+    rc to a human: `cmd_run`, `cmd_sweep`, and `_resume_paused_run` — the shared
+    helper behind both `resume` and `resolve`'s re-arm. The fourth such site, the
+    auto-triggered child sweep in `_sweep_factory`, shares the refusal but not this
+    disposition: it has no rc channel, so it raises (see the comment there).
+    Keyed on Engine construction rather than on "loads policy.toml", which is a
+    wider set that does not all provision — `_configure_mux` reads the file on
+    every command and builds nothing; `cmd_validate` and `cmd_clean` load it and
+    never mount a worktree.
+
+    `validate` deliberately does not call this — it reports rather than aborts, so
+    it renders the same message as a Finding and keeps running its other gates."""
+    conflict = bmadconfig.worktree_isolation_conflict(paths, pol.scm.isolation)
+    if conflict is None:
+        return None
+    print(conflict, file=sys.stderr)
+    return 1
+
+
 def _reconcile_stale(project: Path, paths: bmadconfig.ProjectPaths, pol) -> None:
     """Tear down worktrees leaked by a prior run that stopped mid-flight, before
     starting a new run/sweep — the clean-finish GC never reached them. Gated on
@@ -388,6 +411,20 @@ def cmd_validate(args: argparse.Namespace) -> int:
     except policy_mod.PolicyError as e:
         report.fail("policy", str(e))
 
+    # #414: the one configuration where every gate below reports on a surface the
+    # isolated run will never see. Reported only when it fires — there is no `ok`
+    # twin, because the supported case is "no such conflict", which would print a
+    # line about a coupling most projects have never configured either half of.
+    # Needs both halves loaded; either failing already has its own finding above.
+    if paths is not None and pol is not None:
+        conflict = bmadconfig.worktree_isolation_conflict(paths, pol.scm.isolation)
+        if conflict is not None:
+            report.fail(
+                "policy.isolation-repo-root",
+                conflict,
+                {"repo_root": str(paths.repo_root), "project": str(paths.project)},
+            )
+
     # Built exactly the way run/sweep's real preflight builds it, so validate's verdict
     # and their abort cannot disagree. Deliberately NOT `[p.skill_tree for p in
     # profiles]`: that carries triage's tree, and every skills check below asks a
@@ -427,6 +464,32 @@ def cmd_validate(args: argparse.Namespace) -> int:
             report.ok("git.worktree-clean", "git worktree clean")
     except verify.GitError as e:
         report.fail("git.probe", f"git check failed: {e}")
+
+    # #409: a tracked path ignores .gitignore and info/exclude entirely, so the two
+    # shields 0.9.1 added only help projects that had not already committed the
+    # renderer's output. Those that did keep churning it into every story commit —
+    # a new snapshot dir per machine, per checkout path and per renderer bump, since
+    # the path is keyed on a hash of the absolute project root plus a generation
+    # hash over the renderer, its sources and the resolved config. Probed at
+    # `project`, which is the root the renderer publishes under whenever it and
+    # `repo_root` coincide, and the one the gate above already reads.
+    # Warning, not a problem: nothing about a tracked _bmad/render/ stops a session.
+    try:
+        if verify.path_tracked(project, install.RENDER_DIR_REL):
+            report.warn(
+                "git.render-tracked",
+                f"{install.RENDER_DIR_REL}/ is tracked by git; run "
+                f"`git rm -r --cached {install.RENDER_DIR_REL}` and commit once to stop "
+                "committing rendered skill output",
+                {"path": install.RENDER_DIR_REL},
+            )
+    except verify.GitError:
+        # Not a repo, or git failed — say nothing rather than fabricate an `ok`.
+        # Deliberately not also catching OSError: a missing git binary raises out of
+        # `worktree_clean` above, which does not catch it either, so a second and
+        # differently-shaped degrade here would only imply a robustness validate
+        # does not have.
+        pass
 
     report.extend(_platform_preflight())
 
@@ -684,7 +747,9 @@ def _skill_trees(project: Path, pol) -> list[str]:
     return trees
 
 
-def _warn_preflight_would_abort(project: Path, pol, *, require_stories: bool = False) -> None:
+def _warn_preflight_would_abort(
+    paths: bmadconfig.ProjectPaths, pol, *, require_stories: bool = False
+) -> None:
     """Dry-run honesty banner: say so when the real command would refuse to run.
 
     ``--dry-run`` returns before `_require_base_skills` (cmd_run/cmd_sweep), so a
@@ -694,14 +759,24 @@ def _warn_preflight_would_abort(project: Path, pol, *, require_stories: bool = F
     ``/bmad-dev-auto`` reads fine and would HALT an unattended session on the
     shim's interactive migration gate.
 
+    Takes the whole :class:`~bmadconfig.ProjectPaths` rather than `project` alone
+    because the #414 refusal is a fact about the two roots' relationship; every
+    other probe here still reads `paths.project`, which is what `init` wrote and
+    what a session's own root resolution will re-derive.
+
     The exit code deliberately stays 0. A dry-run is a diagnostic — refusing to
     print the schedule would withhold the very thing the operator asked for, and
     every existing caller reads rc 0 as "the preview rendered", not as "the
     project is ready". The banner goes to stderr so stdout stays the preview."""
-    trees = _skill_trees(project, pol)
-    problems = install.missing_base_skills(project, trees)
-    if require_stories:
-        problems += install.missing_stories_support(project, trees)
+    trees = _skill_trees(paths.project, pol)
+    problems = [
+        p.message
+        for p in install.missing_base_skills(paths.project, trees)
+        + (install.missing_stories_support(paths.project, trees) if require_stories else [])
+    ]
+    conflict = bmadconfig.worktree_isolation_conflict(paths, pol.scm.isolation)
+    if conflict is not None:
+        problems.insert(0, conflict)
     if not problems:
         return
     print(
@@ -709,7 +784,7 @@ def _warn_preflight_would_abort(project: Path, pol, *, require_stories: bool = F
         file=sys.stderr,
     )
     for problem in problems:
-        print(f"  FAIL: {problem.message}", file=sys.stderr)
+        print(f"  FAIL: {problem}", file=sys.stderr)
     print("run `bmad-loop validate` for details", file=sys.stderr)
 
 
@@ -866,6 +941,14 @@ def cmd_run(args: argparse.Namespace) -> int:
     if args.dry_run:
         return _dry_run(paths, pol, args, stories_on, spec_folder)
 
+    # First of the configuration refusals (`_reject_bad_run_id` and the two loaders
+    # above can abort earlier), and deliberately before the queue and worktree-clean
+    # gates: this one says the configuration cannot run at all, so making the
+    # operator clear a dirty tree or fix a story key first would only delay the
+    # same abort.
+    if (rc := _reject_isolation_conflict(paths, pol)) is not None:
+        return rc
+
     if stories_on:
         problem = _validate_stories_folder(paths, spec_folder, selector=args.story)
         if problem:
@@ -989,7 +1072,7 @@ def _dry_run(
     if stories_on:
         return _dry_run_stories(paths, pol, args, spec_folder)
 
-    _warn_preflight_would_abort(paths.project, pol)
+    _warn_preflight_would_abort(paths, pol)
 
     def render(role: str, prompt: str) -> str:
         return _render_invocation(pol, paths.project, role, prompt)
@@ -1033,7 +1116,7 @@ def _dry_run_stories(
 ) -> int:
     """Print the linear stories-mode schedule (list order, checkpoints, live
     on-disk state) — no topo waves, one story per line, spawns nothing."""
-    _warn_preflight_would_abort(paths.project, pol, require_stories=True)
+    _warn_preflight_would_abort(paths, pol, require_stories=True)
     folder = stories_mod.resolve_spec_folder(paths.project, spec_folder)
     # The real dispatch always uses the project-relative folder (the engine
     # relativizes it); render the identical string here so dry-run and run agree.
@@ -1153,6 +1236,18 @@ def _sweep_factory(project: Path, paths: bmadconfig.ProjectPaths):
 
     def factory(trigger: str) -> None:
         pol = policy_mod.load(_policy_path(project))
+        # Raise rather than return the rc the other three sites return. By the time
+        # the engine calls this it has already latched the trigger and journaled
+        # `sweep-auto-trigger`, and it reads a plain return as success — so a bare
+        # decline would be recorded as `sweep-auto-finished`, which `engine.py`
+        # defines as "a clean completion from the parent's perspective": a child
+        # sweep that ran and finished when none was ever launched. Raising lands on
+        # the same `sweep-auto-failed` + notify path the `load` above already takes
+        # on an unparseable policy.toml, which is the same kind of event — the
+        # config on disk changed under a run that had already started.
+        conflict = bmadconfig.worktree_isolation_conflict(paths, pol.scm.isolation)
+        if conflict is not None:
+            raise RuntimeError(conflict)
         _start_sweep(
             project,
             paths,
@@ -1175,6 +1270,9 @@ def cmd_sweep(args: argparse.Namespace) -> int:
 
     if args.dry_run:
         return _sweep_dry_run(paths, pol)
+
+    if (rc := _reject_isolation_conflict(paths, pol)) is not None:
+        return rc
 
     if not verify.worktree_clean(paths.repo_root):
         print("git worktree is not clean — commit or stash first", file=sys.stderr)
@@ -1200,7 +1298,7 @@ def cmd_sweep(args: argparse.Namespace) -> int:
 
 
 def _sweep_dry_run(paths: bmadconfig.ProjectPaths, pol) -> int:
-    _warn_preflight_would_abort(paths.project, pol)
+    _warn_preflight_would_abort(paths, pol)
     ledger = paths.deferred_work
     if not ledger.is_file():
         print(f"no deferred-work ledger at {ledger}")
@@ -1236,6 +1334,12 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
         print(f"run {run_dir.name} already finished", file=sys.stderr)
         return 1
     pol = policy_mod.load(_policy_path(project))
+    # Resume re-reads config.yaml and policy.toml from disk, so it is a second
+    # entrypoint into the same engine and gets the same refusal — a run started
+    # before the override was added must not finish its remaining stories through
+    # provisioning the preflight would now refuse.
+    if (rc := _reject_isolation_conflict(paths, pol)) is not None:
+        return rc
     if not _require_base_skills(project, pol, require_stories=state.source == "stories"):
         return 1
     journal = Journal(run_dir)

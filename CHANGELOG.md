@@ -173,6 +173,59 @@ editing.
   passed, so the escalations that leave a half-provisioned worktree mounted for inspection now say
   where it is.
 
+- **`isolation = "worktree"` is refused when `repo_root` is overridden (#405).** A project whose
+  `_bmad/bmm/config.yaml` sets `repo_root` decouples the git root from the project dir — the
+  documented monorepo knob — but worktree provisioning reads `repo_root` for every surface it
+  seeds off disk (the upstream skill trees, `_bmad/` and its `_bmad/custom/` overrides, every
+  `seed_files`/`seed_globs` entry) and bakes the absolute hook-relay path from it into the
+  worktree's hook config, while `init`, `validate` and the run
+  preflight write and probe them under `project`. `load_paths` requires
+  `project/_bmad/bmm/config.yaml`, so that surface is under `project` by definition and
+  `repo_root/_bmad/` generally does not exist: the preflight approved a surface the isolated run
+  never received, every seed-completeness gate above went inert rather than firing, and each
+  story ended as a result-less Stop with nothing naming the cause. `validate` now reports the
+  pair as a `policy.isolation-repo-root` problem, and `run`, `sweep`, `resume`, `resolve`'s
+  re-arm and the auto-triggered child sweep refuse to start, naming both remediations — drop the
+  `repo_root` override, or set `isolation = "none"`. The child sweep raises rather than declining
+  quietly, so a mid-run flip is journaled as `sweep-auto-failed` instead of being recorded as a
+  sweep that ran. The dry-run banner lists the refusal ahead of the skill
+  ones it aborts before, and the TUI's pre-launch guard mirrors it — ahead of its own clean-tree
+  gate, as the CLI does — so the operator gets a toast rather than a pane that dies.
+  Pre-existing since worktree isolation shipped. Plumbing
+  `project` through provisioning instead — which would make the combination work rather than
+  refuse it — stays open as #414.
+
+- **`validate` warns when the renderer's output is already committed (#405).** The two shields
+  0.9.1 adds — the `_bmad/render/` line `init` writes into `.gitignore`, and the `/_bmad/render/`
+  line provisioning writes into the repo's local git exclude — only help going forward, because a
+  tracked path ignores both entirely. A project that committed `_bmad/render/` earlier keeps
+  churning it into every story commit, gaining a snapshot directory per machine, per checkout path
+  and per upstream renderer bump, since the path is keyed on a hash of the absolute project root
+  plus a generation hash over the renderer, its sources and the resolved config. A new
+  `git.render-tracked` warning names the one-time
+  `git rm -r --cached _bmad/render`. A warning and not a problem — nothing about a tracked
+  `_bmad/render/` stops a session — and outside a git repo it stays quiet rather than fabricating
+  an ok (#409). All three sites now spell the path from one `install.RENDER_DIR_REL`, so the
+  probe cannot drift away from the shields it reports on.
+
+- **`verify`'s two emptiness probes no longer read their answer out of git's stderr (#405).**
+  `path_tracked` and `worktree_clean` both tested stdout and stderr merged, but `ls-files` and
+  `status` exit 0 while still writing to stderr — a `core.fsmonitor` hook that cannot exec, an
+  unknown `core.fsyncMethod` — and that chatter is indistinguishable from an index entry or a
+  porcelain line. Both answers were silently inverted: the new `git.render-tracked` check would
+  have told operators to `git rm -r --cached` a path that was never committed, and a checkout with
+  nothing in it was reported dirty, blocking `run`, `sweep` and `validate` outright. Both now read
+  stdout alone; the error paths keep the merge, where stderr is the informative half.
+
+- **An undecodable `policy.toml` or `config.yaml` is reported, not a traceback (#405).**
+  `read_text` raises `UnicodeDecodeError` on a file saved as UTF-16 or latin-1, and that is a
+  `ValueError`, not an `OSError` — so it escaped every `except (PolicyError, OSError)` handler in
+  the codebase, which are precisely the ones whose job is to degrade to defaults. The TUI could
+  not open its dashboard, and `_configure_mux` runs before argument dispatch on every command, so
+  the CLI died at startup with a bare traceback instead of any of its named findings. `policy.load`
+  and `bmadconfig.load_paths` now convert it to their own typed errors, which fixes every caller at
+  once; `validate` reports the file by name.
+
 - **Deferred review findings are harvested out of the spec's frontmatter (#405).**
   BMAD-METHOD#2640 moved `defer`-triaged findings from `deferred-work.md` into the spec's own
   `deferred:` list, silently starving the sweep pipeline. A successful dev or review session

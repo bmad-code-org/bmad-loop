@@ -159,10 +159,28 @@ def worktree_clean(repo: Path) -> bool:
     # count as a "dirty tree" that blocks run/sweep/validate or forces a commit.
     # Scope is policy.toml only — the deferred-work ledger also lives under
     # .bmad-loop/ and is meant to be committed (see sweep._commit_ledger).
-    rc, out = _git(repo, "status", "--porcelain", "--", ".", f":(exclude){POLICY_FILE_REL}")
-    if rc != 0:
-        raise GitError(f"git status failed in {repo}: {out}")
-    return out == ""
+    #
+    # Reads `stdout` alone for the same reason :func:`path_tracked` does: `status`
+    # exits 0 while still writing diagnostics to stderr (a `core.fsmonitor` hook that
+    # cannot exec, an unknown `core.fsyncMethod`), and against `_git`'s merged stream
+    # that chatter is indistinguishable from a porcelain line — reporting a clean
+    # checkout as dirty and blocking run/sweep/validate on a tree with nothing in it.
+    proc = _run_git(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "status",
+            "--porcelain",
+            "--",
+            ".",
+            f":(exclude){POLICY_FILE_REL}",
+        ],
+        repo,
+    )
+    if proc.returncode != 0:
+        raise GitError(f"git status failed in {repo}: {(proc.stdout + proc.stderr).strip()}")
+    return proc.stdout.strip() == ""
 
 
 def same_commit(a: str, b: str) -> bool:
@@ -297,13 +315,21 @@ def path_tracked(repo: Path, rel: str) -> bool:
     a RULE matches rather than whether git owns the path — a `git add -f`'d file under
     an ignore rule has to read tracked here.
 
+    Reads `stdout` ALONE, not `_git`'s stdout+stderr merge: `ls-files` exits 0 while
+    still writing to stderr — a `core.fsmonitor` hook that cannot exec, an unknown
+    `core.fsyncMethod` — and against the merged stream that chatter reads as an index
+    entry for a path git does not track at all. The failure is silent and inverted
+    (untracked answers "tracked"), so callers act on the opposite of the truth. The
+    error path keeps the merge, where stderr is the only informative half.
+
     Raises GitError like every other probe in this module. Callers inside a rollback
     `finally` catch it and degrade toward leaving the file alone: uncertainty must
     never authorize a delete."""
-    rc, out = _git(repo, "ls-files", "--", rel)
-    if rc != 0:
-        raise GitError(f"git ls-files -- {rel} failed in {repo}: {out}")
-    return bool(out)
+    proc = _run_git(["git", "-C", str(repo), "ls-files", "--", rel], repo)
+    if proc.returncode != 0:
+        merged = (proc.stdout + proc.stderr).strip()
+        raise GitError(f"git ls-files -- {rel} failed in {repo}: {merged}")
+    return bool(proc.stdout.strip())
 
 
 def commits_above(repo: Path, baseline: str) -> list[str]:

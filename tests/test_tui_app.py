@@ -14,7 +14,7 @@ import tomllib
 from pathlib import Path
 
 import pytest
-from conftest import install_bmad_config, make_validate_document, write_sprint
+from conftest import git, install_bmad_config, make_validate_document, write_sprint
 from rich.console import Console
 from rich.text import Text
 from textual.events import MouseMove
@@ -32,7 +32,7 @@ from textual.widgets import (
     TabbedContent,
 )
 
-from bmad_loop import documents
+from bmad_loop import bmadconfig, documents
 from bmad_loop import policy as policy_mod
 from bmad_loop.adapters.multiplexer import MultiplexerError
 from bmad_loop.journal import Journal, save_state
@@ -1333,6 +1333,78 @@ async def test_dirty_worktree_blocks_launch(project, monkeypatch):
         await pilot.click(await ready(pilot, "#ok"))
         await until(pilot, lambda: any("not clean" in m for m in notifications(app)))
         assert not calls
+
+
+def _split_root_tui_project(project):
+    """The #414 pair, written where the guard reads them. Deliberately left
+    UNCOMMITTED: the guard is ordered ahead of the clean-tree gate exactly as
+    `cmd_run` orders it, and a committed fixture could not tell the two orders
+    apart."""
+    install_bmad_config(project)
+    cfg = project.project / "_bmad" / "bmm" / "config.yaml"
+    cfg.write_text(cfg.read_text() + "repo_root: '{project-root}/git-root'\n", encoding="utf-8")
+    (project.project / ".bmad-loop").mkdir(parents=True, exist_ok=True)
+    (project.project / ".bmad-loop" / "policy.toml").write_text(
+        '[adapter]\nname = "claude"\n\n[scm]\nisolation = "worktree"\n', encoding="utf-8"
+    )
+
+
+async def test_worktree_isolation_under_a_repo_root_override_blocks_launch(project, monkeypatch):
+    """#414: the TUI launches a detached CLI, and that CLI refuses this combination
+    itself — this guard exists so the operator gets a toast instead of a pane that
+    dies immediately. Asserted against the sole producer of the text rather than a
+    literal, so a reworded message cannot drift this test away from the CLI's."""
+    calls = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "start_run_detached", lambda *a, **kw: calls.append(a))
+    _split_root_tui_project(project)
+    expected = bmadconfig.worktree_isolation_conflict(
+        bmadconfig.load_paths(project.project), "worktree"
+    )
+    assert expected is not None, "the fixture really does carry the conflicting pair"
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("r")
+        await until(pilot, lambda: isinstance(app.screen, StartRunModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        await until(pilot, lambda: expected in notifications(app))
+        # The tree is dirty, so this also pins the ORDER: the clean-tree gate would
+        # otherwise have spoken first and sent the operator to commit something
+        # that is not the problem.
+        assert not any("not clean" in m for m in notifications(app))
+        assert not calls
+
+
+async def test_unreadable_policy_falls_through_the_isolation_guard(project, monkeypatch):
+    """The guard's deliberate blind spot, and the one branch where a wrong `except`
+    tuple silently disables it. It cannot tell "no conflict" from "could not look",
+    so it defers to the detached CLI, which reads the same two files and fails
+    loudly on whichever it cannot parse. The bytes here are undecodable rather than
+    merely malformed: `read_text` raises `UnicodeDecodeError`, which is a ValueError
+    and NOT an OSError, so it escapes the obvious tuple and would take the TUI down
+    instead of launching.
+
+    Committed, unlike the sibling above: this one asserts the launch actually
+    HAPPENS, so the clean-tree gate downstream has to be satisfied or it would
+    block for an unrelated reason and the fall-through would go unwitnessed."""
+    calls = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "start_run_detached", lambda *a, **kw: calls.append(a))
+    _split_root_tui_project(project)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "split roots")
+    (project.project / ".bmad-loop" / "policy.toml").write_bytes(b'[scm]\nisolation = "\xff\xfe"\n')
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("r")
+        await until(pilot, lambda: isinstance(app.screen, StartRunModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        await until(pilot, lambda: calls)
+        assert not any("isolation" in m for m in notifications(app))
 
 
 async def test_live_run_asks_for_confirmation(project, monkeypatch):

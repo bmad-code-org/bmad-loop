@@ -197,7 +197,14 @@ SNAPSHOT_TOKEN_RE = re.compile(r"\[\[bmad-snapshot:([A-Za-z0-9_./-]+\.md)\]\]")
 # keyed on a hash of the project root's absolute path, so seeding the main
 # checkout's copy would carry ITS paths into the worktree and make every parallel
 # session race on one shared tree.
-BMAD_SEED_EXCLUDES = ("render",)
+RENDER_DIR_NAME = "render"
+BMAD_SEED_EXCLUDES = (RENDER_DIR_NAME,)
+
+# The one spelling of the renderer's output dir, shared by the two shields that keep
+# it out of commits (`init`'s .gitignore line, the worktree exclude) and by
+# `validate`'s tracked-output probe. They have to agree: a probe that looked
+# somewhere the shields do not write would warn about a path nothing protects.
+RENDER_DIR_REL = f"{BMAD_DIR}/{RENDER_DIR_NAME}"
 
 # Upstream per-skill customization overrides live here, named after the skill. The
 # rename does NOT migrate them, so a project upgraded to bmad-build-auto silently
@@ -1651,8 +1658,14 @@ def base_skills_seed_incomplete(worktree: Path, repo_root: Path, trees: Sequence
     beside a `SKILL.md`-less `bmad-build-auto` dir, which nothing can resolve and the
     preflight never stats. Resolving here rather than filtering the caller's list keeps
     the engine's re-probe a pure function of disk. (It resolves against ``repo_root``
-    while the engine spells the prompt from ``paths.project``; those are the same path
-    unless a project overrides it — tracked as #414.)
+    while the engine spells the prompt from ``paths.project``. Reading the two as one
+    is sound on every shipped path: both call sites sit under `Engine._run_isolated`,
+    so nothing reaches this function outside worktree isolation, and every CLI
+    entrypoint that constructs an Engine refuses that mode when a project overrides
+    `repo_root` (:func:`bmadconfig.worktree_isolation_conflict`). It holds by those
+    guards rather than by anything checked here — an in-process caller building an
+    Engine directly, as the tests do, is not covered. #414's fix-1, plumbing
+    `project` through provisioning, is a main-line option this release does not take.)
 
     The other two non-preflight entries stay gated on purpose. ``bmad-review`` is absent
     from :data:`DEV_BASE_SKILLS` so a pre-merge bmm install keeps validating, but on a
@@ -2091,7 +2104,7 @@ def provision_worktree(
         # producers: the `_bmad/` merge when the checkout had none, and a user
         # `worktree_seed = ["_bmad"]` entry that copied (0.9.0's documented broken
         # example, which really does copy when nothing under `_bmad/` is tracked).
-        patterns.add(f"/{BMAD_DIR}/render/")
+        patterns.add(f"/{RENDER_DIR_REL}/")
     _worktree_local_exclude(worktree, sorted(patterns))
     return skipped
 
@@ -2197,7 +2210,7 @@ def install_into(
             # keyed on this machine's absolute project root. Under isolation =
             # "none" (the default) this line is the only thing keeping it out of
             # story commits — worktrees get a git exclude instead.
-            f"{BMAD_DIR}/render/",
+            f"{RENDER_DIR_REL}/",
         )
         if line not in have
     ]

@@ -179,7 +179,10 @@ class DashboardScreen(Screen[None]):
         super().__init__()
         self.project = project
         # Persisted pane sizes to seed on first layout; a malformed or unreadable
-        # policy file degrades to defaults rather than blocking the dashboard.
+        # policy file degrades to defaults rather than blocking the dashboard. That
+        # now covers a file whose BYTES are unreadable too — `policy.load` converts
+        # the `UnicodeDecodeError` rather than letting a ValueError past a handler
+        # that runs before the app can draw anything.
         try:
             self._tui_policy = policy_mod.load(project / policy_mod.POLICY_FILE).tui
         except (policy_mod.PolicyError, OSError):
