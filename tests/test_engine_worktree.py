@@ -1170,7 +1170,7 @@ def test_a_short_skill_dir_pauses_before_dispatch(project, tmp_path):
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
 def test_a_dropped_non_marker_file_pauses_before_dispatch(project, tmp_path):
-    """The nine-twelfths the old required set could not see. `step-01-clarify-and-route
+    """The ten-thirteenths the old required set could not see. `step-01-clarify-and-route
     .md` is not a :data:`DEV_PRIMITIVE_MARKER`, so a gate asking for `SKILL.md` plus the
     two markers finds this dir complete and dispatches — the sibling test above passes
     unchanged under that gate because `customize.toml` happens to be a marker.
@@ -1194,7 +1194,7 @@ def test_a_dropped_non_marker_file_pauses_before_dispatch(project, tmp_path):
     assert dropped not in install.DEV_PRIMITIVE_MARKERS
 
     (project.project / ".gitignore").write_text(".bmad-loop/runs/\n.claude/\n", encoding="utf-8")
-    # the real 12-file primitive, INLINE era, so no renderer leg can be what fires
+    # the realistic multi-file primitive (7 files), INLINE era, so no renderer leg fires
     install_build_auto_skill(project.project)
     _real_skill_dirs(project, *install.REVIEW_HUNTER_SKILLS)
     _symlink_skill_file(
