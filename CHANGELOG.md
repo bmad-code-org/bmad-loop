@@ -175,6 +175,23 @@ editing.
   proof-of-work diff, so a bundle session which changed no code now fails the gate instead of
   passing on the orchestrator's own bookkeeping.
 
+- **A review-leg defer takes the bundle's ledger closes back (#405).** The bullet above stops a
+  DISCARDED dev attempt from closing anything; a bundle accepted at dev that then defers in
+  review is a different shape. There the closes were correct when written and are required —
+  `verify_review_bundle` gates on them — and only the later failure makes them wrong. `_defer`
+  then writes its own post-close ledger snapshot back over the `reset --hard` that had reverted
+  them, deliberately, since a harvested finding's ledger entry is its only surviving record once
+  the spec is stashed. But the restore replays the whole file, so the closes rode it too and
+  named code that no longer existed — on all four routes into that defer: review budget
+  exhausted, the repair phase exhausted after a clean review, the budget rescue's own verify
+  failing, and `review.enabled = false` failing at its gate. The defer now re-opens the ids it
+  closed itself. `deferredwork.mark_open` is the undo of one specific `mark_done`, not a general
+  reopen: it refuses any entry that is not closed carrying exactly the resolution note the caller
+  wrote, so a close from an earlier sweep, from the legacy path where the session edits the
+  ledger, or from a human is never revoked — and the round trip is byte-exact. Unchanged on the
+  stop-and-wait path (`rollback_on_failure = off` keeps the tree, so there is nothing to undo)
+  and under worktree isolation (those closes live in the unit's own worktree, dropped unmerged).
+
 ## [0.9.0] — 2026-07-21
 
 ### Added

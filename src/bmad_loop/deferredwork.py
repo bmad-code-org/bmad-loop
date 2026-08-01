@@ -103,6 +103,42 @@ def mark_done(path: Path, dw_id: str, date: str, note: str) -> bool:
     return True
 
 
+_MARK_DONE_TAIL_RE = re.compile(r"\nresolution:[ \t]*(.*)$", re.MULTILINE)
+
+
+def mark_open(path: Path, dw_id: str, note: str) -> bool:
+    """Undo one specific `mark_done`: flip `status: done <date>` back to
+    `status: open` and delete the `resolution:` line that call inserted. Returns
+    False (no write) when there is nothing of that shape to undo.
+
+    Deliberately NOT a general reopen. The write is refused unless the entry is
+    closed AND the line directly below its status is exactly the ``resolution:``
+    ``note`` the caller passed, so a close recorded by another run, by the legacy
+    path where the session edits the ledger itself, or by a human is never revoked
+    by a caller that did not write it. The ledger has no field that could say who
+    reopened what after the fact, so the check has to happen here.
+
+    The round trip is byte-exact — `mark_done` writes its resolution on the line
+    directly after the status line, and this removes exactly that line — which is
+    what lets a caller undo a close without having snapshotted the file."""
+    if not path.is_file():
+        return False
+    text = path.read_text(encoding="utf-8")
+    entry = _find_entry(text, dw_id)
+    if entry is None or entry.open:
+        return False
+    status_m = STATUS_RE.search(entry.body)
+    if status_m is None:
+        return False
+    res_m = _MARK_DONE_TAIL_RE.match(entry.body, status_m.end())
+    if res_m is None or res_m.group(1).strip() != note:
+        return False
+    start = entry.span[0] + status_m.start()
+    end = entry.span[0] + res_m.end()
+    path.write_text(text[:start] + "status: open" + text[end:], encoding="utf-8")
+    return True
+
+
 def append_decision(path: Path, dw_id: str, date: str, label: str, detail: str) -> bool:
     """Record a human decision on an entry without changing its status."""
     if not path.is_file():

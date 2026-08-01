@@ -9,6 +9,7 @@ from bmad_loop.deferredwork import (
     field_severity,
     has_legacy,
     mark_done,
+    mark_open,
     next_seq,
     open_ids,
     parse_ledger,
@@ -110,6 +111,73 @@ def test_mark_done_missing_entry(tmp_path):
     path = write_ledger(tmp_path)
     snapshot = path.read_text(encoding="utf-8")
     assert not mark_done(path, "DW-99", "2026-06-11", "n/a")
+    assert path.read_text(encoding="utf-8") == snapshot
+
+
+def test_mark_open_round_trips_mark_done_byte_for_byte(tmp_path):
+    """The contract that lets a caller undo a close without having snapshotted the
+    file: `mark_done` writes its resolution on the line directly below the status,
+    and `mark_open` removes exactly that line."""
+    path = write_ledger(tmp_path)
+    before = path.read_text(encoding="utf-8")
+    assert mark_done(path, "DW-1", "2026-06-11", "resolved by sweep bundle dw-fix")
+    assert path.read_text(encoding="utf-8") != before
+    assert mark_open(path, "DW-1", "resolved by sweep bundle dw-fix")
+    assert path.read_text(encoding="utf-8") == before
+
+
+def test_mark_open_touches_only_target(tmp_path):
+    path = write_ledger(tmp_path)
+    assert mark_done(path, "DW-1", "2026-06-11", "by dw-a")
+    assert mark_done(path, "DW-3", "2026-06-11", "by dw-a")
+    assert mark_open(path, "DW-1", "by dw-a")
+    entries = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}
+    assert entries["DW-1"].open and "resolution:" not in entries["DW-1"].body
+    assert entries["DW-3"].status == "done 2026-06-11"
+    assert entries["DW-2"].status == "done 2026-05-25"  # untouched pre-existing close
+
+
+def test_mark_open_refuses_a_close_it_did_not_write(tmp_path):
+    """The guard that makes this an UNDO rather than a reopen. DW-2 is closed in the
+    fixture with no resolution line at all, and a close carrying someone else's note
+    is equally off limits — neither is the caller's to revoke, and once reopened the
+    ledger has no field that could record who did it or why."""
+    path = write_ledger(tmp_path)
+    assert mark_done(path, "DW-1", "2026-06-11", "resolved by sweep bundle dw-other")
+    snapshot = path.read_text(encoding="utf-8")
+
+    assert not mark_open(path, "DW-1", "resolved by sweep bundle dw-mine")
+    assert not mark_open(path, "DW-2", "resolved by sweep bundle dw-mine")
+    assert not mark_open(path, "DW-2", "")
+    assert path.read_text(encoding="utf-8") == snapshot
+
+
+def test_mark_open_refuses_an_entry_that_is_still_open(tmp_path):
+    """The `entry.open` guard, which is NOT redundant with the note match. An entry
+    the inner session appended can carry a `resolution:` line while still open — this
+    module exists because the orchestrator never trusts an LLM to have edited the
+    file. Drop the guard and such an entry is rewritten and its note silently deleted,
+    which no caller asked for."""
+    path = tmp_path / "dw.md"
+    path.write_text(
+        "# Deferred Work\n\n### DW-1: partially handled\n\n"
+        "origin: a session, 2026-06-01\nstatus: open\nresolution: half of it landed\n",
+        encoding="utf-8",
+    )
+    snapshot = path.read_text(encoding="utf-8")
+    assert not mark_open(path, "DW-1", "half of it landed")
+    assert path.read_text(encoding="utf-8") == snapshot
+
+
+def test_mark_open_noop_on_open_and_missing_entries(tmp_path):
+    """Idempotent, so a resume that re-drives a deferred bundle cannot double-undo."""
+    path = write_ledger(tmp_path)
+    assert mark_done(path, "DW-1", "2026-06-11", "by dw-a")
+    assert mark_open(path, "DW-1", "by dw-a")
+    snapshot = path.read_text(encoding="utf-8")
+    assert not mark_open(path, "DW-1", "by dw-a")  # already open
+    assert not mark_open(path, "DW-99", "by dw-a")  # absent
+    assert not mark_open(tmp_path / "nope.md", "DW-1", "by dw-a")  # no ledger
     assert path.read_text(encoding="utf-8") == snapshot
 
 

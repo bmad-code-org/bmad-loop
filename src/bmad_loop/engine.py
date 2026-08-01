@@ -3417,6 +3417,10 @@ class Engine:
                 if current != snapshot:
                     deferred_work.parent.mkdir(parents=True, exist_ok=True)
                     deferred_work.write_text(snapshot, encoding="utf-8")
+            # ...but that restore replays the whole file, so an entry the
+            # ORCHESTRATOR closed earlier in this story rides back over the reset
+            # too. Undo those specifically.
+            self._reopen_ledger_after_defer(task)
         self.journal.append("story-deferred", story_key=task.story_key, reason=reason)
         gates.notify(
             self.policy,
@@ -3425,6 +3429,34 @@ class Engine:
             reason,
         )
         self._save()
+
+    def _reopen_ledger_after_defer(self, task: StoryTask) -> None:
+        """Undo the engine-side deferred-work CLOSES that `_defer`'s restore just
+        wrote back over its own `reset --hard`.
+
+        That restore is deliberate and stays: `_stash_deferred_artifacts` has already
+        moved the spec out of the artifacts dir, so a harvested finding's ledger entry
+        is its only surviving record. But it replays the whole file, so an entry the
+        orchestrator marked `status: done` earlier in this story is resurrected as
+        well — now naming code the reset discarded. The asymmetry is the whole reason
+        this exists: a surviving open finding reads as noise, while a surviving close
+        drops out of `deferredwork.open_ids`, which re-bundles only `open` entries, so
+        no later sweep looks at that id again and the work is silently lost.
+
+        `_post_dev_accepted_sync` closed the dev-leg legs of this by withholding the
+        close until the attempt is accepted. It cannot cover the REVIEW leg, because
+        by then the close describes an attempt that WAS accepted and has to be on disk
+        — `verify_review_bundle` requires it — and only the later review failure makes
+        it wrong (#405).
+
+        Runs only where a reset actually happened: inside the `baseline_commit`
+        branch, after the restore, and unreached when `_rollback_or_pause` raises —
+        the `rollback_on_failure = off` stop-and-wait path keeps the tree, so there is
+        nothing to undo. The isolated branch returns earlier still: its closes were
+        written in the unit's own worktree, which `_integrate_unit` drops unmerged.
+
+        No-op on the base path; only `SweepEngine` closes ledger entries."""
+        return
 
     def _ledger_text(self) -> str | None:
         """The deferred-work ledger's current text, or ``None`` when the file does

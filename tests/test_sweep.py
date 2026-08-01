@@ -34,6 +34,7 @@ from bmad_loop.policy import (
     ScmPolicy,
     StageAdapterPolicy,
     SweepPolicy,
+    VerifyPolicy,
 )
 from bmad_loop.sweep import DecisionPrompter, SweepEngine, validate_migration, validate_triage
 from bmad_loop.verify import worktree_clean
@@ -636,6 +637,102 @@ def test_bundle_ledger_close_withheld_when_a_critical_escalation_preempts_the_ga
     assert summary.paused
     assert ledger_entries(project)["DW-1"].open
     assert "sweep-bundle-closed" not in {e["kind"] for e in engine.journal.entries()}
+
+
+def test_bundle_ledger_close_reopened_when_the_review_leg_defers(project):
+    """The REVIEW-leg counterpart, which withholding the close cannot reach.
+
+    By review time the close is not premature — the dev attempt WAS accepted, and
+    `verify_review_bundle` requires the entries `done`, so they have to be on disk.
+    Only the later review failure makes them wrong, and then `_defer` writes its own
+    post-close snapshot back over the `reset --hard` that had correctly reverted
+    them. Deliberately, because a harvested finding's ledger entry is its only
+    surviving record once `_stash_deferred_artifacts` moves the spec away — but the
+    restore replays the whole file, so the closes ride it too and name code that no
+    longer exists. `_reopen_ledger_after_defer` takes back exactly this run's own.
+
+    Route: the final review session dies with the cycle budget spent, so
+    `decide_review_session` returns DEFER."""
+    write_ledger(project, {"DW-1": "open"})  # committed ⇒ tracked
+    plan = triage_result(
+        ["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "resolve DW-1"}]
+    )
+    pol = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=True, trigger="always"),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        scm=ScmPolicy(rollback_on_failure=True),
+        limits=LimitsPolicy(max_review_cycles=1),
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "fix", ["DW-1"], mark_ledger=False),
+            lambda spec: SessionResult(status="died"),
+        ],
+        policy=pol,
+    )
+    summary = engine.run()
+
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    # the scenario really is: closed at dev, then discarded by a review-leg defer
+    assert "sweep-bundle-closed" in kinds
+    assert summary.deferred == 1 and not summary.paused
+    assert "change for dw-fix" not in (project.project / "src.txt").read_text()
+
+    text = project.deferred_work.read_text(encoding="utf-8")
+    assert deferredwork.open_ids(text) == {"DW-1"}
+    assert "resolved by sweep bundle dw-fix" not in text
+    reopened = [e for e in engine.journal.entries() if e["kind"] == "sweep-bundle-reopened"]
+    assert len(reopened) == 1 and reopened[0]["dw_ids"] == ["DW-1"]
+    # the tree is clean: the reopen restored the ledger byte-for-byte, so the defer
+    # leaves nothing staged for the next cycle's baseline
+    assert worktree_clean(project.project)
+
+
+def test_bundle_ledger_close_reopened_when_review_disabled_defers_at_the_gate(project):
+    """The second route into the same `_defer`: with `review.enabled = false` there is
+    no review session to decide anything, and `_skip_review_and_commit` defers
+    directly when its own verify fails.
+
+    The verify command passes once and fails once, so it is GREEN at the dev gate —
+    letting the attempt be accepted and the ids closed — and RED at the review gate.
+    Nothing else can produce that ordering: every other input to `verify_review_bundle`
+    is already satisfied by the accepted dev attempt."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = triage_result(
+        ["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "resolve DW-1"}]
+    )
+    once = "n=$(cat CNT 2>/dev/null || echo 0); n=$((n+1)); echo $n > CNT; test $n -lt 2"
+    pol = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=False),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        scm=ScmPolicy(rollback_on_failure=True),
+        verify=VerifyPolicy(commands=(once,)),
+        # no dev budget left for `_skip_review_and_commit`'s repair phase, so the
+        # fixable verify failure goes straight to the defer this test is about
+        limits=LimitsPolicy(max_dev_attempts=1),
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "fix", ["DW-1"], mark_ledger=False, followup_review=False),
+        ],
+        policy=pol,
+    )
+    summary = engine.run()
+
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "sweep-bundle-closed" in kinds
+    assert summary.deferred == 1 and not summary.paused
+    assert "change for dw-fix" not in (project.project / "src.txt").read_text()
+    assert deferredwork.open_ids(project.deferred_work.read_text(encoding="utf-8")) == {"DW-1"}
+    assert "sweep-bundle-reopened" in kinds
 
 
 def test_bundle_ledger_close_skips_on_unreadable_spec(project, monkeypatch):

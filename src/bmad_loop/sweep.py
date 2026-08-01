@@ -494,21 +494,17 @@ class SweepEngine(Engine):
         and no fresh triage can re-bundle those ids (validate_triage rejects a plan
         whose open_ids disagree with the ledger).
 
-        A recovered bundle that escalates keeps its ids open, and so does one that
-        defers on the DEV leg: the close is withheld until the attempt is accepted
+        A recovered bundle that defers or escalates keeps its ids open, where the
+        existing failed_ids filter drops the fresh plan's overlapping bundle. That
+        holds on both legs, by two different mechanisms, and used to hold on neither
+        (#405): on the DEV leg the close is withheld until the attempt is accepted
         (`_post_dev_accepted_sync`), so a discarded attempt leaves nothing on disk to
-        survive its rollback. `failed_ids` then drops the fresh plan's overlapping
-        bundle.
+        survive its rollback; on the REVIEW leg the close is already written — it has
+        to be, `verify_review_bundle` gates on it — so `_reopen_ledger_after_defer`
+        takes it back after `_defer`'s restore has replayed it over the reset.
 
-        A bundle that gets past dev and then defers in REVIEW does NOT keep its ids
-        open, and the wording above used to claim otherwise. By that point they are
-        `done` — the accepted dev attempt closed them, and `_verify_review` re-closes
-        ahead of `verify_review_bundle` besides — and `_defer` writes its own ledger
-        snapshot back over its `reset --hard`, deliberately, so review-found
-        deferrals survive a defer. The restore is indiscriminate, so those closes ride
-        it too and name code the reset just discarded. `failed_ids` still covers the
-        current run; nothing covers a later one, because `open_ids` re-bundles only
-        `open` entries and `deferredwork` has no reopen primitive (#405)."""
+        Escalation needs neither: it preserves the tree for the human, so the close
+        still names code that exists."""
         recovered = 0
         for task in list(self.state.tasks.values()):
             if task.terminal or not BUNDLE_KEY_RE.match(task.story_key):
@@ -1276,6 +1272,27 @@ class SweepEngine(Engine):
         marked = [i for i in task.dw_ids if deferredwork.mark_done(ledger, i, self._today(), note)]
         if marked:
             self.journal.append(kind, story_key=task.story_key, dw_ids=marked)
+
+    def _reopen_ledger_after_defer(self, task: StoryTask) -> None:
+        """Re-open the dw ids THIS bundle closed, when the defer that just ran
+        discarded the code they claim to resolve.
+
+        Keyed on the resolution note rather than on `task.dw_ids` alone, and
+        `deferredwork.mark_open` refuses any entry whose note differs: the operation
+        is "undo my own close", not "reopen this id". A close written by an earlier
+        sweep, by a human, or by the legacy path where the session edits the ledger
+        itself is left standing — none of them is this run's to revoke, and the
+        ledger has no field that could record who reopened what.
+
+        Idempotent by construction: a second call finds the entries already `open`
+        and writes nothing, so a resume that re-drives a deferred bundle cannot
+        double-undo. The distinct journal kind makes "a defer took a close back"
+        greppable next to `sweep-bundle-closed` / `sweep-bundle-reclosed`."""
+        ledger = self.workspace.paths.deferred_work
+        note = f"resolved by sweep bundle {task.story_key}"
+        reopened = [i for i in task.dw_ids if deferredwork.mark_open(ledger, i, note)]
+        if reopened:
+            self.journal.append("sweep-bundle-reopened", story_key=task.story_key, dw_ids=reopened)
 
     def _verify_dev_artifacts(self, task: StoryTask, result_json: dict | None):
         return verify.verify_dev_bundle(
