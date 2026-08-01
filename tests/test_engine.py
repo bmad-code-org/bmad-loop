@@ -6359,6 +6359,55 @@ def test_a_finished_story_carries_no_ledger_copy(project):
     assert [e.title for e in _ledger_entries(project)] == ["Operator's own note"]
 
 
+def test_the_proceed_disarm_is_persisted_before_the_review_leg(project):
+    """Clear site 1's own `_save()` — the one call site where the "never save after a
+    disarm" rule does NOT hold, and the only place it can be seen.
+
+    `run()`'s `finally: self._save()` re-persists the disarmed fields after any crash
+    an in-process fixture can stage, so `test_a_finished_story_carries_no_ledger_copy`
+    above stays GREEN with this `_save()` deleted — only a hard kill, which no test
+    can inject, would ever notice. This test therefore reads state.json off disk at
+    the first moment after the disarm, exactly as
+    `test_the_pre_harvest_snapshot_is_persisted_before_the_harvest_runs` does for the
+    arm.
+
+    Why this site and not the other three. A kill here resumes through
+    `_finish_inflight`'s FIRST branch — the phase is `DEV_VERIFY` and the artifact
+    gate has set `spec_file` — into `_resume_after_dev_verify` → `_review_and_commit`.
+    `_dev_phase` is never re-entered, so nothing ever consumes the snapshot and a full
+    copy of the ledger rides a terminal task in state.json for the rest of the run. At
+    the RETRY site the same kill replays that attempt, which still WANTS the snapshot;
+    that is why THAT site deliberately has no save, and why the rationale is scoped to
+    it rather than stated universally (#405)."""
+    from bmad_loop import deferredwork
+
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    deferredwork.append_entry(
+        project.deferred_work,
+        title="Operator's own note",
+        origin="a human",
+        source_spec="specs/older.md",
+        reason="on disk before the story ran, so an armed snapshot is non-empty",
+    )
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project, [dev_effect(project, "1-1-a", followup_review=False)], policy=_harvest_policy()
+    )
+    seen = []
+    original_emit = engine._emit
+
+    def probing_emit(stage, task=None, **fields):
+        if stage == "post_dev_phase" and task is not None:
+            persisted = load_state(engine.run_dir).tasks[task.story_key]
+            seen.append((persisted.pre_harvest_ledger_captured, persisted.pre_harvest_ledger))
+        return original_emit(stage, task, **fields)
+
+    engine._emit = probing_emit
+    assert engine.run().done == 1
+
+    assert seen == [(False, None)]
+
+
 def test_dev_leg_defer_keeps_its_harvested_entry_and_disarms(project):
     """Clear site 3, and the DEFER asymmetry it sits beside.
 

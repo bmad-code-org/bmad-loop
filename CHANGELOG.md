@@ -152,7 +152,11 @@ editing.
   `keep`-shielded besides. The restore never unlinks a ledger git tracks — that one is the reset's
   to restore, and deleting it would hand the next attempt's `git add -A` a deletion to commit. The
   snapshot is armed at the attempt's pre-harvest save and cleared once that attempt's decision is
-  acted on, so a finished story carries no copy of the ledger in `state.json`. A defer still
+  acted on, so a finished story carries no copy of the ledger in `state.json`. The clear on the
+  PROCEED path persists immediately, because a hard kill there resumes straight into the review
+  leg and would otherwise strand that copy on a task that is already terminal; the retry site
+  deliberately does not, since the same kill replays that attempt and it still wants the
+  snapshot. A defer still
   keeps its harvested entries: on the in-place path `_stash_deferred_artifacts` has already moved
   the spec out of the artifacts dir, so the ledger entry is the finding's only surviving record.
 

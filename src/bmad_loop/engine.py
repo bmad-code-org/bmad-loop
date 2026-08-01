@@ -1966,7 +1966,18 @@ class Engine:
                 # phase returns and never re-enters this attempt — but without the
                 # clear a story that goes on to finish would carry a copy of the
                 # ledger in state.json for the rest of the run.
+                #
+                # The one clear site that DOES need its own `_save()`. A hard kill
+                # between here and the next ambient save resumes into
+                # `_finish_inflight`'s first branch (phase `DEV_VERIFY`, `spec_file`
+                # set by the artifact gate) → `_resume_after_dev_verify` →
+                # `_review_and_commit`, so `_dev_phase` is never re-entered and the
+                # armed snapshot is never consumed — it just rides the task into a
+                # terminal state.json. That is the opposite of clear site 2, where the
+                # replay re-enters this loop and still wants the snapshot; see
+                # `_disarm_ledger_snapshot`.
                 self._disarm_ledger_snapshot(task)
+                self._save()
                 self._emit("post_dev_phase", task)
                 if self._run_workflows("post_dev_phase", task, task.attempt):
                     return False
@@ -3541,11 +3552,23 @@ class Engine:
         so the residency in state.json is bounded to an in-flight or paused attempt
         rather than accumulating one ledger copy per finished story.
 
-        Deliberately NOT followed by a `_save()`, at any call site. Between a disarm
-        and the next ambient save the on-disk value is still armed, and a death in
-        that window replays *that same attempt* — which still wants the snapshot, so
-        the stale-looking persisted value is the correct one. Saving here would
-        convert a correct recovery into a hands-off one."""
+        Deliberately NOT followed by a `_save()` at the RETRY site, and that
+        rationale is scoped to it (#405). Between that disarm and the next ambient
+        save the on-disk value is still armed, and a death in that window replays
+        *that same attempt* — which still wants the snapshot, so the stale-looking
+        persisted value is the correct one. Saving there would convert a correct
+        recovery into a hands-off one.
+
+        It does NOT generalise to the other three sites, and reading it as universal
+        left one real hole. Site 0 (fresh entry) is followed by a save on the veto
+        path deliberately, and a death before it leaves the phase `pending` ⇒ a
+        resume RESTARTS the story rather than replaying the attempt. Site 3
+        (DEFER / escalate) is saved immediately below by `_defer` / `_escalate`. Site
+        1 (PROCEED) is the hole: a hard kill there resumes through
+        `_finish_inflight`'s `DEV_VERIFY` branch straight into `_review_and_commit`,
+        so `_dev_phase` is never re-entered, nothing ever consumes the snapshot, and
+        a terminal task carries a full copy of the ledger in state.json for good.
+        That site therefore saves explicitly."""
         task.pre_harvest_ledger = None
         task.pre_harvest_ledger_captured = False
 
