@@ -1568,6 +1568,89 @@ def test_a_benign_skipped_seed_does_not_pause(project):
     assert "story-escalated" not in kinds
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
+def test_a_dropped_seed_is_journalled_and_does_not_pause(project, tmp_path):
+    """The OTHER half of the seed silence (#415): an entry the repo HAS that the
+    worktree did not get. The repo carries `.mcp.json` as a symlink out of itself —
+    dotfile-managed, an ordinary healthy setup — so the resolve-and-contain guard
+    drops it and the session runs without it.
+
+    Journaled, never escalated, and that is the deliberate difference from the two
+    gates above: those name files the ORCHESTRATOR dispatches or the renderer HALTs
+    on, so their absence stalls every story determinately. A seed entry is arbitrary
+    user config bmad-loop cannot know the session needs, and the trigger is a setup
+    that works — escalating would refuse every run of such a project over a guard
+    doing its job.
+
+    Its own kind, not `worktree-seed-skipped`: "already there, your entry is doing
+    nothing" and "the repo has it and this worktree does not" want different fixes,
+    and the skipped channel additionally carries reserved sentinels the renderer
+    escalation reads by exact membership."""
+    # gitignored, which is what makes it a seed entry at all: a worktree checks out
+    # tracked files only, so the fresh checkout has none of it
+    (project.project / ".gitignore").write_text(".bmad-loop/runs/\n.mcp.json\n", encoding="utf-8")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    shared = tmp_path / "dotfiles" / "mcp.json"
+    shared.parent.mkdir(parents=True)
+    shared.write_text('{"mcpServers": {}}', encoding="utf-8")
+    (project.project / ".mcp.json").symlink_to(shared)
+
+    engine, _ = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
+        policy=wt_policy(worktree_seed=(".mcp.json",)),
+    )
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused
+    entries = Journal(engine.run_dir).entries()
+    kinds = [e["kind"] for e in entries]
+    assert "story-escalated" not in kinds
+    dropped = [e for e in entries if e["kind"] == "worktree-seed-dropped"]
+    assert dropped and dropped[0]["entries"] == [".mcp.json"]
+    # the no-op channel stayed quiet: this entry is not doing nothing, it is missing
+    assert "worktree-seed-skipped" not in kinds
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
+def test_an_escalating_provision_still_journals_the_worktree_it_mounted(project, tmp_path):
+    """Both provisioning escalations promise the half-provisioned worktree "stays
+    mounted for the operator to inspect", and the journal was the one place that never
+    said WHERE — `worktree-opened` used to be appended after every gate had passed, so
+    the runs that most need the path were exactly the ones with no record of it.
+
+    Appended beside the state it mirrors instead, as soon as `task.worktree_path` is
+    set, so it pairs 1:1 with `worktree-open-failed` and every mount attempt leaves
+    exactly one record either way. The renderer leg is the witness because it is the
+    LAST thing below the append that can raise; the fixture is
+    `test_incomplete_bmad_scripts_seed_pauses_before_dispatch`'s."""
+    from conftest import attach_profile, install_build_auto_skill
+
+    install_build_auto_skill(project.project, ".claude/skills", renderer_stub=True)
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    shared = tmp_path / "shared-bmad-scripts"
+    shared.mkdir()
+    (shared / "render_skill.py").write_text("# render", encoding="utf-8")
+    (shared / "config_utils.py").write_text("# config", encoding="utf-8")
+    bmad = project.project / "_bmad"
+    bmad.mkdir(parents=True)
+    (bmad / "config.toml").write_text("[core]\n", encoding="utf-8")
+    (bmad / "scripts").symlink_to(shared, target_is_directory=True)
+
+    engine, adapter = make_engine(project, [])  # empty script: nothing may be dispatched
+    attach_profile(adapter)
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1
+    entries = Journal(engine.run_dir).entries()
+    kinds = [e["kind"] for e in entries]
+    opened = [e for e in entries if e["kind"] == "worktree-opened"]
+    assert opened and kinds.index("worktree-opened") < kinds.index("story-escalated")
+    # …and it names the worktree the escalation leaves mounted, not just the attempt
+    assert opened[0]["path"] == engine.state.tasks["1-1-a"].worktree_path
+    assert Path(opened[0]["path"]).is_dir()
+
+
 def test_harvest_reverted_on_retry_under_isolation(project):
     """#405, workspace-scoped: the pre-harvest snapshot and its restore read the
     UNIT WORKTREE's ledger — the same tree `_rollback_or_pause` resets — so a

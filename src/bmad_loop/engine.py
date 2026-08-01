@@ -37,6 +37,7 @@ from .install import (
     dev_primitive_or_default,
     provision_worktree,
     renderer_stub_resolved,
+    worktree_seed_undelivered,
 )
 from .journal import Journal, save_state
 from .model import (
@@ -605,6 +606,18 @@ class Engine:
             return
         task.worktree_path = str(unit.path)
         task.branch = unit.branch
+        # Journaled HERE — beside the state it mirrors, and above everything below that
+        # can pause the run — rather than after provisioning. `task.worktree_path` is
+        # already set, and both provisioning escalations below `_save()` it before they
+        # raise; the escalation prose promises the half-provisioned worktree "stays
+        # mounted for the operator to inspect", and the journal was the one place that
+        # never said where. It pairs with the `worktree-open-failed` line above it, so
+        # every mount attempt now leaves exactly one record either way. Nothing keys on
+        # it — no `src/` reader consumes this kind, and no consumer requires it to be
+        # last or to imply that provisioning succeeded.
+        self.journal.append(
+            "worktree-opened", story_key=task.story_key, branch=unit.branch, path=str(unit.path)
+        )
         # A worktree checks out tracked files only, but the bmad-loop-* skill
         # trees + signal-hook config are typically gitignored, so they are absent
         # from the fresh checkout. Re-lay them into the worktree so the bundled
@@ -623,12 +636,14 @@ class Engine:
         # config so the worktree's Editor MCP is reachable. Aggregate every loaded
         # plugin's declared seeds.
         seeds.extend(self._registry.seed_files())
+        seed_files = list(dict.fromkeys(seeds))  # dedupe, preserve order
+        seed_globs = self._registry.seed_globs()
         skipped_seeds = provision_worktree(
             unit.path,
             profiles,
             self.paths.repo_root,
-            seed_files=list(dict.fromkeys(seeds)),  # dedupe, preserve order
-            seed_globs=self._registry.seed_globs(),
+            seed_files=seed_files,
+            seed_globs=seed_globs,
         )
         if skipped_seeds:
             # A seed entry whose destination already exists is a no-op. Harmless for
@@ -638,6 +653,29 @@ class Engine:
             # quiet by contract (it runs under the TUI).
             self.journal.append(
                 "worktree-seed-skipped", story_key=task.story_key, entries=skipped_seeds
+            )
+        # The OTHER half of the same silence, and a different fact (#415): a seed entry
+        # naming something the repo HAS that the worktree did not get. The seed loops
+        # drop one with a bare `continue` when the resolve-and-contain guard refuses it,
+        # and the canonical trigger is a config the repo carries as a symlink OUT of
+        # itself. Re-probed rather than read out of `skipped_seeds` — same reason as the
+        # skills gate below — and on its own kind, because "already there, your entry is
+        # doing nothing" and "the repo has it and this worktree does not" want different
+        # fixes.
+        #
+        # Journaled, never escalated, and that is the deliberate difference from the two
+        # gates below. Those name files the ORCHESTRATOR itself dispatches or the
+        # renderer HALTs on, so their absence is a determinate stall on every story. A
+        # seed entry is arbitrary user/plugin-declared config and bmad-loop cannot know
+        # whether the session needs it — while the trigger is an ordinary healthy setup
+        # (a dotfile-managed `.claude/settings.json`, a shared MCP config), so pausing
+        # would refuse every run of such a project over a guard doing its job.
+        undelivered_seeds = worktree_seed_undelivered(
+            unit.path, self.paths.repo_root, seed_files=seed_files, seed_globs=seed_globs
+        )
+        if undelivered_seeds:
+            self.journal.append(
+                "worktree-seed-dropped", story_key=task.story_key, entries=undelivered_seeds
             )
         # The skills half of the same fault, and it needs no RENDERER-era gate: a
         # worktree missing the dev primitive or a review hunter — or any file inside one
@@ -728,9 +766,6 @@ class Engine:
             )
             self._save()
             raise RunPaused(reason, PAUSE_ESCALATION, task.story_key)
-        self.journal.append(
-            "worktree-opened", story_key=task.story_key, branch=unit.branch, path=str(unit.path)
-        )
         self._save()
         prev = self.workspace
         self.workspace = unit.workspace

@@ -152,6 +152,27 @@ editing.
   The eager copies are unchanged and can still raise — user-authored `worktree_seed`, the
   adapter-default and plugin seeds beside it, and the per-CLI hook-config write.
 
+- **A seed the worktree never got is now reported, and the shared exclude gets one line fewer
+  (#405).** The two explicit seed loops drop an entry with a bare `continue` when the
+  resolve-and-contain guard refuses it, so a config the repo carries as a symlink _out_ of itself —
+  a dotfile-managed `.claude/settings.json`, a shared MCP config — delivered nothing and said
+  nothing: `worktree-seed-skipped` reports only the opposite case, an entry whose destination
+  already exists. Provisioning's result is now re-probed against the repo and the drops journaled
+  as `worktree-seed-dropped`, asking the two trees on disk rather than the loops' bookkeeping, so a
+  drop by any future path is caught the same way. Journaled and never escalated, unlike the
+  `_bmad/` and skills gates beside it: those name files the orchestrator dispatches or the renderer
+  HALTs on, while a seed entry is arbitrary user config whose canonical trigger is an ordinary
+  working setup, so pausing would refuse every run of such a project over a guard doing its job. A
+  broken link or a FIFO stays silent in both halves, as it already does for the skills gate, and
+  the eager copies are still unchanged: a copy that _fails_ raises rather than landing here.
+  `/_bmad/render/` is no longer written into `.git/info/exclude` beside a blanket `/_bmad` — that
+  file lives under the git common dir a linked worktree shares with the main checkout and nothing
+  here ever prunes it, and `/_bmad` prunes the directory before git descends, so the sibling line
+  was permanent state in the operator's own repo that git never consults. `worktree-opened` is
+  journaled as soon as the worktree is mounted rather than after every provisioning gate has
+  passed, so the escalations that leave a half-provisioned worktree mounted for inspection now say
+  where it is.
+
 - **Deferred review findings are harvested out of the spec's frontmatter (#405).**
   BMAD-METHOD#2640 moved `defer`-triaged findings from `deferred-work.md` into the spec's own
   `deferred:` list, silently starving the sweep pipeline. A successful dev or review session

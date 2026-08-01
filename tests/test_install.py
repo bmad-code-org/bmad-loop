@@ -2781,6 +2781,220 @@ def test_provision_worktree_seed_globs_shielded_in_local_exclude(project, tmp_pa
     assert git(wt, "status", "--short", "--", ".claude/skills/tests-run") == ""
 
 
+# ----------------------------------------------------------------- dropped seeds (#415)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_worktree_seed_undelivered_names_a_symlinked_out_config(tmp_path):
+    """The headline fault, end to end: the repo carries `.mcp.json` as a symlink to a
+    shared checkout outside itself — a dotfile-managed config, an ordinary healthy
+    setup — so the seed loop's resolve-and-contain guard drops it with a bare
+    `continue` and provisioning reports nothing at all. `skipped` cannot carry this:
+    it reports only the destination-already-exists no-op.
+
+    `_is_file(src)`'s witness. The source side is deliberately NOT containment-checked,
+    so it stats True *through* the link — which is precisely the entry the loop
+    refused, and re-applying the loop's own guard here would make the gate agree with
+    it and report nothing."""
+    from bmad_loop.install import worktree_seed_undelivered
+
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    repo.mkdir()
+    shared = tmp_path / "dotfiles" / "mcp.json"
+    shared.parent.mkdir()
+    shared.write_text('{"mcpServers": {}}', encoding="utf-8")
+    (repo / ".mcp.json").symlink_to(shared)
+
+    skipped = provision_worktree(wt, [], repo, seed_files=[".mcp.json"])
+
+    assert skipped == []  # the silence the report exists to break
+    assert not (wt / ".mcp.json").exists()
+    assert worktree_seed_undelivered(wt, repo, seed_files=[".mcp.json"]) == [".mcp.json"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_worktree_seed_undelivered_names_a_symlinked_out_directory(tmp_path):
+    """`_is_dir(src)`'s witness, and the reason the source filter is not `_is_file`
+    alone the way `_absent_skill_files`' is: a `worktree_seed` entry may name a
+    DIRECTORY as readily as a file — a plugin's tool tree pointing at a shared
+    install is the canonical shape — and the loop drops the whole entry."""
+    from bmad_loop.install import worktree_seed_undelivered
+
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    repo.mkdir()
+    shared = tmp_path / "shared-tools"
+    shared.mkdir()
+    (shared / "tool.yaml").write_text("x\n", encoding="utf-8")
+    (repo / "vendor").symlink_to(shared, target_is_directory=True)
+
+    skipped = provision_worktree(wt, [], repo, seed_files=["vendor"])
+
+    assert skipped == []
+    assert not (wt / "vendor").exists()
+    assert worktree_seed_undelivered(wt, repo, seed_files=["vendor"]) == ["vendor"]
+
+
+def test_worktree_seed_undelivered_is_silent_on_delivered_absent_and_present(tmp_path):
+    """The no-false-positive control: three entries fine in three different ways —
+    one the seed copied, one the repo simply does not have, one the checkout already
+    carried. Reporting any of them pauses nothing but journals a line per story for
+    every project with a routine seed list, which is how a report stops being read.
+
+    `_is_file(dst)`'s witness (both the delivered and the already-present legs land on
+    a FILE destination), and the two channels' separation: the already-present entry
+    belongs to `skipped` and must not appear in both."""
+    from bmad_loop.install import worktree_seed_undelivered
+
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".mcp.json").write_text("FROM_REPO", encoding="utf-8")
+    (repo / ".envrc").write_text("FROM_REPO", encoding="utf-8")
+    wt.mkdir()
+    (wt / ".envrc").write_text("IN_WORKTREE", encoding="utf-8")
+
+    rels = [".mcp.json", ".envrc", "absent.json"]
+    skipped = provision_worktree(wt, [], repo, seed_files=rels)
+
+    assert skipped == [".envrc"]
+    assert (wt / ".mcp.json").read_text() == "FROM_REPO"
+    assert worktree_seed_undelivered(wt, repo, seed_files=rels) == []
+
+
+def test_worktree_seed_undelivered_is_silent_on_a_delivered_directory(tmp_path):
+    """`_is_dir(dst)`'s witness: a directory entry that really did land is delivered,
+    and probing the destination with `_is_file` alone would call every one of them
+    undelivered — the loudest false positive available, since a seed dir is the shape
+    `worktree_seed` is most often used for."""
+    from bmad_loop.install import worktree_seed_undelivered
+
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    (repo / "vendor").mkdir(parents=True)
+    (repo / "vendor" / "tool.yaml").write_text("x\n", encoding="utf-8")
+
+    provision_worktree(wt, [], repo, seed_files=["vendor"])
+
+    assert (wt / "vendor" / "tool.yaml").is_file()
+    assert worktree_seed_undelivered(wt, repo, seed_files=["vendor"]) == []
+
+
+def test_worktree_seed_undelivered_names_an_entry_whose_destination_escapes(tmp_path):
+    """The destination containment conjunct, which exists for the OPPOSITE reason to
+    the source one: `worktree/../outside.txt` resolves out of the worktree onto the
+    very file the loop refused to write through, so an uncontained probe would stat
+    it, read it as delivered, and go quiet on the one entry that provably copied
+    nothing (`test_provision_worktree_seed_rejects_escaping_path`).
+
+    The worktree directory has to EXIST for the ablation to be visible: a `..`
+    component under a path that is not there fails to resolve on POSIX and reads as
+    absent either way, which would hide the difference the conjunct makes."""
+    from bmad_loop.install import worktree_seed_undelivered
+
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    repo.mkdir()
+    wt.mkdir()
+    (tmp_path / "outside.txt").write_text("SECRET", encoding="utf-8")
+
+    provision_worktree(wt, [], repo, seed_files=["../outside.txt"])
+
+    assert list(wt.iterdir()) == []  # nothing copied
+    assert worktree_seed_undelivered(wt, repo, seed_files=["../outside.txt"]) == ["../outside.txt"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_worktree_seed_undelivered_stays_silent_on_a_dangling_repo_symlink(tmp_path):
+    """The source filter's reverse direction, mirroring
+    `test_a_dangling_repo_symlink_is_dropped_by_the_copier_and_the_gate`: a broken
+    link is neither file nor directory, so both halves drop it — the copier has no
+    bytes to deliver and the gate has nothing to demand. Without the filter every such
+    link becomes a journal line on every story, over a file the operator's own repo
+    cannot produce either."""
+    from bmad_loop.install import worktree_seed_undelivered
+
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".mcp.json").symlink_to(repo / "never-installed.json")
+
+    skipped = provision_worktree(wt, [], repo, seed_files=[".mcp.json"])
+
+    assert skipped == []
+    assert worktree_seed_undelivered(wt, repo, seed_files=[".mcp.json"]) == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+def test_worktree_seed_undelivered_names_an_unreadable_source(tmp_path):
+    """Absent-from-the-repo and unreadable-in-the-repo must not collapse into one
+    silence — the same split `base_skills_seed_incomplete` makes. `_is_dir` reads a
+    refused probe as a directory on every interpreter, so the entry is carried and the
+    gate names it.
+
+    Called DIRECTLY, and that is not shorthand: an end-to-end fixture cannot express
+    this claim, because the two lanes disagree on the step BEFORE the gate. Through
+    3.13 the loop's own `src.exists()` raises `PermissionError` out of
+    `provision_worktree`; on 3.14 it answers False and drops the entry silently. Only
+    the gate itself reads the same on both.
+
+    POSIX-only, non-root runner (root reads through mode 000)."""
+    from bmad_loop.install import worktree_seed_undelivered
+
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    locked = repo / "conf"
+    locked.mkdir(parents=True)
+    (locked / "tool.yaml").write_text("x\n", encoding="utf-8")
+    locked.chmod(0o000)
+    try:
+        undelivered = worktree_seed_undelivered(wt, repo, seed_files=["conf/tool.yaml"])
+    finally:
+        locked.chmod(0o755)
+
+    assert undelivered == ["conf/tool.yaml"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_worktree_seed_undelivered_names_a_symlinked_out_glob_match(tmp_path):
+    """The glob leg — re-expanded here rather than handed in, so the answer stays a
+    pure function of the two trees on disk and a caller cannot forge one. A plugin's
+    `seed_globs` hits a tool dir the repo carries as a link to a shared install; the
+    loop drops that match and copies its siblings. Named as a POSIX rel, matching what
+    the loop itself puts in the git exclude."""
+    from bmad_loop.install import worktree_seed_undelivered
+
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    skills = repo / ".claude" / "skills"
+    (skills / "local").mkdir(parents=True)
+    (skills / "local" / "SKILL.md").write_text("tool", encoding="utf-8")
+    shared = tmp_path / "shared-install" / "scene-open"
+    shared.mkdir(parents=True)
+    (shared / "SKILL.md").write_text("tool", encoding="utf-8")
+    (skills / "scene-open").symlink_to(shared, target_is_directory=True)
+
+    skipped = provision_worktree(wt, [], repo, seed_globs=[".claude/skills/*"])
+
+    assert skipped == []
+    assert (wt / ".claude" / "skills" / "local" / "SKILL.md").is_file()  # the rest landed
+    assert worktree_seed_undelivered(wt, repo, seed_globs=[".claude/skills/*"]) == [
+        ".claude/skills/scene-open"
+    ]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_worktree_seed_undelivered_reports_a_doubly_reachable_rel_once(tmp_path):
+    """A rel a plugin's glob and a user's `worktree_seed` both name is one fact and
+    one journal line — deduped over the concatenated rels, before any probe, so the
+    two spellings cannot each earn an entry."""
+    from bmad_loop.install import worktree_seed_undelivered
+
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    (repo / "vendor").mkdir(parents=True)
+    (tmp_path / "outside.toml").write_text("x\n", encoding="utf-8")
+    (repo / "vendor" / "conf.toml").symlink_to(tmp_path / "outside.toml")
+
+    undelivered = worktree_seed_undelivered(
+        wt, repo, seed_files=["vendor/conf.toml"], seed_globs=["vendor/*"]
+    )
+
+    assert undelivered == ["vendor/conf.toml"]
+
+
 # ----------------------------------------------------------------- _bmad/ config surface
 
 
@@ -3003,7 +3217,10 @@ def test_provision_worktree_shields_whole_bmad_when_worktree_lacked_it(project, 
 
     Asserting the exact line matters — `git status` comes back clean either way
     (per-file lines cover today's files), but the root line is what also shields the
-    files a session's renderer/config writes create AFTER provisioning."""
+    files a session's renderer/config writes create AFTER provisioning. That last
+    claim is witnessed next door, in
+    `test_provision_worktree_render_shield_subsumed_by_the_root_line`, which is also
+    where the `/_bmad/render/` line's absence here is accounted for."""
     repo = project.project
     _write_bmad_surface(repo)
     wt = tmp_path / "wt"
@@ -3038,10 +3255,17 @@ def test_provision_worktree_shields_only_seeded_files_when_bmad_committed(projec
 
 
 def test_provision_worktree_render_shield_only_when_bmad_present(project, tmp_path):
-    """`/_bmad/render/` is shielded whenever the worktree has a `_bmad/` — the
-    renderer rewrites that dir mid-session, long after provisioning. It is NOT
-    written when there is no `_bmad/` at all: `.git/info/exclude` is the COMMON git
-    dir, shared with the main checkout, so an ungated line is pollution there."""
+    """`/_bmad/render/` shields the dir the renderer rewrites mid-session, long after
+    provisioning — where nothing else already does. Both of its conditions exist to
+    keep lines OUT of `.git/info/exclude`, which is the COMMON git dir a linked
+    worktree shares with the main checkout and which nothing here ever prunes.
+
+    Case 1: a bare worktree that can never grow a `_bmad/`, so the line would be
+    permanent pollution in the operator's own repo for a dir that will never exist.
+    Case 2: a checkout that COMMITS its `_bmad/`, so the blanket root line is not
+    written and this line is the only thing standing between the renderer's output and
+    the unit's `git add -A`. The third case — worktree lacked it, root line goes in —
+    is the sibling below."""
     repo = project.project
     wt_bare = tmp_path / "wt-bare"
     verify.worktree_add(repo, wt_bare, "bare", "main")
@@ -3052,12 +3276,49 @@ def test_provision_worktree_render_shield_only_when_bmad_present(project, tmp_pa
     assert "/_bmad/render/" not in exclude_path.read_text(encoding="utf-8").splitlines()
 
     _write_bmad_surface(repo)
+    git(repo, "add", "-A", "--", "_bmad")
+    git(repo, "commit", "-q", "-m", "commit the _bmad surface")
     wt = tmp_path / "wt"
     verify.worktree_add(repo, wt, "feat", "main")
 
     provision_worktree(wt, [get_profile("claude")], repo)
 
-    assert "/_bmad/render/" in exclude_path.read_text(encoding="utf-8").splitlines()
+    exclude = exclude_path.read_text(encoding="utf-8").splitlines()
+    assert "/_bmad" not in exclude  # the checkout carries its own, so nothing blankets it
+    assert "/_bmad/render/" in exclude
+
+
+def test_provision_worktree_render_shield_subsumed_by_the_root_line(project, tmp_path):
+    """The third case, and the one that makes the pair one policy rather than two
+    conditions: the worktree lacked `_bmad/`, so the blanket `/_bmad` root line goes
+    in — and a `/_bmad/render/` line beneath it would never be consulted. Measured
+    with `git check-ignore -v`: `/_bmad` prunes the directory before git descends into
+    it, so both lines attribute to the root one. Writing both was the inconsistency —
+    one sibling gated to avoid polluting a shared file while the other added a
+    provably inert line to it.
+
+    The first assert is the false-positive control, and the witness
+    `test_provision_worktree_shields_whole_bmad_when_worktree_lacked_it` claims but
+    does not make: a renderer write landing AFTER provisioning is still shielded, by
+    the root line alone. Order matters — pytest stops at the first failure, so under an
+    ablation of the subsumption conjunct this one must be read as still GREEN and only
+    the line's absence may move."""
+    repo = project.project
+    _write_bmad_surface(repo)
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    provision_worktree(wt, [get_profile("claude")], repo)
+
+    # what the renderer writes mid-session, long after provisioning ran
+    snapshot = wt / "_bmad" / "render" / "bmad-build-auto" / "repo-abc123" / "deadbeef"
+    snapshot.mkdir(parents=True)
+    (snapshot / "workflow.md").write_text("RENDERED", encoding="utf-8")
+    assert git(wt, "status", "--short", "--", "_bmad") == ""
+
+    exclude = (repo / ".git" / "info" / "exclude").read_text(encoding="utf-8").splitlines()
+    assert "/_bmad" in exclude
+    assert "/_bmad/render/" not in exclude
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")

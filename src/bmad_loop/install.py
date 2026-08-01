@@ -1267,10 +1267,27 @@ def _merge_traversable(src, dst: Path, worktree: Path, repo_root: Path | None = 
 
 
 def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> None:
-    """Add anchored ignore patterns to the worktree's local git exclude so the
-    provisioned tool files are never staged by the unit's `git add -A`. Uses
-    git's standard local-only exclude (never committed or pushed); it does not
-    affect already-tracked files. Best-effort — skipped if git can't be queried.
+    """Add anchored ignore patterns to the git exclude that covers the worktree, so the
+    provisioned tool files are never staged by the unit's `git add -A`. Uses git's
+    standard local-only exclude (never committed or pushed); it does not affect
+    already-tracked files. Best-effort — skipped if git can't be queried.
+
+    ⚠️ "Local" is not "private". `info/exclude` lives under `--git-common-dir`, which a
+    linked worktree SHARES with the main checkout (measured: `rev-parse
+    --git-common-dir` from inside a linked worktree answers the main repo's `.git`), and
+    nothing in this codebase ever prunes a line from it. So a pattern written for one
+    story's worktree also hides that path from the operator's own `git status` — and
+    keeps hiding it after the worktree is gone. That is only harmless because every
+    pattern here names a path a bmad-loop project is expected to gitignore anyway
+    (`.claude/`, `.agents/`, `.mcp.json`, `_bmad/`); for a project that deliberately
+    tracks one of them, the shield is over-broad in the main checkout.
+
+    Callers therefore keep lines OUT of this file wherever they can rather than writing
+    every pattern that might apply — see the `_bmad/render/` gate in
+    :func:`provision_worktree`. Making the shield genuinely per-worktree needs a private
+    `<worktree-gitdir>/info/exclude` plus a worktree-scoped `core.excludesFile` behind
+    `extensions.worktreeConfig`; that is a repo-format change with its own failure modes
+    and is not something a patch release should introduce.
     """
     # Callers pass POSIX-slash patterns (glob rels via as_posix; config strings as
     # authored); git's exclude is POSIX-slash on every platform, so nothing to fix here.
@@ -1707,6 +1724,85 @@ def _central_config_seed_incomplete(worktree: Path, repo_root: Path) -> bool:
     return _is_file(repo_root / CENTRAL_CONFIG_REL) and not _is_file(worktree / CENTRAL_CONFIG_REL)
 
 
+def worktree_seed_undelivered(
+    worktree: Path,
+    repo_root: Path,
+    seed_files: Sequence[str] = (),
+    seed_globs: Sequence[str] = (),
+) -> list[str]:
+    """The seed rels the repo carries that never reached the worktree (#415).
+
+    The last silent leg of ``provision_worktree``'s copy-when-absent seeding. Its two
+    explicit loops drop an entry with a bare ``continue`` when the resolve-and-contain
+    guard refuses it, and from the caller's side that is indistinguishable from an entry
+    that applied: ``skipped`` reports only the *destination already exists* case. The
+    realistic trigger is the same one the ``_bmad/`` and skills gates were written for —
+    a config the repo carries as a **symlink to something outside it** (a
+    dotfile-managed ``.claude/settings.json``, a shared MCP config, a plugin's skill
+    tree pointing at a shared checkout). The seed then delivers nothing and says nothing.
+
+    Asked of the RESULT rather than accumulated inside the loops, the pattern the three
+    sibling gates established (:func:`base_skills_seed_incomplete`,
+    :func:`_bmad_scripts_seed_incomplete`, :func:`_central_config_seed_incomplete`): a
+    drop by any future path is caught the same way, and a caller cannot forge one — the
+    answer is a pure function of the two trees on disk.
+
+    **The SOURCE side is deliberately not containment-checked, and that asymmetry is the
+    whole point.** ``_is_file``/``_is_dir`` stat *through* a symlink, so a source
+    resolving outside ``repo_root`` still reads as "the repo carries this" — which is
+    exactly the entry the loop refused and nothing named. Re-applying the loop's
+    ``src.is_relative_to(repo_root)`` guard here would make the gate agree with the loop
+    and report nothing at all. The DESTINATION side IS containment-checked, for the
+    opposite reason: when ``worktree/rel`` resolves out of the worktree (a ``..``
+    component, or a checked-out symlink pointing away), the probe would otherwise stat
+    the file the loop refused to write *through* and read it as delivered.
+
+    ``_is_file(x) or _is_dir(x)`` on both sides, because a ``seed_files`` entry may name
+    a directory (``vendor``) as readily as a file — unlike :func:`_absent_skill_files`,
+    whose rels always come from a walk and are always files. What that filter excludes
+    is the decision the copier already made: a dangling symlink and a FIFO are neither
+    file nor directory, so both halves drop them in silence (see
+    ``test_a_dangling_repo_symlink_is_dropped_by_the_copier_and_the_gate``) — a broken
+    link the copy could never have followed is not a report. An *unreadable* source is
+    the other way: :func:`_is_dir` answers True for a refused probe, so it is carried,
+    and it is named. Absent-from-the-repo and unreadable-in-the-repo must not collapse
+    into one silence, the same split :func:`base_skills_seed_incomplete` makes.
+
+    ⚠️ Bounded to the SILENT drops. A copy that *fails* still raises out of
+    ``provision_worktree`` — the two seed loops have no ``try`` around
+    :func:`_copy_traversable`, unlike :func:`_merge_traversable` and
+    :func:`_seed_bmad_tree` — so this gate never runs for that fault rather than
+    reporting it. Loud, not silent, and unchanged here.
+
+    ⚠️ This is NOT the ``skipped``/:data:`RENDERER_SEED_SENTINELS` channel and cannot
+    reach the renderer escalation, which reads that list by exact membership. Reported
+    separately because the two facts have different remediations: a *skip* means the
+    checkout already carries the path and the entry is doing nothing, while a *drop*
+    means the repo has something the worktree does not. Rels are echoed in the caller's
+    own spelling — a user-authored ``seed_files`` string verbatim (a Windows-authored
+    ``_bmad\\custom`` included), a glob match as a POSIX rel — matching what the two
+    loops put in ``skipped`` and in the git exclude respectively.
+    """
+    worktree = worktree.resolve()
+    repo_root = repo_root.resolve()
+    rels: list[str] = [str(rel) for rel in seed_files]
+    for pattern in seed_globs:
+        # Re-expanded rather than passed in, so this stays a function of disk. `glob`
+        # never descends a symlinked sub-directory, which is the same match set the
+        # seed loop saw.
+        rels += [m.relative_to(repo_root).as_posix() for m in sorted(repo_root.glob(pattern))]
+    undelivered: list[str] = []
+    for rel in dict.fromkeys(rels):
+        src = repo_root / rel
+        if not (_is_file(src) or _is_dir(src)):
+            continue
+        dst = worktree / rel
+        if dst.resolve().is_relative_to(worktree) and (_is_file(dst) or _is_dir(dst)):
+            continue
+        undelivered.append(rel)
+    return undelivered
+
+
 def _copy_skills(project: Path, trees: Sequence[str], force: bool) -> bool:
     """Install the bundled bmad-loop-* skills into each project skill tree.
 
@@ -1815,6 +1911,11 @@ def provision_worktree(
     so only the checks above can emit them. Whether either is fatal depends on the
     resolved primitive's era, which provisioning cannot see from a repo root and a
     list of CLI profiles — the caller decides (see RENDERER_SEED_SENTINELS).
+
+    Entries the two seed loops DROPPED are NOT in this list: a skip and a drop are
+    different facts with different remediations, so the drop report is its own
+    predicate on its own channel (see worktree_seed_undelivered), which the caller
+    asks of the result afterwards.
     """
     if not profiles and not seed_files and not seed_globs and not (repo_root / BMAD_DIR).is_dir():
         return []
@@ -1825,6 +1926,10 @@ def provision_worktree(
 
     # project gitignored MCP/CLI configs: copy from the main repo when absent.
     # Resolve-and-contain guards against an `..`/absolute entry escaping either tree.
+    # Both loops drop a refused entry with a bare `continue`; what they dropped is named
+    # afterwards by `worktree_seed_undelivered`, which re-asks the result rather than
+    # accumulating a bit here — see its docstring for why the two guards below cannot be
+    # the report (the source one is the very fault being reported).
     seeded: list[str] = []
     # Entries that named a real source but whose destination already exists, so
     # copy-when-absent made them a no-op. Reported to the caller (this function is
@@ -1966,12 +2071,26 @@ def provision_worktree(
     patterns |= {f"/{p.hooks.config_path}" for p in profiles if not p.hookless}
     patterns |= {f"/{rel}" for rel in seeded}
     patterns |= {f"/{rel}" for rel in seeded_bmad}
-    if (worktree / BMAD_DIR).is_dir():
+    if f"/{BMAD_DIR}" not in patterns and (worktree / BMAD_DIR).is_dir():
         # Shielded whether we seeded it or not: the renderer rewrites this dir
-        # DURING the session, long after provisioning. Gated on the worktree
-        # actually having a _bmad/ because .git/info/exclude is the COMMON git dir,
-        # shared with the main checkout — a line for a dir this worktree can never
-        # grow is pollution in the operator's own repo.
+        # DURING the session, long after provisioning. Both conditions exist to keep
+        # lines OUT of this file, and they are one policy rather than two:
+        # `.git/info/exclude` is the COMMON git dir, shared with the main checkout and
+        # never pruned by anything, so every line written here is permanent state in the
+        # operator's own repo. Measured: a `/_bmad` line hides an untracked `_bmad/` from
+        # `git status` in the MAIN checkout, for the life of the repo.
+        #
+        # So: nothing when the worktree can never grow a `_bmad/`, and nothing when the
+        # blanket root line is already going in — `/_bmad` prunes the directory before
+        # git descends, so `/_bmad/render/` beneath it is never consulted (measured with
+        # `check-ignore -v`: both files attribute to the root line). Writing both was the
+        # inconsistency: one sibling gated to avoid polluting a shared file while the
+        # other added a provably inert line to it.
+        #
+        # Read off `patterns` rather than `seeded_bmad`, because the root line has two
+        # producers: the `_bmad/` merge when the checkout had none, and a user
+        # `worktree_seed = ["_bmad"]` entry that copied (0.9.0's documented broken
+        # example, which really does copy when nothing under `_bmad/` is tracked).
         patterns.add(f"/{BMAD_DIR}/render/")
     _worktree_local_exclude(worktree, sorted(patterns))
     return skipped
