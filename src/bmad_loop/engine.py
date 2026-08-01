@@ -1880,14 +1880,18 @@ class Engine:
                 # (`_run_session` returns only once the adapter has reaped it), so
                 # anything the SESSION wrote to the ledger is inside the snapshot and
                 # survives the revert; and BEFORE every ENGINE-side ledger write of
-                # this attempt — `_post_dev_state_sync`, where the sweep engine closes
-                # the bundle's entries `status: done`, as well as
-                # `_harvest_spec_deferrals`. Both of those describe work the rollback
-                # is about to discard, and a close is the more expensive of the two to
-                # get wrong: `deferredwork.open_ids` only ever re-bundles `open`
-                # entries, so a close that outlives its code hides the work from every
-                # future sweep. Snapshotting after the sync would write that close
-                # back on top of a `reset --hard` that had just correctly reverted it.
+                # this attempt that the rollback has to undo — today that is
+                # `_harvest_spec_deferrals` alone, which files findings about work the
+                # rollback is about to discard. The boundary is drawn above
+                # `_reconcile_generic_terminal_status` and `_post_dev_state_sync` too,
+                # rather than immediately above the harvest, so a future ledger write
+                # growing inside either of them is covered by construction.
+                #
+                # The other engine-side ledger write — the sweep engine's `status:
+                # done` bundle closes — is deliberately NOT in this window: it sits
+                # below the artifact gate, in `_post_dev_accepted_sync`, so no revert
+                # of it is needed at all. See that method for why a snapshot could
+                # never have covered it on the DEFER leg (#405).
                 #
                 # NOT on a replayed attempt: the host died somewhere between the dead
                 # process's writes and its rollback, so what is on disk now is already
@@ -1954,6 +1958,10 @@ class Engine:
             )
             self._save()
             if decision.action == Action.PROCEED:
+                # The attempt is ACCEPTED: every gate that could still discard it has
+                # passed. Engine-side bookkeeping that makes a claim about this
+                # attempt's work belongs here rather than upstream of those gates.
+                self._post_dev_accepted_sync(task, result.result_json)
                 # Clear site 1. Nothing downstream can consume the snapshot — the
                 # phase returns and never re-enters this attempt — but without the
                 # clear a story that goes on to finish would carry a copy of the
@@ -2602,9 +2610,14 @@ class Engine:
         before ``verify_dev`` checks the sprint stage. Mirrors ``verify_dev``:
         advance the story to the sprint stage matching the spec status the skill
         actually reached, so a failed or blocked session (spec not at the success
-        status) never advances the sprint. No-op for the legacy path; SweepEngine
-        overrides this to flip the deferred-work ledger instead (bundles carry no
-        sprint-status entry)."""
+        status) never advances the sprint. No-op for the legacy path.
+
+        Runs ABOVE the artifact gate because ``verify_dev`` reads what it writes —
+        the board must already say ``review``/``done`` or the story fails its own
+        gate. That is the whole justification for the position, and it does not
+        generalise: bookkeeping that no gate reads belongs in
+        ``_post_dev_accepted_sync`` instead. SweepEngine overrides this to a no-op
+        for exactly that reason (#405)."""
         if not self._generic_dev():
             return
         spec_file = (result_json or {}).get("spec_file")
@@ -2622,6 +2635,27 @@ class Engine:
             return
         target = "review" if review_enabled else "done"
         sprint_advance(self.workspace.paths.sprint_status, task.story_key, target)
+
+    def _post_dev_accepted_sync(self, task: StoryTask, result_json: dict | None) -> None:
+        """Bookkeeping for a dev attempt the orchestrator has ACCEPTED — the seam for
+        engine-side writes that make a durable claim about the attempt's work.
+
+        The counterpart to ``_post_dev_state_sync``, and the default of the two. That
+        one runs above ``_verify_dev_artifacts`` only because ``verify_dev`` reads the
+        state it writes; anything that does NOT feed a gate belongs here, because
+        above the gate every terminus that discards the attempt has to be taught to
+        undo the write — and one of them, ``_defer``, does the exact opposite on
+        purpose (it snapshots the ledger around its own ``reset --hard`` and writes
+        those bytes back, so review-found deferrals survive). A single accepted-only
+        call site needs no undo on any leg.
+
+        Called after ``decide_dev`` returns PROCEED rather than on ``outcome.ok``, so
+        two more discards are excluded for free: a CRITICAL escalation in the result
+        json preempts even a passing outcome (``escalation.decide_dev``), and a
+        failing ``[verify] commands`` run replaces the outcome after the artifact
+        gate. No-op on the base path; ``SweepEngine`` closes a bundle's deferred-work
+        entries here."""
+        return
 
     def _harvest_spec_deferrals(self, task: StoryTask, result_json: dict | None) -> None:
         """Carry the dev primitive's frontmatter `deferred:` findings into the
@@ -2665,10 +2699,8 @@ class Engine:
         under a protected artifact folder, so `_safe_reset`'s `keep` shields it
         from `safe_rollback`'s untracked cleanup and a ledger this harvest CREATED
         would survive (#405). `_dev_phase` therefore snapshots the ledger ahead of
-        this call — ahead of `_post_dev_state_sync` too, so a sweep bundle's
-        `status: done` closes revert with the code they claim to resolve — and
-        restores it around `_rollback_or_pause`; that restore, not the reset, is
-        what makes the revert unconditional. The snapshot is persisted with the
+        this call and restores it around `_rollback_or_pause`; that restore, not
+        the reset, is what makes the revert unconditional. The snapshot is persisted with the
         attempt, so a REPLAYED one restores the same bytes rather than guessing;
         see `_restore_persisted_ledger`.
         A DEFER does NOT revert: `_defer` snapshots the ledger and writes it back
@@ -3465,8 +3497,8 @@ class Engine:
         The snapshot is PERSISTED rather than held in a local, and that is the whole
         point: a host death between `_harvest_spec_deferrals` and
         `_rollback_or_pause` used to lose the local, leaving the dead attempt's
-        finding (and, for a sweep bundle, its `status: done` closes) behind for the
-        successful retry to commit. `_resumable_session` replays the recorded result
+        finding behind for the successful retry to commit.
+        `_resumable_session` replays the recorded result
         and `_dev_phase` re-enters its loop from the top, so the replay reaches this
         call with the dead attempt's own bytes still on the task.
 

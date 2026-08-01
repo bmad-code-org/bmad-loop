@@ -140,10 +140,9 @@ editing.
   harvest and restores it around the rollback — unlinking the file when the harvest created it,
   and on the stop-and-wait path too, which raises. Lossless, because the spec's `deferred:`
   frontmatter is never mutated and the next attempt re-harvests from it. The snapshot is taken
-  ahead of the orchestrator's own ledger writes too, so a sweep bundle's `status: done` closes
-  revert along with the code they claimed to resolve — a surviving close is worse than a
-  surviving finding, since `open_ids` only ever re-bundles open entries and no later sweep would
-  look at that id again. And it is persisted with the attempt rather than held in a local, so a
+  ahead of every engine-side ledger write in that window rather than immediately ahead of the
+  harvest, so one growing inside the status reconcile or the state sync is covered by
+  construction. And it is persisted with the attempt rather than held in a local, so a
   host death between the harvest and the rollback no longer loses it: the replayed attempt
   writes back the same bytes the live path would have. That replaces a presence bit which could
   only say whether a ledger existed at the attempt baseline — enough to delete one the harvest
@@ -156,6 +155,21 @@ editing.
   acted on, so a finished story carries no copy of the ledger in `state.json`. A defer still
   keeps its harvested entries: on the in-place path `_stash_deferred_artifacts` has already moved
   the spec out of the artifacts dir, so the ledger entry is the finding's only surviving record.
+
+- **A sweep bundle's ledger closes are withheld until its attempt is accepted (#405).** The
+  orchestrator marks a bundle's deferred-work ids `done` itself, and did so above the artifact
+  gate — so an attempt that finalized its spec and then failed a non-fixable check was discarded
+  with the ledger already claiming its work resolved. A surviving close is worse than a surviving
+  finding: `open_ids` only ever re-bundles open entries and there is no reopen primitive, so no
+  later sweep looks at that id again and the work is silently lost rather than mis-recorded. On
+  the retry leg the dev phase's ledger snapshot reverted it; on the DEFER terminus nothing in the
+  dev phase could, because `_defer` takes its own snapshot after the close and writes it back
+  over its own reset — deliberately, so review-found deferrals survive a defer. The close now
+  runs below the gate, for a PROCEED decision only, which also excludes a CRITICAL escalation
+  (it preempts even a passing outcome) and a failing `[verify] commands` run; no dev-phase leg
+  needs a revert any more. One deliberate consequence: that write no longer counts toward the gate's
+  proof-of-work diff, so a bundle session which changed no code now fails the gate instead of
+  passing on the orchestrator's own bookkeeping.
 
 ## [0.9.0] — 2026-07-21
 

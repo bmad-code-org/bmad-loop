@@ -436,8 +436,9 @@ def test_sweep_happy_path(project):
 
 def test_generic_skill_bundle_orchestrator_closes_ledger(project):
     """B4: on the generic bmad-dev-auto path the bundle session never edits the
-    ledger; the orchestrator marks each owned dw id done (in _post_dev_state_sync)
-    and verify_review_bundle confirms its own write. The invocation is freeform."""
+    ledger; the orchestrator marks each owned dw id done (in
+    _post_dev_accepted_sync) and verify_review_bundle confirms its own write. The
+    invocation is freeform."""
     write_ledger(project, {"DW-1": "open", "DW-2": "open"})
     plan = triage_result(
         ["DW-1", "DW-2"],
@@ -475,22 +476,21 @@ def test_generic_skill_bundle_orchestrator_closes_ledger(project):
     assert "sweep-bundle-closed" in kinds
 
 
-def test_bundle_ledger_close_reverted_on_non_fixable_retry(project):
-    """The orchestrator closes a bundle's dw ids in `_post_dev_state_sync`, which
-    runs BEFORE the artifact gate that can still send the attempt back — so a close
-    can outlive the code it claims to resolve. It must not.
+def test_bundle_ledger_close_withheld_on_a_non_fixable_retry(project):
+    """The RETRY leg of the accepted-only close. The orchestrator closes a bundle's
+    dw ids in `_post_dev_accepted_sync`, below the artifact gate that can still send
+    the attempt back — so a close can never outlive the code it claims to resolve.
 
-    A close is the more expensive of the two engine-side ledger writes to leave
-    behind: `deferredwork.open_ids` only ever re-bundles `open` entries, so a `done`
-    id with no code behind it is invisible to every future sweep, where a stray
-    harvest entry merely reads as noise. The ledger here is TRACKED, so `reset --hard`
-    reverts the close by itself and the restore is unambiguously the only thing that
-    could put it back — which is exactly what a snapshot taken after the sync does.
+    A close is the most expensive engine-side ledger write to leave behind:
+    `deferredwork.open_ids` only ever re-bundles `open` entries and there is no
+    reopen primitive, so a `done` id with no code behind it is invisible to every
+    future sweep, where a stray harvest entry merely reads as noise.
 
-    This is the test that discriminates the snapshot's POSITION. Move the arm in
-    `_dev_phase` back below `_post_dev_state_sync` and this reddens; nothing in
-    `test_engine.py`'s ledger family can see the difference, because there the
-    ledger is only ever touched by the harvest."""
+    The ledger here is TRACKED, so `reset --hard` would revert a close by itself —
+    which is what makes this leg the WEAK one and the DEFER leg
+    (`..._when_a_completed_attempt_defers`) the load-bearing one. Kept because it
+    pins the mid-run state no other test sees: attempt 2 opens on a ledger that was
+    never rewritten, rather than on one rewritten and then put back."""
     write_ledger(project, {"DW-1": "open"})  # committed ⇒ tracked
     plan = triage_result(
         ["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "resolve DW-1"}]
@@ -513,9 +513,9 @@ def test_bundle_ledger_close_reverted_on_non_fixable_retry(project):
         project,
         [
             triage_effect(plan),
-            # closes DW-1 off `task.dw_ids`, then fails the gate on the CLAIM: the
-            # close fires either way, so the attempt is discarded with the ledger
-            # already rewritten
+            # reports dw_ids the task does not own, so the artifact gate fails on the
+            # CLAIM — after a spec status (`done`) that would otherwise authorize the
+            # close. The attempt is discarded; the ledger must never have been touched.
             bundle_dev_effect(project, "fix", ["DW-99"], mark_ledger=False, followup_review=False),
             capture_then_die,
         ],
@@ -523,18 +523,119 @@ def test_bundle_ledger_close_reverted_on_non_fixable_retry(project):
     )
     summary = engine.run()
 
-    # the scenario really is: closed, then non-fixably retried and rolled back
-    assert "sweep-bundle-closed" in {e["kind"] for e in engine.journal.entries()}
+    # the scenario really is: spec finalized, gate failed, rolled back
     decisions = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
     assert decisions[0]["action"] == "retry" and "do not match" in decisions[0]["reason"]
     assert "rollback-auto" in journal_text(engine)
+    assert "sweep-bundle-closed" not in {e["kind"] for e in engine.journal.entries()}
 
-    # attempt 2 opens on a ledger whose close went with the code it described …
+    # attempt 2 opens on a ledger the discarded attempt never rewrote …
     assert "status: open" in seen[0]
     assert "resolved by sweep bundle dw-fix" not in seen[0]
     # … and that is where the run leaves it, so a later sweep can re-bundle DW-1
     assert summary.deferred == 1 and not summary.paused
     assert ledger_entries(project)["DW-1"].open
+
+
+def test_bundle_ledger_close_withheld_when_a_completed_attempt_defers(project):
+    """The DEFER terminus — the leg that made the close's position a CORRECTNESS
+    question rather than a tidiness one, and the leg no ledger snapshot in
+    `_dev_phase` could ever have covered.
+
+    Differs from `..._on_a_non_fixable_retry` above by exactly one thing: attempt 2
+    is a second COMPLETED session rather than a corpse. That is enough. A completed
+    attempt runs the engine-side ledger writes; the gate then fails on the dw_ids
+    claim with the budget spent, so `decide_dev` returns DEFER — and `_defer` takes
+    its own snapshot of the ledger AFTER those writes, resets, and writes the
+    snapshot back on purpose, so harvested findings survive a defer. A close written
+    above the gate rode that write-back over the top of the rollback that had just
+    correctly reverted it: `status: done` on an id whose code no longer exists, and
+    `open_ids` never re-bundles it, so the work is silently LOST. Closing only for an
+    accepted attempt means there is nothing for `_defer` to resurrect.
+
+    The `dev-decision` assert is load-bearing: with `max_dev_attempts = 1` the
+    budget is already spent at attempt 1 and the run DEFERS without ever reaching a
+    RETRY, so the ledger is never rewritten and the test would pass vacuously."""
+    write_ledger(project, {"DW-1": "open"})  # committed ⇒ tracked
+    plan = triage_result(
+        ["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "resolve DW-1"}]
+    )
+
+    def mismatching_attempt():
+        return bundle_dev_effect(
+            project, "fix", ["DW-99"], mark_ledger=False, followup_review=False
+        )
+
+    pol = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=False),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        scm=ScmPolicy(rollback_on_failure=True),
+        limits=LimitsPolicy(max_dev_attempts=2),
+    )
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(plan), mismatching_attempt(), mismatching_attempt()],
+        policy=pol,
+    )
+    summary = engine.run()
+
+    actions = [e["action"] for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert actions == ["retry", "defer"]
+    assert summary.deferred == 1 and not summary.paused
+    text = project.deferred_work.read_text(encoding="utf-8")
+    assert "resolved by sweep bundle dw-fix" not in text
+    assert deferredwork.open_ids(text) == {"DW-1"}
+    assert "change for dw-fix" not in (project.project / "src.txt").read_text()
+    assert "sweep-bundle-closed" not in {e["kind"] for e in engine.journal.entries()}
+
+
+def test_bundle_ledger_close_withheld_when_a_critical_escalation_preempts_the_gate(project):
+    """The close is gated on the DECISION being PROCEED, not on `outcome.ok`, and
+    this is the one scenario that can tell the two apart.
+
+    `escalation.decide_dev` checks `critical_escalations(result_json)` before it
+    looks at the outcome at all, so a session that finalized its spec, produced a
+    matching `dw_ids` claim and passed every artifact gate still PAUSEs when it
+    raises a CRITICAL. Gating on `outcome.ok` would close the ids on the way to a
+    human escalation — recording as resolved a bundle whose whole point is that the
+    orchestrator could not resolve it.
+
+    Distinct from `test_escalated_bundle_resume_skips_it_and_runs_rest`, which uses
+    `bundle_dev_escalates`: that session writes its spec `blocked`, so
+    `_close_bundle_ledger_when_spec_status`'s own status guard already refuses and
+    the escalation proves nothing about the decision gate."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = triage_result(
+        ["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "resolve DW-1"}]
+    )
+    clean = bundle_dev_effect(project, "fix", ["DW-1"], mark_ledger=False, followup_review=False)
+
+    def clean_but_critical(spec):
+        result = clean(spec)
+        result.result_json["escalations"] = [
+            {"type": "bundle-item-blocked", "severity": "CRITICAL", "detail": "intent gap"}
+        ]
+        return result
+
+    pol = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=False),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        scm=ScmPolicy(rollback_on_failure=True),
+    )
+    engine, _ = make_sweep(project, [triage_effect(plan), clean_but_critical], policy=pol)
+    summary = engine.run()
+
+    # the gate really did pass — the PAUSE comes from the escalation, not a failure
+    decisions = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert len(decisions) == 1
+    assert decisions[0]["action"] == "pause" and "CRITICAL" in decisions[0]["reason"]
+    assert summary.paused
+    assert ledger_entries(project)["DW-1"].open
+    assert "sweep-bundle-closed" not in {e["kind"] for e in engine.journal.entries()}
 
 
 def test_bundle_ledger_close_skips_on_unreadable_spec(project, monkeypatch):
@@ -556,7 +657,7 @@ def test_bundle_ledger_close_skips_on_unreadable_spec(project, monkeypatch):
     task = StoryTask(story_key="dw-fix-things", epic=0, dw_ids=["DW-1", "DW-2"])
     fault_read_text(monkeypatch, sp)
 
-    engine._post_dev_state_sync(task, {"spec_file": str(sp)})
+    engine._post_dev_accepted_sync(task, {"spec_file": str(sp)})
 
     entries = ledger_entries(project)
     assert entries["DW-1"].status == "open" and entries["DW-2"].status == "open"

@@ -492,9 +492,23 @@ class SweepEngine(Engine):
 
         Runs before the ledger is read, so a bundle it closes leaves the open set
         and no fresh triage can re-bundle those ids (validate_triage rejects a plan
-        whose open_ids disagree with the ledger). A recovered bundle that defers or
-        escalates keeps its ids open, where the existing failed_ids filter drops the
-        fresh plan's overlapping bundle."""
+        whose open_ids disagree with the ledger).
+
+        A recovered bundle that escalates keeps its ids open, and so does one that
+        defers on the DEV leg: the close is withheld until the attempt is accepted
+        (`_post_dev_accepted_sync`), so a discarded attempt leaves nothing on disk to
+        survive its rollback. `failed_ids` then drops the fresh plan's overlapping
+        bundle.
+
+        A bundle that gets past dev and then defers in REVIEW does NOT keep its ids
+        open, and the wording above used to claim otherwise. By that point they are
+        `done` — the accepted dev attempt closed them, and `_verify_review` re-closes
+        ahead of `verify_review_bundle` besides — and `_defer` writes its own ledger
+        snapshot back over its `reset --hard`, deliberately, so review-found
+        deferrals survive a defer. The restore is indiscriminate, so those closes ride
+        it too and name code the reset just discarded. `failed_ids` still covers the
+        current run; nothing covers a later one, because `open_ids` re-bundles only
+        `open` entries and `deferredwork` has no reopen primitive (#405)."""
         recovered = 0
         for task in list(self.state.tasks.values()):
             if task.terminal or not BUNDLE_KEY_RE.match(task.story_key):
@@ -1159,7 +1173,7 @@ class SweepEngine(Engine):
         """Bundle invocation for the generic bmad-dev-auto dev skill: the self-contained
         intent.md (intent + verbatim ledger entries) is handed over as freeform
         intent. The orchestrator owns the deferred-work ledger — the skill is told
-        not to edit it — and records resolution itself in `_post_dev_state_sync`.
+        not to edit it — and records resolution itself in `_post_dev_accepted_sync`.
         On a repair the bundle spec is re-opened first (B6) so step-01 resumes.
 
         A patch-restore re-drive (#2564, #75) must point at the bundle spec
@@ -1197,11 +1211,43 @@ class SweepEngine(Engine):
         )
 
     def _post_dev_state_sync(self, task: StoryTask, result_json: dict | None) -> None:
+        """No-op: a bundle has no sprint-status row, so the base engine's pre-gate
+        sprint advance has nothing to write. The bundle's own bookkeeping — closing
+        the dw ids it owns — used to live here and does not any more; it moved below
+        the artifact gate, into `_post_dev_accepted_sync` (#405)."""
+        return
+
+    def _post_dev_accepted_sync(self, task: StoryTask, result_json: dict | None) -> None:
         """Generic-path ledger single-writer for bundles. The decoupled
         bmad-dev-auto skill does not touch the ledger, so the orchestrator marks
         each dw id the bundle owns ``done`` once the bundle's spec reaches the
-        terminal status for the current stage. Mirrors the story sprint sync;
-        no-op on the legacy path."""
+        terminal status for the current stage. No-op on the legacy path.
+
+        Below the artifact gate, not above it, and that is the whole design (#405).
+        A close is the most expensive engine-side ledger write to leave behind:
+        `deferredwork.open_ids` re-bundles only `open` entries and the module has no
+        reopen primitive, so a `done` id whose code was discarded is invisible to
+        every future sweep — the work is lost, not merely mis-recorded. Written
+        above the gate it outlived its attempt on two legs. The non-fixable RETRY
+        was covered by `_dev_phase`'s pre-harvest ledger snapshot; the DEFER
+        terminus was not, and no snapshot in `_dev_phase` could have covered it,
+        because `_defer` takes its OWN snapshot after this call and writes those
+        bytes back over its `reset --hard` on purpose, to keep harvested findings.
+        Gating on the accepted decision retires both legs at once and needs no
+        revert on any of them.
+
+        Nothing between the old position and this one reads the ledger:
+        `verify_dev_bundle` gates on the spec path, `_verify_shared_gates` and an
+        in-memory `dw_ids` cross-check, and `[verify] commands` is operator shell.
+        `verify_review_bundle` DOES require these entries `done`, and it runs later
+        still — with `_verify_review` re-closing immediately ahead of it anyway, for
+        the case where a review session rewrote the ledger.
+
+        One deliberate consequence: the close no longer contributes to the artifact
+        gate's proof-of-work diff (`verify_dev_exclude_relpaths` does not exclude the
+        ledger). A bundle session that finalized its spec but changed no code used to
+        pass that gate on the orchestrator's own write; it now fails it, which is the
+        answer the gate exists to give."""
         if not self._generic_dev():
             return
         spec_file = (result_json or {}).get("spec_file")
