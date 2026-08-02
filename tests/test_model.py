@@ -289,6 +289,41 @@ def test_harvested_deferrals_do_not_alias_the_persisted_doc():
     assert doc["harvested_deferrals"][0]["title"] == "t"
 
 
+def test_bundle_closes_intended_round_trips_json_native():
+    """Persisted for the sharper version of its neighbour's reason: a replay re-runs
+    the close, `mark_done` finds the entries already `done` and returns False, and a
+    record derived fresh from that comes back empty while the flip is still confined
+    to the unmerged worktree.
+
+    The `json.loads(json.dumps(...))` leg is the #189 guard — a tuple survives
+    `from_dict(to_dict(...))` intact but returns from *disk* as a list, so an
+    in-memory comparison of the two reads as a spurious "changed"."""
+    import json
+
+    ids = ["DW-3", "DW-7"]
+    task = StoryTask(story_key="sweep-1", epic=0, bundle_closes_intended=ids)
+    assert StoryTask.from_dict(task.to_dict()).bundle_closes_intended == ids
+    assert StoryTask.from_dict(json.loads(json.dumps(task.to_dict()))).bundle_closes_intended == ids
+
+
+def test_bundle_closes_intended_defaults_empty_for_legacy_state():
+    """Absent ⇒ no close was recorded, so none is re-applied — the pre-#405 shape,
+    and the conservative direction (the carry WRITES `status: done` into a ledger)."""
+    doc = StoryTask(story_key="sweep-1", epic=0).to_dict()
+    del doc["bundle_closes_intended"]  # state.json from before the field existed
+    assert StoryTask.from_dict(doc).bundle_closes_intended == []
+
+
+def test_bundle_closes_intended_does_not_alias_the_persisted_doc():
+    """A container field, so it gets the same aliasing guard `harvested_deferrals`
+    has: the sweep re-assigns this list per bundle, and a task rehydrated from a
+    shared `state.json` doc must not write back through it."""
+    doc = StoryTask(story_key="sweep-1", epic=0, bundle_closes_intended=["DW-3"]).to_dict()
+    task = StoryTask.from_dict(doc)
+    task.bundle_closes_intended.append("DW-9")
+    assert doc["bundle_closes_intended"] == ["DW-3"]
+
+
 def test_baseline_ledger_digest_round_trips():
     """The digest is the reference `_harvest_gate_exclude` measures each attempt
     against, and a resumed `_dev_phase` call cannot re-capture it (that would move the

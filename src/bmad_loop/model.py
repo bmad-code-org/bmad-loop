@@ -304,6 +304,35 @@ class StoryTask:
     # stall or budget exhaustion defers with an empty record while the entry dies
     # unmerged with the worktree (#405).
     harvested_deferrals: list[dict[str, Any]] = field(default_factory=list)
+    # The dw ids a sweep bundle's ledger CLOSE decided to flip — recorded by
+    # `SweepEngine._close_bundle_ledger_when_spec_status` when the spec reached its
+    # success status, and re-applied to the MAIN checkout's ledger by
+    # `SweepEngine._carry_isolated_ledger_writes` after an isolated unit lands.
+    #
+    # The isolated sibling of `harvested_deferrals` above. The close writes
+    # `workspace.paths.deferred_work`, which under `scm.isolation = "worktree"` is
+    # the unit worktree's — and when the ledger is gitignored (seeded into the
+    # worktree by `scm.worktree_seed`) `finalize_commit`'s `add -A` skips it in
+    # silence, so the flip never rides the branch. The entries stay `open`,
+    # `deferredwork.open_ids` re-bundles them, and every later sweep re-triages and
+    # re-drives work that is already done — an unbounded loop, not a one-time drop.
+    #
+    # The INTENT, not the ids the close managed to flip, and that distinction is the
+    # whole design: the close runs TWICE on a landing bundle (after dev, and again
+    # from `_verify_review`'s idempotent reclose), and the second run finds every id
+    # already `done`, so its `marked` is EMPTY. A record keyed off `marked` is wiped
+    # by the reclose on exactly the run that needs it. Same trap
+    # `harvested_deferrals` already paid for once (it records the harvest's full
+    # `pending` set, never its `filed` ids).
+    #
+    # PERSISTED for the same reason its neighbour is: a replay re-runs the close,
+    # `mark_done` finds the entries already `done` and returns False, and a record
+    # derived fresh from that comes back empty while the flip is still confined to
+    # the worktree.
+    #
+    # JSON-native values only — a `list[str]`, never a tuple: a tuple/list
+    # round-trip reads back as a spurious "changed" (#189).
+    bundle_closes_intended: list[str] = field(default_factory=list)
     spec_file: str | None = None
     commit_sha: str | None = None
     defer_reason: str | None = None
@@ -402,6 +431,7 @@ class StoryTask:
             "harvest_wrote_ledger": self.harvest_wrote_ledger,
             "ledger_changed_before_harvest": self.ledger_changed_before_harvest,
             "harvested_deferrals": self.harvested_deferrals,
+            "bundle_closes_intended": self.bundle_closes_intended,
             "spec_file": self._serialized_spec_file(),
             "commit_sha": self.commit_sha,
             "defer_reason": self.defer_reason,
@@ -476,6 +506,9 @@ class StoryTask:
             # `[]` for a state.json written before this field existed: nothing was
             # recorded, so nothing carries — the pre-#405 shape exactly.
             harvested_deferrals=[dict(item) for item in d.get("harvested_deferrals", [])],
+            # `[]` on a legacy state.json for the same reason: no close was recorded,
+            # so none is re-applied, which is the pre-#405 shape.
+            bundle_closes_intended=[str(i) for i in d.get("bundle_closes_intended", [])],
             spec_file=d.get("spec_file"),
             commit_sha=d.get("commit_sha"),
             defer_reason=d.get("defer_reason"),

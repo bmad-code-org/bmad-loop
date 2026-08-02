@@ -1275,9 +1275,98 @@ class SweepEngine(Engine):
             return
         ledger = self.workspace.paths.deferred_work
         note = f"resolved by sweep bundle {task.story_key}"
+        # Record the INTENT before attempting the flips, and record `task.dw_ids`
+        # rather than `marked`, which `_carry_isolated_ledger_writes` re-applies to
+        # the MAIN checkout. This method runs TWICE on a landing bundle — here and
+        # again from `_verify_review`'s idempotent reclose — and the second call finds
+        # every id already `done`, so `mark_done` returns False for all of them and
+        # `marked` comes back EMPTY. Keying the record off it would wipe the record on
+        # exactly the run that needs it. Same trap `harvested_deferrals` already paid
+        # for once, which is why that one records the harvest's `pending` set and not
+        # its `filed` ids (#405).
+        task.bundle_closes_intended = list(task.dw_ids)
         marked = [i for i in task.dw_ids if deferredwork.mark_done(ledger, i, self._today(), note)]
         if marked:
             self.journal.append(kind, story_key=task.story_key, dw_ids=marked)
+
+    def _carry_isolated_ledger_writes(self, task: StoryTask) -> None:
+        """The base hook's sweep half: re-apply this bundle's ledger CLOSES to the
+        MAIN checkout after an isolated unit lands, having first let the base carry
+        the harvest.
+
+        `_close_bundle_ledger_when_spec_status` writes
+        `self.workspace.paths.deferred_work` — under `scm.isolation = "worktree"`
+        the unit worktree's. The shape this fixes is a GITIGNORED ledger named in
+        `scm.worktree_seed`: the flip lands in the worktree, and then
+        `finalize_commit`'s `add -A` skips the ignored path in silence, so it never
+        rides the branch and the merge brings nothing over. The bundle's entries
+        stay `open`, `deferredwork.open_ids` re-bundles them, and every later sweep
+        re-triages and re-drives work that is already done — an unbounded loop, not
+        a one-time drop, which is why this is worth a carry rather than a note.
+
+        The UNSEEDED gitignored ledger is a different, still-open hole and this
+        cannot reach it: a worktree checks out tracked files only, so the ledger is
+        absent there entirely, `verify_review_bundle` (which reads the WORKTREE's
+        copy) never sees the bundle's ids `done`, and the unit DEFERS on a fixable
+        retry rather than landing. Loud — `review-verify-failed` — where the seeded
+        shape above is silent, and no DONE-leg carry can help a unit that never
+        reaches DONE.
+
+        DONE leg only, and deliberately so: `_defer` calls
+        `_carry_harvested_deferrals` directly, never this. A defer discarded the code
+        the close claims to have RESOLVED, and a close is the most expensive
+        engine-side write to leave behind — `open_ids` re-bundles only `open`
+        entries, so a wrong `done` is invisible to every future sweep. (Consistent
+        with today: under isolation the close never reaches main, and
+        `_reopen_ledger_after_defer` is reachable only from the in-place branch.)
+
+        `task.bundle_closes_intended`, not the ids the close managed to flip:
+        `marked` is EMPTY in exactly the broken case above. Same trap the harvest
+        record already paid for once.
+
+        `mark_done` is idempotent — it returns False on an entry already `done` — so
+        a project whose ledger is TRACKED, where the close merged normally, gets a
+        no-op here. That is the same property that makes the harvest carry safe to
+        call unconditionally.
+
+        No `_generic_dev()` guard, unlike the two ledger WRITERS: the record is the
+        guard. `bundle_closes_intended` is only ever assigned by
+        `_close_bundle_ledger_when_spec_status`, which `_post_dev_accepted_sync`
+        reaches on the generic path alone — so on the legacy path, where the session
+        owns the ledger, it is empty and this returns before touching anything. A
+        second, unfalsifiable predicate saying the same thing would be a branch no
+        test could redden.
+
+        The commit is best effort for the same reason the harvest carry's is: `git
+        add -- <ignored path>` refuses with rc 1, and raising here would cost the run
+        its `_integrate_unit` over bookkeeping whose real job is already done. The
+        flips themselves are unguarded — losing them is the hazard this exists to
+        prevent."""
+        super()._carry_isolated_ledger_writes(task)
+        if not task.bundle_closes_intended:
+            return
+        ledger = self.paths.deferred_work
+        note = f"resolved by sweep bundle {task.story_key}"
+        carried = [
+            i
+            for i in task.bundle_closes_intended
+            if deferredwork.mark_done(ledger, i, self._today(), note)
+        ]
+        if carried:
+            try:
+                verify.commit_paths(
+                    self.paths.repo_root,
+                    f"chore(deferred-work): close {task.story_key}'s bundle ids",
+                    [ledger],
+                )
+            except verify.GitError as e:
+                self.journal.append(
+                    "sweep-bundle-close-carry-uncommitted",
+                    story_key=task.story_key,
+                    dw_ids=carried,
+                    error=str(e),
+                )
+        self.journal.append("sweep-bundle-close-carried", story_key=task.story_key, dw_ids=carried)
 
     def _reopen_ledger_after_defer(self, task: StoryTask) -> None:
         """Re-open the dw ids THIS bundle closed, when the defer that just ran

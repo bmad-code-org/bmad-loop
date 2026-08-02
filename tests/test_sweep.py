@@ -392,6 +392,197 @@ def test_sweep_worktree_bundle_merges_to_target(project):
     assert [p.resolve() for p in worktree_list(project.project)] == [project.project.resolve()]
     assert not branch_exists(project.project, "bmad_loop/sweep-run/dw-fix")
     assert worktree_clean(project.project)
+    # …and the DONE leg's close carry was a NO-OP here: the ledger is TRACKED, so
+    # the flip rode the branch and `mark_done` finds every id already done. An empty
+    # id list is how that stays visible, and it is what keeps the carry safe to run
+    # unconditionally (#405)
+    carried = [e for e in engine.journal.entries() if e["kind"] == "sweep-bundle-close-carried"]
+    assert len(carried) == 1 and carried[0]["dw_ids"] == []
+    assert "sweep-bundle-close-carry-uncommitted" not in {
+        e["kind"] for e in engine.journal.entries()
+    }
+
+
+def _wt_bundle_dev(project, dw_ids, deferred=None):
+    """A bundle dev session inside the unit worktree: does real source work and
+    self-finalizes its spec to `done`, leaving the ledger to the orchestrator.
+    ``deferred`` is the spec frontmatter's post-#2640 `deferred:` list the harvest
+    reads; ``None`` omits the field, which is the common shape."""
+    from conftest import write_spec
+
+    from bmad_loop.verify import rev_parse_head
+
+    def effect(spec):
+        cwd = spec.cwd
+        wt = project.rebased(cwd)
+        baseline = rev_parse_head(cwd)
+        src = cwd / "src.txt"
+        src.write_text(src.read_text() + "change for dw-fix\n")
+        sp = wt.implementation_artifacts / "spec-dw-fix.md"
+        write_spec(sp, "done", baseline, deferred=deferred)
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "auto-dev",
+                "story_key": "dw-fix",
+                "spec_file": str(sp),
+                "baseline_commit": baseline,
+                "tasks_total": 1,
+                "tasks_done": 1,
+                "verification": [],
+                "escalations": [],
+                "dw_ids": list(dw_ids),
+            },
+        )
+
+    return effect
+
+
+def test_a_worktree_bundles_ledger_close_reaches_the_main_checkout(project):
+    """Sibling (b) of the harvest carry, and the same mechanism one layer over.
+
+    `_close_bundle_ledger_when_spec_status` writes `workspace.paths.deferred_work`
+    — the unit WORKTREE's ledger. The flip lands there (`sweep-bundle-closed` fires,
+    so this is not a run where the close never happened), and then
+    `finalize_commit`'s `add -A` skips the GITIGNORED path in silence, so it never
+    rides the branch and the merge brings nothing over. Without the carry the main
+    ledger's entry stays `open`, `deferredwork.open_ids` re-bundles it, and every
+    later sweep re-triages and re-drives work that is already done — an unbounded
+    loop, not a one-time drop.
+
+    `worktree_seed` naming the ledger is what makes this the DONE leg at all: it is
+    also the only way the ledger is IN the worktree, and `verify_review_bundle`
+    reads the worktree's copy. Unseeded — the `scm.worktree_seed = ()` default — the
+    ledger is absent from the worktree, that gate never sees its ids `done`, and the
+    bundle DEFERS instead of landing. That is a separate, still-open hole with a
+    loud failure (`review-verify-failed`), not a silent one, and no DONE-leg carry
+    can reach it."""
+    ledger_rel = project.deferred_work.relative_to(project.project).as_posix()
+    (project.project / ".gitignore").write_text(
+        ".bmad-loop/runs/\ndeferred-work.md\n", encoding="utf-8"
+    )
+    write_ledger(project, {"DW-1": "open"})  # gitignored ⇒ untracked, seeded in below
+    plan = triage_result(
+        ["DW-1"],
+        bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "fix it"}],
+    )
+    pol = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(isolation="worktree", worktree_seed=(ledger_rel,)),
+    )
+    engine, _ = make_sweep(
+        project, [triage_effect(plan), _wt_bundle_dev(project, ["DW-1"])], policy=pol
+    )
+    summary = engine.run()
+
+    assert not summary.paused and summary.deferred == 0
+    assert engine.state.tasks["dw-fix"].phase == Phase.DONE
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    # the close DID fire inside the worktree — so an `open` main ledger without the
+    # carry is the flip dying unmerged, not a run where nothing was ever closed
+    assert "sweep-bundle-closed" in kinds and "unit-merged" in kinds
+    assert ledger_entries(project)["DW-1"].status.startswith("done")
+    carried = [e for e in engine.journal.entries() if e["kind"] == "sweep-bundle-close-carried"]
+    assert len(carried) == 1 and carried[0]["dw_ids"] == ["DW-1"]
+    # the commit is best effort and `git add -- <ignored path>` refuses with rc 1
+    uncommitted = [
+        e for e in engine.journal.entries() if e["kind"] == "sweep-bundle-close-carry-uncommitted"
+    ]
+    assert len(uncommitted) == 1 and uncommitted[0]["dw_ids"] == ["DW-1"]
+    assert "git add failed" in uncommitted[0]["error"]
+    assert worktree_clean(project.project)
+
+
+def test_the_bundle_close_carry_records_the_intent_not_the_flips_it_landed(project):
+    """Why the record is `task.dw_ids` and not the ids `mark_done` actually flipped.
+
+    `_close_bundle_ledger_when_spec_status` runs TWICE on a landing bundle — once
+    from `_post_dev_accepted_sync` and once from `_verify_review`'s idempotent
+    reclose — and the second call finds every id already `done`, so its `marked`
+    comes back EMPTY. A record keyed off `marked` is therefore wiped by the reclose
+    on exactly the run that needs it, and the carry has nothing to apply.
+
+    The same trap `harvested_deferrals` paid for once, which is why that one records
+    the harvest's `pending` set rather than its `filed` ids. This row asserts the
+    reclose really did fire with nothing to mark, so the ablation it guards against
+    is a live path and not a hypothetical."""
+    ledger_rel = project.deferred_work.relative_to(project.project).as_posix()
+    (project.project / ".gitignore").write_text(
+        ".bmad-loop/runs/\ndeferred-work.md\n", encoding="utf-8"
+    )
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    plan = triage_result(
+        ["DW-1", "DW-2"],
+        bundles=[{"name": "fix", "dw_ids": ["DW-1", "DW-2"], "intent": "fix both"}],
+    )
+    pol = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(isolation="worktree", worktree_seed=(ledger_rel,)),
+    )
+    engine, _ = make_sweep(
+        project, [triage_effect(plan), _wt_bundle_dev(project, ["DW-1", "DW-2"])], policy=pol
+    )
+    summary = engine.run()
+
+    assert not summary.paused and engine.state.tasks["dw-fix"].phase == Phase.DONE
+    # the first close flipped both; the reclose flipped nothing, which is why it
+    # never journalled — that silence is precisely the `marked` a record must ignore
+    closed = [e for e in engine.journal.entries() if e["kind"] == "sweep-bundle-closed"]
+    assert len(closed) == 1 and closed[0]["dw_ids"] == ["DW-1", "DW-2"]
+    assert "sweep-bundle-reclosed" not in {e["kind"] for e in engine.journal.entries()}
+    assert engine.state.tasks["dw-fix"].bundle_closes_intended == ["DW-1", "DW-2"]
+    entries = ledger_entries(project)
+    assert entries["DW-1"].status.startswith("done")
+    assert entries["DW-2"].status.startswith("done")
+
+
+def test_a_landing_bundle_carries_its_harvest_as_well_as_its_closes(project):
+    """The override's `super()` call. A bundle's own spec can record a `deferred:`
+    finding, and the harvest files it into the same doomed worktree ledger the close
+    writes — so both halves of `_carry_isolated_ledger_writes` have to run on a
+    landing sweep unit, not just the sweep-specific one.
+
+    Nothing else in the suite drives a sweep bundle that harvests under isolation,
+    so without this row the override could drop its `super()` call and silently take
+    the harvest carry away from every sweep run."""
+    ledger_rel = project.deferred_work.relative_to(project.project).as_posix()
+    (project.project / ".gitignore").write_text(
+        ".bmad-loop/runs/\ndeferred-work.md\n", encoding="utf-8"
+    )
+    write_ledger(project, {"DW-1": "open"})
+    plan = triage_result(
+        ["DW-1"],
+        bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "fix it"}],
+    )
+    finding = {
+        "summary": "Retry loop has no ceiling",
+        "evidence": "the backoff doubles forever: no cap",
+        "location": "src/retry.py:88",
+        "severity": "medium",
+    }
+    pol = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(isolation="worktree", worktree_seed=(ledger_rel,)),
+    )
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(plan), _wt_bundle_dev(project, ["DW-1"], deferred=[finding])],
+        policy=pol,
+    )
+    summary = engine.run()
+
+    assert not summary.paused and engine.state.tasks["dw-fix"].phase == Phase.DONE
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "spec-deferrals-harvested" in kinds and "unit-merged" in kinds
+    entries = ledger_entries(project)
+    # the close reached the main checkout …
+    assert entries["DW-1"].status.startswith("done")
+    # … and so did the harvest's brand-new entry, which only the base half carries
+    assert [e.title for e in entries.values() if e.open] == ["Retry loop has no ceiling"]
+    assert "harvest-carried" in kinds
 
 
 def test_sweep_happy_path(project):
