@@ -10,7 +10,13 @@ on:
     branches: [main, release/*]
 
 concurrency:
-  group: release-${{ github.ref }}
+  # Deliberately ref-independent: `main` and a `release/*` branch can carry the
+  # same version, and keying on `github.ref` would put them in separate groups and
+  # let both publish runs proceed at once. One group repo-wide serializes them, so
+  # the second run checks out *after* the first pushed the tag and its `tag_exists`
+  # probe short-circuits cleanly. Never cancel-in-progress — a cancelled publish
+  # leaves the tag unmade.
+  group: release-publish
   cancel-in-progress: false
 
 permissions:
