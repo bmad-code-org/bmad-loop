@@ -439,8 +439,31 @@ that rode the same window. Both skill eras are supported; the rename itself need
   story's merge. `append_entry` dedups on `origin:` + `source_spec:`, so an entry already open
   there is not duplicated. Only the final attempt's record carries: it is cleared at each attempt's
   start, so an attempt whose session never completed cannot re-file the findings its predecessor's
-  rollback removed. A unit that lands is untouched — its ledger edit merges as before. The gap
-  pre-dates this release; the harvest added a systematic producer of such entries.
+  rollback removed. The gap pre-dates this release; the harvest added a systematic producer of
+  such entries.
+
+- **…and so does a unit that LANDS (#405).** A landing unit looked untouched — its ledger edit
+  merges with the branch. Not when the ledger is gitignored: `finalize_commit` stages with
+  `git add -A`, which skips such a path in silence, so the entry never rode the branch and the
+  merge brings nothing over. (This repo's own default puts the ledger under a gitignored artifacts dir.)
+  The worktree then goes unconditionally, and the DONE leg takes no forensic patch, so the finding
+  simply disappears. That leg now runs the same carry — **after** the merge, since carrying first
+  files a fresh id where the merge would have delivered the entry for dedup. A tracked ledger
+  rides the branch as before and every row dedups, so nothing is committed. Not on the escalation
+  legs: those keep the branch for a human to merge, and that merge brings the entry with it.
+
+- **A sweep bundle's ledger closes reach the main checkout too (#405).** The same mechanism one
+  layer up. The close writes the unit worktree's ledger, and with a gitignored ledger seeded into
+  the worktree (`scm.worktree_seed`) the flip dies unmerged — the entries stay open, `open_ids`
+  re-bundles them, and every later sweep re-triages and re-drives work that is already done. The
+  DONE leg now re-applies the closes the bundle intended; `mark_done` is idempotent, so a tracked
+  ledger whose flip merged normally is a no-op. What is recorded is what the close **intended**,
+  not what it flipped: the close runs twice on a landing bundle — after dev, and again from the
+  review gate's idempotent reclose — and the second run finds every id already done, so a record
+  of the flips is empty on exactly the run that needs it. A DEFER still carries findings only and
+  never closes: it discarded the code they claim to resolve. Not closed here: an _unseeded_
+  gitignored ledger is absent from the worktree entirely, so `verify_review_bundle` never sees the
+  ids done and the bundle defers rather than landing — loud, where this one was silent.
 
 - **An artifacts dir whose name holds `[` or `]` no longer misdirects the two paths above
   (#405, #423).** Git reads a positional operand as a pathspec, so such a path was a glob that
