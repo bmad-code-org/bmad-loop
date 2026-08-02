@@ -232,6 +232,63 @@ def test_ledger_changed_before_harvest_defaults_false_for_legacy_state():
     assert StoryTask.from_dict(doc).ledger_changed_before_harvest is False
 
 
+def test_harvested_deferrals_round_trip_json_native():
+    """Persisted for the same reason the flag above is — a replayed harvest dedups
+    against the dead attempt's entries and would re-assign an empty list — and it has
+    to come back through JSON unchanged, because that is the form `_defer` reads to
+    re-file into the main ledger.
+
+    The `json.loads(json.dumps(...))` leg is the #189 guard: a tuple anywhere in
+    these dicts survives `from_dict(to_dict(...))` intact but returns from *disk* as a
+    list, so an in-memory comparison of the two reads as a spurious "changed"."""
+    import json
+
+    items = [
+        {
+            "origin": "spec-deferred abc123def456",
+            "title": "Retry loop has no ceiling",
+            "reason": "the backoff doubles forever: no cap",
+            "location": "src/retry.py:88",
+            "severity": "medium",
+            "source_spec": "spec-1-1-a.md",
+        },
+        # the shape the harvest emits for a finding with neither field
+        {
+            "origin": "spec-deferred 0123456789ab",
+            "title": "No location",
+            "reason": "why",
+            "location": None,
+            "severity": None,
+            "source_spec": "spec-1-1-a.md",
+        },
+    ]
+    task = StoryTask(story_key="1-1-a", epic=1, harvested_deferrals=items)
+    assert StoryTask.from_dict(task.to_dict()).harvested_deferrals == items
+    assert StoryTask.from_dict(json.loads(json.dumps(task.to_dict()))).harvested_deferrals == items
+
+
+def test_harvested_deferrals_defaults_empty_for_legacy_state():
+    """Absent ⇒ nothing was recorded, so nothing carries — the pre-#405 behaviour
+    exactly, and the conservative direction (a carry files entries into a ledger)."""
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    del doc["harvested_deferrals"]  # state.json from before the field existed
+    assert StoryTask.from_dict(doc).harvested_deferrals == []
+
+
+def test_harvested_deferrals_do_not_alias_the_persisted_doc():
+    """`from_dict` copies each item rather than adopting the parsed doc's dicts: the
+    engine mutates this list per attempt, and a task rehydrated from a shared
+    `state.json` doc must not write back through it."""
+    doc = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        harvested_deferrals=[{"origin": "spec-deferred x", "title": "t"}],
+    ).to_dict()
+    task = StoryTask.from_dict(doc)
+    task.harvested_deferrals[0]["title"] = "mutated"
+    assert doc["harvested_deferrals"][0]["title"] == "t"
+
+
 def test_baseline_ledger_digest_round_trips():
     """The digest is the reference `_harvest_gate_exclude` measures each attempt
     against, and a resumed `_dev_phase` call cannot re-capture it (that would move the

@@ -61,6 +61,13 @@ name = "claude"
 name = "gemini"
 """
 
+# DUAL_CLIENT_POLICY with the follow-up review session turned off — the config
+# shape #424 is about, and the one an automated reviewer proposed narrowing on.
+REVIEW_DISABLED_SPLIT_POLICY = DUAL_CLIENT_POLICY + """\
+[review]
+enabled = false
+"""
+
 
 def _write_policy(project, text=DUAL_CLIENT_POLICY) -> None:
     bmad_loop_dir = project / ".bmad-loop"
@@ -4255,6 +4262,23 @@ def test_skill_trees_still_covers_a_split_dev_review_pair(project):
     _write_policy(project.project, DUAL_CLIENT_POLICY)  # dev=claude, review=codex
     pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
 
+    assert cli._skill_trees(project.project, pol) == [".claude/skills", ".agents/skills"]
+
+
+def test_skill_trees_covers_review_even_when_review_is_disabled(project):
+    """#424: `review.enabled = false` retires the follow-up review SESSION, not the
+    review ADAPTER — a plugin workflow declaring `role = "review"` still dispatches on
+    it from `_commit`'s unconditional `pre_commit_gate`, and the wheel's TEA plugin
+    ships three there. So the review tree stays gated and its skills stay seeded.
+
+    The sibling above pins only the UNCONDITIONAL form, which a narrowing keyed on
+    `review.enabled` passes untouched — this is the row that reddens on it. Worth its
+    own test rather than a parametrize of that one: they answer different questions,
+    and only this one is load-bearing against a proposed change."""
+    _write_policy(project.project, REVIEW_DISABLED_SPLIT_POLICY)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+
+    assert pol.review.enabled is False  # the fixture actually expresses the case
     assert cli._skill_trees(project.project, pol) == [".claude/skills", ".agents/skills"]
 
 

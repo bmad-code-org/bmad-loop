@@ -1899,6 +1899,25 @@ class Engine:
                 # advance; a second host death then still finds the record and
                 # re-enters this continuation instead of falling back to restart.
                 task.attempt += 1
+                # Same guard, same reason, for the record of what this attempt's
+                # harvest intends to file — which the isolated DEFER carries into
+                # the main checkout's ledger (`_carry_harvested_deferrals`). A
+                # fresh attempt owes nothing to the previous one, whose harvest a
+                # non-fixable RETRY has already reverted out of the tree; a REPLAY
+                # keeps the dead attempt's record, because the replayed harvest
+                # dedupes against the entries already on disk and would re-assign
+                # an empty list (see the field's comment).
+                #
+                # HERE and not at the harvest's arm site below, which the sibling
+                # `harvest_wrote_ledger` clear uses: that site sits inside `if
+                # result.status == "completed"`, and the case this has to cover is
+                # exactly the attempt that did NOT complete — a stalled final
+                # attempt would otherwise reach `_defer` still carrying the
+                # PREVIOUS attempt's reverted findings, and carry them into the
+                # main ledger as a claim about code no attempt ever landed. The
+                # flag can live in the narrower site because nothing outside the
+                # completed branch reads it; this record is read from `_defer`.
+                task.harvested_deferrals = []
             advance(task, Phase.DEV_RUNNING)
             self._save()
             if resume_result is not None:
@@ -2940,6 +2959,34 @@ class Engine:
                 )
             )
 
+        # Record what this harvest INTENDED to file, before any dedup — every row,
+        # not just the ones `filed` below returns an id for. Under isolation this
+        # record is the findings' only route out of the unit worktree when the
+        # story defers (`_carry_harvested_deferrals`); keying it off `filed` would
+        # empty it on a crash replay, whose harvest dedupes against the entries the
+        # dead attempt already wrote.
+        #
+        # ASSIGNED, never appended, and this is about the record's SHAPE rather
+        # than about what carries: the same attempt's dev→review double call
+        # re-enters here, and the review pass reads the SAME spec — whose
+        # `deferred:` list the skill accumulates into — so its `pending` is
+        # already the union and an append would just double every dev-leg row in
+        # `state.json`. It was measured: appending carries the same entries,
+        # because the per-attempt clear draws the boundary that matters and
+        # `append_entry` dedups the rest. A review pass that deferred nothing
+        # returns above (no findings, no malformed) and leaves the dev leg's
+        # record untouched.
+        task.harvested_deferrals = [
+            {
+                "origin": origin,
+                "title": title,
+                "reason": reason,
+                "location": location,
+                "severity": severity,
+                "source_spec": spec_name,
+            }
+            for origin, title, reason, location, severity in pending
+        ]
         ledger = self.workspace.paths.deferred_work
         text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
         seen = deferredwork.parse_ledger(text)
@@ -3616,6 +3663,9 @@ class Engine:
             # the failed work lives in the unit's worktree; the diff is captured
             # and the worktree kept/dropped by _integrate_unit. Don't touch the
             # tree here (no reset into the main repo — there's nothing to undo).
+            # The harvested findings are the one exception: they describe the SPEC,
+            # not the discarded code, and the worktree is about to go.
+            self._carry_harvested_deferrals(task)
             self.journal.append("story-deferred", story_key=task.story_key, reason=reason)
             gates.notify(self.policy, self.run_dir, f"story deferred: {task.story_key}", reason)
             self._save()
@@ -3648,6 +3698,84 @@ class Engine:
             reason,
         )
         self._save()
+
+    def _carry_harvested_deferrals(self, task: StoryTask) -> None:
+        """Re-file this attempt's harvested `deferred:` findings into the MAIN
+        checkout's ledger when an ISOLATED unit defers, and commit them.
+
+        Under `scm.isolation = "worktree"` `self.workspace` is the unit's for the
+        whole drive (`_run_unit`), so `_harvest_spec_deferrals` writes the UNIT
+        WORKTREE's `deferred-work.md`. On a defer that worktree is never merged —
+        `_integrate_unit`'s DEFERRED arm only captures a forensic patch, and
+        `_merge_local` is reachable from the DONE arm alone. Nothing was destroyed
+        (`scm.keep_failed` defaults True, and `capture_diff` includes untracked
+        files, so the entries survive in the kept worktree and in `changes.patch`)
+        but no ledger a sweep reads ever sees them, which is the operative half.
+        This is the carry-out the non-isolated branch below gets from its
+        snapshot/restore around `_rollback_or_pause`.
+
+        Here rather than in `_integrate_unit` so the parity sits directly against
+        the in-place branch it mirrors, and so this is ONE site instead of
+        `_integrate_unit`'s six call sites.
+
+        `self.paths`, NOT `self.workspace.paths`: the destination is the main
+        checkout, which is on `state.target_branch` throughout an isolated run
+        (`_merge_local` merges INTO `repo`'s current HEAD), so the carry lands on
+        the target branch.
+
+        Re-filing is safe and dedup is free: `append_entry` is idempotent by
+        `origin:` + `source_spec:` against OPEN entries, and creates the ledger and
+        its parent dir when the project has none yet. `None` back means an open
+        entry already says this, so it drops out of `carried`.
+
+        COMMITTING, rather than leaving the edit dirty, is the point. An
+        uncommitted ledger edit in the main checkout sits in the path of a later
+        story's `_merge_local`, whose `clean_incoming_collisions` escalates on any
+        dirt outside the incoming branch's path set. `verify.commit_paths` commits
+        exactly this path and nothing else, leaving any operator work in the tree
+        alone.
+
+        The ledger WRITE is unguarded — repair raises, and losing the findings is
+        the hazard this exists to prevent — but the commit is best effort, and that
+        split is not timidity. `commit_paths` names the path explicitly, and `git
+        add -- <path>` REFUSES (rc 1) a path git is ignoring; a project that
+        gitignores its artifacts dir is an ordinary one (this repo does, and its
+        ledger's default home is under it), while every in-place path never notices
+        because `commit_story`'s `add -A` skips such a path in silence. Raising
+        would cost the run its `_integrate_unit` — no forensic patch, worktree left
+        mounted, no `unit-closed` — over bookkeeping that has already done its real
+        job. Same shape and same reasoning as `decisions.commit_pre_answer`; the
+        journal records the miss, and a later `_merge_local` names the dirt itself.
+
+        Pre-existing exposure, not introduced here and not fixed here (#423):
+        `commit_paths` interpolates the path into a git pathspec unescaped, so an
+        `implementation_artifacts` containing `[` / `]` over-stages — the same for
+        every caller."""
+        if not task.harvested_deferrals:
+            return
+        ledger = self.paths.deferred_work
+        carried = [
+            dw_id
+            for dw_id in (
+                deferredwork.append_entry(ledger, **item) for item in task.harvested_deferrals
+            )
+            if dw_id
+        ]
+        if carried:
+            try:
+                verify.commit_paths(
+                    self.paths.repo_root,
+                    f"chore(deferred-work): carry harvested findings from {task.story_key}",
+                    [ledger],
+                )
+            except verify.GitError as e:
+                self.journal.append(
+                    "harvest-carry-uncommitted",
+                    story_key=task.story_key,
+                    dw_ids=carried,
+                    error=str(e),
+                )
+        self.journal.append("harvest-carried", story_key=task.story_key, dw_ids=carried)
 
     def _reopen_ledger_after_defer(self, task: StoryTask) -> None:
         """Undo the engine-side deferred-work CLOSES that `_defer`'s restore just

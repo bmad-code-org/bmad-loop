@@ -236,6 +236,34 @@ class StoryTask:
     # Re-answered per attempt, in the same `if not replayed:` block that clears the
     # flag above and for the same reason — see `Engine._dev_phase`.
     ledger_changed_before_harvest: bool = False
+    # What this attempt's harvest INTENDED to file, one dict per ledger entry
+    # (`origin`, `title`, `reason`, `location`, `severity`, `source_spec` —
+    # exactly `deferredwork.append_entry`'s keywords, so a carry is a `**item`).
+    #
+    # Exists for the isolated DEFER: the harvest writes
+    # `workspace.paths.deferred_work`, which under `scm.isolation = "worktree"`
+    # is the UNIT WORKTREE's ledger, and `_integrate_unit` drops that worktree
+    # unmerged — so without this record the findings reach no ledger any sweep
+    # reads. `Engine._carry_harvested_deferrals` re-files them into the main
+    # checkout from here.
+    #
+    # PERSISTED, for the same reason as `harvest_wrote_ledger` above: a replay
+    # re-runs the harvest, which dedupes against the entries the dead attempt
+    # already wrote, so a list derived fresh from what was FILED comes back
+    # empty while those entries sit in the tree. Read from disk it stays whole.
+    # That is also why the harvest assigns it from the full `pending` set rather
+    # than from `filed`.
+    #
+    # JSON-native values only — never tuples: a tuple/list round-trip reads back
+    # as a spurious "changed" (#189).
+    #
+    # Cleared per attempt under the same not-replayed rule as the flag above, so
+    # an attempt whose harvest never ran cannot carry the PREVIOUS attempt's
+    # entries — which the retry's ledger restore has already reverted. At a
+    # different site, though: `_dev_phase`'s attempt-counter bump, not the
+    # harvest's arm, because the attempt that has to clear it is precisely the one
+    # whose session never completed and so never reaches the arm.
+    harvested_deferrals: list[dict[str, Any]] = field(default_factory=list)
     spec_file: str | None = None
     commit_sha: str | None = None
     defer_reason: str | None = None
@@ -333,6 +361,7 @@ class StoryTask:
             "pre_harvest_ledger_captured": self.pre_harvest_ledger_captured,
             "harvest_wrote_ledger": self.harvest_wrote_ledger,
             "ledger_changed_before_harvest": self.ledger_changed_before_harvest,
+            "harvested_deferrals": self.harvested_deferrals,
             "spec_file": self._serialized_spec_file(),
             "commit_sha": self.commit_sha,
             "defer_reason": self.defer_reason,
@@ -404,6 +433,9 @@ class StoryTask:
             pre_harvest_ledger_captured=bool(d.get("pre_harvest_ledger_captured", False)),
             harvest_wrote_ledger=bool(d.get("harvest_wrote_ledger", False)),
             ledger_changed_before_harvest=bool(d.get("ledger_changed_before_harvest", False)),
+            # `[]` for a state.json written before this field existed: nothing was
+            # recorded, so nothing carries — the pre-#405 shape exactly.
+            harvested_deferrals=[dict(item) for item in d.get("harvested_deferrals", [])],
             spec_file=d.get("spec_file"),
             commit_sha=d.get("commit_sha"),
             defer_reason=d.get("defer_reason"),

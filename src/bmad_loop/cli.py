@@ -733,7 +733,20 @@ def _skill_trees(project: Path, pol) -> list[str]:
     these trees are asked about is one only a dev or review session dispatches, and
     triage's whole prompt surface ships in this wheel. It is also the set
     `Engine._worktree_profiles` provisions, so what is gated and what is carried
-    into a worktree stay one decision."""
+    into a worktree stay one decision.
+
+    Deliberately does NOT consult `review.enabled`. Disabling review does not
+    retire the review ADAPTER: `_skip_review_and_commit` still ends at
+    `Engine._commit`, which opens with an unconditional
+    `_run_workflows("pre_commit_gate", …)`, and a plugin workflow may declare
+    `role = "review"` (`WORKFLOW_ROLES`) — which dispatches on `adapters["review"]`
+    with review disabled. The TEA plugin this wheel ships binds three such
+    workflows at that stage, so `review.enabled = false` is routinely a run that
+    still needs the review tree's skills. Narrowing here would also have to answer
+    for `_worktree_profiles`, which drives per-CLI Stop-signal hook registration as
+    well as seeding: a worktree provisioned without the review profile has no
+    completion signal for those sessions and stalls rather than merely missing a
+    skill. See #424 for the narrow residue that IS real."""
     from .adapters.profile import ProfileError, get_profile
 
     trees = []

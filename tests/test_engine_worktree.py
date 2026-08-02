@@ -62,12 +62,14 @@ def commit_sprint(project, statuses: dict[str, str]) -> None:
     git(project.project, "commit", "-q", "-m", "sprint")
 
 
-def wt_dev_effect(project, story_key, *, final_status="done", followup_review=True):
+def wt_dev_effect(project, story_key, *, final_status="done", followup_review=True, deferred=None):
     """Dev session running inside the unit worktree (spec.cwd). Mirrors the
     bmad-dev-auto skill: self-finalizes the spec to done, never writes the sprint
     board (the orchestrator advances it via the B2 seam, inside the worktree).
     ``followup_review`` mirrors the skill's `followup_review_recommended` signal;
-    defaults True so the review runs under the default trigger = "recommended"."""
+    defaults True so the review runs under the default trigger = "recommended".
+    ``deferred`` is the post-#2640 frontmatter `deferred:` list the harvest reads;
+    ``None`` omits the field, which is the common shape."""
 
     def effect(spec):
         cwd = spec.cwd
@@ -76,7 +78,7 @@ def wt_dev_effect(project, story_key, *, final_status="done", followup_review=Tr
         src = cwd / "src.txt"
         src.write_text(src.read_text() + f"change for {story_key}\n")
         sp = wt.implementation_artifacts / f"spec-{story_key}.md"
-        write_spec(sp, final_status, baseline)
+        write_spec(sp, final_status, baseline, deferred=deferred)
         # NO set_sprint: the orchestrator is the single sprint-status writer
         return SessionResult(
             status="completed",
@@ -96,16 +98,19 @@ def wt_dev_effect(project, story_key, *, final_status="done", followup_review=Tr
     return effect
 
 
-def wt_review_effect(project, story_key, clean: bool, patched: int = 0):
+def wt_review_effect(project, story_key, clean: bool, patched: int = 0, deferred=None):
     """Follow-up review pass in a worktree — a bmad-dev-auto re-invocation on the
-    done spec. ``clean=True`` converges; ``clean=False`` keeps recommending."""
+    done spec. ``clean=True`` converges; ``clean=False`` keeps recommending.
+    ``deferred`` is the spec's `deferred:` list as this pass leaves it — the skill
+    accumulates into it, so a pass that defers its own finding rewrites the list
+    with the dev leg's items still in place; ``None`` omits the field."""
 
     def effect(spec):
         cwd = spec.cwd
         wt = project.rebased(cwd)
         sp = wt.implementation_artifacts / f"spec-{story_key}.md"
         baseline = _spec_baseline(sp)
-        write_spec(sp, "done", baseline)
+        write_spec(sp, "done", baseline, deferred=deferred)
         set_sprint(wt, story_key, "done")
         return SessionResult(
             status="completed",
@@ -1769,6 +1774,358 @@ def test_harvest_reverted_on_retry_under_isolation(project):
     assert "src.txt" in files
     assert not [f for f in files if f.endswith("deferred-work.md")]
     assert not project.deferred_work.exists()
+
+
+# ------------------- carrying a deferred isolated unit's harvest out (#405, PR #406)
+#
+# The harvest writes `workspace.paths.deferred_work`, which under isolation is the
+# UNIT WORKTREE's ledger — and `_integrate_unit`'s DEFERRED arm never merges that
+# worktree. Nothing is destroyed (keep_failed defaults True; `capture_diff` takes
+# untracked files too), but no ledger a sweep READS would ever see the findings.
+# `_carry_harvested_deferrals` re-files them into the main checkout and commits.
+
+_CARRY_A = {
+    "summary": "Retry loop has no ceiling",
+    "evidence": "the backoff doubles forever: no cap",
+    "location": "src/retry.py:88",
+    "severity": "medium",
+}
+_CARRY_B = {
+    "summary": "Timeout is not configurable",
+    "evidence": "hardcoded 30s",
+    "location": "src/net.py:12",
+    "severity": "low",
+}
+
+
+def _carry_origin(finding: dict) -> str:
+    """The `origin:` marker the harvest fingerprints a finding into. Derived here
+    the way the harvest derives it (summary + location) rather than pasted as a
+    literal, so a change to the fingerprint's inputs cannot leave this file
+    asserting against a hash nothing produces any more."""
+    from bmad_loop import devcontract
+    from bmad_loop.engine import HARVEST_ORIGIN
+
+    return (
+        f"{HARVEST_ORIGIN} "
+        f"{devcontract.harvest_fingerprint(finding['summary'], finding['location'])}"
+    )
+
+
+def _main_ledger(project):
+    """Entries in the MAIN checkout's ledger — the one a sweep reads. Deliberately
+    `project.deferred_work`, never a worktree-rebased path: that distinction is the
+    whole subject of these tests."""
+    from bmad_loop import deferredwork
+
+    text = (
+        project.deferred_work.read_text(encoding="utf-8") if project.deferred_work.is_file() else ""
+    )
+    return deferredwork.parse_ledger(text)
+
+
+def _carry_defer_script(project, key, *, deferred):
+    """Dev harvests `deferred`, then a review that never converges exhausts the
+    budget and defers the unit. Consumers must pin `_NO_DAMP` — see `_defer_script`.
+
+    The review passes write the spec with NO `deferred:` field, which is the common
+    shape and, importantly, the one that makes them re-enter `_harvest_spec_deferrals`
+    and return early: the dev leg's record must survive that."""
+    return [wt_dev_effect(project, key, deferred=deferred)] + [
+        wt_review_effect(project, key, clean=False, patched=1) for _ in range(3)
+    ]
+
+
+def _wt_baseline_liar(project, key, *, deferred=None):
+    """A unit-worktree dev session that COMPLETES, does real work and finalizes its
+    spec to `done` — so the harvest fires — but stamps a baseline that is not the
+    orchestrator's, so `_verify_dev_artifacts` returns a NON-fixable retry. Under
+    isolation `_rollback_or_pause` always auto-recovers (the worktree is
+    disposable), which is what reverts the attempt's ledger edit."""
+
+    def effect(spec):
+        cwd = spec.cwd
+        wt = project.rebased(cwd)
+        src = cwd / "src.txt"
+        src.write_text(src.read_text() + f"bad attempt for {key}\n")
+        sp = wt.implementation_artifacts / f"spec-{key}.md"
+        write_spec(sp, "done", "0" * 40, deferred=deferred)
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "auto-dev",
+                "story_key": key,
+                "spec_file": str(sp),
+                "baseline_commit": "0" * 40,
+                "escalations": [],
+                "followup_review_recommended": False,
+            },
+        )
+
+    return effect
+
+
+def _ledger_commits(project, head_before) -> list[str]:
+    """Commits on the main checkout since `head_before` that touched the ledger."""
+    log = git(
+        project.project,
+        "log",
+        "--pretty=format:%H",
+        "--name-only",
+        f"{head_before}..HEAD",
+    )
+    out, sha = [], ""
+    for line in log.splitlines():
+        if not line.strip():
+            continue
+        if len(line) == 40 and " " not in line:
+            sha = line
+        elif line.endswith("deferred-work.md"):
+            out.append(sha)
+    return out
+
+
+def test_deferred_isolated_unit_carries_its_harvest_into_the_main_ledger(project):
+    """The gap this closes: the finding is filed in a worktree that is about to be
+    dropped unmerged, so every sweep-side reader sees nothing. The carry re-files it
+    into the MAIN checkout and COMMITS it — committing is not incidental, an
+    uncommitted ledger edit here is dirt in the path of the next story's
+    `_merge_local`, whose `clean_incoming_collisions` escalates on it."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    head_before = rev_parse_head(project.project)
+    engine, _ = make_engine(
+        project,
+        _carry_defer_script(project, "1-1-a", deferred=[_CARRY_A]),
+        policy=wt_policy(limits=_NO_DAMP),
+    )
+    summary = engine.run()
+
+    assert summary.deferred == 1 and summary.done == 0 and not summary.paused
+    entries = _main_ledger(project)
+    assert [e.title for e in entries] == ["Retry loop has no ceiling"]
+    assert entries[0].open
+    body = entries[0].body
+    assert f"origin: {_carry_origin(_CARRY_A)}" in body
+    assert "source_spec: `spec-1-1-a.md`" in body
+    assert "location: src/retry.py:88" in body and "severity: medium" in body
+    # committed on the target branch, and nothing left dirty behind it
+    assert len(_ledger_commits(project, head_before)) == 1
+    assert worktree_clean(project.project)
+    # …and ONLY the ledger came out: the deferred unit's code is still in its worktree
+    assert "change for 1-1-a" not in (project.project / "src.txt").read_text()
+    carried = [e for e in engine.journal.entries() if e["kind"] == "harvest-carried"]
+    assert len(carried) == 1 and carried[0]["dw_ids"] == [entries[0].id]
+
+
+def test_the_carry_does_not_depend_on_the_worktree_surviving(project):
+    """`keep_failed = False` drops the unit worktree and deletes its branch, so the
+    ledger the harvest wrote is gone by the end of the run. The carry still lands —
+    it re-files from the task's own persisted record, not by reading the doomed
+    tree, which is what lets it run before teardown and stay correct regardless of
+    where teardown sits."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        _carry_defer_script(project, "1-1-a", deferred=[_CARRY_A]),
+        policy=wt_policy(keep_failed=False, limits=_NO_DAMP),
+    )
+    summary = engine.run()
+
+    assert summary.deferred == 1 and not summary.paused
+    # the worktree that held the harvested entry is gone …
+    assert [p.resolve() for p in worktree_list(project.project)] == [project.project.resolve()]
+    assert not branch_exists(project.project, "bmad-loop/test-run/1-1-a")
+    # … and the finding is in the main ledger anyway
+    assert [e.title for e in _main_ledger(project)] == ["Retry loop has no ceiling"]
+    assert worktree_clean(project.project)
+
+
+def test_only_the_final_attempts_harvest_carries(project):
+    """Attempt 1 harvests A and is rolled back — the ledger edit reverted with the
+    code it describes. Attempt 2 harvests B and exhausts the attempt budget. Only B
+    may carry: A names work no attempt ever landed.
+
+    Reddens on an append-instead-of-assign harvest record (A would ride along) and
+    on dropping the per-attempt clear is NOT what this pins — see the sibling
+    below, whose final attempt never reaches the harvest at all."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            _wt_baseline_liar(project, "1-1-a", deferred=[_CARRY_A]),
+            _wt_baseline_liar(project, "1-1-a", deferred=[_CARRY_B]),
+        ],
+        policy=wt_policy(limits=LimitsPolicy(max_dev_attempts=2)),
+    )
+    summary = engine.run()
+
+    assert summary.deferred == 1 and not summary.paused
+    assert "rollback-auto" in journal_kinds(engine)
+    # both attempts really did harvest — without this the assertion below passes
+    # on a build where the second harvest never fired either
+    harvests = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert len(harvests) == 2
+    assert [e.title for e in _main_ledger(project)] == ["Timeout is not configurable"]
+
+
+def test_a_final_attempt_that_never_harvested_carries_nothing(project):
+    """The `20d3dc0` bug in a new place. Attempt 1 harvests A and is rolled back;
+    attempt 2's session STALLS, so the harvest never runs and there is nothing this
+    attempt intended to file. Carrying A here would re-file, into the main ledger,
+    the very entry the rollback removed.
+
+    The stall is the point, and why the per-attempt clear cannot live at the
+    harvest's arm site: that site sits inside `if result.status == "completed"`, so
+    a non-completing final attempt never reaches it and would defer still carrying
+    attempt 1's record."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+
+    def stalling(spec):
+        return SessionResult(status="stalled")
+
+    engine, _ = make_engine(
+        project,
+        [_wt_baseline_liar(project, "1-1-a", deferred=[_CARRY_A]), stalling],
+        policy=wt_policy(limits=LimitsPolicy(max_dev_attempts=2)),
+    )
+    summary = engine.run()
+
+    assert summary.deferred == 1 and not summary.paused
+    kinds = journal_kinds(engine)
+    # attempt 1's harvest DID fire and its record was persisted — so an empty main
+    # ledger below is the clear working, not a run where nothing was ever recorded
+    harvests = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert len(harvests) == 1 and harvests[0]["dw_ids"] == ["DW-1"]
+    assert "rollback-auto" in kinds and "story-deferred" in kinds
+    assert _main_ledger(project) == []
+    assert "harvest-carried" not in kinds
+
+
+def test_the_carry_never_duplicates_an_entry_already_open_in_the_main_ledger(project):
+    """A previous run already filed this finding into the main ledger and it is
+    still open. `append_entry` dedups on `origin:` + `source_spec:`, so the carry
+    is free to be unconditional; the journal still records the attempt with an
+    empty id list, which is how a full-dedup carry stays visible."""
+    from bmad_loop import deferredwork
+
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    deferredwork.append_entry(
+        project.deferred_work,
+        title="Already filed by an earlier run",
+        origin=_carry_origin(_CARRY_A),
+        source_spec="spec-1-1-a.md",
+        reason="same finding, same spec",
+    )
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "seed deferred-work")
+    head_before = rev_parse_head(project.project)
+
+    engine, _ = make_engine(
+        project,
+        _carry_defer_script(project, "1-1-a", deferred=[_CARRY_A]),
+        policy=wt_policy(limits=_NO_DAMP),
+    )
+    summary = engine.run()
+
+    assert summary.deferred == 1
+    assert [e.title for e in _main_ledger(project)] == ["Already filed by an earlier run"]
+    assert _ledger_commits(project, head_before) == []  # nothing to commit either
+    carried = [e for e in engine.journal.entries() if e["kind"] == "harvest-carried"]
+    assert len(carried) == 1 and carried[0]["dw_ids"] == []
+
+
+def test_the_carry_records_what_the_harvest_intended_not_what_it_filed(project):
+    """The dev leg files A. The review leg re-reads the same spec — whose
+    `deferred:` list now holds A *and* its own B — and its harvest dedups A against
+    the entry the dev leg already wrote, so it reports filing B alone. Both must
+    still carry.
+
+    That gap between "intended" and "filed" is the whole reason the record is taken
+    from the harvest's full pending set. This is the cheap, same-run instance of it;
+    the expensive one is a crash replay, where the replayed harvest dedups against
+    the dead attempt's entries and reports filing *nothing at all*."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    script = [wt_dev_effect(project, "1-1-a", deferred=[_CARRY_A])] + [
+        wt_review_effect(project, "1-1-a", clean=False, deferred=[_CARRY_A, _CARRY_B])
+        for _ in range(3)
+    ]
+    engine, _ = make_engine(project, script, policy=wt_policy(limits=_NO_DAMP))
+    summary = engine.run()
+
+    assert summary.deferred == 1
+    # the review harvest reported filing B only — A deduped against the dev leg's
+    # entry — which is the state the record must NOT be derived from
+    harvests = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert [h["dw_ids"] for h in harvests] == [["DW-1"], ["DW-2"], [], []]
+    assert sorted(e.title for e in _main_ledger(project)) == [
+        "Retry loop has no ceiling",
+        "Timeout is not configurable",
+    ]
+    # …and the record itself is the union, not four re-appended rows. Behaviourally
+    # an append carries the same entries — the per-attempt clear draws the boundary
+    # and `append_entry` dedups the rest — so this row is what keeps `state.json`
+    # from growing a copy of every dev-leg finding per review pass.
+    assert len(engine.state.tasks["1-1-a"].harvested_deferrals) == 2
+
+
+def test_a_ledger_git_refuses_to_commit_still_gets_the_finding(project):
+    """A project that gitignores its ledger. `commit_paths` names the path
+    explicitly and `git add -- <ignored path>` REFUSES with rc 1 — where every
+    in-place path never notices, because `commit_story`'s `add -A` skips such a path
+    in silence. Unguarded, that `GitError` would leave the run with no
+    `_integrate_unit` at all: no forensic patch, no `unit-closed`, worktree still
+    mounted — all to protect bookkeeping whose real job (getting the finding into a
+    ledger a sweep reads) is already done.
+
+    So the write raises and the commit does not. The miss is journalled, and the
+    dirt it leaves is exactly what the next story's `clean_incoming_collisions`
+    reports on its own.
+
+    Gitignoring only the ledger file, not the artifacts dir, is deliberate: the
+    sprint board and specs beside it must still commit, or the run fails for an
+    unrelated reason and the assertion below proves nothing. (`_bmad-output/` — this
+    repo's own shape — ignores the whole dir and is the realistic carrier.)"""
+    (project.project / ".gitignore").write_text("deferred-work.md\n", encoding="utf-8")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        _carry_defer_script(project, "1-1-a", deferred=[_CARRY_A]),
+        policy=wt_policy(limits=_NO_DAMP),
+    )
+    summary = engine.run()
+
+    assert summary.deferred == 1 and not summary.paused  # no crash, no escalation
+    assert [e.title for e in _main_ledger(project)] == ["Retry loop has no ceiling"]
+    kinds = journal_kinds(engine)
+    assert "harvest-carried" in kinds and "unit-closed" in kinds
+    uncommitted = [e for e in engine.journal.entries() if e["kind"] == "harvest-carry-uncommitted"]
+    assert len(uncommitted) == 1 and uncommitted[0]["dw_ids"] == ["DW-1"]
+    assert "git add failed" in uncommitted[0]["error"]
+    # the forensic patch the raise would have cost the run
+    assert (engine.run_dir / "failed" / "1-1-a" / "changes.patch").is_file()
+
+
+def test_a_done_isolated_unit_files_its_harvest_exactly_once(project):
+    """Regression guard on the untouched half: a unit that lands still carries its
+    harvest the ordinary way — through `_merge_local` — and the carry must not add
+    a second copy. `_carry_harvested_deferrals` runs from `_defer` alone, so a DONE
+    story never reaches it."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            wt_dev_effect(project, "1-1-a", deferred=[_CARRY_A]),
+            wt_review_effect(project, "1-1-a", clean=True),
+        ],
+    )
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused
+    assert "unit-merged" in journal_kinds(engine)
+    assert "harvest-carried" not in journal_kinds(engine)
+    entries = _main_ledger(project)
+    assert [e.title for e in entries] == ["Retry loop has no ceiling"]
+    assert f"origin: {_carry_origin(_CARRY_A)}" in entries[0].body
 
 
 # ----------------------------------------------------------------- new guards (review hardening)

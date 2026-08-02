@@ -391,6 +391,18 @@ that rode the same window. Both skill eras are supported; the rename itself need
   stop-and-wait path (`rollback_on_failure = off` keeps the tree, so there is nothing to undo)
   and under worktree isolation (those closes live in the unit's own worktree, dropped unmerged).
 
+- **A deferred worktree unit carries its harvested findings out (#405).** Under
+  `isolation = "worktree"` the harvest writes the unit worktree's ledger, and a defer drops that
+  worktree unmerged — so no ledger a sweep reads ever saw the findings. (Nothing was destroyed:
+  `keep_failed` defaults on and the forensic patch takes untracked files, so they survive in the
+  kept worktree.) `_defer` now re-files what the final attempt's harvest intended to file into the
+  main checkout's ledger and commits that path alone — leaving it dirty would escalate the next
+  story's merge. `append_entry` dedups on `origin:` + `source_spec:`, so an entry already open
+  there is not duplicated. Only the final attempt's record carries: it is cleared at each attempt's
+  start, so an attempt whose session never completed cannot re-file the findings its predecessor's
+  rollback removed. A unit that lands is untouched — its ledger edit merges as before. The gap
+  pre-dates this release; the harvest added a systematic producer of such entries.
+
 - **Three small contracts brought back into line (#405).** A ledger entry filed with no file:line
   now carries `location: n/a` rather than no `location:` line: `deferred-work-format.md` has
   always specified that value, and of the fields an entry is created with, `severity:` is the
