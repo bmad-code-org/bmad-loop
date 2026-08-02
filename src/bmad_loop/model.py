@@ -201,9 +201,15 @@ class StoryTask:
     # the deferred-work ledger's text as of THIS attempt's pre-harvest moment,
     # persisted so a host death between `_harvest_spec_deferrals` and the
     # non-fixable-RETRY rollback cannot lose it: the replayed attempt writes these
-    # bytes back rather than guessing from a presence bit. Scoped to the attempt,
-    # not to the `_dev_phase` entry — re-armed every attempt, unlike
-    # baseline_commit/baseline_untracked.
+    # bytes back rather than guessing from a presence bit.
+    #
+    # Scoped to the RETRY CHAIN, which is narrower than the `_dev_phase` entry and
+    # wider than one attempt: re-armed on every attempt that starts from a reverted
+    # tree, and deliberately not on one that continues a FIXABLE retry. That leg
+    # keeps its tree and its harvest, and `_rollback_or_pause` only ever resets to
+    # the phase's `baseline_commit` — so re-arming there would snapshot a ledger
+    # already holding the kept entry and write it back over a reset that discarded
+    # the code it describes (#405).
     #
     # The split is load-bearing. A `None` TEXT means the ledger did NOT EXIST when
     # the snapshot was taken, so the restore has to UNLINK (the first-ever harvest

@@ -2102,12 +2102,32 @@ class Engine:
                         task.ledger_changed_before_harvest = (
                             self._ledger_digest() != task.baseline_ledger_digest
                         )
-                if not replayed or not task.pre_harvest_ledger_captured:
+                # CHAIN-scoped, not attempt-scoped, and `feedback is None` is what
+                # says so. A fixable retry keeps its tree AND its harvest, so the
+                # next attempt is a continuation of the same body of work above one
+                # `baseline_commit` — and `_rollback_or_pause` only ever resets to
+                # THAT. Re-arming here would snapshot a ledger that already holds the
+                # kept attempt's entry, so a later non-fixable failure would reset the
+                # whole chain's code and then write the entry describing it straight
+                # back: a finding about deleted work, open in the ledger, swept later
+                # as if the code existed. Holding the chain's first snapshot instead
+                # makes the revert reach as far as the reset does (#405).
+                #
+                # The `or not captured` relaxation stays, and is what lets a chain
+                # whose snapshot was SPENT re-arm from disk rather than run blind —
+                # the `rollback_on_failure = off` pause disarms in its `finally`, and
+                # its resume replays this same attempt.
+                if (not replayed and feedback is None) or not task.pre_harvest_ledger_captured:
                     task.pre_harvest_ledger = self._ledger_text()
                     task.pre_harvest_ledger_captured = True
-                    # persists the clear and the compute above as well: `not
-                    # replayed` implies this condition, so every pass through that
-                    # block saves here.
+                    self._save()
+                elif not replayed:
+                    # A fixable continuation no longer re-arms, but the clear and the
+                    # compute above DID run for it. Persist them here: without this,
+                    # a host death before the decision's own `_save()` would replay
+                    # onto the PREVIOUS attempt's answers, which is the staleness
+                    # those two fields are persisted to avoid. (The arm above used to
+                    # cover every non-replayed attempt for free.)
                     self._save()
                 # bmad-dev-auto sometimes finalizes the spec in prose (## Auto Run
                 # Result: Status done) but leaves the frontmatter status at the
@@ -2303,14 +2323,24 @@ class Engine:
                             # what makes "nothing armed" mean "arm from disk" there.
                             self._disarm_ledger_snapshot(task)
                             self._save()
-                # Clear site 2, for BOTH retry legs and deliberately OUTSIDE the
-                # `finally`. A fixable retry keeps its tree and its harvest on
-                # purpose, so a stale arm would let attempt N+1's replay delete them;
-                # and when `_rollback_or_pause` RAISES (the `rollback_on_failure =
-                # off` default) control never reaches here — correctly, because the
-                # pause's own resume replays this same attempt and still needs the
-                # snapshot. Moving this into the `finally` breaks exactly that.
-                self._disarm_ledger_snapshot(task)
+                    # Clear site 2 — the NON-FIXABLE leg only, and deliberately
+                    # OUTSIDE the `finally`. This snapshot has just been spent: the
+                    # restore above put the ledger back and the reset discarded the
+                    # work it covered, so nothing downstream may consume it again.
+                    #
+                    # The fixable branch does NOT reach here, and that is the second
+                    # half of the chain-scoping above: keeping the arm is exactly what
+                    # makes the next attempt hold the CHAIN's first snapshot rather
+                    # than re-arm over a tree that already carries the kept harvest.
+                    # The two halves are one fix — either alone leaves the entry
+                    # standing after the chain rolls back.
+                    #
+                    # Outside the `finally` because `_rollback_or_pause` RAISES under
+                    # the `rollback_on_failure = off` default and control must not
+                    # reach here on that leg: the pause's own resume replays this same
+                    # attempt. (The pause spends the arm itself, in the `finally`
+                    # above, for the different reason written there.)
+                    self._disarm_ledger_snapshot(task)
                 continue
             # Clear site 3, covering DEFER and the PAUSE/escalate fall-through alike.
             # Neither reverts: `_defer` snapshots the ledger around its own reset and
@@ -3001,7 +3031,10 @@ class Engine:
         Rollback is asymmetric between the two failure paths, and deliberately so.
         A non-fixable RETRY reverts the ledger edit along with the work it
         describes, and the next attempt re-harvests from the untouched
-        frontmatter. The reset does not achieve that by itself: the ledger sits
+        frontmatter — for the whole retry CHAIN, not just the failing attempt,
+        because the reset it rides is to the phase's `baseline_commit` and a fixable
+        retry may have accumulated several attempts above that. The reset does not
+        achieve that by itself: the ledger sits
         under a protected artifact folder, so `_safe_reset`'s `keep` shields it
         from `safe_rollback`'s untracked cleanup and a ledger this harvest CREATED
         would survive (#405). `_dev_phase` therefore snapshots the ledger ahead of
@@ -4047,7 +4080,12 @@ class Engine:
 
     def _restore_persisted_ledger(self, task: StoryTask, *, replayed: bool) -> None:
         """Put the deferred-work ledger back to the snapshot `_dev_phase` armed
-        before this attempt's engine-side ledger writes — if it armed one.
+        before this retry CHAIN's engine-side ledger writes — if it armed one.
+
+        Chain, not attempt, and the two differ only across a fixable retry: that leg
+        keeps its tree, so the snapshot it is holding is the one taken before the
+        FIRST attempt of the chain, and the restore reaches exactly as far back as
+        the `reset --hard` to `baseline_commit` beside it does (#405).
 
         The snapshot is PERSISTED rather than held in a local, and that is the whole
         point: a host death between `_harvest_spec_deferrals` and

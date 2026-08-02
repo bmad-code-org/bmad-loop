@@ -374,6 +374,27 @@ that rode the same window. Both skill eras are supported; the rename itself need
   fixable retry followed by a stalled attempt used to defer with an empty record while the entry
   it named sat in a worktree about to be dropped.
 
+- **The pre-harvest snapshot is scoped to the retry chain, not to one attempt (#405).** The
+  rollback it feeds always resets to the dev phase's `baseline_commit`, so after a fixable
+  retry — which keeps its tree, and its harvest, on purpose — a later non-fixable failure
+  discarded several attempts' code while restoring only the last one's ledger. The kept
+  attempt's finding was written straight back over the reset that removed the code it named:
+  open in the ledger, and driven by the next sweep as if that work existed. A fixable retry now
+  neither re-arms the snapshot nor spends it, so the chain holds the one taken before its first
+  attempt and the revert reaches as far as the reset does. Both halves are required; either
+  alone leaves the entry standing. The rolling ledger reference is re-based back to the restored
+  bytes at the same point, or the next attempt reads the restore itself as somebody else's write
+  and stands the proof-of-work exclusion down. On the `rollback_on_failure = off` default the
+  tree is kept and the restore now reverts the whole chain's ledger writes rather than the last
+  attempt's — matching the `git reset --hard <baseline_commit>` the pause notice tells the
+  operator to run. The disarm that spent the snapshot on both retry legs moves onto the
+  non-fixable one, where it belongs; the stale comment claiming a fixable retry needed it, and
+  claiming the pause leg could not reach it, is replaced (the pause has disarmed in its own
+  `finally` since `0a8088f`, and a fresh attempt re-arms unconditionally, so neither clause held).
+  Not closed here: `_finish_inflight`'s restart arm resets to the same baseline with no ledger
+  restore at all, and cannot simply gain one — it also handles the resolved-escalation re-drive,
+  which preserves the artifacts folder through the reset on purpose.
+
 - **A sweep bundle's ledger closes are withheld until its attempt is accepted (#405).** The
   orchestrator marks a bundle's deferred-work ids `done` itself, and did so above the artifact
   gate — so an attempt that finalized its spec and then failed a non-fixable check was discarded

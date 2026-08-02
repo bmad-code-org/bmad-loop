@@ -6759,6 +6759,116 @@ def test_harvest_retry_reharvests_after_the_rollback(project):
     assert "_bmad-output/implementation-artifacts/deferred-work.md" in files
 
 
+def _fixable_chain_policy(marker, *, attempts: int = 3):
+    """A harvest policy whose `[verify] commands` gate is FIXABLE — the only such
+    source on the dev leg — so attempt 1 can keep its tree and its harvest and hand
+    the failure to a repair session. `marker` must be outside the project tree: the
+    rollback below removes untracked files this attempt created, and inside the repo
+    the marker would also be untracked proof of work."""
+    return dataclasses.replace(
+        _harvest_policy(),
+        limits=LimitsPolicy(max_dev_attempts=attempts),
+        verify=VerifyPolicy(commands=(_file_exists_cmd(marker),)),
+    )
+
+
+def test_a_kept_harvest_is_reverted_when_a_later_attempt_rolls_the_phase_back(project, tmp_path):
+    """The `20d3dc0` bug class in the one sequence the per-attempt snapshot cannot
+    reach — and the strongest shape of it, because the revert here is an UNLINK.
+
+    Attempt 1 harvests DW-1 and fails FIXABLY, so its tree and its ledger entry are
+    kept on purpose. Attempt 2 fixes the fixable failure and fails NON-fixably, and
+    `_rollback_or_pause` resets to `task.baseline_commit` — which is PHASE-scoped, so
+    it discards attempt 1's code as well. The entry must go with it. Left behind, it
+    is an open finding about code no attempt ever landed, and the next sweep drives
+    work for it.
+
+    An attempt-scoped snapshot cannot do this: attempt 2 armed over a tree that
+    already held DW-1, so its restore wrote the entry straight back. The snapshot is
+    now CHAIN-scoped — a fixable retry neither re-arms nor disarms — so the revert
+    reaches exactly as far as the reset does."""
+    assert not project.deferred_work.exists()  # so the revert is an unlink, not a rewrite
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    marker = tmp_path / "fixed.marker"  # outside the tree — see _fixable_chain_policy
+
+    def repairing_liar(spec):
+        marker.write_text("ok\n")  # the fixable failure is fixed …
+        return _baseline_liar_effect(project)(spec)  # … and this one is not fixable
+
+    engine, _ = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a", followup_review=False, deferred=[HARVEST_A]),
+            repairing_liar,
+            dev_effect(project, "1-1-a", followup_review=False),
+        ],
+        policy=_fixable_chain_policy(marker),
+    )
+    summary = engine.run()
+
+    assert summary.done == 1
+    actions = [e["action"] for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert actions == ["retry", "retry", "proceed"]
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    # exactly one rollback: attempt 1's retry was the fixable one that kept the tree
+    assert kinds.count("rollback-auto") == 1
+    # attempt 1 really did file the entry — attempts 2 and 3 carry no `deferred:`, so
+    # one harvest ever fired and an empty ledger below is the revert, not an absence
+    harvests = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert len(harvests) == 1 and harvests[0]["dw_ids"] == ["DW-1"]
+    assert not project.deferred_work.exists()
+    sha = engine.state.tasks["1-1-a"].commit_sha
+    files = git(project.project, "show", "--name-only", "--pretty=format:", sha).split()
+    assert "_bmad-output/implementation-artifacts/deferred-work.md" not in files
+
+
+def test_a_rolled_back_chain_moves_the_ledger_reference_back_too(project, tmp_path):
+    """The gate half of the row above, and why the rolling ledger reference is
+    re-based at BOTH ends of a fixable retry rather than only the forward one.
+
+    Same chain: attempt 1 harvests and is kept by a fixable retry, which moves the
+    reference forward onto that tree; attempt 2 fails non-fixably and the restore
+    unlinks the ledger. Attempt 3 then writes NO source and finalizes a spec that
+    still carries the finding, so the harvest re-creates the ledger from nothing.
+
+    Without the backward re-base the reference still names the kept chain's ledger,
+    the recompute reads `D(absent) != D(with DW-1)`, calls that "someone else wrote
+    it", stands the exclusion down — and the file the ORCHESTRATOR just created
+    becomes attempt 3's proof of work. An empty implementation PROCEEDs, three
+    attempts after the retry that made it possible."""
+    assert not project.deferred_work.exists()
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    marker = tmp_path / "fixed.marker"
+
+    def repairing_liar(spec):
+        marker.write_text("ok\n")
+        return _baseline_liar_effect(project)(spec)
+
+    engine, _ = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a", followup_review=False, deferred=[HARVEST_A]),
+            repairing_liar,
+            # attempt 3: no code at all, and the same finding still in the frontmatter
+            dev_effect(
+                project, "1-1-a", followup_review=False, write_src=False, deferred=[HARVEST_A]
+            ),
+        ],
+        policy=_fixable_chain_policy(marker),
+    )
+    summary = engine.run()
+
+    assert summary.deferred == 1 and summary.done == 0
+    decisions = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    # the last attempt is refused for the right reason (the budget then defers it)
+    assert [d["action"] for d in decisions] == ["retry", "retry", "defer"]
+    assert "no changes" in decisions[2]["reason"]
+    # attempt 3's harvest really did re-create the ledger — the exclusion is what the
+    # gate answered on, not an absent file
+    harvests = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert [h["dw_ids"] for h in harvests] == [["DW-1"], ["DW-1"]]
+
+
 def test_harvest_reverted_when_rollback_pauses(project):
     """`scm.rollback_on_failure` OFF is the DEFAULT, and it does not reset at all:
     it prints manual-recovery instructions and raises out of
