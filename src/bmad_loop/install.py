@@ -1481,8 +1481,8 @@ def _bmad_scripts_seed_incomplete(worktree: Path, repo_root: Path) -> bool:
     """
     if not _is_file(repo_root / RENDERER_SCRIPT_REL):
         return False
-    scripts = repo_root / BMAD_DIR / "scripts"
-    dst_scripts = worktree / BMAD_DIR / "scripts"
+    scripts = repo_root.joinpath(*BMAD_SCRIPTS_SEED_REL.split("/"))
+    dst_scripts = worktree.joinpath(*BMAD_SCRIPTS_SEED_REL.split("/"))
     return any(
         (_is_file(src) or _is_dir(src)) and not _is_file(dst_scripts.joinpath(*rel.split("/")))
         for rel, src in _walk_traversable_files(scripts)
