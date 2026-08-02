@@ -403,6 +403,14 @@ that rode the same window. Both skill eras are supported; the rename itself need
   rollback removed. A unit that lands is untouched — its ledger edit merges as before. The gap
   pre-dates this release; the harvest added a systematic producer of such entries.
 
+- **An artifacts dir whose name holds `[` or `]` no longer misdirects the two paths above
+  (#405, #423).** Git reads a positional operand as a pathspec, so such a path was a glob that
+  also matched its neighbours. The harvest revert's tracked-probe answered "git owns it" off a
+  neighbour and skipped its unlink, leaving the entry open for a later sweep; and the carry's
+  commit swept a neighbour's uncommitted edit in under the story's name — or, for the gitignored
+  ledger it is built to hit, staged nothing and reported success, since `git add` refuses an
+  explicitly-named ignored path but skips a globbed one. Both now name the path literally.
+
 - **Three small contracts brought back into line (#405).** A ledger entry filed with no file:line
   now carries `location: n/a` rather than no `location:` line: `deferred-work-format.md` has
   always specified that value, and of the fields an entry is created with, `severity:` is the

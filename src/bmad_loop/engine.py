@@ -3747,10 +3747,11 @@ class Engine:
         job. Same shape and same reasoning as `decisions.commit_pre_answer`; the
         journal records the miss, and a later `_merge_local` names the dirt itself.
 
-        Pre-existing exposure, not introduced here and not fixed here (#423):
-        `commit_paths` interpolates the path into a git pathspec unescaped, so an
-        `implementation_artifacts` containing `[` / `]` over-stages — the same for
-        every caller."""
+        `commit_paths` takes LITERAL pathspecs, which this caller is why: it is the
+        first unattended one, so an `implementation_artifacts` holding `[` / `]` would
+        over-stage an operator's uncommitted work into the commit below — and silently
+        skip the ignored ledger that makes the journalled miss above fire at all
+        (#423)."""
         if not task.harvested_deferrals:
             return
         ledger = self.paths.deferred_work

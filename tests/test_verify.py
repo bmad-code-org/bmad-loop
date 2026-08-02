@@ -1336,6 +1336,31 @@ def test_commit_paths_commits_only_listed(project):
     assert "src.txt" not in status
 
 
+def test_commit_paths_does_not_stage_a_glob_neighbour(project):
+    """The promise above — commit exactly `paths`, leave unrelated work alone — was
+    made through three globbing pathspecs. A target under a bracketed dir therefore
+    swept a tracked NEIGHBOUR's uncommitted edit into the commit, under a story's
+    name, leaving `git status` clean afterwards so nothing surfaced it (#423).
+
+    Unattended since `_carry_harvested_deferrals` began calling this from `_defer`;
+    before that its only caller was the operator-invoked `bmad-loop decisions`."""
+    repo = project.project
+    (repo / "docs1").mkdir()
+    (repo / "docs1" / "f.md").write_text("committed\n", encoding="utf-8")
+    git(repo, "add", "docs1/f.md")
+    git(repo, "commit", "-q", "-m", "neighbour")
+    (repo / "docs1" / "f.md").write_text("the operator's uncommitted edit\n", encoding="utf-8")
+    (repo / "docs[1]").mkdir()
+    target = repo / "docs[1]" / "f.md"
+    target.write_text("the ledger\n", encoding="utf-8")
+
+    sha = verify.commit_paths(repo, "chore: targeted", [target])
+
+    assert sha is not None  # the target is new, so there really is something to commit
+    assert git(repo, "show", "--name-only", "--format=", "HEAD").split() == ["docs[1]/f.md"]
+    assert "docs1/f.md" in git(repo, "status", "--porcelain")  # still the operator's
+
+
 def test_commit_paths_noop_when_unchanged(project):
     assert verify.commit_paths(project.project, "noop", [project.project / "src.txt"]) is None
     # a path outside the repo is ignored, not an error

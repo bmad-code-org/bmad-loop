@@ -1867,26 +1867,43 @@ def commit_paths(repo: Path, message: str, paths: list[Path]) -> str | None:
     or staged changes untouched. Unlike commit_story's `add -A`, this is safe to
     call out of band (e.g. `bmad-loop decisions`) when the tree may hold the
     user's own uncommitted work. Returns the new HEAD sha, or None when the
-    given paths had no changes to commit. Paths outside the repo are ignored."""
+    given paths had no changes to commit. Paths outside the repo are ignored.
+
+    All three operands are LITERAL pathspecs (`path_tracked` carries the full
+    reasoning). Without that, "exactly `paths` and nothing else" was untrue for any
+    path holding `[` / `]`: the operand is a glob that matches its own literal text AND
+    every neighbour the glob reaches, so a target under a bracketed dir swept a tracked
+    sibling's uncommitted edit into the commit — under a story's name, leaving `git
+    status` clean so nothing surfaced it. It also repairs a subtler miss on the ignored
+    path this function is expected to hit (`_carry_harvested_deferrals`): `git add`
+    REFUSES an explicitly-named ignored path but SKIPS one it reached by globbing, so
+    the plain form could exit 0 having staged nothing and return None, reporting a
+    success that committed no ledger and journalled no miss.
+
+    `as_posix()` rather than `str()` for the same reason, and it is not cosmetic: on
+    Windows `str()` yields backslash separators, which today's glob operand survives
+    only because git-for-windows normalises them — the very tolerance literal semantics
+    removes. POSIX-invisible, so Windows CI is its only oracle."""
     rels: list[str] = []
     repo_root = repo.resolve()
     for p in paths:
         try:
-            rels.append(str(Path(p).resolve().relative_to(repo_root)))
+            rels.append(Path(p).resolve().relative_to(repo_root).as_posix())
         except ValueError:
             continue
     if not rels:
         return None
-    rc, out = _git(repo, "add", "--", *rels)
+    specs = _literal_specs(rels)
+    rc, out = _git(repo, "add", "--", *specs)
     if rc != 0:
         raise GitError(f"git add failed: {out}")
-    rc, out = _git(repo, "status", "--porcelain", "--", *rels)
+    rc, out = _git(repo, "status", "--porcelain", "--", *specs)
     if rc != 0:
         raise GitError(f"git status failed: {out}")
     if not out:
         return None  # nothing changed in these paths
     # pathspec form commits only `rels`, ignoring any other staged changes
-    rc, out = _git(repo, "commit", "-m", message, "--", *rels)
+    rc, out = _git(repo, "commit", "-m", message, "--", *specs)
     if rc != 0:
         raise GitError(f"git commit failed: {out}")
     return rev_parse_head(repo)

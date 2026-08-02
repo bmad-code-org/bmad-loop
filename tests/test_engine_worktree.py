@@ -8,6 +8,7 @@ adapter (no tmux, no LLM).
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import shutil
 from collections.abc import Sequence
@@ -2103,6 +2104,53 @@ def test_a_ledger_git_refuses_to_commit_still_gets_the_finding(project):
     assert "git add failed" in uncommitted[0]["error"]
     # the forensic patch the raise would have cost the run
     assert (engine.run_dir / "failed" / "1-1-a" / "changes.patch").is_file()
+
+
+def test_a_gitignored_ledger_whose_name_globs_still_reports_the_commit_miss(project):
+    """The row above under an artifacts dir holding `[` / `]`, where the journalled miss
+    is precisely what a globbing pathspec loses.
+
+    A glob operand and an explicit one disagree about ignored paths: `git add` REFUSES an
+    explicitly-named ignored path — rc 1, the row above's whole premise — but SKIPS
+    ignored paths it reached by GLOBBING. So the operand lands on the tracked sibling
+    instead, `add` exits 0 having staged nothing, `status` finds no ledger change to
+    commit, and the carry returns success having committed no ledger and journalled no
+    miss. A silent loss exactly where the row above keeps a record (#423).
+
+    (rc 0 needs a glob-reachable neighbour to exist. Clean, as here, and the add stages
+    nothing; dirty, and it stages the operator's edit instead — the harm
+    `test_commit_paths_does_not_stage_a_glob_neighbour` pins.)
+
+    The ledger is ignored by FILENAME, like the row above and for the same reason: the
+    sprint board lives in the artifacts dir too, and ignoring the dir wholesale would
+    fail the run for an unrelated reason. The decoy is force-added past that same rule,
+    which is an ordinary tracked-and-ignored path — `path_tracked` documents it."""
+    root = project.project
+    (root / ".gitignore").write_text("deferred-work.md\n", encoding="utf-8")
+    paths = dataclasses.replace(project, implementation_artifacts=root / "_bmad-output" / "impl[1]")
+    paths.implementation_artifacts.mkdir(parents=True)
+    decoy = root / "_bmad-output" / "impl1" / "deferred-work.md"
+    decoy.parent.mkdir(parents=True)
+    decoy.write_text("# a neighbour's ledger\n", encoding="utf-8")
+
+    commit_sprint(paths, {"1-1-a": "ready-for-dev"})
+    git(root, "add", "-f", "--", "_bmad-output/impl1/deferred-work.md")
+    git(root, "commit", "-q", "-m", "tracked neighbour")
+
+    engine, _ = make_engine(
+        paths,
+        _carry_defer_script(paths, "1-1-a", deferred=[_CARRY_A]),
+        policy=wt_policy(limits=_NO_DAMP),
+    )
+    summary = engine.run()
+
+    assert summary.deferred == 1 and not summary.paused
+    uncommitted = [e for e in engine.journal.entries() if e["kind"] == "harvest-carry-uncommitted"]
+    assert len(uncommitted) == 1 and uncommitted[0]["dw_ids"] == ["DW-1"]
+    assert "git add failed" in uncommitted[0]["error"]
+    # the finding still reached the ledger a sweep reads — only the commit was missed
+    assert [e.title for e in _main_ledger(paths)] == ["Retry loop has no ceiling"]
+    assert decoy.read_text(encoding="utf-8") == "# a neighbour's ledger\n"
 
 
 def test_a_done_isolated_unit_files_its_harvest_exactly_once(project):
