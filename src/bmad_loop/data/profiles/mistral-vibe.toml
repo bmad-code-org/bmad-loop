@@ -28,7 +28,10 @@ launch_args = ["--trust"]
 bypass_args = ["--auto-approve"]
 model_flag = "--model"
 usage_parser = "none"
-stop_without_result_nudges = 5  # post_agent fires per response turn
+# post_agent fires PER response turn, not once per session, so a multi-turn
+# review ends several turns; the global default of 1 nudge would declare it
+# stalled on the 2nd Stop. 5 matches copilot's agentStop, for the same reason.
+stop_without_result_nudges = 5
 first_run_note = "run `vibe --setup` once and authenticate (Mistral API key) before `bmad-loop run` — spawned sessions can't answer the setup prompt, and a pending one reads as a session timeout. Leave `[adapter] model` empty: vibe has no --model flag, so set the model via VIBE_ACTIVE_MODEL or vibe's own config. Requires Mistral Vibe >= 2.23."
 skill_tree = ".agents/skills"
 # .vibe/config.toml holds project MCP servers and the active-model setting; it is
