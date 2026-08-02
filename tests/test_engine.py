@@ -17,6 +17,7 @@ from conftest import (
     fault_read_text,
     generic_dev_effect,
     git,
+    mark_ledger_done,
     review_effect,
     set_sprint,
     spec_path,
@@ -5675,6 +5676,39 @@ def test_spec_frontmatter_deferrals_harvested_into_ledger(project):
     assert events[0]["dw_ids"] == [entries[0].id]
     assert events[0]["deduped"] == 0 and events[0]["malformed"] == 0
     assert events[0]["spec"] == "spec-1-1-a.md"
+
+
+def test_an_in_place_done_story_never_replays_its_harvest_carry(project):
+    """The crash-replay pass is an ISOLATION concept and must stay one. In-place the
+    harvest wrote the main checkout's ledger directly — there was never a worktree
+    copy to lose — so a replay has nothing to carry and everything to break: once the
+    entry is closed (here by hand, standing in for a later sweep), `append_entry` no
+    longer dedups against it and files a DUPLICATE under a fresh id.
+
+    `task.worktree_path` is `""` on this leg, and `Path("")` is `PosixPath(".")`,
+    which reads as a directory — so the mounted-worktree guard would silently absorb
+    this case and leave the in-place guard a branch no test could redden. That is why
+    the guards are ordered mounted-first with an explicit truthiness clause (#405)."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", deferred=[HARVEST_A])],
+        policy=_harvest_policy(),
+    )
+    assert engine.run().done == 1
+    entries = _ledger_entries(project)
+    assert [e.id for e in entries] == ["DW-1"] and entries[0].open
+    # the payload is recorded here too — the pass has a live record to act on, so an
+    # inert result below is the guard and not an empty task
+    assert engine.state.tasks["1-1-a"].harvested_deferrals
+
+    mark_ledger_done(project, ["DW-1"])
+    resumed, _ = resume_engine(project, engine, [])
+    resumed.run()
+
+    assert "resume-ledger-carry" not in [e["kind"] for e in resumed.journal.entries()]
+    entries = _ledger_entries(project)
+    assert [e.id for e in entries] == ["DW-1"] and not entries[0].open
 
 
 def test_spec_deferrals_harvested_before_the_dev_decision(project):

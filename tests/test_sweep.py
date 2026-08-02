@@ -1,5 +1,6 @@
 """Sweep engine scenario tests against the mock adapter — no tmux, no LLM."""
 
+import dataclasses
 import json
 import re
 from pathlib import Path
@@ -9,6 +10,7 @@ from conftest import (
     bundle_dev_effect,
     bundle_dev_escalates,
     bundle_review_effect,
+    crash_at_merge_back,
     fault_read_text,
     git,
     migrate_effect,
@@ -583,6 +585,133 @@ def test_a_landing_bundle_carries_its_harvest_as_well_as_its_closes(project):
     # … and so did the harvest's brand-new entry, which only the base half carries
     assert [e.title for e in entries.values() if e.open] == ["Retry loop has no ceiling"]
     assert "harvest-carried" in kinds
+
+
+def _isolated_ledger_policy(project, **scm):
+    """The three rows above's policy, hoisted: isolation with the GITIGNORED ledger
+    seeded into each unit worktree — the one shape where a bundle's close lands in the
+    worktree, is skipped by `add -A`, and needs the carry to reach the main checkout."""
+    ledger_rel = project.deferred_work.relative_to(project.project).as_posix()
+    (project.project / ".gitignore").write_text(
+        ".bmad-loop/runs/\ndeferred-work.md\n", encoding="utf-8"
+    )
+    return Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(isolation="worktree", worktree_seed=(ledger_rel,), **scm),
+    )
+
+
+def test_a_bundle_close_lost_to_a_crash_replays_before_the_next_triage(project):
+    """The sweep half of the DONE-leg crash window, and the sharper half: a lost close
+    is a LIVENESS bug, not a data loss.
+
+    A close that never reaches the main checkout leaves its ids `open`,
+    `deferredwork.open_ids` re-bundles them, and the suppression filter (`failed_ids`)
+    covers DEFERRED and ESCALATED but not DONE — so every later sweep re-triages and
+    re-drives work that already merged. The re-drive then changes nothing, reads as
+    "no changes since baseline", takes a non-fixable RETRY and PAUSES the run under
+    the default `scm.rollback_on_failure = off`. Unbounded, and silent besides:
+    `_warn_stranded_bundles` filters terminal tasks.
+
+    `sweep.py` is not touched to fix it — the replay lives in `run()`, the one frame
+    `SweepEngine` shares (it overrides `_loop`, not `run`), and reaches the sweep half
+    through the `_carry_isolated_ledger_writes` override seam.
+
+    The resume script is EMPTY on purpose, which is what makes this row the sharp one:
+    without the replay DW-1 is still open when `_loop` reads the ledger, a fresh
+    triage session starts, and the adapter has nothing to give it — the absence of the
+    fix is a CRASH here, not a soft assertion failure (#405)."""
+    # the policy call writes the ignore rule, so it must precede the ledger write —
+    # a ledger `write_ledger` already committed is TRACKED, the rule never bites, and
+    # the close would ride the branch like any ordinary file
+    pol = _isolated_ledger_policy(project)
+    write_ledger(project, {"DW-1": "open"})  # gitignored ⇒ untracked, seeded in below
+    plan = triage_result(
+        ["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "fix it"}]
+    )
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(plan), _wt_bundle_dev(project, ["DW-1"])],
+        policy=pol,
+    )
+    crash_at_merge_back(engine)
+    assert engine.run().crashed
+
+    crashed = load_state(engine.run_dir).tasks["dw-fix"]
+    assert crashed.phase == Phase.DONE and not crashed.isolated_ledger_carried
+    # the intent survived the crash in state.json — only its application was lost
+    assert crashed.bundle_closes_intended == ["DW-1"]
+    assert ledger_entries(project)["DW-1"].open
+
+    resumed, adapter = resume_sweep(project, engine, [])
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused
+    assert adapter.sessions == []
+    kinds = [e["kind"] for e in resumed.journal.entries()]
+    assert "resume-ledger-carry" in kinds
+    # the close left the open set BEFORE the loop read the ledger, so no fresh triage
+    # re-bundled merged work — that ordering is why the replay sits in `run()`
+    assert "sweep-nothing-open" in kinds
+    assert ledger_entries(project)["DW-1"].status.startswith("done")
+
+
+def test_a_deferred_bundles_closes_are_never_replayed(project):
+    """DONE only, and the DEFERRED exclusion is the expensive one to get wrong. A
+    defer discarded the very code the close claims to have RESOLVED, and a wrongful
+    `done` is invisible to every future sweep — `open_ids` re-bundles only `open`
+    entries — so the work is silently lost rather than merely re-done.
+
+    Route (the only one that records an intent and then defers): the dev attempt is
+    ACCEPTED, so `_post_dev_accepted_sync` closes the ids and records them, and the
+    review leg then dies with its cycle budget spent. `keep_failed=False` so the unit
+    worktree is torn down — otherwise the mounted-worktree guard would answer first
+    and this row would say nothing about the phase guard."""
+    pol = dataclasses.replace(  # before write_ledger: see the row above
+        _isolated_ledger_policy(project, keep_failed=False),
+        review=ReviewPolicy(enabled=True, trigger="always"),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        limits=LimitsPolicy(max_review_cycles=1),
+    )
+    write_ledger(project, {"DW-1": "open"})
+    plan = triage_result(
+        ["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "fix it"}]
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            _wt_bundle_dev(project, ["DW-1"]),
+            lambda spec: SessionResult(status="died"),
+        ],
+        policy=pol,
+    )
+    summary = engine.run()
+
+    assert summary.deferred == 1 and not summary.paused
+    deferred_task = load_state(engine.run_dir).tasks["dw-fix"]
+    assert deferred_task.phase == Phase.DEFERRED
+    # the close DID fire and its intent IS on the task — so the row below is the phase
+    # guard withholding a replay, not a run with nothing recorded to replay
+    assert "sweep-bundle-closed" in [e["kind"] for e in engine.journal.entries()]
+    assert deferred_task.bundle_closes_intended == ["DW-1"]
+    assert not Path(deferred_task.worktree_path).is_dir()
+    assert ledger_entries(project)["DW-1"].open
+
+    # An empty script is enough: the cached triage.json reloads and `failed_ids`
+    # suppresses the deferred bundle's ids, so a correct resume drives no session.
+    resumed, adapter = resume_sweep(project, engine, [])
+    resumed.run()
+
+    kinds = [e["kind"] for e in resumed.journal.entries()]
+    assert "resume-ledger-carry" not in kinds
+    assert ledger_entries(project)["DW-1"].open
+    assert adapter.sessions == []
+    # …and the loop still read an OPEN ledger. A wrongful replay would have closed
+    # DW-1 ahead of it, emptying the open set and short-circuiting the cycle — which
+    # is how a lost defer would disguise itself as a finished sweep.
+    assert "sweep-nothing-open" not in kinds
 
 
 def test_sweep_happy_path(project):

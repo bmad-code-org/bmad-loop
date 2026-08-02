@@ -333,6 +333,33 @@ class StoryTask:
     # JSON-native values only — a `list[str]`, never a tuple: a tuple/list
     # round-trip reads back as a spurious "changed" (#189).
     bundle_closes_intended: list[str] = field(default_factory=list)
+    # The two payloads above have been carried into the MAIN checkout's ledger for
+    # this task. Governs `Engine._replay_unlatched_ledger_carries`, the resume pass
+    # that re-runs a carry the host died before reaching.
+    #
+    # A LATCH rather than a re-derivation, because the writes are only PARTLY
+    # idempotent. `deferredwork.append_entry` dedups on `origin:` + `source_spec:`
+    # against OPEN entries only, so if anything closed the entry between the crash
+    # and the resume — a later sweep bundle, a human — a blind replay files a
+    # DUPLICATE under a fresh id. (`mark_done` is fully idempotent, returning False
+    # on an entry already done, so the close half would be safe alone. The harvest
+    # half is what forces the latch.)
+    #
+    # Set at the CALL SITES (`_integrate_unit`'s DONE arm and the replay pass), never
+    # inside `_carry_isolated_ledger_writes`: `SweepEngine` overrides that hook and
+    # runs its own half AFTER `super()`, so a latch set inside the base would claim
+    # the close carry had happened while it was still one statement away.
+    #
+    # `_defer` deliberately never sets it — it calls `_carry_harvested_deferrals`
+    # directly, not the hook — so a DEFERRED task carries False forever. Read that as
+    # "this latch is a DONE-leg concept", NOT as "a carry is owed": the replay's own
+    # `phase != Phase.DONE` guard is what keeps a defer's discarded closes from ever
+    # being applied.
+    #
+    # `False` on a legacy state.json is provably safe rather than merely conservative:
+    # both payload fields landed on this same unreleased branch, so a state.json old
+    # enough to lack this key has nothing recorded to replay either way.
+    isolated_ledger_carried: bool = False
     spec_file: str | None = None
     commit_sha: str | None = None
     defer_reason: str | None = None
@@ -432,6 +459,7 @@ class StoryTask:
             "ledger_changed_before_harvest": self.ledger_changed_before_harvest,
             "harvested_deferrals": self.harvested_deferrals,
             "bundle_closes_intended": self.bundle_closes_intended,
+            "isolated_ledger_carried": self.isolated_ledger_carried,
             "spec_file": self._serialized_spec_file(),
             "commit_sha": self.commit_sha,
             "defer_reason": self.defer_reason,
@@ -509,6 +537,10 @@ class StoryTask:
             # `[]` on a legacy state.json for the same reason: no close was recorded,
             # so none is re-applied, which is the pre-#405 shape.
             bundle_closes_intended=[str(i) for i in d.get("bundle_closes_intended", [])],
+            # `False` on a legacy state.json: the two payloads above default to empty
+            # there, so the replay pass finds nothing to carry regardless — the
+            # pre-#405 shape, reached without guessing.
+            isolated_ledger_carried=bool(d.get("isolated_ledger_carried", False)),
             spec_file=d.get("spec_file"),
             commit_sha=d.get("commit_sha"),
             defer_reason=d.get("defer_reason"),

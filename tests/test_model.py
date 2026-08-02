@@ -324,6 +324,25 @@ def test_bundle_closes_intended_does_not_alias_the_persisted_doc():
     assert doc["bundle_closes_intended"] == ["DW-3"]
 
 
+def test_isolated_ledger_carried_round_trips():
+    """The latch governing `Engine._replay_unlatched_ledger_carries`. It has to come
+    off DISK, because the crash it guards against is precisely the one that loses the
+    in-memory copy: a run that carried and then died would replay its own carry on
+    resume and — once anything closed the entry — file a duplicate under a fresh id."""
+    task = StoryTask(story_key="1-1-a", epic=1, isolated_ledger_carried=True)
+    assert StoryTask.from_dict(task.to_dict()).isolated_ledger_carried is True
+
+
+def test_isolated_ledger_carried_defaults_false_for_legacy_state():
+    """`False` here is provably safe rather than merely conservative: the two payloads
+    the replay applies (`harvested_deferrals`, `bundle_closes_intended`) landed on the
+    same unreleased branch, so a state.json old enough to lack this key has nothing
+    recorded to replay either way."""
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    del doc["isolated_ledger_carried"]  # state.json from before the field existed
+    assert StoryTask.from_dict(doc).isolated_ledger_carried is False
+
+
 def test_baseline_ledger_digest_round_trips():
     """The digest is the reference `_harvest_gate_exclude` measures each attempt
     against, and a resumed `_dev_phase` call cannot re-capture it (that would move the

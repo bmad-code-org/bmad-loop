@@ -465,6 +465,20 @@ that rode the same window. Both skill eras are supported; the rename itself need
   gitignored ledger is absent from the worktree entirely, so `verify_review_bundle` never sees the
   ids done and the bundle defers rather than landing — loud, where this one was silent.
 
+- **…and a carry lost to a crash mid-landing replays on resume (#405).** `Phase.DONE` is
+  persisted before the merge runs, the merge ends by removing the worktree, and only then does
+  the carry fire — so a host death in that window destroyed the worktree's copy and skipped the
+  carry, and resume never looked again (it skips terminal tasks). The sibling DEFER leg carries
+  **before** its terminal save, which is why only DONE had the hole. Nothing was unrecoverable:
+  both payloads are already in `state.json`, so only the replay was missing. Resume now re-runs
+  an unlatched carry, once, guarded by a persisted latch — the writes are only partly idempotent,
+  since `append_entry` dedups against **open** entries and a later close would turn a blind
+  replay into a duplicate. Skipped when the worktree is still mounted (the branch may never have
+  landed, and the human's merge would bring the entry itself), on the in-place path, and on any
+  phase but DONE. The sweep half is the sharper one: a lost close leaves ids open, the
+  suppression filter does not cover DONE, and every later sweep re-drives already-merged work
+  into a non-fixable retry that pauses the run.
+
 - **An artifacts dir whose name holds `[` or `]` no longer misdirects the two paths above
   (#405, #423).** Git reads a positional operand as a pathspec, so such a path was a glob that
   also matched its neighbours. The harvest revert's tracked-probe answered "git owns it" off a

@@ -22,7 +22,9 @@ from conftest import (
     _seeded_then_touch,
     _spec_baseline,
     _touch_run,
+    crash_at_merge_back,
     git,
+    mark_ledger_done,
     set_sprint,
     write_spec,
     write_sprint,
@@ -2304,6 +2306,186 @@ def test_a_done_isolated_unit_with_a_gitignored_ledger_still_carries(project):
     assert "change for 1-1-a" in (project.project / "src.txt").read_text()
 
 
+def _gitignored_ledger_run(project, deferred=(_CARRY_A,)):
+    """The row above's shape, hoisted: a gitignored ledger, a committed sprint, a dev
+    leg that harvests `deferred` and a review that converges. Every row below either
+    crashes this run in `_integrate_unit`'s DONE window or resumes over it."""
+    (project.project / ".gitignore").write_text(
+        ".bmad-loop/runs/\ndeferred-work.md\n", encoding="utf-8"
+    )
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    return make_engine(
+        project,
+        [
+            wt_dev_effect(project, "1-1-a", deferred=list(deferred) or None),
+            wt_review_effect(project, "1-1-a", clean=True),
+        ],
+    )
+
+
+def _resume(project, engine, script=()):
+    """A fresh Engine over the persisted state — the hand-rolled resume the worktree
+    rows above use, hoisted because these rows resume twice. Empty script by default:
+    the replay must not drive a session, and `ScriptExhausted` says so loudly."""
+    state = load_state(engine.run_dir)
+    state.clear_pause()
+    adapter = MockAdapter(list(script))
+    resumed = Engine(
+        paths=project,
+        policy=engine.policy,
+        adapter=adapter,
+        run_dir=engine.run_dir,
+        journal=engine.journal,
+        state=state,
+    )
+    return resumed, adapter
+
+
+def test_a_carry_lost_to_a_crash_after_the_merge_replays_on_resume(project):
+    """P2. `_finalize_commit_phase` persists Phase.DONE BEFORE `_integrate_unit` runs,
+    and `_merge_local` ends by removing the worktree unconditionally — so a host death
+    between the merge and the carry destroys the worktree's copy of the harvest and
+    skips the carry that was going to rescue it. `_finish_inflight` opens with `if
+    task.terminal: continue`, so nothing in the ordinary resume path looks at a DONE
+    task again.
+
+    The sibling DEFER terminus has no such window: `_defer` carries BEFORE its
+    terminal `_save()`, so a death there leaves a non-terminal phase that resume
+    re-drives normally. DONE is the only leg that persists terminal and then carries.
+
+    Nothing is unrecoverable, which is what makes the fix a replay rather than a
+    rescue: `harvested_deferrals` is persisted to state.json and survives the crash
+    intact — only its application to the main ledger was missing (#405)."""
+    engine, _ = _gitignored_ledger_run(project)
+    crash_at_merge_back(engine)
+    assert engine.run().crashed
+
+    crashed = load_state(engine.run_dir).tasks["1-1-a"]
+    assert crashed.phase == Phase.DONE and not crashed.isolated_ledger_carried
+    # the payload survived the crash — this is a lost WRITE, not lost data
+    assert [d["title"] for d in crashed.harvested_deferrals] == ["Retry loop has no ceiling"]
+    # …and the merge really landed, taking the worktree (the finding's only other
+    # copy) with it. Without the replay below the entry is gone for good.
+    assert "change for 1-1-a" in (project.project / "src.txt").read_text()
+    assert [p.resolve() for p in worktree_list(project.project)] == [project.project.resolve()]
+    assert _main_ledger(project) == []
+
+    resumed, adapter = _resume(project, engine)
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused
+    assert adapter.sessions == []  # a replay, not a re-drive of committed work
+    assert "resume-ledger-carry" in journal_kinds(resumed)
+    entries = _main_ledger(project)
+    assert [e.title for e in entries] == ["Retry loop has no ceiling"]
+    assert entries[0].open and f"origin: {_carry_origin(_CARRY_A)}" in entries[0].body
+    assert resumed.state.tasks["1-1-a"].isolated_ledger_carried
+
+
+def test_a_replayed_carry_latches_so_a_second_resume_files_no_duplicate(project):
+    """Why the replay needs a persisted LATCH and not just the writes' idempotency.
+
+    `append_entry` dedups on `origin:` + `source_spec:` against OPEN entries only, so
+    once anything closes the carried entry — a later sweep bundle, a human — a blind
+    second replay no longer dedups and files a DUPLICATE under a fresh id. The close
+    here stands in for that: it is the exact condition the latch exists for, and the
+    reason `mark_done`'s full idempotency (False on an entry already done) is not
+    enough on its own."""
+    engine, _ = _gitignored_ledger_run(project)
+    crash_at_merge_back(engine)
+    assert engine.run().crashed
+
+    first, _ = _resume(project, engine)
+    first.run()
+    assert [e.id for e in _main_ledger(project)] == ["DW-1"]
+
+    mark_ledger_done(project, ["DW-1"])
+    second, _ = _resume(project, engine)
+    second.run()
+
+    # one entry, still the closed one — no DW-2 filed behind its back
+    entries = _main_ledger(project)
+    assert [e.id for e in entries] == ["DW-1"] and not entries[0].open
+    replays = [e for e in second.journal.entries() if e["kind"] == "resume-ledger-carry"]
+    assert len(replays) == 1
+
+
+def test_a_clean_landing_latches_its_carry_so_resume_never_refiles_it(project):
+    """The latch's other half: the carry that DID run must say so durably, or every
+    later resume of a finished run re-files a landed unit's harvest.
+
+    Same closed-entry setup as the row above, for the same reason — an open entry
+    would dedup a wrongful replay into invisibility and this row would pass on a build
+    with no latch at all."""
+    engine, _ = _gitignored_ledger_run(project)
+    assert engine.run().done == 1
+    assert engine.state.tasks["1-1-a"].isolated_ledger_carried
+    assert [e.id for e in _main_ledger(project)] == ["DW-1"]
+
+    mark_ledger_done(project, ["DW-1"])
+    resumed, _ = _resume(project, engine)
+    resumed.run()
+
+    assert "resume-ledger-carry" not in journal_kinds(resumed)
+    entries = _main_ledger(project)
+    assert [e.id for e in entries] == ["DW-1"] and not entries[0].open
+
+
+def test_a_crash_before_the_merge_leaves_a_mounted_worktree_uncarried(project):
+    """The mounted-worktree guard, and it is a CORRECTNESS guard rather than an
+    optimization. A worktree still on disk means the death landed at or before
+    `close_unit_workspace`, and from the replay's vantage that is indistinguishable
+    from "the branch never merged" — as here, where it did not. Carrying a unit whose
+    branch never landed files an id the human's later merge would duplicate.
+
+    It costs the narrower merged-but-not-torn-down sub-window, where the carry is lost
+    exactly as it is today — never wrongly applied."""
+    engine, _ = _gitignored_ledger_run(project)
+    crash_at_merge_back(engine, after=False)
+    assert engine.run().crashed
+
+    crashed = load_state(engine.run_dir).tasks["1-1-a"]
+    assert crashed.phase == Phase.DONE and crashed.harvested_deferrals
+    # the branch never landed and its worktree is still mounted — the two facts the
+    # guard reads as "this is not mine to carry"
+    assert "change for 1-1-a" not in (project.project / "src.txt").read_text()
+    assert len(worktree_list(project.project)) == 2
+
+    resumed, adapter = _resume(project, engine)
+    resumed.run()
+
+    assert adapter.sessions == []
+    assert "resume-ledger-carry" not in journal_kinds(resumed)
+    assert _main_ledger(project) == []
+
+
+def test_the_replay_pass_is_silent_when_the_crashed_unit_had_nothing_to_carry(project):
+    """`resume-ledger-carry` is a RECOVERY signal an operator reads, so the pass must
+    not emit it for a unit with an empty record. Most landing units have one: the
+    payloads are only non-empty when a spec deferred a finding or a sweep bundle
+    closed ids, and every other crashed-at-merge unit would otherwise announce a
+    rescue that carried nothing.
+
+    Same crash in the same window as the row above, with the dev leg's `deferred:`
+    list omitted — the common shape — so the only difference is the empty record."""
+    engine, _ = _gitignored_ledger_run(project, deferred=())
+    crash_at_merge_back(engine)
+    assert engine.run().crashed
+
+    crashed = load_state(engine.run_dir).tasks["1-1-a"]
+    # the crash landed in the same window (DONE, un-latched, worktree torn down) —
+    # every guard but the record's emptiness would let this one through
+    assert crashed.phase == Phase.DONE and not crashed.isolated_ledger_carried
+    assert not crashed.harvested_deferrals and not crashed.bundle_closes_intended
+    assert [p.resolve() for p in worktree_list(project.project)] == [project.project.resolve()]
+
+    resumed, _ = _resume(project, engine)
+    resumed.run()
+
+    assert "resume-ledger-carry" not in journal_kinds(resumed)
+    assert _main_ledger(project) == []
+
+
 def test_a_done_unit_whose_merge_escalates_does_not_carry(project):
     """The escalation legs keep the unit branch for a HUMAN to merge, and that merge
     brings the branch's own ledger state with it — so a copy carried here under a
@@ -2356,6 +2538,15 @@ def test_a_done_unit_whose_merge_escalates_does_not_carry(project):
     assert _main_ledger(project) == []
     # …and the branch is still there, holding the finding for the human's merge
     assert branch_exists(project.project, "bmad-loop/test-run/1-1-a")
+
+    # …and the crash-replay pass must not carry it either, on resume after resume.
+    # Two guards say so independently: the phase is ESCALATED, not DONE, and
+    # `_keep_branch_and_escalate` keeps the worktree mounted — which is exactly the
+    # state that means "a human still owns this merge".
+    resumed, _ = _resume(project, engine)
+    resumed.run()
+    assert "resume-ledger-carry" not in journal_kinds(resumed)
+    assert _main_ledger(project) == []
 
 
 # ----------------------------------------------------------------- new guards (review hardening)

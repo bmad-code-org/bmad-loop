@@ -572,6 +572,33 @@ def committing_crash_state(paths: ProjectPaths, engine, *, post_squash: bool = F
     return baseline
 
 
+def crash_at_merge_back(engine, *, after: bool = True) -> None:
+    """Kill the host inside `_integrate_unit`'s DONE arm, in the window between
+    `_merge_local` and `_carry_isolated_ledger_writes`.
+
+    `after=True` calls through first, so the branch really lands and
+    `close_unit_workspace(success=True)` really removes the worktree — which is the
+    point: the orchestrator's worktree-local ledger writes are destroyed with it,
+    and `_finalize_commit_phase` already persisted Phase.DONE, which
+    `_finish_inflight` skips. `after=False` raises instead of merging: the branch
+    never lands and the worktree stays mounted.
+
+    `_emit("post_merge")` cannot stand in for this. It fires at the tail of
+    `_merge_local`, one statement ABOVE the teardown, so the worktree survives it —
+    that hook reproduces the wrong window.
+
+    Wraps the bound method on the instance, so a resumed engine built afterwards is
+    an ordinary un-patched one."""
+    original = engine._merge_local
+
+    def crashing(task, unit):
+        if after:
+            original(task, unit)
+        raise RuntimeError("host died between the merge and the ledger carry")
+
+    engine._merge_local = crashing
+
+
 def dev_effect(
     paths: ProjectPaths,
     story_key: str,

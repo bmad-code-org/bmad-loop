@@ -312,6 +312,7 @@ class Engine:
                 self._emit_run_boundary("pre_run")
                 self._ensure_target_branch()
                 self._prune_preserve_refs()
+                self._replay_unlatched_ledger_carries()
                 self._loop()
                 self.state.finished = True
                 self._gc_run_worktrees()
@@ -843,6 +844,24 @@ class Engine:
             # puts the open entry in front of `append_entry`'s dedup, and carrying
             # first would file a fresh id and then merge the branch's copy on top.
             self._carry_isolated_ledger_writes(task)
+            # …and latch it durably. `_finalize_commit_phase` already persisted
+            # Phase.DONE before this method ran, and `_finish_inflight` skips
+            # terminal tasks, so the window between the merge above and this line
+            # is the one place a persisted phase does not re-drive:
+            # `_replay_unlatched_ledger_carries` covers it on resume and this is
+            # what tells it the carry is not owed.
+            #
+            # The explicit `_save()` is load-bearing, not bookkeeping. The next
+            # natural save is far away: in the base engine a `_pick_next` that
+            # returns None runs `_maybe_auto_sweep("run-end", …)` — a whole nested
+            # sweep, the single most likely thing to CLOSE the entry just carried,
+            # which is the one condition that turns a replay into a duplicate —
+            # before `run()`'s `finally: self._save()`; in the sweep engine it is
+            # `_loop`'s next cycle, after every remaining bundle has been driven.
+            # `save_state` is a tmp-write plus `atomic_replace`, so this costs one
+            # small atomic write per landed unit.
+            task.isolated_ledger_carried = True
+            self._save()
         else:  # DEFERRED — capture the diff, keep or drop per keep_failed
             patch = close_unit_workspace(
                 unit,
@@ -1529,6 +1548,73 @@ class Engine:
         )
         self._save()
         raise RunPaused(notice, PAUSE_ESCALATION, task.story_key)
+
+    def _replay_unlatched_ledger_carries(self) -> None:
+        """Re-run the DONE leg's ledger carry for a unit whose host died between the
+        merge and the carry.
+
+        `_finalize_commit_phase` persists `Phase.DONE` BEFORE `_integrate_unit`
+        merges (`_merge_local`) and carries, and `_merge_local` ends by removing the
+        worktree unconditionally — so a death in that window destroys the worktree's
+        copy of the orchestrator's ledger writes and skips the carry that was going
+        to rescue them. `_finish_inflight` cannot cover it: it opens with `if
+        task.terminal: continue`, and DONE is terminal.
+
+        The sibling DEFER terminus has no such window. `_defer` carries BEFORE its
+        terminal `_save()`, so a death there leaves a non-terminal persisted phase
+        that ordinary resume re-drives. DONE is the only leg that persists terminal
+        and then carries, and that asymmetry is the whole of this (#405).
+
+        Nothing is unrecoverable, which is what makes this cheap: both payloads —
+        `harvested_deferrals` and `bundle_closes_intended` — are already persisted to
+        `state.json` and survive the crash. Only the replay was missing.
+
+        In `run()` rather than in `_finish_inflight`, and that placement is forced
+        twice over. `SweepEngine` replaces `_loop` wholesale and never calls the base
+        recovery pass, while it does NOT override `run()` — that frame is the one
+        both engines share, so the sweep half comes free through the
+        `_carry_isolated_ledger_writes` override seam without touching `sweep.py`.
+        And it must PRECEDE `_loop` for the sweep: a carried close has to leave the
+        open set before the loop reads the ledger, or a fresh triage re-bundles work
+        that already merged. Ordering against its neighbours is safe: after
+        `_ensure_target_branch` (the carry commits into the main checkout, which must
+        be on the pinned target; on resume that method early-returns), and
+        `_finish_inflight` — which runs later, inside `_loop` — cannot itself produce
+        an un-carried DONE task. On a fresh run `state.tasks` is empty, so this is a
+        no-op.
+
+        Failure direction is safe. A lost latch means a replay, and a replay is a
+        no-op in the ordinary case: `mark_done` returns False on an entry already
+        done, and `append_entry` dedups against the still-open entry. The residual
+        cost is one duplicate, bounded and journalled, only if something closed the
+        entry in between — which is exactly why the latch above pays for its own
+        `_save()`."""
+        for task in list(self.state.tasks.values()):
+            if task.isolated_ledger_carried or task.phase != Phase.DONE:
+                continue
+            wt = task.worktree_path
+            # A still-mounted worktree means the death landed at or before
+            # `close_unit_workspace`, and from here that is indistinguishable from
+            # "the branch never merged" — carrying a unit whose branch never landed
+            # files an id the human's later merge duplicates. Same predicate
+            # `_gc_run_worktrees` reads for the same crash. It costs the narrower
+            # merged-but-not-torn-down sub-window, where the carry is lost exactly as
+            # it is today, and never wrongly applied.
+            #
+            # `wt and …` rather than a bare `Path(wt).is_dir()`, and that clause is
+            # why this guard comes FIRST: `Path("")` is `PosixPath(".")` and reads as
+            # a directory, so without it this line would silently absorb the in-place
+            # case the next guard owns — leaving that one a branch no test can redden.
+            if wt and Path(wt).is_dir():
+                continue
+            if not wt:
+                continue  # in-place run: nothing was ever isolated from the main ledger
+            if not (task.harvested_deferrals or task.bundle_closes_intended):
+                continue
+            self.journal.append("resume-ledger-carry", story_key=task.story_key)
+            self._carry_isolated_ledger_writes(task)
+            task.isolated_ledger_carried = True
+            self._save()
 
     def _finish_inflight(self) -> None:
         """Complete or roll back tasks interrupted by a pause or crash."""
