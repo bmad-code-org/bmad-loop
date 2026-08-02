@@ -167,3 +167,61 @@ def test_publish_dry_run_prints_notes(monkeypatch, capsys, tmp_path):
     assert rc == 0
     assert "would create release v0.5.0" in out
     assert "**A thing.**" in out
+
+
+# --- publish under a concurrent publisher ---------------------------------- #
+# `tag_exists` reads the checkout's refs, so a run whose checkout predates another
+# runner's tag push reaches `gh release create` and loses. That is the only failure
+# the command may swallow; every other one still has to be loud.
+def _publish_with_gh(monkeypatch, tmp_path, *, returncode, stderr):
+    cl = tmp_path / "CHANGELOG.md"
+    cl.write_text(SAMPLE)
+    monkeypatch.setattr(release, "CHANGELOG", cl)
+    monkeypatch.setattr(release.sync_version, "read_canonical", lambda: "0.5.0")
+    monkeypatch.setattr(release, "tag_exists", lambda tag: False)
+    monkeypatch.setattr(release, "_git_out", lambda *a: "deadbeef" * 5)
+    monkeypatch.setattr(release.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(
+        release.subprocess,
+        "run",
+        lambda *a, **kw: SimpleNamespace(returncode=returncode, stdout="", stderr=stderr),
+    )
+    return release.cmd_publish(SimpleNamespace(dry_run=False))
+
+
+def test_publish_treats_a_lost_race_as_success(monkeypatch, capsys, tmp_path):
+    rc = _publish_with_gh(
+        monkeypatch,
+        tmp_path,
+        returncode=1,
+        stderr="HTTP 422: Validation Failed\nRelease.tag_name already exists",
+    )
+    assert rc == 0
+    assert "created concurrently" in capsys.readouterr().out
+
+
+def test_publish_still_dies_on_a_genuine_gh_failure(monkeypatch, capsys, tmp_path):
+    with pytest.raises(SystemExit) as exc:
+        _publish_with_gh(
+            monkeypatch,
+            tmp_path,
+            returncode=1,
+            stderr="HTTP 401: Bad credentials",
+        )
+    assert "gh release create v0.5.0" in str(exc.value)
+    assert "Bad credentials" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "stderr,lost",
+    [
+        ("Release.tag_name already exists", True),
+        ("release already exists", True),
+        ("ALREADY EXISTS", True),
+        ("HTTP 401: Bad credentials", False),
+        ("HTTP 422: Validation Failed\ntarget_commitish is invalid", False),
+        ("", False),
+    ],
+)
+def test_already_exists_matches_only_the_duplicate_tag_error(stderr, lost):
+    assert release._already_exists(stderr) is lost

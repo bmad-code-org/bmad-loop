@@ -188,10 +188,28 @@ def current_branch() -> str:
 
 
 def tag_exists(tag: str) -> bool:
+    """Whether ``tag`` is in *this checkout's* refs.
+
+    Deliberately local: it is the cheap pre-check, not a distributed lock. Nothing
+    re-fetches between it and the ``gh release create`` it guards, so it cannot see
+    a tag another runner pushed after this job checked out. ``_already_exists``
+    covers that window on the failure side.
+    """
     return (
         _run(["git", "rev-parse", "-q", "--verify", f"refs/tags/{tag}"], check=False).returncode
         == 0
     )
+
+
+def _already_exists(stderr: str) -> bool:
+    """Whether a failed ``gh release create`` lost a race rather than genuinely erroring.
+
+    GitHub answers a duplicate tag with an HTTP 422 whose body names the offending
+    field, e.g. ``Release.tag_name already exists``. Matching the phrase rather than
+    the status keeps a 422 raised for some *other* validation failure (malformed
+    target, bad notes) on the loud path where it belongs.
+    """
+    return "already exists" in (stderr or "").lower()
 
 
 def last_release_tag() -> str | None:
@@ -409,13 +427,29 @@ def cmd_publish(args: argparse.Namespace) -> int:
     if not shutil.which("gh"):
         _die("`gh` CLI not found — required to create the GitHub release")
     print(f"creating release {tag} at {sha[:12]} ...")
-    subprocess.run(
+    proc = subprocess.run(
         ["gh", "release", "create", tag, "--target", sha, "--title", tag, "--notes-file", "-"],
         cwd=REPO,
-        check=True,
+        check=False,
         text=True,
         input=notes,
+        capture_output=True,
     )
+    if proc.returncode != 0:
+        # The `tag_exists` probe above reads the *checkout's* refs, and nothing
+        # fetches between it and this call — so it answers for tag state at
+        # checkout time, not for the remote now. Since release.yml fires on
+        # `main` and on `release/*`, and its concurrency group keys on
+        # `github.ref` (two branches ⇒ two groups), two runs carrying the same
+        # version can both pass the probe and both land here. Losing that race
+        # is not a failure: the winner created this exact tag from this exact
+        # CHANGELOG section, so the desired end state already holds. Anything
+        # else is a real error and still dies loudly.
+        if _already_exists(proc.stderr):
+            print(f"{tag} was created concurrently — nothing to publish")
+            return 0
+        sys.stderr.write(proc.stderr)
+        _die(f"`gh release create {tag}` failed with rc {proc.returncode}")
     print(f"published {tag}")
     return 0
 
