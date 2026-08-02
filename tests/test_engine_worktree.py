@@ -18,6 +18,7 @@ import pytest
 from conftest import (
     _OK,
     _exists_run,
+    _file_exists_cmd,
     _seeded_then_touch,
     _spec_baseline,
     _touch_run,
@@ -34,7 +35,14 @@ from bmad_loop.engine import Engine
 from bmad_loop.install import BMAD_SCRIPTS_SEED_REL, CENTRAL_CONFIG_REL, renderer_stub_resolved
 from bmad_loop.journal import Journal, load_state
 from bmad_loop.model import Phase, RunState, SessionRecord, StoryTask, TokenUsage
-from bmad_loop.policy import GatesPolicy, LimitsPolicy, NotifyPolicy, Policy, ScmPolicy
+from bmad_loop.policy import (
+    GatesPolicy,
+    LimitsPolicy,
+    NotifyPolicy,
+    Policy,
+    ScmPolicy,
+    VerifyPolicy,
+)
 from bmad_loop.verify import (
     branch_exists,
     current_branch,
@@ -2000,6 +2008,51 @@ def test_a_final_attempt_that_never_harvested_carries_nothing(project):
     assert "rollback-auto" in kinds and "story-deferred" in kinds
     assert _main_ledger(project) == []
     assert "harvest-carried" not in kinds
+
+
+def test_a_fixable_retrys_kept_harvest_still_carries_when_the_next_attempt_stalls(
+    project, tmp_path
+):
+    """The other side of the row above, and the reason the per-attempt clear is not
+    unconditional. Attempt 1 harvests A and fails a FIXABLE gate, which keeps the tree
+    AND the ledger entry on purpose. Attempt 2's session STALLS — so its harvest never
+    runs, nothing re-files A, and nothing re-records it either. The budget is spent, the
+    unit defers, and A is still sitting in the worktree that is about to go unmerged.
+
+    A cleared record here is a silent loss with no journal line to show for it: the
+    carry returns on an empty record before it ever reaches `append_entry`.
+
+    The marker lives outside the project tree so attempt 1's failure is the verify
+    command's and nothing else's — inside, it would be untracked proof of work in the
+    worktree and change what the artifact gate answers."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    marker = tmp_path / "never-created.marker"
+
+    def stalling(spec):
+        return SessionResult(status="stalled")
+
+    pol = dataclasses.replace(
+        wt_policy(limits=LimitsPolicy(max_dev_attempts=2)),
+        verify=VerifyPolicy(commands=(_file_exists_cmd(marker),)),
+    )
+    engine, _ = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a", followup_review=False, deferred=[_CARRY_A]), stalling],
+        policy=pol,
+    )
+    summary = engine.run()
+
+    assert summary.deferred == 1 and not summary.paused
+    kinds = journal_kinds(engine)
+    # attempt 1's retry really was the FIXABLE one — the non-fixable leg would have
+    # reverted the entry, and then carrying nothing would be correct
+    assert "rollback-auto" not in kinds and "story-deferred" in kinds
+    harvests = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert len(harvests) == 1 and harvests[0]["dw_ids"] == ["DW-1"]
+    # …and the finding attempt 1 filed in the doomed worktree reached the main ledger
+    assert [e.title for e in _main_ledger(project)] == ["Retry loop has no ceiling"]
+    carried = [e for e in engine.journal.entries() if e["kind"] == "harvest-carried"]
+    assert len(carried) == 1 and carried[0]["dw_ids"] == ["DW-1"]
 
 
 def test_the_carry_never_duplicates_an_entry_already_open_in_the_main_ledger(project):

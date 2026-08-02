@@ -356,6 +356,24 @@ that rode the same window. Both skill eras are supported; the rename itself need
   would be absent for every attempt after a crash-resume and the mask would survive there.
   Introduced earlier in this same release.
 
+- **…and both answers now span a fixable retry (#405).** The two bullets above scope every piece
+  of harvest provenance to one attempt, and the dev phase's ledger baseline to the whole phase.
+  Those coincide on every run where at most one attempt's work sits above `baseline_commit` — and
+  a _fixable_ retry is the one construct that breaks that: it keeps the tree, and the harvest's
+  ledger line with it, on purpose. So the repair session was judged against a baseline that
+  predated the surviving line: the flag was cleared, the exclusion stood down, and an attempt that
+  reverted the offending change and wrote nothing else passed the proof-of-work gate on the
+  orchestrator's own write — with the `[verify] commands` that had failed now passing precisely
+  because the change was reverted. (Only for a tracked or untracked-but-not-ignored ledger; an
+  ignored one is invisible to the gate either way.) Both records now survive the continuation, and
+  the ledger baseline is re-based to match — forward onto the kept tree when the fixable retry is
+  taken, back onto the restored snapshot if that chain later rolls back. Latching the _answer_
+  instead is the obvious pairing and re-opens the bullet above: the mask is path-granular, so a
+  stale one hides a repair session whose honest work genuinely is a ledger entry, and that pauses
+  the run. Same continuation, same reason, for the record of what the harvest intended to file: a
+  fixable retry followed by a stalled attempt used to defer with an empty record while the entry
+  it named sat in a worktree about to be dropped.
+
 - **A sweep bundle's ledger closes are withheld until its attempt is accepted (#405).** The
   orchestrator marks a bundle's deferred-work ids `done` itself, and did so above the artifact
   gate — so an attempt that finalized its spec and then failed a non-fixable check was discarded

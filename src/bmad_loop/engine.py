@@ -190,6 +190,24 @@ def _setup_mcp_agent_id(profile_name: str) -> str:
     return _SETUP_MCP_AGENT_IDS.get(profile_name, profile_name)
 
 
+def _digest_of(text: str | None) -> str:
+    """The digest `task.baseline_ledger_digest` holds, for a ledger text that is
+    already in hand.
+
+    An ABSENT ledger and an EMPTY one hash identically, and this is the one place
+    that collapse is spelled. The `pre_harvest_ledger` split next door exists only
+    because its restore has to UNLINK; nothing this digest feeds ever does, and
+    neither state carries an entry, so for "did the ledger change" they are the same
+    answer.
+
+    Split out of `Engine._ledger_digest` so the two spellings of the question share
+    one hash. The method reads the tree; this takes a snapshot the caller already
+    holds — which is how the post-restore re-base avoids putting a `read_text`, hence
+    a new raise site, inside a `finally` that is usually propagating `RunPaused`
+    (#405)."""
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
 def _session_task_id(story_key: str, part: str, seq: int) -> str:
     """Single composition point for session task ids. Sanitize the whole
     composition, not the parts: two individually capped parts can still compose
@@ -1899,14 +1917,27 @@ class Engine:
                 # advance; a second host death then still finds the record and
                 # re-enters this continuation instead of falling back to restart.
                 task.attempt += 1
-                # Same guard, same reason, for the record of what this attempt's
-                # harvest intends to file — which the isolated DEFER carries into
-                # the main checkout's ledger (`_carry_harvested_deferrals`). A
-                # fresh attempt owes nothing to the previous one, whose harvest a
-                # non-fixable RETRY has already reverted out of the tree; a REPLAY
-                # keeps the dead attempt's record, because the replayed harvest
-                # dedupes against the entries already on disk and would re-assign
-                # an empty list (see the field's comment).
+                # Same reason, for the record of what this attempt's harvest intends
+                # to file — which the isolated DEFER carries into the main
+                # checkout's ledger (`_carry_harvested_deferrals`). An attempt that starts
+                # from a REVERTED tree owes nothing to the previous one, whose
+                # harvest the non-fixable RETRY took out with the code it described.
+                #
+                # But a FIXABLE retry is not that attempt. It keeps the tree AND the
+                # ledger entry on purpose, hands the failing output to a repair
+                # session, and the repair session's own harvest dedupes that entry to
+                # nothing — so clearing here would drop the only record of a finding
+                # that is still sitting in the worktree's ledger, and a later stall or
+                # budget exhaustion would defer with an empty record while the entry
+                # dies unmerged with the worktree. `feedback is not None` is exactly
+                # "the previous iteration took the fixable branch"; see the
+                # discriminator note at the `harvest_wrote_ledger` clear below for why
+                # the local is sound across both re-entries.
+                #
+                # A REPLAY keeps the dead attempt's record too, because the replayed
+                # harvest dedupes against the entries already on disk and would
+                # re-assign an empty list (see the field's comment) — which is why
+                # this sits inside `if resume_result is None:`.
                 #
                 # HERE and not at the harvest's arm site below, which the sibling
                 # `harvest_wrote_ledger` clear uses: that site sits inside `if
@@ -1917,7 +1948,8 @@ class Engine:
                 # main ledger as a claim about code no attempt ever landed. The
                 # flag can live in the narrower site because nothing outside the
                 # completed branch reads it; this record is read from `_defer`.
-                task.harvested_deferrals = []
+                if feedback is None:
+                    task.harvested_deferrals = []
             advance(task, Phase.DEV_RUNNING)
             self._save()
             if resume_result is not None:
@@ -1998,7 +2030,7 @@ class Engine:
                 # Same site, same reason — but deliberately its OWN guard, and NOT
                 # the relaxed one below. Everything under this line that touches the
                 # ledger is the ORCHESTRATOR writing, not the session, so the flag is
-                # cleared here for each attempt to answer for itself; and NEVER on a
+                # cleared for each attempt to answer for itself; and NEVER on a
                 # replay, because the dead attempt's harvest is still in the tree
                 # while the replayed harvest dedupes to nothing, so its True has to
                 # survive (see the field's comment and `_harvest_gate_exclude`).
@@ -2007,10 +2039,34 @@ class Engine:
                 # flag on exactly the replay whose only diff IS the dead attempt's
                 # harvest — handing the proof-of-work gate the orchestrator's own
                 # write, the hazard this flag exists to prevent (#405).
+                #
+                # `feedback is None` for the same reason one level out, and it is the
+                # FIXABLE-retry leg that makes it necessary: that leg keeps the
+                # attempt's tree, so the previous attempt's harvest line is still
+                # above `baseline_commit` when the repair session is judged. Cleared
+                # there, the repair session's proof of work would be the
+                # orchestrator's own write — and its verify commands may well pass
+                # precisely because the offending change was just reverted, so an
+                # EMPTY implementation PROCEEDs. The fixable retry is the only
+                # construct in the engine that lets more than one attempt accumulate
+                # above the baseline, which is why this is the only leg that needs
+                # saying (#405).
+                #
+                # The `feedback` local is the discriminator rather than a persisted
+                # field, and it is sound across both re-entries. It is assigned in
+                # exactly three places in this method — the init above and the two
+                # RETRY branches below — and never reset per iteration, so at the top
+                # of iteration k it means precisely "iteration k-1 took the fixable
+                # branch"; `_restore_patch`'s guard reads it the same way. A REPLAY
+                # loses it, and does not care: this block is `replayed`-guarded to the
+                # same answer a continuation wants. A RESTART loses it too, and
+                # `_finish_inflight` has already reset the tree and re-captured every
+                # baseline — a coherent fresh phase, where `None` is the truth.
                 if not replayed:
-                    task.harvest_wrote_ledger = False
+                    if feedback is None:
+                        task.harvest_wrote_ledger = False
                     # …and, for this attempt, whether the ledger's diff from the
-                    # phase baseline is ALREADY more than the harvest's — the
+                    # reference below is ALREADY more than the harvest's — the
                     # session's own ledger edit, an operator's edit during a
                     # `rollback_on_failure = off` pause, or a previous attempt's
                     # edit that survived a restore. `_harvest_gate_exclude` stands
@@ -2018,9 +2074,19 @@ class Engine:
                     # records a `deferred:` finding is not masked into a false
                     # "no changes since baseline" (#405).
                     #
-                    # It shares the flag's guard because it shares the flag's
-                    # hazard, in mirror image: on a replay the ledger on disk is
-                    # already POST-harvest, so re-answering here would read the
+                    # UNCONDITIONAL under `not replayed`, and deliberately NOT also
+                    # `feedback is None`. Latching this across a continuation
+                    # alongside the flag is the obvious pairing and it is wrong: the
+                    # exclusion is path-granular, so a latched False hides a repair
+                    # session whose honest work genuinely IS a ledger entry, and the
+                    # false "no changes" that follows PAUSES the run under the
+                    # shipped `rollback_on_failure = off`. That is the hole `161c85e`
+                    # closed, re-opened one attempt further along. What moves instead
+                    # is the REFERENCE — see the two re-bases below — so the question
+                    # stays live and answers about the kept chain.
+                    #
+                    # Skipped on a replay for the mirror-image hazard: the ledger on
+                    # disk is already POST-harvest, so re-answering would read the
                     # DEAD attempt's own harvest as "someone else changed it" and
                     # stand the exclusion down over the orchestrator's write.
                     #
@@ -2128,6 +2194,27 @@ class Engine:
                     # work exists and the failure is concrete: keep the tree,
                     # hand the failing output to a repair session
                     feedback = self._write_feedback(task, decision.reason)
+                    # Re-base site 1 of 2. This leg keeps the tree, so every byte
+                    # above `baseline_commit` — including this attempt's harvest —
+                    # is accounted for and carries into the repair session's
+                    # judgement. Move the reference onto it, so the next attempt's
+                    # question is "did anything change since the KEPT chain" rather
+                    # than "since the phase baseline", which the surviving entry
+                    # answers True on its own.
+                    #
+                    # The field stops meaning "the phase baseline" here and starts
+                    # meaning "the last ledger state in which every post-baseline
+                    # byte is accounted for". Its per-attempt compute above is
+                    # unfalsifiable without this; see there for why latching the
+                    # compute instead re-opens `161c85e`.
+                    #
+                    # May raise, like every other unguarded ledger read: this leg is
+                    # not a `finally` propagating a pause, and `_write_feedback`
+                    # above already writes. A legacy `None` acquires a reference
+                    # here rather than staying blind — strictly more information,
+                    # and the only direction it can move the gate is to stand the
+                    # exclusion DOWN, which is the conservative one.
+                    task.baseline_ledger_digest = self._ledger_digest()
                 else:
                     feedback = None
                     paused = False
@@ -2163,6 +2250,36 @@ class Engine:
                         # before the harvest, so a host death in that window costs
                         # nothing. No-op when this attempt armed nothing.
                         self._restore_persisted_ledger(task, replayed=replayed)
+                        # Re-base site 2 of 2, and the pair is what makes the rolling
+                        # reference safe. The restore has just put the ledger back to
+                        # the snapshot, so THAT is now the state in which every
+                        # post-baseline byte is accounted for. Without this a chain
+                        # that re-based on a fixable retry and then failed
+                        # non-fixably would leave the reference naming a state the
+                        # restore just undid: the next attempt reads
+                        # `D(restored) != D(kept chain)`, calls it "someone else
+                        # wrote the ledger", stands the exclusion down, and a session
+                        # that writes no source but finalizes a `deferred:` spec
+                        # PROCEEDs on the re-filed entry alone.
+                        #
+                        # From the SNAPSHOT, never from a fresh read: this `finally`
+                        # is usually propagating `RunPaused` out of
+                        # `_pause_for_manual_recovery`, and an `OSError` here would
+                        # replace that pause with a filesystem failure. Guarded on
+                        # the captured flag for the same reason the restore is — an
+                        # attempt that armed nothing has said nothing about the
+                        # ledger and must not move the reference either.
+                        #
+                        # It can disagree with the tree in one corner: a TRACKED
+                        # ledger the operator had deleted from the worktree, where
+                        # `_restore_ledger` leaves the reset's own bytes standing
+                        # rather than unlinking. The disagreement resolves to a
+                        # spurious "changed" on the next attempt, which stands the
+                        # exclusion down — the direction `_harvest_gate_exclude`
+                        # already documents as the conservative one, and the same
+                        # answer the phase-scoped reference gave there.
+                        if task.pre_harvest_ledger_captured:
+                            task.baseline_ledger_digest = _digest_of(task.pre_harvest_ledger)
                         if paused:
                             # The restore above has just put the ledger back to this
                             # attempt's pre-harvest bytes, which is correct and is the
@@ -3814,25 +3931,22 @@ class Engine:
         return ledger.read_text(encoding="utf-8") if ledger.is_file() else None
 
     def _ledger_digest(self) -> str:
-        """A digest of the deferred-work ledger's current text, for the only
+        """A digest of the deferred-work ledger as it is ON DISK now, for the only
         question `task.baseline_ledger_digest` is ever asked: has the ledger moved
-        since the `_dev_phase` baseline (`_harvest_gate_exclude`, #405).
+        since that reference was last set (`_harvest_gate_exclude`, #405).
 
-        A digest rather than the text, because that field is phase-scoped — it
-        outlives every attempt's arm/disarm window — so persisting the bytes would
-        carry a growing ledger in state.json alongside `pre_harvest_ledger`'s copy.
-        Equality is the whole contract, so a digest loses nothing.
+        A digest rather than the text, because that field outlives every attempt's
+        arm/disarm window, so persisting the bytes would carry a growing ledger in
+        state.json alongside `pre_harvest_ledger`'s copy. Equality is the whole
+        contract, so a digest loses nothing.
 
-        An ABSENT ledger and an EMPTY one hash identically, deliberately. The
-        `pre_harvest_ledger` split next door exists only because its restore has to
-        UNLINK; nothing here does, and neither state carries an entry, so for "did
-        this change" they are the same answer.
-
-        Raises what `_ledger_text` raises. Both callers are already on paths that
-        read or write the ledger unguarded, and a read fault here would otherwise
-        have to be spelled as one of the two answers — either of which is a guess
-        about work the gate is about to judge."""
-        return hashlib.sha256((self._ledger_text() or "").encode("utf-8")).hexdigest()
+        Raises what `_ledger_text` raises. Every caller of THIS spelling is already
+        on a path that reads or writes the ledger unguarded, and a read fault here
+        would otherwise have to be spelled as one of the two answers — either of
+        which is a guess about work the gate is about to judge. The re-base inside
+        `_dev_phase`'s rollback `finally` is the one site that may NOT raise, and it
+        uses `_digest_of` on the snapshot instead."""
+        return _digest_of(self._ledger_text())
 
     def _ledger_is_gits_to_restore(self, task: StoryTask) -> bool:
         """True when git owns the deferred-work ledger — it has an index entry, so

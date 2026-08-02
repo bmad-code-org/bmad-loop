@@ -7431,12 +7431,19 @@ def test_a_session_authored_ledger_entry_is_still_proof_of_work(project):
 
 
 def test_a_later_attempt_that_did_not_harvest_gets_no_exclusion(project):
-    """T2g, and the whole reason the flag is cleared per attempt rather than latched.
+    """T2g, and the whole reason the flag is cleared on every attempt that starts
+    from a REVERTED tree, rather than latched for the phase.
 
     Attempt 1 harvests and is rolled back. Attempt 2 is a ledger-only story of the T2f
     kind — no `deferred:` frontmatter, so nothing of the orchestrator's is in its diff —
     and must PROCEED on its own ledger write. A flag that survived attempt 1 would
-    exclude attempt 2's honest work and defer the story."""
+    exclude attempt 2's honest work and defer the story.
+
+    "Reverted tree" is the partition, not "new attempt": attempt 1 here fails via
+    `_baseline_liar_effect`, the NON-fixable leg, where the rollback takes the harvest
+    with it and `feedback is None`. T2j below is the other half — a FIXABLE retry keeps
+    both the tree and the harvest, so the flag must survive into the repair session or
+    the orchestrator's own surviving write becomes that session's proof of work."""
     assert not project.deferred_work.exists()
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     pol = dataclasses.replace(_harvest_policy(), limits=LimitsPolicy(max_dev_attempts=2))
@@ -7460,6 +7467,155 @@ def test_a_later_attempt_that_did_not_harvest_gets_no_exclusion(project):
     harvests = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
     assert len(harvests) == 1 and harvests[0]["dw_ids"] == ["DW-1"]
     assert [e.title for e in _ledger_entries(project)] == ["Session's own note"]
+
+
+def _fixable_then_repair_policy(marker, *, attempts: int = 3):
+    """The T2 harvest policy with a FIXABLE gate: `[verify] commands` is the only
+    `fixable=True` source on the dev leg (`verify.verify_commands_outcome`), and it
+    runs only after the artifact gate passed — so attempt 1 necessarily did real
+    work before the repair session is dispatched.
+
+    `rollback_on_failure` is left at the SHIPPED DEFAULT (off) rather than the T2
+    family's `True`, because the regression these two rows guard against is a false
+    "no changes" on the repair attempt and that RETRY is the non-fixable one: off, it
+    stops the whole run. A regression therefore reads as `summary.paused`, which is
+    what it would cost an operator."""
+    return dataclasses.replace(
+        _harvest_policy(),
+        scm=ScmPolicy(rollback_on_failure=False),
+        limits=LimitsPolicy(max_dev_attempts=attempts),
+        verify=VerifyPolicy(commands=(_file_exists_cmd(marker),)),
+    )
+
+
+def _repairing_effect(project, marker, inner):
+    """The repair session attempt 2 runs: it fixes the fixable failure, REVERTS
+    attempt 1's source edit, and otherwise does whatever `inner` does.
+
+    The revert is what makes these rows about the ledger at all. A fixable retry
+    keeps the attempt's tree on purpose, so without it attempt 1's `src.txt` line is
+    still above `baseline_commit` and the proof-of-work gate passes on that — the
+    exclusion could be anything.
+
+    `marker` MUST live outside the project tree. `has_changes_since` counts every
+    untracked file not in `baseline_untracked`, so a marker written inside the repo
+    is itself proof of work and both rows go vacuous (precedent:
+    test_harvest_reverted_when_the_ledger_lives_outside_the_repo)."""
+
+    def effect(spec):
+        marker.write_text("ok\n")
+        (project.project / "src.txt").write_text("original\n")
+        return inner(spec)
+
+    return effect
+
+
+def test_a_repair_session_that_writes_the_ledger_itself_still_proceeds(project, tmp_path):
+    """T2i, the fixable-retry chain's half of T2h — and the row that CHOSE the
+    design. Its partition partner is the row below.
+
+    Attempt 1 harvests DW-1 and fails a FIXABLE gate, so the tree AND the ledger
+    entry are kept on purpose. Attempt 2's repair session reverts the source and its
+    entire honest diff is a ledger entry it wrote ITSELF. It must PROCEED.
+
+    The obvious way to fix the row below — skip the per-attempt recompute on a
+    continuation, keeping attempt 1's `harvest_wrote_ledger=True` AND its
+    `ledger_changed_before_harvest=False` — reddens exactly here. The exclusion is
+    path-granular, so a latched one hides the repair session's own entry along with
+    the harvest's, the gate reads "no changes since baseline", and the non-fixable
+    RETRY that follows PAUSES the run under the shipped default. That is
+    `161c85e`'s hole re-opened one attempt further along.
+
+    Re-basing `baseline_ledger_digest` at the fixable branch instead keeps the
+    recompute unconditional and lets it answer: the reference moves to "the ledger as
+    the kept chain left it", so the repair session's write is still visible as a
+    change and the exclusion stands down."""
+    assert not project.deferred_work.exists()
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    marker = tmp_path / "fixed.marker"  # outside the project tree — see _repairing_effect
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a", followup_review=False, deferred=[HARVEST_A]),
+            _repairing_effect(
+                project,
+                marker,
+                _session_authored_ledger_effect(project, "Session's own note"),
+            ),
+        ],
+        policy=_fixable_then_repair_policy(marker),
+    )
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused
+    decisions = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert [d["action"] for d in decisions] == ["retry", "proceed"]
+    # attempt 1's retry really was the FIXABLE one — neither rollback leg ran, so the
+    # tree (and the harvest's entry) carried into attempt 2
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "rollback-auto" not in kinds and "rollback-manual-required" not in kinds
+    # …and the harvest really did fire on attempt 1, so the exclusion was live on
+    # attempt 2 rather than moot on an absent ledger
+    harvests = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert harvests[0]["dw_ids"] == ["DW-1"]
+    assert [s.role for s in adapter.sessions] == ["dev", "dev"]
+    # the repair session wrote no code — the gate answered on its ledger entry alone
+    assert "change for 1-1-a" not in (project.project / "src.txt").read_text()
+    assert [e.title for e in _ledger_entries(project)] == [
+        "Retry loop has no ceiling",
+        "Session's own note",
+    ]
+
+
+def test_a_fixable_retrys_surviving_harvest_is_not_the_repair_sessions_work(project, tmp_path):
+    """T2j, the partition partner of the row above and the hazard both halves of the
+    provenance fix exist for.
+
+    Same chain, one difference: the repair session writes NOTHING. It reverts attempt
+    1's source, finalizes a spec with no `deferred:` findings, and leaves an empty
+    implementation. The only post-baseline diff in the tree is the ledger line
+    attempt 1's harvest wrote — the ORCHESTRATOR's own write, kept above the baseline
+    because a FIXABLE retry keeps the tree on purpose. It must RETRY, not PROCEED.
+
+    The fixable retry is the only construct in the engine that lets more than one
+    attempt accumulate above `baseline_commit`, which is why this needs both halves:
+    `harvest_wrote_ledger` must survive the continuation (attempt 2's harvest dedupes
+    to nothing, so re-deriving it reads False), AND `baseline_ledger_digest` must have
+    moved with the kept chain (against the PHASE baseline the surviving entry reads as
+    "someone else changed it" and stands the exclusion down regardless).
+
+    Under the shipped `rollback_on_failure = off` the retry raises, so the regression
+    signature is `summary.done == 1` — an empty implementation accepted, and its
+    verify commands passing precisely BECAUSE the offending change was reverted."""
+    assert not project.deferred_work.exists()
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    marker = tmp_path / "fixed.marker"  # outside the project tree — see _repairing_effect
+    engine, _ = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a", followup_review=False, deferred=[HARVEST_A]),
+            _repairing_effect(
+                project,
+                marker,
+                dev_effect(project, "1-1-a", followup_review=False, write_src=False),
+            ),
+        ],
+        policy=_fixable_then_repair_policy(marker),
+    )
+    summary = engine.run()
+
+    assert summary.paused and summary.done == 0
+    decisions = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert [d["action"] for d in decisions] == ["retry", "retry"]
+    # attempt 1's retry was the fixable one (no rollback), attempt 2's is the
+    # non-fixable one that stops the run
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "rollback-auto" not in kinds and "rollback-manual-required" in kinds
+    # …and it refused for the right reason: the ledger was excluded, so nothing was
+    # left in the diff at all
+    assert "no changes" in decisions[1]["reason"]
+    harvests = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert harvests[0]["dw_ids"] == ["DW-1"]
 
 
 def test_a_replayed_harvest_that_deduped_still_excludes_the_ledger(project):
