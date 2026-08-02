@@ -836,6 +836,13 @@ class Engine:
             # ourselves by hand once the branch has landed; the orchestrator only
             # commits the worktree onto the selected target.
             self._merge_local(task, unit)
+            # …and then carry out the orchestrator-written ledger edits the merge
+            # could not, because `finalize_commit`'s `add -A` silently skips a
+            # GITIGNORED ledger, so they never rode the branch. AFTER the merge,
+            # never before: on a project whose ledger IS tracked the merge is what
+            # puts the open entry in front of `append_entry`'s dedup, and carrying
+            # first would file a fresh id and then merge the branch's copy on top.
+            self._carry_isolated_ledger_writes(task)
         else:  # DEFERRED — capture the diff, keep or drop per keep_failed
             patch = close_unit_workspace(
                 unit,
@@ -3815,6 +3822,9 @@ class Engine:
             # tree here (no reset into the main repo — there's nothing to undo).
             # The harvested findings are the one exception: they describe the SPEC,
             # not the discarded code, and the worktree is about to go.
+            # Directly, NOT via `_carry_isolated_ledger_writes`: that hook also
+            # applies a sweep bundle's ledger CLOSES, and a defer discarded the very
+            # code those closes claim to have resolved.
             self._carry_harvested_deferrals(task)
             self.journal.append("story-deferred", story_key=task.story_key, reason=reason)
             gates.notify(self.policy, self.run_dir, f"story deferred: {task.story_key}", reason)
@@ -3849,13 +3859,42 @@ class Engine:
         )
         self._save()
 
+    def _carry_isolated_ledger_writes(self, task: StoryTask) -> None:
+        """The orchestrator-written ledger edits an isolated unit's MERGE did not
+        carry into the main checkout. Base: the harvest. `SweepEngine` adds the
+        bundle close.
+
+        DONE leg only, and that asymmetry is deliberate — see the override. The
+        DEFER terminus calls `_carry_harvested_deferrals` directly from `_defer`,
+        because a defer discarded the code, so a close claiming to RESOLVE that
+        code must not be applied while the finding it filed still must be.
+
+        WHY a landing unit needs a carry at all, when its branch just merged: the
+        harvest writes `workspace.paths.deferred_work` — the unit worktree's — and
+        `finalize_commit` stages with `git add -A` (`verify.py`), which SKIPS a
+        gitignored path in silence. So on a project that gitignores its ledger
+        (this repo's own shape: the ledger's default home is under a gitignored
+        artifacts dir) the entry never reaches the branch, the merge has nothing to
+        bring over, and `close_unit_workspace(success=True)` removes the worktree
+        unconditionally — with no `capture_diff` on this leg, unlike DEFER, so not
+        even a `changes.patch` copy survives. A ledger that is TRACKED rides the
+        branch normally and every row below dedups to nothing, which is what makes
+        one unconditional call site correct for both project shapes.
+
+        Not on the escalation legs: both `_keep_branch_and_escalate` calls always
+        raise `RunPaused`, so this line is unreachable from them. Deliberately —
+        those legs keep the branch for a HUMAN to merge, and that merge brings the
+        branch's own entry with it, so a copy carried here under a fresh id would
+        duplicate it. The conflict leg can also leave the repo mid-merge."""
+        self._carry_harvested_deferrals(task)
+
     def _carry_harvested_deferrals(self, task: StoryTask) -> None:
         """Re-file this attempt's harvested `deferred:` findings into the MAIN
-        checkout's ledger when an ISOLATED unit defers, and commit them.
+        checkout's ledger when an ISOLATED unit ends, and commit them.
 
         Under `scm.isolation = "worktree"` `self.workspace` is the unit's for the
         whole drive (`_run_unit`), so `_harvest_spec_deferrals` writes the UNIT
-        WORKTREE's `deferred-work.md`. On a defer that worktree is never merged —
+        WORKTREE's `deferred-work.md`. On a DEFER that worktree is never merged —
         `_integrate_unit`'s DEFERRED arm only captures a forensic patch, and
         `_merge_local` is reachable from the DONE arm alone. Nothing was destroyed
         (`scm.keep_failed` defaults True, and `capture_diff` includes untracked
@@ -3864,9 +3903,15 @@ class Engine:
         This is the carry-out the non-isolated branch below gets from its
         snapshot/restore around `_rollback_or_pause`.
 
-        Here rather than in `_integrate_unit` so the parity sits directly against
-        the in-place branch it mirrors, and so this is ONE site instead of
-        `_integrate_unit`'s six call sites.
+        On a DONE unit the branch merges but a GITIGNORED ledger never rode it, so
+        the same re-file runs there too, from `_carry_isolated_ledger_writes`. Both
+        call sites are cheap when the ledger is tracked: every row dedups against
+        the entry the merge (or the in-place write) already landed, `carried` comes
+        back empty, and no commit is added at all.
+
+        Here rather than in `_integrate_unit` so the DEFER parity sits directly
+        against the in-place branch it mirrors, and so that leg is ONE site instead
+        of `_integrate_unit`'s six call sites.
 
         `self.paths`, NOT `self.workspace.paths`: the destination is the main
         checkout, which is on `state.target_branch` throughout an isolated run
@@ -3877,6 +3922,13 @@ class Engine:
         `origin:` + `source_spec:` against OPEN entries, and creates the ledger and
         its parent dir when the project has none yet. `None` back means an open
         entry already says this, so it drops out of `carried`.
+
+        Against OPEN entries — so a duplicate would need the merged copy to be
+        `status: done` by the time this runs. It cannot be: the only writer that
+        closes an existing entry is `deferredwork.mark_done`, whose in-story caller
+        closes strictly `task.dw_ids`, assigned once at bundle materialization and
+        never appended to, while a harvested entry gets a fresh `DW-<next>`. No
+        guard needed on the DONE leg.
 
         COMMITTING, rather than leaving the edit dirty, is the point. An
         uncommitted ledger edit in the main checkout sits in the path of a later

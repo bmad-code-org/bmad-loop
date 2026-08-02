@@ -184,6 +184,9 @@ def test_worktree_happy_path_merges_to_target(project):
     assert "worktree-opened" in kinds and "unit-merged" in kinds
     # a clean teardown degrades nothing (gh-139): no warning event is emitted
     assert "worktree-teardown-degraded" not in kinds
+    # the DONE leg's ledger carry is a no-op on a story that harvested nothing —
+    # it returns on the empty record before it can journal anything (#405)
+    assert "harvest-carried" not in kinds
 
 
 def test_worktree_run_dir_is_outside_worktree(project):
@@ -2207,11 +2210,26 @@ def test_a_gitignored_ledger_whose_name_globs_still_reports_the_commit_miss(proj
 
 
 def test_a_done_isolated_unit_files_its_harvest_exactly_once(project):
-    """Regression guard on the untouched half: a unit that lands still carries its
-    harvest the ordinary way — through `_merge_local` — and the carry must not add
-    a second copy. `_carry_harvested_deferrals` runs from `_defer` alone, so a DONE
-    story never reaches it."""
+    """The TRACKED-ledger half of the DONE leg. Here the entry really does ride the
+    branch — `finalize_commit`'s `add -A` stages it — so the merge lands it and the
+    carry that follows must add nothing: no second entry, and no commit of its own.
+
+    The empty `dw_ids` is what pins the carry's PLACEMENT. Hoisted above
+    `_merge_local` the carry meets a main ledger that does not hold the branch's
+    copy yet, so it FILES instead of dedupping and commits what it filed — and the
+    merge then lays the branch's own copy over it. Here the two copies are
+    byte-identical (`append_entry` writes no timestamp and computes the same next
+    id from the same base), so git resolves them and only the extra commit and the
+    non-empty id list show; that equality is a coincidence of the simplest shape,
+    not a property to lean on. Getting the merge in first makes the dedup do the
+    work in every shape, which is the invariant, so this row asserts the dedup and
+    not the downstream damage.
+
+    Its sibling below is this same shape with a GITIGNORED ledger, where `add -A`
+    skips the path and the merge has nothing to bring: that one is what the carry
+    exists for, and this one is what keeps it from double-filing (#405)."""
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    head_before = rev_parse_head(project.project)
     engine, _ = make_engine(
         project,
         [
@@ -2223,10 +2241,121 @@ def test_a_done_isolated_unit_files_its_harvest_exactly_once(project):
 
     assert summary.done == 1 and not summary.paused
     assert "unit-merged" in journal_kinds(engine)
-    assert "harvest-carried" not in journal_kinds(engine)
     entries = _main_ledger(project)
     assert [e.title for e in entries] == ["Retry loop has no ceiling"]
     assert f"origin: {_carry_origin(_CARRY_A)}" in entries[0].body
+    # the carry DID run and deduped to nothing — an empty id list is how a
+    # full-dedup carry stays visible, and proves the row is not vacuous
+    carried = [e for e in engine.journal.entries() if e["kind"] == "harvest-carried"]
+    assert len(carried) == 1 and carried[0]["dw_ids"] == []
+    # …and it added no commit: the only commit touching the ledger is the unit's own
+    subjects = git(project.project, "log", "--format=%s", f"{head_before}..HEAD").splitlines()
+    assert [s for s in subjects if s.startswith("chore(deferred-work)")] == []
+    assert worktree_clean(project.project)
+
+
+def test_a_done_isolated_unit_with_a_gitignored_ledger_still_carries(project):
+    """P1, the leg the row above cannot reach. The unit LANDS and its branch merges,
+    but `finalize_commit` stages with `git add -A`, which skips a GITIGNORED path in
+    silence — so the harvest's entry never rode the branch and the merge has nothing
+    to bring over. `close_unit_workspace(success=True)` then removes the worktree
+    unconditionally, and the DONE leg (unlike DEFER) takes no `capture_diff`, so
+    without the carry the finding has no surviving copy anywhere.
+
+    Ignoring the ledger by FILENAME rather than the artifacts dir is deliberate and
+    the same choice `test_a_ledger_git_refuses_to_commit_still_gets_the_finding`
+    makes: the sprint board and the spec live in that dir too and must still commit,
+    or the unit never reaches DONE and the assertions below prove nothing."""
+    # keeping the template's run-dir ignore matters: the cleanliness assertion below
+    # is about the carry's leftovers, not about the run dir going untracked
+    (project.project / ".gitignore").write_text(
+        ".bmad-loop/runs/\ndeferred-work.md\n", encoding="utf-8"
+    )
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            wt_dev_effect(project, "1-1-a", deferred=[_CARRY_A]),
+            wt_review_effect(project, "1-1-a", clean=True),
+        ],
+    )
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused
+    kinds = journal_kinds(engine)
+    assert "unit-merged" in kinds
+    # the harvest fired and the worktree it wrote into is gone — so the main ledger
+    # below holds the only copy, and it got there by the carry
+    harvests = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert len(harvests) == 1 and harvests[0]["dw_ids"] == ["DW-1"]
+    assert [p.resolve() for p in worktree_list(project.project)] == [project.project.resolve()]
+    entries = _main_ledger(project)
+    assert [e.title for e in entries] == ["Retry loop has no ceiling"]
+    assert entries[0].open and f"origin: {_carry_origin(_CARRY_A)}" in entries[0].body
+    carried = [e for e in engine.journal.entries() if e["kind"] == "harvest-carried"]
+    assert len(carried) == 1 and carried[0]["dw_ids"] == ["DW-1"]
+    # the commit is best effort and `git add -- <ignored path>` refuses (rc 1); the
+    # miss is journalled, and the dirt it leaves is invisible to `status --porcelain`
+    uncommitted = [e for e in engine.journal.entries() if e["kind"] == "harvest-carry-uncommitted"]
+    assert len(uncommitted) == 1 and uncommitted[0]["dw_ids"] == ["DW-1"]
+    assert "git add failed" in uncommitted[0]["error"]
+    assert worktree_clean(project.project)
+    # the unit's code really did land — this is the DONE leg, not a disguised defer
+    assert "change for 1-1-a" in (project.project / "src.txt").read_text()
+
+
+def test_a_done_unit_whose_merge_escalates_does_not_carry(project):
+    """The escalation legs keep the unit branch for a HUMAN to merge, and that merge
+    brings the branch's own ledger state with it — so a copy carried here under a
+    fresh id would duplicate it, and the conflict leg can leave the repo mid-merge
+    besides. Both `_keep_branch_and_escalate` calls always raise `RunPaused`, which
+    is what makes the carry unreachable; this row is what keeps that structural.
+
+    Reddens on hoisting the carry into `_merge_local`'s prologue — the shape that
+    looks equivalent because the DONE arm has exactly one caller."""
+    (project.project / ".gitignore").write_text(
+        ".bmad-loop/runs/\ndeferred-work.md\n", encoding="utf-8"
+    )
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            wt_dev_effect(project, "1-1-a", deferred=[_CARRY_A]),
+            wt_review_effect(project, "1-1-a", clean=True),
+        ],
+        policy=wt_policy(merge_strategy="ff"),
+    )
+    # diverge the target right after the worktree is cut so ff-only cannot apply
+    import bmad_loop.engine as eng
+
+    real_open = eng.open_unit_workspace
+
+    def diverging_open(*a, **k):
+        unit = real_open(*a, **k)
+        (project.project / "diverge.txt").write_text("target moved\n")
+        git(project.project, "add", "-A")
+        git(project.project, "commit", "-q", "-m", "target diverges")
+        return unit
+
+    eng.open_unit_workspace = diverging_open
+    try:
+        summary = engine.run()
+    finally:
+        eng.open_unit_workspace = real_open
+
+    assert summary.paused and summary.escalated == 1
+    # the MERGE leg specifically, not the pre-merge collision leg — the run dir stays
+    # ignored above so the target checkout is clean and only the ff-only merge fails
+    assert "content conflict against the target" in (engine.state.paused_reason or "")
+    kinds = journal_kinds(engine)
+    # the harvest DID run, so an empty main ledger is the escalation withholding the
+    # carry rather than a run where there was never anything to carry
+    harvests = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert len(harvests) == 1 and harvests[0]["dw_ids"] == ["DW-1"]
+    assert "harvest-carried" not in kinds
+    assert _main_ledger(project) == []
+    # …and the branch is still there, holding the finding for the human's merge
+    assert branch_exists(project.project, "bmad-loop/test-run/1-1-a")
 
 
 # ----------------------------------------------------------------- new guards (review hardening)
