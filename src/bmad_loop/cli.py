@@ -107,6 +107,29 @@ def _reject_bad_run_id(run_id: str | None) -> int | None:
     return None
 
 
+def _reject_isolation_conflict(paths: bmadconfig.ProjectPaths, pol) -> int | None:
+    """Refuse `isolation = "worktree"` under a `repo_root` override (#414). Returns
+    1 to abort, None to proceed — the `_reject_bad_run_id` shape.
+
+    Called from the three :class:`~engine.Engine` construction sites that return an
+    rc to a human: `cmd_run`, `cmd_sweep`, and `_resume_paused_run` — the shared
+    helper behind both `resume` and `resolve`'s re-arm. The fourth such site, the
+    auto-triggered child sweep in `_sweep_factory`, shares the refusal but not this
+    disposition: it has no rc channel, so it raises (see the comment there).
+    Keyed on Engine construction rather than on "loads policy.toml", which is a
+    wider set that does not all provision — `_configure_mux` reads the file on
+    every command and builds nothing; `cmd_validate` and `cmd_clean` load it and
+    never mount a worktree.
+
+    `validate` deliberately does not call this — it reports rather than aborts, so
+    it renders the same message as a Finding and keeps running its other gates."""
+    conflict = bmadconfig.worktree_isolation_conflict(paths, pol.scm.isolation)
+    if conflict is None:
+        return None
+    print(conflict, file=sys.stderr)
+    return 1
+
+
 def _reconcile_stale(project: Path, paths: bmadconfig.ProjectPaths, pol) -> None:
     """Tear down worktrees leaked by a prior run that stopped mid-flight, before
     starting a new run/sweep — the clean-finish GC never reached them. Gated on
@@ -119,6 +142,10 @@ def _reconcile_stale(project: Path, paths: bmadconfig.ProjectPaths, pol) -> None
         print(f"reclaimed {len(freed)} stale worktree(s) from prior runs")
 
 
+# Every adapter role the orchestrator constructs. NOT the set the skills preflight
+# gates — that is install.DEV_PRIMITIVE_ROLES (dev+review), because triage's only
+# prompt ships in this wheel. Widening a skill probe back to ROLES re-breaks a
+# triage-only third CLI; see _skill_trees.
 ROLES = ("dev", "review", "triage")
 
 
@@ -384,12 +411,32 @@ def cmd_validate(args: argparse.Namespace) -> int:
     except policy_mod.PolicyError as e:
         report.fail("policy", str(e))
 
+    # #414: the one configuration where every gate below reports on a surface the
+    # isolated run will never see. Reported only when it fires — there is no `ok`
+    # twin, because the supported case is "no such conflict", which would print a
+    # line about a coupling most projects have never configured either half of.
+    # Needs both halves loaded; either failing already has its own finding above.
+    if paths is not None and pol is not None:
+        conflict = bmadconfig.worktree_isolation_conflict(paths, pol.scm.isolation)
+        if conflict is not None:
+            report.fail(
+                "policy.isolation-repo-root",
+                conflict,
+                {"repo_root": str(paths.repo_root), "project": str(paths.project)},
+            )
+
+    # Built exactly the way run/sweep's real preflight builds it, so validate's verdict
+    # and their abort cannot disagree. Deliberately NOT `[p.skill_tree for p in
+    # profiles]`: that carries triage's tree, and every skills check below asks a
+    # dev-primitive question. The `pol is not None` guard is load-bearing — `resolved`
+    # never raises, so the except above fires only on a policy that failed to load, and
+    # an unguarded call would crash validate instead of reporting the parse failure.
+    dev_trees = _skill_trees(project, pol) if pol is not None else []
+
     stories_on, spec_folder = _stories_mode(args, pol)
     if paths:
         if stories_on:
-            _validate_stories_queue(
-                project, paths, spec_folder, [p.skill_tree for p in profiles], report
-            )
+            _validate_stories_queue(project, paths, spec_folder, dev_trees, report)
         else:
             try:
                 ss = sprintstatus.load(paths.sprint_status)
@@ -417,6 +464,32 @@ def cmd_validate(args: argparse.Namespace) -> int:
             report.ok("git.worktree-clean", "git worktree clean")
     except verify.GitError as e:
         report.fail("git.probe", f"git check failed: {e}")
+
+    # #409: a tracked path ignores .gitignore and info/exclude entirely, so the two
+    # shields 0.9.1 added only help projects that had not already committed the
+    # renderer's output. Those that did keep churning it into every story commit —
+    # a new snapshot dir per machine, per checkout path and per renderer bump, since
+    # the path is keyed on a hash of the absolute project root plus a generation
+    # hash over the renderer, its sources and the resolved config. Probed at
+    # `project`, which is the root the renderer publishes under whenever it and
+    # `repo_root` coincide, and the one the gate above already reads.
+    # Warning, not a problem: nothing about a tracked _bmad/render/ stops a session.
+    try:
+        if verify.path_tracked(project, install.RENDER_DIR_REL):
+            report.warn(
+                "git.render-tracked",
+                f"{install.RENDER_DIR_REL}/ is tracked by git; run "
+                f"`git rm -r --cached {install.RENDER_DIR_REL}` and commit once to stop "
+                "committing rendered skill output",
+                {"path": install.RENDER_DIR_REL},
+            )
+    except verify.GitError:
+        # Not a repo, or git failed — say nothing rather than fabricate an `ok`.
+        # Deliberately not also catching OSError: a missing git binary raises out of
+        # `worktree_clean` above, which does not catch it either, so a second and
+        # differently-shaped degrade here would only imply a robustness validate
+        # does not have.
+        pass
 
     report.extend(_platform_preflight())
 
@@ -492,14 +565,33 @@ def cmd_validate(args: argparse.Namespace) -> int:
                     {"role": role, "model": cfg.model, "profile": prof.name},
                 )
 
-    base_problems = install.missing_base_skills(project, [p.skill_tree for p in profiles])
-    if profiles and not base_problems:
+    base_problems = install.missing_base_skills(project, dev_trees)
+    # Gate on `dev_trees`, not `profiles`: policy never validates an adapter name (the
+    # first test is `get_profile`), so `[adapter] name = "nosuchcli"` beside a loadable
+    # `[adapter.triage]` leaves `profiles` non-empty while nothing dev-side resolved —
+    # and the ok line below would then be a green sentence assembled from an empty
+    # probe. Can only tighten: `dev_trees` truthy implies `profiles` truthy.
+    if dev_trees and not base_problems:
+        # Name the primitive that actually resolved, not a hardcoded era: on an
+        # upgraded project this is the operator's confirmation that the rename was
+        # picked up (and, across trees, that both picked up the same one).
+        resolved = list(
+            dict.fromkeys(
+                name
+                for tree in dict.fromkeys(dev_trees)
+                if (name := install.resolve_dev_primitive(project, tree)) is not None
+            )
+        )
         report.ok(
             "skills.base",
-            "upstream skills present (bmad-dev-auto + review hunters)",
-            {"trees": list(dict.fromkeys(p.skill_tree for p in profiles))},
+            f"upstream skills present ({' + '.join(resolved)} + review hunters)",
+            {
+                "trees": list(dict.fromkeys(dev_trees)),
+                "dev_primitive": resolved,
+            },
         )
     report.extend(base_problems)
+    report.extend(install.dev_primitive_warnings(project, dev_trees))
 
     if getattr(args, "json", False):
         # getattr, not args.json: cmd_validate is called directly by tests (and by
@@ -628,26 +720,103 @@ def _mux_set(project: Path, args: argparse.Namespace) -> int:
     return 0
 
 
+def _skill_trees(project: Path, pol) -> list[str]:
+    """The skill trees this run's dev-primitive adapters read, one per distinct name.
+
+    Shared by the real preflight, the dry-run banner and `cmd_validate` so the
+    three cannot drift: a preview that claims "run would abort" has to key on
+    exactly what makes run abort, and validate's verdict has to key on the same
+    thing again. Profiles that fail to load are skipped rather than raising — an
+    unknown adapter name is the policy loader's problem, not the skill probe's.
+
+    Scoped to :data:`install.DEV_PRIMITIVE_ROLES`, not :data:`ROLES`: every skill
+    these trees are asked about is one only a dev or review session dispatches, and
+    triage's whole prompt surface ships in this wheel. It is also the set
+    `Engine._worktree_profiles` provisions, so what is gated and what is carried
+    into a worktree stay one decision.
+
+    Deliberately does NOT consult `review.enabled`. Disabling review does not
+    retire the review ADAPTER: `_skip_review_and_commit` still ends at
+    `Engine._commit`, which opens with an unconditional
+    `_run_workflows("pre_commit_gate", …)`, and a plugin workflow may declare
+    `role = "review"` (`WORKFLOW_ROLES`) — which dispatches on `adapters["review"]`
+    with review disabled. The TEA plugin this wheel ships binds three such
+    workflows at that stage, so `review.enabled = false` is routinely a run that
+    still needs the review tree's skills. Narrowing here would also have to answer
+    for `_worktree_profiles`, which drives per-CLI Stop-signal hook registration as
+    well as seeding: a worktree provisioned without the review profile has no
+    completion signal for those sessions and stalls rather than merely missing a
+    skill. See #424 for the narrow residue that IS real."""
+    from .adapters.profile import ProfileError, get_profile
+
+    trees = []
+    for name in dict.fromkeys(
+        pol.adapter.resolved(role).name for role in install.DEV_PRIMITIVE_ROLES
+    ):
+        try:
+            trees.append(get_profile(name, project).skill_tree)
+        except ProfileError:
+            continue
+    return trees
+
+
+def _warn_preflight_would_abort(
+    paths: bmadconfig.ProjectPaths, pol, *, require_stories: bool = False
+) -> None:
+    """Dry-run honesty banner: say so when the real command would refuse to run.
+
+    ``--dry-run`` returns before `_require_base_skills` (cmd_run/cmd_sweep), so a
+    project whose skills are broken still gets a plausible-looking preview. Since
+    the upstream rename that preview is actively misleading rather than merely
+    incomplete: the forwarding shim IS a valid slash command, so a previewed
+    ``/bmad-dev-auto`` reads fine and would HALT an unattended session on the
+    shim's interactive migration gate.
+
+    Takes the whole :class:`~bmadconfig.ProjectPaths` rather than `project` alone
+    because the #414 refusal is a fact about the two roots' relationship; every
+    other probe here still reads `paths.project`, which is what `init` wrote and
+    what a session's own root resolution will re-derive.
+
+    The exit code deliberately stays 0. A dry-run is a diagnostic — refusing to
+    print the schedule would withhold the very thing the operator asked for, and
+    every existing caller reads rc 0 as "the preview rendered", not as "the
+    project is ready". The banner goes to stderr so stdout stays the preview."""
+    trees = _skill_trees(paths.project, pol)
+    problems = [
+        p.message
+        for p in install.missing_base_skills(paths.project, trees)
+        + (install.missing_stories_support(paths.project, trees) if require_stories else [])
+    ]
+    conflict = bmadconfig.worktree_isolation_conflict(paths, pol.scm.isolation)
+    if conflict is not None:
+        problems.insert(0, conflict)
+    if not problems:
+        return
+    print(
+        "note: this preview is NOT runnable as-is — the real command aborts at preflight:",
+        file=sys.stderr,
+    )
+    for problem in problems:
+        print(f"  FAIL: {problem}", file=sys.stderr)
+    print("run `bmad-loop validate` for details", file=sys.stderr)
+
+
 def _require_base_skills(project: Path, pol, *, require_stories: bool = False) -> bool:
-    """Preflight the upstream skills the orchestrator drives (bmad-dev-auto + the
-    three review hunters it invokes inline).
+    """Preflight the upstream skills the orchestrator drives (the dev primitive —
+    bmad-build-auto, or a complete pre-rename bmad-dev-auto — plus the three review
+    hunters it invokes inline).
 
     Returns True when everything is in place; otherwise prints the problems and
     returns False so the caller can abort before spawning any session (a missing
     skill would otherwise stall as an `Unknown command` until the run times out).
+    A post-rename install left with only the forwarding shim fails here too: the
+    shim's interactive migration gate would HALT the session with nothing written.
 
-    ``require_stories`` additionally content-probes bmad-dev-auto for folder+id
-    dispatch — stories mode needs a newer skill than sprint mode, so an older
-    install must fail loudly here rather than HALT `no stories.yaml`-style at
+    ``require_stories`` additionally content-probes the resolved primitive for
+    folder+id dispatch — stories mode needs a newer skill than sprint mode, so an
+    older install must fail loudly here rather than HALT `no stories.yaml`-style at
     dispatch time."""
-    from .adapters.profile import ProfileError, get_profile
-
-    skill_trees = []
-    for name in dict.fromkeys(pol.adapter.resolved(role).name for role in ROLES):
-        try:
-            skill_trees.append(get_profile(name, project).skill_tree)
-        except ProfileError:
-            continue
+    skill_trees = _skill_trees(project, pol)
     problems = install.missing_base_skills(project, skill_trees)
     if require_stories:
         problems += install.missing_stories_support(project, skill_trees)
@@ -710,10 +879,14 @@ def _validate_stories_queue(
     report: ValidationReport,
 ) -> None:
     """Stories-mode counterpart of ``cmd_validate``'s sprint-status gate: validate
-    the ``stories.yaml`` manifest + ``SPEC.md`` and confirm the installed
-    ``bmad-dev-auto`` carries the folder+id dispatch flow stories mode needs (an
-    older skill would HALT at dispatch). Appends findings to ``report`` in place;
-    the probe carries its own remediation text ("update the bmm module")."""
+    the ``stories.yaml`` manifest + ``SPEC.md`` and confirm the installed dev
+    primitive carries the folder+id dispatch flow stories mode needs (an older
+    skill would HALT at dispatch). Appends findings to ``report`` in place;
+    the probe carries its own remediation text ("update the bmm module").
+
+    ``skill_trees`` is the dev+review subset :func:`_skill_trees` returns, not every
+    profile's tree: dispatch is a dev-primitive question, so a triage-only tree has
+    no say in it."""
     folder = stories_mod.resolve_spec_folder(paths.project, spec_folder)
     problem = _validate_stories_folder(paths, spec_folder)
     if problem:
@@ -734,10 +907,16 @@ def _validate_stories_queue(
             )
     stories_probs = install.missing_stories_support(project, skill_trees)
     if skill_trees and not stories_probs:
+        probed = list(
+            dict.fromkeys(
+                install.dev_primitive_or_default(project, tree)
+                for tree in dict.fromkeys(skill_trees)
+            )
+        )
         report.ok(
             "skills.stories-dispatch",
-            "bmad-dev-auto supports folder+id dispatch (stories mode)",
-            {"trees": list(dict.fromkeys(skill_trees))},
+            f"{' + '.join(probed)} supports folder+id dispatch (stories mode)",
+            {"trees": list(dict.fromkeys(skill_trees)), "dev_primitive": probed},
         )
     report.extend(stories_probs)
 
@@ -774,6 +953,14 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     if args.dry_run:
         return _dry_run(paths, pol, args, stories_on, spec_folder)
+
+    # First of the configuration refusals (`_reject_bad_run_id` and the two loaders
+    # above can abort earlier), and deliberately before the queue and worktree-clean
+    # gates: this one says the configuration cannot run at all, so making the
+    # operator clear a dirty tree or fix a story key first would only delay the
+    # same abort.
+    if (rc := _reject_isolation_conflict(paths, pol)) is not None:
+        return rc
 
     if stories_on:
         problem = _validate_stories_folder(paths, spec_folder, selector=args.story)
@@ -845,6 +1032,22 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _dev_skill_for_role(pol, project: Path, role: str) -> str:
+    """The dev-primitive skill name ``role``'s adapter would invoke, for dry-run
+    previews. Mirrors `_require_base_skills`' profile→skill_tree lookup so the
+    preview and the real dispatch (``Engine._dev_skill``) resolve identically —
+    a pre-rename project previews ``/bmad-dev-auto``, a post-rename one
+    ``/bmad-build-auto``. An unloadable profile falls back to the legacy name;
+    the run itself would fail preflight before ever dispatching."""
+    from .adapters.profile import ProfileError, get_profile
+
+    try:
+        tree = get_profile(pol.adapter.resolved(role).name, project).skill_tree
+    except ProfileError:
+        tree = None
+    return install.dev_primitive_or_default(project, tree)
+
+
 def _render_invocation(pol, project: Path, role: str, prompt: str) -> str:
     from .adapters.profile import get_profile
 
@@ -882,6 +1085,8 @@ def _dry_run(
     if stories_on:
         return _dry_run_stories(paths, pol, args, spec_folder)
 
+    _warn_preflight_would_abort(paths, pol)
+
     def render(role: str, prompt: str) -> str:
         return _render_invocation(pol, paths.project, role, prompt)
 
@@ -898,10 +1103,12 @@ def _dry_run(
         print("no actionable stories")
         return 0
     print(f"would process {len(queue)} stories (gates={pol.gates.mode}):")
+    dev_skill = _dev_skill_for_role(pol, paths.project, "dev")
+    review_skill = _dev_skill_for_role(pol, paths.project, "review")
     for story in queue:
         print(f"\n  {story.key} (epic {story.epic}, status {story.status})")
-        print(f"    dev:    {render('dev', f'/bmad-dev-auto {story.key}')}")
-        print(f"    review: {render('review', '/bmad-dev-auto <done spec from dev>')}")
+        print(f"    dev:    {render('dev', f'/{dev_skill} {story.key}')}")
+        print(f"    review: {render('review', f'/{review_skill} <done spec from dev>')}")
         print(f"    env:    BMAD_LOOP_MODE=1 BMAD_LOOP_STORY_KEY={story.key}")
     return 0
 
@@ -922,6 +1129,7 @@ def _dry_run_stories(
 ) -> int:
     """Print the linear stories-mode schedule (list order, checkpoints, live
     on-disk state) — no topo waves, one story per line, spawns nothing."""
+    _warn_preflight_would_abort(paths, pol, require_stories=True)
     folder = stories_mod.resolve_spec_folder(paths.project, spec_folder)
     # The real dispatch always uses the project-relative folder (the engine
     # relativizes it); render the identical string here so dry-run and run agree.
@@ -940,13 +1148,14 @@ def _dry_run_stories(
         f"(gates={pol.gates.mode}){spec_ok}"
     )
     print("linear schedule (list order — no depends_on, strictly serial):")
+    dev_skill = _dev_skill_for_role(pol, paths.project, "dev")
     for row in rows:
         print(f"\n  {row.position}. {row.id}  ({row.label}){_checkpoint_badge(row)}  {row.title}")
         # A spec_checkpoint story whose plan is not yet on disk dispatches leg 1
         # (Halt after planning + BMAD_LOOP_PLAN_HALT); mirror the real dispatch's
         # markers so dry-run does not under-report what run would emit.
         plan_halt = stories_mod.is_plan_halt_leg(row.spec_checkpoint, row.state)
-        dispatch = f"/bmad-dev-auto Spec folder: {rel}. Story id: {row.id}."
+        dispatch = f"/{dev_skill} Spec folder: {rel}. Story id: {row.id}."
         if plan_halt:
             dispatch += " Halt after planning."
         print(f"    dev:    {_render_invocation(pol, paths.project, 'dev', dispatch)}")
@@ -1040,6 +1249,18 @@ def _sweep_factory(project: Path, paths: bmadconfig.ProjectPaths):
 
     def factory(trigger: str) -> None:
         pol = policy_mod.load(_policy_path(project))
+        # Raise rather than return the rc the other three sites return. By the time
+        # the engine calls this it has already latched the trigger and journaled
+        # `sweep-auto-trigger`, and it reads a plain return as success — so a bare
+        # decline would be recorded as `sweep-auto-finished`, which `engine.py`
+        # defines as "a clean completion from the parent's perspective": a child
+        # sweep that ran and finished when none was ever launched. Raising lands on
+        # the same `sweep-auto-failed` + notify path the `load` above already takes
+        # on an unparseable policy.toml, which is the same kind of event — the
+        # config on disk changed under a run that had already started.
+        conflict = bmadconfig.worktree_isolation_conflict(paths, pol.scm.isolation)
+        if conflict is not None:
+            raise RuntimeError(conflict)
         _start_sweep(
             project,
             paths,
@@ -1062,6 +1283,9 @@ def cmd_sweep(args: argparse.Namespace) -> int:
 
     if args.dry_run:
         return _sweep_dry_run(paths, pol)
+
+    if (rc := _reject_isolation_conflict(paths, pol)) is not None:
+        return rc
 
     if not verify.worktree_clean(paths.repo_root):
         print("git worktree is not clean — commit or stash first", file=sys.stderr)
@@ -1087,6 +1311,7 @@ def cmd_sweep(args: argparse.Namespace) -> int:
 
 
 def _sweep_dry_run(paths: bmadconfig.ProjectPaths, pol) -> int:
+    _warn_preflight_would_abort(paths, pol)
     ledger = paths.deferred_work
     if not ledger.is_file():
         print(f"no deferred-work ledger at {ledger}")
@@ -1122,6 +1347,12 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
         print(f"run {run_dir.name} already finished", file=sys.stderr)
         return 1
     pol = policy_mod.load(_policy_path(project))
+    # Resume re-reads config.yaml and policy.toml from disk, so it is a second
+    # entrypoint into the same engine and gets the same refusal — a run started
+    # before the override was added must not finish its remaining stories through
+    # provisioning the preflight would now refuse.
+    if (rc := _reject_isolation_conflict(paths, pol)) is not None:
+        return rc
     if not _require_base_skills(project, pol, require_stories=state.source == "stories"):
         return 1
     journal = Journal(run_dir)

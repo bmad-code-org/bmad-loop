@@ -26,6 +26,9 @@ STORIES_SOURCES = {"sprint-status", "stories"}
 ISOLATION_MODES = {"none", "worktree"}
 BRANCH_PER_MODES = {"story", "run"}
 MERGE_STRATEGIES = {"ff", "merge", "squash"}
+# Accepted `[dev] skill` values — the adapter discriminator, not the invoked skill
+# name (see DevPolicy.skill): the post-rename "bmad-build-auto" speaks the same
+# contract and is resolved on disk, so it is deliberately NOT a separate value here.
 DEV_SKILLS = {"bmad-dev-auto"}
 
 # Backend names are registry keys (adapters/multiplexer.py), never paths or
@@ -198,6 +201,13 @@ class DevPolicy:
     # it writes no result.json — the GenericDevAdapter synthesizes one from the
     # spec the session leaves on disk. The field is retained (rather than inlined)
     # as the seam for a future alternative dev skill; see DEV_SKILLS.
+    #
+    # This value is the ADAPTER DISCRIMINATOR ("which contract does the session
+    # speak"), NOT the skill name the prompt invokes. BMAD-METHOD PR #2651 renamed
+    # the skill to "bmad-build-auto" without changing that contract, so the invoked
+    # NAME is resolved from disk per skill tree (install.resolve_dev_primitive) and
+    # the value here deliberately stays "bmad-dev-auto" — a target project must not
+    # have to edit policy.toml to survive an upstream rename.
     skill: str = "bmad-dev-auto"
 
 
@@ -593,11 +603,22 @@ def _validate_plugin_settings(name: str, raw: dict[str, Any], specs: Any) -> Non
 
 
 def load(path: Path | None) -> Policy:
-    """Load policy from a TOML file; a missing file yields all defaults."""
+    """Load policy from a TOML file; a missing file yields all defaults.
+
+    An undecodable file is a `PolicyError` like a malformed one. `read_text` raises
+    `UnicodeDecodeError`, which is a `ValueError` and not an `OSError`, so left raw it
+    escapes every `except (PolicyError, OSError)` handler in the codebase — and those
+    handlers are the ones whose whole job is to degrade to defaults rather than take
+    the process down. Converting here fixes them all at once instead of asking each
+    to name a second exception type it has no other reason to know about."""
     if path is None or not path.is_file():
         return loads("")
     try:
-        return loads(path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as e:
+        raise PolicyError(f"{path}: not valid UTF-8: {e}") from e
+    try:
+        return loads(text)
     except PolicyError as e:
         raise PolicyError(f"{path}: {e}") from e
 

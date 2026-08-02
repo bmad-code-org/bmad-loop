@@ -440,3 +440,78 @@ def test_example_plugin_inert_until_enabled(project):
     assert gr is not None and gr.instance is None and gr.trusted is False
     # its workflow is declared but inert (the plugin is not active)
     assert reg.workflows_for("post_dev_phase") == []
+
+
+def test_workflow_marker_path_follows_the_resolved_dev_primitive(project):
+    """#405: the completion-contract marker filename carries the dev primitive's
+    name as its prefix, and that name is disk-resolved like every other prompt
+    site — a post-rename project gets `bmad-build-auto-result-*`. The adapter
+    matches the prefix (devcontract.FALLBACK_RESULT_PREFIXES accepts both
+    spellings), so this is about the two halves agreeing, not about the name.
+
+    One adapter serves both roles here, so this cannot see WHICH role's tree was
+    resolved — that is the sibling below."""
+    from conftest import attach_profile, install_build_auto_skill
+
+    captured: list = []
+    setup_story(project)
+    install_build_auto_skill(project.project, ".claude/skills")
+    reg = PluginRegistry([LoadedPlugin(manifest=wf_manifest("wf"))])
+    script = [
+        dev_effect(project, "1-1-a"),
+        workflow_effect(captured),
+        review_effect(project, "1-1-a", clean=True),
+    ]
+    engine, adapter = make_engine(project, script, reg)
+    attach_profile(adapter)
+
+    assert engine.run().done == 1
+    assert len(captured) == 1
+    assert "bmad-build-auto-result-1-1-a-wf.doc-1.md" in captured[0].prompt
+    assert "bmad-dev-auto-result-" not in captured[0].prompt
+
+
+def test_workflow_marker_path_follows_its_own_roles_tree(project):
+    """#405: a workflow declares its role and runs on THAT adapter, so its
+    completion marker must name the primitive resolved on that adapter's skill
+    tree — not the dev adapter's.
+
+    A run can mix trees at different upstream eras: dev=claude reads
+    `.claude/skills` (post-rename `bmad-build-auto`), review=codex reads
+    `.agents/skills` (a marker-complete legacy `bmad-dev-auto`). `wf_manifest`
+    declares `role = "review"`, so the contract this session is handed must
+    spell the legacy name; resolving off the dev tree would order a codex
+    session to write a file named after a skill only the claude tree carries.
+    Discovery would still read either back (FALLBACK_RESULT_PREFIXES matches
+    both spellings unconditionally) — the defect is the prompt contradicting
+    the session's own tree, which is the claim CHANGELOG's "a run mixing
+    `.claude/skills` and `.agents/skills` gets the right one per role" makes."""
+    from conftest import attach_profile, install_build_auto_skill, install_dev_base_skills
+
+    captured: list = []
+    setup_story(project)
+    install_build_auto_skill(project.project, ".claude/skills")
+    install_dev_base_skills(project.project, ".agents/skills", folder_id=False)
+    reg = PluginRegistry([LoadedPlugin(manifest=wf_manifest("wf"))])
+    review = attach_profile(
+        MockAdapter(
+            [workflow_effect(captured), review_effect(project, "1-1-a", clean=True)],
+            usage_per_session=TokenUsage(input_tokens=10, output_tokens=5),
+        ),
+        "codex",
+    )
+    engine, dev = make_engine(project, [dev_effect(project, "1-1-a")], reg, review_adapter=review)
+    attach_profile(dev, "claude")
+
+    assert engine.run().done == 1
+    assert len(captured) == 1
+    assert "bmad-dev-auto-result-1-1-a-wf.doc-1.md" in captured[0].prompt
+    assert "bmad-build-auto-result-" not in captured[0].prompt
+    # Fixture provenance, NOT a second witness: this assert stays GREEN when the
+    # marker path's `role` argument is ablated away (measured), because the
+    # `.agents/skills` cache entry is populated by the review PROMPT site, which
+    # this change did not touch. The two asserts above carry the whole signal.
+    assert engine._dev_skill_cache == {
+        ".claude/skills": "bmad-build-auto",
+        ".agents/skills": "bmad-dev-auto",
+    }

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import hashlib
 import os
 import shutil
 import signal
@@ -30,7 +31,15 @@ from .escalation import (
     decide_review_session,
     preference_escalations,
 )
-from .install import provision_worktree
+from .install import (
+    RENDERER_SCRIPT_MARKER,
+    RENDERER_SEED_SENTINELS,
+    base_skills_seed_incomplete,
+    dev_primitive_or_default,
+    provision_worktree,
+    renderer_stub_resolved,
+    worktree_seed_undelivered,
+)
 from .journal import Journal, save_state
 from .model import (
     PAUSE_EPIC_BOUNDARY,
@@ -58,6 +67,13 @@ from .workspace import (
     open_unit_workspace,
     unit_worktrees_dir,
 )
+
+# `origin:` marker prefix for ledger entries harvested out of a spec's
+# frontmatter `deferred:` list (BMAD-METHOD #2640). The full marker is
+# `<prefix> <fingerprint>` — matched verbatim on every later harvest, so it is
+# the dedup key and must never be reworded; `<prefix>-malformed <fingerprint>`
+# marks the aggregated unparseable-items meta-entry.
+HARVEST_ORIGIN = "spec-deferred"
 
 
 class RunPaused(Exception):
@@ -144,8 +160,9 @@ _SETUP_MCP_AGENT_IDS = {"claude": "claude-code"}
 # *infer* the completion-marker convention, and one that finishes its work but
 # never writes the marker leaves the orchestrator waiting (a completion-signal
 # livelock, bounded only by session_timeout_min). The orchestrator's adapter
-# discovers the marker by its `bmad-dev-auto-result-` filename prefix and
-# mtime, not by exact name.
+# discovers the marker by its `<dev primitive>-result-` filename prefix and
+# mtime, not by exact name (devcontract.FALLBACK_RESULT_PREFIXES accepts both
+# the pre- and post-rename spellings, so either resolution reads back).
 WORKFLOW_COMPLETION_CONTRACT = """
 
 ## Completion signal (required)
@@ -171,6 +188,24 @@ stalled and its work may be discarded."""
 def _setup_mcp_agent_id(profile_name: str) -> str:
     """Map a CLI profile name to its Unity-MCP `setup-mcp` agent id."""
     return _SETUP_MCP_AGENT_IDS.get(profile_name, profile_name)
+
+
+def _digest_of(text: str | None) -> str:
+    """The digest `task.baseline_ledger_digest` holds, for a ledger text that is
+    already in hand.
+
+    An ABSENT ledger and an EMPTY one hash identically, and this is the one place
+    that collapse is spelled. The `pre_harvest_ledger` split next door exists only
+    because its restore has to UNLINK; nothing this digest feeds ever does, and
+    neither state carries an entry, so for "did the ledger change" they are the same
+    answer.
+
+    Split out of `Engine._ledger_digest` so the two spellings of the question share
+    one hash. The method reads the tree; this takes a snapshot the caller already
+    holds — which is how the post-restore re-base avoids putting a `read_text`, hence
+    a new raise site, inside a `finally` that is usually propagating `RunPaused`
+    (#405)."""
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
 
 
 def _session_task_id(story_key: str, part: str, seq: int) -> str:
@@ -260,6 +295,11 @@ class Engine:
         # best-effort hint (None when the estimate could not be computed).
         self._graceful_stopped = False
         self._graceful_remaining: int | None = None
+        # dev-primitive name resolved from disk, memoized per skill tree (see
+        # _dev_skill). Keyed by tree — one run can mix trees (dev=claude reads
+        # .claude/skills, review=codex reads .agents/skills) — with None for an
+        # adapter that carries no profile at all.
+        self._dev_skill_cache: dict[str | None, str] = {}
 
     # ------------------------------------------------------------- top level
 
@@ -272,6 +312,7 @@ class Engine:
                 self._emit_run_boundary("pre_run")
                 self._ensure_target_branch()
                 self._prune_preserve_refs()
+                self._replay_unlatched_ledger_carries()
                 self._loop()
                 self.state.finished = True
                 self._gc_run_worktrees()
@@ -530,7 +571,12 @@ class Engine:
     def _worktree_profiles(self):
         """The distinct CLI profiles of the dev + review adapters, for provisioning
         their skills/hooks into a worktree. Adapters without a `profile` (e.g. test
-        fakes) contribute nothing, so provisioning is a no-op for them."""
+        fakes) contribute nothing, so provisioning is a no-op for them.
+
+        Deliberately the same roles as :data:`install.DEV_PRIMITIVE_ROLES`, which is
+        what the skills preflight gates — one decision read from opposite ends. This
+        side stays keyed on the adapters actually constructed rather than on role
+        names, since a test fake has no profile to provision either way."""
         seen: dict[str, object] = {}
         for adapter in (self.adapters["dev"], self.adapters["review"]):
             profile = getattr(adapter, "profile", None)
@@ -580,6 +626,18 @@ class Engine:
             return
         task.worktree_path = str(unit.path)
         task.branch = unit.branch
+        # Journaled HERE — beside the state it mirrors, and above everything below that
+        # can pause the run — rather than after provisioning. `task.worktree_path` is
+        # already set, and both provisioning escalations below `_save()` it before they
+        # raise; the escalation prose promises the half-provisioned worktree "stays
+        # mounted for the operator to inspect", and the journal was the one place that
+        # never said where. It pairs with the `worktree-open-failed` line above it, so
+        # every mount attempt now leaves exactly one record either way. Nothing keys on
+        # it — no `src/` reader consumes this kind, and no consumer requires it to be
+        # last or to imply that provisioning succeeded.
+        self.journal.append(
+            "worktree-opened", story_key=task.story_key, branch=unit.branch, path=str(unit.path)
+        )
         # A worktree checks out tracked files only, but the bmad-loop-* skill
         # trees + signal-hook config are typically gitignored, so they are absent
         # from the fresh checkout. Re-lay them into the worktree so the bundled
@@ -598,12 +656,14 @@ class Engine:
         # config so the worktree's Editor MCP is reachable. Aggregate every loaded
         # plugin's declared seeds.
         seeds.extend(self._registry.seed_files())
+        seed_files = list(dict.fromkeys(seeds))  # dedupe, preserve order
+        seed_globs = self._registry.seed_globs()
         skipped_seeds = provision_worktree(
             unit.path,
             profiles,
             self.paths.repo_root,
-            seed_files=list(dict.fromkeys(seeds)),  # dedupe, preserve order
-            seed_globs=self._registry.seed_globs(),
+            seed_files=seed_files,
+            seed_globs=seed_globs,
         )
         if skipped_seeds:
             # A seed entry whose destination already exists is a no-op. Harmless for
@@ -614,9 +674,129 @@ class Engine:
             self.journal.append(
                 "worktree-seed-skipped", story_key=task.story_key, entries=skipped_seeds
             )
-        self.journal.append(
-            "worktree-opened", story_key=task.story_key, branch=unit.branch, path=str(unit.path)
+        # The OTHER half of the same silence, and a different fact (#415): a seed entry
+        # naming something the repo HAS that the worktree did not get. The seed loops
+        # drop one with a bare `continue` when the resolve-and-contain guard refuses it,
+        # and the canonical trigger is a config the repo carries as a symlink OUT of
+        # itself. Re-probed rather than read out of `skipped_seeds` — same reason as the
+        # skills gate below — and on its own kind, because "already there, your entry is
+        # doing nothing" and "the repo has it and this worktree does not" want different
+        # fixes.
+        #
+        # Journaled, never escalated, and that is the deliberate difference from the two
+        # gates below. Those name files the ORCHESTRATOR itself dispatches or the
+        # renderer HALTs on, so their absence is a determinate stall on every story. A
+        # seed entry is arbitrary user/plugin-declared config and bmad-loop cannot know
+        # whether the session needs it — while the trigger is an ordinary healthy setup
+        # (a dotfile-managed `.claude/settings.json`, a shared MCP config), so pausing
+        # would refuse every run of such a project over a guard doing its job.
+        #
+        # The hook configs are named separately because the step BELOW provisioning
+        # writes them itself, so their presence in the worktree proves nothing about
+        # the seed — and every one of them is also a profile seed entry, the sole one
+        # for gemini/copilot/antigravity. Hookless profiles are excluded here for the
+        # same reason the exclude patterns exclude them: they have no `config_path`,
+        # and their empty string would name the worktree root.
+        undelivered_seeds = worktree_seed_undelivered(
+            unit.path,
+            self.paths.repo_root,
+            seed_files=seed_files,
+            seed_globs=seed_globs,
+            config_paths=[p.hooks.config_path for p in profiles if not p.hookless],
         )
+        if undelivered_seeds:
+            self.journal.append(
+                "worktree-seed-dropped", story_key=task.story_key, entries=undelivered_seeds
+            )
+        # The skills half of the same fault, and it needs no RENDERER-era gate: a
+        # worktree missing the dev primitive or a review hunter — or any file inside one
+        # the repo carries — stalls the session whether that SKILL.md renders or is inline,
+        # and the seed reads the same repo on every story. It does carry a
+        # PRIMITIVE-era one, inside the predicate: the era this run will not dispatch is
+        # not a stall to pause over. Re-probed rather than
+        # read out of `skipped_seeds`, so a user `worktree_seed` entry spelling a skill
+        # rel cannot forge a pause. Checked BEFORE the renderer branch: a worktree with
+        # no dev primitive at all has nothing for a renderer surface to be short FOR,
+        # so naming the renderer there would send the operator to the wrong file.
+        absent_skills = base_skills_seed_incomplete(
+            unit.path, self.paths.repo_root, [p.skill_tree for p in profiles]
+        )
+        if absent_skills:
+            reason = (
+                f"the worktree is missing upstream skill files the repo has "
+                f"({', '.join(absent_skills)}) — the session would stall having "
+                f"written nothing: on `Unknown command` when the whole skill is "
+                f"absent, inside the workflow when the dir is there but short of a "
+                f"file the repo carries. The usual cause is a skill directory — or one "
+                f"file or sub-directory inside one — symlinked to a shared BMad install "
+                f"outside the repo, which worktree seeding cannot follow; a checked-out "
+                f"symlink whose target does not exist on this machine reads the same way"
+            )
+            task.phase = Phase.ESCALATED
+            self.journal.append("story-escalated", story_key=task.story_key, reason=reason)
+            gates.notify(
+                self.policy,
+                self.run_dir,
+                f"CRITICAL escalation: {task.story_key}",
+                f"{reason} — resolve, then `bmad-loop resume {self.state.run_id}`",
+            )
+            self._save()
+            raise RunPaused(reason, PAUSE_ESCALATION, task.story_key)
+        short_surface = [rel for rel in RENDERER_SEED_SENTINELS if rel in skipped_seeds]
+        if short_surface and renderer_stub_resolved(
+            self.paths.project, [p.skill_tree for p in profiles]
+        ):
+            # ...with exactly one exception, and only for a project whose sessions
+            # actually render: the worktree's copy of the renderer's required surface
+            # came up SHORT of the repo's — an incomplete `_bmad/scripts/`, an absent
+            # `_bmad/config.toml`, or both. A renderer stub would then run without
+            # `render_skill.py`/`config_utils.py`, or without the config layer
+            # `load_central_config` requires, and Stop having written nothing — on
+            # THIS story and, since the seed reads the same repo every time, on every
+            # story after it. That is the env-fault shape `VerifyOutcome.env_fault`
+            # names: no repair session can fix it and no other story escapes it, so
+            # pause the run instead of walking the whole backlog into it. Escalate
+            # rather than defer for the same reason.
+            #
+            # Intersect the sentinel tuple rather than testing one constant, and name
+            # what actually fired: the two legs have different remediations and the
+            # symlink that drops a config is not the symlink that drops a scripts dir.
+            #
+            # The renderer conjunct is what keeps this era-agnostic, and it is not
+            # optional: the provisioning-side checks can only see the REPO (they fire
+            # on any repo carrying a renderer-era `_bmad/scripts/` or a `config.toml`
+            # the seed cannot follow — a shared install wired as a symlink is the
+            # canonical shape), while whether that matters depends on the resolved
+            # primitive's content. On a pre-#2601 inline SKILL.md nothing reads either
+            # path, so the short seed costs the run nothing and stays an ordinary
+            # `worktree-seed-skipped` line. This is the worktree continuation of the
+            # `skills.dev-renderer` preflight, which asked the same content question of
+            # the main checkout and passed — only the worktree's copy is short. ANY
+            # over the dev+review trees, since resolution is per tree and either
+            # session kind needing the renderer is enough.
+            #
+            # Raised BEFORE the workspace swaps to the unit below, so the half-seeded
+            # worktree stays mounted for the operator to inspect — the same courtesy
+            # _run_isolated's docstring promises a RunPaused out of `drive`. The phase
+            # is set directly: PENDING has no legal move to ESCALATED (see the
+            # worktree-open-failed branch above, which sets DEFERRED the same way).
+            reason = (
+                f"the dev primitive renders via {RENDERER_SCRIPT_MARKER} but the "
+                f"worktree's renderer surface came up short of the repo's "
+                f"({', '.join(short_surface)}) — the session would HALT without "
+                f"writing a spec. The usual cause is a symlinked _bmad/ pointing "
+                f"outside the repo, which worktree seeding cannot follow"
+            )
+            task.phase = Phase.ESCALATED
+            self.journal.append("story-escalated", story_key=task.story_key, reason=reason)
+            gates.notify(
+                self.policy,
+                self.run_dir,
+                f"CRITICAL escalation: {task.story_key}",
+                f"{reason} — resolve, then `bmad-loop resume {self.state.run_id}`",
+            )
+            self._save()
+            raise RunPaused(reason, PAUSE_ESCALATION, task.story_key)
         self._save()
         prev = self.workspace
         self.workspace = unit.workspace
@@ -657,6 +837,31 @@ class Engine:
             # ourselves by hand once the branch has landed; the orchestrator only
             # commits the worktree onto the selected target.
             self._merge_local(task, unit)
+            # …and then carry out the orchestrator-written ledger edits the merge
+            # could not, because `finalize_commit`'s `add -A` silently skips a
+            # GITIGNORED ledger, so they never rode the branch. AFTER the merge,
+            # never before: on a project whose ledger IS tracked the merge is what
+            # puts the open entry in front of `append_entry`'s dedup, and carrying
+            # first would file a fresh id and then merge the branch's copy on top.
+            self._carry_isolated_ledger_writes(task)
+            # …and latch it durably. `_finalize_commit_phase` already persisted
+            # Phase.DONE before this method ran, and `_finish_inflight` skips
+            # terminal tasks, so the window between the merge above and this line
+            # is the one place a persisted phase does not re-drive:
+            # `_replay_unlatched_ledger_carries` covers it on resume and this is
+            # what tells it the carry is not owed.
+            #
+            # The explicit `_save()` is load-bearing, not bookkeeping. The next
+            # natural save is far away: in the base engine a `_pick_next` that
+            # returns None runs `_maybe_auto_sweep("run-end", …)` — a whole nested
+            # sweep, the single most likely thing to CLOSE the entry just carried,
+            # which is the one condition that turns a replay into a duplicate —
+            # before `run()`'s `finally: self._save()`; in the sweep engine it is
+            # `_loop`'s next cycle, after every remaining bundle has been driven.
+            # `save_state` is a tmp-write plus `atomic_replace`, so this costs one
+            # small atomic write per landed unit.
+            task.isolated_ledger_carried = True
+            self._save()
         else:  # DEFERRED — capture the diff, keep or drop per keep_failed
             patch = close_unit_workspace(
                 unit,
@@ -1344,6 +1549,73 @@ class Engine:
         self._save()
         raise RunPaused(notice, PAUSE_ESCALATION, task.story_key)
 
+    def _replay_unlatched_ledger_carries(self) -> None:
+        """Re-run the DONE leg's ledger carry for a unit whose host died between the
+        merge and the carry.
+
+        `_finalize_commit_phase` persists `Phase.DONE` BEFORE `_integrate_unit`
+        merges (`_merge_local`) and carries, and `_merge_local` ends by removing the
+        worktree unconditionally — so a death in that window destroys the worktree's
+        copy of the orchestrator's ledger writes and skips the carry that was going
+        to rescue them. `_finish_inflight` cannot cover it: it opens with `if
+        task.terminal: continue`, and DONE is terminal.
+
+        The sibling DEFER terminus has no such window. `_defer` carries BEFORE its
+        terminal `_save()`, so a death there leaves a non-terminal persisted phase
+        that ordinary resume re-drives. DONE is the only leg that persists terminal
+        and then carries, and that asymmetry is the whole of this (#405).
+
+        Nothing is unrecoverable, which is what makes this cheap: both payloads —
+        `harvested_deferrals` and `bundle_closes_intended` — are already persisted to
+        `state.json` and survive the crash. Only the replay was missing.
+
+        In `run()` rather than in `_finish_inflight`, and that placement is forced
+        twice over. `SweepEngine` replaces `_loop` wholesale and never calls the base
+        recovery pass, while it does NOT override `run()` — that frame is the one
+        both engines share, so the sweep half comes free through the
+        `_carry_isolated_ledger_writes` override seam without touching `sweep.py`.
+        And it must PRECEDE `_loop` for the sweep: a carried close has to leave the
+        open set before the loop reads the ledger, or a fresh triage re-bundles work
+        that already merged. Ordering against its neighbours is safe: after
+        `_ensure_target_branch` (the carry commits into the main checkout, which must
+        be on the pinned target; on resume that method early-returns), and
+        `_finish_inflight` — which runs later, inside `_loop` — cannot itself produce
+        an un-carried DONE task. On a fresh run `state.tasks` is empty, so this is a
+        no-op.
+
+        Failure direction is safe. A lost latch means a replay, and a replay is a
+        no-op in the ordinary case: `mark_done` returns False on an entry already
+        done, and `append_entry` dedups against the still-open entry. The residual
+        cost is one duplicate, bounded and journalled, only if something closed the
+        entry in between — which is exactly why the latch above pays for its own
+        `_save()`."""
+        for task in list(self.state.tasks.values()):
+            if task.isolated_ledger_carried or task.phase != Phase.DONE:
+                continue
+            wt = task.worktree_path
+            # A still-mounted worktree means the death landed at or before
+            # `close_unit_workspace`, and from here that is indistinguishable from
+            # "the branch never merged" — carrying a unit whose branch never landed
+            # files an id the human's later merge duplicates. Same predicate
+            # `_gc_run_worktrees` reads for the same crash. It costs the narrower
+            # merged-but-not-torn-down sub-window, where the carry is lost exactly as
+            # it is today, and never wrongly applied.
+            #
+            # `wt and …` rather than a bare `Path(wt).is_dir()`, and that clause is
+            # why this guard comes FIRST: `Path("")` is `PosixPath(".")` and reads as
+            # a directory, so without it this line would silently absorb the in-place
+            # case the next guard owns — leaving that one a branch no test can redden.
+            if wt and Path(wt).is_dir():
+                continue
+            if not wt:
+                continue  # in-place run: nothing was ever isolated from the main ledger
+            if not (task.harvested_deferrals or task.bundle_closes_intended):
+                continue
+            self.journal.append("resume-ledger-carry", story_key=task.story_key)
+            self._carry_isolated_ledger_writes(task)
+            task.isolated_ledger_carried = True
+            self._save()
+
     def _finish_inflight(self) -> None:
         """Complete or roll back tasks interrupted by a pause or crash."""
         for task in list(self.state.tasks.values()):
@@ -1701,6 +1973,16 @@ class Engine:
         self._review_and_commit(task)
 
     def _dev_phase(self, task: StoryTask, resume_result: SessionResult | None = None) -> bool:
+        if resume_result is None:
+            # Ledger-snapshot clear site 0, and deliberately ABOVE the veto check:
+            # `_vetoed` drives the task terminal and saves, so a veto below this
+            # would persist a dead task still carrying a copy of the ledger. A fresh
+            # (non-replayed) entry owes nothing to a previous invocation, and one
+            # real hole needs closing: a completed session record with `result_json
+            # is None` refuses replay (see `_resumable_session`), so the resume
+            # RESTARTS the story and re-enters here still carrying the dead
+            # invocation's armed snapshot. Disarming here makes that unreachable.
+            self._disarm_ledger_snapshot(task)
         if self._vetoed(self._emit("pre_dev_phase", task), task):
             return False
         if resume_result is None:
@@ -1711,14 +1993,56 @@ class Engine:
             # would shift the rollback/squash reference onto the completed
             # session's own tree.
             task.baseline_untracked = sorted(verify.untracked_files(self.workspace.root))
+            # and the ledger's baseline bytes, under the same rule and for the same
+            # kind of reason: `_harvest_gate_exclude` measures each attempt's ledger
+            # against THIS reference to tell its own harvest's write from anyone
+            # else's, so re-capturing on a resume would move the reference onto the
+            # completed session's tree — the one place that session's ledger edit is
+            # guaranteed to already be, which is precisely the edit the gate must
+            # still be able to see (#405).
+            task.baseline_ledger_digest = self._ledger_digest()
         feedback: Path | None = None
         while True:
+            replayed = resume_result is not None
             if resume_result is None:
                 # a resumed result replays the attempt it was recorded under, so
                 # the counter (and the session task_id derived from it) must not
                 # advance; a second host death then still finds the record and
                 # re-enters this continuation instead of falling back to restart.
                 task.attempt += 1
+                # Same reason, for the record of what this attempt's harvest intends
+                # to file — which the isolated DEFER carries into the main
+                # checkout's ledger (`_carry_harvested_deferrals`). An attempt that starts
+                # from a REVERTED tree owes nothing to the previous one, whose
+                # harvest the non-fixable RETRY took out with the code it described.
+                #
+                # But a FIXABLE retry is not that attempt. It keeps the tree AND the
+                # ledger entry on purpose, hands the failing output to a repair
+                # session, and the repair session's own harvest dedupes that entry to
+                # nothing — so clearing here would drop the only record of a finding
+                # that is still sitting in the worktree's ledger, and a later stall or
+                # budget exhaustion would defer with an empty record while the entry
+                # dies unmerged with the worktree. `feedback is not None` is exactly
+                # "the previous iteration took the fixable branch"; see the
+                # discriminator note at the `harvest_wrote_ledger` clear below for why
+                # the local is sound across both re-entries.
+                #
+                # A REPLAY keeps the dead attempt's record too, because the replayed
+                # harvest dedupes against the entries already on disk and would
+                # re-assign an empty list (see the field's comment) — which is why
+                # this sits inside `if resume_result is None:`.
+                #
+                # HERE and not at the harvest's arm site below, which the sibling
+                # `harvest_wrote_ledger` clear uses: that site sits inside `if
+                # result.status == "completed"`, and the case this has to cover is
+                # exactly the attempt that did NOT complete — a stalled final
+                # attempt would otherwise reach `_defer` still carrying the
+                # PREVIOUS attempt's reverted findings, and carry them into the
+                # main ledger as a claim about code no attempt ever landed. The
+                # flag can live in the narrower site because nothing outside the
+                # completed branch reads it; this record is read from `_defer`.
+                if feedback is None:
+                    task.harvested_deferrals = []
             advance(task, Phase.DEV_RUNNING)
             self._save()
             if resume_result is not None:
@@ -1746,6 +2070,158 @@ class Engine:
             advance(task, Phase.DEV_VERIFY)
             outcome = None
             if result.status == "completed":
+                # Arm the pre-harvest ledger snapshot for the non-fixable-RETRY revert
+                # below. PERSISTED, with a `_save()`, so a host death anywhere between
+                # here and the rollback cannot lose it: the replayed attempt writes
+                # back the very bytes the live path would have.
+                #
+                # The position is the design. It is AFTER the session process ended
+                # (`_run_session` returns only once the adapter has reaped it), so
+                # anything the SESSION wrote to the ledger is inside the snapshot and
+                # survives the revert; and BEFORE every ENGINE-side ledger write of
+                # this attempt that the rollback has to undo — today that is
+                # `_harvest_spec_deferrals` alone, which files findings about work the
+                # rollback is about to discard. The boundary is drawn above
+                # `_reconcile_generic_terminal_status` and `_post_dev_state_sync` too,
+                # rather than immediately above the harvest, so a future ledger write
+                # growing inside either of them is covered by construction.
+                #
+                # The other engine-side ledger write — the sweep engine's `status:
+                # done` bundle closes — is deliberately NOT in this window: it sits
+                # below the artifact gate, in `_post_dev_accepted_sync`, so no
+                # snapshot of THIS phase's making has to cover it. (A blocking
+                # `post_dev_phase` workflow can still defer an accepted attempt after
+                # that close; `_reopen_ledger_after_defer` is what covers that, and
+                # every other post-acceptance defer.) See that method for why a
+                # snapshot here could never have covered the DEFER leg (#405).
+                #
+                # NOT pinned by a test, and said on measurement rather than
+                # assertion: with the sweep close moved out there is no engine-side
+                # ledger write left between the arm and `_harvest_spec_deferrals`, so
+                # sliding the arm down to just above the harvest leaves the whole
+                # suite green. The boundary is defensive positioning for the next
+                # write to grow inside either sync, not an observable property.
+                #
+                # NOT on a replayed attempt that still HAS a snapshot: the host died
+                # somewhere between the dead process's writes and its rollback, so what
+                # is on disk now is already post-harvest and re-arming would restore the
+                # very edits the rollback exists to undo. The dead attempt's persisted
+                # snapshot is what the replay restores instead.
+                #
+                # A replay with NOTHING armed is the opposite case and re-arms (#405).
+                # It means the previous pass through here already spent its snapshot —
+                # the `rollback_on_failure = off` pause disarms in its `finally`, so the
+                # ledger on disk is pre-harvest bytes plus whatever the operator wrote
+                # during the pause, which is exactly what this attempt should be able to
+                # revert to. Without the re-arm the resumed attempt runs its harvest with
+                # no snapshot at all and a second failure leaves that harvest behind.
+                # (The pre-existing `ledger-snapshot-missing` states are unaffected: they
+                # are replays that never reached the arm, and they still find nothing
+                # armed — but they now re-arm from disk rather than proceeding blind,
+                # which is strictly more recoverable.)
+                #
+                # Same site, same reason — but deliberately its OWN guard, and NOT
+                # the relaxed one below. Everything under this line that touches the
+                # ledger is the ORCHESTRATOR writing, not the session, so the flag is
+                # cleared for each attempt to answer for itself; and NEVER on a
+                # replay, because the dead attempt's harvest is still in the tree
+                # while the replayed harvest dedupes to nothing, so its True has to
+                # survive (see the field's comment and `_harvest_gate_exclude`).
+                # Sharing the arm's guard would couple the two: the relaxation below
+                # fires on a replay that has nothing armed, which would clear the
+                # flag on exactly the replay whose only diff IS the dead attempt's
+                # harvest — handing the proof-of-work gate the orchestrator's own
+                # write, the hazard this flag exists to prevent (#405).
+                #
+                # `feedback is None` for the same reason one level out, and it is the
+                # FIXABLE-retry leg that makes it necessary: that leg keeps the
+                # attempt's tree, so the previous attempt's harvest line is still
+                # above `baseline_commit` when the repair session is judged. Cleared
+                # there, the repair session's proof of work would be the
+                # orchestrator's own write — and its verify commands may well pass
+                # precisely because the offending change was just reverted, so an
+                # EMPTY implementation PROCEEDs. The fixable retry is the only
+                # construct in the engine that lets more than one attempt accumulate
+                # above the baseline, which is why this is the only leg that needs
+                # saying (#405).
+                #
+                # The `feedback` local is the discriminator rather than a persisted
+                # field, and it is sound across both re-entries. It is assigned in
+                # exactly three places in this method — the init above and the two
+                # RETRY branches below — and never reset per iteration, so at the top
+                # of iteration k it means precisely "iteration k-1 took the fixable
+                # branch"; `_restore_patch`'s guard reads it the same way. A REPLAY
+                # loses it, and does not care: this block is `replayed`-guarded to the
+                # same answer a continuation wants. A RESTART loses it too, and
+                # `_finish_inflight` has already reset the tree and re-captured every
+                # baseline — a coherent fresh phase, where `None` is the truth.
+                if not replayed:
+                    if feedback is None:
+                        task.harvest_wrote_ledger = False
+                    # …and, for this attempt, whether the ledger's diff from the
+                    # reference below is ALREADY more than the harvest's — the
+                    # session's own ledger edit, an operator's edit during a
+                    # `rollback_on_failure = off` pause, or a previous attempt's
+                    # edit that survived a restore. `_harvest_gate_exclude` stands
+                    # down when it is, so a ledger-reconciliation story that also
+                    # records a `deferred:` finding is not masked into a false
+                    # "no changes since baseline" (#405).
+                    #
+                    # UNCONDITIONAL under `not replayed`, and deliberately NOT also
+                    # `feedback is None`. Latching this across a continuation
+                    # alongside the flag is the obvious pairing and it is wrong: the
+                    # exclusion is path-granular, so a latched False hides a repair
+                    # session whose honest work genuinely IS a ledger entry, and the
+                    # false "no changes" that follows PAUSES the run under the
+                    # shipped `rollback_on_failure = off`. That is the hole `161c85e`
+                    # closed, re-opened one attempt further along. What moves instead
+                    # is the REFERENCE — see the two re-bases below — so the question
+                    # stays live and answers about the kept chain.
+                    #
+                    # Skipped on a replay for the mirror-image hazard: the ledger on
+                    # disk is already POST-harvest, so re-answering would read the
+                    # DEAD attempt's own harvest as "someone else changed it" and
+                    # stand the exclusion down over the orchestrator's write.
+                    #
+                    # Here rather than hoisted onto the arm's read below: hoisting
+                    # would put a `read_text` — hence a new raise site — on the
+                    # replayed-and-armed path, which has none today. Two reads on
+                    # the fresh path is the cheaper half of that trade.
+                    #
+                    # `None` = no baseline digest was captured (a legacy
+                    # state.json), so the question has no reference to answer
+                    # against and the gate keeps its pre-#405 shape.
+                    if task.baseline_ledger_digest is not None:
+                        task.ledger_changed_before_harvest = (
+                            self._ledger_digest() != task.baseline_ledger_digest
+                        )
+                # CHAIN-scoped, not attempt-scoped, and `feedback is None` is what
+                # says so. A fixable retry keeps its tree AND its harvest, so the
+                # next attempt is a continuation of the same body of work above one
+                # `baseline_commit` — and `_rollback_or_pause` only ever resets to
+                # THAT. Re-arming here would snapshot a ledger that already holds the
+                # kept attempt's entry, so a later non-fixable failure would reset the
+                # whole chain's code and then write the entry describing it straight
+                # back: a finding about deleted work, open in the ledger, swept later
+                # as if the code existed. Holding the chain's first snapshot instead
+                # makes the revert reach as far as the reset does (#405).
+                #
+                # The `or not captured` relaxation stays, and is what lets a chain
+                # whose snapshot was SPENT re-arm from disk rather than run blind —
+                # the `rollback_on_failure = off` pause disarms in its `finally`, and
+                # its resume replays this same attempt.
+                if (not replayed and feedback is None) or not task.pre_harvest_ledger_captured:
+                    task.pre_harvest_ledger = self._ledger_text()
+                    task.pre_harvest_ledger_captured = True
+                    self._save()
+                elif not replayed:
+                    # A fixable continuation no longer re-arms, but the clear and the
+                    # compute above DID run for it. Persist them here: without this,
+                    # a host death before the decision's own `_save()` would replay
+                    # onto the PREVIOUS attempt's answers, which is the staleness
+                    # those two fields are persisted to avoid. (The arm above used to
+                    # cover every non-replayed attempt for free.)
+                    self._save()
                 # bmad-dev-auto sometimes finalizes the spec in prose (## Auto Run
                 # Result: Status done) but leaves the frontmatter status at the
                 # template default. Repair it BEFORE any frontmatter reader runs —
@@ -1756,6 +2232,16 @@ class Engine:
                 # skill never touches (sprint-status for stories, the deferred-work
                 # ledger for sweep bundles), before verify reads that state.
                 self._post_dev_state_sync(task, result.result_json)
+                # Harvest the session's frontmatter `deferred:` findings (#2640)
+                # into the ledger BEFORE _verify_dev_artifacts, so the edit is in
+                # the tree the story commit squashes — a ledger entry recording
+                # work deferred by an attempt that is later rolled back would be a
+                # claim about code that no longer exists. Placement gets the commit
+                # half only: the harvest fires on the spec's status, before the
+                # artifact gate that can still send this attempt back. The rollback
+                # half is enforced explicitly, by the snapshot armed above and the
+                # restore at the RETRY branch below.
+                self._harvest_spec_deferrals(task, result.result_json)
                 # carry the skill's follow-up-review recommendation (PR #2505)
                 # onto the task so _review_and_commit can gate the review loop.
                 # A present key is authoritative (folded from the frontmatter, or
@@ -1792,6 +2278,26 @@ class Engine:
             )
             self._save()
             if decision.action == Action.PROCEED:
+                # The attempt is ACCEPTED: every gate that could still discard it has
+                # passed. Engine-side bookkeeping that makes a claim about this
+                # attempt's work belongs here rather than upstream of those gates.
+                self._post_dev_accepted_sync(task, result.result_json)
+                # Clear site 1. Nothing downstream can consume the snapshot — the
+                # phase returns and never re-enters this attempt — but without the
+                # clear a story that goes on to finish would carry a copy of the
+                # ledger in state.json for the rest of the run.
+                #
+                # The one clear site that DOES need its own `_save()`. A hard kill
+                # between here and the next ambient save resumes into
+                # `_finish_inflight`'s first branch (phase `DEV_VERIFY`, `spec_file`
+                # set by the artifact gate) → `_resume_after_dev_verify` →
+                # `_review_and_commit`, so `_dev_phase` is never re-entered and the
+                # armed snapshot is never consumed — it just rides the task into a
+                # terminal state.json. That is the opposite of clear site 2, where the
+                # replay re-enters this loop and still wants the snapshot; see
+                # `_disarm_ledger_snapshot`.
+                self._disarm_ledger_snapshot(task)
+                self._save()
                 self._emit("post_dev_phase", task)
                 if self._run_workflows("post_dev_phase", task, task.attempt):
                     return False
@@ -1801,10 +2307,140 @@ class Engine:
                     # work exists and the failure is concrete: keep the tree,
                     # hand the failing output to a repair session
                     feedback = self._write_feedback(task, decision.reason)
+                    # Re-base site 1 of 2. This leg keeps the tree, so every byte
+                    # above `baseline_commit` — including this attempt's harvest —
+                    # is accounted for and carries into the repair session's
+                    # judgement. Move the reference onto it, so the next attempt's
+                    # question is "did anything change since the KEPT chain" rather
+                    # than "since the phase baseline", which the surviving entry
+                    # answers True on its own.
+                    #
+                    # The field stops meaning "the phase baseline" here and starts
+                    # meaning "the last ledger state in which every post-baseline
+                    # byte is accounted for". Its per-attempt compute above is
+                    # unfalsifiable without this; see there for why latching the
+                    # compute instead re-opens `161c85e`.
+                    #
+                    # May raise, like every other unguarded ledger read: this leg is
+                    # not a `finally` propagating a pause, and `_write_feedback`
+                    # above already writes. A legacy `None` acquires a reference
+                    # here rather than staying blind — strictly more information,
+                    # and the only direction it can move the gate is to stand the
+                    # exclusion DOWN, which is the conservative one.
+                    task.baseline_ledger_digest = self._ledger_digest()
                 else:
                     feedback = None
-                    self._rollback_or_pause(task)
+                    paused = False
+                    try:
+                        self._rollback_or_pause(task)
+                    except RunPaused:
+                        # `rollback_on_failure = off` (the DEFAULT) does not roll
+                        # back at all: it hands the tree to a human and raises. The
+                        # gap that opens is not a crash window measured in
+                        # milliseconds but a HUMAN-scale one — the operator reads the
+                        # notice, inspects the tree, and may well append to the
+                        # deferred-work ledger before typing `resume`. Latch it here
+                        # so the `finally` below can tell that leg apart (#405).
+                        paused = True
+                        raise
+                    finally:
+                        # The reset discards the attempt but NOT what this phase
+                        # wrote to the deferred-work ledger: the ledger lives under a
+                        # protected artifact folder, so `_safe_reset`'s `keep`
+                        # shields it from the untracked-file cleanup and a ledger
+                        # this attempt CREATED outlives the work it describes (#405).
+                        # Put it back by hand. `finally`, not a plain call after:
+                        # rollback_on_failure OFF (the default) raises out of
+                        # `_pause_for_manual_recovery`, and the manual `reset --hard`
+                        # it prints would not remove an untracked ledger either.
+                        # Lossless because the harvest never mutates the spec's
+                        # `deferred:` frontmatter and the next attempt re-runs
+                        # `_post_dev_state_sync` as well, so both reverted writes are
+                        # simply re-made by whichever attempt survives.
+                        #
+                        # ONE snapshot, the same bytes either way: the live path and
+                        # the crash-REPLAY path both restore the text persisted
+                        # before the harvest, so a host death in that window costs
+                        # nothing. No-op when this attempt armed nothing.
+                        self._restore_persisted_ledger(task, replayed=replayed)
+                        # Re-base site 2 of 2, and the pair is what makes the rolling
+                        # reference safe. The restore has just put the ledger back to
+                        # the snapshot, so THAT is now the state in which every
+                        # post-baseline byte is accounted for. Without this a chain
+                        # that re-based on a fixable retry and then failed
+                        # non-fixably would leave the reference naming a state the
+                        # restore just undid: the next attempt reads
+                        # `D(restored) != D(kept chain)`, calls it "someone else
+                        # wrote the ledger", stands the exclusion down, and a session
+                        # that writes no source but finalizes a `deferred:` spec
+                        # PROCEEDs on the re-filed entry alone.
+                        #
+                        # From the SNAPSHOT, never from a fresh read: this `finally`
+                        # is usually propagating `RunPaused` out of
+                        # `_pause_for_manual_recovery`, and an `OSError` here would
+                        # replace that pause with a filesystem failure. Guarded on
+                        # the captured flag for the same reason the restore is — an
+                        # attempt that armed nothing has said nothing about the
+                        # ledger and must not move the reference either.
+                        #
+                        # It can disagree with the tree in one corner: a TRACKED
+                        # ledger the operator had deleted from the worktree, where
+                        # `_restore_ledger` leaves the reset's own bytes standing
+                        # rather than unlinking. The disagreement resolves to a
+                        # spurious "changed" on the next attempt, which stands the
+                        # exclusion down — the direction `_harvest_gate_exclude`
+                        # already documents as the conservative one, and the same
+                        # answer the phase-scoped reference gave there.
+                        if task.pre_harvest_ledger_captured:
+                            task.baseline_ledger_digest = _digest_of(task.pre_harvest_ledger)
+                        if paused:
+                            # The restore above has just put the ledger back to this
+                            # attempt's pre-harvest bytes, which is correct and is the
+                            # last thing this snapshot is good for. Spend it HERE
+                            # rather than letting it ride the pause: clear site 2
+                            # below is unreachable on this leg (the raise skips it),
+                            # so without this the copy stays armed in state.json
+                            # across a pause of arbitrary length, and the resume —
+                            # which replays this same attempt — writes those stale
+                            # bytes back over whatever the operator did in the
+                            # meantime. Every ledger state loses work that way, not
+                            # just the created-by-the-harvest one: the overwrite arm
+                            # has no `_ledger_is_gits_to_restore` guard, so a TRACKED
+                            # ledger is rewritten too, and the arm is never spent, so
+                            # it happens again on every subsequent resume.
+                            #
+                            # `_save()` immediately, because the whole point is that
+                            # the value the RESUME reads off disk is the disarmed one.
+                            # The re-arm then happens at the arm site from the tree as
+                            # the operator left it — see its relaxed guard, which is
+                            # what makes "nothing armed" mean "arm from disk" there.
+                            self._disarm_ledger_snapshot(task)
+                            self._save()
+                    # Clear site 2 — the NON-FIXABLE leg only, and deliberately
+                    # OUTSIDE the `finally`. This snapshot has just been spent: the
+                    # restore above put the ledger back and the reset discarded the
+                    # work it covered, so nothing downstream may consume it again.
+                    #
+                    # The fixable branch does NOT reach here, and that is the second
+                    # half of the chain-scoping above: keeping the arm is exactly what
+                    # makes the next attempt hold the CHAIN's first snapshot rather
+                    # than re-arm over a tree that already carries the kept harvest.
+                    # The two halves are one fix — either alone leaves the entry
+                    # standing after the chain rolls back.
+                    #
+                    # Outside the `finally` because `_rollback_or_pause` RAISES under
+                    # the `rollback_on_failure = off` default and control must not
+                    # reach here on that leg: the pause's own resume replays this same
+                    # attempt. (The pause spends the arm itself, in the `finally`
+                    # above, for the different reason written there.)
+                    self._disarm_ledger_snapshot(task)
                 continue
+            # Clear site 3, covering DEFER and the PAUSE/escalate fall-through alike.
+            # Neither reverts: `_defer` snapshots the ledger around its own reset and
+            # writes the harvested entries back, and an escalation preserves the tree
+            # for the human. Both `_save()` immediately below, so the snapshot dies
+            # here rather than riding a paused or terminal task in state.json.
+            self._disarm_ledger_snapshot(task)
             if decision.action == Action.DEFER:
                 self._record_dev_spec(task, result.result_json)
                 self._defer(task, decision.reason)
@@ -1950,6 +2586,13 @@ class Engine:
             # frontmatter's followup flag into `rj` (only when present), so the
             # convergence/damping gate below sees the finalized state.
             self._reconcile_generic_terminal_status(task, rj)
+            # A review pass is a full dev-primitive run, so it triages and defers
+            # its own findings into the same frontmatter list. Harvest after the
+            # reconcile (which is what advances a prose-finalized spec to the
+            # success status this gates on) and before the convergence gate, so a
+            # converging pass's ledger edit still lands in the story commit. The
+            # dev leg's already-filed findings dedup on their fingerprint.
+            self._harvest_spec_deferrals(task, rj)
             status = str(rj.get("status", "")).strip()
             last_status = status  # remember the last completed pass for the defer reason
             followup = bool(rj.get("followup_review_recommended", False))
@@ -2187,6 +2830,30 @@ class Engine:
         a future alternative dev skill can re-introduce the legacy branch."""
         return self.policy.dev.skill == "bmad-dev-auto"
 
+    def _dev_skill(self, role: str = "dev") -> str:
+        """The dev-primitive skill NAME to spell in ``role``'s session prompt.
+
+        Upstream renamed the primitive ``bmad-dev-auto`` → ``bmad-build-auto``
+        (BMAD-METHOD #2651), so the invoked name is resolved from what is
+        actually on disk rather than hardcoded: a target project can be on
+        either era. This is NOT ``policy.dev.skill`` — that stays the adapter
+        discriminator ``_generic_dev`` reads; only the spelled name moves.
+
+        Resolution is per skill tree because one run can mix them (dev=claude →
+        ``.claude/skills``, review=codex → ``.agents/skills``), and memoized
+        because every prompt build would otherwise re-stat the tree. An adapter
+        with no ``profile`` (test fakes) yields tree None, which
+        ``dev_primitive_or_default`` maps to the legacy name.
+
+        Resolving against the main checkout is correct under worktree isolation
+        too: ``provision_worktree`` copies the skill from this same tree path,
+        so the worktree can only carry the name resolved here."""
+        adapter = self.adapters.get(role)
+        tree = getattr(getattr(adapter, "profile", None), "skill_tree", None)
+        if tree not in self._dev_skill_cache:
+            self._dev_skill_cache[tree] = dev_primitive_or_default(self.paths.project, tree)
+        return self._dev_skill_cache[tree]
+
     def _dev_review_enabled(self) -> bool:
         """Spec-status/sprint semantics for verify_dev and the sprint sync. The
         generic skill always self-finalizes to ``done`` (no in-review handoff), so
@@ -2369,9 +3036,14 @@ class Engine:
         before ``verify_dev`` checks the sprint stage. Mirrors ``verify_dev``:
         advance the story to the sprint stage matching the spec status the skill
         actually reached, so a failed or blocked session (spec not at the success
-        status) never advances the sprint. No-op for the legacy path; SweepEngine
-        overrides this to flip the deferred-work ledger instead (bundles carry no
-        sprint-status entry)."""
+        status) never advances the sprint. No-op for the legacy path.
+
+        Runs ABOVE the artifact gate because ``verify_dev`` reads what it writes —
+        the board must already say ``review``/``done`` or the story fails its own
+        gate. That is the whole justification for the position, and it does not
+        generalise: bookkeeping that no gate reads belongs in
+        ``_post_dev_accepted_sync`` instead. SweepEngine overrides this to a no-op
+        for exactly that reason (#405)."""
         if not self._generic_dev():
             return
         spec_file = (result_json or {}).get("spec_file")
@@ -2389,6 +3061,220 @@ class Engine:
             return
         target = "review" if review_enabled else "done"
         sprint_advance(self.workspace.paths.sprint_status, task.story_key, target)
+
+    def _post_dev_accepted_sync(self, task: StoryTask, result_json: dict | None) -> None:
+        """Bookkeeping for a dev attempt the orchestrator has ACCEPTED — the seam for
+        engine-side writes that make a durable claim about the attempt's work.
+
+        The counterpart to ``_post_dev_state_sync``, and the default of the two. That
+        one runs above ``_verify_dev_artifacts`` only because ``verify_dev`` reads the
+        state it writes; anything that does NOT feed a gate belongs here, because
+        above the gate every terminus that discards the attempt has to be taught to
+        undo the write — and one of them, ``_defer``, does the exact opposite on
+        purpose (it snapshots the ledger around its own ``reset --hard`` and writes
+        those bytes back, so review-found deferrals survive). One accepted-only call
+        site collapses all of that into a single undo, `_reopen_ledger_after_defer`,
+        on the one leg that still needs one: a defer AFTER the attempt was accepted,
+        whether it comes from the review loop or from a blocking `post_dev_phase`
+        workflow.
+
+        Called after ``decide_dev`` returns PROCEED rather than on ``outcome.ok``, so
+        two more discards are excluded for free: a CRITICAL escalation in the result
+        json preempts even a passing outcome (``escalation.decide_dev``), and a
+        failing ``[verify] commands`` run replaces the outcome after the artifact
+        gate. No-op on the base path; ``SweepEngine`` closes a bundle's deferred-work
+        entries here."""
+        return
+
+    def _harvest_spec_deferrals(self, task: StoryTask, result_json: dict | None) -> None:
+        """Carry the dev primitive's frontmatter `deferred:` findings into the
+        deferred-work ledger.
+
+        BMAD-METHOD #2640 moved the skill's `defer`-triaged review findings out of
+        `deferred-work.md` and into the spec's own frontmatter, on the reasoning
+        that the worker owns its spec and the orchestrator owns follow-up policy.
+        Without this harvest the sweep pipeline silently starves: the findings are
+        real, recorded, and invisible to every reader downstream.
+
+        Era-agnostic by construction. The gate is the FIELD's presence plus the
+        generic-dev seam — never the skill name resolved on disk — so a project on
+        either side of the rename behaves the same, and a pre-#2640 spec (no field)
+        simply harvests nothing while its flat ledger appends keep working.
+
+        Gated on the spec having reached the success status, mirroring the
+        append-on-success semantics the old step-04 ledger writer had: a blocked
+        spec keeps its findings in frontmatter and harvests them on the eventual
+        successful re-drive. That gate is only half of "a story that never lands
+        cannot seed the ledger with findings about work that was rolled back" —
+        it reads the SPEC's status, not whether the attempt's artifacts verified,
+        and a session can finalize its spec and still fail the artifact gate. The
+        rollback contract below carries the other half.
+
+        Idempotent across retries, crash-replay, and the dev→review double call:
+        each entry's `origin:` carries the finding's fingerprint, and the pre-scan
+        below matches it against ledger entries of EVERY status. `append_entry`'s
+        own dedup is open-only by design (a re-filed entry should reappear after a
+        human reopens the topic), which is exactly wrong here — a harvest replayed
+        after the entry was swept done would file it a second time.
+
+        The frontmatter is deliberately never mutated: block-scalar surgery on a
+        `deferred:` list is the frontmatter-edit trap in a nastier form, and the
+        fingerprinted `origin:` above already watermarks the ledger side.
+
+        Rollback is asymmetric between the two failure paths, and deliberately so.
+        A non-fixable RETRY reverts the ledger edit along with the work it
+        describes, and the next attempt re-harvests from the untouched
+        frontmatter — for the whole retry CHAIN, not just the failing attempt,
+        because the reset it rides is to the phase's `baseline_commit` and a fixable
+        retry may have accumulated several attempts above that. The reset does not
+        achieve that by itself: the ledger sits
+        under a protected artifact folder, so `_safe_reset`'s `keep` shields it
+        from `safe_rollback`'s untracked cleanup and a ledger this harvest CREATED
+        would survive (#405). `_dev_phase` therefore snapshots the ledger ahead of
+        this call and restores it around `_rollback_or_pause`; that restore, not
+        the reset, is what makes the revert unconditional. The snapshot is persisted with the
+        attempt, so a REPLAYED one restores the same bytes rather than guessing;
+        see `_restore_persisted_ledger`.
+        A DEFER does NOT revert: `_defer` snapshots the ledger and writes it back
+        after the reset, keeping harvested entries. It has to —
+        `_stash_deferred_artifacts` moves the spec out of the artifacts dir first,
+        so after a defer the frontmatter is no longer where a re-drive would find
+        it, and the ledger entry is the finding's only surviving record.
+
+        Ledger writes are UNGUARDED — observation degrades, repair raises — so a
+        write fault reaches run()'s crash recorder instead of silently dropping
+        the findings.
+        """
+        if not self._generic_dev():
+            return
+        spec_file = (result_json or {}).get("spec_file")
+        if not spec_file:
+            return
+        spec_path = verify.resolve_spec_path(str(spec_file), self.workspace.paths)
+        if not spec_path.is_file():
+            return
+        fm = self._observed_frontmatter(spec_path, task.story_key, "spec-deferrals")
+        if fm is None:
+            return
+        success_status = "in-review" if self._dev_review_enabled() else "done"
+        if verify.status_of(fm) != success_status:
+            return
+        findings, malformed = devcontract.parse_deferred_findings(fm)
+        if not findings and not malformed:
+            return
+
+        spec_name = spec_path.name
+        # (origin, title, reason, location, severity) — one row per ledger entry
+        # this harvest may file.
+        pending: list[tuple[str, str, str, str | None, str | None]] = [
+            (
+                f"{HARVEST_ORIGIN} {f.fingerprint}",
+                f.summary,
+                f.evidence or f.summary,
+                f.location or None,
+                f.severity or None,
+            )
+            for f in findings
+        ]
+        if malformed:
+            self.journal.append(
+                "spec-deferrals-malformed",
+                story_key=task.story_key,
+                spec=spec_name,
+                items=malformed,
+            )
+            # One aggregated meta-entry, not one per bad item: the loss is a single
+            # fact about this spec, and filing it on the sweep channel is what stops
+            # a mangled `deferred:` block from being a silent drop. Fingerprinting
+            # the notes keeps a replay quiet while letting a spec whose malformed
+            # set actually changed file afresh.
+            pending.append(
+                (
+                    f"{HARVEST_ORIGIN}-malformed "
+                    f"{devcontract.harvest_fingerprint(spec_name, *malformed)}",
+                    f"Unreadable `deferred:` items in {spec_name}",
+                    "The dev session recorded deferred findings the orchestrator could not "
+                    "parse, so they were NOT filed as entries: "
+                    + "; ".join(malformed)
+                    + f". Read `{spec_name}`'s frontmatter and re-file them by hand.",
+                    None,
+                    "low",
+                )
+            )
+
+        # Record what this harvest INTENDED to file, before any dedup — every row,
+        # not just the ones `filed` below returns an id for. Under isolation this
+        # record is the findings' only route out of the unit worktree when the
+        # story defers (`_carry_harvested_deferrals`); keying it off `filed` would
+        # empty it on a crash replay, whose harvest dedupes against the entries the
+        # dead attempt already wrote.
+        #
+        # ASSIGNED, never appended, and this is about the record's SHAPE rather
+        # than about what carries: the same attempt's dev→review double call
+        # re-enters here, and the review pass reads the SAME spec — whose
+        # `deferred:` list the skill accumulates into — so its `pending` is
+        # already the union and an append would just double every dev-leg row in
+        # `state.json`. It was measured: appending carries the same entries,
+        # because the per-attempt clear draws the boundary that matters and
+        # `append_entry` dedups the rest. A review pass that deferred nothing
+        # returns above (no findings, no malformed) and leaves the dev leg's
+        # record untouched.
+        task.harvested_deferrals = [
+            {
+                "origin": origin,
+                "title": title,
+                "reason": reason,
+                "location": location,
+                "severity": severity,
+                "source_spec": spec_name,
+            }
+            for origin, title, reason, location, severity in pending
+        ]
+        ledger = self.workspace.paths.deferred_work
+        text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
+        seen = deferredwork.parse_ledger(text)
+        filed: list[str] = []
+        deduped = 0
+        for origin, title, reason, location, severity in pending:
+            if any(
+                deferredwork.field_line_present(e.body, "origin", origin)
+                and deferredwork.field_line_present(e.body, "source_spec", spec_name)
+                for e in seen
+            ):
+                deduped += 1
+                continue
+            dw_id = deferredwork.append_entry(
+                ledger,
+                title=title,
+                origin=origin,
+                source_spec=spec_name,
+                reason=reason,
+                location=location,
+                severity=severity,
+            )
+            # None means append_entry's own open-entry guard caught it — a
+            # duplicate the pre-scan snapshot could not see because THIS harvest
+            # just wrote it (two frontmatter items with identical summary and
+            # location).
+            if dw_id is None:
+                deduped += 1
+            else:
+                filed.append(dw_id)
+        # Set-only, never cleared here. A replay re-runs this harvest and dedupes
+        # every entry the dead attempt wrote, so `filed` comes back empty while
+        # those entries are still on disk — clearing on that would hand the gate
+        # below the orchestrator's own write. The per-attempt clear lives at the
+        # arm site.
+        if filed:
+            task.harvest_wrote_ledger = True
+        self.journal.append(
+            "spec-deferrals-harvested",
+            story_key=task.story_key,
+            spec=spec_name,
+            dw_ids=filed,
+            deduped=deduped,
+            malformed=len(malformed),
+        )
 
     def _extra_session_env(
         self, task: StoryTask, role: str, label: str | None = None
@@ -2423,9 +3309,54 @@ class Engine:
         unit is merged before the run stops."""
         return
 
+    def _harvest_gate_exclude(self, task: StoryTask) -> tuple[str, ...]:
+        """The deferred-work ledger's project-relative path, when THIS attempt's
+        harvest filed into it — and `()` otherwise.
+
+        `_harvest_spec_deferrals` runs four statements above the artifact gate, and
+        `verify_dev_exclude_relpaths` deliberately does NOT exclude the ledger (a
+        story whose whole authorized scope is ledger reconciliation must register as
+        real work — `KNOWN-BUG-ledger-only-story-false-no-changes.md`). So without
+        this the gate cannot tell the orchestrator's write from the session's, and a
+        session that finalized its spec and changed no code PROCEEDs on the strength
+        of the harvest alone. That is the exact hazard `sweep.py`'s close was moved
+        below the gate to retire; moving the close audited only the write it moved.
+
+        Keyed on the persisted flag rather than re-derived, because a replay's
+        harvest dedupes to nothing while the dead attempt's entries remain in the
+        tree. Narrow by construction: it excludes the ledger only on the attempts
+        that actually wrote it, so a session's OWN ledger edit still counts as work
+        on every other attempt.
+
+        And on THIS attempt too. The exclusion is path-granular — it hides the whole
+        relpath, not the harvest's lines — so on its own it also masks a session
+        ledger edit that shares the attempt, and a ledger-reconciliation story that
+        additionally records one `deferred:` finding reads as "no changes since
+        baseline". That is not merely a false negative: the RETRY it produces is the
+        default non-fixable one, so under the default `scm.rollback_on_failure = off`
+        it PAUSES the whole run rather than costing an attempt. Hence the second
+        early return: `ledger_changed_before_harvest` says the ledger had already
+        left the phase baseline when this attempt's pre-harvest snapshot was armed,
+        so its diff is provably not the harvest's alone and the gate must judge it in
+        full. Stepping aside is the conservative direction — the gate then sees more
+        of the tree, never less."""
+        if not task.harvest_wrote_ledger:
+            return ()
+        if task.ledger_changed_before_harvest:
+            return ()
+        paths = self.workspace.paths
+        try:
+            return (paths.deferred_work.resolve().relative_to(paths.project.resolve()).as_posix(),)
+        except ValueError:
+            return ()  # ledger outside the project tree; nothing to exclude here
+
     def _verify_dev_artifacts(self, task: StoryTask, result_json: dict | None):
         return verify.verify_dev(
-            task, self.workspace.paths, result_json, review_enabled=self._dev_review_enabled()
+            task,
+            self.workspace.paths,
+            result_json,
+            review_enabled=self._dev_review_enabled(),
+            engine_written=self._harvest_gate_exclude(task),
         )
 
     def _verify_review(self, task: StoryTask):
@@ -2438,14 +3369,20 @@ class Engine:
         # separate review skill. task.spec_file is set by verify_dev on success.
         # The ledger instruction is the prevention side of the reclose in
         # SweepEngine._verify_review: a review that rewrites deferred-work.md
-        # from a stale snapshot clobbers orchestrator-recorded closures. The
-        # ledger is append-only for sessions — new findings are fine, existing
-        # entries are orchestrator-owned.
+        # from a stale snapshot clobbers orchestrator-recorded closures.
+        # Existing entries are orchestrator-owned; NEW ones are simply not asked
+        # for. Post-BMAD-METHOD#2640 the primitive records its own `defer`
+        # findings in the spec's frontmatter and `_harvest_spec_deferrals` files
+        # them, so an affirmative "append them" here files each finding twice:
+        # `append_entry`'s dedup is exact-match on `origin:` + `source_spec:` and
+        # an agent-written entry carries neither, so the pair can never collapse.
+        # Deliberately neutral rather than the sweep prompts' outright ban — on a
+        # pre-#2640 skill there is no frontmatter to harvest and the session's own
+        # flat append is the only record, so forbidding it would lose findings.
         return (
-            f"/bmad-dev-auto {task.spec_file} — If this review defers new "
-            f"findings, append them to the deferred-work ledger as NEW entries "
-            f"only; do NOT modify, re-open, or rewrite existing ledger entries — "
-            f"the orchestrator owns their status and resolution."
+            f"/{self._dev_skill('review')} {task.spec_file} — do NOT modify, "
+            f"re-open, or rewrite existing deferred-work ledger entries; the "
+            f"orchestrator owns their status and resolution."
         )
 
     def _render_commit_template(self, task: StoryTask) -> str | None:
@@ -2577,8 +3514,17 @@ class Engine:
             # the same implementation-artifacts dir the dev adapter already
             # searches — correct in place and under worktree isolation alike,
             # because spec.cwd is self.workspace.root either way.
+            # ``role``, not the default: a workflow declares its own role
+            # (WORKFLOW_ROLES = dev | review) and runs on THAT adapter, whose
+            # skill tree can be a different one at a different era — dev=claude
+            # on .claude/skills post-rename, review=codex on .agents/skills
+            # pre-rename. Resolving off the dev tree would name the session a
+            # primitive its own tree does not carry. Discovery survives either
+            # spelling (FALLBACK_RESULT_PREFIXES matches both unconditionally),
+            # so this is the two halves agreeing, not a broken read-back.
             marker_path = (
-                self.workspace.paths.implementation_artifacts / f"bmad-dev-auto-result-{task_id}.md"
+                self.workspace.paths.implementation_artifacts
+                / f"{self._dev_skill(role)}-result-{task_id}.md"
             )
             prompt += WORKFLOW_COMPLETION_CONTRACT.format(marker_path=marker_path)
         spec = SessionSpec(
@@ -2736,16 +3682,16 @@ class Engine:
         if feedback is None:
             if task.restore_patch and task.spec_file:
                 return (
-                    f"/bmad-dev-auto Resume review of the in-review spec at "
+                    f"/{self._dev_skill()} Resume review of the in-review spec at "
                     f"`{task.spec_file}`. The attempted change was restored onto "
                     f"the working tree after an intent-gap resolution; review it "
                     f"against the amended spec."
                 )
-            return f"/bmad-dev-auto {task.story_key}"
+            return f"/{self._dev_skill()} {task.story_key}"
         self._reset_spec_for_repair(task)
         spec_ref = task.spec_file or task.story_key
         return (
-            f"/bmad-dev-auto Resume the autonomous dev session on the in-progress "
+            f"/{self._dev_skill()} Resume the autonomous dev session on the in-progress "
             f"spec at `{spec_ref}`. The previous session's work failed deterministic "
             f"verification; repair the working tree so verification passes without "
             f"changing the spec's frozen intent contract. Verification evidence is "
@@ -2960,6 +3906,12 @@ class Engine:
             # the failed work lives in the unit's worktree; the diff is captured
             # and the worktree kept/dropped by _integrate_unit. Don't touch the
             # tree here (no reset into the main repo — there's nothing to undo).
+            # The harvested findings are the one exception: they describe the SPEC,
+            # not the discarded code, and the worktree is about to go.
+            # Directly, NOT via `_carry_isolated_ledger_writes`: that hook also
+            # applies a sweep bundle's ledger CLOSES, and a defer discarded the very
+            # code those closes claim to have resolved.
+            self._carry_harvested_deferrals(task)
             self.journal.append("story-deferred", story_key=task.story_key, reason=reason)
             gates.notify(self.policy, self.run_dir, f"story deferred: {task.story_key}", reason)
             self._save()
@@ -2980,6 +3932,10 @@ class Engine:
                 if current != snapshot:
                     deferred_work.parent.mkdir(parents=True, exist_ok=True)
                     deferred_work.write_text(snapshot, encoding="utf-8")
+            # ...but that restore replays the whole file, so an entry the
+            # ORCHESTRATOR closed earlier in this story rides back over the reset
+            # too. Undo those specifically.
+            self._reopen_ledger_after_defer(task)
         self.journal.append("story-deferred", story_key=task.story_key, reason=reason)
         gates.notify(
             self.policy,
@@ -2988,6 +3944,353 @@ class Engine:
             reason,
         )
         self._save()
+
+    def _carry_isolated_ledger_writes(self, task: StoryTask) -> None:
+        """The orchestrator-written ledger edits an isolated unit's MERGE did not
+        carry into the main checkout. Base: the harvest. `SweepEngine` adds the
+        bundle close.
+
+        DONE leg only, and that asymmetry is deliberate — see the override. The
+        DEFER terminus calls `_carry_harvested_deferrals` directly from `_defer`,
+        because a defer discarded the code, so a close claiming to RESOLVE that
+        code must not be applied while the finding it filed still must be.
+
+        WHY a landing unit needs a carry at all, when its branch just merged: the
+        harvest writes `workspace.paths.deferred_work` — the unit worktree's — and
+        `finalize_commit` stages with `git add -A` (`verify.py`), which SKIPS a
+        gitignored path in silence. So on a project that gitignores its ledger
+        (this repo's own shape: the ledger's default home is under a gitignored
+        artifacts dir) the entry never reaches the branch, the merge has nothing to
+        bring over, and `close_unit_workspace(success=True)` removes the worktree
+        unconditionally — with no `capture_diff` on this leg, unlike DEFER, so not
+        even a `changes.patch` copy survives. A ledger that is TRACKED rides the
+        branch normally and every row below dedups to nothing, which is what makes
+        one unconditional call site correct for both project shapes.
+
+        Not on the escalation legs: both `_keep_branch_and_escalate` calls always
+        raise `RunPaused`, so this line is unreachable from them. Deliberately —
+        those legs keep the branch for a HUMAN to merge, and that merge brings the
+        branch's own entry with it, so a copy carried here under a fresh id would
+        duplicate it. The conflict leg can also leave the repo mid-merge."""
+        self._carry_harvested_deferrals(task)
+
+    def _carry_harvested_deferrals(self, task: StoryTask) -> None:
+        """Re-file this attempt's harvested `deferred:` findings into the MAIN
+        checkout's ledger when an ISOLATED unit ends, and commit them.
+
+        Under `scm.isolation = "worktree"` `self.workspace` is the unit's for the
+        whole drive (`_run_unit`), so `_harvest_spec_deferrals` writes the UNIT
+        WORKTREE's `deferred-work.md`. On a DEFER that worktree is never merged —
+        `_integrate_unit`'s DEFERRED arm only captures a forensic patch, and
+        `_merge_local` is reachable from the DONE arm alone. Nothing was destroyed
+        (`scm.keep_failed` defaults True, and `capture_diff` includes untracked
+        files, so the entries survive in the kept worktree and in `changes.patch`)
+        but no ledger a sweep reads ever sees them, which is the operative half.
+        This is the carry-out the non-isolated branch below gets from its
+        snapshot/restore around `_rollback_or_pause`.
+
+        On a DONE unit the branch merges but a GITIGNORED ledger never rode it, so
+        the same re-file runs there too, from `_carry_isolated_ledger_writes`. Both
+        call sites are cheap when the ledger is tracked: every row dedups against
+        the entry the merge (or the in-place write) already landed, `carried` comes
+        back empty, and no commit is added at all.
+
+        Here rather than in `_integrate_unit` so the DEFER parity sits directly
+        against the in-place branch it mirrors, and so that leg is ONE site instead
+        of `_integrate_unit`'s six call sites.
+
+        `self.paths`, NOT `self.workspace.paths`: the destination is the main
+        checkout, which is on `state.target_branch` throughout an isolated run
+        (`_merge_local` merges INTO `repo`'s current HEAD), so the carry lands on
+        the target branch.
+
+        Re-filing is safe and dedup is free: `append_entry` is idempotent by
+        `origin:` + `source_spec:` against OPEN entries, and creates the ledger and
+        its parent dir when the project has none yet. `None` back means an open
+        entry already says this, so it drops out of `carried`.
+
+        Against OPEN entries — so a duplicate would need the merged copy to be
+        `status: done` by the time this runs. It cannot be: the only writer that
+        closes an existing entry is `deferredwork.mark_done`, whose in-story caller
+        closes strictly `task.dw_ids`, assigned once at bundle materialization and
+        never appended to, while a harvested entry gets a fresh `DW-<next>`. No
+        guard needed on the DONE leg.
+
+        COMMITTING, rather than leaving the edit dirty, is the point. An
+        uncommitted ledger edit in the main checkout sits in the path of a later
+        story's `_merge_local`, whose `clean_incoming_collisions` escalates on any
+        dirt outside the incoming branch's path set. `verify.commit_paths` commits
+        exactly this path and nothing else, leaving any operator work in the tree
+        alone.
+
+        The ledger WRITE is unguarded — repair raises, and losing the findings is
+        the hazard this exists to prevent — but the commit is best effort, and that
+        split is not timidity. `commit_paths` names the path explicitly, and `git
+        add -- <path>` REFUSES (rc 1) a path git is ignoring; a project that
+        gitignores its artifacts dir is an ordinary one (this repo does, and its
+        ledger's default home is under it), while every in-place path never notices
+        because `commit_story`'s `add -A` skips such a path in silence. Raising
+        would cost the run its `_integrate_unit` — no forensic patch, worktree left
+        mounted, no `unit-closed` — over bookkeeping that has already done its real
+        job. Same shape and same reasoning as `decisions.commit_pre_answer`; the
+        journal records the miss, and a later `_merge_local` names the dirt itself.
+
+        `commit_paths` takes LITERAL pathspecs, which this caller is why: it is the
+        first unattended one, so an `implementation_artifacts` holding `[` / `]` would
+        over-stage an operator's uncommitted work into the commit below — and silently
+        skip the ignored ledger that makes the journalled miss above fire at all
+        (#423)."""
+        if not task.harvested_deferrals:
+            return
+        ledger = self.paths.deferred_work
+        carried = [
+            dw_id
+            for dw_id in (
+                deferredwork.append_entry(ledger, **item) for item in task.harvested_deferrals
+            )
+            if dw_id
+        ]
+        if carried:
+            try:
+                verify.commit_paths(
+                    self.paths.repo_root,
+                    f"chore(deferred-work): carry harvested findings from {task.story_key}",
+                    [ledger],
+                )
+            except verify.GitError as e:
+                self.journal.append(
+                    "harvest-carry-uncommitted",
+                    story_key=task.story_key,
+                    dw_ids=carried,
+                    error=str(e),
+                )
+        self.journal.append("harvest-carried", story_key=task.story_key, dw_ids=carried)
+
+    def _reopen_ledger_after_defer(self, task: StoryTask) -> None:
+        """Undo the engine-side deferred-work CLOSES that `_defer`'s restore just
+        wrote back over its own `reset --hard`.
+
+        That restore is deliberate and stays: `_stash_deferred_artifacts` has already
+        moved the spec out of the artifacts dir, so a harvested finding's ledger entry
+        is its only surviving record. But it replays the whole file, so an entry the
+        orchestrator marked `status: done` earlier in this story is resurrected as
+        well — now naming code the reset discarded. The asymmetry is the whole reason
+        this exists: a surviving open finding reads as noise, while a surviving close
+        drops out of `deferredwork.open_ids`, which re-bundles only `open` entries, so
+        no later sweep looks at that id again and the work is silently lost.
+
+        `_post_dev_accepted_sync` closed the dev-leg legs of this by withholding the
+        close until the attempt is accepted. It cannot cover the REVIEW leg, because
+        by then the close describes an attempt that WAS accepted and has to be on disk
+        — `verify_review_bundle` requires it — and only the later review failure makes
+        it wrong (#405).
+
+        Runs on the branch where a reset was attempted: inside `baseline_commit`,
+        after the restore, and unreached when `_rollback_or_pause` raises —
+        the `rollback_on_failure = off` stop-and-wait path keeps the tree, so there is
+        nothing to undo. The isolated branch returns earlier still: its closes were
+        written in the unit's own worktree, which `_integrate_unit` drops unmerged.
+
+        No-op on the base path; only `SweepEngine` closes ledger entries."""
+        return
+
+    def _ledger_text(self) -> str | None:
+        """The deferred-work ledger's current text, or ``None`` when the file does
+        not exist. Workspace-scoped, so an isolated run reads the unit worktree's
+        own ledger — the same one `_rollback_or_pause` resets around."""
+        ledger = self.workspace.paths.deferred_work
+        return ledger.read_text(encoding="utf-8") if ledger.is_file() else None
+
+    def _ledger_digest(self) -> str:
+        """A digest of the deferred-work ledger as it is ON DISK now, for the only
+        question `task.baseline_ledger_digest` is ever asked: has the ledger moved
+        since that reference was last set (`_harvest_gate_exclude`, #405).
+
+        A digest rather than the text, because that field outlives every attempt's
+        arm/disarm window, so persisting the bytes would carry a growing ledger in
+        state.json alongside `pre_harvest_ledger`'s copy. Equality is the whole
+        contract, so a digest loses nothing.
+
+        Raises what `_ledger_text` raises. Every caller of THIS spelling is already
+        on a path that reads or writes the ledger unguarded, and a read fault here
+        would otherwise have to be spelled as one of the two answers — either of
+        which is a guess about work the gate is about to judge. The re-base inside
+        `_dev_phase`'s rollback `finally` is the one site that may NOT raise, and it
+        uses `_digest_of` on the snapshot instead."""
+        return _digest_of(self._ledger_text())
+
+    def _ledger_is_gits_to_restore(self, task: StoryTask) -> bool:
+        """True when git owns the deferred-work ledger — it has an index entry, so
+        `_rollback_or_pause`'s `reset --hard` has already put it right and unlinking
+        it by hand would turn a reverted EDIT into a deleted FILE, which the next
+        attempt's `add -A` would then commit.
+
+        Asked with `verify.path_tracked` rather than `untracked_files`, because the
+        two are not complements: a GITIGNORED ledger is absent from the untracked set
+        as well, so reading "not untracked" as "tracked" silently files every ignored
+        ledger under "the reset already handled it" — and the reset never touches an
+        ignored path (#405).
+
+        A ledger OUTSIDE `workspace.root` reads False, not True. That reset runs in
+        `workspace.root` and cannot reach a path outside it, so it restored nothing
+        and there is no reverted EDIT to protect — which makes "outside" the one
+        containment answer that positively RULES OUT the hazard this method exists
+        for. `implementation_artifacts` configured out of tree is a supported shape
+        (`ProjectPaths.rebased` keeps it put; `_protected_relpaths` and
+        `_harvest_gate_exclude` both budget for it), so the earlier "shared with
+        other checkouts, not ours to delete" reading turned every harvest revert
+        into a silent no-op for those projects: a finding about code the rollback
+        just discarded stayed open in the ledger and was later swept. Nor was that
+        reading honoured anyway — `_restore_ledger`'s non-`None` arm rewrites an
+        external ledger wholesale with no ownership guard at all. A `None` snapshot
+        for an external ledger means THIS harvest created the file, and inside the
+        arm→restore window (see `_dev_phase`) nothing else writes it.
+
+        The containment test is re-asked with both sides RESOLVED before that False
+        is returned, mirroring `_harvest_gate_exclude`. `relative_to` is purely
+        lexical, and while "outside" was a no-op a false positive cost nothing;
+        now that it authorizes a delete, one would delete a tracked in-workspace
+        ledger. Nested rather than unconditional so the syscall stays off the
+        common path.
+
+        Degrades to True. It runs inside a ``finally`` that is usually propagating
+        `RunPaused` out of `_pause_for_manual_recovery`, so a `GitError` — or an
+        `OSError` out of `resolve()` — raised here would replace that pause with a
+        filesystem failure; and every caller uses the answer to authorize a DELETE,
+        so uncertainty has to mean "leave it alone"."""
+        ledger = self.workspace.paths.deferred_work
+        try:
+            rel = ledger.relative_to(self.workspace.root).as_posix()
+        except ValueError:
+            try:
+                rel = ledger.resolve().relative_to(self.workspace.root.resolve()).as_posix()
+            except OSError as e:
+                self.journal.append(
+                    "ledger-scope-probe-failed", story_key=task.story_key, error=str(e)
+                )
+                return True
+            except ValueError:
+                return False  # genuinely outside: our reset never touched it
+        try:
+            return verify.path_tracked(self.workspace.root, rel)
+        except verify.GitError as e:
+            self.journal.append(
+                "ledger-tracked-probe-failed", story_key=task.story_key, error=str(e)
+            )
+            return True
+
+    def _restore_ledger(self, task: StoryTask, snapshot: str | None) -> None:
+        """Put the deferred-work ledger back to a pre-harvest ``_ledger_text()``
+        snapshot — `_defer`'s own snapshot/restore run in the opposite direction,
+        and for the opposite reason.
+
+        A ``None`` snapshot means the ledger did not exist yet, so the restore is
+        an unlink: the first harvest of a project CREATES `deferred-work.md`, which
+        is both the common case and the one the reset cannot undo (untracked, and
+        `keep`-shielded from `safe_rollback`'s cleanup). Skipping it would leave
+        the whole point of the revert unfixed.
+
+        ...unless git owns the path. "Absent when the snapshot was taken" is a
+        CREATION for an untracked or ignored ledger, but only a modification for a
+        tracked one the operator had deleted from the worktree without committing:
+        the harvest re-creates it, the reset restores the committed bytes, and an
+        unconditional unlink here would delete a tracked file that no rollback asked
+        to lose. Under `rollback_on_failure = off` no reset runs and the harvest's
+        file simply stays until the operator's own `reset --hard`, which lands in the
+        same place — so leaving it alone converges either way.
+
+        Empty parent dirs are deliberately not pruned: the artifacts dir is
+        orchestrator-owned, an empty one is harmless, and removing a directory the
+        session may still hold open is a worse trade than leaving it.
+
+        Writes raise, like every other ledger write — a failure here would silently
+        leave a stale finding pointing at code that was just discarded."""
+        ledger = self.workspace.paths.deferred_work
+        current = self._ledger_text()
+        if current == snapshot:
+            return
+        if snapshot is None:
+            if not self._ledger_is_gits_to_restore(task):
+                ledger.unlink(missing_ok=True)
+            return
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        ledger.write_text(snapshot, encoding="utf-8")
+
+    def _restore_persisted_ledger(self, task: StoryTask, *, replayed: bool) -> None:
+        """Put the deferred-work ledger back to the snapshot `_dev_phase` armed
+        before this retry CHAIN's engine-side ledger writes — if it armed one.
+
+        Chain, not attempt, and the two differ only across a fixable retry: that leg
+        keeps its tree, so the snapshot it is holding is the one taken before the
+        FIRST attempt of the chain, and the restore reaches exactly as far back as
+        the `reset --hard` to `baseline_commit` beside it does (#405).
+
+        The snapshot is PERSISTED rather than held in a local, and that is the whole
+        point: a host death between `_harvest_spec_deferrals` and
+        `_rollback_or_pause` used to lose the local, leaving the dead attempt's
+        finding behind for the successful retry to commit.
+        `_resumable_session` replays the recorded result
+        and `_dev_phase` re-enters its loop from the top, so the replay reaches this
+        call with the dead attempt's own bytes still on the task.
+
+        ``pre_harvest_ledger_captured`` is the gate, NOT ``pre_harvest_ledger is not
+        None``. The text's ``None`` is a real value meaning "no ledger existed when
+        the snapshot was taken, so the restore is an unlink" (see `_restore_ledger`),
+        and that is the commonest case of all — the first harvest of a project
+        CREATES `deferred-work.md`. Collapsing the two states would turn exactly the
+        case the revert exists for into a no-op.
+
+        No-op when nothing was armed, silently on a live attempt and journalled on a
+        replayed one. Live: a non-``completed`` session never reaches the arm, and an
+        attempt with nothing to say about the ledger must not touch it — an
+        unconditional restore here would unlink an operator's pre-existing ledger.
+        Replayed: the arm is unreachable by construction (`_resumable_session` only
+        ever hands back a ``completed`` record), so an unarmed replay means the host
+        died upstream of the pre-harvest save, or the task predates these fields.
+        Hands off either way, but worth a journal line — that is a real, if narrow,
+        window in which a harvest survives its attempt.
+
+        Why the snapshot is a filesystem read and never a git query: the ledger is
+        commonly GITIGNORED (it sits under `output_folder`, which many projects
+        ignore — this one included), and every git-side signal is ignore-blind.
+        `baseline_untracked` and `verify.untracked_files` both come from
+        `git ls-files --others --exclude-standard`, so an ignored ledger is absent
+        from them whether the attempt created it or not; `reset --hard` never touches
+        an ignored path; this module never runs `git clean`; and `_safe_reset`'s
+        `keep` shields the artifacts dir besides. Only the bytes speak for tracked,
+        untracked and ignored ledgers alike."""
+        if not task.pre_harvest_ledger_captured:
+            if replayed:
+                self.journal.append("ledger-snapshot-missing", story_key=task.story_key)
+            return
+        self._restore_ledger(task, task.pre_harvest_ledger)
+
+    def _disarm_ledger_snapshot(self, task: StoryTask) -> None:
+        """Drop the armed pre-harvest ledger snapshot.
+
+        Armed from an attempt's pre-harvest `_save()` until its decision is acted on,
+        so the residency in state.json is bounded to an in-flight or paused attempt
+        rather than accumulating one ledger copy per finished story.
+
+        Deliberately NOT followed by a `_save()` at the RETRY site, and that
+        rationale is scoped to it (#405). Between that disarm and the next ambient
+        save the on-disk value is still armed, and a death in that window replays
+        *that same attempt* — which still wants the snapshot, so the stale-looking
+        persisted value is the correct one. Saving there would convert a correct
+        recovery into a hands-off one.
+
+        It does NOT generalise to the other three sites, and reading it as universal
+        left one real hole. Site 0 (fresh entry) is followed by a save on the veto
+        path deliberately, and a death before it leaves the phase `pending` ⇒ a
+        resume RESTARTS the story rather than replaying the attempt. Site 3
+        (DEFER / escalate) is saved immediately below by `_defer` / `_escalate`. Site
+        1 (PROCEED) is the hole: a hard kill there resumes through
+        `_finish_inflight`'s `DEV_VERIFY` branch straight into `_review_and_commit`,
+        so `_dev_phase` is never re-entered, nothing ever consumes the snapshot, and
+        a terminal task carries a full copy of the ledger in state.json for good.
+        That site therefore saves explicitly."""
+        task.pre_harvest_ledger = None
+        task.pre_harvest_ledger_captured = False
 
     def _stash_deferred_artifacts(self, task: StoryTask) -> None:
         """Move the deferred story's spec out of the artifacts dir into the run

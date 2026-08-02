@@ -103,6 +103,50 @@ def mark_done(path: Path, dw_id: str, date: str, note: str) -> bool:
     return True
 
 
+_MARK_DONE_TAIL_RE = re.compile(r"\nresolution:[ \t]*(.*)$", re.MULTILINE)
+
+
+def mark_open(path: Path, dw_id: str, note: str) -> bool:
+    """Undo one specific `mark_done`: flip `status: done <date>` back to
+    `status: open` and delete the `resolution:` line that call inserted. Returns
+    False (no write) when there is nothing of that shape to undo.
+
+    Deliberately NOT a general reopen. The write is refused unless the entry is
+    closed AND the line directly below its status is exactly the ``resolution:``
+    ``note`` the caller passed, so a close recorded by another run, by the legacy
+    path where the session edits the ledger itself, or by a human is never revoked
+    by a caller that did not write it. The ledger has no field that could say who
+    reopened what after the fact, so the check has to happen here.
+
+    The round trip restores the text `mark_done` changed, character for character,
+    because that call writes its resolution on the line directly below the status and
+    this removes exactly that line — which is what lets a caller undo a close without
+    having snapshotted the file. Character for character as `read_text` sees it, NOT
+    byte for byte: `mark_done` rewrites the whole file through `write_text`, so a
+    ledger stored CRLF is normalised to the platform's line ending by the close and
+    the reopen cannot put that back. Pre-existing, and invisible to git on a repo with
+    the usual `text=auto` handling."""
+    if not path.is_file():
+        return False
+    text = path.read_text(encoding="utf-8")
+    entry = _find_entry(text, dw_id)
+    if entry is None or entry.open:
+        return False
+    status_m = STATUS_RE.search(entry.body)
+    if status_m is None:
+        # `parse_ledger` tolerates an entry with no status line (it reads as not
+        # open, hence not caught above), and this runs from `_defer` — where an
+        # AttributeError would replace a deferral with a crash.
+        return False
+    res_m = _MARK_DONE_TAIL_RE.match(entry.body, status_m.end())
+    if res_m is None or res_m.group(1).strip() != note:
+        return False
+    start = entry.span[0] + status_m.start()
+    end = entry.span[0] + res_m.end()
+    path.write_text(text[:start] + "status: open" + text[end:], encoding="utf-8")
+    return True
+
+
 def append_decision(path: Path, dw_id: str, date: str, label: str, detail: str) -> bool:
     """Record a human decision on an entry without changing its status."""
     if not path.is_file():
@@ -146,6 +190,7 @@ def append_entry(
     reason: str,
     status: str = "open",
     severity: str | None = None,
+    location: str | None = None,
 ) -> str | None:
     """Append a new canonical `### DW-<seq>` entry numbered past the highest
     existing DW id, returning the new id (e.g. "DW-42").
@@ -153,7 +198,34 @@ def append_entry(
     Idempotent: returns None without writing when an open entry already carries
     the same `origin:` marker and `source_spec:` — so re-running the same defer
     (e.g. a second sweep of the same story) never duplicates the entry. Creates
-    the ledger (and parent dir) if it does not yet exist."""
+    the ledger (and parent dir) if it does not yet exist.
+
+    `location` is the format's file:line/component field; it is written directly
+    after `source_spec:` so the emitted order matches the canonical
+    origin → location → severity → reason → status shape.
+
+    The line is written ALWAYS, with `n/a` standing in for an empty (or
+    whitespace-only) value, because that is what the format has always specified:
+    deferred-work-format.md gives `location:` as `<file:line or component, or
+    "n/a" for deferred goals>` — unchanged in every revision of the file since the
+    repo's first commit — and migration-mode.md tells the migrating session to
+    write `n/a` when it can extract nothing. Omitting the line instead made this
+    writer the one producer disagreeing with its own spec. The reader that cares
+    is an LLM — the sweep skill's triage step ("Read its `location:`
+    (file/component) in the current tree") — and `n/a` tells it there is nothing
+    to open, where an absent line leaves it inferring that from a gap.
+
+    `severity:` keeps the opposite treatment on purpose: of the fields an entry
+    is CREATED with, it is the only one the format calls optional, and it says in
+    as many words that a missing one is fine. (`resolution:` and `decision:` are
+    also called optional, but they are sweep annotations added to an entry that
+    already exists, so this writer never emits them.)
+
+    Nothing in Python parses THIS field — `parse_ledger` extracts only the
+    heading and `status:`, and the one field the TUI pulls out of an entry body
+    is `severity:` (`tui/data.py`, for row colouring); the body itself reaches the
+    entry modal verbatim. So entries already on disk without the line stay valid,
+    and readers must treat an absent `location:` as `n/a`."""
     text = path.read_text(encoding="utf-8") if path.is_file() else ""
     for entry in parse_ledger(text):
         if (
@@ -164,6 +236,7 @@ def append_entry(
             return None
     dw_id = f"DW-{next_seq(text)}"
     lines = [f"### {dw_id}: {title}", f"origin: {origin}", f"source_spec: `{source_spec}`"]
+    lines.append(f"location: {(location or '').strip() or 'n/a'}")
     if severity:
         lines.append(f"severity: {severity}")
     lines.append(f"reason: {reason}")

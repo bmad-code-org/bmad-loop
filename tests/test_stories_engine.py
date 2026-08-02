@@ -63,11 +63,20 @@ def setup_stories(paths, entries: list[dict], *, spec_folder: str = SPEC_FOLDER)
 
 
 def stories_dev_effect(
-    *, final_status: str = "done", followup_review: bool = False, prose_status: str | None = None
+    *,
+    final_status: str = "done",
+    followup_review: bool = False,
+    prose_status: str | None = None,
+    deferred=None,
+    write_src: bool = True,
 ):
     """Simulate a bmad-dev-auto folder+id dispatch: read the story id + spec
     folder from the session env (as the real adapter does), write the id-keyed
-    story spec, and touch real code so proof-of-work passes."""
+    story spec, and touch real code so proof-of-work passes.
+
+    ``write_src=False`` mirrors `conftest.dev_effect`'s knob of the same name: it
+    keeps the session from touching code at all, the only way to express a stories
+    session whose whole post-baseline diff belongs to the ORCHESTRATOR."""
 
     def effect(spec) -> SessionResult:
         story_id = spec.env["BMAD_LOOP_STORY_KEY"]
@@ -77,8 +86,9 @@ def stories_dev_effect(
         stories_dir.mkdir(parents=True, exist_ok=True)
         sp = stories_dir / f"{story_id}-slug.md"
         src = Path(spec.cwd) / "src.txt"
-        src.write_text(src.read_text() + f"work for {story_id}\n")
-        write_spec(sp, final_status, baseline, prose_status=prose_status)
+        if write_src:
+            src.write_text(src.read_text() + f"work for {story_id}\n")
+        write_spec(sp, final_status, baseline, prose_status=prose_status, deferred=deferred)
         return SessionResult(
             status="completed",
             result_json={
@@ -97,7 +107,7 @@ def stories_dev_effect(
     return effect
 
 
-def stories_checkpoint_effect():
+def stories_checkpoint_effect(*, deferred=None):
     """Simulate bmad-dev-auto honoring `Halt after planning.`: on a plan-halt leg
     (BMAD_LOOP_PLAN_HALT set by the engine) write the id-keyed spec at
     ready-for-dev with NO code change — the plan is just the spec — and mark the
@@ -120,14 +130,14 @@ def stories_checkpoint_effect():
             "escalations": [],
         }
         if spec.env.get("BMAD_LOOP_PLAN_HALT"):
-            write_spec(sp, "ready-for-dev", baseline)
+            write_spec(sp, "ready-for-dev", baseline, deferred=deferred)
             return SessionResult(
                 status="completed",
                 result_json={**common, "status": "ready-for-dev", "plan_halt": True},
             )
         src = Path(spec.cwd) / "src.txt"
         src.write_text(src.read_text() + f"work for {story_id}\n")
-        write_spec(sp, "done", baseline)
+        write_spec(sp, "done", baseline, deferred=deferred)
         return SessionResult(
             status="completed",
             result_json={**common, "status": "done", "followup_review_recommended": False},
@@ -1220,3 +1230,117 @@ def test_entry_for_unreadable_manifest_journals_warning_once(project):
     # a second call for the same story does not re-journal (dedup per story key)
     assert engine._entry_for(task) is None
     assert len(_kinds(engine.journal, "stories-manifest-unreadable")) == 1
+
+
+def test_dev_prompt_spells_the_post_rename_primitive(project):
+    """#405: folder+id dispatch invokes the primitive resolved from the dev
+    adapter's skill tree — both the fresh leg and the inherited repair leg."""
+    from conftest import attach_profile, install_build_auto_skill
+
+    setup_stories(project, [entry("1")])
+    install_build_auto_skill(project.project, ".claude/skills")
+    engine, adapter = make_engine(project, [])
+    attach_profile(adapter)
+    task = StoryTask(story_key="1", epic=0)
+
+    assert (
+        engine._dev_prompt(task, None)
+        == "/bmad-build-auto Spec folder: _bmad-output/epic-1. Story id: 1."
+    )
+    feedback = project.implementation_artifacts / "feedback.md"
+    assert engine._dev_prompt(task, feedback).startswith(
+        "/bmad-build-auto Resume the autonomous dev session"
+    )
+
+
+# ---------------- frontmatter `deferred:` harvest parity (BMAD-METHOD #2640)
+
+
+STORY_FINDING = {
+    "summary": "The id-keyed spec loader rescans on every call",
+    "evidence": "resolve_story_spec globs the folder each time",
+    "location": "src/bmad_loop/stories.py:120",
+    "severity": "low",
+}
+
+
+def test_stories_mode_harvests_spec_deferrals_into_the_ledger(project):
+    """Stories mode overrides `_post_dev_state_sync` to a no-op (no sprint board,
+    no bundle ledger to flip) — but the harvest is its own call in the shared dev
+    phase, so a folder+id story's deferred findings reach the ledger exactly like
+    a sprint story's. Without that, stories-mode runs would starve the sweep."""
+    from bmad_loop import deferredwork
+
+    setup_stories(project, [entry("1")])
+    engine, _ = make_engine(project, [stories_dev_effect(deferred=[STORY_FINDING])])
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused
+    entries = deferredwork.parse_ledger(project.deferred_work.read_text(encoding="utf-8"))
+    assert len(entries) == 1
+    assert entries[0].title == "The id-keyed spec loader rescans on every call"
+    assert entries[0].open
+    assert "source_spec: `1-slug.md`" in entries[0].body
+    assert "location: src/bmad_loop/stories.py:120" in entries[0].body
+    harvested = _kinds(engine.journal, "spec-deferrals-harvested")
+    assert len(harvested) == 1 and harvested[0]["dw_ids"] == ["DW-1"]
+
+
+def test_plan_halt_leg_does_not_harvest_then_implement_leg_does(project):
+    """A plan-halt leg leaves the spec at `ready-for-dev` — a successful terminal
+    for that leg, but NOT the success status the harvest gates on. Its findings
+    stay in frontmatter until the implement leg finalizes the story, so a plan a
+    human might still reject cannot seed the ledger."""
+    from bmad_loop import deferredwork
+
+    setup_stories(project, [entry("1", spec_checkpoint=True)])
+    engine, _ = make_engine(project, [stories_checkpoint_effect(deferred=[STORY_FINDING])])
+    summary = engine.run()
+
+    assert summary.paused and summary.done == 0
+    assert status_of(read_frontmatter(story_spec(project, "1"))) == "ready-for-dev"
+    assert not project.deferred_work.exists()
+    assert not _kinds(engine.journal, "spec-deferrals-harvested")
+
+    resumed, _ = resume_engine(
+        project, engine, [stories_checkpoint_effect(deferred=[STORY_FINDING])]
+    )
+    rsummary = resumed.run()
+
+    assert rsummary.done == 1
+    entries = deferredwork.parse_ledger(project.deferred_work.read_text(encoding="utf-8"))
+    assert len(entries) == 1 and entries[0].open
+    assert _kinds(resumed.journal, "spec-deferrals-harvested")[0]["dw_ids"] == ["DW-1"]
+
+
+def test_stories_harvest_alone_is_not_proof_of_work(project):
+    """T2j, the stories leg of the harvest-vs-proof-of-work hazard, and the third
+    `_verify_dev_artifacts` override that has to pass `engine_written` through.
+
+    Stories mode already excludes `stories/` and `stories.yaml` from proof-of-work
+    (`verify._stories_relpaths`), but the ledger lives under implementation-artifacts
+    — a different subtree — so the harvest's own write lands squarely in the diff the
+    gate reads. Attempt 1 finalizes its spec, changes no code and records one
+    `deferred:` finding, so its entire post-baseline diff is the line the ORCHESTRATOR
+    wrote: it must RETRY. Attempt 2 does real work and proceeds.
+
+    `entry("1")` and not `spec_checkpoint=True` is load-bearing: a plan-halt leg
+    passes `extra_exclude=None`, which skips the proof-of-work gate outright, and the
+    test would pass on any build."""
+    setup_stories(project, [entry("1")])
+    engine, _ = make_engine(
+        project,
+        [
+            stories_dev_effect(write_src=False, deferred=[STORY_FINDING]),
+            stories_dev_effect(),
+        ],
+    )
+    summary = engine.run()
+
+    decisions = _kinds(engine.journal, "dev-decision")
+    assert [d["action"] for d in decisions] == ["retry", "proceed"]
+    assert "no changes" in decisions[0]["reason"]
+    # the harvest really did fire on the refused attempt — the exclusion is what the
+    # gate answered on, not an absent ledger
+    assert _kinds(engine.journal, "spec-deferrals-harvested")[0]["dw_ids"] == ["DW-1"]
+    assert summary.done == 1

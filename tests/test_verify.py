@@ -913,6 +913,65 @@ def test_verify_review_bundle_ledger_oserror_degrades_to_retry(project, monkeypa
     assert "DW-1" not in out.reason  # not the "entries not marked done" verdict
 
 
+def test_path_tracked_separates_tracked_untracked_and_ignored(project):
+    """The three states a rollback has to tell apart, plus the one that reads wrong
+    if you probe the filesystem instead of the index.
+
+    `untracked_files` alone cannot do this: it answers False for an ignored path AND
+    for a tracked one, so a caller reasoning over it in isolation files every ignored
+    path under whichever branch it wrote last — which is exactly how a gitignored
+    deferred-work ledger came to be treated as "already reverted by the reset" (#405).
+    """
+    repo = project.project
+    (repo / ".gitignore").write_text(".bmad-loop/runs/\nblind/\n", encoding="utf-8")
+    (repo / "blind").mkdir()
+    (repo / "blind" / "note.md").write_text("ignored\n", encoding="utf-8")
+    (repo / "loose.txt").write_text("untracked\n", encoding="utf-8")
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-q", "-m", "ignore rules")
+
+    assert verify.path_tracked(repo, "src.txt")  # committed by the fixture
+    assert not verify.path_tracked(repo, "loose.txt")
+    assert not verify.path_tracked(repo, "blind/note.md")
+    assert not verify.path_tracked(repo, "never/existed.md")
+    # ignored is invisible to the untracked probe too — neither signal alone is enough
+    assert "blind/note.md" not in verify.untracked_files(repo)
+    assert "loose.txt" in verify.untracked_files(repo)
+
+    # the state a plain `Path.exists()` gets backwards: the index entry outlives the
+    # file, and `reset --hard` is what puts it back — so it is still git's to restore.
+    (repo / "src.txt").unlink()
+    assert verify.path_tracked(repo, "src.txt")
+
+
+def test_path_tracked_reads_its_operand_as_a_path_not_a_pathspec(project):
+    """`ls-files` takes a PATHSPEC, not a path, so `[` and `]` in an operator-named
+    `implementation_artifacts` are wildmatch metacharacters: the probe for an ABSENT
+    path answers True off a tracked NEIGHBOUR that happens to match the glob, and the
+    harvest revert then skips the unlink it exists to perform (#423).
+
+    The direction is what makes it expensive. Git compares literally before it falls
+    through to fnmatch, so a genuinely tracked path never reads untracked — the error
+    only ever runs toward the answer that authorizes leaving a file alone.
+
+    The third assert is the other half of one claim, not a separate one. Literal is not
+    EXACT: git still matches a literal operand as a directory PREFIX. A "fix" that
+    tightened this to `stdout.strip() == rel` passes the two rows above while silently
+    disarming `cmd_validate`'s render-tracked warning, whose only match on `_bmad/render`
+    is that prefix."""
+    repo = project.project
+    (repo / "probe1").mkdir()
+    (repo / "probe1" / "note.md").write_text("the decoy\n", encoding="utf-8")
+    git(repo, "add", "probe1/note.md")
+    git(repo, "commit", "-q", "-m", "tracked neighbour")
+    (repo / "probe[1]").mkdir()
+    (repo / "probe[1]" / "note.md").write_text("untracked\n", encoding="utf-8")
+
+    assert not verify.path_tracked(repo, "probe[1]/note.md")
+    assert verify.path_tracked(repo, "probe1/note.md")  # the decoy really is tracked
+    assert verify.path_tracked(repo, "probe1")  # a directory prefix still matches
+
+
 def test_safe_rollback_reverts_tracked_and_removes_run_created(project):
     repo = project.project
     baseline = verify.rev_parse_head(repo)
@@ -1275,6 +1334,31 @@ def test_commit_paths_commits_only_listed(project):
     status = git(project.project, "status", "--porcelain")
     assert "other.txt" in status
     assert "src.txt" not in status
+
+
+def test_commit_paths_does_not_stage_a_glob_neighbour(project):
+    """The promise above — commit exactly `paths`, leave unrelated work alone — was
+    made through three globbing pathspecs. A target under a bracketed dir therefore
+    swept a tracked NEIGHBOUR's uncommitted edit into the commit, under a story's
+    name, leaving `git status` clean afterwards so nothing surfaced it (#423).
+
+    Unattended since `_carry_harvested_deferrals` began calling this from `_defer`;
+    before that its only caller was the operator-invoked `bmad-loop decisions`."""
+    repo = project.project
+    (repo / "docs1").mkdir()
+    (repo / "docs1" / "f.md").write_text("committed\n", encoding="utf-8")
+    git(repo, "add", "docs1/f.md")
+    git(repo, "commit", "-q", "-m", "neighbour")
+    (repo / "docs1" / "f.md").write_text("the operator's uncommitted edit\n", encoding="utf-8")
+    (repo / "docs[1]").mkdir()
+    target = repo / "docs[1]" / "f.md"
+    target.write_text("the ledger\n", encoding="utf-8")
+
+    sha = verify.commit_paths(repo, "chore: targeted", [target])
+
+    assert sha is not None  # the target is new, so there really is something to commit
+    assert git(repo, "show", "--name-only", "--format=", "HEAD").split() == ["docs[1]/f.md"]
+    assert "docs1/f.md" in git(repo, "status", "--porcelain")  # still the operator's
 
 
 def test_commit_paths_noop_when_unchanged(project):

@@ -443,7 +443,7 @@ Merge-back is always **serialized** — `max_parallel` is a validated knob clamp
 <img src="docs/images/settings-scm.png" alt="The settings editor with the [scm] section expanded: isolation, branch_per, merge_strategy, the seed-adapter-configs switch, and the extra-worktree-seed-files field." width="880">
 </p>
 
-For a monorepo or any layout where the git root differs from the project dir, set an optional `repo_root` key in `_bmad/bmm/config.yaml` — it decouples where git/code work happens from where run state lives (defaults to the project dir).
+For a monorepo or any layout where the git root differs from the project dir, set an optional `repo_root` key in `_bmad/bmm/config.yaml` — it decouples where git/code work happens from where run state lives (defaults to the project dir). It is **not compatible with `isolation = "worktree"`**: provisioning seeds a worktree from `repo_root` while the preflight probes `project`, so `validate` reports the pair and `run`/`sweep`/`resume` refuse to start. Use one or the other on 0.9.x — plumbing both through provisioning is tracked as #414.
 
 ### Plugins
 

@@ -63,6 +63,50 @@ class ProjectPaths:
         )
 
 
+def worktree_isolation_conflict(paths: ProjectPaths, isolation: str) -> str | None:
+    """The refusal message for ``isolation = "worktree"`` under a `repo_root`
+    override, or None when the combination is supported (#414).
+
+    Worktree provisioning reads ``repo_root`` for every surface it seeds *off disk*
+    — the upstream skill trees, `_bmad/` and the `_bmad/custom/` overrides inside
+    it, and each `seed_files`/`seed_globs` entry — and bakes the absolute hook-relay
+    path from it into the worktree's hook config, while `init`, `validate` and the
+    run preflight write and probe those same surfaces under ``project``. (The relay
+    itself is pointed at, never copied. The `MODULE_SKILLS` this wheel bundles are
+    seeded from package data and are unaffected by either root; nothing is seeded
+    from ``project``, which `provision_worktree` is never even passed.)
+    `load_paths` *requires* `project/_bmad/bmm/config.yaml`, so `_bmad/` is under
+    `project` by definition and `repo_root/_bmad/` generally does not exist. When
+    the two diverge the preflight therefore approves a surface the isolated run
+    never receives, and the seed-completeness gates go inert rather than fire: an
+    isolated session dispatches into a worktree with no dev primitive and no
+    renderer, and stops with no result and nothing journaled naming the cause.
+
+    Refusing is the whole fix here — the alternative (plumb `project` through
+    provisioning for the non-git reads) is a behaviour change this patch release
+    does not make, so the message names only remediations that exist today. Both
+    are named because either alone is sufficient and which one is right is the
+    operator's call: the override buys a decoupled git root, the isolation mode
+    buys per-unit worktrees, and 0.9.x cannot give both.
+
+    Sole producer of the text, shared by `cmd_validate`, the run/sweep preflight,
+    the dry-run honesty banner and the TUI's pre-launch guard, so the four cannot
+    drift. Compares resolved paths: `load_paths` resolves both sides, but a
+    hand-built :class:`ProjectPaths` (tests) need not have."""
+    if isolation != "worktree":
+        return None
+    if paths.repo_root.resolve() == paths.project.resolve():
+        return None
+    return (
+        'isolation = "worktree" is not supported when repo_root differs from the project '
+        f"directory: worktree provisioning seeds from repo_root ({paths.repo_root}) while "
+        f"init, validate and the run preflight read the project ({paths.project}), so an "
+        "isolated session would get none of the skills the preflight just approved. "
+        "Remove the `repo_root` key from _bmad/bmm/config.yaml, or set "
+        '`isolation = "none"` under [scm] in .bmad-loop/policy.toml.'
+    )
+
+
 def _resolve(raw: str, project: Path) -> Path:
     return Path(raw.replace("{project-root}", str(project))).resolve()
 
@@ -73,7 +117,14 @@ def load_paths(project: Path) -> ProjectPaths:
     if not config_path.is_file():
         raise BmadConfigError(f"BMAD config not found: {config_path} (is BMAD installed here?)")
     try:
-        doc = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        # UnicodeDecodeError is a ValueError, not an OSError, so an undecodable file
+        # would otherwise escape every caller's `except BmadConfigError` and crash
+        # them. Same reasoning as `policy.load`.
+        raw = config_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as e:
+        raise BmadConfigError(f"{config_path} is not valid UTF-8: {e}") from e
+    try:
+        doc = yaml.safe_load(raw) or {}
     except yaml.YAMLError as e:
         raise BmadConfigError(f"invalid YAML in {config_path}: {e}") from e
 

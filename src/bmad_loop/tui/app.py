@@ -178,8 +178,31 @@ class BmadLoopApp(App[None]):
             return False, None
 
     def _guarded(self, go: Callable[[], None]) -> None:
-        """Pre-launch guard mirroring the CLI: clean worktree required, plus a
-        confirm when another engine is already live."""
+        """Pre-launch guard mirroring the CLI: the #414 isolation/repo_root conflict
+        refused first, then a clean worktree required, plus a confirm when another
+        engine is already live."""
+        # The detached CLI refuses this combination too, and it is the authority —
+        # this only turns a pane that dies immediately into a toast. Ordered ahead of
+        # the clean-tree gate for the same reason `cmd_run` orders it ahead: this one
+        # says the configuration cannot run at all, so answering "commit or stash
+        # first" would send the operator to fix something that is not the problem.
+        #
+        # An unreadable config or policy falls through to launch rather than
+        # blocking: the guard cannot tell "no conflict" from "could not look", so it
+        # defers to the CLI, which reads the same two files and fails loudly on
+        # whichever one it cannot parse. Both loaders convert an undecodable file
+        # into their own typed error, so the two named here are the whole surface;
+        # a raw `UnicodeDecodeError` would be a ValueError and escape.
+        try:
+            conflict = bmadconfig.worktree_isolation_conflict(
+                bmadconfig.load_paths(self.project),
+                policy.load(self.project / POLICY_FILE).scm.isolation,
+            )
+        except (bmadconfig.BmadConfigError, policy.PolicyError, OSError):
+            conflict = None
+        if conflict is not None:
+            self.notify(conflict, severity="error")
+            return
         try:
             if not verify.worktree_clean(self.project):
                 self.notify(
@@ -217,10 +240,12 @@ class BmadLoopApp(App[None]):
 
     def _stories_defaults(self) -> tuple[str, str]:
         """The [stories] policy source + spec_folder to prefill the start-run
-        modal, or the sprint-mode default when policy is unreadable."""
+        modal, or the sprint-mode default when policy is unreadable — including
+        undecodable, which `policy.load` reports as a `PolicyError` rather than
+        letting a raw `UnicodeDecodeError` past this handler."""
         try:
             pol = policy.load(self.project / POLICY_FILE)
-        except (policy.PolicyError, OSError, ParseError):
+        except (policy.PolicyError, OSError):
             return "sprint-status", ""
         return pol.stories.source, pol.stories.spec_folder
 

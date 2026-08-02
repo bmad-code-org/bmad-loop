@@ -27,6 +27,15 @@ SECRET_AWS = "AKIACANARY0123456789"
 HOME_PATH = "/home/canaryuser/secret/proj"
 CODE = "def steal_creds(token): return token"
 SHA = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
+# Deliberately does NOT embed STORY_KEY: the harvest events journal a bare
+# `spec_path.name`, and a spec is free to be named after the feature rather than
+# the story. Such a name is identifier-shaped, so the scrub_json fallback emits
+# it verbatim, and the egress backstop cannot repair what was never aliased —
+# only per-field routing can. A name like `1.2-Acme….md` would be rescued by the
+# story key inside it and would prove nothing.
+SPEC_NAME = "AcmeVaultRotation.md"
+# The same spec as the reconcile kinds journal it: absolute, under the home path.
+SPEC_ABS = f"{HOME_PATH}/docs/stories/{SPEC_NAME}"
 
 CANARIES = [
     EMAIL,
@@ -48,6 +57,7 @@ CANARIES = [
     "CANARY_FEEDBACK",
     "CANARY_PATCH",
     SHA,
+    "AcmeVaultRotation",
 ]
 
 
@@ -128,6 +138,12 @@ def _seed_run(root, run_id="20260627-120000-aaaa", *, extra_journal=None, sweeps
     )
     j.append("story-done", story_key=STORY_KEY, commit=SHA)
     j.append("sprint-status-unknown-keys", keys=[STORY_KEY, "9.9-OtherSecret"])
+    j.append("spec-deferrals-harvested", story_key=STORY_KEY, spec=SPEC_NAME)
+    # The SAME spec, in the other shape a producer emits: the reconcile kinds
+    # journal `str(spec_path)`, which `verify.resolve_spec_path` returns
+    # absolute. Seeded here rather than in one test so the canary sweep covers
+    # the path shape too.
+    j.append("spec-status-reconciled", story_key=STORY_KEY, spec=SPEC_ABS)
     for kind, fields in extra_journal or []:
         j.append(kind, **fields)
 
@@ -185,6 +201,88 @@ def test_pseudonymization_is_stable_and_correlates(project):
     # the same alias appears in the per-task journal event counts (correlation)
     assert alias in run.journal.per_alias_event_counts
     assert alias in combined
+
+
+def test_spec_name_is_aliased_in_its_own_namespace(project):
+    """The `spec-*` journal kinds carry the spec's name, which is the customer's
+    feature name. `test_no_canary_leaks_anywhere` already proves it does not
+    ship; this pins HOW — a per-field alias in a `spec` namespace of its own, so
+    it never renders in the epic-less `story-<hex>` shape a reused "story"
+    namespace would give a filename. Nothing else can cover it: the value is not
+    in the legend until it is routed, so the egress backstop has no alias to
+    substitute.
+
+    The namespace, not just the routing, is what this pins: `fullmatch` on the
+    `spec-` prefix is what fails if the field is moved to "story". (Correlation
+    across the two shapes a producer emits is a separate contract with its own
+    witness below — this test's run seeds both, but neither of its assertions can
+    see the difference.)"""
+    run_dir = _seed_run(project.project)
+    diag, pseudo, combined = _render_all([run_dir])
+    alias = next(a for _ns, orig, a in pseudo.entries() if orig == SPEC_NAME)
+    assert re.fullmatch(r"spec-[0-9a-f]{12}", alias), alias
+    assert alias in combined
+    # distinct from the story alias, and not wearing its shape
+    assert alias != diag.runs[0].tasks[0].alias
+
+
+def test_one_spec_gets_one_alias_whichever_shape_it_was_journalled_in(project):
+    """A spec journalled as a bare basename by the harvest kinds and as an
+    absolute path by the reconcile kinds is ONE spec, and must read as one.
+
+    Aliasing is chosen over dropping precisely so a maintainer can follow one
+    identifier across events (`_JOURNAL_ALIAS_FIELDS`' own docstring says so), so
+    two aliases for one spec is not cosmetic — it is the feature failing silently
+    in a dump that looks correct. The seeded run carries both shapes; the fixture
+    can express the failure because `SPEC_ABS` and `SPEC_NAME` are different
+    strings that must nonetheless collapse to a single alias.
+
+    The legend assertion is the second half of the same fix and needs its own
+    line: normalizing to the basename is also what keeps the user's absolute home
+    path out of the `--legend` file. Before `spec` was routed at all, a path-shaped
+    value was rejected by `scrub_json` and never entered the map; routing it
+    without normalizing would have put it there."""
+    run_dir = _seed_run(project.project)
+    _diag, pseudo, _combined = _render_all([run_dir])
+    aliases = {a for _ns, orig, a in pseudo.entries() if SPEC_NAME in orig}
+    assert len(aliases) == 1, pseudo.entries()
+    originals = [orig for _ns, orig, _a in pseudo.entries() if SPEC_NAME in orig]
+    assert originals == [SPEC_NAME], originals
+    assert HOME_PATH not in str(pseudo.legend())
+
+
+def test_a_windows_spec_path_normalizes_to_the_same_alias(project):
+    """The basename split handles backslashes, on every platform.
+
+    A journal written on Windows is routinely read by `diagnose` on POSIX, where
+    `PurePath(r"C:\\Users\\a\\x.md").name` is the WHOLE string — so the split is
+    separator-agnostic by hand rather than delegated to pathlib. This test is the
+    Windows witness that runs on the POSIX lanes too: it asserts on strings, never
+    on the filesystem, so it must NOT be skipped off Windows — which is the only
+    reason the divergence is covered at all."""
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    posix = diagnostics._scrub_entry(
+        {"kind": "spec-status-reconciled", "spec": f"/home/u/docs/{SPEC_NAME}"}, pseudo, {}, None
+    )
+    windows = diagnostics._scrub_entry(
+        {"kind": "spec-status-reconciled", "spec": f"C:\\Users\\u\\docs\\{SPEC_NAME}"},
+        pseudo,
+        {},
+        None,
+    )
+    bare = diagnostics._scrub_entry(
+        {"kind": "spec-deferrals-harvested", "spec": SPEC_NAME}, pseudo, {}, None
+    )
+    assert posix["spec"] == windows["spec"] == bare["spec"]
+    assert list(pseudo.legend().values()) == [SPEC_NAME]
+    # Totality: a value ending in a separator has an empty tail, and `alias()`
+    # passes "" through unaliased — the event would lose its only reference to
+    # the spec rather than gain one. The `or value` fallback owns this line.
+    trailing = diagnostics._scrub_entry(
+        {"kind": "spec-status-reconciled", "spec": "docs/"}, pseudo, {}, None
+    )
+    assert trailing["spec"] != ""
+    assert re.fullmatch(r"spec-[0-9a-f]{12}", trailing["spec"])
 
 
 def test_structure_is_preserved(project):

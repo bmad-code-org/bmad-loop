@@ -492,9 +492,19 @@ class SweepEngine(Engine):
 
         Runs before the ledger is read, so a bundle it closes leaves the open set
         and no fresh triage can re-bundle those ids (validate_triage rejects a plan
-        whose open_ids disagree with the ledger). A recovered bundle that defers or
-        escalates keeps its ids open, where the existing failed_ids filter drops the
-        fresh plan's overlapping bundle."""
+        whose open_ids disagree with the ledger).
+
+        A recovered bundle that defers or escalates keeps its ids open, where the
+        existing failed_ids filter drops the fresh plan's overlapping bundle. That
+        holds on both legs, by two different mechanisms, and used to hold on neither
+        (#405): on the DEV leg the close is withheld until the attempt is accepted
+        (`_post_dev_accepted_sync`), so a discarded attempt leaves nothing on disk to
+        survive its rollback; on the REVIEW leg the close is already written — it has
+        to be, `verify_review_bundle` gates on it — so `_reopen_ledger_after_defer`
+        takes it back after `_defer`'s restore has replayed it over the reset.
+
+        Escalation needs neither: it preserves the tree for the human, so the close
+        still names code that exists."""
         recovered = 0
         for task in list(self.state.tasks.values()):
             if task.terminal or not BUNDLE_KEY_RE.match(task.story_key):
@@ -1159,7 +1169,7 @@ class SweepEngine(Engine):
         """Bundle invocation for the generic bmad-dev-auto dev skill: the self-contained
         intent.md (intent + verbatim ledger entries) is handed over as freeform
         intent. The orchestrator owns the deferred-work ledger — the skill is told
-        not to edit it — and records resolution itself in `_post_dev_state_sync`.
+        not to edit it — and records resolution itself in `_post_dev_accepted_sync`.
         On a repair the bundle spec is re-opened first (B6) so step-01 resumes.
 
         A patch-restore re-drive (#2564, #75) must point at the bundle spec
@@ -1172,7 +1182,7 @@ class SweepEngine(Engine):
         if feedback is None:
             if task.restore_patch and task.spec_file:
                 return (
-                    f"/bmad-dev-auto Resume review of the in-review spec at "
+                    f"/{self._dev_skill()} Resume review of the in-review spec at "
                     f"`{task.spec_file}` for the deferred-work bundle `{bundle_ref}`. "
                     f"The attempted change was restored onto the working tree after "
                     f"an intent-gap resolution; review it against the amended spec. "
@@ -1180,7 +1190,7 @@ class SweepEngine(Engine):
                     f"resolution."
                 )
             return (
-                f"/bmad-dev-auto Implement the deferred-work bundle described in "
+                f"/{self._dev_skill()} Implement the deferred-work bundle described in "
                 f"`{bundle_ref}` — it carries the intent and the verbatim ledger "
                 f"entries to resolve. Do NOT edit the deferred-work ledger; the "
                 f"orchestrator records resolution."
@@ -1188,7 +1198,7 @@ class SweepEngine(Engine):
         self._reset_spec_for_repair(task)
         spec_ref = task.spec_file or bundle_ref
         return (
-            f"/bmad-dev-auto Resume the autonomous dev session on the in-progress "
+            f"/{self._dev_skill()} Resume the autonomous dev session on the in-progress "
             f"spec at `{spec_ref}` for the deferred-work bundle `{bundle_ref}`. The "
             f"previous session's work failed deterministic verification; repair the "
             f"working tree so verification passes without changing the frozen intent "
@@ -1197,11 +1207,49 @@ class SweepEngine(Engine):
         )
 
     def _post_dev_state_sync(self, task: StoryTask, result_json: dict | None) -> None:
+        """No-op: a bundle has no sprint-status row, so the base engine's pre-gate
+        sprint advance has nothing to write. The bundle's own bookkeeping — closing
+        the dw ids it owns — used to live here and does not any more; it moved below
+        the artifact gate, into `_post_dev_accepted_sync` (#405)."""
+        return
+
+    def _post_dev_accepted_sync(self, task: StoryTask, result_json: dict | None) -> None:
         """Generic-path ledger single-writer for bundles. The decoupled
         bmad-dev-auto skill does not touch the ledger, so the orchestrator marks
         each dw id the bundle owns ``done`` once the bundle's spec reaches the
-        terminal status for the current stage. Mirrors the story sprint sync;
-        no-op on the legacy path."""
+        terminal status for the current stage. No-op on the legacy path.
+
+        Below the artifact gate, not above it, and that is the whole design (#405).
+        A close is the most expensive engine-side ledger write to leave behind:
+        `deferredwork.open_ids` re-bundles only `open` entries, and the module's one
+        reopen — `mark_open`, driven by `_reopen_ledger_after_defer` below — undoes
+        only a close its own caller wrote, so a `done` id whose code was discarded is
+        invisible to every future sweep unless this same run takes it back: the work
+        is lost, not merely mis-recorded. Written
+        above the gate it outlived its attempt on two legs. The non-fixable RETRY
+        was covered by `_dev_phase`'s pre-harvest ledger snapshot; the DEFER
+        terminus was not, and no snapshot in `_dev_phase` could have covered it,
+        because `_defer` takes its OWN snapshot after this call and writes those
+        bytes back over its `reset --hard` on purpose, to keep harvested findings.
+        Gating on the accepted decision retires both legs at once and needs no
+        revert on any of them.
+
+        Nothing between the old position and this one GATES on the ledger:
+        `verify_dev_bundle` reads the spec path, `_verify_shared_gates` and an
+        in-memory `dw_ids` cross-check, and `[verify] commands` is operator shell.
+        `_harvest_spec_deferrals` is in that span and does read the file, but is
+        insensitive to the reorder: its pre-scan matches the fingerprinted `origin:`
+        across entries of EVERY status, so a status flip cannot change what it files,
+        and `append_entry`'s open-only dedup only ever fires against rows that same
+        harvest just wrote. `verify_review_bundle` DOES require these entries `done`,
+        and it runs later still — with `_verify_review` re-closing immediately ahead
+        of it anyway, for the case where a review session rewrote the ledger.
+
+        One deliberate consequence: the close no longer contributes to the artifact
+        gate's proof-of-work diff (`verify_dev_exclude_relpaths` does not exclude the
+        ledger). A bundle session that finalized its spec but changed no code used to
+        pass that gate on the orchestrator's own write; it now fails it, which is the
+        answer the gate exists to give."""
         if not self._generic_dev():
             return
         spec_file = (result_json or {}).get("spec_file")
@@ -1227,13 +1275,130 @@ class SweepEngine(Engine):
             return
         ledger = self.workspace.paths.deferred_work
         note = f"resolved by sweep bundle {task.story_key}"
+        # Record the INTENT before attempting the flips, and record `task.dw_ids`
+        # rather than `marked`, which `_carry_isolated_ledger_writes` re-applies to
+        # the MAIN checkout. This method runs TWICE on a landing bundle — here and
+        # again from `_verify_review`'s idempotent reclose — and the second call finds
+        # every id already `done`, so `mark_done` returns False for all of them and
+        # `marked` comes back EMPTY. Keying the record off it would wipe the record on
+        # exactly the run that needs it. Same trap `harvested_deferrals` already paid
+        # for once, which is why that one records the harvest's `pending` set and not
+        # its `filed` ids (#405).
+        task.bundle_closes_intended = list(task.dw_ids)
         marked = [i for i in task.dw_ids if deferredwork.mark_done(ledger, i, self._today(), note)]
         if marked:
             self.journal.append(kind, story_key=task.story_key, dw_ids=marked)
 
+    def _carry_isolated_ledger_writes(self, task: StoryTask) -> None:
+        """The base hook's sweep half: re-apply this bundle's ledger CLOSES to the
+        MAIN checkout after an isolated unit lands, having first let the base carry
+        the harvest.
+
+        `_close_bundle_ledger_when_spec_status` writes
+        `self.workspace.paths.deferred_work` — under `scm.isolation = "worktree"`
+        the unit worktree's. The shape this fixes is a GITIGNORED ledger named in
+        `scm.worktree_seed`: the flip lands in the worktree, and then
+        `finalize_commit`'s `add -A` skips the ignored path in silence, so it never
+        rides the branch and the merge brings nothing over. The bundle's entries
+        stay `open`, `deferredwork.open_ids` re-bundles them, and every later sweep
+        re-triages and re-drives work that is already done — an unbounded loop, not
+        a one-time drop, which is why this is worth a carry rather than a note.
+
+        The UNSEEDED gitignored ledger is a different, still-open hole and this
+        cannot reach it: a worktree checks out tracked files only, so the ledger is
+        absent there entirely, `verify_review_bundle` (which reads the WORKTREE's
+        copy) never sees the bundle's ids `done`, and the unit DEFERS on a fixable
+        retry rather than landing. Loud — `review-verify-failed` — where the seeded
+        shape above is silent, and no DONE-leg carry can help a unit that never
+        reaches DONE.
+
+        DONE leg only, and deliberately so: `_defer` calls
+        `_carry_harvested_deferrals` directly, never this. A defer discarded the code
+        the close claims to have RESOLVED, and a close is the most expensive
+        engine-side write to leave behind — `open_ids` re-bundles only `open`
+        entries, so a wrong `done` is invisible to every future sweep. (Consistent
+        with today: under isolation the close never reaches main, and
+        `_reopen_ledger_after_defer` is reachable only from the in-place branch.)
+
+        `task.bundle_closes_intended`, not the ids the close managed to flip:
+        `marked` is EMPTY in exactly the broken case above. Same trap the harvest
+        record already paid for once.
+
+        `mark_done` is idempotent — it returns False on an entry already `done` — so
+        a project whose ledger is TRACKED, where the close merged normally, gets a
+        no-op here. That is the same property that makes the harvest carry safe to
+        call unconditionally.
+
+        No `_generic_dev()` guard, unlike the two ledger WRITERS: the record is the
+        guard. `bundle_closes_intended` is only ever assigned by
+        `_close_bundle_ledger_when_spec_status`, which `_post_dev_accepted_sync`
+        reaches on the generic path alone — so on the legacy path, where the session
+        owns the ledger, it is empty and this returns before touching anything. A
+        second, unfalsifiable predicate saying the same thing would be a branch no
+        test could redden.
+
+        The commit is best effort for the same reason the harvest carry's is: `git
+        add -- <ignored path>` refuses with rc 1, and raising here would cost the run
+        its `_integrate_unit` over bookkeeping whose real job is already done. The
+        flips themselves are unguarded — losing them is the hazard this exists to
+        prevent."""
+        super()._carry_isolated_ledger_writes(task)
+        if not task.bundle_closes_intended:
+            return
+        ledger = self.paths.deferred_work
+        note = f"resolved by sweep bundle {task.story_key}"
+        carried = [
+            i
+            for i in task.bundle_closes_intended
+            if deferredwork.mark_done(ledger, i, self._today(), note)
+        ]
+        if carried:
+            try:
+                verify.commit_paths(
+                    self.paths.repo_root,
+                    f"chore(deferred-work): close {task.story_key}'s bundle ids",
+                    [ledger],
+                )
+            except verify.GitError as e:
+                self.journal.append(
+                    "sweep-bundle-close-carry-uncommitted",
+                    story_key=task.story_key,
+                    dw_ids=carried,
+                    error=str(e),
+                )
+        self.journal.append("sweep-bundle-close-carried", story_key=task.story_key, dw_ids=carried)
+
+    def _reopen_ledger_after_defer(self, task: StoryTask) -> None:
+        """Re-open the dw ids THIS bundle closed, when the defer that just ran
+        discarded the code they claim to resolve.
+
+        Keyed on the resolution note rather than on `task.dw_ids` alone, and
+        `deferredwork.mark_open` refuses any entry whose note differs: the operation
+        is "undo my own close", not "reopen this id". A close written by an earlier
+        sweep, by a human, or by the legacy path where the session edits the ledger
+        itself is left standing — none of them is this run's to revoke, and the
+        ledger has no field that could record who reopened what. That note check is
+        also why this has no `_generic_dev()` guard, unlike `_post_dev_accepted_sync`
+        and `_verify_review`'s reclose: those two WRITE, so they need to know which
+        path owns the ledger, while this one only ever undoes a note it recognises.
+
+        Idempotent by construction: a second call finds the entries already `open`
+        and writes nothing, so a resume that re-drives a deferred bundle cannot
+        double-undo. The distinct journal kind makes "a defer took a close back"
+        greppable next to `sweep-bundle-closed` / `sweep-bundle-reclosed`."""
+        ledger = self.workspace.paths.deferred_work
+        note = f"resolved by sweep bundle {task.story_key}"
+        reopened = [i for i in task.dw_ids if deferredwork.mark_open(ledger, i, note)]
+        if reopened:
+            self.journal.append("sweep-bundle-reopened", story_key=task.story_key, dw_ids=reopened)
+
     def _verify_dev_artifacts(self, task: StoryTask, result_json: dict | None):
         return verify.verify_dev_bundle(
-            task, self.workspace.paths, result_json, review_enabled=self._dev_review_enabled()
+            task,
+            self.workspace.paths,
+            result_json,
+            review_enabled=self._dev_review_enabled(),
+            engine_written=self._harvest_gate_exclude(task),
         )
 
     def _verify_review(self, task: StoryTask):

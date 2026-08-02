@@ -3,6 +3,7 @@
 import argparse
 import io
 import json
+import shutil
 import sys
 
 import pytest
@@ -18,6 +19,7 @@ from conftest import (
 
 from bmad_loop import cli
 from bmad_loop import policy as policy_mod
+from bmad_loop import verify
 from bmad_loop.adapters import multiplexer as mux_mod
 
 STORIES_SPEC_FOLDER = "_bmad-output/epic-1"
@@ -45,6 +47,25 @@ model = "opus"
 [adapter.review]
 name = "codex"
 model = "gpt-5-codex"
+"""
+
+# A third CLI for triage only, with dev+review sharing the default. The triage adapter
+# must differ by *name* rather than by model: `skill_tree` is a property of the profile,
+# and only two distinct values ship (claude/opencode-http -> `.claude/skills`;
+# codex/gemini/copilot/antigravity -> `.agents/skills`), so a same-name triage adapter
+# would read the very tree dev already reads and could not tell the two apart.
+TRIAGE_SPLIT_POLICY = """\
+[adapter]
+name = "claude"
+[adapter.triage]
+name = "gemini"
+"""
+
+# DUAL_CLIENT_POLICY with the follow-up review session turned off — the config
+# shape #424 is about, and the one an automated reviewer proposed narrowing on.
+REVIEW_DISABLED_SPLIT_POLICY = DUAL_CLIENT_POLICY + """\
+[review]
+enabled = false
 """
 
 
@@ -1549,9 +1570,9 @@ def test_start_rejects_invalid_run_id(project, monkeypatch, capsys, command, bad
 
 
 def test_run_aborts_when_base_skills_missing(project, monkeypatch, capsys):
-    """The orchestrator depends on the non-bundled upstream skills (bmad-dev-auto
-    + the review hunters); a run must fail loudly at preflight (not stall mid-run)
-    when they are absent."""
+    """The orchestrator depends on the non-bundled upstream skills (the dev
+    primitive + the review hunters); a run must fail loudly at preflight (not stall
+    mid-run) when they are absent."""
     from conftest import git
 
     install_bmad_config(project)
@@ -1564,7 +1585,139 @@ def test_run_aborts_when_base_skills_missing(project, monkeypatch, capsys):
 
     assert cli.main(["run", "--project", str(project.project)]) == 1
     err = capsys.readouterr().err
-    assert "bmad-dev-auto" in err
+    assert "bmad-build-auto" in err
+
+
+def test_run_aborts_when_only_the_dev_shim_is_installed(project, monkeypatch, capsys):
+    """The post-#2651 hazard: the shim IS a SKILL.md, so a run would happily
+    dispatch `/bmad-dev-auto` into an interactive migration gate and HALT having
+    written nothing. The preflight refuses it and names the rename instead."""
+    from conftest import git, install_base_skills, install_dev_shim
+
+    install_bmad_config(project)
+    install_base_skills(project)
+    for tree in (".claude/skills", ".agents/skills"):
+        shutil.rmtree(project.project / tree / "bmad-build-auto")
+        shutil.rmtree(project.project / tree / "bmad-dev-auto")
+        install_dev_shim(project.project, tree)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "setup")
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {r: None for r in cli.ROLES})
+
+    assert cli.main(["run", "--project", str(project.project)]) == 1
+    err = capsys.readouterr().err
+    assert "bmad-build-auto" in err and "HALT" in err
+
+
+def _install_renderer_stub_project(
+    project, monkeypatch, *, script: bool, utils: bool, config: bool
+):
+    """A project whose resolved primitive is a #2601 renderer stub in every tree.
+    `script`/`utils`/`config` choose which of the three renderer prerequisites exist,
+    so each caller isolates one absence. Everything is laid down before the commit —
+    the preflight runs behind a clean-worktree gate.
+
+    The script it writes is the REAL upstream shape (a module-scope
+    `from config_utils import ...`), because the sibling's requirement is keyed on
+    that text; `utils` has no default so every caller must say which era it means."""
+    from conftest import (
+        RENDERER_SCRIPT_IMPORTING_SIBLING,
+        git,
+        install_base_skills,
+        install_build_auto_skill,
+    )
+
+    install_bmad_config(project)
+    install_base_skills(project)
+    for tree in (".claude/skills", ".agents/skills"):
+        shutil.rmtree(project.project / tree / "bmad-dev-auto")
+        install_build_auto_skill(project.project, tree, renderer_stub=True)
+    if script:
+        rendered = project.project / "_bmad" / "scripts" / "render_skill.py"
+        rendered.parent.mkdir(parents=True, exist_ok=True)
+        rendered.write_text(RENDERER_SCRIPT_IMPORTING_SIBLING, encoding="utf-8")
+    if utils:
+        helper = project.project / "_bmad" / "scripts" / "config_utils.py"
+        helper.parent.mkdir(parents=True, exist_ok=True)
+        helper.write_text("# helper\n", encoding="utf-8")
+    if config:
+        central = project.project / "_bmad" / "config.toml"
+        central.parent.mkdir(parents=True, exist_ok=True)
+        central.write_text("[core]\nx = 1\n", encoding="utf-8")
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "setup")
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {r: None for r in cli.ROLES})
+
+
+def test_run_aborts_when_the_renderer_script_is_missing(project, monkeypatch, capsys):
+    """A renderer stub with no `_bmad/scripts/render_skill.py` HALTs every single
+    unattended session with nothing written, so the preflight refuses the run rather
+    than burning the whole budget on guaranteed result-less Stops."""
+    _install_renderer_stub_project(project, monkeypatch, script=False, utils=False, config=True)
+
+    assert cli.main(["run", "--project", str(project.project)]) == 1
+    err = capsys.readouterr().err
+    assert "_bmad/scripts/render_skill.py" in err and "HALT" in err
+
+
+def test_run_aborts_when_the_renderer_config_utils_is_missing(project, monkeypatch, capsys):
+    """The script's own sibling. `render_skill.py` imports `config_utils` at module
+    scope off sys.path[0], above its try/except, so a half-present unit dies on a
+    bare ModuleNotFoundError — the same result-less Stop, with the structured
+    `HALT: <error>` line replaced by a raw traceback. `_require_base_skills` has no
+    severity filter, so the run is refused here exactly like the other two."""
+    _install_renderer_stub_project(project, monkeypatch, script=True, utils=False, config=True)
+
+    assert cli.main(["run", "--project", str(project.project)]) == 1
+    err = capsys.readouterr().err
+    assert "_bmad/scripts/config_utils.py" in err and "HALT" in err
+
+
+def test_run_aborts_when_the_renderer_central_config_is_missing(project, monkeypatch, capsys):
+    """One file further in: the script unit is whole but `_bmad/config.toml` — the
+    renderer's one required layer — is not, so `uv run` raises before composing and
+    exits `HALT:`. Same result-less Stop, same refusal."""
+    _install_renderer_stub_project(project, monkeypatch, script=True, utils=True, config=False)
+
+    assert cli.main(["run", "--project", str(project.project)]) == 1
+    err = capsys.readouterr().err
+    assert "_bmad/config.toml" in err and "HALT" in err
+
+
+def test_run_aborts_when_the_renderer_entry_document_is_missing(project, monkeypatch, capsys):
+    """One layer further in again: the project-global script unit and config are all
+    present, and the skill's OWN `workflow.md` — the document `render_skill.py`
+    composes from — is not. `render entry is missing` exits `HALT:` on every story,
+    so the run is refused for the same reason as the three above.
+
+    The re-commit matters: `run`'s preflight is behind a clean-worktree gate, so
+    deleting a tracked file without staging it would abort for the wrong reason and
+    the test would pass with the gate reverted."""
+    from bmad_loop.install import RENDERER_ENTRY_REL
+
+    _install_renderer_stub_project(project, monkeypatch, script=True, utils=True, config=True)
+    for tree in (".claude/skills", ".agents/skills"):
+        (project.project / tree / "bmad-build-auto" / RENDERER_ENTRY_REL).unlink()
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "truncated renderer install")
+
+    assert cli.main(["run", "--project", str(project.project)]) == 1
+    err = capsys.readouterr().err
+    assert RENDERER_ENTRY_REL in err and "HALT" in err
+
+
+def test_run_proceeds_once_the_renderer_files_are_present(project, monkeypatch, capsys):
+    """The clearing leg. Without it, ablating any of the three `is_file()` predicates
+    away leaves all three aborts above passing — the run would refuse a healthy stub
+    project and no test would notice."""
+    _install_renderer_stub_project(project, monkeypatch, script=True, utils=True, config=True)
+
+    assert cli.main(["run", "--project", str(project.project)]) == 0
+    assert "render_skill.py" not in capsys.readouterr().err
 
 
 def _stub_run_tui(monkeypatch):
@@ -3380,14 +3533,18 @@ def test_validate_stories_folder_known_selector_ok(project):
 CLAUDE_ONLY_POLICY = '[adapter]\nname = "claude"\nmodel = "opus"\n'
 
 
-def _make_validate_pass(project, monkeypatch, capsys):
+def _make_validate_pass(project, monkeypatch, capsys, *, policy_text=CLAUDE_ONLY_POLICY):
     """Set a project up so every validate gate passes, and pin the two gates whose
     outcome is a property of the *host* rather than of the project: whether the CLI
     binary is on PATH and whether a multiplexer is installed. Without those pins the
     rc-0 leg would pass or fail by machine, which is exactly the kind of green that
-    means nothing."""
+    means nothing.
+
+    ``policy_text`` is keyword-only with the single-CLI default, so every existing
+    caller is unchanged. It is written *before* the `init` below, because `cmd_init`
+    derives the CLI list it installs skills and hooks into from the policy."""
     install_bmad_config(project)
-    _write_policy(project.project, CLAUDE_ONLY_POLICY)
+    _write_policy(project.project, policy_text)
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     install_dev_base_skills(project.project, folder_id=True)
     assert cli.main(["init", "--project", str(project.project)]) == 0  # registers the hooks
@@ -3400,6 +3557,210 @@ def _make_validate_pass(project, monkeypatch, capsys):
         lambda: [cli.Finding("mux.backend", "ok", "multiplexer TmuxBackend available (tmux 3.4)")],
     )
     capsys.readouterr()  # drop `init`'s chatter — the next read must see only the document
+
+
+def _findings_by_check(doc):
+    return {f["check"]: f for f in doc["findings"]}
+
+
+def _render_findings(doc) -> str:
+    """Draw a document through the TUI renderer (#210) and return the text. The
+    `{'` assertion is that file's nested-dict tell: a renderer that str()s a detail
+    shape it did not model prints a Python repr."""
+    from rich.console import Console
+
+    from bmad_loop.tui import widgets
+
+    console = Console(width=96)
+    with console.capture() as capture:
+        console.print(widgets.validate_findings(doc, details=True))
+    rendered = capture.get()
+    assert "{'" not in rendered
+    return rendered
+
+
+def test_validate_names_the_resolved_dev_primitive(project, capsys, monkeypatch):
+    """`skills.base` reports which era actually resolved — on an upgraded project
+    that ok line is the operator's confirmation the rename was picked up, so it
+    must not be a hardcoded name."""
+    from conftest import install_build_auto_skill
+
+    _make_validate_pass(project, monkeypatch, capsys)  # lays down the LEGACY skill
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+    base = _findings_by_check(doc)["skills.base"]
+    assert "bmad-dev-auto" in base["message"]
+    assert base["detail"]["dev_primitive"] == ["bmad-dev-auto"]
+
+    install_build_auto_skill(project.project, ".claude/skills")
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    # rc 1 only because laying down a skill dirtied the worktree — the skills gate
+    # itself still passes, now naming the new primitive
+    base = _findings_by_check(doc)["skills.base"]
+    assert base["severity"] == "ok"
+    assert "bmad-build-auto" in base["message"] and "bmad-dev-auto" not in base["message"]
+    assert base["detail"]["dev_primitive"] == ["bmad-build-auto"]
+
+
+def test_validate_skills_gates_ignore_a_triage_only_tree(project, capsys, monkeypatch):
+    """#405: every `skills.*` check asks a dev-primitive question — which primitive
+    resolves, whether the review hunters it invokes inline are there, whether a
+    renderer stub's script unit is whole. `cmd_validate` built its tree list from all
+    three adapter roles, so a third CLI used only for triage had the whole bmm module
+    demanded of a tree whose only prompt (`/bmad-loop-sweep`) ships in this wheel.
+
+    The triage tree here carries exactly what the un-narrowed gate choked on: a
+    RESOLVED renderer stub — resolution is what arms the renderer checks, so a merely
+    absent tree could not reproduce this — with no `_bmad/scripts/` and no
+    `_bmad/config.toml`, plus a legacy customization override the rename orphaned."""
+    from conftest import install_build_auto_skill
+
+    _make_validate_pass(project, monkeypatch, capsys, policy_text=TRIAGE_SPLIT_POLICY)
+    install_build_auto_skill(project.project, ".agents/skills", renderer_stub=True)
+    custom = project.project / "_bmad" / "custom"
+    custom.mkdir(parents=True, exist_ok=True)
+    (custom / "bmad-dev-auto.toml").write_text('[core]\nx = "y"\n', encoding="utf-8")
+    # `_make_validate_pass` commits internally, and validate gates on a clean worktree.
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "triage-only tree")
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+    assert doc["ok"] is True
+    checks = _findings_by_check(doc)
+    for absent in (
+        "skills.dev-renderer",
+        "skills.dev-renderer-config",
+        "skills.base-missing",
+        "skills.customize-legacy",
+    ):
+        assert absent not in checks, f"{absent} fired on a tree no dev session reads"
+    assert checks["skills.base"]["detail"]["trees"] == [".claude/skills"]
+    assert checks["skills.base"]["detail"]["dev_primitive"] == ["bmad-dev-auto"]
+    # The triage tree is live, not absent: `init` laid this wheel's own sweep skill
+    # into it, which is precisely why it needs nothing from the bmm module.
+    assert (project.project / ".agents/skills/bmad-loop-sweep/SKILL.md").is_file()
+
+
+def test_validate_stories_dispatch_ignores_a_triage_only_tree(project, capsys):
+    """The same narrowing on the stories-mode leg, which `cmd_validate` fed from its
+    own all-role list. The triage tree's primitive has step-01 present but without the
+    dispatch marker, so an un-narrowed probe reports `-stale` — a finding only a tree
+    that actually resolved can produce."""
+    from conftest import install_build_auto_skill
+
+    install_bmad_config(project)
+    _setup_stories_fixture(project, [_stories_entry("1")])
+    _write_policy(project.project, TRIAGE_SPLIT_POLICY + STORIES_POLICY)
+    install_dev_base_skills(project.project, ".claude/skills", folder_id=True)
+    install_build_auto_skill(project.project, ".agents/skills", folder_id=False)
+
+    # rc 1 (the fixture leaves the worktree dirty); `--json` never calls report.render,
+    # so stderr stays empty and the document is still owed in full.
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    checks = _findings_by_check(doc)
+    assert "skills.stories-dispatch-stale" not in checks
+    assert checks["skills.stories-dispatch"]["detail"]["trees"] == [".claude/skills"]
+
+
+def test_validate_skills_ok_line_needs_a_dev_tree_not_just_a_profile(project, capsys):
+    """The `skills.base` ok line gates on the dev+review trees, not on `profiles`.
+    Policy never validates an adapter *name* — the first test is `get_profile` — so an
+    unknown dev CLI beside a loadable triage one leaves `profiles` non-empty while
+    nothing dev-side resolved. Gating on `profiles` there printed "upstream skills
+    present ( + review hunters)": a green sentence assembled from an empty probe.
+
+    The triage tree is deliberately given a COMPLETE base install. Leave it empty and
+    the ok line is suppressed by `base_problems` instead — the gate is never reached,
+    and the test passes with the gate reverted."""
+    install_bmad_config(project)
+    install_dev_base_skills(project.project, ".agents/skills", folder_id=False)
+    _write_policy(
+        project.project, '[adapter]\nname = "nosuchcli"\n[adapter.triage]\nname = "gemini"\n'
+    )
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    checks = _findings_by_check(doc)
+    assert checks["adapter.profile"]["severity"] == "problem"
+    assert "nosuchcli" in checks["adapter.profile"]["message"]
+    # Triage's profile DID load, so `profiles` is non-empty — the old gate's input.
+    assert checks["adapter.binary"]["detail"]["binary"] == "gemini"
+    # ...yet nothing resolved to probe, so the line must not be emitted at all.
+    assert "skills.base" not in checks
+
+
+def test_validate_reports_the_shim_as_a_problem(project, capsys, monkeypatch):
+    from conftest import install_dev_shim
+
+    _make_validate_pass(project, monkeypatch, capsys)
+    for marker in ("step-04-review.md", "customize.toml"):
+        (project.project / ".claude/skills/bmad-dev-auto" / marker).unlink()
+    install_dev_shim(project.project, ".claude/skills")  # rewrite SKILL.md as the shim
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    shim = _findings_by_check(doc)["skills.base-shim"]
+    assert shim["severity"] == "problem"
+    assert "bmad-build-auto" in shim["message"]
+    assert "skills.base" not in _findings_by_check(doc)  # no ok line beside the failure
+    assert "skills.base-shim" in _render_findings(doc)  # new detail shape draws
+
+
+def test_validate_fails_on_a_renderer_stub_and_warns_on_an_orphaned_customize_file(
+    project, capsys, monkeypatch
+):
+    """The two renderer findings are preflight problems and DO flip the verdict —
+    each is a deterministic HALT-without-a-spec on every story. The customize
+    orphan beside them is advisory and would not have.
+
+    This is also the only end-to-end proof that each id clears
+    `ValidationReport.add`'s registry assert — `_make_validate_pass` installs no
+    renderer stub, so the every-id-registered test never reaches these sites."""
+    from conftest import install_build_auto_skill
+
+    _make_validate_pass(project, monkeypatch, capsys)  # claude-only policy
+    shutil.rmtree(project.project / ".claude/skills/bmad-dev-auto")
+    install_build_auto_skill(project.project, ".claude/skills", renderer_stub=True)
+    custom = project.project / "_bmad" / "custom"
+    custom.mkdir(parents=True, exist_ok=True)
+    (custom / "bmad-dev-auto.toml").write_text("x\n", encoding="utf-8")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "upgrade to bmad-build-auto")
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    assert doc["ok"] is False  # the renderer problems fail the run
+    found = _findings_by_check(doc)
+    assert found["skills.dev-renderer"]["severity"] == "problem"
+    assert found["skills.dev-renderer-config"]["severity"] == "problem"  # no _bmad/config.toml
+    assert found["skills.customize-legacy"]["severity"] == "warning"
+    assert "_bmad/scripts/render_skill.py" in found["skills.dev-renderer"]["message"]
+    rendered = _render_findings(doc)  # every new detail shape draws, plus skills.base's
+    assert "skills.dev-renderer" in rendered and "skills.customize-legacy" in rendered
+    assert "skills.dev-renderer-config" in rendered
+
+
+def test_validate_stays_ok_when_only_the_customize_orphan_fires(project, capsys, monkeypatch):
+    """The advisory half, isolated: with the renderer's script and central config
+    both present, the orphaned override is the only finding and the verdict stays
+    ok. Without this leg the split above cannot show that `skills.customize-legacy`
+    is still a warning rather than riding the renderer problems' rc."""
+    from conftest import install_build_auto_skill
+
+    _make_validate_pass(project, monkeypatch, capsys)  # claude-only policy
+    shutil.rmtree(project.project / ".claude/skills/bmad-dev-auto")
+    install_build_auto_skill(project.project, ".claude/skills", renderer_stub=True)
+    script = project.project / "_bmad" / "scripts" / "render_skill.py"
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text("# renderer\n", encoding="utf-8")
+    (project.project / "_bmad" / "config.toml").write_text("[core]\nx = 1\n", encoding="utf-8")
+    custom = project.project / "_bmad" / "custom"
+    custom.mkdir(parents=True, exist_ok=True)
+    (custom / "bmad-dev-auto.toml").write_text("x\n", encoding="utf-8")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "upgrade to bmad-build-auto")
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+    assert doc["ok"] is True  # a warning does not fail the run
+    found = _findings_by_check(doc)
+    assert "skills.dev-renderer" not in found and "skills.dev-renderer-config" not in found
+    assert found["skills.customize-legacy"]["severity"] == "warning"
 
 
 def test_validate_json_clean_project_is_a_pure_document_at_rc_0(project, capsys, monkeypatch):
@@ -3839,3 +4200,524 @@ def test_platform_preflight_notes_forced_selection_provenance(mux_registry, monk
     mux_registry.get_multiplexer.cache_clear()
     notes, problems = _preflight_notes_problems()
     assert any("forced by BMAD_LOOP_MUX_BACKEND" in n for n in notes)
+
+
+def test_dry_run_previews_the_disk_resolved_primitive_per_role(project, capsys):
+    """#405: the preview must spell what `run` would actually dispatch, resolved
+    per role from that adapter's skill tree. dev=claude reads .claude/skills
+    (post-rename here) and review=codex reads .agents/skills (still pre-rename),
+    so one honest preview shows both eras side by side. The all-legacy default is
+    pinned by test_dry_run_renders_per_stage_commands, which installs no skills."""
+    from conftest import install_build_auto_skill, install_dev_base_skills
+
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    install_build_auto_skill(project.project, ".claude/skills")
+    install_dev_base_skills(project.project, ".agents/skills", folder_id=False)
+    _write_policy(project.project)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    args = argparse.Namespace(epic=None, story=None, max_stories=None)
+
+    assert cli._dry_run(project, pol, args) == 0
+    out = capsys.readouterr().out
+    dev_line = next(line for line in out.splitlines() if "dev:" in line)
+    review_line = next(line for line in out.splitlines() if "review:" in line)
+    assert "/bmad-build-auto 1-1-a" in dev_line
+    # codex's prompt_template rewrites "/skill args" into "$skill ... args"
+    assert "$bmad-dev-auto" in review_line and "<done spec from dev>" in review_line
+    assert "bmad-build-auto" not in review_line
+
+
+def test_dry_run_stories_previews_the_resolved_primitive(project, capsys):
+    """The folder+id dispatch preview follows the same resolution."""
+    from conftest import install_build_auto_skill
+
+    _setup_stories_fixture(project, [_stories_entry("1")])
+    install_build_auto_skill(project.project, ".claude/skills")
+    _write_policy(project.project)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    args = argparse.Namespace(spec=STORIES_SPEC_FOLDER, epic=None, story=None, max_stories=None)
+
+    assert cli._dry_run(project, pol, args, True, STORIES_SPEC_FOLDER) == 0
+    out = capsys.readouterr().out
+    assert "/bmad-build-auto Spec folder: _bmad-output/epic-1. Story id: 1." in out
+    assert "/bmad-dev-auto Spec folder:" not in out
+
+
+def test_skill_trees_skips_the_triage_only_tree(project):
+    """#405: the trees the skills preflight probes are the dev+review ones. Triage's
+    entire prompt surface is `/bmad-loop-sweep`, which this wheel bundles and
+    `bmad-loop init` lays into that tree, so a triage-only CLI never needs one byte of
+    the bmm module — and the set gated here has to stay the set
+    `Engine._worktree_profiles` provisions."""
+    _write_policy(project.project, TRIAGE_SPLIT_POLICY)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+
+    assert cli._skill_trees(project.project, pol) == [".claude/skills"]
+
+
+def test_skill_trees_still_covers_a_split_dev_review_pair(project):
+    """Control for the narrowing: a dev/review split across two CLIs still yields
+    BOTH trees. Kills any "fix" that collapses to the dev adapter's tree alone —
+    the review session dispatches the very same primitive."""
+    _write_policy(project.project, DUAL_CLIENT_POLICY)  # dev=claude, review=codex
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+
+    assert cli._skill_trees(project.project, pol) == [".claude/skills", ".agents/skills"]
+
+
+def test_skill_trees_covers_review_even_when_review_is_disabled(project):
+    """#424: `review.enabled = false` retires the follow-up review SESSION, not the
+    review ADAPTER — a plugin workflow declaring `role = "review"` still dispatches on
+    it from `_commit`'s unconditional `pre_commit_gate`, and the wheel's TEA plugin
+    ships three there. So the review tree stays gated and its skills stay seeded.
+
+    The sibling above pins only the UNCONDITIONAL form, which a narrowing keyed on
+    `review.enabled` passes untouched — this is the row that reddens on it. Worth its
+    own test rather than a parametrize of that one: they answer different questions,
+    and only this one is load-bearing against a proposed change."""
+    _write_policy(project.project, REVIEW_DISABLED_SPLIT_POLICY)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+
+    assert pol.review.enabled is False  # the fixture actually expresses the case
+    assert cli._skill_trees(project.project, pol) == [".claude/skills", ".agents/skills"]
+
+
+def _triage_tree_renderer_stub(paths, stub_tree: str) -> None:
+    """A healthy INLINE dev primitive plus its review hunters in `.claude/skills`
+    (what dev+review actually dispatch), and a resolved #2601 renderer stub in
+    ``stub_tree`` with no `_bmad/` beside it to satisfy it.
+
+    `stub_tree` is the whole experiment: `.agents/skills` puts the broken stub where
+    only the triage adapter of TRIAGE_SPLIT_POLICY reads, `.claude/skills` puts the
+    identical bytes in the dev tree."""
+    from conftest import install_build_auto_skill
+
+    install_dev_base_skills(paths.project, ".claude/skills", folder_id=False)
+    install_build_auto_skill(paths.project, stub_tree, renderer_stub=True)
+
+
+def test_require_base_skills_ignores_a_broken_triage_only_tree(project, capsys):
+    """A renderer stub in a tree only triage reads must not abort run/sweep/resume.
+    Before this, `[adapter.triage] name = "gemini"` under a claude dev/review pair was
+    a hard preflight FAIL — the renderer checks are problems, not warnings, so a
+    config 0.9.0 merely nagged about became unrunnable on 0.9.1."""
+    _triage_tree_renderer_stub(project, ".agents/skills")
+    _write_policy(project.project, TRIAGE_SPLIT_POLICY)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+
+    assert cli._require_base_skills(project.project, pol) is True
+    assert capsys.readouterr().err == ""  # a passing gate is silent
+
+
+def test_require_base_skills_still_fails_on_a_dev_tree_renderer_stub(project, capsys):
+    """Control: the identical stub in the DEV tree still refuses the run. Without it,
+    deleting the renderer checks outright would pass the test above."""
+    _triage_tree_renderer_stub(project, ".claude/skills")
+    _write_policy(project.project, TRIAGE_SPLIT_POLICY)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+
+    assert cli._require_base_skills(project.project, pol) is False
+    err = capsys.readouterr().err
+    assert "_bmad/scripts/render_skill.py" in err and "_bmad/config.toml" in err
+
+
+def _shim_only(paths) -> None:
+    """Post-rename install left with nothing but the forwarding shim, in every
+    tree the dual-client policy reads."""
+    from conftest import install_base_skills, install_dev_shim
+
+    install_base_skills(paths)
+    for tree in (".claude/skills", ".agents/skills"):
+        shutil.rmtree(paths.project / tree / "bmad-build-auto")
+        shutil.rmtree(paths.project / tree / "bmad-dev-auto")
+        install_dev_shim(paths.project, tree)
+
+
+def test_dry_run_warns_when_preflight_would_abort(project, capsys):
+    """#405: `--dry-run` returns before `_require_base_skills`, so a broken install
+    still renders a plausible preview. On a shim-only project that preview is a lie
+    the operator cannot see through — the shim IS a valid slash command, so
+    `/bmad-dev-auto ...` reads fine and would HALT the session. Say so.
+
+    stdout keeps the schedule (a diagnostic must not withhold what was asked for)
+    and the exit code stays 0; the banner is stderr-only."""
+    _shim_only(project)
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    _write_policy(project.project)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    args = argparse.Namespace(epic=None, story=None, max_stories=None)
+
+    assert cli._dry_run(project, pol, args) == 0
+    out, err = capsys.readouterr()
+    assert "NOT runnable" in err and "bmad-build-auto" in err
+    assert "run `bmad-loop validate` for details" in err
+    assert "1-1-a" in out  # the schedule itself still rendered
+
+
+def test_dry_run_stories_warns_when_preflight_would_abort(project, capsys):
+    """Same banner on the stories preview, which additionally probes folder+id
+    dispatch support on the resolved primitive."""
+    _shim_only(project)
+    _setup_stories_fixture(project, [_stories_entry("1")])
+    _write_policy(project.project)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    args = argparse.Namespace(spec=STORIES_SPEC_FOLDER, epic=None, story=None, max_stories=None)
+
+    assert cli._dry_run(project, pol, args, True, STORIES_SPEC_FOLDER) == 0
+    out, err = capsys.readouterr()
+    assert "NOT runnable" in err and "bmad-build-auto" in err
+    assert "Story id: 1." in out
+
+
+def test_sweep_dry_run_warns_when_preflight_would_abort(project, capsys):
+    """`cmd_sweep` has the same shape — dry-run returns before its preflight."""
+    _shim_only(project)
+    _write_policy(project.project)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+
+    assert cli._sweep_dry_run(project, pol) == 0
+    assert "NOT runnable" in capsys.readouterr().err
+
+
+def test_dry_run_warns_when_the_renderer_files_are_missing(project, capsys):
+    """The banner mirrors `_require_base_skills` by reading the same list, so
+    promoting the renderer checks to problems covered the preview too. Without this
+    the preview would print a `/bmad-build-auto` schedule for a project whose every
+    session HALTs — the exact lie the banner exists to stop."""
+    from conftest import install_base_skills, install_build_auto_skill
+
+    install_base_skills(project)
+    for tree in (".claude/skills", ".agents/skills"):
+        shutil.rmtree(project.project / tree / "bmad-dev-auto")
+        install_build_auto_skill(project.project, tree, renderer_stub=True)
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    _write_policy(project.project)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    args = argparse.Namespace(epic=None, story=None, max_stories=None)
+
+    assert cli._dry_run(project, pol, args) == 0
+    out, err = capsys.readouterr()
+    assert "NOT runnable" in err
+    assert "_bmad/scripts/render_skill.py" in err and "_bmad/config.toml" in err
+    assert "1-1-a" in out  # the schedule itself still rendered
+
+
+def test_dry_run_is_silent_when_preflight_would_pass(project, capsys):
+    """The banner must be evidence, not decoration: a complete install prints
+    nothing to stderr. Without this the warning could be unconditional and every
+    assertion above would still pass."""
+    from conftest import install_base_skills
+
+    install_base_skills(project)
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    _write_policy(project.project)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    args = argparse.Namespace(epic=None, story=None, max_stories=None)
+
+    assert cli._dry_run(project, pol, args) == 0
+    out, err = capsys.readouterr()
+    assert err == ""
+    assert "/bmad-build-auto 1-1-a" in out
+
+
+# ---- #414: worktree isolation is refused under a repo_root override ----------
+
+ISOLATION_WORKTREE_POLICY = (
+    '[adapter]\nname = "claude"\nmodel = "opus"\n\n[scm]\nisolation = "worktree"\n'
+)
+NO_ISOLATION_POLICY = '[adapter]\nname = "claude"\nmodel = "opus"\n\n[scm]\nisolation = "none"\n'
+REFUSAL = 'isolation = "worktree" is not supported'
+
+
+def _override_repo_root(paths, rel="git-root"):
+    """Point `repo_root` away from the project — #414's monorepo layout, minus the
+    monorepo. The target has no `_bmad/`, which is the shape the issue reports, but
+    it DOES exist: `cmd_run`/`cmd_sweep` probe `verify.worktree_clean(repo_root)`,
+    and against a missing dir that raises `GitError` instead of answering, which
+    would make every "the isolation gate spoke first" assertion below unfalsifiable
+    — the later gate would crash rather than print the message it is asserted not to
+    print."""
+    (paths.project / rel).mkdir(exist_ok=True)
+    cfg = paths.project / "_bmad" / "bmm" / "config.yaml"
+    cfg.write_text(cfg.read_text() + f"repo_root: '{{project-root}}/{rel}'\n", encoding="utf-8")
+
+
+def test_validate_refuses_worktree_isolation_under_a_repo_root_override(
+    project, monkeypatch, capsys
+):
+    """#414: provisioning seeds every non-git surface from `repo_root` while every
+    gate validate runs probes `project`, so a split pair makes validate approve a
+    surface the isolated run never receives. A `problem`, so the rc flips — and the
+    fixture is committed first, so the rc-1 is this gate and not a dirty tree."""
+    _make_validate_pass(project, monkeypatch, capsys, policy_text=ISOLATION_WORKTREE_POLICY)
+    _override_repo_root(project)
+    git(project.project, "commit", "-qam", "repo_root override")
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    finding = _findings_by_check(doc)["policy.isolation-repo-root"]
+    assert finding["severity"] == "problem"
+    # Both remediations named, and only remediations that exist on this line: fix-1
+    # (plumbing `project` through provisioning) is a main-line option, so the message
+    # must not gesture at a flag or a version that would make the pair work.
+    assert "Remove the `repo_root` key" in finding["message"]
+    assert '`isolation = "none"`' in finding["message"]
+    assert finding["detail"] == {
+        "repo_root": str(project.project / "git-root"),
+        "project": str(project.project),
+    }
+    _render_findings(doc)  # the detail shape draws in the TUI modal
+
+
+@pytest.mark.parametrize(
+    "override,policy_text",
+    [(True, NO_ISOLATION_POLICY), (False, ISOLATION_WORKTREE_POLICY)],
+    ids=["override-without-worktree", "worktree-without-override"],
+)
+def test_validate_isolation_gate_needs_both_halves(
+    project, monkeypatch, capsys, override, policy_text
+):
+    """Either half alone is a configuration this release supports and documents: a
+    `repo_root` override under `isolation = "none"` is the monorepo knob (README:446),
+    and worktree isolation without an override is the ordinary isolated setup. The
+    gate stays silent on both, and validate still passes — the green rc is the second
+    witness, since a gate that fired would take the whole verdict with it."""
+    from bmad_loop import bmadconfig
+
+    _make_validate_pass(project, monkeypatch, capsys, policy_text=policy_text)
+    if override:
+        _override_repo_root(project)
+        git(project.project, "commit", "-qam", "repo_root override")
+
+    # The fixture can express the failing value: each leg really does carry exactly
+    # one half of it, so neither silence is the silence of a setup that never landed.
+    loaded = bmadconfig.load_paths(project.project)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    assert (loaded.repo_root != loaded.project) is override
+    assert (pol.scm.isolation == "worktree") is not override
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+    assert "policy.isolation-repo-root" not in _findings_by_check(doc)
+
+
+def _split_root_project(project, *, policy_text=ISOLATION_WORKTREE_POLICY):
+    install_bmad_config(project)
+    _override_repo_root(project)
+    _write_policy(project.project, policy_text)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    # `worktree_clean` scopes `git status` to `-- .` inside the dir it is handed, so
+    # only dirt UNDER repo_root can make the next gate speak. Without this the
+    # ordering assertion below passes no matter where the gate sits.
+    (project.project / "git-root" / "dirty.txt").write_text("uncommitted\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize("command", ["run", "sweep"])
+def test_start_refuses_worktree_isolation_under_a_repo_root_override(
+    project, monkeypatch, capsys, command
+):
+    """The refusal validate reports is also the one the real command makes, and it is
+    the FIRST one: `repo_root` is left genuinely dirty, so a gate ordered after
+    `worktree_clean` would answer "commit or stash first" instead — a message that
+    sends the operator to fix something that is not the problem. Both halves of that
+    are load-bearing: the probe reads `repo_root`, not `project`, so dirtying the
+    project would prove nothing."""
+    _split_root_project(project)
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {r: None for r in cli.ROLES})
+
+    assert cli.main([command, "--project", str(project.project)]) == 1
+    err = capsys.readouterr().err
+    assert REFUSAL in err
+    assert "not clean" not in err
+
+
+def test_resume_refuses_worktree_isolation_under_a_repo_root_override(project, monkeypatch, capsys):
+    """Resume re-reads config.yaml and policy.toml off disk, so it is a second
+    entrypoint into the same provisioning: a run whose config grew the override
+    mid-flight must not finish its remaining stories through worktrees the preflight
+    would now refuse. Refused before the `run-resume` entry, so the journal does not
+    record a resume that never happened."""
+    run_dir = _paused_run_for_resume(project, monkeypatch)
+    _write_policy(project.project, RESUME_POLICY + '\n[scm]\nisolation = "worktree"\n')
+    _override_repo_root(project)
+    monkeypatch.setattr(cli, "Engine", lambda **kw: pytest.fail("engine constructed"))
+
+    assert cli._resume_paused_run(project.project, run_dir) == 1
+    assert REFUSAL in capsys.readouterr().err
+    assert _resume_entries(run_dir) == []
+
+
+def test_auto_sweep_refuses_worktree_isolation_under_a_repo_root_override(project, monkeypatch):
+    """The child sweep an engine auto-triggers is the one caller that reloads
+    policy.toml while reusing the parent's already-loaded paths — so it is the only
+    way a mid-run flip to `isolation = "worktree"` reaches provisioning under a split
+    the parent's own start was allowed not to check.
+
+    It RAISES rather than returning, which is the whole point: `_maybe_auto_sweep`
+    has already journaled `sweep-auto-trigger` and latched the trigger by the time it
+    calls the factory, and it reads a plain return as success — so a quiet decline is
+    recorded as `sweep-auto-finished`, a child sweep that ran and finished when none
+    was launched. Raising lands on the `sweep-auto-failed` + notify path instead,
+    which is the same one an unparseable policy.toml already takes, and the parent
+    run is still unaffected (`_maybe_auto_sweep` swallows it)."""
+    from bmad_loop import bmadconfig
+
+    _split_root_project(project)
+    started = []
+    monkeypatch.setattr(cli, "_start_sweep", lambda *a, **kw: started.append(kw) or 0)
+
+    factory = cli._sweep_factory(project.project, bmadconfig.load_paths(project.project))
+    with pytest.raises(RuntimeError, match=REFUSAL):
+        factory("epic-boundary")
+    assert started == []
+
+
+def test_dry_run_banner_names_the_isolation_refusal_first(project, capsys):
+    """The preview keeps rc 0 and still renders the schedule, but the banner has to
+    name every refusal the dry-run's early return skips past — and in the order the
+    real command makes them. (Not every refusal there is: the dirty-tree, queue and
+    run-id gates are not part of this banner.) This
+    project is short of base skills too, so the ordering is observable: the isolation
+    refusal aborts before `_require_base_skills`, so it heads the list."""
+    import dataclasses
+
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    _write_policy(project.project, ISOLATION_WORKTREE_POLICY)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    paths = dataclasses.replace(project, repo_root=project.project / "git-root")
+    args = argparse.Namespace(epic=None, story=None, max_stories=None)
+
+    assert cli._dry_run(paths, pol, args) == 0
+    out, err = capsys.readouterr()
+    fails = [line for line in err.splitlines() if line.startswith("  FAIL:")]
+    assert REFUSAL in fails[0]
+    assert len(fails) > 1, "the base-skill problems the banner already reported"
+    assert "1-1-a" in out  # the schedule itself still rendered
+
+
+def test_validate_reports_an_undecodable_policy_instead_of_crashing(project, capsys):
+    """`read_text` raises `UnicodeDecodeError` on a policy.toml saved as UTF-16 or
+    latin-1 — a ValueError, not an OSError, so it used to escape every
+    `except (PolicyError, OSError)` in the codebase, including `_configure_mux`,
+    which runs before argument dispatch on EVERY command. The result was a bare
+    traceback at startup in place of the named findings validate exists to print.
+    `policy.load` converts it, so the file is reported like any other bad policy."""
+    _write_policy(project.project, "")
+    (project.project / ".bmad-loop" / "policy.toml").write_bytes(b'[scm]\nisolation = "\xff\xfe"\n')
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    finding = _findings_by_check(doc)["policy"]
+    assert finding["severity"] == "problem"
+    assert "not valid UTF-8" in finding["message"]
+
+
+def test_validate_reports_an_undecodable_bmad_config_instead_of_crashing(project, capsys):
+    """The `config.yaml` half of the same conversion. Separate from the policy leg
+    because they are separate loaders with separate typed errors, and the TUI guard
+    that first exposed this calls BOTH — a fix to one would leave the other raising a
+    raw ValueError straight through the handler."""
+    _write_policy(project.project, CLAUDE_ONLY_POLICY)
+    cfg = project.project / "_bmad" / "bmm"
+    cfg.mkdir(parents=True, exist_ok=True)
+    (cfg / "config.yaml").write_bytes(b"implementation_artifacts: '\xff\xfe'\n")
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    finding = _findings_by_check(doc)["bmad-config"]
+    assert finding["severity"] == "problem"
+    assert "not valid UTF-8" in finding["message"]
+
+
+# ---- #409: a tracked _bmad/render/ keeps churning through both shields -------
+
+
+def _committed_render_snapshot(project, *, track: bool):
+    """A renderer output tree at the depth and location `render_skill.py` publishes
+    to (the two hash segments are stand-ins, not real digests). `track` forces it past
+    the `_bmad/render/` line `init` just wrote into .gitignore — which is the state
+    #409 is about: an ignore rule does not untrack anything."""
+    snapshot = project.project / "_bmad" / "render" / "bmad-build-auto" / "sk-a1b2c3" / "d4e5f6"
+    snapshot.mkdir(parents=True)
+    (snapshot / "SKILL.md").write_text("# rendered\n", encoding="utf-8")
+    if track:
+        git(project.project, "add", "-f", "_bmad/render")
+        git(project.project, "commit", "-q", "-m", "committed render output")
+    return snapshot
+
+
+def test_validate_warns_when_rendered_output_is_tracked(project, monkeypatch, capsys):
+    """#409: a tracked path ignores .gitignore and info/exclude entirely, so both
+    shields 0.9.1 added miss the projects that already committed the renderer's
+    output — and those keep gaining a snapshot dir per machine, per checkout path
+    and per renderer bump. A warning, not a problem: nothing here stops a session,
+    so `ok` and the exit code both stay green."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    _committed_render_snapshot(project, track=True)
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+    finding = _findings_by_check(doc)["git.render-tracked"]
+    assert finding["severity"] == "warning"
+    assert "git rm -r --cached _bmad/render" in finding["message"]
+    assert doc["ok"] is True and doc["counts"]["problem"] == 0
+    _render_findings(doc)  # the detail shape draws in the TUI modal
+
+
+def test_validate_render_tracked_is_silent_when_the_output_is_only_on_disk(
+    project, monkeypatch, capsys
+):
+    """The control that pins WHICH state the probe reads. Every project that has run
+    a renderer has a `_bmad/render/` full of files; only the index distinguishes the
+    one that needs the warning. Same tree as above, never added — so a probe that
+    stat'ed the filesystem would fire here, on essentially every install."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    snapshot = _committed_render_snapshot(project, track=False)
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+    assert (snapshot / "SKILL.md").is_file(), "the tree the probe declined to warn about"
+    assert "git.render-tracked" not in _findings_by_check(doc)
+
+
+def test_validate_render_tracked_ignores_rc_zero_git_chatter(project, monkeypatch, capsys):
+    """`git ls-files` exits 0 while still writing to stderr — here a `core.fsmonitor`
+    hook that cannot exec, the Windows-first perf knob whose usual failure this is.
+    Read off a stdout+stderr merge that chatter is indistinguishable from an index
+    entry, so the warning fires at a project that tracks nothing and sends the
+    operator to `git rm -r --cached` a path git has never heard of. Nothing is added
+    here, so the only thing that can make the probe answer True is the noise.
+
+    `worktree_clean` reads the same stream off the same repo, so the green rc is the
+    second witness: it is the sibling that turns the identical chatter into "git
+    worktree is not clean" for a checkout with nothing in it."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    _committed_render_snapshot(project, track=False)
+    git(project.project, "config", "core.fsmonitor", ".git/hooks/absent-fsmonitor-hook")
+    assert verify.path_tracked(project.project, "_bmad/render") is False
+    assert verify.worktree_clean(project.project) is True
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+    findings = _findings_by_check(doc)
+    assert "git.render-tracked" not in findings
+    assert findings["git.worktree-clean"]["severity"] == "ok"
+
+
+def test_validate_render_tracked_degrades_quietly_outside_a_git_repo(tmp_path, capsys):
+    """No repo means no index, and a check that could not ask its question must not
+    answer it — neither a warning nor a fabricated `ok`.
+
+    It also records what #409's own premise gets wrong: validate does NOT pass
+    outside a repo on this line. `worktree_clean` raises first and `git.probe` fails
+    the run, which is asserted here so the silence above cannot be mistaken for
+    "validate is fine outside a repo". Skipping is still right — a second finding
+    saying the same thing helps nobody."""
+    cfg = tmp_path / "_bmad" / "bmm"
+    cfg.mkdir(parents=True)
+    (cfg / "config.yaml").write_text(
+        "implementation_artifacts: '{project-root}/impl'\n"
+        "planning_artifacts: '{project-root}/plan'\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "_bmad" / "render").mkdir()
+    _write_policy(tmp_path, CLAUDE_ONLY_POLICY)
+
+    doc = machine_json(["validate", "--project", str(tmp_path), "--json"], capsys, rc=1)
+    findings = _findings_by_check(doc)
+    assert "git.render-tracked" not in findings
+    assert findings["git.probe"]["severity"] == "problem"

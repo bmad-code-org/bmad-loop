@@ -159,10 +159,28 @@ def worktree_clean(repo: Path) -> bool:
     # count as a "dirty tree" that blocks run/sweep/validate or forces a commit.
     # Scope is policy.toml only — the deferred-work ledger also lives under
     # .bmad-loop/ and is meant to be committed (see sweep._commit_ledger).
-    rc, out = _git(repo, "status", "--porcelain", "--", ".", f":(exclude){POLICY_FILE_REL}")
-    if rc != 0:
-        raise GitError(f"git status failed in {repo}: {out}")
-    return out == ""
+    #
+    # Reads `stdout` alone for the same reason :func:`path_tracked` does: `status`
+    # exits 0 while still writing diagnostics to stderr (a `core.fsmonitor` hook that
+    # cannot exec, an unknown `core.fsyncMethod`), and against `_git`'s merged stream
+    # that chatter is indistinguishable from a porcelain line — reporting a clean
+    # checkout as dirty and blocking run/sweep/validate on a tree with nothing in it.
+    proc = _run_git(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "status",
+            "--porcelain",
+            "--",
+            ".",
+            f":(exclude){POLICY_FILE_REL}",
+        ],
+        repo,
+    )
+    if proc.returncode != 0:
+        raise GitError(f"git status failed in {repo}: {(proc.stdout + proc.stderr).strip()}")
+    return proc.stdout.strip() == ""
 
 
 def same_commit(a: str, b: str) -> bool:
@@ -264,6 +282,12 @@ def _exclude_specs(dirs: tuple[str, ...]) -> list[str]:
     return [f":(exclude){d}" for d in dirs]
 
 
+def _literal_specs(rels: list[str]) -> list[str]:
+    """git pathspec `:(literal)<rel>` for each repo-relative posix path — the operand
+    form that means "this path", not "this glob". See `path_tracked` for why."""
+    return [f":(literal){r}" for r in rels]
+
+
 def _path_under_any(path: str, prefixes: tuple[str, ...]) -> bool:
     """True if repo-relative posix `path` equals or sits under any `prefixes` dir."""
     return any(path == p or path.startswith(p.rstrip("/") + "/") for p in prefixes)
@@ -277,6 +301,62 @@ def untracked_files(repo: Path) -> set[str]:
     if rc != 0:
         raise GitError(f"git ls-files --others failed in {repo}: {out}")
     return {line.strip() for line in out.splitlines() if line.strip()}
+
+
+def path_tracked(repo: Path, rel: str) -> bool:
+    """True when repo-relative posix ``rel`` has an index entry — i.e. git OWNS the
+    path, so a `reset --hard` restores it and no caller should delete it by hand.
+
+    The single-path complement of :func:`untracked_files`, and the pair is what makes
+    the third state legible: neither tracked nor in that set means IGNORED, which no
+    rollback step touches at all (`reset --hard` skips it, and this module never runs
+    `git clean`). A caller that reasons only over "tracked vs untracked" silently
+    files every ignored path under whichever branch it wrote last.
+
+    Only the output's EMPTINESS is read, never its text: `core.quotePath` mangles
+    non-ASCII names, and a tracked-but-deleted-from-the-worktree path still lists (the
+    index entry outlives the file), which is exactly the state a caller must not
+    mistake for "not git's". Not `--error-unmatch`, which reports "not tracked" and
+    "git blew up" with the same non-zero rc; not `check-ignore`, which answers whether
+    a RULE matches rather than whether git owns the path — a `git add -f`'d file under
+    an ignore rule has to read tracked here.
+
+    Reads `stdout` ALONE, not `_git`'s stdout+stderr merge: `ls-files` exits 0 while
+    still writing to stderr — a `core.fsmonitor` hook that cannot exec, an unknown
+    `core.fsyncMethod` — and against the merged stream that chatter reads as an index
+    entry for a path git does not track at all. The failure is silent and inverted
+    (untracked answers "tracked"), so callers act on the opposite of the truth. The
+    error path keeps the merge, where stderr is the only informative half.
+
+    The pathspec is forced LITERAL, because git reads a positional operand as a
+    PATHSPEC and not as a path: `[`, `]`, `*` and `?` in ``rel`` are wildmatch
+    metacharacters, so a probe for an ABSENT path answers True the moment some OTHER
+    tracked path happens to match the glob. The error is one-directional —
+    `match_pathspec_item` compares literally before it falls through to fnmatch, so a
+    genuinely tracked path never reads untracked — and it runs toward the answer that
+    authorizes leaving a file alone, which is how a harvested ledger under an
+    operator-named `implementation_artifacts` (`bmadconfig._resolve` takes that key
+    verbatim, metacharacters and all) outlived the rollback that discarded the code it
+    described. Not the global `--literal-pathspecs` / `GIT_LITERAL_PATHSPECS` form,
+    which would also disarm the `:(exclude)` magic `worktree_clean`, `has_changes_since`
+    and `attempt_dirty` are built on; the per-operand prefix is scoped to this call. It
+    costs the callers nothing: that same literal comparison is what matches a DIRECTORY
+    prefix, so `_bmad/render` still lists everything beneath it (`cmd_validate`'s
+    render-tracked warning), and it additionally disarms a ``rel`` that itself begins
+    with `:`, which git would otherwise parse as magic. Measured identical at git 2.20.4
+    — the floor `install._WORKTREE_CONFIG_GIT` declares — and at 2.55.0; below a version
+    that understands the prefix it would read as a literal FILENAME, match nothing and
+    answer False, which is the one direction that authorizes a delete.
+
+    Raises GitError like every other probe in this module. Callers inside a rollback
+    `finally` catch it and degrade toward leaving the file alone: uncertainty must
+    never authorize a delete. The message keeps the BARE ``rel``: the operator's path is
+    its informative half and the magic prefix is our own plumbing."""
+    proc = _run_git(["git", "-C", str(repo), "ls-files", "--", *_literal_specs([rel])], repo)
+    if proc.returncode != 0:
+        merged = (proc.stdout + proc.stderr).strip()
+        raise GitError(f"git ls-files -- {rel} failed in {repo}: {merged}")
+    return bool(proc.stdout.strip())
 
 
 def commits_above(repo: Path, baseline: str) -> list[str]:
@@ -1255,6 +1335,8 @@ def verify_dev(
     paths: ProjectPaths,
     result_json: dict[str, Any] | None,
     review_enabled: bool = True,
+    *,
+    engine_written: tuple[str, ...] = (),
 ) -> VerifyOutcome:
     """Verify a dev session's on-disk artifacts against its result.json claims.
 
@@ -1264,6 +1346,12 @@ def verify_dev(
     orchestrator's, has produced changes since that baseline, and that the
     story's sprint-status was advanced to the matching stage. Returns a retryable
     VerifyOutcome on any mismatch, escalates on git failure, passes otherwise.
+
+    ``engine_written`` names paths the ORCHESTRATOR itself wrote during this
+    attempt, above this gate. Distinct from ``extra_exclude``'s mode-specific
+    artifacts: those are excluded because every session rewrites them as routine
+    bookkeeping, these because the session did not write them at all. See
+    `Engine._harvest_gate_exclude` (#405).
     """
     rj = result_json or {}
     spec_file = rj.get("spec_file")
@@ -1281,7 +1369,7 @@ def verify_dev(
         task,
         paths,
         expected_status="in-review" if review_enabled else "done",
-        extra_exclude=(),
+        extra_exclude=engine_written,
     )
     if gate is not None:
         return gate
@@ -1302,13 +1390,19 @@ def verify_dev_bundle(
     paths: ProjectPaths,
     result_json: dict[str, Any] | None,
     review_enabled: bool = True,
+    *,
+    engine_written: tuple[str, ...] = (),
 ) -> VerifyOutcome:
     """verify_dev for a deferred-work bundle: bundles have no sprint-status
     entry. The orchestrator owns the bundle→dw-id binding (``task.dw_ids``,
     marked done by ``SweepEngine``'s ledger sync); the generic ``bmad-dev-auto``
     primitive never authors dw ids. So the dw_ids cross-check is enforced only
     when the session actually claims them — an empty/absent claim is the normal
-    generic path and passes."""
+    generic path and passes.
+
+    ``engine_written``: see :func:`verify_dev`. The bundle leg is the one that
+    needs it most — a close it lets through marks real dw ids ``done`` with no
+    code behind them, and `open_ids` re-bundles only ``open`` entries."""
     rj = result_json or {}
     spec_file = rj.get("spec_file")
     if not spec_file:
@@ -1326,7 +1420,7 @@ def verify_dev_bundle(
         task,
         paths,
         expected_status="in-review" if review_enabled else "done",
-        extra_exclude=(),
+        extra_exclude=engine_written,
         allow_ancestor_baseline=True,
     )
     if gate is not None:
@@ -1358,6 +1452,7 @@ def verify_dev_stories(
     spec_folder: Path,
     review_enabled: bool = True,
     plan_halt: bool = False,
+    engine_written: tuple[str, ...] = (),
 ) -> VerifyOutcome:
     """verify_dev for stories mode: the story spec lives at the id-keyed path
     ``<spec-folder>/stories/<id>-<slug>.md`` and there is no sprint-status entry.
@@ -1430,13 +1525,19 @@ def verify_dev_stories(
     # on top of the gate's own file-granular exclude — NOT the whole-folder
     # artifact_relpaths, so a story whose entire authorized scope is ledger/spec
     # reconciliation doesn't register as a false "no changes".
+    #
+    # `engine_written` rides on the same tuple. Nothing to add on the plan-halt
+    # leg: `None` skips the proof-of-work gate outright, so there is no diff for
+    # an orchestrator write to satisfy.
     gate = _verify_shared_gates(
         spec_path,
         rj,
         task,
         paths,
         expected_status=expected,
-        extra_exclude=(None if plan_halt else _stories_relpaths(paths.project, spec_folder)),
+        extra_exclude=(
+            None if plan_halt else _stories_relpaths(paths.project, spec_folder) + engine_written
+        ),
     )
     if gate is not None:
         return gate
@@ -1766,26 +1867,43 @@ def commit_paths(repo: Path, message: str, paths: list[Path]) -> str | None:
     or staged changes untouched. Unlike commit_story's `add -A`, this is safe to
     call out of band (e.g. `bmad-loop decisions`) when the tree may hold the
     user's own uncommitted work. Returns the new HEAD sha, or None when the
-    given paths had no changes to commit. Paths outside the repo are ignored."""
+    given paths had no changes to commit. Paths outside the repo are ignored.
+
+    All three operands are LITERAL pathspecs (`path_tracked` carries the full
+    reasoning). Without that, "exactly `paths` and nothing else" was untrue for any
+    path holding `[` / `]`: the operand is a glob that matches its own literal text AND
+    every neighbour the glob reaches, so a target under a bracketed dir swept a tracked
+    sibling's uncommitted edit into the commit — under a story's name, leaving `git
+    status` clean so nothing surfaced it. It also repairs a subtler miss on the ignored
+    path this function is expected to hit (`_carry_harvested_deferrals`): `git add`
+    REFUSES an explicitly-named ignored path but SKIPS one it reached by globbing, so
+    the plain form could exit 0 having staged nothing and return None, reporting a
+    success that committed no ledger and journalled no miss.
+
+    `as_posix()` rather than `str()` for the same reason, and it is not cosmetic: on
+    Windows `str()` yields backslash separators, which today's glob operand survives
+    only because git-for-windows normalises them — the very tolerance literal semantics
+    removes. POSIX-invisible, so Windows CI is its only oracle."""
     rels: list[str] = []
     repo_root = repo.resolve()
     for p in paths:
         try:
-            rels.append(str(Path(p).resolve().relative_to(repo_root)))
+            rels.append(Path(p).resolve().relative_to(repo_root).as_posix())
         except ValueError:
             continue
     if not rels:
         return None
-    rc, out = _git(repo, "add", "--", *rels)
+    specs = _literal_specs(rels)
+    rc, out = _git(repo, "add", "--", *specs)
     if rc != 0:
         raise GitError(f"git add failed: {out}")
-    rc, out = _git(repo, "status", "--porcelain", "--", *rels)
+    rc, out = _git(repo, "status", "--porcelain", "--", *specs)
     if rc != 0:
         raise GitError(f"git status failed: {out}")
     if not out:
         return None  # nothing changed in these paths
     # pathspec form commits only `rels`, ignoring any other staged changes
-    rc, out = _git(repo, "commit", "-m", message, "--", *rels)
+    rc, out = _git(repo, "commit", "-m", message, "--", *specs)
     if rc != 0:
         raise GitError(f"git commit failed: {out}")
     return rev_parse_head(repo)

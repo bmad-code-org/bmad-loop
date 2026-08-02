@@ -109,6 +109,28 @@ def _exists_run(marker: str) -> str:
     return f'test -f "{_RUN}/{marker}"'
 
 
+def passes_once(marker) -> str:
+    """Shell verify command exiting 0 the FIRST time it runs and 1 every time after,
+    by latching `marker` — the only way to make one `[verify] commands` gate pass at
+    dev time and fail at review time, which is what separates the two gates within a
+    single run.
+
+    Takes an absolute path rather than the `$BMAD_LOOP_RUN_DIR` its neighbours above
+    use: `verify.run_verify_commands` passes no env to the subprocess, so that
+    variable is unset here and the command would latch at the filesystem root. Pass
+    something outside the worktree, or a rollback's untracked cleanup will eat the
+    marker between the two runs and the command passes twice.
+
+    Written for cmd as well as sh for the same reason as its neighbours: CI runs the
+    whole suite on windows-latest, where `shell=True` is `cmd.exe /c`, and a POSIX
+    `test`/`$(…)` command there is silently MIS-PARSED into a constant exit code
+    rather than rejected — so the test fails on the lane no one runs locally."""
+    if sys.platform == "win32":
+        win = str(marker).replace("/", "\\")
+        return f'if exist "{win}" (exit 1) else (type nul > "{win}")'
+    return f'test ! -f "{marker}" && touch "{marker}"'
+
+
 def _seeded_then_touch(rel: str, marker: str) -> str:
     if sys.platform == "win32":
         norm_rel = rel.replace("/", "\\")
@@ -272,12 +294,129 @@ def install_dev_base_skills(root: Path, tree: str = ".claude/skills", *, folder_
 def install_base_skills(paths: ProjectPaths, trees=(".claude/skills", ".agents/skills")) -> None:
     """Stub every non-bundled upstream skill (`install.BASE_SKILLS` — a superset of
     DEV_BASE_SKILLS that also covers what a worktree mount must copy) in each of a
-    sandbox project's active CLI skill trees. Sprint mode drives any bmad-dev-auto,
-    so no folder+id probe is written."""
+    sandbox project's active CLI skill trees. Sprint mode drives any dev primitive,
+    so no folder+id probe is written.
+
+    BASE_SKILLS names BOTH primitive eras, so this lays down bmad-build-auto AND
+    bmad-dev-auto — a state no real bmm install produces, but the point of this
+    scaffold is "nothing the orchestrator may copy is absent". Resolution therefore
+    picks bmad-build-auto here; use `install_dev_base_skills` for a pre-rename
+    project and `install_dev_shim` for a post-rename one."""
     from bmad_loop.install import BASE_SKILLS
 
     for tree in trees:
         _write_skill_stubs(paths.project / tree, BASE_SKILLS)
+
+
+BUILD_AUTO_STEPS = (
+    "step-01-clarify-and-route.md",
+    "step-02-plan.md",
+    "step-03-implement.md",
+    "step-04-review.md",
+)
+# What a renderer-stub SKILL.md looks like since BMAD-METHOD #2601: it delegates to
+# the project-local render script instead of carrying the prompt inline.
+RENDERER_STUB_SKILL_MD = (
+    "# bmad-build-auto\n\nRun:\n\n```bash\nuv run _bmad/scripts/render_skill.py "
+    "bmad-build-auto\n```\n"
+)
+# How upstream's render_skill.py actually opens: a plain module-scope import of its
+# sibling off sys.path[0] — no try, no path fixup — so the helper's absence is a bare
+# ModuleNotFoundError. The preflight keys the sibling's requirement on this text, so a
+# scaffold wanting the REAL two-file unit must carry it; a bare "# renderer" body
+# models the other era, a renderer with no sibling to lose.
+RENDERER_SCRIPT_IMPORTING_SIBLING = (
+    "from config_utils import ConfigError, load_central_config\n\n\ndef main():\n"
+    "    load_central_config('.')\n"
+)
+# The renderer's ENTRY document, the half a stub SKILL.md does not carry: since #2601
+# `render_skill.py` composes the real prompt from `workflow.md` and hard-fails when it
+# is absent (`render entry is missing`) or when a `[[bmad-snapshot:…]]` token names a
+# file outside the skill's own source set (`snapshot reference targets undeclared
+# source`) — both printed as `HALT:`, i.e. a result-less Stop on every story.
+#
+# The token names `step-04-review.md` deliberately: it is a DEV_PRIMITIVE_MARKER, so
+# every fixture that lays down a renderer-era stub already carries the target and stays
+# a HEALTHY install. A fixture modelling a BROKEN one writes its own body.
+RENDERER_WORKFLOW_MD = (
+    "# bmad-build-auto\n\nRead fully and follow: [[bmad-snapshot:step-04-review.md]]\n"
+)
+
+
+def install_build_auto_skill(
+    root: Path,
+    tree: str = ".claude/skills",
+    *,
+    folder_id: bool = True,
+    renderer_stub: bool = False,
+) -> Path:
+    """Lay down a realistic POST-rename dev primitive (`bmad-build-auto`) under
+    ``root/tree``: SKILL.md, all four step files, customize.toml with prompt-file
+    layers, and a review-prompts/ payload.
+
+    Richer than `_write_skill_stubs` on purpose — the marker files alone can't show
+    that a worktree mount carries a skill's *subdirectories*, and `renderer_stub`
+    needs a SKILL.md whose content is the thing under test. ``folder_id`` writes the
+    dispatch marker into step-01 (stories mode's content probe); ``renderer_stub``
+    swaps SKILL.md for the #2601 renderer stub AND adds the `workflow.md` entry that
+    stub composes from — the two are one era, and an install with the stub but no entry
+    is a broken one, not a variant. Which makes ``renderer_stub=False`` the pre-#2601
+    INLINE era and this fixture its own era control. Returns the skill dir."""
+    from bmad_loop.install import DEV_PRIMITIVE_NEW, STORIES_PROBE_FILE, STORIES_PROBE_TEXT
+
+    skill = Path(root) / tree / DEV_PRIMITIVE_NEW
+    (skill / "review-prompts").mkdir(parents=True, exist_ok=True)
+    (skill / "SKILL.md").write_text(
+        RENDERER_STUB_SKILL_MD if renderer_stub else f"# {DEV_PRIMITIVE_NEW}\n", encoding="utf-8"
+    )
+    if renderer_stub:
+        (skill / "workflow.md").write_text(RENDERER_WORKFLOW_MD, encoding="utf-8")
+    for step in BUILD_AUTO_STEPS:
+        body = f"# {step}\n"
+        if folder_id and step == STORIES_PROBE_FILE:
+            body = f"This is a **{STORIES_PROBE_TEXT}** router.\n"
+        (skill / step).write_text(body, encoding="utf-8")
+    (skill / "customize.toml").write_text(
+        '[[review_layers]]\nid = "adversarial"\nprompt_file = "review-prompts/adversarial.md"\n',
+        encoding="utf-8",
+    )
+    (skill / "review-prompts" / "adversarial.md").write_text("# adversarial\n", encoding="utf-8")
+    return skill
+
+
+def install_dev_shim(root: Path, tree: str = ".claude/skills") -> Path:
+    """Lay down the post-rename FORWARDING SHIM: a lone `bmad-dev-auto/SKILL.md`
+    with no step files and no customize.toml.
+
+    This is what upstream leaves behind after the bmad-build-auto rename, and its
+    migration gate is interactive — an unattended session dispatched to it HALTs
+    without writing anything. Writing only SKILL.md is the whole point: the absent
+    markers are what the shim detector keys on. Returns the shim dir."""
+    from bmad_loop.install import DEV_PRIMITIVE_LEGACY
+
+    shim = Path(root) / tree / DEV_PRIMITIVE_LEGACY
+    shim.mkdir(parents=True, exist_ok=True)
+    (shim / "SKILL.md").write_text(
+        f"# {DEV_PRIMITIVE_LEGACY}\n\nThis skill has been renamed to bmad-build-auto.\n",
+        encoding="utf-8",
+    )
+    return shim
+
+
+def attach_profile(adapter, name: str = "claude", project: Path | None = None):
+    """Give a scripted adapter the ``profile`` a real CLI adapter carries, so the
+    seams that read ``adapter.profile.skill_tree`` — chiefly ``Engine._dev_skill``,
+    which resolves the invoked dev-primitive NAME off disk — see a real skill tree.
+
+    `MockAdapter` deliberately has no `profile` at all, and that is not an
+    oversight to paper over globally: the profile-less shape IS the None-tree
+    fallback path (legacy name), so it stays the default and gets pinned by its
+    own test. Attach only where the resolved name is what's under test. Returns
+    the adapter for chaining."""
+    from bmad_loop.adapters.profile import get_profile
+
+    adapter.profile = get_profile(name, project)
+    return adapter
 
 
 def fault_read_text(monkeypatch, target: Path) -> None:
@@ -308,15 +447,70 @@ def set_sprint(paths: ProjectPaths, key: str, status: str) -> None:
     paths.sprint_status.write_text(yaml.safe_dump(doc, sort_keys=False))
 
 
-def write_spec(path: Path, status: str, baseline: str, *, prose_status: str | None = None) -> None:
+def render_deferred(items) -> str:
+    """Render a frontmatter `deferred:` block the way bmad-build-auto's step-04
+    writes one (BMAD-METHOD #2640): a YAML list whose free-form values are block
+    scalars — `>-` folds the single-line summary/location, `|-` keeps evidence
+    verbatim — so a `:`, `#`, quote, or line break inside a finding stays data.
+
+    Rendering the real block scalars (rather than plain `key: value`) is the
+    point: the harvest reads through `verify.read_frontmatter`, and a fixture
+    that quoted its values would prove only that YAML parses quoted strings.
+
+    A dict item renders that shape, omitting keys it does not carry — so
+    `{"evidence": ...}` alone is the missing-summary malformed case. A plain
+    string item renders as a bare scalar list entry: the not-a-mapping malformed
+    case. Both exist so a test can put malformed items NEXT TO good ones."""
+    if not items:
+        return "deferred: []\n"
+    lines = ["deferred:"]
+    for item in items:
+        if not isinstance(item, dict):
+            lines.append(f"  - {item}")
+            continue
+        rendered = False
+        for key in ("summary", "evidence", "location", "severity"):
+            if key not in item:
+                continue
+            lead = "    " if rendered else "  - "
+            rendered = True
+            text = str(item[key])
+            if not text:
+                lines.append(f"{lead}{key}: ''")  # a block scalar cannot be empty
+                continue
+            if key == "severity":
+                lines.append(f"{lead}{key}: {text}")  # a plain enum token upstream
+                continue
+            lines.append(f"{lead}{key}: {'|-' if key == 'evidence' else '>-'}")
+            lines += [f"      {ln}" for ln in text.splitlines()]
+        if not rendered:
+            lines.append("  - {}")
+    return "\n".join(lines) + "\n"
+
+
+def write_spec(
+    path: Path,
+    status: str,
+    baseline: str,
+    *,
+    prose_status: str | None = None,
+    deferred=None,
+) -> None:
     """Write a spec the way the real bmad-dev-auto skill does. The skill's step-03
     stamps `baseline_revision` and NEVER `baseline_commit` (that name exists only
     in the orchestrator's synthesized result.json), so this fixture stamps the
     same key — a reader that only knows `baseline_commit` must fail a test here,
-    not sail through production (issue #89)."""
+    not sail through production (issue #89).
+
+    ``deferred`` adds the post-#2640 frontmatter `deferred:` list (see
+    `render_deferred`); ``None`` — the default — omits the field entirely, which
+    is both the pre-#2640 spec shape and the overwhelmingly common post-#2640 one
+    (nothing was deferred). Pass ``[]`` for an explicitly empty list."""
     body = (
         f"---\ntitle: 'test'\ntype: 'feature'\nstatus: '{status}'\n"
-        f"baseline_revision: '{baseline}'\n---\n\n## Intent\n\ntest spec\n"
+        f"baseline_revision: '{baseline}'\n"
+        f"{render_deferred(deferred) if deferred is not None else ''}"
+        f"---\n\n## Intent\n\ntest spec\n"
     )
     if prose_status is not None:
         # mirror bmad-dev-auto's terminal finalize: it appends a `## Auto Run
@@ -378,6 +572,33 @@ def committing_crash_state(paths: ProjectPaths, engine, *, post_squash: bool = F
     return baseline
 
 
+def crash_at_merge_back(engine, *, after: bool = True) -> None:
+    """Kill the host inside `_integrate_unit`'s DONE arm, in the window between
+    `_merge_local` and `_carry_isolated_ledger_writes`.
+
+    `after=True` calls through first, so the branch really lands and
+    `close_unit_workspace(success=True)` really removes the worktree — which is the
+    point: the orchestrator's worktree-local ledger writes are destroyed with it,
+    and `_finalize_commit_phase` already persisted Phase.DONE, which
+    `_finish_inflight` skips. `after=False` raises instead of merging: the branch
+    never lands and the worktree stays mounted.
+
+    `_emit("post_merge")` cannot stand in for this. It fires at the tail of
+    `_merge_local`, one statement ABOVE the teardown, so the worktree survives it —
+    that hook reproduces the wrong window.
+
+    Wraps the bound method on the instance, so a resumed engine built afterwards is
+    an ordinary un-patched one."""
+    original = engine._merge_local
+
+    def crashing(task, unit):
+        if after:
+            original(task, unit)
+        raise RuntimeError("host died between the merge and the ledger carry")
+
+    engine._merge_local = crashing
+
+
 def dev_effect(
     paths: ProjectPaths,
     story_key: str,
@@ -387,6 +608,7 @@ def dev_effect(
     prose_status: str | None = None,
     seen: list[str] | None = None,
     write_src: bool = True,
+    deferred=None,
 ):
     """Simulate a successful bmad-dev-auto session: it self-finalizes the spec
     (no in-review handoff — always straight to ``done``) but never touches the
@@ -404,7 +626,11 @@ def dev_effect(
     patch-restore tests assert the re-driven session ran against the RESTORED diff.
     ``write_src=False`` then keeps the session from appending its own line, so what
     lands in the tree is exactly what the restore laid down (the applied patch is
-    the session's proof of work; a second edit would muddy the assertion)."""
+    the session's proof of work; a second edit would muddy the assertion).
+
+    ``deferred`` records review findings in the spec's frontmatter the way the
+    post-#2640 skill does (the orchestrator harvests them into the ledger); the
+    session still never touches `deferred-work.md` itself."""
 
     def effect(spec: SessionSpec) -> SessionResult:
         baseline = rev_parse_head(paths.project)
@@ -414,7 +640,7 @@ def dev_effect(
         if write_src:
             source.write_text(source.read_text() + f"change for {story_key}\n")
         sp = spec_path(paths, story_key)
-        write_spec(sp, final_status, baseline, prose_status=prose_status)
+        write_spec(sp, final_status, baseline, prose_status=prose_status, deferred=deferred)
         # deliberately NO set_sprint: the dev skill does not write sprint-status
         return SessionResult(
             status="completed",
@@ -561,6 +787,8 @@ def bundle_dev_effect(
     followup_review: bool = True,
     final_status: str = "done",
     prose_status: str | None = None,
+    deferred=None,
+    write_src: bool = True,
 ):
     """Simulate a bmad-dev-auto bundle dev session: edits code and self-finalizes
     the bundle spec to ``done`` (no in-review handoff). On the decoupled path the
@@ -568,16 +796,21 @@ def bundle_dev_effect(
     ``mark_ledger=True`` is kept only for the legacy-marking path in older tests.
     ``followup_review`` mirrors `followup_review_recommended` — defaults True so
     the bundle review runs under the default trigger = "recommended". ``final_status``
-    / ``prose_status`` mirror ``dev_effect``: pair a non-terminal ``final_status``
-    with ``prose_status="done"`` to reproduce the skill finalizing in prose only."""
+    / ``prose_status`` / ``deferred`` / ``write_src`` mirror ``dev_effect``: pair a
+    non-terminal ``final_status`` with ``prose_status="done"`` to reproduce the skill
+    finalizing in prose only; ``deferred`` records post-#2640 frontmatter findings;
+    ``write_src=False`` keeps the session from touching code at all, which is the only
+    way to express a bundle session whose whole post-baseline diff belongs to the
+    orchestrator (the harvest, or the ledger close) rather than to the session."""
 
     def effect(spec: SessionSpec) -> SessionResult:
         baseline = rev_parse_head(paths.project)
         source = paths.project / "src.txt"
-        source.write_text(source.read_text() + f"change for dw-{name}\n")
+        if write_src:
+            source.write_text(source.read_text() + f"change for dw-{name}\n")
         sp = bundle_spec_path(paths, name)
         # mirror the skill: always self-finalize the bundle spec straight to done
-        write_spec(sp, final_status, baseline, prose_status=prose_status)
+        write_spec(sp, final_status, baseline, prose_status=prose_status, deferred=deferred)
         if mark_ledger:
             mark_ledger_done(paths, dw_ids)
         return SessionResult(

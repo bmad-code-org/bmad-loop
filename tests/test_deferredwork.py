@@ -9,6 +9,7 @@ from bmad_loop.deferredwork import (
     field_severity,
     has_legacy,
     mark_done,
+    mark_open,
     next_seq,
     open_ids,
     parse_ledger,
@@ -110,6 +111,104 @@ def test_mark_done_missing_entry(tmp_path):
     path = write_ledger(tmp_path)
     snapshot = path.read_text(encoding="utf-8")
     assert not mark_done(path, "DW-99", "2026-06-11", "n/a")
+    assert path.read_text(encoding="utf-8") == snapshot
+
+
+def test_mark_open_round_trips_mark_done_byte_for_byte(tmp_path):
+    """The contract that lets a caller undo a close without having snapshotted the
+    file: `mark_done` writes its resolution on the line directly below the status,
+    and `mark_open` removes exactly that line."""
+    path = write_ledger(tmp_path)
+    before = path.read_text(encoding="utf-8")
+    assert mark_done(path, "DW-1", "2026-06-11", "resolved by sweep bundle dw-fix")
+    assert path.read_text(encoding="utf-8") != before
+    assert mark_open(path, "DW-1", "resolved by sweep bundle dw-fix")
+    assert path.read_text(encoding="utf-8") == before
+
+
+def test_mark_open_touches_only_target(tmp_path):
+    path = write_ledger(tmp_path)
+    assert mark_done(path, "DW-1", "2026-06-11", "by dw-a")
+    assert mark_done(path, "DW-3", "2026-06-11", "by dw-a")
+    assert mark_open(path, "DW-1", "by dw-a")
+    entries = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}
+    assert entries["DW-1"].open and "resolution:" not in entries["DW-1"].body
+    assert entries["DW-3"].status == "done 2026-06-11"
+    assert entries["DW-2"].status == "done 2026-05-25"  # untouched pre-existing close
+
+
+def test_mark_open_refuses_a_close_it_did_not_write(tmp_path):
+    """The guard that makes this an UNDO rather than a reopen. DW-2 is closed in the
+    fixture with no resolution line at all, and a close carrying someone else's note
+    is equally off limits — neither is the caller's to revoke, and once reopened the
+    ledger has no field that could record who did it or why."""
+    path = write_ledger(tmp_path)
+    assert mark_done(path, "DW-1", "2026-06-11", "resolved by sweep bundle dw-other")
+    snapshot = path.read_text(encoding="utf-8")
+
+    assert not mark_open(path, "DW-1", "resolved by sweep bundle dw-mine")
+    assert not mark_open(path, "DW-2", "resolved by sweep bundle dw-mine")
+    assert not mark_open(path, "DW-2", "")
+    assert path.read_text(encoding="utf-8") == snapshot
+
+
+def test_mark_open_refuses_an_entry_that_is_still_open(tmp_path):
+    """The `entry.open` guard, which is NOT redundant with the note match. An entry
+    the inner session appended can carry a `resolution:` line while still open — this
+    module exists because the orchestrator never trusts an LLM to have edited the
+    file. Drop the guard and such an entry is rewritten and its note silently deleted,
+    which no caller asked for."""
+    path = tmp_path / "dw.md"
+    path.write_text(
+        "# Deferred Work\n\n### DW-1: partially handled\n\n"
+        "origin: a session, 2026-06-01\nstatus: open\nresolution: half of it landed\n",
+        encoding="utf-8",
+    )
+    snapshot = path.read_text(encoding="utf-8")
+    assert not mark_open(path, "DW-1", "half of it landed")
+    assert path.read_text(encoding="utf-8") == snapshot
+
+
+def test_mark_open_refuses_an_entry_with_no_status_line(tmp_path):
+    """`parse_ledger` tolerates a status-less entry (it reads as not open, so the
+    guard above does not catch it) and `mark_open` runs from `_defer`, where an
+    AttributeError on `status_m` would replace a deferral with a crashed run."""
+    path = tmp_path / "dw.md"
+    path.write_text(
+        "# Deferred Work\n\n### DW-1: no status at all\n\n"
+        "origin: a session, 2026-06-01\nresolution: by dw-a\n",
+        encoding="utf-8",
+    )
+    snapshot = path.read_text(encoding="utf-8")
+    assert not mark_open(path, "DW-1", "by dw-a")
+    assert path.read_text(encoding="utf-8") == snapshot
+
+
+def test_mark_open_tolerates_reformatted_whitespace_around_the_note(tmp_path):
+    """The note is compared stripped, so a ledger a session reformatted — trailing
+    whitespace on the resolution line — is still recognised as this caller's own
+    close rather than silently treated as someone else's."""
+    path = tmp_path / "dw.md"
+    path.write_text(
+        "# Deferred Work\n\n### DW-1: closed then reflowed\n\n"
+        "origin: a session, 2026-06-01\nstatus: done 2026-06-11\n"
+        "resolution:   by dw-a  \n",
+        encoding="utf-8",
+    )
+    assert mark_open(path, "DW-1", "by dw-a")
+    entries = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}
+    assert entries["DW-1"].open and "resolution:" not in entries["DW-1"].body
+
+
+def test_mark_open_noop_on_open_and_missing_entries(tmp_path):
+    """Idempotent, so a resume that re-drives a deferred bundle cannot double-undo."""
+    path = write_ledger(tmp_path)
+    assert mark_done(path, "DW-1", "2026-06-11", "by dw-a")
+    assert mark_open(path, "DW-1", "by dw-a")
+    snapshot = path.read_text(encoding="utf-8")
+    assert not mark_open(path, "DW-1", "by dw-a")  # already open
+    assert not mark_open(path, "DW-99", "by dw-a")  # absent
+    assert not mark_open(tmp_path / "nope.md", "DW-1", "by dw-a")  # no ledger
     assert path.read_text(encoding="utf-8") == snapshot
 
 
@@ -448,6 +547,82 @@ def test_append_entry_not_blocked_when_prior_is_done(tmp_path):
         p, title="t2", origin="review-budget-followup", source_spec="spec-foo.md", reason="r"
     )
     assert new_id == "DW-2"  # prior entry is done, not open → re-file allowed
+
+
+def test_append_entry_writes_location_between_source_spec_and_severity(tmp_path):
+    """`location:` is the canonical format's third field (origin → location →
+    severity → reason → status), so the harvested file:line lands where every
+    existing reader — the format doc, the TUI, sweep triage — expects it, not
+    appended wherever it happened to be convenient."""
+    p = tmp_path / "deferred-work.md"
+    new_id = append_entry(
+        p,
+        title="Retry loop can spin",
+        origin="spec-deferred abc123abc123",
+        source_spec="spec-1-1-a.md",
+        reason="the backoff has no ceiling",
+        location="src/retry.py:88",
+        severity="medium",
+    )
+    lines = [ln for ln in parse_ledger(p.read_text())[0].body.splitlines() if ln.strip()]
+    assert new_id == "DW-1"
+    assert lines == [
+        "### DW-1: Retry loop can spin",
+        "origin: spec-deferred abc123abc123",
+        "source_spec: `spec-1-1-a.md`",
+        "location: src/retry.py:88",
+        "severity: medium",
+        "reason: the backoff has no ceiling",
+        "status: open",
+    ]
+    assert field_line_present(parse_ledger(p.read_text())[0].body, "location", "src/retry.py:88")
+
+
+def test_append_entry_writes_n_a_when_location_is_absent(tmp_path):
+    """An entry with no location still carries a `location:` line, holding `n/a`.
+    deferred-work-format.md specifies exactly that value for an item with no
+    file:line, and marks only `severity:` optional — so omitting the line made
+    this writer the one producer disagreeing with the format the sweep skill
+    reads. The whole line list is asserted so the placeholder is pinned in the
+    canonical position, not merely present somewhere."""
+    p = tmp_path / "deferred-work.md"
+    append_entry(p, title="t", origin="o", source_spec="s.md", reason="r")
+    lines = [ln for ln in parse_ledger(p.read_text())[0].body.splitlines() if ln.strip()]
+    assert lines == [
+        "### DW-1: t",
+        "origin: o",
+        "source_spec: `s.md`",
+        "location: n/a",
+        "reason: r",
+        "status: open",
+    ]
+
+
+def test_append_entry_strips_a_location_before_deciding_it_is_empty(tmp_path):
+    """The value is stripped: a blank one reads as absent, a padded one is written
+    clean. Both are the same one-line guard, so this is its sole witness.
+
+    NEITHER half is reachable from the harvest, and saying so is the point —
+    this guard is a promise `append_entry` makes about its own `str | None`
+    signature, kept because it has two callers and one of them is not the
+    harvest. `devcontract._flatten` collapses runs and yields "" for a blank
+    scalar (and its caller maps "" to None), and since
+    `test_flatten_leaves_no_trailing_space_when_the_clamp_lands_on_one` it also
+    strips after clamping — the route that once made the trailing-space half
+    reachable. It was closed at the source deliberately: `location` feeds the
+    ledger AND `harvest_fingerprint`, so cleaning it only here would have left
+    the entry's `origin:` key underivable from the entry's own `location:`.
+
+    `field_line_present` tolerates padding around a value, which is exactly why
+    the second half asserts the raw text instead of going through it."""
+    p = tmp_path / "deferred-work.md"
+    append_entry(p, title="t", origin="o", source_spec="s.md", reason="r", location="  \t ")
+    assert field_line_present(parse_ledger(p.read_text())[0].body, "location", "n/a")
+
+    # a separate ledger: same origin + source_spec would hit the idempotency guard
+    q = tmp_path / "clamped.md"
+    append_entry(q, title="t", origin="o", source_spec="s.md", reason="r", location="src/a.py:1 ")
+    assert "location: src/a.py:1\n" in q.read_text()
 
 
 def test_append_entry_creates_missing_ledger(tmp_path):
