@@ -1,12 +1,13 @@
 name: Release
 
-# Auto-publish on merge: when a version bump lands on `main`, create the matching
-# `vX.Y.Z` tag and GitHub release with notes from CHANGELOG.md. Idempotent —
-# `release.py publish` is a no-op when the tag already exists, so merges that
-# don't bump the version do nothing.
+# Auto-publish on merge: when a version bump lands on `main` or a `release/*`
+# maintenance branch, create the matching `vX.Y.Z` tag and GitHub release with
+# notes from CHANGELOG.md. Idempotent — `release.py publish` is a no-op when the
+# tag already exists, so merges that don't bump the version do nothing, and
+# whichever branch carries a given version first wins the tag.
 on:
   push:
-    branches: [main]
+    branches: [main, release/*]
 
 concurrency:
   group: release-${{ github.ref }}
