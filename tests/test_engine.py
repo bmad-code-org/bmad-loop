@@ -6245,6 +6245,57 @@ def test_harvest_reverted_when_the_ledger_lives_outside_the_repo(project, tmp_pa
     assert not paths.deferred_work.exists()
 
 
+def test_harvest_reverted_when_the_artifacts_dir_globs_onto_a_tracked_path(project):
+    """The same end state as the row above — an entry outliving the code it describes,
+    open in the ledger and swept later as if the work still existed — reached by a
+    different wrong answer.
+
+    An `implementation_artifacts` holding `[` / `]` is an operator's to name and
+    `bmadconfig._resolve` takes it verbatim. The ledger's tracked-probe passes that path
+    to git as a PATHSPEC, so it globs onto the neighbour under the sibling literal name
+    and the revert reads "git owns it, the reset already put it back" for a file the
+    reset never saw (#423).
+
+    Consequence only: no `path_tracked` precondition assert here, or the row reddens at
+    its precondition and re-proves the unit test instead of the harm."""
+    paths = dataclasses.replace(
+        project, implementation_artifacts=project.project / "_bmad-output" / "impl[1]"
+    )
+    paths.implementation_artifacts.mkdir(parents=True)
+    # The glob's landing pad, and it has to be committed on purpose: `conftest`'s template
+    # creates the artifact dirs EMPTY, and git tracks no empty dir, so nothing under
+    # `_bmad-output/` is tracked and the pathspec would have nothing to land on.
+    decoy = project.project / "_bmad-output" / "impl1" / "deferred-work.md"
+    decoy.parent.mkdir(parents=True)
+    decoy.write_text("# a neighbour's ledger\n", encoding="utf-8")
+    git(project.project, "add", "--", "_bmad-output/impl1/deferred-work.md")
+    git(project.project, "commit", "-q", "-m", "tracked neighbour")
+
+    write_sprint(paths, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    pol = dataclasses.replace(_harvest_policy(), limits=LimitsPolicy(max_dev_attempts=2))
+    engine, _ = make_engine(
+        paths,
+        [
+            # attempt 1: harvests HARVEST_A, then fails the baseline gate
+            _baseline_liar_effect(paths, deferred=[HARVEST_A]),
+            # attempt 2: an honest session, so the run terminates cleanly
+            dev_effect(paths, "1-1-a", followup_review=False),
+        ],
+        policy=pol,
+    )
+    summary = engine.run()
+
+    # attempt 1 really did file the entry, so there is something for the revert to undo
+    harvests = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert len(harvests) == 1 and harvests[0]["dw_ids"] == ["DW-1"]
+
+    assert summary.done == 1
+    assert _ledger_entries(paths) == []
+    assert not paths.deferred_work.exists()
+    # and the revert reached the ledger WITHOUT touching what the glob pointed at
+    assert decoy.read_text(encoding="utf-8") == "# a neighbour's ledger\n"
+
+
 def test_ledger_outside_the_workspace_is_not_gits(project, tmp_path):
     """The classifier's out-of-tree row, isolated from the run that reaches it."""
     paths = _external_artifacts(project, tmp_path)

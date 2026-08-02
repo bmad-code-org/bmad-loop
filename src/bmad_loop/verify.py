@@ -282,6 +282,12 @@ def _exclude_specs(dirs: tuple[str, ...]) -> list[str]:
     return [f":(exclude){d}" for d in dirs]
 
 
+def _literal_specs(rels: list[str]) -> list[str]:
+    """git pathspec `:(literal)<rel>` for each repo-relative posix path — the operand
+    form that means "this path", not "this glob". See `path_tracked` for why."""
+    return [f":(literal){r}" for r in rels]
+
+
 def _path_under_any(path: str, prefixes: tuple[str, ...]) -> bool:
     """True if repo-relative posix `path` equals or sits under any `prefixes` dir."""
     return any(path == p or path.startswith(p.rstrip("/") + "/") for p in prefixes)
@@ -322,10 +328,31 @@ def path_tracked(repo: Path, rel: str) -> bool:
     (untracked answers "tracked"), so callers act on the opposite of the truth. The
     error path keeps the merge, where stderr is the only informative half.
 
+    The pathspec is forced LITERAL, because git reads a positional operand as a
+    PATHSPEC and not as a path: `[`, `]`, `*` and `?` in ``rel`` are wildmatch
+    metacharacters, so a probe for an ABSENT path answers True the moment some OTHER
+    tracked path happens to match the glob. The error is one-directional —
+    `match_pathspec_item` compares literally before it falls through to fnmatch, so a
+    genuinely tracked path never reads untracked — and it runs toward the answer that
+    authorizes leaving a file alone, which is how a harvested ledger under an
+    operator-named `implementation_artifacts` (`bmadconfig._resolve` takes that key
+    verbatim, metacharacters and all) outlived the rollback that discarded the code it
+    described. Not the global `--literal-pathspecs` / `GIT_LITERAL_PATHSPECS` form,
+    which would also disarm the `:(exclude)` magic `worktree_clean`, `has_changes_since`
+    and `attempt_dirty` are built on; the per-operand prefix is scoped to this call. It
+    costs the callers nothing: that same literal comparison is what matches a DIRECTORY
+    prefix, so `_bmad/render` still lists everything beneath it (`cmd_validate`'s
+    render-tracked warning), and it additionally disarms a ``rel`` that itself begins
+    with `:`, which git would otherwise parse as magic. Measured identical at git 2.20.4
+    — the floor `install._WORKTREE_CONFIG_GIT` declares — and at 2.55.0; below a version
+    that understands the prefix it would read as a literal FILENAME, match nothing and
+    answer False, which is the one direction that authorizes a delete.
+
     Raises GitError like every other probe in this module. Callers inside a rollback
     `finally` catch it and degrade toward leaving the file alone: uncertainty must
-    never authorize a delete."""
-    proc = _run_git(["git", "-C", str(repo), "ls-files", "--", rel], repo)
+    never authorize a delete. The message keeps the BARE ``rel``: the operator's path is
+    its informative half and the magic prefix is our own plumbing."""
+    proc = _run_git(["git", "-C", str(repo), "ls-files", "--", *_literal_specs([rel])], repo)
     if proc.returncode != 0:
         merged = (proc.stdout + proc.stderr).strip()
         raise GitError(f"git ls-files -- {rel} failed in {repo}: {merged}")

@@ -944,6 +944,34 @@ def test_path_tracked_separates_tracked_untracked_and_ignored(project):
     assert verify.path_tracked(repo, "src.txt")
 
 
+def test_path_tracked_reads_its_operand_as_a_path_not_a_pathspec(project):
+    """`ls-files` takes a PATHSPEC, not a path, so `[` and `]` in an operator-named
+    `implementation_artifacts` are wildmatch metacharacters: the probe for an ABSENT
+    path answers True off a tracked NEIGHBOUR that happens to match the glob, and the
+    harvest revert then skips the unlink it exists to perform (#423).
+
+    The direction is what makes it expensive. Git compares literally before it falls
+    through to fnmatch, so a genuinely tracked path never reads untracked — the error
+    only ever runs toward the answer that authorizes leaving a file alone.
+
+    The third assert is the other half of one claim, not a separate one. Literal is not
+    EXACT: git still matches a literal operand as a directory PREFIX. A "fix" that
+    tightened this to `stdout.strip() == rel` passes the two rows above while silently
+    disarming `cmd_validate`'s render-tracked warning, whose only match on `_bmad/render`
+    is that prefix."""
+    repo = project.project
+    (repo / "probe1").mkdir()
+    (repo / "probe1" / "note.md").write_text("the decoy\n", encoding="utf-8")
+    git(repo, "add", "probe1/note.md")
+    git(repo, "commit", "-q", "-m", "tracked neighbour")
+    (repo / "probe[1]").mkdir()
+    (repo / "probe[1]" / "note.md").write_text("untracked\n", encoding="utf-8")
+
+    assert not verify.path_tracked(repo, "probe[1]/note.md")
+    assert verify.path_tracked(repo, "probe1/note.md")  # the decoy really is tracked
+    assert verify.path_tracked(repo, "probe1")  # a directory prefix still matches
+
+
 def test_safe_rollback_reverts_tracked_and_removes_run_created(project):
     repo = project.project
     baseline = verify.rev_parse_head(repo)
