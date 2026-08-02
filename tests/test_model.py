@@ -215,6 +215,40 @@ def test_harvest_wrote_ledger_defaults_false_for_legacy_state():
     assert StoryTask.from_dict(doc).harvest_wrote_ledger is False
 
 
+def test_ledger_changed_before_harvest_round_trips():
+    """Persisted for the same reason its neighbour is, and it has to survive the
+    round-trip to be read at all: the attempt that answers the question may be a
+    fresh one whose `_dev_phase` call began before a host death."""
+    for value in (True, False):
+        task = StoryTask(story_key="1-1-a", epic=1, ledger_changed_before_harvest=value)
+        assert StoryTask.from_dict(task.to_dict()).ledger_changed_before_harvest is value
+
+
+def test_ledger_changed_before_harvest_defaults_false_for_legacy_state():
+    """Absent ⇒ the exclusion applies whenever the harvest wrote, i.e. exactly the
+    behaviour shipped before this field — the conservative direction."""
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    del doc["ledger_changed_before_harvest"]  # state.json from before the field existed
+    assert StoryTask.from_dict(doc).ledger_changed_before_harvest is False
+
+
+def test_baseline_ledger_digest_round_trips():
+    """The digest is the reference `_harvest_gate_exclude` measures each attempt
+    against, and a resumed `_dev_phase` call cannot re-capture it (that would move the
+    reference onto the completed session's own tree). So it comes off disk or not at
+    all."""
+    task = StoryTask(story_key="1-1-a", epic=1, baseline_ledger_digest="a" * 64)
+    assert StoryTask.from_dict(task.to_dict()).baseline_ledger_digest == "a" * 64
+
+
+def test_baseline_ledger_digest_defaults_none_for_legacy_state():
+    """`None` is a real state — "no reference was captured" — and it skips the
+    per-attempt compute rather than guessing a comparison against nothing."""
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    del doc["baseline_ledger_digest"]  # state.json from before the field existed
+    assert StoryTask.from_dict(doc).baseline_ledger_digest is None
+
+
 def test_restore_patch_round_trips():
     task = StoryTask(story_key="1-1-a", epic=1, restore_patch="artifacts/attempt.patch")
     assert StoryTask.from_dict(task.to_dict()).restore_patch == "artifacts/attempt.patch"

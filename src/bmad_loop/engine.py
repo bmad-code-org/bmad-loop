@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import hashlib
 import os
 import shutil
 import signal
@@ -1881,6 +1882,14 @@ class Engine:
             # would shift the rollback/squash reference onto the completed
             # session's own tree.
             task.baseline_untracked = sorted(verify.untracked_files(self.workspace.root))
+            # and the ledger's baseline bytes, under the same rule and for the same
+            # kind of reason: `_harvest_gate_exclude` measures each attempt's ledger
+            # against THIS reference to tell its own harvest's write from anyone
+            # else's, so re-capturing on a resume would move the reference onto the
+            # completed session's tree — the one place that session's ledger edit is
+            # guaranteed to already be, which is precisely the edit the gate must
+            # still be able to see (#405).
+            task.baseline_ledger_digest = self._ledger_digest()
         feedback: Path | None = None
         while True:
             replayed = resume_result is not None
@@ -1981,11 +1990,39 @@ class Engine:
                 # write, the hazard this flag exists to prevent (#405).
                 if not replayed:
                     task.harvest_wrote_ledger = False
+                    # …and, for this attempt, whether the ledger's diff from the
+                    # phase baseline is ALREADY more than the harvest's — the
+                    # session's own ledger edit, an operator's edit during a
+                    # `rollback_on_failure = off` pause, or a previous attempt's
+                    # edit that survived a restore. `_harvest_gate_exclude` stands
+                    # down when it is, so a ledger-reconciliation story that also
+                    # records a `deferred:` finding is not masked into a false
+                    # "no changes since baseline" (#405).
+                    #
+                    # It shares the flag's guard because it shares the flag's
+                    # hazard, in mirror image: on a replay the ledger on disk is
+                    # already POST-harvest, so re-answering here would read the
+                    # DEAD attempt's own harvest as "someone else changed it" and
+                    # stand the exclusion down over the orchestrator's write.
+                    #
+                    # Here rather than hoisted onto the arm's read below: hoisting
+                    # would put a `read_text` — hence a new raise site — on the
+                    # replayed-and-armed path, which has none today. Two reads on
+                    # the fresh path is the cheaper half of that trade.
+                    #
+                    # `None` = no baseline digest was captured (a legacy
+                    # state.json), so the question has no reference to answer
+                    # against and the gate keeps its pre-#405 shape.
+                    if task.baseline_ledger_digest is not None:
+                        task.ledger_changed_before_harvest = (
+                            self._ledger_digest() != task.baseline_ledger_digest
+                        )
                 if not replayed or not task.pre_harvest_ledger_captured:
                     task.pre_harvest_ledger = self._ledger_text()
                     task.pre_harvest_ledger_captured = True
-                    # persists the clear above as well: `not replayed` implies this
-                    # condition, so every pass that clears the flag saves here.
+                    # persists the clear and the compute above as well: `not
+                    # replayed` implies this condition, so every pass through that
+                    # block saves here.
                     self._save()
                 # bmad-dev-auto sometimes finalizes the spec in prose (## Auto Run
                 # Result: Status done) but leaves the frontmatter status at the
@@ -2999,10 +3036,23 @@ class Engine:
         harvest dedupes to nothing while the dead attempt's entries remain in the
         tree. Narrow by construction: it excludes the ledger only on the attempts
         that actually wrote it, so a session's OWN ledger edit still counts as work
-        on every other attempt. The residual is a session that edits the ledger on
-        an attempt that also harvests — false-negatived, which is the safe
-        direction for a proof-of-work gate."""
+        on every other attempt.
+
+        And on THIS attempt too. The exclusion is path-granular — it hides the whole
+        relpath, not the harvest's lines — so on its own it also masks a session
+        ledger edit that shares the attempt, and a ledger-reconciliation story that
+        additionally records one `deferred:` finding reads as "no changes since
+        baseline". That is not merely a false negative: the RETRY it produces is the
+        default non-fixable one, so under the default `scm.rollback_on_failure = off`
+        it PAUSES the whole run rather than costing an attempt. Hence the second
+        early return: `ledger_changed_before_harvest` says the ledger had already
+        left the phase baseline when this attempt's pre-harvest snapshot was armed,
+        so its diff is provably not the harvest's alone and the gate must judge it in
+        full. Stepping aside is the conservative direction — the gate then sees more
+        of the tree, never less."""
         if not task.harvest_wrote_ledger:
+            return ()
+        if task.ledger_changed_before_harvest:
             return ()
         paths = self.workspace.paths
         try:
@@ -3633,6 +3683,27 @@ class Engine:
         own ledger — the same one `_rollback_or_pause` resets around."""
         ledger = self.workspace.paths.deferred_work
         return ledger.read_text(encoding="utf-8") if ledger.is_file() else None
+
+    def _ledger_digest(self) -> str:
+        """A digest of the deferred-work ledger's current text, for the only
+        question `task.baseline_ledger_digest` is ever asked: has the ledger moved
+        since the `_dev_phase` baseline (`_harvest_gate_exclude`, #405).
+
+        A digest rather than the text, because that field is phase-scoped — it
+        outlives every attempt's arm/disarm window — so persisting the bytes would
+        carry a growing ledger in state.json alongside `pre_harvest_ledger`'s copy.
+        Equality is the whole contract, so a digest loses nothing.
+
+        An ABSENT ledger and an EMPTY one hash identically, deliberately. The
+        `pre_harvest_ledger` split next door exists only because its restore has to
+        UNLINK; nothing here does, and neither state carries an entry, so for "did
+        this change" they are the same answer.
+
+        Raises what `_ledger_text` raises. Both callers are already on paths that
+        read or write the ledger unguarded, and a read fault here would otherwise
+        have to be spelled as one of the two answers — either of which is a guess
+        about work the gate is about to judge."""
+        return hashlib.sha256((self._ledger_text() or "").encode("utf-8")).hexdigest()
 
     def _ledger_is_gits_to_restore(self, task: StoryTask) -> bool:
         """True when git owns the deferred-work ledger — it has an index entry, so

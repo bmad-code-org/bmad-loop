@@ -160,6 +160,29 @@ class StoryTask:
     # user already had on disk are never deleted. None = pre-upgrade run (no
     # snapshot); rollback then removes no untracked files at all.
     baseline_untracked: list[str] | None = None
+    # digest of the deferred-work ledger as of the same baseline capture, so
+    # `Engine._harvest_gate_exclude` can tell "the ledger's diff from baseline is
+    # this harvest's alone" from "someone else wrote it first". Phase-scoped like
+    # the two above, and captured under the same `resume_result is None` rule: a
+    # re-capture on resume would move the reference onto the completed session's
+    # own tree, where that session's ledger edit already is.
+    #
+    # PERSISTED rather than held in a local across the attempt loop, and that is
+    # the point. A local is only ever set on a FRESH `_dev_phase` entry, where the
+    # per-attempt compute below always runs — so the compute's guard would be
+    # unfalsifiable and the mask would survive a crash-resume unchanged.
+    #
+    # A digest, not the text: only equality is ever asked, and unlike
+    # `pre_harvest_ledger` this one lives for the whole phase rather than one
+    # attempt's arm/disarm window, so persisting the bytes would put a growing
+    # ledger in every state.json twice. An ABSENT and an EMPTY ledger collapse to
+    # the same digest deliberately — nothing here unlinks (see the split below,
+    # which exists only because a restore must), and neither state holds an entry.
+    #
+    # None = a legacy state.json, or an entry captured before this field existed;
+    # the compute is then skipped and the gate keeps its pre-#405 behaviour, which
+    # is the conservative direction for a proof-of-work gate.
+    baseline_ledger_digest: str | None = None
     # the deferred-work ledger's text as of THIS attempt's pre-harvest moment,
     # persisted so a host death between `_harvest_spec_deferrals` and the
     # non-fixable-RETRY rollback cannot lose it: the replayed attempt writes these
@@ -192,6 +215,27 @@ class StoryTask:
     # replayed:` block that arms the snapshot above — which a replay skips, on
     # purpose, and a fresh RETRY iteration re-enters.
     harvest_wrote_ledger: bool = False
+    # The ledger had ALREADY moved off `baseline_ledger_digest` when this attempt's
+    # pre-harvest snapshot was armed, so its post-baseline diff is not the harvest's
+    # alone and `Engine._harvest_gate_exclude` must not mask it. Without this the
+    # exclusion is path-granular: a story that reconciles the ledger AND records a
+    # `deferred:` finding has its own edit hidden along with the harvest's, reads as
+    # "no changes since baseline", and the non-fixable RETRY that follows PAUSES the
+    # run under the default `scm.rollback_on_failure = off` (#405).
+    #
+    # Named for what it MEASURES, not for the expected author. The session is the
+    # intended occupant, but an operator's edit during a `rollback_on_failure = off`
+    # pause and a previous attempt's edit that survived a restore land here too —
+    # correctly, because none of them is THIS harvest's write. A "session_wrote_"
+    # spelling would be a claim the code does not make.
+    #
+    # PERSISTED for exactly the reason the flag above is: a replay must keep the
+    # dead attempt's answer rather than re-derive it from a tree that already holds
+    # the dead attempt's harvest.
+    #
+    # Re-answered per attempt, in the same `if not replayed:` block that clears the
+    # flag above and for the same reason — see `Engine._dev_phase`.
+    ledger_changed_before_harvest: bool = False
     spec_file: str | None = None
     commit_sha: str | None = None
     defer_reason: str | None = None
@@ -284,9 +328,11 @@ class StoryTask:
             "followup_review_recommended": self.followup_review_recommended,
             "baseline_commit": self.baseline_commit,
             "baseline_untracked": self.baseline_untracked,
+            "baseline_ledger_digest": self.baseline_ledger_digest,
             "pre_harvest_ledger": self.pre_harvest_ledger,
             "pre_harvest_ledger_captured": self.pre_harvest_ledger_captured,
             "harvest_wrote_ledger": self.harvest_wrote_ledger,
+            "ledger_changed_before_harvest": self.ledger_changed_before_harvest,
             "spec_file": self._serialized_spec_file(),
             "commit_sha": self.commit_sha,
             "defer_reason": self.defer_reason,
@@ -334,6 +380,14 @@ class StoryTask:
                 if d.get("baseline_untracked") is not None
                 else None
             ),
+            # `None` here means "no baseline digest was captured" — a state.json
+            # written before this field existed — and the compute keyed off it is
+            # skipped in that case, so hands-off is the safe rehydration.
+            baseline_ledger_digest=(
+                str(d["baseline_ledger_digest"])
+                if d.get("baseline_ledger_digest") is not None
+                else None
+            ),
             # `is not None`, NOT the natural `str(d.get(k, "")) or None`: a persisted
             # EMPTY string means "the ledger existed and was empty", and it has to
             # rehydrate as "" — `None` means "no file at all" and would turn the
@@ -349,6 +403,7 @@ class StoryTask:
             ),
             pre_harvest_ledger_captured=bool(d.get("pre_harvest_ledger_captured", False)),
             harvest_wrote_ledger=bool(d.get("harvest_wrote_ledger", False)),
+            ledger_changed_before_harvest=bool(d.get("ledger_changed_before_harvest", False)),
             spec_file=d.get("spec_file"),
             commit_sha=d.get("commit_sha"),
             defer_reason=d.get("defer_reason"),

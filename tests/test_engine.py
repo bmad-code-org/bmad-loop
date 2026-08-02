@@ -7252,12 +7252,19 @@ def test_an_unarmed_replay_still_refuses_the_dead_attempts_harvest_as_work(proje
 # its spec and changed no code proceeds to done on the strength of the harvest alone.
 
 
-def _session_authored_ledger_effect(project, title: str, story_key: str = "1-1-a"):
+def _session_authored_ledger_effect(project, title: str, story_key: str = "1-1-a", deferred=None):
     """An HONEST dev session whose entire diff is a ledger entry it wrote ITSELF, with
-    no `deferred:` frontmatter and no source edit — the ledger-only story shape that
-    `verify_dev_exclude_relpaths` refuses to exclude on purpose. The mirror image of the
-    harvest: same file, same attempt window, different author."""
-    inner = dev_effect(project, story_key, followup_review=False, write_src=False)
+    no source edit — the ledger-only story shape that `verify_dev_exclude_relpaths`
+    refuses to exclude on purpose. The mirror image of the harvest: same file, same
+    attempt window, different author.
+
+    ``deferred`` adds `deferred:` frontmatter findings on top, so the SAME attempt
+    carries both authors' writes to the ledger — the collision the path-granular
+    exclusion used to resolve against the session (T2h/T2k). Defaulted, so the two
+    callers that want the pure shape (T2f, T2g) are unaffected."""
+    inner = dev_effect(
+        project, story_key, followup_review=False, write_src=False, deferred=deferred
+    )
 
     def effect(spec):
         from bmad_loop import deferredwork
@@ -7446,3 +7453,105 @@ def test_a_replayed_harvest_that_deduped_still_excludes_the_ledger(project):
     assert decisions[0]["action"] == "retry"
     assert "no changes" in decisions[0]["reason"]
     assert summary.done == 1
+
+
+def test_a_session_ledger_edit_survives_an_attempt_that_also_harvests(project):
+    """T2h, and the residual `_harvest_gate_exclude`'s docstring used to concede.
+
+    The exclusion is path-granular — it hides the whole ledger relpath, not the
+    harvest's lines — so on an attempt where BOTH authors wrote, the session's own
+    edit went out with the orchestrator's. A story whose authorized scope is ledger
+    reconciliation, and which also records one `deferred:` finding, therefore read as
+    "no changes since baseline". This must PROCEED on the session's entry.
+
+    Not a mere false negative: `decide_dev` turns the gate's failure into the DEFAULT
+    non-fixable RETRY, which under the shipped `scm.rollback_on_failure = off` pauses
+    the whole run. (The fixture keeps rollback ON, like the rest of the T2 family, so
+    the failure shows up as the retry rather than as a `RunPaused`.)
+
+    Both halves of the fixture are load-bearing, and the second script entry exists
+    only so a regression fails legibly as `["retry", "proceed"]` rather than as a
+    `ScriptExhausted`."""
+    assert not project.deferred_work.exists()
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    pol = dataclasses.replace(_harvest_policy(), limits=LimitsPolicy(max_dev_attempts=2))
+    engine, adapter = make_engine(
+        project,
+        [
+            _session_authored_ledger_effect(project, "Session's own note", deferred=[HARVEST_A]),
+            dev_effect(project, "1-1-a", followup_review=False),
+        ],
+        policy=pol,
+    )
+    summary = engine.run()
+
+    decisions = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert [d["action"] for d in decisions] == ["proceed"]
+    assert [s.role for s in adapter.sessions] == ["dev"]
+    assert summary.done == 1
+    # the orchestrator's harvest really did fire on this attempt, so the gate answered
+    # with the exclusion live rather than on an absent ledger …
+    harvests = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert harvests[0]["dw_ids"] == ["DW-2"]
+    # … and both authors' entries are in the committed tree
+    assert [e.title for e in _ledger_entries(project)] == [
+        "Session's own note",
+        HARVEST_A["summary"],
+    ]
+
+
+def test_a_session_ledger_edit_after_a_crash_replay_is_still_proof_of_work(project):
+    """T2k, and the whole reason the baseline is a PERSISTED digest rather than a
+    local held across `_dev_phase`'s attempt loop.
+
+    A local is only ever assigned in the `if resume_result is None:` block, where
+    `replayed` is always False — so on this resume it would be unset for every
+    attempt in the call, the per-attempt compute could not run, and T2h's bug would
+    be alive again on exactly the leg that is hardest to reproduce. The persisted
+    digest is read back off `state.json` and answers.
+
+    Attempt 1 harvests and the host dies (T2e's window). The replay re-runs the
+    harvest, which dedupes to nothing, and is correctly refused — its whole ledger
+    diff IS the dead attempt's harvest. Attempt 2 is then the T2h shape and must
+    PROCEED on the session's own entry."""
+    assert not project.deferred_work.exists()
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    pol = dataclasses.replace(_harvest_policy(), limits=LimitsPolicy(max_dev_attempts=2))
+    engine, _ = make_engine(
+        project,
+        [
+            dev_effect(
+                project, "1-1-a", followup_review=False, write_src=False, deferred=[HARVEST_A]
+            )
+        ],
+        policy=pol,
+    )
+    _crash_at_post_dev_verify(engine)
+    assert engine.run().crashed
+    assert _ledger_entries(project), "the dead attempt really did harvest"
+
+    resumed, _ = resume_engine(
+        project,
+        engine,
+        [_session_authored_ledger_effect(project, "Session's own note", deferred=[HARVEST_A])],
+        policy=pol,
+    )
+    # the reference the replayed call can no longer capture for itself
+    assert resumed.state.tasks["1-1-a"].baseline_ledger_digest is not None
+    summary = resumed.run()
+
+    kinds = [e["kind"] for e in resumed.journal.entries()]
+    assert "resume-verify" in kinds  # it really was a replay, not a restart
+    decisions = [e for e in resumed.journal.entries() if e["kind"] == "dev-decision"]
+    assert [d["action"] for d in decisions] == ["retry", "proceed"]
+    assert "no changes" in decisions[0]["reason"]
+    assert summary.done == 1
+    # three harvests: the dead attempt's, the replay's dedupe, and attempt 2's — which
+    # fired, so attempt 2's gate answered with the exclusion live
+    harvests = [e for e in resumed.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert [h["dw_ids"] for h in harvests] == [["DW-1"], [], ["DW-2"]]
+    # the replay's rollback took the dead harvest with it; what survives is attempt 2's
+    assert [e.title for e in _ledger_entries(project)] == [
+        "Session's own note",
+        HARVEST_A["summary"],
+    ]

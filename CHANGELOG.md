@@ -342,6 +342,20 @@ that rode the same window. Both skill eras are supported; the rename itself need
   folder+id stories. The bundle leg is the costlier one, since an attempt let through there marks
   real ids `done` and `open_ids` re-bundles only `open` entries.
 
+- **…and a session's own ledger edit on that same attempt still is (#405).** That exclusion is
+  path-granular — it hides the whole ledger relpath, not the harvest's lines — so on an attempt
+  where both authors wrote, the session's edit went out with the orchestrator's. A
+  ledger-reconciliation story that also recorded one `deferred:` finding therefore read as "no
+  changes since baseline", and the non-fixable retry that follows _pauses the whole run_ under the
+  default `scm.rollback_on_failure = false`. The gate now stands down whenever the ledger had
+  already moved off the dev phase's baseline by the time that attempt's pre-harvest snapshot was
+  armed: its diff is then provably not the harvest's alone, and the gate judges the tree in full —
+  which is the conservative direction, since it sees more of the diff rather than less. The
+  baseline is a digest persisted beside `baseline_commit`, and persisting it is the point: a
+  resumed dev phase deliberately does not re-capture its baselines, so a phase-local reference
+  would be absent for every attempt after a crash-resume and the mask would survive there.
+  Introduced earlier in this same release.
+
 - **A sweep bundle's ledger closes are withheld until its attempt is accepted (#405).** The
   orchestrator marks a bundle's deferred-work ids `done` itself, and did so above the artifact
   gate — so an attempt that finalized its spec and then failed a non-fixable check was discarded
