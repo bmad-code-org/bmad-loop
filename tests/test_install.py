@@ -19,15 +19,20 @@ from bmad_loop.adapters.profile import get_profile
 from bmad_loop.install import (
     BASE_SKILLS,
     DEV_BASE_SKILLS,
+    LEGACY_PRIMITIVE_SKILL,
     MODULE_SKILLS,
+    PRIMITIVE_SKILL,
     _copy_traversable,
     _git_version_at_least,
     _shield_undo_extension,
     _worktree_local_exclude,
+    base_skills_for_tree,
     install_into,
     merge_hooks,
     missing_base_skills,
     provision_worktree,
+    resolve_primitive_skill,
+    resolve_review_layers,
 )
 
 
@@ -718,6 +723,198 @@ def _install_dev_auto(root, tree, *, customize="x\n", step04="x\n"):
     (d / "customize.toml").write_text(customize, encoding="utf-8")
     (d / "step-04-review.md").write_text(step04, encoding="utf-8")
     return d
+
+
+def _install_build_auto(root, tree, *, customize="x\n", step04="x\n"):
+    """Install bmad-build-auto (the post-rename primitive) with real
+    customize.toml/step-04 content — the current-bmm counterpart of
+    `_install_dev_auto`."""
+    d = root / tree / "bmad-build-auto"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "SKILL.md").write_text("# bmad-build-auto\n", encoding="utf-8")
+    (d / "customize.toml").write_text(customize, encoding="utf-8")
+    (d / "step-04-review.md").write_text(step04, encoding="utf-8")
+    return d
+
+
+class TestResolvePrimitiveSkill:
+    """`resolve_primitive_skill` decides which name every other install.py
+    function (marker check, review-layer resolution, stories probe, customize
+    overrides, worktree provisioning) reads as this project's dev primitive —
+    it is the fix for the bmm rename (`bmad-dev-auto` -> `bmad-build-auto`) that
+    made `bmad-loop validate` FAIL on a current, correctly-installed project."""
+
+    def test_prefers_build_auto_when_fully_installed(self, tmp_path):
+        claude = get_profile("claude")
+        _install_build_auto(tmp_path, claude.skill_tree)
+        assert resolve_primitive_skill(tmp_path, claude.skill_tree) == PRIMITIVE_SKILL
+
+    def test_falls_back_to_dev_auto_when_build_auto_absent(self, tmp_path):
+        """The pre-rename shape: only `bmad-dev-auto` installed, no
+        `bmad-build-auto` at all — must resolve to the legacy name so an older
+        bmm install keeps validating."""
+        claude = get_profile("claude")
+        _install_dev_auto(tmp_path, claude.skill_tree)
+        assert resolve_primitive_skill(tmp_path, claude.skill_tree) == LEGACY_PRIMITIVE_SKILL
+
+    def test_falls_back_when_neither_is_installed(self, tmp_path):
+        """Nothing installed at all: falls back to the legacy name (not build-auto)
+        so a from-scratch project's remediation message keeps pointing at the name
+        it has always pointed at."""
+        claude = get_profile("claude")
+        assert resolve_primitive_skill(tmp_path, claude.skill_tree) == LEGACY_PRIMITIVE_SKILL
+
+    def test_build_auto_with_a_missing_marker_still_resolves_to_build_auto(self, tmp_path):
+        """A half-applied upgrade — `bmad-build-auto/SKILL.md` present but no
+        customize.toml/step-04-review.md of its own — still resolves to
+        bmad-build-auto: existence decides here, and the marker gap itself is a
+        separate `skills.base-incomplete` finding (see
+        test_missing_base_skills_resolves_against_build_auto_when_installed).
+        Falling back to bmad-dev-auto in this case would misdiagnose a
+        half-upgraded project as having no primitive installed at all."""
+        claude = get_profile("claude")
+        d = tmp_path / claude.skill_tree / "bmad-build-auto"
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text("# bmad-build-auto\n", encoding="utf-8")
+        assert resolve_primitive_skill(tmp_path, claude.skill_tree) == PRIMITIVE_SKILL
+
+    def test_build_auto_present_alongside_the_forwarding_shim(self, tmp_path):
+        """The realistic post-rename topology: bmm ships BOTH — `bmad-build-auto`
+        as the real primitive and `bmad-dev-auto` as a permanent one-file
+        forwarding shim (no step-04-review.md/customize.toml of its own). Build-auto
+        must win."""
+        claude = get_profile("claude")
+        _install_build_auto(tmp_path, claude.skill_tree)
+        shim = tmp_path / claude.skill_tree / "bmad-dev-auto"
+        shim.mkdir(parents=True)
+        (shim / "SKILL.md").write_text("forwards to bmad-build-auto\n", encoding="utf-8")
+        assert resolve_primitive_skill(tmp_path, claude.skill_tree) == PRIMITIVE_SKILL
+
+
+def test_missing_base_skills_resolves_against_build_auto_when_installed(tmp_path):
+    """#<rename>: a project on the current bmm module (bmad-build-auto, not
+    bmad-dev-auto) must validate clean, and a marker gap must be reported against
+    bmad-build-auto — not the false "bmad-dev-auto is incomplete" FAIL the
+    hardcoded name used to produce."""
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    _install_build_auto(tmp_path, tree)
+    _install_skills(
+        tmp_path,
+        tree,
+        {"bmad-review-adversarial-general": (), "bmad-review-edge-case-hunter": ()},
+    )
+    assert missing_base_skills(tmp_path, [tree]) == []
+
+    (tmp_path / tree / "bmad-build-auto" / "step-04-review.md").unlink()
+    problems = missing_base_skills(tmp_path, [tree])
+    assert len(problems) == 1
+    assert problems[0].check == "skills.base-incomplete"
+    assert problems[0].detail["skill"] == "bmad-build-auto"
+    assert "step-04-review.md" in problems[0].message
+
+
+def test_resolve_review_layers_reads_build_auto_when_that_is_the_primitive(tmp_path):
+    """Review-layer resolution must read the RESOLVED primitive's own
+    step-04-review.md/customize.toml — reading the deprecated bmad-dev-auto shim
+    (which carries neither) instead would silently drop every review requirement
+    on a current bmm install."""
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    _install_build_auto(tmp_path, tree, customize=LAYER_CUSTOMIZE)
+
+    resolved = resolve_review_layers(tmp_path, tree)
+    assert resolved is not None
+    assert resolved.source == "customize.toml"
+    assert "bmad-review" in resolved.required
+
+
+def test_customize_override_prefers_build_auto_filename_when_resolved(tmp_path):
+    """`_bmad/custom/bmad-build-auto.toml` (not the deprecated `bmad-dev-auto.toml`
+    name) is the override file read once the project's primitive resolves to
+    bmad-build-auto."""
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    only_one_layer = LAYER_CUSTOMIZE.split("[[workflow.review_layers]]")[0] + (
+        """[[workflow.review_layers]]
+id = "blind-hunter"
+instruction = '''
+> Invoke the `bmad-review` skill with only the `adversarial` lens on this diff:
+'''
+"""
+    )
+    _install_build_auto(tmp_path, tree, customize=only_one_layer)
+    _install_skills(tmp_path, tree, {"bmad-review": ()})
+    assert missing_base_skills(tmp_path, [tree]) == []
+
+    override = tmp_path / "_bmad" / "custom" / "bmad-build-auto.toml"
+    override.parent.mkdir(parents=True, exist_ok=True)
+    override.write_text(
+        """[[workflow.review_layers]]
+id = "blind-hunter"
+instruction = '''
+> Invoke the `bmad-review-adversarial-general` skill on this diff:
+'''
+""",
+        encoding="utf-8",
+    )
+    problems = missing_base_skills(tmp_path, [tree])
+    assert len(problems) == 1
+    assert problems[0].detail["skill"] == "bmad-review-adversarial-general"
+
+    # a same-named `bmad-dev-auto.toml` override must NOT apply once the project
+    # has resolved to bmad-build-auto — it would be reading the wrong project's
+    # customization by coincidence of a shared filename convention.
+    legacy_override = tmp_path / "_bmad" / "custom" / "bmad-dev-auto.toml"
+    legacy_override.write_text(
+        """[[workflow.review_layers]]
+id = "blind-hunter"
+instruction = ""
+""",
+        encoding="utf-8",
+    )
+    problems = missing_base_skills(tmp_path, [tree])
+    assert len(problems) == 1
+    assert problems[0].detail["skill"] == "bmad-review-adversarial-general"
+
+
+def test_base_skills_for_tree_names_the_resolved_primitive(tmp_path):
+    """`base_skills_for_tree` (worktree provisioning's copy-list floor) must name
+    whichever primitive this project/tree actually resolves to, not always the
+    legacy `bmad-dev-auto` — or an isolated worktree run on a bmad-build-auto
+    project would get seeded with a skill that was never installed."""
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+
+    _install_dev_auto(tmp_path, tree)
+    assert LEGACY_PRIMITIVE_SKILL in base_skills_for_tree(tmp_path, tree)
+    assert PRIMITIVE_SKILL not in base_skills_for_tree(tmp_path, tree)
+
+    import shutil as _shutil
+
+    _shutil.rmtree(tmp_path / tree / LEGACY_PRIMITIVE_SKILL)
+    _install_build_auto(tmp_path, tree)
+    assert PRIMITIVE_SKILL in base_skills_for_tree(tmp_path, tree)
+    assert LEGACY_PRIMITIVE_SKILL not in base_skills_for_tree(tmp_path, tree)
+
+
+def test_provision_worktree_copies_build_auto_when_that_is_the_repo_primitive(tmp_path):
+    """End-to-end worktree-provisioning check: a main repo on bmad-build-auto (no
+    bmad-dev-auto at all) must have bmad-build-auto — not bmad-dev-auto — copied
+    into the isolated worktree."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    claude = get_profile("claude")
+    _install_build_auto(repo, claude.skill_tree)
+    _install_skills(
+        repo,
+        claude.skill_tree,
+        {"bmad-review-adversarial-general": (), "bmad-review-edge-case-hunter": ()},
+    )
+
+    provision_worktree(wt, [claude], repo)
+
+    assert (wt / claude.skill_tree / "bmad-build-auto" / "step-04-review.md").is_file()
+    assert not (wt / claude.skill_tree / "bmad-dev-auto").exists()
 
 
 def test_layer_driven_review_requires_the_merged_skill_it_names(tmp_path):

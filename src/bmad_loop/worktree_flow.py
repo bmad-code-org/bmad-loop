@@ -27,12 +27,12 @@ from typing import TYPE_CHECKING, Callable, NoReturn
 
 from . import gates, verify
 from .install import (
-    BASE_SKILLS,
     CUSTOMIZE_DIR,
     HOOK_SCRIPT_REL,
     MODULE_SKILLS,
     _copy_traversable,
     _worktree_local_exclude,
+    base_skills_for_tree,
     merge_hooks,
     resolve_review_layers,
 )
@@ -84,8 +84,9 @@ def provision_worktree(
     the Stop-signal hook never fires, and isolated sessions can't reach their MCP
     server. Lay the bundled skills + signal hook into the worktree for the active
     CLI profiles, and copy the `seed_files` configs in from the main repo. The
-    upstream skills the orchestrator drives (BASE_SKILLS: bmad-dev-auto + the review
-    hunters, plus whatever review layers this project's own config names) are not
+    upstream skills the orchestrator drives (base_skills_for_tree: the resolved dev
+    primitive + the review hunters, plus whatever review layers this project's own
+    config names) are not
     bundled in the wheel, so they are copied from the MAIN REPO's installed tree
     instead — together with `_bmad/custom/`, the customization those layers resolve
     through, so the isolated run resolves the same layer set the preflight
@@ -216,18 +217,24 @@ def provision_worktree(
             _copy_traversable(skills_root.joinpath(skill), dst)
         # The orchestrator-driven upstream skills are not in the wheel; copy them
         # from the MAIN REPO's installed tree (same tree path) so an isolated
-        # worktree can still resolve /bmad-dev-auto and the review layers. Skip
+        # worktree can still resolve the dev primitive and the review layers. Skip
         # silently when the main repo lacks them — the run-start preflight reports
         # it.
         #
-        # BASE_SKILLS is only the floor. The review layers this project actually
-        # invokes are read from the installed bmad-dev-auto, exactly as the
-        # preflight reads them, so a reviewer named by a project override (a
-        # custom or renamed skill) is provisioned too. Validating a skill here and
-        # then not copying it is how preflight passes in the main checkout while
-        # the isolated review fails on a skill that was never there.
+        # base_skills_for_tree(repo_root, tree) is only the floor, and — unlike the
+        # static BASE_SKILLS it replaces — names whichever primitive
+        # (bmad-build-auto or bmad-dev-auto) THIS repo actually has installed for
+        # this tree, so a build-auto project doesn't get a dev-auto that was never
+        # there. The review layers this project actually invokes are read from
+        # that same resolved primitive, exactly as the preflight reads them, so a
+        # reviewer named by a project override (a custom or renamed skill) is
+        # provisioned too. Validating a skill here and then not copying it is how
+        # preflight passes in the main checkout while the isolated review fails on
+        # a skill that was never there.
         resolved = resolve_review_layers(repo_root, tree)
-        required = dict.fromkeys((*BASE_SKILLS, *(resolved.skills() if resolved else ())))
+        required = dict.fromkeys(
+            (*base_skills_for_tree(repo_root, tree), *(resolved.skills() if resolved else ()))
+        )
         for skill in required:
             dst = tree_dir / skill
             if dst.exists():

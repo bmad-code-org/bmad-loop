@@ -370,7 +370,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
     if profiles and not any(f.severity == "problem" for f in base_findings):
         report.ok(
             "skills.base",
-            "upstream skills present (bmad-dev-auto + review layers)",
+            "upstream skills present (dev primitive + review layers)",
             {"trees": list(dict.fromkeys(p.skill_tree for p in profiles))},
         )
     report.extend(base_findings)
@@ -492,17 +492,17 @@ def _mux_set(project: Path, args: argparse.Namespace) -> int:
 
 
 def _require_base_skills(project: Path, pol, *, require_stories: bool = False) -> bool:
-    """Preflight the upstream skills the orchestrator drives (bmad-dev-auto + the
-    review layers it invokes inline).
+    """Preflight the upstream skills the orchestrator drives (the resolved dev
+    primitive + the review layers it invokes inline).
 
     Returns True when everything is in place; otherwise prints the problems and
     returns False so the caller can abort before spawning any session (a missing
     skill would otherwise stall as an `Unknown command` until the run times out).
     Warnings are printed but never abort — only ``problem`` findings block.
 
-    ``require_stories`` additionally content-probes bmad-dev-auto for folder+id
-    dispatch — stories mode needs a newer skill than sprint mode, so an older
-    install must fail loudly here rather than HALT `no stories.yaml`-style at
+    ``require_stories`` additionally content-probes the resolved primitive for
+    folder+id dispatch — stories mode needs a newer skill than sprint mode, so an
+    older install must fail loudly here rather than HALT `no stories.yaml`-style at
     dispatch time."""
     from .adapters.profile import ProfileError, get_profile
 
@@ -581,10 +581,10 @@ def _validate_stories_queue(
     report: ValidationReport,
 ) -> None:
     """Stories-mode counterpart of ``cmd_validate``'s sprint-status gate: validate
-    the ``stories.yaml`` manifest + ``SPEC.md`` and confirm the installed
-    ``bmad-dev-auto`` carries the folder+id dispatch flow stories mode needs (an
-    older skill would HALT at dispatch). Appends findings to ``report`` in place;
-    the probe carries its own remediation text ("update the bmm module")."""
+    the ``stories.yaml`` manifest + ``SPEC.md`` and confirm the installed dev
+    primitive carries the folder+id dispatch flow stories mode needs (an older
+    skill would HALT at dispatch). Appends findings to ``report`` in place; the
+    probe carries its own remediation text ("update the bmm module")."""
     folder = stories_mod.resolve_spec_folder(paths.project, spec_folder)
     problem = _validate_stories_folder(paths, spec_folder)
     if problem:
@@ -607,7 +607,7 @@ def _validate_stories_queue(
     if skill_trees and not stories_probs:
         report.ok(
             "skills.stories-dispatch",
-            "bmad-dev-auto supports folder+id dispatch (stories mode)",
+            "the installed dev primitive supports folder+id dispatch (stories mode)",
             {"trees": list(dict.fromkeys(skill_trees))},
         )
     report.extend(stories_probs)

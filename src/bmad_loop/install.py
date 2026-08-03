@@ -55,26 +55,83 @@ ANTIGRAVITY_HOOK_TIMEOUT_SEC = 60  # agy hook timeouts are seconds (default 30)
 ANTIGRAVITY_HOOK_GROUP = "bmad-loop"
 
 # The bmad-loop-* skills bundled in the wheel (bmad_loop/data/skills/) that
-# `bmad-loop init` lays down. The inner dev primitive `bmad-dev-auto` is upstream
-# (not bundled here): the orchestrator drives it as an already-installed skill.
+# `bmad-loop init` lays down. The inner dev primitive (see PRIMITIVE_SKILL below)
+# is upstream (not bundled here): the orchestrator drives it as an
+# already-installed skill.
 MODULE_SKILLS = (
     "bmad-loop-resolve",
     "bmad-loop-sweep",
     "bmad-loop-setup",
 )
 
+# The inner dev primitive's name, across the BMAD-METHOD rename that renamed
+# `bmad-dev-auto` to `bmad-build-auto`. Post-rename bmm ships `bmad-dev-auto` only
+# as a permanent one-file shim that forwards to `bmad-build-auto` — so a project's
+# real primitive (the one carrying step-04-review.md/customize.toml, the one every
+# dev/review session actually runs) is whichever of the two is genuinely installed.
+# `resolve_primitive_skill` (below) is the one place that decides; every other
+# function in this module resolves through it rather than hardcoding a name, or
+# validate would drift from what a dev run really invokes (see its docstring).
+PRIMITIVE_SKILL = "bmad-build-auto"
+LEGACY_PRIMITIVE_SKILL = "bmad-dev-auto"
+# Markers pin BOTH a step file (catches a truncated copy) AND customize.toml, the
+# layer/handoff config step-04 resolves review_layers from (BMAD-METHOD
+# #2535/#2550): an install predating that would let every dev run's step-04 fail.
+# Identical requirement for both PRIMITIVE_SKILL and LEGACY_PRIMITIVE_SKILL — the
+# rename changed the skill's name, not its shape.
+PRIMITIVE_MARKERS = ("step-04-review.md", "customize.toml")
+
+
+def resolve_primitive_skill(project: Path, tree: str) -> str:
+    """Which skill is this project's inner dev primitive, for one skill tree.
+
+    Prefers ``bmad-build-auto`` whenever it is installed there at all (its
+    SKILL.md exists) — that is what every current bmm module ships. Falls back
+    to ``bmad-dev-auto`` only when ``bmad-build-auto`` is entirely absent: an
+    install that predates the rename ships ``bmad-dev-auto`` as the real
+    primitive, and bmm's post-rename forwarding shim (a single SKILL.md with no
+    step-04-review.md/customize.toml of its own) never creates a build-auto
+    directory, so it never masks a genuine dev-auto-only install.
+
+    Existence, not completeness, decides: a build-auto directory present but
+    missing a marker (a half-applied upgrade) still counts as "installed" and is
+    still returned here — the marker gap itself is reported separately by
+    :func:`missing_base_skills` as ``skills.base-incomplete`` against
+    ``bmad-build-auto``. Requiring full markers here instead would misdiagnose
+    that half-applied upgrade as "no primitive at all", pointing the remediation
+    at the wrong skill name (``bmad-dev-auto``, which in this scenario may not
+    exist either).
+
+    Every consumer in this module — the base-skills marker check, review-layer
+    resolution (which must read the primitive's OWN
+    step-04-review.md/customize.toml, not the shim's), the stories-dispatch
+    probe, customize overrides, and worktree provisioning's copy list — resolves
+    through this one function, so they can never name different skills for the
+    same project.
+
+    When NEITHER is installed at all, this still falls back to ``bmad-dev-auto``
+    rather than reporting the (also absent) ``bmad-build-auto``: that keeps every
+    existing consumer's remediation message pointing at the name it has always
+    pointed at for a from-scratch project.
+    """
+    if (project / tree / PRIMITIVE_SKILL / "SKILL.md").is_file():
+        return PRIMITIVE_SKILL
+    return LEGACY_PRIMITIVE_SKILL
+
+
 # Upstream skills the orchestrator invokes but does NOT bundle in the wheel — the
 # BMad Method (bmm) module installs them. Each must exist in every active CLI skill
 # tree and carry its marker files (a half-installed or pre-automation skill is
 # caught by the `bmad-loop validate` preflight). `{skill: (marker-rel-path, ...)}`.
+# Kept here under the LEGACY name for back-compat with call sites (including
+# tests) that build a full skill topology explicitly; the live preflight below
+# does NOT read this dict for the primitive — it resolves the marker requirement
+# from PRIMITIVE_MARKERS against whichever skill `resolve_primitive_skill` picks.
 #   - bmad-dev-auto: the inner dev primitive — always required, and never
-#     substitutable. Markers pin BOTH a step file (catches a truncated copy) AND
-#     customize.toml, the layer/handoff config step-04 resolves review_layers from
-#     (BMAD-METHOD #2535/#2550): a pre-July bmm install predating it would let
-#     every dev run's step-04 fail.
+#     substitutable. See PRIMITIVE_MARKERS for why both markers are pinned.
 #   - the two review hunters v6.10.0 ships. These are only the FALLBACK review
 #     requirement, used when the installed skill's shape can't be read: normally the
-#     reviewers are derived per tree from bmad-dev-auto itself
+#     reviewers are derived per tree from the resolved primitive itself
 #     (resolve_review_layers), because which skills the review step invokes is a
 #     property of that skill version, not of a catalog pinned in here (#260).
 # bmad-review-verification-gap is not in the fallback set: no tagged BMAD-METHOD
@@ -83,7 +140,7 @@ MODULE_SKILLS = (
 # unsatisfiable on real installs. A project whose review layers DO name it still has
 # it required — by derivation from its own config, not by this list.
 DEV_BASE_SKILLS = {
-    "bmad-dev-auto": ("step-04-review.md", "customize.toml"),
+    LEGACY_PRIMITIVE_SKILL: PRIMITIVE_MARKERS,
     "bmad-review-adversarial-general": (),
     "bmad-review-edge-case-hunter": (),
 }
@@ -94,8 +151,8 @@ DEV_BASE_SKILLS = {
 # bmad-review alone satisfies every layer that needs a skill. Named here for the
 # fallback path only; the derived path sees it named in the layers themselves.
 MERGED_REVIEW_SKILL = "bmad-review"
-# The DEV_BASE_SKILLS entries MERGED_REVIEW_SKILL subsumes. bmad-dev-auto (the dev
-# primitive) is NOT here — the merged reviewer never substitutes for it.
+# The DEV_BASE_SKILLS entries MERGED_REVIEW_SKILL subsumes. The dev primitive is
+# NOT here — the merged reviewer never substitutes for it.
 _REVIEW_LAYER_SKILLS = frozenset(
     {"bmad-review-adversarial-general", "bmad-review-edge-case-hunter"}
 )
@@ -103,11 +160,35 @@ _REVIEW_LAYER_SKILLS = frozenset(
 # preflight set above plus the merged reviewer and the pre-consolidation standalone
 # verification-gap forwarder (carried so a hand-installed forwarder still resolves,
 # never validated). provision_worktree skips skills the main repo lacks, so this
-# copy-if-present superset is safe in both directions.
+# copy-if-present superset is safe in both directions. Retained under the LEGACY
+# primitive name for back-compat with existing call sites and tests that treat it
+# as a fixed catalog; `base_skills_for_tree` is the per-project/tree equivalent
+# that resolves the primitive dynamically, and is what worktree provisioning uses.
 BASE_SKILLS = {**DEV_BASE_SKILLS, "bmad-review-verification-gap": (), MERGED_REVIEW_SKILL: ()}
 
-DEV_PRIMITIVE_SKILL = "bmad-dev-auto"
-# How bmad-dev-auto names a skill it hands a review off to, in both shapes:
+
+def base_skills_for_tree(project: Path, tree: str) -> dict[str, tuple[str, ...]]:
+    """:data:`BASE_SKILLS`, but with the dev primitive resolved for THIS project/tree.
+
+    Same composition — the primitive plus the fallback review hunters, the merged
+    reviewer, and the pre-consolidation verification-gap forwarder — except the
+    primitive entry names whichever skill :func:`resolve_primitive_skill` actually
+    finds installed, instead of always the legacy name. Worktree provisioning uses
+    this (not the static ``BASE_SKILLS``) so an isolated run copies the SAME
+    primitive the main repo's preflight validated — a project on `bmad-build-auto`
+    must not have its worktree seeded with a `bmad-dev-auto` that was never there.
+    """
+    primitive = resolve_primitive_skill(project, tree)
+    return {
+        primitive: PRIMITIVE_MARKERS,
+        "bmad-review-adversarial-general": (),
+        "bmad-review-edge-case-hunter": (),
+        "bmad-review-verification-gap": (),
+        MERGED_REVIEW_SKILL: (),
+    }
+
+
+# How the primitive names a skill it hands a review off to, in both shapes:
 # "Invoke the `bmad-review` skill with only the `adversarial` lens" (a
 # customize.toml review layer) and "Invoke the `bmad-review-edge-case-hunter`
 # skill on this diff" (pre-consolidation step-04). Deliberately narrow —
@@ -128,13 +209,23 @@ _SKILL_REF_RE = re.compile(r"`(bmad-[a-z0-9-]+)`")
 # them, so an isolated run resolves the same layers) derive their paths from
 # this one constant, or they drift.
 CUSTOMIZE_DIR = Path("_bmad") / "custom"
-# Overrides of the skill's shipped customize.toml, in precedence order (later
-# wins), per customize.toml's own header. The `.user.toml` layer is personal and
-# gitignored by the upstream installer.
-_CUSTOMIZE_OVERRIDES = (
-    CUSTOMIZE_DIR / f"{DEV_PRIMITIVE_SKILL}.toml",
-    CUSTOMIZE_DIR / f"{DEV_PRIMITIVE_SKILL}.user.toml",
-)
+
+
+def _customize_overrides(primitive: str) -> tuple[Path, Path]:
+    """Override files for `primitive`'s shipped customize.toml, precedence order.
+
+    Per customize.toml's own header, later wins; the `.user.toml` layer is
+    personal and gitignored by the upstream installer. Named after the RESOLVED
+    primitive (see :func:`resolve_primitive_skill`), so a project on
+    `bmad-build-auto` reads/writes `_bmad/custom/bmad-build-auto*.toml` and an
+    older project still on `bmad-dev-auto` keeps using
+    `_bmad/custom/bmad-dev-auto*.toml` — the deprecated override files are still
+    honored, just under whichever name is this project's actual primitive.
+    """
+    return (
+        CUSTOMIZE_DIR / f"{primitive}.toml",
+        CUSTOMIZE_DIR / f"{primitive}.user.toml",
+    )
 
 
 class ReviewResolution(NamedTuple):
@@ -238,8 +329,10 @@ def _merge_layer_arrays(base: list[Any], override: list[Any]) -> list[Any]:
     return result
 
 
-def _merged_review_layers(project: Path, tree: str) -> tuple[list[Any], tuple[str, ...]] | None:
-    """The skill's shipped review layers with project overrides applied.
+def _merged_review_layers(
+    project: Path, tree: str, primitive: str
+) -> tuple[list[Any], tuple[str, ...]] | None:
+    """`primitive`'s shipped review layers with project overrides applied.
 
     Returns ``(layers, unreadable_override_paths)``, or None when the skill's OWN
     customize.toml is absent or unparseable — the one case that genuinely means
@@ -249,12 +342,12 @@ def _merged_review_layers(project: Path, tree: str) -> tuple[list[Any], tuple[st
     as empty, still resolving every other layer. Matching that keeps the preflight
     agreeing with the run; the broken file is reported separately as a warning.
     """
-    data = _read_toml(project / tree / DEV_PRIMITIVE_SKILL / "customize.toml")
+    data = _read_toml(project / tree / primitive / "customize.toml")
     if data is None:
         return None
     layers = _layers_of(data)
     unreadable: list[str] = []
-    for rel in _CUSTOMIZE_OVERRIDES:
+    for rel in _customize_overrides(primitive):
         override = project / rel
         if not override.is_file():
             continue
@@ -272,10 +365,18 @@ def _layer_id(layer: dict[str, Any], index: int) -> str:
     return lid if isinstance(lid, str) and lid else f"#{index + 1}"
 
 
-def resolve_review_layers(project: Path, tree: str) -> ReviewResolution | None:
+def resolve_review_layers(
+    project: Path, tree: str, primitive: str | None = None
+) -> ReviewResolution | None:
     """Read the review skills this project will really invoke, or None if unknown.
 
-    Post-consolidation bmad-dev-auto is layer-driven: each
+    ``primitive`` is the skill to read this from — defaults to whatever
+    :func:`resolve_primitive_skill` picks for this project/tree, so most callers
+    can omit it; a caller that already resolved the primitive (e.g.
+    :func:`missing_base_skills`, which needs the same value for its own marker
+    check) passes it through instead of resolving it twice.
+
+    Post-consolidation, the primitive is layer-driven: each
     ``[[workflow.review_layers]]`` entry carries its whole execution recipe, and a
     layer that runs a skill names it inline (an empty ``instruction`` disables the
     layer, and a layer may legitimately name no skill at all — `intent-alignment`
@@ -292,7 +393,9 @@ def resolve_review_layers(project: Path, tree: str) -> ReviewResolution | None:
     the model in run context — undecidable here, so hard-requiring its skill would
     be a false FAIL.
     """
-    merged = _merged_review_layers(project, tree)
+    if primitive is None:
+        primitive = resolve_primitive_skill(project, tree)
+    merged = _merged_review_layers(project, tree, primitive)
     if merged is None:
         return None
     layers, unreadable = merged
@@ -330,9 +433,7 @@ def resolve_review_layers(project: Path, tree: str) -> ReviewResolution | None:
             unreadable,
         )
     try:
-        step04 = (project / tree / DEV_PRIMITIVE_SKILL / "step-04-review.md").read_text(
-            encoding="utf-8"
-        )
+        step04 = (project / tree / primitive / "step-04-review.md").read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return None
     # step-04 is a whole prose document rather than a self-contained execution
@@ -344,33 +445,39 @@ def resolve_review_layers(project: Path, tree: str) -> ReviewResolution | None:
     return ReviewResolution("step-04-review.md", dict(named), {}, False, (), unreadable)
 
 
-# Stories mode (folder+id dispatch, BMAD-METHOD #2549) needs a *newer* bmad-dev-auto
+# Stories mode (folder+id dispatch, BMAD-METHOD #2549) needs a *newer* primitive
 # than sprint mode: one whose step-01 routes a spec-folder + story-id invocation.
 # File existence (missing_base_skills) can't tell the two skill versions apart, so
 # a content probe confirms the merged dispatch protocol is present. This literal is
 # stable prose in the merged step-01 ("this is a **folder+id dispatch**").
-STORIES_PROBE_SKILL = "bmad-dev-auto"
+#
+# STORIES_PROBE_SKILL is kept as an alias of LEGACY_PRIMITIVE_SKILL for back-compat
+# with call sites (including tests) that build a probe path directly; the function
+# below resolves the actual skill to probe per tree via resolve_primitive_skill.
+STORIES_PROBE_SKILL = LEGACY_PRIMITIVE_SKILL
 STORIES_PROBE_FILE = "step-01-clarify-and-route.md"
 STORIES_PROBE_TEXT = "folder+id dispatch"
 
 
 def missing_stories_support(project: Path, trees: Sequence[str]) -> list[Finding]:
-    """Problems for stories mode's stricter bmad-dev-auto requirement.
+    """Problems for stories mode's stricter dev-primitive requirement.
 
-    Sprint mode drives any bmad-dev-auto; stories mode needs the folder+id
+    Sprint mode drives any resolved primitive; stories mode needs the folder+id
     dispatch flow, which older skill versions lack. For each active CLI skill
-    tree, confirm ``bmad-dev-auto/step-01-clarify-and-route.md`` exists and
-    carries the dispatch-protocol marker. Returns one problem :class:`Finding`
-    per tree lacking it (empty = OK). Callers gate this on stories mode only —
-    sprint-mode runs must not require the newer skill.
+    tree, resolve the primitive (:func:`resolve_primitive_skill`) and confirm its
+    ``step-01-clarify-and-route.md`` exists and carries the dispatch-protocol
+    marker. Returns one problem :class:`Finding` per tree lacking it (empty = OK).
+    Callers gate this on stories mode only — sprint-mode runs must not require the
+    newer skill.
 
     The two failures are separate check ids because they are separate conditions
     with separate remediations: ``-missing`` is a half install (reinstall the
     module), ``-stale`` is an install that is simply too old (update it)."""
     problems: list[Finding] = []
     for tree in dict.fromkeys(trees):
-        probe = project / tree / STORIES_PROBE_SKILL / STORIES_PROBE_FILE
-        detail = {"tree": tree, "skill": STORIES_PROBE_SKILL, "file": STORIES_PROBE_FILE}
+        primitive = resolve_primitive_skill(project, tree)
+        probe = project / tree / primitive / STORIES_PROBE_FILE
+        detail = {"tree": tree, "skill": primitive, "file": STORIES_PROBE_FILE}
         try:
             text = probe.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
@@ -382,7 +489,7 @@ def missing_stories_support(project: Path, trees: Sequence[str]) -> list[Finding
                 Finding(
                     "skills.stories-dispatch-missing",
                     "problem",
-                    f"{tree}/{STORIES_PROBE_SKILL}/{STORIES_PROBE_FILE} not found — stories "
+                    f"{tree}/{primitive}/{STORIES_PROBE_FILE} not found — stories "
                     f"mode needs folder+id dispatch; update the BMad Method (bmm) module",
                     detail,
                 )
@@ -393,9 +500,9 @@ def missing_stories_support(project: Path, trees: Sequence[str]) -> list[Finding
                 Finding(
                     "skills.stories-dispatch-stale",
                     "problem",
-                    f"{tree}/{STORIES_PROBE_SKILL} lacks folder+id dispatch (no "
+                    f"{tree}/{primitive} lacks folder+id dispatch (no "
                     f"{STORIES_PROBE_TEXT!r} in {STORIES_PROBE_FILE}) — stories mode needs a "
-                    f"newer bmad-dev-auto; update the bmm module",
+                    f"newer dev primitive; update the bmm module",
                     {**detail, "marker": STORIES_PROBE_TEXT},
                 )
             )
@@ -405,19 +512,21 @@ def missing_stories_support(project: Path, trees: Sequence[str]) -> list[Finding
 def missing_base_skills(project: Path, trees: Sequence[str]) -> list[Finding]:
     """Problems for the upstream skills the orchestrator drives but doesn't bundle.
 
-    The dev primitive (bmad-dev-auto) and the review layers its step-04 invokes
-    inline are installed by the BMad Method module, not by `bmad-loop init`. Each
-    must exist in every active CLI skill tree and carry its marker files. Returns
-    one :class:`Finding` per missing/incomplete skill; empty list means OK. Run as
-    a preflight so a missing skill fails loudly with remediation instead of
-    stalling as an `Unknown command` until the run times out.
+    The dev primitive (resolved per tree by :func:`resolve_primitive_skill` —
+    ``bmad-build-auto`` on current bmm installs, ``bmad-dev-auto`` on installs that
+    predate the rename) and the review layers its step-04 invokes inline are
+    installed by the BMad Method module, not by `bmad-loop init`. Each must exist
+    in every active CLI skill tree and carry its marker files. Returns one
+    :class:`Finding` per missing/incomplete skill; empty list means OK. Run as a
+    preflight so a missing skill fails loudly with remediation instead of stalling
+    as an `Unknown command` until the run times out.
 
     Not every finding is fatal: review layers that are conditional, ambiguously
     phrased, or configured by an unparseable override come back as ``warning``
     (see :func:`_review_findings`). **Callers must branch on severity** — treating
     a non-empty return as failure turns every advisory into a blocked run.
 
-    The review skills are read from the installed bmad-dev-auto itself
+    The review skills are read from the installed primitive itself
     (:func:`resolve_review_layers`) so the preflight requires what this project
     will really invoke: a tree whose configured layers call the merged
     ``bmad-review`` needs that skill and not the standalone hunters, and a tree on
@@ -433,32 +542,32 @@ def missing_base_skills(project: Path, trees: Sequence[str]) -> list[Finding]:
     """
     problems: list[Finding] = []
     for tree in dict.fromkeys(trees):
-        skill_dir = project / tree / DEV_PRIMITIVE_SKILL
-        markers = DEV_BASE_SKILLS[DEV_PRIMITIVE_SKILL]
+        primitive = resolve_primitive_skill(project, tree)
+        skill_dir = project / tree / primitive
         if not (skill_dir / "SKILL.md").is_file():
             problems.append(
                 Finding(
                     "skills.base-missing",
                     "problem",
-                    f"{tree}/{DEV_PRIMITIVE_SKILL} not found — the orchestrator drives this "
+                    f"{tree}/{primitive} not found — the orchestrator drives this "
                     f"upstream dev primitive directly; it ships with the bmm module "
                     f"(BMAD-METHOD >= 6.10.0); install or update bmm in this project",
-                    {"tree": tree, "skill": DEV_PRIMITIVE_SKILL},
+                    {"tree": tree, "skill": primitive},
                 )
             )
         else:
-            absent = [m for m in markers if not (skill_dir / m).is_file()]
+            absent = [m for m in PRIMITIVE_MARKERS if not (skill_dir / m).is_file()]
             if absent:
                 problems.append(
                     Finding(
                         "skills.base-incomplete",
                         "problem",
-                        f"{tree}/{DEV_PRIMITIVE_SKILL} is incomplete (missing "
+                        f"{tree}/{primitive} is incomplete (missing "
                         f"{', '.join(absent)}) — reinstall it from the bmm module",
-                        {"tree": tree, "skill": DEV_PRIMITIVE_SKILL, "missing_markers": absent},
+                        {"tree": tree, "skill": primitive, "missing_markers": absent},
                     )
                 )
-        problems.extend(_review_findings(project, tree))
+        problems.extend(_review_findings(project, tree, primitive))
     return problems
 
 
@@ -471,8 +580,13 @@ def _where_clause(layer_ids: Sequence[str]) -> str:
     return "review step invokes"
 
 
-def _review_findings(project: Path, tree: str) -> list[Finding]:
-    """Findings for the review skills this tree's bmad-dev-auto invokes.
+def _review_findings(project: Path, tree: str, primitive: str) -> list[Finding]:
+    """Findings for the review skills this tree's resolved primitive invokes.
+
+    ``primitive`` is the skill :func:`missing_base_skills` already resolved for
+    this tree (:func:`resolve_primitive_skill`) — passed through rather than
+    re-resolved, so a caller and this helper can never disagree on which skill's
+    step-04-review.md/customize.toml is authoritative.
 
     Problems block; warnings never do. A skill is only a problem when the
     installed config says this run WILL invoke it — anything conditional or
@@ -480,7 +594,7 @@ def _review_findings(project: Path, tree: str) -> list[Finding]:
     Callers must therefore honour severity rather than treating any finding as
     fatal.
     """
-    resolved = resolve_review_layers(project, tree)
+    resolved = resolve_review_layers(project, tree, primitive)
     if resolved is None:
         # Unknown shape: keep the long-standing static requirement, which both real
         # topologies satisfy — the two hunters, or the merged reviewer instead.
@@ -516,10 +630,10 @@ def _review_findings(project: Path, tree: str) -> list[Finding]:
             Finding(
                 "skills.review-layers-empty",
                 "problem",
-                f"{tree}/{DEV_PRIMITIVE_SKILL} has no enabled review layer (every "
+                f"{tree}/{primitive} has no enabled review layer (every "
                 f"`instruction` is empty) — every dev run would HALT blocked with "
                 f"'no active review layers'; re-enable a layer in "
-                f"{_CUSTOMIZE_OVERRIDES[0].as_posix()}",
+                f"{_customize_overrides(primitive)[0].as_posix()}",
                 {"tree": tree, "source": resolved.source},
             )
         )
@@ -530,7 +644,7 @@ def _review_findings(project: Path, tree: str) -> list[Finding]:
             Finding(
                 "skills.review-layer-missing",
                 "problem",
-                f"{tree}/{skill} not found — {tree}/{DEV_PRIMITIVE_SKILL}'s "
+                f"{tree}/{skill} not found — {tree}/{primitive}'s "
                 f"{_where_clause(layer_ids)} it ({resolved.source}), so every dev run's "
                 f"review would fail; install or update the bmm module so this project's "
                 f"review layers resolve",
@@ -549,7 +663,7 @@ def _review_findings(project: Path, tree: str) -> list[Finding]:
             Finding(
                 "skills.review-layer-unresolved",
                 "warning",
-                f"{tree}/{skill} not found — {tree}/{DEV_PRIMITIVE_SKILL}'s "
+                f"{tree}/{skill} not found — {tree}/{primitive}'s "
                 f"{_where_clause(layer_ids)} it conditionally, or names it in prose this "
                 f"check cannot confirm is a handoff ({resolved.source}); install it if "
                 f"that layer is meant to run",
