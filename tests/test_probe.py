@@ -190,7 +190,9 @@ def test_discover_location_redacts_username(tmp_path, monkeypatch):
 # ----------------------------------------------------------- registration
 
 
-@pytest.mark.parametrize("dialect_cli", ["claude", "codex", "gemini", "copilot", "antigravity"])
+@pytest.mark.parametrize(
+    "dialect_cli", ["claude", "codex", "gemini", "copilot", "antigravity", "mistral-vibe"]
+)
 def test_probe_hook_registers_under_native_events(dialect_cli):
     from bmad_loop.install import ANTIGRAVITY_HOOK_GROUP, merge_hooks
 
@@ -201,12 +203,16 @@ def test_probe_hook_registers_under_native_events(dialect_cli):
     }
     config, changed = merge_hooks({}, registrations, profile.hooks.dialect)
     assert changed
-    # agy keys by hook-group name at the top level; the others wrap in "hooks".
-    container = (
-        config[ANTIGRAVITY_HOOK_GROUP]
-        if profile.hooks.dialect == "antigravity-hooks-json"
-        else config["hooks"]
-    )
+    # Three container shapes: agy keys by hook-group name at the top level, vibe
+    # has no map at all (a flat array whose entries name their event in `type`),
+    # and the rest wrap in "hooks". Derived here rather than via
+    # hook_event_container so the assertion is independent of that helper.
+    if profile.hooks.dialect == "antigravity-hooks-json":
+        container = config[ANTIGRAVITY_HOOK_GROUP]
+    elif profile.hooks.dialect == "vibe-hooks-toml":
+        container = {entry["type"] for entry in config["hooks"]}
+    else:
+        container = config["hooks"]
     for native in profile.hooks.events:
         assert native in container
     # idempotent re-run
@@ -214,12 +220,13 @@ def test_probe_hook_registers_under_native_events(dialect_cli):
     assert not changed2
 
 
-@pytest.mark.parametrize("cli", ["claude", "antigravity"])
+@pytest.mark.parametrize("cli", ["claude", "antigravity", "mistral-vibe"])
 def test_scan_reports_registered_state(project, cli):
     """Registration detection must follow each dialect's container shape.
 
     agy keys .agents/hooks.json by hook-GROUP name with no "hooks" wrapper, so
     reading "hooks" there reports a correctly-installed relay as unregistered.
+    vibe adds the other axis: its config is TOML, so a JSON reader sees nothing.
     """
     proj = project.project
     profile = get_profile(cli)

@@ -92,9 +92,9 @@ Unless the user explicitly asked to skip it (e.g. `skills only` / `--no-tool`), 
 
 3. **Bootstrap the project** — install the coding-CLI hooks, the bundled `bmad-loop-*` skills, the `.bmad-loop/policy.toml` template, and the gitignore entry (idempotent).
 
-   First decide **which coding CLI(s)** the orchestrator should drive. The supported adapters are `claude` (default), `codex`, `gemini`, `copilot`, and `antigravity` (Google's `agy`). Hooks are registered per CLI, so the choice matters — register every CLI you intend to use for dev/review/triage. Ask the user (unless they already specified it in their setup args, e.g. `cli: claude, codex`, or accepted defaults — then default to `claude` only):
+   First decide **which coding CLI(s)** the orchestrator should drive. The supported adapters are `claude` (default), `codex`, `gemini`, `copilot`, `antigravity` (Google's `agy`), and `mistral-vibe` (Mistral's `vibe`). Hooks are registered per CLI, so the choice matters — register every CLI you intend to use for dev/review/triage. Ask the user (unless they already specified it in their setup args, e.g. `cli: claude, codex`, or accepted defaults — then default to `claude` only):
 
-   > "Which coding CLI(s) should the orchestrator drive — `claude`, `codex`, `gemini`, `copilot`, and/or `antigravity`? You can pick more than one. [claude]"
+   > "Which coding CLI(s) should the orchestrator drive — `claude`, `codex`, `gemini`, `copilot`, `antigravity`, and/or `mistral-vibe`? You can pick more than one. [claude]"
 
    Build the command with one `--cli <name>` per selected CLI (the flag is repeatable). **On an upgrade, append `--force-skills`** so the per-project skill copies are actually refreshed — without it `init` skips every existing skill dir and the project keeps stale skills against the upgraded tool. On a fresh install, omit it.
 
@@ -109,9 +109,9 @@ Unless the user explicitly asked to skip it (e.g. `skills only` / `--no-tool`), 
    bmad-loop init --project "{project-root}" --cli claude --force-skills
    ```
 
-   Names must be exactly `claude`, `codex`, `gemini`, `copilot`, or `antigravity` — `init` errors on an unknown profile and lists the valid ones. `init` prints any one-time first-run notes per CLI (e.g. start `claude` once in the project and accept the workspace-trust + hooks-approval dialogs before `bmad-loop run` — spawned sessions can't answer first-run dialogs). Relay those notes to the user.
+   Names must be exactly `claude`, `codex`, `gemini`, `copilot`, `antigravity`, or `mistral-vibe` — `init` errors on an unknown profile and lists the valid ones. `init` prints any one-time first-run notes per CLI (e.g. start `claude` once in the project and accept the workspace-trust + hooks-approval dialogs before `bmad-loop run` — spawned sessions can't answer first-run dialogs). Relay those notes to the user.
 
-   **Skills are installed automatically:** `init` lays the bundled `bmad-loop-*` skills into the right tree for each selected CLI — `.claude/skills/` for `claude`, `.agents/skills/` for `codex`/`gemini`/`copilot`/`antigravity`. On a fresh install, existing skill dirs are left untouched; on an upgrade, `--force-skills` overwrites them with the bundled copies from the upgraded tool (use `--no-skills` to skip the step and manage skills yourself).
+   **Skills are installed automatically:** `init` lays the bundled `bmad-loop-*` skills into the right tree for each selected CLI — `.claude/skills/` for `claude`, `.agents/skills/` for `codex`/`gemini`/`copilot`/`antigravity`/`mistral-vibe`. On a fresh install, existing skill dirs are left untouched; on an upgrade, `--force-skills` overwrites them with the bundled copies from the upgraded tool (use `--no-skills` to skip the step and manage skills yourself).
 
    > **Note:** `--force-skills` also overwrites `bmad-loop-setup` itself (it ships in the same bundle). That's expected and safe — the freshly laid-down setup skill takes effect on the **next** invocation, and your `_bmad/custom/*.toml` overrides (keyed by skill directory name) are untouched.
 

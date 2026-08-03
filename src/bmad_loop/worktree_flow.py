@@ -19,13 +19,13 @@ it lazily for its own tests.
 
 from __future__ import annotations
 
-import json
 from collections.abc import Sequence
 from importlib import resources
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, NoReturn
 
 from . import gates, verify
+from .adapters.profile import ProfileError
 from .install import (
     BASE_SKILLS,
     CUSTOMIZE_DIR,
@@ -34,6 +34,8 @@ from .install import (
     MODULE_SKILLS,
     _copy_traversable,
     _worktree_local_exclude,
+    dump_hook_config,
+    load_hook_config,
     merge_hooks,
     resolve_review_layers,
 )
@@ -283,8 +285,10 @@ def provision_worktree(
         config: dict = {}
         if config_path.is_file():
             try:
-                config = json.loads(config_path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
+                config = load_hook_config(
+                    config_path.read_text(encoding="utf-8"), profile.hooks.dialect
+                )
+            except ProfileError:
                 config = {}
         host = get_process_host()
         interp = host.hook_interpreter()
@@ -294,7 +298,9 @@ def provision_worktree(
         }
         config, changed = merge_hooks(config, registrations, profile.hooks.dialect)
         if changed:
-            config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+            config_path.write_text(
+                dump_hook_config(config, profile.hooks.dialect), encoding="utf-8"
+            )
 
     # Shield exactly the paths we wrote (skill trees + hook configs + seeded
     # configs) from the unit's `git add -A`, in case a project doesn't gitignore

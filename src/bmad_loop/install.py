@@ -53,6 +53,10 @@ ANTIGRAVITY_HOOK_TIMEOUT_SEC = 60  # agy hook timeouts are seconds (default 30)
 # agy's .agents/hooks.json keys by hook NAME at the top level (not a "hooks"
 # wrapper); bmad-loop registers all its handlers under this single group.
 ANTIGRAVITY_HOOK_GROUP = "bmad-loop"
+VIBE_HOOK_TIMEOUT_SEC = 60  # vibe hook timeouts are seconds, float (default 60)
+# vibe's .vibe/hooks.toml is a flat `hooks = [...]` array whose entries carry a
+# unique `name`; ours is registered under this one.
+VIBE_HOOK_NAME = "bmad-loop-stop"
 
 # The bmad-loop-* skills bundled in the wheel (bmad_loop/data/skills/) that
 # `bmad-loop init` lays down. The inner dev primitive (`bmad-build-auto`, formerly
@@ -809,6 +813,86 @@ def _review_findings(project: Path, tree: str) -> list[Finding]:
     return findings
 
 
+_TOML_ESCAPES = {
+    "\\": "\\\\",
+    '"': '\\"',
+    "\b": "\\b",
+    "\t": "\\t",
+    "\n": "\\n",
+    "\f": "\\f",
+    "\r": "\\r",
+}
+
+
+def _toml_scalar(key: str, value: object) -> str:
+    """Render one scalar as TOML. Anything else is a boundary failure."""
+    if isinstance(value, bool):  # before int: bool IS an int in Python
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    if isinstance(value, str):
+        body = "".join(
+            _TOML_ESCAPES.get(ch) or (ch if ch >= " " else f"\\u{ord(ch):04X}") for ch in value
+        )
+        return f'"{body}"'
+    raise ProfileError(
+        f"hook field {key!r} holds a {type(value).__name__}, which this TOML writer cannot emit"
+    )
+
+
+def _dump_vibe_hooks(config: dict) -> str:
+    """Serialize a vibe hook config as `[[hooks]]` array-of-tables TOML.
+
+    Hand-rolled rather than tomlkit/tomli-w because neither is a core dependency
+    (tomlkit ships only with the [tui] extra) and vibe's HookConfig schema is
+    closed and entirely scalar — see the profile header for the field list.
+
+    KNOWN LOSS: this re-emits the whole file, so comments and formatting in a
+    user's .vibe/hooks.toml do not survive. Callers only write when merge_hooks
+    reports `changed`, so a steady-state `init` re-run rewrites nothing. A `None`
+    value drops its key: TOML has no null.
+    """
+    entries = config.get("hooks", [])
+    if not isinstance(entries, list):
+        raise ProfileError("'hooks' in the vibe hooks file is not an array of tables")
+    out: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ProfileError("every entry in the vibe 'hooks' array must be a table")
+        out.append("[[hooks]]")
+        out += [f"{k} = {_toml_scalar(k, v)}" for k, v in entry.items() if v is not None]
+        out.append("")
+    return "\n".join(out)
+
+
+def load_hook_config(text: str, dialect: str) -> dict:
+    """Parse a hook config's bytes into the dict shape merge_hooks operates on.
+
+    The dialect owns its own on-disk format: every shipped dialect is JSON except
+    vibe's, which is TOML. Raises ProfileError on a syntax error so the caller can
+    report the path — a hook config we cannot read must never be silently replaced.
+    """
+    if dialect == "vibe-hooks-toml":
+        try:
+            return tomllib.loads(text)
+        except tomllib.TOMLDecodeError as exc:
+            raise ProfileError(f"not valid TOML: {exc}") from exc
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ProfileError(f"not valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ProfileError("hook config must be a JSON object")
+    return parsed
+
+
+def dump_hook_config(config: dict, dialect: str) -> str:
+    """Serialize a merged hook config back to its dialect's on-disk format."""
+    if dialect == "vibe-hooks-toml":
+        return _dump_vibe_hooks(config)
+    return json.dumps(config, indent=2) + "\n"
+
+
 def _hook_command(project: Path, profile: CLIProfile, canonical_event: str) -> str:
     host = get_process_host()
     interp = host.hook_interpreter()
@@ -819,7 +903,17 @@ def _hook_command(project: Path, profile: CLIProfile, canonical_event: str) -> s
     return f"{interp} {host.shell_quote(str(project / HOOK_SCRIPT_REL))} {canonical_event}"
 
 
-def _hook_entry(dialect: str, command: str) -> dict:
+def _hook_entry(dialect: str, command: str, native_event: str = "") -> dict:
+    if dialect == "vibe-hooks-toml":
+        # vibe's hooks.toml is a flat array whose entries name their own event in
+        # a `type` field, so the native event travels IN the entry rather than as
+        # the key it is filed under. Every other dialect ignores native_event.
+        return {
+            "name": VIBE_HOOK_NAME,
+            "type": native_event,
+            "command": command,
+            "timeout": VIBE_HOOK_TIMEOUT_SEC,
+        }
     handler: dict = {"type": "command", "command": command}
     if dialect == "gemini-settings-json":
         handler["timeout"] = GEMINI_HOOK_TIMEOUT_MS  # Gemini timeouts are milliseconds
@@ -843,8 +937,16 @@ def hook_event_container(config: dict, dialect: str) -> dict:
     Most dialects nest it under "hooks". agy instead keys the file by hook GROUP
     name at the top level, so our relay lives under ANTIGRAVITY_HOOK_GROUP —
     reading "hooks" there yields {} and reports a correctly-installed relay as
-    unregistered (issue #159). Every reader must go through this, or it drifts.
+    unregistered (issue #159). vibe has no map at all: "hooks" is a flat array
+    whose entries carry their own event in a `type` field, so the map is derived
+    by grouping on it. Every reader must go through this, or it drifts.
     """
+    if dialect == "vibe-hooks-toml":
+        grouped: dict = {}
+        for entry in config.get("hooks", []) or []:
+            if isinstance(entry, dict) and isinstance(event := entry.get("type"), str):
+                grouped.setdefault(event, []).append(entry)
+        return grouped
     if dialect == "antigravity-hooks-json":
         container = config.get(ANTIGRAVITY_HOOK_GROUP, {})
     else:
@@ -872,6 +974,23 @@ def relay_registered(config: dict, dialect: str, events: Iterable[str]) -> bool:
 def merge_hooks(config: dict, registrations: dict[str, str], dialect: str) -> tuple[dict, bool]:
     """Add relay registrations (native event -> command) to a hook config dict."""
     changed = False
+    if dialect == "vibe-hooks-toml":
+        # vibe reads ONE flat array; unrelated user hooks sit alongside ours and
+        # are preserved. Dedup goes through the grouped view so the idempotency
+        # rule is the same serialized-scan every other dialect uses.
+        entries = config.setdefault("hooks", [])
+        if not isinstance(entries, list):
+            raise ProfileError(
+                "'hooks' in the vibe hooks file is not an array of tables; "
+                "fix or remove it before registering the Stop hook"
+            )
+        for native_event, command in registrations.items():
+            if not _managed_hook_in_handlers(
+                hook_event_container(config, dialect).get(native_event, [])
+            ):
+                entries.append(_hook_entry(dialect, command, native_event))
+                changed = True
+        return config, changed
     if dialect == "antigravity-hooks-json":
         # agy keys .agents/hooks.json by hook NAME at the top level (no "hooks"
         # wrapper); register every handler under one ANTIGRAVITY_HOOK_GROUP group.
@@ -916,9 +1035,11 @@ def _register_hooks(project: Path, profile: CLIProfile) -> int:
     config: dict = {}
     if config_path.is_file():
         try:
-            config = json.loads(config_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            print(f"FAIL: {config_path} is not valid JSON; fix it and re-run init")
+            config = load_hook_config(
+                config_path.read_text(encoding="utf-8"), profile.hooks.dialect
+            )
+        except ProfileError as exc:
+            print(f"FAIL: {config_path} is {exc}; fix it and re-run init")
             return 1
     registrations = {
         native: _hook_command(project, profile, canonical)
@@ -926,7 +1047,7 @@ def _register_hooks(project: Path, profile: CLIProfile) -> int:
     }
     config, changed = merge_hooks(config, registrations, profile.hooks.dialect)
     if changed:
-        config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+        config_path.write_text(dump_hook_config(config, profile.hooks.dialect), encoding="utf-8")
         print(f"  hooks registered ({profile.name}): {config_path}")
     else:
         print(f"  hooks already registered ({profile.name})")

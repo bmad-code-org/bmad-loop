@@ -281,7 +281,8 @@ Drop a TOML file in `<project>/.bmad-loop/profiles/<name>.toml` with the fields
 from the [Profile field reference](#profile-field-reference) below. The minimum is
 a `binary`, a `prompt_template`, bypass flags, a `[hooks]` block picking one of the
 config dialects (`claude-settings-json` / `codex-hooks-json` /
-`gemini-settings-json` / `copilot-settings-json` / `antigravity-hooks-json`) and
+`gemini-settings-json` / `copilot-settings-json` / `antigravity-hooks-json` /
+`vibe-hooks-toml`) and
 a native→canonical event map, and a `usage_parser` (start with `"none"` until
 you've written one).
 
@@ -423,11 +424,11 @@ resolves to `claude`.
 
 ### `HookSpec` (the `[hooks]` table)
 
-| Field         | Required | Meaning                                                                                                                                                                                                                                   |
-| ------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `dialect`     | ✅       | The CLI's hook-config format — one of `claude-settings-json`, `codex-hooks-json`, `gemini-settings-json`, `copilot-settings-json`, `antigravity-hooks-json`.                                                                              |
-| `config_path` | ✅       | Project-relative path the hook config is written to (e.g. `.claude/settings.json`). Absolute paths are rejected.                                                                                                                          |
-| `events`      | ✅       | Map of **native** event name → **canonical** event name. The canonical side must be one of `SessionStart`, `Stop`, `SessionEnd`, `PreCompact`; the native side is whatever the CLI emits (e.g. `agentStop = "Stop"`). At least one entry. |
+| Field         | Required | Meaning                                                                                                                                                                                                                                                                                                                                                                            |
+| ------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `dialect`     | ✅       | The CLI's hook-config format — one of `claude-settings-json`, `codex-hooks-json`, `gemini-settings-json`, `copilot-settings-json`, `antigravity-hooks-json`, `vibe-hooks-toml`. Every dialect is JSON except `vibe-hooks-toml`, whose `.vibe/hooks.toml` is a flat `hooks = [...]` array of tables — entries name their own event in a `type` field rather than being keyed by it. |
+| `config_path` | ✅       | Project-relative path the hook config is written to (e.g. `.claude/settings.json`). Absolute paths are rejected.                                                                                                                                                                                                                                                                   |
+| `events`      | ✅       | Map of **native** event name → **canonical** event name. The canonical side must be one of `SessionStart`, `Stop`, `SessionEnd`, `PreCompact`; the native side is whatever the CLI emits (e.g. `agentStop = "Stop"`). At least one entry.                                                                                                                                          |
 
 ### Worked TOML — copilot
 

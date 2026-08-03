@@ -154,7 +154,8 @@ would not carry.
 ## Choosing which CLIs to drive
 
 The supported adapters are `claude` (the default), `codex`, `gemini`, `copilot`,
-`antigravity` (Google's `agy`, experimental — `isolation = "none"` only), and `opencode`
+`antigravity` (Google's `agy`, experimental — `isolation = "none"` only),
+`mistral-vibe` (Mistral's `vibe`, experimental), and `opencode`
 (OpenCode ≥ 1.18 over HTTP/SSE, profile `opencode-http` — no tmux window; needs the
 `bmad-loop[opencode]` extra and `model` set as `provider/model`). You can pick more
 than one — register every CLI you intend to use for dev, review, or sweep triage.
@@ -234,7 +235,8 @@ bmad-loop init --project <project-root> --cli claude --cli codex --cli gemini
 
 Run with no `--cli` and `init` registers hooks for every CLI the `policy.toml` references,
 so a dual-client setup that's already configured in policy needs no extra flags. Names must
-be exactly `claude`, `codex`, `gemini`, `copilot`, `antigravity`, or `opencode-http` (alias
+be exactly `claude`, `codex`, `gemini`, `copilot`, `antigravity`, `mistral-vibe` (alias
+`vibe`), or `opencode-http` (alias
 `opencode`) — `init` errors on an unknown profile and lists the valid ones. A hookless
 profile like `opencode-http` installs its skills but registers no hooks (it signals over
 HTTP/SSE).
@@ -269,6 +271,22 @@ them to whoever owns the machine:
   - **Token usage is not recorded** (`usage_parser = "none"`) — and this is permanent,
     not a gap: agy's transcript carries no usage data at all (it counts tokens only in
     an internal SQLite/protobuf store). Runs work; the token columns stay empty.
+- **mistral-vibe** — run `vibe --setup` once and authenticate (Mistral API key) before
+  `bmad-loop run`; spawned sessions can't answer the setup prompt, and a pending one
+  reads as a session timeout. Requires Mistral Vibe ≥ 2.23. Three things to know,
+  verified against 2.23.2:
+  - **Trust gates the hooks.** vibe reads `<project>/.vibe/hooks.toml` only when the
+    working directory is trusted, so the profile launches with `--trust` (trusted for
+    that invocation only, never persisted). Without it no `Stop` ever arrives and every
+    session reads as a timeout. Because trust is per-invocation rather than an
+    exact-path store, `isolation = "worktree"` works fine here.
+  - **No `--model` flag.** Leave `[adapter] model` empty and select the model with the
+    `VIBE_ACTIVE_MODEL` env var or vibe's own `active_model` config; setting it in
+    policy passes an argument vibe's parser rejects.
+  - **Token usage is not yet recorded** (`usage_parser = "none"`) — unlike antigravity
+    this is pending rather than permanent: vibe writes a `messages.jsonl` per session
+    under `~/.vibe/logs/session/`, which a parser may be able to read. Runs work; the
+    token columns stay empty. Confirm with `bmad-loop probe-adapter mistral-vibe`.
 - **opencode** — install the HTTP client extra (`pip install 'bmad-loop[opencode]'`) and
   authenticate once, **globally**, with `opencode auth login` (not per-project — there is no
   workspace-trust dialog to answer). Requires OpenCode ≥ 1.18. Set the model as
@@ -281,7 +299,7 @@ them to whoever owns the machine:
 
 ### Skill location
 
-`claude` reads skills from `.claude/skills/`; `codex`, `gemini`, `copilot`, and `antigravity`
+`claude` reads skills from `.claude/skills/`; `codex`, `gemini`, `copilot`, `antigravity`, and `mistral-vibe`
 read from `.agents/skills/`. `init` installs the bundled `bmad-loop-*` skills into the right tree
 for each CLI you pass via `--cli`, so selecting any of the `.agents/skills/` CLIs populates it automatically. It skips skill
 dirs that already exist — pass `--force-skills` to overwrite a stale copy, or `--no-skills` to

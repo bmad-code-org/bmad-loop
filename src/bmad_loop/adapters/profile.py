@@ -29,6 +29,9 @@ HOOK_DIALECTS = {
     "gemini-settings-json",
     "copilot-settings-json",
     "antigravity-hooks-json",
+    # the one non-JSON dialect: vibe's .vibe/hooks.toml is a flat `hooks = [...]`
+    # array of tables whose entries name their own event in a `type` field.
+    "vibe-hooks-toml",
     # hookless: the adapter observes completion itself (HTTP/SSE transport) —
     # no hook config is ever written, so config_path/events must stay empty.
     "none",
@@ -37,7 +40,7 @@ CANONICAL_EVENTS = {"SessionStart", "Stop", "SessionEnd", "PreCompact"}
 USER_PROFILES_REL = Path(".bmad-loop") / "profiles"
 
 # legacy adapter names from older policy.toml files, plus friendly short names
-ALIASES = {"claude-code-tmux": "claude", "opencode": "opencode-http"}
+ALIASES = {"claude-code-tmux": "claude", "opencode": "opencode-http", "vibe": "mistral-vibe"}
 
 
 class ProfileError(Exception):
