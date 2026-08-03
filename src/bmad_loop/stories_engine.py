@@ -11,6 +11,8 @@ mtime-scan, no shared mutable board.
 Like ``SweepEngine``, this is a thin override layer over the mature story
 pipeline: only the story source (``_pick_next``), the dispatch prompt
 (``_dev_prompt``), the (absent) bookkeeping sync (``_post_dev_state_sync``), the
+board-ownership clause the inherited review prompt injects
+(``_sprint_board_instruction``, empty here — there is no board), the
 artifact verification (``_verify_dev_artifacts``), the session env
 (``_extra_session_env``), and the HITL checkpoints differ. Everything else —
 dev/verify/review/commit, crash resume, worktree isolation, gates — is inherited
@@ -494,6 +496,17 @@ class StoriesEngine(Engine):
         # Drop the sprint-status gate (stories mode has no board); the id-keyed
         # story spec's own `done` frontmatter is authoritative.
         return verify.verify_review_stories(task, self.workspace.paths, self.policy)
+
+    def _sprint_board_instruction(self) -> str:
+        # Stories mode has no sprint-status.yaml: `_post_dev_state_sync` is a no-op
+        # here and `verify_review_stories` reads the id-keyed story spec alone. The
+        # base clause tells a session that a file it will never see is
+        # orchestrator-owned, so it would be a false claim rather than a harmless
+        # one — dropped for the same reason `_operator_park_enabled` is False below.
+        # This also drops the review prompt's `blocked` hand-back redirect, which
+        # `_review_prompt` gates on this clause: the board it redirects away from
+        # does not exist in this mode.
+        return ""
 
     def _operator_park_enabled(self) -> bool:
         # Stories mode has no sprint board, so the (awaiting-operator,

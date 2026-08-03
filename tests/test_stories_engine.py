@@ -11,6 +11,7 @@ from conftest import attach_profile, git, install_build_auto_skill, write_spec
 
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
+from bmad_loop.engine import Engine
 from bmad_loop.journal import Journal, load_state, save_state
 from bmad_loop.model import (
     PAUSE_ESCALATION,
@@ -478,6 +479,29 @@ def test_plan_halt_env_only_on_leg_one(project):
     assert engine._extra_session_env(task, "dev")["BMAD_LOOP_PLAN_HALT"] == "1"
     # review sessions never carry it
     assert "BMAD_LOOP_PLAN_HALT" not in engine._extra_session_env(task, "review")
+
+
+def test_review_prompt_carries_no_sprint_board_clause(project):
+    """Stories mode has no sprint-status.yaml — `_post_dev_state_sync` is a no-op and
+    `verify_review_stories` reads the id-keyed story spec alone — so the inherited
+    review prompt's board-ownership clause would assert ownership of a file this mode
+    never touches. One override empties it, and the `blocked` hand-back redirect
+    (gated on that clause) goes with it: there is no board to redirect away from.
+
+    The base-class check is the ablation guard — without it every assertion here
+    passes for free the moment the clause is emptied for ALL modes."""
+    setup_stories(project, [entry("1")])
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1", epic=0, spec_file=str(story_spec(project, "1")))
+
+    assert Engine._sprint_board_instruction(engine)  # the base clause is non-empty
+    assert engine._sprint_board_instruction() == ""
+    prompt = engine._review_prompt(task)
+    assert "sprint-status" not in prompt
+    assert "status: blocked" not in prompt
+    # the ledger sentence — the other injected ownership clause — is untouched, and
+    # the prompt ends on it with no trailing space where the clause used to join
+    assert prompt.endswith("the orchestrator owns their status and resolution.")
 
 
 def test_dev_prompt_repair_leg_is_explicit_spec_resume(project, tmp_path):

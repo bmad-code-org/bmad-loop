@@ -223,8 +223,11 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
   — and stays conservative: without the orchestrator's own launch-time sign-off, or on a status
   outside the known lifecycle, it falls back to the old retry. New knob
   `[review] on_status_contradiction`, default `escalate`; `retry` restores the previous
-  burn-cycles-then-defer behavior verbatim. Review prompts are unchanged by design: forbidding the
-  revert would make a correct reviewer comply and the story would commit without sign-off.
+  burn-cycles-then-defer behavior for a revert that still reaches the gate. Story dev and review
+  prompts now name the board's owner outright rather than leaving this gate to catch the revert
+  after the fact (see Fixed), and a review session that judges the story unfinished is pointed at
+  `status: blocked` on the spec instead — which withholds the commit without contradicting the
+  board, and escalates on its own terms under either setting of the knob.
 
 - **`bmad-loop-setup` stops registering BMAD config; the installer owns it (#258).** The skill
   wrote `_bmad/config.yaml`, `_bmad/config.user.yaml` and a root `_bmad/module-help.csv` — the
@@ -259,6 +262,14 @@ story <id>`, the same annotation a sweep bundle writes. Both sprint and stories 
   A project still on `bmad-auto` should migrate on 0.9.0 before upgrading past it.
 
 ### Fixed
+
+- **Dispatched sessions are now told the sprint board is orchestrator-owned.** Story dev prompts and
+  the review prompts of sprint and sweep runs carry one shared prohibition: never write
+  `sprint-status.yaml`, never revert it, and a row at `done` or `awaiting-operator` is the
+  orchestrator's own bookkeeping rather than a defect. Review prompts alone add the way out, pointing
+  a reviewer that judges the story genuinely unfinished at `status: blocked`; dev prompts get no such
+  invitation, because `blocked` halts the whole run. The `#334` gate is unchanged and still escalates
+  a revert that slips through. Mode-by-mode behavior is in `docs/FEATURES.md`.
 
 - **Refuse `isolation = "worktree"` combined with a `repo_root` override (#414).** The pair
   previously produced a green preflight and then an isolated session with no dev primitive, no

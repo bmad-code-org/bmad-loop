@@ -2689,12 +2689,23 @@ class Engine:
         # from a stale snapshot clobbers orchestrator-recorded closures. The
         # ledger is append-only for sessions — new findings are fine, existing
         # entries are orchestrator-owned.
+        #
+        # Both board clauses are bare sentences and the text above ends in a full
+        # stop, so this seam joins with a plain space; the em dash the bare-story-key
+        # dev seam uses would render a `. — ` here. The hand-back redirect rides
+        # ONLY this prompt (a dev session must not be nudged toward the run-halting
+        # `blocked`) and only while the prohibition is non-empty, so a mode that
+        # overrides the prohibition away — `StoriesEngine`, which has no board —
+        # drops both halves from one override.
+        board = self._sprint_board_instruction()
+        halves = [c for c in (board, self._board_handback_redirect()) if c] if board else []
+        board_clause = "".join(f" {half}" for half in halves)
         return (
             f"/{self._dev_skill('review')} {task.spec_file} — If this review defers new "
             f"findings, append them to the deferred-work ledger as NEW entries "
             f"only; do NOT modify, re-open, or rewrite existing ledger entries — "
             f"the orchestrator owns their status and resolution."
-        )
+        ) + board_clause
 
     def _render_commit_template(self, task: StoryTask) -> str | None:
         """The configured commit message template with {story_key}/{run_id}
@@ -3130,6 +3141,19 @@ class Engine:
         check, which would otherwise HALT `blocked` on the very diff
         `_restore_patch` just laid onto the tree. A bare story key takes the
         freeform/epic path instead, where that dirty-tree check runs first."""
+        # Both injected clauses ride every branch, in this order — the park clause
+        # stays LAST because its docstring's backtick argument depends on nothing
+        # being appended after it. Both are bare sentences, so this seam owns every
+        # separator: an em dash after the bare story key (the one branch whose text
+        # carries no terminal punctuation), a plain space after a sentence. A full
+        # stop followed by an em dash renders as punctuation noise and must not
+        # appear in an assembled prompt.
+        clauses = [
+            c for c in (self._sprint_board_instruction(), self._operator_park_instruction()) if c
+        ]
+        tail = " ".join(clauses)
+        after_sentence = f" {tail}" if tail else ""
+        after_key = f" — {tail}" if tail else ""
         if feedback is None:
             if task.restore_patch and task.spec_file:
                 return (
@@ -3137,8 +3161,8 @@ class Engine:
                     f"`{task.spec_file}`. The attempted change was restored onto "
                     f"the working tree after an intent-gap resolution; review it "
                     f"against the amended spec."
-                ) + self._operator_park_instruction()
-            return f"/{self._dev_skill()} {task.story_key}" + self._operator_park_instruction()
+                ) + after_sentence
+            return f"/{self._dev_skill()} {task.story_key}" + after_key
         self._reset_spec_for_repair(task)
         spec_ref = task.spec_file or task.story_key
         return (
@@ -3147,7 +3171,92 @@ class Engine:
             f"verification; repair the working tree so verification passes without "
             f"changing the spec's frozen intent contract. Verification evidence is "
             f"in `{feedback}`."
-        ) + self._operator_park_instruction()
+        ) + after_sentence
+
+    def _sprint_board_instruction(self) -> str:
+        """The board-ownership PROHIBITION — never write the board, never revert
+        it — injected into `_review_prompt` and `_generic_dev_prompt`, the two
+        prompt seams `Engine` itself builds, the way the deferred-work sentence
+        beside it is. It says nothing about what a session should do instead; that
+        half is `_board_handback_redirect`, and it rides the review prompt only.
+
+        Injection surface, exactly: story dev sessions (`_generic_dev_prompt`) and
+        the review sessions of sprint and sweep runs (both inherit
+        `_review_prompt`). `SweepEngine` and `StoriesEngine` override `_dev_prompt`,
+        so no bundle or stories dev prompt reaches this; `StoriesEngine` overrides
+        this method to "" as well, which drops it from that mode's review prompt
+        too. Plugin workflow sessions and the interactive resolve agent get nothing
+        from this seam. For `resolve` that costs nothing — `bmad-loop-resolve`'s own
+        skill already forbids touching the board outright. Plugin workflow sessions
+        dispatched between the board write and the commit (`post_dev_phase`,
+        `post_review_result`, `pre_commit_gate`) are a genuine gap, left as
+        follow-up work rather than widened into here.
+
+        `_post_dev_state_sync` advances sprint-status.yaml right after the dev
+        session — to `done`, or to `awaiting-operator` on a park — but the story's
+        single commit lands only after the review loop, so every session dispatched
+        in that window opens on an uncommitted, unattributed board change with
+        nothing in the repo naming its author. A review session read the
+        orchestrator's own write as a spec violation, reverted it, and the #334
+        contradiction gate correctly escalated a story both sessions agreed was
+        finished. This clause names the owner, which is the cheap half of the fix;
+        moving the board write inside the commit window is the expensive half, left
+        as follow-up work.
+
+        The row is called BOOKKEEPING, never a verified sign-off, because it is not
+        one: `_post_dev_state_sync` writes the board before `_verify_dev_artifacts`
+        runs, and a repair session is dispatched precisely when that verification
+        failed — it opens on a red tree under a `done` row, and a prompt telling it
+        the row was verified would be lying to it.
+
+        This deliberately reverses the "#334: review prompts are unchanged by
+        design" note in CHANGELOG. That rationale assumed forbidding the revert
+        would let an unfinished story commit — but `verify.verify_review` reads the
+        SPEC frontmatter first (`verify._gate_frontmatter`, then the spec-status
+        check) and returns `retry` there, before `verify.story_status` ever reads
+        the board. A reviewer that withholds sign-off through the spec still blocks
+        the commit, so the board revert was never the load-bearing channel; it was
+        only ever the one that escalated.
+
+        Returned as a bare sentence with NO leading separator, because the call
+        sites need different ones — after the dev prompt's bare story key an em dash
+        is right, after a sentence a plain space is. Deliberately backtick-free, for
+        the reason `_operator_park_instruction` documents, and appended BEFORE that
+        clause so the park contract stays the last thing a dev prompt says."""
+        return (
+            "sprint-status.yaml is owned by the orchestrator: never write it, and "
+            "never revert a change to it. A row at done or awaiting-operator is the "
+            "orchestrator's own bookkeeping, not a defect."
+        )
+
+    def _board_handback_redirect(self) -> str:
+        """Where a session that disagrees with the board should go instead. Appended
+        to `_sprint_board_instruction` on the REVIEW prompt only, and only while
+        that clause is non-empty.
+
+        `blocked` is named deliberately: it is the only spec status that both
+        withholds the commit and reaches a human (`devcontract` synthesizes a
+        CRITICAL escalation from it). Any other non-terminal status merely retries
+        until the cycle budget exhausts and `_defer` rolls the work back to
+        baseline — honest dissent discarded in silence.
+
+        Review-only for the same reason. That CRITICAL halts the whole run, which is
+        the right trade for a review session (judging sign-off is its job, and a halt
+        beats a silent rollback) and the wrong one for a dev session: a repair or
+        `_fix_phase` re-drive would gain a sanctioned early exit out of a run that
+        otherwise continues, and the invitation would flatly contradict
+        `_operator_park_instruction`'s "never use the blocked status for this" a
+        sentence later in the same prompt. The dev prompt therefore carries the
+        prohibition alone — a dev session that cannot finish already has park and the
+        skill's own escape.
+
+        Bare sentence, no leading separator, backtick-free — same contract as the
+        clause it follows."""
+        return (
+            "If you judge the story genuinely unfinished, finalize the spec to "
+            "status: blocked and say why — that is the hand-back channel; the board "
+            "is not."
+        )
 
     def _operator_park_instruction(self) -> str:
         """The park contract, injected into every dev prompt while
@@ -3168,11 +3277,15 @@ class Engine:
         Deliberately backtick-free. It is appended AFTER the repair prompt's
         feedback-file pointer, and the last backtick-wrapped token in a dev prompt
         is by convention that path — a backticked word here would quietly become
-        the "feedback file" to anything reading the prompt back."""
+        the "feedback file" to anything reading the prompt back.
+
+        Returned as a bare sentence with NO leading separator. The board clause now
+        always precedes it and ends in a full stop, where the em dash this clause
+        used to carry would render a `. — `; its sole caller owns every separator."""
         if not self._operator_park_enabled():
             return ""
         return (
-            " — If this story's acceptance criteria include actions only a HUMAN "
+            "If this story's acceptance criteria include actions only a HUMAN "
             "can perform outside the repo (buy a domain, publish a DNS record, "
             "grant an API key, click through a vendor console): complete every "
             "part an agent CAN do, commit it, then finalize the spec frontmatter "

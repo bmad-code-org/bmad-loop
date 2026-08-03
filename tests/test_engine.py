@@ -3497,6 +3497,193 @@ def test_expected_spec_withheld_from_labeled_workflow_session(project):
     assert pinned is None
 
 
+# ------------------------------- orchestrator-owned sprint board in prompts
+
+# The board advance lands right after dev verifies; the story's single commit lands
+# only after the review loop — so every session dispatched in between opens on an
+# uncommitted, unattributed board change. One reverted it and #334 escalated a
+# finished story. These pin the clause that names the owner — and its split: the
+# prohibition rides dev prompts too, the `blocked` hand-back rides review prompts
+# ONLY, because `blocked` halts the entire run (devcontract → CRITICAL).
+
+BOARD_OWNED = "sprint-status.yaml is owned by the orchestrator"
+BLOCKED_INVITE = "status: blocked and say why"
+LEDGER_SENTENCE = (
+    "If this review defers new findings, append them to the deferred-work ledger "
+    "as NEW entries only; do NOT modify, re-open, or rewrite existing ledger "
+    "entries — the orchestrator owns their status and resolution."
+)
+
+
+def test_sprint_board_instruction_is_non_empty_and_backtick_free(project):
+    """The backtick ban is load-bearing: the clause rides AFTER the repair prompt's
+    feedback-file pointer, and the last backtick-wrapped token in a dev prompt is by
+    convention that path (`_operator_park_instruction` docstring). The non-empty
+    assertion is the ablation guard — an empty clause satisfies "no backticks" for
+    entirely the wrong reason, and every downstream `in prompt` check with it."""
+    engine, _ = make_engine(project, [])
+    clause = engine._sprint_board_instruction()
+    assert clause.strip()
+    assert "`" not in clause
+    assert BOARD_OWNED in clause
+    # forbids both directions
+    assert "never write it" in clause and "never revert a change to it" in clause
+    # `_post_dev_state_sync` writes awaiting-operator too, so a clause that only
+    # defended `done` would leave a parked row reading as an unattributed edit
+    assert "done or awaiting-operator" in clause
+    # the row is BOOKKEEPING, never "verified": `_post_dev_state_sync` writes it
+    # before `_verify_dev_artifacts` runs, and a repair session reads this prompt
+    # with a red tree under a `done` row
+    assert "own bookkeeping, not a defect" in clause
+    # the shared half carries no terminal: it is appended to dev prompts, where an
+    # invitation to `blocked` would hand a repair session a run-halting early exit
+    assert "blocked" not in clause
+    # no leading separator — each call site supplies its own (em dash after a bare
+    # story key, plain space after a sentence)
+    assert clause == clause.strip()
+
+
+def test_board_handback_redirect_names_blocked_and_stays_a_bare_sentence(project):
+    """The review-only half. `blocked` is named on purpose: it is the one status that
+    both withholds the commit and reaches a human, where any other non-terminal status
+    retries until the budget exhausts into a defer that rolls the work back — and a
+    board revert is the #334 dead-end itself. Non-empty is the ablation guard, exactly
+    as for the prohibition."""
+    engine, _ = make_engine(project, [])
+    redirect = engine._board_handback_redirect()
+    assert redirect.strip()
+    assert "`" not in redirect
+    assert BLOCKED_INVITE in redirect
+    assert "the board is not" in redirect
+    assert redirect == redirect.strip()
+
+
+def test_review_prompt_carries_both_halves_and_keeps_the_ledger_sentence(project):
+    """A review session is the one that read the orchestrator's board write as a spec
+    violation. It now gets told, and told where to go instead. The deferred-work
+    sentence — the same shape of injected ownership clause — must survive verbatim,
+    and the spec pin (#261) still reads the path out of the prompt."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    owed = str(spec_path(project, "1-1-a"))
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=owed)
+
+    prompt = engine._review_prompt(task)
+    assert prompt.startswith(f"/bmad-dev-auto {owed} — ")
+    assert LEDGER_SENTENCE in prompt
+    assert BOARD_OWNED in prompt  # not vacuous the way an emptied clause would be
+    assert BLOCKED_INVITE in prompt
+    assert engine._sprint_board_instruction() in prompt
+    assert engine._board_handback_redirect() in prompt
+    # prohibition first, redirect second: "never do X" then "do Y instead"
+    assert prompt.index(engine._sprint_board_instruction()) < prompt.index(
+        engine._board_handback_redirect()
+    )
+    assert _pin_probe(project, prompt, spec_file=owed) == owed
+
+
+def test_review_prompt_joins_both_halves_as_prose(project):
+    """The ledger sentence ends in a full stop, so the clause joins it as the next
+    sentence, and the redirect joins that one the same way. Carrying the dev prompt's
+    em dash into either seam would render `...their status and resolution. —
+    sprint-status.yaml is owned by...`, which is punctuation noise in the one prompt
+    the whole change exists for."""
+    engine, _ = make_engine(project, [])
+    owed = str(spec_path(project, "1-1-a"))
+
+    prompt = engine._review_prompt(StoryTask(story_key="1-1-a", epic=1, spec_file=owed))
+
+    # positive form first: an emptied clause fails this, where `". — " not in prompt`
+    # alone would pass vacuously
+    assert f"{LEDGER_SENTENCE} {BOARD_OWNED}" in prompt
+    assert f"not a defect. {engine._board_handback_redirect()}" in prompt
+    assert ". — " not in prompt
+    assert prompt == prompt.strip()
+
+
+def test_board_clause_rides_every_dev_branch_ahead_of_the_park_clause(project, tmp_path):
+    """All three `_generic_dev_prompt` branches carry the prohibition, and none of them
+    lets it displace the park contract from the end of the prompt or the feedback path
+    from the last backticked token."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    write_spec(spec_path(project, "1-1-a"), "done", "abc123")  # the repair leg re-opens it
+    engine, _ = make_engine(project, [])
+    owed = str(spec_path(project, "1-1-a"))
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=owed)
+    board, park = engine._sprint_board_instruction(), engine._operator_park_instruction()
+    assert park  # default policy parks; otherwise every ordering check below is vacuous
+    feedback = tmp_path / "feedback.md"
+    feedback.write_text("verification evidence")
+
+    fresh = engine._dev_prompt(task, None)
+    restore = engine._dev_prompt(dataclasses.replace(task, restore_patch="/tmp/a.patch"), None)
+    repair = engine._dev_prompt(task, feedback)
+
+    assert fresh.startswith("/bmad-dev-auto 1-1-a")  # dispatch shape unchanged
+    # after a bare story key the em dash IS the right separator — the seam neither
+    # sentence-joined branch nor the review prompt uses
+    assert fresh.startswith(f"/bmad-dev-auto 1-1-a — {board}")
+    for prompt in (fresh, restore, repair):
+        # BOARD_OWNED, not just `board in prompt`: an emptied clause is "in" every
+        # string, so the substring check alone would pass through the ablation.
+        assert BOARD_OWNED in prompt
+        assert board in prompt and park in prompt  # neither truncated
+        assert prompt.index(board) < prompt.index(park)
+        assert prompt.endswith(park)  # the park contract is still the last word
+        assert ". — " not in prompt  # board→park and prose→board seams alike
+    assert re.findall(r"`([^`]*)`", repair)[-1] == str(feedback)
+
+
+def test_no_dev_branch_invites_blocked(project, tmp_path):
+    """The redirect is review-only. `blocked` synthesizes a CRITICAL escalation
+    (`devcontract`) that halts the whole run, so on a dev prompt it would hand a
+    repair/`_fix_phase` session a sanctioned early exit out of a run that otherwise
+    retries or defers and keeps going — and it would contradict the park clause's
+    "Never use the blocked status for this" a sentence later in the same prompt.
+
+    Asserted as a count against the park clause rather than `"blocked" not in`: the
+    park clause legitimately says the word, twice, to forbid it."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    write_spec(spec_path(project, "1-1-a"), "done", "abc123")
+    engine, _ = make_engine(project, [])
+    owed = str(spec_path(project, "1-1-a"))
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=owed)
+    park = engine._operator_park_instruction()
+    assert park.count("blocked") == 2  # else the count comparison below is vacuous
+    feedback = tmp_path / "feedback.md"
+    feedback.write_text("verification evidence")
+
+    for prompt in (
+        engine._dev_prompt(task, None),
+        engine._dev_prompt(dataclasses.replace(task, restore_patch="/tmp/a.patch"), None),
+        engine._dev_prompt(task, feedback),
+    ):
+        assert BOARD_OWNED in prompt  # the prohibition IS there — not an empty tail
+        assert engine._board_handback_redirect() not in prompt
+        assert BLOCKED_INVITE not in prompt
+        assert "status: blocked" not in prompt
+        # every surviving mention of the word is the park clause forbidding it
+        assert prompt.count("blocked") == park.count("blocked")
+
+
+def test_board_clause_stands_alone_when_parking_is_disabled(project):
+    """`[operator] enabled = false` empties the park clause; the prohibition is
+    unconditional and becomes the tail on its own — with no dangling separator where
+    the park clause used to start, and still no invitation to `blocked` (the park
+    clause was the only thing that ever said the word on a dev prompt)."""
+    engine, _ = make_engine(
+        project, [], policy=_park_policy(operator=OperatorPolicy(enabled=False))
+    )
+    clause = engine._sprint_board_instruction()
+    prompt = engine._dev_prompt(StoryTask(story_key="1-1-a", epic=1), None)
+    assert engine._operator_park_instruction() == ""
+    assert BOARD_OWNED in prompt
+    assert prompt == f"/bmad-dev-auto 1-1-a — {clause}"
+    assert prompt.endswith("own bookkeeping, not a defect.")  # the clause's own last words
+    assert prompt == prompt.strip()  # no trailing space, no orphaned em dash
+    assert "blocked" not in prompt
+
+
 @pytest.mark.parametrize("prefix", ["bmad-build-auto-result-", "bmad-dev-auto-result-"])
 def test_record_dev_spec_refuses_the_no_spec_fallback_marker(project, prefix):
     """`<primitive>-result-*` is the skill's "intent too unclear to even create a

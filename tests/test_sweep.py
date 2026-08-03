@@ -1367,6 +1367,30 @@ def test_generic_bundle_prompt_restore_branch_points_at_spec(project):
     assert "Resume review of the in-review spec" not in fresh_prompt
 
 
+def test_bundle_dev_prompt_carries_no_sprint_board_clause(project):
+    """A bundle has no sprint-status row, so the board-ownership clause the story dev
+    prompt carries is not appended here — `SweepEngine` overrides `_dev_prompt`, and
+    `_generic_bundle_prompt` never reaches the seam. Ablation: append
+    `_sprint_board_instruction()` to `_generic_bundle_prompt` and this must fail.
+
+    The inherited review prompt DOES carry it, both halves. A sweep runs inside a
+    project whose sprint board exists and is just as revertible from a bundle session
+    as from a story one, and `SweepEngine` never overrides `_review_prompt` — unlike
+    `StoriesEngine`, which has no board at all and empties the clause."""
+    engine, _ = make_sweep(project, [])
+    task = StoryTask(
+        story_key="dw-fix", epic=0, dw_ids=["DW-1"], bundle_file="/run/bundles/fix/intent.md"
+    )
+    board = engine._sprint_board_instruction()
+    assert board  # else every check below is vacuous
+    assert board not in engine._dev_prompt(task, None)
+    assert "sprint-status.yaml" not in engine._dev_prompt(task, None)
+    task.spec_file = str(project.implementation_artifacts / "spec-dw-fix.md")
+    review = engine._review_prompt(task)
+    assert board in review
+    assert engine._board_handback_redirect() in review
+
+
 def test_generic_bundle_prompt_spells_the_post_rename_primitive(project):
     """All three bundle legs (restore, fresh implement, repair) spell the dev
     primitive resolved off the dev adapter's skill tree, not a hardcoded name —
