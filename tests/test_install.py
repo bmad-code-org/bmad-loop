@@ -7233,10 +7233,10 @@ def test_legacy_exclude_pollution_skips_the_render_dir_when_walking_bmad(project
 
 
 def test_legacy_exclude_pollution_reports_an_unselected_profile(project):
-    """Codex's open P1 on #386. A repo polluted while `claude` was selected and
-    since switched to another CLI still carries `/.claude/skills`; a candidate set
-    built from the CURRENTLY resolved profiles reports nothing on exactly the repo
-    that needs it most. The caller passes every REGISTERED profile.
+    """A repo polluted while `claude` was selected and since switched to another CLI
+    still carries `/.claude/skills`; a candidate set built from the CURRENTLY
+    resolved profiles reports nothing on exactly the repo that needs it most. The
+    caller passes every REGISTERED profile.
 
     Ablation: pass only the codex profile and this fails."""
     claude, codex = get_profile("claude"), get_profile("codex")

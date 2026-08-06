@@ -4417,9 +4417,9 @@ def test_validate_silent_when_the_exclude_file_is_absent(project, capsys, monkey
 def test_validate_pollution_reports_a_profile_this_policy_never_selects(
     project, capsys, monkeypatch
 ):
-    """Codex's open P1 on #386. The policy names claude only, but the residue is a
-    gemini path — written when the project ran on a different CLI. Candidates come
-    from every REGISTERED profile, so switching CLIs cannot hide the pollution.
+    """The policy names claude only, but the residue is a gemini path — written when
+    the project ran on a different CLI. Candidates come from every REGISTERED
+    profile, so switching CLIs cannot hide the pollution.
 
     Ablation: build the candidate set from `profiles` instead of `all_profiles`
     and this stops reporting."""
