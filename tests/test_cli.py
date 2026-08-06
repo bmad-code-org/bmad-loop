@@ -4529,6 +4529,46 @@ def test_validate_pollution_reports_a_plugin_disabled_since_the_polluting_run(
     assert warned[0]["detail"]["lines"] == ["/vendored/off.json"]
 
 
+def test_validate_pollution_reports_plugin_lines_though_the_policy_is_malformed(
+    project, capsys, monkeypatch
+):
+    """A policy that fails to parse is a fact about TODAY's config, and the
+    reconstruction target is historical — the same rule as the profile set and the
+    `_active_for_seeds` filter, one source over. Manifest discovery never reads the
+    policy (`PluginRegistry.build` takes it as `| None`, and it governs only the
+    settings overlay and the trust gate), so a broken policy.toml must not shrink
+    the candidate set. It is the one run where the operator is already editing that
+    file, so a silent drop there is the worst place for one.
+
+    Ablation: put the manifest loop back inside `if pol is not None:` and this
+    reports nothing."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    root = project.project
+    plug = root / ".bmad-loop" / "plugins" / "declarative"
+    plug.mkdir(parents=True, exist_ok=True)
+    # No `[python]`, so `_active_for_seeds` keeps it either way: the policy guard is
+    # the only thing that can drop this line, which is what makes the ablation exact.
+    (plug / "plugin.toml").write_text(
+        '[plugin]\nname = "declarative"\napi_version = 1\nseed_files = ["vendored/tool.json"]\n',
+        encoding="utf-8",
+    )
+    (root / "vendored").mkdir(exist_ok=True)
+    (root / "vendored" / "tool.json").write_text("{}\n", encoding="utf-8")
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "declarative plugin fixture")
+    capsys.readouterr()
+    _pollute_exclude(project, "/vendored/tool.json")
+    (root / ".bmad-loop" / "policy.toml").write_text("not = = toml\n", encoding="utf-8")
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+
+    problems = [f["check"] for f in doc["findings"] if f["severity"] == "problem"]
+    assert "policy" in problems, "non-vacuity: the policy must really have failed to parse"
+    warned = [f for f in doc["findings"] if f["check"] == "git.exclude-legacy-pollution"]
+    assert len(warned) == 1, "a policy that will not parse still cannot hide plugin lines"
+    assert warned[0]["detail"]["lines"] == ["/vendored/tool.json"]
+
+
 def test_validate_pollution_detail_splits_by_tracked_content(project, capsys, monkeypatch):
     """`.claude/skills` is tracked by the fixture, so the rule over it can only be
     hiding that path's NEW files; nothing is tracked under the seeded customize dir.

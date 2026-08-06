@@ -347,28 +347,35 @@ def cmd_validate(args: argparse.Namespace) -> int:
         pass  # a malformed overlay already reported above; fall back to the resolved set
     seed_rels: list[str] = [rel for p in all_profiles for rel in p.seed_files]
     if pol is not None:
-        seed_rels.extend(pol.scm.worktree_seed)
-        # The third seed source. Plugin-declared literals plus glob expansions, the
-        # latter run through the same `glob` the writer used (worktree_flow.py), which
-        # wrote one line PER MATCH. Expanding against today's tree can only produce
-        # candidates: a match that did not exist when the run happened never appears
-        # in the file, so it costs nothing and matches nothing.
-        #
-        # Read every DISCOVERED manifest, not `registry.seed_files()`/`seed_globs()`:
-        # those filter through `_active_for_seeds`, so a `[python]` plugin enabled
-        # when the polluting run happened and disabled today contributes nothing.
-        # Same current-policy narrowing as the profile set above, one pillar over —
-        # and not hypothetical: with nothing enabled those accessors return EMPTY,
-        # dropping the shipped tea (`_bmad/**`) and unity (`.claude/skills/*`) globs.
-        try:
-            for loaded in PluginRegistry.build(project, pol).plugins():
-                seed_rels.extend(loaded.manifest.seed_files)
-                for pattern in loaded.manifest.seed_globs:
-                    seed_rels.extend(
-                        m.relative_to(project).as_posix() for m in project.glob(pattern)
-                    )
-        except (PluginError, OSError, ValueError):
-            pass  # plugin faults have their own gate; this check does not own them
+        seed_rels.extend(pol.scm.worktree_seed)  # the only source that needs the policy
+    # The third seed source. Plugin-declared literals plus glob expansions, the
+    # latter run through the same `glob` the writer used (worktree_flow.py), which
+    # wrote one line PER MATCH. Expanding against today's tree can only produce
+    # candidates: a match that did not exist when the run happened never appears
+    # in the file, so it costs nothing and matches nothing.
+    #
+    # Read every DISCOVERED manifest, not `registry.seed_files()`/`seed_globs()`:
+    # those filter through `_active_for_seeds`, so a `[python]` plugin enabled
+    # when the polluting run happened and disabled today contributes nothing.
+    # Same current-policy narrowing as the profile set above, one pillar over —
+    # and not hypothetical: with nothing enabled those accessors return EMPTY,
+    # dropping the shipped tea (`_bmad/**`) and unity (`.claude/skills/*`) globs.
+    #
+    # OUTSIDE the `pol is not None` guard, for that same reason a third time: a
+    # malformed policy.toml is a fact about today's config, and the reconstruction
+    # target is historical. `build`'s policy argument is typed `| None` and governs
+    # only the settings overlay and the trust/instantiation gate; the manifests
+    # themselves come from `load_plugins(project)`, which never reads it. Under the
+    # guard, a repo whose policy fails to parse got NO plugin candidates at all —
+    # `validate` reported the policy error and silently dropped the plugin-written
+    # lines, which is the one run where the operator is already editing that file.
+    try:
+        for loaded in PluginRegistry.build(project, pol).plugins():
+            seed_rels.extend(loaded.manifest.seed_files)
+            for pattern in loaded.manifest.seed_globs:
+                seed_rels.extend(m.relative_to(project).as_posix() for m in project.glob(pattern))
+    except (PluginError, OSError, ValueError):
+        pass  # plugin faults have their own gate; this check does not own them
     pollution = legacy_exclude_pollution(project, all_profiles, seed_rels)
     if pollution is not None:
         # The remedy is a DELETION and no line here can be attributed, so "review
