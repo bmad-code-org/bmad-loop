@@ -4418,11 +4418,11 @@ def test_validate_pollution_reports_a_profile_this_policy_never_selects(
     project, capsys, monkeypatch
 ):
     """The policy names claude only, but the residue is a gemini path — written when
-    the project ran on a different CLI. Candidates come from every REGISTERED
+    the project ran on a different CLI. Candidates come from every DISCOVERED
     profile, so switching CLIs cannot hide the pollution.
 
-    Ablation: build the candidate set from `profiles` instead of `all_profiles`
-    and this stops reporting."""
+    Ablation: build the candidate set from the role-resolved `profiles` instead
+    of `_legacy_exclude_candidate_sources`' union and this stops reporting."""
     from bmad_loop.adapters.profile import get_profile
 
     _make_validate_pass(project, monkeypatch, capsys)
@@ -4465,7 +4465,8 @@ def test_validate_pollution_reports_a_plugin_seed_glob_expansion(project, capsys
     pattern and wrote one exclude line PER MATCH, so a repo can carry lines no
     profile and no policy entry can explain.
 
-    Ablation: drop the registry block from cmd_validate and this stops reporting."""
+    Ablation: drop the manifest loop from `_legacy_exclude_candidate_sources`
+    and this stops reporting."""
     _make_validate_pass(project, monkeypatch, capsys)
     root = project.project
     (root / ".bmad-loop" / "plugins" / "seedy").mkdir(parents=True, exist_ok=True)
@@ -4535,10 +4536,11 @@ def test_validate_pollution_reports_plugin_lines_though_the_policy_is_malformed(
     """A policy that fails to parse is a fact about TODAY's config, and the
     reconstruction target is historical — the same rule as the profile set and the
     `_active_for_seeds` filter, one source over. Manifest discovery never reads the
-    policy (`PluginRegistry.build` takes it as `| None`, and it governs only the
-    settings overlay and the trust gate), so a broken policy.toml must not shrink
-    the candidate set. It is the one run where the operator is already editing that
-    file, so a silent drop there is the worst place for one.
+    policy (`discovered_manifests` takes only the project root; policy governs the
+    settings overlay and the trust gate, neither of which is a manifest), so a
+    broken policy.toml must not shrink the candidate set. It is the one run where
+    the operator is already editing that file, so a silent drop there is the worst
+    place for one.
 
     Ablation: put the manifest loop back inside `if pol is not None:` and this
     reports nothing."""
@@ -4572,12 +4574,13 @@ def test_validate_pollution_reports_plugin_lines_though_the_policy_is_malformed(
 def test_validate_pollution_survives_a_malformed_profile_overlay(project, capsys, monkeypatch):
     """`load_profiles` overlays `.bmad-loop/profiles/*.toml` onto the packaged
     built-ins and raises on the first malformed one, discarding the built-ins it had
-    already collected. The role-resolved fallback cannot cover that — `get_profile`
-    calls the same loader, so it is empty for the same reason — which left the
-    candidate set with NO profile entries and `/.claude/skills` unreported in the
-    very run that reported the overlay error.
+    already collected — so this run used to leave the candidate set with NO profile
+    entries and `/.claude/skills` unreported, in the very run that reported the
+    overlay error. `discovered_profiles` parses per item: the broken overlay skips
+    only itself and the packaged profiles still contribute.
 
-    Ablation: drop the packaged-only retry and this reports nothing."""
+    Ablation: route the candidate profiles through `load_profiles` (the effective
+    map) and this reports nothing."""
     _make_validate_pass(project, monkeypatch, capsys)
     root = project.project
     overlay = root / ".bmad-loop" / "profiles"
@@ -4598,10 +4601,10 @@ def test_validate_pollution_survives_a_malformed_profile_overlay(project, capsys
 
 
 def test_validate_never_runs_plugin_code_while_building_candidates(project, capsys, monkeypatch):
-    """The candidate set needs MANIFESTS, so it reads `load_plugins`, never
-    `PluginRegistry.build` — which resolves, and for an enabled `[python]` plugin
-    that means `exec_module` plus the constructor: third-party code inside a
-    preflight.
+    """The candidate set needs MANIFESTS, so it reads `discovered_manifests`,
+    never `PluginRegistry.build` — which resolves, and for an enabled `[python]`
+    plugin that means `exec_module` plus the constructor: third-party code inside
+    a preflight.
 
     Two contracts break when it runs. A top-level `print` puts its line ahead of the
     document, so the whole of stdout stops being one JSON object (AGENTS.md's `--json`
@@ -4690,6 +4693,159 @@ def test_validate_pollution_asks_for_review_before_deleting_every_line(
     ]
     assert "review each before deleting it" in msg, "the hedge covers all hits, not one bucket"
     assert "delete them by hand" not in msg, "no bucket may be presented as safe to delete"
+
+
+def test_validate_pollution_reports_packaged_paths_beside_a_valid_same_name_overlay(
+    project, capsys, monkeypatch
+):
+    """A VALID `.bmad-loop/profiles/claude.toml` replaces the packaged claude in
+    the effective map — no fault anywhere, an ordinary override — and candidates
+    built from that map lose the packaged profile's `config_path`/`seed_files`
+    lines, though the pollution was written while the packaged profile was the
+    one running. The union of every DISCOVERED profile keeps both sides.
+
+    The overlay's own `/.claude/alt-settings.json` line is the non-vacuity pin:
+    an overlay that failed to parse takes the ProfileError path and leaves that
+    line with no candidate, failing the lines assert — an invalid overlay
+    imitates a refutation (this PR's void-fixture family), so the fixture must
+    prove the overlay APPLIED, which the hooks.registered detail does directly.
+
+    The overlay deliberately does NOT list `.claude/settings.json` in its
+    seed_files: the packaged claude's seed_files also carries that path, so an
+    overlay keeping it would supply the packaged line itself and the
+    union-vs-effective distinction would vanish for this fixture.
+
+    Ablation: build `all_profiles` from `load_profiles` (the effective map) and
+    the `/.claude/settings.json` line goes unreported."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    root = project.project
+    overlay = root / ".bmad-loop" / "profiles"
+    overlay.mkdir(parents=True, exist_ok=True)
+    (overlay / "claude.toml").write_text(
+        'name = "claude"\n'
+        'binary = "claude"\n'
+        'seed_files = [".mcp.json"]\n'
+        "[hooks]\n"
+        'dialect = "claude-settings-json"\n'
+        'config_path = ".claude/alt-settings.json"\n'
+        'events = { Stop = "Stop" }\n',
+        encoding="utf-8",
+    )
+    # the role loop resolves the OVERLAY now, so its config_path must carry the
+    # relay registration for hooks.registered to stay green — the settings.json
+    # `init` just wrote has it, and the copy keeps this test about the candidate
+    # set rather than about a deliberately broken hook config
+    settings = root / ".claude" / "settings.json"
+    (root / ".claude" / "alt-settings.json").write_text(
+        settings.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "valid same-name overlay fixture")
+    capsys.readouterr()
+    _pollute_exclude(project, "/.claude/settings.json", "/.claude/alt-settings.json")
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+
+    hooks_f = next(f for f in doc["findings"] if f["check"] == "hooks.registered")
+    assert hooks_f["detail"]["config_path"] == str(
+        root / ".claude" / "alt-settings.json"
+    ), "non-vacuity: the overlay must really have replaced the packaged profile"
+    warned = [f for f in doc["findings"] if f["check"] == "git.exclude-legacy-pollution"]
+    assert len(warned) == 1, "an ordinary valid override cannot hide the packaged paths"
+    assert warned[0]["detail"]["lines"] == [
+        "/.claude/alt-settings.json",  # the overlay's path — proves it contributed
+        "/.claude/settings.json",  # the packaged path the effective map loses
+    ]
+
+
+def test_validate_pollution_reports_builtin_lines_despite_a_malformed_project_manifest(
+    project, capsys, monkeypatch
+):
+    """One malformed project `plugin.toml` used to make the manifest walk raise
+    mid-stream, zeroing every BUILTIN manifest — and with them the builtin
+    unity's `.claude/skills/*` glob candidates. Discovery is per-item now: the
+    broken manifest skips only itself.
+
+    `a-broken` sorts FIRST in the project dir, so the `/vendored/good.json`
+    line doubles as the kill for a per-source `break`: a guard that stops the
+    project source at its first fault loses b-good's line too.
+
+    Ablation: build the manifests from `load_plugins` and validate crashes here
+    instead of reporting; per-item `continue` -> `break` drops the b-good line."""
+    from bmad_loop.plugins import PluginError, load_plugins
+
+    _make_validate_pass(project, monkeypatch, capsys)
+    root = project.project
+    plugins_dir = root / ".bmad-loop" / "plugins"
+    (plugins_dir / "a-broken").mkdir(parents=True, exist_ok=True)
+    (plugins_dir / "a-broken" / "plugin.toml").write_text("[plugin]\nname = \n", encoding="utf-8")
+    (plugins_dir / "b-good").mkdir(parents=True, exist_ok=True)
+    (plugins_dir / "b-good" / "plugin.toml").write_text(
+        '[plugin]\nname = "b-good"\napi_version = 1\nseed_files = ["vendored/good.json"]\n',
+        encoding="utf-8",
+    )
+    # the tree install_dev_base_skills laid down already holds .claude/skills
+    (root / ".claude" / "skills").mkdir(parents=True, exist_ok=True)
+    (root / ".claude" / "skills" / "keep.md").write_text("x\n", encoding="utf-8")
+    (root / "vendored").mkdir(exist_ok=True)
+    (root / "vendored" / "good.json").write_text("{}\n", encoding="utf-8")
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "malformed manifest fixture")
+    capsys.readouterr()
+    # non-vacuity: the effective loader really refuses this project dir, so the
+    # candidates below cannot be coming from a load_plugins that happened to work
+    with pytest.raises(PluginError):
+        load_plugins(root)
+    _pollute_exclude(project, "/.claude/skills/keep.md", "/vendored/good.json")
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+
+    warned = [f for f in doc["findings"] if f["check"] == "git.exclude-legacy-pollution"]
+    assert len(warned) == 1, "one malformed manifest cannot hide the builtin lines"
+    assert warned[0]["detail"]["lines"] == ["/.claude/skills/keep.md", "/vendored/good.json"]
+
+
+def test_validate_pollution_reports_builtin_seeds_beside_a_same_name_project_plugin(
+    project, capsys, monkeypatch
+):
+    """The plugin twin of the valid-overlay case: a project plugin named "unity"
+    EVICTS the builtin unity from the effective map — an ordinary override, no
+    fault — and with it the builtin's `.claude/skills/*` glob candidates. The
+    union keeps both manifests, so the builtin's expansion line and the project
+    plugin's own seed line are both reported.
+
+    Declarative (no `[python]`) on purpose: `_active_for_seeds` and the trust
+    gate keep such a plugin either way, so the NAME collision is the only
+    mechanism that can drop a line here.
+
+    Ablation: collapse the union name-keyed (dict.values()) and the
+    `/.claude/skills/keep.md` line goes unreported."""
+    from bmad_loop.plugins import load_plugins
+
+    _make_validate_pass(project, monkeypatch, capsys)
+    root = project.project
+    plug = root / ".bmad-loop" / "plugins" / "unity"
+    plug.mkdir(parents=True, exist_ok=True)
+    (plug / "plugin.toml").write_text(
+        '[plugin]\nname = "unity"\napi_version = 1\nseed_files = ["vendored/mine.json"]\n',
+        encoding="utf-8",
+    )
+    (root / ".claude" / "skills").mkdir(parents=True, exist_ok=True)
+    (root / ".claude" / "skills" / "keep.md").write_text("x\n", encoding="utf-8")
+    (root / "vendored").mkdir(exist_ok=True)
+    (root / "vendored" / "mine.json").write_text("{}\n", encoding="utf-8")
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "same-name project plugin fixture")
+    capsys.readouterr()
+    # non-vacuity: the eviction is real — the effective map holds the project one
+    assert load_plugins(root)["unity"].source == "project"
+    _pollute_exclude(project, "/.claude/skills/keep.md", "/vendored/mine.json")
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+
+    warned = [f for f in doc["findings"] if f["check"] == "git.exclude-legacy-pollution"]
+    assert len(warned) == 1, "an ordinary same-name plugin cannot hide the builtin's lines"
+    assert warned[0]["detail"]["lines"] == ["/.claude/skills/keep.md", "/vendored/mine.json"]
 
 
 # --------------- `bmad-loop mux`: backend listing + persisted choice (issue #87) ----

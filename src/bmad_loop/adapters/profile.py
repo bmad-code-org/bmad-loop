@@ -14,7 +14,9 @@ existing hook dialect needs no Python.
 from __future__ import annotations
 
 import tomllib
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from functools import partial
 from importlib import resources
 from pathlib import Path
 
@@ -226,21 +228,80 @@ def _load_toml(text: str, source: str) -> CLIProfile:
     return _parse_profile(doc, source)
 
 
-def load_profiles(project: Path | None = None) -> dict[str, CLIProfile]:
-    """Packaged built-ins, overlaid by <project>/.bmad-loop/profiles/*.toml."""
-    profiles: dict[str, CLIProfile] = {}
+def _packaged_profile_files() -> list[tuple[str, Callable[[], str]]]:
+    """(source label, text reader) for every packaged profile TOML. Enumeration
+    only — nothing is read or parsed here, so callers choose their own fault
+    granularity."""
     packaged = resources.files("bmad_loop.data").joinpath("profiles")
-    for entry in sorted(packaged.iterdir(), key=lambda e: e.name):
-        if entry.name.endswith(".toml"):
-            profile = _load_toml(entry.read_text(encoding="utf-8"), entry.name)
-            profiles[profile.name] = profile
-    if project is not None:
-        user_dir = project / USER_PROFILES_REL
-        if user_dir.is_dir():
-            for path in sorted(user_dir.glob("*.toml")):
-                profile = _load_toml(path.read_text(encoding="utf-8"), str(path))
-                profiles[profile.name] = profile
+    return [
+        (entry.name, partial(entry.read_text, encoding="utf-8"))
+        for entry in sorted(packaged.iterdir(), key=lambda e: e.name)
+        if entry.name.endswith(".toml")
+    ]
+
+
+def _overlay_profile_files(project: Path | None) -> list[tuple[str, Callable[[], str]]]:
+    """(source label, text reader) for every <project>/.bmad-loop/profiles TOML."""
+    if project is None:
+        return []
+    user_dir = project / USER_PROFILES_REL
+    if not user_dir.is_dir():
+        return []
+    return [
+        (str(path), partial(path.read_text, encoding="utf-8"))
+        for path in sorted(user_dir.glob("*.toml"))
+    ]
+
+
+def load_profiles(project: Path | None = None) -> dict[str, CLIProfile]:
+    """Packaged built-ins, overlaid by <project>/.bmad-loop/profiles/*.toml.
+
+    This is the EFFECTIVE map: it fails fast on the first unreadable or
+    malformed file, and a later same-name profile replaces an earlier one.
+    Both are what a run wants and both are wrong for reconstructing history —
+    see :func:`discovered_profiles`.
+    """
+    profiles: dict[str, CLIProfile] = {}
+    for source, read in [*_packaged_profile_files(), *_overlay_profile_files(project)]:
+        profile = _load_toml(read(), source)
+        profiles[profile.name] = profile
     return profiles
+
+
+def discovered_profiles(project: Path | None = None) -> list[CLIProfile]:
+    """Every parseable profile from every discovered source — a UNION, never
+    the effective map, so a packaged profile and a same-name overlay BOTH
+    appear.
+
+    Exists for historical reconstruction (`validate`'s #384 shared-exclude
+    check), where :func:`load_profiles`'s semantics are each wrong in a
+    different way: fail-fast lets one malformed overlay zero the packaged
+    built-ins it had already collected, and last-write-wins lets an ordinary
+    valid override silently remove the packaged profile's paths from the set —
+    yet the repo may have been polluted while that packaged profile, or a
+    since-edited overlay, was the one running. Consumers only ever ADD
+    candidates, so over-inclusion is safe by construction.
+
+    Never raises. Enumeration is guarded per SOURCE (losing the overlay dir
+    cannot lose the packaged one) and read+parse per ITEM (one bad file skips
+    only itself). Faults are silent here because the effective loaders are the
+    ones that report them: any file this skips either fails `get_profile` in
+    the same run or is not part of today's config at all. A file today's
+    schema cannot parse contributes nothing — an under-report the #384
+    detector's docstring already records as its safe direction.
+    """
+    union: list[CLIProfile] = []
+    for enumerate_source in (_packaged_profile_files, partial(_overlay_profile_files, project)):
+        try:
+            files = enumerate_source()
+        except OSError:
+            continue
+        for source, read in files:
+            try:
+                union.append(_load_toml(read(), source))
+            except (ProfileError, OSError, UnicodeError):
+                continue
+    return union
 
 
 def get_profile(name: str, project: Path | None = None) -> CLIProfile:

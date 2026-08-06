@@ -228,8 +228,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
     # story-queue gate runs below: the sprint-status file (sprint mode) or the
     # stories.yaml manifest (stories mode). Loaded before the queue gate so a
     # stories-only project is not failed on a missing sprint-status.yaml.
-    from .adapters.profile import ProfileError, get_profile, load_profiles
-    from .plugins import PluginError, load_plugins
+    from .adapters.profile import ProfileError, get_profile
 
     profiles = []
     profile_by_name: dict[str, CLIProfile] = {}
@@ -333,70 +332,9 @@ def cmd_validate(args: argparse.Namespace) -> int:
     # paths projects TRACK, so new files under them stay unstageable in this
     # checkout until someone deletes them. Warn only, never repair: the file is
     # hand-editable and its lines carry no authorship (see the helper's docstring).
-    #
-    # Built from EVERY registered profile, not the three this policy resolves, and
-    # from `seed_files` ungated by `seed_adapter_defaults`. Both widenings answer the
-    # same question: the polluting run may have been configured differently from
-    # today's. A repo polluted while `claude` was selected and since switched to
-    # `codex` carries `/.claude/skills`, and the narrow set — the one the policy names
-    # right now — would report nothing on exactly the repo that needs it most.
-    all_profiles = profiles
-    # Every source below is guarded SEPARATELY, and that is the invariant rather than
-    # a style choice: this is a historical reconstruction, so a fault in one source
-    # must never zero another. Three rounds of this check's review found the same
-    # defect once per source — today's profile set, today's enabled plugins, an
-    # unparseable policy — so the assembly funnels them instead of enumerating.
-    #
-    # `load_profiles` overlays `<project>/.bmad-loop/profiles/*.toml` onto the
-    # packaged built-ins and raises on the FIRST malformed one, discarding the
-    # built-ins it had already collected. The role-resolved fallback cannot cover
-    # that: `get_profile` calls the same loader, so `profiles` is empty for the same
-    # reason. Measured: one bad overlay left the candidate set with no profile
-    # entries at all and `/.claude/skills` went unreported in the same run that
-    # reported the overlay error. Packaged-only is the honest floor — those are the
-    # profiles every past writer shipped with.
-    try:
-        all_profiles = list(load_profiles(project).values())
-    except ProfileError:
-        try:
-            all_profiles = list(load_profiles(None).values())
-        except ProfileError:
-            pass  # a packaged profile is broken; keep the resolved set
-    seed_rels: list[str] = [rel for p in all_profiles for rel in p.seed_files]
-    if pol is not None:
-        seed_rels.extend(pol.scm.worktree_seed)  # the only source that needs the policy
-    # The third seed source. Plugin-declared literals plus glob expansions, the
-    # latter run through the same `glob` the writer used (worktree_flow.py), which
-    # wrote one line PER MATCH. Expanding against today's tree can only produce
-    # candidates: a match that did not exist when the run happened never appears
-    # in the file, so it costs nothing and matches nothing.
-    #
-    # `load_plugins` — the MANIFEST loader — and never `PluginRegistry.build`, for two
-    # independent reasons that happen to have one fix.
-    #
-    # Coverage: the registry's `seed_files()`/`seed_globs()` filter through
-    # `_active_for_seeds`, so a `[python]` plugin enabled when the polluting run
-    # happened and disabled today contributes nothing. Not hypothetical — with
-    # nothing enabled those accessors return EMPTY, dropping the shipped tea
-    # (`_bmad/**`) and unity (`.claude/skills/*`) globs. And `build` needs a policy,
-    # so under a `pol is not None` guard an unparseable policy.toml dropped every
-    # plugin candidate. Both are today's configuration narrowing a historical set.
-    #
-    # Purity: `build` also RESOLVES, and for an enabled `[python]` plugin that means
-    # `_instantiate` -> `exec_module` plus the constructor, i.e. third-party code run
-    # inside a preflight that only ever needed the manifest. Measured: a module with a
-    # top-level `print` put its line ahead of the document, so `json.loads` on the
-    # whole of stdout raised JSONDecodeError — the `--json` one-object contract
-    # (AGENTS.md) broken by a plugin — and a top-level write landed a new file in the
-    # repo AFTER `git.worktree-clean` had already passed. `load_plugins` discovers and
-    # api-checks manifests without resolving any of them.
-    try:
-        for manifest in load_plugins(project).values():
-            seed_rels.extend(manifest.seed_files)
-            for pattern in manifest.seed_globs:
-                seed_rels.extend(m.relative_to(project).as_posix() for m in project.glob(pattern))
-    except (PluginError, OSError, ValueError):
-        pass  # plugin faults have their own gate; this check does not own them
+    # The candidate sources are a historical union, never today's effective config
+    # — the whole contract lives on _legacy_exclude_candidate_sources.
+    all_profiles, seed_rels = _legacy_exclude_candidate_sources(project, pol)
     pollution = legacy_exclude_pollution(project, all_profiles, seed_rels)
     if pollution is not None:
         # The remedy is a DELETION and no line here can be attributed, so "review
@@ -674,6 +612,60 @@ def _mux_set(project: Path, args: argparse.Namespace) -> int:
     policy_mod.write_mux_backend(path, args.name)  # a junk name raises PolicyError → main()
     print(f'mux backend set to "{args.name}" in {path}')
     return 0
+
+
+def _legacy_exclude_candidate_sources(project: Path, pol) -> tuple[list, list[str]]:
+    """The seed-path sources for `install.legacy_exclude_pollution`'s candidate set:
+    (every discovered profile, every seed rel from profiles + policy + plugins).
+
+    HISTORICAL semantics, and that is the invariant of this helper, not a style
+    choice: the check reconstructs what EVERY past writer could have written, so
+    the sources are the UNION of everything discovered — `discovered_profiles` /
+    `discovered_manifests`, which parse item-by-item — and never the effective
+    maps (`load_profiles` / `load_plugins` / `PluginRegistry`). Effective-config
+    semantics answer "what applies NOW", and each of them has already produced a
+    review finding here by narrowing this set: role resolution (today's policy),
+    `_active_for_seeds` (today's enablement), the api gate (today's build),
+    fail-fast (a malformed overlay or manifest zeroing its siblings), and
+    last-write-wins (a perfectly valid same-name override silently removing the
+    packaged entry's paths). Widening is safe by construction — candidates only
+    ever ADD, matching is byte-exact, and a candidate matching nothing costs
+    nothing (see the detector's docstring).
+
+    Never `PluginRegistry.build`, which RESOLVES: for an enabled `[python]`
+    plugin that means `_instantiate` -> `exec_module` plus the constructor —
+    third-party code inside a preflight that only ever needed manifests. A
+    top-level `print` breaks the `--json` one-object contract (AGENTS.md), and a
+    top-level write lands a file in the repo AFTER `git.worktree-clean` passed.
+
+    `seed_files` is deliberately ungated by `seed_adapter_defaults`, and glob
+    expansion runs the same `project.glob` the writer used (worktree_flow.py
+    wrote one line PER MATCH). Expanding against today's tree only produces
+    candidates: a match that did not exist when the run happened never appears
+    in the exclude. The policy is the one source with no union to take — a
+    single file, so `worktree_seed` entries behind an unparseable policy.toml
+    are unreconstructable (the detector's documented under-report direction);
+    everything else must keep reporting on exactly that run, since it is the one
+    where the operator is already editing that file.
+    """
+    from .adapters.profile import discovered_profiles
+    from .plugins import discovered_manifests
+
+    all_profiles = discovered_profiles(project)
+    seed_rels: list[str] = [rel for p in all_profiles for rel in p.seed_files]
+    if pol is not None:
+        seed_rels.extend(pol.scm.worktree_seed)
+    for manifest in discovered_manifests(project):
+        seed_rels.extend(manifest.seed_files)
+        for pattern in manifest.seed_globs:
+            # Guarded per PATTERN: one unexpandable glob (an unreadable subtree,
+            # a pattern `Path.glob` refuses) must not drop this manifest's other
+            # globs, its literals, or any sibling source.
+            try:
+                seed_rels.extend(m.relative_to(project).as_posix() for m in project.glob(pattern))
+            except (OSError, ValueError):
+                continue
+    return all_profiles, seed_rels
 
 
 def _skill_trees(project: Path, pol) -> list[str]:

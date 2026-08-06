@@ -17,6 +17,7 @@ from bmad_loop.plugins import (
     PluginError,
     PluginRegistry,
     discover,
+    discovered_manifests,
     get_plugin,
     load_plugins,
 )
@@ -243,6 +244,58 @@ def test_discover_order_is_builtin_then_project(tmp_path):
     # every builtin precedes every project plugin (entry-point seam is empty)
     assert sources == sorted(sources, key=lambda s: 0 if s == "builtin" else 1)
     assert "builtin" in sources and sources[-1] == "project"
+
+
+def test_discovered_manifests_union_keeps_both_sides_of_a_same_name_override(tmp_path):
+    """A project plugin named after a builtin EVICTS it from the effective map —
+    correct for a run, wrong for `validate`'s historical reconstruction, where
+    the builtin's seed paths may be exactly what an older run wrote into the
+    shared exclude. The union carries both."""
+    write_plugin(
+        tmp_path,
+        "unity",
+        '[plugin]\nname = "unity"\napi_version = 1\nseed_files = ["vendored/mine.json"]\n',
+    )
+
+    union = [m for m in discovered_manifests(tmp_path) if m.name == "unity"]
+
+    assert {m.source for m in union} == {"builtin", "project"}
+    # the contrast that makes the union necessary: the effective map collapses
+    # the pair to the project one, losing the builtin's seed_globs
+    assert load_plugins(tmp_path)["unity"].source == "project"
+
+
+def test_discovered_manifests_skips_only_the_malformed_file(tmp_path):
+    """One bad project plugin.toml skips ITSELF — not the builtins, and not its
+    project siblings. `a-broken` sorts FIRST within the project dir, so a guard
+    that stops that source at the first fault (a `break`, or fail-fast) also
+    loses `b-good` — which is what the "b-good" assert catches."""
+    write_plugin(tmp_path, "a-broken", "[plugin]\nname = \n")
+    write_plugin(tmp_path, "b-good", MINIMAL.format(name="b-good"))
+    # non-vacuity: the effective loader really refuses this project dir, so the
+    # union below cannot be riding on a fixture that never exercised the guards
+    with pytest.raises(PluginError):
+        load_plugins(tmp_path)
+
+    names = {m.name for m in discovered_manifests(tmp_path)}
+
+    assert {"example", "tea", "unity", "b-good"} <= names
+    assert "a-broken" not in names
+
+
+def test_discovered_manifests_apply_no_api_version_gate(tmp_path):
+    """`trust.check_api` filters by what THIS build supports — yet another
+    effective-config narrowing: the polluting run may have been an older
+    bmad-loop that loaded the manifest fine, and its seed lines still need a
+    candidate today. The warns-context doubles as the non-vacuity pin — the
+    effective loader really does gate this manifest out (pyproject sets no
+    filterwarnings, so the warning surfaces; precedent: test_plugin_trust)."""
+    write_plugin(tmp_path, "fromfuture", '[plugin]\nname = "fromfuture"\napi_version = 999\n')
+    with pytest.warns(UserWarning, match="unsupported by this build"):
+        plugins = load_plugins(tmp_path)
+    assert "fromfuture" not in plugins
+
+    assert "fromfuture" in {m.name for m in discovered_manifests(tmp_path)}
 
 
 def test_registry_orders_by_priority(tmp_path):

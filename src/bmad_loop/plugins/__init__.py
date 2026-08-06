@@ -19,6 +19,7 @@ from .loader import (
     ENTRY_POINT_GROUP,
     USER_PLUGINS_REL,
     discover,
+    discovered_manifests,
     get_plugin,
     load_plugins,
 )
@@ -57,6 +58,7 @@ __all__ = [
     "Veto",
     "VETO_ACTIONS",
     "discover",
+    "discovered_manifests",
     "load_plugins",
     "get_plugin",
     "is_enabled",

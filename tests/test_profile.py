@@ -2,6 +2,7 @@ import pytest
 
 from bmad_loop.adapters.profile import (
     ProfileError,
+    discovered_profiles,
     get_profile,
     load_profiles,
 )
@@ -195,6 +196,54 @@ def test_user_profile_overlay(tmp_path):
     assert profiles["mycli"].bypass_args == ("--yes",)
     assert profiles["claude"].binary == "mycli"  # overridden
     assert "codex" in profiles  # built-ins still present
+
+
+def test_discovered_profiles_union_keeps_both_sides_of_a_same_name_overlay(tmp_path):
+    """A valid same-name overlay REPLACES the packaged profile in the effective
+    map — correct for a run, wrong for `validate`'s historical reconstruction,
+    where the packaged profile's paths may be exactly what an older run wrote
+    into the shared exclude. The union carries both.
+
+    `config_path` distinguishes the two sides; `skill_tree` cannot — it is
+    shared across profiles (claude and opencode-http both read .claude/skills),
+    so a probe keyed on it is void."""
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "claude-override.toml").write_text(
+        MINIMAL_PROFILE.replace('name = "mycli"', 'name = "claude"')
+    )
+
+    union = discovered_profiles(tmp_path)
+
+    assert {p.hooks.config_path for p in union if p.name == "claude"} == {
+        ".claude/settings.json",  # the packaged profile, still a candidate source
+        ".mycli/settings.json",  # the overlay that replaced it
+    }
+    # the contrast that makes the union necessary: the effective map collapses
+    # the pair to the overlay, losing the packaged paths
+    assert load_profiles(tmp_path)["claude"].hooks.config_path == ".mycli/settings.json"
+
+
+def test_discovered_profiles_skips_only_the_malformed_file(tmp_path):
+    """One bad overlay skips ITSELF — not the packaged profiles, and not its
+    overlay siblings. `a-broken.toml` sorts FIRST within the overlay dir, so a
+    guard that stops that source at the first fault (a `break`, or fail-fast)
+    also loses `z-extra.toml` — which is what the "extra" assert catches."""
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "a-broken.toml").write_text("this is not = = toml\n")
+    (profiles_dir / "z-extra.toml").write_text(
+        MINIMAL_PROFILE.replace('name = "mycli"', 'name = "extra"')
+    )
+    # non-vacuity: the effective loader really refuses this overlay dir, so the
+    # union below cannot be riding on a fixture that never exercised the guards
+    with pytest.raises(ProfileError):
+        load_profiles(tmp_path)
+
+    names = {p.name for p in discovered_profiles(tmp_path)}
+
+    assert {"claude", "codex", "gemini", "opencode-http"} <= names
+    assert "extra" in names
 
 
 @pytest.mark.parametrize(
