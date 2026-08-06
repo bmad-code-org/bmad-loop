@@ -4714,6 +4714,40 @@ def test_validate_pollution_tracked_config_file_gets_no_effect_claim(project, ca
     assert doc["ok"] is True
 
 
+def test_validate_pollution_withholds_the_effect_claim_from_a_glob_line(
+    project, capsys, monkeypatch
+):
+    """A hit whose pattern carries gitignore syntax gets no effect claim: `/a[bc]d`
+    covers `abd` and `acd`, never the tracked `a[bc]d/` it spells, so the strong
+    sentence asserted the opposite of what git does. The sibling literal line in
+    the same run must keep its claim — this withholds a verdict, it does not
+    switch the check off.
+
+    Ablation: drop the `PATTERN_SPECIALS` guard and the class line joins
+    `hiding_new_files`, failing the first two asserts."""
+    root = project.project
+    (root / "a[bc]d").mkdir()
+    (root / "a[bc]d" / "f.txt").write_text("x\n", encoding="utf-8")
+    # `worktree_seed` is what makes `/a[bc]d` a CANDIDATE — a bracketed directory
+    # with no seed source naming it is not a hit at all, and the test would pass
+    # for the wrong reason. It loads: no seed-boundary predicate rejects a `[`.
+    _make_validate_pass(
+        project,
+        monkeypatch,
+        capsys,
+        policy=CLAUDE_ONLY_POLICY + '[scm]\nworktree_seed = ["a[bc]d"]\n',
+    )
+    _pollute_exclude(project, "/a[bc]d", "/.claude/skills")
+
+    doc = machine_json(["validate", "--project", str(root), "--json"], capsys)
+
+    finding = next(f for f in doc["findings"] if f["check"] == "git.exclude-legacy-pollution")
+    assert finding["detail"]["pattern_not_literal"] == ["/a[bc]d"]
+    assert finding["detail"]["hiding_new_files"] == ["/.claude/skills"], "the literal line keeps it"
+    assert "not the paths they spell" in finding["message"]
+    assert "/a[bc]d" in finding["detail"]["lines"], "still reported, still deletable"
+
+
 def test_validate_pollution_ignores_a_root_naming_exclude_line(project, capsys, monkeypatch):
     """A plugin's `seed_globs = ["**"]` expands to include the project root itself,
     whose rel is `"."` — so `/.` reached the candidate set and an operator's own

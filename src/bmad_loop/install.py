@@ -2389,6 +2389,24 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
     return None
 
 
+#: Every character `wildmatch` gives a meaning beyond itself — the COMPLETE set,
+#: taken from the matcher's syntax rather than from shapes anyone has tripped over.
+#: A gitignore pattern carrying one of these does not name the path it spells, so
+#: the literal index probe `legacy_exclude_pollution` grades with cannot answer for
+#: it and the effect claim is withheld (`pattern_not_literal`).
+#:
+#: `[` and `\` get it WRONG rather than merely wide: measured identically at git
+#: 2.20.4 and 2.55.0, `/a[bc]d` in the exclude leaves a tracked `a[bc]d/`'s new
+#: files fully VISIBLE while the literal probe reports the path tracked with
+#: descendants — the strongest bucket, asserting the opposite of what git does.
+#: `*` and `?` happen to match their own spelling (`/foo*` really does cover
+#: `foo*/`), so they are conservative rather than wrong; they are declined all the
+#: same because deciding WHICH paths they cover is gitignore matching, which this
+#: check does not model, and a set derived from one matcher's syntax is closed
+#: while a set derived from the shapes that have burned us is not.
+PATTERN_SPECIALS = "*?[\\"
+
+
 class LegacyExcludePollution(NamedTuple):
     """Where the repository-wide exclude is, and which shield patterns it carries.
 
@@ -2413,6 +2431,12 @@ class LegacyExcludePollution(NamedTuple):
     exclude cannot suppress the tracked path either, so the strong claim would be
     false — `/.claude/settings.json` over a tracked settings file is the ordinary
     instance, not an edge case, since that path is a first-class shield candidate.
+
+    `pattern_not_literal` holds the hits whose pattern does not NAME the path it
+    spells, so no index probe can speak for them at all — see
+    :data:`PATTERN_SPECIALS`. Every other bucket rests on asking git about a path
+    derived from the line; this one is where that derivation is unavailable, and
+    it is therefore decided AHEAD of the probes rather than from their answers.
     """
 
     path: Path
@@ -2421,6 +2445,7 @@ class LegacyExcludePollution(NamedTuple):
     maybe_neutralized: list[str]
     tracked_file_no_children: list[str]
     no_tracked_content: list[str]
+    pattern_not_literal: list[str]
 
 
 def legacy_exclude_pollution(
@@ -2574,8 +2599,14 @@ def legacy_exclude_pollution(
     present = set(tokens)
     # Set intersection IS the exact-match rule — no normalization, no strip(): a
     # leading space is a meaningful part of a gitignore pattern, so a line that
-    # carries one is not a line this code wrote. Only the line TERMINATOR git
-    # defines (\n, one optional preceding \r) is outside the pattern bytes.
+    # carries one is not a line this code wrote.
+    #
+    # ⚠️ An earlier revision closed that thought with "only the line TERMINATOR is
+    # outside the pattern bytes", which is FALSE — git also drops unescaped
+    # TRAILING spaces — and grading below leaned on it. Matching is unaffected
+    # (the writer emits the same raw bytes, so byte-equality still identifies the
+    # line); the claim was only ever wrong for deriving a PATH, which is why the
+    # correction lives at the grading loop and not here.
     hit_pairs = sorted((wanted[line], line) for line in present & wanted.keys())
     hits = [line for line, _ in hit_pairs]
     if not hits:
@@ -2627,8 +2658,41 @@ def legacy_exclude_pollution(
     maybe_neutralized: list[str] = []
     tracked_file_no_children: list[str] = []
     no_tracked_content: list[str] = []
+    pattern_not_literal: list[str] = []
     for line, line_bytes in hit_pairs:
-        rel = line.strip("/")
+        # Every bucket below asks git about a PATH, so the pattern has to name one.
+        # Two of git's rules stand between the line's bytes and that path, and they
+        # live in different halves of git — which is exactly the boundary this
+        # check already draws, so each is handled on the side it belongs to:
+        #
+        #   TOKENIZER (reproduced here, as the `\r` trim above already is): git
+        #   drops unescaped trailing SPACES from every pattern, one step after
+        #   that trim — literally the next statement in dir.c's
+        #   `add_patterns_from_buffer`. So `/kept ` IS the pattern `/kept`:
+        #   measured at 2.20.4 and 2.55.0, it hides `kept/`'s new files and leaves
+        #   a tracked `kept /` fully visible, while this loop probed `kept ` and
+        #   announced the reverse of that in the strongest bucket.
+        #   Reproduced end to end from `scm.worktree_seed = ["kept "]`, which is
+        #   valid config today — none of the three seed-boundary predicates rejects
+        #   a trailing space, and the writer renders `f"/{rel}"` unescaped.
+        #
+        #   MATCHER (not reproduced, by standing policy): `PATTERN_SPECIALS`.
+        #
+        # The trim is a plain `rstrip` ONLY because `\` is one of PATTERN_SPECIALS
+        # and so cannot reach it — git's own `trim_trailing_spaces` needs an
+        # escape-aware scan precisely because it runs on patterns that may carry
+        # one. Take `\` out of that set and this line starts lying about `/esc\ `,
+        # whose trailing space git KEEPS (measured 2.55.0: it hides `esc /new.txt`
+        # and leaves `esc/new.txt` visible, the exact reverse of `/esc `).
+        #
+        # This is a grading rule, never a matching one: `wanted` is still compared
+        # byte-for-byte, so the hit itself is unaffected and the docstring's
+        # exact-match promise stands. A line whose effect cannot be graded is still
+        # a line the operator may want gone.
+        if any(ch in line for ch in PATTERN_SPECIALS):
+            pattern_not_literal.append(line)
+            continue
+        rel = line.rstrip(" ").strip("/")
         try:
             # TWO emptiness probes, because "tracked" and "has tracked DESCENDANTS"
             # are different questions and only the second one licenses the strong
@@ -2668,6 +2732,7 @@ def legacy_exclude_pollution(
         maybe_neutralized,
         tracked_file_no_children,
         no_tracked_content,
+        pattern_not_literal,
     )
 
 

@@ -7486,25 +7486,114 @@ def test_legacy_exclude_pollution_partition_always_reunites_to_lines(project):
     # `!/other` is the file's LAST negation, so `/dir_b` above it is only maybe
     # neutralized while `/dir_a` below it keeps the strong claim.
     (repo / ".git" / "info" / "exclude").write_text(
-        "/dir_b\n!/other\n/dir_a\n/conf.json\n/vendor\n", encoding="utf-8"
+        "/dir_b\n!/other\n/dir_a\n/conf.json\n/vendor\n/cls[ab]\n", encoding="utf-8"
     )
 
-    found = legacy_exclude_pollution(repo, [], ["dir_a", "dir_b", "conf.json", "vendor"])
+    found = legacy_exclude_pollution(repo, [], ["dir_a", "dir_b", "conf.json", "vendor", "cls[ab]"])
 
     assert found is not None
     assert found.hiding_new_files == ["/dir_a"]
     assert found.maybe_neutralized == ["/dir_b"]
     assert found.tracked_file_no_children == ["/conf.json"]
     assert found.no_tracked_content == ["/vendor"]
+    assert found.pattern_not_literal == ["/cls[ab]"]
     assert (
         sorted(
             found.hiding_new_files
             + found.maybe_neutralized
             + found.tracked_file_no_children
             + found.no_tracked_content
+            + found.pattern_not_literal
         )
         == found.lines
     )
+
+
+@pytest.mark.parametrize(
+    "tracked, bucket",
+    [("kept ", "no_tracked_content"), ("kept", "hiding_new_files")],
+    ids=["names-the-spelled-path", "names-the-path-git-reads"],
+)
+def test_legacy_exclude_pollution_grades_a_trailing_space_line_on_git_s_reading(
+    project, tracked, bucket
+):
+    """git drops a pattern's unescaped TRAILING spaces, so `/kept ` is the pattern
+    `/kept` — it hides `kept/`'s new files and does nothing at all to a tracked
+    `kept /`. Grading probed the spelled path instead and announced the reverse in
+    the strongest bucket, complete with a deletion prompt.
+
+    Reachable from valid config: `scm.worktree_seed = ["kept "]` loads (no
+    seed-boundary predicate rejects a trailing space) and the writer renders
+    `f"/{rel}"` unescaped, so the polluting run really did emit this line.
+
+    BOTH rows are needed and neither alone is enough. The first is the finding —
+    only the spelled path is tracked, so the strong claim must go away. The second
+    is what stops the cure from being "downgrade anything with a space": only the
+    path git actually reads is tracked, and the strong claim must still be made.
+    Measured identical at git 2.20.4 and 2.55.0.
+
+    Ablation: drop the `.rstrip(" ")` and the two rows swap buckets, failing both."""
+    repo = project.project
+    (repo / tracked).mkdir()
+    (repo / tracked / "f.txt").write_text("x\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "track the graded path")
+    # The exclude goes in AFTER the commit, like `_pollute_exclude`: in place
+    # earlier it hides the fixture's own files from `git add -A` and nothing gets
+    # tracked at all — the fixture would then reproduce the bug instead of the
+    # setup, and stage zero of it.
+    _repo_with_exclude(project, "/kept ")
+    # The harm, through git's own answer rather than through our reading of it: the
+    # line leaves a tracked `kept /`'s new file visible and swallows `kept/`'s.
+    (repo / tracked / "new.txt").write_text("n\n", encoding="utf-8")
+    visible = "new.txt" in git(repo, "status", "--porcelain", "-uall")
+    assert visible is (tracked == "kept "), "fixture must reproduce git's own reading"
+
+    found = legacy_exclude_pollution(repo, [], ["kept "])
+
+    assert found is not None
+    assert found.lines == ["/kept "], "matching stays byte-exact; only grading moved"
+    assert getattr(found, bucket) == ["/kept "]
+    assert found.hiding_new_files == ([] if tracked == "kept " else ["/kept "])
+
+
+@pytest.mark.parametrize(
+    "rel",
+    ["a[bc]d", "star*", "q?c", "esc\\ "],
+    ids=["character-class", "star", "question-mark", "backslash-escape"],
+)
+def test_legacy_exclude_pollution_declines_to_grade_a_non_literal_pattern(project, rel):
+    """A pattern carrying a `wildmatch` special does not name the path it spells,
+    so no literal index probe can speak for it — `/a[bc]d` leaves a tracked
+    `a[bc]d/`'s new files fully VISIBLE (measured, git 2.20.4 and 2.55.0) while the
+    probe reported it tracked with descendants and took the strongest bucket.
+
+    `*` and `?` happen to match their own spelling, so they were merely wide rather
+    than wrong; they are declined with the other two because choosing WHICH paths a
+    glob covers is gitignore matching, which this check does not model — and a set
+    closed over one matcher's syntax stays closed, while a set built from the
+    shapes that have burned us does not.
+
+    The hit itself is unaffected: the line is still reported and still deletable.
+
+    Ablation: drop the `PATTERN_SPECIALS` guard and every row lands in a graded
+    bucket — the class and escape rows in `hiding_new_files`, asserting the
+    opposite of what git does."""
+    repo = project.project
+    (repo / rel).mkdir()
+    (repo / rel / "f.txt").write_text("x\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "track the spelled path")
+    # After the commit — a `/star*` in place first hides the fixture's own files.
+    _repo_with_exclude(project, f"/{rel}")
+
+    found = legacy_exclude_pollution(repo, [], [rel])
+
+    assert found is not None
+    assert found.lines == [f"/{rel}"], "still a hit — only the effect claim is withheld"
+    assert found.pattern_not_literal == [f"/{rel}"]
+    assert found.hiding_new_files == []
+    assert found.tracked_file_no_children == []
 
 
 def _repo_with_exclude_bytes(project, raw: bytes) -> Path:

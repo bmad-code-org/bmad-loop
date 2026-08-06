@@ -34,7 +34,10 @@ whose seams had diverged enough that several ports needed a different fix, and t
   it, and a hit a later `!` negation may re-include is reported without the hiding-new-files
   claim (last match wins). The claim needs tracked _descendants_: a line naming a tracked regular
   file (`/.claude/settings.json`) is reported as hiding nothing today. Candidates naming the
-  project root are dropped in every spelling.
+  project root are dropped in every spelling. Effect is graded on the path git actually reads,
+  not the one the line spells: unescaped trailing spaces are dropped the way git drops them, and
+  a line carrying gitignore pattern syntax (`*`, `?`, `[`, `\`) is reported without an effect
+  claim, since the paths it covers are not the path it spells.
   Details: docs/FEATURES.md.
 
 - **A park travels with its story's commit, so `bmad-loop confirm` works from any clone (#356).**

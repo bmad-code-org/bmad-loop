@@ -377,6 +377,13 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 f"These name nothing this repo tracks, so they may be ignoring the "
                 f"path deliberately: {', '.join(pollution.no_tracked_content)}."
             )
+        if pollution.pattern_not_literal:
+            parts.append(
+                f"These carry gitignore pattern syntax — a wildcard, a character "
+                f"class, an escape, or a trailing space git drops — so the paths "
+                f"they cover are not the paths they spell, and what they are hiding "
+                f"is not graded: {', '.join(pollution.pattern_not_literal)}."
+            )
         report.warn(
             "git.exclude-legacy-pollution",
             " ".join(parts),
@@ -387,6 +394,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 "maybe_neutralized": pollution.maybe_neutralized,
                 "tracked_file_no_children": pollution.tracked_file_no_children,
                 "no_tracked_content": pollution.no_tracked_content,
+                "pattern_not_literal": pollution.pattern_not_literal,
             },
         )
 
