@@ -228,10 +228,21 @@ def test_discovered_profiles_skips_only_the_malformed_file(tmp_path):
     """One bad overlay skips ITSELF — not the packaged profiles, and not its
     overlay siblings. `a-broken.toml` sorts FIRST within the overlay dir, so a
     guard that stops that source at the first fault (a `break`, or fail-fast)
-    also loses `z-extra.toml` — which is what the "extra" assert catches."""
+    also loses `z-extra.toml` — which is what the "extra" assert catches.
+
+    Two breakage shapes on purpose: `a-broken.toml` fails at the TOML layer,
+    `b-badfield.toml` is valid TOML whose field value hits a raw conversion —
+    only the `_load_toml` funnel makes that one a ProfileError the per-item
+    guard can catch. Ablation: drop the funnel arm and this ERRORS (bare
+    ValueError out of `discovered_profiles`) instead of skipping the file."""
     profiles_dir = tmp_path / ".bmad-loop" / "profiles"
     profiles_dir.mkdir(parents=True)
     (profiles_dir / "a-broken.toml").write_text("this is not = = toml\n")
+    (profiles_dir / "b-badfield.toml").write_text(
+        MINIMAL_PROFILE.replace('name = "mycli"', 'name = "badfield"').replace(
+            "[hooks]", 'usage_grace_s = "invalid"\n[hooks]'
+        )
+    )
     (profiles_dir / "z-extra.toml").write_text(
         MINIMAL_PROFILE.replace('name = "mycli"', 'name = "extra"')
     )
@@ -244,6 +255,7 @@ def test_discovered_profiles_skips_only_the_malformed_file(tmp_path):
 
     assert {"claude", "codex", "gemini", "opencode-http"} <= names
     assert "extra" in names
+    assert "badfield" not in names
 
 
 @pytest.mark.parametrize(
@@ -345,6 +357,27 @@ def test_discovered_profiles_skips_only_the_malformed_file(tmp_path):
         (
             MINIMAL_PROFILE.replace("[hooks]", "stop_without_result_nudges = -2\n[hooks]"),
             "stop_without_result_nudges",
+        ),
+        # TOML-legal values of the wrong TYPE hit raw conversions (`float()`,
+        # `int()`, `.items()`) — the `_load_toml` funnel turns those bare
+        # ValueError/TypeError/AttributeError escapes into ProfileError, which
+        # is what every consumer's fault handling keys on. Ablation: drop the
+        # funnel arm and these four raise the bare exception instead.
+        (
+            MINIMAL_PROFILE.replace("[hooks]", 'usage_grace_s = "invalid"\n[hooks]'),
+            "malformed field value",
+        ),
+        (
+            MINIMAL_PROFILE.replace("[hooks]", "usage_grace_s = [1]\n[hooks]"),
+            "malformed field value",
+        ),
+        (
+            MINIMAL_PROFILE.replace("[hooks]", 'stop_without_result_nudges = "x"\n[hooks]'),
+            "malformed field value",
+        ),
+        (
+            MINIMAL_PROFILE.replace("[hooks]", 'env = "invalid"\n[hooks]'),
+            "malformed field value",
         ),
         # real dialects still hard-require config_path and events
         (

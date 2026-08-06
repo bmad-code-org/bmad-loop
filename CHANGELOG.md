@@ -28,8 +28,9 @@ whose seams had diverged enough that several ports needed a different fix, and t
   auto-removed. Candidates are a union of every discovered source, parsed item-by-item — packaged
   and overlay profiles, plugin manifests (today's api gate and enablement not applied), policy
   seeds and glob expansions, v0.9.1's `_bmad` family — so a valid same-name override, one
-  malformed file or a switched CLI cannot hide another source's lines. The exclude is read as
-  bytes and split the way git splits it. Details: docs/FEATURES.md.
+  malformed file or a switched CLI cannot hide another source's lines. A profile field of the
+  wrong type reports as `adapter.profile` and skips only its own file instead of crashing the
+  command. The exclude is read as bytes and split the way git splits it. Details: docs/FEATURES.md.
 
 - **A park travels with its story's commit, so `bmad-loop confirm` works from any clone (#356).**
   Each parked story writes one JSON record to `.bmad-loop/operator/<key>.json` inside the story's
