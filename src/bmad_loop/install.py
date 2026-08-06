@@ -2393,7 +2393,7 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
 #: taken from the matcher's syntax rather than from shapes anyone has tripped over.
 #: A gitignore pattern carrying one of these does not name the path it spells, so
 #: the literal index probe `legacy_exclude_pollution` grades with cannot answer for
-#: it and the effect claim is withheld (`pattern_not_literal`).
+#: it and the effect claim is withheld (`pattern_not_plain_path`).
 #:
 #: `[` and `\` get it WRONG rather than merely wide: measured identically at git
 #: 2.20.4 and 2.55.0, `/a[bc]d` in the exclude leaves a tracked `a[bc]d/`'s new
@@ -2405,6 +2405,48 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
 #: check does not model, and a set derived from one matcher's syntax is closed
 #: while a set derived from the shapes that have burned us is not.
 PATTERN_SPECIALS = "*?[\\"
+
+
+def _plain_path_body(pattern: str) -> str | None:
+    """The one repo-relative path ``pattern`` NAMES, or None if no single path is
+    what both of git's parsers read it as.
+
+    Grading compares the answers of TWO git parsers, and a claim is sound only
+    where both resolve the line to the same path. The IGNORE parser (dir.c) takes
+    the pattern's bytes as literal segments and normalizes none of them; the
+    PATHSPEC parser behind the index probe normalizes the spelling it is handed.
+    So `/foo//bar` asks git to ignore a path carrying an EMPTY segment — which no
+    real path has, so the line is inert — while `:(literal)foo//bar` finds
+    `foo/bar` tracked with descendants, and the hit took the strongest bucket
+    complete with a deletion prompt. Measured identical at git 2.20.4 and 2.55.0,
+    for `//`, `/./`, a leading `./`, a doubled trailing `/`, a trailing `/.` and
+    `..` at any position.
+
+    Rather than model either normalizer, this admits only the spellings NEITHER of
+    them can alter. A path spelling is a sequence of segments, and the only
+    segments a normalizer treats as anything other than a literal name are the
+    EMPTY one and the two DOT ones — so requiring every segment to be none of
+    those leaves exactly one path the spelling can denote, under any normalizer.
+    That closes the set over the GRAMMAR of a path rather than over the spellings
+    anyone has tripped over. :data:`PATTERN_SPECIALS` closes the matcher's side the
+    same way, and closing only that side is precisely what let this shape through:
+    a set is only as closed as the boundary it is closed across, and the boundary
+    here is the pair of parsers, not the syntax of either one.
+
+    Two pattern syntaxes come off first, because git strips them too: exactly one
+    leading `/` (the anchor, and every candidate renders `f"/{rel}"`), then at most
+    one trailing `/` (the directory-only marker). At most one EACH is load-bearing
+    — the `strip("/")` this replaces silently REPAIRED `/foo/bar//` into `foo/bar`
+    and then graded the inert line as hiding that path's new files.
+    """
+    body = pattern.removeprefix("/").removesuffix("/")
+    # No separate emptiness check: `"".split("/")` is `[""]`, so a body with nothing
+    # left in it is already an empty segment. (No hit can reach that anyway — the
+    # root-naming candidates are dropped before matching — so a guard for it would
+    # be one no test could fail.)
+    if any(seg in ("", ".", "..") for seg in body.split("/")):
+        return None
+    return body
 
 
 class LegacyExcludePollution(NamedTuple):
@@ -2432,11 +2474,14 @@ class LegacyExcludePollution(NamedTuple):
     false — `/.claude/settings.json` over a tracked settings file is the ordinary
     instance, not an edge case, since that path is a first-class shield candidate.
 
-    `pattern_not_literal` holds the hits whose pattern does not NAME the path it
-    spells, so no index probe can speak for them at all — see
-    :data:`PATTERN_SPECIALS`. Every other bucket rests on asking git about a path
-    derived from the line; this one is where that derivation is unavailable, and
-    it is therefore decided AHEAD of the probes rather than from their answers.
+    `pattern_not_plain_path` holds the hits whose pattern does not NAME one path,
+    so no index probe can speak for them at all — either because it carries
+    gitignore matching syntax (:data:`PATTERN_SPECIALS`) or because its spelling is
+    one git's two parsers read differently (:func:`_plain_path_body`). Plain here
+    is both halves: literal AND canonical. Every other bucket rests on asking git
+    about a path derived from the line; this one is where that derivation is
+    unavailable, and it is therefore decided AHEAD of the probes rather than from
+    their answers.
     """
 
     path: Path
@@ -2445,7 +2490,7 @@ class LegacyExcludePollution(NamedTuple):
     maybe_neutralized: list[str]
     tracked_file_no_children: list[str]
     no_tracked_content: list[str]
-    pattern_not_literal: list[str]
+    pattern_not_plain_path: list[str]
 
 
 def legacy_exclude_pollution(
@@ -2658,11 +2703,12 @@ def legacy_exclude_pollution(
     maybe_neutralized: list[str] = []
     tracked_file_no_children: list[str] = []
     no_tracked_content: list[str] = []
-    pattern_not_literal: list[str] = []
+    pattern_not_plain_path: list[str] = []
     for line, line_bytes in hit_pairs:
-        # Every bucket below asks git about a PATH, so the pattern has to name one.
-        # Two of git's rules stand between the line's bytes and that path, and they
-        # live in different halves of git — which is exactly the boundary this
+        # Every bucket below asks git about a PATH, so the pattern has to name one
+        # — and name the SAME one to both of the git parsers this grading compares.
+        # Three of git's rules stand between the line's bytes and that path, and
+        # they live in different halves of git — which is exactly the boundary this
         # check already draws, so each is handled on the side it belongs to:
         #
         #   TOKENIZER (reproduced here, as the `\r` trim above already is): git
@@ -2678,6 +2724,18 @@ def legacy_exclude_pollution(
         #
         #   MATCHER (not reproduced, by standing policy): `PATTERN_SPECIALS`.
         #
+        #   SPELLING (declined, not reproduced): `_plain_path_body`. The ignore
+        #   parser normalizes no segment of a pattern while the pathspec parser
+        #   normalizes every segment of the rel it is handed, so a non-canonical
+        #   spelling is TWO different paths to the two sides — `/foo//bar` is inert
+        #   as a pattern and reads `foo/bar` as a pathspec, which is the strongest
+        #   bucket asserting the reverse of what git does. Live from valid config
+        #   today for `//`, `/./`, a leading `./`, a doubled trailing `/` and a
+        #   trailing `/.`, all of which `policy.load` stores verbatim; the `..` and
+        #   absolute spellings measure the same but are refused at every seed
+        #   boundary (`has_parent_ref`, `is_absolute_path`), so declining them here
+        #   is depth rather than a live fix.
+        #
         # The trim is a plain `rstrip` ONLY because `\` is one of PATTERN_SPECIALS
         # and so cannot reach it — git's own `trim_trailing_spaces` needs an
         # escape-aware scan precisely because it runs on patterns that may carry
@@ -2690,9 +2748,15 @@ def legacy_exclude_pollution(
         # exact-match promise stands. A line whose effect cannot be graded is still
         # a line the operator may want gone.
         if any(ch in line for ch in PATTERN_SPECIALS):
-            pattern_not_literal.append(line)
+            pattern_not_plain_path.append(line)
             continue
-        rel = line.rstrip(" ").strip("/")
+        # Only reachable once `\` is declined above, which is what licenses the
+        # plain rstrip; the two guards share a bucket because they withhold the
+        # same claim for the same reason — no one path to ask git about.
+        rel = _plain_path_body(line.rstrip(" "))
+        if rel is None:
+            pattern_not_plain_path.append(line)
+            continue
         try:
             # TWO emptiness probes, because "tracked" and "has tracked DESCENDANTS"
             # are different questions and only the second one licenses the strong
@@ -2701,7 +2765,9 @@ def legacy_exclude_pollution(
             # `a/b/c` while `:(literal)file.json/` lists nothing at all. Both read
             # EMPTINESS alone, so `path_tracked`'s reason for never parsing the
             # output (`core.quotePath` mangles non-ASCII names) still holds.
-            tracked = bool(rel) and path_tracked(project, rel)
+            # No emptiness check: `_plain_path_body` returns None rather than an
+            # empty rel, so a line that names no path is out of this loop already.
+            tracked = path_tracked(project, rel)
             descendants = tracked and path_tracked(project, f"{rel}/")
         except GitError:
             tracked = descendants = False
@@ -2732,7 +2798,7 @@ def legacy_exclude_pollution(
         maybe_neutralized,
         tracked_file_no_children,
         no_tracked_content,
-        pattern_not_literal,
+        pattern_not_plain_path,
     )
 
 

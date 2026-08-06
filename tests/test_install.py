@@ -7496,14 +7496,14 @@ def test_legacy_exclude_pollution_partition_always_reunites_to_lines(project):
     assert found.maybe_neutralized == ["/dir_b"]
     assert found.tracked_file_no_children == ["/conf.json"]
     assert found.no_tracked_content == ["/vendor"]
-    assert found.pattern_not_literal == ["/cls[ab]"]
+    assert found.pattern_not_plain_path == ["/cls[ab]"]
     assert (
         sorted(
             found.hiding_new_files
             + found.maybe_neutralized
             + found.tracked_file_no_children
             + found.no_tracked_content
-            + found.pattern_not_literal
+            + found.pattern_not_plain_path
         )
         == found.lines
     )
@@ -7591,9 +7591,98 @@ def test_legacy_exclude_pollution_declines_to_grade_a_non_literal_pattern(projec
 
     assert found is not None
     assert found.lines == [f"/{rel}"], "still a hit — only the effect claim is withheld"
-    assert found.pattern_not_literal == [f"/{rel}"]
+    assert found.pattern_not_plain_path == [f"/{rel}"]
     assert found.hiding_new_files == []
     assert found.tracked_file_no_children == []
+
+
+@pytest.mark.parametrize(
+    "rel",
+    ["foo//bar", "foo/./bar", "./foo/bar", "foo/bar//", "foo/bar/.", "foo/../bar"],
+    ids=[
+        "doubled-slash",
+        "dot-segment",
+        "leading-dot-segment",
+        "doubled-trailing-slash",
+        "trailing-dot-segment",
+        "parent-segment",
+    ],
+)
+def test_legacy_exclude_pollution_declines_to_grade_a_non_canonical_spelling(project, rel):
+    """Grading compares TWO git parsers and they disagree about a non-canonical
+    spelling: the IGNORE parser normalizes no segment, so `/foo//bar` asks git to
+    ignore a path with an empty segment and is INERT, while the `:(literal)`
+    PATHSPEC the probe uses normalizes the same string and finds `foo/bar` tracked
+    with descendants — the strongest bucket, asserting the reverse of what git does,
+    complete with a deletion prompt. Measured identical at git 2.20.4 and 2.55.0 for
+    every row here.
+
+    Reachable from config that loads TODAY for the first five: `policy.load` stores
+    `scm.worktree_seed` entries verbatim, and its three boundary predicates each
+    normalize internally before deciding, so none of these spellings is refused
+    (verified through `policy.load`, not reasoned). The `..` row is the exception
+    and is depth rather than a live fix — `has_parent_ref` refuses it at every seed
+    boundary — but it is the row that proves the rule is closed over the grammar
+    rather than over the shapes measured, because the obvious cure
+    (`rel == PurePosixPath(rel).as_posix()`) accepts it: Python preserves `..`
+    while git's pathspec resolves it, and the bucket comes out wrong again.
+
+    Both tracked trees are needed: the first five rows resolve to `foo/bar` and the
+    `..` row resolves to `bar`, so a fixture carrying only one of them would send
+    that row to `no_tracked_content` and pass against the bug.
+
+    The hit itself is unaffected: the line is still reported and still deletable.
+
+    Ablation: drop the `_plain_path_body` guard (restore `line.strip("/")`) and
+    every row lands in `hiding_new_files`."""
+    repo = project.project
+    for tree in ("foo/bar", "bar"):
+        (repo / tree).mkdir(parents=True)
+        (repo / tree / "f.txt").write_text("x\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "track both paths a spelling can resolve to")
+    # After the commit, like `_pollute_exclude`: in place first it would hide the
+    # fixture's own files and `git add -A` would stage nothing.
+    _repo_with_exclude(project, f"/{rel}")
+    # The harm through git's own answer: the line is inert, so BOTH new files stay
+    # visible — while the grading under test called one of them hidden.
+    (repo / "foo" / "bar" / "new.txt").write_text("n\n", encoding="utf-8")
+    (repo / "bar" / "new.txt").write_text("n\n", encoding="utf-8")
+    status = git(repo, "status", "--porcelain", "-uall")
+    assert "foo/bar/new.txt" in status, "fixture must reproduce git's own reading"
+    assert "bar/new.txt" in status, "fixture must reproduce git's own reading"
+
+    found = legacy_exclude_pollution(repo, [], [rel])
+
+    assert found is not None
+    assert found.lines == [f"/{rel}"], "matching stays byte-exact; only grading moved"
+    assert found.pattern_not_plain_path == [f"/{rel}"]
+    assert found.hiding_new_files == []
+
+
+def test_legacy_exclude_pollution_still_grades_a_single_trailing_slash(project):
+    """The dir-only marker is pattern syntax git strips, not a spelling defect, so
+    exactly one trailing `/` must survive the canonical-spelling guard.
+
+    This is the row that keeps the cure from being "decline anything with a slash
+    at the end": `/_bmad/render/` is what v0.9.1's writer actually emitted, it is
+    a first-class candidate, and it really does hide that path's new files."""
+    repo = project.project
+    (repo / "_bmad" / "render").mkdir(parents=True)
+    (repo / "_bmad" / "render" / "f.txt").write_text("x\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "track the rendered tree")
+    _repo_with_exclude(project, "/_bmad/render/")
+    (repo / "_bmad" / "render" / "new.txt").write_text("n\n", encoding="utf-8")
+    assert "new.txt" not in git(
+        repo, "status", "--porcelain", "-uall"
+    ), "fixture must reproduce git's own reading: the line really does hide it"
+
+    found = legacy_exclude_pollution(repo, [], [])
+
+    assert found is not None
+    assert found.hiding_new_files == ["/_bmad/render/"]
+    assert found.pattern_not_plain_path == []
 
 
 def _repo_with_exclude_bytes(project, raw: bytes) -> Path:

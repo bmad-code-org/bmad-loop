@@ -36,8 +36,10 @@ whose seams had diverged enough that several ports needed a different fix, and t
   file (`/.claude/settings.json`) is reported as hiding nothing today. Candidates naming the
   project root are dropped in every spelling. Effect is graded on the path git actually reads,
   not the one the line spells: unescaped trailing spaces are dropped the way git drops them, and
-  a line carrying gitignore pattern syntax (`*`, `?`, `[`, `\`) is reported without an effect
-  claim, since the paths it covers are not the path it spells.
+  a line that does not name one plain path is reported without an effect claim — either because
+  it carries gitignore pattern syntax (`*`, `?`, `[`, `\`), so the paths it covers are not the
+  path it spells, or because its spelling is one git's ignore and pathspec parsers read
+  differently (a doubled slash, a `.` or `..` segment), which makes it inert as a pattern.
   Details: docs/FEATURES.md.
 
 - **A park travels with its story's commit, so `bmad-loop confirm` works from any clone (#356).**

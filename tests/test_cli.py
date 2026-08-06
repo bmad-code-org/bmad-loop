@@ -4742,10 +4742,44 @@ def test_validate_pollution_withholds_the_effect_claim_from_a_glob_line(
     doc = machine_json(["validate", "--project", str(root), "--json"], capsys)
 
     finding = next(f for f in doc["findings"] if f["check"] == "git.exclude-legacy-pollution")
-    assert finding["detail"]["pattern_not_literal"] == ["/a[bc]d"]
+    assert finding["detail"]["pattern_not_plain_path"] == ["/a[bc]d"]
     assert finding["detail"]["hiding_new_files"] == ["/.claude/skills"], "the literal line keeps it"
-    assert "not the paths they spell" in finding["message"]
+    assert "carry gitignore pattern syntax" in finding["message"]
     assert "/a[bc]d" in finding["detail"]["lines"], "still reported, still deletable"
+
+
+def test_validate_pollution_withholds_the_effect_claim_from_a_non_canonical_line(
+    project, capsys, monkeypatch
+):
+    """The other half of the same bucket, end to end: `/foo//bar` is INERT as an
+    ignore pattern (git normalizes no segment of a pattern) while the `:(literal)`
+    pathspec grading probes with DOES normalize it, so the line was reported as
+    hiding `foo/bar`'s new files with a deletion prompt. The sibling literal line
+    in the same run must keep its claim.
+
+    `worktree_seed = ["foo//bar"]` is what makes it a candidate, and it is also the
+    reachability proof: `policy.load` stores the spelling verbatim because each of
+    its three boundary predicates normalizes internally before deciding.
+
+    Ablation: restore `line.strip("/")` and `/foo//bar` joins `hiding_new_files`."""
+    root = project.project
+    (root / "foo" / "bar").mkdir(parents=True)
+    (root / "foo" / "bar" / "f.txt").write_text("x\n", encoding="utf-8")
+    _make_validate_pass(
+        project,
+        monkeypatch,
+        capsys,
+        policy=CLAUDE_ONLY_POLICY + '[scm]\nworktree_seed = ["foo//bar"]\n',
+    )
+    _pollute_exclude(project, "/foo//bar", "/.claude/skills")
+
+    doc = machine_json(["validate", "--project", str(root), "--json"], capsys)
+
+    finding = next(f for f in doc["findings"] if f["check"] == "git.exclude-legacy-pollution")
+    assert finding["detail"]["pattern_not_plain_path"] == ["/foo//bar"]
+    assert finding["detail"]["hiding_new_files"] == ["/.claude/skills"], "the literal line keeps it"
+    assert "spell a path git reads two ways" in finding["message"]
+    assert "/foo//bar" in finding["detail"]["lines"], "still reported, still deletable"
 
 
 def test_validate_pollution_ignores_a_root_naming_exclude_line(project, capsys, monkeypatch):
