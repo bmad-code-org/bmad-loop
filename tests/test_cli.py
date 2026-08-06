@@ -4569,6 +4569,87 @@ def test_validate_pollution_reports_plugin_lines_though_the_policy_is_malformed(
     assert warned[0]["detail"]["lines"] == ["/vendored/tool.json"]
 
 
+def test_validate_pollution_survives_a_malformed_profile_overlay(project, capsys, monkeypatch):
+    """`load_profiles` overlays `.bmad-loop/profiles/*.toml` onto the packaged
+    built-ins and raises on the first malformed one, discarding the built-ins it had
+    already collected. The role-resolved fallback cannot cover that — `get_profile`
+    calls the same loader, so it is empty for the same reason — which left the
+    candidate set with NO profile entries and `/.claude/skills` unreported in the
+    very run that reported the overlay error.
+
+    Ablation: drop the packaged-only retry and this reports nothing."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    root = project.project
+    overlay = root / ".bmad-loop" / "profiles"
+    overlay.mkdir(parents=True, exist_ok=True)
+    (overlay / "broken.toml").write_text("this is not = = toml\n", encoding="utf-8")
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "malformed profile overlay")
+    capsys.readouterr()
+    _pollute_exclude(project, "/.claude/skills")
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+
+    problems = [f["check"] for f in doc["findings"] if f["severity"] == "problem"]
+    assert "adapter.profile" in problems, "non-vacuity: the overlay must really be rejected"
+    warned = [f for f in doc["findings"] if f["check"] == "git.exclude-legacy-pollution"]
+    assert len(warned) == 1, "one bad overlay cannot hide the packaged profiles' lines"
+    assert warned[0]["detail"]["lines"] == ["/.claude/skills"]
+
+
+def test_validate_never_runs_plugin_code_while_building_candidates(project, capsys, monkeypatch):
+    """The candidate set needs MANIFESTS, so it reads `load_plugins`, never
+    `PluginRegistry.build` — which resolves, and for an enabled `[python]` plugin
+    that means `exec_module` plus the constructor: third-party code inside a
+    preflight.
+
+    Two contracts break when it runs. A top-level `print` puts its line ahead of the
+    document, so the whole of stdout stops being one JSON object (AGENTS.md's `--json`
+    invariant, asserted here by `machine_json` parsing all of stdout). And a top-level
+    write lands a new file in the repo AFTER `git.worktree-clean` has already passed.
+
+    Ablation: build the candidates through `PluginRegistry.build(project, pol).plugins()`
+    and this fails on the stdout contract."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    root = project.project
+    plug = root / ".bmad-loop" / "plugins" / "noisy"
+    plug.mkdir(parents=True, exist_ok=True)
+    (plug / "plugin.toml").write_text(
+        '[plugin]\nname = "noisy"\napi_version = 1\nseed_files = ["vendored/n.json"]\n'
+        '[python]\nmodule = "p.py"\ncls = "P"\n',
+        encoding="utf-8",
+    )
+    (plug / "p.py").write_text(
+        "import pathlib\n"
+        "print('PLUGIN TOP-LEVEL STDOUT')\n"
+        "pathlib.Path('MUTATED-BY-PLUGIN.txt').write_text('x', encoding='utf-8')\n"
+        "class P:\n"
+        "    def __init__(self, *a, **k):\n"
+        "        print('PLUGIN CONSTRUCTOR STDOUT')\n",
+        encoding="utf-8",
+    )
+    (root / "vendored").mkdir(exist_ok=True)
+    (root / "vendored" / "n.json").write_text("{}\n", encoding="utf-8")
+    pol_file = root / ".bmad-loop" / "policy.toml"
+    pol_file.write_text(
+        pol_file.read_text(encoding="utf-8") + '\n[plugins]\nenabled = ["noisy"]\n',
+        encoding="utf-8",
+    )
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "enabled python plugin fixture")
+    capsys.readouterr()
+    _pollute_exclude(project, "/vendored/n.json")
+    # the plugin's write is relative, so it would land wherever validate is run from
+    monkeypatch.chdir(root)
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+
+    warned = [f for f in doc["findings"] if f["check"] == "git.exclude-legacy-pollution"]
+    assert len(warned) == 1, "non-vacuity: the plugin's manifest must still be read"
+    assert warned[0]["detail"]["lines"] == ["/vendored/n.json"]
+    assert not (root / "MUTATED-BY-PLUGIN.txt").exists(), "preflight ran plugin code"
+
+
 def test_validate_pollution_detail_splits_by_tracked_content(project, capsys, monkeypatch):
     """`.claude/skills` is tracked by the fixture, so the rule over it can only be
     hiding that path's NEW files; nothing is tracked under the seeded customize dir.

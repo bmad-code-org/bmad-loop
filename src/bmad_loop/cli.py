@@ -229,7 +229,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
     # stories.yaml manifest (stories mode). Loaded before the queue gate so a
     # stories-only project is not failed on a missing sprint-status.yaml.
     from .adapters.profile import ProfileError, get_profile, load_profiles
-    from .plugins import PluginError, PluginRegistry
+    from .plugins import PluginError, load_plugins
 
     profiles = []
     profile_by_name: dict[str, CLIProfile] = {}
@@ -341,10 +341,27 @@ def cmd_validate(args: argparse.Namespace) -> int:
     # `codex` carries `/.claude/skills`, and the narrow set — the one the policy names
     # right now — would report nothing on exactly the repo that needs it most.
     all_profiles = profiles
+    # Every source below is guarded SEPARATELY, and that is the invariant rather than
+    # a style choice: this is a historical reconstruction, so a fault in one source
+    # must never zero another. Three rounds of this check's review found the same
+    # defect once per source — today's profile set, today's enabled plugins, an
+    # unparseable policy — so the assembly funnels them instead of enumerating.
+    #
+    # `load_profiles` overlays `<project>/.bmad-loop/profiles/*.toml` onto the
+    # packaged built-ins and raises on the FIRST malformed one, discarding the
+    # built-ins it had already collected. The role-resolved fallback cannot cover
+    # that: `get_profile` calls the same loader, so `profiles` is empty for the same
+    # reason. Measured: one bad overlay left the candidate set with no profile
+    # entries at all and `/.claude/skills` went unreported in the same run that
+    # reported the overlay error. Packaged-only is the honest floor — those are the
+    # profiles every past writer shipped with.
     try:
         all_profiles = list(load_profiles(project).values())
     except ProfileError:
-        pass  # a malformed overlay already reported above; fall back to the resolved set
+        try:
+            all_profiles = list(load_profiles(None).values())
+        except ProfileError:
+            pass  # a packaged profile is broken; keep the resolved set
     seed_rels: list[str] = [rel for p in all_profiles for rel in p.seed_files]
     if pol is not None:
         seed_rels.extend(pol.scm.worktree_seed)  # the only source that needs the policy
@@ -354,25 +371,29 @@ def cmd_validate(args: argparse.Namespace) -> int:
     # candidates: a match that did not exist when the run happened never appears
     # in the file, so it costs nothing and matches nothing.
     #
-    # Read every DISCOVERED manifest, not `registry.seed_files()`/`seed_globs()`:
-    # those filter through `_active_for_seeds`, so a `[python]` plugin enabled
-    # when the polluting run happened and disabled today contributes nothing.
-    # Same current-policy narrowing as the profile set above, one pillar over —
-    # and not hypothetical: with nothing enabled those accessors return EMPTY,
-    # dropping the shipped tea (`_bmad/**`) and unity (`.claude/skills/*`) globs.
+    # `load_plugins` — the MANIFEST loader — and never `PluginRegistry.build`, for two
+    # independent reasons that happen to have one fix.
     #
-    # OUTSIDE the `pol is not None` guard, for that same reason a third time: a
-    # malformed policy.toml is a fact about today's config, and the reconstruction
-    # target is historical. `build`'s policy argument is typed `| None` and governs
-    # only the settings overlay and the trust/instantiation gate; the manifests
-    # themselves come from `load_plugins(project)`, which never reads it. Under the
-    # guard, a repo whose policy fails to parse got NO plugin candidates at all —
-    # `validate` reported the policy error and silently dropped the plugin-written
-    # lines, which is the one run where the operator is already editing that file.
+    # Coverage: the registry's `seed_files()`/`seed_globs()` filter through
+    # `_active_for_seeds`, so a `[python]` plugin enabled when the polluting run
+    # happened and disabled today contributes nothing. Not hypothetical — with
+    # nothing enabled those accessors return EMPTY, dropping the shipped tea
+    # (`_bmad/**`) and unity (`.claude/skills/*`) globs. And `build` needs a policy,
+    # so under a `pol is not None` guard an unparseable policy.toml dropped every
+    # plugin candidate. Both are today's configuration narrowing a historical set.
+    #
+    # Purity: `build` also RESOLVES, and for an enabled `[python]` plugin that means
+    # `_instantiate` -> `exec_module` plus the constructor, i.e. third-party code run
+    # inside a preflight that only ever needed the manifest. Measured: a module with a
+    # top-level `print` put its line ahead of the document, so `json.loads` on the
+    # whole of stdout raised JSONDecodeError — the `--json` one-object contract
+    # (AGENTS.md) broken by a plugin — and a top-level write landed a new file in the
+    # repo AFTER `git.worktree-clean` had already passed. `load_plugins` discovers and
+    # api-checks manifests without resolving any of them.
     try:
-        for loaded in PluginRegistry.build(project, pol).plugins():
-            seed_rels.extend(loaded.manifest.seed_files)
-            for pattern in loaded.manifest.seed_globs:
+        for manifest in load_plugins(project).values():
+            seed_rels.extend(manifest.seed_files)
+            for pattern in manifest.seed_globs:
                 seed_rels.extend(m.relative_to(project).as_posix() for m in project.glob(pattern))
     except (PluginError, OSError, ValueError):
         pass  # plugin faults have their own gate; this check does not own them
