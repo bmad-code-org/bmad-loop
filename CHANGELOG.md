@@ -24,8 +24,13 @@ whose seams had diverged enough that several ports needed a different fix, and t
 - **`validate` warns when an old bmad-loop left shield patterns in `.git/info/exclude` (#384).**
   The writer is fixed, but nothing removes the lines already there — and they hide every new file
   under paths like `.claude/skills` from `git add -A` in that checkout. `git.exclude-legacy-pollution`
-  names the file and the exact lines. Warn only, never auto-removed: the same line could be the
-  project's own, so only exact matches are reported and deleting them stays a manual call.
+  names the file and the exact lines. Candidates cover every version that wrote that shared file:
+  all registered profiles rather than the ones this policy resolves today (a project that switched
+  CLIs still carries the old one's lines), plugin seeds and glob expansions, and v0.9.1's `_bmad`
+  family — `main` does not descend from v0.9.1, so those repos upgrade into this check. Warn only,
+  never auto-removed: lines are matched byte-for-byte, and those naming paths the repo **tracks**
+  are reported as the shield's (they can only be hiding new files) while the rest are flagged to
+  review, since a project can legitimately have written the same line for itself.
 
 - **A park travels with its story's commit, so `bmad-loop confirm` works from any clone (#356).**
   Each parked story writes one JSON record to `.bmad-loop/operator/<key>.json` inside the story's
