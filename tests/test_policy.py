@@ -648,8 +648,10 @@ def test_scm_worktree_seed_rejects_non_project_relative_entries(tmp_path, entry)
 
     The empty entry is the one that does damage rather than merely no-op: it makes
     the seed loop resolve src to the repo ROOT and dst to the worktree, both of
-    which pass its containment checks, so the whole repo is copied in and the
-    rendered pattern "/" then git-excludes the entire worktree."""
+    which pass its containment checks, so the whole repo is copied in — and since a
+    worktree mounts under the repo, that copy recurses into itself until the path
+    length fails. The "/" it renders is inert (git strips a bare slash to a pattern
+    matching nothing), so none of the surplus is even shielded from `git add -A`."""
     p = tmp_path / "policy.toml"
     p.write_text(f"[scm]\nworktree_seed = [{entry!r}]\n".replace("'", '"'))
 

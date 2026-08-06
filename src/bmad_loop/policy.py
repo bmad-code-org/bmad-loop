@@ -989,13 +989,22 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
     #
     # The empty entry is why this is a guard rather than a tidy-up: `""` makes that
     # loop resolve src to the repo ROOT and dst to the worktree, both of which pass
-    # its `is_relative_to` containment checks — so it copies the entire repo into
-    # the worktree, gitignored and untracked files included, and then renders as the
-    # exclude pattern "/", which git-excludes the whole worktree so the unit's
-    # `git add -A` stages nothing at all. Absolute and `..` entries are already
-    # contained by those same checks (silently skipped); they are rejected here for
-    # consistency with the sibling sources, and because a silently-inert seed entry
-    # reads as applied configuration when it is not.
+    # its `is_relative_to` containment checks — a path IS relative to itself — so it
+    # copies the entire repo into the worktree, gitignored and untracked files
+    # included. And because a worktree mounts UNDER the repo (.bmad-loop/runs/...),
+    # that copy walks into its own destination: measured at 744 levels of nesting
+    # before the path length failed, silently, since the seed copy suppresses errors.
+    #
+    # The "/" it then renders is INERT, not a blanket exclusion — git strips a bare
+    # slash to a zero-length pattern that matches nothing (worktree_flow.py says the
+    # same at the write side). That is what makes this worth guarding rather than
+    # shrugging at: none of the copied surplus is shielded, so the unit's
+    # `git add -A` stages the main checkout's untracked files into the story.
+    #
+    # Absolute and `..` entries are already contained by those same checks (silently
+    # skipped); they are rejected here for consistency with the sibling sources, and
+    # because a silently-inert seed entry reads as applied configuration when it is
+    # not.
     for seed in scm.worktree_seed:
         if not seed or is_absolute_path(seed) or has_parent_ref(seed):
             raise PolicyError(
