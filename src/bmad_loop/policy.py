@@ -19,7 +19,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .platform_util import atomic_replace, has_parent_ref, is_absolute_path
+from .platform_util import atomic_replace, has_parent_ref, is_absolute_path, names_tree_root
 
 POLICY_FILE = Path(".bmad-loop") / "policy.toml"
 
@@ -944,6 +944,17 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         raise PolicyError(f"scm.preserve_keep must be an integer: got {preserve_keep!r}")
     if preserve_keep < 0:
         raise PolicyError(f"scm.preserve_keep must be >= 0: got {preserve_keep}")
+    # Shape before entries, because `tuple(str(s) for s in raw)` silently accepts
+    # things that are not a list of paths. Measured: `worktree_seed = ""` yields an
+    # empty tuple (the config reads as applied and seeds nothing), `= "foo"` yields
+    # ('f','o','o') — three bogus one-character entries that each pass the
+    # per-entry guard below — and `= 5` raises a bare TypeError out of `loads`,
+    # untyped, where every other malformed value here raises PolicyError.
+    raw_seed = scm_d.get("worktree_seed", ())
+    if isinstance(raw_seed, (str, bytes)) or not isinstance(raw_seed, (list, tuple)):
+        raise PolicyError(f"scm.worktree_seed must be a list of paths: got {raw_seed!r}")
+    if not all(isinstance(s, str) for s in raw_seed):
+        raise PolicyError(f"scm.worktree_seed entries must be strings: got {list(raw_seed)!r}")
     scm = ScmPolicy(
         isolation=str(scm_d.get("isolation", ScmPolicy.isolation)),
         branch_per=str(scm_d.get("branch_per", ScmPolicy.branch_per)),
@@ -965,7 +976,7 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         seed_adapter_defaults=bool(
             scm_d.get("seed_adapter_defaults", ScmPolicy.seed_adapter_defaults)
         ),
-        worktree_seed=tuple(str(s) for s in scm_d.get("worktree_seed", ())),
+        worktree_seed=tuple(raw_seed),
     )
     if scm.isolation not in ISOLATION_MODES:
         raise PolicyError(
@@ -987,13 +998,19 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
     # All three feed one list into provision_worktree's seed loop, and this was the
     # only one arriving unvalidated.
     #
-    # The empty entry is why this is a guard rather than a tidy-up: `""` makes that
+    # A ROOT-NAMING entry is why this is a guard rather than a tidy-up: it makes that
     # loop resolve src to the repo ROOT and dst to the worktree, both of which pass
     # its `is_relative_to` containment checks — a path IS relative to itself — so it
     # copies the entire repo into the worktree, gitignored and untracked files
     # included. And because a worktree mounts UNDER the repo (.bmad-loop/runs/...),
     # that copy walks into its own destination: measured at 744 levels of nesting
     # before the path length failed, silently, since the seed copy suppresses errors.
+    #
+    # `names_tree_root` and not a `not seed` emptiness check, because "" is only one
+    # spelling of the root. Measured: "" and "." produce a byte-identical
+    # (src, raw, dst) triple in that loop, and a run seeded with ["."] copied an
+    # untracked secret.env in and self-recursed until the path length failed, with
+    # provision_worktree returning no skip at all.
     #
     # The "/" it then renders is INERT, not a blanket exclusion — git strips a bare
     # slash to a zero-length pattern that matches nothing (worktree_flow.py says the
@@ -1006,7 +1023,7 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
     # because a silently-inert seed entry reads as applied configuration when it is
     # not.
     for seed in scm.worktree_seed:
-        if not seed or is_absolute_path(seed) or has_parent_ref(seed):
+        if names_tree_root(seed) or is_absolute_path(seed) or has_parent_ref(seed):
             raise PolicyError(
                 f"scm.worktree_seed entries must be project-relative paths: got {seed!r}"
             )

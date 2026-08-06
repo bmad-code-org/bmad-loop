@@ -171,6 +171,12 @@ def test_full_manifest_parses(tmp_path):
         # absolute seed path
         ('[plugin]\nname = "e"\napi_version = 1\nseed_files = ["/etc/passwd"]\n', "seed_files"),
         ('[plugin]\nname = "e"\napi_version = 1\nseed_globs = ["/abs/*"]\n', "seed_globs"),
+        # root-naming seed path — "" is only one spelling. These feed the same
+        # provision_worktree seed loop, where a root ref copies the whole repo into
+        # the worktree and the copy then recurses into its own destination.
+        ('[plugin]\nname = "e"\napi_version = 1\nseed_files = ["."]\n', "seed_files"),
+        ('[plugin]\nname = "e"\napi_version = 1\nseed_files = ["./"]\n', "seed_files"),
+        ('[plugin]\nname = "e"\napi_version = 1\nseed_globs = ["."]\n', "seed_globs"),
         # absolute python module path
         ('[plugin]\nname = "e"\napi_version = 1\n[python]\nmodule = "/x.py"\n', "plugin-relative"),
         # hook with no cmd

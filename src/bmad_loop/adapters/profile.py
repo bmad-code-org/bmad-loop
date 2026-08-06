@@ -20,7 +20,7 @@ from pathlib import Path
 
 import regex
 
-from ..platform_util import has_parent_ref, is_absolute_path
+from ..platform_util import has_parent_ref, is_absolute_path, names_tree_root
 
 USAGE_PARSERS = {"claude-jsonl", "codex-rollout", "gemini-chat", "copilot-events", "none"}
 HOOK_DIALECTS = {
@@ -149,7 +149,11 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
         events: dict[str, str] = {}
     else:
         config_path = str(hooks_d.get("config_path", ""))
-        if not config_path or is_absolute_path(config_path) or has_parent_ref(config_path):
+        if (
+            names_tree_root(config_path)
+            or is_absolute_path(config_path)
+            or has_parent_ref(config_path)
+        ):
             raise fail("hooks.config_path must be a project-relative path")
         events_d = hooks_d.get("events")
         if not isinstance(events_d, dict) or not events_d:
@@ -175,12 +179,16 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
         raise fail(f"stop_without_result_nudges must be >= 0: got {stop_nudges}")
 
     skill_tree = str(doc.get("skill_tree", ".claude/skills"))
-    if not skill_tree or is_absolute_path(skill_tree) or has_parent_ref(skill_tree):
+    if names_tree_root(skill_tree) or is_absolute_path(skill_tree) or has_parent_ref(skill_tree):
         raise fail("skill_tree must be a project-relative path")
 
     seed_files = str_list("seed_files")
+    # `names_tree_root` subsumes the emptiness check it replaced. These entries feed
+    # provision_worktree's seed loop, where any spelling of the root ("", ".", "./",
+    # ".\") resolves src to the repo root and dst to the worktree — both pass the
+    # loop's containment checks, so the whole repo is copied in.
     for seed in seed_files:
-        if not seed or is_absolute_path(seed) or has_parent_ref(seed):
+        if names_tree_root(seed) or is_absolute_path(seed) or has_parent_ref(seed):
             raise fail(f"seed_files entries must be project-relative paths: got {seed!r}")
 
     env_fault_patterns = str_list("env_fault_patterns")

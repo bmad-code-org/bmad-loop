@@ -16,7 +16,7 @@ from __future__ import annotations
 import tomllib
 from typing import Any
 
-from ..platform_util import has_parent_ref, is_absolute_path
+from ..platform_util import has_parent_ref, is_absolute_path, names_tree_root
 from .model import (
     SETTING_TYPES,
     WORKFLOW_ROLES,
@@ -31,8 +31,11 @@ from .model import (
 
 
 def _check_relative_paths(values: tuple[str, ...], label: str, fail) -> None:
+    # `names_tree_root` subsumes the emptiness check it replaced: "", ".", "./" and
+    # ".\" all name the tree rather than anything in it, and a seed entry that names
+    # the tree root makes provision_worktree copy the whole repo into the worktree.
     for value in values:
-        if not value or is_absolute_path(value) or has_parent_ref(value):
+        if names_tree_root(value) or is_absolute_path(value) or has_parent_ref(value):
             raise fail(f"{label} entries must be project-relative paths: got {value!r}")
 
 

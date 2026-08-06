@@ -70,6 +70,22 @@ def test_has_parent_ref_ignores_non_segments(value):
     assert platform_util.has_parent_ref(value) is False
 
 
+@pytest.mark.parametrize("value", ["", ".", "./", ".//", "./.", ".\\"])
+def test_names_tree_root_catches_every_spelling_of_the_root(value):
+    # `""` is the spelling an emptiness check catches; the rest are why this exists.
+    # `.\` is the Windows-only one — POSIX parsing keeps it as a one-segment name,
+    # the same asymmetry `is_absolute_path` checks both flavors for.
+    assert platform_util.names_tree_root(value) is True
+
+
+@pytest.mark.parametrize("value", [".claude/skills", "a", "a/.", "./a", ".hidden", "..", "a/b"])
+def test_names_tree_root_accepts_anything_naming_a_child(value):
+    # `a/.` and `./a` normalize to a real child, so they name something inside the
+    # tree. `..` names the PARENT, which is `has_parent_ref`'s job, not this one —
+    # the guards are paired at every call site.
+    assert platform_util.names_tree_root(value) is False
+
+
 # ---------------------------------------------------------------- atomic_replace
 
 

@@ -636,6 +636,10 @@ def test_scm_worktree_seed_settings(tmp_path):
     "entry",
     [
         "",  # the harmful one — see below
+        ".",  # …and the SAME harm, one spelling later
+        "./",
+        "./.",
+        ".\\",  # a root ref only Windows parsing normalizes away
         "/etc/passwd",  # POSIX-absolute
         "C:\\secrets",  # Windows drive-absolute (rejected on POSIX too)
         "../../etc",  # climbs out without being absolute
@@ -646,16 +650,55 @@ def test_scm_worktree_seed_rejects_non_project_relative_entries(tmp_path, entry)
     provision_worktree that arrived unvalidated — profiles and plugin manifests
     both already apply this rule to their own entries.
 
-    The empty entry is the one that does damage rather than merely no-op: it makes
-    the seed loop resolve src to the repo ROOT and dst to the worktree, both of
-    which pass its containment checks, so the whole repo is copied in — and since a
-    worktree mounts under the repo, that copy recurses into itself until the path
+    A ROOT-NAMING entry is the one that does damage rather than merely no-op: it
+    makes the seed loop resolve src to the repo ROOT and dst to the worktree, both
+    of which pass its containment checks, so the whole repo is copied in — and since
+    a worktree mounts under the repo, that copy recurses into itself until the path
     length fails. The "/" it renders is inert (git strips a bare slash to a pattern
-    matching nothing), so none of the surplus is even shielded from `git add -A`."""
+    matching nothing), so none of the surplus is even shielded from `git add -A`.
+
+    `""` is only ONE spelling of the root, which is why the guard is
+    `names_tree_root` and not an emptiness check. Measured: `""` and `"."` produce a
+    byte-identical (src, raw, dst) triple in that loop, and a real run seeded with
+    `["."]` copied an untracked `secret.env` into the worktree and self-recursed 127
+    levels — with `provision_worktree` reporting no skipped entry at all.
+
+    Ablation: restore `not seed` in place of `names_tree_root(seed)` and the four
+    dot spellings fail while `""` keeps passing — which is what makes them worth
+    parametrizing separately."""
     p = tmp_path / "policy.toml"
     p.write_text(f"[scm]\nworktree_seed = [{entry!r}]\n".replace("'", '"'))
 
     with pytest.raises(policy.PolicyError, match="worktree_seed entries must be project-relative"):
+        policy.load(p)
+
+
+@pytest.mark.parametrize(
+    ("value", "match"),
+    [
+        ('""', "must be a list of paths"),  # iterates to an EMPTY tuple: silently inert
+        ('"foo"', "must be a list of paths"),  # iterates to ('f','o','o')
+        ("5", "must be a list of paths"),  # raised a bare TypeError out of loads()
+        ("[1]", "entries must be strings"),  # str()'d into the path "1"
+    ],
+)
+def test_scm_worktree_seed_rejects_value_shapes_that_are_not_a_list_of_paths(
+    tmp_path, value, match
+):
+    """The per-entry guard runs over whatever `tuple(str(s) for s in raw)` produced,
+    and that coercion accepts things a list of paths never is. A scalar string is
+    the trap: TOML permits it, it iterates CHARACTER-WISE, and every character then
+    passes the per-entry rule — so `worktree_seed = "foo"` seeded three
+    one-character paths while reading as applied configuration. A scalar int did not
+    even reach a PolicyError; it raised TypeError out of `loads`, untyped, where
+    every other malformed value in this file escalates as PolicyError.
+
+    Ablation: drop the shape check and all four cases pass (three silently, the int
+    as a TypeError rather than the PolicyError this asserts)."""
+    p = tmp_path / "policy.toml"
+    p.write_text(f"[scm]\nworktree_seed = {value}\n")
+
+    with pytest.raises(policy.PolicyError, match=match):
         policy.load(p)
 
 

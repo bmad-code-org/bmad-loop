@@ -231,6 +231,29 @@ def test_user_profile_overlay(tmp_path):
             ),
             "seed_files",
         ),
+        # A root-naming entry is the harmful one, and `""` is only one spelling of
+        # it: these feed provision_worktree's seed loop, where any of them resolves
+        # src to the repo root and dst to the worktree — both pass its containment
+        # checks, so the whole repo is copied in and the copy recurses into itself.
+        (
+            MINIMAL_PROFILE.replace("[hooks]", 'seed_files = ["."]\n[hooks]'),
+            "seed_files",
+        ),
+        (
+            MINIMAL_PROFILE.replace("[hooks]", 'seed_files = ["./"]\n[hooks]'),
+            "seed_files",
+        ),
+        (
+            MINIMAL_PROFILE.replace("[hooks]", 'skill_tree = "."\n[hooks]'),
+            "skill_tree",
+        ),
+        (
+            MINIMAL_PROFILE.replace(
+                'config_path = ".mycli/settings.json"',
+                'config_path = "."',
+            ),
+            "relative",
+        ),
         # an env_fault_patterns entry that is not a valid regex fails fast at parse
         (
             MINIMAL_PROFILE.replace(
