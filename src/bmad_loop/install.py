@@ -2385,13 +2385,19 @@ class LegacyExcludePollution(NamedTuple):
 
     Returned only when `lines` is non-empty, so a caller that has one of these has
     something to report and a file to name in the report. `lines` is every hit;
-    `shield_only` and `possibly_yours` partition it and always reunite to it.
+    `hiding_new_files` and `no_tracked_content` partition it and always reunite to
+    it.
+
+    The split grades IMPACT, never AUTHORSHIP. No line here can be attributed —
+    see the detector's docstring — so both buckets are for the operator to review
+    before deleting; they differ only in what the repo's own index proves about
+    what the line is currently doing.
     """
 
     path: Path
     lines: list[str]
-    shield_only: list[str]
-    possibly_yours: list[str]
+    hiding_new_files: list[str]
+    no_tracked_content: list[str]
 
 
 def legacy_exclude_pollution(
@@ -2511,31 +2517,41 @@ def legacy_exclude_pollution(
     if not hits:
         return None
     # Widening the candidate set widened the chance of naming a line the operator
-    # wrote, and this function's output tells them to delete what it names. Split on
-    # the evidence rather than on a hand-curated list of "ours" paths, which would
+    # wrote, and this function's output prompts a deletion. Grade what each line is
+    # DOING, on evidence from the repo's own index — not who wrote it, which nothing
+    # here can establish, and not a hand-curated list of "ours" paths, which would
     # rot against every new profile and plugin:
     #
-    #   TRACKED content under the path -> the project demonstrably does NOT ignore
-    #   it, so the line cannot be an ignore rule they rely on, and its only remaining
-    #   effect is hiding that path's new files. That is exactly #384's harm, and the
-    #   issue proposed this same probe as its own option 3.
+    #   TRACKED content under the path -> the rule cannot be suppressing THAT
+    #   content (an exclude never untracks), so what it is doing right now is hiding
+    #   the path's NEW files, beside files the repo keeps. That is #384's harm
+    #   mechanism, and #384 proposed this same probe as its own option 3.
     #
-    #   nothing tracked -> indistinguishable from a rule they wrote. Still reported,
-    #   because a shield line over an untracked path is the ordinary case; just not
-    #   asserted as ours.
+    #   nothing tracked -> the rule may be ignoring the whole path deliberately, and
+    #   this cannot tell that from residue. Still reported: a shield line over an
+    #   untracked path is the ordinary case.
     #
-    # A git that cannot answer degrades the hit into `possibly_yours` — the cautious
-    # side — rather than dropping it, since the line is present either way.
-    shield_only: list[str] = []
-    possibly_yours: list[str] = []
+    # ⚠️ Tracked content is NOT evidence of authorship, and an earlier revision of
+    # this comment claimed it was ("the project demonstrably does NOT ignore it").
+    # A project can ignore a path it already tracks content under — that is the
+    # ordinary way an ignore rule is adopted for NEW files only, and `git add -f`
+    # reaches the same state deliberately. `path_tracked`'s own docstring says a
+    # force-added file under an ignore rule reads tracked here. So both buckets stay
+    # review-before-deleting; only the described effect differs.
+    #
+    # A git that cannot answer degrades the hit into `no_tracked_content` — the
+    # bucket that claims less — rather than dropping it, since the line is present
+    # either way.
+    hiding_new_files: list[str] = []
+    no_tracked_content: list[str] = []
     for line in hits:
         rel = line.strip("/")
         try:
             tracked = bool(rel) and path_tracked(project, rel)
         except GitError:
             tracked = False
-        (shield_only if tracked else possibly_yours).append(line)
-    return LegacyExcludePollution(exclude, hits, shield_only, possibly_yours)
+        (hiding_new_files if tracked else no_tracked_content).append(line)
+    return LegacyExcludePollution(exclude, hits, hiding_new_files, no_tracked_content)
 
 
 def _copy_skills(project: Path, trees: Sequence[str], force: bool) -> bool:

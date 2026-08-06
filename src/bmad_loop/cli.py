@@ -362,25 +362,30 @@ def cmd_validate(args: argparse.Namespace) -> int:
             pass  # plugin faults have their own gate; this check does not own them
     pollution = legacy_exclude_pollution(project, all_profiles, seed_rels)
     if pollution is not None:
-        # Lead with the lines the repo's own index proves are not its ignore rules,
-        # and keep the rest as "check these" — the remedy is a deletion, so the
-        # message must not assert ownership it cannot demonstrate.
+        # The remedy is a DELETION and no line here can be attributed, so "review
+        # before deleting" applies to every hit and is stated once, up front. The
+        # two buckets then describe what each line is doing — evidence from the
+        # repo's index — and never who wrote it: a project can ignore a path it
+        # already tracks content under (that is how a rule scoped to NEW files is
+        # adopted), so tracked content grades impact, not ownership.
         parts = [
             f"{pollution.path} carries git-add shield patterns written by an older "
             f"bmad-loop — new files under those paths never appear in `git status` or "
             f"`git add -A` in this checkout, however long ago the run that wrote them "
-            f"finished. bmad-loop no longer writes this file (#384)."
+            f"finished. bmad-loop no longer writes this file (#384). These lines are "
+            f"indistinguishable from ones you wrote yourself, so review each before "
+            f"deleting it."
         ]
-        if pollution.shield_only:
+        if pollution.hiding_new_files:
             parts.append(
-                f"These name paths your repo TRACKS, so they can only be hiding new "
-                f"files — delete them by hand: {', '.join(pollution.shield_only)}."
+                f"Your repo tracks content under these, which an exclude cannot "
+                f"suppress — so what they are doing now is hiding that path's NEW "
+                f"files: {', '.join(pollution.hiding_new_files)}."
             )
-        if pollution.possibly_yours:
+        if pollution.no_tracked_content:
             parts.append(
-                f"These match the shield's patterns but name nothing tracked, so they "
-                f"may be your own ignore rules — review before deleting: "
-                f"{', '.join(pollution.possibly_yours)}."
+                f"These name nothing this repo tracks, so they may be ignoring the "
+                f"path deliberately: {', '.join(pollution.no_tracked_content)}."
             )
         report.warn(
             "git.exclude-legacy-pollution",
@@ -388,8 +393,8 @@ def cmd_validate(args: argparse.Namespace) -> int:
             {
                 "exclude": str(pollution.path),
                 "lines": pollution.lines,
-                "shield_only": pollution.shield_only,
-                "possibly_yours": pollution.possibly_yours,
+                "hiding_new_files": pollution.hiding_new_files,
+                "no_tracked_content": pollution.no_tracked_content,
             },
         )
 

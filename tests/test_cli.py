@@ -4389,7 +4389,7 @@ def test_validate_pollution_warning_prints_the_lines_in_text_mode(project, capsy
     # this renders with backslashes, so asserting "info/exclude" passed nowhere
     assert str(exclude).lower() in text
     assert "git add -a" in text  # the symptom, lowercased by _validate_output
-    assert "delete them by hand" in text
+    assert "review each before deleting it" in text  # the remedy
 
 
 def test_validate_does_not_flag_an_operator_authored_exclude_line(project, capsys, monkeypatch):
@@ -4489,12 +4489,11 @@ def test_validate_pollution_reports_a_plugin_seed_glob_expansion(project, capsys
     assert warned[0]["detail"]["lines"] == ["/vendored/tool.json"]
 
 
-def test_validate_pollution_detail_splits_tracked_from_possibly_yours(project, capsys, monkeypatch):
-    """The remedy is a deletion, so the finding must not assert ownership it cannot
-    demonstrate. `.claude/skills` is tracked by the fixture — the project provably
-    does not ignore it — while the seeded settings path is not.
+def test_validate_pollution_detail_splits_by_tracked_content(project, capsys, monkeypatch):
+    """`.claude/skills` is tracked by the fixture, so the rule over it can only be
+    hiding that path's NEW files; nothing is tracked under the seeded customize dir.
 
-    Ablation: classify every hit as shield_only and this fails."""
+    Ablation: classify every hit as `hiding_new_files` and this fails."""
     _make_validate_pass(project, monkeypatch, capsys)
     _pollute_exclude(project, "/.claude/skills", "/_bmad/custom")
 
@@ -4503,9 +4502,33 @@ def test_validate_pollution_detail_splits_tracked_from_possibly_yours(project, c
     detail = next(f for f in doc["findings"] if f["check"] == "git.exclude-legacy-pollution")[
         "detail"
     ]
-    assert detail["shield_only"] == ["/.claude/skills"], "tracked by the fixture"
-    assert detail["possibly_yours"] == ["/_bmad/custom"], "nothing tracked under it"
-    assert sorted(detail["shield_only"] + detail["possibly_yours"]) == detail["lines"]
+    assert detail["hiding_new_files"] == ["/.claude/skills"], "tracked by the fixture"
+    assert detail["no_tracked_content"] == ["/_bmad/custom"], "nothing tracked under it"
+    assert sorted(detail["hiding_new_files"] + detail["no_tracked_content"]) == detail["lines"]
+
+
+def test_validate_pollution_asks_for_review_before_deleting_every_line(
+    project, capsys, monkeypatch
+):
+    """The remedy is a deletion and NOTHING here can attribute a line, so the review
+    instruction covers every hit — including the tracked bucket, which grades what
+    the line is doing rather than who wrote it. An operator can hold tracked content
+    under a rule they wrote themselves, so a message that told them to delete the
+    tracked ones outright would be telling them to delete their own ignore rule.
+
+    Ablation: restore the earlier wording — move the review hedge onto the untracked
+    bucket alone and tell the operator to `delete them by hand` for the tracked one
+    — and both assertions below fail."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    _pollute_exclude(project, "/.claude/skills", "/_bmad/custom")
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+
+    msg = next(f for f in doc["findings"] if f["check"] == "git.exclude-legacy-pollution")[
+        "message"
+    ]
+    assert "review each before deleting it" in msg, "the hedge covers all hits, not one bucket"
+    assert "delete them by hand" not in msg, "no bucket may be presented as safe to delete"
 
 
 # --------------- `bmad-loop mux`: backend listing + persisted choice (issue #87) ----

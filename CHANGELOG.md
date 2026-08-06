@@ -28,9 +28,11 @@ whose seams had diverged enough that several ports needed a different fix, and t
   all registered profiles rather than the ones this policy resolves today (a project that switched
   CLIs still carries the old one's lines), plugin seeds and glob expansions, and v0.9.1's `_bmad`
   family — `main` does not descend from v0.9.1, so those repos upgrade into this check. Warn only,
-  never auto-removed: lines are matched byte-for-byte, and those naming paths the repo **tracks**
-  are reported as the shield's (they can only be hiding new files) while the rest are flagged to
-  review, since a project can legitimately have written the same line for itself.
+  never auto-removed, and every line is flagged to review before deleting: a project can have
+  written the same line for itself, and nothing in the file records who wrote it. Lines are matched
+  byte-for-byte, and those naming paths the repo **tracks** are reported separately — an exclude
+  cannot suppress content already tracked, so what those lines do now is hide that path's **new**
+  files. That grades the line's effect, not its authorship.
 
 - **A park travels with its story's commit, so `bmad-loop confirm` works from any clone (#356).**
   Each parked story writes one JSON record to `.bmad-loop/operator/<key>.json` inside the story's

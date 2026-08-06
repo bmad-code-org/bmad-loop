@@ -7245,13 +7245,14 @@ def test_legacy_exclude_pollution_reports_an_unselected_profile(tmp_path):
     assert found is not None and found.lines == [f"/{claude.skill_tree}"]
 
 
-def test_legacy_exclude_pollution_splits_tracked_from_possibly_operator_authored(tmp_path):
+def test_legacy_exclude_pollution_splits_by_what_the_line_is_hiding(tmp_path):
     """Widening the candidate set widened the chance of naming a line the operator
-    wrote, and the remedy is a deletion. Tracked content under the path proves the
-    project does not ignore it, so the line can only be hiding new files — that is
-    #384's harm. Nothing tracked is indistinguishable from their own rule.
+    wrote, and the remedy is a deletion. So the split grades IMPACT: tracked content
+    under the path cannot be what the rule suppresses (an exclude never untracks),
+    so what the line does now is hide that path's NEW files — #384's harm. Nothing
+    tracked leaves open that the path is ignored deliberately.
 
-    Ablation: return every hit as `shield_only` and this fails on `/vendor`."""
+    Ablation: return every hit as `hiding_new_files` and this fails on `/vendor`."""
     # The exclude is written AFTER the commit, the way a real run polluted it: in
     # place earlier it would exclude `kept/f.txt` from the `git add` that is meant
     # to track it, and the fixture rather than the gate would be under test.
@@ -7268,8 +7269,38 @@ def test_legacy_exclude_pollution_splits_tracked_from_possibly_operator_authored
 
     assert found is not None
     assert found.lines == ["/kept", "/vendor"], "both still reported"
-    assert found.shield_only == ["/kept"], "tracked -> provably not their ignore rule"
-    assert found.possibly_yours == ["/vendor"], "untracked -> could be theirs"
+    assert found.hiding_new_files == ["/kept"], "tracked -> the rule hides only NEW files there"
+    assert found.no_tracked_content == ["/vendor"], "nothing tracked -> effect unknown"
+
+
+def test_legacy_exclude_pollution_tracked_content_is_impact_never_authorship(tmp_path):
+    """An exclude does not untrack, so a project can hold tracked content under a
+    rule it wrote ITSELF — by adding the path before writing the rule, or with
+    `git add -f` after (`path_tracked`'s docstring pins that a force-added file
+    reads tracked). Tracked content therefore grades what the line is DOING, and
+    an earlier revision read it as proof the line was bmad-loop's.
+
+    Ablation: restore that reading — treat `hiding_new_files` as an ownership
+    claim by dropping the shared review instruction from `cmd_validate` — and the
+    cli-side sibling of this test fails. Here the pin is that a demonstrably
+    operator-authored line still lands in the bucket, so no caller may read the
+    bucket as authorship."""
+    repo = _repo_with_exclude(tmp_path)
+    (repo / "vendor").mkdir()
+    (repo / "vendor" / "keep.txt").write_text("x\n", encoding="utf-8")
+    (repo / "vendor" / "other.txt").write_text("x\n", encoding="utf-8")
+    # The operator's OWN rule, written first, then one file deliberately force-added
+    # under it — the state `git add -f` exists to create.
+    (repo / ".git" / "info" / "exclude").write_text("/vendor\n", encoding="utf-8")
+    git(repo, "add", "-f", "vendor/keep.txt")
+    git(repo, "-c", "user.email=t@e", "-c", "user.name=t", "commit", "-qm", "force-add one")
+
+    found = legacy_exclude_pollution(repo, [], ["vendor"])
+
+    assert found is not None
+    assert found.hiding_new_files == ["/vendor"], "tracked content, yet the rule is theirs"
+    # `other.txt` is the proof the rule is live and doing its job, not residue.
+    assert git(repo, "status", "--short") == "", "their rule still hides the untracked sibling"
 
 
 def test_legacy_exclude_pollution_partition_always_reunites_to_lines(tmp_path):
@@ -7280,4 +7311,4 @@ def test_legacy_exclude_pollution_partition_always_reunites_to_lines(tmp_path):
     found = legacy_exclude_pollution(repo, [], ["a", "b", "c"])
 
     assert found is not None
-    assert sorted(found.shield_only + found.possibly_yours) == found.lines
+    assert sorted(found.hiding_new_files + found.no_tracked_content) == found.lines
