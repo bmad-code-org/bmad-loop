@@ -339,23 +339,31 @@ def cmd_validate(args: argparse.Namespace) -> int:
     if pollution is not None:
         # The remedy is a DELETION and no line here can be attributed, so "review
         # before deleting" applies to every hit and is stated once, up front. The
-        # two buckets then describe what each line is doing — evidence from the
-        # repo's index — and never who wrote it: a project can ignore a path it
-        # already tracks content under (that is how a rule scoped to NEW files is
-        # adopted), so tracked content grades impact, not ownership.
+        # buckets then describe what each line is doing — evidence from the repo's
+        # index and the file's own line order — and never who wrote it: a project
+        # can ignore a path it already tracks content under (that is how a rule
+        # scoped to NEW files is adopted), so tracked content grades impact, not
+        # ownership; and a `!` line below a hit can re-include it (last match
+        # wins), so the strong claim is made only where no negation follows.
         parts = [
             f"{pollution.path} carries git-add shield patterns written by an older "
-            f"bmad-loop — new files under those paths never appear in `git status` or "
-            f"`git add -A` in this checkout, however long ago the run that wrote them "
-            f"finished. bmad-loop no longer writes this file (#384). These lines are "
-            f"indistinguishable from ones you wrote yourself, so review each before "
-            f"deleting it."
+            f"bmad-loop — while such a pattern is in effect, new files under its path "
+            f"never appear in `git status` or `git add -A` in this checkout, however "
+            f"long ago the run that wrote it finished. bmad-loop no longer writes this "
+            f"file (#384). These lines are indistinguishable from ones you wrote "
+            f"yourself, so review each before deleting it."
         ]
         if pollution.hiding_new_files:
             parts.append(
                 f"Your repo tracks content under these, which an exclude cannot "
                 f"suppress — so what they are doing now is hiding that path's NEW "
                 f"files: {', '.join(pollution.hiding_new_files)}."
+            )
+        if pollution.maybe_neutralized:
+            parts.append(
+                f"Your repo tracks content under these too, but a `!` line later in "
+                f"the file may re-include them, so whether they hide anything right "
+                f"now is not graded: {', '.join(pollution.maybe_neutralized)}."
             )
         if pollution.no_tracked_content:
             parts.append(
@@ -369,6 +377,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 "exclude": str(pollution.path),
                 "lines": pollution.lines,
                 "hiding_new_files": pollution.hiding_new_files,
+                "maybe_neutralized": pollution.maybe_neutralized,
                 "no_tracked_content": pollution.no_tracked_content,
             },
         )

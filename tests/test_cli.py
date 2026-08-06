@@ -4671,6 +4671,28 @@ def test_validate_pollution_detail_splits_by_tracked_content(project, capsys, mo
     assert sorted(detail["hiding_new_files"] + detail["no_tracked_content"]) == detail["lines"]
 
 
+def test_validate_pollution_neutralized_line_is_reported_without_an_effect_claim(
+    project, capsys, monkeypatch
+):
+    """A `!` line below a hit can re-include the path (gitignore is last-match-
+    wins), leaving the hit inert — so the message must not claim it is hiding new
+    files. The hit still reports (residue to review either way) under the hedged
+    `maybe_neutralized` bucket.
+
+    Ablation: classify every tracked hit as `hiding_new_files` and both detail
+    asserts fail."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    _pollute_exclude(project, "/.claude/skills", "!/.claude/skills", "!/.claude/skills/**")
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+
+    finding = next(f for f in doc["findings"] if f["check"] == "git.exclude-legacy-pollution")
+    assert finding["detail"]["maybe_neutralized"] == ["/.claude/skills"]
+    assert finding["detail"]["hiding_new_files"] == []
+    assert "may re-include them" in finding["message"]
+    assert "hiding that path's NEW files" not in finding["message"]
+
+
 def test_validate_pollution_asks_for_review_before_deleting_every_line(
     project, capsys, monkeypatch
 ):

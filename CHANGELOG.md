@@ -30,7 +30,9 @@ whose seams had diverged enough that several ports needed a different fix, and t
   seeds and glob expansions, v0.9.1's `_bmad` family — so a valid same-name override, one
   malformed file or a switched CLI cannot hide another source's lines. A profile field of the
   wrong type reports as `adapter.profile` and skips only its own file instead of crashing the
-  command. The exclude is read as bytes and split the way git splits it. Details: docs/FEATURES.md.
+  command. The exclude is read as bytes and split the way git splits it, and a hit a later `!`
+  negation may re-include is reported without the hiding-new-files claim (last match wins).
+  Details: docs/FEATURES.md.
 
 - **A park travels with its story's commit, so `bmad-loop confirm` works from any clone (#356).**
   Each parked story writes one JSON record to `.bmad-loop/operator/<key>.json` inside the story's

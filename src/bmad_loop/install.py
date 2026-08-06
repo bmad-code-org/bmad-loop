@@ -2394,18 +2394,25 @@ class LegacyExcludePollution(NamedTuple):
 
     Returned only when `lines` is non-empty, so a caller that has one of these has
     something to report and a file to name in the report. `lines` is every hit;
-    `hiding_new_files` and `no_tracked_content` partition it and always reunite to
-    it.
+    `hiding_new_files`, `maybe_neutralized` and `no_tracked_content` partition it
+    and always reunite to it.
 
     The split grades IMPACT, never AUTHORSHIP. No line here can be attributed —
-    see the detector's docstring — so both buckets are for the operator to review
-    before deleting; they differ only in what the repo's own index proves about
-    what the line is currently doing.
+    see the detector's docstring — so every bucket is for the operator to review
+    before deleting; they differ only in what the repo's own index and the file's
+    own line order prove about what the line is currently doing. A hit lands in
+    `hiding_new_files` only when that claim is GUARANTEED: tracked content under
+    the path AND the hit sits after the file's last `!` line, so no negation can
+    re-include it (gitignore is last-match-wins). A tracked hit at-or-before a
+    negation goes to `maybe_neutralized` instead — deciding whether that negation
+    really re-includes it would mean modeling gitignore matching, which this
+    check does not do.
     """
 
     path: Path
     lines: list[str]
     hiding_new_files: list[str]
+    maybe_neutralized: list[str]
     no_tracked_content: list[str]
 
 
@@ -2544,14 +2551,33 @@ def legacy_exclude_pollution(
     # ignores `crlf`, and `/two\r\r\n` ignores a file literally named `two\r`) —
     # a CRLF-saved exclude line really does hide the candidate path's new files,
     # and this check grades effect.
-    present = {line.removesuffix(b"\r") for line in raw.split(b"\n")}
+    tokens = [line.removesuffix(b"\r") for line in raw.split(b"\n")]
+    present = set(tokens)
     # Set intersection IS the exact-match rule — no normalization, no strip(): a
     # leading space is a meaningful part of a gitignore pattern, so a line that
     # carries one is not a line this code wrote. Only the line TERMINATOR git
     # defines (\n, one optional preceding \r) is outside the pattern bytes.
-    hits = sorted(wanted[line] for line in present & wanted.keys())
+    hit_pairs = sorted((wanted[line], line) for line in present & wanted.keys())
+    hits = [line for line, _ in hit_pairs]
     if not hits:
         return None
+    # PRESENT IS NOT THE SAME AS EFFECTIVE, on the read side this time: gitignore
+    # is LAST MATCH WINS, so a `!` line BELOW a hit can re-include the path and
+    # leave the hit doing nothing (measured, git 2.55: `/kept` then `!/kept` +
+    # `!/kept/**` puts kept's new files back in `git status`). Same conservative
+    # rule as the writer's dedupe (`_worktree_local_exclude` above): a hit is
+    # GUARANTEED effective only where its last occurrence sits after the file's
+    # last negation — the last pattern matching any path it covers is then this
+    # line or a positive below it, and both ignore. Anything at-or-before a
+    # negation is only MAYBE effective, and deciding for real would mean
+    # modeling gitignore matching. Positional, never semantic: a negation ABOVE
+    # the hit cannot defeat it and must not degrade the claim.
+    last_negation = -1
+    last_at: dict[bytes, int] = {}
+    for i, token in enumerate(tokens):
+        if token.startswith(b"!"):
+            last_negation = i
+        last_at[token] = i
     # Widening the candidate set widened the chance of naming a line the operator
     # wrote, and this function's output prompts a deletion. Grade what each line is
     # DOING, on evidence from the repo's own index — not who wrote it, which nothing
@@ -2572,22 +2598,30 @@ def legacy_exclude_pollution(
     # A project can ignore a path it already tracks content under — that is the
     # ordinary way an ignore rule is adopted for NEW files only, and `git add -f`
     # reaches the same state deliberately. `path_tracked`'s own docstring says a
-    # force-added file under an ignore rule reads tracked here. So both buckets stay
+    # force-added file under an ignore rule reads tracked here. So every bucket stays
     # review-before-deleting; only the described effect differs.
     #
     # A git that cannot answer degrades the hit into `no_tracked_content` — the
     # bucket that claims less — rather than dropping it, since the line is present
     # either way.
     hiding_new_files: list[str] = []
+    maybe_neutralized: list[str] = []
     no_tracked_content: list[str] = []
-    for line in hits:
+    for line, line_bytes in hit_pairs:
         rel = line.strip("/")
         try:
             tracked = bool(rel) and path_tracked(project, rel)
         except GitError:
             tracked = False
-        (hiding_new_files if tracked else no_tracked_content).append(line)
-    return LegacyExcludePollution(exclude, hits, hiding_new_files, no_tracked_content)
+        if not tracked:
+            no_tracked_content.append(line)
+        elif last_at[line_bytes] > last_negation:
+            hiding_new_files.append(line)
+        else:
+            maybe_neutralized.append(line)
+    return LegacyExcludePollution(
+        exclude, hits, hiding_new_files, maybe_neutralized, no_tracked_content
+    )
 
 
 def _copy_skills(project: Path, trees: Sequence[str], force: bool) -> bool:

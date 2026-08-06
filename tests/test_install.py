@@ -7305,6 +7305,94 @@ def test_legacy_exclude_pollution_tracked_content_is_impact_never_authorship(pro
     assert git(repo, "status", "--short") == "", "their rule still hides the untracked sibling"
 
 
+def test_legacy_exclude_pollution_negation_below_a_hit_ungrades_the_effect_claim(project):
+    """gitignore is LAST MATCH WINS, so a `!` line BELOW a hit can re-include the
+    path and leave the hit doing nothing — `hiding_new_files` would then be a
+    false effect claim prompting a deletion on false urgency. Such a hit is still
+    reported (it is still residue to review) but lands in `maybe_neutralized`,
+    which claims nothing about current effect.
+
+    The status assert is the non-vacuity pin: git itself shows the new file, so
+    the strong bucket's claim really would have been false here.
+
+    Ablation: classify every tracked hit as `hiding_new_files` and this fails."""
+    repo = _repo_with_exclude(project)
+    (repo / "kept").mkdir()
+    (repo / "kept" / "f.txt").write_text("x\n", encoding="utf-8")
+    git(repo, "add", "kept/f.txt")
+    git(repo, "commit", "-qm", "track kept")
+    (repo / ".git" / "info" / "exclude").write_text("/kept\n!/kept\n!/kept/**\n", encoding="utf-8")
+    (repo / "kept" / "new.txt").write_text("x\n", encoding="utf-8")
+    assert "kept/new.txt" in git(repo, "status", "--porcelain", "-uall")
+
+    found = legacy_exclude_pollution(repo, [], ["kept"])
+
+    assert found is not None
+    assert found.lines == ["/kept"], "the negations match no candidate; the hit still reports"
+    assert found.maybe_neutralized == ["/kept"]
+    assert found.hiding_new_files == []
+
+
+def test_legacy_exclude_pollution_negation_above_a_hit_keeps_the_effect_claim(project):
+    """A negation ABOVE the hit loses to it (last match wins), so the effect
+    claim is still guaranteed and must not be degraded. This is what makes the
+    rule POSITIONAL rather than "any `!` anywhere in the file" — the blunt form
+    would ungrade every repo that carries one unrelated negation.
+
+    Ablation: degrade whenever the file contains any negation and this fails."""
+    repo = _repo_with_exclude(project)
+    (repo / "kept").mkdir()
+    (repo / "kept" / "f.txt").write_text("x\n", encoding="utf-8")
+    git(repo, "add", "kept/f.txt")
+    git(repo, "commit", "-qm", "track kept")
+    (repo / ".git" / "info" / "exclude").write_text("!/kept/**\n/kept\n", encoding="utf-8")
+    (repo / "kept" / "new.txt").write_text("x\n", encoding="utf-8")
+    assert "kept/new.txt" not in git(repo, "status", "--porcelain", "-uall")
+
+    found = legacy_exclude_pollution(repo, [], ["kept"])
+
+    assert found is not None
+    assert found.hiding_new_files == ["/kept"], "the positive line sits last, so it decides"
+    assert found.maybe_neutralized == []
+
+
+def test_legacy_exclude_pollution_grades_a_hits_last_occurrence(project):
+    """A hit appearing before AND after the negation is decided by its LAST
+    occurrence — that copy sits below the `!` line, so it wins and really hides
+    new files (the status assert proves it through git).
+
+    Ablation: grade the FIRST occurrence (`list.index`) and this fails."""
+    repo = _repo_with_exclude(project)
+    (repo / "kept").mkdir()
+    (repo / "kept" / "f.txt").write_text("x\n", encoding="utf-8")
+    git(repo, "add", "kept/f.txt")
+    git(repo, "commit", "-qm", "track kept")
+    (repo / ".git" / "info" / "exclude").write_text("/kept\n!/kept\n/kept\n", encoding="utf-8")
+    (repo / "kept" / "new.txt").write_text("x\n", encoding="utf-8")
+    assert "kept/new.txt" not in git(repo, "status", "--porcelain", "-uall")
+
+    found = legacy_exclude_pollution(repo, [], ["kept"])
+
+    assert found is not None
+    assert found.hiding_new_files == ["/kept"]
+    assert found.maybe_neutralized == []
+
+
+def test_legacy_exclude_pollution_untracked_bucket_ignores_negations(project):
+    """`no_tracked_content` already claims nothing about effect ("may be ignoring
+    it deliberately"), so a negation below such a hit changes nothing — the
+    neutralization hedge exists only to soften the strong bucket's claim, and an
+    untracked hit must not be promoted out of the bucket that claims least."""
+    repo = _repo_with_exclude(project)
+    (repo / ".git" / "info" / "exclude").write_text("/vendor\n!/vendor\n", encoding="utf-8")
+
+    found = legacy_exclude_pollution(repo, [], ["vendor"])
+
+    assert found is not None
+    assert found.no_tracked_content == ["/vendor"]
+    assert found.maybe_neutralized == []
+
+
 def test_legacy_exclude_pollution_partition_always_reunites_to_lines(project):
     """The two buckets are a partition, not a filter: a hit is never dropped by
     being unclassifiable, because the line is in the file either way."""
@@ -7313,7 +7401,10 @@ def test_legacy_exclude_pollution_partition_always_reunites_to_lines(project):
     found = legacy_exclude_pollution(repo, [], ["a", "b", "c"])
 
     assert found is not None
-    assert sorted(found.hiding_new_files + found.no_tracked_content) == found.lines
+    assert (
+        sorted(found.hiding_new_files + found.maybe_neutralized + found.no_tracked_content)
+        == found.lines
+    )
 
 
 def _repo_with_exclude_bytes(project, raw: bytes) -> Path:
