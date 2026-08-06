@@ -379,6 +379,19 @@ def test_discovered_profiles_skips_only_the_malformed_file(tmp_path):
             MINIMAL_PROFILE.replace("[hooks]", 'env = "invalid"\n[hooks]'),
             "malformed field value",
         ),
+        # `inf` and an oversized int are legal TOML and raise OverflowError, a
+        # sibling of neither ValueError nor TypeError — the rows that show why
+        # the funnel has to be the CLOSED set for the tomllib domain rather than
+        # the types seen so far. Ablation: drop OverflowError from
+        # CONVERSION_FAULTS and exactly these two raise the bare exception.
+        (
+            MINIMAL_PROFILE.replace("[hooks]", "stop_without_result_nudges = inf\n[hooks]"),
+            "malformed field value",
+        ),
+        (
+            MINIMAL_PROFILE.replace("[hooks]", f"usage_grace_s = {'9' * 400}\n[hooks]"),
+            "malformed field value",
+        ),
         # real dialects still hard-require config_path and events
         (
             MINIMAL_PROFILE.replace('config_path = ".mycli/settings.json"', ""),
@@ -403,3 +416,46 @@ def test_invalid_profiles_rejected(tmp_path, mutation, match):
     (profiles_dir / "bad.toml").write_text(mutation)
     with pytest.raises(ProfileError, match=match):
         load_profiles(tmp_path)
+
+
+# every type `tomllib` can yield, plus the numeric spellings that are legal TOML
+# and hostile to a raw coercion
+TOML_VALUE_DOMAIN = [
+    '"x"',
+    "1",
+    "1.5",
+    "true",
+    "1979-05-27T07:32:00Z",
+    "1979-05-27",
+    "07:32:00",
+    "[1]",
+    "{ k = 1 }",
+    "inf",
+    "-inf",
+    "nan",
+    "9" * 400,  # tomllib keeps arbitrary precision; float() of this overflows
+]
+
+
+@pytest.mark.parametrize("value", TOML_VALUE_DOMAIN)
+@pytest.mark.parametrize("key", ["usage_grace_s", "stop_without_result_nudges"])
+def test_every_toml_value_type_parses_or_raises_profile_error(tmp_path, key, value):
+    """The closure pin behind `CONVERSION_FAULTS`: a profile field can hold any of
+    the nine types `tomllib` yields, and the contract is that each either parses or
+    raises the DOMAIN error — never a bare conversion fault out of a `float()`,
+    `int()` or `.items()`.
+
+    Both a float knob and an int knob, because they fault differently: `inf` is a
+    fine float and an OverflowError for `int()`, while a 400-digit integer is a
+    fine int and an OverflowError for `float()`. A per-type exception list cannot
+    promise this; two review rounds each added one type after a bot found a
+    spelling nobody had tried."""
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "probe.toml").write_text(
+        MINIMAL_PROFILE.replace("[hooks]", f"{key} = {value}\n[hooks]")
+    )
+    try:
+        load_profiles(tmp_path)
+    except ProfileError:
+        pass

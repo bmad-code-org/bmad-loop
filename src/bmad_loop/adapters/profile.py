@@ -46,6 +46,19 @@ class ProfileError(Exception):
     pass
 
 
+# Every fault a raw coercion over a `tomllib` value can raise — the set is CLOSED,
+# not a list of the ones seen so far, which is what makes funnelling on it a funnel
+# rather than another round of enumeration. `tomllib` yields exactly nine types
+# (str, int, float, bool, datetime, date, time, list, dict) and all nine were run
+# through this module's coercions: `int()`/`float()` answer TypeError for the five
+# non-numerics, ValueError for a non-numeric str and for `nan`, and **OverflowError**
+# for `inf`/`-inf` (int) and for an int too large to be a float — `tomllib` accepts
+# arbitrary-precision integers, so that second one is reachable from a config file.
+# Iteration and `.items()` add TypeError and AttributeError and nothing new.
+# `plugins/manifest.py` funnels on the same set for the same reason.
+CONVERSION_FAULTS = (AttributeError, OverflowError, TypeError, ValueError)
+
+
 @dataclass(frozen=True)
 class HookSpec:
     dialect: str
@@ -228,8 +241,8 @@ def _load_toml(text: str, source: str) -> CLIProfile:
     try:
         return _parse_profile(doc, source)
     except ProfileError:
-        raise
-    except (AttributeError, TypeError, ValueError) as e:
+        raise  # intent: a domain error is never re-wrapped (it is not a CONVERSION_FAULT)
+    except CONVERSION_FAULTS as e:
         # A funnel, not per-field guards: `_parse_profile`'s raw conversions
         # (`float()`, `int()`, `.items()`) raise bare conversion errors on
         # TOML-legal values of the wrong type, and every consumer keys its

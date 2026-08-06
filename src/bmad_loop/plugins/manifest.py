@@ -29,6 +29,14 @@ from .model import (
     WorkflowSpec,
 )
 
+# The CLOSED set of faults a raw coercion over a `tomllib` value can raise — see
+# `adapters/profile.py::CONVERSION_FAULTS` for the nine-type enumeration behind it
+# (the `inf`/`-inf` and oversized-int OverflowError rows are the ones a per-field
+# guard keeps missing). Restated here rather than imported: the plugin layer does
+# not otherwise depend on the adapter layer, and each module's own domain test
+# pins its copy.
+CONVERSION_FAULTS = (AttributeError, OverflowError, TypeError, ValueError)
+
 
 def _str_list(plugin_d: dict, key: str, fail) -> tuple[str, ...]:
     # Shape before entries, the same rule the sibling seed sources apply to their
@@ -188,7 +196,7 @@ def parse_manifest(
         raise fail("[plugin] 'api_version' is required")
     try:
         api_version = int(raw_api)
-    except (TypeError, ValueError):
+    except CONVERSION_FAULTS:
         raise fail(f"[plugin] api_version must be an integer: got {raw_api!r}") from None
 
     seed_files = _str_list(plugin_d, "seed_files", fail)
@@ -224,16 +232,16 @@ def load_manifest(
     try:
         return parse_manifest(doc, source, scripts_dir, origin)
     except PluginError:
-        raise
-    except (TypeError, ValueError) as e:
+        raise  # intent: a domain error is never re-wrapped (it is not a CONVERSION_FAULT)
+    except CONVERSION_FAULTS as e:
         # A funnel, not per-field guards — the `_load_toml` arm of
         # adapters/profile.py, same reason: `parse_manifest`'s raw conversions
-        # (`int()` on `priority` and a hook's `timeout_sec`, iteration over a
-        # setting's `options`) raise bare conversion errors on TOML-legal values
-        # of the wrong type, and every consumer keys its fault handling on
-        # PluginError — `discovered_manifests` skips the one file, `load_plugins`
-        # reports it. A bare escape crashed `validate` before any document was
-        # printed. AttributeError is absent from the tuple deliberately: every
-        # `.get()`/`.items()` here is isinstance-guarded first, so it has no site
-        # to come from (profile.py's `.items()` on `env` does).
+        # (`int()` on `priority`, `api_version` and a hook's `timeout_sec`,
+        # iteration over a setting's `options`) raise bare conversion errors on
+        # TOML-legal values of the wrong type, and every consumer keys its fault
+        # handling on PluginError — `discovered_manifests` skips the one file,
+        # `load_plugins` reports it. A bare escape crashed `validate` before any
+        # document was printed. The tuple is that module's CLOSED set for the
+        # `tomllib` value domain, shared so the two parsers cannot drift apart
+        # one exception type at a time.
         raise PluginError(f"plugin {source}: malformed field value: {e}") from e

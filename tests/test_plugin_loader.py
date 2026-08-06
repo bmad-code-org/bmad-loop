@@ -153,6 +153,11 @@ def test_full_manifest_parses(tmp_path):
         ("[plugin]\napi_version = 1\n", "name"),  # missing name
         ('[plugin]\nname = "e"\n', "api_version"),  # missing api_version
         ('[plugin]\nname = "e"\napi_version = "x"\n', "api_version must be an integer"),
+        # `inf` reaches api_version's own guard as OverflowError. The load_manifest
+        # funnel would catch it either way, so this row is what keeps the field's
+        # specific message (rather than the funnel's generic one) — ablate the
+        # guard's tuple back to (TypeError, ValueError) and only this row reddens.
+        ('[plugin]\nname = "e"\napi_version = inf\n', "api_version must be an integer"),
         # duplicate setting key
         (
             '[plugin]\nname = "e"\napi_version = 1\n'
@@ -337,18 +342,64 @@ def test_seed_list_shapes_rejected(key, value, match):
         "priority = [1]",  # int() -> TypeError
         '[hooks.pre_session]\ncmd = "true"\ntimeout_sec = "x"',  # int() -> ValueError
         '[[settings]]\nkey = "k"\ntype = "select"\noptions = 5',  # iteration -> TypeError
+        "priority = inf",  # int() -> OverflowError
+        "priority = -inf",  # int() -> OverflowError
+        "priority = nan",  # int() -> ValueError
+        '[hooks.pre_session]\ncmd = "true"\ntimeout_sec = inf',  # int() -> OverflowError
     ],
 )
 def test_malformed_field_values_raise_plugin_error(tail):
     """TOML-legal values of the wrong TYPE hit raw conversions (`int()`, and
     iteration over a setting's `options`) that `api_version`'s own guard shows
     were only ever handled one field at a time. The `load_manifest` funnel turns
-    those bare ValueError/TypeError escapes into PluginError, which is what every
-    consumer's fault handling keys on. Ablation: drop the funnel arm and these
-    four raise the bare exception instead."""
+    those bare escapes into PluginError, which is what every consumer's fault
+    handling keys on.
+
+    `inf` is the row that shows why the funnel must be the CLOSED set rather than
+    the types seen so far: `int(float('inf'))` raises OverflowError, a sibling of
+    neither ValueError nor TypeError, so the first version of this funnel let it
+    through. Ablation: drop the funnel arm and every row raises the bare exception;
+    drop OverflowError alone and exactly the three `inf` rows do."""
     body = f'[plugin]\nname = "e"\napi_version = 1\n{tail}\n'
     with pytest.raises(PluginError, match="malformed field value"):
         load_manifest(body, "e/plugin.toml", "e")
+
+
+# every type `tomllib` can yield, plus the numeric spellings that are legal TOML
+# and hostile to a raw coercion
+TOML_VALUE_DOMAIN = [
+    '"x"',
+    "1",
+    "1.5",
+    "true",
+    "1979-05-27T07:32:00Z",
+    "1979-05-27",
+    "07:32:00",
+    "[1]",
+    "{ k = 1 }",
+    "inf",
+    "-inf",
+    "nan",
+    "9" * 400,  # tomllib keeps arbitrary precision; float() of this overflows
+]
+
+
+@pytest.mark.parametrize("value", TOML_VALUE_DOMAIN)
+def test_every_toml_value_type_parses_or_raises_plugin_error(value):
+    """The closure pin behind `CONVERSION_FAULTS`, and the reason that tuple is a
+    funnel rather than one more round of enumeration: a manifest field can hold
+    any of the nine types `tomllib` yields, and the contract is that each either
+    parses or raises the DOMAIN error — never a bare conversion fault.
+
+    This is what a per-type exception list cannot promise: the last two review
+    rounds each added a type after a bot found a spelling nobody had tried. A new
+    coercion that raises something outside the set reddens this without anyone
+    having to think of the spelling first."""
+    body = f'[plugin]\nname = "e"\napi_version = 1\npriority = {value}\n'
+    try:
+        load_manifest(body, "e/plugin.toml", "e")
+    except PluginError:
+        pass
 
 
 def test_registry_orders_by_priority(tmp_path):
