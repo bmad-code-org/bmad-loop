@@ -30,6 +30,20 @@ from .model import (
 )
 
 
+def _str_list(plugin_d: dict, key: str, fail) -> tuple[str, ...]:
+    # Shape before entries, the same rule the sibling seed sources apply to their
+    # own lists (policy.py `worktree_seed`, adapters/profile.py `str_list`): a
+    # bare string iterates into per-character entries that each pass the
+    # per-entry guard below, and a scalar raises a bare TypeError out of `loads`
+    # where every other malformed value here raises PluginError.
+    raw = plugin_d.get(key, ())
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, (list, tuple)):
+        raise fail(f"[plugin] {key} must be a list of paths: got {raw!r}")
+    if not all(isinstance(s, str) for s in raw):
+        raise fail(f"[plugin] {key} entries must be strings: got {list(raw)!r}")
+    return tuple(raw)
+
+
 def _check_relative_paths(values: tuple[str, ...], label: str, fail) -> None:
     # `names_tree_root` subsumes the emptiness check it replaced: "", ".", "./" and
     # ".\" all name the tree rather than anything in it, and a seed entry that names
@@ -177,9 +191,9 @@ def parse_manifest(
     except (TypeError, ValueError):
         raise fail(f"[plugin] api_version must be an integer: got {raw_api!r}") from None
 
-    seed_files = tuple(str(s) for s in plugin_d.get("seed_files", ()))
+    seed_files = _str_list(plugin_d, "seed_files", fail)
     _check_relative_paths(seed_files, "seed_files", fail)
-    seed_globs = tuple(str(s) for s in plugin_d.get("seed_globs", ()))
+    seed_globs = _str_list(plugin_d, "seed_globs", fail)
     _check_relative_paths(seed_globs, "seed_globs", fail)
 
     return PluginManifest(

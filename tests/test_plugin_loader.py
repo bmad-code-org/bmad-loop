@@ -22,6 +22,7 @@ from bmad_loop.plugins import (
     load_plugins,
 )
 from bmad_loop.plugins.loader import USER_PLUGINS_REL
+from bmad_loop.plugins.manifest import load_manifest
 
 # --------------------------------------------------------------- helpers
 
@@ -296,6 +297,27 @@ def test_discovered_manifests_apply_no_api_version_gate(tmp_path):
     assert "fromfuture" not in plugins
 
     assert "fromfuture" in {m.name for m in discovered_manifests(tmp_path)}
+
+
+@pytest.mark.parametrize("key", ["seed_files", "seed_globs"])
+@pytest.mark.parametrize(
+    ("value", "match"),
+    [
+        ('""', "must be a list of paths"),
+        ('"foo"', "must be a list of paths"),
+        ("5", "must be a list of paths"),
+        ("[1]", "entries must be strings"),
+    ],
+)
+def test_seed_list_shapes_rejected(key, value, match):
+    """Shape before entries, mirroring the sibling seed sources (policy.py
+    `worktree_seed`, profile `str_list`): a bare string iterates into
+    per-character entries that each pass the per-entry path guard, and a scalar
+    used to leak a raw TypeError out of `loads` where every other malformed
+    value raises PluginError."""
+    body = f'[plugin]\nname = "e"\napi_version = 1\n{key} = {value}\n'
+    with pytest.raises(PluginError, match=match):
+        load_manifest(body, "e/plugin.toml", "e")
 
 
 def test_registry_orders_by_priority(tmp_path):
