@@ -4788,12 +4788,20 @@ def test_validate_pollution_reports_builtin_lines_despite_a_malformed_project_ma
     unity's `.claude/skills/*` glob candidates. Discovery is per-item now: the
     broken manifest skips only itself.
 
+    Two breakage shapes: `a-broken` fails at the TOML layer, `a2-badfield` is
+    valid TOML whose `priority` hits a raw `int()`. The second one escaped the
+    per-item guard as a bare ValueError and took the whole command down before
+    any document reached stdout — `machine_json` parsing all of stdout is what
+    catches that here.
+
     `a-broken` sorts FIRST in the project dir, so the `/vendored/good.json`
     line doubles as the kill for a per-source `break`: a guard that stops the
     project source at its first fault loses b-good's line too.
 
     Ablation: build the manifests from `load_plugins` and validate crashes here
-    instead of reporting; per-item `continue` -> `break` drops the b-good line."""
+    instead of reporting; per-item `continue` -> `break` drops the b-good line;
+    drop `load_manifest`'s conversion funnel and the command crashes with no
+    JSON at all."""
     from bmad_loop.plugins import PluginError, load_plugins
 
     _make_validate_pass(project, monkeypatch, capsys)
@@ -4801,6 +4809,12 @@ def test_validate_pollution_reports_builtin_lines_despite_a_malformed_project_ma
     plugins_dir = root / ".bmad-loop" / "plugins"
     (plugins_dir / "a-broken").mkdir(parents=True, exist_ok=True)
     (plugins_dir / "a-broken" / "plugin.toml").write_text("[plugin]\nname = \n", encoding="utf-8")
+    (plugins_dir / "a2-badfield").mkdir(parents=True, exist_ok=True)
+    (plugins_dir / "a2-badfield" / "plugin.toml").write_text(
+        '[plugin]\nname = "a2-badfield"\napi_version = 1\npriority = "x"\n'
+        'seed_files = ["vendored/never.json"]\n',
+        encoding="utf-8",
+    )
     (plugins_dir / "b-good").mkdir(parents=True, exist_ok=True)
     (plugins_dir / "b-good" / "plugin.toml").write_text(
         '[plugin]\nname = "b-good"\napi_version = 1\nseed_files = ["vendored/good.json"]\n',
@@ -4818,12 +4832,16 @@ def test_validate_pollution_reports_builtin_lines_despite_a_malformed_project_ma
     # candidates below cannot be coming from a load_plugins that happened to work
     with pytest.raises(PluginError):
         load_plugins(root)
-    _pollute_exclude(project, "/.claude/skills/keep.md", "/vendored/good.json")
+    _pollute_exclude(
+        project, "/.claude/skills/keep.md", "/vendored/good.json", "/vendored/never.json"
+    )
 
     doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
 
     warned = [f for f in doc["findings"] if f["check"] == "git.exclude-legacy-pollution"]
     assert len(warned) == 1, "one malformed manifest cannot hide the builtin lines"
+    # never.json is a2-badfield's seed: a manifest today's schema cannot parse
+    # contributes no candidate, the documented safe direction of this detector
     assert warned[0]["detail"]["lines"] == ["/.claude/skills/keep.md", "/vendored/good.json"]
 
 

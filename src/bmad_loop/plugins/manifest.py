@@ -221,4 +221,19 @@ def load_manifest(
         doc = tomllib.loads(text)
     except tomllib.TOMLDecodeError as e:
         raise PluginError(f"plugin {source}: invalid TOML: {e}") from e
-    return parse_manifest(doc, source, scripts_dir, origin)
+    try:
+        return parse_manifest(doc, source, scripts_dir, origin)
+    except PluginError:
+        raise
+    except (TypeError, ValueError) as e:
+        # A funnel, not per-field guards — the `_load_toml` arm of
+        # adapters/profile.py, same reason: `parse_manifest`'s raw conversions
+        # (`int()` on `priority` and a hook's `timeout_sec`, iteration over a
+        # setting's `options`) raise bare conversion errors on TOML-legal values
+        # of the wrong type, and every consumer keys its fault handling on
+        # PluginError — `discovered_manifests` skips the one file, `load_plugins`
+        # reports it. A bare escape crashed `validate` before any document was
+        # printed. AttributeError is absent from the tuple deliberately: every
+        # `.get()`/`.items()` here is isinstance-guarded first, so it has no site
+        # to come from (profile.py's `.items()` on `env` does).
+        raise PluginError(f"plugin {source}: malformed field value: {e}") from e

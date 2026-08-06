@@ -270,8 +270,17 @@ def test_discovered_manifests_skips_only_the_malformed_file(tmp_path):
     """One bad project plugin.toml skips ITSELF — not the builtins, and not its
     project siblings. `a-broken` sorts FIRST within the project dir, so a guard
     that stops that source at the first fault (a `break`, or fail-fast) also
-    loses `b-good` — which is what the "b-good" assert catches."""
+    loses `b-good` — which is what the "b-good" assert catches.
+
+    Two breakage shapes on purpose: `a-broken` fails at the TOML layer,
+    `a2-badfield` is valid TOML whose field value hits a raw conversion — only
+    the `load_manifest` funnel makes that one a PluginError the per-item guard
+    can catch. Ablation: drop the funnel arm and this ERRORS (bare ValueError
+    out of `discovered_manifests`) instead of skipping the file."""
     write_plugin(tmp_path, "a-broken", "[plugin]\nname = \n")
+    write_plugin(
+        tmp_path, "a2-badfield", '[plugin]\nname = "a2-badfield"\napi_version = 1\npriority = "x"\n'
+    )
     write_plugin(tmp_path, "b-good", MINIMAL.format(name="b-good"))
     # non-vacuity: the effective loader really refuses this project dir, so the
     # union below cannot be riding on a fixture that never exercised the guards
@@ -282,6 +291,7 @@ def test_discovered_manifests_skips_only_the_malformed_file(tmp_path):
 
     assert {"example", "tea", "unity", "b-good"} <= names
     assert "a-broken" not in names
+    assert "a2-badfield" not in names
 
 
 def test_discovered_manifests_apply_no_api_version_gate(tmp_path):
@@ -317,6 +327,27 @@ def test_seed_list_shapes_rejected(key, value, match):
     value raises PluginError."""
     body = f'[plugin]\nname = "e"\napi_version = 1\n{key} = {value}\n'
     with pytest.raises(PluginError, match=match):
+        load_manifest(body, "e/plugin.toml", "e")
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        'priority = "x"',  # int() -> ValueError
+        "priority = [1]",  # int() -> TypeError
+        '[hooks.pre_session]\ncmd = "true"\ntimeout_sec = "x"',  # int() -> ValueError
+        '[[settings]]\nkey = "k"\ntype = "select"\noptions = 5',  # iteration -> TypeError
+    ],
+)
+def test_malformed_field_values_raise_plugin_error(tail):
+    """TOML-legal values of the wrong TYPE hit raw conversions (`int()`, and
+    iteration over a setting's `options`) that `api_version`'s own guard shows
+    were only ever handled one field at a time. The `load_manifest` funnel turns
+    those bare ValueError/TypeError escapes into PluginError, which is what every
+    consumer's fault handling keys on. Ablation: drop the funnel arm and these
+    four raise the bare exception instead."""
+    body = f'[plugin]\nname = "e"\napi_version = 1\n{tail}\n'
+    with pytest.raises(PluginError, match="malformed field value"):
         load_manifest(body, "e/plugin.toml", "e")
 
 
