@@ -359,6 +359,13 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 f"suppress — so what they are doing now is hiding that path's NEW "
                 f"files: {', '.join(pollution.hiding_new_files)}."
             )
+        if pollution.tracked_file_no_children:
+            parts.append(
+                f"These name a file your repo tracks, and an exclude suppresses "
+                f"neither a tracked path nor files under a path that is not a "
+                f"directory — so they are not hiding anything today: "
+                f"{', '.join(pollution.tracked_file_no_children)}."
+            )
         if pollution.maybe_neutralized:
             parts.append(
                 f"Your repo tracks content under these too, but a `!` line later in "
@@ -378,6 +385,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 "lines": pollution.lines,
                 "hiding_new_files": pollution.hiding_new_files,
                 "maybe_neutralized": pollution.maybe_neutralized,
+                "tracked_file_no_children": pollution.tracked_file_no_children,
                 "no_tracked_content": pollution.no_tracked_content,
             },
         )

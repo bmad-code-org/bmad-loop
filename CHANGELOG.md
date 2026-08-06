@@ -32,7 +32,9 @@ whose seams had diverged enough that several ports needed a different fix, and t
   field of the wrong type skips only its own file instead of crashing the command (a profile's
   also reports as `adapter.profile`). The exclude is read as bytes and split the way git splits
   it, and a hit a later `!` negation may re-include is reported without the hiding-new-files
-  claim (last match wins).
+  claim (last match wins). The claim needs tracked _descendants_: a line naming a tracked regular
+  file (`/.claude/settings.json`) is reported as hiding nothing today. Candidates naming the
+  project root are dropped in every spelling.
   Details: docs/FEATURES.md.
 
 - **A park travels with its story's commit, so `bmad-loop confirm` works from any clone (#356).**

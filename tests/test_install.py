@@ -7393,16 +7393,116 @@ def test_legacy_exclude_pollution_untracked_bucket_ignores_negations(project):
     assert found.maybe_neutralized == []
 
 
-def test_legacy_exclude_pollution_partition_always_reunites_to_lines(project):
-    """The two buckets are a partition, not a filter: a hit is never dropped by
-    being unclassifiable, because the line is in the file either way."""
-    repo = _repo_with_exclude(project, "/a", "/b", "/c")
+def test_legacy_exclude_pollution_tracked_regular_file_is_not_hiding_new_files(project):
+    """A candidate naming a TRACKED REGULAR FILE reads tracked, and the strong
+    bucket's claim is false for it: an exclude suppresses neither the tracked path
+    itself nor "new files under" something that is not a directory. git's own
+    `status` is the oracle here rather than the bucket name — with the line in
+    place the porcelain output is byte-identical, while the tracked DIRECTORY in
+    the sibling test really does swallow a new child.
 
-    found = legacy_exclude_pollution(repo, [], ["a", "b", "c"])
+    `/.claude/settings.json` is the shape that matters: `hooks.config_path` is a
+    first-class shield candidate and the detector's own docstring names that file
+    as one projects legitimately track, so this is the ordinary case rather than
+    an edge one. Every other bucket test uses a directory, which is exactly why
+    this went unnoticed.
+
+    Ablation: drop the `descendants` probe (grade on `tracked` alone) and this
+    fails — the line lands back in `hiding_new_files`."""
+    repo = _repo_with_exclude(project)
+    (repo / "conf.json").write_text("{}\n", encoding="utf-8")
+    git(repo, "add", "conf.json")
+    git(repo, "commit", "-qm", "track a regular file")
+    before = git(repo, "status", "--porcelain", "-uall")
+    (repo / ".git" / "info" / "exclude").write_text("/conf.json\n", encoding="utf-8")
+
+    found = legacy_exclude_pollution(repo, [], ["conf.json"])
 
     assert found is not None
+    assert found.lines == ["/conf.json"], "still reported: it is still residue to review"
+    assert found.tracked_file_no_children == ["/conf.json"]
+    assert found.hiding_new_files == [], "a file has no new files beneath it"
+    # git's answer, not ours: the line changes nothing this checkout can see.
+    assert git(repo, "status", "--porcelain", "-uall") == before
+
+
+def test_legacy_exclude_pollution_tracked_file_bucket_ignores_negations(project):
+    """The tracked-file bucket is decided BEFORE the negation test, and that order
+    is deliberate: a later `!` line could only make an already-nil effect nil, so
+    `maybe_neutralized`'s hedge ("whether they hide anything right now is not
+    graded") would say strictly less than the flat statement this bucket makes.
+
+    Ablation: move the `descendants` arm below the negation test and this fails —
+    the hit lands in `maybe_neutralized` instead."""
+    repo = _repo_with_exclude(project)
+    (repo / "conf.json").write_text("{}\n", encoding="utf-8")
+    git(repo, "add", "conf.json")
+    git(repo, "commit", "-qm", "track a regular file")
+    (repo / ".git" / "info" / "exclude").write_text("/conf.json\n!/other\n", encoding="utf-8")
+
+    found = legacy_exclude_pollution(repo, [], ["conf.json"])
+
+    assert found is not None
+    assert found.tracked_file_no_children == ["/conf.json"]
+    assert found.maybe_neutralized == []
+
+
+@pytest.mark.parametrize("rel", ["", ".", "./", "./."])
+def test_legacy_exclude_pollution_drops_every_root_naming_candidate(project, rel):
+    """A candidate naming the project ROOT is dropped, and `names_tree_root` is the
+    whole rule rather than a list of spellings — the render is `f"/{rel}"` on both
+    sides, so `""`, `"."` and `"./"` arrive here as the three DIFFERENT strings
+    `/`, `/.` and `/./`.
+
+    These are not unreachable lines. A pre-#384 run whose `scm.worktree_seed` named
+    the root really did emit one (the seed loop resolves src to the repo root and
+    dst to the worktree, both of which pass its containment checks). They are
+    dropped for the reason this detector under-reports everywhere else: they are
+    inert as gitignore patterns, they are plausible operator lines, and the output
+    tells someone to delete what it names. No config that still loads can produce
+    one — `policy.load` applies this same predicate to `worktree_seed`.
+
+    Ablation: restore `candidates.discard("/")` and the three dot spellings fail
+    while `""` keeps passing, which is what makes them worth parametrizing."""
+    repo = _repo_with_exclude(project, f"/{rel}")
+
+    assert legacy_exclude_pollution(repo, [], [rel]) is None
+
+
+def test_legacy_exclude_pollution_partition_always_reunites_to_lines(project):
+    """The buckets are a partition, not a filter: a hit is never dropped by being
+    unclassifiable, because the line is in the file either way.
+
+    Every bucket is populated, so the reunion is a real claim: an earlier version
+    of this test used three untracked paths, which put every hit in one bucket and
+    could not have caught a bucket being dropped from the sum."""
+    repo = _repo_with_exclude(project)
+    for name in ("dir_a", "dir_b"):
+        (repo / name).mkdir()
+        (repo / name / "f.txt").write_text("x\n", encoding="utf-8")
+    (repo / "conf.json").write_text("{}\n", encoding="utf-8")
+    git(repo, "add", "dir_a/f.txt", "dir_b/f.txt", "conf.json")
+    git(repo, "commit", "-qm", "track the graded paths")
+    # `!/other` is the file's LAST negation, so `/dir_b` above it is only maybe
+    # neutralized while `/dir_a` below it keeps the strong claim.
+    (repo / ".git" / "info" / "exclude").write_text(
+        "/dir_b\n!/other\n/dir_a\n/conf.json\n/vendor\n", encoding="utf-8"
+    )
+
+    found = legacy_exclude_pollution(repo, [], ["dir_a", "dir_b", "conf.json", "vendor"])
+
+    assert found is not None
+    assert found.hiding_new_files == ["/dir_a"]
+    assert found.maybe_neutralized == ["/dir_b"]
+    assert found.tracked_file_no_children == ["/conf.json"]
+    assert found.no_tracked_content == ["/vendor"]
     assert (
-        sorted(found.hiding_new_files + found.maybe_neutralized + found.no_tracked_content)
+        sorted(
+            found.hiding_new_files
+            + found.maybe_neutralized
+            + found.tracked_file_no_children
+            + found.no_tracked_content
+        )
         == found.lines
     )
 

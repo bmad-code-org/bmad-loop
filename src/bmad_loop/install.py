@@ -32,7 +32,7 @@ from typing import Any, NamedTuple
 
 from .adapters.profile import ALIASES, CLIProfile, ProfileError, load_profiles
 from .checks import Finding
-from .platform_util import atomic_write_bytes, file_lock
+from .platform_util import atomic_write_bytes, file_lock, names_tree_root
 from .policy import POLICY_TEMPLATE
 from .process_host import get_process_host
 from .verify import GitError, git_bytes, path_tracked
@@ -2394,25 +2394,32 @@ class LegacyExcludePollution(NamedTuple):
 
     Returned only when `lines` is non-empty, so a caller that has one of these has
     something to report and a file to name in the report. `lines` is every hit;
-    `hiding_new_files`, `maybe_neutralized` and `no_tracked_content` partition it
-    and always reunite to it.
+    `hiding_new_files`, `maybe_neutralized`, `tracked_file_no_children` and
+    `no_tracked_content` partition it and always reunite to it.
 
     The split grades IMPACT, never AUTHORSHIP. No line here can be attributed —
     see the detector's docstring — so every bucket is for the operator to review
     before deleting; they differ only in what the repo's own index and the file's
     own line order prove about what the line is currently doing. A hit lands in
-    `hiding_new_files` only when that claim is GUARANTEED: tracked content under
-    the path AND the hit sits after the file's last `!` line, so no negation can
-    re-include it (gitignore is last-match-wins). A tracked hit at-or-before a
+    `hiding_new_files` only when that claim is GUARANTEED: tracked DESCENDANTS
+    under the path AND the hit sits after the file's last `!` line, so no negation
+    can re-include it (gitignore is last-match-wins). A tracked hit at-or-before a
     negation goes to `maybe_neutralized` instead — deciding whether that negation
     really re-includes it would mean modeling gitignore matching, which this
     check does not do.
+
+    `tracked_file_no_children` is the case where the path is itself a tracked
+    regular file. It reads tracked, but there is nothing BENEATH it to hide and an
+    exclude cannot suppress the tracked path either, so the strong claim would be
+    false — `/.claude/settings.json` over a tracked settings file is the ordinary
+    instance, not an edge case, since that path is a first-class shield candidate.
     """
 
     path: Path
     lines: list[str]
     hiding_new_files: list[str]
     maybe_neutralized: list[str]
+    tracked_file_no_children: list[str]
     no_tracked_content: list[str]
 
 
@@ -2501,18 +2508,30 @@ def legacy_exclude_pollution(
                     candidates.add(f"/{BMAD_DIR}/{rel}")
         except OSError:
             pass  # observation degrades; an unreadable tree is not a finding
-    # A bare "/" is never a shield pattern, and it is the candidate that could do
-    # harm: it is a real (if odd) line for an operator to have written, and this
-    # function's output tells them to delete what it names.
+    # A candidate that names the PROJECT ROOT rather than anything inside it is
+    # dropped, and `names_tree_root` is the whole rule rather than a list of
+    # spellings. `""` renders "/", `"."` renders "/.", `"./"` renders "/./" — the
+    # render is `f"/{rel}"` on both sides, so each spelling reaches this set as a
+    # DIFFERENT string, and an earlier version of this guard discarded only the
+    # first of them.
     #
-    # No validated caller can produce it any more — every seed source is checked
-    # at its own boundary (`skill_tree` and profile `seed_files` in
-    # adapters/profile.py, plugin seeds in plugins/manifest.py, and
-    # `scm.worktree_seed` in policy.py, which was the hole), and the writer skips
-    # hookless config_paths for this same reason. This stays as the helper's own
-    # contract: it takes `seed_rels` from its caller, and a detector that tells
-    # someone to delete a line should not depend on validation happening upstream.
-    candidates.discard("/")
+    # Not "impossible": a pre-#384 run whose `scm.worktree_seed` named the root
+    # really did emit one of these (the seed loop resolves src to the repo root
+    # and dst to the worktree, both of which pass its containment checks, so the
+    # entry seeds and reaches `patterns`). Dropped anyway, for the reason this
+    # detector under-reports everywhere else — these are the candidates that could
+    # do harm. They are real, if odd, lines for an operator to have written, they
+    # are inert as gitignore patterns, and this function's output tells someone to
+    # delete what it names. No validated config can produce one now: every seed
+    # source applies this same predicate at its own boundary (`skill_tree` and
+    # profile `seed_files` in adapters/profile.py, plugin seeds in
+    # plugins/manifest.py, `scm.worktree_seed` in policy.py, which was the hole),
+    # so the population is a config that no longer loads.
+    #
+    # It stays here rather than at the caller's glob expansion because this helper
+    # takes `seed_rels` from whoever calls it, and a detector that tells someone to
+    # delete a line must not depend on validation having happened upstream.
+    candidates = {c for c in candidates if not names_tree_root(c[1:])}
     try:
         # fsencode is the writer's own encoding for these same patterns
         # (_worktree_local_exclude), so a hit is byte-identical to what a shield
@@ -2606,21 +2625,49 @@ def legacy_exclude_pollution(
     # either way.
     hiding_new_files: list[str] = []
     maybe_neutralized: list[str] = []
+    tracked_file_no_children: list[str] = []
     no_tracked_content: list[str] = []
     for line, line_bytes in hit_pairs:
         rel = line.strip("/")
         try:
+            # TWO emptiness probes, because "tracked" and "has tracked DESCENDANTS"
+            # are different questions and only the second one licenses the strong
+            # claim. A trailing slash makes the pathspec match under the path only:
+            # measured identical at git 2.20.4 and 2.55.0, `:(literal)a/b/` lists
+            # `a/b/c` while `:(literal)file.json/` lists nothing at all. Both read
+            # EMPTINESS alone, so `path_tracked`'s reason for never parsing the
+            # output (`core.quotePath` mangles non-ASCII names) still holds.
             tracked = bool(rel) and path_tracked(project, rel)
+            descendants = tracked and path_tracked(project, f"{rel}/")
         except GitError:
-            tracked = False
+            tracked = descendants = False
         if not tracked:
             no_tracked_content.append(line)
+        elif not descendants:
+            # The path IS the tracked thing — a regular file, since git's index
+            # cannot hold both a blob at `a/b` and an entry under `a/b/`. An
+            # exclude never suppresses a tracked path, and a file has no new files
+            # beneath it, so this line is doing nothing at all right now. Measured:
+            # with `/.claude/settings.json` in the exclude and that file tracked,
+            # `git status --porcelain -uall` is byte-identical to without it, while
+            # the same test over the tracked DIRECTORY `/.claude/skills` really
+            # does swallow a new child.
+            #
+            # Ahead of the negation test on purpose: a later `!` line could only
+            # make an already-nil effect nil, so `maybe_neutralized`'s hedge would
+            # say less about this line than the flat statement does.
+            tracked_file_no_children.append(line)
         elif last_at[line_bytes] > last_negation:
             hiding_new_files.append(line)
         else:
             maybe_neutralized.append(line)
     return LegacyExcludePollution(
-        exclude, hits, hiding_new_files, maybe_neutralized, no_tracked_content
+        exclude,
+        hits,
+        hiding_new_files,
+        maybe_neutralized,
+        tracked_file_no_children,
+        no_tracked_content,
     )
 
 

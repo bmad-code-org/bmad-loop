@@ -4693,6 +4693,59 @@ def test_validate_pollution_neutralized_line_is_reported_without_an_effect_claim
     assert "hiding that path's NEW files" not in finding["message"]
 
 
+def test_validate_pollution_tracked_config_file_gets_no_effect_claim(project, capsys, monkeypatch):
+    """`.claude/settings.json` is a first-class shield candidate (`hooks.config_path`)
+    and the fixture tracks it as a regular FILE. An exclude suppresses neither a
+    tracked path nor "new files under" a non-directory, so the strong sentence would
+    be false — this is the common case, not an edge one, and the sibling directory
+    line in the same run must keep the strong claim.
+
+    Ablation: grade on `tracked` alone (drop the descendants probe) and the settings
+    line moves back into `hiding_new_files`, failing both detail asserts."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    _pollute_exclude(project, "/.claude/settings.json", "/.claude/skills")
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+
+    finding = next(f for f in doc["findings"] if f["check"] == "git.exclude-legacy-pollution")
+    assert finding["detail"]["tracked_file_no_children"] == ["/.claude/settings.json"]
+    assert finding["detail"]["hiding_new_files"] == ["/.claude/skills"], "the dir keeps the claim"
+    assert "not hiding anything today" in finding["message"]
+    assert doc["ok"] is True
+
+
+def test_validate_pollution_ignores_a_root_naming_exclude_line(project, capsys, monkeypatch):
+    """A plugin's `seed_globs = ["**"]` expands to include the project root itself,
+    whose rel is `"."` — so `/.` reached the candidate set and an operator's own
+    `/.` line was reported with a deletion prompt, in the strongest bucket.
+
+    Dropped for the same reason the bare `/` is: root-naming lines are inert as
+    gitignore patterns, plausible for an operator to have written, and no config
+    that still loads can seed the root.
+
+    Ablation: restore `candidates.discard("/")` and this fails."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    root = project.project
+    d = root / ".bmad-loop" / "plugins" / "starry"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "plugin.toml").write_text(
+        '[plugin]\nname = "starry"\napi_version = 1\nseed_globs = ["**"]\n', encoding="utf-8"
+    )
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "root-glob plugin fixture")
+    capsys.readouterr()
+    # `/vendored/tool.json` is the non-vacuity pin: the same `**` expansion still
+    # reconstructs ordinary matches, so this is not "the manifest went unread".
+    (root / "vendored").mkdir(exist_ok=True)
+    (root / "vendored" / "tool.json").write_text("{}\n", encoding="utf-8")
+    _pollute_exclude(project, "/.", "/vendored/tool.json")
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+
+    finding = next(f for f in doc["findings"] if f["check"] == "git.exclude-legacy-pollution")
+    assert finding["detail"]["lines"] == ["/vendored/tool.json"], "the root line is not ours"
+
+
 def test_validate_pollution_asks_for_review_before_deleting_every_line(
     project, capsys, monkeypatch
 ):
