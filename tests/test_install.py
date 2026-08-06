@@ -7045,21 +7045,27 @@ def test_hook_config_cannot_supply_its_dropped_seed_alibi(tmp_path):
 # ------------- #384 follow-through: legacy shared-exclude detection ------------
 
 
-def _repo_with_exclude(tmp_path, *lines: str) -> Path:
-    """A git repo whose repository-wide exclude carries exactly `lines`."""
-    root = tmp_path / "repo"
-    root.mkdir(parents=True)
-    git(root, "init", "-q")
+def _repo_with_exclude(project, *lines: str) -> Path:
+    """The sandbox repo, with its repository-wide exclude carrying exactly `lines`.
+
+    The conftest `project` fixture rather than a hand-rolled `git init` (AGENTS.md):
+    it is a copytree of a per-worker template, so it costs no git subprocess per
+    test — the cost that fixture exists to remove, and which showed up as ~3s a test
+    on Windows CI — and it arrives with a commit and a git identity already
+    configured. Its template carries no `.claude/` or `_bmad/` tree, so nothing in it
+    can quietly supply a candidate these tests assert an exact match against.
+    """
+    root = project.project
     exclude = root / ".git" / "info" / "exclude"
     exclude.parent.mkdir(parents=True, exist_ok=True)
     exclude.write_text("".join(f"{line}\n" for line in lines), encoding="utf-8")
     return root
 
 
-def test_legacy_exclude_pollution_finds_the_shield_patterns(tmp_path):
+def test_legacy_exclude_pollution_finds_the_shield_patterns(project):
     """The residue #384 is about: patterns an older bmad-loop appended to the
     repository-wide exclude, which nothing removes."""
-    repo = _repo_with_exclude(tmp_path, "/.claude/settings.json", "/.claude/skills")
+    repo = _repo_with_exclude(project, "/.claude/settings.json", "/.claude/skills")
     claude = get_profile("claude")
 
     found = legacy_exclude_pollution(repo, [claude], [])
@@ -7070,10 +7076,10 @@ def test_legacy_exclude_pollution_finds_the_shield_patterns(tmp_path):
     assert found.path == repo / ".git" / "info" / "exclude"
 
 
-def test_legacy_exclude_pollution_covers_seed_rels_and_customize_dir(tmp_path):
+def test_legacy_exclude_pollution_covers_seed_rels_and_customize_dir(project):
     """The candidate set mirrors provision_worktree's: seeded rels and
     `_bmad/custom` are shield patterns too, not just the skill tree."""
-    repo = _repo_with_exclude(tmp_path, "/_bmad/custom", "/vendor/creds.json")
+    repo = _repo_with_exclude(project, "/_bmad/custom", "/vendor/creds.json")
 
     found = legacy_exclude_pollution(repo, [], ["vendor/creds.json"])
 
@@ -7081,12 +7087,12 @@ def test_legacy_exclude_pollution_covers_seed_rels_and_customize_dir(tmp_path):
     assert found.lines == ["/_bmad/custom", "/vendor/creds.json"]
 
 
-def test_legacy_exclude_pollution_matches_exactly_never_by_containment(tmp_path):
+def test_legacy_exclude_pollution_matches_exactly_never_by_containment(project):
     """Authorship is ambiguous, so only a byte-identical line counts. Every line
     here CONTAINS or is contained by `/.claude/skills`, and none of them is ours —
     flagging any would be telling the operator to delete their own rule."""
     repo = _repo_with_exclude(
-        tmp_path,
+        project,
         ".claude/skills",  # no leading slash: a different git pattern
         "/.claude/skills/local",  # narrower: their own subdir rule
         "/.claude/skills-mine",  # a sibling path that merely shares the prefix
@@ -7097,11 +7103,9 @@ def test_legacy_exclude_pollution_matches_exactly_never_by_containment(tmp_path)
     assert legacy_exclude_pollution(repo, [get_profile("claude")], []) is None
 
 
-def test_legacy_exclude_pollution_silent_without_an_exclude_file(tmp_path):
+def test_legacy_exclude_pollution_silent_without_an_exclude_file(project):
     """A repo that has never been provisioned has nothing to report."""
-    root = tmp_path / "clean"
-    root.mkdir()
-    git(root, "init", "-q")
+    root = project.project
     (root / ".git" / "info" / "exclude").unlink(missing_ok=True)
 
     assert legacy_exclude_pollution(root, [get_profile("claude")], []) is None
@@ -7141,17 +7145,15 @@ def test_legacy_exclude_pollution_silent_when_git_never_answers(project, monkeyp
     assert legacy_exclude_pollution(project.project, [get_profile("claude")], []) is None
 
 
-def test_legacy_exclude_pollution_ignores_the_private_worktree_exclude(tmp_path):
+def test_legacy_exclude_pollution_ignores_the_private_worktree_exclude(project, tmp_path):
     """The current shield's own file must never be reported: it is SUPPOSED to
     carry these patterns, and it dies with its worktree.
 
     `--git-path info/exclude` answers with the shared file from a linked worktree
     too, so the private one is not even looked at — the assertion is that a
     worktree whose private exclude is full of patterns still reports nothing."""
-    repo = _repo_with_exclude(tmp_path)  # shared exclude: empty
+    repo = _repo_with_exclude(project)  # shared exclude: empty
     (repo / "f.txt").write_text("x\n", encoding="utf-8")
-    git(repo, "config", "user.email", "t@t")
-    git(repo, "config", "user.name", "t")
     git(repo, "add", "-A")
     git(repo, "commit", "-q", "-m", "init")
     wt = tmp_path / "wt"
@@ -7163,7 +7165,7 @@ def test_legacy_exclude_pollution_ignores_the_private_worktree_exclude(tmp_path)
     assert legacy_exclude_pollution(wt, [claude], []) is None
 
 
-def test_legacy_exclude_pollution_never_flags_a_bare_slash(tmp_path):
+def test_legacy_exclude_pollution_never_flags_a_bare_slash(project):
     """An empty seed rel renders as the candidate "/", which must never match: a
     bare "/" is a line an operator could legitimately have, and this function's
     output tells them to delete what it names.
@@ -7172,16 +7174,16 @@ def test_legacy_exclude_pollution_never_flags_a_bare_slash(tmp_path):
     caller reaches this. The guard is the helper's own contract — it takes
     `seed_rels` from its caller, and a detector that instructs deletion should not
     depend on validation having happened upstream."""
-    repo = _repo_with_exclude(tmp_path, "/")
+    repo = _repo_with_exclude(project, "/")
 
     assert legacy_exclude_pollution(repo, [], [""]) is None
     # the guard is scoped to "/" alone — a real seed rel alongside it still reports
-    repo2 = _repo_with_exclude(tmp_path / "b", "/", "/vendor/creds.json")
-    found = legacy_exclude_pollution(repo2, [], ["", "vendor/creds.json"])
+    _repo_with_exclude(project, "/", "/vendor/creds.json")
+    found = legacy_exclude_pollution(repo, [], ["", "vendor/creds.json"])
     assert found is not None and found.lines == ["/vendor/creds.json"]
 
 
-def test_legacy_exclude_pollution_covers_the_v091_bmad_family(tmp_path):
+def test_legacy_exclude_pollution_covers_the_v091_bmad_family(project):
     """v0.9.1 still resolved `--git-common-dir`, so it wrote THIS shared file, and
     its pattern set was larger than 0.9.0's: the `_bmad` root, the render dir with
     its trailing slash, and one rel per seeded file when the checkout already had a
@@ -7191,7 +7193,7 @@ def test_legacy_exclude_pollution_covers_the_v091_bmad_family(tmp_path):
     Ablation: drop any of the three `candidates.add` lines, or the `_bmad/` walk,
     and this fails on the pattern that line contributed."""
     repo = _repo_with_exclude(
-        tmp_path,
+        project,
         f"/{BMAD_DIR}",
         f"/{RENDER_DIR_REL}/",
         f"/{BMAD_DIR}/bmm/cfg.yaml",
@@ -7211,26 +7213,26 @@ def test_legacy_exclude_pollution_covers_the_v091_bmad_family(tmp_path):
     ]
 
 
-def test_legacy_exclude_pollution_render_pattern_matches_only_with_its_slash(tmp_path):
+def test_legacy_exclude_pollution_render_pattern_matches_only_with_its_slash(project):
     """The writer emitted `/_bmad/render/` WITH the trailing slash. Byte-identical
     matching means the slashless spelling is a different line — the operator's."""
-    repo = _repo_with_exclude(tmp_path, f"/{RENDER_DIR_REL}")
+    repo = _repo_with_exclude(project, f"/{RENDER_DIR_REL}")
 
     assert legacy_exclude_pollution(repo, [], []) is None
 
 
-def test_legacy_exclude_pollution_skips_the_render_dir_when_walking_bmad(tmp_path):
+def test_legacy_exclude_pollution_skips_the_render_dir_when_walking_bmad(project):
     """`_seed_bmad_tree` never seeded generated render output (BMAD_SEED_EXCLUDES),
     so a rel beneath it was never written as a per-file line and must not become a
     candidate — the dedicated `/_bmad/render/` pattern is the only render line."""
-    repo = _repo_with_exclude(tmp_path, f"/{BMAD_DIR}/render/out.md")
+    repo = _repo_with_exclude(project, f"/{BMAD_DIR}/render/out.md")
     (repo / RENDER_DIR_REL).mkdir(parents=True)
     (repo / RENDER_DIR_REL / "out.md").write_text("x\n", encoding="utf-8")
 
     assert legacy_exclude_pollution(repo, [], []) is None
 
 
-def test_legacy_exclude_pollution_reports_an_unselected_profile(tmp_path):
+def test_legacy_exclude_pollution_reports_an_unselected_profile(project):
     """Codex's open P1 on #386. A repo polluted while `claude` was selected and
     since switched to another CLI still carries `/.claude/skills`; a candidate set
     built from the CURRENTLY resolved profiles reports nothing on exactly the repo
@@ -7238,14 +7240,14 @@ def test_legacy_exclude_pollution_reports_an_unselected_profile(tmp_path):
 
     Ablation: pass only the codex profile and this fails."""
     claude, codex = get_profile("claude"), get_profile("codex")
-    repo = _repo_with_exclude(tmp_path, f"/{claude.skill_tree}")
+    repo = _repo_with_exclude(project, f"/{claude.skill_tree}")
 
     assert legacy_exclude_pollution(repo, [codex], []) is None, "narrow set misses it"
     found = legacy_exclude_pollution(repo, [claude, codex], [])
     assert found is not None and found.lines == [f"/{claude.skill_tree}"]
 
 
-def test_legacy_exclude_pollution_splits_by_what_the_line_is_hiding(tmp_path):
+def test_legacy_exclude_pollution_splits_by_what_the_line_is_hiding(project):
     """Widening the candidate set widened the chance of naming a line the operator
     wrote, and the remedy is a deletion. So the split grades IMPACT: tracked content
     under the path cannot be what the rule suppresses (an exclude never untracks),
@@ -7256,13 +7258,13 @@ def test_legacy_exclude_pollution_splits_by_what_the_line_is_hiding(tmp_path):
     # The exclude is written AFTER the commit, the way a real run polluted it: in
     # place earlier it would exclude `kept/f.txt` from the `git add` that is meant
     # to track it, and the fixture rather than the gate would be under test.
-    repo = _repo_with_exclude(tmp_path)
+    repo = _repo_with_exclude(project)
     (repo / "kept").mkdir()
     (repo / "kept" / "f.txt").write_text("x\n", encoding="utf-8")
     (repo / "vendor").mkdir()
     (repo / "vendor" / "u.txt").write_text("x\n", encoding="utf-8")
     git(repo, "add", "kept/f.txt")
-    git(repo, "-c", "user.email=t@e", "-c", "user.name=t", "commit", "-qm", "track kept")
+    git(repo, "commit", "-qm", "track kept")
     (repo / ".git" / "info" / "exclude").write_text("/kept\n/vendor\n", encoding="utf-8")
 
     found = legacy_exclude_pollution(repo, [], ["kept", "vendor"])
@@ -7273,7 +7275,7 @@ def test_legacy_exclude_pollution_splits_by_what_the_line_is_hiding(tmp_path):
     assert found.no_tracked_content == ["/vendor"], "nothing tracked -> effect unknown"
 
 
-def test_legacy_exclude_pollution_tracked_content_is_impact_never_authorship(tmp_path):
+def test_legacy_exclude_pollution_tracked_content_is_impact_never_authorship(project):
     """An exclude does not untrack, so a project can hold tracked content under a
     rule it wrote ITSELF — by adding the path before writing the rule, or with
     `git add -f` after (`path_tracked`'s docstring pins that a force-added file
@@ -7285,7 +7287,7 @@ def test_legacy_exclude_pollution_tracked_content_is_impact_never_authorship(tmp
     cli-side sibling of this test fails. Here the pin is that a demonstrably
     operator-authored line still lands in the bucket, so no caller may read the
     bucket as authorship."""
-    repo = _repo_with_exclude(tmp_path)
+    repo = _repo_with_exclude(project)
     (repo / "vendor").mkdir()
     (repo / "vendor" / "keep.txt").write_text("x\n", encoding="utf-8")
     (repo / "vendor" / "other.txt").write_text("x\n", encoding="utf-8")
@@ -7293,7 +7295,7 @@ def test_legacy_exclude_pollution_tracked_content_is_impact_never_authorship(tmp
     # under it — the state `git add -f` exists to create.
     (repo / ".git" / "info" / "exclude").write_text("/vendor\n", encoding="utf-8")
     git(repo, "add", "-f", "vendor/keep.txt")
-    git(repo, "-c", "user.email=t@e", "-c", "user.name=t", "commit", "-qm", "force-add one")
+    git(repo, "commit", "-qm", "force-add one")
 
     found = legacy_exclude_pollution(repo, [], ["vendor"])
 
@@ -7303,10 +7305,10 @@ def test_legacy_exclude_pollution_tracked_content_is_impact_never_authorship(tmp
     assert git(repo, "status", "--short") == "", "their rule still hides the untracked sibling"
 
 
-def test_legacy_exclude_pollution_partition_always_reunites_to_lines(tmp_path):
+def test_legacy_exclude_pollution_partition_always_reunites_to_lines(project):
     """The two buckets are a partition, not a filter: a hit is never dropped by
     being unclassifiable, because the line is in the file either way."""
-    repo = _repo_with_exclude(tmp_path, "/a", "/b", "/c")
+    repo = _repo_with_exclude(project, "/a", "/b", "/c")
 
     found = legacy_exclude_pollution(repo, [], ["a", "b", "c"])
 

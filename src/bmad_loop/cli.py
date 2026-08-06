@@ -353,11 +353,20 @@ def cmd_validate(args: argparse.Namespace) -> int:
         # wrote one line PER MATCH. Expanding against today's tree can only produce
         # candidates: a match that did not exist when the run happened never appears
         # in the file, so it costs nothing and matches nothing.
+        #
+        # Read every DISCOVERED manifest, not `registry.seed_files()`/`seed_globs()`:
+        # those filter through `_active_for_seeds`, so a `[python]` plugin enabled
+        # when the polluting run happened and disabled today contributes nothing.
+        # Same current-policy narrowing as the profile set above, one pillar over —
+        # and not hypothetical: with nothing enabled those accessors return EMPTY,
+        # dropping the shipped tea (`_bmad/**`) and unity (`.claude/skills/*`) globs.
         try:
-            registry = PluginRegistry.build(project, pol)
-            seed_rels.extend(registry.seed_files())
-            for pattern in registry.seed_globs():
-                seed_rels.extend(m.relative_to(project).as_posix() for m in project.glob(pattern))
+            for loaded in PluginRegistry.build(project, pol).plugins():
+                seed_rels.extend(loaded.manifest.seed_files)
+                for pattern in loaded.manifest.seed_globs:
+                    seed_rels.extend(
+                        m.relative_to(project).as_posix() for m in project.glob(pattern)
+                    )
         except (PluginError, OSError, ValueError):
             pass  # plugin faults have their own gate; this check does not own them
     pollution = legacy_exclude_pollution(project, all_profiles, seed_rels)

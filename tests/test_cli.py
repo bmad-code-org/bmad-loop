@@ -4489,6 +4489,46 @@ def test_validate_pollution_reports_a_plugin_seed_glob_expansion(project, capsys
     assert warned[0]["detail"]["lines"] == ["/vendored/tool.json"]
 
 
+def test_validate_pollution_reports_a_plugin_disabled_since_the_polluting_run(
+    project, capsys, monkeypatch
+):
+    """The plugin half of the current-policy narrowing. `PluginRegistry.seed_files`
+    and `seed_globs` filter through `_active_for_seeds`, which requires a `[python]`
+    plugin to be in `[plugins] enabled` — so a plugin that was enabled when the
+    polluting run happened and is disabled today contributes NO candidates, and its
+    lines keep hiding new files unreported. Measured with nothing enabled: both
+    accessors return empty, dropping even the shipped tea and unity globs.
+
+    Reconstruction is historical, so it reads every DISCOVERED manifest instead.
+
+    Ablation: build the candidates from `registry.seed_files()`/`seed_globs()` and
+    this stops reporting. The sibling glob test cannot catch it — its plugin has no
+    `[python]`, so it is declarative and always active."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    root = project.project
+    plug = root / ".bmad-loop" / "plugins" / "offnow"
+    plug.mkdir(parents=True, exist_ok=True)
+    # `[python]` and NOT in `[plugins] enabled` -> untrusted, module never imported
+    (plug / "plugin.toml").write_text(
+        '[plugin]\nname = "offnow"\napi_version = 1\nseed_files = ["vendored/off.json"]\n'
+        '[python]\nmodule = "p.py"\n',
+        encoding="utf-8",
+    )
+    (plug / "p.py").write_text("x = 1\n", encoding="utf-8")
+    (root / "vendored").mkdir(exist_ok=True)
+    (root / "vendored" / "off.json").write_text("{}\n", encoding="utf-8")
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "disabled plugin fixture")
+    capsys.readouterr()
+    _pollute_exclude(project, "/vendored/off.json")
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+
+    warned = [f for f in doc["findings"] if f["check"] == "git.exclude-legacy-pollution"]
+    assert len(warned) == 1, "a plugin disabled TODAY still explains the line"
+    assert warned[0]["detail"]["lines"] == ["/vendored/off.json"]
+
+
 def test_validate_pollution_detail_splits_by_tracked_content(project, capsys, monkeypatch):
     """`.claude/skills` is tracked by the fixture, so the rule over it can only be
     hiding that path's NEW files; nothing is tracked under the seeded customize dir.
