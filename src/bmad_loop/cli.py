@@ -228,7 +228,8 @@ def cmd_validate(args: argparse.Namespace) -> int:
     # story-queue gate runs below: the sprint-status file (sprint mode) or the
     # stories.yaml manifest (stories mode). Loaded before the queue gate so a
     # stories-only project is not failed on a missing sprint-status.yaml.
-    from .adapters.profile import ProfileError, get_profile
+    from .adapters.profile import ProfileError, get_profile, load_profiles
+    from .plugins import PluginError, PluginRegistry
 
     profiles = []
     profile_by_name: dict[str, CLIProfile] = {}
@@ -332,22 +333,64 @@ def cmd_validate(args: argparse.Namespace) -> int:
     # paths projects TRACK, so new files under them stay unstageable in this
     # checkout until someone deletes them. Warn only, never repair: the file is
     # hand-editable and its lines carry no authorship (see the helper's docstring).
-    seed_rels: list[str] = []
+    #
+    # Built from EVERY registered profile, not the three this policy resolves, and
+    # from `seed_files` ungated by `seed_adapter_defaults`. Both widenings answer the
+    # same question: the polluting run may have been configured differently from
+    # today's. A repo polluted while `claude` was selected and since switched to
+    # `codex` carries `/.claude/skills`, and the narrow set — the one the policy names
+    # right now — would report nothing on exactly the repo that needs it most.
+    all_profiles = profiles
+    try:
+        all_profiles = list(load_profiles(project).values())
+    except ProfileError:
+        pass  # a malformed overlay already reported above; fall back to the resolved set
+    seed_rels: list[str] = [rel for p in all_profiles for rel in p.seed_files]
     if pol is not None:
-        if pol.scm.seed_adapter_defaults:
-            for profile in profiles:
-                seed_rels.extend(profile.seed_files)
         seed_rels.extend(pol.scm.worktree_seed)
-    pollution = legacy_exclude_pollution(project, profiles, seed_rels)
+        # The third seed source. Plugin-declared literals plus glob expansions, the
+        # latter run through the same `glob` the writer used (worktree_flow.py), which
+        # wrote one line PER MATCH. Expanding against today's tree can only produce
+        # candidates: a match that did not exist when the run happened never appears
+        # in the file, so it costs nothing and matches nothing.
+        try:
+            registry = PluginRegistry.build(project, pol)
+            seed_rels.extend(registry.seed_files())
+            for pattern in registry.seed_globs():
+                seed_rels.extend(m.relative_to(project).as_posix() for m in project.glob(pattern))
+        except (PluginError, OSError, ValueError):
+            pass  # plugin faults have their own gate; this check does not own them
+    pollution = legacy_exclude_pollution(project, all_profiles, seed_rels)
     if pollution is not None:
+        # Lead with the lines the repo's own index proves are not its ignore rules,
+        # and keep the rest as "check these" — the remedy is a deletion, so the
+        # message must not assert ownership it cannot demonstrate.
+        parts = [
+            f"{pollution.path} carries git-add shield patterns written by an older "
+            f"bmad-loop — new files under those paths never appear in `git status` or "
+            f"`git add -A` in this checkout, however long ago the run that wrote them "
+            f"finished. bmad-loop no longer writes this file (#384)."
+        ]
+        if pollution.shield_only:
+            parts.append(
+                f"These name paths your repo TRACKS, so they can only be hiding new "
+                f"files — delete them by hand: {', '.join(pollution.shield_only)}."
+            )
+        if pollution.possibly_yours:
+            parts.append(
+                f"These match the shield's patterns but name nothing tracked, so they "
+                f"may be your own ignore rules — review before deleting: "
+                f"{', '.join(pollution.possibly_yours)}."
+            )
         report.warn(
             "git.exclude-legacy-pollution",
-            f"{pollution.path} carries git-add shield patterns written by an older "
-            f"bmad-loop: {', '.join(pollution.lines)} — new files under those paths never "
-            f"appear in `git status` or `git add -A` in this checkout, however long ago the "
-            f"run that wrote them finished. bmad-loop no longer writes this file (#384); "
-            f"review those lines and delete them by hand if your project tracks those paths.",
-            {"exclude": str(pollution.path), "lines": pollution.lines},
+            " ".join(parts),
+            {
+                "exclude": str(pollution.path),
+                "lines": pollution.lines,
+                "shield_only": pollution.shield_only,
+                "possibly_yours": pollution.possibly_yours,
+            },
         )
 
     report.extend(_platform_preflight())

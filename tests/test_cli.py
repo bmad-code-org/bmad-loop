@@ -4414,6 +4414,100 @@ def test_validate_silent_when_the_exclude_file_is_absent(project, capsys, monkey
     assert not [f for f in doc["findings"] if f["check"] == "git.exclude-legacy-pollution"]
 
 
+def test_validate_pollution_reports_a_profile_this_policy_never_selects(
+    project, capsys, monkeypatch
+):
+    """Codex's open P1 on #386. The policy names claude only, but the residue is a
+    gemini path — written when the project ran on a different CLI. Candidates come
+    from every REGISTERED profile, so switching CLIs cannot hide the pollution.
+
+    Ablation: build the candidate set from `profiles` instead of `all_profiles`
+    and this stops reporting."""
+    from bmad_loop.adapters.profile import get_profile
+
+    _make_validate_pass(project, monkeypatch, capsys)
+    gemini = get_profile("gemini")
+    _pollute_exclude(project, f"/{gemini.hooks.config_path}")
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+
+    warned = [f for f in doc["findings"] if f["check"] == "git.exclude-legacy-pollution"]
+    assert len(warned) == 1
+    assert warned[0]["detail"]["lines"] == [f"/{gemini.hooks.config_path}"]
+
+
+def test_validate_pollution_reports_a_seed_file_though_seeding_is_off_today(
+    project, capsys, monkeypatch
+):
+    """`seed_adapter_defaults` describes the policy NOW; the polluting run had its
+    own. `.mcp.json` is reachable only through a profile's `seed_files`, so with
+    the union re-gated on today's flag this residue would report nothing.
+
+    Ablation: gate the `seed_files` union on `pol.scm.seed_adapter_defaults` (or
+    drop it) and this fails."""
+    _make_validate_pass(
+        project,
+        monkeypatch,
+        capsys,
+        policy=CLAUDE_ONLY_POLICY + "[scm]\nseed_adapter_defaults = false\n",
+    )
+    _pollute_exclude(project, "/.mcp.json")
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+
+    warned = [f for f in doc["findings"] if f["check"] == "git.exclude-legacy-pollution"]
+    assert len(warned) == 1
+    assert warned[0]["detail"]["lines"] == ["/.mcp.json"]
+
+
+def test_validate_pollution_reports_a_plugin_seed_glob_expansion(project, capsys, monkeypatch):
+    """The third seed source. A pre-#385 run expanded each plugin `seed_globs`
+    pattern and wrote one exclude line PER MATCH, so a repo can carry lines no
+    profile and no policy entry can explain.
+
+    Ablation: drop the registry block from cmd_validate and this stops reporting."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    root = project.project
+    (root / ".bmad-loop" / "plugins" / "seedy").mkdir(parents=True, exist_ok=True)
+    (root / ".bmad-loop" / "plugins" / "seedy" / "plugin.toml").write_text(
+        '[plugin]\nname = "seedy"\napi_version = 1\nseed_globs = ["vendored/*"]\n',
+        encoding="utf-8",
+    )
+    (root / "vendored").mkdir(exist_ok=True)
+    (root / "vendored" / "tool.json").write_text("{}\n", encoding="utf-8")
+    # commit first: the fixture's own files would otherwise fail git.worktree-clean,
+    # and the exclude has to land after the commit anyway (see _pollute_exclude)
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "plugin seed fixture")
+    capsys.readouterr()
+    _pollute_exclude(project, "/vendored/tool.json")
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+
+    warned = [f for f in doc["findings"] if f["check"] == "git.exclude-legacy-pollution"]
+    assert len(warned) == 1
+    assert warned[0]["detail"]["lines"] == ["/vendored/tool.json"]
+
+
+def test_validate_pollution_detail_splits_tracked_from_possibly_yours(project, capsys, monkeypatch):
+    """The remedy is a deletion, so the finding must not assert ownership it cannot
+    demonstrate. `.claude/skills` is tracked by the fixture — the project provably
+    does not ignore it — while the seeded settings path is not.
+
+    Ablation: classify every hit as shield_only and this fails."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    _pollute_exclude(project, "/.claude/skills", "/_bmad/custom")
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+
+    detail = next(f for f in doc["findings"] if f["check"] == "git.exclude-legacy-pollution")[
+        "detail"
+    ]
+    assert detail["shield_only"] == ["/.claude/skills"], "tracked by the fixture"
+    assert detail["possibly_yours"] == ["/_bmad/custom"], "nothing tracked under it"
+    assert sorted(detail["shield_only"] + detail["possibly_yours"]) == detail["lines"]
+
+
 # --------------- `bmad-loop mux`: backend listing + persisted choice (issue #87) ----
 
 

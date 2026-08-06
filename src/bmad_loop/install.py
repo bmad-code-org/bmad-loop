@@ -35,7 +35,7 @@ from .checks import Finding
 from .platform_util import atomic_write_bytes, file_lock
 from .policy import POLICY_TEMPLATE
 from .process_host import get_process_host
-from .verify import GitError, git_bytes
+from .verify import GitError, git_bytes, path_tracked
 
 HOOK_SCRIPT_REL = ".bmad-loop/bmad_loop_hook.py"
 # Markers for bmad-loop-managed hook commands. RELAY_MARKER is shared by
@@ -2384,11 +2384,14 @@ class LegacyExcludePollution(NamedTuple):
     """Where the repository-wide exclude is, and which shield patterns it carries.
 
     Returned only when `lines` is non-empty, so a caller that has one of these has
-    something to report and a file to name in the report.
+    something to report and a file to name in the report. `lines` is every hit;
+    `shield_only` and `possibly_yours` partition it and always reunite to it.
     """
 
     path: Path
     lines: list[str]
+    shield_only: list[str]
+    possibly_yours: list[str]
 
 
 def legacy_exclude_pollution(
@@ -2414,12 +2417,23 @@ def legacy_exclude_pollution(
     one is a change only the operator can be sure is right. `validate` warns and
     names the lines; deleting them is theirs.
 
-    EXACT matches only, for the same reason. The candidate set is rebuilt the way
-    `provision_worktree` builds it, and a line counts only if it is byte-identical
-    to a pattern that set contains. No prefix, substring or path-containment
+    EXACT matches only, for the same reason. A line counts only if it is
+    byte-identical to a candidate. No prefix, substring or path-containment
     matching: `/.claude/skills-of-my-own` and a bare `.claude/skills` are the
     operator's lines, not ours, and a preflight that flagged them would be telling
     someone to delete their own gitignore rules.
+
+    The candidate set reconstructs the HISTORICAL shared-exclude writers, which is a
+    FIXED target — 0.8.x through v0.9.1 and pre-#384 `main`, every version that
+    resolved `--git-common-dir`. It is deliberately NOT kept in step with today's
+    `provision_worktree`: patterns that writer gained after #384 (the `seeded_bmad`
+    per-file rels, the ledger seed) only ever reached the private per-worktree
+    exclude, so a repo cannot carry them here.
+
+    Limits — it UNDER-reports and never over-reports. Unreconstructable: a `_bmad/`
+    child, an overlay profile or a `worktree_seed` entry REMOVED since the polluting
+    run, and a `seed_globs` match that no longer exists on disk. Each leaves a line
+    with no candidate, so it goes unreported rather than misreported.
 
     `--git-path info/exclude` names git's ONE shared exclude from either vantage:
     a main checkout answers relative (`.git/info/exclude`), a linked worktree
@@ -2432,17 +2446,37 @@ def legacy_exclude_pollution(
     undecodable exclude — because this is preflight observation, and a repo whose
     exclude cannot be read is not thereby a repo with a problem to report.
     """
-    # Mirror provision_worktree's pattern build (worktree_flow.py). Kept in step by
-    # construction rather than by a shared constant: the shield's set is derived
-    # per-run from what it actually wrote, and this one is a superset guess about
-    # runs that are long over.
     candidates = {f"/{p.skill_tree}" for p in profiles}
     candidates |= {f"/{p.hooks.config_path}" for p in profiles if not p.hookless}
     candidates |= {f"/{rel}" for rel in seed_rels}
-    # Unconditional, unlike the writer's `if customize_seeded`: whether some past
-    # run seeded _bmad/custom is not knowable from here, and the pattern is ours
-    # either way.
+    # Unconditional, unlike the writers' `if customize_seeded` / `is_dir()` gates:
+    # whether some past run seeded these is not knowable from here, and every one of
+    # them is a pattern only the shield writes.
+    #
+    # The `_bmad` family is v0.9.1's, not 0.9.0's. That release still resolved
+    # `--git-common-dir` (v0.9.1 install.py:1303), so it wrote this same shared file,
+    # and `main` does not descend from it — a 0.9.1 user upgrading is the population
+    # this detector exists for. Its own comment measured the damage: "a /_bmad line
+    # hides an untracked _bmad/ from `git status` in the MAIN checkout, for the life
+    # of the repo." The trailing slash on the render pattern is load-bearing; it is
+    # what that writer emitted, and the match is byte-identical.
     candidates.add(f"/{CUSTOMIZE_DIR.as_posix()}")
+    candidates.add(f"/{BMAD_DIR}")
+    candidates.add(f"/{RENDER_DIR_REL}/")
+    # `_seed_bmad_tree` returns [BMAD_DIR] when the checkout had no `_bmad/` — the
+    # root line above — but one rel PER SEEDED FILE when it already had one. Mirror
+    # that walk over the tree as it stands now. A child deleted since the polluting
+    # run is unreconstructable and simply goes unreported (see Limits).
+    bmad_root = project / BMAD_DIR
+    if bmad_root.is_dir():
+        try:
+            for top in sorted(bmad_root.iterdir()):
+                if top.name in BMAD_SEED_EXCLUDES or not top.is_dir():
+                    continue
+                for rel, _src in _walk_traversable_files(top, top.name):
+                    candidates.add(f"/{BMAD_DIR}/{rel}")
+        except OSError:
+            pass  # observation degrades; an unreadable tree is not a finding
     # A bare "/" is never a shield pattern, and it is the candidate that could do
     # harm: it is a real (if odd) line for an operator to have written, and this
     # function's output tells them to delete what it names.
@@ -2474,7 +2508,34 @@ def legacy_exclude_pollution(
     # leading space is a meaningful part of a gitignore pattern, so a line that
     # carries one is not a line this code wrote.
     hits = sorted(candidates.intersection(present))
-    return LegacyExcludePollution(exclude, hits) if hits else None
+    if not hits:
+        return None
+    # Widening the candidate set widened the chance of naming a line the operator
+    # wrote, and this function's output tells them to delete what it names. Split on
+    # the evidence rather than on a hand-curated list of "ours" paths, which would
+    # rot against every new profile and plugin:
+    #
+    #   TRACKED content under the path -> the project demonstrably does NOT ignore
+    #   it, so the line cannot be an ignore rule they rely on, and its only remaining
+    #   effect is hiding that path's new files. That is exactly #384's harm, and the
+    #   issue proposed this same probe as its own option 3.
+    #
+    #   nothing tracked -> indistinguishable from a rule they wrote. Still reported,
+    #   because a shield line over an untracked path is the ordinary case; just not
+    #   asserted as ours.
+    #
+    # A git that cannot answer degrades the hit into `possibly_yours` — the cautious
+    # side — rather than dropping it, since the line is present either way.
+    shield_only: list[str] = []
+    possibly_yours: list[str] = []
+    for line in hits:
+        rel = line.strip("/")
+        try:
+            tracked = bool(rel) and path_tracked(project, rel)
+        except GitError:
+            tracked = False
+        (shield_only if tracked else possibly_yours).append(line)
+    return LegacyExcludePollution(exclude, hits, shield_only, possibly_yours)
 
 
 def _copy_skills(project: Path, trees: Sequence[str], force: bool) -> bool:
