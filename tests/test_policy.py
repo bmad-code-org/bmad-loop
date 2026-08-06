@@ -658,10 +658,10 @@ def test_scm_worktree_seed_rejects_non_project_relative_entries(tmp_path, entry)
     matching nothing), so none of the surplus is even shielded from `git add -A`.
 
     `""` is only ONE spelling of the root, which is why the guard is
-    `names_tree_root` and not an emptiness check. Measured: `""` and `"."` produce a
-    byte-identical (src, raw, dst) triple in that loop, and a real run seeded with
-    `["."]` copied an untracked `secret.env` into the worktree and self-recursed 127
-    levels — with `provision_worktree` reporting no skipped entry at all.
+    `names_tree_root` and not an emptiness check: `""` and `"."` produce a
+    byte-identical (src, raw, dst) triple in that loop, so a seed of `["."]`
+    recurses the same way — with `provision_worktree` reporting no skipped entry
+    at all.
 
     Ablation: restore `not seed` in place of `names_tree_root(seed)` and the four
     dot spellings fail while `""` keeps passing — which is what makes them worth
@@ -688,9 +688,9 @@ def test_scm_worktree_seed_rejects_value_shapes_that_are_not_a_list_of_paths(
     """The per-entry guard runs over whatever `tuple(str(s) for s in raw)` produced,
     and that coercion accepts things a list of paths never is. A scalar string is
     the trap: TOML permits it, it iterates CHARACTER-WISE, and every character then
-    passes the per-entry rule — so `worktree_seed = "foo"` seeded three
-    one-character paths while reading as applied configuration. A scalar int did not
-    even reach a PolicyError; it raised TypeError out of `loads`, untyped, where
+    passes the per-entry rule — `worktree_seed = "foo"` would seed three
+    one-character paths while reading as applied configuration. A scalar int does
+    not even reach a PolicyError; it raises TypeError out of `loads`, untyped, where
     every other malformed value in this file escalates as PolicyError.
 
     Ablation: drop the shape check and all four cases pass (three silently, the int

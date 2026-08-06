@@ -125,9 +125,10 @@ def names_tree_root(value: str | Path) -> bool:
     one a `not value` emptiness check misses. It exists because these guards feed
     `provision_worktree`'s seed loop, where a root-naming entry resolves ``src``
     to the repo root and ``dst`` to the worktree, both of which pass the loop's
-    ``is_relative_to`` containment checks — a path is relative to itself. Measured:
-    ``""`` and ``"."`` produce a byte-identical ``(src, raw, dst)`` triple there,
-    so a guard rejecting only the first is a guard against one spelling.
+    ``is_relative_to`` containment checks — a path is relative to itself. ``""``
+    and ``"."`` produce a byte-identical ``(src, raw, dst)`` triple there
+    (``PurePosixPath("") == PurePosixPath(".")``), so a guard rejecting only the
+    first is a guard against one spelling.
 
     Both flavours are checked for the same reason :func:`is_absolute_path` checks
     both: ``".\\"`` is a root ref Windows normalizes away and POSIX parsing keeps

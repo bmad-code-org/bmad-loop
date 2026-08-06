@@ -945,8 +945,8 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
     if preserve_keep < 0:
         raise PolicyError(f"scm.preserve_keep must be >= 0: got {preserve_keep}")
     # Shape before entries, because `tuple(str(s) for s in raw)` silently accepts
-    # things that are not a list of paths. Measured: `worktree_seed = ""` yields an
-    # empty tuple (the config reads as applied and seeds nothing), `= "foo"` yields
+    # things that are not a list of paths: `worktree_seed = ""` yields an empty
+    # tuple (the config reads as applied and seeds nothing), `= "foo"` yields
     # ('f','o','o') — three bogus one-character entries that each pass the
     # per-entry guard below — and `= 5` raises a bare TypeError out of `loads`,
     # untyped, where every other malformed value here raises PolicyError.
@@ -1003,14 +1003,14 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
     # its `is_relative_to` containment checks — a path IS relative to itself — so it
     # copies the entire repo into the worktree, gitignored and untracked files
     # included. And because a worktree mounts UNDER the repo (.bmad-loop/runs/...),
-    # that copy walks into its own destination: measured at 744 levels of nesting
-    # before the path length failed, silently, since the seed copy suppresses errors.
+    # that copy walks into its own destination and recurses until the path length
+    # fails — silently, since the seed copy suppresses errors, and with
+    # provision_worktree reporting no skip at all.
     #
     # `names_tree_root` and not a `not seed` emptiness check, because "" is only one
-    # spelling of the root. Measured: "" and "." produce a byte-identical
-    # (src, raw, dst) triple in that loop, and a run seeded with ["."] copied an
-    # untracked secret.env in and self-recursed until the path length failed, with
-    # provision_worktree returning no skip at all.
+    # spelling of the root: "" and "." produce a byte-identical (src, raw, dst)
+    # triple in that loop, so a guard rejecting only the first spelling guards one
+    # spelling.
     #
     # The "/" it then renders is INERT, not a blanket exclusion — git strips a bare
     # slash to a zero-length pattern that matches nothing (worktree_flow.py says the

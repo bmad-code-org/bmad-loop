@@ -22,17 +22,14 @@ whose seams had diverged enough that several ports needed a different fix, and t
   `spec_file` outside the orchestrator's roots is refused (`spec-deferrals-skipped-out-of-tree`).
 
 - **`validate` warns when an old bmad-loop left shield patterns in `.git/info/exclude` (#384).**
-  The writer is fixed, but nothing removes the lines already there — and they hide every new file
-  under paths like `.claude/skills` from `git add -A` in that checkout. `git.exclude-legacy-pollution`
-  names the file and the exact lines. Candidates cover every version that wrote that shared file:
-  all registered profiles rather than the ones this policy resolves today (a project that switched
-  CLIs still carries the old one's lines), plugin seeds and glob expansions, and v0.9.1's `_bmad`
-  family — `main` does not descend from v0.9.1, so those repos upgrade into this check. Warn only,
-  never auto-removed, and every line is flagged to review before deleting: a project can have
-  written the same line for itself, and nothing in the file records who wrote it. Lines are matched
-  byte-for-byte, and those naming paths the repo **tracks** are reported separately — an exclude
-  cannot suppress content already tracked, so what those lines do now is hide that path's **new**
-  files. That grades the line's effect, not its authorship.
+  Those lines hide every new file under paths like `.claude/skills` from `git add -A` in that
+  checkout; the writer is fixed, nothing removes what it already wrote.
+  `git.exclude-legacy-pollution` names the file and the exact lines — warn-only, never
+  auto-removed. Candidates are a union of every discovered source, parsed item-by-item — packaged
+  and overlay profiles, plugin manifests (today's api gate and enablement not applied), policy
+  seeds and glob expansions, v0.9.1's `_bmad` family — so a valid same-name override, one
+  malformed file or a switched CLI cannot hide another source's lines. The exclude is read as
+  bytes and split the way git splits it. Details: docs/FEATURES.md.
 
 - **A park travels with its story's commit, so `bmad-loop confirm` works from any clone (#356).**
   Each parked story writes one JSON record to `.bmad-loop/operator/<key>.json` inside the story's
