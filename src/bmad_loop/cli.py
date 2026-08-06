@@ -380,9 +380,9 @@ def cmd_validate(args: argparse.Namespace) -> int:
         if pollution.pattern_not_literal:
             parts.append(
                 f"These carry gitignore pattern syntax — a wildcard, a character "
-                f"class, an escape, or a trailing space git drops — so the paths "
-                f"they cover are not the paths they spell, and what they are hiding "
-                f"is not graded: {', '.join(pollution.pattern_not_literal)}."
+                f"class or an escape — so the paths they cover are not the paths "
+                f"they spell, and what they are hiding is not graded: "
+                f"{', '.join(pollution.pattern_not_literal)}."
             )
         report.warn(
             "git.exclude-legacy-pollution",
