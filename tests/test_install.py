@@ -7314,3 +7314,74 @@ def test_legacy_exclude_pollution_partition_always_reunites_to_lines(project):
 
     assert found is not None
     assert sorted(found.hiding_new_files + found.no_tracked_content) == found.lines
+
+
+def _repo_with_exclude_bytes(project, raw: bytes) -> Path:
+    """`_repo_with_exclude`, but the exclude's exact BYTES are the fixture.
+
+    Separate from the text-mode helper on purpose: `write_text` would decode-
+    then-encode (and a text-mode writer can normalize line ends), pre-normalizing
+    away the very byte sequences these tests exist to pin — the same
+    harness-destroys-the-measurement family as conftest's `git()` stripping the
+    stdout whose edge whitespace was under test."""
+    root = project.project
+    exclude = root / ".git" / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    exclude.write_bytes(raw)
+    return root
+
+
+@pytest.mark.parametrize(
+    "sep",
+    [b"\x0b", b"\x0c", b"\x1c", b"\x1d", b"\x1e", b"\xc2\x85", b"\r"],
+    ids=["VT", "FF", "FS", "GS", "RS", "NEL", "CR"],
+)
+def test_legacy_exclude_pollution_never_names_a_fragment_of_a_longer_line(project, sep):
+    """git treats NONE of these bytes as a gitignore line boundary (measured:
+    `/hidden\\rjunk` does not ignore `hidden`), so a line carrying one is a
+    single operator-authored pattern — not our line followed by junk. The old
+    `str.splitlines()` read fragmented it and named a line that does not exist
+    in the file, telling the operator to delete a rule they wrote.
+
+    The NEL row is utf-8-encoded U+0085 (b"\\xc2\\x85") deliberately: a raw
+    b"\\x85" is invalid utf-8, so the OLD `read_text("utf-8")` code returned
+    None on it for the wrong reason and the row would pass vacuously. The CR
+    row is what kills a `bytes.splitlines()` "fix" — it still splits on a lone
+    \\r, which git does not."""
+    repo = _repo_with_exclude_bytes(project, b"/.claude/skills" + sep + b"mine\n")
+
+    assert legacy_exclude_pollution(repo, [get_profile("claude")], []) is None
+
+
+def test_legacy_exclude_pollution_reads_a_legacy_8bit_exclude(project):
+    """An exclude saved as latin-1 (or any 8-bit encoding) is still a file git
+    reads line by line — its ASCII lines match candidates byte-for-byte. The old
+    `read_text("utf-8")` raised on it and the except swallowed the raise into
+    "no pollution", dropping every matchable line in the file."""
+    raw = b"caf\xe9-notes\n/.claude/skills\n"
+    # non-vacuity: 0xe9 followed by ASCII really is invalid utf-8 — unlike a
+    # trap byte such as 0xff-in-isolation patterns that happen to decode (#378's
+    # latin-1 family), this fixture cannot silently pass through a decode path
+    with pytest.raises(UnicodeDecodeError):
+        raw.decode("utf-8")
+    repo = _repo_with_exclude_bytes(project, raw)
+
+    found = legacy_exclude_pollution(repo, [get_profile("claude")], [])
+
+    assert found is not None
+    assert found.lines == ["/.claude/skills"]
+
+
+def test_legacy_exclude_pollution_tokenizes_line_ends_the_way_git_does(project):
+    """git splits this file on \\n and trims exactly ONE trailing \\r (measured:
+    `/crlf\\r\\n` ignores `crlf`; `/two\\r\\r\\n` ignores a file literally named
+    `two\\r`). So a CRLF-saved exclude line really does hide the candidate
+    path's new files — a hit — while a double-\\r line is a DIFFERENT pattern
+    and must not match. The second half pins trim-ONE against an rstrip."""
+    repo = _repo_with_exclude_bytes(project, b"/.claude/skills\r\n")
+    found = legacy_exclude_pollution(repo, [get_profile("claude")], [])
+    assert found is not None
+    assert found.lines == ["/.claude/skills"]
+
+    _repo_with_exclude_bytes(project, b"/.claude/skills\r\r\n")
+    assert legacy_exclude_pollution(repo, [get_profile("claude")], []) is None

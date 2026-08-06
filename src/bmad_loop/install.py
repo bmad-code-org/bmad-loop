@@ -2198,10 +2198,19 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
             #
             # BYTES, never decoded text: an exclude holds path patterns, POSIX paths
             # are arbitrary bytes, and an operator's own file may be in any legacy
-            # 8-bit encoding. `bytes.splitlines()` is also the git-CORRECT split —
-            # `str.splitlines()` breaks on \x0b, \x0c, \x1c, \x1d, \x1e and \x85, none
-            # of which git treats as a line boundary, so a legitimate pattern carrying
-            # one fragments into wrong dedupe keys.
+            # 8-bit encoding. `str.splitlines()` breaks on \x0b, \x0c, \x1c, \x1d,
+            # \x1e and \x85, none of which git treats as a line boundary, so a
+            # legitimate pattern carrying one fragments into wrong dedupe keys.
+            # `bytes.splitlines()` is CLOSE to git's split but not identical: it
+            # still breaks on a lone \r, which git does not (measured, 2.55 — see
+            # legacy_exclude_pollution, which must tokenize exactly and therefore
+            # splits on \n alone). Acceptable HERE because a fragmented dedupe key
+            # can only make a wanted pattern read as absent-or-unsettled, and the
+            # consequence of that is an appended duplicate: last match still wins.
+            # (The mirror risk — a fragment matching a wanted pattern and SKIPPING
+            # the append — needs the fragment to sit after the last negation; the
+            # settled-set rule below keeps that window, so prefer \n-splitting if
+            # this is ever touched.)
             existing = exclude.read_bytes() if existed else _shield_inherited_excludes(worktree)
             lines = existing.splitlines()
             # PRESENT IS NOT THE SAME AS EFFECTIVE (#384). gitignore is LAST MATCH
@@ -2448,9 +2457,11 @@ def legacy_exclude_pollution(
     per-worktree exclude the current shield writes; that one is supposed to carry
     these patterns.
 
-    Silent on every fault — not a repo, git missing or too old, an unreadable or
-    undecodable exclude — because this is preflight observation, and a repo whose
-    exclude cannot be read is not thereby a repo with a problem to report.
+    Silent on every fault — not a repo, git missing or too old, an unreadable
+    exclude — because this is preflight observation, and a repo whose exclude
+    cannot be read is not thereby a repo with a problem to report. The file's
+    ENCODING is never a fault: it is read as bytes and matched byte-for-byte,
+    so a legacy 8-bit exclude keeps its ASCII lines matchable.
     """
     candidates = {f"/{p.skill_tree}" for p in profiles}
     candidates |= {f"/{p.hooks.config_path}" for p in profiles if not p.hookless}
@@ -2496,6 +2507,11 @@ def legacy_exclude_pollution(
     # someone to delete a line should not depend on validation happening upstream.
     candidates.discard("/")
     try:
+        # fsencode is the writer's own encoding for these same patterns
+        # (_worktree_local_exclude), so a hit is byte-identical to what a shield
+        # wrote. Inside the try for the surrogate edge fsencode can refuse —
+        # this function is contracted silent on every fault.
+        wanted = {os.fsencode(c): c for c in candidates}
         answered = git_bytes(project, "rev-parse", "--git-path", "info/exclude")
         if answered.returncode != 0:
             return None  # not a repo, or a git too old to answer
@@ -2504,16 +2520,36 @@ def legacy_exclude_pollution(
         exclude = Path(os.fsdecode(answered.stdout).strip())
         if not exclude.is_absolute():
             exclude = project / exclude
-        present = exclude.read_text(encoding="utf-8").splitlines()
+        raw = exclude.read_bytes()
     # GitError for the chokepoint's two raised faults (a timeout, and a spawn
     # failure as GitSpawnError) — this is a `validate` warning, and a git that
-    # cannot answer is not a finding. OSError and UnicodeError stay for the read.
+    # cannot answer is not a finding. OSError stays for the read.
     except (GitError, OSError, UnicodeError):
         return None
+    # BYTES, tokenized the way GIT tokenizes this file: split on b"\n", trim one
+    # trailing b"\r". Two defects lived in the decoded-text version of this read.
+    # `str.splitlines()` breaks on \x0b \x0c \x1c \x1d \x1e \x85 — none of which
+    # git treats as a line boundary — so an operator's line carrying one
+    # FRAGMENTED, its first piece matched a candidate byte-for-byte, and validate
+    # named a line that does not exist in the file: the one thing the Limits
+    # paragraph above promises never happens. And `read_text("utf-8")` raised on
+    # a legacy 8-bit exclude, which the except swallowed into "no pollution",
+    # dropping every matchable ASCII line in the file.
+    #
+    # NOT `bytes.splitlines()` either — it still splits on a lone \r, which git
+    # does not (measured, git 2.55: `/hidden\rjunk` leaves a file named `hidden`
+    # unignored). That is the writer's dedupe splitter, where an over-split risks
+    # only a redundant append; here it is a false deletion prompt. The single
+    # trailing \r IS trimmed because git trims exactly one (measured: `/crlf\r\n`
+    # ignores `crlf`, and `/two\r\r\n` ignores a file literally named `two\r`) —
+    # a CRLF-saved exclude line really does hide the candidate path's new files,
+    # and this check grades effect.
+    present = {line.removesuffix(b"\r") for line in raw.split(b"\n")}
     # Set intersection IS the exact-match rule — no normalization, no strip(): a
     # leading space is a meaningful part of a gitignore pattern, so a line that
-    # carries one is not a line this code wrote.
-    hits = sorted(candidates.intersection(present))
+    # carries one is not a line this code wrote. Only the line TERMINATOR git
+    # defines (\n, one optional preceding \r) is outside the pattern bytes.
+    hits = sorted(wanted[line] for line in present & wanted.keys())
     if not hits:
         return None
     # Widening the candidate set widened the chance of naming a line the operator
