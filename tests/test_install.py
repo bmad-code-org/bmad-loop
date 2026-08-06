@@ -7509,9 +7509,24 @@ def test_legacy_exclude_pollution_partition_always_reunites_to_lines(project):
     )
 
 
+#: Windows cannot CREATE these names at all — a trailing space is stripped from a
+#: directory name, and `*`/`?` are reserved characters (WinError 123). The behavior
+#: under test is git's and is identical on both platforms; what is unavailable there
+#: is the FIXTURE, and a repo carrying such a path cannot exist on Windows either.
+#: The rows that survive are the load-bearing ones: `a[bc]d` is the spelling that
+#: grades WRONG rather than merely wide, and `kept` is the row that keeps the
+#: trailing-space cure from being "downgrade anything with a space".
+_NEEDS_POSIX_NAMES = pytest.mark.skipif(
+    os.name == "nt", reason="Windows forbids these filenames (trailing space, * and ?)"
+)
+
+
 @pytest.mark.parametrize(
     "tracked, bucket",
-    [("kept ", "no_tracked_content"), ("kept", "hiding_new_files")],
+    [
+        pytest.param("kept ", "no_tracked_content", marks=_NEEDS_POSIX_NAMES),
+        ("kept", "hiding_new_files"),
+    ],
     ids=["names-the-spelled-path", "names-the-path-git-reads"],
 )
 def test_legacy_exclude_pollution_grades_a_trailing_space_line_on_git_s_reading(
@@ -7559,7 +7574,12 @@ def test_legacy_exclude_pollution_grades_a_trailing_space_line_on_git_s_reading(
 
 @pytest.mark.parametrize(
     "rel",
-    ["a[bc]d", "star*", "q?c", "esc\\ "],
+    [
+        "a[bc]d",
+        pytest.param("star*", marks=_NEEDS_POSIX_NAMES),
+        pytest.param("q?c", marks=_NEEDS_POSIX_NAMES),
+        pytest.param("esc\\ ", marks=_NEEDS_POSIX_NAMES),
+    ],
     ids=["character-class", "star", "question-mark", "backslash-escape"],
 )
 def test_legacy_exclude_pollution_declines_to_grade_a_non_literal_pattern(project, rel):
@@ -7578,7 +7598,8 @@ def test_legacy_exclude_pollution_declines_to_grade_a_non_literal_pattern(projec
 
     Ablation: drop the `PATTERN_SPECIALS` guard and every row lands in a graded
     bucket — the class and escape rows in `hiding_new_files`, asserting the
-    opposite of what git does."""
+    opposite of what git does. Narrowing the set to `[` is caught only by the three
+    rows Windows skips, so that half of the set is pinned on POSIX alone."""
     repo = project.project
     (repo / rel).mkdir()
     (repo / rel / "f.txt").write_text("x\n", encoding="utf-8")

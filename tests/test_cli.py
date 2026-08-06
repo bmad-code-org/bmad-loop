@@ -4802,16 +4802,19 @@ def test_validate_pollution_ignores_a_root_naming_exclude_line(project, capsys, 
     git(root, "add", "-A")
     git(root, "commit", "-q", "-m", "root-glob plugin fixture")
     capsys.readouterr()
-    # `/vendored/tool.json` is the non-vacuity pin: the same `**` expansion still
-    # reconstructs ordinary matches, so this is not "the manifest went unread".
+    # `/vendored` is the non-vacuity pin: the same `**` expansion still reconstructs
+    # ordinary matches, so this is not "the manifest went unread". A DIRECTORY, not
+    # the file inside it: `Path.glob("**")` yields directories only before Python
+    # 3.13, so pinning on `/vendored/tool.json` made this test pass on 3.13+ and
+    # fail on 3.11/3.12 for a reason that has nothing to do with what it asserts.
     (root / "vendored").mkdir(exist_ok=True)
     (root / "vendored" / "tool.json").write_text("{}\n", encoding="utf-8")
-    _pollute_exclude(project, "/.", "/vendored/tool.json")
+    _pollute_exclude(project, "/.", "/vendored")
 
     doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
 
     finding = next(f for f in doc["findings"] if f["check"] == "git.exclude-legacy-pollution")
-    assert finding["detail"]["lines"] == ["/vendored/tool.json"], "the root line is not ours"
+    assert finding["detail"]["lines"] == ["/vendored"], "the root line is not ours"
 
 
 def test_validate_pollution_asks_for_review_before_deleting_every_line(
