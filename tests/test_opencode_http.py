@@ -23,6 +23,7 @@ from pathlib import Path
 
 import pytest
 from conftest import write_script_launcher
+from opencode_support import _opencode_runs
 
 from bmad_loop.adapters import generic, opencode_http
 from bmad_loop.adapters.base import SessionHandle, SessionResult, SessionSpec
@@ -46,6 +47,68 @@ from bmad_loop.bmadconfig import ProjectPaths
 from bmad_loop.model import TokenUsage
 from bmad_loop.policy import LimitsPolicy, NotifyPolicy, Policy
 from bmad_loop.process_host import ProcessHostError, get_process_host
+
+
+def test_live_gate_requires_a_successful_version_probe(monkeypatch):
+    calls = []
+
+    def failed_probe(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess([], returncode=2)
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr("opencode_support.shutil.which", lambda _binary: "/usr/bin/opencode")
+    monkeypatch.setattr("opencode_support.subprocess.run", failed_probe)
+    assert not _opencode_runs()
+    assert calls == [
+        (
+            ["/usr/bin/opencode", "--version"],
+            {"capture_output": True, "timeout": 10, "check": False},
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [OSError("broken shim"), subprocess.TimeoutExpired("opencode", timeout=10)],
+)
+def test_live_gate_treats_probe_errors_as_unavailable(monkeypatch, error):
+    calls = []
+
+    def raise_error(command, **kwargs):
+        calls.append((command, kwargs))
+        raise error
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr("opencode_support.shutil.which", lambda _binary: "/usr/bin/opencode")
+    monkeypatch.setattr("opencode_support.subprocess.run", raise_error)
+    assert not _opencode_runs()
+    assert calls == [
+        (
+            ["/usr/bin/opencode", "--version"],
+            {"capture_output": True, "timeout": 10, "check": False},
+        )
+    ]
+
+
+def test_live_gate_accepts_a_runnable_binary(monkeypatch):
+    calls = []
+
+    def successful_probe(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess([], returncode=0)
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr("opencode_support.shutil.which", lambda _binary: "/usr/bin/opencode")
+    monkeypatch.setattr("opencode_support.subprocess.run", successful_probe)
+    assert _opencode_runs()
+    assert calls == [
+        (
+            ["/usr/bin/opencode", "--version"],
+            {"capture_output": True, "timeout": 10, "check": False},
+        )
+    ]
+
 
 # A pinned example timestamp from the pins file (§4): OpenCode `time.*` values
 # are epoch MILLISECONDS. The proof-of-work floor must live in the same unit —

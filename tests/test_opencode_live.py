@@ -20,13 +20,12 @@ from __future__ import annotations
 
 import json
 import re
-import shutil
 import socket
-import sys
 
 import pytest
+from opencode_support import _opencode_runs
 
-HAVE_OPENCODE = sys.platform != "win32" and shutil.which("opencode") is not None
+HAVE_OPENCODE = _opencode_runs()
 pytestmark = pytest.mark.skipif(
     not HAVE_OPENCODE, reason="live smoke needs a real `opencode` binary (POSIX)"
 )
