@@ -14,261 +14,185 @@ whose seams had diverged enough that several ports needed a different fix, and t
 
 ### Added
 
-- **The hook-event channel moves out of the project tree (#494).** A run's session-completion
-  signals now land under a user-scoped state root — `$XDG_STATE_HOME/bmad-loop` (else
-  `~/.local/state/bmad-loop`), `%LOCALAPPDATA%\bmad-loop\state` on Windows, or wherever
-  `BMAD_LOOP_STATE_DIR` points (absolute paths only — the orchestrator and the session it
-  launches read the root from different working directories) — keyed
-  `<root>/<project>/<run-id>/events/`, so a branch switch, a
-  worktree mount or a rollback can no longer take a live run's control plane away.
+- **Hook events move out of the project tree (#494).** A run's session-completion signals now land
+  under a user-scoped state root — `$XDG_STATE_HOME/bmad-loop`, `%LOCALAPPDATA%\bmad-loop\state`, or
+  an absolute `BMAD_LOOP_STATE_DIR` — so a branch switch, a worktree mount or a rollback can no
+  longer take a live run's control plane away. Relays predating the move keep working through an
+  in-tree fallback until you re-run `bmad-loop init`; `validate` flags a stale one as
+  `hooks.relay-stale`, and `delete`/`archive`/`clean` collect the new directory with the run
+  (`clean --json` gains `state_dirs_swept`).
 
-  - **Older relays keep working.** Sessions are told the directory via `BMAD_LOOP_EVENTS_DIR`; both
-    relays fall back to the in-tree `<run-dir>/events` and the orchestrator polls both locations.
-    `init` copies the relay into the project, so an upgraded orchestrator regularly drives sessions
-    whose relay predates the move — re-run `bmad-loop init` to refresh it.
-  - **`bmad-loop relay <Event>`** writes a session event without the copied-in script, on the same
-    contract (nothing on stdout, rc 0 always, silent no-op outside a driven session). `init` does
-    not point hooks at it yet — that retargeting is #461 Phase 2 — so it changes no run today. It
-    is backed
-    by a new `events.py`, whose write path an AST parity test holds byte-identical to the
-    stdlib-only relay's, and dispatches ahead of the shared error handler so a broken
-    `policy.toml` cannot fail a hook.
-  - **`validate` gains `hooks.relay-stale`** — the installed relay compared against the packaged
-    one, a warning that never moves the exit code (the fallback keeps a stale relay working).
-    `diagnose`'s `events` group now counts both locations; payload and schema unchanged.
-  - **`delete`/`archive`/`clean` collect the out-of-tree dir** with the run, and `clean` sweeps
-    orphans whose run dir is already gone (`--json`: `state_dirs_swept`, an additive field). An
-    archived tarball therefore no longer contains `events/` — consumed transient signals.
-  - `run`/`sweep` `--dry-run` previews the events directory a session would use.
+- **`bmad-loop relay <Event>` records a session event without the copied-in script (#494).** It
+  keeps the script's contract: nothing on stdout, rc 0 always, a silent no-op outside a driven
+  session. `init` does not point hooks at it yet, so no run behaves differently today.
 
-- **Coding-CLI adapter registry: a new adapter class ships out-of-tree (#226).** The transport axis
-  has long been extensible out-of-tree; the CLI axis had no equivalent, so a CLI needing its own
-  adapter _class_ forced a name-branch in the run bootstrap. A profile's new `adapter` field names a
-  kind resolved against `adapters/registry.py`, and a co-installed package registers its own kind
-  via the `bmad_loop.adapters` entry point and the profile that selects it via `bmad_loop.profiles`
-  — with no core edit. `bmad-loop adapters` lists the registered kinds and which profiles select
-  them; `validate` gains `adapter.kind` (checked against the live registry, never a hardcoded set)
-  plus `adapter.external` / `adapter.external-profile` warnings. A broken third-party package
-  degrades to a recorded, surfaced reason and can never break selection. `opencode-http` is migrated
-  to a registered builtin behind a dispatch-unchanged regression pin.
+- **A coding-CLI adapter class can ship out-of-tree (#226).** A profile's new `adapter` field names
+  a kind resolved against the adapter registry, so a co-installed package can register its own
+  driving class — and the profile that selects it — with no core edit, as the transport axis has
+  long allowed. `bmad-loop adapters` lists the registered kinds and the profiles selecting them,
+  `validate` gains `adapter.kind` and `adapter.external` reports, and a broken third-party package
+  degrades to a surfaced reason instead of breaking selection.
 
-- **docs/testing.md: the formal testing strategy.** Layer taxonomy and placement rules, fixture
-  and ablation doctrine, the quality-guard inventory, zero-token and flake policy, and a tracked
-  gap register (#545–#549); AGENTS.md, docs/README.md and CONTRIBUTING.md link here.
+- **A deferred-work entry can block stories from running: `gate:`.** A `gate: 3-2, 3-3` line names
+  the story keys that must wait for the entry, and both `validate` (`deferred.hard-gate`) and `run`
+  (a `story-gate` pause) enforce it — the prose `HARD GATE:` convention stopped nothing. Closing the
+  entry or dropping the token clears it, sweeps are exempt because a sweep is what closes the entry,
+  and a gate that can enforce nothing warns as `deferred.hard-gate-unstructured`.
 
-- **Add raw psmux premise probes (#488).** The zero-token Windows live gate now flags droppable
-  workarounds, and ablation repairs two vacuous backend assertions.
+- **Deferred review findings are harvested from spec frontmatter (#433).** A successful dev, review,
+  repair or review-timeout-salvage pass files each item from the spec's `deferred:` list into the
+  ledger as `### DW-<n>`, so findings triaged as `defer` reach the sweep instead of stopping at the
+  spec. Retries and replays never re-file, malformed items collapse into one `severity: low` entry,
+  and a spec outside the orchestrator's roots is refused.
 
-- **A deferred-work entry can block a story: `gate:`.** An entry that must land before specific
-  stories run could only say so in prose (`HARD GATE: must land before 3-2`), and prose stopped
-  nothing — `run` drove the story anyway. A `gate: 3-2, 3-3` line names the blocked story keys, and
-  it is enforced on both sides: `bmad-loop validate` fails (`deferred.hard-gate`) for every
-  actionable story a token matches, in both queue modes, and `run` pauses (`story-gate`) rather
-  than dispatch a gated story — so the refusal no longer depends on remembering to run the
-  preflight. The pause happens before the story is recorded, so closing the entry and resuming
-  runs it. Sweeps are exempt: they are what closes the gating entry. The only deferred check that
-  gates rather than advises; cleared by closing the entry or dropping the token. A gate that can
-  enforce nothing — an unusable token, an empty `gate:` line, a `gate:` not written lowercase at
-  the start of a line, or a prose-only `HARD GATE:` — warns instead
-  (`deferred.hard-gate-unstructured`). Silent on a ledger that gates nothing, as before.
+- **A park record travels with its story's commit (#356).** Each parked story writes
+  `.bmad-loop/operator/<key>.json` inside the story's own commit window, so `bmad-loop confirm`
+  works from any clone; the machine-local `operator-actions.json` index is retired — still read and
+  pruned, never written. `validate` reports a park with no record as `operator.park-record-missing`;
+  pull the park commit's branch if that is what you are missing.
 
-- **Deferred review findings are harvested from spec frontmatter (#433).** BMAD-METHOD#2640 moved
-  `defer`-triaged findings into the spec's unfiled `deferred:` list. A successful dev, review,
-  repair or review-timeout-salvage pass now files each as `### DW-<n>` (`spec-deferrals-harvested`),
-  keyed on a fingerprinted `origin:` so a retry or replay never re-files; the spec's list is
-  untouched. Malformed items become one `severity: low` entry (`spec-deferrals-malformed`); a
-  `spec_file` outside the orchestrator's roots is refused (`spec-deferrals-skipped-out-of-tree`).
+- **Stories can park at `awaiting-operator`, and `bmad-loop confirm` completes them (#335).** A dev
+  session whose story needs an action only a human can take outside the repo — publish a DNS record,
+  grant an API key — now commits everything an agent can do, records what is owed in the spec's
+  `operator_actions:` frontmatter, and parks so the run moves on, in place of a dishonest `done` or
+  a run-halting `blocked`. Once you have carried the external work out, `bmad-loop confirm
+<story-key>` walks the actions (`--yes` skips the prompts, `--reverify` re-runs `[verify]` first
+  and blocks on failure, `--list`/`--json` show what is parked), advances the spec and board to
+  `done` and commits the pair; `[operator] enabled = false` reverts. Run state carrying the new
+  phase is forward-only — an older bmad-loop rejects it.
 
-- **A park travels with its story's commit, so `bmad-loop confirm` works from any clone (#356).**
-  Each parked story writes one JSON record to `.bmad-loop/operator/<key>.json` inside the story's
-  own commit window, so it rides the park's commit — worktree merge-back included — into every
-  clone. The machine-local `.bmad-loop/operator-actions.json` index is retired: still read and
-  pruned, never written. `validate` reports a park with no record as `operator.park-record-missing`
-  — a failed write, a pre-upgrade park, or a checkout lacking the park commit's branch (pull it).
+- **Defer notifications name the branch where the work survives (#333).** A deferred story's
+  rollback parks the attempt on `attempt-preserve/*`, but the ref only ever reached `journal.jsonl`,
+  leaving you to hunt with `git log --all`; the notice now names the ref and the
+  `git merge --ff-only` that restores it. New `preserve_ref` on each task is projected into `status`
+  and `--json` (additive; schema stays 1).
 
-- **Stories can park at `awaiting-operator`, and `bmad-loop confirm` completes them (#335).** A
-  dev session whose story needs an action only a human can take outside the repo — publish a DNS
-  record, grant an API key — now commits everything an agent can do, records what is owed in the
-  spec's `operator_actions:` frontmatter, and parks. The run moves on and the board advances, in
-  place of the old dishonest pair: `done`, which hid the work behind a green board, or `blocked`,
-  which halted the run. A park clears the gates a `done` story clears and skips review;
-  `[operator] enabled = false` reverts. Once you have carried out the external actions a story owed,
-  `bmad-loop confirm <story-key>` walks them one at a time (`--yes` skips the prompts), writes the
-  spec's `## Operator Confirmation` audit section, advances the spec and board to `done`, and
-  commits the pair. Nothing is re-driven. `--reverify` re-runs the project's `[verify]` commands
-  first and blocks on failure; `--list`/`--json` show every parked story and what it owes. An
-  interrupted confirmation resumes (`operator.confirm-interrupted`). The state is named at every
-  layer: `Phase.AWAITING_OPERATOR` (terminal, reachable only from `COMMITTING`), a sprint-status
-  token ordered immediately before `done`, `operator_actions` on each task, and the matching
-  run-summary count, `status` output and TUI glyphs. A `state.json` carrying the new phase is
-  forward-only — an older binary rejects it. Because the token is now ordered rather than unknown, a
-  review session writing it onto a `done` board escalates as a sign-off regression (#334).
-
-- **Defer notifications name where the work survives (#333).** A deferred story's rollback parks the
-  attempt on an `attempt-preserve/*` branch (or a `refs/attempt-preserve-dirty/*` snapshot), but the
-  ref only ever reached `journal.jsonl`, leaving the operator to hunt with `git log --all`. The
-  notice now names the ref and the `git merge --ff-only` that restores it — commits-only when the
-  dirty snapshot could not be captured. New `preserve_ref` on each task, projected into `status` and
-  `--json` (additive; schema stays 1) from run state, so a ref `scm.preserve_keep` pruned is named.
-
-- **Stories can close deferred-work entries (#234).** A story can declare what it closes —
-  `closes_deferred: [DW-5, DW-6]` on its `stories.yaml` entry or in the spec's frontmatter, unioned
-  — and on commit each flips to `status: done <date>` plus `resolution: resolved by story <id>`. No
-  upstream skill emits the field yet (BMAD-METHOD#2619). Advisory, at the commit boundary: a failed
-  or escalated story closes nothing, and bad ids only warn, reported up front by `validate`
-  (`deferred.closes-unknown` / `-malformed` / `-entry-unreadable`, `deferred.ledger-unreadable`).
+- **Stories can close deferred-work entries (#234).** `closes_deferred: [DW-5, DW-6]` on a
+  `stories.yaml` entry or in a spec's frontmatter flips each named entry to `status: done` with a
+  `resolution:` naming the story, at the story's commit. Advisory: a failed or escalated story
+  closes nothing, bad ids only warn and `validate` reports them up front
+  (`deferred.closes-unknown`), and no upstream skill emits the field yet (BMAD-METHOD#2619).
 
 - **Readable run logs for `opencode-http` (#306).** Contributed by
   [@jackmcintyre](https://github.com/jackmcintyre). The HTTP adapter has no tmux pane to replay, so
-  a finished opencode run left `logs/<task-id>.log` holding nothing but the server's own INFO
-  stdout. Per-session logs now split three ways off the SSE stream the adapter already reads:
-  `<task-id>.log`, a curated role-prefixed transcript with `[bmad]` marker lines for tool calls,
-  edits, permission asks and errors; `<task-id>.server.out`; and `<task-id>.sse.jsonl`, a raw trace.
+  a finished run left `logs/<task-id>.log` holding nothing but the server's own INFO stdout; the SSE
+  stream now also yields a curated role-prefixed transcript, a `<task-id>.server.out` and a raw
+  `<task-id>.sse.jsonl` trace.
 
-- **`review.on_timeout` policy knob (#271).** A timeout-like review verdict (`timeout` / `stalled` /
-  `over_budget`) always burned a review cycle until `max_review_cycles` and then deferred — even
-  when the dev product was already finalized and verify-green. Beside the default `"retry"`:
-  `"salvage-if-done"` commits the verified dev product, refiles the outstanding follow-up
-  recommendation to deferred work and journals `review-timeout-salvage`; `"defer"` gives up on the
-  first timeout-like verdict. Env-fault (#194) and `crashed` verdicts keep their own routing.
+- **`review.on_timeout` policy knob (#271).** A timeout-like review verdict (`timeout`, `stalled`,
+  `over_budget`) burned every review cycle before deferring, even when the dev product was already
+  finalized and verify-green. Beside the default `"retry"`, `"salvage-if-done"` commits the verified
+  product and refiles the outstanding recommendation to deferred work, and `"defer"` gives up on the
+  first such verdict.
 
-- **Transport failures pause instead of burning attempts (#194).** A session whose CLI lost its API
-  connection stayed alive but idle, printing `API Error: Unable to connect …` until the session
-  clock ran out — indistinguishable from a timeout, so two outages exhausted `max_dev_attempts` and
-  deferred it untouched. Adapters classify it from per-profile `env_fault_patterns`; dev, review and
-  fix pause like an `rc 126/127` verify fault; re-arm restores the budget. A blocking plugin
-  workflow and the sweep's migration and triage loops escalate instead, before charging a retry.
+- **Transport failures pause the run instead of burning attempts (#194).** A session whose CLI lost
+  its API connection stayed alive but idle until the session clock ran out, so two outages could
+  exhaust `max_dev_attempts` and defer a story untouched. Adapters classify it from per-profile
+  `env_fault_patterns` and pause like an `rc 126/127` verify fault; re-arming restores the budget.
 
-- **Documented the `BMAD_LOOP_*` environment variables (#246).** The three runtime override vars —
-  `BMAD_LOOP_MUX_BACKEND`, `BMAD_LOOP_PROCESS_HOST`, `BMAD_LOOP_SESSION_TIMEOUT_S` — now have a
-  reference table in the README, and are read through one `bmad_loop.envvars` registry so the
-  supported knobs are discoverable in one place. Behavior is unchanged.
+- **Raw psmux premise probes (#488).** The zero-token Windows live gate now flags the workarounds a
+  current psmux no longer needs, so they can be dropped on evidence rather than kept on suspicion.
 
-- **`python -m bmad_loop` (#240).** The package is now runnable as a module, mirroring the installed
-  `bmad-loop` console script via a thin `__main__.py`. Characterization tests pin the current CLI
-  exit codes (typed errors and the broad backstop → 1, argparse usage → 2).
+- **`python -m bmad_loop` (#240).** The package is runnable as a module, mirroring the installed
+  `bmad-loop` console script.
 
 - **`{story_title}` in `scm.commit_message_template` (#475).** The placeholder renders the spec's
-  `title:` frontmatter, minus any leading `Story <id>:` label, so a template can carry a readable
-  subject. Specs authored without that field fall back to a first `#` heading, then to the story
-  key — as does a spec that is missing, unreadable or not valid UTF-8, so the placeholder never
-  renders empty and a commit-time read failure never fails the commit. The rendered title is
-  whitespace-collapsed, and characters `git commit -m` cannot take in an argv (control characters,
-  unpaired surrogates) are dropped. Templates that do not name the placeholder skip the read.
+  `title:` frontmatter minus any leading `Story <id>:` label, so a commit subject can carry a
+  readable title. It never renders empty and never fails a commit — a spec that is missing,
+  unreadable or lacks the field falls back to a first `#` heading and then to the story key, and
+  characters `git commit -m` cannot take in an argv are dropped.
 
 ### Changed
 
-- **Docs state the deferred-work contract of the 6.11 era (#567).** Since BMAD-METHOD
-  6.10.1-next.33 the unattended primitive `bmad-build-auto` records defer-triaged review findings
-  in its spec's frontmatter `deferred:` list and writes nothing to the ledger; the orchestrator
-  harvests them into canonical `DW-<n>` entries, deduped on `origin: spec-deferred <fp>` plus
-  `source_spec:`, so `deferred-work.md` stays the sweep's sole read surface. Pre-rename primitives
-  and the attended `bmad-build` still append flat `- source_spec:` blocks, which `sweep --migrate`
-  normalizes; multi-goal splits belong to that era only, since the current primitive warns
-  `multiple-goals` and proceeds. The sweep's format doc, FEATURES.md, the setup guide and the
-  module skills now name `bmad-build-auto` (and `_bmad/custom/bmad-build-auto.toml`), keeping the
-  legacy spelling where a pre-rename install still needs it. Review-layer prose matches 6.11 too:
-  every layer is a self-contained prompt invoking no skill, so such a tree requires no review
-  skill — both topologies stay supported. Prose only, no behavior change.
+- **Docs state the deferred-work contract of the 6.11 era (#567).** The sweep's format doc,
+  FEATURES.md, the setup guide and the module skills now name `bmad-build-auto` and describe the
+  spec-frontmatter harvest it uses, keeping the legacy spelling only where a pre-rename install
+  still needs it. Prose only, no behavior change.
+
+- **docs/testing.md states the testing strategy.** Layer taxonomy and placement rules, fixture and
+  ablation doctrine, the quality-guard inventory, and the zero-token and flake policy; AGENTS.md,
+  docs/README.md and CONTRIBUTING.md link to it.
+
+- **The `BMAD_LOOP_*` environment variables are documented and centrally registered (#246).** The
+  three runtime override vars — `BMAD_LOOP_MUX_BACKEND`, `BMAD_LOOP_PROCESS_HOST`,
+  `BMAD_LOOP_SESSION_TIMEOUT_S` — now have a reference table in the README and are read through one
+  registry, so the supported knobs are discoverable in one place. Behavior is unchanged.
+
+- **The supported tmux floor is 3.2.** It was never written down, so the only floor a reader could
+  infer was whatever the argv grammar happens to accept — older than anything the project tests. No
+  version gate gets added: an older tmux is not refused up front, it is simply unsupported.
 
 - **The mid-run config pin covers the adapter kind (#461).** `adapter` selects which argv builder
-  runs at all, so it joins the `config_digest` launch payload — a driven session rewriting it now
-  moves the pin the auto-triggered child sweep gates on, instead of swapping the whole launch shape
-  underneath it. The digest resolves the kind from the profile bytes it was handed, not a second
-  read.
+  runs at all, so it joins the `config_digest` launch payload — a driven session that rewrites it
+  now moves the pin the auto-triggered child sweep gates on, instead of swapping the whole launch
+  shape underneath it.
 
-- **`validate`'s httpx and model-format checks key on the adapter kind, not hooklessness (#226).** `httpx`
-  is the `opencode-http` family's optional extra and `provider/model` is its server's config-file
-  spelling; both are facts about one adapter class, not about whether a profile registers hooks.
-  With the transport and driving class now separate axes, a hookless profile driven by another kind
-  no longer FAILs with a remedy that installs the wrong package, nor draws a `policy.model-qualified`
-  warning naming a convention it does not use — and an `opencode-http` profile carrying a hook
-  dialect now gets the model warning it always needed.
+- **`validate`'s httpx and model-format checks key on the adapter kind, not hooklessness (#226).**
+  Both are facts about the `opencode-http` class rather than about whether a profile registers
+  hooks, so a hookless profile driven by another kind no longer FAILs with a remedy that installs
+  the wrong package, nor warns about a naming convention it does not use. An `opencode-http` profile
+  carrying a hook dialect now gets the model warning it always needed.
 
-- **A profile written before the `adapter` field keeps its old dispatch (#226).** `hooks.dialect = "none"`
-  used to be the class selector, so a project overlay copied from the packaged opencode profile
-  carries no `adapter` key; it now resolves to `opencode-http` rather than defaulting onto the tmux
-  generic adapter, where it would have waited out `session_timeout_min` for a hook a hookless profile
-  never registers. An explicit `adapter` is always honored, including hookless driven by another kind.
+- **A hookless profile can no longer wait out the clock on the `generic` adapter (#226).** `generic`
+  completes on a Stop hook that `hooks.dialect = "none"` never registers, so both routes into the
+  profile map refuse the pair outright rather than passing `validate` and then idling until
+  `session_timeout_min`. A pre-`adapter` overlay copied from the packaged opencode profile resolves
+  to `opencode-http` instead of that dead pairing; an explicit `adapter` is always honored, and
+  hookless on any other kind stays legal.
 
-- **A hookless profile can no longer select the `generic` adapter (#226).** `generic` completes on a Stop
-  hook and `dialect = "none"` means none is ever registered, so the pair described a session that
-  could only wait out `session_timeout_min` against a CLI that never exits — with `validate` green.
-  Both routes into the profile map now refuse it: a TOML file naming the pair outright, and an
-  entry-point provider that builds a hookless profile while leaving `adapter` at its default.
-  Hookless on any other kind stays legal — that decoupling is what the registry is for.
+- **Profiles from a `bmad_loop.profiles` entry point are validated like TOML ones (#226).** Both
+  routes share one invariant set — hook dialect, path containment, `env_fault_patterns` compilation,
+  canonical `name`/`binary`/`adapter` — so a package can no longer install a profile state the TOML
+  parser would refuse, such as an invalid env-fault regex that trades a load-time error for a silent
+  never-match at classification time.
 
-- **Profiles from a `bmad_loop.profiles` entry point are validated like TOML ones (#226).** Both routes into
-  the profile map now share one invariant set (hook dialect, path containment, `env_fault_patterns`
-  compilation, …), so a package can no longer install a profile state the parser would refuse — an
-  invalid env-fault regex used to trade a load-time error for a silent never-match at classification
-  time. A malformed `adapter` value funnels into `ProfileError` rather than being `str()`-coerced,
-  and `name`/`binary`/`adapter` must arrive already canonical — the TOML route strips them, so a
-  provider handing over `" acme "` would otherwise install a profile filed under a key no `--cli`
-  resolves, with the provider itself recorded as fine.
-
-- **State the supported tmux floor: 3.2.** It was never written down, so the only floor a reader
-  could infer was whatever the argv grammar happens to accept — which is older than anything the
-  project tests, and would have read as support for tmux releases nobody has verified. No version
-  gate enforces the floor; an older tmux is not refused up front, though it need not get far
-  either (env injection uses `new-window -e`, tmux 3.0). psmux's separate version gate is
-  unrelated and unchanged.
-
-- **An unreadable deferred-work ledger fails `validate` instead of warning
-  (`deferred.ledger-unreadable`).** The hard gate rides on the same bytes, so a warning exited 0
-  with the gate never evaluated — a fail-open on the one deferred check that refuses, and one that
-  cannot be narrowed by asking whether the project uses gates, because the file that would answer
-  is the unreadable one. `run` pauses on the same fault, so preflight and dispatch now agree.
+- **An unreadable deferred-work ledger fails `validate` rather than warning.** The `gate:` hard gate
+  rides on the same bytes, so `deferred.ledger-unreadable` as a warning exited 0 with the gate never
+  evaluated — a fail-open on the one deferred check that refuses. `run` pauses on the same fault, so
+  preflight and dispatch now agree.
 
 - **Every spec-frontmatter status read goes through `status_of` (#358 follow-up).** Five inline
-  status reads remained in the engine and the generic adapter, each reading a blank `status:` as the
-  token `none` — the defect #358 fixed at the shared reader. Three were neutral; the pair that was
-  not is the review-launch snapshot and the mid-session status-transition tick, which compare
-  against each other. One behavior change falls out: a session that ERASES a previously-set status
-  no longer records a transition — a blank is not an observed live status.
+  reads remained in the engine and the generic adapter, each taking a blank `status:` as the token
+  `none`. One behavior change falls out: a session that erases a previously-set status no longer
+  records a transition, because a blank is not an observed live status.
 
 - **The story token budget is checked while the story runs (#336).** `max_tokens_per_story` was read
-  once, after the story was marked done, so an overrun surfaced only after every token was spent —
-  and a story that deferred or escalated went unchecked. Cumulative weighted spend is now re-checked
-  at every session boundary; the first crossing raises an ATTENTION plus a desktop notice naming
-  spend and cap, latched per story and persisted so a resume does not re-warn. Still advisory —
-  nothing is terminated; `limits.max_tokens_per_session` remains the session-ending cap.
+  once, after the story was marked done, so an overrun surfaced only after every token was spent and
+  a story that deferred or escalated went unchecked. Cumulative weighted spend is now re-checked at
+  every session boundary, raising one ATTENTION plus a desktop notice, latched per story; still
+  advisory — `limits.max_tokens_per_session` remains the session-ending cap.
 
-- **A failed snapshot now blocks the rollback reset (#340).** An auto-rollback refused to reset past
-  commits it could not park, yet journaled a failed _uncommitted_-work snapshot and reset anyway —
-  destroying the tracked edits and run-created untracked files it existed to capture. Both preserve
-  steps now refuse alike, pausing with rescue instructions naming the tree. A capture failure over a
-  fully committed tree still resets; a resolved re-drive stays pause-free (#338). Inert under
-  shipped defaults; it bites `scm.rollback_on_failure = true` and in-worktree retries.
+- **A failed snapshot blocks the rollback reset (#340).** An auto-rollback refused to reset past
+  commits it could not park, yet journaled a failed _uncommitted_-work snapshot and reset anyway,
+  destroying the tracked edits and run-created files that snapshot existed to capture. Both preserve
+  steps now refuse alike, pausing with rescue instructions naming the tree; inert under shipped
+  defaults, this bites `scm.rollback_on_failure = true` and in-worktree retries.
 
-- **A review revoking the sprint sign-off now escalates (#334).** `sprint-status` is advanced to
-  `done` at dev time; a review session writing it back contradicts that, and nothing re-advances it
-  — the remaining cycles re-read the same failure and the story deferred, work rolled back. The
-  review-verify gate now pauses with the two ways out: finish and re-arm, or accept and advance the
-  board. Keys on `sprint-status` alone; `status: blocked` stays the hand-back channel. New
+- **A review that revokes the sprint sign-off escalates (#334).** `sprint-status` is advanced to
+  `done` at dev time, so a review session writing it back left the remaining cycles re-reading the
+  same failure until the story deferred and its work rolled back. The review-verify gate now pauses
+  with the two ways out — finish and re-arm, or accept and advance the board — under a new
   `[review] on_status_contradiction` (default `escalate`; `retry` restores the old behavior).
 
 - **`bmad-loop-setup` stops registering BMAD config; the installer owns it (#258).** The skill wrote
-  the pre-v6.10 `_bmad/config.yaml` layout, which BMAD's own resolver never reads. Since v6.10.0
-  bmad-loop is an installer-installed module, so the installer already stages `_bmad/bmad-loop/`,
-  writes the manifests, rebuilds the help catalog and regenerates the central `config.toml`
-  wholesale, discarding outside writes. The PEP 723 scripts are **removed**, closing the
-  bare-`python3` bug (#259); setup now writes one help CSV, installs the tool and preflights.
+  the pre-v6.10 `_bmad/config.yaml` layout that BMAD's own resolver never reads, and since v6.10.0
+  the installer stages the module and regenerates `config.toml` wholesale, discarding outside
+  writes. Its PEP 723 scripts go with it, closing the bare-`python3` bug (#259); setup now writes
+  one help CSV, installs the tool and preflights.
 
-- **Ctrl+C outside a run now exits `130` cleanly (#241).** A `KeyboardInterrupt` escaping `main()`
-  outside `engine.run()` (config load, engine construction) now prints a one-line `interrupted` to
-  stderr and returns the new `ExitCode.INTERRUPTED` (`130` = 128 + SIGINT). The shell exit code is
-  **unchanged** — uncaught, CPython re-raised SIGINT and died at `130` — but previously as a bare
-  traceback dumped after any partial `--json` stdout; it is now a clean exit, so a Python caller's
-  `subprocess.returncode` shows `130` rather than `-2`. A Ctrl+C _during_ a run is unchanged.
+- **Ctrl+C outside a run exits `130` cleanly (#241).** A `KeyboardInterrupt` escaping `main()`
+  during config load or engine construction now prints a one-line `interrupted` to stderr and
+  returns the new `ExitCode.INTERRUPTED`, in place of a bare traceback dumped after any partial
+  `--json` stdout. The shell exit code is unchanged, but a Python caller's `subprocess.returncode`
+  now reads `130` rather than `-2`; Ctrl+C _during_ a run is unaffected.
 
 ### Removed
 
-- **The `bmad-auto` → `bmad-loop` rename compatibility is gone.** The rename shipped in 0.8.0 and no
+- **The `bmad-auto` → `bmad-loop` rename shims are gone.** The rename shipped in 0.8.0 and no
   pre-rename installs remain in the wild, so `init` no longer strips `bmad_auto`-marked hooks,
   deletes `bmad-auto-*` skill dirs, carries `.automator/policy.toml` over to `.bmad-loop/`, or
-  prints the leftover-`.automator/` note; `bmad-loop-setup` drops its migration section with them.
-  A project still on `bmad-auto` should migrate on 0.9.1 — the last release carrying the shims —
+  prints the leftover-`.automator/` note, and `bmad-loop-setup` drops its migration section. A
+  project still on `bmad-auto` should migrate on 0.9.1 — the last release carrying the shims —
   before upgrading past it.
 
 ### Fixed
