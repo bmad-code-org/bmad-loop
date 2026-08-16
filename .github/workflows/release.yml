@@ -33,7 +33,7 @@ jobs:
           fetch-depth: 0 # need all tags to detect whether vX.Y.Z already exists
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v9.0.0
+        uses: astral-sh/setup-uv@v10.0.0
         with:
           # This is the one job that writes outside the run (it pushes a tag and
           # cuts a release), so it does not restore a cache another workflow could
