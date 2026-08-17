@@ -336,6 +336,46 @@ def is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
     return code == 0
 
 
+def commit_made_above_baseline(repo: Path, claimed: str, baseline: str) -> bool:
+    """True when ``claimed`` is a commit THIS UNIT itself made on top of
+    ``baseline`` — strictly newer than the orchestrator-recorded baseline AND
+    reachable from the worktree's current HEAD.
+
+    The generic skill's step-03 stamps `baseline_revision` with *current HEAD
+    before making any changes* — what the dev pass actually diffs from — while
+    :func:`_verify_shared_gates` compares that stamp against the baseline
+    recorded when the dev phase began. The two agree only while nothing is
+    committed in between. Anything that does commit in between — a session that
+    commits the spec it was asked to write or rewrite before implementing —
+    makes the stamp a DESCENDANT of the recorded baseline, a shape no branch of
+    the gate accepts (`allow_ancestor_baseline` points the other way). The gate
+    then refuses a finished attempt and its work is rolled back. Same class of
+    loss as #640, which is this very mismatch in the opposite direction: re-arm
+    advances the task baseline while the spec keeps the older one.
+
+    Narrow on purpose, and the HEAD-reachability half is what makes it narrow. A
+    unit worktree is cut at ``baseline`` and can only advance by commits made
+    inside it, so a commit both ABOVE the baseline and BELOW HEAD was
+    necessarily produced by this unit — its premises cannot be older than the
+    baseline, which is the only thing this gate protects. A descendant that
+    landed on another branch after launch is above the baseline too, but HEAD
+    does not reach it, so it stays refused. An OLDER (ancestor) or diverged
+    baseline — the stale-premise case the gate exists for — is untouched:
+    ``is_ancestor(baseline, claimed)`` is False for both, so this returns False
+    and the refusal stands.
+
+    Any git failure reads as False, exactly like :func:`is_ancestor`: this
+    relaxes a gate, so uncertainty must keep the gate strict.
+    """
+    if not is_ancestor(repo, baseline, claimed):
+        return False  # older, diverged or unknown -> not a commit of ours
+    try:
+        head = rev_parse_head(repo)
+    except (OSError, GitError):
+        return False
+    return is_ancestor(repo, claimed, head)
+
+
 def has_changes_since(
     repo: Path,
     baseline: str,
@@ -2110,10 +2150,20 @@ def _verify_shared_gates(
             # the session diffed from an earlier commit on the unit's own
             # history (a superset of the unit's changes), which is sound; a
             # diverged or unknown baseline still fails.
-            if not (
-                allow_ancestor_baseline
-                and is_ancestor(paths.project, claimed_baseline, task.baseline_commit)
-            ):
+            older_ok = allow_ancestor_baseline and is_ancestor(
+                paths.project, claimed_baseline, task.baseline_commit
+            )
+            # The other direction, and it needs no opt-in flag: a session that
+            # commits inside the unit before step-03 stamps `baseline_revision`
+            # makes that stamp a commit this unit made ABOVE the recorded
+            # baseline. Accepting it is not a hole — see
+            # :func:`commit_made_above_baseline` for why "above the baseline AND
+            # below this worktree's HEAD" can only be our own work, and why a
+            # genuinely stale (older/diverged/unknown) baseline still fails.
+            newer_ok = commit_made_above_baseline(
+                paths.project, claimed_baseline, task.baseline_commit
+            )
+            if not (older_ok or newer_ok):
                 return VerifyOutcome.retry(
                     f"spec baseline {claimed_baseline[:12]} does not match "
                     f"orchestrator-recorded baseline {task.baseline_commit[:12]}"

@@ -759,6 +759,70 @@ def test_verify_dev_short_hash_baseline(project):
     assert out.ok
 
 
+def test_verify_dev_accepts_a_baseline_this_unit_committed(project):
+    """A session that commits inside the unit before step-03 stamps
+    `baseline_revision` makes that stamp a DESCENDANT of the baseline the
+    orchestrator recorded — the shape no branch of the gate could accept, so a
+    finished attempt was refused at the door. Above the baseline AND below this
+    worktree's HEAD can only be this unit's own work."""
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "spec for 1-1-a")
+    spec_commit = verify.rev_parse_head(project.project)
+
+    # step-03 stamps "current HEAD before making any changes" — the spec commit
+    write_spec(sp, "in-review", spec_commit)
+    (project.project / "src.txt").write_text("changed\n")
+
+    assert verify.is_ancestor(project.project, task.baseline_commit, spec_commit)
+    out = verify.verify_dev(task, project, dev_result(sp))
+    assert out.ok
+
+
+def test_verify_dev_still_refuses_a_stale_ancestor_baseline(project):
+    """The stale-premise case the gate exists for is untouched: an OLDER
+    baseline outside a deferred-work bundle still fails."""
+    ancestor = verify.rev_parse_head(project.project)
+    (project.project / "prior.txt").write_text("work that landed first\n")
+    git(project.project, "add", "prior.txt")
+    git(project.project, "commit", "-q", "-m", "prior work")
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)  # baseline = the newer HEAD
+
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", ancestor)
+    (project.project / "src.txt").write_text("changed\n")
+
+    out = verify.verify_dev(task, project, dev_result(sp))
+    assert not out.ok and "does not match" in out.reason
+
+
+def test_verify_dev_refuses_a_descendant_off_this_worktree(project):
+    """The half that keeps the widening narrow: a commit above the baseline that
+    this worktree's HEAD does not reach is not this unit's work."""
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+
+    git(project.project, "checkout", "-q", "-b", "elsewhere")
+    (project.project / "foreign.txt").write_text("another branch\n")
+    git(project.project, "add", "foreign.txt")
+    git(project.project, "commit", "-q", "-m", "foreign work")
+    foreign = verify.rev_parse_head(project.project)
+    git(project.project, "checkout", "-q", "-")
+
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", foreign)
+    (project.project / "src.txt").write_text("changed\n")
+
+    assert verify.is_ancestor(project.project, task.baseline_commit, foreign)
+    out = verify.verify_dev(task, project, dev_result(sp))
+    assert not out.ok and "does not match" in out.reason
+
+
 def test_verify_dev_no_changes(project):
     # Spec claims NO_VCS baseline (skips the mismatch check); everything is
     # committed, so there are no changes since the orchestrator's baseline.
