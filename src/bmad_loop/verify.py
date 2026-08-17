@@ -8,6 +8,7 @@ policy's test/lint gates with the orchestrator's own subprocess calls.
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -336,6 +337,15 @@ def is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
     return code == 0
 
 
+# A `baseline_revision` that is a Git revision EXPRESSION rather than an object id
+# (`HEAD`, a branch or tag name, `main~2`) resolves at verification time, not at the
+# moment the session stamped it — so every ancestry question about it answers yes and
+# `commit_made_above_baseline` would relax the gate unconditionally. The stamp is
+# `git rev-parse HEAD` output by contract, so requiring hex here costs a well-behaved
+# session nothing. Length floor mirrors `same_commit`'s 7; ceiling admits sha256.
+_OBJECT_ID = re.compile(r"\A[0-9a-fA-F]{7,64}\Z")
+
+
 def commit_made_above_baseline(repo: Path, claimed: str, baseline: str) -> bool:
     """True when ``claimed`` is a commit THIS UNIT itself made on top of
     ``baseline`` — strictly newer than the orchestrator-recorded baseline AND
@@ -372,6 +382,9 @@ def commit_made_above_baseline(repo: Path, claimed: str, baseline: str) -> bool:
     must show work ABOVE the commit it claims. An outside commit therefore buys
     a session nothing.
 
+    ``claimed`` must be an object id, never a revision expression: see
+    :data:`_OBJECT_ID`.
+
     Equality is not screened out here: ``is_ancestor`` answers True for a commit
     against itself, so a claim that resolves to ``baseline`` under a different
     spelling returns True — which is the right answer (it IS the baseline), and
@@ -381,6 +394,8 @@ def commit_made_above_baseline(repo: Path, claimed: str, baseline: str) -> bool:
     Any git failure reads as False, exactly like :func:`is_ancestor`: this
     relaxes a gate, so uncertainty must keep the gate strict.
     """
+    if not _OBJECT_ID.match(claimed):
+        return False  # a revision expression, not a commit the session pinned
     if not is_ancestor(repo, baseline, claimed):
         return False  # older, diverged or unknown -> not a commit of ours
     try:

@@ -846,6 +846,25 @@ def test_verify_dev_descendant_baseline_needs_work_above_it(project):
     assert not out.ok, "a session that implemented nothing passed the gate"
 
 
+def test_verify_dev_refuses_a_symbolic_baseline_revision(project):
+    """A spec naming a Git revision expression instead of an immutable object id
+    (`baseline_revision: HEAD`) resolves at verification time, so every ancestry
+    question about it answers yes. It must not buy the relaxation."""
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "spec for 1-1-a")
+
+    write_spec(sp, "in-review", "HEAD")
+    (project.project / "src.txt").write_text("changed\n")
+
+    out = verify.verify_dev(task, project, dev_result(sp))
+    assert not out.ok and "does not match" in out.reason
+
+
 def test_verify_dev_no_changes(project):
     # Spec claims NO_VCS baseline (skips the mismatch check); everything is
     # committed, so there are no changes since the orchestrator's baseline.
