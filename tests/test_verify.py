@@ -1069,6 +1069,33 @@ def test_verify_commands_preserve_separate_stdout_and_stderr(tmp_path):
     assert result.output_tail == "stdout proof\nstderr proof\n"
 
 
+@pytest.mark.parametrize(
+    ("stdout", "stderr", "expected_stdout", "expected_stderr"),
+    [
+        (None, None, "", ""),
+        ("stdout proof", "stderr proof", "stdout proof", "stderr proof"),
+        (b"stdout \xff", b"stderr \xff", "stdout \ufffd", "stderr \ufffd"),
+    ],
+)
+def test_verify_commands_timeout_normalizes_separate_streams(
+    tmp_path, monkeypatch, stdout, stderr, expected_stdout, expected_stderr
+):
+    """Timeout output keeps the same separate-stream contract as a completed child."""
+    policy = Policy(verify=VerifyPolicy(commands=("verify command",)))
+
+    def timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired("verify command", 1, output=stdout, stderr=stderr)
+
+    monkeypatch.setattr(verify.subprocess, "run", timeout)
+
+    (result,) = verify.run_verify_commands(policy, tmp_path)
+
+    assert result.returncode == -1
+    assert result.output_tail == "timed out"
+    assert result.stdout == expected_stdout
+    assert result.stderr == expected_stderr
+
+
 def test_verify_commands_timeout_stays_charged(tmp_path, monkeypatch):
     """A timeout is plausibly the story's own tests hanging — it keeps the
     fixable-retry classification, not the env-fault escalate."""
