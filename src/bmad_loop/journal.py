@@ -43,6 +43,22 @@ class Journal:
         with self.path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(entry, default=str) + "\n")
 
+    def write_log_payload(self, name: str, content: str) -> str:
+        """Atomically retain a verifier stream under ``logs/`` and return its
+        run-relative pointer.  The journal records the pointer and byte count,
+        never unbounded subprocess output inline.
+
+        ``name`` is engine-generated (not plugin or command supplied), so it is
+        safe to join below.  Callers retain the original stream separately in a
+        hook context; this method is journal storage only.
+        """
+        target = self.run_dir / LOGS_DIR / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_suffix(target.suffix + ".tmp")
+        tmp.write_text(content, encoding="utf-8")
+        atomic_replace(tmp, target)
+        return target.relative_to(self.run_dir).as_posix()
+
     def entries(self) -> list[dict[str, Any]]:
         if not self.path.is_file():
             return []

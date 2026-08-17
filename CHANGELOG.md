@@ -9,6 +9,13 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- **Plugins can now observe structured dev verification results (#641).** The existing
+  `post_dev_verify` hook receives immutable per-command results after normal and repair
+  verification, with separate `stdout`/`stderr` alongside the compatible bounded
+  `output_tail`. Core writes `verify-command-result` journal records with stream pointers
+  under the run's `logs/` directory; plugins remain unable to alter verification or commit
+  decisions. Storage, upload, signing, and any policy response stay plugin-owned.
+
 - **A refused auto-sweep is now visible outside the journal (#501).** A run whose deferred-work
   sweep was refused ended looking exactly like one that swept, and under `[sweep] auto = "run-end"`
   there is one trigger per run that is never re-asked once the run finishes — so the journal was

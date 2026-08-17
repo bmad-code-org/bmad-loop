@@ -98,6 +98,17 @@ def test_observe_sees_readonly_context():
     assert seen == {"story": "1-1-a", "stage": "pre_story"}
 
 
+def test_command_results_are_readonly_observation_data():
+    from bmad_loop.verify import CommandResult
+
+    result = CommandResult("pytest -q", 0, "tail", "out", "err")
+    c = ctx("post_dev_verify", command_results=[result])
+
+    assert c.command_results == (result,)
+    with pytest.raises(AttributeError):
+        c.command_results = ()
+
+
 def test_mutations_pipeline_last_writer_wins():
     # lower priority runs first; the later plugin sees the earlier edit and wins
     class First(Plugin):

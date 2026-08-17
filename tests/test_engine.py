@@ -128,6 +128,91 @@ def resume_engine(project, engine, script, policy=None) -> tuple[Engine, MockAda
     return new_engine, adapter
 
 
+class _PostDevVerifyCaptureBus:
+    """Small hook-bus double for testing the engine-to-plugin public seam."""
+
+    def __init__(self):
+        self.contexts = []
+
+    def active(self, stage):
+        return stage == "post_dev_verify"
+
+    def emit(self, stage, ctx):
+        self.contexts.append(ctx)
+        return ctx
+
+
+def test_post_dev_verify_exposes_journaled_command_results(project, monkeypatch):
+    """A normal dev verification retains the exact result for the existing hook
+    and journals stream pointers instead of unbounded JSON payloads."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", followup_review=False)],
+        policy=Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            review=ReviewPolicy(enabled=False),
+        ),
+    )
+    capture = _PostDevVerifyCaptureBus()
+    engine._bus = capture
+    result = verify.CommandResult("pytest -q", 0, "out\nerr\n", "out\n", "err\n")
+    monkeypatch.setattr(verify, "run_verify_commands", lambda policy, cwd: [result])
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    (ctx,) = capture.contexts
+    assert ctx.command_results == (result,)
+    (entry,) = [e for e in engine.journal.entries() if e["kind"] == "verify-command-result"]
+    assert entry["verification_stage"] == "dev"
+    assert entry["verification_sequence"] == 1
+    assert entry["command_index"] == 0 and entry["returncode"] == 0
+    assert (engine.run_dir / entry["stdout_path"]).read_text(encoding="utf-8") == "out\n"
+    assert (engine.run_dir / entry["stderr_path"]).read_text(encoding="utf-8") == "err\n"
+
+
+def test_fix_verification_emits_post_dev_verify_with_command_results(project, monkeypatch):
+    """The repair leg emits the same existing hook after it re-runs verification."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=False),
+        limits=LimitsPolicy(max_dev_attempts=2),
+    )
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", followup_review=False), dev_effect(project, "1-1-a")],
+        policy=policy,
+    )
+    capture = _PostDevVerifyCaptureBus()
+    engine._bus = capture
+    calls = iter(
+        [
+            [verify.CommandResult("check", 0, "first", "first-out", "")],
+            [verify.CommandResult("check", 1, "review fail", "", "review fail")],
+            [verify.CommandResult("check", 0, "fixed", "fixed-out", "")],
+            [verify.CommandResult("check", 0, "final", "final-out", "")],
+        ]
+    )
+    monkeypatch.setattr(verify, "run_verify_commands", lambda policy, cwd: next(calls))
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    assert [ctx.command_results[0].stdout for ctx in capture.contexts] == ["first-out", "fixed-out"]
+    entries = [e for e in engine.journal.entries() if e["kind"] == "verify-command-result"]
+    assert [
+        (e["verification_stage"], e["verification_sequence"], e["command_index"])
+        for e in entries
+    ] == [
+        ("dev", 1, 0),
+        ("fix", 2, 0),
+    ]
+
+
 def _notify_engine(project):
     return make_engine(
         project,

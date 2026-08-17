@@ -1808,16 +1808,20 @@ class Engine:
                 else:
                     task.followup_review_recommended = self._followup_from_spec(task, rj)
                 outcome = harvest_outcome or self._verify_dev_artifacts(task, result.result_json)
+                command_results = ()
                 if outcome.ok and self._run_verify_commands_after_dev(task, result.result_json):
                     # deterministic gates run here too: a broken build must not
                     # reach the (far more expensive) review loop
-                    outcome = verify.verify_commands_outcome(self.policy, self.workspace.root)
+                    outcome, command_results = self._verify_commands_with_results(task, "dev")
+            else:
+                command_results = ()
             self._emit(
                 "post_dev_verify",
                 task,
                 session_status=result.status,
                 result_json=result.result_json,
                 verify_reason=(outcome.reason if outcome is not None else None),
+                command_results=command_results,
             )
             decision = decide_dev(task, result, outcome, self.policy)
             self.journal.append(
@@ -3772,6 +3776,62 @@ class Engine:
         build/test gate would spuriously fail before the plan review."""
         return True
 
+    def _verify_commands_with_results(
+        self, task: StoryTask, verification_stage: str
+    ) -> tuple[VerifyOutcome, tuple[verify.CommandResult, ...]]:
+        """Execute, retain, and classify verifier results as one engine action.
+
+        Core alone executes and classifies commands.  The returned immutable
+        records are only journalled and exposed to ``post_dev_verify`` plugins.
+        """
+        results = tuple(verify.run_verify_commands(self.policy, self.workspace.root))
+        self._journal_verify_command_results(task, verification_stage, results)
+        return verify.verify_command_results_outcome(list(results), self.workspace.root), results
+
+    def _journal_verify_command_results(
+        self,
+        task: StoryTask,
+        verification_stage: str,
+        results: tuple[verify.CommandResult, ...],
+    ) -> None:
+        """Record each verifier subprocess result plus bounded log pointers.
+
+        ``attempt`` and ``verification_stage`` make the public journal records
+        correlate to a concrete dev or repair verification pass.  The filenames
+        contain only engine-derived ordinal values; command text never becomes a
+        filesystem path.
+        """
+        prior_sequences = [
+            int(entry["verification_sequence"])
+            for entry in self.journal.entries()
+            if entry.get("kind") == "verify-command-result"
+            and entry.get("story_key") == task.story_key
+            and isinstance(entry.get("verification_sequence"), int)
+        ]
+        verification_sequence = max(prior_sequences, default=0) + 1
+        for command_index, result in enumerate(results):
+            stem = (
+                f"verify-{safe_segment(task.story_key)}-"
+                f"{verification_stage}-{task.attempt}-{verification_sequence}-{command_index}"
+            )
+            stdout_path = self.journal.write_log_payload(f"{stem}.stdout.log", result.stdout)
+            stderr_path = self.journal.write_log_payload(f"{stem}.stderr.log", result.stderr)
+            self.journal.append(
+                "verify-command-result",
+                story_key=task.story_key,
+                attempt=task.attempt,
+                verification_stage=verification_stage,
+                verification_sequence=verification_sequence,
+                command_index=command_index,
+                command=result.command,
+                returncode=result.returncode,
+                output_tail=result.output_tail,
+                stdout_path=stdout_path,
+                stdout_bytes=len(result.stdout.encode("utf-8")),
+                stderr_path=stderr_path,
+                stderr_bytes=len(result.stderr.encode("utf-8")),
+            )
+
     def _resume_after_dev_verify(self, task: StoryTask) -> None:
         """Resume a task the run paused at DEV_VERIFY (dev verified, spec on disk).
         Base: the spec-approval-gate resume — run the review loop + commit.
@@ -4906,6 +4966,7 @@ class Engine:
                 details = "; ".join(str(e.get("detail", e.get("type", "?"))) for e in crits)
                 self._escalate(task, f"CRITICAL escalation from fix session: {details}")
             outcome = None
+            command_results = ()
             terminal = None
             if result.status == "completed":
                 # A repair is another generic dev-primitive pass: it can leave
@@ -4939,14 +5000,23 @@ class Engine:
                     )
                 else:
                     terminal = None
-                outcome = harvest_outcome or verify.verify_commands_outcome(
-                    self.policy, self.workspace.root
-                )
+                if harvest_outcome is not None:
+                    outcome = harvest_outcome
+                else:
+                    outcome, command_results = self._verify_commands_with_results(task, "fix")
                 if not outcome.ok:
                     reason = outcome.reason
             ok = outcome is not None and outcome.ok
             session_failure = (
                 "" if result.status == "completed" else session_failure_reason("fix", result)
+            )
+            self._emit(
+                "post_dev_verify",
+                task,
+                session_status=result.status,
+                result_json=result.result_json,
+                verify_reason=(outcome.reason if outcome is not None else None),
+                command_results=command_results,
             )
             self.journal.append(
                 "fix-decision",

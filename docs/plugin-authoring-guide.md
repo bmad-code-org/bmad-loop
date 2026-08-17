@@ -390,7 +390,18 @@ there.
 | ---------------------------------- | --------------------------- | ------------------------------------------------------------------------------------ |
 | `pre_dev_phase` / `post_dev_phase` | around the dev attempt loop | veto (`pre_`); `post_dev_phase` is a [workflow injection point](#workflows-provides) |
 | `pre_dev_session`                  | before each dev session     | `proposed_prompt`, `proposed_env`, veto                                              |
-| `post_dev_verify`                  | after dev verification      | —                                                                                    |
+| `post_dev_verify`                  | after dev or repair verification | —                                                  |
+
+`post_dev_verify` exposes `ctx.command_results`: an immutable tuple of the
+per-command `CommandResult` records core just executed. Each has `command`,
+`returncode`, the existing merged bounded `output_tail`, and separate `stdout`
+and `stderr` strings. This is observation data only: a plugin cannot change the
+verifier's outcome or the commit decision. The run's `journal.jsonl` also records
+one `verify-command-result` entry per command with run/story/attempt/stage and
+verification-sequence correlation, `output_tail`, byte counts, and run-relative `stdout_path` /
+`stderr_path` pointers under `logs/`; full streams are not embedded in the
+journal. Treat verifier output as potentially sensitive and store, upload, sign,
+or act on it only from an explicitly configured plugin.
 
 ### Review
 

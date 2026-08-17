@@ -1051,6 +1051,24 @@ def test_verify_commands_rc1_stays_fixable_retry(tmp_path):
     assert not out.ok and out.fixable and out.retryable and not out.env_fault
 
 
+def test_verify_commands_preserve_separate_stdout_and_stderr(tmp_path):
+    """The merged bounded tail remains compatible while the raw streams stay
+    distinguishable for engine-owned journal pointers and plugin observation."""
+    script = tmp_path / "streams.py"
+    script.write_text(
+        "import sys\nprint('stdout proof')\nprint('stderr proof', file=sys.stderr)\n",
+        encoding="utf-8",
+    )
+    policy = Policy(verify=VerifyPolicy(commands=(f'"{sys.executable}" "{script}"',)))
+
+    (result,) = verify.run_verify_commands(policy, tmp_path)
+
+    assert result.returncode == 0
+    assert result.stdout == "stdout proof\n"
+    assert result.stderr == "stderr proof\n"
+    assert result.output_tail == "stdout proof\nstderr proof\n"
+
+
 def test_verify_commands_timeout_stays_charged(tmp_path, monkeypatch):
     """A timeout is plausibly the story's own tests hanging — it keeps the
     fixable-retry classification, not the env-fault escalate."""

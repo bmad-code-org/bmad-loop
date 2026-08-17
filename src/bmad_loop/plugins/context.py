@@ -79,6 +79,7 @@ class HookContext:
         result_json: dict[str, Any] | None = None,
         session_status: str | None = None,
         verify_reason: str | None = None,
+        command_results: tuple[Any, ...] = (),
         decision_action: str | None = None,
         settings: dict[str, Any] | None = None,
         shared: dict[str, Any] | None = None,
@@ -107,6 +108,10 @@ class HookContext:
         self._result_json = dict(result_json) if result_json is not None else None
         self._session_status = session_status
         self._verify_reason = verify_reason
+        # Frozen command-result records with immutable strings.  This is an
+        # observe-only surface: plugins cannot replace the verifier outcome or
+        # modify this tuple, and the engine never reads it back for a decision.
+        self._command_results = tuple(command_results)
         self._decision_action = decision_action
         self._settings = dict(settings) if settings is not None else {}
         # free-form, persisted across stages (engine backs it with plugin_shared)
@@ -183,6 +188,15 @@ class HookContext:
     @property
     def verify_reason(self) -> str | None:
         return self._verify_reason
+
+    @property
+    def command_results(self) -> tuple[Any, ...]:
+        """The per-command results from this dev verification attempt.
+
+        Present only as a read-only observability value for ``post_dev_verify``;
+        an empty tuple means that this attempt did not execute verify commands.
+        """
+        return self._command_results
 
     @property
     def decision_action(self) -> str | None:

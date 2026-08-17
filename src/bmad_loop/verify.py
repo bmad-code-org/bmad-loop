@@ -2105,9 +2105,19 @@ def _stories_relpaths(project: Path, spec_folder: Path) -> tuple[str, ...]:
 
 @dataclass(frozen=True)
 class CommandResult:
+    """One verifier subprocess result.
+
+    ``output_tail`` remains the merged, bounded compatibility field used by the
+    existing failure classifiers and repair feedback.  ``stdout`` and ``stderr``
+    retain the separate streams observed at the subprocess boundary so the
+    engine can expose them to trusted plugins and retain them by journal pointer.
+    """
+
     command: str
     returncode: int
     output_tail: str
+    stdout: str = ""
+    stderr: str = ""
 
 
 # sh launcher convention (verify commands run shell=True): 126 = command found
@@ -2249,6 +2259,15 @@ def env_fault_reason(result: CommandResult, cwd: Path) -> str | None:
     return _win32_env_fault_reason(result, cwd)
 
 
+def _timeout_stream(value: str | bytes | None) -> str:
+    """Normalize optional timeout output without reintroducing decode faults."""
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+    return value
+
+
 def run_verify_commands(policy: Policy, cwd: Path) -> list[CommandResult]:
     """Run each of the policy's verify commands, one CommandResult apiece.
 
@@ -2274,14 +2293,25 @@ def run_verify_commands(policy: Policy, cwd: Path) -> list[CommandResult]:
                 timeout=COMMAND_TIMEOUT_S,
             )
             output = (proc.stdout + proc.stderr)[-2000:]
-            results.append(CommandResult(command, proc.returncode, output))
-        except subprocess.TimeoutExpired:
-            results.append(CommandResult(command, -1, "timed out"))
+            results.append(CommandResult(command, proc.returncode, output, proc.stdout, proc.stderr))
+        except subprocess.TimeoutExpired as exc:
+            results.append(
+                CommandResult(
+                    command,
+                    -1,
+                    "timed out",
+                    _timeout_stream(exc.stdout),
+                    _timeout_stream(exc.stderr),
+                )
+            )
     return results
 
 
-def verify_commands_outcome(policy: Policy, cwd: Path) -> VerifyOutcome:
-    """Run the policy's deterministic verify commands. Failures are fixable:
+def verify_command_results_outcome(results: list[CommandResult], cwd: Path) -> VerifyOutcome:
+    """Classify already-observed verifier results without discarding them.
+
+    Kept separate from :func:`verify_commands_outcome` so the engine can retain
+    and expose exactly the same results it asks core to classify. Failures are fixable:
     the captured output is concrete feedback a repair session can act on —
     except environment faults (see env_fault_reason), which escalate so the run
     pauses for an environment fix instead of burning story budgets. An env
@@ -2289,7 +2319,6 @@ def verify_commands_outcome(policy: Policy, cwd: Path) -> VerifyOutcome:
     session dispatched for the ordinary failure would still run in the
     broken environment. Note the first loop inspects rc=0 results too — on
     Windows an unrunnable command is a silent pass, not a failure (#302)."""
-    results = run_verify_commands(policy, cwd)
     for result in results:
         reason = env_fault_reason(result, cwd)
         if reason is not None:
@@ -2309,6 +2338,11 @@ def verify_commands_outcome(policy: Policy, cwd: Path) -> VerifyOutcome:
                 fixable=True,
             )
     return VerifyOutcome.passed()
+
+
+def verify_commands_outcome(policy: Policy, cwd: Path) -> VerifyOutcome:
+    """Run the policy's deterministic verify commands and classify the results."""
+    return verify_command_results_outcome(run_verify_commands(policy, cwd), cwd)
 
 
 def verify_review(
