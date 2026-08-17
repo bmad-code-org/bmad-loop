@@ -823,6 +823,29 @@ def test_verify_dev_refuses_a_descendant_off_this_worktree(project):
     assert not out.ok and "does not match" in out.reason
 
 
+def test_verify_dev_descendant_baseline_needs_work_above_it(project):
+    """Accepting a newer claim re-anchors proof-of-work onto it. Under the default
+    `isolation = "none"` the unit works in the shared checkout, so a commit can
+    arrive from outside the session and still be reachable from HEAD; measuring
+    from the recorded baseline would let that commit satisfy proof-of-work on its
+    own, passing an attempt that implemented nothing."""
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+    (project.project / "someone-elses-work.txt").write_text("not this session\n")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "a commit from outside the session")
+    foreign_but_reachable = verify.rev_parse_head(project.project)
+
+    # the spec claims it, and the session then implements NOTHING
+    write_spec(sp, "in-review", foreign_but_reachable)
+
+    out = verify.verify_dev(task, project, dev_result(sp))
+    assert not out.ok, "a session that implemented nothing passed the gate"
+
+
 def test_verify_dev_no_changes(project):
     # Spec claims NO_VCS baseline (skips the mismatch check); everything is
     # committed, so there are no changes since the orchestrator's baseline.

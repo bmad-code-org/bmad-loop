@@ -355,14 +355,28 @@ def commit_made_above_baseline(repo: Path, claimed: str, baseline: str) -> bool:
 
     Narrow on purpose, and the HEAD-reachability half is what makes it narrow. A
     unit worktree is cut at ``baseline`` and can only advance by commits made
-    inside it, so a commit both ABOVE the baseline and BELOW HEAD was
-    necessarily produced by this unit — its premises cannot be older than the
-    baseline, which is the only thing this gate protects. A descendant that
-    landed on another branch after launch is above the baseline too, but HEAD
-    does not reach it, so it stays refused. An OLDER (ancestor) or diverged
-    baseline — the stale-premise case the gate exists for — is untouched:
-    ``is_ancestor(baseline, claimed)`` is False for both, so this returns False
-    and the refusal stands.
+    inside it, so a commit both ABOVE the baseline and BELOW HEAD was produced
+    by this unit — its premises cannot be older than the baseline, which is the
+    only thing this gate protects. A descendant that landed on another branch
+    after launch is above the baseline too, but HEAD does not reach it, so it
+    stays refused. An OLDER (ancestor) or diverged baseline — the stale-premise
+    case the gate exists for — is untouched: ``is_ancestor(baseline, claimed)``
+    is False for both, so this returns False and the refusal stands.
+
+    That provenance argument holds under ``[scm] isolation = "worktree"``. Under
+    the default ``"none"`` the unit works in the shared checkout, where a commit
+    can arrive from outside the session and still be reachable from HEAD — so
+    reachability alone is NOT proof of authorship there. The caller closes that
+    gap rather than this helper: when a claim is accepted on this branch, the
+    proof-of-work gate is re-anchored to the claimed baseline, so the attempt
+    must show work ABOVE the commit it claims. An outside commit therefore buys
+    a session nothing.
+
+    Equality is not screened out here: ``is_ancestor`` answers True for a commit
+    against itself, so a claim that resolves to ``baseline`` under a different
+    spelling returns True — which is the right answer (it IS the baseline), and
+    it is unreachable in practice because :func:`same_commit` accepts it before
+    this is ever called.
 
     Any git failure reads as False, exactly like :func:`is_ancestor`: this
     relaxes a gate, so uncertainty must keep the gate strict.
@@ -2140,6 +2154,7 @@ def _verify_shared_gates(
     # made this gate dead code for every generic-skill session. Read both, the
     # same idiom as `devcontract.synthesize_result`.
     claimed_baseline = str(fm.get("baseline_commit", fm.get("baseline_revision", ""))).strip()
+    proof_baseline: str = task.baseline_commit or ""
     if task.baseline_commit and claimed_baseline not in ("", "NO_VCS"):
         if not same_commit(claimed_baseline, task.baseline_commit):
             # A deferred-work bundle may legitimately adopt a pre-existing story
@@ -2163,6 +2178,12 @@ def _verify_shared_gates(
             newer_ok = commit_made_above_baseline(
                 paths.project, claimed_baseline, task.baseline_commit
             )
+            # Accepting a newer claim moves the proof-of-work reference onto it:
+            # under `isolation = "none"` the claimed commit may have arrived in
+            # the shared checkout from outside the session, and measuring from
+            # the recorded baseline would let that commit satisfy proof-of-work
+            # on its own — passing an attempt that implemented nothing.
+            proof_baseline = claimed_baseline if newer_ok else proof_baseline
             if not (older_ok or newer_ok):
                 return VerifyOutcome.retry(
                     f"spec baseline {claimed_baseline[:12]} does not match "
@@ -2174,7 +2195,7 @@ def _verify_shared_gates(
         try:
             if not has_changes_since(
                 paths.project,
-                task.baseline_commit,
+                proof_baseline,
                 exclude=exclude,
                 baseline_untracked=task.baseline_untracked,
             ):
