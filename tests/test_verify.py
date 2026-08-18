@@ -563,7 +563,7 @@ def test_verify_dev_spawn_fault_escalates(project, monkeypatch):
     real_run = verify.subprocess.run
 
     def cannot_spawn_diff(cmd, **kwargs):
-        if cmd[3] == "diff":
+        if cmd[3] == "diff" and "--quiet" in cmd:
             raise OSError(12, "Cannot allocate memory")
         return real_run(cmd, **kwargs)
 
@@ -814,6 +814,8 @@ def test_canonical_commit_oid_accepts_full_uppercase_and_unique_abbreviation(pro
 
 @pytest.mark.parametrize("object_kind", ["blob", "tree", "tag"])
 def test_canonical_commit_oid_refuses_non_commit_objects(project, object_kind):
+    """Ablation: returning the sole disambiguated object without the
+    ``cat-file -t`` direct-commit check makes every parameter fail."""
     if object_kind == "blob":
         oid = git(project.project, "hash-object", "-w", "src.txt")
     elif object_kind == "tree":
@@ -826,6 +828,8 @@ def test_canonical_commit_oid_refuses_non_commit_objects(project, object_kind):
 
 
 def test_canonical_commit_oid_refuses_an_ambiguous_prefix(project):
+    """Ablation: accepting the first disambiguated object instead of requiring
+    ``len(objects) == 1`` makes this assertion fail."""
     prefix, oids = _write_ambiguous_commit_prefix(project.project)
 
     assert set(git(project.project, "rev-parse", f"--disambiguate={prefix}").splitlines()) == set(
@@ -917,7 +921,11 @@ def test_verify_dev_uses_canonical_oid_after_same_named_ref_moves(project, monke
 
 def test_verify_dev_still_refuses_a_stale_ancestor_baseline(project):
     """The stale-premise case the gate exists for is untouched: an OLDER
-    baseline outside a deferred-work bundle still fails."""
+    baseline outside a deferred-work bundle still fails.
+
+    Ablation: force ``commit_reachable_above_baseline`` to return ``True`` and
+    the attempt passes, failing the refusal assertion.
+    """
     ancestor = verify.rev_parse_head(project.project)
     (project.project / "prior.txt").write_text("work that landed first\n")
     git(project.project, "add", "prior.txt")
@@ -934,6 +942,8 @@ def test_verify_dev_still_refuses_a_stale_ancestor_baseline(project):
 
 
 def test_verify_dev_still_refuses_a_diverged_commit_baseline(project):
+    """Ablation: force ``commit_reachable_above_baseline`` to return ``True``
+    and this unrelated root passes, failing the refusal assertion."""
     write_sprint(project, {"1-1-a": "review"})
     task = make_task(project)
     tree = git(project.project, "rev-parse", "HEAD^{tree}")
@@ -949,7 +959,11 @@ def test_verify_dev_still_refuses_a_diverged_commit_baseline(project):
 
 def test_verify_dev_refuses_a_descendant_off_this_worktree(project):
     """The half that keeps the widening narrow: a commit above the baseline that
-    this checkout's HEAD does not reach is outside the accepted history."""
+    this checkout's HEAD does not reach is outside the accepted history.
+
+    Ablation: force ``commit_reachable_above_baseline`` to return ``True``
+    (bypassing its final HEAD-ancestry call) and the refusal assertion fails.
+    """
     write_sprint(project, {"1-1-a": "review"})
     task = make_task(project)
 
@@ -974,7 +988,11 @@ def test_verify_dev_descendant_baseline_needs_work_above_it(project):
     `isolation = "none"` the unit works in the shared checkout, so a commit can
     arrive from outside the session and still be reachable from HEAD; measuring
     from the recorded baseline would let that commit satisfy proof-of-work on its
-    own, passing an attempt that implemented nothing."""
+    own, passing an attempt that implemented nothing.
+
+    Ablation: leave ``proof_baseline`` at the recorded baseline after accepting
+    the descendant and this no-work attempt passes, failing the assertion.
+    """
     write_sprint(project, {"1-1-a": "review"})
     task = make_task(project)
 
@@ -995,7 +1013,11 @@ def test_verify_dev_descendant_baseline_needs_work_above_it(project):
 def test_verify_dev_descendant_baseline_refuses_untracked_only_residue(project):
     """The launch-time untracked snapshot says when residue appeared relative
     to the recorded baseline, not relative to a later claimed descendant. It
-    therefore cannot prove that an untracked file was made after that claim."""
+    therefore cannot prove that an untracked file was made after that claim.
+
+    Ablation: keep ``include_untracked_proof`` true for the accepted descendant
+    and the residue makes the attempt pass, failing the refusal assertion.
+    """
     write_sprint(project, {"1-1-a": "review"})
     task = make_task(project)
     task.baseline_untracked = []
@@ -1060,7 +1082,11 @@ def test_verify_dev_equal_baseline_still_accepts_new_untracked_file(project):
 def test_verify_dev_refuses_a_symbolic_baseline_revision(project):
     """A spec naming a Git revision expression instead of an immutable object id
     (`baseline_revision: HEAD`) resolves at verification time, so every ancestry
-    question about it answers yes. It must not buy the relaxation."""
+    question about it answers yes. It must not buy the relaxation.
+
+    Ablation: restore the old lexical-hex check plus raw-ref ancestry calls and
+    ``HEAD`` makes the attempt pass, failing the refusal assertion.
+    """
     write_sprint(project, {"1-1-a": "review"})
     task = make_task(project)
 
@@ -1080,7 +1106,11 @@ def test_verify_dev_refuses_a_symbolic_baseline_revision(project):
 def test_verify_dev_refuses_an_all_hex_ref_baseline(project, ref_kind):
     """Hex spelling alone does not make a claim immutable. Git resolves an
     all-hex branch or tag when no object has that prefix, so the baseline gate
-    must disambiguate the object id independently of the ref namespace."""
+    must disambiguate the object id independently of the ref namespace.
+
+    Ablation: restore the old ``_OBJECT_ID``-only gate and raw-ref ancestry
+    calls; both parameters pass verification and fail this refusal assertion.
+    """
     write_sprint(project, {"1-1-a": "review"})
     task = make_task(project)
 
