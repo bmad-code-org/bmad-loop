@@ -421,11 +421,42 @@ def cmd_validate(args: argparse.Namespace) -> int:
             {"platform": sys.platform},
         )
 
+    from . import probe as probe_mod
+
     for tool in dict.fromkeys(p.binary for p in profiles):
-        if shutil.which(tool):
+        resolved = shutil.which(tool)
+        if resolved:
             report.ok("adapter.binary", f"{tool} found", {"binary": tool})
         else:
             report.fail("adapter.binary", f"{tool} not found on PATH", {"binary": tool})
+            continue
+        # #294: the gate above answers "a file with that name carries the execute
+        # bit", which a dead WSL/npm shim satisfies while every launch of it fails.
+        # So validate went green on an install that could not start a session —
+        # and opencode_http's own "binary not found" remedy points the user at
+        # `bmad-loop validate`, which then told them everything was fine. Probe the
+        # path `which` RETURNED rather than the bare name: re-resolving is a TOCTOU,
+        # and on Windows the PATHEXT shim `which` picked is the very file at issue.
+        rc = probe_mod.binary_runs(resolved)
+        if rc == 0:
+            continue
+        # Any nonzero code, never an allowlist: #294's own transcript reports rc 2
+        # and a reproduction of the same shim exits 127, the code being a property
+        # of the shell and the failure mode. {126, 127} would miss the case fixed.
+        #
+        # `warning`, deliberately, and not to be promoted without evidence: severity
+        # `problem` is validate's exit code (checks.py), and rc is a compatibility
+        # contract (AGENTS.md). Nothing rules out one of claude/codex/gemini/copilot/
+        # antigravity answering `--version` nonzero on a perfectly live install, and
+        # that user must not start failing validate.
+        outcome = "could not be launched" if rc is None else f"exited {rc}"
+        report.warn(
+            "adapter.binary-unrunnable",
+            f"{tool} is on PATH at {resolved} but `{tool} --version` {outcome} — "
+            "that is a stale or broken install (a dead WSL/npm shim is the usual "
+            "cause), and runs using it will fail to start; reinstall it or fix PATH",
+            {"binary": tool, "path": resolved, "returncode": rc},
+        )
 
     any_hooks_registered = False
     for profile in profiles:

@@ -18,6 +18,17 @@ breaking changes may land in a minor release.
   `failed` or `dirty` — never an exception message, which `diagnose` would refuse to emit at all.
   The `--json` key is additive and always present, so `STATUS_SCHEMA_VERSION` is unchanged.
 
+- **`validate` now reports a binary that is on PATH but will not run (#294).** The
+  `adapter.binary` gate asked `shutil.which`, which a dead WSL/npm shim satisfies — it is a real
+  file with the execute bit — so validate went green on an install that could not start a session,
+  and the opencode adapter's own "binary not found" error sent the user to `bmad-loop validate` to
+  be told everything was fine. Each resolved binary is now run once as `<binary> --version`; a
+  nonzero exit or a launch fault reports the new check id `adapter.binary-unrunnable`, carrying the
+  resolved path and the return code. The severity is `warning`, so validate's exit code is
+  unchanged for a live CLI that merely answers `--version` oddly, and `adapter.binary` keeps its
+  existing found/absent meaning. The check id is additive, so `VALIDATE_SCHEMA_VERSION` is
+  unchanged.
+
 ### Changed
 
 - **Files the orchestrator replaces by name now land at `0600`.** Those writes pass

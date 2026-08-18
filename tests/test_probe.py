@@ -3,10 +3,11 @@ CLI plumbing, and end-to-end scrub-through. No live CLI required."""
 
 import json
 import re
+import subprocess
 import sys
 
 import pytest
-from conftest import machine_json, needs_strict_codec
+from conftest import machine_json, needs_strict_codec, write_script_launcher
 from test_probe_hook import run_hook
 
 from bmad_loop import cli, probe, sanitize
@@ -750,3 +751,106 @@ def test_run_capture_replaces_undecodable_banner_bytes(tmp_path):
     assert out is not None
     assert "�" in out  # the replacement, not a survivor
     assert "before" in out and "after" in out
+
+
+# ------------------------------------------------------ liveness (#294)
+
+
+@pytest.mark.parametrize("exit_code", [0, 2, 127], ids=["runs", "rc-2", "rc-127"])
+def test_binary_runs_returns_the_exit_code_of_a_real_child(tmp_path, exit_code):
+    """`binary_runs` reports the child's code, not a boolean — 0 is the only "this
+    install works" answer, and any other value is what the #294 finding carries as
+    its `returncode` detail.
+
+    Both nonzero rows are the issue's OWN evidence, not invented codes: its
+    transcript reports rc 2 and a reproduction of the same dead shim exits 127.
+    They are here to pin `binary_runs` as a faithful pass-through, which is what
+    lets cli.py gate on `rc != 0` rather than on an allowlist of shell-ish codes —
+    the code depends on the shell and the failure mode, so {126, 127} would miss
+    the very case #294 is about.
+
+    Driven through a real child rather than a patched `subprocess.run`: the point
+    of this function is that a process actually launched and exited, and a mock
+    proves nothing about that.
+    """
+    launcher = write_script_launcher(tmp_path, "shim", f"import sys\nsys.exit({exit_code})\n")
+
+    assert probe.binary_runs(str(launcher), timeout_s=30) == exit_code
+
+
+def test_binary_runs_returns_none_when_the_process_cannot_be_launched(tmp_path):
+    """A path that is not there at all faults in `subprocess.run` (FileNotFoundError,
+    an OSError) and comes back as None — "there is no return code to report", which
+    is a different finding from "it ran and said 5", not the same sentinel.
+
+    This is the guard machine.py depends on: every gate in `cmd_validate` runs inside
+    a try precisely so "the command has no error path of its own — its rc is purely
+    the verdict", and a probe that raised would hand it one.
+
+    Ablation target: delete the `except (OSError, subprocess.SubprocessError)` clause
+    in `probe.binary_runs` and this reddens with a raised FileNotFoundError rather
+    than a None return — the two outcomes a bare "did not raise" could not tell
+    apart, which is why the assertion is on the value.
+    """
+    missing = tmp_path / "nope" / "not-a-binary"
+
+    assert probe.binary_runs(str(missing), timeout_s=30) is None
+
+
+def test_binary_runs_returns_none_when_the_child_outlives_the_timeout(tmp_path):
+    """A child that never exits is killed at `timeout_s` and reported as None.
+
+    TimeoutExpired is a `subprocess.SubprocessError`, not an OSError, so this row is
+    what proves the guard names BOTH families — a hang is the failure mode of a shim
+    that prompts, which is exactly the shape `stdin=DEVNULL` exists to avoid.
+
+    Ablation target: narrow the guard to `except OSError` and this reddens with a
+    raised subprocess.TimeoutExpired.
+    """
+    launcher = write_script_launcher(tmp_path, "hang", "import time\ntime.sleep(120)\n")
+
+    assert probe.binary_runs(str(launcher), timeout_s=0.5) is None
+
+
+def test_binary_runs_pins_devnull_stdin_and_the_caller_timeout():
+    """The one contract row over the call itself: argv is `<binary> --version`, stdin
+    is DEVNULL, the caller's timeout is honored, and a nonzero exit is data rather
+    than an exception (`check=False`).
+
+    `stdin=DEVNULL` is required, not cosmetic: with the caller's tty inherited a shim
+    that prompts blocks on the read for the entire timeout (measured 4.00s against
+    0.00s), inside an interactive command. Nothing else observes it — the real-child
+    rows above pass either way — so it is pinned here or not at all.
+
+    Asserted as a SUBSET of the recorded kwargs, never dict equality: a future kwarg
+    (`env`, `cwd`, ...) is additive, and equality would turn every such addition into
+    a multi-row breakage in this file.
+
+    Ablation target: drop `stdin=subprocess.DEVNULL` from `probe.binary_runs` and the
+    stdin assertion reddens with a KeyError. `check=False` is the stdlib default, so
+    dropping it reddens only this row (KeyError) and nothing else — it is pinned as
+    intent against a future flip to `check=True`, which is the mutation that bites:
+    that turns every nonzero exit into a CalledProcessError, a SubprocessError the
+    guard swallows into None, reddening both real-child rows above as well.
+    """
+    recorded: dict = {}
+
+    def fake_run(argv, **kwargs):
+        recorded["argv"] = argv
+        recorded["kwargs"] = kwargs
+        return subprocess.CompletedProcess(argv, 0)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(probe.subprocess, "run", fake_run)
+        assert probe.binary_runs("some-cli", timeout_s=3.5) == 0
+
+    assert recorded["argv"] == ["some-cli", "--version"]
+    kwargs = recorded["kwargs"]
+    assert kwargs["stdin"] is subprocess.DEVNULL
+    assert kwargs["timeout"] == 3.5
+    assert kwargs["check"] is False
+    assert kwargs["capture_output"] is True
+    # No `text=True`: nothing reads the output, so the locale decode that forced
+    # `errors="replace"` onto `_run_capture` (#383) never happens here and cannot
+    # raise the UnicodeDecodeError the guard above does not name.
+    assert kwargs.get("text") is None
