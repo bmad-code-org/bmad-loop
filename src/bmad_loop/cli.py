@@ -2444,8 +2444,17 @@ def _resolve_restore_patch(
         return None, err
     # `.resolve()` on top of the shared normalizer: this is the one consumer that
     # feeds a containment check (spec_within_roots), which needs `..`/symlinks
-    # collapsed. The resolved absolute path is what gets latched.
-    patch = verify.resolve_restore_path(raw, project).resolve()
+    # collapsed. The resolved absolute path is what gets latched, so this stays a
+    # bare `.resolve()` rather than `resolve_or_lexical`: a degraded, non-canonical
+    # answer here could pass containment on the wrong directory.
+    try:
+        patch = verify.resolve_restore_path(raw, project).resolve()
+    except (OSError, RuntimeError) as e:
+        return None, (
+            f"cannot canonicalize the restore patch path {raw!r}: {e}, so whether it "
+            "lies inside or outside the project tree cannot be determined, and the "
+            "restore cannot be latched"
+        )
     # Same trusted-roots shape as the frontmatter reconcile's spec_within_roots:
     # bmad-build-auto saves the patch under implementation_artifacts, and artifact
     # dirs configured OUTSIDE the project tree are a supported layout — a bare

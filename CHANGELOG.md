@@ -230,6 +230,16 @@ breaking changes may land in a minor release.
   Quoted booleans and other coercible values now raise `PolicyError` instead of silently changing
   the configured limit or enabling a disabled behavior.
 
+- **Unresolvable restore-patch and spec-folder paths no longer bypass their own rejection
+  message (#560).** `_resolve_restore_patch` (`cli --restore-patch`) and
+  `relativize_spec_folder` (`--spec`, `[stories] source`) each called `.resolve()` outside the
+  exception type their local handler caught, so a host that cannot canonicalize the path (a dead
+  UNC provider, `WinError 64`; a symlink loop on the 3.11/3.12 floor) fell through to a generic,
+  unscoped error instead of the specific one the rest of the function reports. The restore-patch
+  path now returns the same rejected-latch shape as its sibling checks; the spec-folder path
+  degrades to the shared lexical fallback like every other `platform_util.resolve_or_lexical`
+  consumer.
+
 - **Attempt-owned spec-only retries no longer demand a false manual rollback (#123).** A
   bound plain attempt whose only residue is its lifecycle flip is restored to its pre-attempt
   lifecycle status and proven Git-clean before retry. A resolved re-drive may instead retain an

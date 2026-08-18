@@ -30,6 +30,7 @@ import yaml
 
 from . import deferredwork
 from .frontmatter import read_frontmatter, status_of
+from .platform_util import resolve_or_lexical
 
 # Fixed-name discovery, like SPEC.md / .memlog.md — never listed in companions.
 STORIES_FILENAME = "stories.yaml"
@@ -480,7 +481,7 @@ def relativize_spec_folder(project: Path, spec_folder: str) -> str:
     raw = Path(spec_folder)
     if raw.is_absolute():
         try:
-            return raw.resolve().relative_to(project.resolve()).as_posix()
+            return resolve_or_lexical(raw).relative_to(resolve_or_lexical(project)).as_posix()
         except ValueError:
             return raw.as_posix()  # outside the project tree — leave absolute
     return raw.as_posix()

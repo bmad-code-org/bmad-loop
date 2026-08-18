@@ -4,7 +4,7 @@ import re
 from pathlib import Path
 
 import pytest
-from conftest import fault_read_text
+from conftest import UNRESOLVABLE, fault_read_text, refuse_to_resolve
 
 from bmad_loop import stories
 
@@ -590,3 +590,31 @@ def test_story_rows_limit_counts_dispatchable_not_done(tmp_path):
 def test_story_rows_missing_manifest_raises(tmp_path):
     with pytest.raises(stories.StoriesError, match=re.escape("no stories.yaml found")):
         stories.story_rows(tmp_path)
+
+
+# --------------------------------------------------------- relativize_spec_folder
+
+
+def test_relativize_spec_folder_rebases_absolute_path_in_project(tmp_path):
+    project = tmp_path / "proj"
+    spec_folder = project / "specs" / "s1"
+    spec_folder.mkdir(parents=True)
+    assert stories.relativize_spec_folder(project, str(spec_folder)) == "specs/s1"
+
+
+def test_relativize_spec_folder_survives_unresolvable_project_root(tmp_path, monkeypatch, capsys):
+    """The project root's own `.resolve()` faulting (WinError 64 on a dead UNC
+    provider, or a symlink loop on the 3.11/3.12 floor, #560) escaped this
+    function's try/except, which caught only `ValueError` around a bare
+    `.resolve()` on both sides. `relativize_spec_folder` degrades to the
+    lexical path instead now, like every other consumer of the shared
+    canonicalization helper."""
+    project = tmp_path / "proj"
+    spec_folder = project / "specs" / "s1"
+    spec_folder.mkdir(parents=True)
+    refuse_to_resolve(monkeypatch, project)
+
+    rel = stories.relativize_spec_folder(project, str(spec_folder))
+
+    assert rel == "specs/s1"  # degraded (lexical) project root still contains it
+    assert UNRESOLVABLE in capsys.readouterr().err

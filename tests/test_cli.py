@@ -2613,6 +2613,47 @@ def test_resolve_restore_patch_outside_project_rejected(tmp_path, monkeypatch, c
     assert task.phase == Phase.ESCALATED and task.restore_patch is None  # not re-armed
 
 
+def test_resolve_restore_patch_unresolvable_rejected(tmp_path, monkeypatch, capsys):
+    """A restore patch path whose `.resolve()` faults (WinError 64 on a dead UNC
+    provider, or a symlink loop on the 3.11/3.12 floor, #560) escaped this
+    function's own try/except (scoped to `bmadconfig.BmadConfigError`) and fell
+    through to `main()`'s generic backstop, which reports a bare `[Errno ...]`
+    string instead of naming the restore-patch path or what failed. Pin the
+    specific message this function now returns, matching its other three
+    rejection reasons."""
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    spec = tmp_path / "spec.md"
+    spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+    _write_bmad_config(tmp_path)
+    run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
+    called: list = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: called.append(rd) or 0)
+    patch = tmp_path / "whatever.patch"
+    refuse_to_resolve(monkeypatch, patch)
+
+    rc = cli.main(
+        [
+            "resolve",
+            "--project",
+            str(tmp_path),
+            "r1",
+            "--no-interactive",
+            "--restore-patch",
+            str(patch),
+            "--resume",
+        ]
+    )
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "cannot canonicalize the restore patch path" in err
+    assert UNRESOLVABLE in err
+    assert called == []  # never resumed
+    task = load_state(run_dir).tasks["s1"]
+    assert task.phase == Phase.ESCALATED and task.restore_patch is None  # not re-armed
+
+
 def test_resolve_restore_patch_in_outside_project_artifacts_allowed(tmp_path, monkeypatch):
     """Artifact dirs configured OUTSIDE the project tree are a supported layout
     (bmadconfig keeps them absolute; verify special-cases them throughout), and
