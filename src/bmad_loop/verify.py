@@ -354,20 +354,18 @@ def _canonical_commit_oid(repo: Path, claim: str) -> str | None:
     direct commit: blob, tree, and annotated-tag objects are refused rather
     than peeled. The returned value is Git's canonical full object id.
 
-    Every failure reads as ``None`` because callers use this helper to relax a
-    baseline gate; uncertainty must preserve the stricter path.
+    Invalid, unresolved, ambiguous, and non-commit claims read as ``None``.
+    Operational Git failures retain their typed :class:`GitError` so the
+    verification boundary can escalate instead of misreporting a mismatch.
     """
     if not _OBJECT_ID.fullmatch(claim):
         return None
-    try:
-        rc, out, _ = _git_out(repo, "rev-parse", f"--disambiguate={claim}")
-        objects = out.splitlines()
-        if rc != 0 or len(objects) != 1:
-            return None
-        oid = objects[0]
-        rc, object_type, _ = _git_out(repo, "cat-file", "-t", oid)
-    except (OSError, GitError):
+    rc, out, _ = _git_out(repo, "rev-parse", f"--disambiguate={claim}")
+    objects = out.splitlines()
+    if rc != 0 or len(objects) != 1:
         return None
+    oid = objects[0]
+    rc, object_type, _ = _git_out(repo, "cat-file", "-t", oid)
     return oid if rc == 0 and object_type == "commit" else None
 
 
@@ -2173,7 +2171,10 @@ def _verify_shared_gates(
     proof_baseline: str = task.baseline_commit or ""
     include_untracked_proof = True
     if task.baseline_commit and claimed_baseline not in ("", "NO_VCS"):
-        canonical_claimed = _canonical_commit_oid(paths.project, claimed_baseline)
+        try:
+            canonical_claimed = _canonical_commit_oid(paths.project, claimed_baseline)
+        except GitError as e:
+            return VerifyOutcome.escalate(str(e))
         if canonical_claimed is None:
             return VerifyOutcome.retry(
                 f"spec baseline {claimed_baseline[:12]} does not match "

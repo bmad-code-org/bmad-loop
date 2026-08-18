@@ -574,6 +574,41 @@ def test_verify_dev_spawn_fault_escalates(project, monkeypatch):
     assert "failed to spawn" in out.reason
 
 
+@pytest.mark.parametrize("subcommand", ["rev-parse", "cat-file"])
+def test_verify_dev_canonical_baseline_spawn_fault_escalates(project, monkeypatch, subcommand):
+    """Baseline canonicalization is a validation boundary, not a best-effort
+    ancestry probe. A machine fault while resolving or typing the claimed object
+    must escalate instead of masquerading as a retryable baseline mismatch.
+
+    Ablation: catch ``GitError`` in ``_canonical_commit_oid`` and return ``None``;
+    both parameters become retryable mismatches and fail the severity assertions.
+    """
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+    (project.project / "src.txt").write_text("changed\n")
+
+    real_run = verify.subprocess.run
+    fault_args = (
+        ["rev-parse", f"--disambiguate={task.baseline_commit}"]
+        if subcommand == "rev-parse"
+        else ["cat-file", "-t", task.baseline_commit]
+    )
+
+    def cannot_spawn_canonicalization(cmd, **kwargs):
+        if cmd[3:] == fault_args:
+            raise OSError(12, "Cannot allocate memory")
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(verify.subprocess, "run", cannot_spawn_canonicalization)
+    out = verify.verify_dev(task, project, dev_result(sp))
+
+    assert not out.ok and not out.retryable
+    assert out.severity == "CRITICAL"
+    assert f"git {subcommand} failed to spawn" in out.reason
+
+
 def test_verify_dev_status_is_case_insensitive(project):
     # A hand-edited spec with a stray-cased status must still pass the gate —
     # the spec template emits lowercase, but casing must never decide it.
@@ -1693,7 +1728,12 @@ def test_verify_dev_bundle_ancestor_probe_git_failure_stays_strict(project, monk
     """A git failure inside the ancestor probe (e.g. a timeout, which surfaces
     as GitError since #156's `_run_git` translation) must read as
     not-an-ancestor and fail the gate closed — never propagate out of
-    `_verify_shared_gates` and crash the run."""
+    `_verify_shared_gates` and crash the run. Baseline canonicalization is an
+    earlier escalation boundary, so the injection targets ``merge-base``.
+
+    Ablation: delete the ``except (OSError, GitError)`` guard in ``is_ancestor``;
+    the timeout propagates instead of reading as false and this test errors.
+    """
     ancestor = verify.rev_parse_head(project.project)
     (project.project / "story-work.txt").write_text("stories 1.1-1.3\n")
     git(project.project, "add", "-A")
@@ -1703,7 +1743,15 @@ def test_verify_dev_bundle_ancestor_probe_git_failure_stays_strict(project, monk
     write_spec(sp, "in-review", ancestor)
     (project.project / "src.txt").write_text("review fixes\n")
     rj = {"workflow": "auto-dev", "spec_file": str(sp), "dw_ids": ["DW-1"]}
-    monkeypatch.setattr(verify.subprocess, "run", _timing_out_run)
+
+    real_run = verify.subprocess.run
+
+    def timing_out_merge_base(cmd, **kwargs):
+        if cmd[3] == "merge-base":
+            return _timing_out_run(cmd, **kwargs)
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(verify.subprocess, "run", timing_out_merge_base)
     assert verify.is_ancestor(project.project, ancestor, task.baseline_commit) is False
     out = verify.verify_dev_bundle(task, project, rj)
     assert not out.ok and "baseline" in out.reason
