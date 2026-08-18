@@ -371,56 +371,25 @@ def _canonical_commit_oid(repo: Path, claim: str) -> str | None:
     return oid if rc == 0 and object_type == "commit" else None
 
 
-def commit_made_above_baseline(repo: Path, claimed_oid: str, baseline: str) -> bool:
-    """True when ``claimed`` is a commit THIS UNIT itself made on top of
-    ``baseline`` — strictly newer than the orchestrator-recorded baseline AND
-    reachable from the worktree's current HEAD.
+def commit_reachable_above_baseline(repo: Path, claimed_oid: str, baseline: str) -> bool:
+    """Whether a canonical claimed commit descends from ``baseline`` and is
+    reachable from this checkout's current ``HEAD``.
 
-    The generic skill's step-03 stamps `baseline_revision` with *current HEAD
-    before making any changes* — what the dev pass actually diffs from — while
-    :func:`_verify_shared_gates` compares that stamp against the baseline
-    recorded when the dev phase began. The two agree only while nothing is
-    committed in between. Anything that does commit in between — a session that
-    commits the spec it was asked to write or rewrite before implementing —
-    makes the stamp a DESCENDANT of the recorded baseline, a shape no branch of
-    the gate accepts (`allow_ancestor_baseline` points the other way). The gate
-    then refuses a finished attempt and its work is rolled back. Same class of
-    loss as #640, which is this very mismatch in the opposite direction: re-arm
-    advances the task baseline while the spec keeps the older one.
+    The caller handles equality first, so a successful call represents the
+    strictly newer shape needed when step-03 stamps ``baseline_revision`` after
+    an intervening commit. Older, diverged, and off-HEAD commits stay refused.
 
-    Narrow on purpose, and the HEAD-reachability half is what makes it narrow. A
-    unit worktree is cut at ``baseline`` and can only advance by commits made
-    inside it, so a commit both ABOVE the baseline and BELOW HEAD was produced
-    by this unit — its premises cannot be older than the baseline, which is the
-    only thing this gate protects. A descendant that landed on another branch
-    after launch is above the baseline too, but HEAD does not reach it, so it
-    stays refused. An OLDER (ancestor) or diverged baseline — the stale-premise
-    case the gate exists for — is untouched: ``is_ancestor(baseline, claimed)``
-    is False for both, so this returns False and the refusal stands.
+    With worktree isolation, the isolated history preserves provenance for the
+    unit. In the default shared checkout, reachability cannot identify which
+    session produced a commit; the caller therefore re-anchors proof to this
+    claim and requires a later tracked, staged, or committed change. The shared
+    mode proves only that such work exists after the claim, not who made it.
 
-    That provenance argument holds under ``[scm] isolation = "worktree"``. Under
-    the default ``"none"`` the unit works in the shared checkout, where a commit
-    can arrive from outside the session and still be reachable from HEAD — so
-    reachability alone is NOT proof of authorship there. The caller closes that
-    gap rather than this helper: when a claim is accepted on this branch, the
-    proof-of-work gate is re-anchored to the claimed baseline, so the attempt
-    must show work ABOVE the commit it claims. An outside commit therefore buys
-    a session nothing.
-
-    ``claimed_oid`` is the canonical full commit id returned by
-    :func:`_canonical_commit_oid`, never a revision expression.
-
-    Equality is not screened out here: ``is_ancestor`` answers True for a commit
-    against itself, so a claim that resolves to ``baseline`` under a different
-    spelling returns True — which is the right answer (it IS the baseline), and
-    it is unreachable in practice because :func:`same_commit` accepts it before
-    this is ever called.
-
-    Any git failure reads as False, exactly like :func:`is_ancestor`: this
-    relaxes a gate, so uncertainty must keep the gate strict.
+    Any Git failure reads as ``False`` because this result relaxes a gate and
+    uncertainty must keep the stricter path.
     """
     if not is_ancestor(repo, baseline, claimed_oid):
-        return False  # older, diverged or unknown -> not a commit of ours
+        return False  # older, diverged, or unknown -> not an accepted descendant
     try:
         head = rev_parse_head(repo)
     except (OSError, GitError):
@@ -434,8 +403,9 @@ def has_changes_since(
     exclude: tuple[str, ...] = (),
     *,
     baseline_untracked: list[str] | None = None,
+    include_untracked: bool = True,
 ) -> bool:
-    """True if tracked changes since baseline OR untracked files exist.
+    """True if tracked changes since baseline, or allowed untracked files exist.
 
     `exclude` is repo-relative posix dir prefixes whose changes don't count —
     used by the dev/bundle proof-of-work gate to ignore the orchestrator-owned
@@ -450,6 +420,12 @@ def has_changes_since(
     intent-gap patch, which `_protected_relpaths` shields from every reset) can
     never masquerade as this session's work.
 
+    ``include_untracked=False`` restricts proof to tracked, staged, or committed
+    changes. It is used when verification adopts a later descendant baseline:
+    the launch-time snapshot cannot establish whether an untracked file appeared
+    before or after that later commit. The default preserves every established
+    caller and exact-baseline proof.
+
     `None` means count EVERY untracked file — deliberately the *opposite* of
     `attempt_dirty`'s `None` = ignore-all, and not an oversight. The two gates
     fail open in opposite directions: a proof-of-work gate must fail open toward
@@ -460,6 +436,8 @@ def has_changes_since(
     rc, _ = _git(repo, "diff", "--quiet", baseline, "--", ".", *_exclude_specs(exclude))
     if rc != 0:
         return True
+    if not include_untracked:
+        return False
     created = untracked_files(repo)
     if baseline_untracked is not None:
         created -= set(baseline_untracked)
@@ -2193,6 +2171,7 @@ def _verify_shared_gates(
     # same idiom as `devcontract.synthesize_result`.
     claimed_baseline = str(fm.get("baseline_commit", fm.get("baseline_revision", ""))).strip()
     proof_baseline: str = task.baseline_commit or ""
+    include_untracked_proof = True
     if task.baseline_commit and claimed_baseline not in ("", "NO_VCS"):
         canonical_claimed = _canonical_commit_oid(paths.project, claimed_baseline)
         if canonical_claimed is None:
@@ -2212,22 +2191,23 @@ def _verify_shared_gates(
             older_ok = allow_ancestor_baseline and is_ancestor(
                 paths.project, canonical_claimed, task.baseline_commit
             )
-            # The other direction, and it needs no opt-in flag: a session that
-            # commits inside the unit before step-03 stamps `baseline_revision`
-            # makes that stamp a commit this unit made ABOVE the recorded
-            # baseline. Accepting it is not a hole — see
-            # :func:`commit_made_above_baseline` for why "above the baseline AND
-            # below this worktree's HEAD" can only be our own work, and why a
-            # genuinely stale (older/diverged/unknown) baseline still fails.
-            newer_ok = commit_made_above_baseline(
+            # The other direction needs no opt-in flag: an intervening commit
+            # before step-03 stamps `baseline_revision` makes the claim newer
+            # than the recorded baseline. Accept it only when this checkout's
+            # HEAD reaches that canonical descendant; stale, diverged, unknown,
+            # and off-HEAD commits still fail.
+            newer_ok = commit_reachable_above_baseline(
                 paths.project, canonical_claimed, task.baseline_commit
             )
             # Accepting a newer claim moves the proof-of-work reference onto it:
             # under `isolation = "none"` the claimed commit may have arrived in
             # the shared checkout from outside the session, and measuring from
             # the recorded baseline would let that commit satisfy proof-of-work
-            # on its own — passing an attempt that implemented nothing.
+            # on its own — passing an attempt that implemented nothing. Ignore
+            # untracked proof here because the launch snapshot cannot establish
+            # whether it appeared before or after this later claimed commit.
             proof_baseline = canonical_claimed if newer_ok else proof_baseline
+            include_untracked_proof = not newer_ok
             if not (older_ok or newer_ok):
                 return VerifyOutcome.retry(
                     f"spec baseline {claimed_baseline[:12]} does not match "
@@ -2242,6 +2222,7 @@ def _verify_shared_gates(
                 proof_baseline,
                 exclude=exclude,
                 baseline_untracked=task.baseline_untracked,
+                include_untracked=include_untracked_proof,
             ):
                 return VerifyOutcome.retry("no changes in worktree since baseline commit")
         except GitError as e:

@@ -854,12 +854,12 @@ def test_canonical_commit_oid_accepts_sha256_when_git_supports_it(project):
     assert verify._canonical_commit_oid(repo, oid[:12].upper()) == oid
 
 
-def test_verify_dev_accepts_a_baseline_this_unit_committed(project):
+def test_verify_dev_accepts_a_reachable_descendant_baseline(project):
     """A session that commits inside the unit before step-03 stamps
     `baseline_revision` makes that stamp a DESCENDANT of the baseline the
     orchestrator recorded — the shape no branch of the gate could accept, so a
-    finished attempt was refused at the door. Above the baseline AND below this
-    worktree's HEAD can only be this unit's own work."""
+    finished attempt was refused at the door. The immutable descendant is
+    accepted when this checkout's HEAD reaches it and later work is proven."""
     write_sprint(project, {"1-1-a": "review"})
     task = make_task(project)
 
@@ -949,7 +949,7 @@ def test_verify_dev_still_refuses_a_diverged_commit_baseline(project):
 
 def test_verify_dev_refuses_a_descendant_off_this_worktree(project):
     """The half that keeps the widening narrow: a commit above the baseline that
-    this worktree's HEAD does not reach is not this unit's work."""
+    this checkout's HEAD does not reach is outside the accepted history."""
     write_sprint(project, {"1-1-a": "review"})
     task = make_task(project)
 
@@ -990,6 +990,71 @@ def test_verify_dev_descendant_baseline_needs_work_above_it(project):
 
     out = verify.verify_dev(task, project, dev_result(sp))
     assert not out.ok, "a session that implemented nothing passed the gate"
+
+
+def test_verify_dev_descendant_baseline_refuses_untracked_only_residue(project):
+    """The launch-time untracked snapshot says when residue appeared relative
+    to the recorded baseline, not relative to a later claimed descendant. It
+    therefore cannot prove that an untracked file was made after that claim."""
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+    task.baseline_untracked = []
+
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+    residue = project.project / "intervening-untracked.txt"
+    residue.write_text("created before the descendant claim\n")
+    git(
+        project.project,
+        "add",
+        project.sprint_status.relative_to(project.project).as_posix(),
+        sp.relative_to(project.project).as_posix(),
+    )
+    git(project.project, "commit", "-q", "-m", "descendant baseline")
+    descendant = verify.rev_parse_head(project.project)
+
+    write_spec(sp, "in-review", descendant)
+    out = verify.verify_dev(task, project, dev_result(sp))
+
+    assert residue.is_file()
+    assert not out.ok and "no changes" in out.reason
+
+
+@pytest.mark.parametrize("proof_kind", ["tracked", "staged", "committed"])
+def test_verify_dev_descendant_baseline_accepts_tracked_proof(project, proof_kind):
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "descendant baseline")
+    descendant = verify.rev_parse_head(project.project)
+    write_spec(sp, "in-review", descendant)
+
+    if proof_kind == "tracked":
+        (project.project / "src.txt").write_text("tracked modification\n")
+    elif proof_kind == "staged":
+        (project.project / "staged-proof.txt").write_text("staged new file\n")
+        git(project.project, "add", "staged-proof.txt")
+    else:
+        (project.project / "src.txt").write_text("committed work\n")
+        git(project.project, "add", "src.txt")
+        git(project.project, "commit", "-q", "-m", "work after descendant")
+
+    out = verify.verify_dev(task, project, dev_result(sp))
+    assert out.ok
+
+
+def test_verify_dev_equal_baseline_still_accepts_new_untracked_file(project):
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+    task.baseline_untracked = []
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+    (project.project / "untracked-proof.txt").write_text("new after exact baseline\n")
+
+    assert verify.verify_dev(task, project, dev_result(sp)).ok
 
 
 def test_verify_dev_refuses_a_symbolic_baseline_revision(project):
@@ -1565,6 +1630,21 @@ def test_verify_dev_bundle_ancestor_baseline_passes(project):
     out = verify.verify_dev_bundle(task, project, rj)
     assert out.ok
     assert task.spec_file == str(sp)
+
+
+def test_verify_dev_bundle_ancestor_baseline_retains_untracked_proof(project):
+    ancestor = verify.rev_parse_head(project.project)
+    (project.project / "story-work.txt").write_text("story work\n")
+    git(project.project, "add", "story-work.txt")
+    git(project.project, "commit", "-q", "-m", "story work")
+    task = make_bundle_task(project, dw_ids=("DW-1",))
+    task.baseline_untracked = []
+    sp = project.implementation_artifacts / "spec-1-1-a.md"
+    write_spec(sp, "in-review", ancestor)
+    (project.project / "untracked-bundle-proof.txt").write_text("new bundle work\n")
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "dw_ids": ["DW-1"]}
+
+    assert verify.verify_dev_bundle(task, project, rj).ok
 
 
 def test_verify_dev_bundle_foreign_baseline_still_fails(project):
@@ -3932,6 +4012,7 @@ def test_has_changes_since_subtracts_baseline_untracked(project):
 
     assert verify.has_changes_since(project.project, baseline) is True
     assert verify.has_changes_since(project.project, baseline, baseline_untracked=None) is True
+    assert verify.has_changes_since(project.project, baseline, include_untracked=False) is False
     assert (
         verify.has_changes_since(project.project, baseline, baseline_untracked=["residue.txt"])
         is False
@@ -3950,6 +4031,7 @@ def test_has_changes_since_subtracts_baseline_untracked(project):
         verify.has_changes_since(project.project, baseline, baseline_untracked=["residue.txt"])
         is True
     )
+    assert verify.has_changes_since(project.project, baseline, include_untracked=False) is True
 
 
 def test_verify_dev_exclude_relpaths_is_file_granular(project):
