@@ -618,3 +618,18 @@ def test_relativize_spec_folder_survives_unresolvable_project_root(tmp_path, mon
 
     assert rel == "specs/s1"  # degraded (lexical) project root still contains it
     assert UNRESOLVABLE in capsys.readouterr().err
+
+
+def test_relativize_spec_folder_survives_unresolvable_spec_folder(tmp_path, monkeypatch, capsys):
+    """Same guard, the other operand: a regression that restored the bare
+    `raw.resolve()` `resolve_or_lexical` replaced would still pass the project-root
+    variant above, since that one only injects the failure into `project`."""
+    project = tmp_path / "proj"
+    spec_folder = project / "specs" / "s1"
+    spec_folder.mkdir(parents=True)
+    refuse_to_resolve(monkeypatch, spec_folder)
+
+    rel = stories.relativize_spec_folder(project, str(spec_folder))
+
+    assert rel == "specs/s1"
+    assert UNRESOLVABLE in capsys.readouterr().err
