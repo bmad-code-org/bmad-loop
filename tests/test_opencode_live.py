@@ -23,11 +23,13 @@ import re
 import socket
 
 import pytest
-from opencode_support import _opencode_runs
+from conftest import opencode_runs
 
-HAVE_OPENCODE = _opencode_runs()
+HAVE_OPENCODE = opencode_runs()
 pytestmark = pytest.mark.skipif(
-    not HAVE_OPENCODE, reason="live smoke needs a real `opencode` binary (POSIX)"
+    not HAVE_OPENCODE,
+    reason="live smoke needs a runnable `opencode` binary (POSIX): not on PATH, or on "
+    "PATH but failing `--version` — e.g. a dead WSL/npm shim (#294)",
 )
 
 httpx = pytest.importorskip("httpx")
