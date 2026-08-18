@@ -337,16 +337,41 @@ def is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
     return code == 0
 
 
-# A `baseline_revision` that is a Git revision EXPRESSION rather than an object id
-# (`HEAD`, a branch or tag name, `main~2`) resolves at verification time, not at the
-# moment the session stamped it — so every ancestry question about it answers yes and
-# `commit_made_above_baseline` would relax the gate unconditionally. The stamp is
-# `git rev-parse HEAD` output by contract, so requiring hex here costs a well-behaved
-# session nothing. Length floor mirrors `same_commit`'s 7; ceiling admits sha256.
+# A `baseline_revision` that is a Git revision expression rather than an object id
+# (`HEAD`, a branch or tag name, `main~2`) resolves at verification time, not when the
+# session stamped it. Hex spelling is necessary but insufficient: Git also permits
+# all-hex ref names. The stamp is `git rev-parse HEAD` output by contract, so requiring
+# a uniquely disambiguated direct commit costs a well-behaved session nothing. Length
+# floor mirrors `same_commit`'s 7; ceiling admits sha256.
 _OBJECT_ID = re.compile(r"\A[0-9a-fA-F]{7,64}\Z")
 
 
-def commit_made_above_baseline(repo: Path, claimed: str, baseline: str) -> bool:
+def _canonical_commit_oid(repo: Path, claim: str) -> str | None:
+    """Resolve one immutable commit object id, independent of Git refs.
+
+    ``claim`` must be 7–64 hexadecimal characters and uniquely identify one
+    object through ``rev-parse --disambiguate``. The object itself must be a
+    direct commit: blob, tree, and annotated-tag objects are refused rather
+    than peeled. The returned value is Git's canonical full object id.
+
+    Every failure reads as ``None`` because callers use this helper to relax a
+    baseline gate; uncertainty must preserve the stricter path.
+    """
+    if not _OBJECT_ID.fullmatch(claim):
+        return None
+    try:
+        rc, out, _ = _git_out(repo, "rev-parse", f"--disambiguate={claim}")
+        objects = out.splitlines()
+        if rc != 0 or len(objects) != 1:
+            return None
+        oid = objects[0]
+        rc, object_type, _ = _git_out(repo, "cat-file", "-t", oid)
+    except (OSError, GitError):
+        return None
+    return oid if rc == 0 and object_type == "commit" else None
+
+
+def commit_made_above_baseline(repo: Path, claimed_oid: str, baseline: str) -> bool:
     """True when ``claimed`` is a commit THIS UNIT itself made on top of
     ``baseline`` — strictly newer than the orchestrator-recorded baseline AND
     reachable from the worktree's current HEAD.
@@ -382,8 +407,8 @@ def commit_made_above_baseline(repo: Path, claimed: str, baseline: str) -> bool:
     must show work ABOVE the commit it claims. An outside commit therefore buys
     a session nothing.
 
-    ``claimed`` must be an object id, never a revision expression: see
-    :data:`_OBJECT_ID`.
+    ``claimed_oid`` is the canonical full commit id returned by
+    :func:`_canonical_commit_oid`, never a revision expression.
 
     Equality is not screened out here: ``is_ancestor`` answers True for a commit
     against itself, so a claim that resolves to ``baseline`` under a different
@@ -394,15 +419,13 @@ def commit_made_above_baseline(repo: Path, claimed: str, baseline: str) -> bool:
     Any git failure reads as False, exactly like :func:`is_ancestor`: this
     relaxes a gate, so uncertainty must keep the gate strict.
     """
-    if not _OBJECT_ID.match(claimed):
-        return False  # a revision expression, not a commit the session pinned
-    if not is_ancestor(repo, baseline, claimed):
+    if not is_ancestor(repo, baseline, claimed_oid):
         return False  # older, diverged or unknown -> not a commit of ours
     try:
         head = rev_parse_head(repo)
     except (OSError, GitError):
         return False
-    return is_ancestor(repo, claimed, head)
+    return is_ancestor(repo, claimed_oid, head)
 
 
 def has_changes_since(
@@ -2171,7 +2194,13 @@ def _verify_shared_gates(
     claimed_baseline = str(fm.get("baseline_commit", fm.get("baseline_revision", ""))).strip()
     proof_baseline: str = task.baseline_commit or ""
     if task.baseline_commit and claimed_baseline not in ("", "NO_VCS"):
-        if not same_commit(claimed_baseline, task.baseline_commit):
+        canonical_claimed = _canonical_commit_oid(paths.project, claimed_baseline)
+        if canonical_claimed is None:
+            return VerifyOutcome.retry(
+                f"spec baseline {claimed_baseline[:12]} does not match "
+                f"orchestrator-recorded baseline {task.baseline_commit[:12]}"
+            )
+        if canonical_claimed != task.baseline_commit:
             # A deferred-work bundle may legitimately adopt a pre-existing story
             # spec: bmad-build-auto routes a "follow-up review of story X" bundle
             # into that story's done spec, whose baseline_revision is the
@@ -2181,7 +2210,7 @@ def _verify_shared_gates(
             # history (a superset of the unit's changes), which is sound; a
             # diverged or unknown baseline still fails.
             older_ok = allow_ancestor_baseline and is_ancestor(
-                paths.project, claimed_baseline, task.baseline_commit
+                paths.project, canonical_claimed, task.baseline_commit
             )
             # The other direction, and it needs no opt-in flag: a session that
             # commits inside the unit before step-03 stamps `baseline_revision`
@@ -2191,14 +2220,14 @@ def _verify_shared_gates(
             # below this worktree's HEAD" can only be our own work, and why a
             # genuinely stale (older/diverged/unknown) baseline still fails.
             newer_ok = commit_made_above_baseline(
-                paths.project, claimed_baseline, task.baseline_commit
+                paths.project, canonical_claimed, task.baseline_commit
             )
             # Accepting a newer claim moves the proof-of-work reference onto it:
             # under `isolation = "none"` the claimed commit may have arrived in
             # the shared checkout from outside the session, and measuring from
             # the recorded baseline would let that commit satisfy proof-of-work
             # on its own — passing an attempt that implemented nothing.
-            proof_baseline = claimed_baseline if newer_ok else proof_baseline
+            proof_baseline = canonical_claimed if newer_ok else proof_baseline
             if not (older_ok or newer_ok):
                 return VerifyOutcome.retry(
                     f"spec baseline {claimed_baseline[:12]} does not match "

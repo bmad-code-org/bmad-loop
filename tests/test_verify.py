@@ -1,4 +1,5 @@
 import dataclasses
+import hashlib
 import io
 import os
 import subprocess
@@ -47,6 +48,46 @@ def _codec_rejects_bad_byte() -> bool:
     except UnicodeDecodeError:
         return True
     return False
+
+
+def _write_ambiguous_commit_prefix(repo: Path) -> tuple[str, tuple[str, str]]:
+    """Write two valid commit objects sharing a seven-hex prefix.
+
+    Generate candidate object bytes in memory so the fixture pays only two Git
+    subprocesses rather than the birthday search's roughly 20,000 attempts.
+    """
+    tree = git(repo, "rev-parse", "HEAD^{tree}")
+    parent = git(repo, "rev-parse", "HEAD")
+    fixed = (
+        f"tree {tree}\n"
+        f"parent {parent}\n"
+        "author Test <test@example.com> 0 +0000\n"
+        "committer Test <test@example.com> 0 +0000\n\n"
+    )
+    seen: dict[str, tuple[str, bytes]] = {}
+    pair: tuple[tuple[str, bytes], tuple[str, bytes]] | None = None
+    for nonce in range(500_000):
+        body = f"{fixed}ambiguous-prefix-{nonce}\n".encode()
+        serialized = f"commit {len(body)}\0".encode() + body
+        oid = hashlib.sha1(serialized, usedforsecurity=False).hexdigest()
+        prefix = oid[:7]
+        previous = seen.get(prefix)
+        if previous is not None and previous[0] != oid:
+            pair = (previous, (oid, body))
+            break
+        seen[prefix] = (oid, body)
+    if pair is None:  # pragma: no cover - collision probability is effectively 1
+        raise AssertionError("failed to generate a seven-hex commit collision")
+
+    for expected_oid, body in pair:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "hash-object", "-t", "commit", "-w", "--stdin"],
+            input=body,
+            capture_output=True,
+            check=True,
+        )
+        assert proc.stdout.decode().strip() == expected_oid
+    return pair[0][0][:7], (pair[0][0], pair[1][0])
 
 
 # Guard for every test whose subject is a STRICT DECODE of subprocess output —
@@ -507,9 +548,9 @@ def test_verify_dev_spawn_fault_escalates(project, monkeypatch):
     """#343 acceptance, escalate class: with the OSError injected at
     `subprocess.run` itself, the shared change-gate's `except GitError` guard
     catches the translated GitSpawnError and escalates (CRITICAL, not
-    retryable) instead of crashing. Everything on the path before
-    `has_changes_since` is filesystem-only, so the blanket injection's first
-    git spawn is exactly the guarded call.
+    retryable) instead of crashing. Baseline canonicalization now performs
+    fail-closed Git reads first, so the injection targets the proof-of-work diff
+    explicitly.
 
     Ablation target: delete the `except OSError` arm in `verify._run_git` and
     this fails with the raw OSError."""
@@ -519,10 +560,14 @@ def test_verify_dev_spawn_fault_escalates(project, monkeypatch):
     write_spec(sp, "in-review", task.baseline_commit)
     (project.project / "src.txt").write_text("changed\n")
 
-    def cannot_spawn(cmd, **kwargs):
-        raise OSError(12, "Cannot allocate memory")
+    real_run = verify.subprocess.run
 
-    monkeypatch.setattr(verify.subprocess, "run", cannot_spawn)
+    def cannot_spawn_diff(cmd, **kwargs):
+        if cmd[3] == "diff":
+            raise OSError(12, "Cannot allocate memory")
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(verify.subprocess, "run", cannot_spawn_diff)
     out = verify.verify_dev(task, project, dev_result(sp))
     assert not out.ok and not out.retryable
     assert out.severity == "CRITICAL"
@@ -759,6 +804,56 @@ def test_verify_dev_short_hash_baseline(project):
     assert out.ok
 
 
+def test_canonical_commit_oid_accepts_full_uppercase_and_unique_abbreviation(project):
+    oid = verify.rev_parse_head(project.project)
+
+    assert verify._canonical_commit_oid(project.project, oid) == oid
+    assert verify._canonical_commit_oid(project.project, oid.upper()) == oid
+    assert verify._canonical_commit_oid(project.project, oid[:7]) == oid
+
+
+@pytest.mark.parametrize("object_kind", ["blob", "tree", "tag"])
+def test_canonical_commit_oid_refuses_non_commit_objects(project, object_kind):
+    if object_kind == "blob":
+        oid = git(project.project, "hash-object", "-w", "src.txt")
+    elif object_kind == "tree":
+        oid = git(project.project, "rev-parse", "HEAD^{tree}")
+    else:
+        git(project.project, "tag", "-a", "object-tag", "-m", "tag object", "HEAD")
+        oid = git(project.project, "rev-parse", "object-tag^{tag}")
+
+    assert verify._canonical_commit_oid(project.project, oid) is None
+
+
+def test_canonical_commit_oid_refuses_an_ambiguous_prefix(project):
+    prefix, oids = _write_ambiguous_commit_prefix(project.project)
+
+    assert set(git(project.project, "rev-parse", f"--disambiguate={prefix}").splitlines()) == set(
+        oids
+    )
+    assert verify._canonical_commit_oid(project.project, prefix) is None
+
+
+def test_canonical_commit_oid_accepts_sha256_when_git_supports_it(project):
+    repo = project.project / "sha256-repo"
+    proc = subprocess.run(
+        ["git", "init", "-q", "--object-format=sha256", str(repo)],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        pytest.skip(f"Git does not support SHA-256 repositories: {proc.stderr.strip()}")
+    git(repo, "config", "user.name", "Test")
+    git(repo, "config", "user.email", "test@example.com")
+    (repo / "file.txt").write_text("sha256 fixture\n")
+    git(repo, "add", "file.txt")
+    git(repo, "commit", "-q", "-m", "sha256 commit")
+    oid = verify.rev_parse_head(repo)
+
+    assert len(oid) == 64
+    assert verify._canonical_commit_oid(repo, oid[:12].upper()) == oid
+
+
 def test_verify_dev_accepts_a_baseline_this_unit_committed(project):
     """A session that commits inside the unit before step-03 stamps
     `baseline_revision` makes that stamp a DESCENDANT of the baseline the
@@ -783,6 +878,43 @@ def test_verify_dev_accepts_a_baseline_this_unit_committed(project):
     assert out.ok
 
 
+def test_verify_dev_uses_canonical_oid_after_same_named_ref_moves(project, monkeypatch):
+    """Once the claim is disambiguated, later ref movement cannot retarget any
+    ancestry or proof-of-work operation back onto the mutable ref name."""
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "descendant baseline")
+    descendant = verify.rev_parse_head(project.project)
+    claimed_ref = descendant[:12]
+    git(project.project, "branch", claimed_ref, descendant)
+
+    write_spec(sp, "in-review", claimed_ref)
+    (project.project / "src.txt").write_text("work after the descendant\n")
+
+    real_is_ancestor = verify.is_ancestor
+    calls: list[tuple[str, str]] = []
+
+    def move_ref_then_check(repo, ancestor, candidate):
+        if not calls:
+            git(repo, "branch", "-f", claimed_ref, task.baseline_commit)
+        calls.append((ancestor, candidate))
+        return real_is_ancestor(repo, ancestor, candidate)
+
+    monkeypatch.setattr(verify, "is_ancestor", move_ref_then_check)
+    out = verify.verify_dev(task, project, dev_result(sp))
+
+    assert out.ok
+    assert calls == [
+        (task.baseline_commit, descendant),
+        (descendant, descendant),
+    ]
+    assert git(project.project, "rev-parse", f"refs/heads/{claimed_ref}") == task.baseline_commit
+
+
 def test_verify_dev_still_refuses_a_stale_ancestor_baseline(project):
     """The stale-premise case the gate exists for is untouched: an OLDER
     baseline outside a deferred-work bundle still fails."""
@@ -795,6 +927,20 @@ def test_verify_dev_still_refuses_a_stale_ancestor_baseline(project):
 
     sp = spec_path(project, "1-1-a")
     write_spec(sp, "in-review", ancestor)
+    (project.project / "src.txt").write_text("changed\n")
+
+    out = verify.verify_dev(task, project, dev_result(sp))
+    assert not out.ok and "does not match" in out.reason
+
+
+def test_verify_dev_still_refuses_a_diverged_commit_baseline(project):
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+    tree = git(project.project, "rev-parse", "HEAD^{tree}")
+    diverged = git(project.project, "commit-tree", tree, "-m", "unrelated root")
+
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", diverged)
     (project.project / "src.txt").write_text("changed\n")
 
     out = verify.verify_dev(task, project, dev_result(sp))
@@ -860,6 +1006,34 @@ def test_verify_dev_refuses_a_symbolic_baseline_revision(project):
 
     write_spec(sp, "in-review", "HEAD")
     (project.project / "src.txt").write_text("changed\n")
+
+    out = verify.verify_dev(task, project, dev_result(sp))
+    assert not out.ok and "does not match" in out.reason
+
+
+@pytest.mark.parametrize("ref_kind", ["branch", "tag"])
+def test_verify_dev_refuses_an_all_hex_ref_baseline(project, ref_kind):
+    """Hex spelling alone does not make a claim immutable. Git resolves an
+    all-hex branch or tag when no object has that prefix, so the baseline gate
+    must disambiguate the object id independently of the ref namespace."""
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "reachable descendant")
+
+    claimed_ref = "deadbeef"
+    if ref_kind == "branch":
+        git(project.project, "branch", claimed_ref, "HEAD")
+    else:
+        git(project.project, "tag", claimed_ref, "HEAD")
+    assert git(project.project, "rev-parse", claimed_ref) == verify.rev_parse_head(project.project)
+    assert git(project.project, "rev-parse", f"--disambiguate={claimed_ref}") == ""
+
+    write_spec(sp, "in-review", claimed_ref)
+    (project.project / "src.txt").write_text("changed after the claim\n")
 
     out = verify.verify_dev(task, project, dev_result(sp))
     assert not out.ok and "does not match" in out.reason
