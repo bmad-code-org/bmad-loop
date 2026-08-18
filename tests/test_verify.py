@@ -1,4 +1,5 @@
 import dataclasses
+import hashlib
 import io
 import os
 import subprocess
@@ -47,6 +48,46 @@ def _codec_rejects_bad_byte() -> bool:
     except UnicodeDecodeError:
         return True
     return False
+
+
+def _write_ambiguous_commit_prefix(repo: Path) -> tuple[str, tuple[str, str]]:
+    """Write two valid commit objects sharing a seven-hex prefix.
+
+    Generate candidate object bytes in memory so the fixture pays only two Git
+    subprocesses rather than the birthday search's roughly 20,000 attempts.
+    """
+    tree = git(repo, "rev-parse", "HEAD^{tree}")
+    parent = git(repo, "rev-parse", "HEAD")
+    fixed = (
+        f"tree {tree}\n"
+        f"parent {parent}\n"
+        "author Test <test@example.com> 0 +0000\n"
+        "committer Test <test@example.com> 0 +0000\n\n"
+    )
+    seen: dict[str, tuple[str, bytes]] = {}
+    pair: tuple[tuple[str, bytes], tuple[str, bytes]] | None = None
+    for nonce in range(500_000):
+        body = f"{fixed}ambiguous-prefix-{nonce}\n".encode()
+        serialized = f"commit {len(body)}\0".encode() + body
+        oid = hashlib.sha1(serialized, usedforsecurity=False).hexdigest()
+        prefix = oid[:7]
+        previous = seen.get(prefix)
+        if previous is not None and previous[0] != oid:
+            pair = (previous, (oid, body))
+            break
+        seen[prefix] = (oid, body)
+    if pair is None:  # pragma: no cover - collision probability is effectively 1
+        raise AssertionError("failed to generate a seven-hex commit collision")
+
+    for expected_oid, body in pair:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "hash-object", "-t", "commit", "-w", "--stdin"],
+            input=body,
+            capture_output=True,
+            check=True,
+        )
+        assert proc.stdout.decode().strip() == expected_oid
+    return pair[0][0][:7], (pair[0][0], pair[1][0])
 
 
 # Guard for every test whose subject is a STRICT DECODE of subprocess output —
@@ -507,9 +548,9 @@ def test_verify_dev_spawn_fault_escalates(project, monkeypatch):
     """#343 acceptance, escalate class: with the OSError injected at
     `subprocess.run` itself, the shared change-gate's `except GitError` guard
     catches the translated GitSpawnError and escalates (CRITICAL, not
-    retryable) instead of crashing. Everything on the path before
-    `has_changes_since` is filesystem-only, so the blanket injection's first
-    git spawn is exactly the guarded call.
+    retryable) instead of crashing. Baseline canonicalization now performs
+    fail-closed Git reads first, so the injection targets the proof-of-work diff
+    explicitly.
 
     Ablation target: delete the `except OSError` arm in `verify._run_git` and
     this fails with the raw OSError."""
@@ -519,14 +560,53 @@ def test_verify_dev_spawn_fault_escalates(project, monkeypatch):
     write_spec(sp, "in-review", task.baseline_commit)
     (project.project / "src.txt").write_text("changed\n")
 
-    def cannot_spawn(cmd, **kwargs):
-        raise OSError(12, "Cannot allocate memory")
+    real_run = verify.subprocess.run
 
-    monkeypatch.setattr(verify.subprocess, "run", cannot_spawn)
+    def cannot_spawn_diff(cmd, **kwargs):
+        if cmd[3] == "diff" and "--quiet" in cmd:
+            raise OSError(12, "Cannot allocate memory")
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(verify.subprocess, "run", cannot_spawn_diff)
     out = verify.verify_dev(task, project, dev_result(sp))
     assert not out.ok and not out.retryable
     assert out.severity == "CRITICAL"
     assert "failed to spawn" in out.reason
+
+
+@pytest.mark.parametrize("subcommand", ["rev-parse", "cat-file"])
+def test_verify_dev_canonical_baseline_spawn_fault_escalates(project, monkeypatch, subcommand):
+    """Baseline canonicalization is a validation boundary, not a best-effort
+    ancestry probe. A machine fault while resolving or typing the claimed object
+    must escalate instead of masquerading as a retryable baseline mismatch.
+
+    Ablation: catch ``GitError`` in ``_canonical_commit_oid`` and return ``None``;
+    both parameters become retryable mismatches and fail the severity assertions.
+    """
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+    (project.project / "src.txt").write_text("changed\n")
+
+    real_run = verify.subprocess.run
+    fault_args = (
+        ["rev-parse", f"--disambiguate={task.baseline_commit}"]
+        if subcommand == "rev-parse"
+        else ["cat-file", "-t", task.baseline_commit]
+    )
+
+    def cannot_spawn_canonicalization(cmd, **kwargs):
+        if cmd[3:] == fault_args:
+            raise OSError(12, "Cannot allocate memory")
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(verify.subprocess, "run", cannot_spawn_canonicalization)
+    out = verify.verify_dev(task, project, dev_result(sp))
+
+    assert not out.ok and not out.retryable
+    assert out.severity == "CRITICAL"
+    assert f"git {subcommand} failed to spawn" in out.reason
 
 
 def test_verify_dev_status_is_case_insensitive(project):
@@ -757,6 +837,336 @@ def test_verify_dev_short_hash_baseline(project):
 
     out = verify.verify_dev(task, project, dev_result(sp))
     assert out.ok
+
+
+def test_canonical_commit_oid_accepts_full_uppercase_and_unique_abbreviation(project):
+    oid = verify.rev_parse_head(project.project)
+
+    assert verify._canonical_commit_oid(project.project, oid) == oid
+    assert verify._canonical_commit_oid(project.project, oid.upper()) == oid
+    assert verify._canonical_commit_oid(project.project, oid[:7]) == oid
+
+
+@pytest.mark.parametrize("object_kind", ["blob", "tree", "tag"])
+def test_canonical_commit_oid_refuses_non_commit_objects(project, object_kind):
+    """Ablation: returning the sole disambiguated object without the
+    ``cat-file -t`` direct-commit check makes every parameter fail."""
+    if object_kind == "blob":
+        oid = git(project.project, "hash-object", "-w", "src.txt")
+    elif object_kind == "tree":
+        oid = git(project.project, "rev-parse", "HEAD^{tree}")
+    else:
+        git(project.project, "tag", "-a", "object-tag", "-m", "tag object", "HEAD")
+        oid = git(project.project, "rev-parse", "object-tag^{tag}")
+
+    assert verify._canonical_commit_oid(project.project, oid) is None
+
+
+def test_canonical_commit_oid_refuses_an_ambiguous_prefix(project):
+    """Ablation: accepting the first disambiguated object instead of requiring
+    ``len(objects) == 1`` makes this assertion fail."""
+    prefix, oids = _write_ambiguous_commit_prefix(project.project)
+
+    assert set(git(project.project, "rev-parse", f"--disambiguate={prefix}").splitlines()) == set(
+        oids
+    )
+    assert verify._canonical_commit_oid(project.project, prefix) is None
+
+
+def test_canonical_commit_oid_accepts_sha256_when_git_supports_it(project):
+    repo = project.project / "sha256-repo"
+    proc = subprocess.run(
+        ["git", "init", "-q", "--object-format=sha256", str(repo)],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        pytest.skip(f"Git does not support SHA-256 repositories: {proc.stderr.strip()}")
+    git(repo, "config", "user.name", "Test")
+    git(repo, "config", "user.email", "test@example.com")
+    (repo / "file.txt").write_text("sha256 fixture\n")
+    git(repo, "add", "file.txt")
+    git(repo, "commit", "-q", "-m", "sha256 commit")
+    oid = verify.rev_parse_head(repo)
+
+    assert len(oid) == 64
+    assert verify._canonical_commit_oid(repo, oid[:12].upper()) == oid
+
+
+def test_verify_dev_accepts_a_reachable_descendant_baseline(project):
+    """A session that commits inside the unit before step-03 stamps
+    `baseline_revision` makes that stamp a DESCENDANT of the baseline the
+    orchestrator recorded — the shape no branch of the gate could accept, so a
+    finished attempt was refused at the door. The immutable descendant is
+    accepted when this checkout's HEAD reaches it and later work is proven."""
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "spec for 1-1-a")
+    spec_commit = verify.rev_parse_head(project.project)
+
+    # step-03 stamps "current HEAD before making any changes" — the spec commit
+    write_spec(sp, "in-review", spec_commit)
+    (project.project / "src.txt").write_text("changed\n")
+
+    assert verify.is_ancestor(project.project, task.baseline_commit, spec_commit)
+    out = verify.verify_dev(task, project, dev_result(sp))
+    assert out.ok
+
+
+def test_verify_dev_uses_canonical_oid_after_same_named_ref_moves(project, monkeypatch):
+    """Once the claim is disambiguated, later ref movement cannot retarget any
+    ancestry or proof-of-work operation back onto the mutable ref name."""
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "descendant baseline")
+    descendant = verify.rev_parse_head(project.project)
+    claimed_ref = descendant[:12]
+    git(project.project, "branch", claimed_ref, descendant)
+
+    write_spec(sp, "in-review", claimed_ref)
+    (project.project / "src.txt").write_text("work after the descendant\n")
+
+    real_is_ancestor = verify.is_ancestor
+    calls: list[tuple[str, str]] = []
+
+    def move_ref_then_check(repo, ancestor, candidate):
+        if not calls:
+            git(repo, "branch", "-f", claimed_ref, task.baseline_commit)
+        calls.append((ancestor, candidate))
+        return real_is_ancestor(repo, ancestor, candidate)
+
+    monkeypatch.setattr(verify, "is_ancestor", move_ref_then_check)
+    out = verify.verify_dev(task, project, dev_result(sp))
+
+    assert out.ok
+    assert calls == [
+        (task.baseline_commit, descendant),
+        (descendant, descendant),
+    ]
+    assert git(project.project, "rev-parse", f"refs/heads/{claimed_ref}") == task.baseline_commit
+
+
+def test_verify_dev_still_refuses_a_stale_ancestor_baseline(project):
+    """The stale-premise case the gate exists for is untouched: an OLDER
+    baseline outside a deferred-work bundle still fails.
+
+    Ablation: force ``commit_reachable_above_baseline`` to return ``True`` and
+    the attempt passes, failing the refusal assertion.
+    """
+    ancestor = verify.rev_parse_head(project.project)
+    (project.project / "prior.txt").write_text("work that landed first\n")
+    git(project.project, "add", "prior.txt")
+    git(project.project, "commit", "-q", "-m", "prior work")
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)  # baseline = the newer HEAD
+
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", ancestor)
+    (project.project / "src.txt").write_text("changed\n")
+
+    out = verify.verify_dev(task, project, dev_result(sp))
+    assert not out.ok and "does not match" in out.reason
+
+
+def test_verify_dev_still_refuses_a_diverged_commit_baseline(project):
+    """Ablation: force ``commit_reachable_above_baseline`` to return ``True``
+    and this unrelated root passes, failing the refusal assertion."""
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+    tree = git(project.project, "rev-parse", "HEAD^{tree}")
+    diverged = git(project.project, "commit-tree", tree, "-m", "unrelated root")
+
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", diverged)
+    (project.project / "src.txt").write_text("changed\n")
+
+    out = verify.verify_dev(task, project, dev_result(sp))
+    assert not out.ok and "does not match" in out.reason
+
+
+def test_verify_dev_refuses_a_descendant_off_this_worktree(project):
+    """The half that keeps the widening narrow: a commit above the baseline that
+    this checkout's HEAD does not reach is outside the accepted history.
+
+    Ablation: force ``commit_reachable_above_baseline`` to return ``True``
+    (bypassing its final HEAD-ancestry call) and the refusal assertion fails.
+    """
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+
+    git(project.project, "checkout", "-q", "-b", "elsewhere")
+    (project.project / "foreign.txt").write_text("another branch\n")
+    git(project.project, "add", "foreign.txt")
+    git(project.project, "commit", "-q", "-m", "foreign work")
+    foreign = verify.rev_parse_head(project.project)
+    git(project.project, "checkout", "-q", "-")
+
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", foreign)
+    (project.project / "src.txt").write_text("changed\n")
+
+    assert verify.is_ancestor(project.project, task.baseline_commit, foreign)
+    out = verify.verify_dev(task, project, dev_result(sp))
+    assert not out.ok and "does not match" in out.reason
+
+
+def test_verify_dev_descendant_baseline_needs_work_above_it(project):
+    """Accepting a newer claim re-anchors proof-of-work onto it. Under the default
+    `isolation = "none"` the unit works in the shared checkout, so a commit can
+    arrive from outside the session and still be reachable from HEAD; measuring
+    from the recorded baseline would let that commit satisfy proof-of-work on its
+    own, passing an attempt that implemented nothing.
+
+    Ablation: leave ``proof_baseline`` at the recorded baseline after accepting
+    the descendant and this no-work attempt passes, failing the assertion.
+    """
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+    (project.project / "someone-elses-work.txt").write_text("not this session\n")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "a commit from outside the session")
+    foreign_but_reachable = verify.rev_parse_head(project.project)
+
+    # the spec claims it, and the session then implements NOTHING
+    write_spec(sp, "in-review", foreign_but_reachable)
+
+    out = verify.verify_dev(task, project, dev_result(sp))
+    assert not out.ok, "a session that implemented nothing passed the gate"
+
+
+def test_verify_dev_descendant_baseline_refuses_untracked_only_residue(project):
+    """The launch-time untracked snapshot says when residue appeared relative
+    to the recorded baseline, not relative to a later claimed descendant. It
+    therefore cannot prove that an untracked file was made after that claim.
+
+    Ablation: keep ``include_untracked_proof`` true for the accepted descendant
+    and the residue makes the attempt pass, failing the refusal assertion.
+    """
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+    task.baseline_untracked = []
+
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+    residue = project.project / "intervening-untracked.txt"
+    residue.write_text("created before the descendant claim\n")
+    git(
+        project.project,
+        "add",
+        project.sprint_status.relative_to(project.project).as_posix(),
+        sp.relative_to(project.project).as_posix(),
+    )
+    git(project.project, "commit", "-q", "-m", "descendant baseline")
+    descendant = verify.rev_parse_head(project.project)
+
+    write_spec(sp, "in-review", descendant)
+    out = verify.verify_dev(task, project, dev_result(sp))
+
+    assert residue.is_file()
+    assert not out.ok and "no changes" in out.reason
+
+
+@pytest.mark.parametrize("proof_kind", ["tracked", "staged", "committed"])
+def test_verify_dev_descendant_baseline_accepts_tracked_proof(project, proof_kind):
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "descendant baseline")
+    descendant = verify.rev_parse_head(project.project)
+    write_spec(sp, "in-review", descendant)
+
+    if proof_kind == "tracked":
+        (project.project / "src.txt").write_text("tracked modification\n")
+    elif proof_kind == "staged":
+        (project.project / "staged-proof.txt").write_text("staged new file\n")
+        git(project.project, "add", "staged-proof.txt")
+    else:
+        (project.project / "src.txt").write_text("committed work\n")
+        git(project.project, "add", "src.txt")
+        git(project.project, "commit", "-q", "-m", "work after descendant")
+
+    out = verify.verify_dev(task, project, dev_result(sp))
+    assert out.ok
+
+
+def test_verify_dev_equal_baseline_still_accepts_new_untracked_file(project):
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+    task.baseline_untracked = []
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+    (project.project / "untracked-proof.txt").write_text("new after exact baseline\n")
+
+    assert verify.verify_dev(task, project, dev_result(sp)).ok
+
+
+def test_verify_dev_refuses_a_symbolic_baseline_revision(project):
+    """A spec naming a Git revision expression instead of an immutable object id
+    (`baseline_revision: HEAD`) resolves at verification time, so every ancestry
+    question about it answers yes. It must not buy the relaxation.
+
+    Ablation: restore the old lexical-hex check plus raw-ref ancestry calls and
+    ``HEAD`` makes the attempt pass, failing the refusal assertion.
+    """
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "spec for 1-1-a")
+
+    write_spec(sp, "in-review", "HEAD")
+    (project.project / "src.txt").write_text("changed\n")
+
+    out = verify.verify_dev(task, project, dev_result(sp))
+    assert not out.ok and "does not match" in out.reason
+
+
+@pytest.mark.parametrize("ref_kind", ["branch", "tag"])
+def test_verify_dev_refuses_an_all_hex_ref_baseline(project, ref_kind):
+    """Hex spelling alone does not make a claim immutable. Git resolves an
+    all-hex branch or tag when no object has that prefix, so the baseline gate
+    must disambiguate the object id independently of the ref namespace.
+
+    Ablation: restore the old ``_OBJECT_ID``-only gate and raw-ref ancestry
+    calls; both parameters pass verification and fail this refusal assertion.
+    """
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "reachable descendant")
+
+    claimed_ref = "deadbeef"
+    if ref_kind == "branch":
+        git(project.project, "branch", claimed_ref, "HEAD")
+    else:
+        git(project.project, "tag", claimed_ref, "HEAD")
+    assert git(project.project, "rev-parse", claimed_ref) == verify.rev_parse_head(project.project)
+    assert git(project.project, "rev-parse", f"--disambiguate={claimed_ref}") == ""
+
+    write_spec(sp, "in-review", claimed_ref)
+    (project.project / "src.txt").write_text("changed after the claim\n")
+
+    out = verify.verify_dev(task, project, dev_result(sp))
+    assert not out.ok and "does not match" in out.reason
 
 
 def test_verify_dev_no_changes(project):
@@ -1287,6 +1697,21 @@ def test_verify_dev_bundle_ancestor_baseline_passes(project):
     assert task.spec_file == str(sp)
 
 
+def test_verify_dev_bundle_ancestor_baseline_retains_untracked_proof(project):
+    ancestor = verify.rev_parse_head(project.project)
+    (project.project / "story-work.txt").write_text("story work\n")
+    git(project.project, "add", "story-work.txt")
+    git(project.project, "commit", "-q", "-m", "story work")
+    task = make_bundle_task(project, dw_ids=("DW-1",))
+    task.baseline_untracked = []
+    sp = project.implementation_artifacts / "spec-1-1-a.md"
+    write_spec(sp, "in-review", ancestor)
+    (project.project / "untracked-bundle-proof.txt").write_text("new bundle work\n")
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "dw_ids": ["DW-1"]}
+
+    assert verify.verify_dev_bundle(task, project, rj).ok
+
+
 def test_verify_dev_bundle_foreign_baseline_still_fails(project):
     """The bundle relaxation is ancestor-only: a baseline unknown to (or
     diverged from) the unit's history still fails the gate."""
@@ -1303,7 +1728,12 @@ def test_verify_dev_bundle_ancestor_probe_git_failure_stays_strict(project, monk
     """A git failure inside the ancestor probe (e.g. a timeout, which surfaces
     as GitError since #156's `_run_git` translation) must read as
     not-an-ancestor and fail the gate closed — never propagate out of
-    `_verify_shared_gates` and crash the run."""
+    `_verify_shared_gates` and crash the run. Baseline canonicalization is an
+    earlier escalation boundary, so the injection targets ``merge-base``.
+
+    Ablation: delete the ``except (OSError, GitError)`` guard in ``is_ancestor``;
+    the timeout propagates instead of reading as false and this test errors.
+    """
     ancestor = verify.rev_parse_head(project.project)
     (project.project / "story-work.txt").write_text("stories 1.1-1.3\n")
     git(project.project, "add", "-A")
@@ -1313,7 +1743,15 @@ def test_verify_dev_bundle_ancestor_probe_git_failure_stays_strict(project, monk
     write_spec(sp, "in-review", ancestor)
     (project.project / "src.txt").write_text("review fixes\n")
     rj = {"workflow": "auto-dev", "spec_file": str(sp), "dw_ids": ["DW-1"]}
-    monkeypatch.setattr(verify.subprocess, "run", _timing_out_run)
+
+    real_run = verify.subprocess.run
+
+    def timing_out_merge_base(cmd, **kwargs):
+        if cmd[3] == "merge-base":
+            return _timing_out_run(cmd, **kwargs)
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(verify.subprocess, "run", timing_out_merge_base)
     assert verify.is_ancestor(project.project, ancestor, task.baseline_commit) is False
     out = verify.verify_dev_bundle(task, project, rj)
     assert not out.ok and "baseline" in out.reason
@@ -3652,6 +4090,7 @@ def test_has_changes_since_subtracts_baseline_untracked(project):
 
     assert verify.has_changes_since(project.project, baseline) is True
     assert verify.has_changes_since(project.project, baseline, baseline_untracked=None) is True
+    assert verify.has_changes_since(project.project, baseline, include_untracked=False) is False
     assert (
         verify.has_changes_since(project.project, baseline, baseline_untracked=["residue.txt"])
         is False
@@ -3670,6 +4109,7 @@ def test_has_changes_since_subtracts_baseline_untracked(project):
         verify.has_changes_since(project.project, baseline, baseline_untracked=["residue.txt"])
         is True
     )
+    assert verify.has_changes_since(project.project, baseline, include_untracked=False) is True
 
 
 def test_verify_dev_exclude_relpaths_is_file_granular(project):

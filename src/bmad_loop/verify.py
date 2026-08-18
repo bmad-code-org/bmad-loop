@@ -8,6 +8,7 @@ policy's test/lint gates with the orchestrator's own subprocess calls.
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -336,14 +337,73 @@ def is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
     return code == 0
 
 
+# A `baseline_revision` that is a Git revision expression rather than an object id
+# (`HEAD`, a branch or tag name, `main~2`) resolves at verification time, not when the
+# session stamped it. Hex spelling is necessary but insufficient: Git also permits
+# all-hex ref names. The stamp is `git rev-parse HEAD` output by contract, so requiring
+# a uniquely disambiguated direct commit costs a well-behaved session nothing. Length
+# floor mirrors `same_commit`'s 7; ceiling admits sha256.
+_OBJECT_ID = re.compile(r"\A[0-9a-fA-F]{7,64}\Z")
+
+
+def _canonical_commit_oid(repo: Path, claim: str) -> str | None:
+    """Resolve one immutable commit object id, independent of Git refs.
+
+    ``claim`` must be 7–64 hexadecimal characters and uniquely identify one
+    object through ``rev-parse --disambiguate``. The object itself must be a
+    direct commit: blob, tree, and annotated-tag objects are refused rather
+    than peeled. The returned value is Git's canonical full object id.
+
+    Invalid, unresolved, ambiguous, and non-commit claims read as ``None``.
+    Operational Git failures retain their typed :class:`GitError` so the
+    verification boundary can escalate instead of misreporting a mismatch.
+    """
+    if not _OBJECT_ID.fullmatch(claim):
+        return None
+    rc, out, _ = _git_out(repo, "rev-parse", f"--disambiguate={claim}")
+    objects = out.splitlines()
+    if rc != 0 or len(objects) != 1:
+        return None
+    oid = objects[0]
+    rc, object_type, _ = _git_out(repo, "cat-file", "-t", oid)
+    return oid if rc == 0 and object_type == "commit" else None
+
+
+def commit_reachable_above_baseline(repo: Path, claimed_oid: str, baseline: str) -> bool:
+    """Whether a canonical claimed commit descends from ``baseline`` and is
+    reachable from this checkout's current ``HEAD``.
+
+    The caller handles equality first, so a successful call represents the
+    strictly newer shape needed when step-03 stamps ``baseline_revision`` after
+    an intervening commit. Older, diverged, and off-HEAD commits stay refused.
+
+    With worktree isolation, the isolated history preserves provenance for the
+    unit. In the default shared checkout, reachability cannot identify which
+    session produced a commit; the caller therefore re-anchors proof to this
+    claim and requires a later tracked, staged, or committed change. The shared
+    mode proves only that such work exists after the claim, not who made it.
+
+    Any Git failure reads as ``False`` because this result relaxes a gate and
+    uncertainty must keep the stricter path.
+    """
+    if not is_ancestor(repo, baseline, claimed_oid):
+        return False  # older, diverged, or unknown -> not an accepted descendant
+    try:
+        head = rev_parse_head(repo)
+    except (OSError, GitError):
+        return False
+    return is_ancestor(repo, claimed_oid, head)
+
+
 def has_changes_since(
     repo: Path,
     baseline: str,
     exclude: tuple[str, ...] = (),
     *,
     baseline_untracked: list[str] | None = None,
+    include_untracked: bool = True,
 ) -> bool:
-    """True if tracked changes since baseline OR untracked files exist.
+    """True if tracked changes since baseline, or allowed untracked files exist.
 
     `exclude` is repo-relative posix dir prefixes whose changes don't count —
     used by the dev/bundle proof-of-work gate to ignore the orchestrator-owned
@@ -358,6 +418,12 @@ def has_changes_since(
     intent-gap patch, which `_protected_relpaths` shields from every reset) can
     never masquerade as this session's work.
 
+    ``include_untracked=False`` restricts proof to tracked, staged, or committed
+    changes. It is used when verification adopts a later descendant baseline:
+    the launch-time snapshot cannot establish whether an untracked file appeared
+    before or after that later commit. The default preserves every established
+    caller and exact-baseline proof.
+
     `None` means count EVERY untracked file — deliberately the *opposite* of
     `attempt_dirty`'s `None` = ignore-all, and not an oversight. The two gates
     fail open in opposite directions: a proof-of-work gate must fail open toward
@@ -368,6 +434,8 @@ def has_changes_since(
     rc, _ = _git(repo, "diff", "--quiet", baseline, "--", ".", *_exclude_specs(exclude))
     if rc != 0:
         return True
+    if not include_untracked:
+        return False
     created = untracked_files(repo)
     if baseline_untracked is not None:
         created -= set(baseline_untracked)
@@ -2100,8 +2168,19 @@ def _verify_shared_gates(
     # made this gate dead code for every generic-skill session. Read both, the
     # same idiom as `devcontract.synthesize_result`.
     claimed_baseline = str(fm.get("baseline_commit", fm.get("baseline_revision", ""))).strip()
+    proof_baseline: str = task.baseline_commit or ""
+    include_untracked_proof = True
     if task.baseline_commit and claimed_baseline not in ("", "NO_VCS"):
-        if not same_commit(claimed_baseline, task.baseline_commit):
+        try:
+            canonical_claimed = _canonical_commit_oid(paths.project, claimed_baseline)
+        except GitError as e:
+            return VerifyOutcome.escalate(str(e))
+        if canonical_claimed is None:
+            return VerifyOutcome.retry(
+                f"spec baseline {claimed_baseline[:12]} does not match "
+                f"orchestrator-recorded baseline {task.baseline_commit[:12]}"
+            )
+        if canonical_claimed != task.baseline_commit:
             # A deferred-work bundle may legitimately adopt a pre-existing story
             # spec: bmad-build-auto routes a "follow-up review of story X" bundle
             # into that story's done spec, whose baseline_revision is the
@@ -2110,10 +2189,27 @@ def _verify_shared_gates(
             # the session diffed from an earlier commit on the unit's own
             # history (a superset of the unit's changes), which is sound; a
             # diverged or unknown baseline still fails.
-            if not (
-                allow_ancestor_baseline
-                and is_ancestor(paths.project, claimed_baseline, task.baseline_commit)
-            ):
+            older_ok = allow_ancestor_baseline and is_ancestor(
+                paths.project, canonical_claimed, task.baseline_commit
+            )
+            # The other direction needs no opt-in flag: an intervening commit
+            # before step-03 stamps `baseline_revision` makes the claim newer
+            # than the recorded baseline. Accept it only when this checkout's
+            # HEAD reaches that canonical descendant; stale, diverged, unknown,
+            # and off-HEAD commits still fail.
+            newer_ok = commit_reachable_above_baseline(
+                paths.project, canonical_claimed, task.baseline_commit
+            )
+            # Accepting a newer claim moves the proof-of-work reference onto it:
+            # under `isolation = "none"` the claimed commit may have arrived in
+            # the shared checkout from outside the session, and measuring from
+            # the recorded baseline would let that commit satisfy proof-of-work
+            # on its own — passing an attempt that implemented nothing. Ignore
+            # untracked proof here because the launch snapshot cannot establish
+            # whether it appeared before or after this later claimed commit.
+            proof_baseline = canonical_claimed if newer_ok else proof_baseline
+            include_untracked_proof = not newer_ok
+            if not (older_ok or newer_ok):
                 return VerifyOutcome.retry(
                     f"spec baseline {claimed_baseline[:12]} does not match "
                     f"orchestrator-recorded baseline {task.baseline_commit[:12]}"
@@ -2124,9 +2220,10 @@ def _verify_shared_gates(
         try:
             if not has_changes_since(
                 paths.project,
-                task.baseline_commit,
+                proof_baseline,
                 exclude=exclude,
                 baseline_untracked=task.baseline_untracked,
+                include_untracked=include_untracked_proof,
             ):
                 return VerifyOutcome.retry("no changes in worktree since baseline commit")
         except GitError as e:

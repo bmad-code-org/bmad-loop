@@ -88,6 +88,18 @@ breaking changes may land in a minor release.
   verification-feedback routes retain their existing wording and precedence. A filesystem fault
   while observing the dispatch binding leaves that attempt unbound instead of aborting the run.
 
+- **Accept canonical reachable-descendant spec baselines without trusting untracked residue.** An
+  exact recorded baseline remains valid; any different real claim must uniquely resolve from 7–64
+  hex characters to a direct immutable commit that descends from the recorded baseline and is
+  reachable from `HEAD`. Symbolic or movable refs, ambiguous prefixes, non-commit objects, older,
+  diverged, unknown, and off-HEAD claims remain refused, apart from the existing deferred-work
+  bundle ancestor exception. Proof is re-anchored after an accepted descendant and counts only
+  tracked, staged, or committed changes because the launch snapshot cannot date untracked files
+  relative to that later claim. Shared-checkout mode proves later tracked work exists but cannot
+  attribute it to one session; worktree isolation preserves that provenance. This accepts a skill
+  stamp made after an intervening commit without letting stale untracked residue satisfy the gate.
+  The same mismatch in the opposite direction is #640.
+
 - **Overlong lowercase/kebab sweep bundle labels now proceed deterministically (#503).** An
   otherwise valid name over 40 characters is truncated to 40, journaled and persisted before
   validation, so the sweep proceeds without spending a feedback retry or pausing the run.
