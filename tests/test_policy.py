@@ -791,7 +791,7 @@ def test_verify_stream_capture_kb(tmp_path):
     p.write_text("[verify]\nstream_capture_kb = 0\n")
     assert policy.load(p).verify.stream_capture_kb == 0  # opting out is legal
     p.write_text("[verify]\nstream_capture_kb = -1\n")
-    with pytest.raises(policy.PolicyError, match="verify.stream_capture_kb"):
+    with pytest.raises(policy.PolicyError, match=r"verify\.stream_capture_kb"):
         policy.load(p)
 
 
