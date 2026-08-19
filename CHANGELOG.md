@@ -116,6 +116,15 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **A plugin can no longer erase a CRITICAL escalation out from under the engine's audit.**
+  `HookContext` copies the session `result_json` precisely so a plugin observes history rather
+  than rewriting it, but `dict()` is shallow: the nested `escalations` list stayed the engine's
+  own object, and both verify legs emit `post_dev_verify` before reading
+  `critical_escalations(result.result_json)`. An in-process plugin that cleared that list
+  therefore erased the escalation before the audit ran, and a verify-green repair proceeded
+  where the run owed a pause. The copy is now deep, so the observe-only guarantee holds at the
+  depth escalations actually live.
+
 - **The egress self-check now sees Windows→WSL UNC home paths (#512).** `diagnose` and
   `probe-adapter` re-scan their own rendered bytes before emitting and refuse to emit at all on a
   hit, but the absolute-home-path rule knew only forward-slash spellings — so a path reached through

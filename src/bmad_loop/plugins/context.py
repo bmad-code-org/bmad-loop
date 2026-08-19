@@ -20,6 +20,7 @@ control flow — there is no new abort path.
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -115,9 +116,17 @@ class HookContext:
         # the agent ids of the CLIs that run in this unit's worktree (dev + review),
         # for a plugin that routes per-agent config (e.g. the engine's MCP routing).
         self._agents = tuple(agents)
-        # a *copy* — result_json feeds the critical_escalations audit and must
-        # never be mutated through a plugin.
-        self._result_json = dict(result_json) if result_json is not None else None
+        # A *deep* copy, and the depth is the whole point. `dict()` is shallow, so
+        # the nested `escalations` list stayed SHARED with the engine's own
+        # `result.result_json` — and both verify legs now emit `post_dev_verify`
+        # ahead of their `critical_escalations` audit (dev via `decide_dev`, fix
+        # at the reordered call in `_fix_phase`). An in-process plugin holding
+        # this context could therefore clear that list and erase a CRITICAL
+        # escalation out from under the audit, letting a verify-green repair
+        # proceed where the run owed a pause. Copying at all exists to make
+        # "plugins observe, cannot alter" true; shallow made it true only of the
+        # top level, which is not where escalations live.
+        self._result_json = copy.deepcopy(result_json) if result_json is not None else None
         self._session_status = session_status
         self._verify_reason = verify_reason
         # Frozen command-result records with immutable strings.  This is an
