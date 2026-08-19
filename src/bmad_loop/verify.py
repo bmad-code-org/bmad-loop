@@ -2261,7 +2261,7 @@ def env_fault_reason(result: CommandResult, cwd: Path) -> str | None:
 
 
 def _timeout_stream(value: str | bytes | None) -> str:
-    """Normalize optional timeout output onto the codec the completed path used.
+    """Normalize optional timeout output into what the completed path would give.
 
     ``subprocess.run``'s timeout leg is not uniform, so three shapes arrive:
 
@@ -2273,19 +2273,26 @@ def _timeout_stream(value: str | bytes | None) -> str:
       this branch is the only way the output arrives at all.
     * ``None`` — POSIX again, when nothing had been buffered on that stream.
 
-    The bytes branch decoding with ``bytes.decode``'s UTF-8 default contradicted
+    So the bytes branch has to reproduce what text mode would have done to them,
+    which is exactly ``Popen._translate_newlines``: decode, then collapse ``\\r\\n``
+    and lone ``\\r`` to ``\\n``. Doing neither made the same bytes read back
+    differently depending on which path produced them — under an ASCII locale
+    ``b"caf\\xc3\\xa9\\r\\n"`` completed as ``"caf\\ufffd\\ufffd\\n"`` but timed out
+    as ``"café\\r\\n"``. The codec half also contradicted
     :func:`run_verify_commands`' own rule (#378) that host-tool output stays on
-    the locale codec, and the two paths disagreed for real: under an ASCII locale
-    ``b"caf\\xc3\\xa9"`` completes as ``"caf\\ufffd\\ufffd"`` but timed out as
-    ``"café"``. ``locale.getpreferredencoding(False)`` is what ``text=True``
+    the locale codec: ``locale.getpreferredencoding(False)`` is what ``text=True``
     resolves for an unset ``encoding`` — deliberately not ``locale.getencoding()``,
     which disagrees with it under UTF-8 mode (PEP 540), a mode the C/POSIX locale
     enables by itself. ``errors="replace"`` for the reason the completed path uses
-    it: one undecodable byte must not raise and lose every result."""
+    it: one undecodable byte must not raise and lose every result.
+
+    The str branch is left alone: its newlines were translated by the text
+    wrapper the reader thread read through, so there is nothing left to collapse."""
     if value is None:
         return ""
     if isinstance(value, bytes):
-        return value.decode(locale.getpreferredencoding(False), errors="replace")
+        decoded = value.decode(locale.getpreferredencoding(False), errors="replace")
+        return decoded.replace("\r\n", "\n").replace("\r", "\n")
     return value
 
 
