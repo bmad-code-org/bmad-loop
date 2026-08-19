@@ -634,6 +634,35 @@ def is_link_like(path: Path) -> bool:
         return False
 
 
+def walk_files_unlinked(top: Path) -> Iterator[Path]:
+    """Every regular file under ``top``, never crossing a redirect out of it.
+
+    Two holes, closed together because a caller that measures or counts a tree
+    gets both wrong in the same way:
+
+    ``os.walk`` already declines to recurse into a symlinked subdirectory — but
+    it decides that with ``os.path.islink``, which is False for a Windows
+    DIRECTORY JUNCTION. That is the unprivileged redirect (see
+    :func:`is_link_like`), so on win32 the pruning `os.walk` documents is exactly
+    the arm an attacker would use. And ``os.walk`` always follows the top path it
+    is handed, symlink or not, so refusing to descend into links says nothing
+    about the root.
+
+    Both matter to more than tidiness: a session is handed a writable run
+    directory (`BMAD_LOOP_RUN_DIR`) and can plant a link at an entry that `clean`
+    sizes and `diagnose` counts, which would bill a reclaim estimate — or a
+    diagnostic dump — for an arbitrarily large tree outside the run that neither
+    command touches. Yields paths; the caller chooses ``stat`` or ``lstat``.
+    """
+    if is_link_like(top):
+        return
+    for root, dirs, files in os.walk(top, onerror=lambda _e: None):
+        # in-place, which is how os.walk documents pruning under topdown=True
+        dirs[:] = [d for d in dirs if not is_link_like(Path(root) / d)]
+        for name in files:
+            yield Path(root) / name
+
+
 def open_dir_confined(root: Path, target: Path) -> int | None:
     """An open descriptor for ``target``, reached from ``root`` without
     traversing a symlink at any component below it — or None when that cannot be

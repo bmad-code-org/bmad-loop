@@ -1562,3 +1562,44 @@ def test_is_link_like_refuses_a_reparse_tagged_dir(tmp_path, monkeypatch):
         lambda p, *a, **k: _ReparseStat() if str(p) == str(plain) else real_lstat(p),
     )
     assert platform_util.is_link_like(plain) is True
+
+
+def test_walk_files_unlinked_prunes_a_link_like_subdirectory(tmp_path, monkeypatch):
+    """A nested redirect is pruned even where ``os.walk`` would descend into it.
+
+    ``os.walk`` prunes a symlinked subdirectory by itself, so on POSIX this guard
+    looks redundant — which is exactly the trap. It prunes via ``os.path.islink``,
+    and a Windows DIRECTORY JUNCTION is not a symlink, so the arm that actually
+    needs pruning is the one ``os.walk`` misses, and it is unreachable from a
+    POSIX runner. The junction is therefore simulated by making ``is_link_like``
+    answer True for an ordinary directory: that disagreement between the two
+    predicates IS the win32 behaviour under test, and a real symlink would grade
+    ``os.walk`` instead of this function.
+
+    Ablation: delete the ``dirs[:]`` pruning line and `theirs.bin` joins the
+    result — 9000 bytes from a tree the caller never meant to walk. Verified.
+    """
+    root = tmp_path / "run"
+    (root / "keep").mkdir(parents=True)
+    (root / "keep" / "mine.bin").write_bytes(b"m" * 10)
+    junction = root / "verify"
+    junction.mkdir()
+    (junction / "theirs.bin").write_bytes(b"t" * 9000)
+
+    monkeypatch.setattr(platform_util, "is_link_like", lambda q: Path(q) == junction)
+
+    assert sorted(q.name for q in platform_util.walk_files_unlinked(root)) == ["mine.bin"]
+
+
+def test_walk_files_unlinked_refuses_a_link_like_top(tmp_path, monkeypatch):
+    """The other half: ``os.walk`` always follows the top path it is handed, so
+    declining to descend into links says nothing about the root itself. Same
+    simulation, and the two halves fail independently — pruning children cannot
+    save a caller who was pointed at the redirect to begin with."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "theirs.bin").write_bytes(b"t" * 9000)
+
+    monkeypatch.setattr(platform_util, "is_link_like", lambda q: Path(q) == outside)
+
+    assert list(platform_util.walk_files_unlinked(outside)) == []

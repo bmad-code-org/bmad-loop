@@ -51,6 +51,7 @@ from typing import Any
 from . import __version__, sanitize
 from .journal import VERIFY_DIR, Journal, load_state
 from .model import RunState, StoryTask
+from .platform_util import walk_files_unlinked
 
 # The guard machinery (fail-closed egress self-check + alias-substitution
 # repair) moved to sanitize.py so probe-adapter shares the single audited
@@ -387,9 +388,10 @@ def summarize_files(run_dir: Path, *, events_dir: Path | None = None) -> list[Fi
         for root in _category_roots(category, run_dir, events_dir):
             if not root.is_dir():
                 continue
-            for p in root.rglob("*"):
-                if not p.is_file():
-                    continue
+            # walk_files_unlinked, not rglob: `is_dir()` above FOLLOWS a link, so a
+            # planted redirect at a category root reads as a directory and rglob
+            # then counts the target's tree as this run's retained output.
+            for p in walk_files_unlinked(root):
                 count += 1
                 try:
                     total_bytes += p.stat().st_size

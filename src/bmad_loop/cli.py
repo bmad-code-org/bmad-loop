@@ -72,7 +72,7 @@ from .documents import (
 from .engine import Engine
 from .journal import Journal, load_state, save_state
 from .model import RunState
-from .platform_util import MAX_SEGMENT, is_link_like, resolve_or_lexical
+from .platform_util import MAX_SEGMENT, resolve_or_lexical, walk_files_unlinked
 from .process_host import ProcessHostError
 
 # The run-composition helpers now live in runsetup.py (the library layer a non-CLI
@@ -3372,23 +3372,15 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
 
 
 def _dir_size(path: Path) -> int:
-    """Best-effort total bytes under ``path`` (symlinks not followed).
-
-    ``os.walk`` does not descend into links, but it DOES follow the top path it
-    is handed, so the "not followed" contract only holds if a link-like ``path``
-    is refused up front. It is not hypothetical here: a session can plant a
-    redirect at a run-dir entry (`BMAD_LOOP_RUN_DIR` names the writable dir), and
-    walking it would bill `clean`'s reclaim estimate for bytes that live outside
-    the run and that the trim provably does not free."""
-    if is_link_like(path):
-        return 0
+    """Best-effort total bytes under ``path``, never crossing a redirect out of
+    it — see :func:`walk_files_unlinked` for why plain ``os.walk`` is not enough.
+    Sizes with ``lstat``, so a symlinked file counts as the link it is."""
     total = 0
-    for root, _dirs, files in os.walk(path, onerror=lambda _e: None):
-        for name in files:
-            try:
-                total += (Path(root) / name).lstat().st_size
-            except OSError:
-                pass
+    for f in walk_files_unlinked(path):
+        try:
+            total += f.lstat().st_size
+        except OSError:
+            pass
     return total
 
 

@@ -1090,3 +1090,37 @@ def test_verify_streams_are_counted_but_never_read(project, tmp_path):
     # the half that matters as much as the count: the dump STATS, never reads
     assert secret not in diagnostics.render_markdown(diag)
     assert secret not in diagnostics.render_json(diag)
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="planting a directory symlink needs privilege on win32"
+)
+def test_a_redirected_verify_root_is_not_counted_as_this_runs_output(project, tmp_path):
+    """A planted redirect at `verify/` must not make `diagnose` report someone
+    else's tree as this run's retained verifier output.
+
+    `summarize_files` admits a category root on `root.is_dir()`, which FOLLOWS a
+    link, and then walked it with `rglob("*")`. Measured before the fix: two files
+    and 3100 bytes from outside the run, attributed to this run. Registering
+    `verify/` as a category — the fix for the earlier "invisible store" gap — is
+    what put a session-plantable directory on that traversal at all; every other
+    category root is engine-created, which is why the hole opened here and not
+    years ago.
+
+    Ablation: walk the root with `rglob("*")` again and the group comes back
+    naming the target's count and bytes. Verified.
+    """
+    run_dir = _seed_bare_run(project.project)
+    outside = tmp_path / "somewhere-else"
+    outside.mkdir()
+    (outside / "a.bin").write_bytes(b"a" * 3000)
+    (outside / "b.bin").write_bytes(b"b" * 100)
+    (run_dir / "verify").symlink_to(outside, target_is_directory=True)
+
+    diag = diagnostics.collect(
+        [run_dir], pseudo=sanitize.Pseudonymizer(), project=Path(project.project)
+    )
+    group = next((g for g in diag.runs[0].files if g.category == "verify"), None)
+
+    assert group is None  # nothing of ours is in there, so there is nothing to report
+    assert (outside / "a.bin").is_file()  # and the dump did not touch what it found
