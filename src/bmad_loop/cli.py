@@ -443,7 +443,6 @@ def cmd_validate(args: argparse.Namespace) -> int:
         # `.bmad-loop/profiles/*.toml` supplies its fields, both arriving with a
         # clone — and this line EXECUTES it, inside the one command a user runs to
         # decide whether a checkout is safe to run at all (the TUI runs it too).
-        # Inspection must not become execution there.
         #
         # The boundary is provenance because no test on the SPELLING of `binary`
         # can hold: rejecting a path (`./tool`) still leaves a bare `pwn`, which
@@ -453,6 +452,20 @@ def cmd_validate(args: argparse.Namespace) -> int:
         # profile keeps the pre-#294 behavior: resolved, reported found, never
         # launched. #294's own case is a packaged profile (opencode), so the dead
         # WSL/npm shim is still caught.
+        #
+        # What this bounds is WHICH NAME is probed, never what that name resolves
+        # to. Resolution is `shutil.which` against the user's PATH, so a PATH
+        # carrying a checkout-local directory can still answer `claude` with a
+        # file the clone ships. That residual is deliberate and is NOT a hole this
+        # gate is failing to close: the name is ours rather than the project's, and
+        # the same resolution is what the session launch itself performs — the
+        # generic adapter puts this bare `binary` at argv[0] (adapters/generic.py)
+        # and the opencode adapter calls the identical `shutil.which` before
+        # spawning (adapters/opencode_http.py). A PATH that redefines `claude`
+        # has already redefined it for the run, and for the user's own shell.
+        # Refusing checkout-local RESOLUTIONS would be a different guard, over a
+        # predicate (realpath containment) that leaks through symlinks, `..`,
+        # win32 case-folding, UNC paths, and worktree-root vs project-root.
         if tool not in packaged_binaries:
             continue
         rc = probe_mod.binary_runs(resolved)

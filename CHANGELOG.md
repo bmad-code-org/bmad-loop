@@ -26,8 +26,10 @@ breaking changes may land in a minor release.
   `<binary> --version`; a nonzero exit or a launch fault reports the new check id
   `adapter.binary-unrunnable`, carrying the resolved path and the return code. A project overlay's
   profile is resolved and reported found but never launched: its fields are project-supplied, and
-  validate is the command used to decide whether a checkout is safe to run at all, so it must not
-  execute code a clone carries. That boundary is the profile's provenance and not the spelling of
+  validate is the command used to decide whether a checkout is safe to run at all, so a clone's own
+  config cannot choose which binary it launches. The gate bounds which NAME is probed, not what
+  that name resolves to — resolution runs through the user's `PATH`, and a probed name resolves to
+  whatever the session launch would itself run. That boundary is the profile's provenance and not the spelling of
   `binary`, because a bare name still resolves into the checkout whenever a checkout-local
   directory is on `PATH`. The severity is `warning`, so validate's exit code is
   unchanged for a live CLI that merely answers `--version` oddly, and `adapter.binary` keeps its
