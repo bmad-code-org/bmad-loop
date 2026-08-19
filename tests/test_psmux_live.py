@@ -187,6 +187,17 @@ def _mint_probe_window(mux: PsmuxMultiplexer, session: str, name: str, cwd: Path
     return window_id
 
 
+def _active_window(mux: PsmuxMultiplexer, session: str) -> str:
+    """The session's focused window, in the qualified form the seam mints."""
+    proc = mux._run(
+        ["list-windows", "-t", session, "-F", "#{window_id} #{window_active}"], check=False
+    )
+    assert proc.returncode == 0, f"probe setup: active-window probe failed: {proc.stderr.strip()!r}"
+    active = [line.split()[0] for line in proc.stdout.splitlines() if line.endswith(" 1")]
+    assert len(active) == 1, f"probe setup: expected one active window, got {active!r}"
+    return f"{session}:{active[0]}"
+
+
 @pytest.fixture(scope="module")
 def psmux_data_root(tmp_path_factory):
     """Return an isolated registry root only when the installed build honors it."""
@@ -369,3 +380,100 @@ def test_premise_option_values_survive_the_control_line(probe):
             f"psmux no longer carries {value!r} verbatim — _transportable permits a "
             "shape that now corrupts, so a tag reads back different from the prune's"
         )
+    # Interior tab specifically: the wire's own fix (#536) widened the client's
+    # quoting test to char::is_whitespace(), and a tab is ASCII, so it rides the
+    # same branch as the NBSP above by reading of the source. Measure it rather
+    # than reason it — that is what this file is for.
+    accepted, got = roundtrip("a\tb")
+    assert accepted and got == "a\tb", (
+        "psmux no longer carries an interior tab verbatim — _transportable stopped "
+        "refusing interior whitespace when the 3.3.8 floor landed"
+    )
+
+
+# ------------------------------------------------- adopted-behavior probes
+#
+# The mirror image of the premise probes above. Those guarded workarounds and
+# went red when upstream made one droppable; these guard the four behaviors the
+# 3.3.8 floor let this backend START assuming, and go red if a later psmux takes
+# one back. Without them the seam's only evidence for those four is a mocked
+# argv shape, which cannot notice a regression in the binary at all. Ordinary
+# semantics: red means broken.
+
+
+def test_adopted_pipe_pane_delivers_pane_bytes_through_the_flag_transport(probe, tmp_path):
+    mux, _, windows = probe
+    # The real backend verb, not raw argv: the `-EncodedCommand` transport, the
+    # base64 join and the _pwsh_quote'd sink path are all under test together.
+    # A spaced path deliberately — it is what the sidecar could not carry.
+    log = tmp_path / "run log.txt"
+    text = ""
+    for window in windows:  # psmux/psmux#482's first-pipe-after-mint spawn race
+        mux.pipe_pane(window, log)
+        for argv in (
+            ["send-keys", "-t", window, "-l", "echo pipeprobe"],
+            ["send-keys", "-t", window, "Enter"],
+        ):
+            sent = mux._run(argv, check=False)
+            assert (
+                sent.returncode == 0
+            ), f"probe setup: {argv[0]} could not drive pipe-pane output: {sent.stderr.strip()!r}"
+        deadline = time.monotonic() + 7.5
+        while time.monotonic() < deadline:
+            text = log.read_text(encoding="utf-8", errors="replace") if log.exists() else ""
+            if "pipeprobe" in text:
+                break
+            time.sleep(0.25)
+        if "pipeprobe" in text:
+            break
+    assert "pipeprobe" in text, (
+        "the pipe-pane flag transport delivered no pane bytes — psmux stopped "
+        "carrying dash-flag tokens or quoting through pipe-pane (psmux/psmux#482, "
+        f"psmux/psmux#563), so the run log is silently empty. Captured: {text[:200]!r}"
+    )
+    assert not log.with_name(log.name + ".sink.ps1").exists()  # no sidecar, ever again
+
+
+def test_adopted_select_window_focuses_a_qualified_window_id(probe):
+    mux, session, windows = probe
+    # Start focused on the OTHER window, so a green here is a move rather than a
+    # window that happened to be current already.
+    mux.select_window(windows[1])
+    assert (
+        _active_window(mux, session) == windows[1]
+    ), "probe setup: could not establish the select-window probe's starting focus"
+    mux.select_window(windows[0])
+    assert _active_window(mux, session) == windows[0], (
+        "psmux no longer focuses `select-window -t session:@N` — the override "
+        "dropped on the 3.3.8 floor (psmux/psmux#497) is needed again"
+    )
+
+
+def test_adopted_kill_session_honors_the_exact_match_target(probe):
+    mux, session, _ = probe
+    # The base's inherited argv, once the psmux override is gone. A red here
+    # means every session this seam creates outlives its own teardown.
+    mux._run(["kill-session", "-t", f"={session}"], check=False)
+    assert not _plain_has_session(mux, session), (
+        "psmux no longer honors the `=name` form for kill-session (psmux/psmux#558) "
+        "— the plain-name override dropped on the 3.3.8 floor is needed again"
+    )
+
+
+def test_adopted_unresolvable_kill_target_exits_nonzero_and_spares_live_windows(probe):
+    mux, session, _ = probe
+    # Both halves matter and neither implies the other: the non-zero exit is what
+    # kill_window's warning reads, and sparing the live windows is what makes the
+    # old destructive workaround unnecessary (psmux/psmux#545).
+    before = set(mux.list_window_ids(session))
+    assert len(before) >= 2, f"probe setup: probe session should hold the parked windows: {before}"
+    proc = mux._run(["kill-window", "-t", f"{session}:@9999"], check=False)
+    assert proc.returncode != 0, (
+        "psmux is back to exiting 0 for an unresolvable kill-window target — the "
+        "warning in tmux_base.kill_window now reads a code that means nothing"
+    )
+    after = set(mux.list_window_ids(session))
+    assert after == before, (
+        "an unresolvable kill-window target destroyed a live window again "
+        f"(psmux/psmux#545): {sorted(before)} -> {sorted(after)}"
+    )

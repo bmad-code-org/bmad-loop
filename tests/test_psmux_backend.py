@@ -1381,16 +1381,32 @@ def test_tmux_backend_forwards_option_columns_to_format(monkeypatch):
 
 @pytest.mark.parametrize(
     "value",
-    ["\u00a0lead", "trail\u00a0", "\tlead", "trail\t", " lead", "trail "],
+    ["\u00a0lead", "trail\u00a0", "\tlead", "trail\t", " lead", "trail ", "   "],
 )
 def test_set_window_option_refuses_edge_whitespace_of_any_kind(monkeypatch, capsys, value):
     # Not a wire property: this backend's own reads `.strip()`/`.Trim()`, and
     # both strip Unicode whitespace, so an edge NBSP or tab reads back short
-    # exactly as an edge ASCII space does. Interior whitespace is fine.
+    # exactly as an edge ASCII space does. Interior whitespace is fine. An
+    # all-whitespace value is the degenerate case \u2014 it strips to "", i.e. the
+    # empty write the gate refuses outright.
     rec_ = _option_fake(monkeypatch)
     PsmuxMultiplexer().set_window_option("ctl:@3", "@bmad_project", value)
     assert [c[0][1:4] for c in rec_.calls] == [["set-option", "-u", "-t"]]
     assert "transport" in capsys.readouterr().err
+
+
+# `splitlines()` is the refusal, not a `\n` check: it also cuts on \v, \f, the
+# file/group/record separators, NEL and the Unicode line/paragraph separators.
+# Every one of them splits _scoped_options' line-by-line parse, so every one has
+# to be refused \u2014 an `in "\r\n"` rewrite would look equivalent and quietly admit
+# eight corrupting shapes.
+@pytest.mark.parametrize(
+    "sep",
+    ["\n", "\r", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"],
+    ids=lambda s: f"U+{ord(s):04X}",
+)
+def test_transportable_refuses_every_splitlines_separator(sep):
+    assert not PsmuxMultiplexer._transportable(f"a{sep}b")
 
 
 def test_sweep_snapshots_keys_before_live_windows(monkeypatch, tmp_path):
