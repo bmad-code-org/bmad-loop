@@ -44,7 +44,10 @@ breaking changes may land in a minor release.
   report and its `--json` document verbatim: `max_lines=5` over a 5000-character line still emitted
   all 5000. Each line is now bounded, and a line that is cut ends with `… (N more chars redacted)`,
   the same convention as the existing line-count marker. **This is a visible output change** for any
-  line that long. `probe.SCHEMA_VERSION` is unchanged: no field is removed or renamed and no type
+  line that long. A cut that would land inside a credential-shaped token retracts to that token's
+  start and drops it whole: cutting mid-token could otherwise leave a prefix too short for the
+  egress guard's entropy rule to recognize, turning a fail-closed refusal into an emission carrying
+  part of the credential. `probe.SCHEMA_VERSION` is unchanged: no field is removed or renamed and no type
   changes, and the meaning of the value was already "the CLI's scrubbed output, capped" — adding a
   second axis to an already-documented lossy cap is the same class of value, not a new one.
 
