@@ -69,8 +69,11 @@ def test_template_leaves_no_detached_git_maintenance_writing_into_the_copies(pro
     Ablation target: delete the `maintenance.auto` line from `_project_template`
     and this row fails alone, naming the spawned `git maintenance run` in the
     assertion message. The trace-recorded-the-commit assertion is the anti-vacuity
-    guard — without it a git built without trace2, or any typo in the env var,
-    would write no events and the row would pass for having observed nothing."""
+    guard: `spawned` reads empty both when no child ran and when the trace parsed
+    into nothing we recognize, so a trace2 event or field rename would otherwise
+    leave this row green for having observed nothing. It does not guard an absent
+    trace — a git without trace2, or a mistyped env var, writes no file at all and
+    the read below raises `FileNotFoundError`, which is loud on its own."""
     repo = project.project
     (repo / "src.txt").write_text("changed\n")
     subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
