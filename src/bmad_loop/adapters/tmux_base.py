@@ -364,23 +364,28 @@ class BaseTmuxBackend(TerminalMultiplexer):
         # Best-effort teardown: a hang / missing binary is no worse than the window
         # already being gone, so swallow to the documented no-op sentinel. A
         # non-zero exit still says so out loud — the return value stays None and
-        # nothing raises, but a target that resolved to nothing (a wrong session
-        # qualification, a renumbered id) would otherwise leave a live window
-        # behind with no trace anywhere.
+        # nothing raises — but only when the window the target names is still
+        # there to leak.
         #
         # An ALREADY-GONE window exits non-zero too, and that is ordinary
         # teardown, not a fault — the DOMINANT case, not an edge one:
         # CodingCLIAdapter.run kills in a `finally` on every session, and a
         # session that completed by window death has nothing left to kill. The
-        # return code cannot separate the two, so the survivor is what decides:
-        # probe the target once, and warn only when the window is still there.
-        # That is the shape a non-zero exit is actually about — a target that
-        # resolved to nothing (a wrong session qualification, a renumbered id)
-        # leaving a live window behind. The probe is paid on the FAILURE path
-        # only, never per kill, and `list-panes` is used rather than
-        # window_alive because a target here carries no session to pass it.
-        # An unreadable probe stays silent: this is a diagnostic, and guessing
-        # would put the noise back on the path the probe exists to clear.
+        # return code cannot separate the two, so the survivor is what decides.
+        # Replaying the failed target cannot decide it: a target the kill could
+        # not resolve is a target a probe cannot resolve either, so a
+        # same-target probe reads "gone" for the very failures it exists to
+        # catch. For a session-qualified id target the session's OWN window
+        # list answers instead — it resolves independently of the failed
+        # target, and a leaked window is by definition still in it. So the
+        # warning covers exactly the detectable leak class: the kill failed and
+        # the window it named is still listed. A target that names no window at
+        # all leaks nothing and stays silent. The probe is paid only on a
+        # non-zero exit — which on psmux includes ordinary window-death
+        # teardown, one listing alongside the ones the psmux override already
+        # pays. An unreadable probe stays silent: this is a diagnostic, and
+        # guessing would put the noise back on the path the probe exists to
+        # clear.
         try:
             proc = self._run(["kill-window", "-t", target], check=False)
         except (subprocess.SubprocessError, OSError):
@@ -395,11 +400,24 @@ class BaseTmuxBackend(TerminalMultiplexer):
         )
 
     def _window_survived_kill(self, target: str) -> bool:
-        """Whether ``target`` still resolves after a failed kill.
+        """Whether the window ``target`` names outlived a failed kill.
 
         False for both "provably gone" and "cannot tell" — the caller only warns,
         so an unanswerable probe must not manufacture a warning.
         """
+        session, sep, window = target.partition(":")
+        if sep and window.startswith("@"):
+            # Membership is checked against both id shapes list_window_ids can
+            # answer with: bare `@N` (this base) and session-qualified (the
+            # psmux override qualifies to match its native_id form).
+            try:
+                live = self.list_window_ids(session.removeprefix("="))
+            except TmuxError:
+                return False
+            return target in live or window in live
+        # An unqualified or name-token target carries no session to list, so
+        # only the same-resolution probe remains: blind to a wrong-target leak,
+        # but it still catches a kill that failed while the target resolves.
         try:
             probe = self._run(["list-panes", "-t", target], check=False)
         except (subprocess.SubprocessError, OSError):
