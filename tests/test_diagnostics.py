@@ -1051,3 +1051,42 @@ def test_scrub_policy_passes_unknown_section_keys_verbatim():
 # The pure guard-mechanics tests (hard-rule refusal, repair tally, cyclic
 # termination) live in tests/test_sanitize.py since #199 made guard shared API;
 # this file keeps the integration surface: real collectors, real renders.
+
+
+# --------------------------------------------- the verifier stream store
+
+
+def test_verify_streams_are_counted_but_never_read(project, tmp_path):
+    """`verify/` is stat-only: its SIZE is the diagnostic, its contents are not.
+
+    The store can be one of the larger things in a run dir — `stream_capture_kb`
+    defaults to 256 KiB per stream, so up to 512 KiB per command per attempt, with
+    no GC behind it yet — so a dump that omits it cannot show the retention or
+    disk-usage problem a maintainer opens a dump to find. It is equally the one
+    category that must never be READ into the output: retained verifier output is
+    a build's own stdout/stderr and may carry anything the project's test suite
+    prints.
+
+    Ablation guard: drop `VERIFY_DIR` from `_FILE_CATEGORIES` and the group is
+    None — the `is_dir()` guard makes an unregistered category vanish silently
+    rather than redden, which is exactly how this was missed. Verified.
+    """
+    run_dir = _seed_bare_run(project.project)
+    verify_dir = run_dir / "verify"
+    verify_dir.mkdir(parents=True, exist_ok=True)
+    secret = "SUPER-SECRET-BUILD-OUTPUT-DO-NOT-EMIT"
+    (verify_dir / "verify-1-1-a-dev-1-1-0.stdout.log").write_text(secret, encoding="utf-8")
+    (verify_dir / "verify-1-1-a-dev-1-1-0.stderr.log").write_text("err", encoding="utf-8")
+
+    diag = diagnostics.collect(
+        [run_dir], pseudo=sanitize.Pseudonymizer(), project=Path(project.project)
+    )
+    group = next((g for g in diag.runs[0].files if g.category == "verify"), None)
+
+    assert group is not None, "verify/ is not registered as a diagnostic category"
+    assert group.count == 2
+    assert group.total_bytes == len(secret) + len("err")
+
+    # the half that matters as much as the count: the dump STATS, never reads
+    assert secret not in diagnostics.render_markdown(diag)
+    assert secret not in diagnostics.render_json(diag)

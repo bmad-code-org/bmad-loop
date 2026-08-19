@@ -49,7 +49,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__, sanitize
-from .journal import Journal, load_state
+from .journal import VERIFY_DIR, Journal, load_state
 from .model import RunState, StoryTask
 
 # The guard machinery (fail-closed egress self-check + alias-substitution
@@ -75,7 +75,25 @@ DEFAULT_JOURNAL_CAP = 200
 #
 # All are run-dir-relative EXCEPT "events", which since #494 lives out of the
 # project tree at the user state root — see `_category_roots`.
-_FILE_CATEGORIES = ("logs", "tasks", "feedback", "bundles", "failed", "worktrees", "events")
+#
+# VERIFY_DIR belongs here for the reason the category exists: retained verifier
+# stdout/stderr is a build's own output — off-limits to read, but its SIZE is
+# exactly the diagnostic. `[verify] stream_capture_kb` defaults to 256 KiB per
+# stream, so a run retains up to 512 KiB per command per attempt with no GC
+# behind it yet, which can make this store one of the larger things in a run
+# dir. Omitting it left `diagnose` unable to show a retention or disk-usage
+# problem it is the natural place to notice. Imported, not re-spelled, so the
+# reporter cannot drift from the writer that creates the directory.
+_FILE_CATEGORIES = (
+    "logs",
+    "tasks",
+    "feedback",
+    "bundles",
+    "failed",
+    "worktrees",
+    "events",
+    VERIFY_DIR,
+)
 _EVENTS_CATEGORY = "events"
 
 # Journal fields that name a proprietary identifier — pseudonymized, not dropped,
