@@ -1,5 +1,6 @@
 import dataclasses
 import io
+import json
 import os
 import subprocess
 import sys
@@ -1070,30 +1071,115 @@ def test_verify_commands_preserve_separate_stdout_and_stderr(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("stdout", "stderr", "expected_stdout", "expected_stderr"),
-    [
-        (None, None, "", ""),
-        ("stdout proof", "stderr proof", "stdout proof", "stderr proof"),
-        (b"stdout \xff", b"stderr \xff", "stdout \ufffd", "stderr \ufffd"),
-    ],
+    ("value", "expected"),
+    [(None, ""), ("already decoded", "already decoded")],
+    ids=["none", "str-passthrough"],
 )
-def test_verify_commands_timeout_normalizes_separate_streams(
-    tmp_path, monkeypatch, stdout, stderr, expected_stdout, expected_stderr
-):
-    """Timeout output keeps the same separate-stream contract as a completed child."""
-    policy = Policy(verify=VerifyPolicy(commands=("verify command",)))
+def test_timeout_stream_shapes_that_carry_no_decode(value, expected):
+    """The two non-bytes shapes of a timeout payload, asserted directly because
+    neither reaches a codec — there is no stdlib decoding for a real child to
+    exercise, so driving one would add cost without adding evidence.
 
-    def timeout(*args, **kwargs):
-        raise subprocess.TimeoutExpired("verify command", 1, output=stdout, stderr=stderr)
+    ``None`` is POSIX's answer when nothing had been buffered on that stream
+    (``_check_timeout`` passes None, not ``b""``, for an empty chunk list); the
+    CommandResult must still carry a str. The str arm is Windows, where
+    ``subprocess.run`` re-collects through ``communicate()`` after ``kill()`` and
+    the text wrapper has already decoded — dropping it would lose that
+    platform's output entirely. The bytes shape, the only one that picks a
+    codec, is covered by the real-child test below."""
+    assert verify._timeout_stream(value) == expected
 
-    monkeypatch.setattr(verify.subprocess, "run", timeout)
 
-    (result,) = verify.run_verify_commands(policy, tmp_path)
+# ---- timeout-path decode agrees with the completed path (#378, follow-on)
+#
+# The divergence this pins is observable only where the run's codec is not UTF-8:
+# on a UTF-8 host `bytes.decode()`'s hardcoded default and the locale codec are
+# the same codec, so an in-process assertion passes unchanged with the bug
+# restored. Every CI leg is UTF-8 (Linux by locale, Windows by PYTHONUTF8=1), so
+# gating on the host codec — the `needs_strict_codec` shape used above — would
+# skip exactly where the guard is wanted, which is the inverse of what that
+# marker achieves for its own tests. The decode is therefore driven inside a
+# child interpreter pinned to an ASCII locale, making the divergence real on any
+# host. Everything below that boundary is genuine: a real grandchild writes the
+# bytes and hangs, and CPython's own timeout leg is what hands them over —
+# monkeypatching `subprocess.run` instead would supply str objects directly and
+# never run the decode at all (see the #378 block below).
+_TIMEOUT_RAW = b"caf\xc3\xa9\n"  # decodable as UTF-8, not as ASCII: the spellings disagree
 
-    assert result.returncode == -1
-    assert result.output_tail == "timed out"
-    assert result.stdout == expected_stdout
-    assert result.stderr == expected_stderr
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="the bytes arm is unreachable on Windows (run() re-collects via "
+    "communicate() after kill(), which returns str), and LC_ALL is not how "
+    "Windows resolves the codec",
+)
+def test_verify_commands_timeout_decodes_on_the_run_codec(tmp_path):
+    """A timed-out child's output decodes on the same codec a completed child's
+    does, not on ``bytes.decode``'s UTF-8 default.
+
+    run_verify_commands' docstring pins host-tool output to the locale codec
+    (``text=True``); the timeout arm hardcoded UTF-8, so under an ASCII locale
+    the same bytes read back as ``café`` when the command timed out and
+    ``caf<?><?>`` when it completed — the tail a human or repair session sees
+    depended on which path produced it.
+
+    Ablation: restore ``value.decode(errors="replace")`` in ``_timeout_stream``
+    and this fails, because the child resolves ASCII while that spelling stays
+    on UTF-8. Note that ``LC_ALL=C`` alone does NOT redden it: the C locale
+    auto-enables UTF-8 mode (PEP 540), which puts both spellings back on the
+    same codec, so ``PYTHONUTF8=0`` is load-bearing in the env below."""
+    hang = tmp_path / "hang_timeout.py"
+    hang.write_text(
+        "import sys, time\n"
+        f"sys.stdout.buffer.write({_TIMEOUT_RAW!r})\n"
+        "sys.stdout.buffer.flush()\n"
+        "time.sleep(10)\n",
+        encoding="utf-8",
+    )
+    driver = tmp_path / "drive_timeout.py"
+    # Interpreter is sys.executable, never a bare `python`: the suite runs under
+    # uv, where no `python` need be on PATH. json defaults to ensure_ascii, so
+    # the report survives the ASCII stdout it is printed on.
+    driver.write_text(
+        "import json, locale, sys\n"
+        "from pathlib import Path\n"
+        "from bmad_loop import verify\n"
+        "from bmad_loop.policy import Policy, VerifyPolicy\n"
+        "verify.COMMAND_TIMEOUT_S = 1.0\n"
+        'cmd = \'"%s" "%s"\' % (sys.executable, sys.argv[1])\n'
+        "(result,) = verify.run_verify_commands(\n"
+        "    Policy(verify=VerifyPolicy(commands=(cmd,))), Path(sys.argv[2])\n"
+        ")\n"
+        "json.dump({'encoding': locale.getpreferredencoding(False),\n"
+        "           'returncode': result.returncode, 'output_tail': result.output_tail,\n"
+        "           'stdout': result.stdout, 'stderr': result.stderr}, sys.stdout)\n",
+        encoding="utf-8",
+    )
+    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONIOENCODING", "LANG", "LC_CTYPE")}
+    env["LC_ALL"] = "C"
+    env["PYTHONUTF8"] = "0"  # without this the C locale would resolve to UTF-8 (PEP 540)
+
+    proc = subprocess.run(
+        [sys.executable, str(driver), str(hang), str(tmp_path)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env=env,
+        timeout=120,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    observed = json.loads(proc.stdout)
+    on_run_codec = _TIMEOUT_RAW.decode(observed["encoding"], errors="replace")
+    # Anti-vacuity: without this the equality below would hold on a UTF-8 host
+    # with the bug in place, and the test would prove nothing.
+    assert on_run_codec != _TIMEOUT_RAW.decode("utf-8", errors="replace")
+
+    assert observed["returncode"] == -1
+    assert observed["output_tail"] == "timed out"
+    assert observed["stdout"] == on_run_codec
+    # The child wrote nothing to stderr, so POSIX handed _timeout_stream None.
+    assert observed["stderr"] == ""
 
 
 def test_verify_commands_timeout_stays_charged(tmp_path, monkeypatch):

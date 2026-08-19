@@ -7,6 +7,7 @@ policy's test/lint gates with the orchestrator's own subprocess calls.
 
 from __future__ import annotations
 
+import locale
 import os
 import shlex
 import shutil
@@ -2260,11 +2261,31 @@ def env_fault_reason(result: CommandResult, cwd: Path) -> str | None:
 
 
 def _timeout_stream(value: str | bytes | None) -> str:
-    """Normalize optional timeout output without reintroducing decode faults."""
+    """Normalize optional timeout output onto the codec the completed path used.
+
+    ``subprocess.run``'s timeout leg is not uniform, so three shapes arrive:
+
+    * ``bytes`` — POSIX. ``Popen._communicate`` raises ``TimeoutExpired`` from
+      ``_check_timeout`` with the raw chunks joined, *before* the text-mode
+      decode that ends the loop, so ``text=True`` never touched them.
+    * ``str`` — Windows, where ``run`` calls ``communicate()`` after ``kill()``
+      and the text wrapper has already decoded. Load-bearing: on that platform
+      this branch is the only way the output arrives at all.
+    * ``None`` — POSIX again, when nothing had been buffered on that stream.
+
+    The bytes branch decoding with ``bytes.decode``'s UTF-8 default contradicted
+    :func:`run_verify_commands`' own rule (#378) that host-tool output stays on
+    the locale codec, and the two paths disagreed for real: under an ASCII locale
+    ``b"caf\\xc3\\xa9"`` completes as ``"caf\\ufffd\\ufffd"`` but timed out as
+    ``"café"``. ``locale.getpreferredencoding(False)`` is what ``text=True``
+    resolves for an unset ``encoding`` — deliberately not ``locale.getencoding()``,
+    which disagrees with it under UTF-8 mode (PEP 540), a mode the C/POSIX locale
+    enables by itself. ``errors="replace"`` for the reason the completed path uses
+    it: one undecodable byte must not raise and lose every result."""
     if value is None:
         return ""
     if isinstance(value, bytes):
-        return value.decode(errors="replace")
+        return value.decode(locale.getpreferredencoding(False), errors="replace")
     return value
 
 
