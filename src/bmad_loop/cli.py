@@ -437,6 +437,20 @@ def cmd_validate(args: argparse.Namespace) -> int:
         # `bmad-loop validate`, which then told them everything was fine. Probe the
         # path `which` RETURNED rather than the bare name: re-resolving is a TOCTOU,
         # and on Windows the PATHEXT shim `which` picked is the very file at issue.
+        # Probe ONLY a bare name, i.e. one `shutil.which` resolved by SEARCHING
+        # PATH. `binary` is project-controlled (policy.toml picks the profile,
+        # `.bmad-loop/profiles/*.toml` supplies its fields), so `binary = "./tool"`
+        # would have this diagnostic EXECUTE a file carried by a cloned repo —
+        # `which` returns a caller-supplied path unchanged, and validate is exactly
+        # the command a user runs to decide whether a checkout is safe to run at
+        # all (the TUI runs it too). Inspection must not become execution there.
+        # The predicate is `os.path.dirname` because that is the same test
+        # `shutil.which` itself uses to choose direct-path over PATH search, so the
+        # two cannot drift. A path-bearing `binary` keeps the pre-#294 behavior:
+        # reported found, never launched. No packaged profile is affected — all six
+        # ship a bare name — so #294's dead WSL/npm shim is still caught.
+        if os.path.dirname(tool):
+            continue
         rc = probe_mod.binary_runs(resolved)
         if rc == 0:
             continue
@@ -453,8 +467,10 @@ def cmd_validate(args: argparse.Namespace) -> int:
         report.warn(
             "adapter.binary-unrunnable",
             f"{tool} is on PATH at {resolved} but `{tool} --version` {outcome} — "
-            "that is a stale or broken install (a dead WSL/npm shim is the usual "
-            "cause), and runs using it will fail to start; reinstall it or fix PATH",
+            "the usual cause is a stale or broken install (a dead WSL/npm shim), "
+            "and runs using it would then fail to start; a CLI that does not "
+            "implement `--version` also lands here. Reinstall it or fix PATH, or "
+            "ignore this if that CLI has no `--version`.",
             {"binary": tool, "path": resolved, "returncode": rc},
         )
 

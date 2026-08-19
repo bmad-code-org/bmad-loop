@@ -5482,6 +5482,68 @@ def test_validate_warns_when_a_binary_on_path_refuses_to_run(
     assert len(found) == 1 and found[0]["severity"] == "ok"
 
 
+def test_validate_never_executes_a_binary_the_project_supplied_a_path_for(
+    project, capsys, monkeypatch, tmp_path
+):
+    """#294's liveness probe must not turn validate into a code-execution boundary.
+
+    `binary` is project-controlled all the way down: policy.toml picks the profile
+    and `.bmad-loop/profiles/*.toml` supplies its fields, both of which arrive with
+    a clone. `shutil.which` returns a caller-supplied path UNCHANGED rather than
+    searching PATH, so `binary = "./pwn"` resolves to a file the repository itself
+    carries — and validate is precisely the command a user runs to decide whether a
+    checkout is safe (the TUI runs it too). Probing it would execute untrusted code
+    on the strength of reading a config file.
+
+    Driven with a REAL executable on disk and a REAL relative `binary`, from the
+    project directory as a user who just cloned it would be: a stubbed `which` or
+    `binary_runs` would assert nothing about the boundary this is here to hold.
+
+    The sentinel is the whole assertion — an absent `adapter.binary-unrunnable`
+    finding would also be produced by a probe that ran and returned 0, so it cannot
+    distinguish "not launched" from "launched and happy". Only a file that the
+    child alone can create does.
+
+    Ablation target: delete the `if os.path.dirname(tool): continue` gate in cli.py
+    and the sentinel IS created, reddening this. Note the `adapter.binary` assertion
+    below is NOT the gate — it pins the surviving half, that a path-bearing binary
+    is still reported found; it stays green under that ablation.
+    """
+    install_bmad_config(project)
+    _write_policy(project.project, '[adapter]\nname = "pwncli"\n')
+
+    sentinel = tmp_path / "pwned.txt"
+    launcher = write_script_launcher(
+        project.project,
+        "pwn",
+        f"import pathlib\npathlib.Path({str(sentinel)!r}).write_text('executed')\n",
+    )
+    profiles = project.project / ".bmad-loop" / "profiles"
+    profiles.mkdir(parents=True, exist_ok=True)
+    # `launcher.name`, not a bare "pwn": on Windows the launcher is `pwn.cmd`, and
+    # naming the real file keeps this about the path gate rather than about PATHEXT.
+    (profiles / "pwncli.toml").write_text(
+        f'name = "pwncli"\nbinary = "./{launcher.name}"\nbypass_args = ["--yes"]\n'
+        "\n[hooks]\n"
+        'dialect = "claude-settings-json"\n'
+        'config_path = ".pwncli/settings.json"\n'
+        'events = { SessionStart = "SessionStart", Stop = "Stop" }\n',
+        encoding="utf-8",
+    )
+
+    # A relative `binary` resolves against the PROCESS cwd — the clone the user is
+    # standing in when they run `bmad-loop validate`.
+    monkeypatch.chdir(project.project)
+    cli.main(["validate", "--project", str(project.project), "--json"])
+    doc = json.loads(capsys.readouterr().out)
+
+    assert not sentinel.exists(), "validate executed a repository-supplied binary"
+
+    # The surviving half: still resolved and reported, exactly as before #294.
+    found = [f for f in doc["findings"] if f["check"] == "adapter.binary"]
+    assert len(found) == 1 and found[0]["severity"] == "ok"
+
+
 @pytest.mark.parametrize("passing", [True, False], ids=["rc-0", "rc-1"])
 def test_tui_renderer_draws_every_detail_shape_a_real_validate_emits(
     project, capsys, monkeypatch, passing

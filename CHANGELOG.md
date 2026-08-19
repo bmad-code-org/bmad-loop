@@ -22,9 +22,12 @@ breaking changes may land in a minor release.
   `adapter.binary` gate asked `shutil.which`, which a dead WSL/npm shim satisfies — it is a real
   file with the execute bit — so validate went green on an install that could not start a session,
   and the opencode adapter's own "binary not found" error sent the user to `bmad-loop validate` to
-  be told everything was fine. Each resolved binary is now run once as `<binary> --version`; a
-  nonzero exit or a launch fault reports the new check id `adapter.binary-unrunnable`, carrying the
-  resolved path and the return code. The severity is `warning`, so validate's exit code is
+  be told everything was fine. Each binary named as a **bare name** is now run once as
+  `<binary> --version`; a nonzero exit or a launch fault reports the new check id
+  `adapter.binary-unrunnable`, carrying the resolved path and the return code. A `binary` carrying
+  a path separator is resolved and reported found but never launched: profile fields are
+  project-supplied, and validate is the command used to decide whether a checkout is safe to run,
+  so it must not execute code a clone carries. The severity is `warning`, so validate's exit code is
   unchanged for a live CLI that merely answers `--version` oddly, and `adapter.binary` keeps its
   existing found/absent meaning. The check id is additive, so `VALIDATE_SCHEMA_VERSION` is
   unchanged.
