@@ -35,7 +35,7 @@ from pathlib import Path
 import pytest
 
 from bmad_loop import runs
-from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer, _pwsh_quote
+from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer
 from bmad_loop.adapters.tmux_base import TmuxError
 from bmad_loop.tui import launch
 
@@ -397,75 +397,6 @@ def test_premise_option_values_corrupted_by_the_control_line(probe):
             f"psmux no longer carries {value!r} verbatim — _transportable permits a "
             "shape that now corrupts, so a tag reads back different from the prune's"
         )
-
-
-def test_premise_pipe_pane_strips_dash_flag_tokens(probe, tmp_path):
-    mux, _, windows = probe
-    sidecar = tmp_path / "argprobe.ps1"
-    record = tmp_path / "argprobe.txt"
-    # The piped command is a bare double-quoted interpolation, exactly as
-    # pipe_pane composes it — and pipe_pane refuses `$` and a backtick rather
-    # than ship a path pwsh would expand. Match that production refusal, and add
-    # a space: psmux's quote re-parse splits a spaced path (a `C:\Users\John Doe`
-    # profile is enough), the sidecar never spawns, and this probe would then red
-    # permanently while its message blamed a transient spawn race. pipe_pane's
-    # docstring already lists a spaced path as an untested ceiling — skipping is
-    # honest about that; a red here would not be.
-    if any(char in str(sidecar) for char in ("$", "`", " ")):
-        pytest.skip(
-            "tmp path carries PowerShell interpolation syntax, or a space psmux's "
-            "quote re-parse would split before the sidecar spawns"
-        )
-    # Records the argv psmux actually handed it, then drains stdin so the child
-    # outlives the first chunk rather than racing the pane. -Encoding pins the
-    # bytes the reader below assumes rather than trusting a pwsh default.
-    sidecar.write_text(
-        f"Set-Content -Encoding utf8 -LiteralPath {_pwsh_quote(str(record))} "
-        "-Value ($args -join '|')\n"
-        "$in = [System.Console]::OpenStandardInput()\n"
-        "$buf = New-Object byte[] 4096\n"
-        "while (($n = $in.Read($buf, 0, $buf.Length)) -gt 0) { }\n",
-        encoding="utf-8",
-    )
-    piped = f'pwsh "{sidecar}" -flagcanary positional'
-    text = ""
-    for window in windows:
-        attached = mux._run(["pipe-pane", "-t", window, "-o", piped], check=False)
-        assert attached.returncode == 0, (
-            "probe setup: raw pipe-pane failed — psmux_backend.pipe_pane's sidecar "
-            f"workaround premise went unobserved: {attached.stderr.strip()!r}"
-        )
-        for argv in (
-            ["send-keys", "-t", window, "-l", "echo hello"],
-            ["send-keys", "-t", window, "Enter"],
-        ):
-            sent = mux._run(argv, check=False)
-            assert sent.returncode == 0, (
-                f"probe setup: {argv[0]} could not trigger pipe-pane output: "
-                f"{sent.stderr.strip()!r}"
-            )
-        deadline = time.monotonic() + 7.5
-        while time.monotonic() < deadline:
-            text = record.read_text(encoding="utf-8") if record.exists() else ""
-            if text.endswith("\n"):
-                break
-            time.sleep(0.25)
-        if text.endswith("\n"):
-            break
-    # An unobserved premise must fail, never pass: no file means the sidecar
-    # never spawned, which says nothing about flag stripping either way.
-    assert text.endswith("\n"), (
-        "probe setup: pipe-pane sidecar never ran, so the dash-flag premise went "
-        "unobserved — psmux's first-pipe-after-new-window spawn race "
-        "(psmux/psmux#482) is a likelier cause than a premise change; re-run "
-        "before reading anything into it"
-    )
-    recorded = text.strip().split("|")
-    assert "positional" in recorded, f"sidecar recorded an unexpected argv: {recorded!r}"
-    assert "-flagcanary" not in recorded, (
-        "psmux now passes dash-flag tokens through pipe-pane — pipe_pane's "
-        "positional sidecar .ps1 can go back to a flag transport (psmux/psmux#482)"
-    )
 
 
 def test_premise_unresolvable_kill_target_exits_zero_and_kills_a_live_window(probe):
