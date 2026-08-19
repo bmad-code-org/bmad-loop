@@ -150,25 +150,44 @@ def test_scrub_text_max_chars_bounds_a_single_long_line():
     assert "more chars redacted" in out
 
 
-def test_scrub_text_max_chars_never_leaves_a_guard_invisible_secret_prefix():
+@pytest.mark.parametrize(
+    "sensitive,line,rule",
+    [
+        # A bare high-entropy credential. `looks_like_secret`'s entropy arm needs a
+        # contiguous alnum run of `_SECRET_RUN_MIN`, so a 30-character survivor of a
+        # 36-character token is invisible to the guard.
+        (
+            "aZ3kQ9mX7pL2vB8nR4tY6wS1cD5eF0gHjK7m",
+            "word " * 34 + "aZ3kQ9mX7pL2vB8nR4tY6wS1cD5eF0gHjK7m" + " tail",
+            "secret",
+        ),
+        # A URL credential. `_URL_CRED_RE`'s match ENDS at the `@`, so a cut that
+        # clips the `@` away silences the rule while the password prefix still
+        # ships — a different rule from the row above, reached the same way.
+        (
+            "correcthorsebatterystaple",
+            "word " * 34 + "https://bob:correcthorsebatterystaple@localhost/x",
+            "url-credentials",
+        ),
+    ],
+)
+def test_scrub_text_max_chars_never_leaves_a_guard_invisible_fragment(sensitive, line, rule):
     """The cap must not blind the egress guard it feeds (#481).
 
-    `looks_like_secret`'s entropy arm needs a contiguous alnum run of
-    `_SECRET_RUN_MIN`, so a cut landing inside a 36-char credential would leave 30
-    characters of it in the emitted bytes as a run too short for the guard to
-    recognize — converting a fail-closed refusal into an emission that carries a
-    credential prefix. The straddling token is dropped WHOLE instead.
+    Truncation is unsafe wherever the cut lands inside something `assert_no_leak`
+    would have flagged: the fragment keeps the sensitive part while no longer
+    tripping the rule, converting a fail-closed refusal into an emission. The rows
+    are deliberately different RULES, because the hazard is a property of cutting
+    a guard construct in half and not of any one rule — a third shape belongs here
+    as another row rather than as another special case in `_truncate_line`.
     """
-    token = "aZ3kQ9mX7pL2vB8nR4tY6wS1cD5eF0gHjK7m"
-    line = "word " * 34 + token + " tail"  # the token begins at offset 170
-    assert line.index(token) == 170
-    # Without the cap the guard fires and the caller refuses to write at all.
-    assert "secret" in sanitize.assert_no_leak(line)
+    # Uncapped, the guard fires and the caller refuses to write at all.
+    assert rule in sanitize.assert_no_leak(line)
 
     out = sanitize.scrub_text(line, max_chars=200)
-    # Not merely "below the entropy threshold" — no part of the credential ships.
-    assert token[:30] not in out
-    assert not any(token[i : i + 6] in out for i in range(len(token) - 6))
+    # Not merely "below the rule's threshold" — no part of it ships at all.
+    assert sensitive[:12] not in out
+    assert not any(sensitive[i : i + 6] in out for i in range(len(sensitive) - 6))
     assert "more chars redacted" in out
 
 

@@ -88,13 +88,17 @@ _SECRET_RUN_MIN = 32  # length of contiguous alnum run that triggers the entropy
 _SECRET_ENTROPY_MIN = 3.5  # bits/char; pure hex ~4.0, base64 ~6.0, prose/slug well below
 
 # Token shape used by assert_no_leak to re-scan rendered output for secrets.
-# The single-character form is derived from the same class, not re-spelled, so a
-# change to one cannot silently desynchronize scrub_text's cut from what the
-# guard treats as one token.
-_LEAK_TOKEN_CHARS = r"[A-Za-z0-9._/+-]"  # nosec B105 - a regex character class, not a credential
-_LEAK_TOKEN_RE = re.compile(rf"{_LEAK_TOKEN_CHARS}{{6,}}")
-_LEAK_TOKEN_CHAR_RE = re.compile(_LEAK_TOKEN_CHARS)
+_LEAK_TOKEN_RE = re.compile(r"[A-Za-z0-9._/+-]{6,}")
 _URL_CRED_RE = re.compile(r"https?://[^/\s]*:[^/@\s]+@")
+# The guard constructs whose match can straddle a truncation point AND whose
+# leading fragment would still be sensitive once the rest is clipped away.
+# `scrub_text`'s cut retracts out of these -- see `_truncate_line`. This sits
+# beside assert_no_leak's rule list deliberately: a rule added there needs an
+# entry here only if a PREFIX of its match stays sensitive. `_EMAIL_RE` is absent
+# because scrub_text redacts emails BEFORE it truncates, so none survives to be
+# split; `_ABS_HOME_RE` is absent because a fragment too short to match `/home/`
+# no longer carries the home tree the rule names.
+_TRUNCATION_HAZARD_RES = (_LEAK_TOKEN_RE, _URL_CRED_RE)
 # The same bytes reach assert_no_leak either as raw text (the markdown report)
 # or as JSON text (the --json document), and json.dumps DOUBLES a backslash —
 # `C:\Users\alice` is serialized as `C:\\Users\\alice`. Matching only the raw
@@ -184,39 +188,48 @@ def looks_like_secret(s: str) -> bool:
 def _truncate_line(line: str, max_chars: int) -> str:
     """One line clipped to ``max_chars``, never in a way that blinds the guard.
 
-    The naive cut is at ``max_chars``. That is unsafe when it lands INSIDE a
-    token :func:`assert_no_leak` would have flagged: the entropy arm of
-    :func:`looks_like_secret` needs a contiguous alnum run of ``_SECRET_RUN_MIN``,
-    so clipping a 36-char high-entropy credential to 30 characters leaves a
-    credential prefix in the output that the guard no longer recognizes — turning
-    a fail-closed refusal into an emission. The cut therefore retracts to the
-    start of the split token, dropping it WHOLE, but only when the split actually
-    costs the guard its verdict.
+    The naive cut is at ``max_chars``. That is unsafe when it lands INSIDE
+    something :func:`assert_no_leak` would have flagged, because the fragment it
+    leaves behind can keep the sensitive part while no longer tripping the rule
+    — turning a fail-closed refusal into an emission. Two shapes reach here:
 
-    That last condition is what keeps the cap from over-firing: ``"x" * 5000`` is
-    one 5000-char token, but it is not credential-shaped either whole or clipped,
-    so it still truncates at exactly ``max_chars``. The known-prefix arm
-    (``ghp_`` …) is anchored at the token's start and survives clipping, so it
-    needs no retraction either — the entropy arm is the one at risk (#481).
+    * a credential-shaped token, where the entropy arm of
+      :func:`looks_like_secret` needs a contiguous alnum run of
+      ``_SECRET_RUN_MIN``, so clipping a 36-character token to 30 leaves a
+      credential prefix the guard no longer recognizes; and
+    * a URL credential, whose match ends at the ``@`` — clip that off and
+      ``_URL_CRED_RE`` stops matching while the password prefix still ships.
+
+    Rather than special-case either, the cut retracts out of any
+    ``_TRUNCATION_HAZARD_RES`` match it splits whose whole trips the guard while
+    its surviving prefix does not, using :func:`assert_no_leak` itself as the
+    oracle. Deferring to the guard is what keeps this general: it is the same
+    verdict the rendered bytes are judged by, so a rule added there is covered
+    here without a second implementation of what "sensitive" means.
+
+    That verdict test is also what keeps the cap from over-firing. ``"x" * 5000``
+    is a single 5000-character token, but it trips no rule whole OR clipped, so
+    it still truncates at exactly ``max_chars``; a ``ghp_``-prefixed token is
+    matched at its start and still trips the guard once clipped, so it is not
+    retracted either and the refusal is preserved with no content dropped (#481).
     """
     if len(line) <= max_chars:
         return line
     cut = max_chars
-    # Only a cut with a token character on BOTH sides splits a token; one landing
-    # on a delimiter already leaves every token whole.
-    if (
-        cut > 0
-        and _LEAK_TOKEN_CHAR_RE.match(line[cut])
-        and _LEAK_TOKEN_CHAR_RE.match(line[cut - 1])
-    ):
-        start = cut
-        while start > 0 and _LEAK_TOKEN_CHAR_RE.match(line[start - 1]):
-            start -= 1
-        end = cut
-        while end < len(line) and _LEAK_TOKEN_CHAR_RE.match(line[end]):
-            end += 1
-        if looks_like_secret(line[start:end]) and not looks_like_secret(line[start:cut]):
-            cut = start
+    # Retracting out of one hazard can land the cut inside an earlier one, so
+    # iterate to a fixed point. `cut` only ever decreases, so this terminates.
+    changed = True
+    while changed:
+        changed = False
+        for pattern in _TRUNCATION_HAZARD_RES:
+            for match in pattern.finditer(line):
+                if (
+                    match.start() < cut < match.end()
+                    and assert_no_leak(match.group())
+                    and not assert_no_leak(line[match.start() : cut])
+                ):
+                    cut = match.start()
+                    changed = True
     return line[:cut] + f"… ({len(line) - cut} more chars redacted)"
 
 
