@@ -187,16 +187,6 @@ def _mint_probe_window(mux: PsmuxMultiplexer, session: str, name: str, cwd: Path
     return window_id
 
 
-def _active_window(mux: PsmuxMultiplexer, session: str) -> str:
-    proc = mux._run(
-        ["list-windows", "-t", session, "-F", "#{window_id} #{window_active}"], check=False
-    )
-    assert proc.returncode == 0, f"probe setup: active-window probe failed: {proc.stderr.strip()!r}"
-    active = [line.split()[0] for line in proc.stdout.splitlines() if line.endswith(" 1")]
-    assert len(active) == 1, f"probe setup: expected one active window, got {active!r}"
-    return f"{session}:{active[0]}"
-
-
 @pytest.fixture(scope="module")
 def psmux_data_root(tmp_path_factory):
     """Return an isolated registry root only when the installed build honors it."""
@@ -381,31 +371,3 @@ def test_premise_option_values_survive_the_control_line(probe):
         )
 
 
-def test_premise_unresolvable_kill_target_exits_zero_and_kills_a_live_window(probe):
-    # Destructive by construction: on this premise the kill lands on the ACTIVE
-    # window (psmux/psmux#545). The safety property is per-probe session
-    # ownership — the `probe` fixture mints a fresh one per test, so nothing this
-    # destroys is shared. File order enforces nothing here (xdist reorders); it
-    # sits last for reader flow only.
-    mux, session, _ = probe
-    before = set(mux.list_window_ids(session))
-    assert len(before) >= 2, f"probe setup: probe session should hold the parked windows: {before}"
-    active = _active_window(mux, session)
-    proc = mux._run(["kill-window", "-t", f"{session}:@9999"], check=False)
-    after = set(mux.list_window_ids(session))
-    assert proc.returncode == 0, (
-        "psmux now reports a non-zero exit for an unresolvable kill-window target — "
-        "kill_window's check=False swallow in tmux_base can surface the failure"
-    )
-    # Exactly one window and the session still standing. `after < before` is a
-    # strict-subset test that ANY number of vanished windows satisfies — a
-    # collateral kill that took the session down answers [] through
-    # list_window_ids' non-zero leg and would pass while claiming something
-    # entirely different happened.
-    assert mux.has_session(
-        session
-    ), f"the unresolvable kill took the whole session down, not one window: {before}"
-    assert after < before and before - after == {active}, (
-        "an unresolvable kill-window target no longer destroys the active live "
-        f"window (psmux/psmux#545): {sorted(before)} -> {sorted(after)}"
-    )

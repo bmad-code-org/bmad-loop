@@ -362,11 +362,27 @@ class BaseTmuxBackend(TerminalMultiplexer):
 
     def kill_window(self, target: str) -> None:
         # Best-effort teardown: a hang / missing binary is no worse than the window
-        # already being gone, so swallow to the documented no-op sentinel.
+        # already being gone, so swallow to the documented no-op sentinel. A
+        # non-zero exit still says so out loud — the return value stays None and
+        # nothing raises, but a target that resolved to nothing (a wrong session
+        # qualification, a renumbered id) would otherwise leave a live window
+        # behind with no trace anywhere.
+        #
+        # Accepted ceiling: killing an ALREADY-GONE window exits non-zero too,
+        # and that is ordinary teardown, not a fault. The return code cannot
+        # separate the two, so the binary's own stderr rides along verbatim
+        # ("can't find window" reads as benign to whoever sees it) rather than
+        # buying a liveness round-trip per kill.
         try:
-            self._run(["kill-window", "-t", target], check=False)
+            proc = self._run(["kill-window", "-t", target], check=False)
         except (subprocess.SubprocessError, OSError):
-            pass
+            return
+        if proc.returncode != 0:
+            print(
+                f"warning: kill-window {target} exited {proc.returncode}: "
+                f"{proc.stderr.strip()}",
+                file=sys.stderr,
+            )
 
     def window_pane_pids(self, target: str) -> list[int]:
         # Capability method (see the seam default): a transport failure, a dead
