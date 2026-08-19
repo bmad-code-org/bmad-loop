@@ -1391,11 +1391,14 @@ async def test_decision_modal_scrolls_when_content_long(project):
         # `scroll_visible` only queues the scroll. It runs straight through to
         # the container's `Widget.scroll_to`, which defers the offset write via
         # `call_after_refresh`: an InvokeLater the pump forwards to the screen,
-        # where it lands on `Screen._callbacks` and is drained only by the
-        # screen's *idle* handler. `pilot.pause()` does not synchronize on that
-        # drain — its barrier covers messages queued at call time, and it then
-        # calls `_on_timer_update`, which relayouts whatever scroll state
-        # exists right then. Lose that one idle hop and `scroll_y` is still 0,
+        # where it lands on `Screen._callbacks`. Draining that queue always
+        # costs a later pump hop. The screen's idle handler drains it, but only
+        # once the screen is clean — a dirty one resumes the update timer and
+        # returns — and `_on_timer_update` only `call_next`s the drain rather
+        # than running it. So `pilot.pause()` does not synchronize on the
+        # write: its barrier covers messages queued at call time, and the
+        # `_on_timer_update` it ends with relayouts whatever scroll state
+        # exists right then. Lose that hop and `scroll_y` is still 0,
         # so the relayout reflows the old offset and `region` keeps its
         # pre-scroll geometry, putting the option below the fold (#360). Gate
         # on the write landing — `body.scroll_y` is the one observable here not
