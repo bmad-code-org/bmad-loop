@@ -245,8 +245,16 @@ def run_version_help(binary: str, timeout_s: float = 10) -> FlagFinding:
     return FlagFinding(
         binary=binary,
         found=True,
-        version=sanitize.scrub_text(version, max_lines=5) if version else None,
-        help=sanitize.scrub_text(help_txt, max_lines=80) if help_txt else None,
+        version=(
+            sanitize.scrub_text(version, max_lines=5, max_chars=sanitize.SCRUB_TEXT_MAX_CHARS)
+            if version
+            else None
+        ),
+        help=(
+            sanitize.scrub_text(help_txt, max_lines=80, max_chars=sanitize.SCRUB_TEXT_MAX_CHARS)
+            if help_txt
+            else None
+        ),
     )
 
 
@@ -792,7 +800,9 @@ def _log_tail(log_file: Path, max_lines: int = 20) -> str | None:
     if not text.strip():
         return None
     lines = text.splitlines()[-max_lines:]
-    return sanitize.scrub_text("\n".join(lines), max_lines=max_lines)
+    return sanitize.scrub_text(
+        "\n".join(lines), max_lines=max_lines, max_chars=sanitize.SCRUB_TEXT_MAX_CHARS
+    )
 
 
 # ------------------------------------------------------------------ rendering

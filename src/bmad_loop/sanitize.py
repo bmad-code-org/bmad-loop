@@ -61,6 +61,13 @@ from typing import Any, Iterable, Iterator
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _IDENTIFIER_MAX = 80
 
+# Per-line character bound for :func:`scrub_text`. Real ``--version``/``--help``
+# lines from the coding CLIs this probes run well under ~120 characters, so 200
+# is roughly 2x headroom over legitimate output while still bounding an
+# adversarial or corrupted one. Public because `probe.py` passes it explicitly
+# rather than relying on a hidden default.
+SCRUB_TEXT_MAX_CHARS = 200
+
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
 # Known credential token shapes — provider prefixes plus the JWT header. These
@@ -169,22 +176,50 @@ def looks_like_secret(s: str) -> bool:
     return len(longest) >= _SECRET_RUN_MIN and _shannon_entropy(longest) >= _SECRET_ENTROPY_MIN
 
 
-def scrub_text(s: str, *, max_lines: int | None = None) -> str:
+def scrub_text(s: str, *, max_lines: int | None = None, max_chars: int | None = None) -> str:
     """Sanitize free text (a CLI's ``--help`` / ``--version`` / a log tail).
 
     Less aggressive than :func:`scrub_json` — help text is the CLI's own and
     flag lines must survive — so we only redact the home dir and any emails,
-    then optionally cap the line count.
+    then optionally cap the line count and each line's length.
+
+    ``max_chars`` bounds each line's **content** at ``max_chars``; a truncated
+    line is emitted as ``max_chars`` characters plus the
+    ``… (N more chars redacted)`` marker, so its total length is
+    ``max_chars + len(marker)``. That overshoot is the same off-by-one
+    ``max_lines`` already has — ``max_lines=5`` emits six lines, five kept plus
+    the marker line — and it is deliberate (#481): a marker made to fit inside
+    the budget would have to be a bare ellipsis, which does not say that
+    redaction happened. The line-count marker is never itself char-truncated.
+    Composing both caps bounds the whole result at
+    ``max_lines * (max_chars + len(char marker)) + len(line marker)``.
+
+    Passing either cap normalizes line endings and drops a trailing newline
+    (``splitlines``/``join``); passing neither is a byte-identical passthrough
+    of the redaction step.
     """
     s = redact_home(s)
     s = _EMAIL_RE.sub(_REDACTED_EMAIL, s)
-    if max_lines is not None:
-        lines = s.splitlines()
-        if len(lines) > max_lines:
-            dropped = len(lines) - max_lines
-            lines = lines[:max_lines] + [f"… ({dropped} more lines redacted)"]
-        s = "\n".join(lines)
-    return s
+    if max_lines is None and max_chars is None:
+        return s
+    lines = s.splitlines()
+    # Held aside, not appended yet: the line-count marker is a report of what the
+    # line cap removed, so char-truncating it would redact the redaction notice.
+    line_marker: list[str] = []
+    if max_lines is not None and len(lines) > max_lines:
+        dropped = len(lines) - max_lines
+        line_marker = [f"… ({dropped} more lines redacted)"]
+        lines = lines[:max_lines]
+    if max_chars is not None:
+        lines = [
+            (
+                line
+                if len(line) <= max_chars
+                else line[:max_chars] + f"… ({len(line) - max_chars} more chars redacted)"
+            )
+            for line in lines
+        ]
+    return "\n".join(lines + line_marker)
 
 
 def _is_word_boundary(ch: str) -> bool:

@@ -753,6 +753,37 @@ def test_run_capture_replaces_undecodable_banner_bytes(tmp_path):
     assert "before" in out and "after" in out
 
 
+def test_run_version_help_bounds_line_length(monkeypatch):
+    """A single absurdly long banner line is bounded in both fields (#481)."""
+    # The WIRING test: `scrub_text` having the parameter proves nothing if the
+    # call site does not pass it.
+    monkeypatch.setattr(probe.shutil, "which", lambda _binary: "/usr/bin/fakecli")
+    monkeypatch.setattr(probe, "_run_capture", lambda _argv, _timeout_s: "y" * 5000)
+
+    finding = probe.run_version_help("fakecli")
+
+    max_chars = sanitize.SCRUB_TEXT_MAX_CHARS
+    marker = f"… ({5000 - max_chars} more chars redacted)"
+    for value in (finding.version, finding.help):
+        assert value is not None
+        assert len(value) == max_chars + len(marker)
+        assert "more chars redacted" in value
+
+
+def test_log_tail_bounds_line_length(tmp_path):
+    """A log whose tail is one 5000-char line is bounded too (#481)."""
+    log_file = tmp_path / "session.log"
+    log_file.write_text("z" * 5000 + "\n", encoding="utf-8")
+
+    out = probe._log_tail(log_file)
+
+    max_chars = sanitize.SCRUB_TEXT_MAX_CHARS
+    marker = f"… ({5000 - max_chars} more chars redacted)"
+    assert out is not None
+    assert len(out) == max_chars + len(marker)
+    assert "more chars redacted" in out
+
+
 # ------------------------------------------------------ liveness (#294)
 
 

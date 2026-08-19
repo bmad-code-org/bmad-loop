@@ -126,6 +126,37 @@ def test_scrub_text_max_lines_truncates():
     assert "more lines redacted" in out
 
 
+def test_scrub_text_max_chars_truncates_each_line():
+    max_chars = 40
+    text = "\n".join(["short one", "x" * 5000, "short two"])
+    out = sanitize.scrub_text(text, max_chars=max_chars)
+    lines = out.split("\n")
+    assert len(lines) == 3  # per-line truncation must not drop lines
+    assert lines[0] == "short one"  # short lines survive byte-for-byte
+    assert lines[2] == "short two"
+    marker = f"… ({5000 - max_chars} more chars redacted)"
+    assert lines[1] == "x" * max_chars + marker
+    assert len(lines[1]) == max_chars + len(marker)  # the documented bound
+    assert "more chars redacted" in out
+
+
+def test_scrub_text_max_chars_bounds_a_single_long_line():
+    # #481's core case. `max_lines` alone can never bound this input, because one
+    # line is already under the line cap — that is the whole of the issue.
+    max_chars = sanitize.SCRUB_TEXT_MAX_CHARS
+    out = sanitize.scrub_text("x" * 5000, max_lines=5, max_chars=max_chars)
+    marker = f"… ({5000 - max_chars} more chars redacted)"
+    assert len(out) == max_chars + len(marker)
+    assert "more chars redacted" in out
+
+
+def test_scrub_text_without_max_chars_is_byte_identical():
+    # `diagnostics.py` calls with neither cap (the mux `version()` probe and
+    # `os_release`); their output must not change shape.
+    text = "first line\r\nsecond line\r\n"
+    assert sanitize.scrub_text(text) == text  # no normalization, no lost newline
+
+
 def test_scrub_event_payload_is_scrub_json(home):
     payload = {"session_id": "s-1", "cwd": f"{home}/proj", "n": 5}
     out = sanitize.scrub_event_payload(payload)
