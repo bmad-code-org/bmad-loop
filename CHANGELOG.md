@@ -9,6 +9,32 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- **Plugins can now observe structured dev verification results (#641).** The existing
+  `post_dev_verify` hook receives immutable per-command results after normal and repair
+  verification, with separate `stdout`/`stderr` alongside the compatible bounded
+  `output_tail`. The context also carries `verification_stage` (`"dev"` or `"fix"`) and
+  `verification_sequence` — the only way to tell a dev verification from a repair one
+  (both emit the same stage from the same phase) and the key that joins the context to
+  its own journal records. Core writes `verify-command-result` journal records with
+  stream pointers under the run's `verify/` directory — its own store, kept out of the
+  adapter-owned, TUI-consumed `logs/`; plugins remain unable to alter verification or
+  commit decisions. Storage, upload, signing, and any policy response stay plugin-owned.
+  Scope is the dev phase: the review gate runs the same `[verify] commands` and retains
+  nothing, so the journal records are not a census of a run's verifier invocations —
+  `docs/plugin-authoring-guide.md` states the boundary, and #656 tracks closing it.
+  Retention is bounded by the new `[verify] stream_capture_kb` (default 256 KiB per
+  stream, `0` = capture nothing): the tail is kept, and the record carries the full
+  byte count plus a `*_truncated` flag so a cut file is never mistaken for a whole
+  one. A concluded run gives the store back: `bmad-loop clean` trims `verify/` with the
+  rest of a run's heavy scaffolding and counts it in the reclaimed total, leaving the
+  run listed and resumable. Separately from that on-disk cap, a hard 32 MiB per-stream
+  ceiling bounds what is held in memory while the remaining commands run, so a
+  pathologically chatty suite cannot grow peak memory with the number of configured
+  verify commands; the record still reports what the command emitted, so a stream the
+  ceiling cut is never mistaken for a whole one. Retaining a stream is observation, so a failed write (ENOSPC, a read-only run
+  dir) degrades — the record still lands, with a null pointer and `capture_error` —
+  instead of taking down a dev pass whose verify commands passed.
+
 - **A refused auto-sweep is now visible outside the journal (#501).** A run whose deferred-work
   sweep was refused ended looking exactly like one that swept, and under `[sweep] auto = "run-end"`
   there is one trigger per run that is never re-asked once the run finishes — so the journal was
@@ -37,6 +63,14 @@ breaking changes may land in a minor release.
   unchanged.
 
 ### Changed
+
+- **`post_dev_verify` now fires on the repair leg too, not only after dev verification (#641).**
+  A plugin written against "once per story, after the dev session" will see the stage again after
+  every repair session's verification, and on the way to a pause: an attempt whose session reported
+  a CRITICAL escalation now emits before the run stops, on either leg, where the repair leg used to
+  escalate without emitting at all. Discriminate the legs with `ctx.verification_stage`
+  (`"dev"` / `"fix"`) and de-duplicate on `ctx.verification_sequence`; handlers that assumed one
+  call per story must be idempotent.
 
 - **`probe-adapter` now bounds how long a single scrubbed line can be (#481).** `scrub_text` capped
   how many lines it emitted but never how long one of them could be, so a single very long line —
@@ -81,6 +115,15 @@ breaking changes may land in a minor release.
   it cannot read.
 
 ### Fixed
+
+- **A plugin can no longer erase a CRITICAL escalation out from under the engine's audit.**
+  `HookContext` copies the session `result_json` precisely so a plugin observes history rather
+  than rewriting it, but `dict()` is shallow: the nested `escalations` list stayed the engine's
+  own object, and both verify legs emit `post_dev_verify` before reading
+  `critical_escalations(result.result_json)`. An in-process plugin that cleared that list
+  therefore erased the escalation before the audit ran, and a verify-green repair proceeded
+  where the run owed a pause. The copy is now deep, so the observe-only guarantee holds at the
+  depth escalations actually live.
 
 - **The egress self-check now sees Windows→WSL UNC home paths (#512).** `diagnose` and
   `probe-adapter` re-scan their own rendered bytes before emitting and refuse to emit at all on a

@@ -25,6 +25,7 @@ import os
 import random
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -587,6 +588,87 @@ def _atomic_write(
 # presence answers for all of them: it is defined on Linux/macOS and absent on
 # Windows, whose pyconfig has neither HAVE_RENAMEAT nor HAVE_OPENAT.
 DIR_FD_ANCHORED_WRITES = hasattr(os, "O_DIRECTORY")
+
+
+# Windows reparse tags that make a directory entry REDIRECT somewhere else,
+# compared against os.lstat().st_reparse_tag (Windows, 3.8+). Deliberately not
+# os.path.isjunction(), which is 3.12+ while this package's floor is 3.11.
+# Deliberately not "any reparse tag" either: cloud placeholders (OneDrive) and
+# dedup stubs are reparse points too, and refusing those would stall a
+# legitimate run. Empty on POSIX.
+_LINK_REPARSE_TAGS = tuple(
+    tag
+    for tag in (
+        getattr(stat, "IO_REPARSE_TAG_SYMLINK", None),
+        getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", None),
+    )
+    if tag is not None
+)
+
+
+def is_link_like(path: Path) -> bool:
+    """True when ``path`` redirects elsewhere: a POSIX symlink, or a Windows
+    symlink OR DIRECTORY JUNCTION.
+
+    ``Path.is_symlink()`` is False for a junction — junctions are a distinct
+    reparse kind, which is why ``os.path.isjunction()`` exists at all. On Windows
+    the junction is the arm that matters: ``mklink /J`` needs no elevation, while
+    a directory symlink needs SeCreateSymbolicLinkPrivilege or Developer Mode, so
+    the UNPRIVILEGED redirect is exactly the one an ``is_symlink()`` check misses.
+
+    This is the win32 half of :func:`open_dir_confined`, which anchors the POSIX
+    side at a descriptor instead. A path check is inherently check-then-write —
+    answered about a name, and stale the moment it returns — so it narrows the
+    window rather than closing it. That residual is the platform's, not this
+    function's: win32 has no ``*at()`` family to anchor against.
+
+    ``events.py`` and the standalone hook relay keep their own copies of this
+    predicate on purpose: they run under the HOST's interpreter, not this
+    package's, so they cannot import it from here.
+    """
+    if path.is_symlink():
+        return True
+    try:
+        return getattr(os.lstat(path), "st_reparse_tag", 0) in _LINK_REPARSE_TAGS
+    except OSError:
+        return False
+
+
+def walk_files_unlinked(top: Path) -> Iterator[Path]:
+    """Every non-directory entry under ``top``, never crossing a redirect out of it.
+
+    **Non-directory, not regular file** — ``os.walk`` puts FIFOs, device nodes and
+    symlinks in ``files`` alongside ordinary ones, and this yields what it is
+    handed. A caller that only counts or ``lstat``s is fine; a caller that OPENS
+    what it yields owes its own regular-file check, because opening a planted
+    FIFO blocks forever. Swapping ``rglob`` for this helper silently drops the
+    ``is_file()`` guard the old loop carried — that regression shipped once
+    (``diagnostics.summarize_files``, whose ``logs`` arm reads to count lines).
+
+    Two holes, closed together because a caller that measures or counts a tree
+    gets both wrong in the same way:
+
+    ``os.walk`` already declines to recurse into a symlinked subdirectory — but
+    it decides that with ``os.path.islink``, which is False for a Windows
+    DIRECTORY JUNCTION. That is the unprivileged redirect (see
+    :func:`is_link_like`), so on win32 the pruning `os.walk` documents is exactly
+    the arm an attacker would use. And ``os.walk`` always follows the top path it
+    is handed, symlink or not, so refusing to descend into links says nothing
+    about the root.
+
+    Both matter to more than tidiness: a session is handed a writable run
+    directory (`BMAD_LOOP_RUN_DIR`) and can plant a link at an entry that `clean`
+    sizes and `diagnose` counts, which would bill a reclaim estimate — or a
+    diagnostic dump — for an arbitrarily large tree outside the run that neither
+    command touches. Yields paths; the caller chooses ``stat`` or ``lstat``.
+    """
+    if is_link_like(top):
+        return
+    for root, dirs, files in os.walk(top, onerror=lambda _e: None):
+        # in-place, which is how os.walk documents pruning under topdown=True
+        dirs[:] = [d for d in dirs if not is_link_like(Path(root) / d)]
+        for name in files:
+            yield Path(root) / name
 
 
 def open_dir_confined(root: Path, target: Path) -> int | None:

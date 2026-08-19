@@ -37,7 +37,7 @@ from bmad_loop import deferredwork, platform_util, verify
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.engine import Engine, RunPaused, RunStopped, _digest_of, _run_depth
-from bmad_loop.journal import Journal, load_state
+from bmad_loop.journal import LOGS_DIR, VERIFY_DIR, Journal, load_state
 from bmad_loop.model import (
     PAUSE_EPIC_BOUNDARY,
     PAUSE_ESCALATION,
@@ -126,6 +126,654 @@ def resume_engine(project, engine, script, policy=None) -> tuple[Engine, MockAda
         max_stories=state.max_stories,
     )
     return new_engine, adapter
+
+
+class _PostDevVerifyCaptureBus:
+    """Small hook-bus double for testing the engine-to-plugin public seam."""
+
+    def __init__(self):
+        self.contexts = []
+
+    def active(self, stage):
+        return stage == "post_dev_verify"
+
+    def emit(self, stage, ctx):
+        self.contexts.append(ctx)
+        return ctx
+
+
+def test_post_dev_verify_exposes_journaled_command_results(project, monkeypatch):
+    """A normal dev verification retains the exact result for the existing hook
+    and journals stream pointers instead of unbounded JSON payloads."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", followup_review=False)],
+        policy=Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            review=ReviewPolicy(enabled=False),
+        ),
+    )
+    capture = _PostDevVerifyCaptureBus()
+    engine._bus = capture
+    result = verify.CommandResult("pytest -q", 0, "out\nerr\n", "out\n", "err\n")
+    monkeypatch.setattr(verify, "run_verify_commands", lambda policy, cwd: [result])
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    (ctx,) = capture.contexts
+    assert ctx.command_results == (result,)
+    (entry,) = [e for e in engine.journal.entries() if e["kind"] == "verify-command-result"]
+    assert entry["verification_stage"] == "dev"
+    assert entry["verification_sequence"] == 1
+    assert entry["command_index"] == 0 and entry["returncode"] == 0
+    assert (engine.run_dir / entry["stdout_path"]).read_text(encoding="utf-8") == "out\n"
+    assert (engine.run_dir / entry["stderr_path"]).read_text(encoding="utf-8") == "err\n"
+    # Pointers are run-relative and land in the verifier's own store: logs/ is the
+    # adapters' task-id namespace, which the TUI resolves as pane logs.
+    assert entry["stdout_path"].startswith(f"{VERIFY_DIR}/")
+    assert entry["stderr_path"].startswith(f"{VERIFY_DIR}/")
+    assert not list((engine.run_dir / LOGS_DIR).glob("verify-*"))
+
+
+def test_verify_stream_filenames_sanitize_the_whole_composition(project):
+    """A long story key cannot push a composed filename past the segment cap.
+
+    ``_session_task_id`` states the rule these filenames follow verbatim:
+    sanitize the whole composition, not the parts. Capping ``story_key`` alone
+    spends the entire budget on it and then appends the stage/attempt/sequence/
+    index tail unchecked, so the segment overshoots by the length of that tail.
+    """
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-" + "k" * platform_util.MAX_SEGMENT, epic=1)
+
+    engine._journal_verify_command_results(
+        task, "dev", (verify.CommandResult("pytest -q", 0, "tail", "out", "err"),)
+    )
+
+    (entry,) = [e for e in engine.journal.entries() if e["kind"] == "verify-command-result"]
+    for pointer, suffix in ((entry["stdout_path"], "stdout"), (entry["stderr_path"], "stderr")):
+        stem = pointer.rsplit("/", 1)[-1].removesuffix(f".{suffix}.log")
+        assert len(stem) <= platform_util.MAX_SEGMENT
+        assert (engine.run_dir / pointer).is_file()
+    # the untruncated key still reaches the reader — through the record, not the name
+    assert entry["story_key"] == task.story_key
+
+
+def _capture_engine(project, stream_capture_kb):
+    """An engine whose only interesting policy is the verifier stream cap."""
+    return make_engine(
+        project, [], policy=Policy(verify=VerifyPolicy(stream_capture_kb=stream_capture_kb))
+    )[0]
+
+
+def _sole_verify_record(engine):
+    (entry,) = [e for e in engine.journal.entries() if e["kind"] == "verify-command-result"]
+    return entry
+
+
+def test_verify_stream_capture_retains_a_bounded_tail(project):
+    """A chatty command is cut to `verify.stream_capture_kb`, and the record says so.
+
+    COMMAND_TIMEOUT_S is 30 minutes, so an uncapped retain is hundreds of MB per
+    attempt with no GC behind it. The cut keeps the TAIL — the direction every
+    other bound on this output takes, and where a failing suite puts its failure.
+
+    Ablation: have `_bounded_stream_tail` return `(text, full, full)`
+    unconditionally and the file grows back to the full stream, reddening both
+    the size and the truncation-flag assertions.
+    """
+    engine = _capture_engine(project, 1)  # 1 KiB per stream
+    stdout = "".join(f"chatty line {i}\n" for i in range(1000))
+    full = len(stdout.encode("utf-8"))
+    assert full > 1024, "fixture must exceed the cap or it proves nothing"
+
+    engine._journal_verify_command_results(
+        StoryTask(story_key="1-1-a", epic=1),
+        "dev",
+        (verify.CommandResult("pytest -q", 1, "tail", stdout, ""),),
+    )
+
+    entry = _sole_verify_record(engine)
+    retained = (engine.run_dir / entry["stdout_path"]).read_text(encoding="utf-8")
+    assert len(retained.encode("utf-8")) == 1024
+    assert retained == stdout[-len(retained) :]  # a tail, not a head
+    # The record stays honest about the cut: a silently short file reads as a
+    # complete one, so the FULL size and an explicit flag both travel with it.
+    assert entry["stdout_bytes"] == full
+    assert entry["stdout_captured_bytes"] == 1024
+    assert entry["stdout_truncated"] is True
+    # an under-cap stream is kept whole and flagged as such
+    assert entry["stderr_bytes"] == 0
+    assert entry["stderr_captured_bytes"] == 0
+    assert entry["stderr_truncated"] is False
+    assert entry["capture_error"] is None
+
+
+def test_a_ceilinged_stream_still_reports_what_the_command_emitted(project):
+    """When the in-memory ceiling already cut a stream, the record reports what
+    the COMMAND emitted — not what the engine still holds.
+
+    `MAX_STREAM_MEMORY_BYTES` bounds retention in the results list, so by the time
+    a record is built the string in hand can be far smaller than what ran. Sizing
+    the record off that string would under-report emission and, worse, compute
+    `*_truncated` against a false baseline — calling a cut stream whole, which is
+    the single thing that flag exists to prevent. Only the result knows the real
+    figure, so it carries it.
+
+    Ablation: drop the `emitted` override in `_journal_verify_command_results` and
+    `stdout_bytes` comes back 100 with `stdout_truncated` False — a stream cut
+    twice over, reported as complete. Verified.
+    """
+    engine = _capture_engine(project, 1)
+    held = "o" * 100  # what survived the ceiling
+
+    engine._journal_verify_command_results(
+        StoryTask(story_key="1-1-a", epic=1),
+        "dev",
+        (verify.CommandResult("pytest -q", 1, "tail", held, "", 9_000_000, 0),),
+    )
+
+    entry = _sole_verify_record(engine)
+    assert entry["stdout_bytes"] == 9_000_000  # emitted
+    assert entry["stdout_captured_bytes"] == 100  # retained
+    assert entry["stdout_truncated"] is True
+    # the untouched stream keeps the ordinary meaning: emitted == retained
+    assert entry["stderr_bytes"] == 0 and entry["stderr_truncated"] is False
+
+
+def test_verify_stream_capture_cut_lands_on_a_character_boundary(project):
+    """A byte cap cutting a multi-byte character drops the partial lead, it does
+    not decode it into a replacement char.
+
+    The stream already carries whatever U+FFFD its own `errors="replace"` decode
+    produced (#378); minting another one here would put a corruption marker at a
+    boundary WE chose, and a reader cannot tell the two apart.
+
+    Ablation: switch `_bounded_stream_tail`'s decode to `errors="replace"` and
+    the tail both breaks the cap it was just given (U+FFFD is 3 bytes standing in
+    for the 1 it replaced, so 1024 in yields 1026 out) and carries an invented
+    corruption marker. The bound assertion is the one that fires first.
+    """
+    engine = _capture_engine(project, 1)
+    stdout = "\u20ac" * 1000  # 3 bytes apiece
+    full = len(stdout.encode("utf-8"))
+    assert (full - 1024) % 3 != 0, "fixture must cut mid-character or it proves nothing"
+
+    engine._journal_verify_command_results(
+        StoryTask(story_key="1-1-a", epic=1),
+        "dev",
+        (verify.CommandResult("pytest -q", 1, "tail", stdout, ""),),
+    )
+
+    entry = _sole_verify_record(engine)
+    retained = (engine.run_dir / entry["stdout_path"]).read_text(encoding="utf-8")
+    assert entry["stdout_bytes"] == full and entry["stdout_truncated"] is True
+    assert entry["stdout_captured_bytes"] == len(retained.encode("utf-8"))
+    # within the cap, and short of it by at most the one character that was cut
+    assert 1024 - 3 <= entry["stdout_captured_bytes"] <= 1024
+    assert retained == stdout[-len(retained) :]
+    assert "\ufffd" not in retained
+
+
+def test_verify_stream_capture_disabled_writes_no_files_and_still_journals(project):
+    """`stream_capture_kb = 0` retains nothing — and still records what was emitted.
+
+    "Nothing was retained" and "the command was silent" are different facts, so
+    the byte counts survive the opt-out even though the pointers are null.
+
+    Ablation: delete the `if max_bytes > 0:` guard in
+    `_journal_verify_command_results` and the writer is called with an empty
+    tail, which creates `verify/` and two empty files — reddening the
+    directory-absence and null-pointer assertions.
+    """
+    engine = _capture_engine(project, 0)
+
+    engine._journal_verify_command_results(
+        StoryTask(story_key="1-1-a", epic=1),
+        "dev",
+        (verify.CommandResult("pytest -q", 1, "tail", "out\n", "err\n"),),
+    )
+
+    assert not (engine.run_dir / VERIFY_DIR).exists()  # not even the directory
+    entry = _sole_verify_record(engine)
+    assert entry["stdout_path"] is None and entry["stderr_path"] is None
+    assert entry["stdout_captured_bytes"] == 0 and entry["stderr_captured_bytes"] == 0
+    assert entry["stdout_bytes"] == 4 and entry["stderr_bytes"] == 4
+    assert entry["stdout_truncated"] is True and entry["stderr_truncated"] is True
+    assert entry["capture_error"] is None  # opting out is not a failure
+    # the bounded merged feedback a repair session acts on is untouched by the knob
+    assert entry["output_tail"] == "tail"
+
+
+def test_verify_stream_capture_oserror_degrades_instead_of_killing_the_run(project, monkeypatch):
+    """A failed retain is an observation loss, never a lost run (AGENTS.md).
+
+    ENOSPC / a read-only run dir / ENAMETOOLONG used to propagate out of the
+    writer and take the dev phase with it — a diagnostic killing the run it
+    exists to diagnose, on a story whose verify commands PASSED.
+
+    Ablation: delete the `except OSError` arm in
+    `_journal_verify_command_results` and `engine.run()` raises OSError, so the
+    run never reaches `summary.done == 1`.
+    """
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", followup_review=False)],
+        policy=Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            review=ReviewPolicy(enabled=False),
+        ),
+    )
+    monkeypatch.setattr(
+        verify,
+        "run_verify_commands",
+        lambda policy, cwd: [verify.CommandResult("pytest -q", 0, "tail", "out\n", "err\n")],
+    )
+
+    def _enospc(*_args, **_kwargs):
+        raise OSError(28, "No space left on device")
+
+    # BOTH writers, because which one runs is platform-dependent: POSIX anchors
+    # the write at a directory descriptor (`atomic_write_text_at`) to refuse a
+    # symlinked `verify/`, win32 keeps the path-based `atomic_write_text`.
+    # Patching only the latter left this test green on POSIX for the wrong
+    # reason — no write was intercepted, so the degrade arm never ran.
+    monkeypatch.setattr("bmad_loop.journal.atomic_write_text", _enospc)
+    monkeypatch.setattr("bmad_loop.journal.atomic_write_text_at", _enospc)
+
+    summary = engine.run()
+
+    assert summary.done == 1  # the run survives its own logging
+    entry = _sole_verify_record(engine)
+    assert entry["capture_error"] is not None
+    assert "stdout" in entry["capture_error"] and "No space left" in entry["capture_error"]
+    assert entry["stdout_path"] is None and entry["stderr_path"] is None
+    # nothing was published, so 0 retained is the literal truth ...
+    assert entry["stdout_captured_bytes"] == 0 and entry["stderr_captured_bytes"] == 0
+    # ... while what the command emitted, and its verdict, still reach the reader
+    assert entry["stdout_bytes"] == 4 and entry["stderr_bytes"] == 4
+    assert entry["returncode"] == 0 and entry["output_tail"] == "tail"
+
+
+def test_fix_verification_emits_post_dev_verify_with_command_results(project, monkeypatch):
+    """The repair leg emits the same existing hook after it re-runs verification."""
+    capture = _PostDevVerifyCaptureBus()
+    engine, summary = _dev_then_fix_run(project, monkeypatch, capture)
+
+    assert summary.done == 1
+    assert [ctx.command_results[0].stdout for ctx in capture.contexts] == ["first-out", "fixed-out"]
+    entries = [e for e in engine.journal.entries() if e["kind"] == "verify-command-result"]
+    assert [
+        (e["verification_stage"], e["verification_sequence"], e["command_index"]) for e in entries
+    ] == [
+        ("dev", 1, 0),
+        ("fix", 2, 0),
+    ]
+
+
+def _one_result(command="pytest -q"):
+    return (verify.CommandResult(command, 0, "tail", "out", "err"),)
+
+
+def _journalled_sequences(engine):
+    return [
+        (e["story_key"], e["verification_stage"], e["verification_sequence"])
+        for e in engine.journal.entries()
+        if e["kind"] == "verify-command-result"
+    ]
+
+
+def test_verification_sequence_survives_a_resume(project):
+    """A NEW engine over the same run dir keeps counting up, it does not restart.
+
+    The ordinal is a public journal field AND the `post_dev_verify` join key, so
+    a resumed process re-issuing 1 for a story already at 2 mints a second record
+    claiming an ordinal the pre-pause run used — two different verify passes,
+    indistinguishable to anything correlating on it. Re-deriving the ordinal from
+    the journal on every verification is what used to buy this; the seeded
+    counter has to buy it once, and this is the part a naive counter breaks.
+
+    Ablation: seed eagerly to empty instead of lazily from the journal — replace
+    `_next_verification_sequence`'s seed call with
+    `self._verification_sequences = {}` — and the resumed engine re-issues 1 and
+    2, reddening both the return values and the journalled sequence list.
+    """
+    first, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1)
+    assert first._journal_verify_command_results(task, "dev", _one_result()) == 1
+    assert first._journal_verify_command_results(task, "fix", _one_result()) == 2
+
+    # what a resume is: a fresh Engine (so a fresh counter) and a fresh Journal
+    # over the run dir the paused process left behind.
+    resumed, _ = make_engine(project, [])
+    assert resumed.journal.path == first.journal.path, "the fixture must reuse the run dir"
+    assert resumed._journal_verify_command_results(task, "fix", _one_result()) == 3
+    # and from there it increments in memory — the seed is not re-read per pass
+    assert resumed._journal_verify_command_results(task, "fix", _one_result()) == 4
+
+    assert _journalled_sequences(resumed) == [
+        ("1-1-a", "dev", 1),
+        ("1-1-a", "fix", 2),
+        ("1-1-a", "fix", 3),
+        ("1-1-a", "fix", 4),
+    ]
+
+
+def test_verification_sequence_counts_each_story_separately(project):
+    """The ordinal is per story, and the resume seed has to keep it that way.
+
+    A run drives many stories through one Engine and one journal. A counter (or a
+    seed) shared across them makes the ordinal a run-wide clock, so a plugin
+    joining on (story_key, stage, sequence) finds the record it wants only by
+    accident of ordering.
+
+    Ablation: make the ordinal a run-wide clock — key BOTH the seed and the
+    allocator on one constant instead of `story_key` — and `1-1-a`'s post-resume
+    pass lands at 4 instead of 3, because `1-2-b`'s spent one of its numbers.
+    Ablating the seed alone is NOT enough and does not redden this: an unseeded
+    story falls back to 0 either way, so the run-wide bug only shows once both
+    halves share the key.
+    """
+    first, _ = make_engine(project, [])
+    a, b = StoryTask(story_key="1-1-a", epic=1), StoryTask(story_key="1-2-b", epic=1)
+    assert first._journal_verify_command_results(a, "dev", _one_result()) == 1
+    assert first._journal_verify_command_results(a, "fix", _one_result()) == 2
+
+    resumed, _ = make_engine(project, [])
+    # `b` has no records at all, so its seed is absent, not "the run's highest"
+    assert resumed._journal_verify_command_results(b, "dev", _one_result()) == 1
+    assert resumed._journal_verify_command_results(a, "dev", _one_result()) == 3
+
+    assert _journalled_sequences(resumed) == [
+        ("1-1-a", "dev", 1),
+        ("1-1-a", "fix", 2),
+        ("1-2-b", "dev", 1),
+        ("1-1-a", "dev", 3),
+    ]
+
+
+def test_verification_sequence_does_not_rescan_the_journal_per_verification(project, monkeypatch):
+    """Allocating an ordinal reads the journal ONCE per engine, not once per pass.
+
+    `Journal.entries()` read_text()s the whole file and json.loads every line — a
+    file this same writer keeps appending to, so a per-verification rescan costs
+    more the longer the run gets, for a number the writer already knows.
+
+    Ablation: restore the rescan (derive the ordinal from
+    `max(... for entry in self.journal.entries() ...)`) and the count is 5, one
+    per verification, instead of the single seeding read.
+    """
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1)
+    reads = []
+    real_entries = engine.journal.entries
+
+    def counting_entries():
+        reads.append(len(reads))
+        return real_entries()
+
+    monkeypatch.setattr(engine.journal, "entries", counting_entries)
+
+    sequences = [
+        engine._journal_verify_command_results(task, "dev", _one_result()) for _ in range(5)
+    ]
+
+    assert sequences == [1, 2, 3, 4, 5]  # still correct, just not re-derived
+    assert len(reads) == 1, "the journal is read once to seed the counter, never per verification"
+
+
+def test_verification_sequence_is_not_spent_by_a_pass_that_records_nothing(project):
+    """A pass with no configured commands journals nothing and burns no ordinal.
+
+    The rescan this replaced could not observe an ordinal it had not written, so
+    an empty pass left the numbering untouched. A counter that increments anyway
+    would number a run's passes differently depending on WHERE it was resumed,
+    which is exactly the drift the seed exists to prevent.
+
+    Ablation: allocate before the `if not results` guard and the second pass
+    lands at 2, with a gap where the empty pass silently spent 1.
+    """
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1)
+
+    assert engine._journal_verify_command_results(task, "dev", ()) is None
+    assert not _journalled_sequences(engine)
+    assert engine._journal_verify_command_results(task, "dev", _one_result()) == 1
+
+
+def _dev_then_fix_run(project, monkeypatch, capture):
+    """Drive one story through a dev verification and a repair verification.
+
+    The first review-time verify fails, which routes the story into `_fix_phase`;
+    the repair session's verify passes and the story commits. Both legs emit
+    `post_dev_verify`, which is what the callers need.
+
+    FOUR scripted returns, TWO journalled sequences — deliberately, and the
+    inequality is the documented scope boundary, not a miscount to "fix". Returns
+    1 and 3 are the dev and repair verifications, which this PR journals. Returns
+    2 and 4 are the two `_skip_review_and_commit` review gates (the second runs
+    after the repair), and the review leg is neither journalled nor published to
+    any hook — see the boundary section in `docs/plugin-authoring-guide.md` and
+    issue #656. The count is load-bearing, not padding: dropping the fourth value
+    leaves the post-repair gate with nothing to consume and the run ends
+    `crashed=True, crash_error='StopIteration: '` (measured), so a reader who
+    trims the list finds out immediately.
+    """
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", followup_review=False), dev_effect(project, "1-1-a")],
+        policy=Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            review=ReviewPolicy(enabled=False),
+            limits=LimitsPolicy(max_dev_attempts=2),
+        ),
+    )
+    engine._bus = capture
+    calls = iter(
+        [
+            [verify.CommandResult("pytest -q", 0, "first", "first-out", "")],
+            [verify.CommandResult("pytest -q", 1, "review fail", "", "review fail")],
+            [verify.CommandResult("pytest -q", 0, "fixed", "fixed-out", "")],
+            [verify.CommandResult("pytest -q", 0, "final", "final-out", "")],
+        ]
+    )
+    monkeypatch.setattr(verify, "run_verify_commands", lambda policy, cwd: next(calls))
+    return engine, engine.run()
+
+
+def test_post_dev_verify_discriminates_a_dev_emit_from_a_fix_emit(project, monkeypatch):
+    """A plugin can tell which leg it is on, and find its own journal records.
+
+    Both emits carry stage `post_dev_verify` from `Phase.DEV_VERIFY` off one
+    shared `attempt` counter, so `ctx.stage` / `ctx.phase` / `ctx.attempt` cannot
+    separate a dev verification from a repair one. `verification_stage` is the
+    only thing that does, and `verification_sequence` is what joins the context
+    back to the `verify-command-result` entries it is about — which is the point
+    of exposing the results at all.
+
+    Ablation: pass a constant (say `"dev"`) as `verification_stage` at both emit
+    sites and the discriminator assertion reddens; drop `verification_sequence`
+    from the emits and the journal join below finds no matching record.
+    """
+    capture = _PostDevVerifyCaptureBus()
+    engine, summary = _dev_then_fix_run(project, monkeypatch, capture)
+
+    assert summary.done == 1
+    dev_ctx, fix_ctx = capture.contexts
+    # what a plugin CANNOT discriminate on: identical stage and phase, plus one
+    # per-story `attempt` counter the repair leg continues rather than restarts,
+    # so a bare 2 never says whether it was a dev retry or a repair.
+    assert dev_ctx.stage == fix_ctx.stage == "post_dev_verify"
+    assert dev_ctx.phase == fix_ctx.phase == str(Phase.DEV_VERIFY)
+    assert (dev_ctx.attempt, fix_ctx.attempt) == (1, 2)
+    # ... and what now separates them
+    assert (dev_ctx.verification_stage, dev_ctx.verification_sequence) == ("dev", 1)
+    assert (fix_ctx.verification_stage, fix_ctx.verification_sequence) == ("fix", 2)
+
+    # the join a correlating plugin performs: story + stage + sequence names
+    # exactly this context's records, one per command, in command_index order.
+    for ctx in (dev_ctx, fix_ctx):
+        matched = [
+            e
+            for e in engine.journal.entries()
+            if e["kind"] == "verify-command-result"
+            and e["story_key"] == ctx.story_key
+            and e["verification_stage"] == ctx.verification_stage
+            and e["verification_sequence"] == ctx.verification_sequence
+        ]
+        assert [e["command_index"] for e in matched] == list(range(len(ctx.command_results)))
+        assert [e["returncode"] for e in matched] == [r.returncode for r in ctx.command_results]
+        assert [e["command"] for e in matched] == [r.command for r in ctx.command_results]
+
+
+def _critical(inner):
+    """Wrap a session effect so its result reports a CRITICAL escalation."""
+
+    def effect(spec):
+        result = inner(spec)
+        result.result_json["escalations"] = [
+            {"type": "missing-config", "severity": "CRITICAL", "detail": "operator needed"}
+        ]
+        return result
+
+    return effect
+
+
+@pytest.mark.parametrize("leg", ["dev", "fix"])
+def test_a_critical_session_emits_post_dev_verify_on_both_legs(project, monkeypatch, leg):
+    """CRITICAL is one event class, so both legs must expose it identically.
+
+    The dev leg reaches `decide_dev` — which tests `critical_escalations` first —
+    AFTER emitting `post_dev_verify`, so a CRITICAL dev session publishes its own
+    verify pass to plugins on the way to the pause. The repair leg used to
+    escalate ahead of its emit, and `_escalate` raises `RunPaused`: the same
+    event class fired the hook on one leg and nothing at all on the other, which
+    silently withholds half of a correlating plugin's verify passes.
+
+    Both cases assert the same thing — the escalating session's OWN pass reached
+    a plugin — which is the parity claim itself.
+
+    Ablation: restore the old ordering by moving `_fix_phase`'s `crits` block
+    back above `outcome = None` / `if result.status == "completed":`. The `fix`
+    case then reddens (one context, not two; no `"fix"` stage ever reaches a
+    plugin) while `dev` still passes — precisely the asymmetry.
+    """
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    clean = dev_effect(project, "1-1-a", followup_review=False)
+    escalating = _critical(dev_effect(project, "1-1-a", followup_review=False))
+    engine, _ = make_engine(
+        project,
+        [escalating] if leg == "dev" else [clean, escalating],
+        policy=Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            review=ReviewPolicy(enabled=False),
+            limits=LimitsPolicy(max_dev_attempts=2),
+        ),
+    )
+    capture = _PostDevVerifyCaptureBus()
+    engine._bus = capture
+    # the dev leg's own pass; then, on the `fix` case, the commit-time failure
+    # that routes the story into `_fix_phase`, then the repair session's pass
+    calls = iter(
+        [
+            [verify.CommandResult("pytest -q", 0, "dev", "dev-out", "")],
+            [verify.CommandResult("pytest -q", 1, "commit fail", "", "commit fail")],
+            [verify.CommandResult("pytest -q", 0, "fix", "fix-out", "")],
+        ]
+    )
+    monkeypatch.setattr(verify, "run_verify_commands", lambda policy, cwd: next(calls))
+
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1
+    (escalated,) = [e for e in engine.journal.entries() if e["kind"] == "story-escalated"]
+    assert escalated["reason"] == f"CRITICAL escalation from {leg} session: operator needed"
+    # ... and the escalating session's verification is on the hook either way
+    assert len(capture.contexts) == (1 if leg == "dev" else 2)
+    ctx = capture.contexts[-1]
+    assert ctx.verification_stage == leg
+    assert [r.stdout for r in ctx.command_results] == [f"{leg}-out"]
+
+
+_ONE_ATTEMPT = Policy(
+    gates=GatesPolicy(mode="none"),
+    notify=QUIET,
+    review=ReviewPolicy(enabled=False),
+    limits=LimitsPolicy(max_dev_attempts=1),
+    scm=ScmPolicy(rollback_on_failure=True),
+)
+
+
+def _post_dev_verify_contexts(project, script, policy=_ONE_ATTEMPT):
+    """Run one story and return (engine, summary, the post_dev_verify contexts)."""
+    engine, _ = make_engine(project, script, policy)
+    capture = _PostDevVerifyCaptureBus()
+    engine._bus = capture
+    return engine, engine.run(), capture.contexts
+
+
+def test_post_dev_verify_marks_a_pass_that_ran_and_executed_nothing(project):
+    """No `[verify] commands` configured: the pass RAN, and recorded nothing.
+
+    `command_results == ()` alone cannot say that — it is equally what a plugin
+    sees when no pass happened at all. The stage says the pass ran; the null
+    sequence says there is no journal record to join to, which is the truth,
+    because a pass with no results writes none.
+
+    Two independent gates, each verified to redden this on its own. Ablation
+    (stage): set it only when the pass recorded something —
+    `stage=verification_stage if sequence is not None else None` — and this pass
+    reports `None`, collapsing back into "no pass ran". Ablation (sequence):
+    return the allocated ordinal from `_journal_verify_command_results` even with
+    no results, and the context advertises a join key that the
+    `verify-command-result` assertion below proves no record answers. NOTE that
+    simply dropping `verification_sequence` from the emit does NOT redden this —
+    the field defaults to `None`, which is the value under test.
+    """
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, summary, contexts = _post_dev_verify_contexts(
+        project, [dev_effect(project, "1-1-a", followup_review=False)]
+    )
+
+    assert summary.done == 1  # an empty verify config is a pass, not a failure
+    (ctx,) = contexts
+    assert ctx.command_results == () and ctx.verification_stage == "dev"
+    assert ctx.verification_sequence is None
+    assert not [e for e in engine.journal.entries() if e["kind"] == "verify-command-result"]
+
+
+def test_post_dev_verify_marks_an_attempt_that_never_reached_verification(project):
+    """The dev-artifact gate failed first, so no verify pass ran — stage is None.
+
+    This is the other side of the empty tuple, and the one a plugin must not
+    misread as "the commands ran and passed". Four causes reach here (session did
+    not complete, an earlier gate failed, the fix leg's harvest short-circuited,
+    or the engine variant suppressed the pass); the stage separates the CLASS,
+    and `session_status` / `verify_reason` name the cause within it.
+
+    Ablation: hoist `verification_stage` out of the records and pass the literal
+    `"dev"` at the emit site — the gate-failure attempt then claims a pass that
+    never ran, reddening both `is None` assertions.
+    """
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    _, summary, contexts = _post_dev_verify_contexts(
+        project, [dev_effect(project, "1-1-a", final_status="in-progress")]
+    )
+
+    assert summary.done == 0
+    (ctx,) = contexts
+    assert ctx.command_results == ()
+    assert ctx.verification_stage is None and ctx.verification_sequence is None
+    # what the empty tuple cannot carry travels on the fields that can
+    assert ctx.session_status == "completed" and ctx.verify_reason
 
 
 def _notify_engine(project):
@@ -10547,11 +11195,23 @@ def _gitignore_harvest_ledger(project) -> str:
 
 
 def _crash_after_harvest(engine) -> None:
-    """Crash after the ledger write but before the attempt decision acts."""
+    """Crash after the ledger write but before the attempt decision acts.
+
+    `post_dev_verify` names TWO points in the loop — the dev leg's emit and the
+    repair leg's — so an unqualified raise would fire inside `_fix_phase` too,
+    for any caller whose scenario reaches a review->fix route. The dev emit is
+    always the first of the two (a repair leg runs only after a dev leg
+    PROCEEDed, and emitted), so latching on the first one pins the crash to the
+    dev attempt this helper is named for rather than to whichever emit the
+    scenario happens to reach.
+    """
     original_emit = engine._emit
+    crashed = False
 
     def crashing_emit(stage, *args, **kwargs):
-        if stage == "post_dev_verify":
+        nonlocal crashed
+        if stage == "post_dev_verify" and not crashed:
+            crashed = True
             raise RuntimeError("host died after harvest")
         return original_emit(stage, *args, **kwargs)
 

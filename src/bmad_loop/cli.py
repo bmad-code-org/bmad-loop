@@ -72,7 +72,7 @@ from .documents import (
 from .engine import Engine
 from .journal import Journal, load_state, save_state
 from .model import RunState
-from .platform_util import MAX_SEGMENT, resolve_or_lexical
+from .platform_util import MAX_SEGMENT, resolve_or_lexical, walk_files_unlinked
 from .process_host import ProcessHostError
 
 # The run-composition helpers now live in runsetup.py (the library layer a non-CLI
@@ -3372,14 +3372,15 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
 
 
 def _dir_size(path: Path) -> int:
-    """Best-effort total bytes under ``path`` (symlinks not followed)."""
+    """Best-effort total bytes under ``path``, never crossing a redirect out of
+    it — see :func:`walk_files_unlinked` for why plain ``os.walk`` is not enough.
+    Sizes with ``lstat``, so a symlinked file counts as the link it is."""
     total = 0
-    for root, _dirs, files in os.walk(path, onerror=lambda _e: None):
-        for name in files:
-            try:
-                total += (Path(root) / name).lstat().st_size
-            except OSError:
-                pass
+    for f in walk_files_unlinked(path):
+        try:
+            total += f.lstat().st_size
+        except OSError:
+            pass
     return total
 
 
@@ -3458,9 +3459,11 @@ def cmd_clean(args: argparse.Namespace) -> int:
                     f"run {run_dir.name}: engine may still be live (unverifiable pid)",
                     file=sys.stderr,
                 )
-        # measure before mutating so the reclaim estimate holds for --dry-run too
-        wt_dir = run_dir / "worktrees"
-        wt_bytes = _dir_size(wt_dir) if wt_dir.is_dir() else 0
+        # measure before mutating so the reclaim estimate holds for --dry-run too.
+        # Sized over `heavy_run_entries`, not over "worktrees" alone: that is the
+        # exact set `trim_run_dir` removes, so the estimate cannot go stale the
+        # next time an entry joins it (the verifier stream store did).
+        heavy_bytes = sum(_dir_size(p) for p in runs.heavy_run_entries(run_dir) if p.is_dir())
         run_bytes = _dir_size(run_dir)
         # collect, never print-as-you-mutate: the document is emitted once at the
         # end, so every per-item line has to survive the loop as data
@@ -3490,7 +3493,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
                 # concurrent resume — is older than this guard (`reclaimable` is
                 # sampled in the loop above and never re-read) and is tracked in
                 # issue #533.
-                freed += wt_bytes - run_bytes
+                freed += heavy_bytes - run_bytes
                 # Classify by what happened, not by what was intended: the steps
                 # above may already have taken this run's worktree and artifacts,
                 # and `protected` means "left untouched" in the --json contract.
@@ -3504,7 +3507,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
                     )
         elif pol.cleanup.trim_artifacts:
             if runs.trim_run_dir(run_dir, dry_run=dry):
-                freed += wt_bytes
+                freed += heavy_bytes
                 trimmed.append(run_dir.name)
 
     # After the loop, so the counterparts the removals above already took are gone

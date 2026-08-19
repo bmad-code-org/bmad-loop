@@ -188,6 +188,13 @@ description = "post-implementation verification commands"
 [[section.field]]
 key = "commands"
 kind = "lines"
+[[section.field]]
+key = "stream_capture_kb"
+kind = "int"
+minimum = 0
+default_ref = "VerifyPolicy.stream_capture_kb"
+label = "verifier stream capture (KiB)"
+description = "per-stream cap on the verifier stdout/stderr retained under the run's verify/ directory (the tail is kept; the journal records the full size and a truncation flag) · 0 = capture nothing"
 
 [[section]]
 name = "notify"

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import re
 import sys
 import types
@@ -441,6 +442,66 @@ def test_a_windows_spec_path_normalizes_to_the_same_alias():
     )
     assert trailing["spec"] != ""
     assert re.fullmatch(r"spec-[0-9a-f]{12}", trailing["spec"])
+
+
+def test_verify_command_free_text_drops_to_presence_booleans():
+    """A `verify-command-result` record ships its correlation half, never its text.
+
+    `_scrub_entry` routes by field NAME, and five of this record's fields are free
+    text: `command` is operator-authored shell, `output_tail` is a build's own
+    output, `capture_error` is an OSError string carrying a path, and the two
+    stream pointers embed the story key. Left to the `scrub_json` fallback they
+    fail closed only by ACCIDENT of shape — `_IDENTIFIER_RE` forbids `/` and
+    spaces, so paths, argv-ish commands and multi-line tails collapse — but a
+    one-word command like `make` satisfies it and ships verbatim.
+
+    Ablation: remove the five names from `_JOURNAL_DROP_FIELDS`. `command` comes
+    back as the literal `make` (reddening the presence assertion AND the canary
+    sweep), while `output_tail` / `capture_error` / `stdout_path` merely turn into
+    `<redacted:str>` — which is why `make` is the value under test and not a
+    path-shaped one: only it separates the drop list from the fallback.
+    """
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    out = diagnostics._scrub_entry(
+        {
+            "ts": 1.0,
+            "kind": "verify-command-result",
+            "story_key": STORY_KEY,
+            "attempt": 2,
+            "verification_stage": "dev",
+            "verification_sequence": 3,
+            "command_index": 0,
+            "command": "make",
+            "returncode": 1,
+            "output_tail": CODE,
+            "capture_error": f"stdout: [Errno 28] No space left on device: '{HOME_PATH}/x'",
+            "stdout_path": f"verify/verify-{STORY_KEY}-dev-2-3-0.stdout.log",
+            "stderr_path": None,
+            "stdout_bytes": 12,
+            "stdout_truncated": False,
+        },
+        pseudo,
+        {},
+        1.0,
+    )
+
+    for field in ("command", "output_tail", "capture_error", "stdout_path", "stderr_path"):
+        assert field not in out, f"{field} must never be emitted"
+    assert out["command_present"] is True
+    assert out["output_tail_present"] is True
+    assert out["capture_error_present"] is True
+    # the pointers keep the one fact they are worth: whether a stream was retained
+    # at all — `stream_capture_kb = 0` and a failed write both leave it null.
+    assert out["stdout_path_present"] is True
+    assert out["stderr_path_present"] is False
+    # ... while everything a maintainer correlates on still ships verbatim
+    assert (out["verification_stage"], out["verification_sequence"]) == ("dev", 3)
+    assert (out["command_index"], out["returncode"], out["attempt"]) == (0, 1, 2)
+    assert (out["stdout_bytes"], out["stdout_truncated"]) == (12, False)
+
+    rendered = json.dumps(out)
+    for canary in ("make", CODE, HOME_PATH, PROPRIETARY, *CANARIES):
+        assert canary not in rendered, f"LEAK: {canary!r}"
 
 
 def test_structure_is_preserved(project):
@@ -991,3 +1052,206 @@ def test_scrub_policy_passes_unknown_section_keys_verbatim():
 # The pure guard-mechanics tests (hard-rule refusal, repair tally, cyclic
 # termination) live in tests/test_sanitize.py since #199 made guard shared API;
 # this file keeps the integration surface: real collectors, real renders.
+
+
+# --------------------------------------------- the verifier stream store
+
+
+def test_verify_streams_are_counted_but_never_read(project, tmp_path):
+    """`verify/` is stat-only: its SIZE is the diagnostic, its contents are not.
+
+    The store can be one of the larger things in a run dir — `stream_capture_kb`
+    defaults to 256 KiB per stream, so up to 512 KiB per command per attempt, with
+    no GC behind it yet — so a dump that omits it cannot show the retention or
+    disk-usage problem a maintainer opens a dump to find. It is equally the one
+    category that must never be READ into the output: retained verifier output is
+    a build's own stdout/stderr and may carry anything the project's test suite
+    prints.
+
+    Ablation guard: drop `VERIFY_DIR` from `_FILE_CATEGORIES` and the group is
+    None — the `is_dir()` guard makes an unregistered category vanish silently
+    rather than redden, which is exactly how this was missed. Verified.
+    """
+    run_dir = _seed_bare_run(project.project)
+    verify_dir = run_dir / "verify"
+    verify_dir.mkdir(parents=True, exist_ok=True)
+    secret = "SUPER-SECRET-BUILD-OUTPUT-DO-NOT-EMIT"
+    (verify_dir / "verify-1-1-a-dev-1-1-0.stdout.log").write_text(secret, encoding="utf-8")
+    (verify_dir / "verify-1-1-a-dev-1-1-0.stderr.log").write_text("err", encoding="utf-8")
+
+    diag = diagnostics.collect(
+        [run_dir], pseudo=sanitize.Pseudonymizer(), project=Path(project.project)
+    )
+    group = next((g for g in diag.runs[0].files if g.category == "verify"), None)
+
+    assert group is not None, "verify/ is not registered as a diagnostic category"
+    assert group.count == 2
+    assert group.total_bytes == len(secret) + len("err")
+
+    # the half that matters as much as the count: the dump STATS, never reads
+    assert secret not in diagnostics.render_markdown(diag)
+    assert secret not in diagnostics.render_json(diag)
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="planting a directory symlink needs privilege on win32"
+)
+def test_a_redirected_verify_root_is_not_counted_as_this_runs_output(project, tmp_path):
+    """A planted redirect at `verify/` must not make `diagnose` report someone
+    else's tree as this run's retained verifier output.
+
+    `summarize_files` admits a category root on `root.is_dir()`, which FOLLOWS a
+    link, and then walked it with `rglob("*")`. Measured before the fix: two files
+    and 3100 bytes from outside the run, attributed to this run. Registering
+    `verify/` as a category — the fix for the earlier "invisible store" gap — is
+    what put a session-plantable directory on that traversal at all; every other
+    category root is engine-created, which is why the hole opened here and not
+    years ago.
+
+    Ablation: walk the root with `rglob("*")` again and the group comes back
+    naming the target's count and bytes. Verified.
+    """
+    run_dir = _seed_bare_run(project.project)
+    outside = tmp_path / "somewhere-else"
+    outside.mkdir()
+    (outside / "a.bin").write_bytes(b"a" * 3000)
+    (outside / "b.bin").write_bytes(b"b" * 100)
+    (run_dir / "verify").symlink_to(outside, target_is_directory=True)
+
+    diag = diagnostics.collect(
+        [run_dir], pseudo=sanitize.Pseudonymizer(), project=Path(project.project)
+    )
+    group = next((g for g in diag.runs[0].files if g.category == "verify"), None)
+
+    assert group is None  # nothing of ours is in there, so there is nothing to report
+    assert (outside / "a.bin").is_file()  # and the dump did not touch what it found
+
+
+# ---------------------------------------------------- planted non-regular files
+#
+# `summarize_files` walks with `walk_files_unlinked`, and `os.walk` reports every
+# NON-DIRECTORY entry — FIFOs and symlinks included. The `is_file()` guard the old
+# `rglob` loop carried came off with that switch, and the `logs` arm OPENS what it
+# counts. Four ablation axes, and each reddens exactly one test below — the
+# loop's `S_ISREG` inventory filter, and `_count_lines`' `O_NONBLOCK`,
+# `O_NOFOLLOW`, and `S_ISREG`-on-the-fd. Disjoint failures are what shows the
+# four guards are not standing in for each other.
+
+_FIFO = pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX FIFOs")
+
+
+@_FIFO
+def test_count_lines_refuses_an_idle_fifo_instead_of_blocking(tmp_path):
+    """A FIFO nobody is feeding: opening it read-only without ``O_NONBLOCK``
+    blocks until a writer arrives, which for a run directory the session owns
+    means `diagnose` never returns and the operator's terminal is wedged.
+
+    Bounded with ``SIGALRM`` rather than a subprocess, following
+    `test_runs.py`'s twin: a hang is the failure under test, so the test needs a
+    deadline of its own or an ablation wedges the suite instead of reddening it.
+
+    ABLATION: drop ``O_NONBLOCK`` from the flags and the alarm fires. Dropping the
+    fd ``S_ISREG`` check instead does NOT show up here — with no writer the read
+    hits EOF and answers 0 either way, which is exactly why the fed twin below
+    exists. Verified."""
+    import signal
+
+    path = tmp_path / "session.log"
+    os.mkfifo(path)
+
+    def _blew_up(signum, frame):
+        raise AssertionError("the line count blocked on the FIFO instead of refusing it")
+
+    previous = signal.signal(signal.SIGALRM, _blew_up)
+    signal.alarm(20)
+    try:
+        assert diagnostics._count_lines(path) == 0
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+@_FIFO
+def test_count_lines_refuses_a_fed_fifo_without_consuming_it(tmp_path):
+    """The half the alarm above cannot see. There the FIFO is idle, so the harm is
+    a hang and the bytes read are merely empty; here a writer holds it open and is
+    feeding it, so a reader that gets past the open never blocks — it counts
+    whatever the session piped in as this run's log lines, and drains the pipe on
+    the way through. Neither shows up as a hang, so the alarm above would never
+    notice.
+
+    ``O_RDWR`` for the holder deliberately — a write-only open on a FIFO blocks
+    until a reader arrives and would wedge the test itself, and ``O_RDWR`` never
+    blocks.
+
+    ABLATION: delete the ``S_ISREG(os.fstat(fd))`` check and this answers **3** —
+    the piped lines, billed to this run. The byte assert grades the second harm on
+    the same axis: the read consumed them, so the holder's own read no longer
+    finds what it wrote. Verified."""
+    path = tmp_path / "session.log"
+    os.mkfifo(path)
+
+    holder = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+    try:
+        os.write(holder, b"one\ntwo\nthree\n")
+        assert diagnostics._count_lines(path) == 0
+        assert os.read(holder, 64) == b"one\ntwo\nthree\n"  # untouched
+    finally:
+        os.close(holder)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink + O_NOFOLLOW")
+def test_count_lines_refuses_a_symlink_instead_of_reading_its_target(tmp_path):
+    """``O_NOFOLLOW``: the walk refuses to descend THROUGH a redirect, but the
+    final component it hands back is still a name, and the inventory filter that
+    normally screens a symlinked entry out is a check-then-open race on a
+    directory the session can write. The read anchors on the flag instead.
+
+    ABLATION: drop ``O_NOFOLLOW`` and this returns 2 — the target's lines,
+    attributed to this run. Verified."""
+    outside = tmp_path / "elsewhere.txt"
+    outside.write_bytes(b"theirs\nnot ours\n")
+    link = tmp_path / "session.log"
+    link.symlink_to(outside)
+
+    assert diagnostics._count_lines(link) == 0
+
+
+@_FIFO
+def test_a_planted_fifo_is_not_counted_as_this_runs_log_output(project, tmp_path):
+    """The inventory half, at the level a maintainer reads: a FIFO and a symlink
+    planted in the run's own `logs/` are not this run's retained output, and
+    counting either bills the report for bytes nobody wrote.
+
+    Alarmed like the unit twin because an ablation that reaches the open would
+    hang `collect` rather than fail it.
+
+    ABLATION: delete the two ``S_ISREG`` inventory lines in `summarize_files` and
+    the group reports 3 files and the symlink target's 3000 bytes instead of the
+    one real log. Verified."""
+    import signal
+
+    run_dir = _seed_bare_run(project.project)
+    logs = run_dir / "logs"
+    logs.mkdir(parents=True)
+    (logs / "dev.log").write_bytes(b"one\ntwo\n")
+    os.mkfifo(logs / "piped.log")
+    outside = tmp_path / "theirs.log"
+    outside.write_bytes(b"t" * 3000)
+    (logs / "linked.log").symlink_to(outside)
+
+    def _blew_up(signum, frame):
+        raise AssertionError("collect blocked on the planted FIFO")
+
+    previous = signal.signal(signal.SIGALRM, _blew_up)
+    signal.alarm(30)
+    try:
+        diag = diagnostics.collect(
+            [run_dir], pseudo=sanitize.Pseudonymizer(), project=Path(project.project)
+        )
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+    group = next(g for g in diag.runs[0].files if g.category == "logs")
+    assert (group.count, group.total_bytes, group.total_lines) == (1, 8, 2)

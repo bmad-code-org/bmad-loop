@@ -7,6 +7,7 @@ policy's test/lint gates with the orchestrator's own subprocess calls.
 
 from __future__ import annotations
 
+import locale
 import os
 import re
 import shlex
@@ -2512,11 +2513,68 @@ def _stories_relpaths(project: Path, spec_folder: Path) -> tuple[str, ...]:
     return (f"{base}{STORIES_SUBDIR}", f"{base}{STORIES_FILENAME}")
 
 
+# A hard ceiling on how much of one verifier stream is held in memory, separate
+# from and far above `[verify] stream_capture_kb` (which bounds what reaches
+# disk). `subprocess.run(capture_output=True)` already materialises a command's
+# whole output, but before this bound the full streams were then RETAINED in the
+# results list while every later command ran, so peak memory grew with the number
+# of configured verify commands rather than with the largest one. Plugins are
+# meant to see the streams essentially whole, so this is a backstop against a
+# pathologically chatty suite, not a tuning knob — deliberately a constant, and
+# deliberately high enough that ordinary suites never reach it.
+#
+# It bounds retention, not capture: while command N runs, memory still holds the
+# capped earlier results plus whatever N itself emits.
+MAX_STREAM_MEMORY_BYTES = 32 * 1024 * 1024
+
+
+def byte_tail(text: str, max_bytes: int) -> tuple[str, int]:
+    """``(tail, full_bytes)`` — ``text`` cut to its last ``max_bytes`` UTF-8 bytes.
+
+    The one implementation of a rule this feature applies at two different
+    bounds (this in-memory ceiling and the engine's `stream_capture_kb` disk
+    cap), because the subtle half is easy to get wrong twice: a byte cut can
+    land mid-character, and the leading partial is DROPPED rather than decoded
+    into a ``\ufffd`` this function would be inventing. Decoding with
+    ``errors="replace"`` instead would also break the cap it is enforcing —
+    ``\ufffd`` is three UTF-8 bytes standing in for the one it replaces, so the
+    result can exceed ``max_bytes``.
+
+    ``full_bytes`` always measures the input, so a caller can report what was
+    emitted even after keeping less of it. The TAIL is kept: a failing suite
+    puts its failure at the end. ``max_bytes <= 0`` needs no branch — the slice
+    is empty by construction, which is exactly "keep nothing".
+    """
+    encoded = text.encode("utf-8")
+    full_bytes = len(encoded)
+    if full_bytes <= max_bytes:
+        return text, full_bytes
+    return encoded[full_bytes - max_bytes :].decode("utf-8", errors="ignore"), full_bytes
+
+
 @dataclass(frozen=True)
 class CommandResult:
+    """One verifier subprocess result.
+
+    ``output_tail`` remains the merged, bounded compatibility field used by the
+    existing failure classifiers and repair feedback.  ``stdout`` and ``stderr``
+    retain the separate streams observed at the subprocess boundary so the
+    engine can expose them to trusted plugins and retain them by journal pointer.
+
+    ``*_full_bytes`` is what the command EMITTED, which is only interesting when
+    it differs from the stream beside it — i.e. when ``MAX_STREAM_MEMORY_BYTES``
+    cut one. ``None`` means nothing was cut and the stream is the whole of it, so
+    the many callers that build a result from three fields stay correct without
+    knowing this exists.
+    """
+
     command: str
     returncode: int
     output_tail: str
+    stdout: str = ""
+    stderr: str = ""
+    stdout_full_bytes: int | None = None
+    stderr_full_bytes: int | None = None
 
 
 # sh launcher convention (verify commands run shell=True): 126 = command found
@@ -2658,6 +2716,42 @@ def env_fault_reason(result: CommandResult, cwd: Path) -> str | None:
     return _win32_env_fault_reason(result, cwd)
 
 
+def _timeout_stream(value: str | bytes | None) -> str:
+    """Normalize optional timeout output into what the completed path would give.
+
+    ``subprocess.run``'s timeout leg is not uniform, so three shapes arrive:
+
+    * ``bytes`` — POSIX. ``Popen._communicate`` raises ``TimeoutExpired`` from
+      ``_check_timeout`` with the raw chunks joined, *before* the text-mode
+      decode that ends the loop, so ``text=True`` never touched them.
+    * ``str`` — Windows, where ``run`` calls ``communicate()`` after ``kill()``
+      and the text wrapper has already decoded. Load-bearing: on that platform
+      this branch is the only way the output arrives at all.
+    * ``None`` — POSIX again, when nothing had been buffered on that stream.
+
+    So the bytes branch has to reproduce what text mode would have done to them,
+    which is exactly ``Popen._translate_newlines``: decode, then collapse ``\\r\\n``
+    and lone ``\\r`` to ``\\n``. Doing neither made the same bytes read back
+    differently depending on which path produced them — under an ASCII locale
+    ``b"caf\\xc3\\xa9\\r\\n"`` completed as ``"caf\\ufffd\\ufffd\\n"`` but timed out
+    as ``"café\\r\\n"``. The codec half also contradicted
+    :func:`run_verify_commands`' own rule (#378) that host-tool output stays on
+    the locale codec: ``locale.getpreferredencoding(False)`` is what ``text=True``
+    resolves for an unset ``encoding`` — deliberately not ``locale.getencoding()``,
+    which disagrees with it under UTF-8 mode (PEP 540), a mode the C/POSIX locale
+    enables by itself. ``errors="replace"`` for the reason the completed path uses
+    it: one undecodable byte must not raise and lose every result.
+
+    The str branch is left alone: its newlines were translated by the text
+    wrapper the reader thread read through, so there is nothing left to collapse."""
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        decoded = value.decode(locale.getpreferredencoding(False), errors="replace")
+        return decoded.replace("\r\n", "\n").replace("\r", "\n")
+    return value
+
+
 def run_verify_commands(policy: Policy, cwd: Path) -> list[CommandResult]:
     """Run each of the policy's verify commands, one CommandResult apiece.
 
@@ -2682,15 +2776,33 @@ def run_verify_commands(policy: Policy, cwd: Path) -> list[CommandResult]:
                 errors="replace",
                 timeout=COMMAND_TIMEOUT_S,
             )
-            output = (proc.stdout + proc.stderr)[-2000:]
-            results.append(CommandResult(command, proc.returncode, output))
-        except subprocess.TimeoutExpired:
-            results.append(CommandResult(command, -1, "timed out"))
+            stdout, stdout_full = byte_tail(proc.stdout, MAX_STREAM_MEMORY_BYTES)
+            stderr, stderr_full = byte_tail(proc.stderr, MAX_STREAM_MEMORY_BYTES)
+            # merged from the ceilinged streams, not the raw pair: 2000 chars sits
+            # far below the ceiling, so the tail is identical while the full
+            # concatenation — a transient copy of both whole streams — is not built.
+            output = (stdout + stderr)[-2000:]
+            results.append(
+                CommandResult(
+                    command, proc.returncode, output, stdout, stderr, stdout_full, stderr_full
+                )
+            )
+        except subprocess.TimeoutExpired as exc:
+            # the timeout leg is bounded too: a command killed at COMMAND_TIMEOUT_S
+            # is exactly the one that may have been spewing output when it died.
+            t_out, t_out_full = byte_tail(_timeout_stream(exc.stdout), MAX_STREAM_MEMORY_BYTES)
+            t_err, t_err_full = byte_tail(_timeout_stream(exc.stderr), MAX_STREAM_MEMORY_BYTES)
+            results.append(
+                CommandResult(command, -1, "timed out", t_out, t_err, t_out_full, t_err_full)
+            )
     return results
 
 
-def verify_commands_outcome(policy: Policy, cwd: Path) -> VerifyOutcome:
-    """Run the policy's deterministic verify commands. Failures are fixable:
+def verify_command_results_outcome(results: list[CommandResult], cwd: Path) -> VerifyOutcome:
+    """Classify already-observed verifier results without discarding them.
+
+    Kept separate from :func:`verify_commands_outcome` so the engine can retain
+    and expose exactly the same results it asks core to classify. Failures are fixable:
     the captured output is concrete feedback a repair session can act on —
     except environment faults (see env_fault_reason), which escalate so the run
     pauses for an environment fix instead of burning story budgets. An env
@@ -2698,7 +2810,6 @@ def verify_commands_outcome(policy: Policy, cwd: Path) -> VerifyOutcome:
     session dispatched for the ordinary failure would still run in the
     broken environment. Note the first loop inspects rc=0 results too — on
     Windows an unrunnable command is a silent pass, not a failure (#302)."""
-    results = run_verify_commands(policy, cwd)
     for result in results:
         reason = env_fault_reason(result, cwd)
         if reason is not None:
@@ -2718,6 +2829,11 @@ def verify_commands_outcome(policy: Policy, cwd: Path) -> VerifyOutcome:
                 fixable=True,
             )
     return VerifyOutcome.passed()
+
+
+def verify_commands_outcome(policy: Policy, cwd: Path) -> VerifyOutcome:
+    """Run the policy's deterministic verify commands and classify the results."""
+    return verify_command_results_outcome(run_verify_commands(policy, cwd), cwd)
 
 
 def verify_review(

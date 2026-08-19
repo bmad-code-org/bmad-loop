@@ -2,11 +2,13 @@
 artifact trim, and the `clean` CLI command."""
 
 import argparse
+import os
 
+import pytest
 from conftest import install_bmad_config, machine_json
 
 from bmad_loop import cli, runs, verify
-from bmad_loop.journal import save_state
+from bmad_loop.journal import VERIFY_DIR, save_state
 from bmad_loop.model import RunState
 from bmad_loop.tui import data
 
@@ -191,6 +193,77 @@ def test_trim_run_dir_keeps_run_viewable(tmp_path):
     # the run still discovers + lists in the dashboard
     infos = data.discover_runs(tmp_path)
     assert [i.run_id for i in infos] == ["20260101-000000-aaaa"]
+
+
+def test_trim_run_dir_reclaims_the_verifier_stream_store(tmp_path):
+    """The retained verifier stdout/stderr store is trimmed with the worktrees,
+    and trimming it does not cost the run its place in the dashboard.
+
+    It qualifies as heavy on the same measure a worktree checkout does:
+    `[verify] stream_capture_kb` defaults to 256 KiB per stream, so a run
+    accumulates up to 512 KiB per verify command per attempt. Nothing else ever
+    reclaimed it — the store outlived every trim and survived for as long as the
+    run dir did. What it costs is re-reading the streams the journal's
+    `stdout_path`/`stderr_path` still name, which is the bargain `worktrees`
+    already makes: a trimmed run is one you can still see and resume, not one you
+    can still open every artifact of.
+
+    Ablation: drop VERIFY_DIR from `_HEAVY_RUN_ENTRIES` and `removed` comes back
+    `["worktrees"]` with the store still on disk. Verified.
+    """
+    run_dir = _state_run(tmp_path, "20260101-000000-aaaa", finished=True)
+    (run_dir / "journal.jsonl").write_text('{"kind":"run-start"}\n')
+    (run_dir / "logs").mkdir()
+    (run_dir / "worktrees" / "u").mkdir(parents=True)
+    store = run_dir / VERIFY_DIR
+    store.mkdir()
+    (store / "verify-1-1-a-dev-1-1-0.stdout.log").write_bytes(b"o" * 2048)
+    (store / "verify-1-1-a-dev-1-1-0.stderr.log").write_bytes(b"e" * 1024)
+
+    removed = runs.trim_run_dir(run_dir)
+
+    assert [p.name for p in removed] == ["worktrees", VERIFY_DIR]
+    assert not store.exists()
+    # the TUI-visible core the trim exists to preserve
+    assert (run_dir / "state.json").is_file()
+    assert (run_dir / "journal.jsonl").is_file()
+    infos = data.discover_runs(tmp_path)
+    assert [i.run_id for i in infos] == ["20260101-000000-aaaa"]
+
+
+@pytest.mark.skipif(
+    os.name != "posix", reason="planting a directory symlink needs privilege on win32"
+)
+def test_trim_run_dir_removes_a_planted_redirect_without_following_it(tmp_path):
+    """A trimmed entry that is a LINK is removed as a link, and its target is not.
+
+    A session is handed the writable run dir (`BMAD_LOOP_RUN_DIR`) and can plant a
+    redirect at `verify/` — the same escape the write path was hardened against.
+    The reclaim path had the mirror-image hole: `shutil.rmtree` REFUSES a directory
+    symlink by design (following it would delete the target's contents), and under
+    `ignore_errors=True` that refusal is silent, so the trim appended the entry to
+    `removed` and left the link exactly where it was.
+
+    Both halves are graded, because the obvious over-correction is worse than the
+    bug: the redirect goes, and what it pointed at stays. POSIX-only because
+    PLANTING the link needs privilege on win32, not because the fix is — the
+    junction arm rides on `is_link_like`, graded in tests/test_platform_util.py.
+
+    Ablation: restore the bare `shutil.rmtree(p, ignore_errors=True)` and the link
+    is still on disk after the trim, with `removed` still naming it. Verified.
+    """
+    run_dir = _state_run(tmp_path, "20260101-000000-aaaa", finished=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep.txt").write_bytes(b"x" * 5000)
+    link = run_dir / VERIFY_DIR
+    link.symlink_to(outside, target_is_directory=True)
+
+    removed = runs.trim_run_dir(run_dir)
+
+    assert [p.name for p in removed] == [VERIFY_DIR]
+    assert not link.is_symlink() and not link.exists()  # the redirect really went
+    assert outside.is_dir() and (outside / "keep.txt").is_file()  # the target did not
 
 
 # ------------------------------------------------------------- cmd_clean
@@ -452,6 +525,73 @@ def test_cmd_clean_json_real_run_reports_what_it_did(project, capsys):
     # a raw int, never the _human_bytes string the text mode renders
     assert isinstance(doc["freed_bytes"], int)
     assert doc["freed_bytes"] >= 4096
+
+
+def test_cmd_clean_counts_the_verifier_stream_store_it_reclaimed(project, capsys):
+    """The reclaim estimate is sized over what the trim actually takes.
+
+    `freed_bytes` is what an operator reads to decide whether `clean` was worth
+    running, and for a trimmed run it used to sum `worktrees/` alone. That was
+    exactly right while `worktrees/` was the only heavy entry and silently wrong
+    the moment the verifier stream store joined it: `clean` would remove up to
+    512 KiB per verify command per attempt and report reclaiming nothing.
+
+    Seeded with no `worktrees/` at all, so the removal and the accounting are
+    graded independently and neither can ride on the other's bytes.
+
+    Ablation, two axes reddening different assertions: drop VERIFY_DIR from
+    `_HEAVY_RUN_ENTRIES` and `trimmed` empties — the trim finds nothing to take.
+    Restore it but size the estimate over `worktrees/` alone again and the store
+    is gone with `freed_bytes` at 0 — a reclaim that happened and went unreported.
+    Verified.
+    """
+    install_bmad_config(project)
+    repo = project.project
+    run_dir = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
+    store = run_dir / VERIFY_DIR
+    store.mkdir(parents=True)
+    (store / "verify-1-1-a-dev-1-1-0.stdout.log").write_bytes(b"o" * 4096)
+    (store / "verify-1-1-a-dev-1-1-0.stderr.log").write_bytes(b"e" * 2048)
+    save_state(run_dir, RunState(run_id="r", project=str(repo), started_at="x", stopped=True))
+
+    doc = _clean_json(repo, capsys)
+
+    assert doc["trimmed"] == ["20260101-000000-aaaa"]
+    assert not store.exists()
+    assert doc["freed_bytes"] == 4096 + 2048
+    assert (run_dir / "state.json").is_file()  # trimmed, not removed
+
+
+@pytest.mark.skipif(
+    os.name != "posix", reason="planting a directory symlink needs privilege on win32"
+)
+def test_cmd_clean_does_not_bill_the_reclaim_for_bytes_behind_a_redirect(project, capsys):
+    """`freed_bytes` counts what the trim freed, never what a planted link points at.
+
+    `os.walk` does not descend into links, but it does follow the top path it is
+    handed — so sizing a redirected entry bills the reclaim for out-of-run bytes
+    that are demonstrably still on disk when `clean` returns. That is the estimate
+    an operator reads to decide whether the command was worth running, and it is
+    the one number here a session can inflate from outside the run.
+
+    Ablation: drop the `is_link_like` refusal from `_dir_size` and `freed_bytes`
+    comes back 5000 — bytes the assertion below proves were never freed. Verified.
+    """
+    install_bmad_config(project)
+    repo = project.project
+    run_dir = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    outside = repo.parent / "outside"
+    outside.mkdir(exist_ok=True)
+    (outside / "keep.txt").write_bytes(b"x" * 5000)
+    (run_dir / VERIFY_DIR).symlink_to(outside, target_is_directory=True)
+    save_state(run_dir, RunState(run_id="r", project=str(repo), started_at="x", stopped=True))
+
+    doc = _clean_json(repo, capsys)
+
+    assert doc["trimmed"] == ["20260101-000000-aaaa"]
+    assert doc["freed_bytes"] == 0  # nothing inside the run was actually freed
+    assert (outside / "keep.txt").is_file()  # and the 5000 bytes are still there
 
 
 def test_cmd_clean_json_names_every_item_the_text_enumerates(project, capsys):
