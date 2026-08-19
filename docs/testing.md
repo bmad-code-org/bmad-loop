@@ -25,8 +25,8 @@ and every negative assertion proven by ablation.**
   (the `non-linux` extra carries no environment marker, and CI syncs `--all-extras`), so
   xdist's `auto` resolves to the _physical_ core count — half the vCPUs on the hosted
   runners. CI passes `-n logical` in both test jobs for that reason. A test that fails only
-  under xdist load is a flake, which is a bug — #360 is the open instance. Live/E2E modules skip themselves when their host requirements are
-  absent — selection is in-file, never in config.
+  under xdist load is a flake, which is a bug. Live/E2E modules skip themselves when their
+  host requirements are absent — selection is in-file, never in config.
 - Only builtin pytest marks appear: `parametrize`, `skipif`, `usefixtures`, and exactly one
   `xfail(strict=True)` (a pinned known defect, see [Ablation records](#ablation-records)).
   **No custom markers, deliberately**: a marker registry is a second selection mechanism that
@@ -258,11 +258,10 @@ source tree, so packaging breaks were invisible until this job existed).
 **Zero-retry flaky policy.** There is no retry mechanism anywhere: no `--reruns`, no retry
 plugin — `pytest-rerunfailures` was removed from the environment precisely because an installed
 retry plugin is an invitation to paper over a real flake. **A flake is a bug**: it gets an
-issue (#360 and #581 are the open instances), a diagnosis, and a deterministic fix — never a
-rerun loop. The main defense is the **frozen-clock pattern, mandatory for time-dependent
-tests**: no unit or seam test sleeps toward a deadline (the real-process gates use short
-settle polls, which is different from waiting out a production timeout). Two sanctioned
-shapes:
+issue, a diagnosis, and a deterministic fix — never a rerun loop. The main defense is the
+**frozen-clock pattern, mandatory for time-dependent tests**: no unit or seam test sleeps
+toward a deadline (the real-process gates use short settle polls, which is different from
+waiting out a production timeout). Two sanctioned shapes:
 
 1. A scoped `_Clock` shim over a mutable dict, monkeypatched in as the module-under-test's
    `time` reference; a scripted watcher callback advances the dict past the deadline
