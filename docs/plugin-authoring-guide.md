@@ -404,8 +404,16 @@ escalation emits before the run stops, on either leg.
 `post_dev_verify` exposes `ctx.command_results`: an immutable tuple of the
 per-command `CommandResult` records core just executed. Each has `command`,
 `returncode`, the existing merged bounded `output_tail`, and separate `stdout`
-and `stderr` strings. This is observation data only: a plugin cannot change the
-verifier's outcome or the commit decision. The run's `journal.jsonl` also records
+and `stderr` strings. Those two are intended to be the streams essentially whole
+— they are not cut to `[verify] stream_capture_kb`, which bounds only what is
+written to disk — but they are not unbounded either: a hard 32 MiB per-stream
+ceiling applies, so a pathologically chatty command cannot grow the orchestrator's
+peak memory with the number of configured verify commands. When that ceiling cuts
+a stream the **tail** is what a plugin receives, and the matching journal record's
+`stdout_bytes` / `stderr_bytes` still report what the command emitted, so the cut
+is always detectable rather than silent. Ordinary suites never reach it. This is
+observation data only: a plugin cannot change the verifier's outcome or the commit
+decision. The run's `journal.jsonl` also records
 one `verify-command-result` entry per command with run/story/attempt/stage and
 verification-sequence correlation, `output_tail`, byte counts, and run-relative `stdout_path` /
 `stderr_path` pointers under the run's `verify/` directory; full streams are not

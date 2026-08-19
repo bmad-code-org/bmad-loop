@@ -27,7 +27,11 @@ breaking changes may land in a minor release.
   byte count plus a `*_truncated` flag so a cut file is never mistaken for a whole
   one. A concluded run gives the store back: `bmad-loop clean` trims `verify/` with the
   rest of a run's heavy scaffolding and counts it in the reclaimed total, leaving the
-  run listed and resumable. Retaining a stream is observation, so a failed write (ENOSPC, a read-only run
+  run listed and resumable. Separately from that on-disk cap, a hard 32 MiB per-stream
+  ceiling bounds what is held in memory while the remaining commands run, so a
+  pathologically chatty suite cannot grow peak memory with the number of configured
+  verify commands; the record still reports what the command emitted, so a stream the
+  ceiling cut is never mistaken for a whole one. Retaining a stream is observation, so a failed write (ENOSPC, a read-only run
   dir) degrades — the record still lands, with a null pointer and `capture_error` —
   instead of taking down a dev pass whose verify commands passed.
 

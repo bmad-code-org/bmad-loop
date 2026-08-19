@@ -2513,6 +2513,45 @@ def _stories_relpaths(project: Path, spec_folder: Path) -> tuple[str, ...]:
     return (f"{base}{STORIES_SUBDIR}", f"{base}{STORIES_FILENAME}")
 
 
+# A hard ceiling on how much of one verifier stream is held in memory, separate
+# from and far above `[verify] stream_capture_kb` (which bounds what reaches
+# disk). `subprocess.run(capture_output=True)` already materialises a command's
+# whole output, but before this bound the full streams were then RETAINED in the
+# results list while every later command ran, so peak memory grew with the number
+# of configured verify commands rather than with the largest one. Plugins are
+# meant to see the streams essentially whole, so this is a backstop against a
+# pathologically chatty suite, not a tuning knob — deliberately a constant, and
+# deliberately high enough that ordinary suites never reach it.
+#
+# It bounds retention, not capture: while command N runs, memory still holds the
+# capped earlier results plus whatever N itself emits.
+MAX_STREAM_MEMORY_BYTES = 32 * 1024 * 1024
+
+
+def byte_tail(text: str, max_bytes: int) -> tuple[str, int]:
+    """``(tail, full_bytes)`` — ``text`` cut to its last ``max_bytes`` UTF-8 bytes.
+
+    The one implementation of a rule this feature applies at two different
+    bounds (this in-memory ceiling and the engine's `stream_capture_kb` disk
+    cap), because the subtle half is easy to get wrong twice: a byte cut can
+    land mid-character, and the leading partial is DROPPED rather than decoded
+    into a ``\ufffd`` this function would be inventing. Decoding with
+    ``errors="replace"`` instead would also break the cap it is enforcing —
+    ``\ufffd`` is three UTF-8 bytes standing in for the one it replaces, so the
+    result can exceed ``max_bytes``.
+
+    ``full_bytes`` always measures the input, so a caller can report what was
+    emitted even after keeping less of it. The TAIL is kept: a failing suite
+    puts its failure at the end. ``max_bytes <= 0`` needs no branch — the slice
+    is empty by construction, which is exactly "keep nothing".
+    """
+    encoded = text.encode("utf-8")
+    full_bytes = len(encoded)
+    if full_bytes <= max_bytes:
+        return text, full_bytes
+    return encoded[full_bytes - max_bytes :].decode("utf-8", errors="ignore"), full_bytes
+
+
 @dataclass(frozen=True)
 class CommandResult:
     """One verifier subprocess result.
@@ -2521,6 +2560,12 @@ class CommandResult:
     existing failure classifiers and repair feedback.  ``stdout`` and ``stderr``
     retain the separate streams observed at the subprocess boundary so the
     engine can expose them to trusted plugins and retain them by journal pointer.
+
+    ``*_full_bytes`` is what the command EMITTED, which is only interesting when
+    it differs from the stream beside it — i.e. when ``MAX_STREAM_MEMORY_BYTES``
+    cut one. ``None`` means nothing was cut and the stream is the whole of it, so
+    the many callers that build a result from three fields stay correct without
+    knowing this exists.
     """
 
     command: str
@@ -2528,6 +2573,8 @@ class CommandResult:
     output_tail: str
     stdout: str = ""
     stderr: str = ""
+    stdout_full_bytes: int | None = None
+    stderr_full_bytes: int | None = None
 
 
 # sh launcher convention (verify commands run shell=True): 126 = command found
@@ -2729,19 +2776,24 @@ def run_verify_commands(policy: Policy, cwd: Path) -> list[CommandResult]:
                 errors="replace",
                 timeout=COMMAND_TIMEOUT_S,
             )
-            output = (proc.stdout + proc.stderr)[-2000:]
-            results.append(
-                CommandResult(command, proc.returncode, output, proc.stdout, proc.stderr)
-            )
-        except subprocess.TimeoutExpired as exc:
+            stdout, stdout_full = byte_tail(proc.stdout, MAX_STREAM_MEMORY_BYTES)
+            stderr, stderr_full = byte_tail(proc.stderr, MAX_STREAM_MEMORY_BYTES)
+            # merged from the ceilinged streams, not the raw pair: 2000 chars sits
+            # far below the ceiling, so the tail is identical while the full
+            # concatenation — a transient copy of both whole streams — is not built.
+            output = (stdout + stderr)[-2000:]
             results.append(
                 CommandResult(
-                    command,
-                    -1,
-                    "timed out",
-                    _timeout_stream(exc.stdout),
-                    _timeout_stream(exc.stderr),
+                    command, proc.returncode, output, stdout, stderr, stdout_full, stderr_full
                 )
+            )
+        except subprocess.TimeoutExpired as exc:
+            # the timeout leg is bounded too: a command killed at COMMAND_TIMEOUT_S
+            # is exactly the one that may have been spewing output when it died.
+            t_out, t_out_full = byte_tail(_timeout_stream(exc.stdout), MAX_STREAM_MEMORY_BYTES)
+            t_err, t_err_full = byte_tail(_timeout_stream(exc.stderr), MAX_STREAM_MEMORY_BYTES)
+            results.append(
+                CommandResult(command, -1, "timed out", t_out, t_err, t_out_full, t_err_full)
             )
     return results
 

@@ -252,6 +252,38 @@ def test_verify_stream_capture_retains_a_bounded_tail(project):
     assert entry["capture_error"] is None
 
 
+def test_a_ceilinged_stream_still_reports_what_the_command_emitted(project):
+    """When the in-memory ceiling already cut a stream, the record reports what
+    the COMMAND emitted — not what the engine still holds.
+
+    `MAX_STREAM_MEMORY_BYTES` bounds retention in the results list, so by the time
+    a record is built the string in hand can be far smaller than what ran. Sizing
+    the record off that string would under-report emission and, worse, compute
+    `*_truncated` against a false baseline — calling a cut stream whole, which is
+    the single thing that flag exists to prevent. Only the result knows the real
+    figure, so it carries it.
+
+    Ablation: drop the `emitted` override in `_journal_verify_command_results` and
+    `stdout_bytes` comes back 100 with `stdout_truncated` False — a stream cut
+    twice over, reported as complete. Verified.
+    """
+    engine = _capture_engine(project, 1)
+    held = "o" * 100  # what survived the ceiling
+
+    engine._journal_verify_command_results(
+        StoryTask(story_key="1-1-a", epic=1),
+        "dev",
+        (verify.CommandResult("pytest -q", 1, "tail", held, "", 9_000_000, 0),),
+    )
+
+    entry = _sole_verify_record(engine)
+    assert entry["stdout_bytes"] == 9_000_000  # emitted
+    assert entry["stdout_captured_bytes"] == 100  # retained
+    assert entry["stdout_truncated"] is True
+    # the untouched stream keeps the ordinary meaning: emitted == retained
+    assert entry["stderr_bytes"] == 0 and entry["stderr_truncated"] is False
+
+
 def test_verify_stream_capture_cut_lands_on_a_character_boundary(project):
     """A byte cap cutting a multi-byte character drops the partial lead, it does
     not decode it into a replacement char.

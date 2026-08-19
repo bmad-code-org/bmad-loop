@@ -1536,6 +1536,34 @@ def test_verify_commands_rc1_stays_fixable_retry(tmp_path):
     assert not out.ok and out.fixable and out.retryable and not out.env_fault
 
 
+def test_verify_commands_bound_a_stream_instead_of_holding_it_whole(tmp_path, monkeypatch):
+    """A chatty command's stream is cut to `MAX_STREAM_MEMORY_BYTES` as it is
+    collected, and what it emitted is recorded rather than lost.
+
+    `capture_output=True` always materialises one command's whole output; what
+    this bounds is RETENTION — before it, every command's full streams stayed in
+    the results list while all the later commands ran, so peak memory scaled with
+    the number of configured verify commands instead of with the largest one.
+    Plugins are meant to see streams essentially whole, so the ceiling sits far
+    above `stream_capture_kb` and is a backstop, not a knob; the test lowers it
+    rather than emitting 32 MiB to prove the same branch.
+
+    Ablation: hand the raw `proc.stdout` to CommandResult again and `stdout` comes
+    back 5000 bytes with `stdout_full_bytes` None. Verified.
+    """
+    script = tmp_path / "chatty.py"
+    script.write_text("import sys\nsys.stdout.write('o' * 5000)\n", encoding="utf-8")
+    policy = Policy(verify=VerifyPolicy(commands=(f'"{sys.executable}" "{script}"',)))
+    monkeypatch.setattr(verify, "MAX_STREAM_MEMORY_BYTES", 64)
+
+    (result,) = verify.run_verify_commands(policy, tmp_path)
+
+    assert result.stdout == "o" * 64  # the TAIL survives, as at every other bound
+    assert result.stdout_full_bytes == 5000  # and the emitted size is not lost
+    assert result.stderr == "" and result.stderr_full_bytes == 0
+    assert result.output_tail == "o" * 64  # merged view built from the bounded pair
+
+
 def test_verify_commands_preserve_separate_stdout_and_stderr(tmp_path):
     """The merged bounded tail remains compatible while the raw streams stay
     distinguishable for engine-owned journal pointers and plugin observation."""

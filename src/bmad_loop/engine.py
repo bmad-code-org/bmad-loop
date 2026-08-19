@@ -110,11 +110,7 @@ def _bounded_stream_tail(text: str, max_bytes: int) -> tuple[str, int, int]:
     ``max_bytes <= 0`` needs no branch of its own: the slice is empty by
     construction, which is exactly "capture nothing".
     """
-    encoded = text.encode("utf-8")
-    full_bytes = len(encoded)
-    if full_bytes <= max_bytes:
-        return text, full_bytes, full_bytes
-    tail = encoded[full_bytes - max_bytes :].decode("utf-8", errors="ignore")
+    tail, full_bytes = verify.byte_tail(text, max_bytes)
     return tail, full_bytes, len(tail.encode("utf-8"))
 
 
@@ -4205,8 +4201,17 @@ class Engine:
             )
             streams: dict[str, str | int | bool | None] = {}
             capture_error: str | None = None
-            for kind, text in (("stdout", result.stdout), ("stderr", result.stderr)):
+            for kind, text, emitted in (
+                ("stdout", result.stdout, result.stdout_full_bytes),
+                ("stderr", result.stderr, result.stderr_full_bytes),
+            ):
                 tail, full_bytes, captured_bytes = _bounded_stream_tail(text, max_bytes)
+                # `full_bytes` is what we still HOLD; when the in-memory ceiling
+                # already cut this stream, what the command EMITTED is larger and
+                # only the result knows it. Reporting the held size would quietly
+                # under-report emission and, worse, could call a truncated stream
+                # whole — the one thing `*_truncated` exists to prevent.
+                full_bytes = full_bytes if emitted is None else emitted
                 path: str | None = None
                 if max_bytes > 0:
                     try:
