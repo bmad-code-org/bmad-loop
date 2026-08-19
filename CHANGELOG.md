@@ -38,6 +38,16 @@ breaking changes may land in a minor release.
 
 ### Changed
 
+- **`probe-adapter` now bounds how long a single scrubbed line can be (#481).** `scrub_text` capped
+  how many lines it emitted but never how long one of them could be, so a single very long line —
+  from a foreign CLI's `--version`/`--help`, or from a log tail — reached the `probe-adapter`
+  report and its `--json` document verbatim: `max_lines=5` over a 5000-character line still emitted
+  all 5000. Each line is now bounded, and a line that is cut ends with `… (N more chars redacted)`,
+  the same convention as the existing line-count marker. **This is a visible output change** for any
+  line that long. `probe.SCHEMA_VERSION` is unchanged: no field is removed or renamed and no type
+  changes, and the meaning of the value was already "the CLI's scrubbed output, capped" — adding a
+  second axis to an already-documented lossy cap is the same class of value, not a new one.
+
 - **Files the orchestrator replaces by name now land at `0600`.** Those writes pass
   `follow_symlinks=False`, and that mode deliberately carries nothing over from the target — not
   its permission bits, not its xattrs — so the new contents arrive at `mkstemp`'s private default.
@@ -67,6 +77,26 @@ breaking changes may land in a minor release.
   it cannot read.
 
 ### Fixed
+
+- **The egress self-check now sees Windows→WSL UNC home paths (#512).** `diagnose` and
+  `probe-adapter` re-scan their own rendered bytes before emitting and refuse to emit at all on a
+  hit, but the absolute-home-path rule knew only forward-slash spellings — so a path reached through
+  the Windows→WSL UNC bridge (`\\wsl.localhost\<distro>\home\<user>`, the legacy `\\wsl$\...`, the
+  extended-length `\\?\UNC\...` folding) was invisible to it, including through the `--json` render,
+  where every backslash is doubled. **No released version leaked such a path**: since #485
+  `collect_env` reduces the project path to a boolean and no `EnvInfo` field carries it. What was
+  wrong was the claim — the `diagnostics` module docstring described the backstop as fail-closed
+  without qualification — and that docstring is corrected in the same change to say what the guard
+  is, a shape re-scan of the rendered bytes, and what stays outside it: a home spelling it does not
+  know, or a username that is not this process's.
+
+- **The `diagnose` policy snapshot's verbatim-key invariant is now enforced (#202).** The snapshot
+  emits dict keys unredacted, which is correct only while no policy section is a free-keyed table
+  — the one user-keyed table, `plugins.settings`, is intercepted before it reaches the
+  passthrough. Nothing enforced that property, and a value-level check could not: a newly declared
+  free-keyed section defaults to an empty dict, so such a check stays green while the hazard is
+  live. A test now fails at declaration time, the moment such a section appears, and the reason is
+  written down at the passthrough. No behavior change.
 
 - **The zero-token OpenCode live smoke skips stale or broken shims (#294).** Its availability
   gate now requires `opencode --version` to succeed before starting a server; runnable installs
