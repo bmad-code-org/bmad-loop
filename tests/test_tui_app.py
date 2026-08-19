@@ -1392,15 +1392,15 @@ async def test_decision_modal_scrolls_when_content_long(project):
         # the container's `Widget.scroll_to`, which defers the offset write via
         # `call_after_refresh`: an InvokeLater the pump forwards to the screen,
         # where it lands on `Screen._callbacks` and is drained only by the
-        # screen's *idle* handler. `pilot.pause()` never waits for that drain —
-        # its barrier covers messages queued at call time, and it then calls
-        # `_on_timer_update`, which relayouts whatever scroll state exists right
-        # then. Lose that one idle hop and `scroll_y` is still 0, so the
-        # relayout reflows the old offset and `region` keeps its pre-scroll
-        # geometry, putting the option below the fold (#360). Gate on the write
-        # landing — `body.scroll_y` is the one observable here not read through
-        # the compositor map — then let the relayout it triggers settle before
-        # reading a region.
+        # screen's *idle* handler. `pilot.pause()` does not synchronize on that
+        # drain — its barrier covers messages queued at call time, and it then
+        # calls `_on_timer_update`, which relayouts whatever scroll state
+        # exists right then. Lose that one idle hop and `scroll_y` is still 0,
+        # so the relayout reflows the old offset and `region` keeps its
+        # pre-scroll geometry, putting the option below the fold (#360). Gate
+        # on the write landing — `body.scroll_y` is the one observable here not
+        # read through the compositor map — then let the relayout it triggers
+        # settle before reading a region.
         await until(pilot, lambda: body.scroll_y > 0)
         await settle(pilot)
         assert _on_screen(app, opt8)
