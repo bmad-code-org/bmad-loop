@@ -212,6 +212,15 @@ def _truncate_line(line: str, max_chars: int) -> str:
     it still truncates at exactly ``max_chars``; a ``ghp_``-prefixed token is
     matched at its start and still trips the guard once clipped, so it is not
     retracted either and the refusal is preserved with no content dropped (#481).
+
+    What this does NOT cover, deliberately: the guard's rules keyed on values
+    only the CALLER knows. ``assert_no_leak`` is consulted here without its
+    ``extra`` argument, so a caller-supplied sensitive value is not considered,
+    and the hazard patterns need six characters, so a standalone username at the
+    guard's five-character floor is matched by neither. Splitting one of those
+    still costs the guard its verdict. Closing that needs the caller's values
+    threaded into this function, which is tracked separately (#654) rather than
+    widened into #481 — this bounds the cap to the guard's STATIC rules.
     """
     if len(line) <= max_chars:
         return line
