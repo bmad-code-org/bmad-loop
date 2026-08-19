@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import importlib.metadata
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from importlib import resources
 from pathlib import Path
 
@@ -164,6 +164,24 @@ class CLIProfile:
     # across every tracked file. Override/extend via a project profile in
     # .bmad-loop/profiles/.
     env_fault_patterns: tuple[str, ...] = ()
+    # Did this profile ship INSIDE the package (bmad_loop/data/profiles/*.toml)?
+    # Provenance, not configuration: it is stamped by `load_profiles` at the one
+    # place that knows which directory a file came from, and no TOML key sets it —
+    # a project overlay declaring `packaged = true` is read as an unknown key, not
+    # as a promotion. Default False, so the untrusted answer is the one you get by
+    # forgetting: an entry-point profile constructing this dataclass directly is
+    # not packaged either, because "installed alongside us" is not the same claim
+    # as "shipped by us".
+    #
+    # The one consumer is `validate`'s liveness probe (#294), which EXECUTES the
+    # binary. `binary` is project-controlled end to end — policy.toml picks the
+    # profile and .bmad-loop/profiles/*.toml supplies its fields, both arriving
+    # with a clone — so the probe needs a trust boundary that no spelling of
+    # `binary` can talk its way through: gating on the string (rejecting "./tool")
+    # still runs a bare "pwn" whenever a checkout-local directory is on PATH.
+    # Provenance is that boundary; it answers "who wrote this", which is the
+    # question actually being asked.
+    packaged: bool = False
 
     @property
     def hookless(self) -> bool:
@@ -560,7 +578,9 @@ def load_profiles(project: Path | None = None) -> dict[str, CLIProfile]:
     for entry in sorted(packaged.iterdir(), key=lambda e: e.name):
         if entry.name.endswith(".toml"):
             profile = _load_toml(entry.read_text(encoding="utf-8"), entry.name)
-            profiles[profile.name] = profile
+            # Stamped HERE and nowhere else: this loop is the only code that knows
+            # a profile came out of the package rather than off a project's disk.
+            profiles[profile.name] = replace(profile, packaged=True)
     profiles.update(_load_external_profiles())
     if project is not None:
         user_dir = project / USER_PROFILES_REL

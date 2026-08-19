@@ -423,6 +423,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
 
     from . import probe as probe_mod
 
+    packaged_binaries = {p.binary for p in profiles if p.packaged}
     for tool in dict.fromkeys(p.binary for p in profiles):
         resolved = shutil.which(tool)
         if resolved:
@@ -437,19 +438,22 @@ def cmd_validate(args: argparse.Namespace) -> int:
         # `bmad-loop validate`, which then told them everything was fine. Probe the
         # path `which` RETURNED rather than the bare name: re-resolving is a TOCTOU,
         # and on Windows the PATHEXT shim `which` picked is the very file at issue.
-        # Probe ONLY a bare name, i.e. one `shutil.which` resolved by SEARCHING
-        # PATH. `binary` is project-controlled (policy.toml picks the profile,
-        # `.bmad-loop/profiles/*.toml` supplies its fields), so `binary = "./tool"`
-        # would have this diagnostic EXECUTE a file carried by a cloned repo —
-        # `which` returns a caller-supplied path unchanged, and validate is exactly
-        # the command a user runs to decide whether a checkout is safe to run at
-        # all (the TUI runs it too). Inspection must not become execution there.
-        # The predicate is `os.path.dirname` because that is the same test
-        # `shutil.which` itself uses to choose direct-path over PATH search, so the
-        # two cannot drift. A path-bearing `binary` keeps the pre-#294 behavior:
-        # reported found, never launched. No packaged profile is affected — all six
-        # ship a bare name — so #294's dead WSL/npm shim is still caught.
-        if os.path.dirname(tool):
+        # Probe ONLY a binary a PACKAGED profile named. `binary` is
+        # project-controlled end to end — policy.toml picks the profile and
+        # `.bmad-loop/profiles/*.toml` supplies its fields, both arriving with a
+        # clone — and this line EXECUTES it, inside the one command a user runs to
+        # decide whether a checkout is safe to run at all (the TUI runs it too).
+        # Inspection must not become execution there.
+        #
+        # The boundary is provenance because no test on the SPELLING of `binary`
+        # can hold: rejecting a path (`./tool`) still leaves a bare `pwn`, which
+        # `which` resolves to a repository file whenever a checkout-local
+        # directory is on PATH. "Who wrote this profile" is the question actually
+        # being asked, and it has a categorical answer. An overlay or entry-point
+        # profile keeps the pre-#294 behavior: resolved, reported found, never
+        # launched. #294's own case is a packaged profile (opencode), so the dead
+        # WSL/npm shim is still caught.
+        if tool not in packaged_binaries:
             continue
         rc = probe_mod.binary_runs(resolved)
         if rc == 0:

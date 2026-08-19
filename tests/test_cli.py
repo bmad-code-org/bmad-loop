@@ -5482,32 +5482,45 @@ def test_validate_warns_when_a_binary_on_path_refuses_to_run(
     assert len(found) == 1 and found[0]["severity"] == "ok"
 
 
-def test_validate_never_executes_a_binary_the_project_supplied_a_path_for(
-    project, capsys, monkeypatch, tmp_path
+@pytest.mark.parametrize("shape", ["relative-path", "bare-name-on-path"])
+def test_validate_never_executes_a_binary_an_overlay_profile_named(
+    project, capsys, monkeypatch, tmp_path, shape
 ):
     """#294's liveness probe must not turn validate into a code-execution boundary.
 
     `binary` is project-controlled all the way down: policy.toml picks the profile
     and `.bmad-loop/profiles/*.toml` supplies its fields, both of which arrive with
-    a clone. `shutil.which` returns a caller-supplied path UNCHANGED rather than
-    searching PATH, so `binary = "./pwn"` resolves to a file the repository itself
-    carries — and validate is precisely the command a user runs to decide whether a
-    checkout is safe (the TUI runs it too). Probing it would execute untrusted code
-    on the strength of reading a config file.
+    a clone. validate is precisely the command a user runs to decide whether a
+    checkout is safe to run at all (the TUI runs it too), so probing a binary an
+    overlay named would execute untrusted code on the strength of reading config.
 
-    Driven with a REAL executable on disk and a REAL relative `binary`, from the
-    project directory as a user who just cloned it would be: a stubbed `which` or
+    The two shapes are the same family reached by different spellings, which is why
+    they are parametrized rather than written as one row:
+
+    - `relative-path` — `shutil.which` returns a caller-supplied path UNCHANGED
+      instead of searching PATH, so `./pwn` names a file the repository carries.
+    - `bare-name-on-path` — the spelling is clean, and `which` still resolves it
+      into the checkout because a checkout-local directory is on PATH. A guard that
+      tested the spelling of `binary` (rejecting a separator) passed this row.
+
+    Only provenance covers both: an overlay profile is never probed whatever it is
+    called. `test_every_packaged_profile_names_a_bare_binary` holds the other half.
+
+    Driven with a REAL executable and a REAL overlay profile, from the project
+    directory as a user who just cloned it would be: a stubbed `which` or
     `binary_runs` would assert nothing about the boundary this is here to hold.
 
     The sentinel is the whole assertion — an absent `adapter.binary-unrunnable`
     finding would also be produced by a probe that ran and returned 0, so it cannot
-    distinguish "not launched" from "launched and happy". Only a file that the
-    child alone can create does.
+    distinguish "not launched" from "launched and happy". Only a file the child
+    alone can create does.
 
-    Ablation target: delete the `if os.path.dirname(tool): continue` gate in cli.py
-    and the sentinel IS created, reddening this. Note the `adapter.binary` assertion
-    below is NOT the gate — it pins the surviving half, that a path-bearing binary
-    is still reported found; it stays green under that ablation.
+    Ablation target: drop the `if tool not in packaged_binaries` gate in cli.py and
+    BOTH rows create the sentinel. Restore it but gate on `os.path.dirname(tool)`
+    instead and `bare-name-on-path` alone reddens — that is the round-1 fix this
+    row exists to keep dead. The `adapter.binary` assertion below is NOT the gate:
+    it pins the surviving half (a rejected binary is still reported found) and
+    stays green under either ablation.
     """
     install_bmad_config(project)
     _write_policy(project.project, '[adapter]\nname = "pwncli"\n')
@@ -5518,12 +5531,18 @@ def test_validate_never_executes_a_binary_the_project_supplied_a_path_for(
         "pwn",
         f"import pathlib\npathlib.Path({str(sentinel)!r}).write_text('executed')\n",
     )
+    if shape == "relative-path":
+        # `launcher.name`, not a bare "pwn": on Windows the launcher is `pwn.cmd`,
+        # and naming the real file keeps this about the gate, not about PATHEXT.
+        binary = f"./{launcher.name}"
+    else:
+        binary = "pwn"  # resolved through PATH, into the checkout
+        monkeypatch.setenv("PATH", str(project.project) + os.pathsep + os.environ.get("PATH", ""))
+
     profiles = project.project / ".bmad-loop" / "profiles"
     profiles.mkdir(parents=True, exist_ok=True)
-    # `launcher.name`, not a bare "pwn": on Windows the launcher is `pwn.cmd`, and
-    # naming the real file keeps this about the path gate rather than about PATHEXT.
     (profiles / "pwncli.toml").write_text(
-        f'name = "pwncli"\nbinary = "./{launcher.name}"\nbypass_args = ["--yes"]\n'
+        f'name = "pwncli"\nbinary = "{binary}"\nbypass_args = ["--yes"]\n'
         "\n[hooks]\n"
         'dialect = "claude-settings-json"\n'
         'config_path = ".pwncli/settings.json"\n'
@@ -5542,6 +5561,26 @@ def test_validate_never_executes_a_binary_the_project_supplied_a_path_for(
     # The surviving half: still resolved and reported, exactly as before #294.
     found = [f for f in doc["findings"] if f["check"] == "adapter.binary"]
     assert len(found) == 1 and found[0]["severity"] == "ok"
+
+
+def test_every_packaged_profile_names_a_bare_binary():
+    """The packaged half of the probe's trust boundary (#294).
+
+    `validate` executes the binary of any profile stamped `packaged`, and it trusts
+    provenance rather than spelling — so nothing in cli.py stops a packaged profile
+    whose `binary` carried a path from being launched out of the working directory.
+    Nothing needs to, as long as no packaged profile ships one, and that is a
+    property of the shipped TOML rather than of the code: pin it where it is true.
+
+    A future bundled profile that sets `binary = "./vendor/cli"` reddens here, at
+    the file that introduced it, rather than silently widening what a diagnostic
+    executes.
+    """
+    from bmad_loop.adapters.profile import load_profiles
+
+    packaged = {n: p for n, p in load_profiles(project=None).items() if p.packaged}
+    assert packaged, "no packaged profiles loaded — the gate would be vacuous"
+    assert [p.binary for p in packaged.values() if os.path.dirname(p.binary)] == []
 
 
 @pytest.mark.parametrize("passing", [True, False], ids=["rc-0", "rc-1"])
