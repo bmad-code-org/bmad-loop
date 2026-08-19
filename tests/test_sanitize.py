@@ -1,5 +1,6 @@
 """The crown-jewel PII case table for the probe sanitizer."""
 
+import json
 import re
 
 import pytest
@@ -231,6 +232,17 @@ def test_assert_no_leak_clean_text():
         ("path /Users/alice/x", "absolute-home-path"),
         ("path /root/x", "absolute-home-path"),
         ("path C:/Users/alice/x", "absolute-home-path"),
+        # The Windows→WSL UNC bridge (#512). These are NOT redundant with the
+        # `/home/` row above: the bridge spelling is BACKSLASH-separated, so no
+        # forward-slash arm can see it, and the identifier it carries is the
+        # *Linux* username — which assert_no_leak's username rule cannot match,
+        # because that rule compares `getpass.getuser()`, the *Windows* account.
+        # The path rule is therefore the only rule that can fire on this shape.
+        # The last row pins the `root` half of the same arm.
+        (r"path \\wsl.localhost\Ubuntu-24.04\home\u\p", "absolute-home-path"),
+        (r"path \\wsl$\Ubuntu\home\alice\proj", "absolute-home-path"),
+        (r"path \\?\UNC\wsl.localhost\Ubuntu\home\a", "absolute-home-path"),
+        (r"path \\wsl.localhost\Ubuntu\root\proj", "absolute-home-path"),
         ("key ghp_CANARYxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx01", "secret"),
     ],
 )
@@ -238,7 +250,37 @@ def test_assert_no_leak_fires(text, rule):
     assert rule in sanitize.assert_no_leak(text)
 
 
-@pytest.mark.parametrize("text", ["path D:/data/alice/x", "path /var/lib/alice/x"])
+def test_assert_no_leak_sees_wsl_unc_through_the_json_render():
+    """#512's literal reproduction, asserted on BOTH encodings.
+
+    The same bytes reach the guard as raw text (the markdown report) and as JSON
+    text (the ``--json`` document), and ``json.dumps`` DOUBLES every backslash —
+    the historic trap documented at ``src/bmad_loop/cli.py:3737-3750``. The two
+    encodings fail for different reasons, so a test that checked only one would
+    pass while the shipped ``--json`` document still leaked.
+    """
+    raw = r"\\wsl.localhost\Ubuntu-24.04\home\u\p"
+    assert "absolute-home-path" in sanitize.assert_no_leak(raw)
+
+    rendered = json.dumps({"env": {"raw_project": raw}})
+    assert r"\\\\wsl.localhost" in rendered  # the doubling actually happened
+    assert "absolute-home-path" in sanitize.assert_no_leak(rendered)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "path D:/data/alice/x",
+        "path /var/lib/alice/x",
+        # Backslash negatives bound the #512 arm: it names *home* trees, not any
+        # UNC path and not any backslash. A share that is not a home tree, a
+        # plain drive path, and the two ordinary words that contain the literal
+        # substrings `home` and `root` must all stay clean.
+        r"path \\server\share\data\alice\x",
+        r"path D:\data\alice\x",
+        "note homeroom and rootkit are ordinary words",
+    ],
+)
 def test_assert_no_leak_home_rule_is_not_any_absolute_path(text):
     """The rule names *home* directories, and firing is fail-closed — diagnose
     refuses to emit. Matching every absolute path would turn an ordinary dump

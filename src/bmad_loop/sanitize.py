@@ -96,8 +96,26 @@ _URL_CRED_RE = re.compile(r"https?://[^/\s]*:[^/@\s]+@")
 # Widening the drive-letter arm to `[\\/]` buys only the mixed-separator oddity
 # `C:\Users/alice` — and any string carrying a separator at all is rejected by
 # looks_like_identifier upstream and redacted before it can reach here.
-# tests/test_sanitize.py::test_assert_no_leak_fires pins each arm.
-_ABS_HOME_RE = re.compile(r"/home/|/Users/|/root/|[A-Za-z]:\\{1,2}Users\\{1,2}", re.I)
+#
+# The backslash `home`/`root` arm is for the Windows→WSL UNC bridge (#512):
+# `\\wsl.localhost\<distro>\home\<user>`, the legacy `\\wsl$\...`, and the
+# extended-length `\\?\UNC\wsl.localhost\...` folding all reach a POSIX home
+# directory whose separators are BACKSLASHES, so none of the forward-slash arms
+# can see them. That shape needs a path rule for a second reason: the identifier
+# at risk is the *Linux* username, while the username rule in assert_no_leak
+# compares `getpass.getuser()` — the *Windows* account — so on a native-Windows
+# interpreter reaching a distro path, no other rule can fire on the name that
+# matters. The arm anchors on the home segment rather than the `wsl` host
+# because a host anchor misses `\\?\UNC\wsl.localhost\...` entirely: the
+# `?\UNC\` segment sits between the leading backslashes and `wsl`. `Users` is
+# deliberately NOT in this arm — it stays behind the drive-letter arm above,
+# which is the bound the preceding paragraph justifies.
+# tests/test_sanitize.py::test_assert_no_leak_fires pins each arm;
+# ::test_assert_no_leak_home_rule_is_not_any_absolute_path pins the other
+# direction, since a hit makes diagnose refuse to emit at all.
+_ABS_HOME_RE = re.compile(
+    r"/home/|/Users/|/root/|[A-Za-z]:\\{1,2}Users\\{1,2}|\\{1,2}(?:home|root)\\{1,2}", re.I
+)
 
 _REDACTED_STR = "<redacted:str>"
 _REDACTED_SECRET = "<redacted:secret>"  # nosec B105 - redaction marker, not a credential
