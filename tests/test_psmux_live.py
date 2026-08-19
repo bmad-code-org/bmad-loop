@@ -286,24 +286,6 @@ def test_premise_version_leads_with_a_tmux_triple():
     )
 
 
-def test_premise_exact_match_prefix_resolves_for_has_session_but_not_kill(probe):
-    mux, session, _ = probe
-    found = mux._run(["has-session", "-t", f"={session}"], check=False)
-    assert found.returncode == 0, (
-        "psmux no longer resolves the `=name` exact-match form for has-session — "
-        "the post-create verification belt in new_session cannot confirm anything"
-    )
-    # Costs psmux's own 5s settle timeout: the = form routes to the right server
-    # but reaches the kill handler unstripped, so its name compare never matches
-    # and the client waits out its deadline (psmux/psmux#558).
-    mux._run(["kill-session", "-t", f"={session}"], check=False)
-    assert _plain_has_session(mux, session), (
-        "psmux now honors the `=name` form for kill-session (psmux/psmux#558) — "
-        "kill_session's deliberate plain-name target is no longer the only form "
-        "that works"
-    )
-
-
 def test_premise_window_scoped_option_write_lands_at_session_scope(probe):
     mux, session, windows = probe
     written = mux._run(["set-option", "-w", "-t", windows[0], "@probe", "v"], check=False)

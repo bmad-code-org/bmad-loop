@@ -321,16 +321,17 @@ def test_new_session_failure_raises_multiplexer_error(monkeypatch, tmp_path):
 # --------------------------------------------------------------- kill_session
 
 
-def test_kill_session_uses_plain_target(rec, monkeypatch):
-    # strict which-stub: the guard must probe the psmux binary, not a
-    # copy-pasted "tmux"
+def test_kill_session_uses_the_inherited_exact_match_target(rec, monkeypatch):
+    # 3.3.8 honors the `=name` exact-match form (psmux/psmux#558), so the base's
+    # argv is correct here and the override is gone. strict which-stub: the
+    # base's guard must probe the psmux binary, not a copy-pasted "tmux".
     monkeypatch.setattr(
         psmux_backend.shutil,
         "which",
         lambda name: "C:\\bin\\psmux.exe" if name == "psmux" else None,
     )
     PsmuxMultiplexer().kill_session("s")
-    assert rec.argv == ["psmux", "kill-session", "-t", "s"]  # no `=` — psmux ignores it
+    assert rec.argv == ["psmux", "kill-session", "-t", "=s"]
 
 
 def test_kill_session_no_binary_no_spawn(rec, monkeypatch):

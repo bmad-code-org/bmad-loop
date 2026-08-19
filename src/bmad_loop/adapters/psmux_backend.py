@@ -7,7 +7,7 @@ swaps only the shell dialect (PowerShell instead of POSIX sh) via the base's
 hooks, plus the handful of behaviors where psmux diverges from tmux:
 window-level ``-e`` is accepted but silently dropped, an attaching
 ``new-session`` is refused by a nesting guard when run from inside a psmux
-pane, ``kill-session`` ignores the ``=name`` exact-match form, and a quoted
+pane, and a quoted
 command string does not survive psmux's outer re-parse (so shell source
 travels as ``pwsh -EncodedCommand`` — the log sink included, since the
 base's ``cat >>`` assumes a POSIX host shell). Window ids are minted per server (one
@@ -220,16 +220,6 @@ class PsmuxMultiplexer(BaseTmuxBackend):
                 f"{self._BINARY} new-session exited 0 but session {name!r} was not "
                 "created (nesting guard no-op?)"
             )
-
-    def kill_session(self, name: str) -> None:
-        # psmux ignores the `=name` exact-match form for kill-session; plain-name
-        # targeting works. Same best-effort tolerance as the base.
-        if not shutil.which(self._BINARY):
-            return
-        try:
-            self._run(["kill-session", "-t", name], check=False)
-        except (subprocess.SubprocessError, OSError):
-            pass
 
     @staticmethod
     def _qualified_window_id(session: str, window_id: str) -> str:
