@@ -404,6 +404,37 @@ embedded in the journal. That store is deliberately separate from `logs/`, which
 holds coding-CLI pane captures named after session task ids and is read as such
 by the TUI.
 
+Two more context fields say **which** verification the results came from, because
+nothing else on the context can: both the dev leg and the repair leg emit
+`post_dev_verify` from `Phase.DEV_VERIFY`, and `ctx.attempt` is one per-story
+counter the repair leg continues rather than restarts, so its value orders the
+two but names neither.
+
+| Field                       | Value                                                                                  |
+| --------------------------- | -------------------------------------------------------------------------------------- |
+| `ctx.verification_stage`    | `"dev"` for the initial dev verification, `"fix"` for a repair one, `None` if none ran |
+| `ctx.verification_sequence` | the story's 1-based ordinal for that pass, or `None` if it recorded nothing            |
+
+Together they are the join key: the `verify-command-result` entries carrying this
+`story_key` + `verification_stage` + `verification_sequence` are exactly this
+context's results, one per record, ordered by `command_index`. The sequence is
+monotonic per story **across a pause/resume** — unlike `attempt`, which a human
+re-arm reuses — so it is safe to persist as a correlation id.
+
+Read `ctx.command_results == ()` together with `verification_stage`; on its own it
+is ambiguous:
+
+- **`verification_stage is None`** — no verify pass ran. Several causes land here
+  and the empty tuple names none of them: the session did not complete
+  (`ctx.session_status`), an earlier gate already failed the attempt — the
+  dev-artifact check or the deferral harvest (`ctx.verify_reason`) — or the engine
+  variant suppressed the pass for this leg (stories mode skips it on a plan-halt
+  leg, which has no implementation to build).
+- **stage set, `verification_sequence is None`** — the pass ran and executed
+  nothing, because `[verify] commands` is empty. No journal record exists either.
+- **stage set, sequence an int** — those commands ran, and each has a matching
+  journal record.
+
 What lands on disk is bounded by `[verify] stream_capture_kb` (default 256 KiB per
 stream): the **tail** is retained, and the record stays explicit about the cut —
 `stdout_bytes` / `stderr_bytes` are what the command emitted, `stdout_captured_bytes` /

@@ -364,31 +364,8 @@ def test_verify_stream_capture_oserror_degrades_instead_of_killing_the_run(proje
 
 def test_fix_verification_emits_post_dev_verify_with_command_results(project, monkeypatch):
     """The repair leg emits the same existing hook after it re-runs verification."""
-    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
-    policy = Policy(
-        gates=GatesPolicy(mode="none"),
-        notify=QUIET,
-        review=ReviewPolicy(enabled=False),
-        limits=LimitsPolicy(max_dev_attempts=2),
-    )
-    engine, _ = make_engine(
-        project,
-        [dev_effect(project, "1-1-a", followup_review=False), dev_effect(project, "1-1-a")],
-        policy=policy,
-    )
     capture = _PostDevVerifyCaptureBus()
-    engine._bus = capture
-    calls = iter(
-        [
-            [verify.CommandResult("check", 0, "first", "first-out", "")],
-            [verify.CommandResult("check", 1, "review fail", "", "review fail")],
-            [verify.CommandResult("check", 0, "fixed", "fixed-out", "")],
-            [verify.CommandResult("check", 0, "final", "final-out", "")],
-        ]
-    )
-    monkeypatch.setattr(verify, "run_verify_commands", lambda policy, cwd: next(calls))
-
-    summary = engine.run()
+    engine, summary = _dev_then_fix_run(project, monkeypatch, capture)
 
     assert summary.done == 1
     assert [ctx.command_results[0].stdout for ctx in capture.contexts] == ["first-out", "fixed-out"]
@@ -399,6 +376,285 @@ def test_fix_verification_emits_post_dev_verify_with_command_results(project, mo
         ("dev", 1, 0),
         ("fix", 2, 0),
     ]
+
+
+def _one_result(command="pytest -q"):
+    return (verify.CommandResult(command, 0, "tail", "out", "err"),)
+
+
+def _journalled_sequences(engine):
+    return [
+        (e["story_key"], e["verification_stage"], e["verification_sequence"])
+        for e in engine.journal.entries()
+        if e["kind"] == "verify-command-result"
+    ]
+
+
+def test_verification_sequence_survives_a_resume(project):
+    """A NEW engine over the same run dir keeps counting up, it does not restart.
+
+    The ordinal is a public journal field AND the `post_dev_verify` join key, so
+    a resumed process re-issuing 1 for a story already at 2 mints a second record
+    claiming an ordinal the pre-pause run used — two different verify passes,
+    indistinguishable to anything correlating on it. Re-deriving the ordinal from
+    the journal on every verification is what used to buy this; the seeded
+    counter has to buy it once, and this is the part a naive counter breaks.
+
+    Ablation: seed eagerly to empty instead of lazily from the journal — replace
+    `_next_verification_sequence`'s seed call with
+    `self._verification_sequences = {}` — and the resumed engine re-issues 1 and
+    2, reddening both the return values and the journalled sequence list.
+    """
+    first, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1)
+    assert first._journal_verify_command_results(task, "dev", _one_result()) == 1
+    assert first._journal_verify_command_results(task, "fix", _one_result()) == 2
+
+    # what a resume is: a fresh Engine (so a fresh counter) and a fresh Journal
+    # over the run dir the paused process left behind.
+    resumed, _ = make_engine(project, [])
+    assert resumed.journal.path == first.journal.path, "the fixture must reuse the run dir"
+    assert resumed._journal_verify_command_results(task, "fix", _one_result()) == 3
+    # and from there it increments in memory — the seed is not re-read per pass
+    assert resumed._journal_verify_command_results(task, "fix", _one_result()) == 4
+
+    assert _journalled_sequences(resumed) == [
+        ("1-1-a", "dev", 1),
+        ("1-1-a", "fix", 2),
+        ("1-1-a", "fix", 3),
+        ("1-1-a", "fix", 4),
+    ]
+
+
+def test_verification_sequence_counts_each_story_separately(project):
+    """The ordinal is per story, and the resume seed has to keep it that way.
+
+    A run drives many stories through one Engine and one journal. A counter (or a
+    seed) shared across them makes the ordinal a run-wide clock, so a plugin
+    joining on (story_key, stage, sequence) finds the record it wants only by
+    accident of ordering.
+
+    Ablation: make the ordinal a run-wide clock — key BOTH the seed and the
+    allocator on one constant instead of `story_key` — and `1-1-a`'s post-resume
+    pass lands at 4 instead of 3, because `1-2-b`'s spent one of its numbers.
+    Ablating the seed alone is NOT enough and does not redden this: an unseeded
+    story falls back to 0 either way, so the run-wide bug only shows once both
+    halves share the key.
+    """
+    first, _ = make_engine(project, [])
+    a, b = StoryTask(story_key="1-1-a", epic=1), StoryTask(story_key="1-2-b", epic=1)
+    assert first._journal_verify_command_results(a, "dev", _one_result()) == 1
+    assert first._journal_verify_command_results(a, "fix", _one_result()) == 2
+
+    resumed, _ = make_engine(project, [])
+    # `b` has no records at all, so its seed is absent, not "the run's highest"
+    assert resumed._journal_verify_command_results(b, "dev", _one_result()) == 1
+    assert resumed._journal_verify_command_results(a, "dev", _one_result()) == 3
+
+    assert _journalled_sequences(resumed) == [
+        ("1-1-a", "dev", 1),
+        ("1-1-a", "fix", 2),
+        ("1-2-b", "dev", 1),
+        ("1-1-a", "dev", 3),
+    ]
+
+
+def test_verification_sequence_does_not_rescan_the_journal_per_verification(project, monkeypatch):
+    """Allocating an ordinal reads the journal ONCE per engine, not once per pass.
+
+    `Journal.entries()` read_text()s the whole file and json.loads every line — a
+    file this same writer keeps appending to, so a per-verification rescan costs
+    more the longer the run gets, for a number the writer already knows.
+
+    Ablation: restore the rescan (derive the ordinal from
+    `max(... for entry in self.journal.entries() ...)`) and the count is 5, one
+    per verification, instead of the single seeding read.
+    """
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1)
+    reads = []
+    real_entries = engine.journal.entries
+
+    def counting_entries():
+        reads.append(len(reads))
+        return real_entries()
+
+    monkeypatch.setattr(engine.journal, "entries", counting_entries)
+
+    sequences = [
+        engine._journal_verify_command_results(task, "dev", _one_result()) for _ in range(5)
+    ]
+
+    assert sequences == [1, 2, 3, 4, 5]  # still correct, just not re-derived
+    assert len(reads) == 1, "the journal is read once to seed the counter, never per verification"
+
+
+def test_verification_sequence_is_not_spent_by_a_pass_that_records_nothing(project):
+    """A pass with no configured commands journals nothing and burns no ordinal.
+
+    The rescan this replaced could not observe an ordinal it had not written, so
+    an empty pass left the numbering untouched. A counter that increments anyway
+    would number a run's passes differently depending on WHERE it was resumed,
+    which is exactly the drift the seed exists to prevent.
+
+    Ablation: allocate before the `if not results` guard and the second pass
+    lands at 2, with a gap where the empty pass silently spent 1.
+    """
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1)
+
+    assert engine._journal_verify_command_results(task, "dev", ()) is None
+    assert not _journalled_sequences(engine)
+    assert engine._journal_verify_command_results(task, "dev", _one_result()) == 1
+
+
+def _dev_then_fix_run(project, monkeypatch, capture):
+    """Drive one story through a dev verification and a repair verification.
+
+    The first review-time verify fails, which routes the story into `_fix_phase`;
+    the repair session's verify passes and the story commits. Both legs emit
+    `post_dev_verify`, which is what the callers need.
+    """
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", followup_review=False), dev_effect(project, "1-1-a")],
+        policy=Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            review=ReviewPolicy(enabled=False),
+            limits=LimitsPolicy(max_dev_attempts=2),
+        ),
+    )
+    engine._bus = capture
+    calls = iter(
+        [
+            [verify.CommandResult("check", 0, "first", "first-out", "")],
+            [verify.CommandResult("check", 1, "review fail", "", "review fail")],
+            [verify.CommandResult("check", 0, "fixed", "fixed-out", "")],
+            [verify.CommandResult("check", 0, "final", "final-out", "")],
+        ]
+    )
+    monkeypatch.setattr(verify, "run_verify_commands", lambda policy, cwd: next(calls))
+    return engine, engine.run()
+
+
+def test_post_dev_verify_discriminates_a_dev_emit_from_a_fix_emit(project, monkeypatch):
+    """A plugin can tell which leg it is on, and find its own journal records.
+
+    Both emits carry stage `post_dev_verify` from `Phase.DEV_VERIFY` off one
+    shared `attempt` counter, so `ctx.stage` / `ctx.phase` / `ctx.attempt` cannot
+    separate a dev verification from a repair one. `verification_stage` is the
+    only thing that does, and `verification_sequence` is what joins the context
+    back to the `verify-command-result` entries it is about — which is the point
+    of exposing the results at all.
+
+    Ablation: pass a constant (say `"dev"`) as `verification_stage` at both emit
+    sites and the discriminator assertion reddens; drop `verification_sequence`
+    from the emits and the journal join below finds no matching record.
+    """
+    capture = _PostDevVerifyCaptureBus()
+    engine, summary = _dev_then_fix_run(project, monkeypatch, capture)
+
+    assert summary.done == 1
+    dev_ctx, fix_ctx = capture.contexts
+    # what a plugin CANNOT discriminate on: identical stage and phase, plus one
+    # per-story `attempt` counter the repair leg continues rather than restarts,
+    # so a bare 2 never says whether it was a dev retry or a repair.
+    assert dev_ctx.stage == fix_ctx.stage == "post_dev_verify"
+    assert dev_ctx.phase == fix_ctx.phase == str(Phase.DEV_VERIFY)
+    assert (dev_ctx.attempt, fix_ctx.attempt) == (1, 2)
+    # ... and what now separates them
+    assert (dev_ctx.verification_stage, dev_ctx.verification_sequence) == ("dev", 1)
+    assert (fix_ctx.verification_stage, fix_ctx.verification_sequence) == ("fix", 2)
+
+    # the join a correlating plugin performs: story + stage + sequence names
+    # exactly this context's records, one per command, in command_index order.
+    for ctx in (dev_ctx, fix_ctx):
+        matched = [
+            e
+            for e in engine.journal.entries()
+            if e["kind"] == "verify-command-result"
+            and e["story_key"] == ctx.story_key
+            and e["verification_stage"] == ctx.verification_stage
+            and e["verification_sequence"] == ctx.verification_sequence
+        ]
+        assert [e["command_index"] for e in matched] == list(range(len(ctx.command_results)))
+        assert [e["returncode"] for e in matched] == [r.returncode for r in ctx.command_results]
+        assert [e["command"] for e in matched] == [r.command for r in ctx.command_results]
+
+
+_ONE_ATTEMPT = Policy(
+    gates=GatesPolicy(mode="none"),
+    notify=QUIET,
+    review=ReviewPolicy(enabled=False),
+    limits=LimitsPolicy(max_dev_attempts=1),
+    scm=ScmPolicy(rollback_on_failure=True),
+)
+
+
+def _post_dev_verify_contexts(project, script, policy=_ONE_ATTEMPT):
+    """Run one story and return (engine, summary, the post_dev_verify contexts)."""
+    engine, _ = make_engine(project, script, policy)
+    capture = _PostDevVerifyCaptureBus()
+    engine._bus = capture
+    return engine, engine.run(), capture.contexts
+
+
+def test_post_dev_verify_marks_a_pass_that_ran_and_executed_nothing(project):
+    """No `[verify] commands` configured: the pass RAN, and recorded nothing.
+
+    `command_results == ()` alone cannot say that — it is equally what a plugin
+    sees when no pass happened at all. The stage says the pass ran; the null
+    sequence says there is no journal record to join to, which is the truth,
+    because a pass with no results writes none.
+
+    Two independent gates, each verified to redden this on its own. Ablation
+    (stage): set it only when the pass recorded something —
+    `stage=verification_stage if sequence is not None else None` — and this pass
+    reports `None`, collapsing back into "no pass ran". Ablation (sequence):
+    return the allocated ordinal from `_journal_verify_command_results` even with
+    no results, and the context advertises a join key that the
+    `verify-command-result` assertion below proves no record answers. NOTE that
+    simply dropping `verification_sequence` from the emit does NOT redden this —
+    the field defaults to `None`, which is the value under test.
+    """
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, summary, contexts = _post_dev_verify_contexts(
+        project, [dev_effect(project, "1-1-a", followup_review=False)]
+    )
+
+    assert summary.done == 1  # an empty verify config is a pass, not a failure
+    (ctx,) = contexts
+    assert ctx.command_results == () and ctx.verification_stage == "dev"
+    assert ctx.verification_sequence is None
+    assert not [e for e in engine.journal.entries() if e["kind"] == "verify-command-result"]
+
+
+def test_post_dev_verify_marks_an_attempt_that_never_reached_verification(project):
+    """The dev-artifact gate failed first, so no verify pass ran — stage is None.
+
+    This is the other side of the empty tuple, and the one a plugin must not
+    misread as "the commands ran and passed". Four causes reach here (session did
+    not complete, an earlier gate failed, the fix leg's harvest short-circuited,
+    or the engine variant suppressed the pass); the stage separates the CLASS,
+    and `session_status` / `verify_reason` name the cause within it.
+
+    Ablation: hoist `verification_stage` out of the records and pass the literal
+    `"dev"` at the emit site — the gate-failure attempt then claims a pass that
+    never ran, reddening both `is None` assertions.
+    """
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    _, summary, contexts = _post_dev_verify_contexts(
+        project, [dev_effect(project, "1-1-a", final_status="in-progress")]
+    )
+
+    assert summary.done == 0
+    (ctx,) = contexts
+    assert ctx.command_results == ()
+    assert ctx.verification_stage is None and ctx.verification_sequence is None
+    # what the empty tuple cannot carry travels on the fields that can
+    assert ctx.session_status == "completed" and ctx.verify_reason
 
 
 def _notify_engine(project):

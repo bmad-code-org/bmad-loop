@@ -392,6 +392,42 @@ def test_commit_message_mutation_reaches_git(project):
     assert git(project.project, "log", "-1", "--format=%s") == "plugin-authored: 1-1-a"
 
 
+def test_post_dev_verify_reaches_a_real_plugin_through_the_bus(project, monkeypatch):
+    """The verifier results and their discriminators survive the REAL dispatch.
+
+    The engine-side tests for this surface swap `engine._bus` for a capture
+    double: that proves what the engine BUILDS, but skips everything the bus does
+    with it — stage activation, plugin routing, and the read-only view an actual
+    `Plugin` subclass receives. This one goes through `HookBus.emit` into a
+    registered plugin, so the plumbing itself is covered end to end.
+
+    Ablation: drop `command_results`, `verification_stage` or
+    `verification_sequence` from the engine's `post_dev_verify` emit and the
+    plugin observes that field's default (`()` / `None`) instead.
+    """
+    from bmad_loop import verify
+
+    seen = []
+
+    class P(Plugin):
+        def on_post_dev_verify(self, c):
+            seen.append((c.verification_stage, c.verification_sequence, c.command_results))
+
+    result = verify.CommandResult("pytest -q", 0, "tail", "out", "err")
+    monkeypatch.setattr(verify, "run_verify_commands", lambda policy, cwd: [result])
+
+    engine, _ = make_engine(project, one_story(project), registry_of(py_plugin(P, "verifyobs")))
+    summary = engine.run()
+
+    assert summary.done == 1
+    assert seen == [("dev", 1, (result,))]
+    # and the keys the plugin was handed are the ones its journal record carries,
+    # which is the correlation the whole surface exists for
+    (entry,) = [e for e in engine.journal.entries() if e["kind"] == "verify-command-result"]
+    assert (entry["verification_stage"], entry["verification_sequence"]) == ("dev", 1)
+    assert entry["story_key"] == "1-1-a" and entry["command"] == "pytest -q"
+
+
 def _resume_committing(project, engine, registry):
     """Resume a run whose task was persisted at COMMITTING (#115 crash state)."""
     state = load_state(engine.run_dir)

@@ -12,10 +12,13 @@ breaking changes may land in a minor release.
 - **Plugins can now observe structured dev verification results (#641).** The existing
   `post_dev_verify` hook receives immutable per-command results after normal and repair
   verification, with separate `stdout`/`stderr` alongside the compatible bounded
-  `output_tail`. Core writes `verify-command-result` journal records with stream pointers
-  under the run's `verify/` directory — its own store, kept out of the adapter-owned,
-  TUI-consumed `logs/`; plugins remain unable to alter verification or commit
-  decisions. Storage, upload, signing, and any policy response stay plugin-owned.
+  `output_tail`. The context also carries `verification_stage` (`"dev"` or `"fix"`) and
+  `verification_sequence` — the only way to tell a dev verification from a repair one
+  (both emit the same stage from the same phase) and the key that joins the context to
+  its own journal records. Core writes `verify-command-result` journal records with
+  stream pointers under the run's `verify/` directory — its own store, kept out of the
+  adapter-owned, TUI-consumed `logs/`; plugins remain unable to alter verification or
+  commit decisions. Storage, upload, signing, and any policy response stay plugin-owned.
   Retention is bounded by the new `[verify] stream_capture_kb` (default 256 KiB per
   stream, `0` = capture nothing): the tail is kept, and the record carries the full
   byte count plus a `*_truncated` flag so a cut file is never mistaken for a whole
