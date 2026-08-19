@@ -546,10 +546,10 @@ def _dev_then_fix_run(project, monkeypatch, capture):
     engine._bus = capture
     calls = iter(
         [
-            [verify.CommandResult("check", 0, "first", "first-out", "")],
-            [verify.CommandResult("check", 1, "review fail", "", "review fail")],
-            [verify.CommandResult("check", 0, "fixed", "fixed-out", "")],
-            [verify.CommandResult("check", 0, "final", "final-out", "")],
+            [verify.CommandResult("pytest -q", 0, "first", "first-out", "")],
+            [verify.CommandResult("pytest -q", 1, "review fail", "", "review fail")],
+            [verify.CommandResult("pytest -q", 0, "fixed", "fixed-out", "")],
+            [verify.CommandResult("pytest -q", 0, "final", "final-out", "")],
         ]
     )
     monkeypatch.setattr(verify, "run_verify_commands", lambda policy, cwd: next(calls))
@@ -652,9 +652,9 @@ def test_a_critical_session_emits_post_dev_verify_on_both_legs(project, monkeypa
     # that routes the story into `_fix_phase`, then the repair session's pass
     calls = iter(
         [
-            [verify.CommandResult("check", 0, "dev", "dev-out", "")],
-            [verify.CommandResult("check", 1, "commit fail", "", "commit fail")],
-            [verify.CommandResult("check", 0, "fix", "fix-out", "")],
+            [verify.CommandResult("pytest -q", 0, "dev", "dev-out", "")],
+            [verify.CommandResult("pytest -q", 1, "commit fail", "", "commit fail")],
+            [verify.CommandResult("pytest -q", 0, "fix", "fix-out", "")],
         ]
     )
     monkeypatch.setattr(verify, "run_verify_commands", lambda policy, cwd: next(calls))
