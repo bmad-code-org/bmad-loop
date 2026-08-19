@@ -78,7 +78,7 @@ def test_new_window_ships_env_and_command_as_encoded_pwsh(rec, tmp_path):
     )
 
     # the tmux-family scaffolding is the base's, spawned via the psmux binary,
-    # with no -e flags (psmux drops them)
+    # with no -e flags — the env rides the encoded source's prelude instead
     assert rec.argv[:12] == [
         "psmux",
         "new-window",
@@ -321,16 +321,17 @@ def test_new_session_failure_raises_multiplexer_error(monkeypatch, tmp_path):
 # --------------------------------------------------------------- kill_session
 
 
-def test_kill_session_uses_plain_target(rec, monkeypatch):
-    # strict which-stub: the guard must probe the psmux binary, not a
-    # copy-pasted "tmux"
+def test_kill_session_uses_the_inherited_exact_match_target(rec, monkeypatch):
+    # 3.3.8 honors the `=name` exact-match form (psmux/psmux#558), so the base's
+    # argv is correct here and the override is gone. strict which-stub: the
+    # base's guard must probe the psmux binary, not a copy-pasted "tmux".
     monkeypatch.setattr(
         psmux_backend.shutil,
         "which",
         lambda name: "C:\\bin\\psmux.exe" if name == "psmux" else None,
     )
     PsmuxMultiplexer().kill_session("s")
-    assert rec.argv == ["psmux", "kill-session", "-t", "s"]  # no `=` — psmux ignores it
+    assert rec.argv == ["psmux", "kill-session", "-t", "=s"]
 
 
 def test_kill_session_no_binary_no_spawn(rec, monkeypatch):
@@ -439,22 +440,29 @@ def test_new_parked_window_composes_pwsh_source(rec, tmp_path):
 # ------------------------------------------------------------------ pipe_pane
 
 
-def test_pipe_pane_ships_positional_sidecar_sink(rec, tmp_path):
-    log = tmp_path / "win's.log"
+# The path shapes the sidecar could not carry: an apostrophe (doubled by
+# _pwsh_quote), a space and `$`/backtick interpolation syntax. All three ride
+# inside the base64 now, so they are one parametrization rather than a refusal.
+@pytest.mark.parametrize("name", ["win's.log", "my run.log", "$name`x.log"])
+def test_pipe_pane_ships_the_sink_as_an_encoded_flag_transport(rec, tmp_path, name):
+    log = tmp_path / name
     PsmuxMultiplexer().pipe_pane("@1", log)
 
+    assert len(rec.calls) == 1
     assert rec.argv[:5] == ["psmux", "pipe-pane", "-t", "@1", "-o"]
-    # psmux strips every dash-flag token from the piped command, so the sink
-    # must be a purely positional launch of a sidecar script
-    sidecar = tmp_path / "win's.log.sink.ps1"
-    assert rec.argv[5] == f'pwsh "{sidecar}"'
-    sink = sidecar.read_text(encoding="utf-8")
+    # One `-o` string, space-joined: base64 is [A-Za-z0-9+/=], so nothing in the
+    # composed command needs quoting against psmux's re-parse.
+    piped = rec.argv[5].split(" ")
+    assert piped[:3] == ["pwsh", "-NoProfile", "-EncodedCommand"]
+    sink = _decode(piped[3])
     # byte-exact raw stream copy (no console decode / re-encode / CRLF mangling),
     # flushed per chunk so the live tail sees bytes incrementally
     quoted = str(log).replace(chr(39), chr(39) * 2)
     assert f"[System.IO.File]::Open('{quoted}', 'Append', 'Write', 'Read')" in sink
     assert "$in.Read($buf, 0, $buf.Length)" in sink
     assert "$out.Flush()" in sink
+    # nothing is written beside the log any more
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_pipe_pane_swallows_failure_with_warning(monkeypatch, capsys, tmp_path):
@@ -463,21 +471,13 @@ def test_pipe_pane_swallows_failure_with_warning(monkeypatch, capsys, tmp_path):
     assert "pipe-pane log capture failed" in capsys.readouterr().err
 
 
-def test_pipe_pane_sidecar_write_failure_warns_without_spawning(rec, capsys, tmp_path):
-    # An unwritable sidecar path (missing log dir) must warn and skip the psmux
-    # call — never raise
-    assert PsmuxMultiplexer().pipe_pane("@1", tmp_path / "absent" / "log") is None
+def test_pipe_pane_warns_without_spawning_on_an_unencodable_log_path(rec, capsys, tmp_path):
+    # A lone surrogate (surrogateescape filesystem decoding) fails the UTF-16LE
+    # encode inside _shell_wrap BEFORE _tmux ever runs — warn-never-raise must
+    # hold there too, not only for the TmuxError arm.
+    assert PsmuxMultiplexer().pipe_pane("@1", tmp_path / "x\ud800.log") is None
     assert rec.calls == []
     assert "pipe-pane log capture failed" in capsys.readouterr().err
-
-
-@pytest.mark.parametrize("syntax", ["$name", "`name"])
-def test_pipe_pane_rejects_interpolating_sidecar_path(rec, capsys, tmp_path, syntax):
-    log = tmp_path / f"{syntax}.log"
-    assert PsmuxMultiplexer().pipe_pane("@1", log) is None
-    assert rec.calls == []
-    assert not log.with_name(log.name + ".sink.ps1").exists()
-    assert "PowerShell interpolation syntax" in capsys.readouterr().err
 
 
 # ------------------------------------------------------------------ selection
@@ -491,10 +491,14 @@ def test_available_requires_psmux_pwsh_and_supported_version(monkeypatch):
         "which",
         lambda name: f"C:\\bin\\{name}.exe" if name in ("psmux", "pwsh") else None,
     )
-    monkeypatch.setattr(PsmuxMultiplexer, "version", lambda self: "tmux 3.3.7")
+    monkeypatch.setattr(PsmuxMultiplexer, "version", lambda self: "tmux 3.3.8")
     assert PsmuxMultiplexer().available() is True
 
-    # 3.3.6 and older force-kill recycled PIDs on teardown — unusable
+    # 3.3.7 and older are refused: 3.3.6 force-kills recycled PIDs on teardown,
+    # and 3.3.7 lacks the fixes this backend's verbs now assume.
+    monkeypatch.setattr(PsmuxMultiplexer, "version", lambda self: "tmux 3.3.7")
+    assert PsmuxMultiplexer().available() is False
+
     monkeypatch.setattr(PsmuxMultiplexer, "version", lambda self: "tmux 3.3.6")
     assert PsmuxMultiplexer().available() is False
 
@@ -507,9 +511,13 @@ def test_available_requires_psmux_pwsh_and_supported_version(monkeypatch):
     monkeypatch.setattr(PsmuxMultiplexer, "version", lambda self: "tmux 10.0")
     assert PsmuxMultiplexer().available() is True
 
-    # a suffixed newer release still clears the strictly-greater gate
-    monkeypatch.setattr(PsmuxMultiplexer, "version", lambda self: "tmux 3.3.7-rc0")
+    # a suffixed newer release still clears the strictly-greater gate; a
+    # suffixed refused one still fails it (the suffix is not read at all)
+    monkeypatch.setattr(PsmuxMultiplexer, "version", lambda self: "tmux 3.3.8-rc0")
     assert PsmuxMultiplexer().available() is True
+
+    monkeypatch.setattr(PsmuxMultiplexer, "version", lambda self: "tmux 3.3.7-rc0")
+    assert PsmuxMultiplexer().available() is False
 
     # a two-part compat version (tmux's own format) reads as patch 0
     monkeypatch.setattr(PsmuxMultiplexer, "version", lambda self: "tmux 3.4")
@@ -533,7 +541,7 @@ def test_available_composes_real_version_probe(monkeypatch):
         lambda name: f"C:\\bin\\{name}.exe" if name in ("psmux", "pwsh") else None,
     )
     monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"C:\\bin\\{name}.exe")
-    rec = _RecordRun(stdout="tmux 3.3.7\n")
+    rec = _RecordRun(stdout="tmux 3.3.8\n")
     monkeypatch.setattr(tmux_base.subprocess, "run", rec)
     assert PsmuxMultiplexer().available() is True
     assert rec.argv == ["psmux", "-V"]
@@ -554,13 +562,13 @@ def test_available_parses_the_gate_out_of_a_real_two_line_probe(monkeypatch):
         lambda name: f"C:\\bin\\{name}.exe" if name in ("psmux", "pwsh", "tmux") else None,
     )
 
-    for release, expected in (("3.3.7", True), ("3.3.6", False)):
-        rec = _RecordRun(stdout=f"tmux {release}\npsmux {release} (05cc5d4 2026-07-20)\n")
+    for release, expected in (("3.3.8", True), ("3.3.7", False)):
+        rec = _RecordRun(stdout=f"tmux {release}\npsmux {release} (66cf613 2026-08-18)\n")
         monkeypatch.setattr(tmux_base.subprocess, "run", rec)
         mux = PsmuxMultiplexer()
         assert mux.available() is expected
         # The fold reached the gate whole — both segments, one line.
-        assert mux.version() == f"tmux {release}; psmux {release} (05cc5d4 2026-07-20)"
+        assert mux.version() == f"tmux {release}; psmux {release} (66cf613 2026-08-18)"
 
 
 def test_available_caches_version_gate_per_instance(monkeypatch):
@@ -574,7 +582,7 @@ def test_available_caches_version_gate_per_instance(monkeypatch):
     def probe(self):
         nonlocal calls
         calls += 1
-        return "tmux 3.3.7"
+        return "tmux 3.3.8"
 
     monkeypatch.setattr(PsmuxMultiplexer, "version", probe)
     mux = PsmuxMultiplexer()
@@ -609,9 +617,8 @@ def test_registry_selects_psmux_when_forced(monkeypatch):
 # OUTSIDE any pane, where a bare `@N` resolves through the most-recent-session
 # fallback instead of the session that minted it. kill-window on such an id is
 # destructive against the wrong server, so new_parked_window, the `window_id`
-# columns of list_windows, and current_window_id all carry `session:@N` — and
-# select_window, whose CLI-side check matches only window index/name, resolves
-# that form back to an index before sending.
+# columns of list_windows, and current_window_id all carry `session:@N`, and
+# every `-t` consumer replays that form verbatim.
 
 
 def _rows_fake(monkeypatch, rows: str, *, new_window_id: str = "@2\n"):
@@ -731,78 +738,14 @@ def test_current_window_id_none_on_unparseable_probe(monkeypatch):
         assert PsmuxMultiplexer().current_window_id() is None, answer
 
 
-def test_select_window_resolves_qualified_id_to_index(monkeypatch):
-    # psmux exits 1 with "can't find window: @3" for the id form, because the
-    # CLI-side existence check compares only against #{window_index}/#{window_name}.
-    recorder = _RecordRun(stdout="@1\t0\n@3\t2\n")
-    monkeypatch.setattr(tmux_base.subprocess, "run", recorder)
-    PsmuxMultiplexer().select_window("ctl:@3")
-    assert recorder.calls[0][0][1:] == [
-        "list-windows",
-        "-t",
-        "=ctl",
-        "-F",
-        "#{window_id}\t#{window_index}",
-    ]
-    assert recorder.argv[1:] == ["select-window", "-t", "ctl:2"]
-
-
-def test_select_window_resolve_scopes_the_lookup_to_the_session(monkeypatch):
-    # The lookup must carry -t =<session>: psmux routes by the explicit session,
-    # and an unscoped list-windows would read whichever server the fallback picks.
-    recorder = _RecordRun(stdout="@3\t2\n")
-    monkeypatch.setattr(tmux_base.subprocess, "run", recorder)
-    PsmuxMultiplexer().select_window("ctl:@3")
-    assert "-t" in recorder.calls[0][0] and "=ctl" in recorder.calls[0][0]
-
-
-def test_select_window_unresolved_id_sends_original_target(monkeypatch, capsys):
-    # No matching row: send the id anyway (guessing an index would focus an
-    # unrelated window) — but warn, because psmux's "can't find window" exit 1
-    # lands in a discarded pipe and the miss would otherwise be untraceable.
-    recorder = _RecordRun(stdout="@1\t0\n")
-    monkeypatch.setattr(tmux_base.subprocess, "run", recorder)
-    PsmuxMultiplexer().select_window("ctl:@9")
-    assert recorder.argv[1:] == ["select-window", "-t", "ctl:@9"]
-    assert "could not resolve ctl:@9" in capsys.readouterr().err
-
-
-def test_select_window_resolve_failure_sends_original_target(monkeypatch, capsys):
-    # A transport failure during the resolve must not escalate: select_window is
-    # best-effort, so it degrades to the unresolved target (with the same
-    # warning as a resolve miss), never raises — and it must still SEND, not
-    # swallow the verb along with the failure.
-    sent = []
-
-    def fake(argv, **kwargs):
-        if argv[1] == "list-windows":
-            raise subprocess.TimeoutExpired(argv, 1)
-        sent.append(argv)
-        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
-
-    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
-    PsmuxMultiplexer().select_window("ctl:@3")  # must not raise
-    assert sent and sent[-1][1:] == ["select-window", "-t", "ctl:@3"]
-    assert "could not resolve ctl:@3" in capsys.readouterr().err
-
-
-def test_select_window_resolves_equals_prefixed_qualified_id(monkeypatch):
-    # target(session, "@3") composes `=ctl:@3`, which the seam documents as a
-    # legal argument here. Matching without stripping the `=` would capture the
-    # session as "=ctl" and look up `-t ==ctl`; psmux strips only one `=`, so the
-    # resolve would miss and the select would quietly focus nothing.
-    recorder = _RecordRun(stdout="@3\t2\n")
-    monkeypatch.setattr(tmux_base.subprocess, "run", recorder)
-    PsmuxMultiplexer().select_window("=ctl:@3")
-    assert recorder.calls[0][0][3] == "=ctl"
-    assert recorder.argv[1:] == ["select-window", "-t", "ctl:2"]
-
-
-def test_select_window_name_token_passes_through(rec):
-    # A target() name token already resolves CLI-side; it must not be rewritten.
-    PsmuxMultiplexer().select_window("=ctl:run-abc")
-    assert rec.argv[1:] == ["select-window", "-t", "=ctl:run-abc"]
-    assert len(rec.calls) == 1  # no resolve lookup spawned
+@pytest.mark.parametrize("target", ["ctl:@3", "=ctl:@3", "=ctl:run-abc"])
+def test_select_window_sends_every_target_form_unrewritten(rec, target):
+    # psmux 3.3.8 resolves a scoped window-id target server-side (psmux/psmux#497),
+    # so the backend inherits the base verb: no index resolve, no extra listing
+    # round-trip, and the qualified id this backend mints is sent verbatim.
+    PsmuxMultiplexer().select_window(target)
+    assert rec.argv[1:] == ["select-window", "-t", target]
+    assert len(rec.calls) == 1
 
 
 def test_tmux_backend_keeps_bare_tui_ids(monkeypatch, tmp_path):
@@ -1087,6 +1030,44 @@ def test_kill_window_failed_kill_retains_the_keys(monkeypatch):
     assert not [c for c in recorder.calls if c[0][1] in ("set-option", "show-options")]
 
 
+def test_kill_window_failure_warning_reads_the_qualified_listing(monkeypatch, capsys):
+    # The base's survivor probe checks membership against list_window_ids,
+    # which this backend qualifies (`ctl:@3`, not the base's bare `@3`); the
+    # probe must recognize the surviving window through that shape or a failed
+    # psmux kill would never warn.
+    def fake(argv, **kwargs):
+        if argv[1] == "kill-window":
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="boom\n")
+        out = "@1\n@3\n" if argv[1] == "list-windows" else ""
+        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    PsmuxMultiplexer().kill_window("ctl:@3")
+    err = capsys.readouterr().err
+    assert "kill-window ctl:@3 exited 1" in err
+    assert "still alive" in err
+
+
+def test_kill_window_failure_warning_survives_an_exact_match_target(monkeypatch, capsys):
+    # Same probe, the other target shape this seam accepts: `_option_scope`
+    # normalizes a leading `=`, so the survivor probe has to as well — comparing
+    # the raw `=ctl:@3` against a listing of `ctl:@3` matches nothing and would
+    # silence the warning on exactly the leak it exists to report.
+    # Ablation: compare `target` instead of the rebuilt qualified id and this
+    # fails on a missing warning while the sibling test above still passes.
+    def fake(argv, **kwargs):
+        if argv[1] == "kill-window":
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="boom\n")
+        out = "@1\n@3\n" if argv[1] == "list-windows" else ""
+        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    PsmuxMultiplexer().kill_window("=ctl:@3")
+    err = capsys.readouterr().err
+    assert "kill-window =ctl:@3 exited 1" in err
+    assert "still alive" in err
+
+
 def test_kill_window_unverifiable_liveness_retains_the_keys(monkeypatch):
     # An empty liveness listing is a failed probe, not proof of death (the ctl
     # session always keeps its shell window) — retaining beats freeing a live
@@ -1243,44 +1224,48 @@ def test_kill_window_unroutable_target_skips_cleanup_but_kills(monkeypatch):
 @pytest.mark.parametrize(
     "value",
     [
-        "a;b",  # server splits top-level `;` — remainder would EXECUTE
-        "-flag",  # dropped as a flag server-side (or flips to unset via `u`)
-        "it's",  # bare `'` opens a quote in the server tokenizer
-        'x"y',  # bare `"` toggles quoting
-        "bad\nline",  # control line is `\n`-terminated — command injection
+        'x"y',  # `"`: _scoped_options strips ONE surrounding pair, so it corrupts the read
+        'x " y',  # same, spaced
+        "bad\nline",  # the listing is parsed line-by-line — a break splits the value
+        "bad\rline",  # splitlines() cuts on `\r` too, not just `\n`
         "",  # empty write is a silent server-side no-op; unset exists for this
-        "\\\\srv\\share My Proj",  # spaced → client double-quotes → `\\` collapses
-        "C:\\dir with space\\",  # spaced + trailing `\` → `\"` eats the close
-        'x " y',  # spaced + `"`: after a `\` the client's `\"` closes the wrapper
-        "a ; b",  # standalone `;` token splits even inside the client's quotes
-        "a \\; b",  # standalone `\;` token splits the same way
+        "-flag",  # dropped as a flag server-side, or flips to unset (psmux/psmux#583)
         " C:\\p x",  # leading space survives the wire but this backend's reads strip
         "C:\\p x ",  # trailing space, same round-trip loss
-        "C:\\Users\\O'Brien\\dev",  # SPACELESS `'` — unquoted, so the server tokenizer
-        # opens a quote on it. The spaced sibling below is accepted; the docs call
-        # out the inversion because an apostrophe in a Windows home is common.
     ],
 )
 def test_set_window_option_refuses_untransportable_values(monkeypatch, capsys, value):
-    # The CLI→server hop is lossy for these shapes (verified against psmux's
-    # client re-quoting, chain splitter and server tokenizer at v3.3.7; the
-    # `;`-token corruption reproduced on a live 3.3.7: `a ; b` stores as `a`).
-    # A corrupted stored tag never equals project_tag again — the window turns
-    # silently unprunable — so refuse loudly instead of storing garbage. The
-    # refusal also frees any prior value: a refused REwrite must read as unset,
-    # not replay the stale value (e.g. an old parked return target).
+    # What survives the wire on 3.3.8 is not the whole story: the READ half is
+    # ours, and a `"`, a line break or edge whitespace still cannot come back
+    # verbatim. A corrupted stored tag never equals project_tag again — the
+    # window turns silently unprunable — so refuse loudly instead of storing
+    # garbage. The refusal also frees any prior value: a refused REwrite must
+    # read as unset, not replay the stale value (e.g. an old parked return
+    # target).
     rec_ = _option_fake(monkeypatch)
     PsmuxMultiplexer().set_window_option("ctl:@3", "@bmad_project", value)
     assert [c[0][1:4] for c in rec_.calls] == [["set-option", "-u", "-t"]]
     assert "transport" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("value", ["a; b", "C:\\Users\\O'Brien Files\\proj"])
-def test_set_window_option_accepts_quote_safe_spaced_values(monkeypatch, value):
-    # Inside the client's double quotes `'` is literal and a mid-token `;`
-    # survives the whitespace-token chain splitter (live-verified: `a; b`
-    # round-trips on 3.3.7) — so these MUST pass. A blanket `;`/`'` ban would
-    # silently untag every project path with an apostrophe.
+@pytest.mark.parametrize(
+    "value",
+    [
+        "a; b",
+        "C:\\Users\\O'Brien Files\\proj",
+        "C:\\Users\\O'Brien\\dev",  # spaceless `'` — no longer a quote opener
+        "a;b",  # unspaced `;` (psmux/psmux#499)
+        "a ; b",  # standalone `;` token — the chain splitter is quote-aware now
+        "a \\; b",  # and its `\;` sibling
+        "\\\\srv\\share My Proj",  # spaced UNC — `\\` no longer collapses (#547)
+        "C:\\dir with space\\",  # trailing `\` no longer eats the closing quote
+        "x\u00a0y",  # non-ASCII whitespace no longer splits server-side (#536)
+    ],
+)
+def test_set_window_option_accepts_wire_safe_values(monkeypatch, value):
+    # Every ordinary Windows path shape 3.3.8 carries verbatim MUST pass: a
+    # gate still refusing them would silently untag apostrophed, UNC, spaced
+    # and trailing-separator project directories.
     rec_ = _option_fake(monkeypatch)
     PsmuxMultiplexer().set_window_option("ctl:@3", "@bmad_project", value)
     assert rec_.argv[-1] == value
@@ -1298,21 +1283,14 @@ def test_set_window_option_write_failure_warns(monkeypatch, capsys):
 @pytest.mark.parametrize(
     "value",
     [
-        "C:\\a ; b\\proj",  # live-probed: stores as `C:\a`, remainder EXECUTES
-        "C:\\projects\\my proj\\",  # live-probed: trailing `\` eats the closing quote
-        "\\\\srv\\share name\\proj",  # live-probed: spaced → `\\` collapses to `\`
-        "C:\\Users\\O'Brien\\proj",  # live-probed UNSPACED `'`: read back as `OBrien`
-        'C:\\a"b\\proj',  # live-probed unspaced `"`: read back as `ab`
-        "-flag",  # dropped as a flag server-side
-        "bad\nline",  # the control line is `\n`-terminated
+        'C:\\a"b\\proj',  # `"` cannot survive the listing's one-quote-pair strip
+        "bad\nline",  # the listing is parsed line-by-line
         "",  # an empty write is a silent server-side no-op
+        "-flag",  # dropped as a flag server-side (psmux/psmux#583)
     ],
 )
 def test_set_session_option_refuses_untransportable_values(monkeypatch, capsys, value):
-    # Same lossy CLI→server hop as the window channel, previously ungated on the
-    # session tag. The first three round-trips were measured on a live psmux
-    # 3.3.7 (sent → read back: `C:\a ; b\proj` → `C:\a`, `C:\projects\my proj\`
-    # → `C:\projects\my proj"`, `\\srv\share name\proj` → `\srv\share name\proj`).
+    # Same gate as the window channel, on a write that was ungated before #320.
     # Refusing leaves the option unset, which the prune's run-dir fallback
     # handles correctly — a corrupted tag would strand the session forever.
     # The refusal FREES the key instead of just returning: the server loads the
@@ -1328,15 +1306,19 @@ def test_set_session_option_refuses_untransportable_values(monkeypatch, capsys, 
 @pytest.mark.parametrize(
     "value",
     [
-        "C:\\my proj\\app",  # spaced but quote-safe
+        "C:\\my proj\\app",  # spaced
         "C:\\app",  # unspaced
-        "\\\\srv\\share\\app",  # unspaced UNC rides verbatim (no client quoting)
-        "C:\\Users\\O'Brien Files\\proj",  # spaced `'` is literal inside the quotes
+        "\\\\srv\\share\\app",  # unspaced UNC
+        "C:\\Users\\O'Brien Files\\proj",  # spaced `'`
+        "C:\\a ; b\\proj",  # `;` tokens no longer split the value (psmux/psmux#499)
+        "C:\\projects\\my proj\\",  # trailing `\` no longer eats the closing quote
+        "\\\\srv\\share name\\proj",  # spaced UNC — `\\` no longer collapses (#547)
+        "C:\\Users\\O'Brien\\proj",  # unspaced `'` no longer opens a quote
     ],
 )
 def test_set_session_option_accepts_transportable_values(monkeypatch, value):
-    # All four were confirmed to round-trip unchanged on live psmux 3.3.7; a
-    # gate that refused them would untag ordinary Windows project paths.
+    # All eight round-trip unchanged on psmux 3.3.8; a gate that refused them
+    # would untag ordinary Windows project paths.
     rec_ = _option_fake(monkeypatch)
     PsmuxMultiplexer().set_session_option("bmad-loop-x", "@bmad_project", value)
     assert rec_.argv[1:] == ["set-option", "-t", "bmad-loop-x", "@bmad_project", value]
@@ -1356,7 +1338,7 @@ def test_set_session_option_refusal_free_failure_warns_not_raises(monkeypatch, c
     # multiplexer must not abort session creation over a tag that is only an
     # optimization — but it must not pass silently either.
     _option_fake(monkeypatch, rc=1)
-    PsmuxMultiplexer().set_session_option("bmad-loop-x", "@bmad_project", "C:\\a ; b")
+    PsmuxMultiplexer().set_session_option("bmad-loop-x", "@bmad_project", 'C:\\a"b')
     err = capsys.readouterr().err
     assert "transport" in err and "failed" in err
 
@@ -1444,14 +1426,34 @@ def test_tmux_backend_forwards_option_columns_to_format(monkeypatch):
     assert rows == [("@1", "shell", "proj")]
 
 
-@pytest.mark.parametrize("value", ["nb\u00a0sp", "tab\there", "with space\u00a0nb"])
-def test_set_window_option_refuses_non_ascii_whitespace(monkeypatch, capsys, value):
-    # The client quotes only on ASCII space while the server tokenizer splits
-    # on Unicode whitespace — an NBSP/tab in an unquoted value splits the token.
+@pytest.mark.parametrize(
+    "value",
+    ["\u00a0lead", "trail\u00a0", "\tlead", "trail\t", " lead", "trail ", "   "],
+)
+def test_set_window_option_refuses_edge_whitespace_of_any_kind(monkeypatch, capsys, value):
+    # Not a wire property: this backend's own reads `.strip()`/`.Trim()`, and
+    # both strip Unicode whitespace, so an edge NBSP or tab reads back short
+    # exactly as an edge ASCII space does. Interior whitespace is fine. An
+    # all-whitespace value is the degenerate case \u2014 it strips to "", i.e. the
+    # empty write the gate refuses outright.
     rec_ = _option_fake(monkeypatch)
     PsmuxMultiplexer().set_window_option("ctl:@3", "@bmad_project", value)
     assert [c[0][1:4] for c in rec_.calls] == [["set-option", "-u", "-t"]]
     assert "transport" in capsys.readouterr().err
+
+
+# `splitlines()` is the refusal, not a `\n` check: it also cuts on \v, \f, the
+# file/group/record separators, NEL and the Unicode line/paragraph separators.
+# Every one of them splits _scoped_options' line-by-line parse, so every one has
+# to be refused \u2014 an `in "\r\n"` rewrite would look equivalent and quietly admit
+# eight corrupting shapes.
+@pytest.mark.parametrize(
+    "sep",
+    ["\n", "\r", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"],
+    ids=lambda s: f"U+{ord(s):04X}",
+)
+def test_transportable_refuses_every_splitlines_separator(sep):
+    assert not PsmuxMultiplexer._transportable(f"a{sep}b")
 
 
 def test_sweep_snapshots_keys_before_live_windows(monkeypatch, tmp_path):
@@ -1527,12 +1529,26 @@ def test_sweep_transport_exception_never_fails_the_mint(monkeypatch, tmp_path, c
 
 @pytest.mark.parametrize(
     "value",
-    ["a; b", "C:\\Users\\O'Brien Files\\proj", "two  spaces", "C:/p", "\\\\srv\\share"],
+    [
+        "a; b",
+        "a;b",
+        "C:\\Users\\O'Brien Files\\proj",
+        "two  spaces",
+        "C:/p",
+        "\\\\srv\\share",
+        "a ; b",
+        "a \\; b",
+        "C:\\dir with space\\",
+        "\\\\srv\\share My Proj",
+        "x\u00a0y",
+    ],
 )
 def test_accepted_values_round_trip_through_the_listing_parse(monkeypatch, value):
     # The write gate and the read parser are two halves of one invariant:
     # every accepted value must read back IDENTICAL from the `@key "value"`
     # listing shape psmux emits — else the prune's equality compare breaks.
+    # This is the bound on how far the gate may be narrowed: the wire getting
+    # cleaner buys nothing for a shape this parse cannot carry.
     assert PsmuxMultiplexer._transportable(value)
     _option_fake(monkeypatch, value=f'@bmad_project__blw@3 "{value}"\n')
     options = PsmuxMultiplexer()._scoped_options("ctl")

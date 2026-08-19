@@ -362,11 +362,76 @@ class BaseTmuxBackend(TerminalMultiplexer):
 
     def kill_window(self, target: str) -> None:
         # Best-effort teardown: a hang / missing binary is no worse than the window
-        # already being gone, so swallow to the documented no-op sentinel.
+        # already being gone, so swallow to the documented no-op sentinel. A
+        # non-zero exit still says so out loud — the return value stays None and
+        # nothing raises — but only when the window the target names is still
+        # there to leak.
+        #
+        # An ALREADY-GONE window exits non-zero too, and that is ordinary
+        # teardown, not a fault — the DOMINANT case, not an edge one:
+        # CodingCLIAdapter.run kills in a `finally` on every session, and a
+        # session that completed by window death has nothing left to kill. The
+        # return code cannot separate the two, so the survivor is what decides.
+        # Replaying the failed target cannot decide it: a target the kill could
+        # not resolve is a target a probe cannot resolve either, so a
+        # same-target probe reads "gone" for the very failures it exists to
+        # catch. For a session-qualified id target the session's OWN window
+        # list answers instead — it resolves independently of the failed
+        # target, and a leaked window is by definition still in it. So the
+        # warning covers exactly the detectable leak class: the kill failed and
+        # the window it named is still listed. A target that names no window at
+        # all leaks nothing and stays silent. The probe is paid only on a
+        # non-zero exit — which on psmux includes ordinary window-death
+        # teardown, one listing alongside the ones the psmux override already
+        # pays. An unreadable probe stays silent: this is a diagnostic, and
+        # guessing would put the noise back on the path the probe exists to
+        # clear.
         try:
-            self._run(["kill-window", "-t", target], check=False)
+            proc = self._run(["kill-window", "-t", target], check=False)
         except (subprocess.SubprocessError, OSError):
-            pass
+            return
+        if proc.returncode == 0 or not self._window_survived_kill(target):
+            return
+        detail = proc.stderr.strip()
+        print(
+            f"warning: kill-window {target} exited {proc.returncode} and the window "
+            f"is still alive{f': {detail}' if detail else ''}",
+            file=sys.stderr,
+        )
+
+    def _window_survived_kill(self, target: str) -> bool:
+        """Whether the window ``target`` names outlived a failed kill.
+
+        False for both "provably gone" and "cannot tell" — the caller only warns,
+        so an unanswerable probe must not manufacture a warning.
+        """
+        session, sep, window = target.partition(":")
+        if sep and window.startswith("@"):
+            # Membership is checked against both id shapes list_window_ids can
+            # answer with: bare `@N` (this base) and session-qualified (the
+            # psmux override qualifies to match its native_id form). Both are
+            # rebuilt from the `=`-stripped session the listing was actually
+            # asked for, never compared against the raw target: an exact-match
+            # `=session:@N` target — the shape _option_scope also normalizes —
+            # matches neither listed shape verbatim, and would read a survivor
+            # as gone.
+            session = session.removeprefix("=")
+            try:
+                live = self.list_window_ids(session)
+            except TmuxError:
+                return False
+            return f"{session}:{window}" in live or window in live
+        # An unqualified or name-token target carries no session to list, so
+        # only the same-resolution probe remains: blind to a wrong-target leak,
+        # but it still catches a kill that failed while the target resolves.
+        # UnicodeError for the same reason list_window_ids names it: a leaf
+        # overriding _ERRORS back to a strict codec raises a ValueError-family
+        # decode error neither other arm covers, and this helper never raises.
+        try:
+            probe = self._run(["list-panes", "-t", target], check=False)
+        except (subprocess.SubprocessError, OSError, UnicodeError):
+            return False
+        return probe.returncode == 0
 
     def window_pane_pids(self, target: str) -> list[int]:
         # Capability method (see the seam default): a transport failure, a dead

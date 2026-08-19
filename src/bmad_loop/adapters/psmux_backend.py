@@ -4,38 +4,34 @@ psmux (a Rust/ConPTY tmux re-implementation) speaks the tmux CLI through its
 own distinctly-named ``psmux`` binary, so this leaf points the base's spawn
 seam at that name, keeps every argv construction in :mod:`.tmux_base`, and
 swaps only the shell dialect (PowerShell instead of POSIX sh) via the base's
-hooks, plus the handful of behaviors where psmux diverges from tmux:
-window-level ``-e`` is accepted but silently dropped, an attaching
-``new-session`` is refused by a nesting guard when run from inside a psmux
-pane, ``kill-session`` ignores the ``=name`` exact-match form, a quoted
-command string does not survive psmux's outer re-parse (so shell source
-travels as ``pwsh -EncodedCommand``), and ``pipe-pane`` strips every
-dash-flag token from the piped command (so the log sink travels as a
-positional sidecar ``.ps1``). Window ids are minted per server (one
+hooks, plus the handful of behaviors where psmux diverges from tmux: an
+attaching ``new-session`` is refused by a nesting guard when run from
+inside a psmux pane, and a quoted command string does not survive psmux's
+outer re-parse (so shell source travels as ``pwsh -EncodedCommand`` — the
+log sink included, since the base's ``cat >>`` assumes a POSIX host
+shell). Window ids are minted per server (one
 server per session), so every id this backend hands back —
 ``new_window``, ``list_window_ids``, ``new_parked_window``, the
 ``window_id`` columns of ``list_windows``, and ``current_window_id`` — is
 session-qualified to ``session:@N`` (degrading to the bare id only where
 the grammar cannot carry the session name — see ``_qualified_window_id``)
-and routes to the owning server from any caller (psmux/psmux#483).
-``select_window`` is the one verb that
-cannot take that form: psmux validates a scoped target's window part
-CLI-side against window index/name only, so the override resolves the id
-back to an index first. Per-window user options do not exist at all, so
+and routes to the owning server from any caller (psmux/psmux#483). Every
+seam verb takes that form, ``select-window`` included (psmux/psmux#497).
+Per-window user options do not exist at all, so
 the window-option verbs, the ``@``-prefixed columns of ``list_windows``
 and the parked trailer route through a substitute channel — see the
 ``per-window option channel (#310)`` block below for the model and its
 rules. Session-scoped options need no such substitute — one server per
-session means that server's single map is the session's — but they cross
-the same lossy control line, so ``set_session_option`` gates its value on
-the same transportability rule (#320). ``detach-client`` and
-``switch-client`` report dispatch rather than effect — every arm exits 0
-whether or not a client moved — so both seam booleans are measured against
-the session's attached-client count instead of read off the exit code; see
-the ``client verbs: observed effect (#317)`` block. ``available()``
-additionally gates on the reported version: psmux releases up to 3.3.6 kill
-recycled PIDs during pane/session teardown without a process-identity check,
-which can take down an unrelated long-lived process mid-run. ``has_session``
+session means that server's single map is the session's — but a value
+still has to read back verbatim through the same listing parse, so
+``set_session_option`` gates it on the same transportability rule (#320).
+``detach-client`` and ``switch-client`` report dispatch, not effect: a
+nonzero exit is a real failure, but a zero one says only that the verb was
+sent, so both seam booleans are measured against the session's
+attached-client count instead of read off the exit code; see the ``client
+verbs: observed effect (#317)`` block. ``available()``
+additionally gates on the reported version — see ``_LAST_UNSUPPORTED``
+for what the floor buys and why it moves. ``has_session``
 is inherited unchanged, but one server per session gives it a residual the
 tmux path does not have: a ``-t`` read naming a session whose own server is
 gone can be answered by a different server, so a wrong ``True`` is reachable
@@ -45,7 +41,8 @@ rather than inventing one — and the collision it needs is an independently
 created session sharing a ``bmad-loop-<run-id>`` name: an operator's, or
 another run's on a colliding id (see #531). The psmux
 behaviors cited in this module were read from the psmux source at tag
-``v3.3.7``; the safe observable subset is probed in ``tests/test_psmux_live.py``.
+``v3.3.8`` — the oldest build ``available()`` admits — and the safe
+observable subset is probed in ``tests/test_psmux_live.py``.
 See :mod:`.multiplexer` for the contract.
 """
 
@@ -156,10 +153,11 @@ class PsmuxMultiplexer(BaseTmuxBackend):
             f"if ($wid) {{ $key = {_pwsh_quote(return_opt + self._SCOPE_MARKER[:-1])} + $wid; "
             f"$ret = {read_key}; "
             f"if ($ret -eq '{PARKED_RETURN_DETACH}') {{ {mux} detach-client 2>$null }} "
-            # The switch leg is still inert at 3.3.7 (psmux/psmux#483: the
-            # server splits the target without parse_target); only the detach
-            # return actually moves a client today. Kept: it is the correct
-            # verb the moment upstream lands the fix.
+            # The switch leg's target routes on the supported build — the
+            # server parses it rather than splitting it raw (psmux/psmux#483) —
+            # so this is no longer the dead branch it was; whether a real client
+            # actually lands there is an attended-console question, not one any
+            # unattended gate here can answer.
             f"elseif ($ret) {{ {mux} switch-client -t $ret 2>$null; "
             f"if ($LASTEXITCODE -ne 0) {{ {mux} switch-client -l 2>$null }} }} "
             # Free the key on the way out: the ctl session outlives every run,
@@ -168,9 +166,13 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         )
 
     def _window_launch(self, env: dict[str, str], command: str) -> list[str]:
-        # psmux accepts `new-window -e` but silently drops it, so the env rides
-        # an in-source prelude instead. `command` arrives POSIX-quoted (callers
-        # shlex-quote each arg), so split it here and re-quote for pwsh.
+        # 3.3.8 delivers `new-window -e`, but the env keeps riding an in-source
+        # prelude: this leaf's command already travels as `-EncodedCommand`
+        # source that must run the CLAUDE_* scrub (_source_prefix) in-pane
+        # anyway, so the prelude is the transport already present — `-e` flags
+        # would be a second one whose values the scrub then has to be ordered
+        # against. `command` arrives POSIX-quoted (callers shlex-quote each
+        # arg), so split it here and re-quote for pwsh.
         for key in env:
             if not _ENV_NAME.fullmatch(key):
                 raise TmuxError(f"invalid environment variable name: {key!r}")
@@ -223,16 +225,6 @@ class PsmuxMultiplexer(BaseTmuxBackend):
                 f"{self._BINARY} new-session exited 0 but session {name!r} was not "
                 "created (nesting guard no-op?)"
             )
-
-    def kill_session(self, name: str) -> None:
-        # psmux ignores the `=name` exact-match form for kill-session; plain-name
-        # targeting works. Same best-effort tolerance as the base.
-        if not shutil.which(self._BINARY):
-            return
-        try:
-            self._run(["kill-session", "-t", name], check=False)
-        except (subprocess.SubprocessError, OSError):
-            pass
 
     @staticmethod
     def _qualified_window_id(session: str, window_id: str) -> str:
@@ -318,7 +310,7 @@ class PsmuxMultiplexer(BaseTmuxBackend):
             # as if nothing were ever tagged. Visible on the CLI prune (cli.py,
             # incl. the --dry-run this most affects); NOT under the TUI, which
             # captures stderr for the app's whole run (tui/app.py's run_tui
-            # note) — the select_window precedent below, same deliberate ceiling.
+            # note) — a deliberate ceiling, as with every warning in this module.
             print(
                 f"warning: show-options listing failed on {session}; option columns read as unset",
                 file=sys.stderr,
@@ -400,7 +392,9 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         session, window = match["session"], match["window"]
         digits = self._id_digits(window)
         if not digits:
-            # A name token; same one-round-trip renumber race as _window_index.
+            # A name token costs one listing round-trip, and psmux can rename or
+            # renumber between it and the verb using the answer. Best-effort
+            # callers, one round-trip wide, so no lock.
             digits = self._id_digits(self._window_id_for_name(session, window) or "")
         return (session, digits) if digits else None
 
@@ -464,53 +458,39 @@ class PsmuxMultiplexer(BaseTmuxBackend):
 
     @staticmethod
     def _transportable(value: str) -> bool:
-        # The value crosses psmux's CLI→server control line: the client wraps a
-        # spaced value in double quotes escaping only `"`, and the server
-        # tokenizer treats a bare `'` as a quote opener, drops `-`-leading
-        # tokens, and collapses `\\` inside double quotes. A value that cannot
-        # survive that hop verbatim is refused loudly instead of stored
-        # corrupted — a tag that reads back different from what the prune
-        # compares against makes the window silently unprunable.
+        # A value that cannot make the round trip verbatim is refused loudly
+        # instead of stored corrupted — a tag that reads back different from
+        # what the prune compares against makes the window silently unprunable.
         #
-        # The two branches deliberately ban DIFFERENT shapes. Inside the
-        # client's double quotes `'` is literal and a mid-token `;` survives,
-        # so a spaced `O'Brien Files` or `a; b` path passes. But the one-shot
-        # chain splitter (config.rs `split_chained_commands`) is NOT
-        # quote-aware: it cuts on whitespace-delimited `;`/`\;` TOKENS, so
-        # `a ; b` stores as `a` and hands the rest to the server as a command
-        # (live-verified on 3.3.7; psmux/psmux#499). `\\` collapses and a `"` can close the
-        # wrapper early (client-escaped `\"` after a backslash reads back as
-        # `\\` + closing quote). So the spaced branch refuses `"`, `\\`, a
-        # trailing `\`, and standalone `;`/`\;` tokens. Outside double quotes
-        # the tokenizer's escape branch never fires (commands.rs:690 requires
-        # in_double_quotes) — an unquoted backslash is pushed literally, psmux
-        # being Windows-native — so the unspaced branch does not ban `\\` and a
-        # spaceless UNC path (`\\srv\share`) rides verbatim.
-        # Non-ASCII-space whitespace (NBSP, tab, …) is refused outright: the
-        # client quotes only on ASCII `' '` (main.rs `s.contains(' ')`) while
-        # the server tokenizer splits on Unicode `is_whitespace()` — an NBSP in
-        # an unquoted value splits the token server-side. Leading/trailing
-        # ASCII space is refused too: it survives the wire, but this backend's
-        # own reads strip/Trim, so the value could never read back equal.
-        if not value or value.startswith("-") or any(c.isspace() and c != " " for c in value):
+        # 3.3.8 carries the WIRE half whole: the client's quoting, the one-shot
+        # chain splitter and the server tokenizer no longer eat `\\`, a trailing
+        # `\`, `;`/`\;` tokens, a bare `'` or non-ASCII whitespace
+        # (psmux/psmux#547, #499, #536), so ordinary Windows paths — spaced,
+        # UNC, apostrophed, trailing-separator — all pass now.
+        #
+        # What still fails is the READ half, which is ours, not psmux's:
+        # `_scoped_options` iterates `splitlines()` and strips ONE surrounding
+        # `"` pair, and both reads `.strip()`/`.Trim()`. So a `"`, any line
+        # break, and leading/trailing whitespace stay refused however cleanly
+        # the wire now carries them — a value that reads back different is the
+        # same silently-unprunable window whichever hop mangled it. An empty
+        # value is a silent server-side no-op (`-u` is the verb for that), and a
+        # `-`-leading one is still dropped as a flag server-side, or flips the
+        # key to unset at rc 0 (psmux/psmux#583, open upstream).
+        if not value or value.startswith("-"):
             return False
-        if value != value.strip():
+        if '"' in value or value != value.strip():
             return False
-        if " " in value:  # will be double-quoted by the psmux client
-            if '"' in value or "\\\\" in value or value.endswith("\\"):
-                return False
-            return all(tok not in (";", "\\;") for tok in value.split())
-        return not any(c in value for c in ";'\"")
+        return value.splitlines() == [value]
 
     def set_session_option(self, name: str, option: str, value: str) -> None:
         # Session scope itself needs no substitute channel: psmux serves one
         # session per server, so that server's single option map IS the
         # session's map — the same model that makes per-window options unusable
-        # makes session options correct by construction (probed on 3.3.7: two
-        # sessions on two servers read back their own values). What it does
-        # share with the window channel is the lossy CLI->server control line,
-        # and this write was ungated (#320): a spaced value silently loses
-        # `\\`, a trailing `\`, and standalone `;` tokens at rc 0. A corrupted
+        # makes session options correct by construction (probed: two sessions
+        # on two servers read back their own values). What it does share with
+        # the window channel is a value that must survive the write AND this
+        # backend's own read, and this write was ungated (#320). A corrupted
         # tag is non-empty and never equals the caller's tag again, so the
         # prune skips that session forever.
         #
@@ -589,7 +569,7 @@ class PsmuxMultiplexer(BaseTmuxBackend):
             return
         session, digits = scope
         # `-u` genuinely frees the key: the server's SetOptionUnset handler
-        # removes `@`-prefixed names from the map (verified at v3.3.7).
+        # removes `@`-prefixed names from the map (verified at v3.3.8).
         key = self._scoped_option_key(option, digits)
         self._write_scoped(["set-option", "-u", "-t", session, key], key)
 
@@ -616,12 +596,14 @@ class PsmuxMultiplexer(BaseTmuxBackend):
     def _scoped_options(self, session: str) -> dict[str, str] | None:
         """All `@`-prefixed options on ``session`` as ``{key: value}``, or None
         on any failure (distinct from {} — an empty map is a real answer).
-        Live-verified on 3.3.7: `show-options -q -t <session>` lists user
-        options as `@key "value"` lines; accepted channel values can contain
-        neither `"` nor newlines (see _transportable), so the quote strip is
-        lossless for every value this backend wrote. Known hole: one server
-        request handler (the plugin-drain copy, server/mod.rs:465 at v3.3.7)
-        answers this listing empty-with-success while keys exist, so a
+        Live-verified on 3.3.8: `show-options -q -t <session>` lists user
+        options as `@key "value"` lines. This parse is what bounds
+        _transportable: it strips ONE surrounding `"` pair and iterates
+        `splitlines()`, so a `"` or a line break is refused at the WRITE and the
+        strip stays lossless for every value this backend stored. Known hole:
+        one server request handler (the ``ShowOptions`` arm of
+        ``drain_plugin_req`` in server/mod.rs) answers this listing
+        empty-with-success while keys exist, so a
         surprising {} is possible and is not proof that no keys are set."""
         try:
             proc = self._run(["show-options", "-q", "-t", session], check=False)
@@ -699,9 +681,8 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         # Kill first, clean only once the window is verifiably gone: the ctl
         # session outlives every run, so a leaked key lives as long as the
         # server — but a kill that FAILS must leave the live window its keys
-        # (the project tag scopes the prune retry; the return key keeps the
-        # detach return armed — the switch leg is inert at 3.3.7 either way,
-        # see _parked_trailer). Scope resolves before the kill because a name
+        # (the project tag scopes the prune retry; the return key keeps both
+        # return legs armed, see _parked_trailer). Scope resolves before the kill because a name
         # token cannot be resolved once the window is dead. An empty liveness
         # listing is ambiguous — a failed probe, or a session that died with
         # its last window — so it degrades toward retaining the keys; the
@@ -713,7 +694,9 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         # Cost, accepted: two listing round-trips per kill, three for a name
         # target (name-resolve, liveness, then keys; agent-window kills pay it
         # too, for nothing — and prune_ctl_windows fans it out once per stale
-        # window); skip-by-session-name if that ever measures.
+        # window), plus one more from the base's survivor probe whenever the
+        # kill exits non-zero — on psmux that includes ordinary window-death
+        # teardown; skip-by-session-name if that ever measures.
         scope = self._option_scope(target)
         super().kill_window(target)
         if scope is None:
@@ -742,7 +725,9 @@ class PsmuxMultiplexer(BaseTmuxBackend):
 
     # What _qualified_window_id composes: `<session>:@<n>`. The session part
     # excludes `:` because that is exactly when qualification degrades to a bare
-    # id; requiring `@<digits>` keeps a `=session:window-name` token out.
+    # id; requiring `@<digits>` keeps a `=session:window-name` token out — which
+    # is what makes it the shape current_window_id must probe back into, so the
+    # prune's own-window compare lines up against list_windows' rows.
     _QUALIFIED_ID = re.compile(r"^(?P<session>[^:]+):(?P<window_id>@\d+)$")
     _BARE_ID = re.compile(r"^@\d+$")
 
@@ -763,60 +748,6 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         # malformed id is no target at all; half-parsing one would aim a kill.
         _, _, window_id = probed.rpartition(":")
         return window_id if self._BARE_ID.fullmatch(window_id) else None
-
-    def select_window(self, target: str) -> None:
-        # psmux checks a scoped target's window part CLI-side before sending, and
-        # only ever matches `#{window_index}`/`#{window_name}` — never
-        # `#{window_id}` — so a qualified id exits 1 with "can't find window"
-        # while the server itself resolves ids fine (FocusWindowById). Translate
-        # to the index that check accepts and the same window is focused.
-        # The `=` strip matters: target(session, window) composes `=session:@N`,
-        # which would capture the session as `=session` and look up `==session`
-        # (psmux's parse_target removes only one `=`), silently focusing nothing.
-        match = self._QUALIFIED_ID.fullmatch(target.removeprefix("="))
-        if match is not None:
-            session = match["session"]
-            index = self._window_index(session, match["window_id"])
-            if index is None:
-                # The unresolved id sent below is exactly the form that CLI-side
-                # check rejects, and its exit 1 lands in a pipe the base
-                # discards — so the send is known-futile and the caller's later
-                # attach shows whichever window happens to be current. Guessing
-                # an index instead could focus an unrelated window, so warn and
-                # send: the pipe-pane sidecar precedent, but a weaker one, and
-                # deliberately not load-bearing. The qualified-id path's callers
-                # (select_ctl_window_id) split by surface: under the Textual app
-                # this emission is invisible — the app captures stderr for its
-                # whole run, see the run_tui note in tui/app.py, which pre-trips
-                # the forced-backend warning for exactly this reason — while the
-                # textual-free CLI attach path (launch.attach_plan via cli.py)
-                # does show it. A TUI-visible miss would need a return value,
-                # which is more seam than a best-effort focus change is worth.
-                print(
-                    f"warning: select-window could not resolve {target} to a "
-                    "window index; the window will not be focused",
-                    file=sys.stderr,
-                )
-            else:
-                target = f"{session}:{index}"
-        # A name token or a bare id goes through untouched.
-        super().select_window(target)
-
-    def _window_index(self, session: str, window_id: str) -> str | None:
-        """Display index of ``window_id`` within ``session``, or None when it
-        cannot be resolved.
-
-        Known ceiling: psmux can renumber windows between this lookup and the
-        verb using the answer. The race is one round-trip wide and the caller is
-        a best-effort focus change, so no lock; targeting by name instead would
-        reopen the ctl-window name collisions stable ids exist to avoid.
-        """
-        # `window_index` is the display index — the field psmux's own existence
-        # check compares against, so matching it exactly is the point.
-        for row in super().list_windows(session, ["window_id", "window_index"]):
-            if row[0] == window_id:
-                return row[1] or None
-        return None
 
     def current_return_target(self) -> str | None:
         # psmux runs one server per session, so a bare pane id recorded on a
@@ -845,17 +776,17 @@ class PsmuxMultiplexer(BaseTmuxBackend):
 
     # ------------------------------- client verbs: observed effect (#317)
     #
-    # psmux's client verbs report *dispatch*, not effect. At ``v3.3.7`` both CLI
-    # arms end in ``send_control(cmd)?; return Ok(())``, so the only nonzero exit
-    # is an unreachable session server: ``detach-client`` succeeds with zero
-    # clients attached (and a flag-less detach is promoted server-side to
-    # detach-all), and *no* form of ``switch-client`` — ``-t`` included —
-    # carries a server reply. Later builds narrow this but do not close it: a
-    # response path landed after the tag and only for ``-t``, leaving ``-l``
-    # exit-0 regardless. Taking those exit codes as the seam's booleans is the
-    # rc-0 no-op (#228) reached through Python instead of a shell fallback, and
-    # it is what ``tui.launch.return_attached_client`` would consume to decide a
-    # human has been handed their terminal back.
+    # psmux's client verbs report *dispatch*, not effect. The exit code is
+    # trustworthy in ONE direction only: a nonzero one is a real failure (an
+    # unreachable session server, a target that would not parse), but a zero one
+    # says the verb was sent, not that a client moved. ``detach-client`` exits 0
+    # with zero clients attached (and a flag-less detach is promoted server-side
+    # to detach-all); ``switch-client`` carries a server reply for ``-t`` on the
+    # supported build but still exits 0 with nothing to move, and ``-l``, which
+    # has no target form, carries none at all. Taking those exit codes as the
+    # seam's booleans is the rc-0 no-op (#228) reached through Python instead of
+    # a shell fallback, and it is what ``tui.launch.return_attached_client``
+    # would consume to decide a human has been handed their terminal back.
     #
     # So the exit code is discarded and the effect is measured: count the
     # clients attached to this session before and after the verb, and answer on
@@ -868,10 +799,10 @@ class PsmuxMultiplexer(BaseTmuxBackend):
     # Unobservable answers False, never a vacuous True. For the detach that is
     # safe in both directions — the caller's UNREACHABLE and RETURNED agree that
     # nobody is left at this terminal, and the only cost is the parked trailer
-    # re-issuing a detach that no-ops. For the switch it is also the truth
-    # today: the switch leg is inert at 3.3.7 (psmux/psmux#483), so no client
-    # ever moves. When upstream lands that fix the probe reports it without a
-    # code change here — which is why this measures rather than hardcoding.
+    # re-issuing a detach that no-ops. For the switch it is the conservative
+    # direction: the caller keeps prompting rather than reporting a terminal
+    # handed back that was not. Measuring rather than hardcoding is what lets a
+    # build that really does move the client report so with no change here.
     #
     # Residue: a switch whose target pane lives in THIS session moves the client
     # between windows without changing the session's attached count, so it reads
@@ -923,27 +854,20 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         return last_fallback and self._client_left(["switch-client", "-l"])
 
     def pipe_pane(self, window_id: str, log_file: Path) -> None:
-        # The base's POSIX `cat >>` sink assumes a POSIX host shell, and psmux
-        # strips every dash-flag token from the piped command before spawning it
-        # (psmux/psmux#482) — any `pwsh -EncodedCommand` transport dies on launch
-        # — so the sink source lives in a sidecar .ps1 invoked positionally. The
-        # sink is byte-exact like `cat >>` (raw stream copy: no console decode of
-        # the pane bytes, no re-encode, no CRLF normalization) and flushes per
-        # chunk: the run log is live-tailed for activity detection, and a
-        # buffered copy never surfaces bytes — pipe EOF is unreliable on psmux.
-        # Known ceilings until upstream restores a flag transport: whether a
-        # spaced or $-bearing path survives psmux's quote re-parse is untested,
-        # an AllSigned/Restricted execution policy refuses the unsigned .ps1,
-        # and a spawn race that exits 0 still yields a silent empty log — the
-        # warning below covers surfaced failures only.
-        sink_file = log_file.with_name(log_file.name + ".sink.ps1")
-        if any(char in str(sink_file) for char in ("$", "`")):
-            print(
-                f"warning: pipe-pane log capture failed for {window_id}: "
-                "sidecar path contains PowerShell interpolation syntax",
-                file=sys.stderr,
-            )
-            return
+        # The base's POSIX `cat >>` sink assumes a POSIX host shell, so the sink
+        # is pwsh source shipped through the same `-EncodedCommand` transport as
+        # every other window command (psmux 3.3.8 passes dash-flag tokens and
+        # quoting through pipe-pane intact — psmux/psmux#482, psmux/psmux#563).
+        # Space-joining the wrapped argv needs no quoting of its own: base64 is
+        # `[A-Za-z0-9+/=]`, and the log path rides inside the encoded source via
+        # _pwsh_quote, so a spaced, `$`-bearing or backticked path is carried
+        # verbatim rather than re-parsed. The sink is byte-exact like `cat >>`
+        # (raw stream copy: no console decode of the pane bytes, no re-encode, no
+        # CRLF normalization) and flushes per chunk: the run log is live-tailed
+        # for activity detection, and a buffered copy never surfaces bytes — pipe
+        # EOF is unreliable on psmux. Known ceiling: a spawn race that exits 0
+        # still yields a silent empty log — the warning below covers surfaced
+        # failures only.
         sink = (
             "$in = [System.Console]::OpenStandardInput()\n"
             f"$out = [System.IO.File]::Open({_pwsh_quote(str(log_file))}, "
@@ -954,22 +878,28 @@ class PsmuxMultiplexer(BaseTmuxBackend):
             "$out.Dispose()\n"
         )
         try:
-            sink_file.write_text(sink, encoding="utf-8")
-            self._tmux("pipe-pane", "-t", window_id, "-o", f'pwsh "{sink_file}"')
-        except (TmuxError, OSError, UnicodeEncodeError) as exc:
+            self._tmux("pipe-pane", "-t", window_id, "-o", " ".join(self._shell_wrap(sink)))
+        except (TmuxError, UnicodeEncodeError) as exc:
             # Best-effort, as the base: a window that died on launch (or psmux's
             # first-pipe-after-new-window spawn race, noted in psmux/psmux#482)
             # is not a setup failure — but say so, or an empty run log is
-            # unexplainable.
+            # unexplainable. UnicodeEncodeError joins it because the sink source
+            # (log path included) rides a UTF-16LE encode that _tmux never sees;
+            # a timeout / missing binary already arrives as TmuxError from there.
             print(
                 f"warning: pipe-pane log capture failed for {window_id}: {exc}",
                 file=sys.stderr,
             )
 
-    # Releases up to this version can force-kill a recycled PID during pane
-    # teardown and let orphaned servers accumulate — engine-fatal, so they
-    # must never be selected.
-    _LAST_UNSUPPORTED = (3, 3, 6)
+    # Releases up to this version are refused. 3.3.6 and older force-kill a
+    # recycled PID during pane teardown and let orphaned servers accumulate —
+    # engine-fatal on its own. 3.3.7 is excluded for a second reason: 3.3.8 is
+    # the build this backend is written against, and several verbs here now
+    # assume its fixes rather than routing around the defects (a direct
+    # `pipe-pane -o` flag transport, a `select-window` id target, the `=name`
+    # kill-session form, and the control-line shapes `_transportable` admits).
+    # On 3.3.7 those would fail silently, so the floor forbids it outright.
+    _LAST_UNSUPPORTED = (3, 3, 7)
     # Class-level default; instances shadow it on first probe. Never assign on
     # the class outside tests — that would poison every future instance.
     _version_ok: bool | None = None

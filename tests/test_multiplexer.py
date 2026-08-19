@@ -407,6 +407,114 @@ def test_tmux_window_pane_pids_degrades_to_empty(monkeypatch, outcome):
     assert mux.window_pane_pids("@7") == []
 
 
+def _kill_fake(monkeypatch, *, kill_rc: int, kill_err: str = "", live: str = "", probe_rc: int = 0):
+    """Script kill-window's exit and the survivor probe's, recording the argv.
+
+    ``live`` feeds the session-listing probe (qualified targets); ``probe_rc``
+    feeds both it and the list-panes probe (unqualified targets).
+    """
+    calls: list[list[str]] = []
+
+    def fake(argv, **k):
+        calls.append(argv)
+        if argv[1] == "list-windows":
+            return subprocess.CompletedProcess(argv, probe_rc, stdout=live, stderr="")
+        if argv[1] == "list-panes":
+            return subprocess.CompletedProcess(argv, probe_rc, stdout="", stderr="")
+        return subprocess.CompletedProcess(argv, kill_rc, stdout="", stderr=kill_err)
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    return calls
+
+
+def test_kill_window_warns_only_when_the_window_outlived_the_kill(monkeypatch, capsys):
+    # The detectable leak class: the kill failed while the window it names is
+    # still in its session's listing. The listing resolves independently of the
+    # failed target (kill and list-windows are separate verbs against separate
+    # targets), so this state is reachable — a same-target replay was not: a
+    # target the kill could not resolve fails the replay too. The verdict is
+    # unchanged — still None, still never raises — only now the target and the
+    # binary's own stderr reach the operator.
+    calls = _kill_fake(
+        monkeypatch, kill_rc=1, kill_err="server temporarily unavailable\n", live="@1\n@3\n"
+    )
+    mux = TmuxMultiplexer()
+    assert mux.kill_window("ctl:@3") is None
+    err = capsys.readouterr().err
+    assert "kill-window ctl:@3" in err
+    assert "still alive" in err
+    assert "server temporarily unavailable" in err  # verbatim: the reader judges it
+    # The probe reads the session's own window list, not the failed target.
+    assert calls[1][1:] == ["list-windows", "-t", "=ctl", "-F", "#{window_id}"]
+
+
+def test_kill_window_is_silent_when_the_window_is_already_gone(monkeypatch, capsys):
+    # The dominant case, not an edge one: CodingCLIAdapter.run kills in a
+    # `finally` on every session, and a session that completed by window death
+    # has nothing left to kill. A warning here would fire on ordinary teardown.
+    # Covers the never-existed target too: not listed means nothing leaked.
+    # Ablation: drop the `not self._window_survived_kill(target)` half of
+    # kill_window's gate and this fails — every non-zero kill would warn.
+    _kill_fake(monkeypatch, kill_rc=1, kill_err="can't find window: @7\n", live="@1\n")
+    assert TmuxMultiplexer().kill_window("ctl:@7") is None
+    assert capsys.readouterr().err == ""
+
+
+def test_kill_window_is_silent_when_the_session_died_with_the_window(monkeypatch, capsys):
+    # A session that ended when its last window died fails the listing probe —
+    # ambiguous, so no warning: nothing provably survived.
+    # Ablation: same mutation as the already-gone test above; this fails too.
+    _kill_fake(monkeypatch, kill_rc=1, kill_err="can't find session: ctl\n", probe_rc=1)
+    assert TmuxMultiplexer().kill_window("ctl:@7") is None
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize("target", ["ctl:@7", "@7"])
+def test_kill_window_is_silent_when_the_survivor_probe_cannot_answer(monkeypatch, capsys, target):
+    # Unreadable is not "alive": the warning is a diagnostic, so a probe that
+    # could not answer must not manufacture one — that would put the noise back
+    # on exactly the path the probe exists to clear. Both probe shapes: the
+    # session listing (qualified target) and list-panes (bare target).
+    # Ablation: drop the `not self._window_survived_kill(target)` half of
+    # kill_window's gate and both params fail on an unexpected warning.
+    def fake(argv, **k):
+        if argv[1] in ("list-windows", "list-panes"):
+            raise subprocess.TimeoutExpired(argv, 1)
+        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="boom\n")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    assert TmuxMultiplexer().kill_window(target) is None  # must not raise
+    assert capsys.readouterr().err == ""
+
+
+def test_kill_window_unqualified_target_keeps_the_same_resolution_probe(monkeypatch, capsys):
+    # A bare `@N` (tmux native_id shape) carries no session to list, so the
+    # probe replays the target through list-panes: blind to a wrong-target
+    # leak, but a kill that failed while the target resolves still warns.
+    calls = _kill_fake(monkeypatch, kill_rc=1, kill_err="boom\n", probe_rc=0)
+    assert TmuxMultiplexer().kill_window("@7") is None
+    err = capsys.readouterr().err
+    assert "kill-window @7" in err and "still alive" in err
+    assert calls[1][1:] == ["list-panes", "-t", "@7"]
+
+
+def test_kill_window_warning_omits_a_bare_colon_on_empty_stderr(monkeypatch, capsys):
+    # A non-zero exit with nothing on stderr is plausible; "exited 1: " reads as
+    # a truncated message rather than a complete one.
+    _kill_fake(monkeypatch, kill_rc=1, kill_err="")
+    TmuxMultiplexer().kill_window("@7")
+    err = capsys.readouterr().err.strip()
+    assert err.endswith("still alive")
+    assert ": " not in err.removeprefix("warning: ")
+
+
+def test_kill_window_is_silent_when_the_kill_lands(monkeypatch, capsys):
+    calls = _kill_fake(monkeypatch, kill_rc=0)
+    assert TmuxMultiplexer().kill_window("@7") is None
+    assert capsys.readouterr().err == ""
+    assert len(calls) == 1  # a landed kill never pays for the survivor probe
+
+
 # -------------------------------- version() is one bounded line, always (#321)
 #
 # Consumers render version() inline (the `mux` table, validate's preflight

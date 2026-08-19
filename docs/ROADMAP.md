@@ -40,8 +40,8 @@ psmux's tmux-compatible CLI through its own `psmux` binary, via pwsh) while
 `tmux-windows` (#85; drives the tmux-windows port) is still in flight — both subclass
 `BaseTmuxBackend` and both register for `win32`, which is why selection is
 availability-aware with discriminating `available()` probes (psmux →
-`which("psmux") and which("pwsh")` plus a version gate excluding releases ≤ 3.3.6, whose
-teardown can force-kill a recycled PID; tmux-windows →
+`which("psmux") and which("pwsh")` plus a version gate requiring psmux 3.3.8 or newer
+([why](multiplexer-backends.md#psmux-native-windows-experimental)); tmux-windows →
 `which("tmux") and not which("psmux")`) and an explicit `bmad-loop mux set <name>` tie-break.
 
 The third — **herdr** — has **shipped** end-to-end on POSIX (engine run path +

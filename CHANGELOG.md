@@ -64,6 +64,23 @@ breaking changes may land in a minor release.
 
 ### Changed
 
+- **The psmux backend now requires psmux 3.3.8 or newer (#658, closes #222).** `available()`
+  refuses 3.3.7 and below, so **on such a host the backend reports unavailable and selection
+  falls through**. Every verb now assumes 3.3.8's fixes instead of routing around the defects
+  they close, and a 3.3.7 install would fail silently rather than loudly.
+
+- **The retired psmux workarounds change three visible behaviors (#658).** The run-log sink rides
+  the same `-EncodedCommand` transport as every other window command instead of a sidecar
+  `.ps1`, so a log path containing a space, `$` or a backtick no longer breaks or blocks log
+  capture, and nothing is written beside the log. `select-window` takes the session-qualified window id
+  directly, dropping a listing round-trip per focus change. `kill_session` inherits the base's
+  `=name` exact-match target.
+
+- **The psmux option-value gate now refuses only what it cannot read back (#658).** Ordinary
+  Windows paths all pass — spaced, UNC, apostrophed, trailing-separator. What stays refused is
+  what the backend's own listing parse would mangle: a double quote, a line break, edge
+  whitespace, and a `-`-leading value psmux still treats as a flag.
+
 - **`post_dev_verify` now fires on the repair leg too, not only after dev verification (#641).**
   A plugin written against "once per story, after the dev session" will see the stage again after
   every repair session's verification, and on the way to a pause: an attempt whose session reported
@@ -115,6 +132,14 @@ breaking changes may land in a minor release.
   it cannot read.
 
 ### Fixed
+
+- **A failed `kill-window` that left the window alive is no longer swallowed (#658).**
+  `BaseTmuxBackend.kill_window` ran `check=False` and discarded the result, so a kill that failed
+  with the window still standing left it behind with no trace. A non-zero exit now reads the
+  session's own window list once and warns on stderr only when the target's window is still in
+  it; an already-gone window — what ordinary teardown produces — and a target that names no
+  window at all both stay silent, because neither leaves anything behind. The verdict is
+  unchanged: still returns `None`, still never raises.
 
 - **A plugin can no longer erase a CRITICAL escalation out from under the engine's audit.**
   `HookContext` copies the session `result_json` precisely so a plugin observes history rather
