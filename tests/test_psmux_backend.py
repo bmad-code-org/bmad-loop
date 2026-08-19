@@ -1048,6 +1048,26 @@ def test_kill_window_failure_warning_reads_the_qualified_listing(monkeypatch, ca
     assert "still alive" in err
 
 
+def test_kill_window_failure_warning_survives_an_exact_match_target(monkeypatch, capsys):
+    # Same probe, the other target shape this seam accepts: `_option_scope`
+    # normalizes a leading `=`, so the survivor probe has to as well — comparing
+    # the raw `=ctl:@3` against a listing of `ctl:@3` matches nothing and would
+    # silence the warning on exactly the leak it exists to report.
+    # Ablation: compare `target` instead of the rebuilt qualified id and this
+    # fails on a missing warning while the sibling test above still passes.
+    def fake(argv, **kwargs):
+        if argv[1] == "kill-window":
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="boom\n")
+        out = "@1\n@3\n" if argv[1] == "list-windows" else ""
+        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    PsmuxMultiplexer().kill_window("=ctl:@3")
+    err = capsys.readouterr().err
+    assert "kill-window =ctl:@3 exited 1" in err
+    assert "still alive" in err
+
+
 def test_kill_window_unverifiable_liveness_retains_the_keys(monkeypatch):
     # An empty liveness listing is a failed probe, not proof of death (the ctl
     # session always keeps its shell window) — retaining beats freeing a live

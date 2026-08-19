@@ -409,12 +409,18 @@ class BaseTmuxBackend(TerminalMultiplexer):
         if sep and window.startswith("@"):
             # Membership is checked against both id shapes list_window_ids can
             # answer with: bare `@N` (this base) and session-qualified (the
-            # psmux override qualifies to match its native_id form).
+            # psmux override qualifies to match its native_id form). Both are
+            # rebuilt from the `=`-stripped session the listing was actually
+            # asked for, never compared against the raw target: an exact-match
+            # `=session:@N` target — the shape _option_scope also normalizes —
+            # matches neither listed shape verbatim, and would read a survivor
+            # as gone.
+            session = session.removeprefix("=")
             try:
-                live = self.list_window_ids(session.removeprefix("="))
+                live = self.list_window_ids(session)
             except TmuxError:
                 return False
-            return target in live or window in live
+            return f"{session}:{window}" in live or window in live
         # An unqualified or name-token target carries no session to list, so
         # only the same-resolution probe remains: blind to a wrong-target leak,
         # but it still catches a kill that failed while the target resolves.
