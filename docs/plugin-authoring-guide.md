@@ -454,7 +454,9 @@ translation makes the file larger there. Set the knob to `0` to retain nothing a
 all — no files are written and the pointers are null, but the record still lands
 with the full byte counts, because "nothing was retained" and "the command was
 silent" are different facts. Retaining is observation and never fails a run: if the
-write raises (ENOSPC, a read-only run dir), the pointer is null and `capture_error`
+write raises (ENOSPC, a read-only run dir, or a `verify/` directory whose
+confinement cannot be established — the store refuses rather than write through
+a symlink a session planted), the pointer is null and `capture_error`
 carries the reason. A plugin reading these pointers must therefore treat both
 `None` and a missing file as normal, and consult `*_truncated` before assuming a
 file holds a command's whole output. Treat verifier output as potentially sensitive and store, upload, sign,

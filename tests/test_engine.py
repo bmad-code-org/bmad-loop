@@ -343,10 +343,16 @@ def test_verify_stream_capture_oserror_degrades_instead_of_killing_the_run(proje
         lambda policy, cwd: [verify.CommandResult("pytest -q", 0, "tail", "out\n", "err\n")],
     )
 
-    def _enospc(path, text, **kwargs):
+    def _enospc(*_args, **_kwargs):
         raise OSError(28, "No space left on device")
 
+    # BOTH writers, because which one runs is platform-dependent: POSIX anchors
+    # the write at a directory descriptor (`atomic_write_text_at`) to refuse a
+    # symlinked `verify/`, win32 keeps the path-based `atomic_write_text`.
+    # Patching only the latter left this test green on POSIX for the wrong
+    # reason — no write was intercepted, so the degrade arm never ran.
     monkeypatch.setattr("bmad_loop.journal.atomic_write_text", _enospc)
+    monkeypatch.setattr("bmad_loop.journal.atomic_write_text_at", _enospc)
 
     summary = engine.run()
 

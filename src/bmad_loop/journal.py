@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any
 
 from .model import RunState
-from .platform_util import atomic_replace, atomic_write_text
+from .platform_util import (
+    DIR_FD_ANCHORED_WRITES,
+    atomic_replace,
+    atomic_write_text,
+    atomic_write_text_at,
+    open_dir_confined,
+)
 
 STATE_FILE = "state.json"
 JOURNAL_FILE = "journal.jsonl"
@@ -86,13 +93,54 @@ class Journal:
         so the file can be larger there than the count.  ``read_text`` normalizes
         it back, so the content round-trips either way.
 
-        Raises ``OSError`` — the caller degrades (this is observation), it does
-        not swallow it here.
+        The write is **anchored at a directory descriptor** where the platform has
+        one, because ``follow_symlinks=False`` covers the final component and
+        nothing above it.  Sessions are handed this run directory outright
+        (``BMAD_LOOP_RUN_DIR``, which is where they write ``result.json``), so a
+        session that plants a symlink at ``verify/`` before verification redirects
+        every record: ``mkdir(exist_ok=True)`` ACCEPTS a symlink-to-directory —
+        it re-raises only when ``is_dir()`` is false, and that follows links — and
+        the replace then lands wherever the link points, outside the run dir
+        entirely.  Measured, not theorised.
+
+        ``open_dir_confined`` is the fix the repo already keeps for exactly this
+        (``tui/launch.py`` writes its control-window record the same way): it walks
+        each component below the run dir ``O_NOFOLLOW`` and hands back a descriptor
+        for the directory it actually reached, and :func:`atomic_write_text_at`
+        never names a path again.  A path check would be answered *about a path*
+        and stale the moment it returned — the session can re-plant the link
+        between check and write — so this closes the window rather than narrowing
+        it.  The ``mkdir`` above may still be fooled; that is harmless, because the
+        confinement walk that follows is not, and refusal is what the fooled case
+        produces.
+
+        win32 has no ``*at()`` family to anchor against, so it keeps a
+        check-then-write with the residual that implies: the planting session runs
+        as the same uid as this writer, and the names here are engine-minted, so
+        the exposure is a redirected diagnostic rather than a foothold.
+
+        Raises ``OSError`` — including when confinement cannot be established, so
+        an unconfined ``verify/`` REFUSES rather than writing through the link.
+        The caller degrades (this is observation), it does not swallow it here:
+        the record still lands, with a null pointer and ``capture_error``.
         """
-        target = self.run_dir / VERIFY_DIR / name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_text(target, content, follow_symlinks=False)
-        return target.relative_to(self.run_dir).as_posix()
+        verify_dir = self.run_dir / VERIFY_DIR
+        verify_dir.mkdir(parents=True, exist_ok=True)
+        if DIR_FD_ANCHORED_WRITES:
+            dir_fd = open_dir_confined(self.run_dir, verify_dir)
+            if dir_fd is None:
+                raise OSError(
+                    f"refusing to write into an unconfined verify directory: {verify_dir}"
+                )
+            try:
+                atomic_write_text_at(dir_fd, name, content)
+            finally:
+                os.close(dir_fd)
+        else:
+            if verify_dir.is_symlink():
+                raise OSError(f"refusing to write into a symlinked verify directory: {verify_dir}")
+            atomic_write_text(verify_dir / name, content, follow_symlinks=False)
+        return (verify_dir / name).relative_to(self.run_dir).as_posix()
 
     def entries(self) -> list[dict[str, Any]]:
         if not self.path.is_file():
