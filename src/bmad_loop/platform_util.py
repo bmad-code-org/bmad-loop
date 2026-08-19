@@ -25,6 +25,7 @@ import os
 import random
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -587,6 +588,50 @@ def _atomic_write(
 # presence answers for all of them: it is defined on Linux/macOS and absent on
 # Windows, whose pyconfig has neither HAVE_RENAMEAT nor HAVE_OPENAT.
 DIR_FD_ANCHORED_WRITES = hasattr(os, "O_DIRECTORY")
+
+
+# Windows reparse tags that make a directory entry REDIRECT somewhere else,
+# compared against os.lstat().st_reparse_tag (Windows, 3.8+). Deliberately not
+# os.path.isjunction(), which is 3.12+ while this package's floor is 3.11.
+# Deliberately not "any reparse tag" either: cloud placeholders (OneDrive) and
+# dedup stubs are reparse points too, and refusing those would stall a
+# legitimate run. Empty on POSIX.
+_LINK_REPARSE_TAGS = tuple(
+    tag
+    for tag in (
+        getattr(stat, "IO_REPARSE_TAG_SYMLINK", None),
+        getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", None),
+    )
+    if tag is not None
+)
+
+
+def is_link_like(path: Path) -> bool:
+    """True when ``path`` redirects elsewhere: a POSIX symlink, or a Windows
+    symlink OR DIRECTORY JUNCTION.
+
+    ``Path.is_symlink()`` is False for a junction — junctions are a distinct
+    reparse kind, which is why ``os.path.isjunction()`` exists at all. On Windows
+    the junction is the arm that matters: ``mklink /J`` needs no elevation, while
+    a directory symlink needs SeCreateSymbolicLinkPrivilege or Developer Mode, so
+    the UNPRIVILEGED redirect is exactly the one an ``is_symlink()`` check misses.
+
+    This is the win32 half of :func:`open_dir_confined`, which anchors the POSIX
+    side at a descriptor instead. A path check is inherently check-then-write —
+    answered about a name, and stale the moment it returns — so it narrows the
+    window rather than closing it. That residual is the platform's, not this
+    function's: win32 has no ``*at()`` family to anchor against.
+
+    ``events.py`` and the standalone hook relay keep their own copies of this
+    predicate on purpose: they run under the HOST's interpreter, not this
+    package's, so they cannot import it from here.
+    """
+    if path.is_symlink():
+        return True
+    try:
+        return getattr(os.lstat(path), "st_reparse_tag", 0) in _LINK_REPARSE_TAGS
+    except OSError:
+        return False
 
 
 def open_dir_confined(root: Path, target: Path) -> int | None:

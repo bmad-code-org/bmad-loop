@@ -6,6 +6,7 @@ save_state still rides it end to end."""
 from __future__ import annotations
 
 import os
+import stat
 
 import pytest
 
@@ -86,14 +87,14 @@ def test_write_verify_stream_refuses_a_symlinked_verify_directory_on_the_win32_p
     """win32 has no *at() family, so it keeps a check-then-write — which must
     still refuse the planted link rather than fall through to the write.
 
-    Ablation: delete the `verify_dir.is_symlink()` guard and this fails
+    Ablation: delete the `is_link_like(verify_dir)` guard and this fails
     `DID NOT RAISE`, with the file landing in `elsewhere/` exactly as the
     unguarded POSIX path did.
     """
     monkeypatch.setattr(journal_mod, "DIR_FD_ANCHORED_WRITES", False)
     journal, elsewhere = _planted_verify_symlink(tmp_path)
 
-    with pytest.raises(OSError, match=r"symlinked verify directory"):
+    with pytest.raises(OSError, match=r"redirected verify directory"):
         journal.write_verify_stream("v.stdout.log", "verifier output")
 
     assert list(elsewhere.iterdir()) == []
@@ -114,3 +115,46 @@ def test_write_verify_stream_writes_an_ordinary_verify_directory(tmp_path):
 
     assert pointer == "verify/v.stdout.log"
     assert (run_dir / pointer).read_text(encoding="utf-8") == "verifier output"
+
+
+class _ReparseStat:
+    """os.lstat() of a Windows junction: a DIRECTORY mode — which is why
+    Path.is_symlink() answers False — carrying a reparse tag."""
+
+    st_mode = stat.S_IFDIR | 0o755
+    st_reparse_tag = 0xA0000003  # IO_REPARSE_TAG_MOUNT_POINT
+
+
+def test_write_verify_stream_refuses_a_junctioned_verify_directory(tmp_path, monkeypatch):
+    """The win32 fallback must refuse a DIRECTORY JUNCTION, not just a symlink.
+
+    `mklink /J` needs no elevation, while a directory symlink needs
+    SeCreateSymbolicLinkPrivilege or Developer Mode — so on Windows the junction
+    is the unprivileged half of the same escape, and `Path.is_symlink()` reports
+    False for it. A guard written as `is_symlink()` would leave that half open
+    with no race to win. Windows-only in reality; the logic is driven here so it
+    does not ship unexercised.
+
+    Ablation: point the guard back at `verify_dir.is_symlink()` and this fails
+    `DID NOT RAISE` — verified.
+    """
+    monkeypatch.setattr(journal_mod, "DIR_FD_ANCHORED_WRITES", False)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    verify_dir = run_dir / "verify"
+    verify_dir.mkdir()  # a real directory: is_symlink() is False, as for a junction
+
+    # Patch the TAG TUPLE in platform_util, not `is_link_like` itself: journal.py
+    # bound the function by value at import, so replacing the name there would not
+    # reach this call — but the predicate reads `_LINK_REPARSE_TAGS` from its own
+    # module globals on every call, so this does.
+    real_lstat = os.lstat
+    monkeypatch.setattr(platform_util, "_LINK_REPARSE_TAGS", (_ReparseStat.st_reparse_tag,))
+    monkeypatch.setattr(
+        os,
+        "lstat",
+        lambda p, *a, **k: _ReparseStat() if str(p) == str(verify_dir) else real_lstat(p),
+    )
+
+    with pytest.raises(OSError, match=r"redirected verify directory"):
+        Journal(run_dir).write_verify_stream("v.stdout.log", "verifier output")

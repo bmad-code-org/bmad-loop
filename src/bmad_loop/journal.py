@@ -14,6 +14,7 @@ from .platform_util import (
     atomic_replace,
     atomic_write_text,
     atomic_write_text_at,
+    is_link_like,
     open_dir_confined,
 )
 
@@ -115,9 +116,16 @@ class Journal:
         produces.
 
         win32 has no ``*at()`` family to anchor against, so it keeps a
-        check-then-write with the residual that implies: the planting session runs
-        as the same uid as this writer, and the names here are engine-minted, so
-        the exposure is a redirected diagnostic rather than a foothold.
+        check-then-write, and the check is :func:`is_link_like` rather than
+        ``is_symlink()`` — on Windows the redirect that matters is a DIRECTORY
+        JUNCTION, which ``is_symlink()`` reports False for and which ``mklink /J``
+        creates with no elevation at all, while a directory symlink needs
+        SeCreateSymbolicLinkPrivilege or Developer Mode.  Checking only for
+        symlinks there would leave the unprivileged half of the same escape open,
+        and with no race to win.  The residual is the platform's: a path check is
+        stale the moment it returns, but the planting session runs as the same uid
+        as this writer and the names here are engine-minted, so the exposure is a
+        redirected diagnostic rather than a foothold.
 
         Raises ``OSError`` — including when confinement cannot be established, so
         an unconfined ``verify/`` REFUSES rather than writing through the link.
@@ -137,8 +145,8 @@ class Journal:
             finally:
                 os.close(dir_fd)
         else:
-            if verify_dir.is_symlink():
-                raise OSError(f"refusing to write into a symlinked verify directory: {verify_dir}")
+            if is_link_like(verify_dir):
+                raise OSError(f"refusing to write into a redirected verify directory: {verify_dir}")
             atomic_write_text(verify_dir / name, content, follow_symlinks=False)
         return (verify_dir / name).relative_to(self.run_dir).as_posix()
 

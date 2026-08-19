@@ -1524,3 +1524,41 @@ def test_the_lexical_fallback_keeps_every_bridge_spelling_matchable(spelling):
     pure = PureWindowsPath(spelling)
     assert pure.is_absolute(), "absolute() would prepend a POSIX cwd and destroy the prefix"
     assert platform_util.is_wsl_unc_path(pure) is True
+
+
+class _ReparseStat:
+    """Stand-in for the os.lstat() result of a Windows junction: a DIRECTORY
+    mode (which is why Path.is_symlink() answers False) carrying a reparse tag."""
+
+    st_mode = stat.S_IFDIR | 0o755
+    st_reparse_tag = 0xA0000003  # IO_REPARSE_TAG_MOUNT_POINT
+
+
+def test_is_link_like_refuses_a_reparse_tagged_dir(tmp_path, monkeypatch):
+    """A Windows directory junction redirects but is NOT a symlink.
+
+    `Path.is_symlink()` is False for a junction while `mkdir`/`os.open` follow
+    it, and `mklink /J` needs no elevation at all — unlike a directory symlink,
+    which needs SeCreateSymbolicLinkPrivilege or Developer Mode. So the junction
+    is the CHEAPER attack and the one an is_symlink() check misses. The refusal
+    keys on the reparse tag instead.
+
+    That branch is reachable only on Windows; drive its logic here so it does not
+    ship unexercised (the `stat.IO_REPARSE_TAG_*` constants do not exist on
+    POSIX, hence the substituted tuple).
+
+    Ablation guard: dropping the `st_reparse_tag` arm of `is_link_like` makes the
+    last assertion fail — verified.
+    """
+    plain = tmp_path / "verify"
+    plain.mkdir()
+    assert platform_util.is_link_like(plain) is False  # positive control
+
+    real_lstat = os.lstat
+    monkeypatch.setattr(platform_util, "_LINK_REPARSE_TAGS", (_ReparseStat.st_reparse_tag,))
+    monkeypatch.setattr(
+        os,
+        "lstat",
+        lambda p, *a, **k: _ReparseStat() if str(p) == str(plain) else real_lstat(p),
+    )
+    assert platform_util.is_link_like(plain) is True
