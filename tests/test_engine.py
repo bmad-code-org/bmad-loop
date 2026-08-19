@@ -205,8 +205,7 @@ def test_fix_verification_emits_post_dev_verify_with_command_results(project, mo
     assert [ctx.command_results[0].stdout for ctx in capture.contexts] == ["first-out", "fixed-out"]
     entries = [e for e in engine.journal.entries() if e["kind"] == "verify-command-result"]
     assert [
-        (e["verification_stage"], e["verification_sequence"], e["command_index"])
-        for e in entries
+        (e["verification_stage"], e["verification_sequence"], e["command_index"]) for e in entries
     ] == [
         ("dev", 1, 0),
         ("fix", 2, 0),

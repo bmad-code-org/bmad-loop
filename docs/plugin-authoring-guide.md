@@ -386,11 +386,11 @@ there.
 
 ### Dev
 
-| Stage                              | When                        | Mutable surface                                                                      |
-| ---------------------------------- | --------------------------- | ------------------------------------------------------------------------------------ |
-| `pre_dev_phase` / `post_dev_phase` | around the dev attempt loop | veto (`pre_`); `post_dev_phase` is a [workflow injection point](#workflows-provides) |
-| `pre_dev_session`                  | before each dev session     | `proposed_prompt`, `proposed_env`, veto                                              |
-| `post_dev_verify`                  | after dev or repair verification | —                                                  |
+| Stage                              | When                             | Mutable surface                                                                      |
+| ---------------------------------- | -------------------------------- | ------------------------------------------------------------------------------------ |
+| `pre_dev_phase` / `post_dev_phase` | around the dev attempt loop      | veto (`pre_`); `post_dev_phase` is a [workflow injection point](#workflows-provides) |
+| `pre_dev_session`                  | before each dev session          | `proposed_prompt`, `proposed_env`, veto                                              |
+| `post_dev_verify`                  | after dev or repair verification | —                                                                                    |
 
 `post_dev_verify` exposes `ctx.command_results`: an immutable tuple of the
 per-command `CommandResult` records core just executed. Each has `command`,

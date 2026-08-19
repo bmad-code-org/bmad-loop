@@ -2293,7 +2293,9 @@ def run_verify_commands(policy: Policy, cwd: Path) -> list[CommandResult]:
                 timeout=COMMAND_TIMEOUT_S,
             )
             output = (proc.stdout + proc.stderr)[-2000:]
-            results.append(CommandResult(command, proc.returncode, output, proc.stdout, proc.stderr))
+            results.append(
+                CommandResult(command, proc.returncode, output, proc.stdout, proc.stderr)
+            )
         except subprocess.TimeoutExpired as exc:
             results.append(
                 CommandResult(
