@@ -33,16 +33,52 @@ jobs:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
 
-      - name: Install tmux (for generic_tmux integration tests)
+      - name: Ensure tmux (for generic_tmux integration tests)
+        # Bounded above the fallback's worst case (~260s) so the loop always
+        # reaches the final `tmux -V` instead of being cancelled mid-attempt.
+        timeout-minutes: 6
         run: |
-          # `apt-get update` can exit non-zero when an unrelated third-party
-          # repo baked into the runner image (e.g. dl.google.com/chrome) serves
-          # a stale index (Hash Sum mismatch). That must not fail our build —
-          # the Ubuntu archive lists still refresh, so tmux installs cleanly.
-          # `tmux -V` then asserts tmux is actually present, so a genuine
-          # install failure still fails the job loudly.
-          sudo apt-get update -o Acquire::Retries=3 || true
-          sudo apt-get install -y tmux
+          # The ubuntu-24.04 runner image already ships tmux. Measured on this
+          # workflow's own run: "tmux is already the newest version
+          # (3.4-1ubuntu0.1) ... 0 upgraded, 0 newly installed". The apt work this
+          # step used to do unconditionally therefore installed nothing, while
+          # taking the full risk of the network to do it:
+          #
+          #   `apt-get update` produced no output for 14 minutes on `test (py3.11)`
+          #   (run 32230727567) until the 15-minute job cap killed the job, with
+          #   `Install the project` and `Run tests` never reached — so the code
+          #   under review never ran and the red was uninformative. It wedged that
+          #   way four times. `|| true` cannot catch it: a command that never exits
+          #   has no exit status to discard. apt's own Acquire timeouts did not
+          #   fire during the stall either.
+          #
+          # So ask first, and touch the network only if the answer is no. What
+          # follows is a fallback for an image that stops shipping tmux, not the
+          # normal path: every call is bounded by `timeout` (the bound that
+          # actually holds here) and retried once. `tmux -V` remains the
+          # assertion, so a genuine failure fails the job loudly rather than
+          # silently skipping the tmux integration tests.
+          if tmux -V; then
+            exit 0
+          fi
+          echo "::warning::tmux absent from the runner image; falling back to apt"
+          for attempt in 1 2; do
+            if [ "$attempt" -gt 1 ]; then
+              sleep 5
+              # The one breakage `timeout` can itself cause is a kill during
+              # unpack, which would fail every later attempt with "dpkg was
+              # interrupted". Bounded too — it is recovery, not a reason to hang.
+              sudo timeout -k 5 20 dpkg --configure -a || true
+            fi
+            sudo timeout -k 5 45 apt-get update \
+              -o Acquire::Retries=3 \
+              -o Acquire::http::Timeout=20 \
+              -o Acquire::https::Timeout=20 || true
+            if sudo timeout -k 5 60 apt-get install -y tmux; then
+              break
+            fi
+            echo "::warning::tmux install attempt ${attempt} failed"
+          done
           tmux -V
 
       - name: Install the project
