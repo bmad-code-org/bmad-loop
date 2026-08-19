@@ -39,8 +39,10 @@ The guiding assumption: the dump will be posted publicly.
 from __future__ import annotations
 
 import json
+import os
 import platform
 import re
+import stat
 import sys
 from collections import Counter
 from dataclasses import dataclass, field
@@ -373,6 +375,38 @@ def _category_roots(category: str, run_dir: Path, events_dir: Path | None) -> li
     return [events_dir, legacy]
 
 
+def _count_lines(path: Path) -> int:
+    """Lines in a regular file, or 0 — never blocking on a FIFO a session planted.
+
+    ``O_NONBLOCK`` plus an ``S_ISREG`` check **on the descriptor**, the idiom
+    ``runs.read_trusted_config_digest`` and ``tui.launch._read_ctl_window``
+    already carry for the same hazard: the run directory is exported to the
+    driven session as ``BMAD_LOOP_RUN_DIR``, so an lstat taken before the open is
+    a check-then-open race, and ``fstat`` describes the object actually opened.
+    Opening a FIFO read-only without ``O_NONBLOCK`` blocks until a writer
+    arrives — indefinitely, for a diagnostic dump nobody is feeding, and
+    ``diagnose`` is a foreground command a human is waiting on. ``O_NOFOLLOW``
+    keeps the final component from redirecting the read out of the run, which is
+    the one hop :func:`platform_util.walk_files_unlinked` cannot refuse for it.
+    The POSIX-only flags degrade to 0 on win32, where the fd check carries alone.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_BINARY", 0)  # win32: no CRLF translation on the raw fd
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return 0
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return 0
+        with os.fdopen(fd, "rb", closefd=False) as f:
+            return sum(1 for _ in f)
+    except OSError:
+        return 0
+    finally:
+        os.close(fd)
+
+
 def summarize_files(run_dir: Path, *, events_dir: Path | None = None) -> list[FileGroup]:
     """Counts/sizes only — file contents are NEVER opened into the output.
 
@@ -392,17 +426,23 @@ def summarize_files(run_dir: Path, *, events_dir: Path | None = None) -> list[Fi
             # planted redirect at a category root reads as a directory and rglob
             # then counts the target's tree as this run's retained output.
             for p in walk_files_unlinked(root):
-                count += 1
+                # The regular-file filter `rglob` + `is_file()` used to carry, and
+                # which came off with the switch: `os.walk` reports every
+                # non-directory entry, so `files` holds FIFOs, device nodes and
+                # symlinks too. None of those is retained output of this run, and
+                # the `logs` arm below OPENS what it counts. lstat, not
+                # `is_file()` — that FOLLOWS, so it answers about the target of a
+                # planted link rather than about the entry in this run's tree.
                 try:
-                    total_bytes += p.stat().st_size
+                    info = p.lstat()
                 except OSError:
-                    pass
+                    continue
+                if not stat.S_ISREG(info.st_mode):
+                    continue
+                count += 1
+                total_bytes += info.st_size
                 if category == "logs":
-                    try:
-                        with p.open("rb") as f:
-                            total_lines += sum(1 for _ in f)
-                    except OSError:
-                        pass
+                    total_lines += _count_lines(p)
         if count:
             groups.append(
                 FileGroup(

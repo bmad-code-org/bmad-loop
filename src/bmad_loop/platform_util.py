@@ -635,7 +635,15 @@ def is_link_like(path: Path) -> bool:
 
 
 def walk_files_unlinked(top: Path) -> Iterator[Path]:
-    """Every regular file under ``top``, never crossing a redirect out of it.
+    """Every non-directory entry under ``top``, never crossing a redirect out of it.
+
+    **Non-directory, not regular file** — ``os.walk`` puts FIFOs, device nodes and
+    symlinks in ``files`` alongside ordinary ones, and this yields what it is
+    handed. A caller that only counts or ``lstat``s is fine; a caller that OPENS
+    what it yields owes its own regular-file check, because opening a planted
+    FIFO blocks forever. Swapping ``rglob`` for this helper silently drops the
+    ``is_file()`` guard the old loop carried — that regression shipped once
+    (``diagnostics.summarize_files``, whose ``logs`` arm reads to count lines).
 
     Two holes, closed together because a caller that measures or counts a tree
     gets both wrong in the same way:

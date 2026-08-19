@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import re
 import sys
 import types
@@ -1124,3 +1125,133 @@ def test_a_redirected_verify_root_is_not_counted_as_this_runs_output(project, tm
 
     assert group is None  # nothing of ours is in there, so there is nothing to report
     assert (outside / "a.bin").is_file()  # and the dump did not touch what it found
+
+
+# ---------------------------------------------------- planted non-regular files
+#
+# `summarize_files` walks with `walk_files_unlinked`, and `os.walk` reports every
+# NON-DIRECTORY entry — FIFOs and symlinks included. The `is_file()` guard the old
+# `rglob` loop carried came off with that switch, and the `logs` arm OPENS what it
+# counts. Four ablation axes, and each reddens exactly one test below — the
+# loop's `S_ISREG` inventory filter, and `_count_lines`' `O_NONBLOCK`,
+# `O_NOFOLLOW`, and `S_ISREG`-on-the-fd. Disjoint failures are what shows the
+# four guards are not standing in for each other.
+
+_FIFO = pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX FIFOs")
+
+
+@_FIFO
+def test_count_lines_refuses_an_idle_fifo_instead_of_blocking(tmp_path):
+    """A FIFO nobody is feeding: opening it read-only without ``O_NONBLOCK``
+    blocks until a writer arrives, which for a run directory the session owns
+    means `diagnose` never returns and the operator's terminal is wedged.
+
+    Bounded with ``SIGALRM`` rather than a subprocess, following
+    `test_runs.py`'s twin: a hang is the failure under test, so the test needs a
+    deadline of its own or an ablation wedges the suite instead of reddening it.
+
+    ABLATION: drop ``O_NONBLOCK`` from the flags and the alarm fires. Dropping the
+    fd ``S_ISREG`` check instead does NOT show up here — with no writer the read
+    hits EOF and answers 0 either way, which is exactly why the fed twin below
+    exists. Verified."""
+    import signal
+
+    path = tmp_path / "session.log"
+    os.mkfifo(path)
+
+    def _blew_up(signum, frame):
+        raise AssertionError("the line count blocked on the FIFO instead of refusing it")
+
+    previous = signal.signal(signal.SIGALRM, _blew_up)
+    signal.alarm(20)
+    try:
+        assert diagnostics._count_lines(path) == 0
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+@_FIFO
+def test_count_lines_refuses_a_fed_fifo_without_consuming_it(tmp_path):
+    """The half the alarm above cannot see. There the FIFO is idle, so the harm is
+    a hang and the bytes read are merely empty; here a writer holds it open and is
+    feeding it, so a reader that gets past the open never blocks — it counts
+    whatever the session piped in as this run's log lines, and drains the pipe on
+    the way through. Neither shows up as a hang, so the alarm above would never
+    notice.
+
+    ``O_RDWR`` for the holder deliberately — a write-only open on a FIFO blocks
+    until a reader arrives and would wedge the test itself, and ``O_RDWR`` never
+    blocks.
+
+    ABLATION: delete the ``S_ISREG(os.fstat(fd))`` check and this answers **3** —
+    the piped lines, billed to this run. The byte assert grades the second harm on
+    the same axis: the read consumed them, so the holder's own read no longer
+    finds what it wrote. Verified."""
+    path = tmp_path / "session.log"
+    os.mkfifo(path)
+
+    holder = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+    try:
+        os.write(holder, b"one\ntwo\nthree\n")
+        assert diagnostics._count_lines(path) == 0
+        assert os.read(holder, 64) == b"one\ntwo\nthree\n"  # untouched
+    finally:
+        os.close(holder)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink + O_NOFOLLOW")
+def test_count_lines_refuses_a_symlink_instead_of_reading_its_target(tmp_path):
+    """``O_NOFOLLOW``: the walk refuses to descend THROUGH a redirect, but the
+    final component it hands back is still a name, and the inventory filter that
+    normally screens a symlinked entry out is a check-then-open race on a
+    directory the session can write. The read anchors on the flag instead.
+
+    ABLATION: drop ``O_NOFOLLOW`` and this returns 2 — the target's lines,
+    attributed to this run. Verified."""
+    outside = tmp_path / "elsewhere.txt"
+    outside.write_bytes(b"theirs\nnot ours\n")
+    link = tmp_path / "session.log"
+    link.symlink_to(outside)
+
+    assert diagnostics._count_lines(link) == 0
+
+
+@_FIFO
+def test_a_planted_fifo_is_not_counted_as_this_runs_log_output(project, tmp_path):
+    """The inventory half, at the level a maintainer reads: a FIFO and a symlink
+    planted in the run's own `logs/` are not this run's retained output, and
+    counting either bills the report for bytes nobody wrote.
+
+    Alarmed like the unit twin because an ablation that reaches the open would
+    hang `collect` rather than fail it.
+
+    ABLATION: delete the two ``S_ISREG`` inventory lines in `summarize_files` and
+    the group reports 3 files and the symlink target's 3000 bytes instead of the
+    one real log. Verified."""
+    import signal
+
+    run_dir = _seed_bare_run(project.project)
+    logs = run_dir / "logs"
+    logs.mkdir(parents=True)
+    (logs / "dev.log").write_bytes(b"one\ntwo\n")
+    os.mkfifo(logs / "piped.log")
+    outside = tmp_path / "theirs.log"
+    outside.write_bytes(b"t" * 3000)
+    (logs / "linked.log").symlink_to(outside)
+
+    def _blew_up(signum, frame):
+        raise AssertionError("collect blocked on the planted FIFO")
+
+    previous = signal.signal(signal.SIGALRM, _blew_up)
+    signal.alarm(30)
+    try:
+        diag = diagnostics.collect(
+            [run_dir], pseudo=sanitize.Pseudonymizer(), project=Path(project.project)
+        )
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+    group = next(g for g in diag.runs[0].files if g.category == "logs")
+    assert (group.count, group.total_bytes, group.total_lines) == (1, 8, 2)
