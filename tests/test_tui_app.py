@@ -150,6 +150,35 @@ async def until(pilot, condition, timeout: float = 10.0) -> None:
         waited += 0.05
 
 
+async def settle(pilot, timeout: float = 10.0) -> None:
+    """Pump the message queue until the screen's layout stops moving.
+
+    It is the message pump, not a sleep, that does the work: a pending stylesheet
+    reapply, a deferred scroll, a resize of a widget the scroll just exposed —
+    each is a message, and each `pause` drains a round. Requiring the regions to
+    repeat lets a slow runner take as many frames as it needs, and a screen that
+    never settles raises rather than proceeding.
+
+    `ready()` calls this once the modal is mounted (#281). Call it again after
+    anything that moves the layout, before reading a region or a click
+    coordinate: a widget's `region` is served from the compositor map while
+    that map is valid, and a scroll does not invalidate it — so the region
+    holds the old geometry until the screen's next relayout runs (#360)."""
+
+    def _layout():
+        return tuple(w.region for w in pilot.app.screen.query("*"))
+
+    previous, stable, waited = None, 0, 0.0
+    while stable < 3:
+        if waited >= timeout:
+            raise AssertionError("screen layout never settled")
+        await pilot.pause(0.05)
+        waited += 0.05
+        current = _layout()
+        stable = stable + 1 if current == previous else 0
+        previous = current
+
+
 async def ready(pilot, selector: str, timeout: float = 10.0):
     """Wait until a modal widget is mounted *and* laid out on-screen, then return it.
 
@@ -168,13 +197,11 @@ async def ready(pilot, selector: str, timeout: float = 10.0):
     (x=5/23/41, each 16 wide, so the last ends at column 57 — off a 45-column
     screen) and the `-narrow` metrics (14/10/7) on the next.
 
-    So this also pumps the queue until the screen's layout stops moving. It is
-    the message pump, not a sleep, that does the work: the pending reapply is a
-    message, and each `pause` drains it. Requiring the regions to repeat lets a
-    slow runner take as many frames as it needs. Everything downstream — a
-    reachability assert, a `scroll_visible` target, a click coordinate — is then
-    computed against the settled layout rather than a doomed intermediate one.
-    Under load this is worth 2-3 failures per 25 runs on the tests it covers."""
+    So this also `settle`s the screen before returning, so that everything
+    downstream — a reachability assert, a `scroll_visible` target, a click
+    coordinate — is computed against the settled layout rather than a doomed
+    intermediate one. Under load that is worth 2-3 failures per 25 runs on the
+    tests it covers."""
 
     def _hit():
         hits = pilot.app.screen.query(selector)
@@ -182,19 +209,7 @@ async def ready(pilot, selector: str, timeout: float = 10.0):
         return node if node is not None and node.region.area > 0 else None
 
     await until(pilot, lambda: _hit() is not None, timeout)
-
-    def _layout():
-        return tuple(w.region for w in pilot.app.screen.query("*"))
-
-    previous, stable, waited = None, 0, 0.0
-    while stable < 3:
-        if waited >= timeout:
-            raise AssertionError("screen layout never settled")
-        await pilot.pause(0.05)
-        waited += 0.05
-        current = _layout()
-        stable = stable + 1 if current == previous else 0
-        previous = current
+    await settle(pilot, timeout)
     return _hit()
 
 
@@ -1024,6 +1039,15 @@ async def test_poll_skips_while_another_holds_the_lock(project):
     # Regression: exclusive=True cannot stop a running thread worker, so the
     # screen lock must make a second poll bail instead of mutating shared ctx
     # (two threads feeding ctx.log's pyte stream crashed the TUI).
+    #
+    # Ablation target: delete the `if not self._poll_lock.acquire(blocking=False):
+    # return` guard from `_poll` *and* neutralize its paired
+    # `finally: self._poll_lock.release()` to `pass` — one guard, both halves,
+    # not two gates. Dropping only the acquire makes every other tick release a
+    # lock it never took, reddening the whole file on `RuntimeError: release
+    # unlocked lock` instead. With both gone this test fails alone on
+    # `assert ctx.entries == before` — the probe thread runs the body and
+    # appends the checkpoint entry.
     root = project.project
     run_dir = make_run(root, "20260611-100000-aaaa", alive=True)
     write_numbered_log(run_dir, "story-1", count=30)
@@ -1044,9 +1068,26 @@ async def test_poll_skips_while_another_holds_the_lock(project):
         # while waiting on call_from_thread(_apply).
         await until(pilot, lambda: screen._poll_lock.acquire(blocking=False))
         try:
+            gen = screen._generation
             before = list(ctx.entries)
             journal.append("checkpoint", log_task="story-1", log_pos=0)  # new entry on disk
-            worker = screen._poll(ctx, screen._generation, False, None)
+            # Run the undecorated body as our own thread worker, in a group of
+            # our own. Calling the @work-decorated _poll enters group "poll" on
+            # this same node, and the next 1s interval tick's poll cancels that
+            # group on arrival (add_worker -> cancel_group), marking this worker
+            # CANCELLED — so worker.wait() raced the tick and raised
+            # WorkerCancelled on slow Windows runners (#581). A private group is
+            # never a cancel_group candidate, so this awaits to completion;
+            # thread=True keeps it a real second thread entering the guarded body
+            # while the lock is held, which is the point of the test.
+            # exit_on_error=False surfaces a body exception as WorkerFailed at
+            # the await instead of tearing the app down mid-test.
+            worker = screen.run_worker(
+                lambda: DashboardScreen._poll.__wrapped__(screen, ctx, gen, False, None),
+                thread=True,
+                group="poll-probe-581",
+                exit_on_error=False,
+            )
             await worker.wait()
             assert ctx.entries == before  # guarded body never ran
         finally:
@@ -1347,7 +1388,24 @@ async def test_decision_modal_scrolls_when_content_long(project):
         # screen, then click it — the whole point of the scroll fix.
         opt8 = app.screen.query_one("#opt-8", Button)
         opt8.scroll_visible(animate=False)
-        await pilot.pause()
+        # `scroll_visible` only queues the scroll. It runs straight through to
+        # the container's `Widget.scroll_to`, which defers the offset write via
+        # `call_after_refresh`: an InvokeLater the pump forwards to the screen,
+        # where it lands on `Screen._callbacks`. Draining that queue always
+        # costs a later pump hop. The screen's idle handler drains it, but only
+        # once the screen is clean — a dirty one resumes the update timer and
+        # returns — and `_on_timer_update` only `call_next`s the drain rather
+        # than running it. So `pilot.pause()` does not synchronize on the
+        # write: its barrier covers messages queued at call time, and the
+        # `_on_timer_update` it ends with relayouts whatever scroll state
+        # exists right then. Lose that hop and `scroll_y` is still 0,
+        # so the relayout reflows the old offset and `region` keeps its
+        # pre-scroll geometry, putting the option below the fold (#360). Gate
+        # on the write landing — `body.scroll_y` is the one observable here not
+        # read through the compositor map — then let the relayout it triggers
+        # settle before reading a region.
+        await until(pilot, lambda: body.scroll_y > 0)
+        await settle(pilot)
         assert _on_screen(app, opt8)
         await pilot.click("#opt-8")
         await until(pilot, lambda: bool(chosen))
