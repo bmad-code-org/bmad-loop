@@ -1176,44 +1176,48 @@ def test_kill_window_unroutable_target_skips_cleanup_but_kills(monkeypatch):
 @pytest.mark.parametrize(
     "value",
     [
-        "a;b",  # server splits top-level `;` — remainder would EXECUTE
-        "-flag",  # dropped as a flag server-side (or flips to unset via `u`)
-        "it's",  # bare `'` opens a quote in the server tokenizer
-        'x"y',  # bare `"` toggles quoting
-        "bad\nline",  # control line is `\n`-terminated — command injection
+        'x"y',  # `"`: _scoped_options strips ONE surrounding pair, so it corrupts the read
+        'x " y',  # same, spaced
+        "bad\nline",  # the listing is parsed line-by-line — a break splits the value
+        "bad\rline",  # splitlines() cuts on `\r` too, not just `\n`
         "",  # empty write is a silent server-side no-op; unset exists for this
-        "\\\\srv\\share My Proj",  # spaced → client double-quotes → `\\` collapses
-        "C:\\dir with space\\",  # spaced + trailing `\` → `\"` eats the close
-        'x " y',  # spaced + `"`: after a `\` the client's `\"` closes the wrapper
-        "a ; b",  # standalone `;` token splits even inside the client's quotes
-        "a \\; b",  # standalone `\;` token splits the same way
+        "-flag",  # dropped as a flag server-side, or flips to unset (psmux/psmux#583)
         " C:\\p x",  # leading space survives the wire but this backend's reads strip
         "C:\\p x ",  # trailing space, same round-trip loss
-        "C:\\Users\\O'Brien\\dev",  # SPACELESS `'` — unquoted, so the server tokenizer
-        # opens a quote on it. The spaced sibling below is accepted; the docs call
-        # out the inversion because an apostrophe in a Windows home is common.
     ],
 )
 def test_set_window_option_refuses_untransportable_values(monkeypatch, capsys, value):
-    # The CLI→server hop is lossy for these shapes (verified against psmux's
-    # client re-quoting, chain splitter and server tokenizer at v3.3.7; the
-    # `;`-token corruption reproduced on a live 3.3.7: `a ; b` stores as `a`).
-    # A corrupted stored tag never equals project_tag again — the window turns
-    # silently unprunable — so refuse loudly instead of storing garbage. The
-    # refusal also frees any prior value: a refused REwrite must read as unset,
-    # not replay the stale value (e.g. an old parked return target).
+    # What survives the wire on 3.3.8 is not the whole story: the READ half is
+    # ours, and a `"`, a line break or edge whitespace still cannot come back
+    # verbatim. A corrupted stored tag never equals project_tag again — the
+    # window turns silently unprunable — so refuse loudly instead of storing
+    # garbage. The refusal also frees any prior value: a refused REwrite must
+    # read as unset, not replay the stale value (e.g. an old parked return
+    # target).
     rec_ = _option_fake(monkeypatch)
     PsmuxMultiplexer().set_window_option("ctl:@3", "@bmad_project", value)
     assert [c[0][1:4] for c in rec_.calls] == [["set-option", "-u", "-t"]]
     assert "transport" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("value", ["a; b", "C:\\Users\\O'Brien Files\\proj"])
-def test_set_window_option_accepts_quote_safe_spaced_values(monkeypatch, value):
-    # Inside the client's double quotes `'` is literal and a mid-token `;`
-    # survives the whitespace-token chain splitter (live-verified: `a; b`
-    # round-trips on 3.3.7) — so these MUST pass. A blanket `;`/`'` ban would
-    # silently untag every project path with an apostrophe.
+@pytest.mark.parametrize(
+    "value",
+    [
+        "a; b",
+        "C:\\Users\\O'Brien Files\\proj",
+        "C:\\Users\\O'Brien\\dev",  # spaceless `'` — no longer a quote opener
+        "a;b",  # unspaced `;` (psmux/psmux#499)
+        "a ; b",  # standalone `;` token — the chain splitter is quote-aware now
+        "a \\; b",  # and its `\;` sibling
+        "\\\\srv\\share My Proj",  # spaced UNC — `\\` no longer collapses (#547)
+        "C:\\dir with space\\",  # trailing `\` no longer eats the closing quote
+        "x\u00a0y",  # non-ASCII whitespace no longer splits server-side (#536)
+    ],
+)
+def test_set_window_option_accepts_wire_safe_values(monkeypatch, value):
+    # Every ordinary Windows path shape 3.3.8 carries verbatim MUST pass: a
+    # gate still refusing them would silently untag apostrophed, UNC, spaced
+    # and trailing-separator project directories.
     rec_ = _option_fake(monkeypatch)
     PsmuxMultiplexer().set_window_option("ctl:@3", "@bmad_project", value)
     assert rec_.argv[-1] == value
@@ -1231,21 +1235,14 @@ def test_set_window_option_write_failure_warns(monkeypatch, capsys):
 @pytest.mark.parametrize(
     "value",
     [
-        "C:\\a ; b\\proj",  # live-probed: stores as `C:\a`, remainder EXECUTES
-        "C:\\projects\\my proj\\",  # live-probed: trailing `\` eats the closing quote
-        "\\\\srv\\share name\\proj",  # live-probed: spaced → `\\` collapses to `\`
-        "C:\\Users\\O'Brien\\proj",  # live-probed UNSPACED `'`: read back as `OBrien`
-        'C:\\a"b\\proj',  # live-probed unspaced `"`: read back as `ab`
-        "-flag",  # dropped as a flag server-side
-        "bad\nline",  # the control line is `\n`-terminated
+        'C:\\a"b\\proj',  # `"` cannot survive the listing's one-quote-pair strip
+        "bad\nline",  # the listing is parsed line-by-line
         "",  # an empty write is a silent server-side no-op
+        "-flag",  # dropped as a flag server-side (psmux/psmux#583)
     ],
 )
 def test_set_session_option_refuses_untransportable_values(monkeypatch, capsys, value):
-    # Same lossy CLI→server hop as the window channel, previously ungated on the
-    # session tag. The first three round-trips were measured on a live psmux
-    # 3.3.7 (sent → read back: `C:\a ; b\proj` → `C:\a`, `C:\projects\my proj\`
-    # → `C:\projects\my proj"`, `\\srv\share name\proj` → `\srv\share name\proj`).
+    # Same gate as the window channel, on a write that was ungated before #320.
     # Refusing leaves the option unset, which the prune's run-dir fallback
     # handles correctly — a corrupted tag would strand the session forever.
     # The refusal FREES the key instead of just returning: the server loads the
@@ -1261,15 +1258,19 @@ def test_set_session_option_refuses_untransportable_values(monkeypatch, capsys, 
 @pytest.mark.parametrize(
     "value",
     [
-        "C:\\my proj\\app",  # spaced but quote-safe
+        "C:\\my proj\\app",  # spaced
         "C:\\app",  # unspaced
-        "\\\\srv\\share\\app",  # unspaced UNC rides verbatim (no client quoting)
-        "C:\\Users\\O'Brien Files\\proj",  # spaced `'` is literal inside the quotes
+        "\\\\srv\\share\\app",  # unspaced UNC
+        "C:\\Users\\O'Brien Files\\proj",  # spaced `'`
+        "C:\\a ; b\\proj",  # `;` tokens no longer split the value (psmux/psmux#499)
+        "C:\\projects\\my proj\\",  # trailing `\` no longer eats the closing quote
+        "\\\\srv\\share name\\proj",  # spaced UNC — `\\` no longer collapses (#547)
+        "C:\\Users\\O'Brien\\proj",  # unspaced `'` no longer opens a quote
     ],
 )
 def test_set_session_option_accepts_transportable_values(monkeypatch, value):
-    # All four were confirmed to round-trip unchanged on live psmux 3.3.7; a
-    # gate that refused them would untag ordinary Windows project paths.
+    # All eight round-trip unchanged on psmux 3.3.8; a gate that refused them
+    # would untag ordinary Windows project paths.
     rec_ = _option_fake(monkeypatch)
     PsmuxMultiplexer().set_session_option("bmad-loop-x", "@bmad_project", value)
     assert rec_.argv[1:] == ["set-option", "-t", "bmad-loop-x", "@bmad_project", value]
@@ -1289,7 +1290,7 @@ def test_set_session_option_refusal_free_failure_warns_not_raises(monkeypatch, c
     # multiplexer must not abort session creation over a tag that is only an
     # optimization — but it must not pass silently either.
     _option_fake(monkeypatch, rc=1)
-    PsmuxMultiplexer().set_session_option("bmad-loop-x", "@bmad_project", "C:\\a ; b")
+    PsmuxMultiplexer().set_session_option("bmad-loop-x", "@bmad_project", 'C:\\a"b')
     err = capsys.readouterr().err
     assert "transport" in err and "failed" in err
 
@@ -1377,10 +1378,14 @@ def test_tmux_backend_forwards_option_columns_to_format(monkeypatch):
     assert rows == [("@1", "shell", "proj")]
 
 
-@pytest.mark.parametrize("value", ["nb\u00a0sp", "tab\there", "with space\u00a0nb"])
-def test_set_window_option_refuses_non_ascii_whitespace(monkeypatch, capsys, value):
-    # The client quotes only on ASCII space while the server tokenizer splits
-    # on Unicode whitespace — an NBSP/tab in an unquoted value splits the token.
+@pytest.mark.parametrize(
+    "value",
+    ["\u00a0lead", "trail\u00a0", "\tlead", "trail\t", " lead", "trail "],
+)
+def test_set_window_option_refuses_edge_whitespace_of_any_kind(monkeypatch, capsys, value):
+    # Not a wire property: this backend's own reads `.strip()`/`.Trim()`, and
+    # both strip Unicode whitespace, so an edge NBSP or tab reads back short
+    # exactly as an edge ASCII space does. Interior whitespace is fine.
     rec_ = _option_fake(monkeypatch)
     PsmuxMultiplexer().set_window_option("ctl:@3", "@bmad_project", value)
     assert [c[0][1:4] for c in rec_.calls] == [["set-option", "-u", "-t"]]
@@ -1460,12 +1465,24 @@ def test_sweep_transport_exception_never_fails_the_mint(monkeypatch, tmp_path, c
 
 @pytest.mark.parametrize(
     "value",
-    ["a; b", "C:\\Users\\O'Brien Files\\proj", "two  spaces", "C:/p", "\\\\srv\\share"],
+    [
+        "a; b",
+        "C:\\Users\\O'Brien Files\\proj",
+        "two  spaces",
+        "C:/p",
+        "\\\\srv\\share",
+        "a ; b",
+        "C:\\dir with space\\",
+        "\\\\srv\\share My Proj",
+        "x\u00a0y",
+    ],
 )
 def test_accepted_values_round_trip_through_the_listing_parse(monkeypatch, value):
     # The write gate and the read parser are two halves of one invariant:
     # every accepted value must read back IDENTICAL from the `@key "value"`
     # listing shape psmux emits — else the prune's equality compare breaks.
+    # This is the bound on how far the gate may be narrowed: the wire getting
+    # cleaner buys nothing for a shape this parse cannot carry.
     assert PsmuxMultiplexer._transportable(value)
     _option_fake(monkeypatch, value=f'@bmad_project__blw@3 "{value}"\n')
     options = PsmuxMultiplexer()._scoped_options("ctl")

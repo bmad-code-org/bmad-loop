@@ -360,7 +360,12 @@ def test_premise_client_verbs_exit_zero_with_no_client_to_move(probe):
     )
 
 
-def test_premise_option_values_corrupted_by_the_control_line(probe):
+def test_premise_option_values_survive_the_control_line(probe):
+    # The surviving half of the transportable premise: _transportable's refusals
+    # are now bounded by this backend's OWN read parse, not the wire, so only
+    # the permitted shapes are still a premise about psmux. A red here means a
+    # shape the gate admits has started corrupting — silently unprunable
+    # windows — which is the direction that must never pass unnoticed.
     mux, session, _ = probe
 
     def roundtrip(value: str) -> tuple[bool, str]:
@@ -377,21 +382,16 @@ def test_premise_option_values_corrupted_by_the_control_line(probe):
         ), f"probe setup: unset after {value!r} failed: {unset.stderr.strip()!r}"
         return True, got.stdout.strip()
 
-    # The banned canaries may be corrupted or refused by the raw CLI.
-    corrupted = {
-        "a ; b": "the one-shot chain splitter is now quote-aware (psmux/psmux#499)",
-        "-lead": "a dash-leading value now survives the server tokenizer",
-        "a'b": "a bare apostrophe is no longer read as a quote opener",
-        "x\u00a0y": "non-ASCII whitespace no longer splits the value server-side",
-    }
-    for value, why in corrupted.items():
-        accepted, got = roundtrip(value)
-        assert not accepted or got != value, (
-            f"{why} — the matching branch of _transportable in psmux_backend now "
-            "refuses a value the wire carries intact"
-        )
     # The permitted shapes: a refusal here would silently make windows unprunable.
-    for value in ("\\\\srv\\share", "C:/Program Files/x"):
+    for value in (
+        "\\\\srv\\share",
+        "C:/Program Files/x",
+        "a ; b",
+        "a'b",
+        "x\u00a0y",
+        "\\\\srv\\share My Proj",
+        "C:\\dir with space\\",
+    ):
         accepted, got = roundtrip(value)
         assert accepted and got == value, (
             f"psmux no longer carries {value!r} verbatim — _transportable permits a "

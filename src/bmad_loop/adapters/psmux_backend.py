@@ -463,53 +463,39 @@ class PsmuxMultiplexer(BaseTmuxBackend):
 
     @staticmethod
     def _transportable(value: str) -> bool:
-        # The value crosses psmux's CLI→server control line: the client wraps a
-        # spaced value in double quotes escaping only `"`, and the server
-        # tokenizer treats a bare `'` as a quote opener, drops `-`-leading
-        # tokens, and collapses `\\` inside double quotes. A value that cannot
-        # survive that hop verbatim is refused loudly instead of stored
-        # corrupted — a tag that reads back different from what the prune
-        # compares against makes the window silently unprunable.
+        # A value that cannot make the round trip verbatim is refused loudly
+        # instead of stored corrupted — a tag that reads back different from
+        # what the prune compares against makes the window silently unprunable.
         #
-        # The two branches deliberately ban DIFFERENT shapes. Inside the
-        # client's double quotes `'` is literal and a mid-token `;` survives,
-        # so a spaced `O'Brien Files` or `a; b` path passes. But the one-shot
-        # chain splitter (config.rs `split_chained_commands`) is NOT
-        # quote-aware: it cuts on whitespace-delimited `;`/`\;` TOKENS, so
-        # `a ; b` stores as `a` and hands the rest to the server as a command
-        # (live-verified on 3.3.7; psmux/psmux#499). `\\` collapses and a `"` can close the
-        # wrapper early (client-escaped `\"` after a backslash reads back as
-        # `\\` + closing quote). So the spaced branch refuses `"`, `\\`, a
-        # trailing `\`, and standalone `;`/`\;` tokens. Outside double quotes
-        # the tokenizer's escape branch never fires (commands.rs:690 requires
-        # in_double_quotes) — an unquoted backslash is pushed literally, psmux
-        # being Windows-native — so the unspaced branch does not ban `\\` and a
-        # spaceless UNC path (`\\srv\share`) rides verbatim.
-        # Non-ASCII-space whitespace (NBSP, tab, …) is refused outright: the
-        # client quotes only on ASCII `' '` (main.rs `s.contains(' ')`) while
-        # the server tokenizer splits on Unicode `is_whitespace()` — an NBSP in
-        # an unquoted value splits the token server-side. Leading/trailing
-        # ASCII space is refused too: it survives the wire, but this backend's
-        # own reads strip/Trim, so the value could never read back equal.
-        if not value or value.startswith("-") or any(c.isspace() and c != " " for c in value):
+        # 3.3.8 carries the WIRE half whole: the client's quoting, the one-shot
+        # chain splitter and the server tokenizer no longer eat `\\`, a trailing
+        # `\`, `;`/`\;` tokens, a bare `'` or non-ASCII whitespace
+        # (psmux/psmux#547, #499, #536), so ordinary Windows paths — spaced,
+        # UNC, apostrophed, trailing-separator — all pass now.
+        #
+        # What still fails is the READ half, which is ours, not psmux's:
+        # `_scoped_options` iterates `splitlines()` and strips ONE surrounding
+        # `"` pair, and both reads `.strip()`/`.Trim()`. So a `"`, any line
+        # break, and leading/trailing whitespace stay refused however cleanly
+        # the wire now carries them — a value that reads back different is the
+        # same silently-unprunable window whichever hop mangled it. An empty
+        # value is a silent server-side no-op (`-u` is the verb for that), and a
+        # `-`-leading one is still dropped as a flag server-side, or flips the
+        # key to unset at rc 0 (psmux/psmux#583, open upstream).
+        if not value or value.startswith("-"):
             return False
-        if value != value.strip():
+        if '"' in value or value != value.strip():
             return False
-        if " " in value:  # will be double-quoted by the psmux client
-            if '"' in value or "\\\\" in value or value.endswith("\\"):
-                return False
-            return all(tok not in (";", "\\;") for tok in value.split())
-        return not any(c in value for c in ";'\"")
+        return value.splitlines() == [value]
 
     def set_session_option(self, name: str, option: str, value: str) -> None:
         # Session scope itself needs no substitute channel: psmux serves one
         # session per server, so that server's single option map IS the
         # session's map — the same model that makes per-window options unusable
-        # makes session options correct by construction (probed on 3.3.7: two
-        # sessions on two servers read back their own values). What it does
-        # share with the window channel is the lossy CLI->server control line,
-        # and this write was ungated (#320): a spaced value silently loses
-        # `\\`, a trailing `\`, and standalone `;` tokens at rc 0. A corrupted
+        # makes session options correct by construction (probed: two sessions
+        # on two servers read back their own values). What it does share with
+        # the window channel is a value that must survive the write AND this
+        # backend's own read, and this write was ungated (#320). A corrupted
         # tag is non-empty and never equals the caller's tag again, so the
         # prune skips that session forever.
         #
