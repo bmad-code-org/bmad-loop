@@ -471,6 +471,15 @@ def test_pipe_pane_swallows_failure_with_warning(monkeypatch, capsys, tmp_path):
     assert "pipe-pane log capture failed" in capsys.readouterr().err
 
 
+def test_pipe_pane_warns_without_spawning_on_an_unencodable_log_path(rec, capsys, tmp_path):
+    # A lone surrogate (surrogateescape filesystem decoding) fails the UTF-16LE
+    # encode inside _shell_wrap BEFORE _tmux ever runs — warn-never-raise must
+    # hold there too, not only for the TmuxError arm.
+    assert PsmuxMultiplexer().pipe_pane("@1", tmp_path / "x\ud800.log") is None
+    assert rec.calls == []
+    assert "pipe-pane log capture failed" in capsys.readouterr().err
+
+
 # ------------------------------------------------------------------ selection
 
 
@@ -1021,6 +1030,24 @@ def test_kill_window_failed_kill_retains_the_keys(monkeypatch):
     assert not [c for c in recorder.calls if c[0][1] in ("set-option", "show-options")]
 
 
+def test_kill_window_failure_warning_reads_the_qualified_listing(monkeypatch, capsys):
+    # The base's survivor probe checks membership against list_window_ids,
+    # which this backend qualifies (`ctl:@3`, not the base's bare `@3`); the
+    # probe must recognize the surviving window through that shape or a failed
+    # psmux kill would never warn.
+    def fake(argv, **kwargs):
+        if argv[1] == "kill-window":
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="boom\n")
+        out = "@1\n@3\n" if argv[1] == "list-windows" else ""
+        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    PsmuxMultiplexer().kill_window("ctl:@3")
+    err = capsys.readouterr().err
+    assert "kill-window ctl:@3 exited 1" in err
+    assert "still alive" in err
+
+
 def test_kill_window_unverifiable_liveness_retains_the_keys(monkeypatch):
     # An empty liveness listing is a failed probe, not proof of death (the ctl
     # session always keeps its shell window) — retaining beats freeing a live
@@ -1484,11 +1511,13 @@ def test_sweep_transport_exception_never_fails_the_mint(monkeypatch, tmp_path, c
     "value",
     [
         "a; b",
+        "a;b",
         "C:\\Users\\O'Brien Files\\proj",
         "two  spaces",
         "C:/p",
         "\\\\srv\\share",
         "a ; b",
+        "a \\; b",
         "C:\\dir with space\\",
         "\\\\srv\\share My Proj",
         "x\u00a0y",

@@ -17,6 +17,11 @@ probes — session/window mint, focus setup, reads whose value is not itself the
 premise — carry a ``probe setup: `` prefix instead, so an instrument failure is
 never read as a premise flip.
 
+The `test_adopted_*` probes are the ordinary-direction complement: each
+exercises a behavior the 3.3.8 floor let the backend assume (several through
+the backend verb itself, deliberately), so a red probe there means psmux
+regressed, not that a workaround became droppable.
+
 Windows-local by construction (psmux registers for win32 only); skipped
 everywhere else, and when psmux is absent or an unsupported version.
 """
@@ -313,13 +318,13 @@ def test_premise_client_verbs_exit_zero_with_no_client_to_move(probe):
     mux, session, windows = probe
     # The premise is "no client to move", and an inherited $TMUX says otherwise:
     # when pytest itself runs inside psmux there IS a client — the developer's.
-    # At 3.3.7 the verb is inert, so nothing moves and the probe reads the same
-    # either way (target routing is port-file based, and rc is dispatch-only 0);
-    # on the effect-reporting build this probe exists to catch, the switch would
-    # drag that client into the throwaway session and stay green through the very
-    # premise flip. A local scrub, not _new_session_env: this call needs neither
-    # the CLAUDE_CODE strip nor PSMUX_ALLOW_NESTING. PSMUX_DATA_DIR is kept, so
-    # the raw verbs still address the registry the probe session lives in.
+    # On the supported build the `-t` target routes server-side (psmux/psmux#483),
+    # so an inherited client would be dragged into the throwaway session and the
+    # probe would stay green through the very premise flip — the scrub is what
+    # keeps "no client to move" true. A local scrub, not _new_session_env: this
+    # call needs neither the CLAUDE_CODE strip nor PSMUX_ALLOW_NESTING.
+    # PSMUX_DATA_DIR is kept, so the raw verbs still address the registry the
+    # probe session lives in.
     clientless = {
         key: value for key, value in os.environ.items() if key not in ("TMUX", "TMUX_PANE")
     }
@@ -451,9 +456,10 @@ def test_adopted_select_window_focuses_a_qualified_window_id(probe):
 
 def test_adopted_kill_session_honors_the_exact_match_target(probe):
     mux, session, _ = probe
-    # The base's inherited argv, once the psmux override is gone. A red here
-    # means every session this seam creates outlives its own teardown.
-    mux._run(["kill-session", "-t", f"={session}"], check=False)
+    # The inherited base verb end-to-end — its `=name` argv included — once the
+    # psmux override is gone. A red here means every session this seam creates
+    # outlives its own teardown.
+    mux.kill_session(session)
     assert not _plain_has_session(mux, session), (
         "psmux no longer honors the `=name` form for kill-session (psmux/psmux#558) "
         "— the plain-name override dropped on the 3.3.8 floor is needed again"
@@ -463,14 +469,14 @@ def test_adopted_kill_session_honors_the_exact_match_target(probe):
 def test_adopted_unresolvable_kill_target_exits_nonzero_and_spares_live_windows(probe):
     mux, session, _ = probe
     # Both halves matter and neither implies the other: the non-zero exit is what
-    # kill_window's warning reads, and sparing the live windows is what makes the
-    # old destructive workaround unnecessary (psmux/psmux#545).
+    # triggers kill_window's survivor probe, and sparing the live windows is what
+    # makes the old destructive workaround unnecessary (psmux/psmux#545).
     before = set(mux.list_window_ids(session))
     assert len(before) >= 2, f"probe setup: probe session should hold the parked windows: {before}"
     proc = mux._run(["kill-window", "-t", f"{session}:@9999"], check=False)
     assert proc.returncode != 0, (
-        "psmux is back to exiting 0 for an unresolvable kill-window target — the "
-        "warning in tmux_base.kill_window now reads a code that means nothing"
+        "psmux is back to exiting 0 for an unresolvable kill-window target — "
+        "kill_window's survivor probe never triggers and a real failure stays silent"
     )
     after = set(mux.list_window_ids(session))
     assert after == before, (
