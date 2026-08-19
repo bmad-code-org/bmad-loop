@@ -178,6 +178,30 @@ def test_post_dev_verify_exposes_journaled_command_results(project, monkeypatch)
     assert not list((engine.run_dir / LOGS_DIR).glob("verify-*"))
 
 
+def test_verify_stream_filenames_sanitize_the_whole_composition(project):
+    """A long story key cannot push a composed filename past the segment cap.
+
+    ``_session_task_id`` states the rule these filenames follow verbatim:
+    sanitize the whole composition, not the parts. Capping ``story_key`` alone
+    spends the entire budget on it and then appends the stage/attempt/sequence/
+    index tail unchecked, so the segment overshoots by the length of that tail.
+    """
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-" + "k" * platform_util.MAX_SEGMENT, epic=1)
+
+    engine._journal_verify_command_results(
+        task, "dev", (verify.CommandResult("pytest -q", 0, "tail", "out", "err"),)
+    )
+
+    (entry,) = [e for e in engine.journal.entries() if e["kind"] == "verify-command-result"]
+    for pointer, suffix in ((entry["stdout_path"], "stdout"), (entry["stderr_path"], "stderr")):
+        stem = pointer.rsplit("/", 1)[-1].removesuffix(f".{suffix}.log")
+        assert len(stem) <= platform_util.MAX_SEGMENT
+        assert (engine.run_dir / pointer).is_file()
+    # the untruncated key still reaches the reader — through the record, not the name
+    assert entry["story_key"] == task.story_key
+
+
 def test_fix_verification_emits_post_dev_verify_with_command_results(project, monkeypatch):
     """The repair leg emits the same existing hook after it re-runs verification."""
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})

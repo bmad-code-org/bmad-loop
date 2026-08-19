@@ -3799,7 +3799,10 @@ class Engine:
         ``attempt`` and ``verification_stage`` make the public journal records
         correlate to a concrete dev or repair verification pass.  The filenames
         contain only engine-derived ordinal values; command text never becomes a
-        filesystem path.
+        filesystem path.  Sanitize the whole composition, not the parts, for the
+        reason :func:`_session_task_id` gives: two individually capped parts can
+        still compose past a filename segment limit, and ``safe_segment``'s digest
+        suffix differs between the two orders.
         """
         prior_sequences = [
             int(entry["verification_sequence"])
@@ -3810,8 +3813,8 @@ class Engine:
         ]
         verification_sequence = max(prior_sequences, default=0) + 1
         for command_index, result in enumerate(results):
-            stem = (
-                f"verify-{safe_segment(task.story_key)}-"
+            stem = safe_segment(
+                f"verify-{task.story_key}-"
                 f"{verification_stage}-{task.attempt}-{verification_sequence}-{command_index}"
             )
             stdout_path = self.journal.write_verify_stream(f"{stem}.stdout.log", result.stdout)
