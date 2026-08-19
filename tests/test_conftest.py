@@ -79,11 +79,18 @@ def test_template_leaves_no_detached_git_maintenance_writing_into_the_copies(pro
     subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
 
     trace = tmp_path / "trace2.json"
+    # `GIT_CONFIG_COUNT=0` drops any inherited command-scope `GIT_CONFIG_KEY_n`
+    # pair, which outranks `.git/config` exactly as `git -c` does. Measured: an
+    # ambient `maintenance.auto=true` re-arms the spawn straight through the
+    # fixture's own `false` and reddens this row, and an ambient `false` would
+    # hold it green with the fixture line ablated — the vacuity this row exists
+    # to refuse. Scoped to this one probe, not to the suite-wide env fixtures,
+    # which shadow only the variables they must on purpose.
     subprocess.run(
         ["git", "-C", str(repo), "commit", "-q", "-m", "second"],
         check=True,
         capture_output=True,
-        env={**os.environ, "GIT_TRACE2_EVENT": str(trace)},
+        env={**os.environ, "GIT_TRACE2_EVENT": str(trace), "GIT_CONFIG_COUNT": "0"},
     )
 
     events = []
