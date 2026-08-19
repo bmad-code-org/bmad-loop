@@ -369,5 +369,3 @@ def test_premise_option_values_survive_the_control_line(probe):
             f"psmux no longer carries {value!r} verbatim — _transportable permits a "
             "shape that now corrupts, so a tag reads back different from the prune's"
         )
-
-

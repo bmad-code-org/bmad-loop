@@ -4,13 +4,12 @@ psmux (a Rust/ConPTY tmux re-implementation) speaks the tmux CLI through its
 own distinctly-named ``psmux`` binary, so this leaf points the base's spawn
 seam at that name, keeps every argv construction in :mod:`.tmux_base`, and
 swaps only the shell dialect (PowerShell instead of POSIX sh) via the base's
-hooks, plus the handful of behaviors where psmux diverges from tmux:
-window-level ``-e`` is accepted but silently dropped, an attaching
-``new-session`` is refused by a nesting guard when run from inside a psmux
-pane, and a quoted
-command string does not survive psmux's outer re-parse (so shell source
-travels as ``pwsh -EncodedCommand`` — the log sink included, since the
-base's ``cat >>`` assumes a POSIX host shell). Window ids are minted per server (one
+hooks, plus the handful of behaviors where psmux diverges from tmux: an
+attaching ``new-session`` is refused by a nesting guard when run from
+inside a psmux pane, and a quoted command string does not survive psmux's
+outer re-parse (so shell source travels as ``pwsh -EncodedCommand`` — the
+log sink included, since the base's ``cat >>`` assumes a POSIX host
+shell). Window ids are minted per server (one
 server per session), so every id this backend hands back —
 ``new_window``, ``list_window_ids``, ``new_parked_window``, the
 ``window_id`` columns of ``list_windows``, and ``current_window_id`` — is
@@ -23,16 +22,16 @@ the window-option verbs, the ``@``-prefixed columns of ``list_windows``
 and the parked trailer route through a substitute channel — see the
 ``per-window option channel (#310)`` block below for the model and its
 rules. Session-scoped options need no such substitute — one server per
-session means that server's single map is the session's — but they cross
-the same lossy control line, so ``set_session_option`` gates its value on
-the same transportability rule (#320). ``detach-client`` and
-``switch-client`` report dispatch rather than effect — every arm exits 0
-whether or not a client moved — so both seam booleans are measured against
-the session's attached-client count instead of read off the exit code; see
-the ``client verbs: observed effect (#317)`` block. ``available()``
-additionally gates on the reported version: psmux releases up to 3.3.6 kill
-recycled PIDs during pane/session teardown without a process-identity check,
-which can take down an unrelated long-lived process mid-run. ``has_session``
+session means that server's single map is the session's — but a value
+still has to read back verbatim through the same listing parse, so
+``set_session_option`` gates it on the same transportability rule (#320).
+``detach-client`` and ``switch-client`` report dispatch, not effect: a
+nonzero exit is a real failure, but a zero one says only that the verb was
+sent, so both seam booleans are measured against the session's
+attached-client count instead of read off the exit code; see the ``client
+verbs: observed effect (#317)`` block. ``available()``
+additionally gates on the reported version — see ``_LAST_UNSUPPORTED``
+for what the floor buys and why it moves. ``has_session``
 is inherited unchanged, but one server per session gives it a residual the
 tmux path does not have: a ``-t`` read naming a session whose own server is
 gone can be answered by a different server, so a wrong ``True`` is reachable
@@ -42,7 +41,8 @@ rather than inventing one — and the collision it needs is an independently
 created session sharing a ``bmad-loop-<run-id>`` name: an operator's, or
 another run's on a colliding id (see #531). The psmux
 behaviors cited in this module were read from the psmux source at tag
-``v3.3.7``; the safe observable subset is probed in ``tests/test_psmux_live.py``.
+``v3.3.8`` — the oldest build ``available()`` admits — and the safe
+observable subset is probed in ``tests/test_psmux_live.py``.
 See :mod:`.multiplexer` for the contract.
 """
 
@@ -153,10 +153,11 @@ class PsmuxMultiplexer(BaseTmuxBackend):
             f"if ($wid) {{ $key = {_pwsh_quote(return_opt + self._SCOPE_MARKER[:-1])} + $wid; "
             f"$ret = {read_key}; "
             f"if ($ret -eq '{PARKED_RETURN_DETACH}') {{ {mux} detach-client 2>$null }} "
-            # The switch leg is still inert at 3.3.7 (psmux/psmux#483: the
-            # server splits the target without parse_target); only the detach
-            # return actually moves a client today. Kept: it is the correct
-            # verb the moment upstream lands the fix.
+            # The switch leg's target routes on the supported build — the
+            # server parses it rather than splitting it raw (psmux/psmux#483) —
+            # so this is no longer the dead branch it was; whether a real client
+            # actually lands there is an attended-console question, not one any
+            # unattended gate here can answer.
             f"elseif ($ret) {{ {mux} switch-client -t $ret 2>$null; "
             f"if ($LASTEXITCODE -ne 0) {{ {mux} switch-client -l 2>$null }} }} "
             # Free the key on the way out: the ctl session outlives every run,
@@ -165,9 +166,13 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         )
 
     def _window_launch(self, env: dict[str, str], command: str) -> list[str]:
-        # psmux accepts `new-window -e` but silently drops it, so the env rides
-        # an in-source prelude instead. `command` arrives POSIX-quoted (callers
-        # shlex-quote each arg), so split it here and re-quote for pwsh.
+        # 3.3.8 delivers `new-window -e`, but the env keeps riding an in-source
+        # prelude: this leaf's command already travels as `-EncodedCommand`
+        # source that must run the CLAUDE_* scrub (_source_prefix) in-pane
+        # anyway, so the prelude is the transport already present — `-e` flags
+        # would be a second one whose values the scrub then has to be ordered
+        # against. `command` arrives POSIX-quoted (callers shlex-quote each
+        # arg), so split it here and re-quote for pwsh.
         for key in env:
             if not _ENV_NAME.fullmatch(key):
                 raise TmuxError(f"invalid environment variable name: {key!r}")
@@ -564,7 +569,7 @@ class PsmuxMultiplexer(BaseTmuxBackend):
             return
         session, digits = scope
         # `-u` genuinely frees the key: the server's SetOptionUnset handler
-        # removes `@`-prefixed names from the map (verified at v3.3.7).
+        # removes `@`-prefixed names from the map (verified at v3.3.8).
         key = self._scoped_option_key(option, digits)
         self._write_scoped(["set-option", "-u", "-t", session, key], key)
 
@@ -591,11 +596,12 @@ class PsmuxMultiplexer(BaseTmuxBackend):
     def _scoped_options(self, session: str) -> dict[str, str] | None:
         """All `@`-prefixed options on ``session`` as ``{key: value}``, or None
         on any failure (distinct from {} — an empty map is a real answer).
-        Live-verified on 3.3.7: `show-options -q -t <session>` lists user
-        options as `@key "value"` lines; accepted channel values can contain
-        neither `"` nor newlines (see _transportable), so the quote strip is
-        lossless for every value this backend wrote. Known hole: one server
-        request handler (the plugin-drain copy, server/mod.rs:465 at v3.3.7)
+        Live-verified on 3.3.8: `show-options -q -t <session>` lists user
+        options as `@key "value"` lines. This parse is what bounds
+        _transportable: it strips ONE surrounding `"` pair and iterates
+        `splitlines()`, so a `"` or a line break is refused at the WRITE and the
+        strip stays lossless for every value this backend stored. Known hole:
+        one server request handler (the plugin-drain copy, server/mod.rs:465)
         answers this listing empty-with-success while keys exist, so a
         surprising {} is possible and is not proof that no keys are set."""
         try:
@@ -674,9 +680,8 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         # Kill first, clean only once the window is verifiably gone: the ctl
         # session outlives every run, so a leaked key lives as long as the
         # server — but a kill that FAILS must leave the live window its keys
-        # (the project tag scopes the prune retry; the return key keeps the
-        # detach return armed — the switch leg is inert at 3.3.7 either way,
-        # see _parked_trailer). Scope resolves before the kill because a name
+        # (the project tag scopes the prune retry; the return key keeps both
+        # return legs armed, see _parked_trailer). Scope resolves before the kill because a name
         # token cannot be resolved once the window is dead. An empty liveness
         # listing is ambiguous — a failed probe, or a session that died with
         # its last window — so it degrades toward retaining the keys; the
@@ -768,17 +773,17 @@ class PsmuxMultiplexer(BaseTmuxBackend):
 
     # ------------------------------- client verbs: observed effect (#317)
     #
-    # psmux's client verbs report *dispatch*, not effect. At ``v3.3.7`` both CLI
-    # arms end in ``send_control(cmd)?; return Ok(())``, so the only nonzero exit
-    # is an unreachable session server: ``detach-client`` succeeds with zero
-    # clients attached (and a flag-less detach is promoted server-side to
-    # detach-all), and *no* form of ``switch-client`` — ``-t`` included —
-    # carries a server reply. Later builds narrow this but do not close it: a
-    # response path landed after the tag and only for ``-t``, leaving ``-l``
-    # exit-0 regardless. Taking those exit codes as the seam's booleans is the
-    # rc-0 no-op (#228) reached through Python instead of a shell fallback, and
-    # it is what ``tui.launch.return_attached_client`` would consume to decide a
-    # human has been handed their terminal back.
+    # psmux's client verbs report *dispatch*, not effect. The exit code is
+    # trustworthy in ONE direction only: a nonzero one is a real failure (an
+    # unreachable session server, a target that would not parse), but a zero one
+    # says the verb was sent, not that a client moved. ``detach-client`` exits 0
+    # with zero clients attached (and a flag-less detach is promoted server-side
+    # to detach-all); ``switch-client`` carries a server reply for ``-t`` on the
+    # supported build but still exits 0 with nothing to move, and ``-l``, which
+    # has no target form, carries none at all. Taking those exit codes as the
+    # seam's booleans is the rc-0 no-op (#228) reached through Python instead of
+    # a shell fallback, and it is what ``tui.launch.return_attached_client``
+    # would consume to decide a human has been handed their terminal back.
     #
     # So the exit code is discarded and the effect is measured: count the
     # clients attached to this session before and after the verb, and answer on
@@ -791,10 +796,10 @@ class PsmuxMultiplexer(BaseTmuxBackend):
     # Unobservable answers False, never a vacuous True. For the detach that is
     # safe in both directions — the caller's UNREACHABLE and RETURNED agree that
     # nobody is left at this terminal, and the only cost is the parked trailer
-    # re-issuing a detach that no-ops. For the switch it is also the truth
-    # today: the switch leg is inert at 3.3.7 (psmux/psmux#483), so no client
-    # ever moves. When upstream lands that fix the probe reports it without a
-    # code change here — which is why this measures rather than hardcoding.
+    # re-issuing a detach that no-ops. For the switch it is the conservative
+    # direction: the caller keeps prompting rather than reporting a terminal
+    # handed back that was not. Measuring rather than hardcoding is what lets a
+    # build that really does move the client report so with no change here.
     #
     # Residue: a switch whose target pane lives in THIS session moves the client
     # between windows without changing the session's attached count, so it reads

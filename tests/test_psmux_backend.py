@@ -78,7 +78,7 @@ def test_new_window_ships_env_and_command_as_encoded_pwsh(rec, tmp_path):
     )
 
     # the tmux-family scaffolding is the base's, spawned via the psmux binary,
-    # with no -e flags (psmux drops them)
+    # with no -e flags — the env rides the encoded source's prelude instead
     assert rec.argv[:12] == [
         "psmux",
         "new-window",

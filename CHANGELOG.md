@@ -38,6 +38,30 @@ breaking changes may land in a minor release.
 
 ### Changed
 
+- **The psmux backend now requires psmux 3.3.8 or newer, and drops the workarounds that floor
+  retires (#658, closes #222).** `available()` refuses 3.3.7 and below — 3.3.6 and older could
+  force-kill a recycled PID during teardown, and every verb below now assumes 3.3.8's fixes
+  rather than routing around the defects they close, so a 3.3.7 install would fail silently
+  instead. **On such a host the backend reports unavailable and selection falls through.** What
+  the floor buys: `select-window` takes the session-qualified window id directly (no index
+  resolve, one fewer listing round-trip per focus change), the run-log sink rides the same
+  `-EncodedCommand` transport as every other window command instead of a sidecar `.ps1` — so a
+  log path containing a space, `$` or a backtick is now carried verbatim rather than refused,
+  and nothing is written beside the log — and `kill_session` inherits the base's `=name`
+  exact-match target. The option-value gate is rebuilt on its real bound: 3.3.8 carries the wire
+  half whole, so ordinary Windows paths all pass now — spaced, UNC, apostrophed,
+  trailing-separator — and what stays refused is what the backend's own listing parse cannot
+  read back: a double quote, a line break, edge whitespace, and a `-`-leading value psmux still
+  treats as a flag.
+
+- **A failed `kill-window` is no longer swallowed silently (#658).** `BaseTmuxBackend.kill_window`
+  ran `check=False` and discarded the result, so a target that resolved to nothing — a wrong
+  session qualification, a renumbered id — left a live window behind with no trace anywhere.
+  A non-zero exit now warns on stderr with the target and the binary's own message. The verdict
+  is unchanged: the method still returns `None` and still never raises. Killing an already-gone
+  window exits non-zero too and warns the same way; the exit code cannot separate the two, so
+  the stderr rides along verbatim rather than buying a liveness round-trip per kill.
+
 - **`probe-adapter` now bounds how long a single scrubbed line can be (#481).** `scrub_text` capped
   how many lines it emitted but never how long one of them could be, so a single very long line —
   from a foreign CLI's `--version`/`--help`, or from a log tail — reached the `probe-adapter`

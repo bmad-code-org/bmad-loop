@@ -64,9 +64,11 @@ On a native-Windows host the bundled **psmux** backend is the platform default. 
 ConPTY tmux re-implementation that speaks the tmux CLI through its own `psmux` binary, so it
 reuses tmux's session/window model — the `bmad-loop-<run-id>` and `bmad-loop-ctl` session
 names carry over. It is selected automatically when available; `available()` requires the
-`psmux` and `pwsh` (PowerShell) binaries on `PATH` and a psmux **newer than 3.3.6** (older
-releases can force-kill a recycled PID during teardown, so they report unavailable and
-selection falls through). Native Windows is still experimental — see the
+`psmux` and `pwsh` (PowerShell) binaries on `PATH` and a psmux **3.3.8 or newer** (older
+releases report unavailable and selection falls through: 3.3.6 and below can force-kill a
+recycled PID during teardown, and the backend's verbs are written against fixes that landed
+in 3.3.8 rather than routing around the defects they close). Native Windows is still
+experimental — see the
 [roadmap](ROADMAP.md#native-windows-multiplexer-backend) for the remaining work. WSL is
 unaffected: it _is_ Linux and uses tmux — provided bmad-loop was installed with the
 distro's own Python. WSL appends the Windows `PATH` to its own, so a Windows-installed
@@ -87,13 +89,13 @@ upstream release. Practical consequence: such a value is **not** readable via
 `psmux show-options -w` by hand — read it with
 `psmux show-options -qv -t <session> "@bmad_project__blw@N"` instead. Session-scoped options need
 no such substitute — one server per session means that server's single map _is_ the session's —
-but they cross the same control line, so session-scoped `@` options are gated the same way. One
-visible limit: a value that cannot survive psmux's control-line transport verbatim is refused
-with a stderr warning and the option reads as unset. Which values those are is
-counter-intuitive, because the psmux client quotes a value only when it contains an ASCII space
-and `'` is literal inside those quotes: `C:\Users\O'Brien\dev` is **refused** while
-`C:\Users\O'Brien Files\dev` is accepted, and a spaced UNC path (`\\server\share\My Proj`) is
-refused while the spaceless `\\server\share\proj` is accepted. The project ownership tag no
+but the value has to read back verbatim either way, so session-scoped `@` options are gated the
+same way. One visible limit: a value that cannot make that round trip is refused with a stderr
+warning and the option reads as unset. Ordinary Windows paths pass — spaced, UNC, apostrophed,
+trailing-separator alike. What is refused is what the backend's own listing parse cannot carry
+back: a value containing a double quote or a line break, or one with leading/trailing
+whitespace (both reads strip it). A `-`-leading value is refused too, because psmux still
+treats it as a flag. The project ownership tag no
 longer meets this gate: it is stored as a hex digest of the project path, transportable by
 construction ([#419](https://github.com/bmad-code-org/bmad-loop/issues/419)), so sessions stay
 tagged whatever the path and the run-dir fallback remains only for genuinely untagged state.
