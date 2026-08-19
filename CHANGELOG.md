@@ -16,6 +16,12 @@ breaking changes may land in a minor release.
   under the run's `verify/` directory — its own store, kept out of the adapter-owned,
   TUI-consumed `logs/`; plugins remain unable to alter verification or commit
   decisions. Storage, upload, signing, and any policy response stay plugin-owned.
+  Retention is bounded by the new `[verify] stream_capture_kb` (default 256 KiB per
+  stream, `0` = capture nothing): the tail is kept, and the record carries the full
+  byte count plus a `*_truncated` flag so a cut file is never mistaken for a whole
+  one. Retaining a stream is observation, so a failed write (ENOSPC, a read-only run
+  dir) degrades — the record still lands, with a null pointer and `capture_error` —
+  instead of taking down a dev pass whose verify commands passed.
 
 - **A refused auto-sweep is now visible outside the journal (#501).** A run whose deferred-work
   sweep was refused ended looking exactly like one that swept, and under `[sweep] auto = "run-end"`

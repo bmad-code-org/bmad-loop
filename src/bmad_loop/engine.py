@@ -88,6 +88,35 @@ def _digest_of(text: str | None) -> str:
     return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
 
 
+def _bounded_stream_tail(text: str, max_bytes: int) -> tuple[str, int, int]:
+    """Cut a verifier stream down to what ``verify.stream_capture_kb`` retains.
+
+    Returns ``(tail, full_bytes, retained_bytes)``. Both counts measure the
+    DECODED STREAM encoded as UTF-8 — never the file the caller writes it to,
+    whose size differs on Windows because text mode translates ``\\n``. Keeping
+    the counts on one side of that boundary is what makes the journal record
+    unambiguous: ``full_bytes`` is what the command emitted, ``retained_bytes``
+    is how much of it survived the cap, and their inequality IS the truncation.
+
+    The TAIL is kept, the direction every other bound on this output takes
+    (``run_verify_commands``' merged ``[-2000:]``): a failing suite puts its
+    failure at the end.
+
+    A byte cut can land mid-character, so the leading partial is dropped rather
+    than decoded into a ``\\ufffd`` this function would be inventing — the stream
+    already carries whatever replacement chars its own decode produced, and
+    minting one here would put a corruption marker at a boundary WE chose.
+    ``max_bytes <= 0`` needs no branch of its own: the slice is empty by
+    construction, which is exactly "capture nothing".
+    """
+    encoded = text.encode("utf-8")
+    full_bytes = len(encoded)
+    if full_bytes <= max_bytes:
+        return text, full_bytes, full_bytes
+    tail = encoded[full_bytes - max_bytes :].decode("utf-8", errors="ignore")
+    return tail, full_bytes, len(tail.encode("utf-8"))
+
+
 class RunPaused(Exception):
     def __init__(self, reason: str, stage: str, story_key: str | None = None):
         super().__init__(reason)
@@ -3803,6 +3832,22 @@ class Engine:
         reason :func:`_session_task_id` gives: two individually capped parts can
         still compose past a filename segment limit, and ``safe_segment``'s digest
         suffix differs between the two orders.
+
+        Retention is bounded by ``verify.stream_capture_kb`` per stream, and the
+        record says so rather than leaving the reader to guess: ``*_bytes`` is
+        what the command emitted, ``*_captured_bytes`` how much of that reached
+        disk, ``*_truncated`` their inequality.  Both counts are UTF-8 lengths of
+        the decoded stream, NOT file sizes — see :func:`_bounded_stream_tail`.  A
+        zero cap writes no file at all and leaves the pointer null; the record
+        still lands, still carrying the full byte count, because "nothing was
+        retained" and "the command was silent" are different facts.
+
+        This is observation, so it degrades and never raises (AGENTS.md).  An
+        ``OSError`` from the write — ENOSPC, a read-only run dir, ENAMETOOLONG on
+        a path this composition did not shorten enough — is journalled as
+        ``capture_error`` beside a null pointer and the verification continues.
+        The alternative is a lost log killing a dev pass whose commands passed,
+        which trades a diagnostic for the run it was there to diagnose.
         """
         prior_sequences = [
             int(entry["verification_sequence"])
@@ -3812,13 +3857,29 @@ class Engine:
             and isinstance(entry.get("verification_sequence"), int)
         ]
         verification_sequence = max(prior_sequences, default=0) + 1
+        max_bytes = self.policy.verify.stream_capture_kb * 1024
         for command_index, result in enumerate(results):
             stem = safe_segment(
                 f"verify-{task.story_key}-"
                 f"{verification_stage}-{task.attempt}-{verification_sequence}-{command_index}"
             )
-            stdout_path = self.journal.write_verify_stream(f"{stem}.stdout.log", result.stdout)
-            stderr_path = self.journal.write_verify_stream(f"{stem}.stderr.log", result.stderr)
+            streams: dict[str, str | int | bool | None] = {}
+            capture_error: str | None = None
+            for kind, text in (("stdout", result.stdout), ("stderr", result.stderr)):
+                tail, full_bytes, captured_bytes = _bounded_stream_tail(text, max_bytes)
+                path: str | None = None
+                if max_bytes > 0:
+                    try:
+                        path = self.journal.write_verify_stream(f"{stem}.{kind}.log", tail)
+                    except OSError as exc:
+                        # Nothing published: atomic_write_text removes its temp and
+                        # leaves the target absent, so 0 retained is the literal truth.
+                        captured_bytes = 0
+                        capture_error = capture_error or f"{kind}: {exc}"
+                streams[f"{kind}_path"] = path
+                streams[f"{kind}_bytes"] = full_bytes
+                streams[f"{kind}_captured_bytes"] = captured_bytes
+                streams[f"{kind}_truncated"] = captured_bytes < full_bytes
             self.journal.append(
                 "verify-command-result",
                 story_key=task.story_key,
@@ -3829,10 +3890,8 @@ class Engine:
                 command=result.command,
                 returncode=result.returncode,
                 output_tail=result.output_tail,
-                stdout_path=stdout_path,
-                stdout_bytes=len(result.stdout.encode("utf-8")),
-                stderr_path=stderr_path,
-                stderr_bytes=len(result.stderr.encode("utf-8")),
+                capture_error=capture_error,
+                **streams,
             )
 
     def _resume_after_dev_verify(self, task: StoryTask) -> None:

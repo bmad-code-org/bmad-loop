@@ -402,7 +402,22 @@ verification-sequence correlation, `output_tail`, byte counts, and run-relative 
 `stderr_path` pointers under the run's `verify/` directory; full streams are not
 embedded in the journal. That store is deliberately separate from `logs/`, which
 holds coding-CLI pane captures named after session task ids and is read as such
-by the TUI. Treat verifier output as potentially sensitive and store, upload, sign,
+by the TUI.
+
+What lands on disk is bounded by `[verify] stream_capture_kb` (default 256 KiB per
+stream): the **tail** is retained, and the record stays explicit about the cut —
+`stdout_bytes` / `stderr_bytes` are what the command emitted, `stdout_captured_bytes` /
+`stderr_captured_bytes` how much of that reached disk, and `stdout_truncated` /
+`stderr_truncated` their inequality. Both counts are UTF-8 lengths of the decoded
+stream, **not** file sizes: the files are written in text mode, so Windows newline
+translation makes the file larger there. Set the knob to `0` to retain nothing at
+all — no files are written and the pointers are null, but the record still lands
+with the full byte counts, because "nothing was retained" and "the command was
+silent" are different facts. Retaining is observation and never fails a run: if the
+write raises (ENOSPC, a read-only run dir), the pointer is null and `capture_error`
+carries the reason. A plugin reading these pointers must therefore treat both
+`None` and a missing file as normal, and consult `*_truncated` before assuming a
+file holds a command's whole output. Treat verifier output as potentially sensitive and store, upload, sign,
 or act on it only from an explicitly configured plugin.
 
 ### Review

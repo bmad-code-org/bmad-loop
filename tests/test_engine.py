@@ -202,6 +202,166 @@ def test_verify_stream_filenames_sanitize_the_whole_composition(project):
     assert entry["story_key"] == task.story_key
 
 
+def _capture_engine(project, stream_capture_kb):
+    """An engine whose only interesting policy is the verifier stream cap."""
+    return make_engine(
+        project, [], policy=Policy(verify=VerifyPolicy(stream_capture_kb=stream_capture_kb))
+    )[0]
+
+
+def _sole_verify_record(engine):
+    (entry,) = [e for e in engine.journal.entries() if e["kind"] == "verify-command-result"]
+    return entry
+
+
+def test_verify_stream_capture_retains_a_bounded_tail(project):
+    """A chatty command is cut to `verify.stream_capture_kb`, and the record says so.
+
+    COMMAND_TIMEOUT_S is 30 minutes, so an uncapped retain is hundreds of MB per
+    attempt with no GC behind it. The cut keeps the TAIL — the direction every
+    other bound on this output takes, and where a failing suite puts its failure.
+
+    Ablation: have `_bounded_stream_tail` return `(text, full, full)`
+    unconditionally and the file grows back to the full stream, reddening both
+    the size and the truncation-flag assertions.
+    """
+    engine = _capture_engine(project, 1)  # 1 KiB per stream
+    stdout = "".join(f"chatty line {i}\n" for i in range(1000))
+    full = len(stdout.encode("utf-8"))
+    assert full > 1024, "fixture must exceed the cap or it proves nothing"
+
+    engine._journal_verify_command_results(
+        StoryTask(story_key="1-1-a", epic=1),
+        "dev",
+        (verify.CommandResult("pytest -q", 1, "tail", stdout, ""),),
+    )
+
+    entry = _sole_verify_record(engine)
+    retained = (engine.run_dir / entry["stdout_path"]).read_text(encoding="utf-8")
+    assert len(retained.encode("utf-8")) == 1024
+    assert retained == stdout[-len(retained) :]  # a tail, not a head
+    # The record stays honest about the cut: a silently short file reads as a
+    # complete one, so the FULL size and an explicit flag both travel with it.
+    assert entry["stdout_bytes"] == full
+    assert entry["stdout_captured_bytes"] == 1024
+    assert entry["stdout_truncated"] is True
+    # an under-cap stream is kept whole and flagged as such
+    assert entry["stderr_bytes"] == 0
+    assert entry["stderr_captured_bytes"] == 0
+    assert entry["stderr_truncated"] is False
+    assert entry["capture_error"] is None
+
+
+def test_verify_stream_capture_cut_lands_on_a_character_boundary(project):
+    """A byte cap cutting a multi-byte character drops the partial lead, it does
+    not decode it into a replacement char.
+
+    The stream already carries whatever U+FFFD its own `errors="replace"` decode
+    produced (#378); minting another one here would put a corruption marker at a
+    boundary WE chose, and a reader cannot tell the two apart.
+
+    Ablation: switch `_bounded_stream_tail`'s decode to `errors="replace"` and
+    the tail both breaks the cap it was just given (U+FFFD is 3 bytes standing in
+    for the 1 it replaced, so 1024 in yields 1026 out) and carries an invented
+    corruption marker. The bound assertion is the one that fires first.
+    """
+    engine = _capture_engine(project, 1)
+    stdout = "\u20ac" * 1000  # 3 bytes apiece
+    full = len(stdout.encode("utf-8"))
+    assert (full - 1024) % 3 != 0, "fixture must cut mid-character or it proves nothing"
+
+    engine._journal_verify_command_results(
+        StoryTask(story_key="1-1-a", epic=1),
+        "dev",
+        (verify.CommandResult("pytest -q", 1, "tail", stdout, ""),),
+    )
+
+    entry = _sole_verify_record(engine)
+    retained = (engine.run_dir / entry["stdout_path"]).read_text(encoding="utf-8")
+    assert entry["stdout_bytes"] == full and entry["stdout_truncated"] is True
+    assert entry["stdout_captured_bytes"] == len(retained.encode("utf-8"))
+    # within the cap, and short of it by at most the one character that was cut
+    assert 1024 - 3 <= entry["stdout_captured_bytes"] <= 1024
+    assert retained == stdout[-len(retained) :]
+    assert "\ufffd" not in retained
+
+
+def test_verify_stream_capture_disabled_writes_no_files_and_still_journals(project):
+    """`stream_capture_kb = 0` retains nothing — and still records what was emitted.
+
+    "Nothing was retained" and "the command was silent" are different facts, so
+    the byte counts survive the opt-out even though the pointers are null.
+
+    Ablation: delete the `if max_bytes > 0:` guard in
+    `_journal_verify_command_results` and the writer is called with an empty
+    tail, which creates `verify/` and two empty files — reddening the
+    directory-absence and null-pointer assertions.
+    """
+    engine = _capture_engine(project, 0)
+
+    engine._journal_verify_command_results(
+        StoryTask(story_key="1-1-a", epic=1),
+        "dev",
+        (verify.CommandResult("pytest -q", 1, "tail", "out\n", "err\n"),),
+    )
+
+    assert not (engine.run_dir / VERIFY_DIR).exists()  # not even the directory
+    entry = _sole_verify_record(engine)
+    assert entry["stdout_path"] is None and entry["stderr_path"] is None
+    assert entry["stdout_captured_bytes"] == 0 and entry["stderr_captured_bytes"] == 0
+    assert entry["stdout_bytes"] == 4 and entry["stderr_bytes"] == 4
+    assert entry["stdout_truncated"] is True and entry["stderr_truncated"] is True
+    assert entry["capture_error"] is None  # opting out is not a failure
+    # the bounded merged feedback a repair session acts on is untouched by the knob
+    assert entry["output_tail"] == "tail"
+
+
+def test_verify_stream_capture_oserror_degrades_instead_of_killing_the_run(project, monkeypatch):
+    """A failed retain is an observation loss, never a lost run (AGENTS.md).
+
+    ENOSPC / a read-only run dir / ENAMETOOLONG used to propagate out of the
+    writer and take the dev phase with it — a diagnostic killing the run it
+    exists to diagnose, on a story whose verify commands PASSED.
+
+    Ablation: delete the `except OSError` arm in
+    `_journal_verify_command_results` and `engine.run()` raises OSError, so the
+    run never reaches `summary.done == 1`.
+    """
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", followup_review=False)],
+        policy=Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            review=ReviewPolicy(enabled=False),
+        ),
+    )
+    monkeypatch.setattr(
+        verify,
+        "run_verify_commands",
+        lambda policy, cwd: [verify.CommandResult("pytest -q", 0, "tail", "out\n", "err\n")],
+    )
+
+    def _enospc(path, text, **kwargs):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr("bmad_loop.journal.atomic_write_text", _enospc)
+
+    summary = engine.run()
+
+    assert summary.done == 1  # the run survives its own logging
+    entry = _sole_verify_record(engine)
+    assert entry["capture_error"] is not None
+    assert "stdout" in entry["capture_error"] and "No space left" in entry["capture_error"]
+    assert entry["stdout_path"] is None and entry["stderr_path"] is None
+    # nothing was published, so 0 retained is the literal truth ...
+    assert entry["stdout_captured_bytes"] == 0 and entry["stderr_captured_bytes"] == 0
+    # ... while what the command emitted, and its verdict, still reach the reader
+    assert entry["stdout_bytes"] == 4 and entry["stderr_bytes"] == 4
+    assert entry["returncode"] == 0 and entry["output_tail"] == "tail"
+
+
 def test_fix_verification_emits_post_dev_verify_with_command_results(project, monkeypatch):
     """The repair leg emits the same existing hook after it re-runs verification."""
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})

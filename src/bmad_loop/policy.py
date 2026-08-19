@@ -161,6 +161,27 @@ class LimitsPolicy:
 @dataclass(frozen=True)
 class VerifyPolicy:
     commands: tuple[str, ...] = ()
+    # stream_capture_kb bounds, per stream, the verifier stdout/stderr retained
+    # under the run's `verify/` directory for plugins and post-mortems (#641).
+    # A tail is kept, matching every other bound on this output — the merged
+    # `output_tail` is `[-2000:]`, and the end of a failing suite is where the
+    # failure is. The journal record stays honest about the cut: it carries the
+    # FULL byte count beside the retained one and an explicit truncation flag,
+    # because a silently short file reads as a complete one.
+    #
+    # 256 KiB is chosen against what the store is FOR: a repair session or a
+    # plugin reading a failing suite's tail. A verbose pytest/ruff failure runs
+    # tens of KB, so the cap is generous enough that the realistic case is never
+    # cut, while a chatty command under COMMAND_TIMEOUT_S (30 minutes) can no
+    # longer emit hundreds of MB per attempt. Worst case is bounded and small:
+    # commands x 2 streams x attempts x 256 KiB. It sits far under the file-store
+    # precedent it is modelled on (scm.failed_diff_max_mb = 5) and far above the
+    # inline-journal caps, which is the right side of both.
+    #
+    # 0 = capture nothing: no files are written at all, and the record still
+    # lands with null pointers and the full byte counts, so the journal keeps
+    # saying what the command emitted even when none of it is retained.
+    stream_capture_kb: int = 256
 
 
 @dataclass(frozen=True)
@@ -832,7 +853,12 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
             f"limits.session_budget_grace_s must be >= 0: got {limits.session_budget_grace_s}"
         )
 
-    verify = VerifyPolicy(commands=tuple(str(c) for c in verify_d.get("commands", ())))
+    verify = VerifyPolicy(
+        commands=tuple(str(c) for c in verify_d.get("commands", ())),
+        stream_capture_kb=int(verify_d.get("stream_capture_kb", VerifyPolicy.stream_capture_kb)),
+    )
+    if verify.stream_capture_kb < 0:
+        raise PolicyError(f"verify.stream_capture_kb must be >= 0: got {verify.stream_capture_kb}")
     notify = NotifyPolicy(
         desktop=bool(notify_d.get("desktop", NotifyPolicy.desktop)),
         file=bool(notify_d.get("file", NotifyPolicy.file)),
@@ -1145,6 +1171,7 @@ session_budget_grace_s = 240 # enforce mode: seconds a tripped session gets to w
 [verify]
 # Deterministic gates run by the orchestrator after a clean review, before commit.
 commands = []                # e.g. ["pytest -q", "ruff check ."]
+stream_capture_kb = 256      # per-stream cap (KiB) on the verifier stdout/stderr retained under the run's verify/ directory; the TAIL is kept and the journal records the full byte count plus a truncation flag. 0 = capture nothing (records still land, with null pointers)
 
 [notify]
 desktop = true               # notify-send (Linux) / osascript (macOS) / PowerShell toast (Windows), best-effort

@@ -779,6 +779,22 @@ def test_scm_failed_diff_settings(tmp_path):
         policy.load(p)
 
 
+def test_verify_stream_capture_kb(tmp_path):
+    """The retain cap parses, defaults, and admits 0 as "capture nothing" —
+    unlike scm.failed_diff_max_mb, whose 0 is rejected. The opt-out is the whole
+    point of the knob, so the floor is 0 and only a negative is refused."""
+    p = tmp_path / "policy.toml"
+    p.write_text("[verify]\nstream_capture_kb = 8\n")
+    assert policy.load(p).verify.stream_capture_kb == 8
+    p.write_text('[verify]\ncommands = ["pytest -q"]\n')
+    assert policy.load(p).verify.stream_capture_kb == 256  # default survives a partial table
+    p.write_text("[verify]\nstream_capture_kb = 0\n")
+    assert policy.load(p).verify.stream_capture_kb == 0  # opting out is legal
+    p.write_text("[verify]\nstream_capture_kb = -1\n")
+    with pytest.raises(policy.PolicyError, match="verify.stream_capture_kb"):
+        policy.load(p)
+
+
 def test_scm_invalid_values(tmp_path):
     p = tmp_path / "policy.toml"
     p.write_text('[scm]\nisolation = "vm"\n')

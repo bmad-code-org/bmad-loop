@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .model import RunState
-from .platform_util import atomic_replace
+from .platform_util import atomic_replace, atomic_write_text
 
 STATE_FILE = "state.json"
 JOURNAL_FILE = "journal.jsonl"
@@ -49,7 +49,7 @@ class Journal:
     def write_verify_stream(self, name: str, content: str) -> str:
         """Atomically retain one verifier subprocess stream under ``verify/`` and
         return its run-relative pointer.  The journal records the pointer and byte
-        count, never unbounded subprocess output inline.
+        counts, never unbounded subprocess output inline.
 
         Its own directory, not ``logs/``: every other inhabitant of ``logs/`` is a
         coding-CLI pane capture named after a session task id.  The adapters own
@@ -65,14 +65,33 @@ class Journal:
         every future reader of ``logs/`` would have to remember to apply.
 
         ``name`` is engine-generated (not plugin or command supplied), so it is
-        safe to join below.  Callers retain the original stream separately in a
-        hook context; this method is journal storage only.
+        safe to join below.  ``content`` arrives already bounded — the cap is
+        ``verify.stream_capture_kb``, applied by the caller, which is also where
+        the full-size and truncation bookkeeping lives; this method is journal
+        storage only and never decides how much to keep.  Callers retain the
+        original stream separately in a hook context.
+
+        :func:`atomic_write_text`, never ``write_text`` (#379) — the rule
+        ``install.py`` states flatly.  The fixed ``.tmp`` sibling this replaces is
+        the collision that helper's own docstring exists to prevent, and its
+        fsync-before-replace is what keeps a pointer from ever naming blocks that
+        were never written.  ``follow_symlinks=False`` because these are
+        machine-minted records under a run directory a coding-CLI session can
+        reach: honouring a planted link would aim the write at a path of that
+        session's choosing, and there is no operator-curated target here to
+        preserve (contrast the ledgers the default was built for).
+
+        Text mode is deliberate, and it is why the record's byte counts are
+        defined over the *stream*, not the file: ``\\n`` is translated on Windows,
+        so the file can be larger there than the count.  ``read_text`` normalizes
+        it back, so the content round-trips either way.
+
+        Raises ``OSError`` — the caller degrades (this is observation), it does
+        not swallow it here.
         """
         target = self.run_dir / VERIFY_DIR / name
         target.parent.mkdir(parents=True, exist_ok=True)
-        tmp = target.with_suffix(target.suffix + ".tmp")
-        tmp.write_text(content, encoding="utf-8")
-        atomic_replace(tmp, target)
+        atomic_write_text(target, content, follow_symlinks=False)
         return target.relative_to(self.run_dir).as_posix()
 
     def entries(self) -> list[dict[str, Any]]:
