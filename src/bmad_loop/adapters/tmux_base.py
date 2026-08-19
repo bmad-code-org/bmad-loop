@@ -418,9 +418,12 @@ class BaseTmuxBackend(TerminalMultiplexer):
         # An unqualified or name-token target carries no session to list, so
         # only the same-resolution probe remains: blind to a wrong-target leak,
         # but it still catches a kill that failed while the target resolves.
+        # UnicodeError for the same reason list_window_ids names it: a leaf
+        # overriding _ERRORS back to a strict codec raises a ValueError-family
+        # decode error neither other arm covers, and this helper never raises.
         try:
             probe = self._run(["list-panes", "-t", target], check=False)
-        except (subprocess.SubprocessError, OSError):
+        except (subprocess.SubprocessError, OSError, UnicodeError):
             return False
         return probe.returncode == 0
 

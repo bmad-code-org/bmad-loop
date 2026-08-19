@@ -413,7 +413,11 @@ def test_adopted_pipe_pane_delivers_pane_bytes_through_the_flag_transport(probe,
     # A spaced path deliberately — it is what the sidecar could not carry.
     log = tmp_path / "run log.txt"
     text = ""
-    for window in windows:  # psmux/psmux#482's first-pipe-after-mint spawn race
+    # A fresh path per attempt: the sink holds the file open for Write sharing
+    # only Read, so a retry against the same path would be denied the open and
+    # die at once — reporting a file-sharing collision as "no pane bytes".
+    for attempt, window in enumerate(windows):  # psmux/psmux#482's spawn race
+        log = tmp_path / f"run log {attempt}.txt"
         mux.pipe_pane(window, log)
         for argv in (
             ["send-keys", "-t", window, "-l", "echo pipeprobe"],

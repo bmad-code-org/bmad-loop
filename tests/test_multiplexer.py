@@ -453,6 +453,8 @@ def test_kill_window_is_silent_when_the_window_is_already_gone(monkeypatch, caps
     # `finally` on every session, and a session that completed by window death
     # has nothing left to kill. A warning here would fire on ordinary teardown.
     # Covers the never-existed target too: not listed means nothing leaked.
+    # Ablation: drop the `not self._window_survived_kill(target)` half of
+    # kill_window's gate and this fails — every non-zero kill would warn.
     _kill_fake(monkeypatch, kill_rc=1, kill_err="can't find window: @7\n", live="@1\n")
     assert TmuxMultiplexer().kill_window("ctl:@7") is None
     assert capsys.readouterr().err == ""
@@ -461,6 +463,7 @@ def test_kill_window_is_silent_when_the_window_is_already_gone(monkeypatch, caps
 def test_kill_window_is_silent_when_the_session_died_with_the_window(monkeypatch, capsys):
     # A session that ended when its last window died fails the listing probe —
     # ambiguous, so no warning: nothing provably survived.
+    # Ablation: same mutation as the already-gone test above; this fails too.
     _kill_fake(monkeypatch, kill_rc=1, kill_err="can't find session: ctl\n", probe_rc=1)
     assert TmuxMultiplexer().kill_window("ctl:@7") is None
     assert capsys.readouterr().err == ""
@@ -472,6 +475,8 @@ def test_kill_window_is_silent_when_the_survivor_probe_cannot_answer(monkeypatch
     # could not answer must not manufacture one — that would put the noise back
     # on exactly the path the probe exists to clear. Both probe shapes: the
     # session listing (qualified target) and list-panes (bare target).
+    # Ablation: drop the `not self._window_survived_kill(target)` half of
+    # kill_window's gate and both params fail on an unexpected warning.
     def fake(argv, **k):
         if argv[1] in ("list-windows", "list-panes"):
             raise subprocess.TimeoutExpired(argv, 1)

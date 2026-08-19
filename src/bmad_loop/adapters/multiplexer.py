@@ -386,7 +386,7 @@ class TerminalMultiplexer(ABC):
 # row past 350, unreadable for the same reason an embedded newline was (#321).
 # Length is half the seam's promise, not a separate concern. 80 keeps the widest
 # cell inside a standard terminal with room to spare over the real probes, which
-# fold to ~43 (`tmux 3.4; psmux 3.3.8 (66cf613 2026-08-18)`).
+# fold to ~42 (`tmux 3.4; psmux 3.3.8 (66cf613 2026-08-18)`).
 VERSION_MAX_CHARS = 80
 
 
