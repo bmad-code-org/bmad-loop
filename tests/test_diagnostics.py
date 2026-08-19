@@ -970,10 +970,19 @@ def test_scrub_policy_passes_unknown_section_keys_verbatim():
     snapshot, and redacting them would cost the reader the dump's whole index) and
     is the exact hazard `test_no_policy_section_has_a_free_keyed_table` guards. It
     is not an endorsement: if `_scrub_policy` is ever changed to scrub keys, this
-    test is expected to change with it rather than to stand in the way (#202)."""
-    snapshot = {"future": {HOME_PATH: {"model": "x"}}}
+    test is expected to change with it rather than to stand in the way (#202).
+
+    The passthrough is KEYS ONLY, and the value row below is what says so."""
+    snapshot = {"future": {HOME_PATH: {"model": HOME_PATH}}}
     scrubbed = diagnostics._scrub_policy(snapshot)
     assert list(scrubbed["future"]) == [HOME_PATH]
+    # Keys only. An unknown section's VALUES still go through the standard gate,
+    # so the same home path IS redacted one level down. This row is load-bearing
+    # against the shape of fix a reader reaches for when they want the keys kept:
+    # flattening the else-branch's `_scrub_policy(value)` recursion to a bare
+    # `value` keeps every other assertion here green while turning the whole
+    # branch into a leak, so without it this test would characterize one.
+    assert scrubbed["future"][HOME_PATH]["model"] == "<redacted:str>"
     # The contrast that makes the passthrough a deliberate divergence rather than
     # an oversight: the shared value gate would not have let this key through.
     assert HOME_PATH not in sanitize.scrub_json(snapshot)["future"]
