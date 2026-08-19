@@ -14,6 +14,8 @@ therefore pinned here, one fact per row.
 
 from __future__ import annotations
 
+import json
+import os
 import subprocess
 
 import conftest
@@ -46,6 +48,55 @@ def test_template_drops_sample_hooks_but_keeps_hooks_dir_and_exclude(project):
     assert list(hooks.glob("*.sample")) == []
     assert hooks.is_dir()
     assert (git_dir / "info" / "exclude").is_file()
+
+
+def test_template_leaves_no_detached_git_maintenance_writing_into_the_copies(project, tmp_path):
+    """No background git process may outlive a commit into the sandbox.
+
+    `git commit` normally ends by spawning `git maintenance run --auto --quiet
+    --detach`. Detached, it outlives the command that started it and keeps writing
+    under `.git/objects/` — and the template it writes into is exactly what
+    `project` copytrees for every test. `objects/maintenance.lock` gets listed by
+    scandir, unlinked by that child, then opened by copy2 and is already gone, so
+    one arbitrary unrelated test dies at fixture setup on `[Errno 2]`. It reddens a
+    different test each time and only on whichever interpreter leg loses the race,
+    which is the flake signature this suite treats as a bug.
+
+    Graded on the behavior, not on the config key: reading back
+    `maintenance.auto` would pass on a git that had stopped honouring it. This
+    commits into a real copy under GIT_TRACE2 and pins the child list instead.
+
+    Ablation target: delete the `maintenance.auto` line from `_project_template`
+    and this row fails alone, naming the spawned `git maintenance run` in the
+    assertion message. The trace-recorded-the-commit assertion is the anti-vacuity
+    guard — without it a git built without trace2, or any typo in the env var,
+    would write no events and the row would pass for having observed nothing."""
+    repo = project.project
+    (repo / "src.txt").write_text("changed\n")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
+
+    trace = tmp_path / "trace2.json"
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-q", "-m", "second"],
+        check=True,
+        capture_output=True,
+        env={**os.environ, "GIT_TRACE2_EVENT": str(trace)},
+    )
+
+    events = []
+    for line in trace.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            events.append(json.loads(line))
+        except ValueError:  # trace2 writes one JSON object per line; skip any partial
+            continue
+
+    # Anti-vacuity: the trace really did observe this commit.
+    assert any(
+        e.get("event") == "cmd_name" and e.get("name") == "commit" for e in events
+    ), f"GIT_TRACE2 recorded no commit; nothing was actually observed: {events}"
+
+    spawned = [" ".join(e.get("argv") or []) for e in events if e.get("event") == "child_start"]
+    assert not [c for c in spawned if "maintenance" in c or "gc" in c], spawned
 
 
 def test_make_git_noisy_produces_rc_zero_stderr(project):
