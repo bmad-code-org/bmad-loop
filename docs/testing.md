@@ -258,7 +258,7 @@ source tree, so packaging breaks were invisible until this job existed).
 **Zero-retry flaky policy.** There is no retry mechanism anywhere: no `--reruns`, no retry
 plugin — `pytest-rerunfailures` was removed from the environment precisely because an installed
 retry plugin is an invitation to paper over a real flake. **A flake is a bug**: it gets an
-issue (#360 and #529 are the open instances), a diagnosis, and a deterministic fix — never a
+issue (#360 and #581 are the open instances), a diagnosis, and a deterministic fix — never a
 rerun loop. The main defense is the **frozen-clock pattern, mandatory for time-dependent
 tests**: no unit or seam test sleeps toward a deadline (the real-process gates use short
 settle polls, which is different from waiting out a production timeout). Two sanctioned
