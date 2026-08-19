@@ -89,6 +89,60 @@ def _digest_of(text: str | None) -> str:
     return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
 
 
+def _bounded_stream_tail(text: str, max_bytes: int) -> tuple[str, int, int]:
+    """Cut a verifier stream down to what ``verify.stream_capture_kb`` retains.
+
+    Returns ``(tail, full_bytes, retained_bytes)``. Both counts measure the
+    DECODED STREAM encoded as UTF-8 — never the file the caller writes it to,
+    whose size differs on Windows because text mode translates ``\\n``. Keeping
+    the counts on one side of that boundary is what makes the journal record
+    unambiguous: ``full_bytes`` is what the command emitted, ``retained_bytes``
+    is how much of it survived the cap, and their inequality IS the truncation.
+
+    The TAIL is kept, the direction every other bound on this output takes
+    (``run_verify_commands``' merged ``[-2000:]``): a failing suite puts its
+    failure at the end.
+
+    A byte cut can land mid-character, so the leading partial is dropped rather
+    than decoded into a ``\\ufffd`` this function would be inventing — the stream
+    already carries whatever replacement chars its own decode produced, and
+    minting one here would put a corruption marker at a boundary WE chose.
+    ``max_bytes <= 0`` needs no branch of its own: the slice is empty by
+    construction, which is exactly "capture nothing".
+    """
+    tail, full_bytes = verify.byte_tail(text, max_bytes)
+    return tail, full_bytes, len(tail.encode("utf-8"))
+
+
+@dataclass(frozen=True)
+class VerifyCommandRecords:
+    """What one verify-command pass published to ``post_dev_verify``.
+
+    The records themselves plus the two keys that say WHICH pass they are:
+    ``stage`` (``"dev"`` | ``"fix"``) and the story's ``sequence`` ordinal. Both
+    already ride the journal's ``verify-command-result`` entries; carrying them
+    on the hook context too is what lets a plugin tell the two legs apart and
+    join back to those entries — neither of which the results alone can do,
+    since both legs emit the same stage from the same phase on one shared
+    ``attempt`` counter.
+
+    The default instance (:data:`NO_VERIFY_COMMANDS`) is the "no pass ran" value
+    the callers start from, so a leg that never reaches verification publishes
+    three explicit ``None``/empty fields rather than three unexplained defaults.
+    ``sequence`` stays ``None`` when the pass ran but recorded nothing (no
+    ``[verify] commands`` configured) — nothing was journalled, so there is no
+    ordinal to join on. See ``HookContext.command_results`` for the full
+    taxonomy a reader has to apply.
+    """
+
+    results: tuple[verify.CommandResult, ...] = ()
+    stage: str | None = None
+    sequence: int | None = None
+
+
+NO_VERIFY_COMMANDS = VerifyCommandRecords()
+
+
 class RunPaused(Exception):
     def __init__(self, reason: str, stage: str, story_key: str | None = None):
         super().__init__(reason)
@@ -454,6 +508,10 @@ class Engine:
         # because under isolation each unit resolves against its OWN worktree and
         # one Engine drives every unit of a run.
         self._dev_skill_cache: dict[tuple[Path, str | None], str] = {}
+        # story_key -> the highest `verify-command-result` sequence allocated so
+        # far. None until the first verify pass seeds it from the journal — see
+        # _next_verification_sequence, which owns the whole invariant.
+        self._verification_sequences: dict[str, int] | None = None
         # Per-unit worktree isolation + integration flow (issue #244 F-3/F-9a).
         # Built from narrow deps + engine callbacks; the same-name Engine._* worktree
         # methods below delegate to it. `emit` is late-bound (a lambda, not the bound
@@ -1956,6 +2014,7 @@ class Engine:
                 )
             advance(task, Phase.DEV_VERIFY)
             outcome = None
+            verified = NO_VERIFY_COMMANDS
             if result.status == "completed":
                 # Everything below this point that appends to the ledger is the
                 # orchestrator, not the session. Preserve attribution on crash
@@ -2037,13 +2096,19 @@ class Engine:
                 if outcome.ok and self._run_verify_commands_after_dev(task, result.result_json):
                     # deterministic gates run here too: a broken build must not
                     # reach the (far more expensive) review loop
-                    outcome = verify.verify_commands_outcome(self.policy, self.workspace.root)
+                    outcome, verified = self._verify_commands_with_results(task, "dev")
             self._emit(
                 "post_dev_verify",
                 task,
                 session_status=result.status,
                 result_json=result.result_json,
                 verify_reason=(outcome.reason if outcome is not None else None),
+                command_results=verified.results,
+                # The dev-vs-repair discriminator + the journal join key. Left at
+                # NO_VERIFY_COMMANDS' Nones on every arm that never reached
+                # verification, which `session_status`/`verify_reason` name.
+                verification_stage=verified.stage,
+                verification_sequence=verified.sequence,
             )
             decision = decide_dev(task, result, outcome, self.policy)
             self.journal.append(
@@ -4010,6 +4075,171 @@ class Engine:
         build/test gate would spuriously fail before the plan review."""
         return True
 
+    def _verify_commands_with_results(
+        self, task: StoryTask, verification_stage: str
+    ) -> tuple[VerifyOutcome, VerifyCommandRecords]:
+        """Execute, retain, and classify verifier results as one engine action.
+
+        Core alone executes and classifies commands.  The returned immutable
+        records are only journalled and exposed to ``post_dev_verify`` plugins.
+
+        ``stage`` is set on the returned records whenever this method ran at all,
+        including the zero-command case: "the pass ran and executed nothing" and
+        "no pass ran" are different facts, and only the caller that never reaches
+        here may publish the second one.
+        """
+        results = tuple(verify.run_verify_commands(self.policy, self.workspace.root))
+        sequence = self._journal_verify_command_results(task, verification_stage, results)
+        outcome = verify.verify_command_results_outcome(list(results), self.workspace.root)
+        return outcome, VerifyCommandRecords(
+            results=results, stage=verification_stage, sequence=sequence
+        )
+
+    def _next_verification_sequence(self, story_key: str) -> int:
+        """Allocate this story's next ``verify-command-result`` sequence.
+
+        The ordinal is a public journal field and a ``post_dev_verify``
+        correlation key, so it has to stay monotonic per story ACROSS A RESUME —
+        a fresh process must not restart at 1 and mint a second record claiming
+        an ordinal an earlier one already used. That property is the whole reason
+        this used to re-derive the ordinal by rescanning the journal on every
+        verification, which read and JSON-parsed the entire file each time — a
+        file this same method keeps appending to, so the cost grew with the run
+        that was paying it.
+
+        The rescan survives here, once: the first allocation of an engine's life
+        seeds the per-story map from the journal, and every later one is an
+        in-memory increment. One scan, not one per verification, and the resume
+        property is unchanged because a resumed run's seed reads the same journal
+        the rescan did.
+
+        Seeding EVERY story in one pass (rather than lazily per story) is sound
+        because :meth:`_journal_verify_command_results` is the sole writer of
+        this record kind and one Engine drives every unit of a run, so after the
+        seed the map — not the file — is authoritative. A nested auto-sweep is
+        not an exception: a child run composes its own run dir and ``Journal``.
+
+        Deliberately an ``Engine`` field and not a ``StoryTask`` one: the value
+        is recoverable from the journal on every resume, so persisting it would
+        add a ``state.json`` field that can only disagree with the record it
+        duplicates. It is also NOT ``attempt`` — a human re-arm reuses attempt
+        numbers, which is exactly why this counter exists beside it.
+        """
+        if self._verification_sequences is None:
+            self._verification_sequences = self._seed_verification_sequences()
+        allocated = self._verification_sequences.get(story_key, 0) + 1
+        self._verification_sequences[story_key] = allocated
+        return allocated
+
+    def _seed_verification_sequences(self) -> dict[str, int]:
+        """The highest sequence already journalled per story — the resume seed.
+
+        Tolerant by design, like every other journal read-back: a truncated or
+        hand-edited line that lost either key is skipped rather than raising, and
+        the worst case is an ordinal reused in a run whose journal was already
+        corrupt. Missing story = 0, so the first allocation is 1.
+        """
+        highest: dict[str, int] = {}
+        for entry in self.journal.entries():
+            if entry.get("kind") != "verify-command-result":
+                continue
+            story_key = entry.get("story_key")
+            sequence = entry.get("verification_sequence")
+            if isinstance(story_key, str) and isinstance(sequence, int):
+                highest[story_key] = max(highest.get(story_key, 0), sequence)
+        return highest
+
+    def _journal_verify_command_results(
+        self,
+        task: StoryTask,
+        verification_stage: str,
+        results: tuple[verify.CommandResult, ...],
+    ) -> int | None:
+        """Record each verifier subprocess result plus bounded log pointers, and
+        return the sequence they were recorded under — ``None`` when there was
+        nothing to record.
+
+        ``attempt`` and ``verification_stage`` make the public journal records
+        correlate to a concrete dev or repair verification pass.  The filenames
+        contain only engine-derived ordinal values; command text never becomes a
+        filesystem path.  Sanitize the whole composition, not the parts, for the
+        reason :func:`_session_task_id` gives: two individually capped parts can
+        still compose past a filename segment limit, and ``safe_segment``'s digest
+        suffix differs between the two orders.
+
+        Retention is bounded by ``verify.stream_capture_kb`` per stream, and the
+        record says so rather than leaving the reader to guess: ``*_bytes`` is
+        what the command emitted, ``*_captured_bytes`` how much of that reached
+        disk, ``*_truncated`` their inequality.  Both counts are UTF-8 lengths of
+        the decoded stream, NOT file sizes — see :func:`_bounded_stream_tail`.  A
+        zero cap writes no file at all and leaves the pointer null; the record
+        still lands, still carrying the full byte count, because "nothing was
+        retained" and "the command was silent" are different facts.
+
+        This is observation, so it degrades and never raises (AGENTS.md).  An
+        ``OSError`` from the write — ENOSPC, a read-only run dir, ENAMETOOLONG on
+        a path this composition did not shorten enough — is journalled as
+        ``capture_error`` beside a null pointer and the verification continues.
+        The alternative is a lost log killing a dev pass whose commands passed,
+        which trades a diagnostic for the run it was there to diagnose.
+
+        No results means no records, and therefore no sequence: the ordinal is
+        allocated only when at least one record lands, so it never runs ahead of
+        the journal it indexes. That is also the pre-existing behaviour — the
+        max-of-journalled rescan this replaced could not observe an ordinal it
+        had not written — and keeping it is what makes a resumed run number its
+        passes identically to an uninterrupted one.
+        """
+        if not results:
+            return None
+        verification_sequence = self._next_verification_sequence(task.story_key)
+        max_bytes = self.policy.verify.stream_capture_kb * 1024
+        for command_index, result in enumerate(results):
+            stem = safe_segment(
+                f"verify-{task.story_key}-"
+                f"{verification_stage}-{task.attempt}-{verification_sequence}-{command_index}"
+            )
+            streams: dict[str, str | int | bool | None] = {}
+            capture_error: str | None = None
+            for kind, text, emitted in (
+                ("stdout", result.stdout, result.stdout_full_bytes),
+                ("stderr", result.stderr, result.stderr_full_bytes),
+            ):
+                tail, full_bytes, captured_bytes = _bounded_stream_tail(text, max_bytes)
+                # `full_bytes` is what we still HOLD; when the in-memory ceiling
+                # already cut this stream, what the command EMITTED is larger and
+                # only the result knows it. Reporting the held size would quietly
+                # under-report emission and, worse, could call a truncated stream
+                # whole — the one thing `*_truncated` exists to prevent.
+                full_bytes = full_bytes if emitted is None else emitted
+                path: str | None = None
+                if max_bytes > 0:
+                    try:
+                        path = self.journal.write_verify_stream(f"{stem}.{kind}.log", tail)
+                    except OSError as exc:
+                        # Nothing published: atomic_write_text removes its temp and
+                        # leaves the target absent, so 0 retained is the literal truth.
+                        captured_bytes = 0
+                        capture_error = capture_error or f"{kind}: {exc}"
+                streams[f"{kind}_path"] = path
+                streams[f"{kind}_bytes"] = full_bytes
+                streams[f"{kind}_captured_bytes"] = captured_bytes
+                streams[f"{kind}_truncated"] = captured_bytes < full_bytes
+            self.journal.append(
+                "verify-command-result",
+                story_key=task.story_key,
+                attempt=task.attempt,
+                verification_stage=verification_stage,
+                verification_sequence=verification_sequence,
+                command_index=command_index,
+                command=result.command,
+                returncode=result.returncode,
+                output_tail=result.output_tail,
+                capture_error=capture_error,
+                **streams,
+            )
+        return verification_sequence
+
     def _resume_after_dev_verify(self, task: StoryTask) -> None:
         """Resume a task the run paused at DEV_VERIFY (dev verified, spec on disk).
         Base: the spec-approval-gate resume — run the review loop + commit.
@@ -5250,11 +5480,8 @@ class Engine:
                 preserve_dispatched_spec_snapshot=preserve_chain_snapshot,
             )
             advance(task, Phase.DEV_VERIFY)
-            crits = critical_escalations(result.result_json)
-            if crits:
-                details = "; ".join(str(e.get("detail", e.get("type", "?"))) for e in crits)
-                self._escalate(task, f"CRITICAL escalation from fix session: {details}")
             outcome = None
+            verified = NO_VERIFY_COMMANDS
             terminal = None
             if result.status == "completed":
                 # A repair is another generic dev-primitive pass: it can leave
@@ -5288,14 +5515,29 @@ class Engine:
                     )
                 else:
                     terminal = None
-                outcome = harvest_outcome or verify.verify_commands_outcome(
-                    self.policy, self.workspace.root
-                )
+                if harvest_outcome is not None:
+                    outcome = harvest_outcome
+                else:
+                    outcome, verified = self._verify_commands_with_results(task, "fix")
                 if not outcome.ok:
                     reason = outcome.reason
             ok = outcome is not None and outcome.ok
             session_failure = (
                 "" if result.status == "completed" else session_failure_reason("fix", result)
+            )
+            self._emit(
+                "post_dev_verify",
+                task,
+                session_status=result.status,
+                result_json=result.result_json,
+                verify_reason=(outcome.reason if outcome is not None else None),
+                command_results=verified.results,
+                # Stage "fix" is the only thing separating this emit from the dev
+                # one: same stage, same DEV_VERIFY phase, same `attempt` counter.
+                # Stays None when the harvest short-circuited above and the
+                # commands never ran — `verify_reason` carries that reason.
+                verification_stage=verified.stage,
+                verification_sequence=verified.sequence,
             )
             self.journal.append(
                 "fix-decision",
@@ -5308,6 +5550,23 @@ class Engine:
                 # it fed, so the fix path is greppable the same way (#489).
                 session_vanished=result.session_vanished,
             )
+            # CRITICAL routing, deliberately AFTER the emit and the journal record
+            # above, and deliberately AHEAD of the env-fault/retryable arms below.
+            # Both halves mirror `decide_dev`, which the dev leg reaches at the
+            # same point in its own loop: it tests `critical_escalations` FIRST,
+            # so a CRITICAL outranks an env fault there too, and its caller has
+            # already emitted `post_dev_verify` and journalled `dev-decision` by
+            # then. Escalating here before the emit — as this leg used to — made
+            # one event class observable on the dev leg and invisible on the
+            # repair leg: `_escalate` raises `RunPaused`, so a repair session
+            # reporting CRITICAL fired no `post_dev_verify` at all, while a dev
+            # session reporting the same thing fired one. The hook is named for
+            # the verification, the verification ran, and a plugin correlating
+            # verify passes cannot have half of them silently withheld.
+            crits = critical_escalations(result.result_json)
+            if crits:
+                details = "; ".join(str(e.get("detail", e.get("type", "?"))) for e in crits)
+                self._escalate(task, f"CRITICAL escalation from fix session: {details}")
             if result.status != "completed" and result.env_fault:
                 # A fix session whose CLI lost its API connection (#194) did no
                 # repair work — another attempt cannot fix the run environment, so

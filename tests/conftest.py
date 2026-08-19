@@ -446,6 +446,16 @@ def _project_template(
     git(root, "config", "user.email", "test@test")
     git(root, "config", "user.name", "test")
     git(root, "config", "core.fsync", "none")  # cheapen commits; old git ignores unknown keys
+    # `git commit` ends by spawning `git maintenance run --auto --quiet --detach`
+    # (traced on git 2.55). That child DETACHES, so it outlives the commit and this
+    # fixture both, and it writes under `.git/objects/` in the template while later
+    # tests are already copytree-ing it: `objects/maintenance.lock` is listed by
+    # scandir, unlinked by the detached child, and gone by the time copy2 opens it,
+    # failing one arbitrary test on `[Errno 2]` for a file nothing asked for. Disable
+    # the writer rather than teach the copy to tolerate it — an `ignore=` pattern on
+    # the copy would also silently skip a lock that did matter. The copies inherit
+    # this via the copied .git/config, so what they commit cannot re-arm it either.
+    git(root, "config", "maintenance.auto", "false")
     git(root, "add", "-A")
     git(root, "commit", "-q", "-m", "initial")
     return root

@@ -386,11 +386,116 @@ there.
 
 ### Dev
 
-| Stage                              | When                        | Mutable surface                                                                      |
-| ---------------------------------- | --------------------------- | ------------------------------------------------------------------------------------ |
-| `pre_dev_phase` / `post_dev_phase` | around the dev attempt loop | veto (`pre_`); `post_dev_phase` is a [workflow injection point](#workflows-provides) |
-| `pre_dev_session`                  | before each dev session     | `proposed_prompt`, `proposed_env`, veto                                              |
-| `post_dev_verify`                  | after dev verification      | —                                                                                    |
+| Stage                              | When                             | Mutable surface                                                                      |
+| ---------------------------------- | -------------------------------- | ------------------------------------------------------------------------------------ |
+| `pre_dev_phase` / `post_dev_phase` | around the dev attempt loop      | veto (`pre_`); `post_dev_phase` is a [workflow injection point](#workflows-provides) |
+| `pre_dev_session`                  | before each dev session          | `proposed_prompt`, `proposed_env`, veto                                              |
+| `post_dev_verify`                  | after dev or repair verification | —                                                                                    |
+
+`post_dev_verify` fires on **both** legs of the dev phase — once after the dev
+session's verification, and again after each repair session's — so a handler sees
+it **more than once per story**, not once. The two legs share one `attempt`
+counter bounded by `[limits] max_dev_attempts`, which is also the bound on how
+many times the stage can fire for one story. Write handlers to be idempotent and
+to key on the correlation fields below rather than on the story alone. It also
+fires on the way to a pause: an attempt whose session reported a CRITICAL
+escalation emits before the run stops, on either leg.
+
+`post_dev_verify` exposes `ctx.command_results`: an immutable tuple of the
+per-command `CommandResult` records core just executed. Each has `command`,
+`returncode`, the existing merged bounded `output_tail`, and separate `stdout`
+and `stderr` strings. Those two are intended to be the streams essentially whole
+— they are not cut to `[verify] stream_capture_kb`, which bounds only what is
+written to disk — but they are not unbounded either: a hard 32 MiB per-stream
+ceiling applies, so a pathologically chatty command cannot grow the orchestrator's
+peak memory with the number of configured verify commands. When that ceiling cuts
+a stream the **tail** is what a plugin receives, and the matching journal record's
+`stdout_bytes` / `stderr_bytes` still report what the command emitted, so the cut
+is always detectable rather than silent. Ordinary suites never reach it. This is
+observation data only: a plugin cannot change the verifier's outcome or the commit
+decision. The run's `journal.jsonl` also records
+one `verify-command-result` entry per command with run/story/attempt/stage and
+verification-sequence correlation, `output_tail`, byte counts, and run-relative `stdout_path` /
+`stderr_path` pointers under the run's `verify/` directory; full streams are not
+embedded in the journal. That store is deliberately separate from `logs/`, which
+holds coding-CLI pane captures named after session task ids and is read as such
+by the TUI.
+
+Two more context fields say **which** verification the results came from, because
+nothing else on the context can: both the dev leg and the repair leg emit
+`post_dev_verify` from `Phase.DEV_VERIFY`, and `ctx.attempt` is one per-story
+counter the repair leg continues rather than restarts, so its value orders the
+two but names neither.
+
+| Field                       | Value                                                                                  |
+| --------------------------- | -------------------------------------------------------------------------------------- |
+| `ctx.verification_stage`    | `"dev"` for the initial dev verification, `"fix"` for a repair one, `None` if none ran |
+| `ctx.verification_sequence` | the story's 1-based ordinal for that pass, or `None` if it recorded nothing            |
+
+Together they are the join key: the `verify-command-result` entries carrying this
+`story_key` + `verification_stage` + `verification_sequence` are exactly this
+context's results, one per record, ordered by `command_index`. The sequence is
+monotonic per story **across a pause/resume** — unlike `attempt`, which a human
+re-arm reuses — so it is safe to persist as a correlation id.
+
+Read `ctx.command_results == ()` together with `verification_stage`; on its own it
+is ambiguous:
+
+- **`verification_stage is None`** — no verify pass ran. Several causes land here
+  and the empty tuple names none of them: the session did not complete
+  (`ctx.session_status`), an earlier gate already failed the attempt — the
+  dev-artifact check or the deferral harvest (`ctx.verify_reason`) — or the engine
+  variant suppressed the pass for this leg (stories mode skips it on a plan-halt
+  leg, which has no implementation to build).
+- **stage set, `verification_sequence is None`** — the pass ran and executed
+  nothing, because `[verify] commands` is empty. No journal record exists either.
+- **stage set, sequence an int** — those commands ran, and each has a matching
+  journal record.
+
+What lands on disk is bounded by `[verify] stream_capture_kb` (default 256 KiB per
+stream): the **tail** is retained, and the record stays explicit about the cut —
+`stdout_bytes` / `stderr_bytes` are what the command emitted, `stdout_captured_bytes` /
+`stderr_captured_bytes` how much of that reached disk, and `stdout_truncated` /
+`stderr_truncated` their inequality. Both counts are UTF-8 lengths of the decoded
+stream, **not** file sizes: the files are written in text mode, so Windows newline
+translation makes the file larger there. Set the knob to `0` to retain nothing at
+all — no files are written and the pointers are null, but the record still lands
+with the full byte counts, because "nothing was retained" and "the command was
+silent" are different facts. Retaining is observation and never fails a run: if the
+write raises (ENOSPC, a read-only run dir, or a `verify/` directory whose
+confinement cannot be established — the store refuses rather than write through
+a symlink a session planted), the pointer is null and `capture_error`
+carries the reason. A plugin reading these pointers must therefore treat both
+`None` and a missing file as normal, and consult `*_truncated` before assuming a
+file holds a command's whole output. Treat verifier output as potentially sensitive and store, upload, sign,
+or act on it only from an explicitly configured plugin.
+
+**The dev phase is the whole of this surface.** `[verify] commands` also run at
+the _review_ gate — `verify_review` / `verify_review_stories` /
+`verify_review_bundle` end on the same core classifier — and **none of those runs
+are journalled or published to any hook.** Five engine gates reach them: the
+converged review pass, the review-budget-exhaustion rescue, the review-timeout
+salvage, and both passes inside the skip-review commit path (which runs the gate
+again after a repair). `bmad-loop confirm --reverify` runs the commands too, out
+of band by construction — the run that parked the story is finished, so there is
+no journal to write to and no hook bus to emit on.
+
+Two consequences a handler has to be written for:
+
+- **`verify-command-result` entries are not a complete census of a run's verifier
+  invocations.** Every story that reaches a commit ran the commands at least once
+  more than the records show. Never derive "the verifier ran N times" or "the last
+  thing the verifier saw" from the journal — derive only "these are the dev-phase
+  passes", which is what the records claim.
+- **A green commit is not evidence that the last journalled pass was green**, and a
+  red journalled pass is not evidence the commit was blocked: a `fix` pass can fail
+  and the story still commit after a later review-gate run that left no record.
+  Correlate a decision with the `dev-decision` / `fix-decision` / `review-result`
+  entries beside the results, not with the results alone.
+
+The boundary is deliberate, not an oversight — the review leg would need its own
+hook stage rather than a second meaning for one named `post_dev_verify` — and is
+tracked as a follow-up in [#656](https://github.com/bmad-code-org/bmad-loop/issues/656).
 
 ### Review
 
@@ -401,6 +506,9 @@ there.
 | `post_review_session` | after each review session      | —                                                 |
 | `post_review_result`  | after a review verdict         | a [workflow injection point](#workflows-provides) |
 | `pre_fix_session`     | before a verify-repair session | `proposed_prompt`, `proposed_env`, veto           |
+
+None of these carries the review gate's `[verify] commands` results — that gate
+runs the commands and retains nothing. See the boundary note above `### Review`.
 
 ### Commit
 

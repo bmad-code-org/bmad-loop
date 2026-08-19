@@ -1524,3 +1524,82 @@ def test_the_lexical_fallback_keeps_every_bridge_spelling_matchable(spelling):
     pure = PureWindowsPath(spelling)
     assert pure.is_absolute(), "absolute() would prepend a POSIX cwd and destroy the prefix"
     assert platform_util.is_wsl_unc_path(pure) is True
+
+
+class _ReparseStat:
+    """Stand-in for the os.lstat() result of a Windows junction: a DIRECTORY
+    mode (which is why Path.is_symlink() answers False) carrying a reparse tag."""
+
+    st_mode = stat.S_IFDIR | 0o755
+    st_reparse_tag = 0xA0000003  # IO_REPARSE_TAG_MOUNT_POINT
+
+
+def test_is_link_like_refuses_a_reparse_tagged_dir(tmp_path, monkeypatch):
+    """A Windows directory junction redirects but is NOT a symlink.
+
+    `Path.is_symlink()` is False for a junction while `mkdir`/`os.open` follow
+    it, and `mklink /J` needs no elevation at all — unlike a directory symlink,
+    which needs SeCreateSymbolicLinkPrivilege or Developer Mode. So the junction
+    is the CHEAPER attack and the one an is_symlink() check misses. The refusal
+    keys on the reparse tag instead.
+
+    That branch is reachable only on Windows; drive its logic here so it does not
+    ship unexercised (the `stat.IO_REPARSE_TAG_*` constants do not exist on
+    POSIX, hence the substituted tuple).
+
+    Ablation guard: dropping the `st_reparse_tag` arm of `is_link_like` makes the
+    last assertion fail — verified.
+    """
+    plain = tmp_path / "verify"
+    plain.mkdir()
+    assert platform_util.is_link_like(plain) is False  # positive control
+
+    real_lstat = os.lstat
+    monkeypatch.setattr(platform_util, "_LINK_REPARSE_TAGS", (_ReparseStat.st_reparse_tag,))
+    monkeypatch.setattr(
+        os,
+        "lstat",
+        lambda p, *a, **k: _ReparseStat() if str(p) == str(plain) else real_lstat(p),
+    )
+    assert platform_util.is_link_like(plain) is True
+
+
+def test_walk_files_unlinked_prunes_a_link_like_subdirectory(tmp_path, monkeypatch):
+    """A nested redirect is pruned even where ``os.walk`` would descend into it.
+
+    ``os.walk`` prunes a symlinked subdirectory by itself, so on POSIX this guard
+    looks redundant — which is exactly the trap. It prunes via ``os.path.islink``,
+    and a Windows DIRECTORY JUNCTION is not a symlink, so the arm that actually
+    needs pruning is the one ``os.walk`` misses, and it is unreachable from a
+    POSIX runner. The junction is therefore simulated by making ``is_link_like``
+    answer True for an ordinary directory: that disagreement between the two
+    predicates IS the win32 behaviour under test, and a real symlink would grade
+    ``os.walk`` instead of this function.
+
+    Ablation: delete the ``dirs[:]`` pruning line and `theirs.bin` joins the
+    result — 9000 bytes from a tree the caller never meant to walk. Verified.
+    """
+    root = tmp_path / "run"
+    (root / "keep").mkdir(parents=True)
+    (root / "keep" / "mine.bin").write_bytes(b"m" * 10)
+    junction = root / "verify"
+    junction.mkdir()
+    (junction / "theirs.bin").write_bytes(b"t" * 9000)
+
+    monkeypatch.setattr(platform_util, "is_link_like", lambda q: Path(q) == junction)
+
+    assert sorted(q.name for q in platform_util.walk_files_unlinked(root)) == ["mine.bin"]
+
+
+def test_walk_files_unlinked_refuses_a_link_like_top(tmp_path, monkeypatch):
+    """The other half: ``os.walk`` always follows the top path it is handed, so
+    declining to descend into links says nothing about the root itself. Same
+    simulation, and the two halves fail independently — pruning children cannot
+    save a caller who was pointed at the redirect to begin with."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "theirs.bin").write_bytes(b"t" * 9000)
+
+    monkeypatch.setattr(platform_util, "is_link_like", lambda q: Path(q) == outside)
+
+    assert list(platform_util.walk_files_unlinked(outside)) == []

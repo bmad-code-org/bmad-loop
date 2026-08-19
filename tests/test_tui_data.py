@@ -884,6 +884,39 @@ def test_active_task_id_matches_open_session_start(tmp_path):
     assert data.active_task_id(tmp_path, closed) == "t-new"
 
 
+def test_active_task_id_ignores_verifier_streams(tmp_path):
+    """The newest-log fallback sees pane logs only: verifier streams are not tasks.
+
+    Regression. Verifier stdout/stderr used to be retained in ``logs/``, whose
+    every other inhabitant is an adapter pane capture named after a session task
+    id. That collides in the COMMON case, not a corner: session-end is journalled
+    when the session ends, before its result reaches verification, so nothing is
+    open exactly when the verifier files are the newest in the directory. The
+    fallback then returned a stream's stem as the live task and the dashboard
+    reopened it as ``logs/{stem}.log`` — a path that resolves, so the log pane
+    rendered verifier stderr in place of the agent session log.
+
+    The streams are written through the real writer, not hand-placed: pointing
+    ``Journal.write_verify_stream`` back at ``logs/`` must redden this test.
+    """
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "1-1-a-dev-1.log").write_text("pane capture")
+    os.utime(logs / "1-1-a-dev-1.log", ns=(1, 1))  # older than anything written below
+
+    journal = Journal(tmp_path)
+    journal.write_verify_stream("verify-1-1-a-dev-1-1-0.stdout.log", "out")
+    journal.write_verify_stream("verify-1-1-a-dev-1-1-0.stderr.log", "err")
+
+    # a dev session that has ended -> no open session -> the fallback fires
+    ended = [
+        {"kind": "session-start", "task_id": "1-1-a-dev-1"},
+        {"kind": "session-end", "task_id": "1-1-a-dev-1"},
+    ]
+    assert data.active_task_id(tmp_path, ended) == "1-1-a-dev-1"
+    assert data.active_task_id(tmp_path, []) == "1-1-a-dev-1"
+
+
 # ------------------------------------------------------------- active agent
 
 

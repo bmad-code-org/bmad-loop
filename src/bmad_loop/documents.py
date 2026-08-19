@@ -474,7 +474,7 @@ def clean_document(
     this number, and formatting is the renderer's job. It is the same estimate
     the text prints: measured before mutating (so it holds under --dry-run) and
     approximate by construction, since it sums whole run dirs for archive/delete
-    but only the `worktrees/` tree for a trim.
+    but only the trimmed scaffolding (`runs.heavy_run_entries`) for a trim.
 
     Every list names items the text enumerates or counts: `worktrees` holds
     absolute worktree paths, the rest hold run ids. `protected` is the runs left
