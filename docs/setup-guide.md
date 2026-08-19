@@ -38,8 +38,8 @@ of the README.
   experimental** — the bundled `psmux` backend (a ConPTY tmux re-implementation) drives runs
   there and is selected automatically as the win32 default when its prerequisites are present:
   the `psmux` and `pwsh` (PowerShell) binaries on `PATH`, with `psmux` 3.3.8 or newer (older
-  releases read as unavailable: 3.3.6 and below can force-kill a recycled PID during teardown,
-  and the backend's verbs are written against fixes that landed in 3.3.8). It is
+  releases read as unavailable — see
+  [multiplexer backends](multiplexer-backends.md#psmux-native-windows-experimental) for why). It is
   not yet at the Linux/macOS/WSL support tier — the remaining native-Windows work (window
   hosting, attach/detach, Unity cache paths) is tracked in
   [the roadmap](ROADMAP.md#native-windows-multiplexer-backend); the port path is in

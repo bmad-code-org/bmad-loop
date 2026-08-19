@@ -163,10 +163,10 @@ only the platform default / registration order separates them in listings and
 selection. The bundled psmux backend discriminates by construction: it drives
 psmux's distinctly-named binary (`_BINARY = "psmux"`), so it never claims some
 other tmux-family install that owns the `tmux` name. Its probe also
-version-gates — releases up to 3.3.7 are refused (3.3.6 and below can force-kill
-a recycled PID during teardown; the backend's verbs are written against fixes
-released in 3.3.8), so an old or unidentifiable version reads as unavailable
-(`psmux -V` keeps the `tmux X.Y.Z` output format deliberately):
+version-gates — psmux 3.3.8 or newer is required
+([why](multiplexer-backends.md#psmux-native-windows-experimental)), so an old or unidentifiable
+version reads as unavailable (`psmux -V` keeps the `tmux X.Y.Z` output format
+deliberately):
 
 ```python
 class PsmuxMultiplexer(BaseTmuxBackend):
