@@ -122,6 +122,29 @@ jobs:
       - name: Install the project
         run: uv sync --locked --all-extras
 
+      - name: Ensure psmux (for the live multiplexer gate)
+        # Bounded, for the reason the Linux `Ensure tmux` step above documents at
+        # length: an unbounded package install wedged that job for 14 minutes with
+        # no exit status for `|| true` to discard. Chocolatey's own timeout bounds
+        # the install; the step timeout bounds everything else it might do.
+        timeout-minutes: 6
+        shell: pwsh
+        # After `Install the project`, because the assertion below runs `uv run`.
+        # What this buys `Run tests`: 9 more tests, measured at 68s serial on a
+        # dev box (they spread across xdist workers here). Sized against the
+        # job's 20-minute cap and its ~316s mean, so the headroom still holds.
+        run: |
+          choco install psmux -y --no-progress --execution-timeout=300
+          psmux -V
+          # `psmux -V` is not the assertion. test_psmux_live.py skips itself on
+          # PsmuxMultiplexer.available(), so an install at or below the version
+          # floor would leave this job green with the entire live gate never run
+          # — the one failure a "did it install?" check cannot see. Calling
+          # available() also keeps the floor in a single place (it reads
+          # `_LAST_UNSUPPORTED`, so a floor bump needs no edit here) and covers
+          # `pwsh`, which every parked window needs.
+          uv run python -c "import sys; from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer as M; m = M(); sys.exit(0 if m.available() else f'psmux is not an admitted version: {m.version()!r}')"
+
       - name: Run tests
         # pytest roots `tmp_path` at `tempfile.gettempdir()`, which follows
         # TMP/TEMP on Windows. Measured on the windows-2025 image (2026-08-14):
