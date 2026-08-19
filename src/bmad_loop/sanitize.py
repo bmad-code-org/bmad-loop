@@ -61,6 +61,13 @@ from typing import Any, Iterable, Iterator
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _IDENTIFIER_MAX = 80
 
+# Per-line character bound for :func:`scrub_text`. Real ``--version``/``--help``
+# lines from the coding CLIs this probes run well under ~120 characters, so 200
+# is roughly 2x headroom over legitimate output while still bounding an
+# adversarial or corrupted one. Public because `probe.py` passes it explicitly
+# rather than relying on a hidden default.
+SCRUB_TEXT_MAX_CHARS = 200
+
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
 # Known credential token shapes — provider prefixes plus the JWT header. These
@@ -83,6 +90,15 @@ _SECRET_ENTROPY_MIN = 3.5  # bits/char; pure hex ~4.0, base64 ~6.0, prose/slug w
 # Token shape used by assert_no_leak to re-scan rendered output for secrets.
 _LEAK_TOKEN_RE = re.compile(r"[A-Za-z0-9._/+-]{6,}")
 _URL_CRED_RE = re.compile(r"https?://[^/\s]*:[^/@\s]+@")
+# The guard constructs whose match can straddle a truncation point AND whose
+# leading fragment would still be sensitive once the rest is clipped away.
+# `scrub_text`'s cut retracts out of these -- see `_truncate_line`. This sits
+# beside assert_no_leak's rule list deliberately: a rule added there needs an
+# entry here only if a PREFIX of its match stays sensitive. `_EMAIL_RE` is absent
+# because scrub_text redacts emails BEFORE it truncates, so none survives to be
+# split; `_ABS_HOME_RE` is absent because a fragment too short to match `/home/`
+# no longer carries the home tree the rule names.
+_TRUNCATION_HAZARD_RES = (_LEAK_TOKEN_RE, _URL_CRED_RE)
 # The same bytes reach assert_no_leak either as raw text (the markdown report)
 # or as JSON text (the --json document), and json.dumps DOUBLES a backslash —
 # `C:\Users\alice` is serialized as `C:\\Users\\alice`. Matching only the raw
@@ -96,8 +112,26 @@ _URL_CRED_RE = re.compile(r"https?://[^/\s]*:[^/@\s]+@")
 # Widening the drive-letter arm to `[\\/]` buys only the mixed-separator oddity
 # `C:\Users/alice` — and any string carrying a separator at all is rejected by
 # looks_like_identifier upstream and redacted before it can reach here.
-# tests/test_sanitize.py::test_assert_no_leak_fires pins each arm.
-_ABS_HOME_RE = re.compile(r"/home/|/Users/|/root/|[A-Za-z]:\\{1,2}Users\\{1,2}", re.I)
+#
+# The backslash `home`/`root` arm is for the Windows→WSL UNC bridge (#512):
+# `\\wsl.localhost\<distro>\home\<user>`, the legacy `\\wsl$\...`, and the
+# extended-length `\\?\UNC\wsl.localhost\...` folding all reach a POSIX home
+# directory whose separators are BACKSLASHES, so none of the forward-slash arms
+# can see them. That shape needs a path rule for a second reason: the identifier
+# at risk is the *Linux* username, while the username rule in assert_no_leak
+# compares `getpass.getuser()` — the *Windows* account — so on a native-Windows
+# interpreter reaching a distro path, no other rule can fire on the name that
+# matters. The arm anchors on the home segment rather than the `wsl` host
+# because a host anchor misses `\\?\UNC\wsl.localhost\...` entirely: the
+# `?\UNC\` segment sits between the leading backslashes and `wsl`. `Users` is
+# deliberately NOT in this arm — it stays behind the drive-letter arm above,
+# which is the bound the preceding paragraph justifies.
+# tests/test_sanitize.py::test_assert_no_leak_fires pins each arm;
+# ::test_assert_no_leak_home_rule_is_not_any_absolute_path pins the other
+# direction, since a hit makes diagnose refuse to emit at all.
+_ABS_HOME_RE = re.compile(
+    r"/home/|/Users/|/root/|[A-Za-z]:\\{1,2}Users\\{1,2}|\\{1,2}(?:home|root)\\{1,2}", re.I
+)
 
 _REDACTED_STR = "<redacted:str>"
 _REDACTED_SECRET = "<redacted:secret>"  # nosec B105 - redaction marker, not a credential
@@ -151,22 +185,102 @@ def looks_like_secret(s: str) -> bool:
     return len(longest) >= _SECRET_RUN_MIN and _shannon_entropy(longest) >= _SECRET_ENTROPY_MIN
 
 
-def scrub_text(s: str, *, max_lines: int | None = None) -> str:
+def _truncate_line(line: str, max_chars: int) -> str:
+    """One line clipped to ``max_chars``, never in a way that blinds the guard.
+
+    The naive cut is at ``max_chars``. That is unsafe when it lands INSIDE
+    something :func:`assert_no_leak` would have flagged, because the fragment it
+    leaves behind can keep the sensitive part while no longer tripping the rule
+    — turning a fail-closed refusal into an emission. Two shapes reach here:
+
+    * a credential-shaped token, where the entropy arm of
+      :func:`looks_like_secret` needs a contiguous alnum run of
+      ``_SECRET_RUN_MIN``, so clipping a 36-character token to 30 leaves a
+      credential prefix the guard no longer recognizes; and
+    * a URL credential, whose match ends at the ``@`` — clip that off and
+      ``_URL_CRED_RE`` stops matching while the password prefix still ships.
+
+    Rather than special-case either, the cut retracts out of any
+    ``_TRUNCATION_HAZARD_RES`` match it splits whose whole trips the guard while
+    its surviving prefix does not, using :func:`assert_no_leak` itself as the
+    oracle. Deferring to the guard is what keeps this general: it is the same
+    verdict the rendered bytes are judged by, so a rule added there is covered
+    here without a second implementation of what "sensitive" means.
+
+    That verdict test is also what keeps the cap from over-firing. ``"x" * 5000``
+    is a single 5000-character token, but it trips no rule whole OR clipped, so
+    it still truncates at exactly ``max_chars``; a ``ghp_``-prefixed token is
+    matched at its start and still trips the guard once clipped, so it is not
+    retracted either and the refusal is preserved with no content dropped (#481).
+
+    What this does NOT cover, deliberately: the guard's rules keyed on values
+    only the CALLER knows. ``assert_no_leak`` is consulted here without its
+    ``extra`` argument, so a caller-supplied sensitive value is not considered,
+    and the hazard patterns need six characters, so a standalone username at the
+    guard's five-character floor is matched by neither. Splitting one of those
+    still costs the guard its verdict. Closing that needs the caller's values
+    threaded into this function, which is tracked separately (#654) rather than
+    widened into #481 — this bounds the cap to the guard's STATIC rules.
+    """
+    if len(line) <= max_chars:
+        return line
+    cut = max_chars
+    # Retracting out of one hazard can land the cut inside an earlier one, so
+    # iterate to a fixed point. `cut` only ever decreases, so this terminates.
+    changed = True
+    while changed:
+        changed = False
+        for pattern in _TRUNCATION_HAZARD_RES:
+            for match in pattern.finditer(line):
+                if (
+                    match.start() < cut < match.end()
+                    and assert_no_leak(match.group())
+                    and not assert_no_leak(line[match.start() : cut])
+                ):
+                    cut = match.start()
+                    changed = True
+    return line[:cut] + f"… ({len(line) - cut} more chars redacted)"
+
+
+def scrub_text(s: str, *, max_lines: int | None = None, max_chars: int | None = None) -> str:
     """Sanitize free text (a CLI's ``--help`` / ``--version`` / a log tail).
 
     Less aggressive than :func:`scrub_json` — help text is the CLI's own and
     flag lines must survive — so we only redact the home dir and any emails,
-    then optionally cap the line count.
+    then optionally cap the line count and each line's length.
+
+    ``max_chars`` bounds each line's **content** at ``max_chars``; a truncated
+    line is emitted as at most ``max_chars`` characters plus the
+    ``… (N more chars redacted)`` marker, so its total length is at most
+    ``max_chars + len(marker)`` — "at most" because a cut that would split a
+    credential-shaped token retracts to that token's start rather than emit a
+    guard-invisible prefix of it (see :func:`_truncate_line`). That overshoot is
+    the same off-by-one ``max_lines`` already has — ``max_lines=5`` emits six lines, five kept plus
+    the marker line — and it is deliberate (#481): a marker made to fit inside
+    the budget would have to be a bare ellipsis, which does not say that
+    redaction happened. The line-count marker is never itself char-truncated.
+    Composing both caps bounds the whole result at
+    ``max_lines * (max_chars + len(char marker)) + len(line marker)``.
+
+    Passing either cap normalizes line endings and drops a trailing newline
+    (``splitlines``/``join``); passing neither is a byte-identical passthrough
+    of the redaction step.
     """
     s = redact_home(s)
     s = _EMAIL_RE.sub(_REDACTED_EMAIL, s)
-    if max_lines is not None:
-        lines = s.splitlines()
-        if len(lines) > max_lines:
-            dropped = len(lines) - max_lines
-            lines = lines[:max_lines] + [f"… ({dropped} more lines redacted)"]
-        s = "\n".join(lines)
-    return s
+    if max_lines is None and max_chars is None:
+        return s
+    lines = s.splitlines()
+    # Held aside, not appended yet: the line-count marker is a report of what the
+    # line cap removed, so char-truncating it would redact the redaction notice.
+    line_marker: list[str] = []
+    if max_lines is not None and len(lines) > max_lines:
+        dropped = len(lines) - max_lines
+        line_marker = [f"… ({dropped} more lines redacted)"]
+        lines = lines[:max_lines]
+    if max_chars is not None:
+        lines = [_truncate_line(line, max_chars) for line in lines]
+    return "\n".join(lines + line_marker)
 
 
 def _is_word_boundary(ch: str) -> bool:
