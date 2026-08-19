@@ -407,34 +407,74 @@ def test_tmux_window_pane_pids_degrades_to_empty(monkeypatch, outcome):
     assert mux.window_pane_pids("@7") == []
 
 
-def test_kill_window_warns_on_a_non_zero_exit(monkeypatch, capsys):
+def _kill_fake(monkeypatch, *, kill_rc: int, kill_err: str = "", probe_rc: int = 0):
+    """Script kill-window's exit and the survivor probe's, recording the argv."""
+    calls: list[list[str]] = []
+
+    def fake(argv, **k):
+        calls.append(argv)
+        if argv[1] == "list-panes":
+            return subprocess.CompletedProcess(argv, probe_rc, stdout="", stderr="")
+        return subprocess.CompletedProcess(argv, kill_rc, stdout="", stderr=kill_err)
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    return calls
+
+
+def test_kill_window_warns_only_when_the_window_outlived_the_kill(monkeypatch, capsys):
     # A target that resolved to nothing (a wrong session qualification, a
     # renumbered id) leaves the window alive, and the swallow used to hide that
     # completely. The verdict is unchanged — still None, still never raises —
     # only now the target and the binary's own stderr reach the operator.
+    calls = _kill_fake(monkeypatch, kill_rc=1, kill_err="can't find window: @9999\n")
     mux = TmuxMultiplexer()
-    monkeypatch.setattr(
-        tmux_base.subprocess,
-        "run",
-        lambda argv, **k: subprocess.CompletedProcess(
-            argv, 1, stdout="", stderr="can't find window: @9999\n"
-        ),
-    )
     assert mux.kill_window("ctl:@9999") is None
     err = capsys.readouterr().err
     assert "kill-window ctl:@9999" in err
+    assert "still alive" in err
     assert "can't find window: @9999" in err  # verbatim: benign vs real is the reader's call
+    # The probe replays the target as given — it carries no session of its own.
+    assert calls[1][1:] == ["list-panes", "-t", "ctl:@9999"]
+
+
+def test_kill_window_is_silent_when_the_window_is_already_gone(monkeypatch, capsys):
+    # The dominant case, not an edge one: CodingCLIAdapter.run kills in a
+    # `finally` on every session, and a session that completed by window death
+    # has nothing left to kill. A warning here would fire on ordinary teardown.
+    _kill_fake(monkeypatch, kill_rc=1, kill_err="can't find window: @7\n", probe_rc=1)
+    assert TmuxMultiplexer().kill_window("@7") is None
+    assert capsys.readouterr().err == ""
+
+
+def test_kill_window_is_silent_when_the_survivor_probe_cannot_answer(monkeypatch, capsys):
+    # Unreadable is not "alive": the warning is a diagnostic, so a probe that
+    # could not answer must not manufacture one — that would put the noise back
+    # on exactly the path the probe exists to clear.
+    def fake(argv, **k):
+        if argv[1] == "list-panes":
+            raise subprocess.TimeoutExpired(argv, 1)
+        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="boom\n")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    assert TmuxMultiplexer().kill_window("@7") is None  # must not raise
+    assert capsys.readouterr().err == ""
+
+
+def test_kill_window_warning_omits_a_bare_colon_on_empty_stderr(monkeypatch, capsys):
+    # A non-zero exit with nothing on stderr is plausible; "exited 1: " reads as
+    # a truncated message rather than a complete one.
+    _kill_fake(monkeypatch, kill_rc=1, kill_err="")
+    TmuxMultiplexer().kill_window("@7")
+    err = capsys.readouterr().err.strip()
+    assert err.endswith("still alive")
+    assert ": " not in err.removeprefix("warning: ")
 
 
 def test_kill_window_is_silent_when_the_kill_lands(monkeypatch, capsys):
-    mux = TmuxMultiplexer()
-    monkeypatch.setattr(
-        tmux_base.subprocess,
-        "run",
-        lambda argv, **k: subprocess.CompletedProcess(argv, 0, stdout="", stderr=""),
-    )
-    assert mux.kill_window("@7") is None
+    calls = _kill_fake(monkeypatch, kill_rc=0)
+    assert TmuxMultiplexer().kill_window("@7") is None
     assert capsys.readouterr().err == ""
+    assert len(calls) == 1  # a landed kill never pays for the survivor probe
 
 
 # -------------------------------- version() is one bounded line, always (#321)

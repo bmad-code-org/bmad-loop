@@ -368,21 +368,43 @@ class BaseTmuxBackend(TerminalMultiplexer):
         # qualification, a renumbered id) would otherwise leave a live window
         # behind with no trace anywhere.
         #
-        # Accepted ceiling: killing an ALREADY-GONE window exits non-zero too,
-        # and that is ordinary teardown, not a fault. The return code cannot
-        # separate the two, so the binary's own stderr rides along verbatim
-        # ("can't find window" reads as benign to whoever sees it) rather than
-        # buying a liveness round-trip per kill.
+        # An ALREADY-GONE window exits non-zero too, and that is ordinary
+        # teardown, not a fault — the DOMINANT case, not an edge one:
+        # CodingCLIAdapter.run kills in a `finally` on every session, and a
+        # session that completed by window death has nothing left to kill. The
+        # return code cannot separate the two, so the survivor is what decides:
+        # probe the target once, and warn only when the window is still there.
+        # That is the shape a non-zero exit is actually about — a target that
+        # resolved to nothing (a wrong session qualification, a renumbered id)
+        # leaving a live window behind. The probe is paid on the FAILURE path
+        # only, never per kill, and `list-panes` is used rather than
+        # window_alive because a target here carries no session to pass it.
+        # An unreadable probe stays silent: this is a diagnostic, and guessing
+        # would put the noise back on the path the probe exists to clear.
         try:
             proc = self._run(["kill-window", "-t", target], check=False)
         except (subprocess.SubprocessError, OSError):
             return
-        if proc.returncode != 0:
-            print(
-                f"warning: kill-window {target} exited {proc.returncode}: "
-                f"{proc.stderr.strip()}",
-                file=sys.stderr,
-            )
+        if proc.returncode == 0 or not self._window_survived_kill(target):
+            return
+        detail = proc.stderr.strip()
+        print(
+            f"warning: kill-window {target} exited {proc.returncode} and the window "
+            f"is still alive{f': {detail}' if detail else ''}",
+            file=sys.stderr,
+        )
+
+    def _window_survived_kill(self, target: str) -> bool:
+        """Whether ``target`` still resolves after a failed kill.
+
+        False for both "provably gone" and "cannot tell" — the caller only warns,
+        so an unanswerable probe must not manufacture a warning.
+        """
+        try:
+            probe = self._run(["list-panes", "-t", target], check=False)
+        except (subprocess.SubprocessError, OSError):
+            return False
+        return probe.returncode == 0
 
     def window_pane_pids(self, target: str) -> list[int]:
         # Capability method (see the seam default): a transport failure, a dead
