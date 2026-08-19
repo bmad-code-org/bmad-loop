@@ -433,6 +433,26 @@ def _scrub_policy(obj: Any) -> Any:
                     k for k in (str(x) for x in value) if sanitize.looks_like_identifier(k)
                 )
             else:
+                # Keys pass through VERBATIM here, deliberately — unlike
+                # `sanitize._scrub`, which scrubs keys as well as values. The
+                # warrant is what this snapshot IS: `Policy.to_dict()` is
+                # `asdict()` over frozen dataclasses, so every key is a
+                # compile-time field name — developer-authored, non-PII, and the
+                # point of the dump (a reader diagnosing a run needs to see
+                # `max_review_cycles`, not `<redacted:str>`). The one user-keyed
+                # table, `plugins.settings`, never reaches this branch:
+                # `_POLICY_KEYSET_KEYS` intercepts it above and reduces it to its
+                # identifier-gated plugin-id keyset (#186).
+                #
+                # That rests on an invariant nothing else stated until #202: NO
+                # policy section has a free-keyed table. Add one — say an
+                # `adapter.overrides` keyed by binary path — and its keys ship
+                # verbatim in a dump meant to be shareable.
+                # `test_no_policy_section_has_a_free_keyed_table`
+                # (tests/test_diagnostics.py) enforces it over the field TYPES, so
+                # it fires when such a table is declared rather than when a user
+                # first populates it; route a new one through `_POLICY_KEYSET_KEYS`
+                # or `_POLICY_COUNT_KEYS` rather than widening that test.
                 out[key] = _scrub_policy(value)
         return out
     if isinstance(obj, (list, tuple)):
