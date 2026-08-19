@@ -601,8 +601,9 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         _transportable: it strips ONE surrounding `"` pair and iterates
         `splitlines()`, so a `"` or a line break is refused at the WRITE and the
         strip stays lossless for every value this backend stored. Known hole:
-        one server request handler (the plugin-drain copy, server/mod.rs:465)
-        answers this listing empty-with-success while keys exist, so a
+        one server request handler (the ``ShowOptions`` arm of
+        ``drain_plugin_req`` in server/mod.rs) answers this listing
+        empty-with-success while keys exist, so a
         surprising {} is possible and is not proof that no keys are set."""
         try:
             proc = self._run(["show-options", "-q", "-t", session], check=False)
@@ -693,7 +694,9 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         # Cost, accepted: two listing round-trips per kill, three for a name
         # target (name-resolve, liveness, then keys; agent-window kills pay it
         # too, for nothing — and prune_ctl_windows fans it out once per stale
-        # window); skip-by-session-name if that ever measures.
+        # window), plus one more from the base's survivor probe whenever the
+        # kill exits non-zero — on psmux that includes ordinary window-death
+        # teardown; skip-by-session-name if that ever measures.
         scope = self._option_scope(target)
         super().kill_window(target)
         if scope is None:

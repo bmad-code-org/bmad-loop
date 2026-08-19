@@ -45,8 +45,8 @@ breaking changes may land in a minor release.
 
 - **The retired psmux workarounds change three visible behaviors (#658).** The run-log sink rides
   the same `-EncodedCommand` transport as every other window command instead of a sidecar
-  `.ps1`, so a log path containing a space, `$` or a backtick is carried rather than refused and
-  nothing is written beside the log. `select-window` takes the session-qualified window id
+  `.ps1`, so a log path containing a space, `$` or a backtick no longer breaks or blocks log
+  capture, and nothing is written beside the log. `select-window` takes the session-qualified window id
   directly, dropping a listing round-trip per focus change. `kill_session` inherits the base's
   `=name` exact-match target.
 
@@ -100,11 +100,12 @@ breaking changes may land in a minor release.
 ### Fixed
 
 - **A failed `kill-window` that left the window alive is no longer swallowed (#658).**
-  `BaseTmuxBackend.kill_window` ran `check=False` and discarded the result, so a target that
-  resolved to nothing — a wrong session qualification, a renumbered id — left a live window
-  behind with no trace. A non-zero exit now probes the target once and warns on stderr only when
-  the window is still there; an already-gone window, which is what ordinary teardown produces,
-  stays silent. The verdict is unchanged: still returns `None`, still never raises.
+  `BaseTmuxBackend.kill_window` ran `check=False` and discarded the result, so a kill that failed
+  with the window still standing left it behind with no trace. A non-zero exit now reads the
+  session's own window list once and warns on stderr only when the target's window is still in
+  it; an already-gone window — what ordinary teardown produces — and a target that names no
+  window at all both stay silent, because neither leaves anything behind. The verdict is
+  unchanged: still returns `None`, still never raises.
 
 - **The egress self-check now sees Windows→WSL UNC home paths (#512).** `diagnose` and
   `probe-adapter` re-scan their own rendered bytes before emitting and refuse to emit at all on a
