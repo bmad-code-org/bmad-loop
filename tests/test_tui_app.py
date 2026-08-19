@@ -1024,6 +1024,15 @@ async def test_poll_skips_while_another_holds_the_lock(project):
     # Regression: exclusive=True cannot stop a running thread worker, so the
     # screen lock must make a second poll bail instead of mutating shared ctx
     # (two threads feeding ctx.log's pyte stream crashed the TUI).
+    #
+    # Ablation target: delete the `if not self._poll_lock.acquire(blocking=False):
+    # return` guard from `_poll` *and* neutralize its paired
+    # `finally: self._poll_lock.release()` to `pass` — one guard, both halves,
+    # not two gates. Dropping only the acquire makes every other tick release a
+    # lock it never took, reddening the whole file on `RuntimeError: release
+    # unlocked lock` instead. With both gone this test fails alone on
+    # `assert ctx.entries == before` — the probe thread runs the body and
+    # appends the checkpoint entry.
     root = project.project
     run_dir = make_run(root, "20260611-100000-aaaa", alive=True)
     write_numbered_log(run_dir, "story-1", count=30)
@@ -1044,9 +1053,26 @@ async def test_poll_skips_while_another_holds_the_lock(project):
         # while waiting on call_from_thread(_apply).
         await until(pilot, lambda: screen._poll_lock.acquire(blocking=False))
         try:
+            gen = screen._generation
             before = list(ctx.entries)
             journal.append("checkpoint", log_task="story-1", log_pos=0)  # new entry on disk
-            worker = screen._poll(ctx, screen._generation, False, None)
+            # Run the undecorated body as our own thread worker, in a group of
+            # our own. Calling the @work-decorated _poll enters group "poll" on
+            # this same node, and the next 1s interval tick's poll cancels that
+            # group on arrival (add_worker -> cancel_group), marking this worker
+            # CANCELLED — so worker.wait() raced the tick and raised
+            # WorkerCancelled on slow Windows runners (#581). A private group is
+            # never a cancel_group candidate, so this awaits to completion;
+            # thread=True keeps it a real second thread entering the guarded body
+            # while the lock is held, which is the point of the test.
+            # exit_on_error=False surfaces a body exception as WorkerFailed at
+            # the await instead of tearing the app down mid-test.
+            worker = screen.run_worker(
+                lambda: DashboardScreen._poll.__wrapped__(screen, ctx, gen, False, None),
+                thread=True,
+                group="poll-probe-581",
+                exit_on_error=False,
+            )
             await worker.wait()
             assert ctx.entries == before  # guarded body never ran
         finally:
