@@ -19,6 +19,9 @@ breaking changes may land in a minor release.
   stream pointers under the run's `verify/` directory — its own store, kept out of the
   adapter-owned, TUI-consumed `logs/`; plugins remain unable to alter verification or
   commit decisions. Storage, upload, signing, and any policy response stay plugin-owned.
+  Scope is the dev phase: the review gate runs the same `[verify] commands` and retains
+  nothing, so the journal records are not a census of a run's verifier invocations —
+  `docs/plugin-authoring-guide.md` states the boundary, and #656 tracks closing it.
   Retention is bounded by the new `[verify] stream_capture_kb` (default 256 KiB per
   stream, `0` = capture nothing): the tail is kept, and the record carries the full
   byte count plus a `*_truncated` flag so a cut file is never mistaken for a whole

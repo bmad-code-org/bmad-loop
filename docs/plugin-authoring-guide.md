@@ -460,6 +460,33 @@ carries the reason. A plugin reading these pointers must therefore treat both
 file holds a command's whole output. Treat verifier output as potentially sensitive and store, upload, sign,
 or act on it only from an explicitly configured plugin.
 
+**The dev phase is the whole of this surface.** `[verify] commands` also run at
+the _review_ gate — `verify_review` / `verify_review_stories` /
+`verify_review_bundle` end on the same core classifier — and **none of those runs
+are journalled or published to any hook.** Five engine gates reach them: the
+converged review pass, the review-budget-exhaustion rescue, the review-timeout
+salvage, and both passes inside the skip-review commit path (which runs the gate
+again after a repair). `bmad-loop confirm --reverify` runs the commands too, out
+of band by construction — the run that parked the story is finished, so there is
+no journal to write to and no hook bus to emit on.
+
+Two consequences a handler has to be written for:
+
+- **`verify-command-result` entries are not a complete census of a run's verifier
+  invocations.** Every story that reaches a commit ran the commands at least once
+  more than the records show. Never derive "the verifier ran N times" or "the last
+  thing the verifier saw" from the journal — derive only "these are the dev-phase
+  passes", which is what the records claim.
+- **A green commit is not evidence that the last journalled pass was green**, and a
+  red journalled pass is not evidence the commit was blocked: a `fix` pass can fail
+  and the story still commit after a later review-gate run that left no record.
+  Correlate a decision with the `dev-decision` / `fix-decision` / `review-result`
+  entries beside the results, not with the results alone.
+
+The boundary is deliberate, not an oversight — the review leg would need its own
+hook stage rather than a second meaning for one named `post_dev_verify` — and is
+tracked as a follow-up in [#656](https://github.com/bmad-code-org/bmad-loop/issues/656).
+
 ### Review
 
 | Stage                 | When                           | Mutable surface                                   |
@@ -469,6 +496,9 @@ or act on it only from an explicitly configured plugin.
 | `post_review_session` | after each review session      | —                                                 |
 | `post_review_result`  | after a review verdict         | a [workflow injection point](#workflows-provides) |
 | `pre_fix_session`     | before a verify-repair session | `proposed_prompt`, `proposed_env`, veto           |
+
+None of these carries the review gate's `[verify] commands` results — that gate
+runs the commands and retains nothing. See the boundary note above `### Review`.
 
 ### Commit
 

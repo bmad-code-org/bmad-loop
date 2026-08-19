@@ -514,6 +514,17 @@ def _dev_then_fix_run(project, monkeypatch, capture):
     The first review-time verify fails, which routes the story into `_fix_phase`;
     the repair session's verify passes and the story commits. Both legs emit
     `post_dev_verify`, which is what the callers need.
+
+    FOUR scripted returns, TWO journalled sequences — deliberately, and the
+    inequality is the documented scope boundary, not a miscount to "fix". Returns
+    1 and 3 are the dev and repair verifications, which this PR journals. Returns
+    2 and 4 are the two `_skip_review_and_commit` review gates (the second runs
+    after the repair), and the review leg is neither journalled nor published to
+    any hook — see the boundary section in `docs/plugin-authoring-guide.md` and
+    issue #656. The count is load-bearing, not padding: dropping the fourth value
+    leaves the post-repair gate with nothing to consume and the run ends
+    `crashed=True, crash_error='StopIteration: '` (measured), so a reader who
+    trims the list finds out immediately.
     """
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     engine, _ = make_engine(
