@@ -274,6 +274,18 @@ def test_assert_no_leak_clean_text():
         (r"path \\wsl$\Ubuntu\home\alice\proj", "absolute-home-path"),
         (r"path \\?\UNC\wsl.localhost\Ubuntu\home\a", "absolute-home-path"),
         (r"path \\wsl.localhost\Ubuntu\root\proj", "absolute-home-path"),
+        # The arm names a `home`/`root` TREE, not the WSL bridge specifically, so
+        # an ordinary drive path or a plain share carrying that segment fires too.
+        # Reviewers have read that breadth as an over-match and proposed anchoring
+        # the arm on the WSL prefix and its distro segment; these rows record why
+        # it is deliberate. It is the breadth the untouched POSIX arms have always
+        # had — `/home/build` and `/root/data` fire — and the first row's own
+        # FORWARD-slash spelling, `D:/home/build`, already fired before #512 via
+        # the `/home/` arm. An arm anchored on the WSL prefix would leave
+        # `D:\home\build` clean while `D:/home/build` fires, which is the
+        # separator asymmetry that IS #512, reintroduced one level down.
+        (r"path D:\home\build", "absolute-home-path"),
+        (r"path \\server\share\root\data", "absolute-home-path"),
         ("key ghp_CANARYxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx01", "secret"),
     ],
 )
