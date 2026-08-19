@@ -7,6 +7,8 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-08-19
+
 ### Added
 
 - **Plugins can now observe structured dev verification results (#641).** The existing
@@ -31,9 +33,10 @@ breaking changes may land in a minor release.
   ceiling bounds what is held in memory while the remaining commands run, so a
   pathologically chatty suite cannot grow peak memory with the number of configured
   verify commands; the record still reports what the command emitted, so a stream the
-  ceiling cut is never mistaken for a whole one. Retaining a stream is observation, so a failed write (ENOSPC, a read-only run
-  dir) degrades — the record still lands, with a null pointer and `capture_error` —
-  instead of taking down a dev pass whose verify commands passed.
+  ceiling cut is never mistaken for a whole one. Retaining a stream is observation, so a
+  failed write (ENOSPC, a read-only run dir) degrades — the record still lands, with a
+  null pointer and `capture_error` — instead of taking down a dev pass whose verify
+  commands passed.
 
 - **A refused auto-sweep is now visible outside the journal (#501).** A run whose deferred-work
   sweep was refused ended looking exactly like one that swept, and under `[sweep] auto = "run-end"`
@@ -55,9 +58,9 @@ breaking changes may land in a minor release.
   validate is the command used to decide whether a checkout is safe to run at all, so a clone's own
   config cannot choose which binary it launches. The gate bounds which NAME is probed, not what
   that name resolves to — resolution runs through the user's `PATH`, and a probed name resolves to
-  whatever the session launch would itself run. That boundary is the profile's provenance and not the spelling of
-  `binary`, because a bare name still resolves into the checkout whenever a checkout-local
-  directory is on `PATH`. The severity is `warning`, so validate's exit code is
+  whatever the session launch would itself run. That boundary is the profile's provenance and not
+  the spelling of `binary`, because a bare name still resolves into the checkout whenever a
+  checkout-local directory is on `PATH`. The severity is `warning`, so validate's exit code is
   unchanged for a live CLI that merely answers `--version` oddly, and `adapter.binary` keeps its
   existing found/absent meaning. The check id is additive, so `VALIDATE_SCHEMA_VERSION` is
   unchanged.
@@ -430,12 +433,12 @@ breaking changes may land in a minor release.
   `MoveFileEx(MOVEFILE_REPLACE_EXISTING)`, which is not guaranteed atomic and may fall back to a
   non-atomic copy. What holds everywhere is that a failed write cannot truncate the original.
 
-- **An atomic write no longer fails on a file whose name fills the filesystem's limit.** The helpers
-  stage a temp named after their target, and `mkstemp` inserts eight random characters, so the temp
-  ran `len(name) + 13` — long enough that a target with a perfectly legal name produced an illegal
-  _temp_ name and the write died with `ENAMETOOLONG` — or, on Windows, with `ENOENT` carrying
-  `winerror` 206, which is the same condition under a different name. On ext4 the cutoff was a
-  243-byte basename.
+- **An atomic write no longer fails on a file whose name fills the filesystem's limit (#595).** The
+  helpers stage a temp named after their target, and `mkstemp` inserts eight random characters, so
+  the temp ran `len(name) + 13` — long enough that a target with a perfectly legal name produced an
+  illegal _temp_ name and the write died with `ENAMETOOLONG` — or, on Windows, with `ENOENT`
+  carrying `winerror` 206, which is the same condition under a different name. On ext4 the cutoff
+  was a 243-byte basename.
   Latent in the helpers since they were written, and reachable from this release because the story
   spec writers moved onto them: a spec is named by your planning skills, and nothing bounds that
   name. When the readable temp name cannot fit, the helpers now fall back to a short digest of it
@@ -3317,7 +3320,8 @@ enforced in CI.
   implementation phase, driven by a Python control loop with hook-based session transport and
   resumable on-disk run state.
 
-[Unreleased]: https://github.com/bmad-code-org/bmad-loop/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/bmad-code-org/bmad-loop/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.11.0
 [0.10.0]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.10.0
 [0.9.1]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.9.1
 [0.9.0]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.9.0

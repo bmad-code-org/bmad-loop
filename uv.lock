@@ -17,7 +17,7 @@ wheels = [
 
 [[package]]
 name = "bmad-loop"
-version = "0.10.0"
+version = "0.11.0"
 source = { editable = "." }
 dependencies = [
     { name = "psutil", marker = "sys_platform == 'win32'" },
