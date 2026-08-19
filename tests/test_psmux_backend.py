@@ -491,10 +491,14 @@ def test_available_requires_psmux_pwsh_and_supported_version(monkeypatch):
         "which",
         lambda name: f"C:\\bin\\{name}.exe" if name in ("psmux", "pwsh") else None,
     )
-    monkeypatch.setattr(PsmuxMultiplexer, "version", lambda self: "tmux 3.3.7")
+    monkeypatch.setattr(PsmuxMultiplexer, "version", lambda self: "tmux 3.3.8")
     assert PsmuxMultiplexer().available() is True
 
-    # 3.3.6 and older force-kill recycled PIDs on teardown — unusable
+    # 3.3.7 and older are refused: 3.3.6 force-kills recycled PIDs on teardown,
+    # and 3.3.7 lacks the fixes this backend's verbs now assume.
+    monkeypatch.setattr(PsmuxMultiplexer, "version", lambda self: "tmux 3.3.7")
+    assert PsmuxMultiplexer().available() is False
+
     monkeypatch.setattr(PsmuxMultiplexer, "version", lambda self: "tmux 3.3.6")
     assert PsmuxMultiplexer().available() is False
 
@@ -507,9 +511,13 @@ def test_available_requires_psmux_pwsh_and_supported_version(monkeypatch):
     monkeypatch.setattr(PsmuxMultiplexer, "version", lambda self: "tmux 10.0")
     assert PsmuxMultiplexer().available() is True
 
-    # a suffixed newer release still clears the strictly-greater gate
-    monkeypatch.setattr(PsmuxMultiplexer, "version", lambda self: "tmux 3.3.7-rc0")
+    # a suffixed newer release still clears the strictly-greater gate; a
+    # suffixed refused one still fails it (the suffix is not read at all)
+    monkeypatch.setattr(PsmuxMultiplexer, "version", lambda self: "tmux 3.3.8-rc0")
     assert PsmuxMultiplexer().available() is True
+
+    monkeypatch.setattr(PsmuxMultiplexer, "version", lambda self: "tmux 3.3.7-rc0")
+    assert PsmuxMultiplexer().available() is False
 
     # a two-part compat version (tmux's own format) reads as patch 0
     monkeypatch.setattr(PsmuxMultiplexer, "version", lambda self: "tmux 3.4")
@@ -533,7 +541,7 @@ def test_available_composes_real_version_probe(monkeypatch):
         lambda name: f"C:\\bin\\{name}.exe" if name in ("psmux", "pwsh") else None,
     )
     monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"C:\\bin\\{name}.exe")
-    rec = _RecordRun(stdout="tmux 3.3.7\n")
+    rec = _RecordRun(stdout="tmux 3.3.8\n")
     monkeypatch.setattr(tmux_base.subprocess, "run", rec)
     assert PsmuxMultiplexer().available() is True
     assert rec.argv == ["psmux", "-V"]
@@ -554,13 +562,13 @@ def test_available_parses_the_gate_out_of_a_real_two_line_probe(monkeypatch):
         lambda name: f"C:\\bin\\{name}.exe" if name in ("psmux", "pwsh", "tmux") else None,
     )
 
-    for release, expected in (("3.3.7", True), ("3.3.6", False)):
-        rec = _RecordRun(stdout=f"tmux {release}\npsmux {release} (05cc5d4 2026-07-20)\n")
+    for release, expected in (("3.3.8", True), ("3.3.7", False)):
+        rec = _RecordRun(stdout=f"tmux {release}\npsmux {release} (66cf613 2026-08-18)\n")
         monkeypatch.setattr(tmux_base.subprocess, "run", rec)
         mux = PsmuxMultiplexer()
         assert mux.available() is expected
         # The fold reached the gate whole — both segments, one line.
-        assert mux.version() == f"tmux {release}; psmux {release} (05cc5d4 2026-07-20)"
+        assert mux.version() == f"tmux {release}; psmux {release} (66cf613 2026-08-18)"
 
 
 def test_available_caches_version_gate_per_instance(monkeypatch):
@@ -574,7 +582,7 @@ def test_available_caches_version_gate_per_instance(monkeypatch):
     def probe(self):
         nonlocal calls
         calls += 1
-        return "tmux 3.3.7"
+        return "tmux 3.3.8"
 
     monkeypatch.setattr(PsmuxMultiplexer, "version", probe)
     mux = PsmuxMultiplexer()

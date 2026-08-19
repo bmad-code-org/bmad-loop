@@ -966,10 +966,15 @@ class PsmuxMultiplexer(BaseTmuxBackend):
                 file=sys.stderr,
             )
 
-    # Releases up to this version can force-kill a recycled PID during pane
-    # teardown and let orphaned servers accumulate — engine-fatal, so they
-    # must never be selected.
-    _LAST_UNSUPPORTED = (3, 3, 6)
+    # Releases up to this version are refused. 3.3.6 and older force-kill a
+    # recycled PID during pane teardown and let orphaned servers accumulate —
+    # engine-fatal on its own. 3.3.7 is excluded for a second reason: 3.3.8 is
+    # the build this backend is written against, and several verbs here now
+    # assume its fixes rather than routing around the defects (a direct
+    # `pipe-pane -o` flag transport, a `select-window` id target, the `=name`
+    # kill-session form, and the control-line shapes `_transportable` admits).
+    # On 3.3.7 those would fail silently, so the floor forbids it outright.
+    _LAST_UNSUPPORTED = (3, 3, 7)
     # Class-level default; instances shadow it on first probe. Never assign on
     # the class outside tests — that would poison every future instance.
     _version_ok: bool | None = None
