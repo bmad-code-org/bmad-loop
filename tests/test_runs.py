@@ -715,11 +715,15 @@ def test_prunable_sessions_partitions(tmp_path, monkeypatch):
 def test_project_tag_is_transportable_whatever_the_path(tmp_path):
     """Tags have one safe shape even for paths psmux or UTF-8 cannot carry raw.
 
-    Assert the shape, not just that the gate accepts it: an ordinary spaced Windows
-    path clears the gate on its own, so only "hex whatever the input" fails when
+    Assert the shape, not just that the gate accepts it: an ordinary Windows path —
+    spaced, UNC, apostrophed alike — clears the gate on its own now that psmux 3.3.8
+    carries the wire verbatim, so only "hex whatever the input" fails when
     project_tag returns a raw path.
     """
-    assert not PsmuxMultiplexer._transportable(r"\\srv\share name\proj")  # the premise
+    # The premise, on the half of the gate 3.3.8 did NOT retire: a `"` cannot come
+    # back through _scoped_options' one-quote-pair strip, so a raw path carrying one
+    # is refused and a raw-path tag would still be unstorable.
+    assert not PsmuxMultiplexer._transportable(r'C:\a"b\proj')
     project = tmp_path / "share name" / "proj"
     project.mkdir(parents=True)
     tag = runs.project_tag(project)
