@@ -13,7 +13,8 @@ breaking changes may land in a minor release.
   `post_dev_verify` hook receives immutable per-command results after normal and repair
   verification, with separate `stdout`/`stderr` alongside the compatible bounded
   `output_tail`. Core writes `verify-command-result` journal records with stream pointers
-  under the run's `logs/` directory; plugins remain unable to alter verification or commit
+  under the run's `verify/` directory — its own store, kept out of the adapter-owned,
+  TUI-consumed `logs/`; plugins remain unable to alter verification or commit
   decisions. Storage, upload, signing, and any policy response stay plugin-owned.
 
 - **A refused auto-sweep is now visible outside the journal (#501).** A run whose deferred-work

@@ -37,7 +37,7 @@ from bmad_loop import deferredwork, platform_util, verify
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.engine import Engine, RunPaused, RunStopped, _digest_of, _run_depth
-from bmad_loop.journal import Journal, load_state
+from bmad_loop.journal import LOGS_DIR, VERIFY_DIR, Journal, load_state
 from bmad_loop.model import (
     PAUSE_EPIC_BOUNDARY,
     PAUSE_ESCALATION,
@@ -171,6 +171,11 @@ def test_post_dev_verify_exposes_journaled_command_results(project, monkeypatch)
     assert entry["command_index"] == 0 and entry["returncode"] == 0
     assert (engine.run_dir / entry["stdout_path"]).read_text(encoding="utf-8") == "out\n"
     assert (engine.run_dir / entry["stderr_path"]).read_text(encoding="utf-8") == "err\n"
+    # Pointers are run-relative and land in the verifier's own store: logs/ is the
+    # adapters' task-id namespace, which the TUI resolves as pane logs.
+    assert entry["stdout_path"].startswith(f"{VERIFY_DIR}/")
+    assert entry["stderr_path"].startswith(f"{VERIFY_DIR}/")
+    assert not list((engine.run_dir / LOGS_DIR).glob("verify-*"))
 
 
 def test_fix_verification_emits_post_dev_verify_with_command_results(project, monkeypatch):

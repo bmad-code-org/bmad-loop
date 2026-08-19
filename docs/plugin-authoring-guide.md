@@ -399,8 +399,10 @@ and `stderr` strings. This is observation data only: a plugin cannot change the
 verifier's outcome or the commit decision. The run's `journal.jsonl` also records
 one `verify-command-result` entry per command with run/story/attempt/stage and
 verification-sequence correlation, `output_tail`, byte counts, and run-relative `stdout_path` /
-`stderr_path` pointers under `logs/`; full streams are not embedded in the
-journal. Treat verifier output as potentially sensitive and store, upload, sign,
+`stderr_path` pointers under the run's `verify/` directory; full streams are not
+embedded in the journal. That store is deliberately separate from `logs/`, which
+holds coding-CLI pane captures named after session task ids and is read as such
+by the TUI. Treat verifier output as potentially sensitive and store, upload, sign,
 or act on it only from an explicitly configured plugin.
 
 ### Review

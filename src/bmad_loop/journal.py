@@ -13,6 +13,9 @@ from .platform_util import atomic_replace
 STATE_FILE = "state.json"
 JOURNAL_FILE = "journal.jsonl"
 LOGS_DIR = "logs"
+# Verifier subprocess streams, deliberately NOT under LOGS_DIR — see
+# Journal.write_verify_stream for why sharing that directory is a TUI bug.
+VERIFY_DIR = "verify"
 
 
 class Journal:
@@ -43,16 +46,29 @@ class Journal:
         with self.path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(entry, default=str) + "\n")
 
-    def write_log_payload(self, name: str, content: str) -> str:
-        """Atomically retain a verifier stream under ``logs/`` and return its
-        run-relative pointer.  The journal records the pointer and byte count,
-        never unbounded subprocess output inline.
+    def write_verify_stream(self, name: str, content: str) -> str:
+        """Atomically retain one verifier subprocess stream under ``verify/`` and
+        return its run-relative pointer.  The journal records the pointer and byte
+        count, never unbounded subprocess output inline.
+
+        Its own directory, not ``logs/``: every other inhabitant of ``logs/`` is a
+        coding-CLI pane capture named after a session task id.  The adapters own
+        that namespace (they write ``{task_id}.log``) and the TUI reads the whole
+        directory as one — with no session open, ``tui.data.active_task_id`` falls
+        back to the newest ``logs/*.log`` and returns its stem as the live task,
+        which the dashboard then reopens as ``logs/{stem}.log``.  Verifier streams
+        land in exactly that window: session-end is journalled when the session
+        ends, before its result reaches verification, so at the moment these files
+        are newest no session is open and the fallback fires.  Under ``logs/`` that
+        rendered verifier stderr in the agent log pane.  Keeping the store in a
+        separate directory makes that unrepresentable, rather than a name filter
+        every future reader of ``logs/`` would have to remember to apply.
 
         ``name`` is engine-generated (not plugin or command supplied), so it is
         safe to join below.  Callers retain the original stream separately in a
         hook context; this method is journal storage only.
         """
-        target = self.run_dir / LOGS_DIR / name
+        target = self.run_dir / VERIFY_DIR / name
         target.parent.mkdir(parents=True, exist_ok=True)
         tmp = target.with_suffix(target.suffix + ".tmp")
         tmp.write_text(content, encoding="utf-8")

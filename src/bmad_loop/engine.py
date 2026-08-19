@@ -3814,8 +3814,8 @@ class Engine:
                 f"verify-{safe_segment(task.story_key)}-"
                 f"{verification_stage}-{task.attempt}-{verification_sequence}-{command_index}"
             )
-            stdout_path = self.journal.write_log_payload(f"{stem}.stdout.log", result.stdout)
-            stderr_path = self.journal.write_log_payload(f"{stem}.stderr.log", result.stderr)
+            stdout_path = self.journal.write_verify_stream(f"{stem}.stdout.log", result.stdout)
+            stderr_path = self.journal.write_verify_stream(f"{stem}.stderr.log", result.stderr)
             self.journal.append(
                 "verify-command-result",
                 story_key=task.story_key,
