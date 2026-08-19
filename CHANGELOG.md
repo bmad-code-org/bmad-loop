@@ -37,6 +37,14 @@ breaking changes may land in a minor release.
 
 ### Changed
 
+- **`post_dev_verify` now fires on the repair leg too, not only after dev verification (#641).**
+  A plugin written against "once per story, after the dev session" will see the stage again after
+  every repair session's verification, and on the way to a pause: an attempt whose session reported
+  a CRITICAL escalation now emits before the run stops, on either leg, where the repair leg used to
+  escalate without emitting at all. Discriminate the legs with `ctx.verification_stage`
+  (`"dev"` / `"fix"`) and de-duplicate on `ctx.verification_sequence`; handlers that assumed one
+  call per story must be idempotent.
+
 - **Files the orchestrator replaces by name now land at `0600`.** Those writes pass
   `follow_symlinks=False`, and that mode deliberately carries nothing over from the target — not
   its permission bits, not its xattrs — so the new contents arrive at `mkstemp`'s private default.

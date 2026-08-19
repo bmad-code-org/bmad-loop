@@ -120,6 +120,18 @@ _PATH_SEP_RE = re.compile(r"[\\/]")
 # Journal fields that carry free text (LLM/merge prose, prompts, errors). Never
 # emitted — replaced with a boolean presence marker so a maintainer still learns
 # the field was set without seeing it.
+#
+# The `verify-command-result` group at the end is the same convention applied to
+# the verifier records: `command` is operator-authored shell (`[verify] commands`),
+# `output_tail` is a build's own output, `capture_error` is an OSError string
+# carrying a path, and the two pointers embed the story key. Routing them here
+# rather than leaving them to `scrub_json` is deliberate — that fallback fails
+# closed only by accident of shape, since `_IDENTIFIER_RE` forbids `/` and spaces
+# and so collapses paths, argv-ish commands and multi-line tails, while a
+# one-word `command` (`make`) or a one-word tail (`FAILED`) is identifier-shaped
+# and would ship verbatim. The presence boolean is also strictly more useful for
+# the pointers: it separates "a stream was retained" from "the cap is 0 or the
+# write failed", which a redacted string cannot.
 _JOURNAL_DROP_FIELDS = frozenset(
     {
         "prompt",
@@ -132,6 +144,11 @@ _JOURNAL_DROP_FIELDS = frozenset(
         "blocker",
         "commit_message",
         "was_paused",
+        "command",
+        "output_tail",
+        "capture_error",
+        "stdout_path",
+        "stderr_path",
     }
 )
 # Journal fields whose value is a LIST of story keys (sprint unknown-keys).

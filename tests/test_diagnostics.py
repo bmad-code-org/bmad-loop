@@ -438,6 +438,66 @@ def test_a_windows_spec_path_normalizes_to_the_same_alias():
     assert re.fullmatch(r"spec-[0-9a-f]{12}", trailing["spec"])
 
 
+def test_verify_command_free_text_drops_to_presence_booleans():
+    """A `verify-command-result` record ships its correlation half, never its text.
+
+    `_scrub_entry` routes by field NAME, and five of this record's fields are free
+    text: `command` is operator-authored shell, `output_tail` is a build's own
+    output, `capture_error` is an OSError string carrying a path, and the two
+    stream pointers embed the story key. Left to the `scrub_json` fallback they
+    fail closed only by ACCIDENT of shape — `_IDENTIFIER_RE` forbids `/` and
+    spaces, so paths, argv-ish commands and multi-line tails collapse — but a
+    one-word command like `make` satisfies it and ships verbatim.
+
+    Ablation: remove the five names from `_JOURNAL_DROP_FIELDS`. `command` comes
+    back as the literal `make` (reddening the presence assertion AND the canary
+    sweep), while `output_tail` / `capture_error` / `stdout_path` merely turn into
+    `<redacted:str>` — which is why `make` is the value under test and not a
+    path-shaped one: only it separates the drop list from the fallback.
+    """
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    out = diagnostics._scrub_entry(
+        {
+            "ts": 1.0,
+            "kind": "verify-command-result",
+            "story_key": STORY_KEY,
+            "attempt": 2,
+            "verification_stage": "dev",
+            "verification_sequence": 3,
+            "command_index": 0,
+            "command": "make",
+            "returncode": 1,
+            "output_tail": CODE,
+            "capture_error": f"stdout: [Errno 28] No space left on device: '{HOME_PATH}/x'",
+            "stdout_path": f"verify/verify-{STORY_KEY}-dev-2-3-0.stdout.log",
+            "stderr_path": None,
+            "stdout_bytes": 12,
+            "stdout_truncated": False,
+        },
+        pseudo,
+        {},
+        1.0,
+    )
+
+    for field in ("command", "output_tail", "capture_error", "stdout_path", "stderr_path"):
+        assert field not in out, f"{field} must never be emitted"
+    assert out["command_present"] is True
+    assert out["output_tail_present"] is True
+    assert out["capture_error_present"] is True
+    # the pointers keep the one fact they are worth: whether a stream was retained
+    # at all — `stream_capture_kb = 0` and a failed write both leave it null.
+    assert out["stdout_path_present"] is True
+    assert out["stderr_path_present"] is False
+    # ... while everything a maintainer correlates on still ships verbatim
+    assert (out["verification_stage"], out["verification_sequence"]) == ("dev", 3)
+    assert (out["command_index"], out["returncode"], out["attempt"]) == (0, 1, 2)
+    assert (out["stdout_bytes"], out["stdout_truncated"]) == (12, False)
+
+    rendered = json.dumps(out)
+    for canary in ("make", CODE, HOME_PATH, PROPRIETARY, *CANARIES):
+        assert canary not in rendered, f"LEAK: {canary!r}"
+
+
 def test_structure_is_preserved(project):
     run_dir = _seed_run(project.project)
     diag, _pseudo, _combined = _render_all([run_dir])

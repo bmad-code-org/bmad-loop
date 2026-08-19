@@ -392,6 +392,15 @@ there.
 | `pre_dev_session`                  | before each dev session          | `proposed_prompt`, `proposed_env`, veto                                              |
 | `post_dev_verify`                  | after dev or repair verification | —                                                                                    |
 
+`post_dev_verify` fires on **both** legs of the dev phase — once after the dev
+session's verification, and again after each repair session's — so a handler sees
+it **more than once per story**, not once. The two legs share one `attempt`
+counter bounded by `[limits] max_dev_attempts`, which is also the bound on how
+many times the stage can fire for one story. Write handlers to be idempotent and
+to key on the correlation fields below rather than on the story alone. It also
+fires on the way to a pause: an attempt whose session reported a CRITICAL
+escalation emits before the run stops, on either leg.
+
 `post_dev_verify` exposes `ctx.command_results`: an immutable tuple of the
 per-command `CommandResult` records core just executed. Each has `command`,
 `returncode`, the existing merged bounded `output_tail`, and separate `stdout`

@@ -584,6 +584,76 @@ def test_post_dev_verify_discriminates_a_dev_emit_from_a_fix_emit(project, monke
         assert [e["command"] for e in matched] == [r.command for r in ctx.command_results]
 
 
+def _critical(inner):
+    """Wrap a session effect so its result reports a CRITICAL escalation."""
+
+    def effect(spec):
+        result = inner(spec)
+        result.result_json["escalations"] = [
+            {"type": "missing-config", "severity": "CRITICAL", "detail": "operator needed"}
+        ]
+        return result
+
+    return effect
+
+
+@pytest.mark.parametrize("leg", ["dev", "fix"])
+def test_a_critical_session_emits_post_dev_verify_on_both_legs(project, monkeypatch, leg):
+    """CRITICAL is one event class, so both legs must expose it identically.
+
+    The dev leg reaches `decide_dev` — which tests `critical_escalations` first —
+    AFTER emitting `post_dev_verify`, so a CRITICAL dev session publishes its own
+    verify pass to plugins on the way to the pause. The repair leg used to
+    escalate ahead of its emit, and `_escalate` raises `RunPaused`: the same
+    event class fired the hook on one leg and nothing at all on the other, which
+    silently withholds half of a correlating plugin's verify passes.
+
+    Both cases assert the same thing — the escalating session's OWN pass reached
+    a plugin — which is the parity claim itself.
+
+    Ablation: restore the old ordering by moving `_fix_phase`'s `crits` block
+    back above `outcome = None` / `if result.status == "completed":`. The `fix`
+    case then reddens (one context, not two; no `"fix"` stage ever reaches a
+    plugin) while `dev` still passes — precisely the asymmetry.
+    """
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    clean = dev_effect(project, "1-1-a", followup_review=False)
+    escalating = _critical(dev_effect(project, "1-1-a", followup_review=False))
+    engine, _ = make_engine(
+        project,
+        [escalating] if leg == "dev" else [clean, escalating],
+        policy=Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            review=ReviewPolicy(enabled=False),
+            limits=LimitsPolicy(max_dev_attempts=2),
+        ),
+    )
+    capture = _PostDevVerifyCaptureBus()
+    engine._bus = capture
+    # the dev leg's own pass; then, on the `fix` case, the commit-time failure
+    # that routes the story into `_fix_phase`, then the repair session's pass
+    calls = iter(
+        [
+            [verify.CommandResult("check", 0, "dev", "dev-out", "")],
+            [verify.CommandResult("check", 1, "commit fail", "", "commit fail")],
+            [verify.CommandResult("check", 0, "fix", "fix-out", "")],
+        ]
+    )
+    monkeypatch.setattr(verify, "run_verify_commands", lambda policy, cwd: next(calls))
+
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1
+    (escalated,) = [e for e in engine.journal.entries() if e["kind"] == "story-escalated"]
+    assert escalated["reason"] == f"CRITICAL escalation from {leg} session: operator needed"
+    # ... and the escalating session's verification is on the hook either way
+    assert len(capture.contexts) == (1 if leg == "dev" else 2)
+    ctx = capture.contexts[-1]
+    assert ctx.verification_stage == leg
+    assert [r.stdout for r in ctx.command_results] == [f"{leg}-out"]
+
+
 _ONE_ATTEMPT = Policy(
     gates=GatesPolicy(mode="none"),
     notify=QUIET,
@@ -10022,11 +10092,23 @@ def _gitignore_harvest_ledger(project) -> str:
 
 
 def _crash_after_harvest(engine) -> None:
-    """Crash after the ledger write but before the attempt decision acts."""
+    """Crash after the ledger write but before the attempt decision acts.
+
+    `post_dev_verify` names TWO points in the loop — the dev leg's emit and the
+    repair leg's — so an unqualified raise would fire inside `_fix_phase` too,
+    for any caller whose scenario reaches a review->fix route. The dev emit is
+    always the first of the two (a repair leg runs only after a dev leg
+    PROCEEDed, and emitted), so latching on the first one pins the crash to the
+    dev attempt this helper is named for rather than to whichever emit the
+    scenario happens to reach.
+    """
     original_emit = engine._emit
+    crashed = False
 
     def crashing_emit(stage, *args, **kwargs):
-        if stage == "post_dev_verify":
+        nonlocal crashed
+        if stage == "post_dev_verify" and not crashed:
+            crashed = True
             raise RuntimeError("host died after harvest")
         return original_emit(stage, *args, **kwargs)
 

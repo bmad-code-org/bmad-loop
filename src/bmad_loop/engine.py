@@ -5126,10 +5126,6 @@ class Engine:
                 session_stage="pre_fix_session",
             )
             advance(task, Phase.DEV_VERIFY)
-            crits = critical_escalations(result.result_json)
-            if crits:
-                details = "; ".join(str(e.get("detail", e.get("type", "?"))) for e in crits)
-                self._escalate(task, f"CRITICAL escalation from fix session: {details}")
             outcome = None
             verified = NO_VERIFY_COMMANDS
             terminal = None
@@ -5200,6 +5196,23 @@ class Engine:
                 # it fed, so the fix path is greppable the same way (#489).
                 session_vanished=result.session_vanished,
             )
+            # CRITICAL routing, deliberately AFTER the emit and the journal record
+            # above, and deliberately AHEAD of the env-fault/retryable arms below.
+            # Both halves mirror `decide_dev`, which the dev leg reaches at the
+            # same point in its own loop: it tests `critical_escalations` FIRST,
+            # so a CRITICAL outranks an env fault there too, and its caller has
+            # already emitted `post_dev_verify` and journalled `dev-decision` by
+            # then. Escalating here before the emit — as this leg used to — made
+            # one event class observable on the dev leg and invisible on the
+            # repair leg: `_escalate` raises `RunPaused`, so a repair session
+            # reporting CRITICAL fired no `post_dev_verify` at all, while a dev
+            # session reporting the same thing fired one. The hook is named for
+            # the verification, the verification ran, and a plugin correlating
+            # verify passes cannot have half of them silently withheld.
+            crits = critical_escalations(result.result_json)
+            if crits:
+                details = "; ".join(str(e.get("detail", e.get("type", "?"))) for e in crits)
+                self._escalate(task, f"CRITICAL escalation from fix session: {details}")
             if result.status != "completed" and result.env_fault:
                 # A fix session whose CLI lost its API connection (#194) did no
                 # repair work — another attempt cannot fix the run environment, so
