@@ -18,7 +18,13 @@ directly; every value that could carry content is dropped, reduced to a boolean,
 otherwise survive verbatim), or scrubbed. Unknown/future fields default to a
 ``scrub_json`` pass, never raw. As a final backstop the rendered bytes are run
 through :func:`sanitize.guard` — the fail-closed egress self-check shared with
-``probe-adapter`` since #199. A stray pseudonymized original (a
+``probe-adapter`` since #199. That backstop re-scans the rendered bytes for known
+*shapes* — email, URL credentials, credential-shaped tokens, the absolute-home
+spellings in both separator forms (#512 added the backslash WSL-UNC one), and *this
+process's* username — and refuses to emit on a hit; it is not a proof of absence, since
+a home spelling it does not know, or a username that is not this process's (the Linux
+account behind a WSL UNC path), passes it untouched. Per-field routing is the primary
+defense and the guard is defense in depth. A stray pseudonymized original (a
 per-field routing gap — the value is in the legend, so its safe alias is known)
 is **repaired** by substituting the alias, re-verified, and disclosed in the
 dump itself — a "Backstop repairs" section in the markdown report, an optional
@@ -286,7 +292,9 @@ def collect_env(project: Path) -> EnvInfo:
     The project *path* itself is never emitted: it is a redaction hazard — the
     redactor leaves the Linux username in a ``\\\\wsl.localhost\\...\\home\\<user>\\...``
     path standing (it compares against the *Windows* account), and ``collect_env``
-    has no pseudonymizer to alias it against — so the boolean is what ships. Same
+    has no pseudonymizer to alias it against — so the boolean is what ships, and since
+    #512 that shape trips the egress guard, which refuses the whole dump rather than
+    passing it. Same
     reason ``sys.executable`` is absent despite naming the exact mismatch: the venv
     path carries the project name past the redactor."""
     from .adapters.multiplexer import fold_version, get_multiplexer
@@ -442,6 +450,26 @@ def _scrub_policy(obj: Any) -> Any:
                     k for k in (str(x) for x in value) if sanitize.looks_like_identifier(k)
                 )
             else:
+                # Keys pass through VERBATIM here, deliberately — unlike
+                # `sanitize._scrub`, which scrubs keys as well as values. The
+                # warrant is what this snapshot IS: `Policy.to_dict()` is
+                # `asdict()` over frozen dataclasses, so every key is a
+                # compile-time field name — developer-authored, non-PII, and the
+                # point of the dump (a reader diagnosing a run needs to see
+                # `max_review_cycles`, not `<redacted:str>`). The one user-keyed
+                # table, `plugins.settings`, never reaches this branch:
+                # `_POLICY_KEYSET_KEYS` intercepts it above and reduces it to its
+                # identifier-gated plugin-id keyset (#186).
+                #
+                # That rests on an invariant nothing else stated until #202: NO
+                # policy section has a free-keyed table. Add one — say an
+                # `adapter.overrides` keyed by binary path — and its keys ship
+                # verbatim in a dump meant to be shareable.
+                # `test_no_policy_section_has_a_free_keyed_table`
+                # (tests/test_diagnostics.py) enforces it over the field TYPES, so
+                # it fires when such a table is declared rather than when a user
+                # first populates it; route a new one through `_POLICY_KEYSET_KEYS`
+                # or `_POLICY_COUNT_KEYS` rather than widening that test.
                 out[key] = _scrub_policy(value)
         return out
     if isinstance(obj, (list, tuple)):

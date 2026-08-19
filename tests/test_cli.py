@@ -28,12 +28,14 @@ from conftest import (
     spec_path,
     write_gated_ledger,
     write_ledger,
+    write_script_launcher,
     write_spec,
     write_sprint,
 )
 
 from bmad_loop import cli, platform_util
 from bmad_loop import policy as policy_mod
+from bmad_loop import probe as probe_mod
 from bmad_loop import runsetup
 from bmad_loop.adapters import multiplexer as mux_mod
 
@@ -5182,11 +5184,17 @@ CLAUDE_ONLY_POLICY = '[adapter]\nname = "claude"\nmodel = "opus"\n'
 
 
 def _make_validate_pass(project, monkeypatch, capsys, *, policy=CLAUDE_ONLY_POLICY, skills=None):
-    """Set a project up so every validate gate passes, and pin the two gates whose
+    """Set a project up so every validate gate passes, and pin the three gates whose
     outcome is a property of the *host* rather than of the project: whether the CLI
-    binary is on PATH and whether a multiplexer is installed. Without those pins the
-    rc-0 leg would pass or fail by machine, which is exactly the kind of green that
-    means nothing.
+    binary is on PATH, whether it actually runs, and whether a multiplexer is
+    installed. Without those pins the rc-0 leg would pass or fail by machine, which
+    is exactly the kind of green that means nothing.
+
+    The liveness pin (#294) is doubly load-bearing: `which` is stubbed to
+    `/usr/bin/{tool}`, a path that does not exist on this host, so an unpinned
+    `binary_runs` would have every one of these tests spawn a nonexistent path on
+    every run and report `adapter.binary-unrunnable`. Stubbed to rc 0 — the "the
+    binary is fine" answer — because that is the premise of a pass fixture.
 
     ``policy`` and ``skills`` exist so the dev-primitive-rename tests can vary the
     project's *topology* (which CLIs on which roles, which primitive era in which
@@ -5205,6 +5213,7 @@ def _make_validate_pass(project, monkeypatch, capsys, *, policy=CLAUDE_ONLY_POLI
     git(project.project, "add", "-A")  # every file above is a worktree change
     git(project.project, "commit", "-q", "-m", "validate fixture")
     monkeypatch.setattr(cli.shutil, "which", lambda tool: f"/usr/bin/{tool}")
+    monkeypatch.setattr(probe_mod, "binary_runs", lambda *_a, **_kw: 0)
     monkeypatch.setattr(
         cli,
         "_platform_preflight",
@@ -5322,7 +5331,8 @@ def test_validate_json_detail_round_trips_for_every_real_shape(capsys):
     `machine.emit(validate_document(...))` still emits one whole, parseable document
     for every detail a caller actually builds. Each case below mirrors a real call
     site (str values, the nested `dict(role_names)` dict, str+int, install.py's
-    `{**detail, "marker": ...}`, and the `detail=None` leg). A future caller that
+    `{**detail, "marker": ...}`, #294's int and null `returncode`, and the
+    `detail=None` leg). A future caller that
     attaches a non-JSON-serializable detail fails here, by name, rather than at
     runtime on stdout.
     """
@@ -5343,6 +5353,16 @@ def test_validate_json_detail_round_trips_for_every_real_shape(capsys):
         "stale",
         {"tree": ".claude", "skill": "s", "file": "f", "marker": "m"},
     )
+    report.warn(  # str + int `returncode` (cli.py, #294)
+        "adapter.binary-unrunnable",
+        "claude will not run",
+        {"binary": "claude", "path": "/usr/bin/claude", "returncode": 127},
+    )
+    report.warn(  # the launch-fault leg: a null INSIDE a detail dict (cli.py, #294)
+        "adapter.binary-unrunnable",
+        "claude will not launch",
+        {"binary": "claude", "path": "/usr/bin/claude", "returncode": None},
+    )
     report.ok("git.worktree-clean", "clean")  # the detail=None leg
 
     # the exact production path: cli.py does `machine.emit(validate_document(...))`.
@@ -5354,6 +5374,10 @@ def test_validate_json_detail_round_trips_for_every_real_shape(capsys):
     assert by_check["queue.stories-manifest"]["detail"]["stories"] == 3  # int, not "3"
     assert by_check["skills.stories-dispatch-stale"]["detail"]["marker"] == "m"
     assert by_check["git.worktree-clean"]["detail"] is None  # None -> null round-trips
+    # Listed, not dict-indexed: both #294 legs share one check id, so a by-check map
+    # would keep only the last and silently stop covering the int shape.
+    unrunnable = [f for f in parsed["findings"] if f["check"] == "adapter.binary-unrunnable"]
+    assert [f["detail"]["returncode"] for f in unrunnable] == [127, None]  # int, and null-in-dict
 
 
 @pytest.mark.parametrize(
@@ -5394,6 +5418,169 @@ def test_validate_json_every_emitted_check_is_registered(project, capsys, monkey
     emitted = {f["check"] for f in (*passing["findings"], *failing["findings"])}
     assert emitted, "the run emitted findings"
     assert emitted <= VALIDATE_CHECKS
+
+
+@pytest.mark.parametrize("exit_code", [2, 127], ids=["rc-2", "rc-127"])
+def test_validate_warns_when_a_binary_on_path_refuses_to_run(
+    project, capsys, monkeypatch, tmp_path, exit_code
+):
+    """#294: `which` answering yes is not the same question as "this install runs".
+
+    A dead WSL/npm shim is a real file with the execute bit — `adapter.binary` went
+    green on it, and `opencode_http`'s own "binary not found" remedy sends the user
+    to `bmad-loop validate`, which then told them everything was fine. Driven with a
+    REAL non-runnable binary on a REAL PATH: a `which` stub cannot exercise the probe
+    at all, which is the whole of what this row is about.
+
+    The two host pins `_make_validate_pass` installs are lifted back off on purpose —
+    they exist so the OTHER rows do not pass or fail by machine, and here they would
+    stub out the code under test. Everything else it sets up stays, so rc 0 below is
+    a statement about this gate rather than about some unrelated one.
+
+    Both codes are #294's OWN evidence, not invented: its transcript reports rc 2 and
+    a reproduction of the same shim (`exec /nonexistent/opencode "$@"`) exits 127. The
+    pair is what pins the gate as `rc != 0` — an allowlist of shell-ish codes looks
+    right and would miss the case the issue is actually about.
+
+    Ablation target: change `report.warn` to `report.fail` in cli.py's
+    `adapter.binary-unrunnable` branch and the rc-0 assertion inside `machine_json`
+    reddens (severity IS the exit code — checks.py); delete the branch entirely and
+    the `len(...) == 1` assertion reddens on an empty list. Neither is redundant: the
+    first is the severity contract, the second is the finding existing at all.
+    Narrow the gate to `rc in {126, 127}` and the rc-2 leg alone reddens.
+    """
+    real_which, real_binary_runs = shutil.which, probe_mod.binary_runs
+    _make_validate_pass(project, monkeypatch, capsys)
+    monkeypatch.setattr(cli.shutil, "which", real_which)
+    monkeypatch.setattr(probe_mod, "binary_runs", real_binary_runs)
+
+    bin_dir = tmp_path / "shimbin"
+    bin_dir.mkdir()
+    launcher = write_script_launcher(bin_dir, "claude", f"import sys\nsys.exit({exit_code})\n")
+    # Prepended, so it shadows any real `claude` this host happens to carry.
+    monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ.get("PATH", ""))
+
+    # rc=0 is machine_json's default and IS the exit-code assertion: a warning must
+    # not flip validate's verdict for a user whose CLI merely answers oddly.
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+
+    assert doc["schema_version"] == 1, "purely additive — a new check id is not a break"
+    assert doc["ok"] is True  # the document's own verdict, not just the rc
+
+    unrunnable = [f for f in doc["findings"] if f["check"] == "adapter.binary-unrunnable"]
+    assert len(unrunnable) == 1, "one finding per binary, not per profile"
+    assert unrunnable[0]["severity"] == "warning"
+    assert unrunnable[0]["detail"]["binary"] == "claude"
+    assert unrunnable[0]["detail"]["returncode"] == exit_code
+    # The RESOLVED path, not the bare name — re-resolving in the probe would be a
+    # TOCTOU, and on Windows the PATHEXT shim `which` picked is the file at issue.
+    assert Path(unrunnable[0]["detail"]["path"]).samefile(launcher)
+
+    # The pre-existing gate is untouched: it still answers "is it on PATH", and the
+    # answer is still yes. A fix that folded liveness into it would redden this.
+    found = [f for f in doc["findings"] if f["check"] == "adapter.binary"]
+    assert len(found) == 1 and found[0]["severity"] == "ok"
+
+
+@pytest.mark.parametrize("shape", ["relative-path", "bare-name-on-path"])
+def test_validate_never_executes_a_binary_an_overlay_profile_named(
+    project, capsys, monkeypatch, tmp_path, shape
+):
+    """#294's liveness probe must not turn validate into a code-execution boundary.
+
+    `binary` is project-controlled all the way down: policy.toml picks the profile
+    and `.bmad-loop/profiles/*.toml` supplies its fields, both of which arrive with
+    a clone. validate is precisely the command a user runs to decide whether a
+    checkout is safe to run at all (the TUI runs it too), so probing a binary an
+    overlay named would execute untrusted code on the strength of reading config.
+
+    The two shapes are the same family reached by different spellings, which is why
+    they are parametrized rather than written as one row:
+
+    - `relative-path` — `shutil.which` returns a caller-supplied path UNCHANGED
+      instead of searching PATH, so `./pwn` names a file the repository carries.
+    - `bare-name-on-path` — the spelling is clean, and `which` still resolves it
+      into the checkout because a checkout-local directory is on PATH. A guard that
+      tested the spelling of `binary` (rejecting a separator) passed this row.
+
+    Only provenance covers both: an overlay profile is never probed whatever it is
+    called. `test_every_packaged_profile_names_a_bare_binary` holds the other half.
+
+    Driven with a REAL executable and a REAL overlay profile, from the project
+    directory as a user who just cloned it would be: a stubbed `which` or
+    `binary_runs` would assert nothing about the boundary this is here to hold.
+
+    The sentinel is the whole assertion — an absent `adapter.binary-unrunnable`
+    finding would also be produced by a probe that ran and returned 0, so it cannot
+    distinguish "not launched" from "launched and happy". Only a file the child
+    alone can create does.
+
+    Ablation target: drop the `if tool not in packaged_binaries` gate in cli.py and
+    BOTH rows create the sentinel. Restore it but gate on `os.path.dirname(tool)`
+    instead and `bare-name-on-path` alone reddens — that is the round-1 fix this
+    row exists to keep dead. The `adapter.binary` assertion below is NOT the gate:
+    it pins the surviving half (a rejected binary is still reported found) and
+    stays green under either ablation.
+    """
+    install_bmad_config(project)
+    _write_policy(project.project, '[adapter]\nname = "pwncli"\n')
+
+    sentinel = tmp_path / "pwned.txt"
+    launcher = write_script_launcher(
+        project.project,
+        "pwn",
+        f"import pathlib\npathlib.Path({str(sentinel)!r}).write_text('executed')\n",
+    )
+    if shape == "relative-path":
+        # `launcher.name`, not a bare "pwn": on Windows the launcher is `pwn.cmd`,
+        # and naming the real file keeps this about the gate, not about PATHEXT.
+        binary = f"./{launcher.name}"
+    else:
+        binary = "pwn"  # resolved through PATH, into the checkout
+        monkeypatch.setenv("PATH", str(project.project) + os.pathsep + os.environ.get("PATH", ""))
+
+    profiles = project.project / ".bmad-loop" / "profiles"
+    profiles.mkdir(parents=True, exist_ok=True)
+    (profiles / "pwncli.toml").write_text(
+        f'name = "pwncli"\nbinary = "{binary}"\nbypass_args = ["--yes"]\n'
+        "\n[hooks]\n"
+        'dialect = "claude-settings-json"\n'
+        'config_path = ".pwncli/settings.json"\n'
+        'events = { SessionStart = "SessionStart", Stop = "Stop" }\n',
+        encoding="utf-8",
+    )
+
+    # A relative `binary` resolves against the PROCESS cwd — the clone the user is
+    # standing in when they run `bmad-loop validate`.
+    monkeypatch.chdir(project.project)
+    cli.main(["validate", "--project", str(project.project), "--json"])
+    doc = json.loads(capsys.readouterr().out)
+
+    assert not sentinel.exists(), "validate executed a repository-supplied binary"
+
+    # The surviving half: still resolved and reported, exactly as before #294.
+    found = [f for f in doc["findings"] if f["check"] == "adapter.binary"]
+    assert len(found) == 1 and found[0]["severity"] == "ok"
+
+
+def test_every_packaged_profile_names_a_bare_binary():
+    """The packaged half of the probe's trust boundary (#294).
+
+    `validate` executes the binary of any profile stamped `packaged`, and it trusts
+    provenance rather than spelling — so nothing in cli.py stops a packaged profile
+    whose `binary` carried a path from being launched out of the working directory.
+    Nothing needs to, as long as no packaged profile ships one, and that is a
+    property of the shipped TOML rather than of the code: pin it where it is true.
+
+    A future bundled profile that sets `binary = "./vendor/cli"` reddens here, at
+    the file that introduced it, rather than silently widening what a diagnostic
+    executes.
+    """
+    from bmad_loop.adapters.profile import load_profiles
+
+    packaged = {n: p for n, p in load_profiles(project=None).items() if p.packaged}
+    assert packaged, "no packaged profiles loaded — the gate would be vacuous"
+    assert [p.binary for p in packaged.values() if os.path.dirname(p.binary)] == []
 
 
 @pytest.mark.parametrize("passing", [True, False], ids=["rc-0", "rc-1"])

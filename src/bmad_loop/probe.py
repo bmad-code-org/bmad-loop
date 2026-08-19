@@ -194,6 +194,48 @@ def _run_capture(argv: list[str], timeout_s: float) -> str | None:
     return out.strip() or None
 
 
+def binary_runs(binary: str, timeout_s: float = 10) -> int | None:
+    """Return the exit code of ``binary --version``, or None if it never ran.
+
+    The liveness half of a PATH check. ``shutil.which`` answers "a file with that
+    name is on PATH and has the execute bit", which a dead WSL/npm shim satisfies
+    while every launch of it fails (#294) — so ``validate`` reported OK on an
+    install that could not start a session. Running the binary once is the only
+    thing that separates the two.
+
+    Never raises, and that is load-bearing rather than defensive style: machine.py
+    records that every gate in ``cmd_validate`` runs inside a ``try`` so "the
+    command has no error path of its own — its rc is purely the verdict". A probe
+    that raised would give it one. The guard is ``_run_capture``'s exactly, and
+    the return is deliberately left as bytes (no ``text=True``): nothing here reads
+    the output, so the locale decode that forced ``errors="replace"`` on that
+    function never happens and cannot raise the ``UnicodeDecodeError`` the guard
+    does not name.
+
+    None (could not launch, or timed out) and a nonzero code are separate answers
+    to the caller, not one sentinel: the first has no return code to report.
+
+    ``stdin=DEVNULL`` is required, not cosmetic. With the caller's tty inherited, a
+    shim that prompts blocks on the read for the whole timeout — measured 4.00s
+    against 0.00s — inside an interactive command.
+
+    Not folded into :func:`run_version_help`, which discards the return code by
+    design and spawns TWO children (``--version`` then ``--help``) at ``timeout_s``
+    each: reusing it would cost up to 20s per profile here.
+    """
+    try:
+        proc = subprocess.run(
+            [binary, "--version"],
+            capture_output=True,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            timeout=timeout_s,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return proc.returncode
+
+
 def run_version_help(binary: str, timeout_s: float = 10) -> FlagFinding:
     """Scrubbed ``--version``/``--help`` for a binary. Never raises."""
     if not shutil.which(binary):
@@ -203,8 +245,16 @@ def run_version_help(binary: str, timeout_s: float = 10) -> FlagFinding:
     return FlagFinding(
         binary=binary,
         found=True,
-        version=sanitize.scrub_text(version, max_lines=5) if version else None,
-        help=sanitize.scrub_text(help_txt, max_lines=80) if help_txt else None,
+        version=(
+            sanitize.scrub_text(version, max_lines=5, max_chars=sanitize.SCRUB_TEXT_MAX_CHARS)
+            if version
+            else None
+        ),
+        help=(
+            sanitize.scrub_text(help_txt, max_lines=80, max_chars=sanitize.SCRUB_TEXT_MAX_CHARS)
+            if help_txt
+            else None
+        ),
     )
 
 
@@ -750,7 +800,9 @@ def _log_tail(log_file: Path, max_lines: int = 20) -> str | None:
     if not text.strip():
         return None
     lines = text.splitlines()[-max_lines:]
-    return sanitize.scrub_text("\n".join(lines), max_lines=max_lines)
+    return sanitize.scrub_text(
+        "\n".join(lines), max_lines=max_lines, max_chars=sanitize.SCRUB_TEXT_MAX_CHARS
+    )
 
 
 # ------------------------------------------------------------------ rendering

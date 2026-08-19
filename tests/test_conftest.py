@@ -1,12 +1,23 @@
-"""Contract tests for the sandbox fixtures in `tests/conftest.py`.
+"""Contract tests for the shared fixtures and host-capability gates in
+`tests/conftest.py`.
 
 `project` hands every test a copytree clone of a session-scoped template repo, so
 the template's shape is a shared dependency of most of the suite. What is pinned
 here is the part of that shape other modules rely on without asserting it.
+
+The gates need the same treatment for a sharper reason: `opencode_runs` decides
+whether an entire `*_live.py` module runs or skips, and nothing downstream can
+notice when it answers wrongly — a gate that wrongly says "absent" reports a
+tidy skip, not a failure. Its call shape and each of its three refusals are
+therefore pinned here, one fact per row.
 """
 
 from __future__ import annotations
 
+import subprocess
+
+import conftest
+import pytest
 from conftest import make_git_noisy
 
 from bmad_loop import verify
@@ -64,3 +75,129 @@ def test_make_git_noisy_produces_rc_zero_stderr(project):
     assert proc.stderr.strip()  # git really did write to stderr
     sha = proc.stdout.strip()
     assert len(sha) == 40 and all(c in "0123456789abcdef" for c in sha)
+
+
+def test_opencode_gate_probes_the_resolved_binary(monkeypatch):
+    """The one row that owns the probe's call shape.
+
+    `opencode_runs` decides whether `tests/test_opencode_live.py` runs at all,
+    and the shape of this single call is what makes that decision mean
+    anything: the resolved path rather than the bare name (`which` already
+    answered that question), a bounded `timeout` so a wedged shim cannot hang
+    collection, `check=False` so a nonzero exit arrives as data instead of an
+    exception the caller never asked to handle, and `stdin=DEVNULL` so a shim
+    that prompts is refused immediately instead of stalling for the full
+    timeout on the runner's inherited tty.
+
+    The `kwargs` assertions are deliberately a SUBSET, not a dict equality:
+    equality would make deleting `timeout=10` redden this row and both refusal
+    rows at once, grading none of them. Each fact is graded here and only here,
+    and an additive kwarg stays free.
+
+    Ablation target: delete `timeout=10` from the `subprocess.run` call and this
+    test fails alone, on `KeyError: 'timeout'`; delete `stdin=subprocess.DEVNULL`
+    and it fails alone the same way. Neither mutation is visible to any other
+    row in this file."""
+    calls = []
+
+    def probe(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, returncode=0)
+
+    monkeypatch.setattr(conftest.sys, "platform", "linux")
+    monkeypatch.setattr(conftest.shutil, "which", lambda _name: "/usr/bin/opencode")
+    monkeypatch.setattr(conftest.subprocess, "run", probe)
+
+    assert conftest.opencode_runs()
+
+    ((command, kwargs),) = calls
+    assert command == ["/usr/bin/opencode", "--version"]
+    assert kwargs["timeout"] == 10
+    assert kwargs["capture_output"] is True
+    assert kwargs["check"] is False
+    assert kwargs["stdin"] is subprocess.DEVNULL
+
+
+def test_opencode_gate_refuses_a_binary_that_exits_nonzero(monkeypatch):
+    """#294 itself: the dead shim `shutil.which` resolves without complaint.
+
+    A stale WSL interop stub, or an npm wrapper whose target was uninstalled,
+    still occupies a PATH entry and still answers `--version` — nonzero. Before
+    the probe the live module read that as an install and ran the entire smoke
+    against something that could never serve a session.
+
+    Ablation target: replace `return probe.returncode == 0` with `return True`
+    and this test fails alone, on the leading `not` — the call-shape row still
+    sees its one correctly-shaped call, and both launch-fault parameters still
+    return False out of the `except` without reaching the changed line."""
+    calls = []
+
+    def failed_probe(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, returncode=2)
+
+    monkeypatch.setattr(conftest.sys, "platform", "linux")
+    monkeypatch.setattr(conftest.shutil, "which", lambda _name: "/usr/bin/opencode")
+    monkeypatch.setattr(conftest.subprocess, "run", failed_probe)
+
+    assert not conftest.opencode_runs()
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "error",
+    [OSError("broken shim"), subprocess.TimeoutExpired("opencode", timeout=10)],
+    ids=["launch-fault", "timeout"],
+)
+def test_opencode_gate_refuses_a_binary_that_cannot_be_launched(monkeypatch, error):
+    """The two ways a resolved path fails before it can exit at all: the exec
+    faults (`OSError` — a shim naming a deleted interpreter, a dropped mount),
+    or it never returns inside the bound (`TimeoutExpired`). Both are host-shaped
+    absence rather than a suite defect, so both have to become a skip — an
+    exception here escapes at module import of the live suite, where it is an
+    error, not a skip.
+
+    Ablation target: delete the `except (OSError, subprocess.SubprocessError):
+    return False` and this test fails alone, in BOTH parameters, on the escaped
+    exception. `TimeoutExpired` is what proves the `SubprocessError` half of the
+    tuple is load-bearing: it is not an `OSError`, so an `except OSError` alone
+    reddens that parameter and only that one."""
+    calls = []
+
+    def raise_error(command, **kwargs):
+        calls.append((command, kwargs))
+        raise error
+
+    monkeypatch.setattr(conftest.sys, "platform", "linux")
+    monkeypatch.setattr(conftest.shutil, "which", lambda _name: "/usr/bin/opencode")
+    monkeypatch.setattr(conftest.subprocess, "run", raise_error)
+
+    assert not conftest.opencode_runs()
+    assert len(calls) == 1
+
+
+def test_opencode_gate_answers_win32_without_touching_the_host(monkeypatch):
+    """The win32 early-out, which nothing else in the suite grades.
+
+    opencode-on-Windows is unverified for this adapter (README adapter table),
+    so the answer there is False by policy — and it has to be reached before the
+    PATH lookup and before the probe, because Windows CI should pay for
+    neither. Poisoning both `shutil.which` and `subprocess.run` is how the
+    ordering is asserted rather than just the return value: either one being
+    reached is an `AssertionError`.
+
+    Ablation target: delete the `if sys.platform == "win32": return False` early
+    return and this test fails alone, on the `AssertionError` the poisoned
+    `shutil.which` raises. The other three rows all pin `platform` to "linux" to
+    stay host-independent, so they stay GREEN under that same mutation — which
+    is the whole reason this row exists: without it, deleting the early return
+    leaves this file, and the suite, entirely green."""
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("win32 must answer before any PATH lookup or probe")
+
+    monkeypatch.setattr(conftest.sys, "platform", "win32")
+    monkeypatch.setattr(conftest.shutil, "which", refuse)
+    monkeypatch.setattr(conftest.subprocess, "run", refuse)
+
+    assert not conftest.opencode_runs()

@@ -1,5 +1,6 @@
 """RunState serialization + lifecycle-flag tests."""
 
+import binascii
 import json
 
 import pytest
@@ -184,6 +185,61 @@ def test_resolved_redrive_defaults_false_for_legacy_state():
     doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
     del doc["resolved_redrive"]  # state.json from before the field existed
     assert StoryTask.from_dict(doc).resolved_redrive is False
+
+
+def test_dispatched_spec_file_round_trips():
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        dispatched_spec_file="_bmad-output/implementation-artifacts/spec-1-1-a.md",
+    )
+    restored = StoryTask.from_dict(json.loads(json.dumps(task.to_dict())))
+    assert restored.dispatched_spec_file == task.dispatched_spec_file
+
+
+def test_dispatched_spec_file_defaults_none_for_legacy_state():
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    del doc["dispatched_spec_file"]  # state.json from before the field existed
+    assert StoryTask.from_dict(doc).dispatched_spec_file is None
+
+
+def test_dispatched_spec_snapshot_round_trips_byte_exactly():
+    snapshot = b"---\r\nstatus: ready-for-dev\r\n---\r\n\xffoperator intent\r\n"
+    task = StoryTask(story_key="1-1-a", epic=1, dispatched_spec_snapshot=snapshot)
+
+    restored = StoryTask.from_dict(json.loads(json.dumps(task.to_dict())))
+
+    assert restored.dispatched_spec_snapshot == snapshot
+
+
+def test_dispatched_spec_snapshot_defaults_none_for_legacy_state():
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    del doc["dispatched_spec_snapshot"]
+    assert StoryTask.from_dict(doc).dispatched_spec_snapshot is None
+
+
+@pytest.mark.parametrize(
+    ("encoded", "cause_type"),
+    [("%%%", binascii.Error), ("é", UnicodeEncodeError)],
+    ids=["malformed-base64", "non-ascii"],
+)
+def test_dispatched_spec_snapshot_decode_error_names_story_and_field(encoded, cause_type):
+    """Corrupt persisted authority fails with stable task and field context.
+
+    Ablation: restore the inline unguarded decode and both rows leak their
+    low-level exception type and message instead of this contextual ValueError.
+    """
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    doc["dispatched_spec_snapshot"] = encoded
+
+    with pytest.raises(
+        ValueError,
+        match=r"story '1-1-a': dispatched_spec_snapshot is not valid base64",
+    ) as caught:
+        StoryTask.from_dict(doc)
+
+    assert type(caught.value) is ValueError
+    assert isinstance(caught.value.__cause__, cause_type)
 
 
 def test_plan_checkpoint_pending_round_trips():

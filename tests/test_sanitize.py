@@ -1,5 +1,6 @@
 """The crown-jewel PII case table for the probe sanitizer."""
 
+import json
 import re
 
 import pytest
@@ -125,6 +126,96 @@ def test_scrub_text_max_lines_truncates():
     assert "more lines redacted" in out
 
 
+def test_scrub_text_max_chars_truncates_each_line():
+    max_chars = 40
+    text = "\n".join(["short one", "x" * 5000, "short two"])
+    out = sanitize.scrub_text(text, max_chars=max_chars)
+    lines = out.split("\n")
+    assert len(lines) == 3  # per-line truncation must not drop lines
+    assert lines[0] == "short one"  # short lines survive byte-for-byte
+    assert lines[2] == "short two"
+    marker = f"… ({5000 - max_chars} more chars redacted)"
+    assert lines[1] == "x" * max_chars + marker
+    assert len(lines[1]) == max_chars + len(marker)  # the documented bound
+    assert "more chars redacted" in out
+
+
+def test_scrub_text_max_chars_bounds_a_single_long_line():
+    # #481's core case. `max_lines` alone can never bound this input, because one
+    # line is already under the line cap — that is the whole of the issue.
+    max_chars = sanitize.SCRUB_TEXT_MAX_CHARS
+    out = sanitize.scrub_text("x" * 5000, max_lines=5, max_chars=max_chars)
+    marker = f"… ({5000 - max_chars} more chars redacted)"
+    assert len(out) == max_chars + len(marker)
+    assert "more chars redacted" in out
+
+
+@pytest.mark.parametrize(
+    "sensitive,line,rule",
+    [
+        # A bare high-entropy credential. `looks_like_secret`'s entropy arm needs a
+        # contiguous alnum run of `_SECRET_RUN_MIN`, so a 30-character survivor of a
+        # 36-character token is invisible to the guard.
+        (
+            "aZ3kQ9mX7pL2vB8nR4tY6wS1cD5eF0gHjK7m",
+            "word " * 34 + "aZ3kQ9mX7pL2vB8nR4tY6wS1cD5eF0gHjK7m" + " tail",
+            "secret",
+        ),
+        # A URL credential. `_URL_CRED_RE`'s match ENDS at the `@`, so a cut that
+        # clips the `@` away silences the rule while the password prefix still
+        # ships — a different rule from the row above, reached the same way.
+        (
+            "correcthorsebatterystaple",
+            "word " * 34 + "https://bob:correcthorsebatterystaple@localhost/x",
+            "url-credentials",
+        ),
+    ],
+)
+def test_scrub_text_max_chars_never_leaves_a_guard_invisible_fragment(sensitive, line, rule):
+    """The cap must not blind the egress guard it feeds (#481).
+
+    Truncation is unsafe wherever the cut lands inside something `assert_no_leak`
+    would have flagged: the fragment keeps the sensitive part while no longer
+    tripping the rule, converting a fail-closed refusal into an emission. The rows
+    are deliberately different RULES, because the hazard is a property of cutting
+    a guard construct in half and not of any one rule — a third shape belongs here
+    as another row rather than as another special case in `_truncate_line`.
+    """
+    # Uncapped, the guard fires and the caller refuses to write at all.
+    assert rule in sanitize.assert_no_leak(line)
+
+    out = sanitize.scrub_text(line, max_chars=200)
+    # Not merely "below the rule's threshold" — no part of it ships at all.
+    assert sensitive[:12] not in out
+    assert not any(sensitive[i : i + 6] in out for i in range(len(sensitive) - 6))
+    assert "more chars redacted" in out
+
+
+def test_scrub_text_max_chars_retraction_is_conditional():
+    """The retraction fires only when the split would cost the guard its verdict,
+    not on every token the cut happens to land in — otherwise the cap would throw
+    away diagnostic text to solve a problem these two cases do not have.
+
+    A `ghp_`-prefixed token is matched at its START, so a clipped one still fires
+    and the refusal survives with no content dropped; `"x" * 5000` is a single
+    5000-char token that is not credential-shaped whole OR clipped."""
+    max_chars = 200
+    ghp = "ghp_" + "B7kR2mQ9xL4vN8pT6wY1cS5dF0gHjK3n"
+    out = sanitize.scrub_text("word " * 34 + ghp + " tail", max_chars=max_chars)
+    assert "secret" in sanitize.assert_no_leak(out)  # still fail-closed
+    assert out.startswith("word " * 34 + ghp[:30])  # and nothing was retracted
+
+    plain = sanitize.scrub_text("x" * 5000, max_chars=max_chars)
+    assert plain == "x" * max_chars + f"… ({5000 - max_chars} more chars redacted)"
+
+
+def test_scrub_text_without_max_chars_is_byte_identical():
+    # `diagnostics.py` calls with neither cap (the mux `version()` probe and
+    # `os_release`); their output must not change shape.
+    text = "first line\r\nsecond line\r\n"
+    assert sanitize.scrub_text(text) == text  # no normalization, no lost newline
+
+
 def test_scrub_event_payload_is_scrub_json(home):
     payload = {"session_id": "s-1", "cwd": f"{home}/proj", "n": 5}
     out = sanitize.scrub_event_payload(payload)
@@ -231,6 +322,29 @@ def test_assert_no_leak_clean_text():
         ("path /Users/alice/x", "absolute-home-path"),
         ("path /root/x", "absolute-home-path"),
         ("path C:/Users/alice/x", "absolute-home-path"),
+        # The Windows→WSL UNC bridge (#512). These are NOT redundant with the
+        # `/home/` row above: the bridge spelling is BACKSLASH-separated, so no
+        # forward-slash arm can see it, and the identifier it carries is the
+        # *Linux* username — which assert_no_leak's username rule cannot match,
+        # because that rule compares `getpass.getuser()`, the *Windows* account.
+        # The path rule is therefore the only rule that can fire on this shape.
+        # The last row pins the `root` half of the same arm.
+        (r"path \\wsl.localhost\Ubuntu-24.04\home\u\p", "absolute-home-path"),
+        (r"path \\wsl$\Ubuntu\home\alice\proj", "absolute-home-path"),
+        (r"path \\?\UNC\wsl.localhost\Ubuntu\home\a", "absolute-home-path"),
+        (r"path \\wsl.localhost\Ubuntu\root\proj", "absolute-home-path"),
+        # The arm names a `home`/`root` TREE, not the WSL bridge specifically, so
+        # an ordinary drive path or a plain share carrying that segment fires too.
+        # Reviewers have read that breadth as an over-match and proposed anchoring
+        # the arm on the WSL prefix and its distro segment; these rows record why
+        # it is deliberate. It is the breadth the untouched POSIX arms have always
+        # had — `/home/build` and `/root/data` fire — and the first row's own
+        # FORWARD-slash spelling, `D:/home/build`, already fired before #512 via
+        # the `/home/` arm. An arm anchored on the WSL prefix would leave
+        # `D:\home\build` clean while `D:/home/build` fires, which is the
+        # separator asymmetry that IS #512, reintroduced one level down.
+        (r"path D:\home\build", "absolute-home-path"),
+        (r"path \\server\share\root\data", "absolute-home-path"),
         ("key ghp_CANARYxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx01", "secret"),
     ],
 )
@@ -238,7 +352,37 @@ def test_assert_no_leak_fires(text, rule):
     assert rule in sanitize.assert_no_leak(text)
 
 
-@pytest.mark.parametrize("text", ["path D:/data/alice/x", "path /var/lib/alice/x"])
+def test_assert_no_leak_sees_wsl_unc_through_the_json_render():
+    """#512's literal reproduction, asserted on BOTH encodings.
+
+    The same bytes reach the guard as raw text (the markdown report) and as JSON
+    text (the ``--json`` document), and ``json.dumps`` DOUBLES every backslash —
+    the historic trap documented at ``src/bmad_loop/cli.py:3737-3750``. The two
+    encodings fail for different reasons, so a test that checked only one would
+    pass while the shipped ``--json`` document still leaked.
+    """
+    raw = r"\\wsl.localhost\Ubuntu-24.04\home\u\p"
+    assert "absolute-home-path" in sanitize.assert_no_leak(raw)
+
+    rendered = json.dumps({"env": {"raw_project": raw}})
+    assert r"\\\\wsl.localhost" in rendered  # the doubling actually happened
+    assert "absolute-home-path" in sanitize.assert_no_leak(rendered)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "path D:/data/alice/x",
+        "path /var/lib/alice/x",
+        # Backslash negatives bound the #512 arm: it names *home* trees, not any
+        # UNC path and not any backslash. A share that is not a home tree, a
+        # plain drive path, and the two ordinary words that contain the literal
+        # substrings `home` and `root` must all stay clean.
+        r"path \\server\share\data\alice\x",
+        r"path D:\data\alice\x",
+        "note homeroom and rootkit are ordinary words",
+    ],
+)
 def test_assert_no_leak_home_rule_is_not_any_absolute_path(text):
     """The rule names *home* directories, and firing is fail-closed — diagnose
     refuses to emit. Matching every absolute path would turn an ordinary dump

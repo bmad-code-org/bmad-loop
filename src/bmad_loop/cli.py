@@ -421,11 +421,75 @@ def cmd_validate(args: argparse.Namespace) -> int:
             {"platform": sys.platform},
         )
 
+    from . import probe as probe_mod
+
+    packaged_binaries = {p.binary for p in profiles if p.packaged}
     for tool in dict.fromkeys(p.binary for p in profiles):
-        if shutil.which(tool):
+        resolved = shutil.which(tool)
+        if resolved:
             report.ok("adapter.binary", f"{tool} found", {"binary": tool})
         else:
             report.fail("adapter.binary", f"{tool} not found on PATH", {"binary": tool})
+            continue
+        # #294: the gate above answers "a file with that name carries the execute
+        # bit", which a dead WSL/npm shim satisfies while every launch of it fails.
+        # So validate went green on an install that could not start a session —
+        # and opencode_http's own "binary not found" remedy points the user at
+        # `bmad-loop validate`, which then told them everything was fine. Probe the
+        # path `which` RETURNED rather than the bare name: re-resolving is a TOCTOU,
+        # and on Windows the PATHEXT shim `which` picked is the very file at issue.
+        # Probe ONLY a binary a PACKAGED profile named. `binary` is
+        # project-controlled end to end — policy.toml picks the profile and
+        # `.bmad-loop/profiles/*.toml` supplies its fields, both arriving with a
+        # clone — and this line EXECUTES it, inside the one command a user runs to
+        # decide whether a checkout is safe to run at all (the TUI runs it too).
+        #
+        # The boundary is provenance because no test on the SPELLING of `binary`
+        # can hold: rejecting a path (`./tool`) still leaves a bare `pwn`, which
+        # `which` resolves to a repository file whenever a checkout-local
+        # directory is on PATH. "Who wrote this profile" is the question actually
+        # being asked, and it has a categorical answer. An overlay or entry-point
+        # profile keeps the pre-#294 behavior: resolved, reported found, never
+        # launched. #294's own case is a packaged profile (opencode), so the dead
+        # WSL/npm shim is still caught.
+        #
+        # What this bounds is WHICH NAME is probed, never what that name resolves
+        # to. Resolution is `shutil.which` against the user's PATH, so a PATH
+        # carrying a checkout-local directory can still answer `claude` with a
+        # file the clone ships. That residual is deliberate and is NOT a hole this
+        # gate is failing to close: the name is ours rather than the project's, and
+        # the same resolution is what the session launch itself performs — the
+        # generic adapter puts this bare `binary` at argv[0] (adapters/generic.py)
+        # and the opencode adapter calls the identical `shutil.which` before
+        # spawning (adapters/opencode_http.py). A PATH that redefines `claude`
+        # has already redefined it for the run, and for the user's own shell.
+        # Refusing checkout-local RESOLUTIONS would be a different guard, over a
+        # predicate (realpath containment) that leaks through symlinks, `..`,
+        # win32 case-folding, UNC paths, and worktree-root vs project-root.
+        if tool not in packaged_binaries:
+            continue
+        rc = probe_mod.binary_runs(resolved)
+        if rc == 0:
+            continue
+        # Any nonzero code, never an allowlist: #294's own transcript reports rc 2
+        # and a reproduction of the same shim exits 127, the code being a property
+        # of the shell and the failure mode. {126, 127} would miss the case fixed.
+        #
+        # `warning`, deliberately, and not to be promoted without evidence: severity
+        # `problem` is validate's exit code (checks.py), and rc is a compatibility
+        # contract (AGENTS.md). Nothing rules out one of claude/codex/gemini/copilot/
+        # antigravity answering `--version` nonzero on a perfectly live install, and
+        # that user must not start failing validate.
+        outcome = "could not be launched" if rc is None else f"exited {rc}"
+        report.warn(
+            "adapter.binary-unrunnable",
+            f"{tool} is on PATH at {resolved} but `{tool} --version` {outcome} — "
+            "the usual cause is a stale or broken install (a dead WSL/npm shim), "
+            "and runs using it would then fail to start; a CLI that does not "
+            "implement `--version` also lands here. Reinstall it or fix PATH, or "
+            "ignore this if that CLI has no `--version`.",
+            {"binary": tool, "path": resolved, "returncode": rc},
+        )
 
     any_hooks_registered = False
     for profile in profiles:

@@ -38,6 +38,24 @@ breaking changes may land in a minor release.
   `failed` or `dirty` — never an exception message, which `diagnose` would refuse to emit at all.
   The `--json` key is additive and always present, so `STATUS_SCHEMA_VERSION` is unchanged.
 
+- **`validate` now reports a binary that is on PATH but will not run (#294).** The
+  `adapter.binary` gate asked `shutil.which`, which a dead WSL/npm shim satisfies — it is a real
+  file with the execute bit — so validate went green on an install that could not start a session,
+  and the opencode adapter's own "binary not found" error sent the user to `bmad-loop validate` to
+  be told everything was fine. Each binary named by a **packaged** profile is now run once as
+  `<binary> --version`; a nonzero exit or a launch fault reports the new check id
+  `adapter.binary-unrunnable`, carrying the resolved path and the return code. A project overlay's
+  profile is resolved and reported found but never launched: its fields are project-supplied, and
+  validate is the command used to decide whether a checkout is safe to run at all, so a clone's own
+  config cannot choose which binary it launches. The gate bounds which NAME is probed, not what
+  that name resolves to — resolution runs through the user's `PATH`, and a probed name resolves to
+  whatever the session launch would itself run. That boundary is the profile's provenance and not the spelling of
+  `binary`, because a bare name still resolves into the checkout whenever a checkout-local
+  directory is on `PATH`. The severity is `warning`, so validate's exit code is
+  unchanged for a live CLI that merely answers `--version` oddly, and `adapter.binary` keeps its
+  existing found/absent meaning. The check id is additive, so `VALIDATE_SCHEMA_VERSION` is
+  unchanged.
+
 ### Changed
 
 - **`post_dev_verify` now fires on the repair leg too, not only after dev verification (#641).**
@@ -47,6 +65,20 @@ breaking changes may land in a minor release.
   escalate without emitting at all. Discriminate the legs with `ctx.verification_stage`
   (`"dev"` / `"fix"`) and de-duplicate on `ctx.verification_sequence`; handlers that assumed one
   call per story must be idempotent.
+
+- **`probe-adapter` now bounds how long a single scrubbed line can be (#481).** `scrub_text` capped
+  how many lines it emitted but never how long one of them could be, so a single very long line —
+  from a foreign CLI's `--version`/`--help`, or from a log tail — reached the `probe-adapter`
+  report and its `--json` document verbatim: `max_lines=5` over a 5000-character line still emitted
+  all 5000. Each line is now bounded, and a line that is cut ends with `… (N more chars redacted)`,
+  the same convention as the existing line-count marker. **This is a visible output change** for any
+  line that long. A cut that would land inside anything the egress guard flags — a credential-shaped
+  token, or a URL credential whose match ends at the `@` — retracts out of it and drops it whole:
+  cutting mid-construct could otherwise leave a fragment that keeps the sensitive part while no
+  longer tripping the rule, turning a fail-closed refusal into an emission carrying part of the
+  credential. `probe.SCHEMA_VERSION` is unchanged: no field is removed or renamed and no type
+  changes, and the meaning of the value was already "the CLI's scrubbed output, capped" — adding a
+  second axis to an already-documented lossy cap is the same class of value, not a new one.
 
 - **Files the orchestrator replaces by name now land at `0600`.** Those writes pass
   `follow_symlinks=False`, and that mode deliberately carries nothing over from the target — not
@@ -77,6 +109,80 @@ breaking changes may land in a minor release.
   it cannot read.
 
 ### Fixed
+
+- **The egress self-check now sees Windows→WSL UNC home paths (#512).** `diagnose` and
+  `probe-adapter` re-scan their own rendered bytes before emitting and refuse to emit at all on a
+  hit, but the absolute-home-path rule knew only forward-slash spellings — so a path reached through
+  the Windows→WSL UNC bridge (`\\wsl.localhost\<distro>\home\<user>`, the legacy `\\wsl$\...`, the
+  extended-length `\\?\UNC\...` folding) was invisible to it, including through the `--json` render,
+  where every backslash is doubled. **No released version leaked such a path**: since #485
+  `collect_env` reduces the project path to a boolean and no `EnvInfo` field carries it. What was
+  wrong was the claim — the `diagnostics` module docstring described the backstop as fail-closed
+  without qualification — and that docstring is corrected in the same change to say what the guard
+  is, a shape re-scan of the rendered bytes, and what stays outside it: a home spelling it does not
+  know, or a username that is not this process's.
+
+- **The `diagnose` policy snapshot's verbatim-key invariant is now enforced (#202).** The snapshot
+  emits dict keys unredacted, which is correct only while no policy section is a free-keyed table
+  — the one user-keyed table, `plugins.settings`, is intercepted before it reaches the
+  passthrough. Nothing enforced that property, and a value-level check could not: a newly declared
+  free-keyed section defaults to an empty dict, so such a check stays green while the hazard is
+  live. A test now fails at declaration time, the moment such a section appears, and the reason is
+  written down at the passthrough. No behavior change.
+
+- **The zero-token OpenCode live smoke skips stale or broken shims (#294).** Its availability
+  gate now requires `opencode --version` to succeed before starting a server; runnable installs
+  still fail loudly when the pinned API contract drifts.
+
+- **Policy loading now enforces the declared timeout and result-less Stop nudge minima (#648).**
+  The valid `session_timeout_min = 1` and `stop_without_result_nudges = 0` boundaries remain
+  accepted, while smaller values now raise `PolicyError`.
+
+- **Reject mismatched TOML scalar types for every `limits.*` policy field (#278).**
+  Quoted booleans and other coercible values now raise `PolicyError` instead of silently changing
+  the configured limit or enabling a disabled behavior.
+
+- **Attempt-owned spec-only retries no longer demand a false manual rollback (#123).** A
+  bound plain attempt whose only residue is its lifecycle flip is restored to its pre-attempt
+  lifecycle status and proven Git-clean before retry. A resolved re-drive may instead retain an
+  authorized dirty, human-corrected spec and reports `rollback-owned-spec-normalized` without
+  claiming cleanliness or auto-committing the correction. Each bound retry chain now snapshots its
+  first spec input byte-for-byte and retains it across dev- and review-verification repairs, so a
+  later failed child cannot replace that input with its own body edits. Non-fixable retries park the
+  failed child, restore the snapshot, and then re-establish the promised lifecycle route after
+  resetting sibling residue. Repair prompts validate retained authority before they can reset a
+  spec, and a plain child that puts a tracked spec back at Git baseline cannot erase pre-launch
+  operator edits. Pre-existing untracked and ignored bound specs use that snapshot as their
+  independent dirtiness oracle and are force-included only in the private recovery ref before
+  restoration; index-only force-adds and cached removals also trigger cleanup, which restores the
+  baseline index ownership. `rollback-owned-spec-restored` records the repair. Missing, unreadable,
+  retargeted, changed external, or unsafe legacy authority pauses with convergent spec-adoption
+  instructions, and recovery refuses a reset whose baseline would replace the canonical path or a
+  parent directory with a symlink, tree, file, or other unsafe shape. An initial Sprint observation
+  fault may leave a bare-key attempt unbound; an existing Stories folder+id target instead aborts
+  unless it can be snapshotted. Post-bind faults abort before launch while retaining the authority
+  for recovery. Protected rollback inventories and deletion replay remain byte-safe for POSIX
+  filenames outside UTF-8. Snapshots are retired after commit. Other substantive changes and
+  sibling source, artifact, or untracked residue still follow the configured rollback policy.
+
+- **Recorded sprint re-drives now route directly through their known spec (#630).** Only a
+  generic sprint task with a recorded `spec_file` names that `ready-for-dev` spec explicitly and
+  pins deterministic read-back to the same file. Fresh sprint tasks with no recorded path remain
+  bare-key dispatches; Stories stays folder+id, Sweep stays intent-bundle, and patch-restore plus
+  verification-feedback routes retain their existing wording and precedence. A filesystem fault
+  while observing the dispatch binding leaves that attempt unbound instead of aborting the run.
+
+- **Accept canonical reachable-descendant spec baselines without trusting untracked residue.** An
+  exact recorded baseline remains valid; any different real claim must uniquely resolve from 7–64
+  hex characters to a direct immutable commit that descends from the recorded baseline and is
+  reachable from `HEAD`. Symbolic or movable refs, ambiguous prefixes, non-commit objects, older,
+  diverged, unknown, and off-HEAD claims remain refused, apart from the existing deferred-work
+  bundle ancestor exception. Proof is re-anchored after an accepted descendant and counts only
+  tracked, staged, or committed changes because the launch snapshot cannot date untracked files
+  relative to that later claim. Shared-checkout mode proves later tracked work exists but cannot
+  attribute it to one session; worktree isolation preserves that provenance. This accepts a skill
+  stamp made after an intervening commit without letting stale untracked residue satisfy the gate.
+  The same mismatch in the opposite direction is #640.
 
 - **Overlong lowercase/kebab sweep bundle labels now proceed deterministically (#503).** An
   otherwise valid name over 40 characters is truncated to 40, journaled and persisted before

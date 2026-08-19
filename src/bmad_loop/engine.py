@@ -12,6 +12,7 @@ import contextlib
 import contextvars
 import functools
 import hashlib
+import os
 import re
 import shutil
 import signal
@@ -1712,6 +1713,182 @@ class Engine:
             )
         self._review_and_commit(task)
 
+    def _dispatched_spec_for_attempt(self, task: StoryTask) -> str | None:
+        """Resolve the recorded sprint spec this dev attempt will own.
+
+        The result is an observation made immediately before the attempt's
+        durable DEV_RUNNING save. Missing, stale, and non-file paths deliberately
+        leave the attempt unbound. Persist the canonical regular-file name rather
+        than a symlink spelling, so a child cannot retarget the binding after
+        launch and make recovery restore the snapshot into another trusted file.
+        """
+        if not task.spec_file:
+            return None
+        try:
+            spec_path = verify.resolve_spec_path(task.spec_file, self.workspace.paths)
+            if spec_path.is_symlink():
+                return None
+            resolved = spec_path.resolve(strict=True)
+            if not resolved.is_file() or not verify.spec_within_roots(
+                resolved, self.workspace.paths
+            ):
+                return None
+            return str(resolved)
+        except (OSError, RuntimeError):
+            return None
+
+    def _read_dispatched_spec_snapshot(self, task: StoryTask) -> tuple[str, bytes] | None:
+        """Read stable bytes from the already-authoritative canonical path.
+
+        This deliberately never resolves ``task.spec_file`` anew: after prompt
+        construction, promoting a transiently unbound attempt would let recovery
+        claim a file the launched bare-key prompt never named. The open-file and
+        post-read pathname identities must agree, so an atomic regular-file
+        replacement cannot pair bytes from the old inode with the new name.
+
+        This observer never mutates the task. In particular, validating a retained
+        retry-chain snapshot must not temporarily install child-authored bytes: an
+        asynchronous stop in that window would make those bytes durable.
+        """
+        if not task.dispatched_spec_file:
+            return None
+        spec_path = Path(task.dispatched_spec_file)
+        try:
+            if spec_path.is_symlink():
+                raise RuntimeError("attempt-owned spec became a symlink")
+            resolved = spec_path.resolve(strict=True)
+            if (
+                resolved != spec_path
+                or not resolved.is_file()
+                or not verify.spec_within_roots(resolved, self.workspace.paths)
+            ):
+                raise RuntimeError("attempt-owned spec is no longer a trusted regular file")
+            with resolved.open("rb") as stream:
+                before = os.fstat(stream.fileno())
+                snapshot = stream.read()
+                after = os.fstat(stream.fileno())
+            current = resolved.stat(follow_symlinks=False)
+
+            def identity(st):
+                return (st.st_dev, st.st_ino)
+
+            def contents(st):
+                return (st.st_size, st.st_mtime_ns)
+
+            if (
+                identity(before) != identity(after)
+                or identity(after) != identity(current)
+                or contents(before) != contents(after)
+                or contents(after) != contents(current)
+                or resolved.is_symlink()
+                or resolved.resolve(strict=True) != resolved
+            ):
+                raise RuntimeError("attempt-owned spec changed identity while being read")
+        except (OSError, RuntimeError):
+            return None
+        return str(resolved), snapshot
+
+    def _refresh_dispatched_spec_snapshot(
+        self,
+        task: StoryTask,
+        *,
+        clear_on_failure: bool = True,
+    ) -> bool:
+        """Refresh both halves of a fresh attempt's ownership authority.
+
+        Initial observation may degrade to an unbound bare-key attempt, so its
+        failure clears stale authority. Once a child has been promised an explicit
+        spec, callers pass ``clear_on_failure=False``: preserving the last trusted
+        path and bytes lets crash recovery refuse a vanished or retargeted file
+        instead of forgetting that the unsafe binding existed.
+        """
+        observed = self._read_dispatched_spec_snapshot(task)
+        if observed is None:
+            if clear_on_failure:
+                task.dispatched_spec_file = None
+                task.dispatched_spec_snapshot = None
+            return False
+        task.dispatched_spec_file, task.dispatched_spec_snapshot = observed
+        return True
+
+    def _validate_dispatched_spec_snapshot(self, task: StoryTask) -> bool:
+        """Validate the bound path without replacing the retry-chain bytes.
+
+        A fixable retry deliberately inherits the previous child's working tree,
+        but a later non-fixable retry still resets the whole chain to the phase
+        baseline. The retained snapshot must therefore remain the bound input from
+        that chain's first launch, not a body edit authored by an intermediate
+        repair session. During a resolved re-drive that input is the operator's
+        correction.
+        """
+        if task.dispatched_spec_snapshot is None:
+            return False
+        observed = self._read_dispatched_spec_snapshot(task)
+        if observed is None:
+            return False
+        if not task.spec_file:
+            return True
+        try:
+            accepted = verify.resolve_spec_path(task.spec_file, self.workspace.paths)
+            if accepted.is_symlink():
+                return False
+            resolved = accepted.resolve(strict=True)
+            accepted_target = accepted.parent.resolve(strict=True) / accepted.name
+            if (
+                resolved != accepted_target
+                or not resolved.is_file()
+                or not verify.spec_within_roots(resolved, self.workspace.paths)
+            ):
+                return False
+        except (OSError, RuntimeError):
+            return False
+        return str(resolved) == observed[0]
+
+    def _bind_dispatched_spec_for_attempt(self, task: StoryTask) -> None:
+        """Atomically observe this attempt's regular spec and pre-launch bytes.
+
+        The path and snapshot are one authority pair: a read fault leaves both
+        unbound, so recovery can never restore bytes that belong to a stale path.
+        Called once before DEV_RUNNING becomes durable. Later orchestrator and
+        hook mutations refresh only this established path through
+        ``_refresh_dispatched_spec_snapshot``.
+        """
+        task.dispatched_spec_snapshot = None
+        task.dispatched_spec_file = self._dispatched_spec_for_attempt(task)
+        self._refresh_dispatched_spec_snapshot(task)
+
+    @staticmethod
+    def _prompt_names_recorded_spec(task: StoryTask, prompt: str) -> bool:
+        """Whether the prompt contains an engine-authored explicit-spec token."""
+        if not task.spec_file:
+            return False
+        spec = str(task.spec_file)
+        return f"`{spec}`" in prompt or bool(
+            re.match(rf"^/\S+\s+{re.escape(spec)}(?:\s|$)", prompt)
+        )
+
+    def _requires_dispatched_spec_snapshot(self, task: StoryTask, prompt: str) -> bool:
+        """Whether this prompt makes the recorded spec attempt-owned input.
+
+        Sprint and Stories repair routes name the spec they will mutate, so they
+        may launch only with a recoverable byte snapshot. Engine variants whose
+        explicit spec pointer has different ownership semantics override this
+        predicate rather than being identified here by type or task shape.
+        """
+        return self._prompt_names_recorded_spec(task, prompt)
+
+    def _retains_dispatched_spec_snapshot_on_repair(self) -> bool:
+        """Whether fixable repairs remain in the current spec-input chain."""
+        return True
+
+    def _preserves_dispatched_spec_snapshot_for_repair(self, task: StoryTask) -> bool:
+        """Whether this repair must retain (or fail closed on) chain authority."""
+        return self._retains_dispatched_spec_snapshot_on_repair() and (
+            task.resolved_redrive
+            or task.dispatched_spec_file is not None
+            or task.dispatched_spec_snapshot is not None
+        )
+
     def _dev_phase(self, task: StoryTask, resume_result: SessionResult | None = None) -> bool:
         if resume_result is None:
             # A fresh invocation cannot consume a snapshot armed by an earlier,
@@ -1766,8 +1943,32 @@ class Engine:
                     # there back into a `feedback is not None` iteration, so such an
                     # iteration can never hold a record to preserve.
                     task.refiled_followups = []
+                # A fresh-baseline dispatch replaces stale ownership. A fixable
+                # repair inherits the current working tree, but retains the chain's
+                # first bound snapshot because a later non-fixable retry resets all
+                # the way to the phase baseline. For a resolved re-drive those are
+                # the operator-corrected bytes.
+                # Recorded-result replay never enters this branch and therefore
+                # retains the persisted binding unchanged.
+                preserve_chain_snapshot = (
+                    feedback is not None
+                    and self._preserves_dispatched_spec_snapshot_for_repair(task)
+                )
+                if not preserve_chain_snapshot:
+                    self._bind_dispatched_spec_for_attempt(task)
             advance(task, Phase.DEV_RUNNING)
             self._save()
+            if (
+                resume_result is None
+                and preserve_chain_snapshot
+                and not self._validate_dispatched_spec_snapshot(task)
+            ):
+                # Persist the no-session attempt before failing. Resume must enter
+                # rollback/recovery from DEV_RUNNING, not mistake the preceding
+                # DEV_VERIFY state for a completed spec-approval pause.
+                raise RuntimeError(
+                    "attempt-owned spec became unreadable during pre-launch snapshot"
+                )
             if resume_result is not None:
                 # the session already ran before the host died; its recorded
                 # result re-enters the verify/decide pipeline. Consumed exactly
@@ -1784,11 +1985,36 @@ class Engine:
                 # (never dispatches) if the patch fails to apply.
                 if feedback is None:
                     self._restore_patch(task)
+                prompt = self._dev_prompt(task, feedback)
+                # Capture the exact bytes a fresh-baseline child will inherit after
+                # orchestrator-owned pre-launch mutations. A fixable repair validates
+                # that same path but retains the chain's first snapshot, because a
+                # later non-fixable retry resets the whole chain.
+                had_binding = task.dispatched_spec_file is not None
+                snapshot_required = (
+                    preserve_chain_snapshot
+                    or had_binding
+                    or self._requires_dispatched_spec_snapshot(task, prompt)
+                )
+                snapshot_ok = not snapshot_required
+                if had_binding:
+                    if preserve_chain_snapshot:
+                        snapshot_ok = self._validate_dispatched_spec_snapshot(task)
+                    else:
+                        snapshot_ok = self._refresh_dispatched_spec_snapshot(
+                            task, clear_on_failure=False
+                        )
+                self._save()
+                if snapshot_required and not snapshot_ok:
+                    raise RuntimeError(
+                        "attempt-owned spec became unreadable during pre-launch snapshot"
+                    )
                 result = self._run_session(
                     task,
                     role="dev",
-                    prompt=self._dev_prompt(task, feedback),
+                    prompt=prompt,
                     seq=task.attempt,
+                    preserve_dispatched_spec_snapshot=preserve_chain_snapshot,
                 )
             advance(task, Phase.DEV_VERIFY)
             outcome = None
@@ -2642,6 +2868,8 @@ class Engine:
             # (if any) decides afresh whether to restore again.
             task.resolved_redrive = False
             task.restore_patch = None
+            task.dispatched_spec_file = None
+            task.dispatched_spec_snapshot = None
         except verify.GitError as e:
             self._restore_deferred_closes(task, snapshot)
             self._restore_park_record(task, park_record)
@@ -3280,7 +3508,17 @@ class Engine:
         if result_json is None and task.spec_file:
             result_json = {"spec_file": task.spec_file}
         self._post_dev_accepted_sync(task, result_json)
-        # The attempt is accepted; no later path may restore its snapshot.
+        # Pre-snapshot runs may replay an accepted dev result carrying only the
+        # old path half of attempt ownership. It can still guide rollback before
+        # acceptance, but it cannot authorize later review mutation. Retire an
+        # incomplete pair here; complete authority intentionally survives review
+        # repair/rollback and is retired only after commit.
+        if (task.dispatched_spec_file is None) != (task.dispatched_spec_snapshot is None):
+            task.dispatched_spec_file = None
+            task.dispatched_spec_snapshot = None
+        # The attempt is accepted; no later path may restore the pre-harvest
+        # ledger snapshot. Attempt-owned spec authority intentionally survives
+        # through review repair/rollback and is retired only after commit.
         self._disarm_ledger_snapshot(task)
         self._save()
 
@@ -4412,6 +4650,7 @@ class Engine:
         session_stage: str | None = None,
         label: str | None = None,
         spec_snapshot: SpecSnapshot | None = None,
+        preserve_dispatched_spec_snapshot: bool = False,
     ) -> SessionResult:
         # ``label`` names a non-standard session (a plugin-provided workflow) so
         # its task_id stays distinct from the role's own dev/review attempts.
@@ -4477,6 +4716,42 @@ class Engine:
                     role=role,
                 )
                 return SessionResult(status="vetoed")
+        if label is None and role == "dev" and task.phase == Phase.DEV_RUNNING:
+            # Session-gate hooks run after `_dev_phase`'s last observation and may
+            # legitimately mutate the workspace. Refresh a fresh-baseline snapshot,
+            # or only validate an already-armed fixable chain, after those hooks;
+            # fail before `session-start` / adapter.run if the trusted regular file
+            # vanished or became unreadable. Launching an explicit prompt without
+            # recoverable input bytes would make a later rollback unable to
+            # distinguish operator intent from child output.
+            had_binding = task.dispatched_spec_file is not None
+            snapshot_required = (
+                preserve_dispatched_spec_snapshot
+                or had_binding
+                or self._requires_dispatched_spec_snapshot(task, prompt)
+            )
+            snapshot_ok = not snapshot_required
+            if had_binding:
+                if preserve_dispatched_spec_snapshot:
+                    snapshot_ok = self._validate_dispatched_spec_snapshot(task)
+                else:
+                    snapshot_ok = self._refresh_dispatched_spec_snapshot(
+                        task, clear_on_failure=False
+                    )
+            elif snapshot_required and not preserve_dispatched_spec_snapshot:
+                # A hook may introduce an explicit task-spec route into an
+                # originally bare prompt. Bind it now because the actual child
+                # prompt and the ownership record then agree.
+                self._bind_dispatched_spec_for_attempt(task)
+                snapshot_ok = (
+                    task.dispatched_spec_file is not None
+                    and task.dispatched_spec_snapshot is not None
+                )
+            if snapshot_required and not snapshot_ok:
+                self._save()
+                raise RuntimeError("attempt-owned spec became unreadable after pre-session hooks")
+            if had_binding or snapshot_required:
+                self._save()
         if label is not None:
             # Injected workflow session: name the sprint board's owner, then spell
             # out the completion-marker protocol and bound its stall nudges (see
@@ -4545,10 +4820,11 @@ class Engine:
             # Pinned ONLY when the dispatched prompt NAMES that path — the read-back
             # may demand a file back solely because the session was told to write it.
             # Knowing a spec exists is not the same as having pointed a session at it:
-            # a from-scratch re-drive after an escalation/deferral has `task.spec_file`
-            # recorded (`_record_dev_spec`) but dispatches a bare story key, a sweep
-            # bundle dispatches `intent.md`, and StoriesEngine dispatches folder+id.
-            # Pinning those would poll a path the session never promised to rewrite
+            # a generic sprint re-drive names a recorded `task.spec_file` only when
+            # `_dev_phase` also bound that regular file to the current attempt. A
+            # fresh or stale-path task has no binding, a sweep bundle dispatches
+            # `intent.md`, and StoriesEngine dispatches folder+id. Pinning any of
+            # those modes would poll a path the session never promised to rewrite
             # and score its real output as "wrote nothing" — trading #261's unsafe
             # failure for a work-LOSING one, the exact trade this fix exists to avoid.
             # Testing the prompt keeps the pin and the contract that justifies it in
@@ -4568,7 +4844,7 @@ class Engine:
                     label is None
                     and self._generic_dev()
                     and task.spec_file
-                    and str(task.spec_file) in prompt
+                    and self._prompt_names_recorded_spec(task, prompt)
                 )
                 else None
             ),
@@ -4854,6 +5130,15 @@ class Engine:
                     f"the working tree after an intent-gap resolution; review it "
                     f"against the amended spec."
                 ) + after_sentence
+            # The attempt binding was resolved in the active workspace immediately
+            # before DEV_RUNNING became durable. A retained `spec_file` alone may
+            # name a discarded unit worktree, so it cannot authorize this route or
+            # the matching deterministic read-back pin.
+            if task.spec_file and task.dispatched_spec_file:
+                return (
+                    f"/{self._dev_skill()} Resume the autonomous dev session on the "
+                    f"ready-for-dev spec at `{task.spec_file}`."
+                ) + after_sentence
             return f"/{self._dev_skill()} {task.story_key}" + after_key
         self._reset_spec_for_repair(task)
         spec_ref = task.spec_file or task.story_key
@@ -5029,12 +5314,33 @@ class Engine:
         the re-driven session's first save of the spec read as a terminal result."""
         if not task.spec_file:
             return
-        spec_path = Path(task.spec_file)
+        spec_path = verify.resolve_spec_path(task.spec_file, self.workspace.paths)
+        try:
+            if spec_path.is_symlink():
+                raise RuntimeError("repair spec became a symlink")
+            resolved = spec_path.resolve(strict=True)
+            expected = spec_path.parent.resolve(strict=True) / spec_path.name
+            if (
+                resolved != expected
+                or not resolved.is_file()
+                or not verify.spec_within_roots(resolved, self.workspace.paths)
+            ):
+                raise RuntimeError("repair spec is no longer a trusted regular file")
+        except FileNotFoundError:
+            # Preserve the existing missing-result behavior: there is no path to
+            # mutate, and ownership-aware Sprint/Stories dispatch will still fail
+            # its later explicit-route snapshot gate. Sweep deliberately keeps its
+            # accepted-spec routing separate from snapshot ownership.
+            return
+        except (OSError, RuntimeError) as exc:
+            raise RuntimeError(
+                "recorded spec became unsafe before repair prompt construction"
+            ) from exc
         # Repair-write doctrine: raising beats dispatching a repair at a charged
         # attempt against a spec still reading `done` — step-01 would ingest it as
         # context and not resume, re-wedging silently (cf. runs.rearm_escalation).
-        devcontract.reset_spec_status(spec_path, "in-progress")
-        devcontract.strip_auto_run_result(spec_path)
+        devcontract.reset_spec_status(resolved, "in-progress")
+        devcontract.strip_auto_run_result(resolved)
 
     def _reset_spec_for_review(self, task: StoryTask) -> SpecSnapshot | None:
         """Strip the prior pass's stale `## Auto Run Result` before a review launch,
@@ -5074,17 +5380,51 @@ class Engine:
         is recorded yet."""
         if not self._generic_dev() or not task.spec_file:
             return None
-        spec_path = Path(task.spec_file)
-        devcontract.strip_auto_run_result(spec_path)
+        retained_authority = (
+            task.dispatched_spec_file is not None or task.dispatched_spec_snapshot is not None
+        )
+        if (
+            self._retains_dispatched_spec_snapshot_on_repair()
+            and retained_authority
+            and not self._validate_dispatched_spec_snapshot(task)
+        ):
+            raise RuntimeError(
+                "attempt-owned spec became unreadable before review prompt construction"
+            )
+        spec_path = verify.resolve_spec_path(task.spec_file, self.workspace.paths)
         try:
-            raw = spec_path.read_bytes()
-            mtime_ns = spec_path.stat().st_mtime_ns
-            fm_status = verify.status_of(verify.read_frontmatter(spec_path))
+            if spec_path.is_symlink():
+                raise RuntimeError("review spec became a symlink")
+            resolved = spec_path.resolve(strict=True)
+            expected = spec_path.parent.resolve(strict=True) / spec_path.name
+            if (
+                resolved != expected
+                or not resolved.is_file()
+                or not verify.spec_within_roots(resolved, self.workspace.paths)
+            ):
+                raise RuntimeError("review spec is no longer a trusted regular file")
+        except FileNotFoundError as exc:
+            self._journal_spec_read_failed(
+                spec_path,
+                task.story_key,
+                "review-launch-snapshot",
+                exc,
+            )
+            return None
+        except (OSError, RuntimeError) as exc:
+            raise RuntimeError(
+                "recorded spec became unsafe before review prompt construction"
+            ) from exc
+        devcontract.strip_auto_run_result(resolved)
+        try:
+            raw = resolved.read_bytes()
+            mtime_ns = resolved.stat().st_mtime_ns
+            fm_status = verify.status_of(verify.read_frontmatter(resolved))
         except OSError as e:
-            self._journal_spec_read_failed(spec_path, task.story_key, "review-launch-snapshot", e)
+            self._journal_spec_read_failed(resolved, task.story_key, "review-launch-snapshot", e)
             return None
         return SpecSnapshot(
-            path=str(spec_path),
+            path=str(resolved),
             mtime_ns=mtime_ns,
             sha256=hashlib.sha256(raw).hexdigest(),
             fm_status=fm_status,
@@ -5114,16 +5454,25 @@ class Engine:
         # already describes that, and the callers' own wording is the honest one.
         session_failure = ""
         while task.attempt < self.policy.limits.max_dev_attempts:
+            preserve_chain_snapshot = self._preserves_dispatched_spec_snapshot_for_repair(task)
             task.attempt += 1
             feedback = self._write_feedback(task, reason)
             advance(task, Phase.DEV_RUNNING)
             self._save()
+            if preserve_chain_snapshot and not self._validate_dispatched_spec_snapshot(task):
+                # The new attempt/phase is the durable recovery identity. Leaving
+                # REVIEW_VERIFY here would replay the preceding review result on
+                # resume instead of recovering this never-launched repair.
+                raise RuntimeError(
+                    "attempt-owned spec became unreadable before repair prompt construction"
+                )
             result = self._run_session(
                 task,
                 role="dev",
                 prompt=self._dev_prompt(task, feedback),
                 seq=task.attempt,
                 session_stage="pre_fix_session",
+                preserve_dispatched_spec_snapshot=preserve_chain_snapshot,
             )
             advance(task, Phase.DEV_VERIFY)
             outcome = None

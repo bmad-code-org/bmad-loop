@@ -20,15 +20,16 @@ from __future__ import annotations
 
 import json
 import re
-import shutil
 import socket
-import sys
 
 import pytest
+from conftest import opencode_runs
 
-HAVE_OPENCODE = sys.platform != "win32" and shutil.which("opencode") is not None
+HAVE_OPENCODE = opencode_runs()
 pytestmark = pytest.mark.skipif(
-    not HAVE_OPENCODE, reason="live smoke needs a real `opencode` binary (POSIX)"
+    not HAVE_OPENCODE,
+    reason="live smoke needs a runnable `opencode` binary (POSIX): not on PATH, or on "
+    "PATH but failing `--version` — e.g. a dead WSL/npm shim (#294)",
 )
 
 httpx = pytest.importorskip("httpx")

@@ -1413,6 +1413,23 @@ class SweepEngine(Engine):
 
     # ------------------------------------------------------ override seams
 
+    def _dispatched_spec_for_attempt(self, task: StoryTask) -> str | None:
+        """Sweep dispatch owns intent.md, never an accepted bundle spec."""
+        return None
+
+    def _requires_dispatched_spec_snapshot(self, task: StoryTask, prompt: str) -> bool:
+        """Keep explicit bundle-spec routing separate from recovery ownership.
+
+        Repair and patch-restore prompts name the accepted spec so deterministic
+        read-back follows it, but Sweep still owns ``intent.md`` as its dispatched
+        input and must never promote that result artifact into attempt ownership.
+        """
+        return False
+
+    def _retains_dispatched_spec_snapshot_on_repair(self) -> bool:
+        """Sweep repairs remain owned by intent.md, not the accepted spec."""
+        return False
+
     def _dev_prompt(self, task: StoryTask, feedback: Path | None) -> str:
         return self._generic_bundle_prompt(task, feedback)
 

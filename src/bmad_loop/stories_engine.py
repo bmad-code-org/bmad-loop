@@ -317,6 +317,39 @@ class StoriesEngine(Engine):
 
     # -------------------------------------------------------------- dispatch
 
+    def _dispatched_spec_for_attempt(self, task: StoryTask) -> str | None:
+        """Bind only the unique readable id-keyed spec present at dispatch."""
+        try:
+            state = stories.resolve_story_spec(self._stories_folder(), task.story_key)
+            if state.kind != stories.KIND_PRESENT or state.path is None:
+                return None
+            # Resolution degrades a read fault to PRESENT with an unknown status;
+            # ownership must be stricter because recovery may later repair this
+            # exact file. Re-read now and refuse a vanished/non-regular/unreadable
+            # candidate rather than persisting an ownership claim we did not see.
+            if not state.path.is_file():
+                return None
+            state.path.read_text(encoding="utf-8")
+            return str(state.path)
+        except (OSError, RuntimeError, UnicodeDecodeError):
+            return None
+
+    def _requires_dispatched_spec_snapshot(self, task: StoryTask, prompt: str) -> bool:
+        """Require authority when folder+id dispatch targets an existing spec.
+
+        A pending, ambiguous, or sentinel story does not claim file authority
+        through this seam; normal Stories scheduling handles those states. Once
+        resolution identifies one PRESENT spec, however, a transient binding/read
+        fault must abort rather than let the folder+id child mutate an input
+        recovery cannot restore. An uncertain second observation fails closed for
+        the same reason.
+        """
+        try:
+            state = stories.resolve_story_spec(self._stories_folder(), task.story_key)
+        except (OSError, RuntimeError):
+            return True
+        return state.kind == stories.KIND_PRESENT and state.path is not None
+
     def _extra_session_env(
         self, task: StoryTask, role: str, label: str | None = None
     ) -> dict[str, str]:

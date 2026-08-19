@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import base64
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -234,6 +235,18 @@ class StoryTask:
     harvest_carry_commit_pending: bool = False
     isolated_ledger_carried: bool = False
     spec_file: str | None = None
+    # The spec owned by the current/last dispatched dev attempt. Unlike
+    # ``spec_file`` (the accepted/result artifact), this is bound before launch
+    # so recovery can identify an attempt's lifecycle-only residue after a crash.
+    dispatched_spec_file: str | None = None
+    # Byte-exact input contents of ``dispatched_spec_file`` for the current retry
+    # chain. The JSON representation is base64, so CRLF and non-UTF-8 bytes survive
+    # a crash/resume round-trip. The chain's first bound input is retained across
+    # fixable repairs, then restored before a fresh-baseline retry; in a resolved
+    # re-drive this is the operator-corrected spec, so child-authored body edits can
+    # never become the retained correction. Cleared after successful commit. None =
+    # unbound attempt, retired chain, or legacy state.
+    dispatched_spec_snapshot: bytes | None = None
     commit_sha: str | None = None
     # the external, human-only actions this story still owes when it parks at
     # Phase.AWAITING_OPERATOR — one free-text instruction per entry, as the dev
@@ -386,7 +399,13 @@ class StoryTask:
             "accepted_dev_session_index": self.accepted_dev_session_index,
             "harvest_carry_commit_pending": self.harvest_carry_commit_pending,
             "isolated_ledger_carried": self.isolated_ledger_carried,
-            "spec_file": self._serialized_spec_file(),
+            "spec_file": self._serialized_worktree_path(self.spec_file),
+            "dispatched_spec_file": self._serialized_worktree_path(self.dispatched_spec_file),
+            "dispatched_spec_snapshot": (
+                base64.b64encode(self.dispatched_spec_snapshot).decode("ascii")
+                if self.dispatched_spec_snapshot is not None
+                else None
+            ),
             "commit_sha": self.commit_sha,
             "operator_actions": self.operator_actions,
             "defer_reason": self.defer_reason,
@@ -407,22 +426,35 @@ class StoryTask:
             "token_budget_warned": self.token_budget_warned,
         }
 
-    def _serialized_spec_file(self) -> str | None:
-        """In worktree mode the spec lives inside the unit's worktree; persist it
-        relative to the worktree root so a kept-failed run's state.json stays
-        portable if the worktree is later moved (and is never a dangling absolute
-        path into a since-pruned worktree). In-place mode stores it verbatim."""
-        if not self.spec_file or not self.worktree_path:
-            return self.spec_file
+    def _serialized_worktree_path(self, path: str | None) -> str | None:
+        """Persist a worktree-local spec path relative to its mounted root.
+
+        Both the accepted/result spec and the attempt-owned dispatched spec use
+        this one normalization path so their state.json representations cannot
+        drift. In-place and outside-worktree paths remain verbatim.
+        """
+        if not path or not self.worktree_path:
+            return path
         try:
             # as_posix: persist the relative path with forward slashes so state.json
             # stays portable across OSes (matches the in-worktree spec layout).
-            return Path(self.spec_file).relative_to(self.worktree_path).as_posix()
+            return Path(path).relative_to(self.worktree_path).as_posix()
         except ValueError:
-            return self.spec_file  # spec lives outside the worktree; keep absolute
+            return path  # spec lives outside the worktree; keep absolute
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "StoryTask":
+        dispatched_spec_snapshot = d.get("dispatched_spec_snapshot")
+        if dispatched_spec_snapshot is not None:
+            try:
+                dispatched_spec_snapshot = base64.b64decode(
+                    str(dispatched_spec_snapshot).encode("ascii"),
+                    validate=True,
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"story {d.get('story_key')!r}: dispatched_spec_snapshot " "is not valid base64"
+                ) from exc
         return cls(
             story_key=d["story_key"],
             epic=int(d["epic"]),
@@ -467,6 +499,8 @@ class StoryTask:
             harvest_carry_commit_pending=bool(d.get("harvest_carry_commit_pending", False)),
             isolated_ledger_carried=bool(d.get("isolated_ledger_carried", False)),
             spec_file=d.get("spec_file"),
+            dispatched_spec_file=d.get("dispatched_spec_file"),
+            dispatched_spec_snapshot=dispatched_spec_snapshot,
             commit_sha=d.get("commit_sha"),
             operator_actions=[str(a) for a in d.get("operator_actions", [])],
             defer_reason=d.get("defer_reason"),

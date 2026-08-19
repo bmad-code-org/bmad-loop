@@ -2160,6 +2160,40 @@ def test_branch_per_run_escalation_pauses_without_dispatching_next_unit(project)
 # ----------------------------------------------------------------- resume
 
 
+def test_worktree_reopen_reabsolutizes_both_spec_ownership_paths(project, tmp_path):
+    """Portable relative spec ownership is rebound to the live mounted worktree.
+
+    Ablation: remove ``dispatched_spec_file`` from reopen_unit's rebase fields and
+    this test fails alone on the attempt-owned path while accepted spec rebasing stays green.
+    """
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    from bmad_loop.workspace import open_unit_workspace
+
+    unit = open_unit_workspace(
+        project.project, project, "test-run", "1-1-a", "main", "story", engine.run_dir
+    )
+    task = StoryTask("1-1-a", 1, phase=Phase.DEV_VERIFY)
+    task.worktree_path = str(unit.path)
+    task.branch = unit.branch
+    task.spec_file = "_bmad-output/accepted.md"
+    task.dispatched_spec_file = "_bmad-output/dispatched.md"
+
+    reopened = engine._reopen_unit(task)
+
+    assert reopened.path == unit.path
+    assert task.spec_file == str(unit.path / "_bmad-output/accepted.md")
+    assert task.dispatched_spec_file == str(unit.path / "_bmad-output/dispatched.md")
+
+    outside_spec = str(tmp_path / "outside-accepted.md")
+    outside_dispatched = str(tmp_path / "outside-dispatched.md")
+    task.spec_file = outside_spec
+    task.dispatched_spec_file = outside_dispatched
+    engine._reopen_unit(task)
+    assert task.spec_file == outside_spec
+    assert task.dispatched_spec_file == outside_dispatched
+
+
 def test_worktree_spec_approval_pause_resumes_in_same_worktree(project):
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
     gated = Policy(
@@ -3106,20 +3140,25 @@ def test_merge_env_fault_during_target_clean_keeps_branch_and_escalates(
     assert branch_exists(project.project, "bmad-loop/test-run/1-1-a")
 
 
-def test_spec_file_serialized_relative_to_worktree():
-    """A worktree task persists spec_file relative to its worktree so a kept run's
-    state stays portable (no dangling absolute path into a pruned worktree)."""
+def test_spec_paths_serialize_relative_to_worktree_or_preserve_absolute_paths():
+    """Both spec paths stay portable without rewriting paths the worktree does not own."""
     task = StoryTask(story_key="1-1-a", epic=1, phase=Phase.DEFERRED)
     task.worktree_path = "/repo/.bmad-loop/runs/run/worktrees/1-1-a"
     task.spec_file = "/repo/.bmad-loop/runs/run/worktrees/1-1-a/_out/spec.md"
+    task.dispatched_spec_file = "/repo/.bmad-loop/runs/run/worktrees/1-1-a/_out/dispatched.md"
     assert task.to_dict()["spec_file"] == "_out/spec.md"
-    # a spec living outside the worktree stays absolute
+    assert task.to_dict()["dispatched_spec_file"] == "_out/dispatched.md"
+    # specs living outside the worktree stay absolute
     task.spec_file = "/elsewhere/spec.md"
+    task.dispatched_spec_file = "/elsewhere/dispatched.md"
     assert task.to_dict()["spec_file"] == "/elsewhere/spec.md"
+    assert task.to_dict()["dispatched_spec_file"] == "/elsewhere/dispatched.md"
     # in-place mode (no worktree) is unchanged
     task.worktree_path = ""
     task.spec_file = "/repo/_out/spec.md"
+    task.dispatched_spec_file = "/repo/_out/dispatched.md"
     assert task.to_dict()["spec_file"] == "/repo/_out/spec.md"
+    assert task.to_dict()["dispatched_spec_file"] == "/repo/_out/dispatched.md"
 
 
 # ---------------------------------------------- gh-139 resilient teardown
@@ -3584,16 +3623,19 @@ def test_resume_remount_survives_discard_remove_failure(project, monkeypatch):
     assert "worktree-open-failed" not in journal_kinds(resumed)
 
 
-def test_spec_file_serialized_with_posix_separators():
-    """The relative spec_file is persisted with forward slashes (as_posix) so a
+def test_spec_paths_serialize_with_posix_separators():
+    """Relative spec paths persist with forward slashes (as_posix) so a
     state.json written under one OS reads back identically under another — no
     backslashes leak into the cross-OS state contract."""
     task = StoryTask(story_key="1-1-a", epic=1, phase=Phase.DEFERRED)
     task.worktree_path = "/repo/wt"
     task.spec_file = "/repo/wt/_out/sub/spec.md"
-    serialized = task.to_dict()["spec_file"]
-    assert serialized == "_out/sub/spec.md"
-    assert "\\" not in serialized
+    task.dispatched_spec_file = "/repo/wt/_out/sub/dispatched.md"
+    serialized = task.to_dict()
+    assert serialized["spec_file"] == "_out/sub/spec.md"
+    assert serialized["dispatched_spec_file"] == "_out/sub/dispatched.md"
+    assert "\\" not in serialized["spec_file"]
+    assert "\\" not in serialized["dispatched_spec_file"]
 
 
 # ------------------------------------------------- retry recovery (issue #161)

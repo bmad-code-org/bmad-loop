@@ -1685,6 +1685,61 @@ def test_resume_dev_verify_bundle_after_repair_preserves_acceptance(project, mon
     assert saved.accepted_dev_session_index == len(persisted.sessions) - 1
 
 
+def test_resolved_bundle_review_repair_retains_intent_ownership(project):
+    """A resolved Sweep repair never claims the accepted spec as input."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = triage_result(
+        ["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "resolve DW-1"}]
+    )
+    marker = project.project / "resolved-sweep-verify"
+    dev = bundle_dev_effect(project, "fix", ["DW-1"], mark_ledger=False)
+    review = bundle_review_effect(project, "fix")
+    observed: list[tuple[str | None, bytes | None]] = []
+
+    def dev_with_marker(spec):
+        result = dev(spec)
+        marker.write_text("ok\n", encoding="utf-8")
+        engine.state.tasks["dw-fix"].resolved_redrive = True
+        return result
+
+    def breaking_review(spec):
+        marker.unlink()
+        return review(spec)
+
+    def repair(_spec):
+        task = load_state(engine.run_dir).tasks["dw-fix"]
+        observed.append((task.dispatched_spec_file, task.dispatched_spec_snapshot))
+        marker.write_text("repaired\n", encoding="utf-8")
+        return SessionResult(
+            status="completed", result_json={"workflow": "auto-dev", "escalations": []}
+        )
+
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=True, trigger="always"),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        verify=VerifyPolicy(commands=(_file_exists_cmd(marker),)),
+        scm=ScmPolicy(rollback_on_failure=True),
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            dev_with_marker,
+            breaking_review,
+            repair,
+            bundle_review_effect(project, "fix"),
+        ],
+        policy=policy,
+    )
+
+    summary = engine.run()
+
+    assert summary.done >= 1 and not summary.crashed
+    assert observed == [(None, None)]
+
+
 def test_bundle_ledger_close_withheld_on_a_non_fixable_retry(project):
     """A rejected attempt must not close the ids whose code it rolls back."""
     write_ledger(project, {"DW-1": "open"})
@@ -4308,7 +4363,12 @@ def test_bundle_dispatch_does_not_pin_expected_spec(project, tmp_path):
     would poll a path this dispatch never promised to rewrite.
 
     Falls out of the naming rule rather than a sweep-specific carve-out, which is
-    exactly why it needs pinning down: nothing in sweep.py mentions expected_spec."""
+    exactly why it needs pinning down: nothing in sweep.py mentions expected_spec.
+
+    Ablation: route ``SweepEngine._dev_prompt`` through its superclass and this
+    test fails because the inherited known-spec arm names ``task.spec_file`` and
+    pins read-back to it instead of dispatching ``intent.md``.
+    """
     engine, adapter = make_sweep(project, [SessionResult(status="crashed")])
     intent = tmp_path / "bundles" / "fix" / "intent.md"
     intent.parent.mkdir(parents=True)
@@ -4324,6 +4384,54 @@ def test_bundle_dispatch_does_not_pin_expected_spec(project, tmp_path):
     assert str(intent) in prompt and task.spec_file not in prompt
     engine._run_session(task, role="dev", prompt=prompt, seq=1)
     assert adapter.sessions[-1].expected_spec is None
+
+
+def test_bundle_dispatch_does_not_bind_accepted_spec_as_attempt_ownership(project):
+    """A bundle carries accepted result history, but dispatch still owns intent.md.
+
+    Ablation: delete the SweepEngine override and the inherited sprint seam binds
+    the existing ``task.spec_file``, failing this absence assertion alone.
+    """
+    engine, _ = make_sweep(project, [])
+    accepted = project.implementation_artifacts / "spec-adopted-elsewhere.md"
+    accepted.parent.mkdir(parents=True, exist_ok=True)
+    write_spec(accepted, "done", "abc")
+    task = StoryTask(
+        story_key="dw-fix",
+        epic=0,
+        spec_file=str(accepted),
+        dispatched_spec_file="stale/from/earlier-attempt.md",
+    )
+
+    task.dispatched_spec_file = engine._dispatched_spec_for_attempt(task)
+
+    assert task.dispatched_spec_file is None
+
+
+def test_bundle_explicit_spec_route_pins_readback_without_claiming_ownership(project):
+    """Sweep's explicit restore route names output without owning it as input.
+
+    Ablation: delete the Sweep snapshot-requirement override and the inherited
+    pre-session guard refuses this launch because no dispatched spec is bound.
+    """
+    engine, adapter = make_sweep(project, [SessionResult(status="crashed")])
+    accepted = project.implementation_artifacts / "spec-dw-fix.md"
+    accepted.parent.mkdir(parents=True, exist_ok=True)
+    write_spec(accepted, "in-review", "abc")
+    task = StoryTask(
+        story_key="dw-fix",
+        epic=0,
+        phase=Phase.DEV_RUNNING,
+        spec_file=str(accepted),
+        restore_patch="/run/artifacts/attempt-dw-fix.patch",
+    )
+    prompt = engine._generic_bundle_prompt(task, None)
+
+    engine._run_session(task, role="dev", prompt=prompt, seq=1)
+
+    assert adapter.sessions[-1].expected_spec == str(accepted)
+    assert task.dispatched_spec_file is None
+    assert task.dispatched_spec_snapshot is None
 
 
 # ---------------- frontmatter `deferred:` harvest parity (BMAD-METHOD #2640)

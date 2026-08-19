@@ -1672,10 +1672,14 @@ class WorktreeFlow:
                 task,
                 f"worktree for {task.story_key} is gone ({wt}); cannot resume in place",
             )
-        # spec_file is persisted relative to the worktree (model.to_dict) so the
-        # state stays portable; re-absolutize it against the reopened worktree.
-        if task.spec_file and not Path(task.spec_file).is_absolute():
-            task.spec_file = str(wt / task.spec_file)
+        # Spec paths are persisted relative to the worktree (model.to_dict) so
+        # state stays portable; re-absolutize both accepted/result ownership and
+        # the current/last attempt's dispatch ownership against the reopened tree.
+        # Absolute outside-worktree paths pass through unchanged.
+        for field_name in ("spec_file", "dispatched_spec_file"):
+            value = getattr(task, field_name)
+            if value and not Path(value).is_absolute():
+                setattr(task, field_name, str(wt / value))
         return UnitWorkspace(
             workspace=Workspace(root=wt, paths=self.paths.rebased(wt)),
             repo_root=self.paths.repo_root,

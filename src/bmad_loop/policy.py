@@ -687,6 +687,34 @@ def _validate_plugin_settings(name: str, raw: dict[str, Any], specs: Any) -> Non
             )
 
 
+def _limit_int(raw: dict[str, Any], key: str, default: int) -> int:
+    value = raw.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise PolicyError(f"limits.{key} must be an integer: got {value!r}")
+    return value
+
+
+def _limit_float(raw: dict[str, Any], key: str, default: float) -> float:
+    value = raw.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise PolicyError(f"limits.{key} must be a number: got {value!r}")
+    return float(value)
+
+
+def _limit_bool(raw: dict[str, Any], key: str, default: bool) -> bool:
+    value = raw.get(key, default)
+    if not isinstance(value, bool):
+        raise PolicyError(f"limits.{key} must be a boolean: got {value!r}")
+    return value
+
+
+def _limit_str(raw: dict[str, Any], key: str, default: str) -> str:
+    value = raw.get(key, default)
+    if not isinstance(value, str):
+        raise PolicyError(f"limits.{key} must be a string: got {value!r}")
+    return value
+
+
 def load(path: Path | None) -> Policy:
     """Load policy from a TOML file; a missing file yields all defaults.
 
@@ -751,63 +779,46 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
             f"gates.retrospective must be one of {sorted(RETRO_MODES)}: got {gates.retrospective!r}"
         )
 
-    # the budget knobs gate enforce-mode termination, so a coerced bool/float
-    # (true -> 1 token) must be rejected, not silently accepted (same rule as
-    # scm.preserve_keep below). The per-story cap is checked here on the same
-    # terms even though it only warns: a coerced `true` caps a whole story at 1
-    # token, which now fires at the first session boundary of every story.
-    max_tokens_per_story = limits_d.get("max_tokens_per_story", LimitsPolicy.max_tokens_per_story)
-    if isinstance(max_tokens_per_story, bool) or not isinstance(max_tokens_per_story, int):
-        raise PolicyError(
-            f"limits.max_tokens_per_story must be an integer: got {max_tokens_per_story!r}"
-        )
-    max_tokens_per_session = limits_d.get(
-        "max_tokens_per_session", LimitsPolicy.max_tokens_per_session
-    )
-    if isinstance(max_tokens_per_session, bool) or not isinstance(max_tokens_per_session, int):
-        raise PolicyError(
-            f"limits.max_tokens_per_session must be an integer: got {max_tokens_per_session!r}"
-        )
-    session_budget_grace_s = limits_d.get(
-        "session_budget_grace_s", LimitsPolicy.session_budget_grace_s
-    )
-    if isinstance(session_budget_grace_s, bool) or not isinstance(session_budget_grace_s, int):
-        raise PolicyError(
-            f"limits.session_budget_grace_s must be an integer: got {session_budget_grace_s!r}"
-        )
-
     limits = LimitsPolicy(
-        max_review_cycles=int(limits_d.get("max_review_cycles", LimitsPolicy.max_review_cycles)),
-        max_dev_attempts=int(limits_d.get("max_dev_attempts", LimitsPolicy.max_dev_attempts)),
-        max_followup_reviews=int(
-            limits_d.get("max_followup_reviews", LimitsPolicy.max_followup_reviews)
+        max_review_cycles=_limit_int(limits_d, "max_review_cycles", LimitsPolicy.max_review_cycles),
+        max_dev_attempts=_limit_int(limits_d, "max_dev_attempts", LimitsPolicy.max_dev_attempts),
+        max_followup_reviews=_limit_int(
+            limits_d, "max_followup_reviews", LimitsPolicy.max_followup_reviews
         ),
-        session_timeout_min=int(
-            limits_d.get("session_timeout_min", LimitsPolicy.session_timeout_min)
+        session_timeout_min=_limit_int(
+            limits_d, "session_timeout_min", LimitsPolicy.session_timeout_min
         ),
-        git_timeout_s=int(limits_d.get("git_timeout_s", LimitsPolicy.git_timeout_s)),
-        teardown_grace_s=int(limits_d.get("teardown_grace_s", LimitsPolicy.teardown_grace_s)),
-        stop_without_result_nudges=int(
-            limits_d.get("stop_without_result_nudges", LimitsPolicy.stop_without_result_nudges)
+        git_timeout_s=_limit_int(limits_d, "git_timeout_s", LimitsPolicy.git_timeout_s),
+        teardown_grace_s=_limit_int(limits_d, "teardown_grace_s", LimitsPolicy.teardown_grace_s),
+        stop_without_result_nudges=_limit_int(
+            limits_d, "stop_without_result_nudges", LimitsPolicy.stop_without_result_nudges
         ),
-        dev_stall_grace_s=int(limits_d.get("dev_stall_grace_s", LimitsPolicy.dev_stall_grace_s)),
-        dev_stall_nudges=int(limits_d.get("dev_stall_nudges", LimitsPolicy.dev_stall_nudges)),
-        dev_stall_nudges_cap=int(
-            limits_d.get("dev_stall_nudges_cap", LimitsPolicy.dev_stall_nudges_cap)
+        dev_stall_grace_s=_limit_int(limits_d, "dev_stall_grace_s", LimitsPolicy.dev_stall_grace_s),
+        dev_stall_nudges=_limit_int(limits_d, "dev_stall_nudges", LimitsPolicy.dev_stall_nudges),
+        dev_stall_nudges_cap=_limit_int(
+            limits_d, "dev_stall_nudges_cap", LimitsPolicy.dev_stall_nudges_cap
         ),
-        workflow_stall_nudges_cap=int(
-            limits_d.get("workflow_stall_nudges_cap", LimitsPolicy.workflow_stall_nudges_cap)
+        workflow_stall_nudges_cap=_limit_int(
+            limits_d, "workflow_stall_nudges_cap", LimitsPolicy.workflow_stall_nudges_cap
         ),
-        dev_contract_nudge=bool(
-            limits_d.get("dev_contract_nudge", LimitsPolicy.dev_contract_nudge)
+        dev_contract_nudge=_limit_bool(
+            limits_d, "dev_contract_nudge", LimitsPolicy.dev_contract_nudge
         ),
-        max_tokens_per_story=max_tokens_per_story,
-        cache_read_weight=float(limits_d.get("cache_read_weight", LimitsPolicy.cache_read_weight)),
-        session_budget_mode=str(
-            limits_d.get("session_budget_mode", LimitsPolicy.session_budget_mode)
+        max_tokens_per_story=_limit_int(
+            limits_d, "max_tokens_per_story", LimitsPolicy.max_tokens_per_story
         ),
-        max_tokens_per_session=max_tokens_per_session,
-        session_budget_grace_s=session_budget_grace_s,
+        cache_read_weight=_limit_float(
+            limits_d, "cache_read_weight", LimitsPolicy.cache_read_weight
+        ),
+        session_budget_mode=_limit_str(
+            limits_d, "session_budget_mode", LimitsPolicy.session_budget_mode
+        ),
+        max_tokens_per_session=_limit_int(
+            limits_d, "max_tokens_per_session", LimitsPolicy.max_tokens_per_session
+        ),
+        session_budget_grace_s=_limit_int(
+            limits_d, "session_budget_grace_s", LimitsPolicy.session_budget_grace_s
+        ),
     )
     if limits.max_review_cycles < 1 or limits.max_dev_attempts < 1:
         raise PolicyError("limits.max_review_cycles and limits.max_dev_attempts must be >= 1")
@@ -815,10 +826,19 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         raise PolicyError(
             f"limits.max_followup_reviews must be >= 0: got {limits.max_followup_reviews}"
         )
+    if limits.session_timeout_min < 1:
+        raise PolicyError(
+            f"limits.session_timeout_min must be >= 1: got {limits.session_timeout_min}"
+        )
     if limits.git_timeout_s < 1:
         raise PolicyError(f"limits.git_timeout_s must be >= 1: got {limits.git_timeout_s}")
     if limits.teardown_grace_s < 0:
         raise PolicyError(f"limits.teardown_grace_s must be >= 0: got {limits.teardown_grace_s}")
+    if limits.stop_without_result_nudges < 0:
+        raise PolicyError(
+            "limits.stop_without_result_nudges must be >= 0: "
+            f"got {limits.stop_without_result_nudges}"
+        )
     if not 0.0 <= limits.cache_read_weight <= 1.0:
         raise PolicyError(
             f"limits.cache_read_weight must be between 0 and 1: got {limits.cache_read_weight}"

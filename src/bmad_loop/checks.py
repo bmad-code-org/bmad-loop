@@ -50,6 +50,7 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         "policy.isolation-repo-root",
         "adapter.profile",
         "adapter.binary",
+        "adapter.binary-unrunnable",
         "adapter.hookless",
         "adapter.httpx",
         "adapter.kind",

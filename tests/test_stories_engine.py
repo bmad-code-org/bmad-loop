@@ -10,6 +10,7 @@ import pytest
 import yaml
 from conftest import attach_profile, git, install_build_auto_skill, write_gated_ledger, write_spec
 
+from bmad_loop import stories
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.engine import Engine
@@ -272,6 +273,155 @@ def test_stories_validated_journaled_once(project):
     assert validated[0]["count"] == 2
 
 
+# ----------------------------------------------- dispatched spec ownership
+
+
+def test_dispatched_spec_binding_uses_exact_present_id_keyed_file(project):
+    folder = setup_stories(project, [entry("1")])
+    present = story_spec(project, "1")
+    write_spec(present, "ready-for-dev", rev_parse_head(project.project))
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "present story spec")
+    engine, _ = make_engine(project, [])
+
+    assert engine._dispatched_spec_for_attempt(StoryTask("1", 0)) == str(present)
+    assert present.parent == folder / "stories"
+
+
+def test_bound_folder_id_dispatch_aborts_when_final_snapshot_fails(project, monkeypatch):
+    """A Stories prompt stays fail-safe even though it names only folder + id.
+
+    Ablation: require the final snapshot only for prompts containing ``spec_file``
+    and this bound attempt launches despite its failed final observation.
+    """
+    setup_stories(project, [entry("1")])
+    present = story_spec(project, "1")
+    write_spec(present, "ready-for-dev", rev_parse_head(project.project))
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "present story spec")
+    engine, adapter = make_engine(project, [stories_dev_effect()])
+    task = StoryTask("1", 0, spec_file=str(present))
+    engine.state.tasks[task.story_key] = task
+    real_refresh = engine._refresh_dispatched_spec_snapshot
+    calls = 0
+
+    def fail_final_snapshot(bound_task, **kwargs):
+        nonlocal calls
+        calls += 1
+        refreshed = real_refresh(bound_task, **kwargs)
+        if calls == 2:
+            return False
+        return refreshed
+
+    monkeypatch.setattr(engine, "_refresh_dispatched_spec_snapshot", fail_final_snapshot)
+
+    with pytest.raises(RuntimeError, match="pre-launch snapshot"):
+        engine._dev_phase(task)
+
+    assert calls == 2
+    assert adapter.sessions == []
+
+
+def test_present_folder_id_dispatch_aborts_when_initial_binding_fails(project, monkeypatch):
+    """An existing Stories target cannot launch unbound after a read fault."""
+    setup_stories(project, [entry("1")])
+    present = story_spec(project, "1")
+    write_spec(present, "ready-for-dev", rev_parse_head(project.project))
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "present story spec")
+    engine, adapter = make_engine(project, [stories_dev_effect()])
+    task = StoryTask("1", 0, spec_file=str(present))
+    engine.state.tasks[task.story_key] = task
+    monkeypatch.setattr(engine, "_dispatched_spec_for_attempt", lambda _task: None)
+
+    with pytest.raises(RuntimeError, match="pre-launch snapshot"):
+        engine._dev_phase(task)
+
+    assert task.phase == Phase.DEV_RUNNING
+    assert task.dispatched_spec_file is None
+    assert task.dispatched_spec_snapshot is None
+    assert adapter.sessions == []
+    persisted = load_state(engine.run_dir).tasks[task.story_key]
+    assert persisted.phase == Phase.DEV_RUNNING
+    assert persisted.attempt == task.attempt
+
+
+def test_present_folder_id_dispatch_fails_closed_when_requirement_observation_faults(
+    project, monkeypatch
+):
+    """Two failed resolver observations cannot turn an existing target unbound."""
+    setup_stories(project, [entry("1")])
+    present = story_spec(project, "1")
+    write_spec(present, "ready-for-dev", rev_parse_head(project.project))
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "present story spec")
+    engine, adapter = make_engine(project, [stories_dev_effect()])
+    task = StoryTask("1", 0, spec_file=str(present))
+    engine.state.tasks[task.story_key] = task
+    real_resolve = stories.resolve_story_spec
+    calls = 0
+
+    def fail_authority_observations(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls in {1, 3}:
+            raise OSError("transient Stories resolver fault")
+        return real_resolve(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "bmad_loop.stories_engine.stories.resolve_story_spec", fail_authority_observations
+    )
+
+    with pytest.raises(RuntimeError, match="pre-launch snapshot"):
+        engine._dev_phase(task)
+
+    assert adapter.sessions == []
+    assert task.dispatched_spec_file is None
+    assert task.dispatched_spec_snapshot is None
+    assert calls == 3
+    persisted = load_state(engine.run_dir).tasks[task.story_key]
+    assert persisted.phase == Phase.DEV_RUNNING
+    assert persisted.attempt == task.attempt
+
+
+def test_dispatched_spec_binding_refuses_pending_story(project):
+    """Ablation: delete the StoriesEngine override and the inherited sprint seam
+    binds the valid decoy ``task.spec_file``, failing this PENDING refusal alone."""
+    folder = setup_stories(project, [entry("1")])
+    task = StoryTask("1", 0, spec_file=str(folder / "SPEC.md"))
+    engine, _ = make_engine(project, [])
+
+    assert engine._dispatched_spec_for_attempt(task) is None
+
+
+def test_dispatched_spec_binding_refuses_ambiguous_story(project):
+    """Ablation: delete the StoriesEngine override and the inherited sprint seam
+    binds the valid decoy ``task.spec_file``, failing this AMBIGUOUS refusal alone."""
+    folder = setup_stories(project, [entry("1")])
+    write_spec(story_spec(project, "1"), "ready-for-dev", rev_parse_head(project.project))
+    write_spec(folder / "stories" / "1-other.md", "ready-for-dev", rev_parse_head(project.project))
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "ambiguous story specs")
+    task = StoryTask("1", 0, spec_file=str(folder / "SPEC.md"))
+    engine, _ = make_engine(project, [])
+
+    assert engine._dispatched_spec_for_attempt(task) is None
+
+
+def test_dispatched_spec_binding_refuses_sentinel_story(project):
+    """Ablation: delete the StoriesEngine override and the inherited sprint seam
+    binds the valid decoy ``task.spec_file``, failing this SENTINEL refusal alone."""
+    folder = setup_stories(project, [entry("1")])
+    sentinel = folder / "stories" / "1-unresolved.md"
+    write_spec(sentinel, "blocked", rev_parse_head(project.project))
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "sentinel story spec")
+    task = StoryTask("1", 0, spec_file=str(folder / "SPEC.md"))
+    engine, _ = make_engine(project, [])
+
+    assert engine._dispatched_spec_for_attempt(task) is None
+
+
 # ------------------------------------------------------------- scheduling
 
 
@@ -427,6 +577,11 @@ def test_story_selector_filters_to_one_id(project):
 
 
 def test_dev_prompt_fresh_dispatch_shape(project):
+    """Stories keeps its folder+id route instead of inheriting sprint routing.
+
+    Ablation: route ``StoriesEngine._dev_prompt`` through its superclass and this
+    exact assertion fails on the inherited bare sprint-key prompt.
+    """
     setup_stories(project, [entry("1")])
     engine, _ = make_engine(project, [])
     task = StoryTask(story_key="1", epic=0)
@@ -532,6 +687,12 @@ def test_review_prompt_carries_no_sprint_board_clause(project):
 
 
 def test_dev_prompt_repair_leg_is_explicit_spec_resume(project, tmp_path):
+    """A Stories repair remains its pre-sprint-routing explicit-spec invocation.
+
+    Green ablation: routing ``StoriesEngine._dev_prompt`` through its superclass
+    leaves this test green because the two repair legs are intentionally
+    byte-identical; ``test_dev_prompt_fresh_dispatch_shape`` grades the override.
+    """
     setup_stories(project, [entry("1")])
     engine, _ = make_engine(project, [])
     task = StoryTask(story_key="1", epic=0)
@@ -542,8 +703,13 @@ def test_dev_prompt_repair_leg_is_explicit_spec_resume(project, tmp_path):
     feedback = tmp_path / "fb.md"
     feedback.write_text("boom")
     prompt = engine._dev_prompt(task, feedback)
-    assert prompt.startswith("/bmad-dev-auto Resume the autonomous dev session on the in-progress")
-    assert "Story id:" not in prompt  # repair is an explicit-spec-file invocation
+    assert prompt == (
+        f"/bmad-dev-auto Resume the autonomous dev session on the in-progress spec at "
+        f"`{task.spec_file}`. The previous session's work failed deterministic "
+        f"verification; repair the working tree so verification passes without "
+        f"changing the spec's frozen intent contract. Verification evidence is "
+        f"in `{feedback}`."
+    )
 
 
 def test_dev_prompt_spells_the_post_rename_primitive(project, tmp_path, monkeypatch):

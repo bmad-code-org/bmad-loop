@@ -7,9 +7,13 @@ none of them, while still preserving the diagnostic *structure*.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 import sys
+import types
+import typing
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -17,6 +21,7 @@ import pytest
 from bmad_loop import diagnostics, sanitize
 from bmad_loop.journal import Journal, save_state
 from bmad_loop.model import Phase, RunState, SessionRecord, StoryTask, TokenUsage
+from bmad_loop.policy import Policy
 
 # Labelled canaries planted across the run dir. NONE may appear in the dump.
 EMAIL = "victim.canary@example.com"
@@ -921,6 +926,126 @@ def test_state_root_path_is_redacted_in_the_dump(project, tmp_path, monkeypatch)
         with pytest.raises(diagnostics.LeakDetected) as exc:
             _render_json_over(monkeypatch, {"events_dir": planted})
         assert "absolute-home-path" in exc.value.rules
+
+
+# ------------------------------------- the _scrub_policy key invariant (#202)
+#
+# `_scrub_policy` emits dict KEYS verbatim (the else-branch passthrough), unlike
+# `sanitize._scrub`, which scrubs keys as well as values. That is safe only while
+# no policy section is a free-keyed table. These pin the invariant so the rule is
+# discoverable from a failure rather than only from the comment beside the code.
+
+
+def _policy_free_keyed_fields(dc, prefix="", seen=frozenset()):
+    """Dotted paths of every Mapping-typed field in ``dc``'s dataclass tree.
+
+    `policy.py` uses `from __future__ import annotations`, so `field.type` is a
+    STRING and only `typing.get_type_hints` gives back a comparable type."""
+    if dc in seen:  # defensive: the policy tree is a DAG today, not a cycle
+        return
+    seen = seen | {dc}
+    hints = typing.get_type_hints(dc)
+    for fld in dataclasses.fields(dc):
+        yield from _classify_policy_type(hints[fld.name], f"{prefix}{fld.name}", seen)
+
+
+def _classify_policy_type(tp, path, seen):
+    """Walk one resolved annotation, yielding ``path`` when it is a free-keyed
+    table. `get_origin` covers the subscripted `dict[str, X]` case; the bare
+    `dict`/`Mapping` case falls through to `tp` itself."""
+    origin = typing.get_origin(tp)
+    args = typing.get_args(tp)
+    if origin in (typing.Union, types.UnionType):
+        for arg in args:
+            yield from _classify_policy_type(arg, path, seen)
+        return
+    base = origin or tp
+    if isinstance(base, type) and issubclass(base, Mapping):
+        # A free-keyed table: report it and stop. Descending into its value type
+        # would report the same field twice for `dict[str, dict[str, Any]]`.
+        yield path
+        return
+    if dataclasses.is_dataclass(base):
+        yield from _policy_free_keyed_fields(base, f"{path}.", seen)
+        return
+    for arg in args:  # tuple[X, ...] / list[X] could nest a policy dataclass
+        yield from _classify_policy_type(arg, f"{path}[]", seen)
+
+
+def test_no_policy_section_has_a_free_keyed_table():
+    """The invariant `_scrub_policy`'s key passthrough rests on: no policy section
+    is a free-keyed table, so every key in a diagnose dump is a compile-time field
+    name rather than user data. `plugins.settings` is the sole exception and is
+    intercepted by `_POLICY_KEYSET_KEYS` before it can reach the passthrough.
+
+    This walks the field TYPES, and that is the load-bearing half of the pair. A
+    newly added free-keyed section — `adapter.overrides: dict[str, str]` keyed by
+    binary path, say — defaults to an EMPTY dict, so `Policy().to_dict()` yields
+    none of its keys and the value-level twin
+    (`test_every_policy_snapshot_key_is_identifier_shaped`) stays green while the
+    hazard is live. At declaration time the type is the only evidence there is,
+    and this test is what reads it.
+
+    The assertion is an EXACT set rather than a subset for the same reason: a
+    subset check is satisfied by a tree that grew a table, which is precisely the
+    event it would exist to catch.
+
+    When this fails, a new table was added. Either route it through
+    `_POLICY_KEYSET_KEYS` / `_POLICY_COUNT_KEYS` in `diagnostics.py` so its keys
+    are reduced before they ship, or establish that its keys cannot carry user
+    data. Do not simply widen the expected set (#202)."""
+    assert set(_policy_free_keyed_fields(Policy)) == {"plugins.settings"}
+
+
+def test_every_policy_snapshot_key_is_identifier_shaped():
+    """Every key the policy snapshot actually ships is a machine slug, never PII
+    — the value-level companion to the type-level check above (#202)."""
+    offenders: list[str] = []
+
+    def walk(obj, path):
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                if not sanitize.looks_like_identifier(str(key)):
+                    offenders.append(f"{path}.{key}")
+                walk(value, f"{path}.{key}")
+        elif isinstance(obj, (list, tuple)):
+            for item in obj:
+                walk(item, f"{path}[]")
+
+    # Belt to `test_no_policy_section_has_a_free_keyed_table`'s braces: this
+    # catches a field NAME that is not slug-shaped, where a leading-underscore
+    # private field is the realistic case (`sanitize._IDENTIFIER_RE` requires the
+    # first character to be alphanumeric). It cannot catch an empty-by-default
+    # free-keyed table — there are no keys to walk — which is why the type-level
+    # test is the load-bearing one and this cannot replace it.
+    walk(Policy().to_dict(), "policy")
+    assert offenders == []
+
+
+def test_scrub_policy_passes_unknown_section_keys_verbatim():
+    """Characterization of the else-branch: an unknown section's keys are emitted
+    VERBATIM — even a home path — while `sanitize.scrub_json` redacts the same key.
+
+    This pins the CURRENT, deliberate behavior (field names are the point of the
+    snapshot, and redacting them would cost the reader the dump's whole index) and
+    is the exact hazard `test_no_policy_section_has_a_free_keyed_table` guards. It
+    is not an endorsement: if `_scrub_policy` is ever changed to scrub keys, this
+    test is expected to change with it rather than to stand in the way (#202).
+
+    The passthrough is KEYS ONLY, and the value row below is what says so."""
+    snapshot = {"future": {HOME_PATH: {"model": HOME_PATH}}}
+    scrubbed = diagnostics._scrub_policy(snapshot)
+    assert list(scrubbed["future"]) == [HOME_PATH]
+    # Keys only. An unknown section's VALUES still go through the standard gate,
+    # so the same home path IS redacted one level down. This row is load-bearing
+    # against the shape of fix a reader reaches for when they want the keys kept:
+    # flattening the else-branch's `_scrub_policy(value)` recursion to a bare
+    # `value` keeps every other assertion here green while turning the whole
+    # branch into a leak, so without it this test would characterize one.
+    assert scrubbed["future"][HOME_PATH]["model"] == "<redacted:str>"
+    # The contrast that makes the passthrough a deliberate divergence rather than
+    # an oversight: the shared value gate would not have let this key through.
+    assert HOME_PATH not in sanitize.scrub_json(snapshot)["future"]
 
 
 # The pure guard-mechanics tests (hard-rule refusal, repair tally, cyclic
