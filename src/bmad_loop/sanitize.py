@@ -88,7 +88,12 @@ _SECRET_RUN_MIN = 32  # length of contiguous alnum run that triggers the entropy
 _SECRET_ENTROPY_MIN = 3.5  # bits/char; pure hex ~4.0, base64 ~6.0, prose/slug well below
 
 # Token shape used by assert_no_leak to re-scan rendered output for secrets.
-_LEAK_TOKEN_RE = re.compile(r"[A-Za-z0-9._/+-]{6,}")
+# The single-character form is derived from the same class, not re-spelled, so a
+# change to one cannot silently desynchronize scrub_text's cut from what the
+# guard treats as one token.
+_LEAK_TOKEN_CHARS = r"[A-Za-z0-9._/+-]"  # nosec B105 - a regex character class, not a credential
+_LEAK_TOKEN_RE = re.compile(rf"{_LEAK_TOKEN_CHARS}{{6,}}")
+_LEAK_TOKEN_CHAR_RE = re.compile(_LEAK_TOKEN_CHARS)
 _URL_CRED_RE = re.compile(r"https?://[^/\s]*:[^/@\s]+@")
 # The same bytes reach assert_no_leak either as raw text (the markdown report)
 # or as JSON text (the --json document), and json.dumps DOUBLES a backslash —
@@ -176,6 +181,45 @@ def looks_like_secret(s: str) -> bool:
     return len(longest) >= _SECRET_RUN_MIN and _shannon_entropy(longest) >= _SECRET_ENTROPY_MIN
 
 
+def _truncate_line(line: str, max_chars: int) -> str:
+    """One line clipped to ``max_chars``, never in a way that blinds the guard.
+
+    The naive cut is at ``max_chars``. That is unsafe when it lands INSIDE a
+    token :func:`assert_no_leak` would have flagged: the entropy arm of
+    :func:`looks_like_secret` needs a contiguous alnum run of ``_SECRET_RUN_MIN``,
+    so clipping a 36-char high-entropy credential to 30 characters leaves a
+    credential prefix in the output that the guard no longer recognizes — turning
+    a fail-closed refusal into an emission. The cut therefore retracts to the
+    start of the split token, dropping it WHOLE, but only when the split actually
+    costs the guard its verdict.
+
+    That last condition is what keeps the cap from over-firing: ``"x" * 5000`` is
+    one 5000-char token, but it is not credential-shaped either whole or clipped,
+    so it still truncates at exactly ``max_chars``. The known-prefix arm
+    (``ghp_`` …) is anchored at the token's start and survives clipping, so it
+    needs no retraction either — the entropy arm is the one at risk (#481).
+    """
+    if len(line) <= max_chars:
+        return line
+    cut = max_chars
+    # Only a cut with a token character on BOTH sides splits a token; one landing
+    # on a delimiter already leaves every token whole.
+    if (
+        cut > 0
+        and _LEAK_TOKEN_CHAR_RE.match(line[cut])
+        and _LEAK_TOKEN_CHAR_RE.match(line[cut - 1])
+    ):
+        start = cut
+        while start > 0 and _LEAK_TOKEN_CHAR_RE.match(line[start - 1]):
+            start -= 1
+        end = cut
+        while end < len(line) and _LEAK_TOKEN_CHAR_RE.match(line[end]):
+            end += 1
+        if looks_like_secret(line[start:end]) and not looks_like_secret(line[start:cut]):
+            cut = start
+    return line[:cut] + f"… ({len(line) - cut} more chars redacted)"
+
+
 def scrub_text(s: str, *, max_lines: int | None = None, max_chars: int | None = None) -> str:
     """Sanitize free text (a CLI's ``--help`` / ``--version`` / a log tail).
 
@@ -184,10 +228,12 @@ def scrub_text(s: str, *, max_lines: int | None = None, max_chars: int | None = 
     then optionally cap the line count and each line's length.
 
     ``max_chars`` bounds each line's **content** at ``max_chars``; a truncated
-    line is emitted as ``max_chars`` characters plus the
-    ``… (N more chars redacted)`` marker, so its total length is
-    ``max_chars + len(marker)``. That overshoot is the same off-by-one
-    ``max_lines`` already has — ``max_lines=5`` emits six lines, five kept plus
+    line is emitted as at most ``max_chars`` characters plus the
+    ``… (N more chars redacted)`` marker, so its total length is at most
+    ``max_chars + len(marker)`` — "at most" because a cut that would split a
+    credential-shaped token retracts to that token's start rather than emit a
+    guard-invisible prefix of it (see :func:`_truncate_line`). That overshoot is
+    the same off-by-one ``max_lines`` already has — ``max_lines=5`` emits six lines, five kept plus
     the marker line — and it is deliberate (#481): a marker made to fit inside
     the budget would have to be a bare ellipsis, which does not say that
     redaction happened. The line-count marker is never itself char-truncated.
@@ -211,14 +257,7 @@ def scrub_text(s: str, *, max_lines: int | None = None, max_chars: int | None = 
         line_marker = [f"… ({dropped} more lines redacted)"]
         lines = lines[:max_lines]
     if max_chars is not None:
-        lines = [
-            (
-                line
-                if len(line) <= max_chars
-                else line[:max_chars] + f"… ({len(line) - max_chars} more chars redacted)"
-            )
-            for line in lines
-        ]
+        lines = [_truncate_line(line, max_chars) for line in lines]
     return "\n".join(lines + line_marker)
 
 

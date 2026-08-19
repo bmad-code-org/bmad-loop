@@ -150,6 +150,46 @@ def test_scrub_text_max_chars_bounds_a_single_long_line():
     assert "more chars redacted" in out
 
 
+def test_scrub_text_max_chars_never_leaves_a_guard_invisible_secret_prefix():
+    """The cap must not blind the egress guard it feeds (#481).
+
+    `looks_like_secret`'s entropy arm needs a contiguous alnum run of
+    `_SECRET_RUN_MIN`, so a cut landing inside a 36-char credential would leave 30
+    characters of it in the emitted bytes as a run too short for the guard to
+    recognize — converting a fail-closed refusal into an emission that carries a
+    credential prefix. The straddling token is dropped WHOLE instead.
+    """
+    token = "aZ3kQ9mX7pL2vB8nR4tY6wS1cD5eF0gHjK7m"
+    line = "word " * 34 + token + " tail"  # the token begins at offset 170
+    assert line.index(token) == 170
+    # Without the cap the guard fires and the caller refuses to write at all.
+    assert "secret" in sanitize.assert_no_leak(line)
+
+    out = sanitize.scrub_text(line, max_chars=200)
+    # Not merely "below the entropy threshold" — no part of the credential ships.
+    assert token[:30] not in out
+    assert not any(token[i : i + 6] in out for i in range(len(token) - 6))
+    assert "more chars redacted" in out
+
+
+def test_scrub_text_max_chars_retraction_is_conditional():
+    """The retraction fires only when the split would cost the guard its verdict,
+    not on every token the cut happens to land in — otherwise the cap would throw
+    away diagnostic text to solve a problem these two cases do not have.
+
+    A `ghp_`-prefixed token is matched at its START, so a clipped one still fires
+    and the refusal survives with no content dropped; `"x" * 5000` is a single
+    5000-char token that is not credential-shaped whole OR clipped."""
+    max_chars = 200
+    ghp = "ghp_" + "B7kR2mQ9xL4vN8pT6wY1cS5dF0gHjK3n"
+    out = sanitize.scrub_text("word " * 34 + ghp + " tail", max_chars=max_chars)
+    assert "secret" in sanitize.assert_no_leak(out)  # still fail-closed
+    assert out.startswith("word " * 34 + ghp[:30])  # and nothing was retracted
+
+    plain = sanitize.scrub_text("x" * 5000, max_chars=max_chars)
+    assert plain == "x" * max_chars + f"… ({5000 - max_chars} more chars redacted)"
+
+
 def test_scrub_text_without_max_chars_is_byte_identical():
     # `diagnostics.py` calls with neither cap (the mux `version()` probe and
     # `os_release`); their output must not change shape.
