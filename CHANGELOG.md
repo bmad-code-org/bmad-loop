@@ -25,7 +25,9 @@ breaking changes may land in a minor release.
   Retention is bounded by the new `[verify] stream_capture_kb` (default 256 KiB per
   stream, `0` = capture nothing): the tail is kept, and the record carries the full
   byte count plus a `*_truncated` flag so a cut file is never mistaken for a whole
-  one. Retaining a stream is observation, so a failed write (ENOSPC, a read-only run
+  one. A concluded run gives the store back: `bmad-loop clean` trims `verify/` with the
+  rest of a run's heavy scaffolding and counts it in the reclaimed total, leaving the
+  run listed and resumable. Retaining a stream is observation, so a failed write (ENOSPC, a read-only run
   dir) degrades — the record still lands, with a null pointer and `capture_error` —
   instead of taking down a dev pass whose verify commands passed.
 

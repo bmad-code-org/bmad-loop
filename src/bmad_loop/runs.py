@@ -18,7 +18,7 @@ from pathlib import Path
 
 from . import devcontract, envvars, verify
 from .adapters.multiplexer import MultiplexerError, get_multiplexer
-from .journal import STATE_FILE, Journal, load_state, save_state
+from .journal import STATE_FILE, VERIFY_DIR, Journal, load_state, save_state
 from .model import PAUSE_ESCALATION, Phase, RunState, StoryTask
 from .platform_util import (
     MAX_SEGMENT,
@@ -1065,10 +1065,30 @@ def archive_run(project: Path, run_dir: Path, *, force: bool = False) -> Path:
 
 # Heavy per-run scaffolding trimmed from a concluded run dir while the
 # TUI-visible core (state.json, journal.jsonl, logs/, ATTENTION) is preserved,
-# so the run still lists and renders in the dashboard. The value mirrors
+# so the run still lists and renders in the dashboard. "worktrees" mirrors
 # workspace.WORKTREE_DIRNAME; kept literal here to avoid an import cycle
 # (workspace imports nothing from runs, but runs stays leaf-light on purpose).
-_HEAVY_RUN_ENTRIES = ("worktrees",)
+#
+# VERIFY_DIR is the retained verifier stdout/stderr store. It qualifies as heavy
+# on the same measure as a worktree checkout: `[verify] stream_capture_kb`
+# defaults to 256 KiB per stream, so a run accumulates up to 512 KiB per verify
+# command per attempt, and nothing else ever reclaims it. Its journal records
+# survive the trim and keep naming the files (`stdout_path`/`stderr_path`), which
+# is the same bargain `worktrees` already makes — a trimmed run is a run you can
+# still see and resume, not one you can still re-read every artifact of. Imported
+# from the writer rather than re-spelled, so the reclaim cannot drift from the
+# directory `Journal.write_verify_stream` actually creates.
+_HEAVY_RUN_ENTRIES = ("worktrees", VERIFY_DIR)
+
+
+def heavy_run_entries(run_dir: Path) -> list[Path]:
+    """The paths :func:`trim_run_dir` would remove from ``run_dir``.
+
+    Exists so a caller sizing the reclaim measures exactly what the trim takes.
+    `clean` sums these before mutating (its estimate has to hold under
+    --dry-run); reading the tuple through this function is what keeps that sum
+    from silently going stale the next time an entry is added to it."""
+    return [run_dir / name for name in _HEAVY_RUN_ENTRIES]
 
 
 def _state_or_none(run_dir: Path):
@@ -1247,16 +1267,16 @@ def reconcile_orphan_state_dirs(project: Path, *, dry_run: bool = False) -> list
 
 
 def trim_run_dir(run_dir: Path, *, dry_run: bool = False) -> list[Path]:
-    """Delete heavy scaffolding (the ``worktrees/`` tree) from a concluded run
-    dir, preserving its TUI-visible core so the run still appears in the
-    dashboard with full status/journal/logs. Returns the paths removed.
+    """Delete heavy scaffolding (the ``worktrees/`` tree and the retained
+    verifier stream store) from a concluded run dir, preserving its TUI-visible
+    core so the run still appears in the dashboard with full status/journal/logs.
+    Returns the paths removed.
 
     The run's out-of-tree control plane is deliberately left alone (see
     :func:`_discard_state_dir`): a trimmed run still exists and is still
     resumable, so its state dir has to outlive its scaffolding."""
     removed: list[Path] = []
-    for name in _HEAVY_RUN_ENTRIES:
-        p = run_dir / name
+    for p in heavy_run_entries(run_dir):
         if p.exists() or p.is_symlink():
             removed.append(p)
             if not dry_run:

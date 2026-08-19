@@ -6,7 +6,7 @@ import argparse
 from conftest import install_bmad_config, machine_json
 
 from bmad_loop import cli, runs, verify
-from bmad_loop.journal import save_state
+from bmad_loop.journal import VERIFY_DIR, save_state
 from bmad_loop.model import RunState
 from bmad_loop.tui import data
 
@@ -189,6 +189,42 @@ def test_trim_run_dir_keeps_run_viewable(tmp_path):
     assert (run_dir / "state.json").is_file()
     assert (run_dir / "journal.jsonl").is_file()
     # the run still discovers + lists in the dashboard
+    infos = data.discover_runs(tmp_path)
+    assert [i.run_id for i in infos] == ["20260101-000000-aaaa"]
+
+
+def test_trim_run_dir_reclaims_the_verifier_stream_store(tmp_path):
+    """The retained verifier stdout/stderr store is trimmed with the worktrees,
+    and trimming it does not cost the run its place in the dashboard.
+
+    It qualifies as heavy on the same measure a worktree checkout does:
+    `[verify] stream_capture_kb` defaults to 256 KiB per stream, so a run
+    accumulates up to 512 KiB per verify command per attempt. Nothing else ever
+    reclaimed it — the store outlived every trim and survived for as long as the
+    run dir did. What it costs is re-reading the streams the journal's
+    `stdout_path`/`stderr_path` still name, which is the bargain `worktrees`
+    already makes: a trimmed run is one you can still see and resume, not one you
+    can still open every artifact of.
+
+    Ablation: drop VERIFY_DIR from `_HEAVY_RUN_ENTRIES` and `removed` comes back
+    `["worktrees"]` with the store still on disk. Verified.
+    """
+    run_dir = _state_run(tmp_path, "20260101-000000-aaaa", finished=True)
+    (run_dir / "journal.jsonl").write_text('{"kind":"run-start"}\n')
+    (run_dir / "logs").mkdir()
+    (run_dir / "worktrees" / "u").mkdir(parents=True)
+    store = run_dir / VERIFY_DIR
+    store.mkdir()
+    (store / "verify-1-1-a-dev-1-1-0.stdout.log").write_bytes(b"o" * 2048)
+    (store / "verify-1-1-a-dev-1-1-0.stderr.log").write_bytes(b"e" * 1024)
+
+    removed = runs.trim_run_dir(run_dir)
+
+    assert [p.name for p in removed] == ["worktrees", VERIFY_DIR]
+    assert not store.exists()
+    # the TUI-visible core the trim exists to preserve
+    assert (run_dir / "state.json").is_file()
+    assert (run_dir / "journal.jsonl").is_file()
     infos = data.discover_runs(tmp_path)
     assert [i.run_id for i in infos] == ["20260101-000000-aaaa"]
 
@@ -452,6 +488,41 @@ def test_cmd_clean_json_real_run_reports_what_it_did(project, capsys):
     # a raw int, never the _human_bytes string the text mode renders
     assert isinstance(doc["freed_bytes"], int)
     assert doc["freed_bytes"] >= 4096
+
+
+def test_cmd_clean_counts_the_verifier_stream_store_it_reclaimed(project, capsys):
+    """The reclaim estimate is sized over what the trim actually takes.
+
+    `freed_bytes` is what an operator reads to decide whether `clean` was worth
+    running, and for a trimmed run it used to sum `worktrees/` alone. That was
+    exactly right while `worktrees/` was the only heavy entry and silently wrong
+    the moment the verifier stream store joined it: `clean` would remove up to
+    512 KiB per verify command per attempt and report reclaiming nothing.
+
+    Seeded with no `worktrees/` at all, so the removal and the accounting are
+    graded independently and neither can ride on the other's bytes.
+
+    Ablation, two axes reddening different assertions: drop VERIFY_DIR from
+    `_HEAVY_RUN_ENTRIES` and `trimmed` empties — the trim finds nothing to take.
+    Restore it but size the estimate over `worktrees/` alone again and the store
+    is gone with `freed_bytes` at 0 — a reclaim that happened and went unreported.
+    Verified.
+    """
+    install_bmad_config(project)
+    repo = project.project
+    run_dir = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
+    store = run_dir / VERIFY_DIR
+    store.mkdir(parents=True)
+    (store / "verify-1-1-a-dev-1-1-0.stdout.log").write_bytes(b"o" * 4096)
+    (store / "verify-1-1-a-dev-1-1-0.stderr.log").write_bytes(b"e" * 2048)
+    save_state(run_dir, RunState(run_id="r", project=str(repo), started_at="x", stopped=True))
+
+    doc = _clean_json(repo, capsys)
+
+    assert doc["trimmed"] == ["20260101-000000-aaaa"]
+    assert not store.exists()
+    assert doc["freed_bytes"] == 4096 + 2048
+    assert (run_dir / "state.json").is_file()  # trimmed, not removed
 
 
 def test_cmd_clean_json_names_every_item_the_text_enumerates(project, capsys):

@@ -3458,9 +3458,11 @@ def cmd_clean(args: argparse.Namespace) -> int:
                     f"run {run_dir.name}: engine may still be live (unverifiable pid)",
                     file=sys.stderr,
                 )
-        # measure before mutating so the reclaim estimate holds for --dry-run too
-        wt_dir = run_dir / "worktrees"
-        wt_bytes = _dir_size(wt_dir) if wt_dir.is_dir() else 0
+        # measure before mutating so the reclaim estimate holds for --dry-run too.
+        # Sized over `heavy_run_entries`, not over "worktrees" alone: that is the
+        # exact set `trim_run_dir` removes, so the estimate cannot go stale the
+        # next time an entry joins it (the verifier stream store did).
+        heavy_bytes = sum(_dir_size(p) for p in runs.heavy_run_entries(run_dir) if p.is_dir())
         run_bytes = _dir_size(run_dir)
         # collect, never print-as-you-mutate: the document is emitted once at the
         # end, so every per-item line has to survive the loop as data
@@ -3490,7 +3492,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
                 # concurrent resume — is older than this guard (`reclaimable` is
                 # sampled in the loop above and never re-read) and is tracked in
                 # issue #533.
-                freed += wt_bytes - run_bytes
+                freed += heavy_bytes - run_bytes
                 # Classify by what happened, not by what was intended: the steps
                 # above may already have taken this run's worktree and artifacts,
                 # and `protected` means "left untouched" in the --json contract.
@@ -3504,7 +3506,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
                     )
         elif pol.cleanup.trim_artifacts:
             if runs.trim_run_dir(run_dir, dry_run=dry):
-                freed += wt_bytes
+                freed += heavy_bytes
                 trimmed.append(run_dir.name)
 
     # After the loop, so the counterparts the removals above already took are gone
