@@ -2,7 +2,9 @@
 artifact trim, and the `clean` CLI command."""
 
 import argparse
+import os
 
+import pytest
 from conftest import install_bmad_config, machine_json
 
 from bmad_loop import cli, runs, verify
@@ -227,6 +229,41 @@ def test_trim_run_dir_reclaims_the_verifier_stream_store(tmp_path):
     assert (run_dir / "journal.jsonl").is_file()
     infos = data.discover_runs(tmp_path)
     assert [i.run_id for i in infos] == ["20260101-000000-aaaa"]
+
+
+@pytest.mark.skipif(
+    os.name != "posix", reason="planting a directory symlink needs privilege on win32"
+)
+def test_trim_run_dir_removes_a_planted_redirect_without_following_it(tmp_path):
+    """A trimmed entry that is a LINK is removed as a link, and its target is not.
+
+    A session is handed the writable run dir (`BMAD_LOOP_RUN_DIR`) and can plant a
+    redirect at `verify/` — the same escape the write path was hardened against.
+    The reclaim path had the mirror-image hole: `shutil.rmtree` REFUSES a directory
+    symlink by design (following it would delete the target's contents), and under
+    `ignore_errors=True` that refusal is silent, so the trim appended the entry to
+    `removed` and left the link exactly where it was.
+
+    Both halves are graded, because the obvious over-correction is worse than the
+    bug: the redirect goes, and what it pointed at stays. POSIX-only because
+    PLANTING the link needs privilege on win32, not because the fix is — the
+    junction arm rides on `is_link_like`, graded in tests/test_platform_util.py.
+
+    Ablation: restore the bare `shutil.rmtree(p, ignore_errors=True)` and the link
+    is still on disk after the trim, with `removed` still naming it. Verified.
+    """
+    run_dir = _state_run(tmp_path, "20260101-000000-aaaa", finished=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep.txt").write_bytes(b"x" * 5000)
+    link = run_dir / VERIFY_DIR
+    link.symlink_to(outside, target_is_directory=True)
+
+    removed = runs.trim_run_dir(run_dir)
+
+    assert [p.name for p in removed] == [VERIFY_DIR]
+    assert not link.is_symlink() and not link.exists()  # the redirect really went
+    assert outside.is_dir() and (outside / "keep.txt").is_file()  # the target did not
 
 
 # ------------------------------------------------------------- cmd_clean
@@ -523,6 +560,38 @@ def test_cmd_clean_counts_the_verifier_stream_store_it_reclaimed(project, capsys
     assert not store.exists()
     assert doc["freed_bytes"] == 4096 + 2048
     assert (run_dir / "state.json").is_file()  # trimmed, not removed
+
+
+@pytest.mark.skipif(
+    os.name != "posix", reason="planting a directory symlink needs privilege on win32"
+)
+def test_cmd_clean_does_not_bill_the_reclaim_for_bytes_behind_a_redirect(project, capsys):
+    """`freed_bytes` counts what the trim freed, never what a planted link points at.
+
+    `os.walk` does not descend into links, but it does follow the top path it is
+    handed — so sizing a redirected entry bills the reclaim for out-of-run bytes
+    that are demonstrably still on disk when `clean` returns. That is the estimate
+    an operator reads to decide whether the command was worth running, and it is
+    the one number here a session can inflate from outside the run.
+
+    Ablation: drop the `is_link_like` refusal from `_dir_size` and `freed_bytes`
+    comes back 5000 — bytes the assertion below proves were never freed. Verified.
+    """
+    install_bmad_config(project)
+    repo = project.project
+    run_dir = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    outside = repo.parent / "outside"
+    outside.mkdir(exist_ok=True)
+    (outside / "keep.txt").write_bytes(b"x" * 5000)
+    (run_dir / VERIFY_DIR).symlink_to(outside, target_is_directory=True)
+    save_state(run_dir, RunState(run_id="r", project=str(repo), started_at="x", stopped=True))
+
+    doc = _clean_json(repo, capsys)
+
+    assert doc["trimmed"] == ["20260101-000000-aaaa"]
+    assert doc["freed_bytes"] == 0  # nothing inside the run was actually freed
+    assert (outside / "keep.txt").is_file()  # and the 5000 bytes are still there
 
 
 def test_cmd_clean_json_names_every_item_the_text_enumerates(project, capsys):

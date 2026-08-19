@@ -26,6 +26,7 @@ from .platform_util import (
     atomic_write_text,
     has_parent_ref,
     is_absolute_path,
+    is_link_like,
     retrying_unlink,
     safe_segment,
 )
@@ -1266,6 +1267,25 @@ def reconcile_orphan_state_dirs(project: Path, *, dry_run: bool = False) -> list
     return handled
 
 
+def _unlink_redirect(p: Path) -> None:
+    """Remove a link-like entry itself, never what it points at.
+
+    ``shutil.rmtree`` REFUSES a directory symlink by design (it would otherwise
+    delete the target's contents), and under ``ignore_errors=True`` that refusal
+    is swallowed — so trimming a planted redirect reported success while leaving
+    the link on disk. Unlink covers a POSIX symlink and a win32 file symlink;
+    ``rmdir`` is the win32 arm, where ``DeleteFileW`` rejects a directory symlink
+    or junction and ``RemoveDirectoryW`` drops the reparse point without
+    following it. Best-effort to match the ``rmtree`` beside it: a trim is
+    reclamation, and a run dir we cannot fully reclaim is not a reason to abort
+    the whole `clean`."""
+    try:
+        p.unlink()
+    except OSError:
+        with contextlib.suppress(OSError):
+            p.rmdir()
+
+
 def trim_run_dir(run_dir: Path, *, dry_run: bool = False) -> list[Path]:
     """Delete heavy scaffolding (the ``worktrees/`` tree and the retained
     verifier stream store) from a concluded run dir, preserving its TUI-visible
@@ -1277,10 +1297,16 @@ def trim_run_dir(run_dir: Path, *, dry_run: bool = False) -> list[Path]:
     resumable, so its state dir has to outlive its scaffolding."""
     removed: list[Path] = []
     for p in heavy_run_entries(run_dir):
-        if p.exists() or p.is_symlink():
-            removed.append(p)
-            if not dry_run:
-                shutil.rmtree(p, ignore_errors=True)
+        link = is_link_like(p)
+        if not (p.exists() or link):
+            continue
+        removed.append(p)
+        if dry_run:
+            continue
+        if link:
+            _unlink_redirect(p)
+        else:
+            shutil.rmtree(p, ignore_errors=True)
     return removed
 
 
