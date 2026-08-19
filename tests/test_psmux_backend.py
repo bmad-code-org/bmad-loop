@@ -617,9 +617,8 @@ def test_registry_selects_psmux_when_forced(monkeypatch):
 # OUTSIDE any pane, where a bare `@N` resolves through the most-recent-session
 # fallback instead of the session that minted it. kill-window on such an id is
 # destructive against the wrong server, so new_parked_window, the `window_id`
-# columns of list_windows, and current_window_id all carry `session:@N` — and
-# select_window, whose CLI-side check matches only window index/name, resolves
-# that form back to an index before sending.
+# columns of list_windows, and current_window_id all carry `session:@N`, and
+# every `-t` consumer replays that form verbatim.
 
 
 def _rows_fake(monkeypatch, rows: str, *, new_window_id: str = "@2\n"):
@@ -739,78 +738,14 @@ def test_current_window_id_none_on_unparseable_probe(monkeypatch):
         assert PsmuxMultiplexer().current_window_id() is None, answer
 
 
-def test_select_window_resolves_qualified_id_to_index(monkeypatch):
-    # psmux exits 1 with "can't find window: @3" for the id form, because the
-    # CLI-side existence check compares only against #{window_index}/#{window_name}.
-    recorder = _RecordRun(stdout="@1\t0\n@3\t2\n")
-    monkeypatch.setattr(tmux_base.subprocess, "run", recorder)
-    PsmuxMultiplexer().select_window("ctl:@3")
-    assert recorder.calls[0][0][1:] == [
-        "list-windows",
-        "-t",
-        "=ctl",
-        "-F",
-        "#{window_id}\t#{window_index}",
-    ]
-    assert recorder.argv[1:] == ["select-window", "-t", "ctl:2"]
-
-
-def test_select_window_resolve_scopes_the_lookup_to_the_session(monkeypatch):
-    # The lookup must carry -t =<session>: psmux routes by the explicit session,
-    # and an unscoped list-windows would read whichever server the fallback picks.
-    recorder = _RecordRun(stdout="@3\t2\n")
-    monkeypatch.setattr(tmux_base.subprocess, "run", recorder)
-    PsmuxMultiplexer().select_window("ctl:@3")
-    assert "-t" in recorder.calls[0][0] and "=ctl" in recorder.calls[0][0]
-
-
-def test_select_window_unresolved_id_sends_original_target(monkeypatch, capsys):
-    # No matching row: send the id anyway (guessing an index would focus an
-    # unrelated window) — but warn, because psmux's "can't find window" exit 1
-    # lands in a discarded pipe and the miss would otherwise be untraceable.
-    recorder = _RecordRun(stdout="@1\t0\n")
-    monkeypatch.setattr(tmux_base.subprocess, "run", recorder)
-    PsmuxMultiplexer().select_window("ctl:@9")
-    assert recorder.argv[1:] == ["select-window", "-t", "ctl:@9"]
-    assert "could not resolve ctl:@9" in capsys.readouterr().err
-
-
-def test_select_window_resolve_failure_sends_original_target(monkeypatch, capsys):
-    # A transport failure during the resolve must not escalate: select_window is
-    # best-effort, so it degrades to the unresolved target (with the same
-    # warning as a resolve miss), never raises — and it must still SEND, not
-    # swallow the verb along with the failure.
-    sent = []
-
-    def fake(argv, **kwargs):
-        if argv[1] == "list-windows":
-            raise subprocess.TimeoutExpired(argv, 1)
-        sent.append(argv)
-        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
-
-    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
-    PsmuxMultiplexer().select_window("ctl:@3")  # must not raise
-    assert sent and sent[-1][1:] == ["select-window", "-t", "ctl:@3"]
-    assert "could not resolve ctl:@3" in capsys.readouterr().err
-
-
-def test_select_window_resolves_equals_prefixed_qualified_id(monkeypatch):
-    # target(session, "@3") composes `=ctl:@3`, which the seam documents as a
-    # legal argument here. Matching without stripping the `=` would capture the
-    # session as "=ctl" and look up `-t ==ctl`; psmux strips only one `=`, so the
-    # resolve would miss and the select would quietly focus nothing.
-    recorder = _RecordRun(stdout="@3\t2\n")
-    monkeypatch.setattr(tmux_base.subprocess, "run", recorder)
-    PsmuxMultiplexer().select_window("=ctl:@3")
-    assert recorder.calls[0][0][3] == "=ctl"
-    assert recorder.argv[1:] == ["select-window", "-t", "ctl:2"]
-
-
-def test_select_window_name_token_passes_through(rec):
-    # A target() name token already resolves CLI-side; it must not be rewritten.
-    PsmuxMultiplexer().select_window("=ctl:run-abc")
-    assert rec.argv[1:] == ["select-window", "-t", "=ctl:run-abc"]
-    assert len(rec.calls) == 1  # no resolve lookup spawned
+@pytest.mark.parametrize("target", ["ctl:@3", "=ctl:@3", "=ctl:run-abc"])
+def test_select_window_sends_every_target_form_unrewritten(rec, target):
+    # psmux 3.3.8 resolves a scoped window-id target server-side (psmux/psmux#497),
+    # so the backend inherits the base verb: no index resolve, no extra listing
+    # round-trip, and the qualified id this backend mints is sent verbatim.
+    PsmuxMultiplexer().select_window(target)
+    assert rec.argv[1:] == ["select-window", "-t", target]
+    assert len(rec.calls) == 1
 
 
 def test_tmux_backend_keeps_bare_tui_ids(monkeypatch, tmp_path):

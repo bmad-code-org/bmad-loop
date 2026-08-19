@@ -304,34 +304,6 @@ def test_premise_exact_match_prefix_resolves_for_has_session_but_not_kill(probe)
     )
 
 
-def test_premise_select_window_does_not_focus_a_window_id_target(probe):
-    mux, session, windows = probe
-    other_index = mux._window_index(session, windows[1].rsplit(":", 1)[1])
-    assert (
-        other_index is not None
-    ), f"probe setup: could not resolve a display index for {windows[1]}"
-    selected = mux._run(["select-window", "-t", f"{session}:{other_index}"], check=False)
-    assert (
-        selected.returncode == 0 and _active_window(mux, session) == windows[1]
-    ), "probe setup: could not establish the select-window probe's starting focus"
-    mux._run(["select-window", "-t", windows[0]], check=False)
-    assert _active_window(mux, session) != windows[0], (
-        "psmux now focuses `select-window -t session:@N` — the select_window "
-        "override and _window_index in psmux_backend are droppable (psmux/psmux#497)"
-    )
-    # The index form is the escape hatch the override translates to; if this
-    # stopped working the override would be broken rather than merely redundant.
-    # Resolved, never hardcoded to 0: the server loads the user's config, and a
-    # `base-index 1` would turn a working install into a false red here.
-    index = mux._window_index(session, windows[0].rsplit(":", 1)[1])
-    assert index is not None, f"probe setup: could not resolve a display index for {windows[0]}"
-    by_index = mux._run(["select-window", "-t", f"{session}:{index}"], check=False)
-    assert by_index.returncode == 0 and _active_window(mux, session) == windows[0], (
-        f"psmux rejects the window-index target too ({by_index.stderr.strip()!r}) — "
-        "select_window's override has no working form left to translate to"
-    )
-
-
 def test_premise_window_scoped_option_write_lands_at_session_scope(probe):
     mux, session, windows = probe
     written = mux._run(["set-option", "-w", "-t", windows[0], "@probe", "v"], check=False)

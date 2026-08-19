@@ -17,11 +17,9 @@ server per session), so every id this backend hands back —
 ``window_id`` columns of ``list_windows``, and ``current_window_id`` — is
 session-qualified to ``session:@N`` (degrading to the bare id only where
 the grammar cannot carry the session name — see ``_qualified_window_id``)
-and routes to the owning server from any caller (psmux/psmux#483).
-``select_window`` is the one verb that
-cannot take that form: psmux validates a scoped target's window part
-CLI-side against window index/name only, so the override resolves the id
-back to an index first. Per-window user options do not exist at all, so
+and routes to the owning server from any caller (psmux/psmux#483). Every
+seam verb takes that form, ``select-window`` included (psmux/psmux#497).
+Per-window user options do not exist at all, so
 the window-option verbs, the ``@``-prefixed columns of ``list_windows``
 and the parked trailer route through a substitute channel — see the
 ``per-window option channel (#310)`` block below for the model and its
@@ -318,7 +316,7 @@ class PsmuxMultiplexer(BaseTmuxBackend):
             # as if nothing were ever tagged. Visible on the CLI prune (cli.py,
             # incl. the --dry-run this most affects); NOT under the TUI, which
             # captures stderr for the app's whole run (tui/app.py's run_tui
-            # note) — the select_window precedent below, same deliberate ceiling.
+            # note) — a deliberate ceiling, as with every warning in this module.
             print(
                 f"warning: show-options listing failed on {session}; option columns read as unset",
                 file=sys.stderr,
@@ -400,7 +398,9 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         session, window = match["session"], match["window"]
         digits = self._id_digits(window)
         if not digits:
-            # A name token; same one-round-trip renumber race as _window_index.
+            # A name token costs one listing round-trip, and psmux can rename or
+            # renumber between it and the verb using the answer. Best-effort
+            # callers, one round-trip wide, so no lock.
             digits = self._id_digits(self._window_id_for_name(session, window) or "")
         return (session, digits) if digits else None
 
@@ -742,7 +742,9 @@ class PsmuxMultiplexer(BaseTmuxBackend):
 
     # What _qualified_window_id composes: `<session>:@<n>`. The session part
     # excludes `:` because that is exactly when qualification degrades to a bare
-    # id; requiring `@<digits>` keeps a `=session:window-name` token out.
+    # id; requiring `@<digits>` keeps a `=session:window-name` token out — which
+    # is what makes it the shape current_window_id must probe back into, so the
+    # prune's own-window compare lines up against list_windows' rows.
     _QUALIFIED_ID = re.compile(r"^(?P<session>[^:]+):(?P<window_id>@\d+)$")
     _BARE_ID = re.compile(r"^@\d+$")
 
@@ -763,60 +765,6 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         # malformed id is no target at all; half-parsing one would aim a kill.
         _, _, window_id = probed.rpartition(":")
         return window_id if self._BARE_ID.fullmatch(window_id) else None
-
-    def select_window(self, target: str) -> None:
-        # psmux checks a scoped target's window part CLI-side before sending, and
-        # only ever matches `#{window_index}`/`#{window_name}` — never
-        # `#{window_id}` — so a qualified id exits 1 with "can't find window"
-        # while the server itself resolves ids fine (FocusWindowById). Translate
-        # to the index that check accepts and the same window is focused.
-        # The `=` strip matters: target(session, window) composes `=session:@N`,
-        # which would capture the session as `=session` and look up `==session`
-        # (psmux's parse_target removes only one `=`), silently focusing nothing.
-        match = self._QUALIFIED_ID.fullmatch(target.removeprefix("="))
-        if match is not None:
-            session = match["session"]
-            index = self._window_index(session, match["window_id"])
-            if index is None:
-                # The unresolved id sent below is exactly the form that CLI-side
-                # check rejects, and its exit 1 lands in a pipe the base
-                # discards — so the send is known-futile and the caller's later
-                # attach shows whichever window happens to be current. Guessing
-                # an index instead could focus an unrelated window, so warn and
-                # send: the pipe-pane sidecar precedent, but a weaker one, and
-                # deliberately not load-bearing. The qualified-id path's callers
-                # (select_ctl_window_id) split by surface: under the Textual app
-                # this emission is invisible — the app captures stderr for its
-                # whole run, see the run_tui note in tui/app.py, which pre-trips
-                # the forced-backend warning for exactly this reason — while the
-                # textual-free CLI attach path (launch.attach_plan via cli.py)
-                # does show it. A TUI-visible miss would need a return value,
-                # which is more seam than a best-effort focus change is worth.
-                print(
-                    f"warning: select-window could not resolve {target} to a "
-                    "window index; the window will not be focused",
-                    file=sys.stderr,
-                )
-            else:
-                target = f"{session}:{index}"
-        # A name token or a bare id goes through untouched.
-        super().select_window(target)
-
-    def _window_index(self, session: str, window_id: str) -> str | None:
-        """Display index of ``window_id`` within ``session``, or None when it
-        cannot be resolved.
-
-        Known ceiling: psmux can renumber windows between this lookup and the
-        verb using the answer. The race is one round-trip wide and the caller is
-        a best-effort focus change, so no lock; targeting by name instead would
-        reopen the ctl-window name collisions stable ids exist to avoid.
-        """
-        # `window_index` is the display index — the field psmux's own existence
-        # check compares against, so matching it exactly is the point.
-        for row in super().list_windows(session, ["window_id", "window_index"]):
-            if row[0] == window_id:
-                return row[1] or None
-        return None
 
     def current_return_target(self) -> str | None:
         # psmux runs one server per session, so a bare pane id recorded on a
