@@ -18,6 +18,24 @@ breaking changes may land in a minor release.
   `failed` or `dirty` — never an exception message, which `diagnose` would refuse to emit at all.
   The `--json` key is additive and always present, so `STATUS_SCHEMA_VERSION` is unchanged.
 
+- **`validate` now reports a binary that is on PATH but will not run (#294).** The
+  `adapter.binary` gate asked `shutil.which`, which a dead WSL/npm shim satisfies — it is a real
+  file with the execute bit — so validate went green on an install that could not start a session,
+  and the opencode adapter's own "binary not found" error sent the user to `bmad-loop validate` to
+  be told everything was fine. Each binary named by a **packaged** profile is now run once as
+  `<binary> --version`; a nonzero exit or a launch fault reports the new check id
+  `adapter.binary-unrunnable`, carrying the resolved path and the return code. A project overlay's
+  profile is resolved and reported found but never launched: its fields are project-supplied, and
+  validate is the command used to decide whether a checkout is safe to run at all, so a clone's own
+  config cannot choose which binary it launches. The gate bounds which NAME is probed, not what
+  that name resolves to — resolution runs through the user's `PATH`, and a probed name resolves to
+  whatever the session launch would itself run. That boundary is the profile's provenance and not the spelling of
+  `binary`, because a bare name still resolves into the checkout whenever a checkout-local
+  directory is on `PATH`. The severity is `warning`, so validate's exit code is
+  unchanged for a live CLI that merely answers `--version` oddly, and `adapter.binary` keeps its
+  existing found/absent meaning. The check id is additive, so `VALIDATE_SCHEMA_VERSION` is
+  unchanged.
+
 ### Changed
 
 - **Files the orchestrator replaces by name now land at `0600`.** Those writes pass
@@ -49,6 +67,10 @@ breaking changes may land in a minor release.
   it cannot read.
 
 ### Fixed
+
+- **The zero-token OpenCode live smoke skips stale or broken shims (#294).** Its availability
+  gate now requires `opencode --version` to succeed before starting a server; runnable installs
+  still fail loudly when the pinned API contract drifts.
 
 - **Policy loading now enforces the declared timeout and result-less Stop nudge minima (#648).**
   The valid `session_timeout_min = 1` and `stop_without_result_nudges = 0` boundaries remain
