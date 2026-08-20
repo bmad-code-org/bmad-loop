@@ -1569,24 +1569,42 @@ def test_detach_client_argv(fake_run):
 
 
 def _return_fake(
-    monkeypatch, *, win="@5", option="=main:%9", switch_rc=0, fallback_rc=0, detach_rc=0
+    monkeypatch,
+    *,
+    win="@5",
+    option="=main:%9",
+    switch_rc=0,
+    fallback_rc=0,
+    detach_rc=0,
+    switch_exc=None,
+    attached="1",
 ):
     """Script tmux for return_attached_client: display-message -> window id,
     show-options -> the recorded RETURN_OPTION, switch-client -t -> switch_rc,
     switch-client -l -> fallback_rc, detach-client -> detach_rc.
     return_attached_client runs inside a ctl window, so TMUX is set (the
-    backend's current_window_id answers None otherwise)."""
+    backend's current_window_id answers None otherwise).
+
+    ``attached`` answers `#{session_attached}`, which switch_client's FAILURE
+    path reads to tell "that target is unreachable" from "there is no client
+    here at all" — tmux spends one nonzero rc on both. None makes the read
+    itself fail. It defaults to "1" because a client sitting in this window is
+    the premise of every case that expects ATTENDED."""
     monkeypatch.setenv("TMUX", "/tmp/tmux-1000/default,123,0")
     calls: list[list[str]] = []
 
     def fake(argv, **kwargs):
         calls.append(list(argv))
         verb = argv[1]
-        if verb == "display-message":
+        if verb == "display-message" and argv[-1] == "#{session_attached}":
+            out, rc = (f"{attached}\n", 0) if attached is not None else ("", 1)
+        elif verb == "display-message":
             out, rc = (f"{win}\n", 0) if win is not None else ("", 1)
         elif verb == "show-options":
             out, rc = (f"{option}\n" if option else "", 0)
         elif verb == "switch-client" and argv[2] == "-t":
+            if switch_exc is not None:
+                raise switch_exc
             out, rc = "", switch_rc
         elif verb == "switch-client" and argv[2] == "-l":
             out, rc = "", fallback_rc
@@ -1620,12 +1638,64 @@ def test_return_attached_client_switch_fallback(monkeypatch):
 
 
 def test_return_attached_client_switch_fails_stays_attended(monkeypatch):
-    """Stale target plus no last client: the client never left this window, so
-    the human is still in front of it — ATTENDED, and RETURN_OPTION stays set
-    or the post-exit trailer loses its retry."""
-    calls = _return_fake(monkeypatch, option="=main:%9", switch_rc=1, fallback_rc=1)
+    """Stale target plus no last client, with a client still attached here: the
+    refusal is a real one, the client never left this window, and the human is
+    in front of it — ATTENDED, and RETURN_OPTION stays set or the post-exit
+    trailer loses its retry.
+
+    The attached count is what earns that claim rather than assuming it; the two
+    tests below are the same rc with the count answering differently."""
+    calls = _return_fake(monkeypatch, option="=main:%9", switch_rc=1, fallback_rc=1, attached="1")
     assert launch.return_attached_client() is launch.ReturnOutcome.ATTENDED
     assert ["tmux", "switch-client", "-l"] in calls  # fallback was attempted
+    assert not any(c[1] == "set-option" for c in calls)  # option survives
+
+
+def test_return_attached_client_switch_fails_with_no_client_is_unreachable(monkeypatch):
+    """tmux spends ONE nonzero rc on two different facts. Measured on 3.7c from
+    inside a pane whose server had no attached client, `-t <live session>`,
+    `-t <other session>`, `-l` and `-t <nonexistent>` all exit 1 with "no current
+    client" — so a bare rc reads "nobody is here" as "the client is still here".
+    That is #659's hazard on the DEFAULT backend: the sweep keeps prompting a
+    window no one is viewing and a later --repeat cycle blocks on input().
+
+    Same rc as the test above; only the count differs, which is the whole point.
+    The option survives — nothing was handed back, so a real return is still
+    owed."""
+    calls = _return_fake(monkeypatch, option="=main:%9", switch_rc=1, fallback_rc=1, attached="0")
+    assert launch.return_attached_client() is launch.ReturnOutcome.UNREACHABLE
+    assert ["tmux", "switch-client", "-l"] in calls  # the fallback still ran
+    assert not any(c[1] == "set-option" for c in calls)
+
+
+def test_return_attached_client_switch_fails_with_an_unreadable_count_is_unreachable(monkeypatch):
+    """The count probe itself fails, so the rc stays two facts wide and neither
+    can be ruled out. Unreadable and zero are different facts that meet at the
+    same verdict: neither vouches that a human is still in front of this
+    window."""
+    calls = _return_fake(monkeypatch, option="=main:%9", switch_rc=1, fallback_rc=1, attached=None)
+    assert launch.return_attached_client() is launch.ReturnOutcome.UNREACHABLE
+    assert not any(c[1] == "set-option" for c in calls)
+
+
+def test_return_attached_client_unvouched_switch_is_unreachable(monkeypatch):
+    """A switch whose answer never arrived: the server may already have put the
+    client on the target, so this must not report that a human is still in front
+    of this window. UNREACHABLE stops the prompting a later --repeat cycle would
+    block on, and RETURN_OPTION survives so a real hand-back is still owed.
+
+    ATTENDED here is #659's hazard one seam up, and the surviving option is no
+    rescue for it: the parked trailer sits behind the same blocking read the
+    stuck cycle never reaches. The `-l` leg must stay unreached too — firing it
+    at a client that already went where it was asked is the drag itself."""
+    calls = _return_fake(
+        monkeypatch,
+        option="=main:%9",
+        switch_exc=subprocess.TimeoutExpired(["tmux"], 30),
+    )
+    assert launch.return_attached_client() is launch.ReturnOutcome.UNREACHABLE
+    assert ["tmux", "switch-client", "-t", "=main:%9"] in calls
+    assert ["tmux", "switch-client", "-l"] not in calls
     assert not any(c[1] == "set-option" for c in calls)  # option survives
 
 

@@ -7,6 +7,27 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Fixed
+
+- **psmux: a hand-back that succeeded no longer reports as failed — or undoes itself (#659).**
+  `switch_client` read its verdict off the session's attached-client count, which a same-session
+  move cannot change — and same-session is the common shape for the return path, so a correct
+  hand-back answered "failed". With the last-client fallback enabled (how
+  `return_attached_client` always calls it) that verdict then fired `switch-client -l`, relocating
+  the operator to an unrelated session; the relocation supplied the count change the correct move
+  could not, so the call reported success and cleared its return option. The `-t` verb now takes
+  its exit code as the verdict, gated on a client having been attached, and the fallback fires
+  only when that verb failed.
+- **A sweep whose client has dropped no longer keeps prompting the empty window (#659).** On tmux,
+  `switch-client` spends one nonzero exit on both "that target is unreachable" and "there is no
+  client here at all", so a failed hand-back read as "the human is still in front of me" either
+  way; the session's attached-client count now separates them. `TerminalMultiplexer.switch_client`
+  answers a third value, `None`, for any move it cannot vouch for — that state, a timed-out verb,
+  and on psmux an unreadable gate count — which `return_attached_client` routes to `UNREACHABLE`:
+  the return option survives, but the sweep goes unattended instead of blocking a later `--repeat`
+  cycle on `input()`. `False` now carries the joint claim its caller always read it as. Out-of-tree
+  backends answering a plain bool still work; `detach_client` is unchanged.
+
 ## [0.11.0] — 2026-08-19
 
 ### Added
