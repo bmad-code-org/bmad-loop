@@ -317,8 +317,11 @@ def worktree_clean(repo: Path) -> bool:
 
 
 def same_commit(a: str, b: str) -> bool:
-    """Hash equality tolerant of abbreviated forms (>= 7 chars, git's default
-    --short length); sessions sometimes report `git rev-parse --short HEAD`."""
+    """Hash equality tolerant of abbreviated forms (>= 7 chars); sessions
+    sometimes report `git rev-parse --short HEAD`. The 7 is git's *minimum* auto
+    abbreviation, not a fixed default: `core.abbrev` defaults to `auto`, which
+    scales the length with repository size and clamps upward to 7 only for small
+    repos, so there is no single "default --short length" to mirror."""
     if len(a) < 7 or len(b) < 7:
         return a == b
     return a.startswith(b) or b.startswith(a)

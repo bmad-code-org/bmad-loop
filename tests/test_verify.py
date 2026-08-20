@@ -1891,6 +1891,150 @@ def test_verify_dev_bundle_ancestor_baseline_retains_untracked_proof(project):
     assert verify.verify_dev_bundle(task, project, rj).ok
 
 
+def test_verify_dev_bundle_symbolic_baseline_is_refused(project):
+    """The ancestor relaxation must not be buyable with a claim that pins
+    nothing. `baseline_revision: HEAD` is resolved when the gate runs, not when
+    the session stamped it, so it reads as an ancestor of the unit baseline
+    whenever the checkout's HEAD still equals the recorded baseline — exactly
+    the stale premise this gate exists to refuse. Canonicalization has to happen
+    before the leg, not after.
+
+    Ablation: bypass ``_canonical_commit_oid`` in the ``allow_ancestor_baseline``
+    leg only, letting it consume the raw ``claimed_baseline``, and the attempt
+    passes, failing the refusal assertion. The dev-path twin
+    (``test_verify_dev_refuses_a_symbolic_baseline_revision``) stays green under
+    it: it never sets the flag, and ``_OBJECT_ID`` rejects ``HEAD`` ahead of the
+    newer-baseline leg either way.
+    """
+    (project.project / "story-work.txt").write_text("stories 1.1-1.3\n")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "story work")
+    task = make_bundle_task(project, dw_ids=("DW-1",))  # baseline = new HEAD
+    assert verify.is_ancestor(project.project, "HEAD", task.baseline_commit)
+
+    sp = project.implementation_artifacts / "spec-1-1-a.md"
+    write_spec(sp, "in-review", "HEAD")
+    (project.project / "src.txt").write_text("review fixes\n")
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "dw_ids": ["DW-1"]}
+
+    assert verify._canonical_commit_oid(project.project, "HEAD") is None
+    out = verify.verify_dev_bundle(task, project, rj)
+    assert not out.ok and "does not match" in out.reason
+
+
+@pytest.mark.parametrize("ref_kind", ["branch", "tag"])
+def test_verify_dev_bundle_all_hex_ref_baseline_is_refused(project, ref_kind):
+    """Hex spelling does not make a claim immutable on the bundle path either.
+    An all-hex branch or tag pointing at a genuine ancestor would satisfy the
+    relaxation through the ref namespace, so the gate must disambiguate the
+    object id independently of refs before the leg is reached.
+
+    Ablation: bypass ``_canonical_commit_oid`` in the ``allow_ancestor_baseline``
+    leg only and both parameters pass verification. The dev-path twin
+    (``test_verify_dev_refuses_an_all_hex_ref_baseline``) stays green under that
+    mutation, because it never sets the flag. It does redden under a *full*
+    pre-#645 restore, which strips canonicalization from the newer-baseline leg
+    as well — a strictly larger mutation than the one named here.
+    """
+    ancestor = verify.rev_parse_head(project.project)
+    (project.project / "story-work.txt").write_text("stories 1.1-1.3\n")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "story work")
+    task = make_bundle_task(project, dw_ids=("DW-1",))
+
+    claimed_ref = "abcdef0"
+    if ref_kind == "branch":
+        git(project.project, "branch", claimed_ref, ancestor)
+    else:
+        git(project.project, "tag", claimed_ref, ancestor)
+    assert git(project.project, "rev-parse", claimed_ref) == ancestor
+    assert git(project.project, "rev-parse", f"--disambiguate={claimed_ref}") == ""
+    assert verify.is_ancestor(project.project, claimed_ref, task.baseline_commit)
+
+    sp = project.implementation_artifacts / "spec-1-1-a.md"
+    write_spec(sp, "in-review", claimed_ref)
+    (project.project / "src.txt").write_text("review fixes\n")
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "dw_ids": ["DW-1"]}
+
+    assert verify._canonical_commit_oid(project.project, claimed_ref) is None
+    out = verify.verify_dev_bundle(task, project, rj)
+    assert not out.ok and "does not match" in out.reason
+
+
+def test_verify_dev_bundle_single_char_ref_baseline_is_refused(project):
+    """A ref short enough to be a prefix of its own target defeats any test that
+    reasons about spelling: a branch named for its target's first character does
+    begin with its own name. The claim is refused because it cannot be
+    canonicalized at all — one character is below ``_OBJECT_ID``'s floor and
+    below the four ``rev-parse --disambiguate`` requires — so the ref namespace
+    is never consulted, and the self-prefix property never gets a chance to
+    matter.
+
+    Ablation: bypass ``_canonical_commit_oid`` in the ``allow_ancestor_baseline``
+    leg only and the ref resolves through the namespace to a genuine ancestor,
+    so the attempt passes. Relaxing ``_OBJECT_ID``'s length floor does NOT redden
+    this one — a one-character claim is below every floor git itself will
+    resolve.
+    """
+    ancestor = verify.rev_parse_head(project.project)
+    (project.project / "story-work.txt").write_text("stories 1.1-1.3\n")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "story work")
+    task = make_bundle_task(project, dw_ids=("DW-1",))
+
+    claimed_ref = ancestor[0]
+    git(project.project, "branch", claimed_ref, ancestor)
+    assert git(project.project, "rev-parse", claimed_ref) == ancestor
+    assert ancestor.startswith(claimed_ref)  # the target DOES begin with the name
+    assert verify.is_ancestor(project.project, claimed_ref, task.baseline_commit)
+
+    sp = project.implementation_artifacts / "spec-1-1-a.md"
+    write_spec(sp, "in-review", claimed_ref)
+    (project.project / "src.txt").write_text("review fixes\n")
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "dw_ids": ["DW-1"]}
+
+    assert verify._canonical_commit_oid(project.project, claimed_ref) is None
+    out = verify.verify_dev_bundle(task, project, rj)
+    assert not out.ok and "does not match" in out.reason
+
+
+def test_verify_dev_bundle_below_floor_abbreviation_is_refused(project):
+    """Characterizes the deliberate 7-character floor on the bundle path: an
+    abbreviation git itself resolves is still refused when it is shorter than
+    ``_OBJECT_ID``'s floor. That floor mirrors ``same_commit``'s 7; it is not a
+    length git derives (``core.abbrev`` defaults to ``auto``, which scales with
+    repository size and clamps upward to 7 only for small repos, so there is no
+    fixed default to mirror). The stamp is ``git rev-parse HEAD`` output by
+    contract, so the floor costs a well-behaved session nothing, and
+    accepting shorter claims would re-admit prefix collisions the gate cannot
+    distinguish from drift. The refusal is the floor's doing, not an
+    unresolvable string — the premise assertion below pins that.
+
+    Ablation: relax ``_OBJECT_ID``'s length floor from 7 to 4 and the claim
+    canonicalizes to the ancestor, buys the relaxation leg, and the attempt
+    passes. That mutation reddens no other test in the suite, and none of the
+    ref-refusal tests above redden under it.
+    """
+    ancestor = verify.rev_parse_head(project.project)
+    (project.project / "story-work.txt").write_text("stories 1.1-1.3\n")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "story work")
+    task = make_bundle_task(project, dw_ids=("DW-1",))
+
+    claimed = ancestor[:6]
+    assert git(project.project, "rev-parse", claimed) == ancestor  # git resolves it
+    assert verify.is_ancestor(project.project, claimed, task.baseline_commit)
+
+    sp = project.implementation_artifacts / "spec-1-1-a.md"
+    write_spec(sp, "in-review", claimed)
+    (project.project / "src.txt").write_text("review fixes\n")
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "dw_ids": ["DW-1"]}
+
+    assert verify._canonical_commit_oid(project.project, claimed) is None
+    out = verify.verify_dev_bundle(task, project, rj)
+    assert not out.ok and "does not match" in out.reason
+
+
 def test_verify_dev_bundle_foreign_baseline_still_fails(project):
     """The bundle relaxation is ancestor-only: a baseline unknown to (or
     diverged from) the unit's history still fails the gate."""
