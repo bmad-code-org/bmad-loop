@@ -1901,11 +1901,20 @@ def test_psmux_switch_without_fallback_does_not_attempt_it(monkeypatch):
 
 
 def test_psmux_switch_failed_rc_on_an_empty_session_cannot_vouch(monkeypatch):
-    """The rc-nonzero twin of the gate above, and the row the tmux leaf was just
-    fixed for: `switch-client -t` refusing while nothing is attached here. The
-    refusal proves no switch happened — the first half of the seam's False — but
-    an empty session refutes the second half rather than supporting it, so the
-    joint claim is not available and the answer is None.
+    """The rc-nonzero twin of the gate above. Read what a nonzero rc means HERE
+    before reading across from tmux: the live gate bounds psmux's exit code from
+    both sides, and it does not divide the way tmux's does. A `-t` with nothing
+    to move exits ZERO on this backend (test_premise_client_verbs_exit_zero_...)
+    — psmux reports dispatch, not effect, which is the whole reason the count
+    gate exists — and rc goes nonzero for a target that cannot RESOLVE
+    (test_adopted_switch_client_rejects_an_unresolvable_target). So this state is
+    a stale target over an empty session, not tmux's "no current client", which
+    psmux never spends this code on.
+
+    That makes it an edge rather than the return path's common shape, and the
+    gate is still owed: the refusal proves no switch happened — the first half of
+    the seam's False — while a measured 0 refutes the second half rather than
+    supporting it, so the joint claim is not available and the answer is None.
 
     Scripted past the gate though no fallback is expected, so dropping the gate
     fails this on its assertion rather than on the counts running dry."""
