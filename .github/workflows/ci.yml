@@ -88,7 +88,8 @@ jobs:
         run: uv run pytest -q -n logical --durations=15
 
   test-windows:
-    # Real-Windows runner for the deterministic suite (live psmux e2e stays a manual gate).
+    # Real-Windows runner for the deterministic suite plus the live psmux gate,
+    # which this job installs psmux for and runs in its own serial step.
     name: test (windows, py${{ matrix.python-version }})
     runs-on: windows-latest
     # 20, not the 15 the Linux test job uses: the slowest pre-lever Windows run
@@ -130,9 +131,9 @@ jobs:
         timeout-minutes: 6
         shell: pwsh
         # After `Install the project`, because the assertion below runs `uv run`.
-        # What this buys `Run tests`: 9 more tests, measured at 68s serial on a
-        # dev box (they spread across xdist workers here). Sized against the
-        # job's 20-minute cap and its ~316s mean, so the headroom still holds.
+        # What this buys: the 9 tests of the serial gate step below, measured at
+        # 46-68s on a dev box. Sized against this job's 20-minute cap and its
+        # ~316s mean, so the headroom still holds.
         run: |
           choco install psmux -y --no-progress --execution-timeout=300
           psmux -V
@@ -156,7 +157,23 @@ jobs:
         env:
           TMP: ${{ runner.temp }}
           TEMP: ${{ runner.temp }}
-        run: uv run pytest -q -n logical --durations=15
+        run: uv run pytest -q -n logical --durations=15 --ignore=tests/test_psmux_live.py
+
+      - name: Run the live psmux gate
+        # Serial, and deliberately out of the parallel run above: these nine
+        # tests drive real psmux servers, which are a single-machine resource
+        # rather than per-worker state. Interleaved with the other ~2800 tests
+        # under `-n logical`, the window mint in the prune test came back empty
+        # on a dev box and failed the degraded-mint assertion; the registry
+        # isolation that lands with this step fixes that test's own asymmetry,
+        # and running the gate off the shared workers keeps the whole module
+        # from contending for the machine in the first place. A flake here
+        # cannot be retried away — this repo has no retry mechanism by policy.
+        # Cost: 46-68s measured serial, against this job's 20-minute cap.
+        env:
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+        run: uv run pytest -q tests/test_psmux_live.py --durations=15
 
   version-sync:
     name: version-sync

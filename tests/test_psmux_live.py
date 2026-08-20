@@ -50,10 +50,18 @@ pytestmark = pytest.mark.skipif(not HAVE_PSMUX, reason="requires Windows with ps
 PARKED_ARGV = ["pwsh", "-NoProfile", "-Command", "exit 0"]  # zero tokens, parks on read
 
 
-def test_prune_kills_only_the_owning_projects_window(tmp_path: Path, monkeypatch):
+def test_prune_kills_only_the_owning_projects_window(tmp_path: Path, monkeypatch, psmux_data_root):
     mux = PsmuxMultiplexer()
     if not mux.available():
         pytest.skip("psmux present but not an admitted version")
+    # Same registry isolation the `probe` fixture gives every other test here.
+    # Without it this test alone ran against the default registry while its
+    # siblings spawned and killed servers in private ones — under `-n logical`
+    # that contention made the mint below hand back "" and fail at the
+    # degraded-mint assertion. Isolation is what makes the module xdist-safe,
+    # not the uuid session names, which never collided.
+    if psmux_data_root is not None:
+        monkeypatch.setenv("PSMUX_DATA_DIR", str(psmux_data_root))
     session = f"bmad-loop-test-{uuid.uuid4().hex[:8]}"
     proj_a = tmp_path / "proj-a"
     proj_b = tmp_path / "proj-b"

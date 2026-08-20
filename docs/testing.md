@@ -179,8 +179,9 @@ those paths.
 **Manual-gate cadence:** `test_opencode_live.py` is the one gate CI still cannot see. Run it on a
 POSIX box with opencode installed before every release, and after any change to the adapter it
 covers; a release cut without it is trusting stale evidence. `test_psmux_live.py` left this
-category in #662 — the **test-windows** job installs psmux and runs the gate on every push and
-PR, so its evidence is as fresh as the branch rather than as fresh as someone's memory.
+category in #662 — the **test-windows** job installs psmux and runs the gate on every pull
+request and on pushes to `main`/`release/*` (the workflow's own triggers), in its own serial
+step, so its evidence is as fresh as the branch rather than as fresh as someone's memory.
 
 ## Ablation records
 
@@ -286,7 +287,7 @@ Deliberate absences — decisions, not gaps:
 - **No opencode install in CI** — so `test_opencode_live.py` is the last manual gate (table
   above), and faking the server would test the fake. psmux is the counter-example rather than
   the precedent: it is one Chocolatey package, so **test-windows** installs it and runs that
-  gate on every push (#662).
+  gate on every PR and every push to `main`/`release/*` (#662).
 
 ## TUI testing
 

@@ -66,8 +66,10 @@ breaking changes may land in a minor release.
 
 - **The psmux live gate now runs in CI instead of before releases (#662).** The `test-windows`
   job installs psmux from Chocolatey, so `tests/test_psmux_live.py` — prune isolation, the
-  workaround premise probes, the 3.3.8-floor adoption probes — runs on every push and PR
-  rather than on a maintainer's Windows box at release time. The step asserts
+  workaround premise probes, the 3.3.8-floor adoption probes — runs on every pull request
+  and on pushes to `main`/`release/*`, rather than on a maintainer's Windows box at release
+  time. It runs as its own serial step: real psmux servers are a single-machine resource,
+  and the gate flaked when interleaved with the parallel run. The step asserts
   `PsmuxMultiplexer.available()`, not just that the binary resolves: the gate skips itself on
   an unadmitted version, which would otherwise read green. `test_opencode_live.py` remains the
   one manual gate.
