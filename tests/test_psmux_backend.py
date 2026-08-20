@@ -1763,6 +1763,24 @@ def test_psmux_switch_survives_a_transport_fault(monkeypatch):
     assert ["psmux", "switch-client", "-l"] in calls
 
 
+def test_psmux_switch_timeout_does_not_fall_back(monkeypatch):
+    """A timeout is the absence of an answer, not a failed switch: the server may
+    have moved the client before the wait ran out. Treating it as proven failure
+    fires `-l` at a client that already went where it was asked — the #659 drag,
+    which then manufactures the delta that reports it as a success."""
+    calls = _client_fake(monkeypatch, attached=["1", "1", "0"])
+    probing = tmux_base.subprocess.run
+
+    def stall(argv, **kwargs):
+        if argv[1:3] == ["switch-client", "-t"]:
+            raise subprocess.TimeoutExpired(argv, 30)
+        return probing(argv, **kwargs)
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", stall)
+    assert PsmuxMultiplexer().switch_client("ctl:%9", last_fallback=True) is False
+    assert not any(c[1:3] == ["switch-client", "-l"] for c in calls)
+
+
 def test_psmux_switch_transport_fault_without_fallback_is_false(monkeypatch):
     _client_fake(monkeypatch, attached=["1", "1", "1"])
     probing = tmux_base.subprocess.run

@@ -891,7 +891,19 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         before = self._attached_clients(session)
         try:
             sent = self._run(["switch-client", "-t", target], check=False).returncode == 0
+        except subprocess.TimeoutExpired:
+            # A timeout is not a failure — it is the absence of an answer. The
+            # server may well have moved the client before our wait ran out, so
+            # this is the one exit that must neither claim the move nor fall
+            # back: `-l` on a client that already went where it was asked is the
+            # #659 drag, and the drag manufactures the delta that would report it
+            # as a success. Answer False and leave the retry to the caller, which
+            # still holds its return option (return_attached_client clears that
+            # only on a True).
+            return False
         except (subprocess.SubprocessError, OSError):
+            # Spawn-level faults, by contrast, are proof the verb never ran:
+            # nothing moved, so the fallback is as available as after a nonzero rc.
             sent = False
         if sent:
             # None is "cannot say", not "zero" — both refuse the claim, but only
