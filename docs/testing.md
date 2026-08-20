@@ -170,16 +170,18 @@ everywhere, and the mechanism differs per gate — worth knowing before touching
 | `test_generic_tmux.py` (5 `HAVE_TMUX` test functions, 7 collected) | tmux server                                        | The spawned "CLI" is a tiny shell script written by the test                                                                                                                                                                                                                                                                                                                     | CI Linux job + any POSIX dev box with tmux                                                                                  |
 | `test_stories_e2e.py`                                              | tmux + the real `bmad-loop run/resolve/resume` CLI | Scripted fake `claude` variants (bash, defined as string constants in the test module) wired in as a custom TOML profile (`fakestories`); the fake writes its own SessionStart/Stop hook events, so no `bmad-loop init` and no real CLI exists anywhere in the run                                                                                                               | CI Linux job (Linux-only gate: the fakes use GNU coreutils + `setsid`)                                                      |
 | `test_opencode_live.py`                                            | A real `opencode serve` HTTP server                | **Never sends a prompt**: only the spawn/teardown paths are used — nothing that prompts — and the tests touch health/doc/session/event endpoints; the prompt endpoint is asserted against the OpenAPI schema, never called. One test asserts the session's token/cost aggregates are zero                                                                                        | Manual — POSIX box with a **runnable** `opencode` — the gate probes `--version`, so a resolvable-but-dead shim skips (#294) |
-| `test_psmux_live.py`                                               | A real psmux on Windows                            | **Parked windows only**: every parked window runs `pwsh -NoProfile -Command exit 0`, and no coding CLI is ever launched. Includes `test_premise_*` probes with inverted semantics — a red probe means a workaround became droppable — and `test_adopted_*` probes with ordinary semantics — a red probe means psmux regressed a behavior the 3.3.8 floor lets the backend assume | Manual — Windows box with an admitted psmux (3.3.8+) and `pwsh` on PATH                                                     |
+| `test_psmux_live.py`                                               | A real psmux on Windows                            | **Parked windows only**: every parked window runs `pwsh -NoProfile -Command exit 0`, and no coding CLI is ever launched. Includes `test_premise_*` probes with inverted semantics — a red probe means a workaround became droppable — and `test_adopted_*` probes with ordinary semantics — a red probe means psmux regressed a behavior the 3.3.8 floor lets the backend assume | CI Windows job (the job installs psmux) + any Windows dev box with an admitted psmux (3.3.8+) and `pwsh` on PATH            |
 
 Never "fix" a gate to call a real CLI, and never add a completion path that trusts LLM output —
 sessions complete only on hook Stop events or window death, and the fakes exercise exactly
 those paths.
 
-**Manual-gate cadence:** the two manual gates run before every release — `test_opencode_live.py`
-on a POSIX box with opencode installed, `test_psmux_live.py` on a Windows box with an admitted
-psmux version — and after any change to the adapter or backend they cover. CI cannot see these;
-a release cut without them is trusting stale evidence.
+**Manual-gate cadence:** `test_opencode_live.py` is the one gate CI still cannot see. Run it on a
+POSIX box with opencode installed before every release, and after any change to the adapter it
+covers; a release cut without it is trusting stale evidence. `test_psmux_live.py` left this
+category in #662 — the **test-windows** job installs psmux and runs the gate on every pull
+request and on pushes to `main`/`release/*` (the workflow's own triggers), in its own serial
+step, so its evidence is as fresh as the branch rather than as fresh as someone's memory.
 
 ## Ablation records
 
@@ -247,9 +249,10 @@ fixed, the test fails and forces the debt note to be removed with it.
 ## CI, flakes, and deliberate absences
 
 Six jobs (`.github/workflows/ci.yml`): **test** (ubuntu, Python 3.11–3.14, tmux installed so
-L4 and `stories_e2e` run), **test-windows** (`PYTHONUTF8=1`; PRs run the 3.11/3.14 boundary
-only — Windows failures here have been platform-shaped, not version-shaped — pushes to `main`
-and `release/*` run the full spread), **version-sync**, **lint** (trunk, including actionlint + zizmor over the
+L4 and `stories_e2e` run), **test-windows** (`PYTHONUTF8=1`, psmux installed so the L5
+`test_psmux_live.py` gate runs; PRs run the 3.11/3.14 boundary only — Windows failures here
+have been platform-shaped, not version-shaped — pushes to `main` and `release/*` run the full
+spread), **version-sync**, **lint** (trunk, including actionlint + zizmor over the
 workflows themselves), **typecheck** (the same pinned pyright a contributor runs), and
 **build** (packaging smoke: sdist + wheel, the console script executed from the installed
 wheel, and a wheel data-file inventory against `git ls-files` — every other job runs from the
@@ -281,8 +284,12 @@ Deliberate absences — decisions, not gaps:
   guard; macOS-specific traps found in the field get targeted unit tests (the psutil
   `create_time` trap being the canonical example). A macOS job would mostly re-run the Linux
   suite at 10× the queue time.
-- **Live gates stay manual** (table above) — CI has no Windows psmux or opencode install, and
-  faking either would test the fake.
+- **No opencode install in CI** — so `test_opencode_live.py` is the last manual gate (table
+  above), and faking the server would test the fake. psmux is the counter-example rather than
+  the precedent: it is one zip on a GitHub release, so **test-windows** installs it and runs
+  that gate on every PR and every push to `main`/`release/*` (#662). Chocolatey was tried
+  first and dropped — its community feed 503'd on both matrix legs, and Chocolatey document
+  it as unguaranteed and rate-limited per IP, which hosted runners share.
 
 ## TUI testing
 
