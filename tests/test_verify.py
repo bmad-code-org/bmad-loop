@@ -2001,8 +2001,8 @@ def test_verify_dev_bundle_single_char_ref_baseline_is_refused(project):
 def test_verify_dev_bundle_below_floor_abbreviation_is_refused(project):
     """Characterizes the deliberate 7-character floor on the bundle path: an
     abbreviation git itself resolves is still refused when it is shorter than
-    ``_OBJECT_ID``'s floor. That floor mirrors ``same_commit``'s 7; it is not a
-    length git derives (``core.abbrev`` defaults to ``auto``, which scales with
+    ``_OBJECT_ID``'s floor. That 7 is a constant the gate chooses, not a length
+    git derives (``core.abbrev`` defaults to ``auto``, which scales with
     repository size and clamps upward to 7 only for small repos, so there is no
     fixed default to mirror). The stamp is ``git rev-parse HEAD`` output by
     contract, so the floor costs a well-behaved session nothing, and
@@ -3682,7 +3682,7 @@ def test_worktree_clean_ignores_stderr_chatter_on_success(project, monkeypatch):
 
 
 def test_rev_parse_head_reads_stdout_alone_under_host_noise(project):
-    """A warning-suffixed "sha" is not a sha. It reaches `same_commit` comparisons
+    """A warning-suffixed "sha" is not a sha. It reaches every commit comparison
     and the baselines persisted in run state, so a resume grades a warning-carrying
     string against a clean one and reads "moved" — silent, with a plausible-looking
     value.
