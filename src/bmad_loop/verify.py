@@ -252,8 +252,8 @@ def git_bytes(
 
 def rev_parse_head(repo: Path) -> str:
     """The sha HEAD resolves to. Reads stdout alone (`_git_out`): git exits 0 while
-    still warning on stderr, and a warning-suffixed "sha" flows into `same_commit`
-    comparisons and into persisted run baselines (#442)."""
+    still warning on stderr, and a warning-suffixed "sha" flows into every commit
+    comparison and into persisted run baselines (#442)."""
     rc, out, detail = _git_out(repo, "rev-parse", "HEAD")
     if rc != 0:
         raise GitError(f"git rev-parse HEAD failed in {repo}: {detail}")
@@ -316,17 +316,6 @@ def worktree_clean(repo: Path) -> bool:
     return proc.stdout.strip() == ""
 
 
-def same_commit(a: str, b: str) -> bool:
-    """Hash equality tolerant of abbreviated forms (>= 7 chars); sessions
-    sometimes report `git rev-parse --short HEAD`. The 7 is git's *minimum* auto
-    abbreviation, not a fixed default: `core.abbrev` defaults to `auto`, which
-    scales the length with repository size and clamps upward to 7 only for small
-    repos, so there is no single "default --short length" to mirror."""
-    if len(a) < 7 or len(b) < 7:
-        return a == b
-    return a.startswith(b) or b.startswith(a)
-
-
 def is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
     """True when `ancestor` is an ancestor of (or equal to) `descendant`.
 
@@ -346,7 +335,9 @@ def is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
 # session stamped it. Hex spelling is necessary but insufficient: Git also permits
 # all-hex ref names. The stamp is `git rev-parse HEAD` output by contract, so requiring
 # a uniquely disambiguated direct commit costs a well-behaved session nothing. Length
-# floor mirrors `same_commit`'s 7; ceiling admits sha256.
+# floor is git's shortest auto abbreviation: with `core.abbrev` unset the length scales
+# with the repository's object count and clamps upward to 7 only for small repos, so
+# nothing git abbreviates on its own is shorter. Ceiling admits sha256.
 _OBJECT_ID = re.compile(r"\A[0-9a-fA-F]{7,64}\Z")
 
 

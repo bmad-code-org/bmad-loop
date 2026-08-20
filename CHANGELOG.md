@@ -7,6 +7,13 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Removed
+
+- **`verify.same_commit` is gone — nothing called it.** #645's `_canonical_commit_oid` displaced
+  its last call site and compares canonical full object ids exactly. The helper's leftover
+  prefix-tolerant equality — either argument a prefix of the other once both reach 7 characters —
+  would have handed that looseness to whichever caller reached for it next.
+
 ### Fixed
 
 - **psmux: a hand-back that succeeded no longer reports as failed — or undoes itself (#659).**
