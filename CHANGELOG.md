@@ -7,6 +7,15 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Fixed
+
+- psmux probes (`current_window_id`, `current_pane_id`, `current_session`,
+  `current_return_target`) now
+  pin `display-message` to the calling pane via `TMUX_PANE`; a target-less probe
+  answered for the server's _active_ window, so a caller in a non-active window could
+  prune its own window or record another window's return target (#669). With `TMUX`
+  set but `TMUX_PANE` unset the probe returns `None` instead of running unpinned.
+
 ## [0.11.0] — 2026-08-19
 
 ### Added

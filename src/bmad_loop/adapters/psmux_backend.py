@@ -723,6 +723,38 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         except (subprocess.SubprocessError, OSError, TmuxError) as exc:
             print(f"warning: kill-window key cleanup failed on {session}: {exc}", file=sys.stderr)
 
+    def _display_message(self, fmt: str) -> str | None:
+        # The base's target-less probe resolves the server's *active* window on
+        # psmux, so every inherited probe (current_window_id / current_pane_id /
+        # current_session / current_return_target) answers for a foreign window
+        # whenever this process's window is not the focused one (gh-669): the
+        # ctl prune's own-window exclusion lands on the wrong window, and the
+        # attach return records a pane the human never came from. Pin the probe
+        # to the calling pane, exactly as _parked_trailer already does in pwsh:
+        # psmux sets TMUX_PANE in every pane, and a bare `%N` target resolves
+        # globally via DisplayMessageById. Still a probe rather than a
+        # short-circuit to the env value — the round trip also verifies the
+        # pane is live (a dead id exits nonzero, hence None). TMUX guard first,
+        # as in the base; with TMUX set but TMUX_PANE unset the probe is
+        # unpinnable, and an unpinnable probe must not answer for a foreign
+        # window — None without spawning.
+        if not os.environ.get("TMUX"):
+            return None
+        pane = os.environ.get("TMUX_PANE")
+        if not pane:
+            return None
+        # Measured on 3.3.8: an `@N`-shaped or live-session-name value in the
+        # target slot resolves rc=0 to the ACTIVE window — the foreign answer
+        # this override exists to eliminate — while plain garbage fails closed
+        # at rc!=0. Only a pane-shaped value may reach `-t`.
+        if not re.fullmatch(r"%\d+", pane):
+            return None
+        try:
+            proc = self._run(["display-message", "-p", "-t", pane, fmt], check=False)
+        except (subprocess.SubprocessError, OSError):
+            return None
+        return proc.stdout.strip() if proc.returncode == 0 else None
+
     # What _qualified_window_id composes: `<session>:@<n>`. The session part
     # excludes `:` because that is exactly when qualification degrades to a bare
     # id; requiring `@<digits>` keeps a `=session:window-name` token out — which
