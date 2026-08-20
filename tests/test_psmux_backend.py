@@ -357,6 +357,7 @@ def _probe_fake(monkeypatch, answers: dict[str, tuple[int, str]]):
         return subprocess.CompletedProcess(argv, rc, stdout=out, stderr="")
 
     monkeypatch.setenv("TMUX", "/tmp/psmux-1000/default,123,0")  # inside psmux
+    monkeypatch.setenv("TMUX_PANE", "%9")  # the pane the probes pin to (gh-669)
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
 
 
@@ -703,10 +704,11 @@ def test_current_window_id_resolves_session_and_id_in_one_probe(monkeypatch):
     # own window and kill it. One expansion yields both parts or neither.
     recorder = _RecordRun(stdout="ctl:@2\n")
     monkeypatch.setenv("TMUX", "/tmp/psmux-1000/default,123,0")
+    monkeypatch.setenv("TMUX_PANE", "%9")
     monkeypatch.setattr(tmux_base.subprocess, "run", recorder)
     assert PsmuxMultiplexer().current_window_id() == "ctl:@2"
     assert len(recorder.calls) == 1
-    assert recorder.argv[1:] == ["display-message", "-p", _CURRENT_FMT]
+    assert recorder.argv[1:] == ["display-message", "-p", "-t", "%9", _CURRENT_FMT]
 
 
 def test_current_window_id_none_outside_mux(monkeypatch):
@@ -716,6 +718,55 @@ def test_current_window_id_none_outside_mux(monkeypatch):
     rec = _RecordRun()
     monkeypatch.setattr(tmux_base.subprocess, "run", rec)
     assert PsmuxMultiplexer().current_window_id() is None
+    assert rec.calls == []
+
+
+def test_display_message_pins_probe_to_the_calling_pane(monkeypatch):
+    # A target-less display-message resolves the server's *active* window on
+    # psmux, answering for a foreign window whenever the caller's window is not
+    # focused (gh-669) — every probe must carry `-t $TMUX_PANE`.
+    recorder = _RecordRun(stdout="%4\n")
+    monkeypatch.setenv("TMUX", "/tmp/psmux-1000/default,123,0")
+    monkeypatch.setenv("TMUX_PANE", "%4")
+    monkeypatch.setattr(tmux_base.subprocess, "run", recorder)
+    assert PsmuxMultiplexer().current_pane_id() == "%4"
+    assert len(recorder.calls) == 1  # the pinned probe, and nothing unpinned
+    assert recorder.argv[1:] == ["display-message", "-p", "-t", "%4", "#{pane_id}"]
+
+
+def test_display_message_unpinnable_probe_is_refused(monkeypatch):
+    # TMUX set but TMUX_PANE unset: the probe cannot be pinned, and an
+    # unpinnable probe would answer for whichever window is active — None
+    # without spawning, never a target-less display-message (gh-669).
+    monkeypatch.setenv("TMUX", "/tmp/psmux-1000/default,123,0")
+    monkeypatch.delenv("TMUX_PANE", raising=False)
+    rec = _RecordRun()
+    monkeypatch.setattr(tmux_base.subprocess, "run", rec)
+    assert PsmuxMultiplexer().current_window_id() is None
+    assert rec.calls == []
+
+
+def test_display_message_non_pane_shaped_tmux_pane_is_refused(monkeypatch):
+    # Measured on 3.3.8: an `@N`-shaped (or live-session-name) target resolves
+    # rc=0 to the ACTIVE window — a foreign answer the rc cannot catch, unlike
+    # plain garbage, which fails closed at rc!=0 — so a TMUX_PANE that is not
+    # pane-shaped must never reach `-t` (gh-669).
+    monkeypatch.setenv("TMUX", "/tmp/psmux-1000/default,123,0")
+    monkeypatch.setenv("TMUX_PANE", "@3")
+    rec = _RecordRun()
+    monkeypatch.setattr(tmux_base.subprocess, "run", rec)
+    assert PsmuxMultiplexer().current_window_id() is None
+    assert rec.calls == []
+
+
+def test_display_message_none_outside_mux_even_with_pane_var(monkeypatch):
+    # The base's TMUX guard survives the override: a stale TMUX_PANE in the
+    # environment of a plain shell must not conjure an "inside psmux" answer.
+    monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.setenv("TMUX_PANE", "%4")
+    rec = _RecordRun()
+    monkeypatch.setattr(tmux_base.subprocess, "run", rec)
+    assert PsmuxMultiplexer().current_pane_id() is None
     assert rec.calls == []
 
 
@@ -1608,6 +1659,7 @@ def _client_fake(monkeypatch, *, attached, session="ctl", verb_rc=0, drains_on_s
     either position consumes the same single scripted answer.
     """
     monkeypatch.setenv("TMUX", "/tmp/psmux-1000/default,123,0")  # inside a pane
+    monkeypatch.setenv("TMUX_PANE", "%9")  # the pane the probes pin to (gh-669)
     counts = list(attached)
     calls: list[list] = []
 

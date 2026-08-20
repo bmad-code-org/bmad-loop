@@ -420,6 +420,35 @@ def test_premise_option_values_survive_the_control_line(probe):
     )
 
 
+def test_premise_target_less_display_message_ignores_tmux_pane(probe):
+    mux, session, windows = probe
+    # The founding divergence of the _display_message pin (gh-669): psmux
+    # resolves a target-less display-message against the server's ACTIVE
+    # window, ignoring the caller's TMUX_PANE.
+    mux.select_window(windows[1])
+    assert (
+        _active_window(mux, session) == windows[1]
+    ), "probe setup: could not focus the probe's other window"
+    panes = mux._run(["list-panes", "-t", windows[0], "-F", "#{pane_id}"], check=False)
+    assert panes.returncode == 0, f"probe setup: list-panes failed: {panes.stderr.strip()!r}"
+    pane = panes.stdout.split()[0] if panes.stdout.split() else ""
+    assert re.fullmatch(r"%\d+", pane), f"probe setup: unexpected pane id {pane!r}"
+    env = _new_session_env()
+    for var in ("TMUX", "PSMUX_TARGET_SESSION", "PSMUX_TARGET_FULL"):
+        env.pop(var, None)
+    env["TMUX_PANE"] = pane  # a caller in a NON-active window, as psmux sets it
+    answered = mux._run(["display-message", "-p", "#{window_id}"], check=False, env=env)
+    assert (
+        answered.returncode == 0
+    ), f"probe setup: target-less display-message failed: {answered.stderr.strip()!r}"
+    active = windows[1].rsplit(":", 1)[1]
+    assert answered.stdout.strip() == active, (
+        "psmux now resolves a target-less display-message via the caller's "
+        "TMUX_PANE instead of the active window — the `-t $TMUX_PANE` pin in "
+        "psmux_backend._display_message (gh-669) has become droppable"
+    )
+
+
 # ------------------------------------------------- adopted-behavior probes
 #
 # The mirror image of the premise probes above. Those guarded workarounds and
@@ -537,4 +566,41 @@ def test_adopted_unresolvable_kill_target_exits_nonzero_and_spares_live_windows(
     assert after == before, (
         "an unresolvable kill-window target destroyed a live window again "
         f"(psmux/psmux#545): {sorted(before)} -> {sorted(after)}"
+    )
+
+
+def test_adopted_display_message_pane_target_resolves_globally(probe):
+    mux, session, windows = probe
+    # The premise the psmux _display_message override rests on (gh-669): a bare
+    # `%N` display-message target resolves globally across windows
+    # (DisplayMessageById, psmux/psmux#332), so a probe pinned to a pane of a
+    # NON-active window answers that window — while a target-less probe answers
+    # whichever window has focus. Focus the other window first, so a green here
+    # is genuine cross-window resolution, not the active window by accident.
+    mux.select_window(windows[1])
+    assert (
+        _active_window(mux, session) == windows[1]
+    ), "probe setup: could not focus the probe's other window"
+    panes = mux._run(["list-panes", "-t", windows[0], "-F", "#{pane_id}"], check=False)
+    assert panes.returncode == 0, f"probe setup: list-panes failed: {panes.stderr.strip()!r}"
+    pane = panes.stdout.split()[0] if panes.stdout.split() else ""
+    assert re.fullmatch(r"%\d+", pane), f"probe setup: unexpected pane id {pane!r}"
+    # Route by registry (the probe session is the isolated registry's only — and
+    # otherwise its most recent — session): a bare `%N` target carries no session,
+    # and this process's own $TMUX, when running inside a mux, would route the
+    # probe to the wrong server entirely.
+    env = _new_session_env()
+    for var in ("TMUX", "PSMUX_TARGET_SESSION", "PSMUX_TARGET_FULL"):
+        env.pop(var, None)
+    answered = mux._run(["display-message", "-p", "-t", pane, "#{window_id}"], check=False, env=env)
+    assert answered.returncode == 0, (
+        "psmux no longer answers a bare `%N` display-message target "
+        f"(psmux/psmux#332): {answered.stderr.strip()!r}"
+    )
+    expected = windows[0].rsplit(":", 1)[1]
+    assert answered.stdout.strip() == expected, (
+        "a pane-pinned display-message no longer resolves the pane's own window "
+        "across window focus (DisplayMessageById, psmux/psmux#332) — the "
+        "TMUX_PANE pin in psmux_backend._display_message answers for the "
+        f"active window again: expected {expected!r}, got {answered.stdout.strip()!r}"
     )
