@@ -107,16 +107,21 @@ seams of a full OS port are in
   binary's version string or `None` — **one bounded line**, folded with
   `fold_version()`; see [the porting guide](porting-to-a-new-os.md)).
 
-  **Both client verbs report effect, not dispatch.** They answer a bool the
-  parked-window return path trusts, so a backend with no real detach (herdr —
+  **Both client verbs report effect, not dispatch.** They answer what the
+  parked-window return path trusts — a bool from `detach_client`, a tri-state
+  from `switch_client` (see below) — so a backend with no real detach (herdr —
   only a manual chord releases its client) answers `False`. If your CLI's exit
   code already means "a client moved" you are done (tmux: `detach-client` fails
   with _no current client_); if it does not, **measure** what the verb is meant
   to change — psmux counts the session's attached clients across `detach_client`
   and the last-client fallback, and answers on the drop — and record what the
   measure cannot see in your degradation ledger. Where no measure is available,
-  answer `False` and record that gap in the ledger too. Check the ledger against
-  every verb before you trust one measure for all of them: psmux's drop is blind
+  answer `False` from `detach_client` and `None` from `switch_client`, and
+  record that gap in the ledger too — per _call_, though, never as the wiring: a
+  `switch_client` hard-coded to `None` pins the return path to `UNREACHABLE`, and
+  an attended sweep then stops prompting for good. Use the exit code wherever it
+  carries the effect. Check the ledger against every verb before you
+  trust one measure for all of them: psmux's drop is blind
   to a `switch_client` whose target sits in the same session, which is the common
   case for the return path, so that verb gates on the client count read _before_
   the call and takes the exit code as the verdict instead (#659). A fallback verb
@@ -124,14 +129,19 @@ seams of a full OS port are in
   "the primary could not be vouched for", or a hand-back that worked gets undone
   by its own fallback and the undo is read as the success.
   `tui.launch.return_attached_client` reads a failed `switch_client` as
-  `ATTENDED` — normally the client never left this window, so an attended sweep
-  keeps prompting; a False your backend answers for a move it could not _vouch_
-  for (a timed-out verb, an unreadable count) lands in the same bucket, which is
-  why the return option must survive a False: the parked trailer's retry is the
-  recovery — and a failed `detach_client` as `UNREACHABLE`, which is evidence of
-  nothing, so the sweep goes unattended and defers this cycle's decisions to
-  `bmad-loop decisions`. `False` is the safe answer either way; a vacuous `True`
-  is the one answer no backend may give — it announces a hand-back that never
+  `ATTENDED` — the client never left this window, so an attended sweep keeps
+  prompting — and a failed `detach_client` as `UNREACHABLE`, which is evidence
+  of nothing, so the sweep goes unattended and defers this cycle's decisions to
+  `bmad-loop decisions`. That makes `switch_client`'s `False` a **joint claim**:
+  no switch happened _and_ the client is still here. A move you cannot _vouch_
+  for is only its first half — a timed-out verb, an unreadable count, nothing
+  attached to move — so answer `None`, which routes to `UNREACHABLE`: the return
+  option survives and the sweep still stops prompting a window the client may
+  already have left. Do not reach for that surviving option as the recovery. The
+  parked trailer sits behind a blocking read, so it never runs while a `--repeat`
+  cycle is stuck on `input()` in the same window — which is exactly what an
+  `ATTENDED` the client has walked away from produces. A vacuous `True` remains
+  the one answer no backend may give: it announces a hand-back that never
   happened and sends the sweep unattended with the human still sitting there
   (#227).
 
@@ -197,9 +207,11 @@ whenever the content changes, which is exactly enough to drive the two log consu
 a tmux tee would (`generic._log_activity_key`'s stall re-arm and `probe`'s marker
 discovery). Its module docstring is a **degradation ledger** of every such
 divergence (sidecar options, poller `pipe_pane`, the no-op `detach_client` —
-which the widened seam now requires to answer `False`, not `None`, so the
+which #317's widening requires to answer `False`, not `None`, so the
 parked-return path reads it as `UNREACHABLE` and an attended sweep stops
-prompting into a window whose client only a manual chord can release — the attach
+prompting into a window whose client only a manual chord can release; that is a
+different widening from `switch_client`'s tri-state above, and `detach_client`
+is the verb that stays a bool — the attach
 argv, the advisory geometry, the protocol-version policy) — the reference for what
 "implement fresh" costs when the host has no tmux-shaped CLI. The operator-facing
 view — what a herdr _user_ notices and does — is

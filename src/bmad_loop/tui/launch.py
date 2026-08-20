@@ -535,26 +535,25 @@ class ReturnOutcome(StrEnum):
     unattended on the strength of it, whether a human can still answer here.
 
     A plain boolean cannot carry that: "the hand-back succeeded" and "there is
-    still someone at this terminal" are independent, and the two failures point
-    opposite ways. A failed *switch* leaves the client sitting in this very
-    window; a failed *detach* reports no verified hand-back, which is not the
-    same claim and does not license the same response."""
+    still someone at this terminal" are independent, and the ways of failing
+    point in different directions. A *refused* switch leaves the client sitting
+    in this very window; a switch the backend cannot vouch for may already have
+    moved it; a failed *detach* reports no verified hand-back. Three claims, and
+    they do not license the same response."""
 
     RETURNED = "returned"
     #: No hand-back, but a human may still be here: nothing was recorded to
     #: return to (a plain foreground sweep), the backend is unusable, or the
-    #: switch failed — usually with the client still in this window, though a
-    #: backend may also answer False for a switch it could not vouch for (a
-    #: timed-out verb, an unreadable client count) where the client may in fact
-    #: have left. The conservative answer either way — a caller must keep
-    #: talking to the terminal.
+    #: switch failed with the client still in this window. The conservative
+    #: answer — a caller must keep talking to the terminal.
     ATTENDED = "attended"
     #: A hand-back was attempted and did not verifiably happen: the detach found
-    #: nothing attached, the effect could not be observed, or the backend has no
-    #: detach verb at all (herdr). A caller must not rely on anyone answering a
-    #: prompt in this window — a policy for the uncertainty, not a proof that
-    #: the window is empty (see return_attached_client for why it is the safe
-    #: way to be wrong).
+    #: nothing attached, the switch could not be vouched for (a timed-out verb,
+    #: an unreadable client count, nothing attached to move), the effect could
+    #: not be observed, or the backend has no detach verb at all (herdr). A
+    #: caller must not rely on anyone answering a prompt in this window — a
+    #: policy for the uncertainty, not a proof that the window is empty (see
+    #: return_attached_client for why it is the safe way to be wrong).
     UNREACHABLE = "unreachable"
 
 
@@ -575,18 +574,24 @@ def return_attached_client() -> ReturnOutcome:
     only once a human dismisses the park prompt, never in the unattended case.
 
     The two failures are not interchangeable, which is why this answers a
-    ReturnOutcome and not a bool. A failed switch is normally evidence that the
+    ReturnOutcome and not a bool. A failed switch is positive evidence that the
     client is still in this window, so ATTENDED keeps the caller prompting —
-    though not proof: a backend may answer False for a switch it could not
-    vouch for (psmux's timed-out verb or unreadable client count), and the
-    return option surviving a False is what keeps the parked trailer's retry
-    available for exactly that case. A
+    but only because the seam reserves False for that joint claim. A backend
+    that merely cannot vouch for the move (psmux's timed-out verb, an
+    unreadable client count, nothing attached to move) answers None, and that
+    lands in UNREACHABLE instead. The routing is load-bearing, not tidiness:
+    an ATTENDED the client has already walked away from cannot be recovered by
+    the surviving return option, because a --repeat cycle prompting into the
+    empty window blocks on input() before anyone can reach the trailer. A
     failed detach carries no such evidence in general: on tmux it does
     (`detach-client` fails with "no current client"), but off tmux False also
     covers an effect the backend could not observe and a detach verb it does
-    not have at all — herdr, whose False rather than None is exactly what the
-    seam's widened return type buys. UNREACHABLE is the policy for all three,
-    because the two ways of being wrong are not equally bad: prompting into a
+    not have at all — herdr, whose False rather than None is exactly what
+    detach_client's own widening to a returned bool (#317) buys. That is a
+    different widening from switch_client's third state above; detach_client is
+    the verb that stays a bool. UNREACHABLE is the policy for all of them, the
+    unvouched switch included, because the two ways of being wrong are not
+    equally bad: prompting into a
     window no one is viewing blocks a --repeat sweep on input() forever, while
     going unattended in front of a human only defers this cycle's decisions to
     `bmad-loop decisions` or the next attended sweep."""
@@ -603,7 +608,10 @@ def return_attached_client() -> ReturnOutcome:
         outcome = ReturnOutcome.RETURNED if mux.detach_client() else ReturnOutcome.UNREACHABLE
     else:
         switched = mux.switch_client(ret, last_fallback=True)
-        outcome = ReturnOutcome.RETURNED if switched else ReturnOutcome.ATTENDED
+        if switched is None:
+            outcome = ReturnOutcome.UNREACHABLE
+        else:
+            outcome = ReturnOutcome.RETURNED if switched else ReturnOutcome.ATTENDED
     if outcome is ReturnOutcome.RETURNED:
         mux.unset_window_option(win, RETURN_OPTION)
     return outcome

@@ -213,6 +213,7 @@ def boom_run(request, monkeypatch):
         raise request.param
 
     monkeypatch.setattr(tmux_base.subprocess, "run", boom)
+    return request.param
 
 
 def test_seam_methods_never_leak_raw_subprocess_error(boom_run, tmp_path):
@@ -242,8 +243,6 @@ def test_seam_methods_never_leak_raw_subprocess_error(boom_run, tmp_path):
     # (never a raise, never a mis-typed answer).
     assert mux.list_windows("s", ["window_id"]) == []
     assert mux.show_window_option("@1", "opt") == ""
-    assert mux.switch_client("s") is False
-    assert mux.switch_client("s", last_fallback=True) is False
     assert mux.detach_client() is False
     assert mux.kill_window("@1") is None
     assert mux.select_window("@1") is None
@@ -251,6 +250,16 @@ def test_seam_methods_never_leak_raw_subprocess_error(boom_run, tmp_path):
     assert mux.unset_window_option("@1", "opt") is None
     assert mux.pipe_pane("@1", tmp_path / "log") is None
     assert mux.window_pane_pids("@1") == []
+
+    # switch_client is the one sentinel that splits the two faults the rest
+    # collapse: a missing binary never ran the verb, so nobody moved and whoever
+    # was in front of this window still is — the joint claim False stands for.
+    # A timeout may have completed the switch server-side, and only None can say
+    # so; a False there tells the return path to keep prompting a window the
+    # client has already left (#659, one seam up).
+    unvouched = None if isinstance(boom_run, subprocess.TimeoutExpired) else False
+    assert mux.switch_client("s") is unvouched
+    assert mux.switch_client("s", last_fallback=True) is unvouched
 
     # Already-correct swallowers stay swallowing (lock-in).
     assert mux.kill_session("s") is None

@@ -315,18 +315,42 @@ class TerminalMultiplexer(ABC):
         instead (psmux counts the session's attached clients across the call).
         Callers that only want the terminal handed back may ignore the answer;
         the parked-window return path cannot — it clears its return option on a
-        True, and a vacuous one strands the human, while a False is positive
-        evidence that nobody is watching this window any more (see
+        True, and a vacuous one strands the human. It reads a False as
+        UNREACHABLE: on tmux that is positive evidence nobody is watching this
+        window any more, but off tmux the same False also covers an effect the
+        backend could not observe and a backend with no detach verb at all, so
+        the response is a policy for the uncertainty rather than proof (see
         tui.launch.return_attached_client)."""
 
     @abstractmethod
-    def switch_client(self, target: str, last_fallback: bool = False) -> bool:
+    def switch_client(self, target: str, last_fallback: bool = False) -> bool | None:
         """Switch the current client to ``target`` (optionally falling back to
-        the last client on failure). Returns True iff a switch happened — the
-        same effect-not-dispatch rule as :meth:`detach_client`, so a transport
-        failure returns False and a backend whose CLI cannot report the move
-        measures it or answers False. ``target`` is a :meth:`target` token or a
-        backend-native id."""
+        the last client on failure). ``target`` is a :meth:`target` token or a
+        backend-native id.
+
+        Three answers, because the parked-window return path asks two questions
+        of the one verb — did the switch happen, and is anyone still at this
+        terminal:
+
+        - ``True`` — a switch happened. Effect, not dispatch, the same rule as
+          :meth:`detach_client`.
+        - ``False`` — the **joint** claim: no switch happened *and* the client
+          is still here. The verb ran, refused, and moved nobody.
+          :func:`tui.launch.return_attached_client` reads it as ATTENDED and
+          keeps prompting this terminal, so do not answer it for the first half
+          alone.
+        - ``None`` — cannot vouch for the second half: the verb's answer never
+          arrived (a timed-out call), its effect was unobservable, or there was
+          no client here to move. That reads as UNREACHABLE — the sweep keeps
+          its return option but stops prompting, which is the safe way to be
+          wrong, since prompting into a window nobody is viewing blocks a
+          ``--repeat`` sweep on ``input()`` forever and the parked trailer's
+          retry cannot recover it (it sits behind that same blocking read).
+
+        A backend that never widened to the third state keeps working — a bool
+        is a valid answer and the seam only loses a distinction that backend
+        never drew. What no backend may do is answer ``False`` for a move it
+        merely could not confirm, or a vacuous ``True`` (#659)."""
 
     @abstractmethod
     def available(self) -> bool:
