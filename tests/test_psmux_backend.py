@@ -1763,6 +1763,17 @@ def test_psmux_switch_survives_a_transport_fault(monkeypatch):
     assert ["psmux", "switch-client", "-l"] in calls
 
 
+def test_psmux_switch_failed_rc_with_empty_session_still_dispatches_the_fallback(monkeypatch):
+    """The one released `-l` with nobody attached here: a failed `-t` frees the
+    fallback regardless of the gate, and `_client_left` then dispatches it and
+    answers on its own delta (0 -> 0 reads False). Pinned as the fallback leg's
+    pre-#659 shape — skipping `-l` on an empty session would be a behavior
+    change with its own review, not a side effect of the verdict split."""
+    calls = _client_fake(monkeypatch, attached=["0", "0", "0"], verb_rc=1)
+    assert PsmuxMultiplexer().switch_client("ctl:%9", last_fallback=True) is False
+    assert ["psmux", "switch-client", "-l"] in calls
+
+
 def test_psmux_switch_timeout_does_not_fall_back(monkeypatch):
     """A timeout is the absence of an answer, not a failed switch: the server may
     have moved the client before the wait ran out. Treating it as proven failure

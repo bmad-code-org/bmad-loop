@@ -543,8 +543,11 @@ class ReturnOutcome(StrEnum):
     RETURNED = "returned"
     #: No hand-back, but a human may still be here: nothing was recorded to
     #: return to (a plain foreground sweep), the backend is unusable, or the
-    #: switch failed with the client still in this window. The conservative
-    #: answer — a caller must keep talking to the terminal.
+    #: switch failed — usually with the client still in this window, though a
+    #: backend may also answer False for a switch it could not vouch for (a
+    #: timed-out verb, an unreadable client count) where the client may in fact
+    #: have left. The conservative answer either way — a caller must keep
+    #: talking to the terminal.
     ATTENDED = "attended"
     #: A hand-back was attempted and did not verifiably happen: the detach found
     #: nothing attached, the effect could not be observed, or the backend has no
@@ -572,8 +575,12 @@ def return_attached_client() -> ReturnOutcome:
     only once a human dismisses the park prompt, never in the unattended case.
 
     The two failures are not interchangeable, which is why this answers a
-    ReturnOutcome and not a bool. A failed switch is positive evidence that the
-    client is still in this window, so ATTENDED keeps the caller prompting. A
+    ReturnOutcome and not a bool. A failed switch is normally evidence that the
+    client is still in this window, so ATTENDED keeps the caller prompting —
+    though not proof: a backend may answer False for a switch it could not
+    vouch for (psmux's timed-out verb or unreadable client count), and the
+    return option surviving a False is what keeps the parked trailer's retry
+    available for exactly that case. A
     failed detach carries no such evidence in general: on tmux it does
     (`detach-client` fails with "no current client"), but off tmux False also
     covers an effect the backend could not observe and a detach verb it does

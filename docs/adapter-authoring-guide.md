@@ -124,8 +124,11 @@ seams of a full OS port are in
   "the primary could not be vouched for", or a hand-back that worked gets undone
   by its own fallback and the undo is read as the success.
   `tui.launch.return_attached_client` reads a failed `switch_client` as
-  `ATTENDED` — the client never left this window, so an attended sweep keeps
-  prompting — and a failed `detach_client` as `UNREACHABLE`, which is evidence of
+  `ATTENDED` — normally the client never left this window, so an attended sweep
+  keeps prompting; a False your backend answers for a move it could not _vouch_
+  for (a timed-out verb, an unreadable count) lands in the same bucket, which is
+  why the return option must survive a False: the parked trailer's retry is the
+  recovery — and a failed `detach_client` as `UNREACHABLE`, which is evidence of
   nothing, so the sweep goes unattended and defers this cycle's decisions to
   `bmad-loop decisions`. `False` is the safe answer either way; a vacuous `True`
   is the one answer no backend may give — it announces a hand-back that never

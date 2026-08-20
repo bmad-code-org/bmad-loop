@@ -31,7 +31,11 @@ sent, so neither seam boolean can be read off the exit code alone. The
 session's attached-client count supplies what the rc cannot — as a drop
 across ``detach-client`` and ``switch-client -l``, and as a gate on the
 targeted ``switch-client -t``, whose same-session move no drop can see
-(#659); see the ``client verbs: observed effect (#317)`` block. ``available()``
+(#659); see the ``client verbs: observed effect (#317)`` block. Residue of
+that split: a ``switch_client`` False is not proof the client stayed — the
+timed-out verb and the unvouched rc-0 (count unreadable) both answer False
+for a move the server may have completed; the return option survives a
+False, so the parked trailer's retry is the recovery. ``available()``
 additionally gates on the reported version — see ``_LAST_UNSUPPORTED``
 for what the floor buys and why it moves. ``has_session``
 is inherited unchanged, but one server per session gives it a residual the
