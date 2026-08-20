@@ -128,9 +128,9 @@ seams of a full OS port are in
   belongs to the same audit — hang it on the primary verb's failure, never on
   "the primary could not be vouched for", or a hand-back that worked gets undone
   by its own fallback and the undo is read as the success.
-  `tui.launch.return_attached_client` reads a failed `switch_client` as
+  `tui.launch.return_attached_client` reads a `False` from `switch_client` as
   `ATTENDED` — the client never left this window, so an attended sweep keeps
-  prompting — and a failed `detach_client` as `UNREACHABLE`, which is evidence
+  prompting — and a `False` from `detach_client` as `UNREACHABLE`, which is evidence
   of nothing, so the sweep goes unattended and defers this cycle's decisions to
   `bmad-loop decisions`. That makes `switch_client`'s `False` a **joint claim**:
   no switch happened _and_ the client is still here. A move you cannot _vouch_

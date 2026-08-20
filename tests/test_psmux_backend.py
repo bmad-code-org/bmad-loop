@@ -1898,3 +1898,69 @@ def test_psmux_switch_without_fallback_does_not_attempt_it(monkeypatch):
     calls = _client_fake(monkeypatch, attached=["1", "1", "1"], verb_rc=1)
     assert PsmuxMultiplexer().switch_client("ctl:%9") is False
     assert not any(c[1:3] == ["switch-client", "-l"] for c in calls)
+
+
+def test_psmux_switch_failed_rc_on_an_empty_session_cannot_vouch(monkeypatch):
+    """The rc-nonzero twin of the gate above, and the row the tmux leaf was just
+    fixed for: `switch-client -t` refusing while nothing is attached here. The
+    refusal proves no switch happened — the first half of the seam's False — but
+    an empty session refutes the second half rather than supporting it, so the
+    joint claim is not available and the answer is None.
+
+    Scripted past the gate though no fallback is expected, so dropping the gate
+    fails this on its assertion rather than on the counts running dry."""
+    calls = _client_fake(monkeypatch, attached=["0", "0", "0"], verb_rc=1)
+    assert PsmuxMultiplexer().switch_client("ctl:%9") is None
+    assert ["psmux", "switch-client", "-t", "ctl:%9"] in calls
+
+
+def test_psmux_switch_failed_rc_with_an_unreadable_count_cannot_vouch(monkeypatch):
+    """The gate's other half, pinned separately: a count that cannot be read at
+    all. `verb_rc=1` is what separates this from the rc-0 arm's None — the two
+    branches answer alike but are reached through opposite exit codes, so a
+    fixture that left the rc at 0 would grade the wrong gate."""
+    calls = _client_fake(monkeypatch, attached=["#{session_attached}"] * 3, verb_rc=1)
+    assert PsmuxMultiplexer().switch_client("ctl:%9") is None
+    assert ["psmux", "switch-client", "-t", "ctl:%9"] in calls
+
+
+def test_psmux_switch_transport_fault_on_an_empty_session_cannot_vouch(monkeypatch):
+    """A spawn-level fault proves the verb never ran, which is why its sibling
+    (a client measurably here) stays False. It says nothing about whether anyone
+    is at this terminal, and that half is already in hand: the gate count is read
+    BEFORE the verb, so this leaf can answer it on the fault exit too, where a
+    probe taken afterwards would only be measuring the broken transport."""
+    _client_fake(monkeypatch, attached=["0", "0", "0"])
+    probing = tmux_base.subprocess.run
+
+    def boom(argv, **kwargs):
+        if argv[1:3] == ["switch-client", "-t"]:
+            raise OSError("psmux vanished mid-call")
+        return probing(argv, **kwargs)
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", boom)
+    assert PsmuxMultiplexer().switch_client("ctl:%9") is None
+
+
+def test_psmux_switch_fallback_transport_fault_on_an_empty_session_cannot_vouch(monkeypatch):
+    """The same rule one level down. `_client_left`'s fault exit answered False
+    without consulting the count it had already taken, which its own docstring
+    forbids — None when the session had nobody on it to begin with — and the
+    fallback leg is the path that carried it back to the seam.
+
+    The dispatch is recorded inside the fault, not read off `calls`: the raise
+    pre-empts the fixture, so "the fallback faulted" and "the fallback was never
+    reached" would otherwise assert the same."""
+    _client_fake(monkeypatch, attached=["0", "0", "0"], verb_rc=1)
+    probing = tmux_base.subprocess.run
+    dispatched: list[list[str]] = []
+
+    def boom(argv, **kwargs):
+        if argv[1:3] == ["switch-client", "-l"]:
+            dispatched.append(list(argv))
+            raise OSError("psmux vanished mid-call")
+        return probing(argv, **kwargs)
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", boom)
+    assert PsmuxMultiplexer().switch_client("ctl:%9", last_fallback=True) is None
+    assert dispatched == [["psmux", "switch-client", "-l"]]

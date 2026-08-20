@@ -885,7 +885,14 @@ class PsmuxMultiplexer(BaseTmuxBackend):
             # drop can be established in either direction.
             return None
         except (subprocess.SubprocessError, OSError):
-            # A spawn-level fault is proof the verb never ran.
+            # A spawn-level fault is proof the verb never ran — but "nothing
+            # moved" is only the first half of the seam's False, and the count
+            # read before the verb still governs the second. An empty or
+            # unreadable session leaves it unvouched here exactly as it does
+            # past the verb, which is what this function's own docstring
+            # promises; probing again now would only measure a broken transport.
+            if before is None or before == 0:
+                return None
             return False
         after = self._attached_clients(session)
         if before is None or after is None:
@@ -960,7 +967,18 @@ class PsmuxMultiplexer(BaseTmuxBackend):
             if before is None or before == 0:
                 return None
             return True
-        return self._client_left(["switch-client", "-l"]) if last_fallback else False
+        if last_fallback:
+            return self._client_left(["switch-client", "-l"])
+        # The refusal carries the joint claim only if a client was measurably
+        # here to refuse on. Same gate as the rc-0 arm, for the same reason: an
+        # unreadable count and an empty session each leave the "still here" half
+        # unvouched, and which way the rc went does not touch that half. tmux
+        # reaches this by probing AFTER a failed verb; the pre-verb read is what
+        # lets this leaf answer it on the spawn-fault exit too, where a probe
+        # taken now would be measuring an already-broken transport.
+        if before is None or before == 0:
+            return None
+        return False
 
     def pipe_pane(self, window_id: str, log_file: Path) -> None:
         # The base's POSIX `cat >>` sink assumes a POSIX host shell, so the sink
