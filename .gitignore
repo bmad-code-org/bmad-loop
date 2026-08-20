@@ -8,6 +8,7 @@ __pycache__/
 .bmad-loop/archive/
 .claude/
 .agents/
+.config/
 build/
 dist/
 _bmad/
