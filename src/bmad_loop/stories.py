@@ -30,7 +30,6 @@ import yaml
 
 from . import deferredwork
 from .frontmatter import read_frontmatter, status_of
-from .platform_util import resolve_or_lexical
 
 # Fixed-name discovery, like SPEC.md / .memlog.md — never listed in companions.
 STORIES_FILENAME = "stories.yaml"
@@ -476,15 +475,19 @@ def relativize_spec_folder(project: Path, spec_folder: str) -> str:
 
     An absolute path inside the project tree is rebased to the project root;
     anything else is kept verbatim (the contract allows an absolute spec folder,
-    though we never author one). The one place this lives so the engine's real
-    dispatch and the CLI dry-run render the identical folder string."""
+    though we never author one) — including an in-tree one on a host that cannot
+    canonicalize either side, whose location is not knowable here. The one place
+    this lives so the engine's real dispatch and the CLI dry-run render the
+    identical folder string."""
     raw = Path(spec_folder)
-    if raw.is_absolute():
-        try:
-            return resolve_or_lexical(raw).relative_to(resolve_or_lexical(project)).as_posix()
-        except ValueError:
-            return raw.as_posix()  # outside the project tree — leave absolute
-    return raw.as_posix()
+    if not raw.is_absolute():
+        return raw.as_posix()
+    try:
+        return raw.resolve().relative_to(project.resolve()).as_posix()
+    except (OSError, RuntimeError, ValueError):
+        # Outside the project tree, or a host that cannot canonicalize either side
+        # (#552/#560) — an uncertain location must not be rebased.
+        return raw.as_posix()
 
 
 def is_plan_halt_leg(spec_checkpoint: bool, state: StoryState) -> bool:

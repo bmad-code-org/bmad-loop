@@ -237,8 +237,9 @@ breaking changes may land in a minor release.
   UNC provider, `WinError 64`; a symlink loop on the 3.11/3.12 floor) fell through to a generic,
   unscoped error instead of the specific one the rest of the function reports. The restore-patch
   path now returns the same rejected-latch shape as its sibling checks; the spec-folder path
-  degrades to the shared lexical fallback like every other `platform_util.resolve_or_lexical`
-  consumer.
+  widens its own handler to the `(OSError, RuntimeError, ValueError)` house guard and keeps the
+  path verbatim, the answer `verify._stories_relpaths` already gives for the same folder — a
+  location the host cannot canonicalize must not be rebased onto the project root.
 
 - **Attempt-owned spec-only retries no longer demand a false manual rollback (#123).** A
   bound plain attempt whose only residue is its lifecycle flip is restored to its pre-attempt
