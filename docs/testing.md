@@ -286,8 +286,10 @@ Deliberate absences — decisions, not gaps:
   suite at 10× the queue time.
 - **No opencode install in CI** — so `test_opencode_live.py` is the last manual gate (table
   above), and faking the server would test the fake. psmux is the counter-example rather than
-  the precedent: it is one Chocolatey package, so **test-windows** installs it and runs that
-  gate on every PR and every push to `main`/`release/*` (#662).
+  the precedent: it is one zip on a GitHub release, so **test-windows** installs it and runs
+  that gate on every PR and every push to `main`/`release/*` (#662). Chocolatey was tried
+  first and dropped — its community feed 503'd on both matrix legs, and Chocolatey document
+  it as unguaranteed and rate-limited per IP, which hosted runners share.
 
 ## TUI testing
 

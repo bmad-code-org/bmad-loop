@@ -65,7 +65,7 @@ breaking changes may land in a minor release.
 ### Changed
 
 - **The psmux live gate now runs in CI instead of before releases (#662).** The `test-windows`
-  job installs psmux from Chocolatey, so `tests/test_psmux_live.py` — prune isolation, the
+  job installs psmux from its GitHub release, so `tests/test_psmux_live.py` — prune isolation, the
   workaround premise probes, the 3.3.8-floor adoption probes — runs on every pull request
   and on pushes to `main`/`release/*`, rather than on a maintainer's Windows box at release
   time. It runs as its own serial step: real psmux servers are a single-machine resource,

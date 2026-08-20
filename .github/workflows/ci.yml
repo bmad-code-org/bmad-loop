@@ -125,17 +125,43 @@ jobs:
 
       - name: Ensure psmux (for the live multiplexer gate)
         # Bounded, for the reason the Linux `Ensure tmux` step above documents at
-        # length: an unbounded package install wedged that job for 14 minutes with
-        # no exit status for `|| true` to discard. Chocolatey's own timeout bounds
-        # the install; the step timeout bounds everything else it might do.
+        # length: an unbounded fetch wedged that job for 14 minutes with no exit
+        # status for `|| true` to discard. Here the retries are bounded by
+        # Invoke-WebRequest and everything else by the step timeout.
         timeout-minutes: 6
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         # After `Install the project`, because the assertion below runs `uv run`.
         # What this buys: the 9 tests of the serial gate step below, measured at
         # 46-68s on a dev box. Sized against this job's 20-minute cap and its
         # ~316s mean, so the headroom still holds.
         run: |
-          choco install psmux -y --no-progress --execution-timeout=300
+          $ErrorActionPreference = 'Stop'
+          # The release archive, not `choco install`. Chocolatey's community feed
+          # answered the V2 package lookup with 503 on BOTH matrix legs of this
+          # job's first run, while the package itself sat published and healthy.
+          # Chocolatey document that feed as neither supported nor guaranteed and
+          # rate-limited per IP behind Cloudflare, and hosted runners share egress
+          # addresses — other projects track the same feed-503 flake. This is one
+          # GET against the host the job already depends on.
+          #
+          # `releases/latest`, not a pinned tag: the floor assertion below stays
+          # the only version gate, so a psmux release needs no edit here.
+          $url = gh api repos/psmux/psmux/releases/latest --jq '.assets[] | select(.name | endswith("windows-x64.zip")) | .browser_download_url'
+          if (-not $url) { throw 'no windows-x64 asset on the latest psmux release' }
+          $zip = Join-Path $env:RUNNER_TEMP 'psmux.zip'
+          $dir = Join-Path $env:RUNNER_TEMP 'psmux'
+          Invoke-WebRequest -Uri $url -OutFile $zip -MaximumRetryCount 3 -RetryIntervalSec 5
+          Expand-Archive -LiteralPath $zip -DestinationPath $dir -Force
+          $exe = Get-ChildItem -Path $dir -Recurse -Filter psmux.exe | Select-Object -First 1
+          if (-not $exe) { throw "no psmux.exe in $url" }
+          # The archive ships tmux.exe beside psmux.exe, which looks alarming on a
+          # PATH but is inert: test_generic_tmux's HAVE_TMUX gates on
+          # `sys.platform != "win32"` before it ever looks for the binary.
+          # PATH for this step, GITHUB_PATH for `Run tests` and the gate step.
+          $env:PATH = "$($exe.Directory.FullName);$env:PATH"
+          Add-Content -Path $env:GITHUB_PATH -Value $exe.Directory.FullName
           psmux -V
           # `psmux -V` is not the assertion. test_psmux_live.py skips itself on
           # PsmuxMultiplexer.available(), so an install at or below the version
