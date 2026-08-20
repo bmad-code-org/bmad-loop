@@ -112,11 +112,17 @@ seams of a full OS port are in
   only a manual chord releases its client) answers `False`. If your CLI's exit
   code already means "a client moved" you are done (tmux: `detach-client` fails
   with _no current client_); if it does not, **measure** what the verb is meant
-  to change — psmux counts the session's attached clients across the call and
-  answers on the drop — and record what the measure cannot see in your
-  degradation ledger (psmux's `Residue:` note: a switch _within_ one session
-  moves no client count, so it reads as no effect). Where no measure is
-  available, answer `False` and record that gap in the ledger too.
+  to change — psmux counts the session's attached clients across `detach_client`
+  and the last-client fallback, and answers on the drop — and record what the
+  measure cannot see in your degradation ledger. Where no measure is available,
+  answer `False` and record that gap in the ledger too. Check the ledger against
+  every verb before you trust one measure for all of them: psmux's drop is blind
+  to a `switch_client` whose target sits in the same session, which is the common
+  case for the return path, so that verb gates on the client count read _before_
+  the call and takes the exit code as the verdict instead (#659). A fallback verb
+  belongs to the same audit — hang it on the primary verb's failure, never on
+  "the primary could not be vouched for", or a hand-back that worked gets undone
+  by its own fallback and the undo is read as the success.
   `tui.launch.return_attached_client` reads a failed `switch_client` as
   `ATTENDED` — the client never left this window, so an attended sweep keeps
   prompting — and a failed `detach_client` as `UNREACHABLE`, which is evidence of

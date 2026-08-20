@@ -343,8 +343,8 @@ def test_premise_client_verbs_exit_zero_with_no_client_to_move(probe):
     # when pytest itself runs inside psmux, so it is deliberately unobservable.
     proc = mux._run(["switch-client", "-t", windows[0]], check=False, env=clientless)
     assert proc.returncode == 0, (
-        "psmux now reports effect rather than dispatch for switch-client — the "
-        "#{session_attached} delta in _client_left can go back to trusting rc"
+        "psmux now reports effect rather than dispatch for switch-client -t — the "
+        "attached-count gate in switch_client is droppable and rc alone can answer"
     )
 
 
@@ -455,6 +455,33 @@ def test_adopted_select_window_focuses_a_qualified_window_id(probe):
     assert _active_window(mux, session) == windows[0], (
         "psmux no longer focuses `select-window -t session:@N` — the override "
         "dropped on the 3.3.8 floor (psmux/psmux#497) is needed again"
+    )
+
+
+def test_adopted_switch_client_rejects_an_unresolvable_target(probe):
+    mux, session, _ = probe
+    # The half of switch_client's verdict that needs no attached client: rc is
+    # honest in the FAILURE direction, which is what lets the `-t` leg read it at
+    # all — and what its `-l` fallback hangs on. Green with zero clients here and
+    # green in the premise probe above (rc 0 with nothing to move) are what bound
+    # rc between them — neither alone would justify trusting it (#659).
+    #
+    # Same scrub as that premise probe, and the same reason: pytest may itself be
+    # running inside psmux, and a raw client verb issued with an inherited $TMUX
+    # addresses the developer's server. Here it would also decide the rc — a
+    # target unresolvable on THAT server proves nothing about this one.
+    clientless = {
+        key: value for key, value in os.environ.items() if key not in ("TMUX", "TMUX_PANE")
+    }
+    # `=session:%N` is what current_return_target composes and switch_client is
+    # handed, so probe that grammar rather than the bare one (psmux strips the
+    # leading `=`, but the rc under test belongs to the argv production emits).
+    target = mux.target(session, "%9999")
+    proc = mux._run(["switch-client", "-t", target], check=False, env=clientless)
+    assert proc.returncode != 0, (
+        "psmux now exits 0 for a switch-client target that cannot resolve — rc no "
+        "longer separates a failed switch from a real one, so switch_client's "
+        "verdict and its `-l` fallback both lose their source"
     )
 
 

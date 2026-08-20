@@ -27,9 +27,11 @@ still has to read back verbatim through the same listing parse, so
 ``set_session_option`` gates it on the same transportability rule (#320).
 ``detach-client`` and ``switch-client`` report dispatch, not effect: a
 nonzero exit is a real failure, but a zero one says only that the verb was
-sent, so both seam booleans are measured against the session's
-attached-client count instead of read off the exit code; see the ``client
-verbs: observed effect (#317)`` block. ``available()``
+sent, so neither seam boolean can be read off the exit code alone. The
+session's attached-client count supplies what the rc cannot — as a drop
+across ``detach-client`` and ``switch-client -l``, and as a gate on the
+targeted ``switch-client -t``, whose same-session move no drop can see
+(#659); see the ``client verbs: observed effect (#317)`` block. ``available()``
 additionally gates on the reported version — see ``_LAST_UNSUPPORTED``
 for what the floor buys and why it moves. ``has_session``
 is inherited unchanged, but one server per session gives it a residual the
@@ -776,39 +778,57 @@ class PsmuxMultiplexer(BaseTmuxBackend):
 
     # ------------------------------- client verbs: observed effect (#317)
     #
-    # psmux's client verbs report *dispatch*, not effect. The exit code is
-    # trustworthy in ONE direction only: a nonzero one is a real failure (an
-    # unreachable session server, a target that would not parse), but a zero one
-    # says the verb was sent, not that a client moved. ``detach-client`` exits 0
-    # with zero clients attached (and a flag-less detach is promoted server-side
-    # to detach-all); ``switch-client`` carries a server reply for ``-t`` on the
-    # supported build but still exits 0 with nothing to move, and ``-l``, which
-    # has no target form, carries none at all. Taking those exit codes as the
-    # seam's booleans is the rc-0 no-op (#228) reached through Python instead of
-    # a shell fallback, and it is what ``tui.launch.return_attached_client``
-    # would consume to decide a human has been handed their terminal back.
+    # psmux's client verbs report *dispatch*, not effect, and the seam's contract
+    # is effect: an unobservable move must answer False, never a vacuous True.
+    # The exit code is trustworthy in ONE direction for every verb — a nonzero
+    # one is a real failure (an unreachable session server, a target that would
+    # not parse) — so the verdict source is per verb, and there are two of them.
     #
-    # So the exit code is discarded and the effect is measured: count the
-    # clients attached to this session before and after the verb, and answer on
-    # the DELTA. Never on an absolute count — a ``-t`` read against a session
-    # whose server is gone answers from whichever server the fallback picks, so
-    # "zero attached" on its own proves nothing (#315). A drop cannot be
-    # manufactured that way: it needs two successful reads of the same session,
-    # the first of them nonzero.
+    # ``switch-client -t`` reads the exit code, gated on this session having had
+    # a client to move. The gate is what a bare rc cannot supply: the verb still
+    # exits 0 with nothing attached (pinned by
+    # test_premise_client_verbs_exit_zero_with_no_client_to_move), which is the
+    # rc-0 no-op (#228) reached through Python. With a client present the rc is
+    # the whole answer, because the target either resolved server-side and moved
+    # it (psmux/psmux#483) or failed loudly — pinned in the failure direction by
+    # test_adopted_switch_client_rejects_an_unresolvable_target, and measured with
+    # a real attached client only by hand (no CI box has one).
     #
-    # Unobservable answers False, never a vacuous True. For the detach that is
-    # safe in both directions — the caller's UNREACHABLE and RETURNED agree that
-    # nobody is left at this terminal, and the only cost is the parked trailer
-    # re-issuing a detach that no-ops. For the switch it is the conservative
-    # direction: the caller keeps prompting rather than reporting a terminal
-    # handed back that was not. Measuring rather than hardcoding is what lets a
-    # build that really does move the client report so with no change here.
+    # Two costs are taken deliberately here, since both are the kind that go
+    # unnoticed. The gate IS an absolute count, which the delta rule below
+    # forbids for good reason: the same server-fallback that makes "zero
+    # attached" meaningless (#315) can hand back a FOREIGN session's nonzero
+    # count, and a switch that exits 0 for its own reasons would then read as
+    # vouched-for. It is admitted only because the alternative — the delta — is
+    # blind to the same-session move this verb's main caller performs, and the
+    # damage directions are not equal: a wrong True here costs one unverified
+    # hand-back claim, where the delta cost a relocated human. And the rc rule
+    # assumes the admitted floor: psmux/psmux#483 lands in 3.3.8, so on a build
+    # forced past ``available()`` (an explicit backend override) a ``-t`` that
+    # moves nobody still exits 0 and is answered True.
     #
-    # Residue: a switch whose target pane lives in THIS session moves the client
-    # between windows without changing the session's attached count, so it reads
-    # as no effect. Reachable only when the return target was recorded from
-    # inside a control-session window; the caller then keeps prompting, which is
-    # the safe direction.
+    # ``switch-client -l`` and ``detach-client`` read the attached-client DELTA:
+    # count the clients on this session before and after, and answer on the drop.
+    # Neither can use rc — ``-l`` has no target form and carries no server reply
+    # at all, and ``detach-client`` exits 0 with zero clients attached (a
+    # flag-less detach is promoted server-side to detach-all). Never an absolute
+    # count: a read against a session whose server is gone answers from whichever
+    # server the fallback picks, so "zero attached" on its own proves nothing
+    # (#315). A drop cannot be manufactured that way — it needs two successful
+    # reads of the same session, the first of them nonzero.
+    #
+    # The delta is why ``-t`` could not stay on it (#659): a switch whose target
+    # lives in THIS session moves the client between windows without changing the
+    # session's count, so a real move read as no effect. That was not merely a
+    # conservative False. With ``last_fallback`` set — which is exactly how
+    # ``tui.launch.return_attached_client`` calls it — the failed verdict fired
+    # ``-l``, which dragged the client out to an unrelated session and produced
+    # the delta the correct move never could, so the call returned True and the
+    # caller cleared its return option. Measured on a live attended client:
+    # right move, undone, reported as success. Which is why the fallback in
+    # switch_client hangs on the rc and not on the verdict — see the comment
+    # there; a verdict-gated fallback keeps that drag alive for every rc-0
+    # switch the gate merely cannot vouch for.
 
     def _attached_clients(self, session: str) -> int | None:
         """Clients attached to ``session``, or None when psmux cannot say.
@@ -849,8 +869,35 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         return self._client_left(["detach-client"])
 
     def switch_client(self, target: str, last_fallback: bool = False) -> bool:
-        if self._client_left(["switch-client", "-t", target]):
-            return True
+        # Two questions, deliberately separate: did the verb SUCCEED (rc), and
+        # was there a client here to succeed on (the gate count, read BEFORE the
+        # verb — a successful move can take the client off this session, so a
+        # read taken after would answer 0 for the very case it has to admit).
+        #
+        # The fallback hangs on the rc alone, never on the verdict. `-l` has no
+        # target form: it relocates whichever client the server last had, so
+        # firing it after a `-t` that already succeeded is the #659 drag itself —
+        # the correct move undone, and the delta the drag produces then read as
+        # success. An rc-0 switch we merely cannot VOUCH for (count unreadable,
+        # or zero clients here) is still a switch that happened or a no-op that
+        # moved nobody; either way there is nothing to fall back to. This is the
+        # `$LASTEXITCODE -ne 0` rule the pwsh trailer (_parked_trailer) has
+        # always used, and the same shape as the tmux leaf's switch_client.
+        session = self.current_session()
+        if not session:
+            # Not inside a pane (or the probe failed): there is no "this
+            # session" to measure against, and no client of ours to move.
+            return False
+        before = self._attached_clients(session)
+        try:
+            sent = self._run(["switch-client", "-t", target], check=False).returncode == 0
+        except (subprocess.SubprocessError, OSError):
+            sent = False
+        if sent:
+            # None is "cannot say", not "zero" — both refuse the claim, but only
+            # the second is evidence, so keep them spelled apart (as _client_left
+            # does) rather than collapsed into a truthiness test.
+            return before is not None and before > 0
         return last_fallback and self._client_left(["switch-client", "-l"])
 
     def pipe_pane(self, window_id: str, log_file: Path) -> None:

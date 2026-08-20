@@ -7,6 +7,20 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Fixed
+
+- **psmux: a hand-back that succeeded no longer reports as failed — or undoes itself
+  (#659).** `switch_client` decided whether a client moved from the session's
+  attached-client count, which a same-session move cannot change: the common return
+  path landed the client correctly, read no change, and answered "failed". With the
+  last-client fallback enabled — how `return_attached_client` always calls it — the
+  failed verdict then fired `switch-client -l`, dragging the operator into an unrelated
+  session, and the drag produced the very count change the correct move could not, so
+  the call reported success and cleared its return option. The `-t` verb now takes its
+  exit code as the verdict, gated on a client having been attached to this session, and
+  the fallback fires only when that verb actually failed. Measured on a live attached
+  client against psmux 3.3.8.
+
 ## [0.11.0] — 2026-08-19
 
 ### Added
