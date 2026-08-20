@@ -9,11 +9,10 @@ breaking changes may land in a minor release.
 
 ### Removed
 
-- **Dropped `verify.same_commit`, which no longer had a caller.** Its last call site went with
-  #645's `_canonical_commit_oid`, which resolves both sides to a canonical full object id and
-  compares them exactly. The helper's prefix-tolerant equality — either argument a prefix of the
-  other once both reach 7 characters — would have handed that looseness back to whichever caller
-  reached for it next.
+- **`verify.same_commit` is gone — nothing called it.** #645's `_canonical_commit_oid` displaced
+  its last call site and compares canonical full object ids exactly. The helper's leftover
+  prefix-tolerant equality — either argument a prefix of the other once both reach 7 characters —
+  would have handed that looseness to whichever caller reached for it next.
 
 ### Fixed
 

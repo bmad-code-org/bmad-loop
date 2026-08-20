@@ -2011,10 +2011,10 @@ def test_verify_dev_bundle_single_char_ref_baseline_is_refused(project):
 def test_verify_dev_bundle_below_floor_abbreviation_is_refused(project):
     """Characterizes the deliberate 7-character floor on the bundle path: an
     abbreviation git itself resolves is still refused when it is shorter than
-    ``_OBJECT_ID``'s floor. That 7 is a constant the gate chooses, not a length
-    git derives (``core.abbrev`` defaults to ``auto``, which scales with
-    repository size and clamps upward to 7 only for small repos, so there is no
-    fixed default to mirror). The stamp is ``git rev-parse HEAD`` output by
+    ``_OBJECT_ID``'s floor. That 7 is the gate's own constant, set where git's
+    auto abbreviation bottoms out (``core.abbrev`` defaults to ``auto``, which
+    scales with repository size and clamps upward to 7 only for small repos, so
+    there is no fixed default to mirror). The stamp is ``git rev-parse HEAD`` output by
     contract, so the floor costs a well-behaved session nothing, and
     accepting shorter claims would re-admit prefix collisions the gate cannot
     distinguish from drift. The refusal is the floor's doing, not an
