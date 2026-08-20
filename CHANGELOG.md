@@ -27,12 +27,13 @@ breaking changes may land in a minor release.
   the return option survives, but the sweep goes unattended instead of blocking a later `--repeat`
   cycle on `input()`. `False` now carries the joint claim its caller always read it as. Out-of-tree
   backends answering a plain bool still work; `detach_client` is unchanged.
-- psmux probes (`current_window_id`, `current_pane_id`, `current_session`,
-  `current_return_target`) now
-  pin `display-message` to the calling pane via `TMUX_PANE`; a target-less probe
-  answered for the server's _active_ window, so a caller in a non-active window could
-  prune its own window or record another window's return target (#669). With `TMUX`
-  set but `TMUX_PANE` unset the probe returns `None` instead of running unpinned.
+- **A psmux probe now answers for the calling pane, not the focused window (#669).** A target-less
+  `display-message -p` resolves the server's _active_ window, so `current_window_id`,
+  `current_pane_id`, `current_session` and `current_return_target` answered for a foreign window
+  whenever the caller's own window was not the focused one — the ctl prune could kill the window it
+  was running in, and the attach return could record a pane the human never came from. The probes
+  now pin to the calling pane via `TMUX_PANE`, and answer `None` without spawning when that value
+  is absent or not pane-shaped.
 
 ## [0.11.0] — 2026-08-19
 
