@@ -122,7 +122,17 @@ def test_attempt_dirty_tracked_change(project):
 
 
 def test_file_bytes_at_revision_distinguishes_blob_absence_tree_and_git_failure(project):
-    """The baseline oracle returns only proven blob bytes, never tree listings."""
+    """The baseline oracle returns only proven blob bytes, never tree listings.
+
+    Ablation: drop either side of ``entry is None or entry[1] != "blob"`` from
+    either oracle — four mutations, each reddening exactly one of the four ``is
+    None`` assertions. The absence side raises ``TypeError`` on the ``missing.bin``
+    case; the type side reddens the ``oracle`` case, and only there do the two
+    oracles differ. Plain ``cat-file blob`` is refused by git on a tree oid, so
+    that mutation still fails loudly; ``cat-file --filters`` instead renders the
+    tree's listing and hands it back as file content, which nothing but this
+    clause keeps out of a baseline comparison.
+    """
     repo = project.project
     nested = repo / "oracle" / "spec.bin"
     nested.parent.mkdir()
