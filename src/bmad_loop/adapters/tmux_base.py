@@ -545,18 +545,48 @@ class BaseTmuxBackend(TerminalMultiplexer):
             return False
         return proc.returncode == 0
 
-    def switch_client(self, target: str, last_fallback: bool = False) -> bool:
-        # Returns True iff a switch happened; a transport failure didn't switch, so
-        # the documented False sentinel is the honest answer.
+    def _attached_here(self) -> int | None:
+        """Clients attached to this process's session, or None when tmux cannot
+        say. Only :meth:`switch_client`'s failure path needs it, so it is read
+        after the verb — nothing moved on that path, and the success path pays
+        no probe at all."""
+        text = self._display_message("#{session_attached}")
+        return int(text) if text is not None and text.isdigit() else None
+
+    def switch_client(self, target: str, last_fallback: bool = False) -> bool | None:
+        # rc 0 is a real move and needs no gate: tmux runs one server, and it
+        # refuses rather than no-ops when there is nobody to move.
+        #
+        # A nonzero rc is where the exit code stops being the whole answer. It
+        # is TWO facts wearing one code — a target this client cannot reach, and
+        # no client here at all — and only the first is the seam's False.
+        # Measured on tmux 3.7c from inside a pane whose server had no attached
+        # client: `-t <live session>`, `-t <other session>`, `-l` and `-t
+        # <nonexistent>` ALL exit 1 with "no current client". So a bare rc would
+        # answer False — "no switch, and the client is still here" — for the one
+        # state where there is no client here at all, which is #659's hazard on
+        # the default backend. The attached count is what separates them, the
+        # same gate the psmux leaf applies to its own rc.
+        #
+        # A TIMEOUT is neither: the server may have completed the switch before
+        # the wait expired, so False would report a human still watching a
+        # window the client has already left. A spawn-level fault IS the joint
+        # claim — proof the verb never ran, so nothing moved.
         try:
             proc = self._run(["switch-client", "-t", target], check=False)
             if proc.returncode == 0:
                 return True
-            if last_fallback:
-                fb = self._run(["switch-client", "-l"], check=False)
-                return fb.returncode == 0
+            if last_fallback and self._run(["switch-client", "-l"], check=False).returncode == 0:
+                return True
+        except subprocess.TimeoutExpired:
+            return None
         except (subprocess.SubprocessError, OSError):
             return False
+        attached = self._attached_here()
+        if attached is None or attached == 0:
+            # Unreadable and zero part company as facts and meet as verdicts:
+            # neither can vouch that a human is still in front of this window.
+            return None
         return False
 
     def available(self) -> bool:

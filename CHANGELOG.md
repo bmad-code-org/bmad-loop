@@ -9,6 +9,24 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **psmux: a hand-back that succeeded no longer reports as failed — or undoes itself (#659).**
+  `switch_client` read its verdict off the session's attached-client count, which a same-session
+  move cannot change — and same-session is the common shape for the return path, so a correct
+  hand-back answered "failed". With the last-client fallback enabled (how
+  `return_attached_client` always calls it) that verdict then fired `switch-client -l`, relocating
+  the operator to an unrelated session; the relocation supplied the count change the correct move
+  could not, so the call reported success and cleared its return option. The `-t` verb now takes
+  its exit code as the verdict, gated on a client having been attached, and the fallback fires
+  only when that verb failed.
+- **A sweep whose client has dropped no longer keeps prompting the empty window (#659).** On tmux,
+  `switch-client` spends one nonzero exit on both "that target is unreachable" and "there is no
+  client here at all", so a failed hand-back read as "the human is still in front of me" either
+  way; the session's attached-client count now separates them. `TerminalMultiplexer.switch_client`
+  answers a third value, `None`, for any move it cannot vouch for — that state, a timed-out verb,
+  and on psmux an unreadable gate count — which `return_attached_client` routes to `UNREACHABLE`:
+  the return option survives, but the sweep goes unattended instead of blocking a later `--repeat`
+  cycle on `input()`. `False` now carries the joint claim its caller always read it as. Out-of-tree
+  backends answering a plain bool still work; `detach_client` is unchanged.
 - psmux probes (`current_window_id`, `current_pane_id`, `current_session`,
   `current_return_target`) now
   pin `display-message` to the calling pane via `TMUX_PANE`; a target-less probe
@@ -75,6 +93,16 @@ breaking changes may land in a minor release.
   unchanged.
 
 ### Changed
+
+- **The psmux live gate now runs in CI instead of before releases (#662).** The `test-windows`
+  job installs psmux from its GitHub release, so `tests/test_psmux_live.py` — prune isolation, the
+  workaround premise probes, the 3.3.8-floor adoption probes — runs on every pull request
+  and on pushes to `main`/`release/*`, rather than on a maintainer's Windows box at release
+  time. It runs as its own serial step: real psmux servers are a single-machine resource,
+  and the gate flaked when interleaved with the parallel run. The step asserts
+  `PsmuxMultiplexer.available()`, not just that the binary resolves: the gate skips itself on
+  an unadmitted version, which would otherwise read green. `test_opencode_live.py` remains the
+  one manual gate.
 
 - **The psmux backend now requires psmux 3.3.8 or newer (#658, closes #222).** `available()`
   refuses 3.3.7 and below, so **on such a host the backend reports unavailable and selection

@@ -88,7 +88,8 @@ jobs:
         run: uv run pytest -q -n logical --durations=15
 
   test-windows:
-    # Real-Windows runner for the deterministic suite (live psmux e2e stays a manual gate).
+    # Real-Windows runner for the deterministic suite plus the live psmux gate,
+    # which this job installs psmux for and runs in its own serial step.
     name: test (windows, py${{ matrix.python-version }})
     runs-on: windows-latest
     # 20, not the 15 the Linux test job uses: the slowest pre-lever Windows run
@@ -122,6 +123,56 @@ jobs:
       - name: Install the project
         run: uv sync --locked --all-extras
 
+      - name: Ensure psmux (for the live multiplexer gate)
+        # Bounded, for the reason the Linux `Ensure tmux` step above documents at
+        # length: an unbounded fetch wedged that job for 14 minutes with no exit
+        # status for `|| true` to discard. Here the retries are bounded by
+        # Invoke-WebRequest and everything else by the step timeout.
+        timeout-minutes: 6
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # After `Install the project`, because the assertion below runs `uv run`.
+        # What this buys: the 9 tests of the serial gate step below, measured on
+        # this runner at 9.6s (py3.11) and 12.4s (py3.14) against the job's
+        # 20-minute cap. A dev box took 46-68s for the same nine — the runner is
+        # the faster of the two, so the cap is sized off the slower number.
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # The release archive, not `choco install`. Chocolatey's community feed
+          # answered the V2 package lookup with 503 on BOTH matrix legs of this
+          # job's first run, while the package itself sat published and healthy.
+          # Chocolatey document that feed as neither supported nor guaranteed and
+          # rate-limited per IP behind Cloudflare, and hosted runners share egress
+          # addresses — other projects track the same feed-503 flake. This is one
+          # GET against the host the job already depends on.
+          #
+          # `releases/latest`, not a pinned tag: the floor assertion below stays
+          # the only version gate, so a psmux release needs no edit here.
+          $url = gh api repos/psmux/psmux/releases/latest --jq '.assets[] | select(.name | endswith("windows-x64.zip")) | .browser_download_url'
+          if (-not $url) { throw 'no windows-x64 asset on the latest psmux release' }
+          $zip = Join-Path $env:RUNNER_TEMP 'psmux.zip'
+          $dir = Join-Path $env:RUNNER_TEMP 'psmux'
+          Invoke-WebRequest -Uri $url -OutFile $zip -MaximumRetryCount 3 -RetryIntervalSec 5
+          Expand-Archive -LiteralPath $zip -DestinationPath $dir -Force
+          $exe = Get-ChildItem -Path $dir -Recurse -Filter psmux.exe | Select-Object -First 1
+          if (-not $exe) { throw "no psmux.exe in $url" }
+          # The archive ships tmux.exe beside psmux.exe, which looks alarming on a
+          # PATH but is inert: test_generic_tmux's HAVE_TMUX gates on
+          # `sys.platform != "win32"` before it ever looks for the binary.
+          # PATH for this step, GITHUB_PATH for `Run tests` and the gate step.
+          $env:PATH = "$($exe.Directory.FullName);$env:PATH"
+          Add-Content -Path $env:GITHUB_PATH -Value $exe.Directory.FullName
+          psmux -V
+          # `psmux -V` is not the assertion. test_psmux_live.py skips itself on
+          # PsmuxMultiplexer.available(), so an install at or below the version
+          # floor would leave this job green with the entire live gate never run
+          # — the one failure a "did it install?" check cannot see. Calling
+          # available() also keeps the floor in a single place (it reads
+          # `_LAST_UNSUPPORTED`, so a floor bump needs no edit here) and covers
+          # `pwsh`, which every parked window needs.
+          uv run python -c "import sys; from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer as M; m = M(); sys.exit(0 if m.available() else f'psmux is not an admitted version: {m.version()!r}')"
+
       - name: Run tests
         # pytest roots `tmp_path` at `tempfile.gettempdir()`, which follows
         # TMP/TEMP on Windows. Measured on the windows-2025 image (2026-08-14):
@@ -133,7 +184,23 @@ jobs:
         env:
           TMP: ${{ runner.temp }}
           TEMP: ${{ runner.temp }}
-        run: uv run pytest -q -n logical --durations=15
+        run: uv run pytest -q -n logical --durations=15 --ignore=tests/test_psmux_live.py
+
+      - name: Run the live psmux gate
+        # Serial, and deliberately out of the parallel run above: these nine
+        # tests drive real psmux servers, which are a single-machine resource
+        # rather than per-worker state. Interleaved with the other ~2800 tests
+        # under `-n logical`, the window mint in the prune test came back empty
+        # on a dev box and failed the degraded-mint assertion; the registry
+        # isolation that lands with this step fixes that test's own asymmetry,
+        # and running the gate off the shared workers keeps the whole module
+        # from contending for the machine in the first place. A flake here
+        # cannot be retried away — this repo has no retry mechanism by policy.
+        # Cost: 9.6-12.4s measured here, 46-68s on a dev box.
+        env:
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+        run: uv run pytest -q tests/test_psmux_live.py --durations=15
 
   version-sync:
     name: version-sync

@@ -1643,13 +1643,20 @@ def test_ctl_prune_scan_discriminates_projects_end_to_end(monkeypatch, tmp_path)
 # ---------------------------------------- client verbs: observed effect (#317)
 
 
-def _client_fake(monkeypatch, *, attached, session="ctl", verb_rc=0):
+def _client_fake(monkeypatch, *, attached, session="ctl", verb_rc=0, drains_on_switch=False):
     """Script the two probes the client verbs measure with.
 
     ``attached`` is the successive answers to ``#{session_attached}``, consumed
-    in call order — so a detach that worked is ["1", "0"] and psmux's rc-0 no-op
-    is ["1", "1"]. Every verb exits ``verb_rc`` (0 by default: on psmux the exit
-    code says nothing, which is the whole point).
+    in call order. The delta verbs (``-l``, ``detach-client``) take two each — a
+    detach that worked is ["1", "0"] and psmux's rc-0 no-op is ["1", "1"] — while
+    ``switch-client -t`` takes ONE, the gate count read before it. Every verb
+    exits ``verb_rc`` (0 by default), which only the ``-t`` leg reads.
+
+    ``drains_on_switch`` makes the count answer ``"0"`` from the moment a
+    ``switch-client`` has been seen, i.e. the session empties BECAUSE the verb
+    ran — the one input that tells a gate read taken before the verb apart from
+    one taken after it. Without it that ordering is unobservable here, since
+    either position consumes the same single scripted answer.
     """
     monkeypatch.setenv("TMUX", "/tmp/psmux-1000/default,123,0")  # inside a pane
     monkeypatch.setenv("TMUX_PANE", "%9")  # the pane the probes pin to (gh-669)
@@ -1661,7 +1668,9 @@ def _client_fake(monkeypatch, *, attached, session="ctl", verb_rc=0):
         if argv[1] == "display-message" and argv[-1] == "#{session_name}":
             return subprocess.CompletedProcess(argv, 0, stdout=f"{session}\n", stderr="")
         if argv[1] == "display-message" and argv[-1] == "#{session_attached}":
-            return subprocess.CompletedProcess(argv, 0, stdout=f"{counts.pop(0)}\n", stderr="")
+            drained = drains_on_switch and any(c[1] == "switch-client" for c in calls[:-1])
+            answer = "0" if drained else counts.pop(0)
+            return subprocess.CompletedProcess(argv, 0, stdout=f"{answer}\n", stderr="")
         return subprocess.CompletedProcess(argv, verb_rc, stdout="", stderr="")
 
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
@@ -1704,38 +1713,315 @@ def test_psmux_detach_outside_a_pane_is_false(monkeypatch):
     assert not any(c[1] == "detach-client" for c in calls)
 
 
-def test_psmux_switch_reports_the_drop(monkeypatch):
-    # `last_fallback=True` is what gives the last assertion teeth: with the
-    # default False the `-l` leg is unreachable by construction, so "no fallback
-    # when -t moved it" would hold even with the early return gone. Counts for
-    # two probes for the same reason — a second one must reach the assertion
-    # rather than run the fixture dry.
-    calls = _client_fake(monkeypatch, attached=["1", "0", "1", "0"])
+def test_psmux_switch_reports_a_same_session_move(monkeypatch):
+    """The regression the delta could not see (#659): the target pane lives in
+    THIS session, so the client moves between windows and the attached count
+    never changes. rc plus "there was a client here" is what answers True — and
+    the `-l` leg must stay unreached, since on a live client it drags that human
+    out to whatever session psmux last had, and reports THAT as the success.
+
+    `last_fallback=True` is what gives the last assertion teeth: with the
+    default False the `-l` leg is unreachable by construction. The counts are
+    scripted well past what either leg can consume for the same reason — put
+    the verdict back on the delta and this must fail on its own assertions, not
+    on a fixture running dry.
+    """
+    calls = _client_fake(monkeypatch, attached=["1"] * 6)
     assert PsmuxMultiplexer().switch_client("ctl:%9", last_fallback=True) is True
     assert ["psmux", "switch-client", "-t", "ctl:%9"] in calls
-    # no fallback when -t moved it
+    assert not any(c[1:3] == ["switch-client", "-l"] for c in calls)
+
+
+def test_psmux_switch_reports_a_cross_session_move(monkeypatch):
+    """The move empties this session, and the gate still admits it: the count is
+    read BEFORE the verb. `drains_on_switch` is what makes that ordering an
+    observable input — take the read after the switch and the emptied session
+    answers 0, refusing the very hand-back that just succeeded."""
+    calls = _client_fake(monkeypatch, attached=["1"] * 4, drains_on_switch=True)
+    assert PsmuxMultiplexer().switch_client("ctl:%9", last_fallback=True) is True
+    assert ["psmux", "switch-client", "-t", "ctl:%9"] in calls
+    assert not any(c[1:3] == ["switch-client", "-l"] for c in calls)
+    # One gate read, routed at this session — the #315-safe shape the detach
+    # tests pin for the delta legs, and the arity a re-added `after` read breaks.
+    assert calls.count(["psmux", "display-message", "-p", "-t", "ctl", "#{session_attached}"]) == 1
+
+
+def test_psmux_switch_with_nothing_attached_cannot_vouch(monkeypatch):
+    """psmux's switch-client exits 0 with no client to move, so rc alone would be
+    the vacuous True the seam forbids; the gate count refuses it. The verb is
+    still dispatched — the refusal is a verdict, not a skip — but the `-l`
+    fallback must NOT be: it has no target form, so with nobody attached here it
+    can only relocate a stranger's client.
+
+    None, not False: False is the joint claim that the client is still in this
+    window, and a session with nothing attached is the case that flatly refutes
+    its second half. Answering False routes the caller to ATTENDED and leaves a
+    --repeat sweep prompting a window nobody is viewing."""
+    calls = _client_fake(monkeypatch, attached=["0"] * 4)
+    assert PsmuxMultiplexer().switch_client("ctl:%9", last_fallback=True) is None
+    assert ["psmux", "switch-client", "-t", "ctl:%9"] in calls
+    assert not any(c[1:3] == ["switch-client", "-l"] for c in calls)
+
+
+def test_psmux_switch_does_not_fall_back_after_a_switch_that_succeeded(monkeypatch):
+    """The #659 drag, in the window the gate cannot vouch for: the count is
+    unreadable (any transient probe failure, not just an old build) while the
+    verb exits 0 and, on a supported build, really moved the client. Hanging the
+    fallback on the verdict rather than the rc fires `-l` here — undoing a
+    correct move and, worse, manufacturing the delta that reports it as success.
+
+    And the verdict itself is None: on a supported build the client really did
+    move, so the one thing this exit must not tell the caller is that a human is
+    still sitting in front of this window."""
+    calls = _client_fake(monkeypatch, attached=["#{session_attached}", "1", "0"])
+    assert PsmuxMultiplexer().switch_client("ctl:%9", last_fallback=True) is None
+    assert ["psmux", "switch-client", "-t", "ctl:%9"] in calls
     assert not any(c[1:3] == ["switch-client", "-l"] for c in calls)
 
 
 def test_psmux_switch_falls_back_then_reports_the_drop(monkeypatch):
-    calls = _client_fake(monkeypatch, attached=["1", "1", "1", "0"])
+    """A target that would not parse or no longer exists exits nonzero — the one
+    direction psmux's exit code was always honest in — so the `-l` leg runs and
+    answers on its own delta."""
+    calls = _client_fake(monkeypatch, attached=["1", "1", "0"], verb_rc=1)
     assert PsmuxMultiplexer().switch_client("ctl:%9", last_fallback=True) is True
     assert ["psmux", "switch-client", "-l"] in calls
 
 
-def test_psmux_switch_is_false_while_the_leg_is_inert(monkeypatch):
-    """psmux/psmux#483: the switch moves no client, and every arm still exits 0.
-    Both legs are attempted and both read as no effect, so the caller keeps
-    prompting instead of being told the human was handed their terminal back."""
-    calls = _client_fake(monkeypatch, attached=["1", "1", "1", "1"])
+def test_psmux_switch_is_false_when_both_legs_fail(monkeypatch):
+    calls = _client_fake(monkeypatch, attached=["1", "1", "1"], verb_rc=1)
     assert PsmuxMultiplexer().switch_client("ctl:%9", last_fallback=True) is False
     assert ["psmux", "switch-client", "-t", "ctl:%9"] in calls
     assert ["psmux", "switch-client", "-l"] in calls
 
 
+def test_psmux_switch_never_claims_an_unobservable_move(monkeypatch):
+    """A build with no #{session_attached} to read cannot establish that a client
+    was here, so rc 0 never becomes True — but the verb is dispatched anyway, so
+    the degraded read costs the caller nothing but the claim.
+
+    It costs it the opposite claim too, which is why this is None and not False.
+    An unreadable count does not say WHICH world this is: on a pre-floor build
+    `-t` is inert (psmux/psmux#483) and the client certainly stayed, while a
+    transient probe failure on a supported build means it certainly moved — the
+    case its sibling test pins. One branch, two physical stories, and nothing
+    here can tell them apart. None is the only answer that does not pick one."""
+    calls = _client_fake(monkeypatch, attached=["#{session_attached}"] * 3)
+    assert PsmuxMultiplexer().switch_client("ctl:%9") is None
+    assert ["psmux", "switch-client", "-t", "ctl:%9"] in calls
+
+
+def test_psmux_switch_survives_a_transport_fault(monkeypatch):
+    """A `-t` that cannot be spawned at all moved nobody — the documented False
+    sentinel, never an escalation out of a seam whose callers treat the answer as
+    advisory. The fault is scoped to `-t` on purpose: faulting both legs could
+    not tell "the fallback ran and also faulted" from "it was never reached",
+    and reaching it is the claim here — a fault is a failed switch, so the
+    fallback is exactly as available as it is after a nonzero rc."""
+    calls = _client_fake(monkeypatch, attached=["1", "1", "0"])
+    probing = tmux_base.subprocess.run  # the fixture's scripted probes
+
+    def boom(argv, **kwargs):
+        if argv[1:3] == ["switch-client", "-t"]:
+            raise OSError("psmux vanished mid-call")
+        return probing(argv, **kwargs)
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", boom)
+    assert PsmuxMultiplexer().switch_client("ctl:%9", last_fallback=True) is True
+    assert ["psmux", "switch-client", "-l"] in calls
+
+
+def test_psmux_switch_failed_rc_with_empty_session_still_dispatches_the_fallback(monkeypatch):
+    """The one released `-l` with nobody attached here: a failed `-t` frees the
+    fallback regardless of the gate, and `_client_left` then dispatches it and
+    answers on its own delta. Pinned as the fallback leg's pre-#659 shape —
+    skipping `-l` on an empty session would be a behavior change with its own
+    review, not a side effect of the verdict split.
+
+    0 -> 0 is no drop, but it is not the joint claim either: nobody was here to
+    stay, so the leg answers None and the sweep stops prompting."""
+    calls = _client_fake(monkeypatch, attached=["0", "0", "0"], verb_rc=1)
+    assert PsmuxMultiplexer().switch_client("ctl:%9", last_fallback=True) is None
+    assert ["psmux", "switch-client", "-l"] in calls
+
+
+def test_psmux_switch_timeout_does_not_fall_back(monkeypatch):
+    """A timeout is the absence of an answer, not a failed switch: the server may
+    have moved the client before the wait ran out. Treating it as proven failure
+    fires `-l` at a client that already went where it was asked — the #659 drag,
+    which then manufactures the delta that reports it as a success.
+
+    None is the same refusal one level up: a False would tell the return path
+    the client is still in this window, and the surviving return option is no
+    rescue when the caller answers that by blocking on input() here."""
+    calls = _client_fake(monkeypatch, attached=["1", "1", "0"])
+    probing = tmux_base.subprocess.run
+
+    def stall(argv, **kwargs):
+        if argv[1:3] == ["switch-client", "-t"]:
+            raise subprocess.TimeoutExpired(argv, 30)
+        return probing(argv, **kwargs)
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", stall)
+    assert PsmuxMultiplexer().switch_client("ctl:%9", last_fallback=True) is None
+    assert not any(c[1:3] == ["switch-client", "-l"] for c in calls)
+
+
+def test_psmux_switch_fallback_timeout_cannot_vouch(monkeypatch):
+    """The `-t` leg is not the only one that can relocate a client without
+    saying so. A `-l` whose answer never arrives may have moved the operator
+    anyway, so the delta legs owe the same None — otherwise the walked-away
+    client lands back in the ATTENDED bucket through the one path the #659 fix
+    left measuring.
+
+    The dispatch is recorded inside the stall, not read off `calls`: the raise
+    pre-empts the fixture, and without the record "the fallback timed out" and
+    "the fallback was never reached" would assert the same."""
+    _client_fake(monkeypatch, attached=["1", "1", "1"], verb_rc=1)
+    probing = tmux_base.subprocess.run
+    dispatched: list[list[str]] = []
+
+    def stall(argv, **kwargs):
+        if argv[1:3] == ["switch-client", "-l"]:
+            dispatched.append(list(argv))
+            raise subprocess.TimeoutExpired(argv, 30)
+        return probing(argv, **kwargs)
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", stall)
+    assert PsmuxMultiplexer().switch_client("ctl:%9", last_fallback=True) is None
+    assert dispatched == [["psmux", "switch-client", "-l"]]
+
+
+def test_psmux_switch_fallback_with_an_unreadable_count_cannot_vouch(monkeypatch):
+    """`-l` dispatched, its drop unmeasurable: the verb may have relocated the
+    client, so the leg answers None rather than claiming one stayed. Only the
+    fallback's own pair degrades — the `-t` gate read is scripted readable, so a
+    blanket-unreadable fixture could not tell this from the rc-0 gate's None."""
+    calls = _client_fake(
+        monkeypatch, attached=["1", "#{session_attached}", "#{session_attached}"], verb_rc=1
+    )
+    assert PsmuxMultiplexer().switch_client("ctl:%9", last_fallback=True) is None
+    assert ["psmux", "switch-client", "-l"] in calls
+
+
+def test_psmux_detach_timeout_still_answers_false(monkeypatch):
+    """`_client_left` widened to a tri-state for the switch leg; the detach leg
+    must not widen with it. Its caller already routes a failed detach to
+    UNREACHABLE, so a None here would be a seam state with no consumer — and
+    `detach_client` is typed bool."""
+    _client_fake(monkeypatch, attached=["1", "0"])
+    probing = tmux_base.subprocess.run
+
+    def stall(argv, **kwargs):
+        if argv[1] == "detach-client":
+            raise subprocess.TimeoutExpired(argv, 30)
+        return probing(argv, **kwargs)
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", stall)
+    assert PsmuxMultiplexer().detach_client() is False
+
+
+def test_psmux_switch_transport_fault_without_fallback_is_false(monkeypatch):
+    _client_fake(monkeypatch, attached=["1", "1", "1"])
+    probing = tmux_base.subprocess.run
+
+    def boom(argv, **kwargs):
+        if argv[1:3] == ["switch-client", "-t"]:
+            raise OSError("psmux vanished mid-call")
+        return probing(argv, **kwargs)
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", boom)
+    assert PsmuxMultiplexer().switch_client("ctl:%9") is False
+
+
+def test_psmux_switch_outside_a_pane_is_false(monkeypatch):
+    """No TMUX, so current_session answers None: no session to gate against and
+    no client of ours to move. Answer False without issuing the switch."""
+    calls = _client_fake(monkeypatch, attached=["1", "1"])
+    monkeypatch.delenv("TMUX", raising=False)
+    assert PsmuxMultiplexer().switch_client("ctl:%9", last_fallback=True) is False
+    assert not any(c[1] == "switch-client" for c in calls)
+
+
 def test_psmux_switch_without_fallback_does_not_attempt_it(monkeypatch):
-    # Scripted for two probes though one is expected: dropping the `last_fallback`
-    # conjunct must fail this on its assertion, not on the counts running dry.
-    calls = _client_fake(monkeypatch, attached=["1", "1", "1", "1"])
+    # Scripted past the gate though the fallback is not expected: dropping the
+    # `last_fallback` conjunct must fail this on its assertion, not on the
+    # counts running dry.
+    calls = _client_fake(monkeypatch, attached=["1", "1", "1"], verb_rc=1)
     assert PsmuxMultiplexer().switch_client("ctl:%9") is False
     assert not any(c[1:3] == ["switch-client", "-l"] for c in calls)
+
+
+def test_psmux_switch_failed_rc_on_an_empty_session_cannot_vouch(monkeypatch):
+    """The rc-nonzero twin of the gate above. Read what a nonzero rc means HERE
+    before reading across from tmux: the live gate bounds psmux's exit code from
+    both sides, and it does not divide the way tmux's does. A `-t` with nothing
+    to move exits ZERO on this backend (test_premise_client_verbs_exit_zero_...)
+    — psmux reports dispatch, not effect, which is the whole reason the count
+    gate exists — and rc goes nonzero for a target that cannot RESOLVE
+    (test_adopted_switch_client_rejects_an_unresolvable_target). So this state is
+    a stale target over an empty session, not tmux's "no current client", which
+    psmux never spends this code on.
+
+    That makes it an edge rather than the return path's common shape, and the
+    gate is still owed: the refusal proves no switch happened — the first half of
+    the seam's False — while a measured 0 refutes the second half rather than
+    supporting it, so the joint claim is not available and the answer is None.
+
+    Scripted past the gate though no fallback is expected, so dropping the gate
+    fails this on its assertion rather than on the counts running dry."""
+    calls = _client_fake(monkeypatch, attached=["0", "0", "0"], verb_rc=1)
+    assert PsmuxMultiplexer().switch_client("ctl:%9") is None
+    assert ["psmux", "switch-client", "-t", "ctl:%9"] in calls
+
+
+def test_psmux_switch_failed_rc_with_an_unreadable_count_cannot_vouch(monkeypatch):
+    """The gate's other half, pinned separately: a count that cannot be read at
+    all. `verb_rc=1` is what separates this from the rc-0 arm's None — the two
+    branches answer alike but are reached through opposite exit codes, so a
+    fixture that left the rc at 0 would grade the wrong gate."""
+    calls = _client_fake(monkeypatch, attached=["#{session_attached}"] * 3, verb_rc=1)
+    assert PsmuxMultiplexer().switch_client("ctl:%9") is None
+    assert ["psmux", "switch-client", "-t", "ctl:%9"] in calls
+
+
+def test_psmux_switch_transport_fault_on_an_empty_session_cannot_vouch(monkeypatch):
+    """A spawn-level fault proves the verb never ran, which is why its sibling
+    (a client measurably here) stays False. It says nothing about whether anyone
+    is at this terminal, and that half is already in hand: the gate count is read
+    BEFORE the verb, so this leaf can answer it on the fault exit too, where a
+    probe taken afterwards would only be measuring the broken transport."""
+    _client_fake(monkeypatch, attached=["0", "0", "0"])
+    probing = tmux_base.subprocess.run
+
+    def boom(argv, **kwargs):
+        if argv[1:3] == ["switch-client", "-t"]:
+            raise OSError("psmux vanished mid-call")
+        return probing(argv, **kwargs)
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", boom)
+    assert PsmuxMultiplexer().switch_client("ctl:%9") is None
+
+
+def test_psmux_switch_fallback_transport_fault_on_an_empty_session_cannot_vouch(monkeypatch):
+    """The same rule one level down. `_client_left`'s fault exit answered False
+    without consulting the count it had already taken, which its own docstring
+    forbids — None when the session had nobody on it to begin with — and the
+    fallback leg is the path that carried it back to the seam.
+
+    The dispatch is recorded inside the fault, not read off `calls`: the raise
+    pre-empts the fixture, so "the fallback faulted" and "the fallback was never
+    reached" would otherwise assert the same."""
+    _client_fake(monkeypatch, attached=["0", "0", "0"], verb_rc=1)
+    probing = tmux_base.subprocess.run
+    dispatched: list[list[str]] = []
+
+    def boom(argv, **kwargs):
+        if argv[1:3] == ["switch-client", "-l"]:
+            dispatched.append(list(argv))
+            raise OSError("psmux vanished mid-call")
+        return probing(argv, **kwargs)
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", boom)
+    assert PsmuxMultiplexer().switch_client("ctl:%9", last_fallback=True) is None
+    assert dispatched == [["psmux", "switch-client", "-l"]]
