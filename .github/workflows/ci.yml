@@ -133,9 +133,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         # After `Install the project`, because the assertion below runs `uv run`.
-        # What this buys: the 9 tests of the serial gate step below, measured at
-        # 46-68s on a dev box. Sized against this job's 20-minute cap and its
-        # ~316s mean, so the headroom still holds.
+        # What this buys: the 9 tests of the serial gate step below, measured on
+        # this runner at 9.6s (py3.11) and 12.4s (py3.14) against the job's
+        # 20-minute cap. A dev box took 46-68s for the same nine — the runner is
+        # the faster of the two, so the cap is sized off the slower number.
         run: |
           $ErrorActionPreference = 'Stop'
           # The release archive, not `choco install`. Chocolatey's community feed
@@ -195,7 +196,7 @@ jobs:
         # and running the gate off the shared workers keeps the whole module
         # from contending for the machine in the first place. A flake here
         # cannot be retried away — this repo has no retry mechanism by policy.
-        # Cost: 46-68s measured serial, against this job's 20-minute cap.
+        # Cost: 9.6-12.4s measured here, 46-68s on a dev box.
         env:
           TMP: ${{ runner.temp }}
           TEMP: ${{ runner.temp }}

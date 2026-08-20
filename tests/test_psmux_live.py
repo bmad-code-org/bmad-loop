@@ -60,8 +60,7 @@ def test_prune_kills_only_the_owning_projects_window(tmp_path: Path, monkeypatch
     # that contention made the mint below hand back "" and fail at the
     # degraded-mint assertion. Isolation is what makes the module xdist-safe,
     # not the uuid session names, which never collided.
-    if psmux_data_root is not None:
-        monkeypatch.setenv("PSMUX_DATA_DIR", str(psmux_data_root))
+    monkeypatch.setenv("PSMUX_DATA_DIR", str(psmux_data_root))
     session = f"bmad-loop-test-{uuid.uuid4().hex[:8]}"
     proj_a = tmp_path / "proj-a"
     proj_b = tmp_path / "proj-b"
@@ -213,7 +212,16 @@ def _active_window(mux: PsmuxMultiplexer, session: str) -> str:
 
 @pytest.fixture(scope="module")
 def psmux_data_root(tmp_path_factory):
-    """Return an isolated registry root only when the installed build honors it."""
+    """Return an isolated registry root, or fail loudly if one cannot be had.
+
+    Isolation is a precondition here, not a nicety: without it every test in this
+    module shares the developer's real registry, and under xdist that contention
+    is what made the prune test's window mint hand back "". Returning a degraded
+    ``None`` would restore that flake silently — and worst under load, where the
+    probe below is itself most likely to fail — so both failure directions raise
+    instead. On the 3.3.8 floor the ignored-variable branch is unreachable
+    anyway; what stays live is the probe failing as an instrument.
+    """
     mux = PsmuxMultiplexer()
     if not mux.available():
         pytest.skip("psmux present but not an admitted version")
@@ -226,10 +234,19 @@ def psmux_data_root(tmp_path_factory):
             ["new-session", "-d", "-s", session, "-c", str(root)], check=False, env=env
         )
         if created.returncode != 0:
-            return None
+            pytest.fail(
+                "probe setup: could not mint the isolation probe session: "
+                f"{created.stderr.strip()!r}"
+            )
         isolated = _plain_has_session(mux, session, env=env)
         default = _plain_has_session(mux, session)
-        return root if isolated and not default else None
+        if not isolated or default:
+            pytest.fail(
+                "probe setup: the installed psmux ignored PSMUX_DATA_DIR "
+                f"(visible in the isolated registry={isolated}, "
+                f"visible in the default one={default})"
+            )
+        return root
     finally:
         # The one session here that can land in the developer's real registry —
         # a build ignoring PSMUX_DATA_DIR is the very branch this fixture exists
@@ -256,8 +273,7 @@ def probe(tmp_path, monkeypatch, psmux_data_root):
     mux = PsmuxMultiplexer()
     if not mux.available():
         pytest.skip("psmux present but not an admitted version")
-    if psmux_data_root is not None:
-        monkeypatch.setenv("PSMUX_DATA_DIR", str(psmux_data_root))
+    monkeypatch.setenv("PSMUX_DATA_DIR", str(psmux_data_root))
     session = f"bmad-loop-test-{uuid.uuid4().hex[:8]}"
     try:
         _raw_new_session(mux, session, tmp_path)
