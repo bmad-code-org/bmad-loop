@@ -6135,12 +6135,12 @@ class Engine:
 
         ``dirty_paths`` — git's own answer — and nothing else decides whether the byte
         compare in the sibling below runs at all. That ordering is load-bearing rather
-        than an optimization. ``head_blob`` reads the RAW blob, unfiltered and without
-        eol conversion, so on a repo that normalizes line endings it differs from the
-        checked-out file on every line; a compare run unconditionally would refuse the
-        carry on every such repo. Gated behind git already calling the path dirty, the
-        same skew can cost only a bookkeeping commit on a board that really is dirty,
-        and never a false pass.
+        than an optimization: it is what keeps the compare from being asked about a
+        board nobody has written, where the only honest answer is git's. It is NOT what
+        makes the compare safe on a repo that normalizes line endings — ``head_blob``
+        answers in the working-tree domain for that, since gating a skewed compare would
+        still have refused a crashed pass's own advance, the one carry this leg exists
+        to finish.
 
         Fail CLOSED. A probe that could not run has not ruled an operator out, and the
         write it gates is the one that leaves no trace of what it took. The cost of the
@@ -6188,9 +6188,11 @@ class Engine:
         pair unreadable.
 
         Fail CLOSED, like its sibling and for its reason, and that covers
-        ``advanced_bytes`` returning None: a row missing from HEAD's board, or a line
-        the writer declines to rewrite, leaves nothing to compare against, and "I could
-        not compute the intended content" must not read as "the tree is mine"."""
+        ``advanced_bytes`` returning None: a row missing from HEAD's board leaves nothing
+        to compare against, and "I could not compute the intended content" must not read
+        as "the tree is mine". A row the writer declines to rewrite is NOT that case — it
+        hands HEAD's bytes back unchanged, and the compare then rightly accepts a board
+        nobody touched."""
         repo = self.paths.repo_root
         try:
             rel = board.resolve().relative_to(repo.resolve()).as_posix()

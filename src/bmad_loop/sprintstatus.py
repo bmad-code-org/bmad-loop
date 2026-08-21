@@ -324,10 +324,16 @@ def advanced_bytes(source: bytes, story_key: str, target: str) -> bytes | None:
     No ``now=``: the caller's own carry passes none either, and a ``last_updated`` line
     rewritten here and not there would make every comparison fail.
 
-    Returns None when ``advance`` declines to write at all — the board's row is absent,
-    or its line is a shape ``_set_mapping_value`` will not rewrite. There is then no
-    intended content to compare against, and a caller must not read "I could not
-    compute it" as "the tree is mine"."""
+    Returns None only when the board's row is absent. ``advance``'s other None — a
+    missing file — cannot be reached from here, the shadow being this function's own
+    copy. There is then no intended content to compare against, and a caller must not
+    read "I could not compute it" as "the tree is mine".
+
+    Declining to WRITE is a different answer, and it comes back as bytes: a row already
+    at or past ``target``, and a row whose line ``_set_mapping_value`` will not rewrite,
+    both report the unchanged status and hand ``source`` back byte-identical. A caller
+    comparing against that is right to accept an untouched board, because for those rows
+    an untouched board IS this run's advance."""
     with tempfile.TemporaryDirectory() as tmp:
         shadow = Path(tmp) / "sprint-status.yaml"
         shadow.write_bytes(source)
