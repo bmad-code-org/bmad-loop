@@ -1730,6 +1730,7 @@ def clean_incoming_collisions(
     target: str,
     branch: str,
     *,
+    protected: tuple[str, ...] = (),
     on_tolerated: Callable[[list[str]], None] | None = None,
 ) -> list[str]:
     """Reconcile a target checkout dirtied by a per-worktree Unity Editor so the
@@ -1745,39 +1746,80 @@ def clean_incoming_collisions(
 
     Guard: only paths that lie within the branch's incoming set are cleaned. A dirty
     path *outside* that set is real operator work and is never touched. Whether it also
-    BLOCKS the merge depends on trackedness (#460): the merge writes only paths that
-    differ between `target` and `branch`, so an untracked stray can be neither
-    overwritten nor staged into the commit — it is tolerated and the merge proceeds.
-    Uncommitted changes to TRACKED files outside the set do threaten the commit — git
-    refuses a merge outright when the change is staged, and `merge --squash` + `commit`
-    folds it into the story's commit either way — so those still raise GitError naming
-    the paths, without touching anything.
+    BLOCKS the merge is decided per path by the INDEX column, not by trackedness
+    (#618): the merge writes only paths that differ between `target` and `branch`, so
+    a stray git has nothing staged for — untracked, or tracked and edited in the
+    working tree only — can be neither overwritten by the merge nor written into its
+    commit. Measured on both topologies and both strategies: rc 0, the edit survives
+    uncommitted, and it is absent from the resulting commit. A STAGED stray is the
+    real hazard, and it is one under both strategies — `merge --no-ff` refuses it
+    outright, and so does `merge --squash` against a diverged target; only a
+    fast-forwardable `--squash` accepts it, and that one FOLDS the operator's staged
+    work into the story's commit.
 
-    ``on_tolerated``, when given, is called once with the sorted list of untracked
-    stray paths the guard walked past — the mirror of the returned ``cleaned`` list,
-    so a merge that proceeded over operator dirt leaves the same kind of trace as one
-    that cleaned a leak. Not called when there are no such paths.
+    ``protected`` names repo-relative posix paths the ORCHESTRATOR itself commits
+    after the merge, and a stray among them blocks whatever its index column says.
+    The merge's own inertness does not protect them, because the merge is not what
+    would commit them: ``commit_paths`` runs `git add -- :(literal)<path>` and then a
+    pathspec commit, so ANY working-tree change to a named path is committed no
+    matter who wrote it. The run's carry bookkeeping passes the sprint board and the
+    deferred-work ledger through that call — ``_carry_board_advance``
+    unconditionally — so an operator's private unstaged edit to one of those files
+    lands in git history under a `chore(sprint-status): carry ...` message, leaving
+    the tree clean and no trace of the substitution. The blast radius is strictly
+    SAME-PATH: `git commit -- <pathspec>` is implicitly `--only`, so dirt on any
+    other path is never swept in, which is why this list is a set of exact paths and
+    not a policy. Default empty — the wiring is the caller's.
+
+    ``on_tolerated``, when given, is called once with the sorted list of stray paths
+    the guard walked past — the exact complement of the blocking ones within the
+    strays, and the mirror of the returned ``cleaned`` list — so a merge that
+    proceeded over operator dirt leaves the same kind of trace as one that cleaned a
+    leak. Not called when there are no such paths.
     """
     dirty = dirty_paths(repo)
     if not dirty:
         return []
     incoming = branch_incoming_paths(repo, target, branch)
     stray = sorted(p for p in dirty if p not in incoming)
-    # A merge writes only paths that differ between `target` and `branch`, so a dirty
-    # path outside `incoming` can never be created or overwritten by it, and git never
-    # stages an untracked file into a merge or squash commit. Untracked strays are
-    # therefore inert and are left exactly where they are (#460) — refusing over one
-    # stopped unattended runs at the first story with no hazard to point at.
-    # Tracked dirt is NOT inert: a staged change makes `git merge` refuse outright, and
-    # `merge --squash` + `git commit` folds it into the story's commit. That half keeps
-    # refusing.
-    blocking = [p for p in stray if not dirty[p].startswith("??")]
+    # Trackedness was the wrong axis (#618). What a merge can write into its commit is
+    # what git has STAGED, so the index column alone decides: a stray with nothing
+    # staged is inert under both strategies and both topologies, and refusing over one
+    # stopped unattended runs with no hazard to point at. Everything else this method
+    # can see is a hazard the operator has to resolve first — a staged change, and the
+    # unmerged stages of a half-resolved conflict, which carry a letter in that column
+    # for every one of git's seven combinations.
+    #
+    # `protected` is the second half, and it is not about the merge at all: the run's
+    # own post-merge carry commits those paths by pathspec, sweeping in whatever the
+    # working tree holds. Inert-under-merge and safe-to-proceed stopped being the same
+    # question the moment a path was on both lists.
+    guarded = set(protected)
+    staged = [p for p in stray if dirty[p][0] not in " ?"]
+    blocking = [p for p in stray if dirty[p][0] not in " ?" or p in guarded]
     if blocking:
-        raise GitError(
-            "the target checkout has uncommitted changes to tracked files outside "
-            f"this branch's files (not introduced by the merge): {', '.join(blocking)}"
-        )
-    tolerated = [p for p in stray if dirty[p].startswith("??")]
+        # One raise, two remedies: staged work has to be committed or unstaged, while
+        # dirt on a carried path has to leave the path entirely. A single undifferentiated
+        # list would send the operator to the wrong one.
+        clauses: list[str] = []
+        if staged:
+            clauses.append(
+                "staged changes to tracked files outside this branch's files "
+                f"(not introduced by the merge): {', '.join(staged)}"
+            )
+        already_named = set(staged)
+        swept = [p for p in blocking if p not in already_named]
+        if swept:
+            clauses.append(
+                "uncommitted changes to paths this run commits for itself after the "
+                f"merge, which it would sweep into its own bookkeeping commit: {', '.join(swept)}"
+            )
+        raise GitError("the target checkout has " + "; and ".join(clauses))
+    # Every stray that survives the raise above is tolerated — the exact complement of
+    # `blocking`, not a second independent predicate. Recomputing one here is how the
+    # two lists drift: an unstaged tracked stray answering neither test would proceed
+    # with no journal trace at all, which is the silent half of #618.
+    tolerated = list(stray)
     if tolerated and on_tolerated is not None:
         on_tolerated(tolerated)
     # Resolve every untracked cleanup parent before deleting or checking out any

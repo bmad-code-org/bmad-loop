@@ -5,6 +5,8 @@ Exercised against the conftest `project` sandbox (a real git repo at
 helpers carry no engine wiring yet — they are the plumbing Phase 3 builds on.
 """
 
+import subprocess
+
 import pytest
 from conftest import git, make_git_noisy, refuse_to_resolve
 
@@ -611,23 +613,278 @@ def test_clean_incoming_collisions_shape_clash_stops_at_gits_own_preflight(
     assert git(repo, "rev-parse", "HEAD") == head_before  # and no merge commit exists
 
 
-def test_clean_incoming_collisions_still_refuses_tracked_stray(project, tmp_path):
-    """The other half of #460: uncommitted changes to a TRACKED file outside the
-    incoming set are not inert — git refuses a merge outright once the change is
-    staged, and `merge --squash` + `commit` folds it into the story's commit — so
-    they still refuse, and still clean nothing."""
+@pytest.mark.parametrize("stage", [True, False], ids=["staged", "unstaged"])
+def test_clean_incoming_collisions_splits_tracked_stray_on_the_index(project, tmp_path, stage):
+    """The half of #460 that #618 re-cut. Trackedness was never the axis: what a
+    merge can write into a commit is what git has STAGED. Measured on git 2.55 across
+    both topologies and both strategies — a staged stray outside the incoming set is
+    refused by `merge --no-ff` and by a divergent `merge --squash`, and folded into
+    the story's commit by a fast-forwardable one; an UNSTAGED one is inert in every
+    cell (rc 0, absent from the commit, still uncommitted afterwards).
+
+    So the staged row refuses and the unstaged row proceeds. The unstaged row also
+    pins that it is REPORTED: were `tolerated` left on the untracked test it used to
+    carry, this stray would answer neither list and the merge would proceed with no
+    journal trace at all."""
     repo = project.project
     _branch_with(repo, tmp_path, adds={"leak.cs": "branch\n"})  # `feat` never touches src.txt
     (repo / "leak.cs").write_text("editor leaked\n")  # within branch set
     (repo / "src.txt").write_text("operator edit\n")  # tracked-modified, NOT in the set
+    if stage:
+        git(repo, "add", "src.txt")
+
+    calls: list[list[str]] = []
+    if stage:
+        with pytest.raises(verify.GitError) as ei:
+            verify.clean_incoming_collisions(repo, "main", "feat", on_tolerated=calls.append)
+        assert "src.txt" in str(ei.value)
+        assert "tracked" in str(ei.value)  # the refusal names which half it is about
+        assert calls == []  # a refusal reports no tolerance
+        # nothing was cleaned — the leak still sits there and the edit is unreverted
+        assert (repo / "leak.cs").exists()
+    else:
+        cleaned = verify.clean_incoming_collisions(repo, "main", "feat", on_tolerated=calls.append)
+        assert cleaned == ["leak.cs"]  # the incoming leak is still reconciled
+        assert calls == [["src.txt"]]  # and the stray it walked past is on the record
+    assert (repo / "src.txt").read_text() == "operator edit\n"  # untouched either way
+
+
+# ------------------------------------------------- #618 porcelain grid + parse pins
+
+
+def _feat_adding_leak(repo, tmp_path):
+    """Cut `feat` adding one file the main checkout never touches, so the incoming
+    set is exactly {"leak.cs"} and dirt made anywhere else is a stray."""
+    _branch_with(repo, tmp_path, adds={"leak.cs": "branch\n"})
+
+
+def _xy_unstaged_modify(repo, tmp_path):
+    _feat_adding_leak(repo, tmp_path)
+    (repo / "src.txt").write_text("operator edit\n")
+    return "src.txt"
+
+
+def _xy_staged_modify(repo, tmp_path):
+    _feat_adding_leak(repo, tmp_path)
+    (repo / "src.txt").write_text("operator edit\n")
+    git(repo, "add", "src.txt")
+    return "src.txt"
+
+
+def _xy_staged_and_unstaged_modify(repo, tmp_path):
+    _feat_adding_leak(repo, tmp_path)
+    (repo / "src.txt").write_text("staged half\n")
+    git(repo, "add", "src.txt")
+    (repo / "src.txt").write_text("and an unstaged half\n")
+    return "src.txt"
+
+
+def _xy_staged_add(repo, tmp_path):
+    _feat_adding_leak(repo, tmp_path)
+    (repo / "new.txt").write_text("operator\n")
+    git(repo, "add", "new.txt")
+    return "new.txt"
+
+
+def _xy_staged_delete(repo, tmp_path):
+    _feat_adding_leak(repo, tmp_path)
+    git(repo, "rm", "-q", "src.txt")
+    return "src.txt"
+
+
+def _xy_unstaged_delete(repo, tmp_path):
+    _feat_adding_leak(repo, tmp_path)
+    (repo / "src.txt").unlink()
+    return "src.txt"
+
+
+def _xy_staged_rename(repo, tmp_path):
+    _feat_adding_leak(repo, tmp_path)
+    git(repo, "mv", "src.txt", "renamed.txt")
+    return "renamed.txt"  # `dirty_paths` records the DESTINATION
+
+
+def _xy_untracked(repo, tmp_path):
+    _feat_adding_leak(repo, tmp_path)
+    (repo / "operator-notes.txt").write_text("real work\n")
+    return "operator-notes.txt"
+
+
+def _xy_unmerged(repo, tmp_path):
+    """A real conflicted merge, left half-resolved in the MAIN checkout.
+
+    The ordering is load-bearing: both sides of the conflict land before `feat` is
+    cut, so `conflict.txt` is identical on the two tips and stays OUT of the incoming
+    set. Cut `feat` first and main's later commits would pull it in, and the row
+    would grade cleaning rather than blocking."""
+    commit(repo, "conflict.txt", "base\n", "conflict base")
+    git(repo, "checkout", "-q", "-b", "theirs")
+    commit(repo, "conflict.txt", "theirs\n", "their edit")
+    git(repo, "checkout", "-q", "main")
+    commit(repo, "conflict.txt", "ours\n", "our edit")
+    _feat_adding_leak(repo, tmp_path)
+    with pytest.raises(subprocess.CalledProcessError):  # the conflict is the fixture
+        git(repo, "merge", "theirs")
+    return "conflict.txt"
+
+
+@pytest.mark.parametrize(
+    ("xy", "setup", "blocks"),
+    [
+        (" M", _xy_unstaged_modify, False),
+        ("M ", _xy_staged_modify, True),
+        ("MM", _xy_staged_and_unstaged_modify, True),
+        ("A ", _xy_staged_add, True),
+        ("D ", _xy_staged_delete, True),
+        (" D", _xy_unstaged_delete, False),
+        ("R ", _xy_staged_rename, True),
+        ("??", _xy_untracked, False),
+        ("UU", _xy_unmerged, True),
+    ],
+    ids=[
+        "unstaged-modify",
+        "staged-modify",
+        "staged-and-unstaged-modify",
+        "staged-add",
+        "staged-delete",
+        "unstaged-delete",
+        "staged-rename",
+        "untracked",
+        "unmerged",
+    ],
+)
+def test_clean_incoming_collisions_porcelain_grid(project, tmp_path, xy, setup, blocks):
+    """One row per porcelain XY a stray can wear (#618). The split is the INDEX
+    column alone: a letter there is work git would carry into the merge's commit, a
+    space or a `?` is work only the working tree holds. Unmerged stages block for the
+    same reason — every one of git's seven combinations puts a letter in X.
+
+    Deliberately silent about `on_tolerated`: the proceeding rows assert only that no
+    refusal happened. Reporting is pinned by
+    `test_clean_incoming_collisions_splits_tracked_stray_on_the_index`, and asserting
+    it here too would make the `blocking` and `tolerated` ablations redden one
+    indistinguishable set instead of two."""
+    repo = project.project
+    stray = setup(repo, tmp_path)
+
+    # Prove the fixture built a STRAY and wore the XY the row claims. A path that
+    # drifted into the incoming set would be cleaned rather than judged, and the row
+    # would pass for a reason that has nothing to do with the predicate.
+    assert verify.branch_incoming_paths(repo, "main", "feat") == {"leak.cs"}
+    assert verify.dirty_paths(repo) == {stray: xy}
+
+    if blocks:
+        with pytest.raises(verify.GitError) as ei:
+            verify.clean_incoming_collisions(repo, "main", "feat")
+        assert stray in str(ei.value)
+    else:
+        assert verify.clean_incoming_collisions(repo, "main", "feat") == []
+
+
+def test_clean_incoming_collisions_rename_stray_names_the_destination(project, tmp_path):
+    """A rename is the one entry whose porcelain record has two paths, and under `-z`
+    git emits them destination-first — the INVERSE of plain porcelain's `old -> new`.
+    `dirty_paths` consumes the second field as the source, so the path that reaches
+    the operator is the one now on disk, which is the one they have to deal with.
+
+    Ablation target: drop the `"R" in xy or "C" in xy` skip in `dirty_paths` and the
+    source field is re-parsed as its own entry — `xy=tok[:2]`, `path=tok[3:]` turns
+    `src.txt` into a phantom `.txt` stray — which the dict equality below catches."""
+    repo = project.project
+    _feat_adding_leak(repo, tmp_path)
+    git(repo, "mv", "src.txt", "renamed.txt")
+
+    assert verify.dirty_paths(repo) == {"renamed.txt": "R "}
 
     with pytest.raises(verify.GitError) as ei:
         verify.clean_incoming_collisions(repo, "main", "feat")
-    assert "src.txt" in str(ei.value)
-    assert "tracked" in str(ei.value)  # the refusal names which half it is about
-    # nothing was cleaned — the leak still sits there and the edit is unreverted
-    assert (repo / "leak.cs").exists()
-    assert (repo / "src.txt").read_text() == "operator edit\n"
+    assert "renamed.txt" in str(ei.value)
+    assert "src.txt" not in str(ei.value)  # the source is not what is on disk
+
+
+def test_clean_incoming_collisions_copy_stray_names_the_destination(project, tmp_path):
+    """The `C` half of that same two-path branch, which nothing else covers.
+
+    Both conjuncts are needed to make git emit one at all: `status.renames=copies`
+    AND a MODIFIED source. With an unmodified source git reports a plain `A` and the
+    branch is never entered, so a fixture missing either half grades nothing."""
+    repo = project.project
+    _feat_adding_leak(repo, tmp_path)
+    git(repo, "config", "status.renames", "copies")
+    (repo / "copy.txt").write_text("original\n")  # byte copy of src.txt's committed content
+    (repo / "src.txt").write_text("operator edit\n")  # the modified source half
+    git(repo, "add", "copy.txt", "src.txt")
+
+    dirty = verify.dirty_paths(repo)
+    assert set(dirty) == {"copy.txt", "src.txt"}  # no phantom entry from the source field
+    assert dirty["copy.txt"].startswith("C")  # the fixture really produced a copy entry
+
+    with pytest.raises(verify.GitError) as ei:
+        verify.clean_incoming_collisions(repo, "main", "feat")
+    assert "copy.txt" in str(ei.value)
+
+
+# ------------------------------------------------------------- #618 `protected`
+
+
+def test_clean_incoming_collisions_protected_blocks_unstaged_dirt(project, tmp_path):
+    """`protected` is not about the merge. The merge would walk past this unstaged
+    edit harmlessly; what would not is `commit_paths`, which the run's carry
+    bookkeeping calls with this exact path — `git add` then a pathspec commit stages
+    whatever the working tree holds, so the operator's private edit would land in
+    history under a `chore(...): carry ...` message with the tree left clean.
+
+    The refusal names it under the CARRY clause, not the staged one: unstaging is not
+    a remedy for a path this run is going to commit either way."""
+    repo = project.project
+    _feat_adding_leak(repo, tmp_path)
+    (repo / "src.txt").write_text("operator edit\n")
+    assert verify.dirty_paths(repo) == {"src.txt": " M"}  # inert for the merge itself
+
+    with pytest.raises(verify.GitError) as ei:
+        verify.clean_incoming_collisions(repo, "main", "feat", protected=("src.txt",))
+    msg = str(ei.value)
+    assert "src.txt" in msg
+    assert "bookkeeping commit" in msg
+    assert "staged changes" not in msg  # the other clause is absent, not merely joined
+    assert (repo / "src.txt").read_text() == "operator edit\n"  # nothing touched
+
+
+def test_clean_incoming_collisions_protected_names_both_groups_separately(project, tmp_path):
+    """One raise, two remedies. A run can hit both at once, and an undifferentiated
+    path list would send the operator to the wrong fix for one of them."""
+    repo = project.project
+    _feat_adding_leak(repo, tmp_path)
+    (repo / "staged.txt").write_text("operator\n")
+    git(repo, "add", "staged.txt")
+    (repo / "src.txt").write_text("operator edit\n")  # unstaged, but carried
+
+    with pytest.raises(verify.GitError) as ei:
+        verify.clean_incoming_collisions(repo, "main", "feat", protected=("src.txt",))
+    msg = str(ei.value)
+    staged_clause, _, carry_clause = msg.partition("; and ")
+    assert "staged.txt" in staged_clause and "src.txt" not in staged_clause
+    assert "src.txt" in carry_clause and "staged.txt" not in carry_clause
+
+
+def test_clean_incoming_collisions_protected_is_paths_not_a_mode(project, tmp_path):
+    """Naming a path the operator has not dirtied changes nothing, and naming one
+    does not make an unrelated stray block either — `protected` intersects the
+    strays, it does not switch the guard into a stricter mode."""
+    repo = project.project
+    _feat_adding_leak(repo, tmp_path)
+
+    # row (a): the protected path is clean, and so is everything else
+    assert verify.clean_incoming_collisions(repo, "main", "feat", protected=("src.txt",)) == []
+
+    # row (b): the protected path is still clean; the dirt is somewhere else entirely
+    (repo / "operator-notes.txt").write_text("real work\n")
+    calls: list[list[str]] = []
+    cleaned = verify.clean_incoming_collisions(
+        repo, "main", "feat", protected=("src.txt",), on_tolerated=calls.append
+    )
+    assert cleaned == []
+    assert calls == [["operator-notes.txt"]]
 
 
 def test_clean_incoming_collisions_reports_tolerated_paths(project, tmp_path):

@@ -2992,13 +2992,19 @@ def _operator_edit_dev_effect(project, story_key, *, rel_path, marker):
     """A dev effect that does the normal worktree work AND appends `marker` to a
     TRACKED file in the *main* checkout that the branch never touches — the operator
     editing their own working copy mid-run. Appends rather than overwrites so the
-    edit stays inert in whatever file it lands on."""
+    edit stays inert in whatever file it lands on.
+
+    The append is STAGED, which is what makes it block (#618): an edit git holds only
+    in the working tree cannot reach the merge's commit and is tolerated, so an
+    unstaged fixture here would grade the tolerance path instead of the refusal this
+    caller is about."""
     base = wt_dev_effect(project, story_key)
 
     def effect(spec):
         result = base(spec)
         fp = project.project / rel_path
         fp.write_text(fp.read_text(encoding="utf-8") + marker, encoding="utf-8")
+        git(project.project, "add", "--", rel_path)
         return result
 
     return effect
@@ -3010,10 +3016,13 @@ def test_merge_stray_dirt_escalates_with_clear_message(project):
     branch, with a message that names tracked dirt as the hazard and offers the two
     SAFE resolutions rather than blaming a Unity Editor and saying "clean them" (#460).
 
-    Since #460 that refusal is scoped to TRACKED dirt — an untracked stray is inert
-    and tolerated (`test_merge_tolerates_untracked_stray_in_main_checkout`) — so the
-    stray here is an appended comment line in the repo's tracked `.gitignore`: the
-    branch never touches it, and a trailing comment changes no ignore behavior."""
+    Since #460 that refusal is scoped to dirt a merge could actually commit, and since
+    #618 the axis is the index rather than trackedness — an unstaged tracked stray is
+    inert and tolerated, like an untracked one
+    (`test_merge_tolerates_untracked_stray_in_main_checkout`). So the stray here is an
+    appended comment line in the repo's tracked `.gitignore`, STAGED by the effect:
+    the branch never touches the file, and a trailing comment changes no ignore
+    behavior."""
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
     # The target must really be tracked, or this test silently degrades into the
     # tolerated case it is no longer about. `git` raises on a nonzero rc.
