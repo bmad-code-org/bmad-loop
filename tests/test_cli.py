@@ -5899,6 +5899,43 @@ def test_dry_run_stories_relativizes_absolute_folder(project, capsys):
     assert f"Spec folder: {abs_folder}" not in out  # not the raw absolute path
 
 
+def test_dry_run_stories_unresolvable_absolute_folder_refused(project, monkeypatch, capsys):
+    """`relativize_spec_folder` reaches the CLI only here, and the refusal it
+    now raises (#560) is the one answer the dry-run cannot render: an absolute
+    `--spec` inside the project whose `.resolve()` faults has no knowable
+    location, so there is no folder string to preview. Print the reason and exit
+    1, in the shape of its `story_rows` sibling just below — minus that sibling's
+    `(spec folder: ...)` suffix, which would be a third printing of a path the
+    reason already names twice (this leg is reachable only from the absolute
+    branch, where `folder` is `spec_folder` re-spelled).
+
+    Measured ablations:
+    - B3 (delete the `try`/`except stories_mod.StoriesError` around the
+      `relativize_spec_folder` call in `cli._dry_run_stories`): FAILS at `assert
+      cli._dry_run(project, pol, args, True, abs_folder) == 1` — the
+      `StoriesError` propagates out of `_dry_run` uncaught, so the row errors on
+      that line and the two stderr assertions are never reached. That line alone
+      carries this row.
+    - B1 (collapse `relativize_spec_folder` back to one degrade arm): FAILS on
+      the same line with `assert 0 == 1`, and the captured stdout is the
+      regression itself — a rendered `BMAD_LOOP_SPEC_FOLDER=<absolute path into
+      the main checkout>` previewed as runnable.
+    - B2 (blanket raise): green — this row travels the `OSError` leg, which B2
+      leaves refusing."""
+    _setup_stories_fixture(project, [_stories_entry("1")])
+    abs_folder = str(project.project / STORIES_SPEC_FOLDER)
+    pol = policy_mod.loads("")
+    args = argparse.Namespace(spec=abs_folder, epic=None, story=None, max_stories=None)
+    refuse_to_resolve(monkeypatch, Path(abs_folder))
+
+    assert cli._dry_run(project, pol, args, True, abs_folder) == 1
+
+    cap = capsys.readouterr()
+    assert f"stories mode: cannot canonicalize the spec folder {abs_folder!r}" in cap.err
+    assert "Run `bmad-loop validate` for what this host is doing." in cap.err
+    assert "linear schedule" not in cap.out  # no preview of a folder we cannot place
+
+
 # --------------- `bmad-loop mux`: backend listing + persisted choice (issue #87) ----
 
 
