@@ -914,10 +914,52 @@ def file_holds_content(repo: Path, rel: str, path: Path, data: bytes) -> bool:
     ``data`` is hashed from a shadow file rather than stdin because the git chokepoint
     spawns without one, and widening it for a single caller would put a stdin path
     through every git call in the module."""
+    return _blob_oid_for_file(repo, rel, path) == _blob_oid_for_bytes(repo, rel, data)
+
+
+def _blob_oid_for_bytes(repo: Path, rel: str, data: bytes) -> str:
+    """``_blob_oid_for_file`` for bytes that are not on disk, via a shadow copy — the
+    git chokepoint spawns without a stdin, and widening it for one caller would put a
+    stdin path through every git call in the module."""
     with tempfile.TemporaryDirectory() as tmp:
         shadow = Path(tmp) / "intended"
         shadow.write_bytes(data)
-        return _blob_oid_for_file(repo, rel, shadow) == _blob_oid_for_file(repo, rel, path)
+        return _blob_oid_for_file(repo, rel, shadow)
+
+
+def index_holds_no_foreign_content(repo: Path, rel: str, data: bytes) -> bool:
+    """Whether the INDEX entry for ``rel`` is safe to overwrite with ``data``.
+
+    Git holds a path in two places and `commit_paths` writes both: `git add` copies the
+    WORKING TREE into the commit and overwrites the INDEX in place. A staged version
+    distinct from both HEAD and ``data`` therefore exists nowhere afterwards — not in
+    the commit, which took the working tree, and not on disk — so proving only the
+    working tree is not proving the carry destroys nothing. Measured: with the operator's
+    edit staged and the working tree restored, the carry commits, the row is absent from
+    HEAD and from disk, and the tree reads clean, the bytes surviving only as a dangling
+    blob (#618).
+
+    True when the index holds no entry, or holds HEAD's own content, or already holds
+    ``data`` — the first two lose nothing that git cannot still reach, and the third is
+    the write itself. Unmerged stages raise rather than answer: a half-resolved index is
+    not a state this can prove anything about.
+    """
+    proc = git_bytes(repo, "ls-files", "-s", "-z", "--", *_literal_specs([rel]))
+    if proc.returncode != 0:
+        detail = (proc.stdout + proc.stderr).decode("utf-8", "replace").strip()
+        raise GitError(f"git ls-files -s -- {rel} failed in {repo}: {detail}")
+    records = [r for r in proc.stdout.split(b"\0") if r]
+    if not records:
+        return True  # nothing staged here to overwrite
+    if len(records) != 1:
+        raise GitError(f"git ls-files -s returned unmerged stages for {rel!r} in {repo}")
+    fields = records[0].split(b"\t", 1)[0].decode("ascii", "strict").split()
+    if len(fields) != 3:
+        raise GitError(f"git ls-files -s returned a malformed entry for {rel!r} in {repo}")
+    staged = fields[1]
+    head = _entry_at_revision(repo, "HEAD", rel)
+    head_oid = head[2] if head is not None and head[1] == "blob" else None
+    return staged in {head_oid, _blob_oid_for_bytes(repo, rel, data)}
 
 
 def path_ignored(repo: Path, path: Path) -> bool:

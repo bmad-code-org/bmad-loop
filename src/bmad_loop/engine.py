@@ -6186,6 +6186,11 @@ class Engine:
         committed its board — and a second frame drawing it elsewhere would make the
         pair unreadable.
 
+        BOTH of the places git holds this path are proved, because `commit_paths`
+        overwrites both: the working tree it copies into the commit, and the index it
+        stages over. A staged edit distinct from HEAD and from this advance survives
+        neither, so proving the working tree alone would authorize destroying it.
+
         Sameness is GIT's question here, not a byte compare's (``file_holds_content``).
         The baseline is HEAD's raw blob, and the board on disk may be its CRLF twin or
         its LF one depending on nothing the run controls — git calls the tree clean
@@ -6207,7 +6212,12 @@ class Engine:
             if head is None:
                 return True
             intended = sprint_advanced_bytes(head, story_key, target)
-            return intended is not None and verify.file_holds_content(repo, rel, board, intended)
+            if intended is None or not verify.file_holds_content(repo, rel, board, intended):
+                return False
+            # The working tree is only half of what the carry overwrites: `commit_paths`
+            # stages it OVER the index, so a staged version distinct from both HEAD and
+            # this advance is destroyed rather than committed.
+            return verify.index_holds_no_foreign_content(repo, rel, intended)
         except (verify.GitError, OSError, RuntimeError, ValueError):
             return False
 

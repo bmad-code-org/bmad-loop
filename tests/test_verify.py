@@ -3391,6 +3391,41 @@ def test_file_holds_content_accepts_a_pristine_board_in_either_eol_domain(projec
     assert not verify.file_holds_content(repo, "board.yaml", board, head)
 
 
+def test_index_holds_no_foreign_content_guards_the_half_the_working_tree_cannot(project):
+    """A staged edit is destroyed by the carry, not committed by it (#618).
+
+    `commit_paths` runs `git add` for the path, which copies the WORKING TREE into the
+    commit and overwrites the INDEX in place. So an operator who staged an edit and then
+    restored the working copy loses those bytes to a carry that proved only the working
+    tree: absent from the commit, which took the other content, and absent from disk.
+    Nothing surfaces it — the tree reads clean afterwards.
+
+    HEAD's own content and the advance itself are both safe to overwrite: the first is
+    still in history, the second is the write being authorized.
+    """
+    repo = project.project
+    head_bytes = b"development_status:\n  1-1-a: ready-for-dev\n"
+    (repo / "board.yaml").write_bytes(head_bytes)
+    git(repo, "add", "--", "board.yaml")
+    git(repo, "commit", "-q", "-m", "board")
+    advance = head_bytes.replace(b"ready-for-dev", b"done")
+
+    assert verify.index_holds_no_foreign_content(repo, "board.yaml", advance)  # HEAD's own
+
+    (repo / "board.yaml").write_bytes(advance)
+    git(repo, "add", "--", "board.yaml")
+    assert verify.index_holds_no_foreign_content(repo, "board.yaml", advance)  # the advance
+
+    # the operator's own bytes, staged — reachable nowhere else once `git add` runs
+    (repo / "board.yaml").write_bytes(head_bytes + b"  9-9-operator: backlog\n")
+    git(repo, "add", "--", "board.yaml")
+    (repo / "board.yaml").write_bytes(advance)  # ...working tree restored over them
+    assert not verify.index_holds_no_foreign_content(repo, "board.yaml", advance)
+
+    # an untracked, unstaged path has nothing to overwrite
+    assert verify.index_holds_no_foreign_content(repo, "never-staged.yaml", advance)
+
+
 def test_file_holds_content_raises_rather_than_answering_when_git_cannot_hash(project):
     """An id it could not compute must not read as a verdict either way.
 

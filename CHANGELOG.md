@@ -70,9 +70,11 @@ breaking changes may land in a minor release.
   own half-written advance is dirt on exactly that path and finishing it is what the leg exists
   for. It now asks whether the board holds HEAD's content plus this pass's advance — git's own
   question, so a board spelled CRLF by one host and LF by another still answers yes: a crashed
-  pass's write matches, an operator's edit does not, and foreign content skips the commit and
-  journals `board-advance-carry-foreign-dirt`, the status already being on disk where scheduling
-  reads it.
+  pass's write matches, an operator's edit does not. Both places git holds the path are proved,
+  since the carry's `git add` overwrites the index as well as committing the working tree, and an
+  edit staged and then restored would otherwise be destroyed rather than committed. Foreign
+  content skips the commit and journals `board-advance-carry-foreign-dirt`, the status already
+  being on disk where scheduling reads it.
 - **A merge git refused before it started no longer sends you to resolve a conflict that does not
   exist (#619).** Every `GitError` out of the merge was labelled "content conflict against the
   target", but most are git declining at pre-flight — an untracked file the merge would overwrite,
