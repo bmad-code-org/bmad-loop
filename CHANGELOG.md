@@ -51,6 +51,66 @@ breaking changes may land in a minor release.
   its sibling rejected-latch shape, the spec folder raises `stories.StoriesError`, and `--dry-run`
   reports it before exiting 1. A spec folder that merely lies outside the project tree still comes
   back verbatim — that is a supported layout, and only the canonicalization leg refuses.
+- **An unstaged edit in your main checkout no longer escalates the story and pauses an unattended
+  run (#618).** Under `[scm] isolation = "worktree"` the merge pre-flight refused over any dirty
+  _tracked_ path outside the unit branch's incoming set, so a porcelain ` M` — modified in the
+  working tree, nothing staged — stopped the run over a hazard git itself does not have. The axis
+  is the index column, not trackedness: measured on git 2.55.0 across both topologies and both
+  merge strategies, such a stray leaves the merge at rc 0, survives uncommitted, and is absent from
+  the resulting commit. It is now tolerated and journaled `merge-target-tolerated` alongside
+  untracked dirt. A **staged** stray still escalates — `merge --no-ff` refuses it outright, and a
+  fast-forwardable `merge --squash` folds it into the story's commit.
+- **Dirt on a path the run commits for itself now blocks the merge whatever its index column
+  (#618).** Narrowing the pre-flight to staged strays alone would have opened a silent data-loss
+  path, so the two ship together: the post-merge carries stage the sprint board and the
+  deferred-work ledger by pathspec (`git add -- :(literal)<path>`), which takes whatever the
+  working tree holds no matter who wrote it, and the board carry commits unconditionally. An
+  operator's private unstaged reopen of a story row would have landed in history under
+  `chore(sprint-status): carry ...` with the tree left clean and nothing to read the substitution
+  back from. Those two paths are now passed to the pre-flight as protected, and a stray among them
+  escalates with its own remedy — such dirt has to leave the path, not merely be unstaged. Tracked
+  artifacts only: an untracked one has no baseline to diverge from, and protecting it would halt
+  the first story of every project that has yet to commit its board.
+- **A resumed run no longer commits board edits you made while it was down (#618).** When the merge
+  was already journaled `unit-merged`, the replay falls straight through to the carry commits with
+  no merge — and therefore no pre-flight — in front of them, so the protection above could not
+  reach that leg. The carry cannot simply refuse on dirt, because a crashed pass's own half-written
+  advance is dirt on exactly that path and finishing it is what the leg exists for. It now asks
+  whether the board's bytes are HEAD's blob plus this pass's advance, recomputed through
+  `sprintstatus.advance` and compared byte for byte: a crashed pass's write matches, an operator's
+  edit does not. Foreign bytes skip the commit and journal `board-advance-carry-foreign-dirt` — the
+  status is already on disk where scheduling reads it, and the dirt is still escalated by the next
+  run's merge pre-flight. Both probes fail closed, and git's own dirt answer gates the compare so a
+  repo that normalizes line endings does not refuse every carry.
+- **A merge git refused before it started no longer sends you to resolve a conflict that does not
+  exist (#619).** Every `GitError` out of the merge was labelled "content conflict against the
+  target", but most are git declining at pre-flight — an untracked file the merge would overwrite,
+  a staged change on an incoming path, a file/directory shape clash, an `ff` target that cannot
+  fast-forward — where nothing merged, the target checkout is untouched, and there are no markers
+  to find. Those now raise `verify.MergePreflightError` (a `GitError` subclass, so every existing
+  handler is unchanged) and escalate describing that state, letting git's appended text name the
+  cause and the paths. The discriminator is `git ls-files -u`, not `MERGE_HEAD`: a conflicted
+  `merge --squash` writes three unmerged stages and conflict markers while creating no `MERGE_HEAD`
+  at all. Neither exit code nor wording can stand in — the same refusal is rc 1 or rc 2 depending
+  on topology, rc 1 is also what a conflict returns, and the message is fully translated.
+- **A refused `squash` merge no longer destroys the uncommitted work in your main checkout
+  (#619).** `--squash` has no `--abort`, so the recovery is `git reset --hard HEAD` — gated on a
+  tree-state probe read _after_ the merge and used to answer "did the squash act". A checkout
+  already carrying an unstaged edit reads dirty whether or not git touched a byte, so a merge git
+  refused at pre-flight fired the reset and discarded work the merge never went near. The probe is
+  now read once _before_ the squash and a tree found dirty is never reset; a conflict landing on
+  top of pre-existing dirt is left conflicted with the raised error saying so, rather than silently
+  reverted. The same root cause corrupted the replay gate that recognises "the squash staged
+  nothing", which now asks the index (`git diff --cached --quiet HEAD`) that unstaged dirt cannot
+  perturb, so a valid host-loss recovery is no longer reported as a failed merge.
+- **The journal no longer records a path as tolerated when that path is what stopped the merge
+  (#623).** `merge-target-tolerated` is written from inside the pre-flight guard, strictly before
+  the merge runs, so it can only record what the guard decided. A stray outside the incoming set by
+  _path_ can still clash with it by _shape_ — a file where the merge needs a directory, or the
+  reverse — and git then refuses over the very path the event called harmless. The event stays
+  where it is, since emitting it only on success would lose the trace in exactly the run worth
+  debugging; the pre-flight-refusal path now appends a corrective `merge-preflight-refused` naming
+  the same paths and carrying git's raw text.
 
 ## [0.11.0] — 2026-08-19
 
