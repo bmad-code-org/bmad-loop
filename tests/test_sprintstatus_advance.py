@@ -538,3 +538,59 @@ def test_advanced_bytes_preserves_crlf_and_inline_comments(tmp_path):
     assert out is not None
     assert b"3-2-digest-delivery: done # owner: pat\r\n" in out
     assert out.count(b"\r\n") == source.count(b"\r\n")
+
+
+def test_status_in_bytes_reads_a_row_exactly_as_story_status_does(tmp_path):
+    """`status_in_bytes` must be the READER, not a second reading of the board.
+
+    Its caller holds one side of the comparison as a git blob and the other as a file,
+    and treats a difference as "somebody else wrote this row" — so a reading that
+    diverges from `story_status` on either side manufactures a difference that is not
+    there, and costs an ordinary carry its advance.
+
+    Graded against `story_status` on the same bytes rather than against a literal, so
+    the two cannot drift apart silently. The row carries an inline comment, which is
+    where a line-regex reading would take ` # the next story` for part of the value.
+    """
+    board = _write(tmp_path)
+    source = board.read_bytes()
+
+    for key in ("3-2-digest-delivery", "3-1-login", "4-1-thing"):
+        assert sprintstatus.status_in_bytes(source, key) == sprintstatus.story_status(board, key)
+    assert sprintstatus.status_in_bytes(source, "3-2-digest-delivery") == "backlog"
+
+
+def test_status_in_bytes_folds_the_legacy_spelling_like_the_reader(tmp_path):
+    """`drafted` and `ready-for-dev` are ONE status, and the fold is why this goes
+    through `story_status` instead of reading the line.
+
+    The comparison this feeds is between a row at HEAD and the same row on disk. A
+    board committed before the rename and normalized since holds both spellings across
+    those two sides, and a reading that kept them apart would call an untouched row
+    foreign — refusing a carry over a change of vocabulary.
+    """
+    legacy = b"development_status:\n  epic-3: backlog\n  3-2-digest-delivery: drafted\n"
+    current = b"development_status:\n  epic-3: backlog\n  3-2-digest-delivery: ready-for-dev\n"
+
+    assert sprintstatus.status_in_bytes(legacy, "3-2-digest-delivery") == "ready-for-dev"
+    assert sprintstatus.status_in_bytes(legacy, "3-2-digest-delivery") == (
+        sprintstatus.status_in_bytes(current, "3-2-digest-delivery")
+    )
+
+
+def test_status_in_bytes_is_none_when_the_row_is_absent(tmp_path):
+    """An absent row is a real answer — the caller reads it as "nothing here to
+    protect" and lets `advance` report the missing row itself."""
+    assert sprintstatus.status_in_bytes(_write(tmp_path).read_bytes(), "9-9-nope") is None
+
+
+def test_status_in_bytes_raises_rather_than_calling_an_unreadable_board_absent(tmp_path):
+    """The distinction the caller's fail-closed handling rests on.
+
+    A board that does not parse is not a board whose row is gone, and collapsing the
+    two would hand the caller a None it reads as "no row to protect" — authorizing the
+    very write the check exists to withhold.
+    """
+    for source in (b"development_status: []\n", b"{ this is not: [valid yaml\n"):
+        with pytest.raises(sprintstatus.SprintStatusError):
+            sprintstatus.status_in_bytes(source, "3-2-digest-delivery")

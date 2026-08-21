@@ -64,17 +64,17 @@ breaking changes may land in a minor release.
   under a `chore(sprint-status): carry ...` message with the tree left clean. Both paths are now
   passed to the pre-flight as protected, and a stray among them escalates with its own remedy —
   such dirt has to leave the path, not merely be unstaged. Tracked artifacts only.
-- **A resumed run no longer commits board edits you made while it was down (#618).** When the
-  merge was already journaled `unit-merged`, the replay falls through to the carry commits with no
-  pre-flight in front of them. The carry cannot simply refuse on dirt, because a crashed pass's
-  own half-written advance is dirt on exactly that path and finishing it is what the leg exists
-  for. It now asks whether the board holds HEAD's content plus this pass's advance — git's own
-  question, so a board spelled CRLF by one host and LF by another still answers yes: a crashed
-  pass's write matches, an operator's edit does not. Both places git holds the path are proved,
-  since the carry's `git add` overwrites the index as well as committing the working tree, and an
-  edit staged and then restored would otherwise be destroyed rather than committed. Foreign
-  content skips the commit and journals `board-advance-carry-foreign-dirt`, the status already
-  being on disk where scheduling reads it.
+- **A resumed run no longer commits — or overwrites — board edits you made while it was down
+  (#618).** When the merge was already journaled `unit-merged`, the replay falls through to the
+  carry commits with no pre-flight in front of them. The carry cannot simply refuse on dirt: a
+  crashed pass's own half-written advance is dirt on exactly that path and finishing it is what
+  the leg exists for. It now asks whether the board holds HEAD's content plus this pass's
+  advance — git's own question, so a board spelled CRLF by one host and LF by another still
+  answers yes — and proves the index too, since the carry's `git add` overwrites it as well as
+  the working tree. That guards the commit, which is one write too late for the story's OWN row:
+  `advance` would already have replaced the edit with the target, leaving precisely the bytes the
+  proof accepts. So that row is now checked BEFORE the advance, and a status that is neither
+  HEAD's nor this pass's own refuses it. Either refusal journals `board-advance-carry-foreign-dirt`.
 - **A merge git refused before it started no longer sends you to resolve a conflict that does not
   exist (#619).** Every `GitError` out of the merge was labelled "content conflict against the
   target", but most are git declining at pre-flight — an untracked file the merge would overwrite,

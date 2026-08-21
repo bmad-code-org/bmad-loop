@@ -342,6 +342,27 @@ def advanced_bytes(source: bytes, story_key: str, target: str) -> bytes | None:
         return shadow.read_bytes()
 
 
+def status_in_bytes(source: bytes, story_key: str) -> str | None:
+    """:func:`story_status` asked of a board held as BYTES rather than as a file.
+
+    For the caller comparing a live row against the same row at a git revision,
+    where one side is a blob and never a path on disk.
+
+    Goes through ``story_status`` against a throwaway copy, like
+    :func:`advanced_bytes` above and for its reason: the full YAML resolution and the
+    ``LEGACY_STORY_STATUSES`` folding ARE what makes two rows "the same status", and a
+    second reading of them would drift from the one every other caller uses.
+
+    Returns None when the row is absent. A board that does not parse raises
+    ``SprintStatusError``, exactly as ``story_status`` does — "I could not read it"
+    must not reach a caller spelled as "the row is gone".
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        shadow = Path(tmp) / "sprint-status.yaml"
+        shadow.write_bytes(source)
+        return story_status(shadow, story_key)
+
+
 @dataclass(frozen=True)
 class StorySelector:
     """Resolves a human story reference (``--epic``/``--story``) to the

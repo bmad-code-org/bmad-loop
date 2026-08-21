@@ -4507,6 +4507,72 @@ def test_replayed_board_carry_leaves_an_operators_edit_out_of_its_commit(project
     assert "resume-ledger-carry" in kinds and "board-advance-carry-foreign-dirt" in kinds
 
 
+def test_replayed_board_carry_refuses_before_it_overwrites_an_operators_row_edit(project):
+    """The same hazard on the one row the commit proof cannot be asked about in time:
+    the story's own.
+
+    That proof guards the COMMIT, and `sprint_advance` runs first — so for this row it
+    arrives after the evidence it would have judged is already overwritten, and then
+    agrees, the board holding exactly HEAD's bytes plus this advance because that is
+    what `advance` just made of them. Refusing the commit at that point saves nothing
+    either: the operator's status is gone from disk, which is the value `_pick_next`
+    reads and the value the next run schedules from. Hence a row check BEFORE the
+    write, additive to the proof that still guards every other row.
+
+    The reopened status is `awaiting-operator` for two independent reasons. It sits
+    BELOW `done` in STATUS_ORDER, so `advance` really writes over it rather than
+    handing back the never-regress echo a same-or-later status would — no write, no
+    hazard, nothing to pin. And it is outside ACTIONABLE_STATUSES, so the resumed
+    engine does not re-pick the story and drive a MockAdapter with no sessions left.
+
+    `before` is captured AFTER the operator's write, so the row asserts survival of
+    exactly their bytes and stays indifferent to how the board happens to be
+    serialized. Ablation: drop the pre-advance check and the row is `done` on disk
+    with `board-advance-carried` filed over it.
+    """
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    board = project.sprint_status
+    rel = board.relative_to(project.project).as_posix()
+    engine, _ = make_engine(project, [wt_dev_effect(project, "1-1-a", followup_review=False)])
+    crash_at_merge_back(engine, after="merge")
+
+    assert engine.run().crashed
+    assert "unit-merged" in journal_kinds(engine)
+    crashed = load_state(engine.run_dir).tasks["1-1-a"]
+    assert crashed.phase == Phase.DONE and not crashed.isolated_ledger_carried
+    assert crashed.board_advance_intended == "done"
+    # the tracked flip rode the merge, so HEAD already holds the target this carry
+    # would re-apply: whatever the row says now, somebody else put there.
+    assert sprintstatus.story_status(board, "1-1-a") == "done"
+    assert rel not in verify.dirty_paths(project.project)
+
+    set_sprint(project, "1-1-a", "awaiting-operator")
+    before = board.read_bytes()
+
+    state = load_state(engine.run_dir)
+    state.clear_pause()
+    resumed = Engine(
+        paths=project,
+        policy=engine.policy,
+        adapter=MockAdapter([]),
+        run_dir=engine.run_dir,
+        journal=engine.journal,
+        state=state,
+    )
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.crashed
+    # The DAMAGE assertions lead: an ablation must redden on the operator's status
+    # being overwritten, not on a journal kind going missing.
+    assert sprintstatus.story_status(board, "1-1-a") == "awaiting-operator"
+    assert board.read_bytes() == before
+    kinds = journal_kinds(resumed)
+    assert "board-advance-carry-foreign-dirt" in kinds
+    # nothing was written, so the event that says the status is on disk would lie
+    assert "board-advance-carried" not in kinds
+    assert _sprint_carry_commits(project) == []
+
+
 def test_replayed_board_carry_still_commits_a_crashed_passs_own_advance(project):
     """The regression the row above could cause, and why the guard compares BYTES
     rather than refusing on dirt.

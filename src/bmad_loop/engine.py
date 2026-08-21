@@ -59,11 +59,13 @@ from .plugins import HookBus, HookContext, PluginRegistry
 from .policy import Policy
 from .recovery_flow import RecoveryFlow
 from .runs import clear_graceful_stop, events_dir_for, graceful_stop_requested, kill_session
-from .sprintstatus import ACTIONABLE_STATUSES, STATUS_ORDER
+from .sprintstatus import ACTIONABLE_STATUSES, STATUS_ORDER, SprintStatusError
 from .sprintstatus import advance as sprint_advance
 from .sprintstatus import advanced_bytes as sprint_advanced_bytes
 from .sprintstatus import load as load_sprint_status
 from .sprintstatus import next_actionable, parse_selector
+from .sprintstatus import status_in_bytes as sprint_status_in_bytes
+from .sprintstatus import story_status as sprint_story_status
 from .statemachine import advance
 from .workspace import UnitWorkspace, Workspace, discard_worktree, open_unit_workspace
 from .worktree_flow import WorktreeFlow
@@ -6133,23 +6135,26 @@ class Engine:
         why it is a separate frame: a moment later this run's write is on the path and
         "was anybody else here" has stopped being answerable.
 
-        ``dirty_paths`` — git's own answer — and nothing else decides whether the
-        comparison in the sibling below runs at all. That ordering is load-bearing
-        rather than an optimization: it is what keeps the comparison from being asked
-        about a board nobody has written, where the only honest answer is git's. It is
-        NOT what makes the comparison safe on a repo that normalizes line endings —
-        ``file_holds_content`` hashes both sides through the path's clean filter for
-        that, so no eol domain has to be guessed at either end.
+        ``dirty_paths`` — git's own answer — and nothing else decides whether EITHER
+        comparison below runs at all. That ordering is load-bearing rather than an
+        optimization: it is what keeps them from being asked about a board nobody has
+        written, where the only honest answer is git's. It is NOT what makes the byte
+        comparison safe on a repo that normalizes line endings — ``file_holds_content``
+        hashes both sides through the path's clean filter for that, so no eol domain
+        has to be guessed at either end.
 
         Fail CLOSED. A probe that could not run has not ruled an operator out, and the
-        write it gates is the one that leaves no trace of what it took. The cost of the
-        conservative answer is the commit alone — ``advance`` has already put the
-        status on disk, which is the value ``_pick_next`` reads.
+        writes it gates are the ones that leave no trace of what they took. What the
+        conservative answer costs depends on which check then answers, and neither cost
+        is the destructive one: the sibling guarding the COMMIT costs a no-op commit,
+        ``advance`` having already put the status on disk; the row check that PRECEDES
+        ``advance`` costs the carry itself, and with it the next run re-picking the
+        story — the #350 behavior, minus the false claim that it was fixed.
 
         A board outside the repo is the one False the failure paths do not share: git
-        cannot commit it either way, so there is nothing here to protect and nothing
-        for the sibling to compare, and answering True would trade a no-op commit for a
-        no-op refusal."""
+        cannot commit it either way, so there is nothing here to protect and no
+        baseline for either comparison below, and answering True would trade a no-op
+        commit for a real refusal."""
         repo = self.paths.repo_root
         try:
             rel = board.resolve().relative_to(repo.resolve()).as_posix()
@@ -6161,6 +6166,59 @@ class Engine:
             return rel in verify.dirty_paths(repo)
         except (verify.GitError, OSError, RuntimeError):
             return True
+
+    def _board_carry_foreign_row_status(
+        self, board: Path, story_key: str, target: str
+    ) -> str | None:
+        """The status ``story_key``'s row holds for somebody OTHER than this pass.
+
+        ``None`` means the row is this pass's to write. Anything else is a status
+        ``advance`` would overwrite that this run did not put there, and it is handed
+        back rather than a bare False because it is the whole of what the refusal has
+        to report: nothing lands, so there is no ``landed`` to journal in its place.
+
+        The one question the sibling below cannot be asked in time. That one guards the
+        COMMIT and runs after ``advance``, which for the story's OWN row is after the
+        evidence is gone — ``advance`` has replaced the operator's status with the
+        target, so the board then holds precisely HEAD's bytes plus this advance and
+        the proof rightly says so. Nor would refusing the commit at that point have
+        saved anything: the status on disk is the value ``_pick_next`` schedules from.
+        Hence a check that runs BEFORE the write.
+
+        ADDITIVE, and about one ROW rather than the board. A stray on some OTHER row is
+        not this write's to refuse — ``advance`` cannot reach it, and today's outcome
+        there (the advance lands, the sibling declines the commit, ``_pick_next`` stays
+        honest) is the right one. Refusing on a whole-board difference would trade that
+        for a finished story re-picked by every run until a human intervenes.
+
+        Two shapes are this pass's own. A row still holding HEAD's status was written by
+        nobody since the commit ``advance`` recomputes from. A row already AT or PAST
+        ``target`` is the replay leg's reason to exist — a crashed pass's landed advance
+        — and never-regress means ``advance`` writes nothing over it either way, so that
+        shape is settled first and without asking git anything, which keeps a replay off
+        the fail-closed path entirely. An ABSENT row accepts too, and is not this
+        frame's to judge: ``advance`` returns None over it and writes nothing, and
+        ``board-advance-carry-failed`` already names that outcome.
+
+        Fail CLOSED on git, like both siblings and for their reason. The board's own
+        parse is deliberately NOT caught: ``advance`` raises ``SprintStatusError`` out
+        of the caller for a board that is missing or carries no ``development_status``
+        map, and reading the live row FIRST leaves that raise exactly where it was
+        rather than quietly converting it into a refusal. A path HEAD does not carry
+        accepts — the #460 boundary the sibling draws, drawn once for both.
+        """
+        live = sprint_story_status(board, story_key)
+        if live is None or _at_or_past(live, target):
+            return None
+        repo = self.paths.repo_root
+        try:
+            rel = board.resolve().relative_to(repo.resolve()).as_posix()
+            head = verify.file_bytes_at_revision(repo, "HEAD", rel)
+            if head is None:
+                return None
+            return None if live == sprint_status_in_bytes(head, story_key) else live
+        except (verify.GitError, OSError, RuntimeError, ValueError, SprintStatusError):
+            return live
 
     def _board_carry_holds_only_this_advance(
         self, board: Path, story_key: str, target: str
@@ -6281,6 +6339,14 @@ class Engine:
         ``_board_carry_must_prove_ownership``, which asks there what the pre-flight
         asks here.
 
+        Ownership is then asked TWICE, on either side of ``advance``, because the two
+        questions have different deadlines. What the COMMIT must not be handed is
+        answerable afterwards, about the whole board. What ``advance`` ITSELF must not
+        overwrite is answerable only before it, and only about this story's row — so
+        ``_board_carry_foreign_row_status`` leads, and a refusal there returns without
+        journaling ``board-advance-carried``: nothing reached the disk, and that event's
+        claim is precisely that the status did.
+
         What ``advance`` CAN report is that the row did not REACH ``target``, and
         that is a different question from whether it wrote — the one this method has
         to ask before naming its outcome ``board-advance-carried``. It answers
@@ -6304,6 +6370,17 @@ class Engine:
             return
         board = self.paths.sprint_status
         prove = self._board_carry_must_prove_ownership(board)
+        if prove:
+            # `is not None`, not truthiness: an empty status is still somebody's edit.
+            foreign = self._board_carry_foreign_row_status(board, task.story_key, target)
+            if foreign is not None:
+                self.journal.append(
+                    "board-advance-carry-foreign-dirt",
+                    story_key=task.story_key,
+                    target=target,
+                    status=foreign,
+                )
+                return
         landed = sprint_advance(board, task.story_key, target)
         if not _at_or_past(landed, target):
             self.journal.append(
