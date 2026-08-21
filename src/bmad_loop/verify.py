@@ -1823,10 +1823,25 @@ def _merge_in_progress(repo: Path) -> bool:
 
 
 def _tree_dirty_vs_head(repo: Path) -> bool:
-    """True when tracked tree/index differs from HEAD — i.e. a squash actually
-    touched things and needs a reset. A pre-flight-refused squash leaves HEAD's
-    tree intact, so this stays False and we skip the bogus reset."""
+    """True when the tracked tree/index differs from HEAD.
+
+    A TREE-STATE probe, not a did-the-merge-act probe. A checkout carrying a
+    pre-existing unstaged edit answers True whether or not git touched anything,
+    so a single post-merge reading cannot tell a refused merge from one that
+    half-applied — which is why `merge_branch` reads it once BEFORE the squash
+    and resets only a tree it found clean (#619)."""
     rc, _ = _git(repo, "diff", "--quiet", "HEAD", "--")
+    return rc != 0
+
+
+def _index_dirty_vs_head(repo: Path) -> bool:
+    """True when the INDEX differs from HEAD — i.e. a squash actually staged
+    something to commit. Blind, unlike `_tree_dirty_vs_head`, to pre-existing
+    UNSTAGED edits in the checkout, which are none of a replay's business: with
+    such an edit present the tree probe reports dirt a valid `allow_empty_squash`
+    replay never staged, so the clean early return is skipped and the ensuing
+    `git commit` fails with "no changes added to commit" (#619)."""
+    rc, _ = _git(repo, "diff", "--cached", "--quiet", "HEAD")
     return rc != 0
 
 
@@ -1909,21 +1924,26 @@ def merge_branch(
             raise MergePreflightError(detail)
         return
     if strategy == "squash":
+        # `--squash` has no `--abort`, so the restore is `reset --hard` — which
+        # discards the whole working tree, the operator's uncommitted edits with
+        # it. `_tree_dirty_vs_head` cannot say whether the squash caused the dirt
+        # it sees, so read it BEFORE and reset only a tree that was clean then:
+        # a checkout already carrying an unstaged edit reads dirty even when git
+        # refused and touched nothing, and the reset would destroy it (#619).
+        pre_dirty = _tree_dirty_vs_head(repo)
         rc, out = _git(repo, "merge", "--squash", branch)
         if rc != 0:
             unmerged = _index_unmerged(repo)  # read before any reset clears the stages
             kind = "conflict" if unmerged else "refused before starting"
             detail = f"git merge --squash {branch} failed in {repo} ({kind}): {out}"
-            # squash leaves no MERGE_HEAD; only reset if it actually modified the
-            # tree/index (a pre-flight refusal leaves HEAD's tree untouched).
-            if _tree_dirty_vs_head(repo):
+            if not pre_dirty and _tree_dirty_vs_head(repo):
                 reset_rc, reset_out = _git(repo, "reset", "--hard", "HEAD")
                 if reset_rc != 0:
                     detail += f"; AND git reset --hard HEAD failed (tree not restored): {reset_out}"
             if unmerged:
                 raise GitError(detail)
             raise MergePreflightError(detail)
-        if allow_empty_squash and not _tree_dirty_vs_head(repo):
+        if allow_empty_squash and not _index_dirty_vs_head(repo):
             return
         msg = message or f"Squash-merge branch '{branch}'"
         rc, out = _git(repo, "commit", "-m", msg)

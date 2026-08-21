@@ -387,6 +387,56 @@ def test_merge_content_conflict_is_not_a_preflight_refusal(project, tmp_path, st
     assert not isinstance(ei.value, verify.MergePreflightError)
 
 
+@pytest.mark.parametrize("diverged", [False, True], ids=["ff-able", "diverged"])
+def test_squash_preflight_refusal_never_resets_a_tree_it_found_dirty(project, tmp_path, diverged):
+    """DATA-SAFETY PIN. `--squash` has no `--abort`, so its restore is
+    `reset --hard HEAD` — which discards the operator's uncommitted work along with
+    the merge's. The old guard asked `_tree_dirty_vs_head` AFTER the squash and read
+    a checkout that was already dirty as "the squash acted", so a merge git refused
+    without touching a byte still triggered the reset and destroyed an unstaged edit
+    to a file no branch involved ever mentions (#619).
+
+    Both topologies are covered because the refusal renders differently when the
+    merge would have been a fast-forward, and neither rendering may reset.
+
+    Ablation: restore the unconditional `if _tree_dirty_vs_head(repo)` reset and
+    both rows fail on the last assertion — with the operator's bytes gone, which is
+    the point: this test exists to make that destruction loud."""
+    repo = project.project
+    _branch_with(repo, tmp_path, adds={"leak.cs": "branch\n"})
+    if diverged:
+        commit(repo, "m.txt", "m\n", "main work")  # commit BEFORE the dirt exists
+    (repo / "leak.cs").write_text("operator\n")  # untracked → git refuses at pre-flight
+    (repo / "src.txt").write_text("operator edit\n")  # unstaged, tracked, outside `feat`
+
+    with pytest.raises(verify.MergePreflightError):
+        verify.merge_branch(repo, "feat", strategy="squash")
+
+    assert (repo / "src.txt").read_text() == "operator edit\n"
+    assert (repo / "leak.cs").read_text() == "operator\n"
+
+
+def test_squash_replay_ignores_preexisting_unstaged_dirt(project, tmp_path):
+    """`allow_empty_squash` recognises a replay by "the squash staged nothing" — the
+    target already carries the merged tree. Asking that of the WORKING TREE let a
+    pre-existing unstaged edit answer for the squash: the clean early return was
+    skipped, `git commit` found nothing staged, and a host-loss recovery was reported
+    as a failed merge. The index is the honest question (#619).
+
+    Ablation: put the gate back on `_tree_dirty_vs_head` and this fails with a
+    GitError naming "no changes added to commit"."""
+    repo = project.project
+    _branch_with(repo, tmp_path, adds={"f.txt": "branch\n"})
+    verify.merge_branch(repo, "feat", strategy="squash", message="squash feat")  # the lost commit
+    (repo / "src.txt").write_text("operator edit\n")  # unstaged, tracked, outside `feat`
+    head_before = git(repo, "rev-parse", "HEAD")
+
+    verify.merge_branch(repo, "feat", strategy="squash", allow_empty_squash=True)  # must not raise
+
+    assert git(repo, "rev-parse", "HEAD") == head_before  # no empty commit manufactured
+    assert (repo / "src.txt").read_text() == "operator edit\n"
+
+
 def test_no_ff_conflict_with_preexisting_dirt_aborts_and_keeps_it(project, tmp_path):
     """The `merge` leg's restore is `git merge --abort`, which — unlike the squash
     leg's `reset --hard` — leaves an unstaged edit to an untouched tracked file
