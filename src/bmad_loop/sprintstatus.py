@@ -10,6 +10,7 @@ session claims, so the no-races invariant holds.
 from __future__ import annotations
 
 import re
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -304,6 +305,35 @@ def advance(path: Path, story_key: str, target: str, *, now: str | None = None) 
     if changed:
         atomic_write_bytes(path, "".join(lines).encode("utf-8"))
     return target
+
+
+def advanced_bytes(source: bytes, story_key: str, target: str) -> bytes | None:
+    """What :func:`advance` would leave behind, given ``source`` as the board's bytes.
+
+    For the caller that has to know whether a board on disk holds THIS run's advance
+    and nothing else, and so needs the intended content recomputed from a baseline it
+    trusts rather than read back out of the file it is about to commit.
+
+    Goes through ``advance`` itself, against a throwaway copy, rather than
+    reimplementing the edit. Never-regress, the epic lift, and
+    ``_set_mapping_value``'s quoted-scalar, inline-comment and per-line-terminator
+    handling ARE what makes two boards "the same advance" — a second implementation of
+    them would drift from the writer silently, and for this caller a silent drift means
+    committing somebody else's bytes.
+
+    No ``now=``: the caller's own carry passes none either, and a ``last_updated`` line
+    rewritten here and not there would make every comparison fail.
+
+    Returns None when ``advance`` declines to write at all — the board's row is absent,
+    or its line is a shape ``_set_mapping_value`` will not rewrite. There is then no
+    intended content to compare against, and a caller must not read "I could not
+    compute it" as "the tree is mine"."""
+    with tempfile.TemporaryDirectory() as tmp:
+        shadow = Path(tmp) / "sprint-status.yaml"
+        shadow.write_bytes(source)
+        if advance(shadow, story_key, target) is None:
+            return None
+        return shadow.read_bytes()
 
 
 @dataclass(frozen=True)

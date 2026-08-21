@@ -3343,6 +3343,45 @@ def _metachar_pair(repo, meta: str, victim: str):
     return repo / meta / "f.md", repo / victim / "f.md"
 
 
+def test_head_blob_reads_the_committed_bytes_not_the_working_tree(project):
+    """The baseline contract: HEAD's bytes, unaffected by whatever the tree now holds.
+
+    Its caller compares the answer against a file it is about to commit in order to
+    decide whether that file holds anyone else's edits. An implementation that read
+    the working tree instead would answer "mine" for every edit ever made, which is
+    the exact failure the comparison exists to prevent.
+    """
+    repo = project.project
+    committed = (repo / "src.txt").read_bytes()
+    (repo / "src.txt").write_bytes(committed + b"operator was here\n")
+
+    assert verify.head_blob(repo, "src.txt") == committed
+
+
+def test_head_blob_is_none_for_every_path_head_does_not_carry(project):
+    """One None for untracked, absent, and directory paths alike.
+
+    The caller reads None as "git holds no prior content here to compare against" and
+    lets the pre-existing behaviour stand, so these three must not be separable — an
+    untracked board is committed by the carry exactly as it was before (#460), and a
+    board git has never heard of has nothing to protect.
+    """
+    repo = project.project
+    (repo / "stray.txt").write_bytes(b"untracked\n")
+    # A directory that is REALLY in HEAD, committed here because the sandbox template
+    # tracks none: git stores no empty tree, so asserting against an absent name would
+    # pass for the "never_existed" reason and grade nothing.
+    (repo / "nested").mkdir()
+    (repo / "nested" / "f.txt").write_bytes(b"in a tree\n")
+    git(repo, "add", "--", "nested/f.txt")
+    git(repo, "commit", "-q", "-m", "nested")
+
+    assert verify.head_blob(repo, "stray.txt") is None
+    assert verify.head_blob(repo, "never_existed.txt") is None
+    assert verify.head_blob(repo, "nested/f.txt") == b"in a tree\n"  # the tree is real...
+    assert verify.head_blob(repo, "nested") is None  # ...and naming it yields no blob
+
+
 def test_path_tracked_reports_index_membership(project):
     """The basic contract: an index entry is True, an untracked file is False."""
     repo = project.project

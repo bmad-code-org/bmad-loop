@@ -4434,6 +4434,145 @@ def test_crashed_post_merge_board_advance_replays_from_its_record(project):
     assert load_state(resumed.run_dir).tasks["1-1-a"].isolated_ledger_carried
 
 
+def test_replayed_board_carry_leaves_an_operators_edit_out_of_its_commit(project):
+    """#618's carry hazard, on the one leg its merge pre-flight cannot reach.
+
+    `merge_local` refuses a stray on a protected artifact BEFORE it merges, and that
+    refusal is the whole of what keeps `_carry_board_advance`'s pathspec commit from
+    taking bytes the run never wrote. `_replay_unlatched_ledger_carries` skips it:
+    the re-merge block is guarded on `merged_key not in merged_units`, so a unit whose
+    `unit-merged` was already journaled falls straight through to the carry with no
+    merge — and therefore no pre-flight — in front of it. The operator's window is the
+    crash itself: the host is down, they edit their own checkout, the run comes back.
+
+    `unit-merged` in the crashed run's journal is that leg's precondition and is
+    asserted rather than assumed. Without it the resume takes the OTHER branch,
+    re-runs the merge, and the pre-flight would have caught the edit after all —
+    which is exactly how this row stays disjoint from #618's own witnesses.
+
+    A tracked board's flip rides the merge, so by the time the carry runs it has
+    nothing of its own left to write: every byte its commit could take belongs to
+    somebody else. That is asserted too, because it is what makes the sweep total
+    rather than partial.
+
+    The last assertions read git HISTORY, not the working tree, for the reason
+    `_committed_versions` exists: a pathspec carry that swept the edit in leaves the
+    tree clean and the file's bytes unchanged on disk, so "the edit is still there"
+    passes in the unsafe outcome just as well as in the safe one.
+    """
+    marker = "# operator: reopened locally, do not ship\n"
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    board = project.sprint_status
+    rel = board.relative_to(project.project).as_posix()
+    engine, _ = make_engine(project, [wt_dev_effect(project, "1-1-a", followup_review=False)])
+    crash_at_merge_back(engine, after="merge")
+
+    assert engine.run().crashed
+    assert "unit-merged" in journal_kinds(engine)
+    crashed = load_state(engine.run_dir).tasks["1-1-a"]
+    assert crashed.phase == Phase.DONE and not crashed.isolated_ledger_carried
+    assert crashed.board_advance_intended == "done"
+    assert sprintstatus.story_status(board, "1-1-a") == "done"
+    assert rel not in verify.dirty_paths(project.project)
+
+    board.write_text(board.read_text(encoding="utf-8") + marker, encoding="utf-8")
+    before = board.read_text(encoding="utf-8")
+
+    state = load_state(engine.run_dir)
+    state.clear_pause()
+    resumed = Engine(
+        paths=project,
+        policy=engine.policy,
+        adapter=MockAdapter([]),
+        run_dir=engine.run_dir,
+        journal=engine.journal,
+        state=state,
+    )
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.crashed
+    # The DAMAGE assertions lead, so that an ablation of the guard reddens this row on
+    # the operator's bytes reaching a commit and not on a journal kind going missing.
+    # Non-empty first: `any()` over an empty history is False, so a read that found no
+    # commits at all would pass the next line for the wrong reason.
+    versions = _committed_versions(project, rel)
+    assert versions and not any(marker.strip() in v for v in versions)
+    assert not any(
+        "chore(sprint-status)" in s for s in git(project.project, "log", "--format=%s").splitlines()
+    )
+    # refused, never repaired: the operator's bytes and the row's status both survive
+    assert board.read_text(encoding="utf-8") == before
+    assert sprintstatus.story_status(board, "1-1-a") == "done"
+    kinds = journal_kinds(resumed)
+    assert "resume-ledger-carry" in kinds and "board-advance-carry-foreign-dirt" in kinds
+
+
+def test_replayed_board_carry_still_commits_a_crashed_passs_own_advance(project):
+    """The regression the row above could cause, and why the guard compares BYTES
+    rather than refusing on dirt.
+
+    A pass that advanced the board and died before its commit leaves that advance as
+    uncommitted dirt on exactly the path the guard watches — and finishing it is what
+    the replay leg is for. A guard that refused on dirt alone would strand it: the
+    row's status would keep being right on disk and wrong in every commit, for ever.
+
+    So the state is built, not raced for, and built through `sprintstatus.advance` —
+    the same call the carry itself makes — so the bytes under test are the carry's own
+    and not a hand-rolled imitation of them. HEAD is moved below the target first,
+    because that is what makes the advance a real write rather than the never-regress
+    echo a merged tracked board gives.
+
+    Green with the guard ablated as well as with it in place: this row exists to pin
+    that the guard costs nothing here, so it is deliberately NOT part of the ablation
+    set. The row above is.
+    """
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    board = project.sprint_status
+    rel = board.relative_to(project.project).as_posix()
+    engine, _ = make_engine(project, [wt_dev_effect(project, "1-1-a", followup_review=False)])
+    crash_at_merge_back(engine, after="merge")
+
+    assert engine.run().crashed
+    assert "unit-merged" in journal_kinds(engine)
+    assert not load_state(engine.run_dir).tasks["1-1-a"].isolated_ledger_carried
+
+    # HEAD below the target, so the carry has real work; then the dead pass's own
+    # write on top of it, uncommitted — the exact shape a crash leaves behind.
+    set_sprint(project, "1-1-a", "ready-for-dev")
+    git(project.project, "commit", "-q", "-m", "operator reopens the row", "--", rel)
+    sprintstatus.advance(board, "1-1-a", "done")
+    assert rel in verify.dirty_paths(project.project)
+
+    state = load_state(engine.run_dir)
+    state.clear_pause()
+    resumed = Engine(
+        paths=project,
+        policy=engine.policy,
+        adapter=MockAdapter([]),
+        run_dir=engine.run_dir,
+        journal=engine.journal,
+        state=state,
+    )
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.crashed
+    # As above, the substantive assertions lead: a guard that refused on dirt alone
+    # has to redden this row on the carry never reaching a commit, not on a journal
+    # kind. Non-empty first, for the reason the sibling row spells out.
+    versions = _committed_versions(project, rel)
+    assert versions and "1-1-a: done" in versions[0]
+    assert any(
+        s == "chore(sprint-status): carry 1-1-a to done"
+        for s in git(project.project, "log", "--format=%s").splitlines()
+    )
+    assert rel not in verify.dirty_paths(project.project)
+    assert sprintstatus.story_status(board, "1-1-a") == "done"
+    kinds = journal_kinds(resumed)
+    assert "board-advance-carried" in kinds
+    assert "board-advance-carry-foreign-dirt" not in kinds
+    assert "board-advance-carry-uncommitted" not in kinds
+
+
 def test_board_advance_carried_twice_by_a_crash_before_its_latch_is_a_no_op(project):
     """The carry-to-latch window: the resume replays a carry that already ran.
 

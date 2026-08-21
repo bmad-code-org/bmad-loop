@@ -874,6 +874,31 @@ def path_tracked_file(repo: Path, rel: str) -> bool:
     return {entry for entry in proc.stdout.split(b"\0") if entry} == {os.fsencode(rel)}
 
 
+def head_blob(repo: Path, rel: str) -> bytes | None:
+    """The bytes HEAD records at repo-relative posix ``rel``, or None when it records
+    nothing there.
+
+    The RAW blob, not the working-tree form: `cat-file` runs no smudge filter and no
+    eol conversion, so on a repo that normalizes line endings this answer differs from
+    the checked-out file for reasons no author is responsible for. That makes it a
+    BASELINE, never a dirt oracle — :func:`dirty_paths` is git's own answer to "did
+    anyone touch this", and a caller that reaches for a byte compare instead will
+    refuse a pristine checkout on such a repo. Use this only to ask what dirt git has
+    ALREADY reported is made of.
+
+    One `None` for every "HEAD has no such blob" shape, because the callers treat them
+    alike: an unborn HEAD, an untracked or ignored path, a path that names a tree, and
+    a rev-parse failure are all "git holds no prior content here to compare against".
+
+    Reads stdout as BYTES (`git_bytes`), never a decode: a board or ledger is arbitrary
+    file content, and a strict decode would raise on a path the caller is only trying
+    to compare (#377). Comparison is what bytes are for; nothing here needs the text."""
+    proc = git_bytes(repo, "cat-file", "blob", f"HEAD:{rel}")
+    if proc.returncode != 0:
+        return None
+    return proc.stdout
+
+
 def path_ignored(repo: Path, path: Path) -> bool:
     """True when `git add` would REFUSE ``path`` for being ignored — i.e. an ignore
     rule matches it AND git does not already track it (#577).

@@ -466,3 +466,75 @@ def test_advance_writes_through_a_symlinked_board(tmp_path):
 
     assert link.is_symlink()  # still a link, not turned into a regular file
     assert sprintstatus.story_status(real, "3-2-digest-delivery") == "in-progress"
+
+
+def test_advanced_bytes_matches_what_advance_writes_to_a_file(tmp_path):
+    """`advanced_bytes` must answer with the WRITER's bytes, not an imitation of them.
+
+    Its caller compares the answer to a board it is about to commit and skips the
+    commit when they differ, so any divergence from `advance` — an inline comment
+    dropped, a terminator normalized, the epic lift missed — reads to that caller as
+    "somebody else wrote this" and silently costs the carry its commit.
+
+    Graded against a real advance of the same board rather than a literal, so the
+    comparison stays honest when `advance`'s own output changes. `in-progress` is the
+    target because it is the one that also lifts the parent epic, exercising the
+    second write no single-line check would notice was missing.
+    """
+    board = tmp_path / "sprint-status.yaml"
+    board.write_text(SPRINT, encoding="utf-8")
+    source = board.read_bytes()
+
+    assert sprintstatus.advance(board, "3-2-digest-delivery", "in-progress") == "in-progress"
+
+    assert sprintstatus.advanced_bytes(source, "3-2-digest-delivery", "in-progress") == (
+        board.read_bytes()
+    )
+    # ...and the source it was handed is untouched: the recomputation runs on a copy
+    assert source != board.read_bytes()
+
+
+def test_advanced_bytes_echoes_the_source_when_advance_would_not_write(tmp_path):
+    """A row already AT the target is a no-op for `advance` and must be one here too.
+
+    This is the shape the carry meets most often — a tracked board whose flip rode the
+    merge — so an `advanced_bytes` that rewrote anything at all would make the guard
+    refuse every ordinary carry.
+    """
+    board = tmp_path / "sprint-status.yaml"
+    board.write_text(SPRINT, encoding="utf-8")
+    source = board.read_bytes()
+    sprintstatus.advance(board, "3-2-digest-delivery", "done")
+    done = board.read_bytes()
+
+    assert sprintstatus.advanced_bytes(done, "3-2-digest-delivery", "done") == done
+    assert sprintstatus.advanced_bytes(source, "3-2-digest-delivery", "backlog") == source
+
+
+def test_advanced_bytes_is_none_when_the_row_is_absent(tmp_path):
+    """No intended content to compare against, and the caller must not read the
+    absence as agreement — it fails closed on this answer."""
+    board = tmp_path / "sprint-status.yaml"
+    board.write_text(SPRINT, encoding="utf-8")
+
+    assert sprintstatus.advanced_bytes(board.read_bytes(), "9-9-not-a-story", "done") is None
+
+
+def test_advanced_bytes_preserves_crlf_and_inline_comments(tmp_path):
+    """The two shapes a hand-rolled line edit gets wrong, and both are byte-visible.
+
+    #576 (per-line terminators) and #366 (a value's trailing ` # comment`) are exactly
+    the cases where a second implementation would diverge from `advance` — and a
+    divergence here is a carry that stops committing on every board carrying one.
+    """
+    source = (
+        "development_status:\r\n"
+        "  epic-3: in-progress\r\n"
+        "  3-2-digest-delivery: ready-for-dev # owner: pat\r\n"
+    ).encode("utf-8")
+
+    out = sprintstatus.advanced_bytes(source, "3-2-digest-delivery", "done")
+
+    assert out is not None
+    assert b"3-2-digest-delivery: done # owner: pat\r\n" in out
+    assert out.count(b"\r\n") == source.count(b"\r\n")

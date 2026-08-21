@@ -61,6 +61,7 @@ from .recovery_flow import RecoveryFlow
 from .runs import clear_graceful_stop, events_dir_for, graceful_stop_requested, kill_session
 from .sprintstatus import ACTIONABLE_STATUSES, STATUS_ORDER
 from .sprintstatus import advance as sprint_advance
+from .sprintstatus import advanced_bytes as sprint_advanced_bytes
 from .sprintstatus import load as load_sprint_status
 from .sprintstatus import next_actionable, parse_selector
 from .statemachine import advance
@@ -6125,6 +6126,82 @@ class Engine:
             "story-deferred-close-carried", story_key=task.story_key, dw_ids=carried
         )
 
+    def _board_carry_must_prove_ownership(self, board: Path) -> bool:
+        """Whether anyone other than this pass may already have written ``board``.
+
+        Asked by ``_carry_board_advance`` BEFORE its own advance, which is the whole of
+        why it is a separate frame: a moment later this run's write is on the path and
+        "was anybody else here" has stopped being answerable.
+
+        ``dirty_paths`` — git's own answer — and nothing else decides whether the byte
+        compare in the sibling below runs at all. That ordering is load-bearing rather
+        than an optimization. ``head_blob`` reads the RAW blob, unfiltered and without
+        eol conversion, so on a repo that normalizes line endings it differs from the
+        checked-out file on every line; a compare run unconditionally would refuse the
+        carry on every such repo. Gated behind git already calling the path dirty, the
+        same skew can cost only a bookkeeping commit on a board that really is dirty,
+        and never a false pass.
+
+        Fail CLOSED. A probe that could not run has not ruled an operator out, and the
+        write it gates is the one that leaves no trace of what it took. The cost of the
+        conservative answer is the commit alone — ``advance`` has already put the
+        status on disk, which is the value ``_pick_next`` reads.
+
+        A board outside the repo is the one False the failure paths do not share: git
+        cannot commit it either way, so there is nothing here to protect and nothing
+        for the sibling to compare, and answering True would trade a no-op commit for a
+        no-op refusal."""
+        repo = self.paths.repo_root
+        try:
+            rel = board.resolve().relative_to(repo.resolve()).as_posix()
+        except ValueError:
+            return False  # external board — never git's to commit in the first place
+        except (OSError, RuntimeError):
+            return True
+        try:
+            return rel in verify.dirty_paths(repo)
+        except (verify.GitError, OSError, RuntimeError):
+            return True
+
+    def _board_carry_holds_only_this_advance(
+        self, board: Path, story_key: str, target: str
+    ) -> bool:
+        """Whether ``board``'s bytes are HEAD's plus this pass's advance and no more.
+
+        The discrimination the replay leg needs. Refusing on DIRT alone would break the
+        recovery that leg exists for: a crashed pass's own advance IS uncommitted dirt
+        on exactly this path, and finishing it is the point. So the question asked is
+        not whether the board is dirty but whether what is on it is what this pass
+        intends — recomputed from HEAD's blob through ``advance`` itself, then compared
+        byte for byte. A crashed pass's write matches, ``advance`` being deterministic
+        and never-regressing, so replaying a landed one lands on the same bytes; an
+        operator's edit does not.
+
+        HEAD's blob, not a snapshot taken earlier in the run: the baseline has to
+        predate every writer, and only git holds one that does.
+
+        A path HEAD does not carry answers True, leaving an untracked board committed
+        exactly as before (#460). That is the boundary ``merge_local`` already draws —
+        ``_carried_artifact_rels`` filters ``protected`` to TRACKED paths, because
+        protecting an untracked artifact would halt every run whose project never
+        committed its board — and a second frame drawing it elsewhere would make the
+        pair unreadable.
+
+        Fail CLOSED, like its sibling and for its reason, and that covers
+        ``advanced_bytes`` returning None: a row missing from HEAD's board, or a line
+        the writer declines to rewrite, leaves nothing to compare against, and "I could
+        not compute the intended content" must not read as "the tree is mine"."""
+        repo = self.paths.repo_root
+        try:
+            rel = board.resolve().relative_to(repo.resolve()).as_posix()
+            head = verify.head_blob(repo, rel)
+            if head is None:
+                return True
+            intended = sprint_advanced_bytes(head, story_key, target)
+            return intended is not None and board.read_bytes() == intended
+        except (verify.GitError, OSError, RuntimeError, ValueError):
+            return False
+
     def _carry_board_advance(self, task: StoryTask) -> None:
         """Re-apply the story's sprint-board advance to the main checkout (#350).
 
@@ -6166,15 +6243,24 @@ class Engine:
         anything to write, and ``git add`` refuses an ignored path with rc 1 every
         time — a commit-pending latch would only retry a refusal. The status on disk
         is the value that keeps ``_pick_next`` honest; the commit is bookkeeping.
-        The commit is attempted unconditionally rather than gated on evidence of a
-        write, because ``advance`` cannot report whether it wrote (a never-regress
-        echo returns the target too) — an unchanged board simply gives
-        ``commit_paths`` nothing to commit, and ``clean_incoming_collisions`` has
-        just accounted for any unrelated dirt on it: inside the branch's incoming
-        set it was restored, and outside that set it REFUSED the merge, this frame
-        among everything else it precedes (the board is one of the two paths
-        ``merge_local`` passes as ``protected``, precisely because the pathspec
-        stage below would otherwise commit it). So there is none to sweep in.
+        The commit is not gated on evidence of a WRITE, because ``advance`` cannot
+        report whether it wrote (a never-regress echo returns the target too) — and it
+        does not need to be: an unchanged board simply gives ``commit_paths`` nothing
+        to commit.
+
+        What the commit must NOT be given is somebody else's bytes, and on the LIVE
+        merge path ``clean_incoming_collisions`` has already accounted for those:
+        inside the branch's incoming set unrelated dirt was restored, and outside that
+        set it REFUSED the merge, this frame among everything else it precedes (the
+        board is one of the two paths ``merge_local`` passes as ``protected``,
+        precisely because the pathspec stage below would otherwise commit it). That
+        pre-flight does not precede every caller. ``_replay_unlatched_ledger_carries``
+        falls straight through to the carry for a unit whose ``unit-merged`` was
+        already journaled — it re-runs no merge on that leg, so no pre-flight runs on
+        it either — and an edit the operator made while the host was down would ride
+        out under this method's own message, tree clean behind it. Hence
+        ``_board_carry_must_prove_ownership``, which asks there what the pre-flight
+        asks here.
 
         What ``advance`` CAN report is that the row did not REACH ``target``, and
         that is a different question from whether it wrote — the one this method has
@@ -6198,6 +6284,7 @@ class Engine:
         if not target:
             return
         board = self.paths.sprint_status
+        prove = self._board_carry_must_prove_ownership(board)
         landed = sprint_advance(board, task.story_key, target)
         if not _at_or_past(landed, target):
             self.journal.append(
@@ -6207,19 +6294,27 @@ class Engine:
                 status=landed,
             )
             return
-        try:
-            verify.commit_paths(
-                self.paths.repo_root,
-                f"chore(sprint-status): carry {task.story_key} to {target}",
-                [board],
-            )
-        except verify.GitError as e:
+        if prove and not self._board_carry_holds_only_this_advance(board, task.story_key, target):
             self.journal.append(
-                "board-advance-carry-uncommitted",
+                "board-advance-carry-foreign-dirt",
                 story_key=task.story_key,
                 target=target,
-                error=str(e),
+                status=landed,
             )
+        else:
+            try:
+                verify.commit_paths(
+                    self.paths.repo_root,
+                    f"chore(sprint-status): carry {task.story_key} to {target}",
+                    [board],
+                )
+            except verify.GitError as e:
+                self.journal.append(
+                    "board-advance-carry-uncommitted",
+                    story_key=task.story_key,
+                    target=target,
+                    error=str(e),
+                )
         self.journal.append(
             "board-advance-carried",
             story_key=task.story_key,
