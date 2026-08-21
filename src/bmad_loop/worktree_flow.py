@@ -1700,14 +1700,31 @@ class WorktreeFlow:
             # resolved cleanly, so there is no conflict to resolve either. `merge_branch`
             # aborted it, so the checkout is back where it started and the operator is
             # sent to the policy that declined the commit rather than to the tree (#619).
-            reason = (
-                f"merge of {unit.branch} into {target} resolved cleanly, but git refused "
-                f"to COMMIT it, so the merge was aborted and the target checkout is back "
-                f"as it was. There is no conflict to resolve and nothing to clear from "
-                f"the tree: a `pre-merge-commit` or `commit-msg` hook, or commit signing, "
-                f"declined it — git's own message below names which. Fix that, then "
-                f"`bmad-loop resume {self.state.run_id}`. {e}"
-            )
+            if e.restored:
+                reason = (
+                    f"merge of {unit.branch} into {target} resolved cleanly, but git "
+                    f"refused to COMMIT it, so the merge was aborted and the target "
+                    f"checkout is back as it was. There is no conflict to resolve and "
+                    f"nothing to clear from the tree: a `pre-merge-commit` or "
+                    f"`commit-msg` hook, or commit signing, declined it — git's own "
+                    f"message below names which. Fix that, then "
+                    f"`bmad-loop resume {self.state.run_id}`. {e}"
+                )
+            else:
+                # The abort failed too, so the sentence above would be a lie about the
+                # one thing the operator has to act on FIRST: a resume attempted over a
+                # mid-merge checkout dies on the merge state, not on the policy, and
+                # keeps doing so however well they fix the hook.
+                reason = (
+                    f"merge of {unit.branch} into {target} resolved cleanly, git refused "
+                    f"to COMMIT it, and the abort meant to undo that failed as well — so "
+                    f"the target checkout is left MID-MERGE and has to be recovered "
+                    f"first (`git merge --abort`, or reset it to the pre-merge commit). "
+                    f"Only then fix whatever declined the commit: a `pre-merge-commit` "
+                    f"or `commit-msg` hook, or commit signing. git's own message below "
+                    f"names both failures. Then `bmad-loop resume {self.state.run_id}`. "
+                    f"{e}"
+                )
             self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
             return  # defensive: never fall through to the success teardown below
         except verify.GitError as e:

@@ -121,9 +121,18 @@ class MergeCommitRefusedError(GitError):
     `merge_branch` reads that BEFORE its abort rather than only to decide whether
     to abort at all.
 
-    `merge_branch` does abort before raising, so the tree the operator finds is
-    restored. What the `MergePreflightError` framing gets wrong here is "nothing
-    was merged", not "something is left behind" (#619)."""
+    ``restored`` says whether the abort that follows actually put the checkout back.
+    It is an attribute rather than a fourth exception type because the operator's
+    CAUSE is the same either way — a policy declined the commit — and only the first
+    step of their remedy differs: a checkout left mid-merge has to be recovered
+    before fixing that policy is worth anything, and a resume attempted before then
+    fails again on the merge state rather than on the policy. A caller that ignores
+    the flag still gets a true statement of the cause; one that reads it can order
+    the two steps (#619)."""
+
+    def __init__(self, message: str, *, restored: bool = True) -> None:
+        super().__init__(message)
+        self.restored = restored
 
 
 @overload
@@ -963,6 +972,18 @@ def index_holds_no_foreign_content(repo: Path, rel: str, data: bytes) -> bool:
     ``data`` — the first two lose nothing that git cannot still reach, and the third is
     the write itself. Unmerged stages raise rather than answer: a half-resolved index is
     not a state this can prove anything about.
+
+    CONTENT is the whole of what this proves, and that ceiling is deliberate.
+    ``ls-files -s`` reports the entry's MODE too and this reads only the oid beside
+    it, so an operator who stages nothing but an exec-bit flip
+    (``update-index --chmod=+x``) leaves the blob identical, is approved here, and has
+    that staged mode reset by the carry's ``git add``. 100644/100755 is the only pair
+    that can reach it — a symlink entry (120000) carries a different blob, which the
+    oid compare already catches — so the exposure is exactly an exec bit on a YAML
+    data file that nothing reads and nothing runs. Widening the proof to index
+    metadata no workflow here sets would protect nothing and hand the carry one more
+    way to refuse an ordinary board. A caller must not read this as "the index entry
+    is untouched"; it says "the index holds no content this write would lose".
     """
     proc = git_bytes(repo, "ls-files", "-s", "-z", "--", *_literal_specs([rel]))
     if proc.returncode != 0:
@@ -2085,14 +2106,19 @@ def merge_branch(
             else:
                 kind = "refused before starting"
             detail = f"git merge --no-ff {branch} failed in {repo} ({kind}): {out}"
+            restored = True
             if started:  # only abort a merge that actually started
                 abort_rc, abort_out = _git(repo, "merge", "--abort")  # restore pre-merge HEAD
                 if abort_rc != 0:
+                    # The repair write failed, so the claim the caller's message would
+                    # otherwise make — "the checkout is back as it was" — is now false.
+                    # Carry that, rather than letting the classification imply it.
+                    restored = False
                     detail += f"; AND git merge --abort failed (repo left mid-merge): {abort_out}"
             if unmerged:
                 raise GitError(detail)
             if started:
-                raise MergeCommitRefusedError(detail)
+                raise MergeCommitRefusedError(detail, restored=restored)
             raise MergePreflightError(detail)
         return
     if strategy == "squash":

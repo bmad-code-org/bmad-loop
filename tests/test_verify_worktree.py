@@ -443,6 +443,49 @@ def test_merge_whose_commit_git_refused_is_not_a_preflight_refusal(project, tmp_
     assert not verify._merge_in_progress(repo)
     assert not (repo / "feature.txt").exists()
     assert git(repo, "rev-parse", "HEAD") == head_before
+    assert ei.value.restored is True  # the abort ran and worked; the sibling row is the other half
+
+
+def test_merge_commit_refusal_whose_abort_also_failed_reports_the_tree_unrestored(
+    project, tmp_path, monkeypatch
+):
+    """The repair write can fail too, and then the classification's implied claim —
+    "the checkout is back as it was" — is false about the one thing the operator has
+    to do FIRST. A resume over a mid-merge checkout dies on the merge state however
+    well they fix the hook that declined the commit, so `merge_branch` carries whether
+    the abort actually worked rather than letting the exception's type imply it.
+
+    The abort is failed through the `_git` seam because there is no portable way to
+    make a real `git merge --abort` fail on demand; everything else in the row is the
+    genuine article, including the merge and the signing refusal that precede it. The
+    delegation is by argv rather than call count, so it stays pinned to the abort even
+    if the surrounding code grows another git call.
+
+    The last assertion is the point of failing it at all: the repo really is left
+    mid-merge, so the flag is reporting the tree's state and not just echoing a
+    branch it was told to take.
+
+    Ablation: drop the `restored` argument at the raise and this row fails on the
+    flag, while the sibling above — which asserts the True half — stays green."""
+    repo = project.project
+    _cleanly_mergeable_branch(repo, tmp_path)
+    git(repo, "config", "commit.gpgsign", "true")
+    git(repo, "config", "gpg.program", "bmad-loop-no-such-signer")
+    real_git = verify._git
+
+    def failing_abort(r, *args):
+        if args[:2] == ("merge", "--abort"):
+            return 1, "fatal: could not abort"
+        return real_git(r, *args)
+
+    monkeypatch.setattr(verify, "_git", failing_abort)
+
+    with pytest.raises(verify.MergeCommitRefusedError) as ei:
+        verify.merge_branch(repo, "feat", strategy="merge")
+
+    assert ei.value.restored is False
+    assert "repo left mid-merge" in str(ei.value)
+    assert verify._merge_in_progress(repo)  # the tree really is unrestored
 
 
 @pytest.mark.parametrize("diverged", [False, True], ids=["ff-able", "diverged"])

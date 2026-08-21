@@ -3394,8 +3394,19 @@ def test_merge_env_fault_during_target_clean_keeps_branch_and_escalates(
     assert branch_exists(project.project, "bmad-loop/test-run/1-1-a")
 
 
+# One phrase per escalation shape. The test asserts its own row's phrase present and
+# every OTHER row's absent, so the set is written once here rather than as a per-row
+# exclusion list that silently stops covering a shape the moment one is added.
+_MERGE_FAILURE_PHRASES = (
+    "refused by git before it started",
+    "the target checkout is back as it was",
+    "left MID-MERGE",
+    "content conflict",
+)
+
+
 @pytest.mark.parametrize(
-    "make_exc, present, absent",
+    "make_exc, present",
     [
         (
             lambda: verify.MergePreflightError(
@@ -3404,15 +3415,22 @@ def test_merge_env_fault_during_target_clean_keeps_branch_and_escalates(
                 "overwritten by merge:\n\tleak.cs"
             ),
             "refused by git before it started",
-            ("content conflict", "refused to COMMIT"),
         ),
         (
             lambda: verify.MergeCommitRefusedError(
                 "git merge --no-ff feat failed in /repo (merged, but git refused the "
                 "commit): error: gpg failed to sign the data"
             ),
-            "refused to COMMIT",
-            ("content conflict", "refused by git before it started"),
+            "the target checkout is back as it was",
+        ),
+        (
+            lambda: verify.MergeCommitRefusedError(
+                "git merge --no-ff feat failed in /repo (merged, but git refused the "
+                "commit): error: gpg failed to sign the data; AND git merge --abort "
+                "failed (repo left mid-merge): fatal: could not abort",
+                restored=False,
+            ),
+            "left MID-MERGE",
         ),
         (
             lambda: verify.GitError(
@@ -3420,13 +3438,12 @@ def test_merge_env_fault_during_target_clean_keeps_branch_and_escalates(
                 "CONFLICT (content): Merge conflict in src.txt"
             ),
             "content conflict",
-            ("refused by git before it started", "refused to COMMIT"),
         ),
     ],
-    ids=["preflight-refusal", "commit-refused", "content-conflict"],
+    ids=["preflight-refusal", "commit-refused", "commit-refused-unrestored", "content-conflict"],
 )
 def test_merge_failure_escalation_tells_a_preflight_refusal_from_a_conflict(
-    project, monkeypatch, make_exc, present, absent
+    project, monkeypatch, make_exc, present
 ):
     """#619: `merge_local` caught every `verify.GitError` out of `merge_branch` and
     told the operator to resolve "a content conflict against the target". Most of
@@ -3435,21 +3452,27 @@ def test_merge_failure_escalation_tells_a_preflight_refusal_from_a_conflict(
     conflict that does not exist. `MergePreflightError` is a GitError subclass, so
     the two arms must be ordered subclass-first for the split to exist at all.
 
-    Each row asserts its own phrase PRESENT and BOTH neighbours' phrases ABSENT.
-    The absence half is the discriminator: a single catch-all arm still makes each
-    row's own phrase appear on one of them, and only the cross-check catches the
-    collapse. Both neighbours rather than one, because with three arms a pair could
-    collapse into each other while the third stayed distinct.
+    Each row asserts its own phrase PRESENT and every OTHER row's phrase ABSENT. The
+    absence half is the discriminator: a single catch-all arm still makes each row's
+    own phrase appear on one of them, and only the cross-check catches the collapse.
+    Every other rather than one neighbour, because past two arms a pair can collapse
+    into each other while the rest stay distinct.
 
     `commit-refused` is the third state (#619): git merged cleanly and then declined
-    to COMMIT — a `pre-merge-commit`/`commit-msg` hook or a signing step. Its arm
-    exists because neither neighbour's remedy fits it, so both of their phrases have
-    to stay off its escalation.
+    to COMMIT — a `pre-merge-commit`/`commit-msg` hook, or a signing step. Its arm
+    exists because neither neighbour's remedy fits it.
 
-    Ablation: delete any one of the two subclass arms from `merge_local` and that
-    row fails on both halves while the others stay green — and every verify-layer
-    row stays green too, because this is the wiring axis and those are the predicate
-    axis."""
+    `commit-refused-unrestored` is that state with the abort ALSO failed. It is a
+    row and not a footnote because the two differ in what the operator must do
+    FIRST: a resume over a mid-merge checkout dies on the merge state however well
+    they fix the hook, so a message claiming the checkout was restored costs them
+    the one step that unblocks it.
+
+    Ablation: delete either subclass arm from `merge_local` and its rows fail on
+    both halves while the others stay green; collapse the `e.restored` branch to the
+    restored wording and only `commit-refused-unrestored` reddens. Every verify-layer
+    row stays green throughout, because this is the wiring axis and those are the
+    predicate axis."""
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
     engine, _ = make_engine(
         project,
@@ -3467,8 +3490,9 @@ def test_merge_failure_escalation_tells_a_preflight_refusal_from_a_conflict(
     assert engine.state.tasks["1-1-a"].phase == Phase.ESCALATED
     reason = engine.state.paused_reason or ""
     assert present in reason
-    for phrase in absent:
-        assert phrase not in reason
+    for phrase in _MERGE_FAILURE_PHRASES:
+        if phrase != present:
+            assert phrase not in reason
     assert str(exc).splitlines()[0] in reason  # git's own text is passed through
     # branch kept for manual merge — the unit's work is not stranded either way
     assert branch_exists(project.project, "bmad-loop/test-run/1-1-a")

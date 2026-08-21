@@ -86,8 +86,10 @@ breaking changes may land in a minor release.
   COMMIT — a `pre-merge-commit` or `commit-msg` hook, or a `commit.gpgsign` that cannot sign —
   leaves no unmerged stages but does leave `MERGE_HEAD`, so reading the index alone called a
   started merge a pre-flight refusal and sent you to clear a clash that does not exist.
-  `verify.MergeCommitRefusedError` now names it: the merge is aborted, the checkout restored, and
-  the escalation points at the policy that declined rather than at a tree with nothing wrong.
+  `verify.MergeCommitRefusedError` now names it: the merge is aborted and the escalation points at
+  the policy that declined rather than at a tree with nothing wrong. Where the abort ITSELF fails,
+  it says so and sends you to recover the mid-merge checkout first — a resume attempted before
+  that dies on the merge state however well the hook is fixed.
 - **A refused `squash` merge no longer destroys the uncommitted work in your main checkout
   (#619).** `--squash` has no `--abort`, so the recovery is `git reset --hard HEAD` — gated on a
   tree-state probe read _after_ the merge and used to answer "did the squash act". A checkout
