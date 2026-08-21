@@ -3059,7 +3059,15 @@ def test_merge_tolerates_untracked_stray_in_main_checkout(project):
     that differ between target and branch, and git never stages an untracked file
     into a merge or squash commit, so the file cannot be overwritten or swept in.
     Before #460 this exact run ended `done=0 paused=True escalated=1` — one stray
-    `notes.txt` halted an unattended loop at its first story."""
+    `notes.txt` halted an unattended loop at its first story.
+
+    The `merge-preflight-refused` assertion at the end is a GREEN-ABLATION record:
+    no mutation of #623's code reddens it, because it asserts an absence on a path
+    that never raises. It is here to stop a later change firing the corrective event
+    unconditionally — pairing every tolerated stray with a refusal that did not
+    happen — and its positive counterpart is
+    `test_merge_shape_clash_journals_the_corrective_refusal`, which is the row that
+    goes red if the event stops firing."""
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
     engine, _ = make_engine(
         project,
@@ -3088,6 +3096,95 @@ def test_merge_tolerates_untracked_stray_in_main_checkout(project):
     assert tolerated["paths"] == ["operator-notes.txt"]
     assert tolerated["story_key"] == "1-1-a"
     assert tolerated["branch"] == "bmad-loop/test-run/1-1-a"
+    # ...and nothing corrects it, because nothing went wrong: the merge landed.
+    assert "merge-preflight-refused" not in kinds
+
+
+def _shape_clash_dev_effect(project, story_key, *, incoming_path, stray_path):
+    """A dev effect whose branch commits `incoming_path` while an untracked stray
+    lands at `stray_path` in the MAIN checkout. Neither path is a member of the
+    other's set, so #460's tolerance walks past the stray — but the two collide
+    STRUCTURALLY, so git refuses the merge at its own pre-flight. The two shapes are
+    the ones pinned at the verify layer by
+    `test_clean_incoming_collisions_shape_clash_stops_at_gits_own_preflight`."""
+    base = wt_dev_effect(project, story_key)
+
+    def effect(spec):
+        incoming = spec.cwd / incoming_path
+        incoming.parent.mkdir(parents=True, exist_ok=True)
+        incoming.write_text(f"branch content for {story_key}\n")
+        result = base(spec)
+        stray = project.project / stray_path
+        stray.parent.mkdir(parents=True, exist_ok=True)
+        stray.write_text("operator\n")
+        return result
+
+    return effect
+
+
+@pytest.mark.parametrize(
+    ("incoming_path", "stray_path"),
+    [
+        ("Assets/Leak.cs", "Assets"),  # untracked FILE where the merge needs a DIR
+        ("notes", "notes/keep.txt"),  # untracked DIR where the merge needs a FILE
+    ],
+    ids=["file-where-dir-needed", "dir-where-file-needed"],
+)
+def test_merge_shape_clash_journals_the_corrective_refusal(project, incoming_path, stray_path):
+    """#623. `merge-target-tolerated` is written from inside `clean_incoming_collisions`'s
+    callback, strictly BEFORE `merge_branch` runs, so it can only ever record what the
+    GUARD decided. A stray outside the incoming set by PATH can still clash with it by
+    SHAPE, and git then refuses the merge over the very path that event called harmless
+    — leaving the journal asserting the run tolerated something that in fact stopped it.
+
+    The fix is corrective, not a rewrite: the pre-merge event stays (emitting it only on
+    success would lose the trace in exactly the run worth debugging) and the pre-flight
+    arm appends `merge-preflight-refused` carrying the same paths plus git's own text.
+    Order is the whole claim — a reader scanning the journal top-down must meet the
+    correction after the assertion it corrects, not before it.
+
+    Real git, no monkeypatch: the wiring axis is
+    `test_merge_failure_escalation_tells_a_preflight_refusal_from_a_conflict`, which
+    injects the exception; this row proves the two shapes really do reach that arm.
+
+    Ablation: delete the corrective `journal.append` from `merge_local` and both rows
+    fail here while `test_merge_tolerates_untracked_stray_in_main_checkout` stays green
+    — disjoint sets, which is what makes the negative pin there meaningful."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            _shape_clash_dev_effect(
+                project, "1-1-a", incoming_path=incoming_path, stray_path=stray_path
+            ),
+            wt_review_effect(project, "1-1-a", clean=True),
+        ],
+    )
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and not summary.crashed
+    assert engine.state.tasks["1-1-a"].phase == Phase.ESCALATED
+    entries = engine.journal.entries()
+    kinds = [e["kind"] for e in entries]
+    # both land, and in the order that makes the second one a correction of the first
+    assert kinds.index("merge-target-tolerated") < kinds.index("merge-preflight-refused")
+    assert kinds.index("merge-preflight-refused") < kinds.index("story-escalated")
+    tolerated = next(e for e in entries if e["kind"] == "merge-target-tolerated")
+    refused = next(e for e in entries if e["kind"] == "merge-preflight-refused")
+    assert tolerated["paths"] == [stray_path]  # the guard really did wave it through
+    assert refused["tolerated"] == tolerated["paths"]  # same list, so they can be paired
+    assert refused["story_key"] == tolerated["story_key"] == "1-1-a"
+    assert refused["branch"] == tolerated["branch"] == "bmad-loop/test-run/1-1-a"
+    # git's raw text rides along: it is the only thing that names WHICH path clashed,
+    # and "refused before starting" pins that this came off the pre-flight arm rather
+    # than the content-conflict one, which must never write this event.
+    assert "refused before starting" in refused["error"]
+    assert stray_path.split("/")[0] in refused["error"]
+    # the operator's bytes and shape survive, and the branch is kept for manual merge
+    stray = project.project / stray_path
+    assert stray.is_file() and stray.read_text() == "operator\n"
+    assert branch_exists(project.project, "bmad-loop/test-run/1-1-a")
+    assert "merge-target-cleaned" not in kinds
 
 
 @pytest.mark.parametrize(

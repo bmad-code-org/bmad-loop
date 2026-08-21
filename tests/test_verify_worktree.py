@@ -575,10 +575,14 @@ def test_clean_incoming_collisions_shape_clash_stops_at_gits_own_preflight(
     What this test pins is that deferring is SAFE — the halt is not lost, only moved
     one call later, and the operator's bytes survive it. Were tolerance ever widened
     to swallow git's refusal too, this test goes red rather than a run silently
-    destroying operator data. The two labelling gaps this shape leaves behind are
-    filed, not fixed here: #619 (the escalation calls a pre-flight refusal a "content
-    conflict") and #623 (`merge-target-tolerated` is journaled for a stray that then
-    blocked the merge)."""
+    destroying operator data. The two labelling gaps this shape used to leave behind
+    are now closed one layer up, and this row stays the fixture both were measured
+    against: #619 (the escalation called a pre-flight refusal a "content conflict")
+    by the `MergePreflightError` split asserted above, and #623 (`merge-target-
+    tolerated` journaled for a stray that then blocked the merge) by the corrective
+    `merge-preflight-refused` event — see
+    `test_merge_shape_clash_journals_the_corrective_refusal` in
+    tests/test_engine_worktree.py, which drives these same two shapes end to end."""
     repo = project.project
     _branch_with(repo, tmp_path, adds={incoming_path: "branch\n"})
     stray = repo / stray_path

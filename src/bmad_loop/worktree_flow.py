@@ -1504,17 +1504,35 @@ class WorktreeFlow:
         # untracked dirt cannot be overwritten or staged in, so it is tolerated and
         # journaled; uncommitted changes to tracked files can be folded into this story's
         # commit, so they escalate.
+        tolerated: list[str] = []
+
+        def note_tolerated(paths: list[str]) -> None:
+            """Journal the guard's decision AND keep the paths for the arms below.
+
+            The event stays here, before the merge, because it records what the
+            GUARD decided; emitting it only on success would lose the trace in
+            exactly the run worth debugging. But "tolerated" is a claim about the
+            path SET, and a stray outside that set by path can still clash with it
+            structurally — a file where the merge needs a directory, or the reverse
+            — so git may refuse the merge over a path this event just called
+            harmless. Holding the list lets the pre-flight arm correct the record
+            instead of leaving it asserting the run merged past a path that in fact
+            stopped it (#623).
+            """
+            tolerated.extend(paths)
+            self.journal.append(
+                "merge-target-tolerated",
+                story_key=task.story_key,
+                branch=unit.branch,
+                paths=paths,
+            )
+
         try:
             cleaned = verify.clean_incoming_collisions(
                 repo,
                 target,
                 merge_ref,
-                on_tolerated=lambda paths: self.journal.append(
-                    "merge-target-tolerated",
-                    story_key=task.story_key,
-                    branch=unit.branch,
-                    paths=paths,
-                ),
+                on_tolerated=note_tolerated,
             )
         except (verify.GitError, OSError, RuntimeError) as e:
             # OSError/RuntimeError join GitError because clean_incoming_collisions
@@ -1585,6 +1603,19 @@ class WorktreeFlow:
                 f"paths. Clear that clash, then `bmad-loop resume {self.state.run_id}`. "
                 f"{e}"
             )
+            if tolerated:
+                # Corrective, not duplicative: only this arm knows the merge died at
+                # git's pre-flight, and only the callback above knows which paths the
+                # guard waved through. One of them may be the cause — git's text names
+                # it — so pair the two rather than making either infer the other. Rides
+                # phase 1's typed error: one discriminator, two consumers (#623).
+                self.journal.append(
+                    "merge-preflight-refused",
+                    story_key=task.story_key,
+                    branch=unit.branch,
+                    tolerated=tolerated,
+                    error=str(e),
+                )
             self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
             return  # defensive: never fall through to the success teardown below
         except verify.GitError as e:
