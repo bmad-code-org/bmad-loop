@@ -1936,8 +1936,12 @@ def clean_incoming_collisions(
                 "staged changes to tracked files outside this branch's files "
                 f"(not introduced by the merge): {', '.join(staged)}"
             )
-        already_named = set(staged)
-        swept = [p for p in blocking if p not in already_named]
+        # Membership in `guarded`, NOT the `staged` complement. A path can be both,
+        # and the two clauses carry DIFFERENT remedies — so subtracting the staged ones
+        # here would name a staged-and-carried path under "commit or unstage it" alone,
+        # which does not remove the hazard: the carry stages whatever the working tree
+        # holds either way. Overlap means it is listed twice, which is the honest answer.
+        swept = [p for p in blocking if p in guarded]
         if swept:
             clauses.append(
                 "uncommitted changes to paths this run commits for itself after the "

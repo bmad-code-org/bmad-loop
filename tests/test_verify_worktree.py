@@ -966,6 +966,39 @@ def test_clean_incoming_collisions_protected_names_both_groups_separately(projec
     assert "src.txt" in carry_clause and "staged.txt" not in carry_clause
 
 
+def test_clean_incoming_collisions_names_a_staged_carried_path_under_both_clauses(
+    project, tmp_path
+):
+    """The OVERLAP the sibling above does not cover: one path that is staged AND
+    carried. The two clauses carry different remedies, and only one of them removes
+    this path's hazard — the carry stages whatever the working tree holds, so
+    "commit or unstage it" leaves the operator's bytes exactly where the carry will
+    find them. Naming it under the staged clause alone therefore sends them to a fix
+    that does not fix it.
+
+    Both clauses have to exist for the row to mean anything, which is why the raise
+    is partitioned rather than searched: `"src.txt" in msg` would pass on a message
+    carrying only one of them.
+
+    Ablation: compute `swept` from the `staged` complement again and this row fails
+    on the carry clause, while both sibling rows — disjoint paths, and carried-only —
+    stay green, because neither has a path in both sets."""
+    repo = project.project
+    _feat_adding_leak(repo, tmp_path)
+    (repo / "src.txt").write_text("operator edit\n")
+    git(repo, "add", "src.txt")  # staged AND named as carried below
+    assert verify.dirty_paths(repo) == {"src.txt": "M "}
+
+    with pytest.raises(verify.GitError) as ei:
+        verify.clean_incoming_collisions(repo, "main", "feat", protected=("src.txt",))
+    msg = str(ei.value)
+    staged_clause, sep, carry_clause = msg.partition("; and ")
+    assert sep, f"expected both clauses, got: {msg}"
+    assert "src.txt" in staged_clause
+    assert "src.txt" in carry_clause
+    assert (repo / "src.txt").read_text() == "operator edit\n"  # nothing touched
+
+
 def test_clean_incoming_collisions_protected_is_paths_not_a_mode(project, tmp_path):
     """Naming a path the operator has not dirtied changes nothing, and naming one
     does not make an unrelated stray block either — `protected` intersects the

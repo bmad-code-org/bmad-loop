@@ -6154,7 +6154,19 @@ class Engine:
         A board outside the repo is the one False the failure paths do not share: git
         cannot commit it either way, so there is nothing here to protect and no
         baseline for either comparison below, and answering True would trade a no-op
-        commit for a real refusal."""
+        commit for a real refusal.
+
+        A GITIGNORED board is the ceiling, and it is git's rather than this probe's.
+        ``dirty_paths`` never reports one — ``git status --porcelain`` needs
+        ``--ignored`` to spell it ``!!`` at all — so both comparisons are skipped
+        here. Reporting it would change NOTHING, which is why the probe is left
+        alone: an ignored board is untracked, HEAD carries no blob for it, and both
+        comparisons accept a path HEAD does not carry precisely because there is no
+        baseline to compare against (the #460 boundary). Measured. Nor can the COMMIT
+        half of the hazard arise there — ``git add`` refuses an ignored path with rc 1
+        every time. What is genuinely unprotected is the ADVANCE: a replayed carry can
+        still overwrite a row an operator edited on an ignored board while the host
+        was down, and nothing git holds could prove otherwise."""
         repo = self.paths.repo_root
         try:
             rel = board.resolve().relative_to(repo.resolve()).as_posix()

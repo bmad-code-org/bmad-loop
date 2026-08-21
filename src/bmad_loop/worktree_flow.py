@@ -1624,11 +1624,17 @@ class WorktreeFlow:
                     f"fault, then `bmad-loop resume {self.state.run_id}`"
                 )
             else:
+                # The outer sentence names the HAZARD, never the mechanism: since #618
+                # there are two, and only the inner clause knows which applies to which
+                # path. Saying "a merge or squash would fold them" out here attributed
+                # every refusal to the merge, including one raised because the run's own
+                # post-merge carry would sweep a path it commits for itself.
                 reason = (
                     f"merge of {unit.branch} into {target} blocked: the target checkout has "
-                    f"uncommitted changes to tracked files outside this branch — a merge or "
-                    f"squash would fold them into this story's commit. Commit, stash or revert "
-                    f"them, then `bmad-loop resume {self.state.run_id}`. One cause is a "
+                    f"uncommitted changes to tracked files outside this branch that this run "
+                    f"could commit under the story's name — the clause below names the paths, "
+                    f"the mechanism, and what each one needs. Commit, stash or revert them, "
+                    f"then `bmad-loop resume {self.state.run_id}`. One cause is a "
                     f"per_worktree engine Editor writing into the main checkout; another is "
                     f"ordinary local work. {e}"
                 )
