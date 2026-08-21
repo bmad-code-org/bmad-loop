@@ -4,7 +4,7 @@ import re
 from pathlib import Path
 
 import pytest
-from conftest import fault_read_text
+from conftest import UNRESOLVABLE, fault_read_text, refuse_to_resolve
 
 from bmad_loop import stories
 
@@ -590,3 +590,235 @@ def test_story_rows_limit_counts_dispatchable_not_done(tmp_path):
 def test_story_rows_missing_manifest_raises(tmp_path):
     with pytest.raises(stories.StoriesError, match=re.escape("no stories.yaml found")):
         stories.story_rows(tmp_path)
+
+
+# --------------------------------------------------------- relativize_spec_folder
+
+
+def test_relativize_spec_folder_rebases_absolute_path_in_project(tmp_path):
+    """CONTROL for the whole section, not an ablation row: the healthy path. Both
+    `.resolve()` calls answer, they agree on a shared prefix, and the result is
+    project-relative — so a red neighbour below is evidence about a refusal leg,
+    never about rebasing itself. Measured green under B1, B2 and B3."""
+    project = tmp_path / "proj"
+    spec_folder = project / "specs" / "s1"
+    spec_folder.mkdir(parents=True)
+    assert stories.relativize_spec_folder(project, str(spec_folder)) == "specs/s1"
+
+
+def test_relativize_spec_folder_refuses_unresolvable_project_root(tmp_path, monkeypatch):
+    """The project root's own `.resolve()` faulting (WinError 64 from a
+    registered-but-not-serving UNC provider, or a symlink loop on the 3.11/3.12
+    floor, #560) escaped the `except ValueError` that used to be the whole guard
+    around this pair of `.resolve()` calls. Catching it must not mean answering
+    it: a host that cannot canonicalize one side cannot say where the folder is,
+    and every sink downstream takes the string as given — `BMAD_LOOP_SPEC_FOLDER`,
+    the dev prompt, `RunState.spec_folder`, post-session verification — while
+    `StoriesEngine._stories_folder` anchors only a *relative* answer on the live
+    workspace root. Degrading to the raw absolute spelling therefore trades a loud
+    abort for an isolated story that silently reads and writes the main checkout,
+    so this leg refuses instead.
+
+    Measured ablations:
+    - B1 (collapse the split back to one degrade arm,
+      `except (OSError, RuntimeError, ValueError): return raw.as_posix()`): FAILS
+      at `with pytest.raises(stories.StoriesError)` — `Failed: DID NOT RAISE
+      StoriesError`. That line alone carries the row; the five assertions after it
+      are never reached.
+    - B2 (widen the raise arm to the whole tuple): green. B2 changes only the
+      `ValueError` leg, which this row does not travel — the outside-the-tree row
+      at the end of this section is the one that catches it.
+    - B3 (delete the `cli._dry_run_stories` handler): green — no CLI here."""
+    project = tmp_path / "proj"
+    spec_folder = project / "specs" / "s1"
+    spec_folder.mkdir(parents=True)
+    refuse_to_resolve(monkeypatch, project)
+
+    with pytest.raises(stories.StoriesError) as excinfo:
+        stories.relativize_spec_folder(project, str(spec_folder))
+
+    msg = str(excinfo.value)
+    assert f"cannot canonicalize the spec folder {str(spec_folder)!r}" in msg
+    assert f"project root {str(project)!r}" in msg
+    assert UNRESOLVABLE in msg  # the refusing OSError's own text, interpolated
+    assert "Run `bmad-loop validate` for what this host is doing." in msg
+    assert isinstance(excinfo.value.__cause__, OSError)  # `raise ... from e`
+
+
+def test_relativize_spec_folder_refuses_unresolvable_spec_folder(tmp_path, monkeypatch):
+    """Same arm, the other operand: `refuse_to_resolve` matches on the exact
+    `str()` spelling, so refusing the project root above leaves `raw.resolve()`
+    answering normally and vice versa. Without this row a regression that
+    re-degraded only the `raw` side would still pass the project-root row.
+
+    Measured ablations: identical to the project-root row above — B1 FAILS at
+    `with pytest.raises(stories.StoriesError)` (`DID NOT RAISE StoriesError`),
+    B2 green, B3 green."""
+    project = tmp_path / "proj"
+    spec_folder = project / "specs" / "s1"
+    spec_folder.mkdir(parents=True)
+    refuse_to_resolve(monkeypatch, spec_folder)
+
+    with pytest.raises(stories.StoriesError) as excinfo:
+        stories.relativize_spec_folder(project, str(spec_folder))
+
+    msg = str(excinfo.value)
+    assert f"cannot canonicalize the spec folder {str(spec_folder)!r}" in msg
+    assert f"project root {str(project)!r}" in msg
+    assert UNRESOLVABLE in msg
+    assert "Run `bmad-loop validate` for what this host is doing." in msg
+    assert isinstance(excinfo.value.__cause__, OSError)
+
+
+def _symlinked_project_root(tmp_path: Path) -> Path:
+    """A project root reached through a symlink, so its lexical and canonical
+    spellings really are different strings.
+
+    The two rows above cannot see a mixed-spelling message on their own: measured
+    here, `tmp_path.resolve() == tmp_path`, so a raw operand and a dereferenced one
+    are the same text and every spelling assertion passes either way.
+    Follows `test_bmadconfig.py`'s `worktree_isolation_conflict` symlink row,
+    including its skip for a Windows host without SeCreateSymbolicLink."""
+    target = tmp_path / "target"
+    target.mkdir()
+    root = tmp_path / "p"
+    try:
+        root.symlink_to(target, target_is_directory=True)
+    except OSError as e:  # Windows without SeCreateSymbolicLink / developer mode
+        pytest.skip(f"cannot create a symlink here: {e}")
+    assert root.resolve() != root, "the two spellings really are different"
+    return root
+
+
+def test_relativize_spec_folder_symlinked_root_still_rebases_when_healthy(tmp_path):
+    """CONTROL for the two symlinked rows below, not an ablation row: reaching
+    the root through a symlink does not by itself stop the rebase. Both
+    `.resolve()` calls answer, they agree on the canonical spelling, and the
+    result is project-relative. Measured green under B1, B2 and B3 — it is here
+    so a red neighbour cannot be blamed on the symlink itself."""
+    root = _symlinked_project_root(tmp_path)
+    spec_folder = root / "specs" / "s1"
+    spec_folder.mkdir(parents=True)
+
+    assert stories.relativize_spec_folder(root, str(spec_folder)) == "specs/s1"
+
+
+def test_relativize_spec_folder_symlinked_root_project_refused_raises(tmp_path, monkeypatch):
+    """The project-root operand refused on a host where a path's raw and
+    canonical spellings really are different strings. The refusal quotes the
+    *raw* spelling the caller passed, never the dereferenced one: the message is
+    the only place an operator learns which path to fix, and both the engine and
+    the dry-run consume that same raw string, so a silently re-spelled one would
+    name a directory nobody configured.
+
+    Measured ablations:
+    - B1: FAILS at `with pytest.raises(stories.StoriesError)` (`DID NOT RAISE
+      StoriesError`) — that line carries the row.
+    - B2: green (the `ValueError` leg is untravelled here). B3: green.
+
+    The `not in msg` line is INERT under all three: nothing in this change
+    canonicalizes the operands before interpolating them, so no mandated ablation
+    can redden it. It is a forward guard on the message shape — the one assertion
+    the two non-symlinked rows above cannot make, since `tmp_path.resolve() ==
+    tmp_path` there — and not what carries the row."""
+    root = _symlinked_project_root(tmp_path)
+    spec_folder = root / "specs" / "s1"
+    spec_folder.mkdir(parents=True)
+    canonical = spec_folder.resolve()
+    refuse_to_resolve(monkeypatch, root)
+
+    with pytest.raises(stories.StoriesError) as excinfo:
+        stories.relativize_spec_folder(root, str(spec_folder))
+
+    msg = str(excinfo.value)
+    assert f"cannot canonicalize the spec folder {str(spec_folder)!r}" in msg
+    assert "Run `bmad-loop validate` for what this host is doing." in msg
+    assert f"{str(canonical)!r}" not in msg, "the raw spelling, not the dereferenced one"
+
+
+def test_relativize_spec_folder_symlinked_root_spec_folder_refused_raises(tmp_path, monkeypatch):
+    """The spec-folder operand refused, same symlinked host — the pairing the
+    project-root row above cannot cover, for the reason its own sibling states.
+
+    Measured ablations exactly as for that row: B1 FAILS at `with
+    pytest.raises(stories.StoriesError)` (`DID NOT RAISE StoriesError`), B2 and
+    B3 green, and the `not in msg` line is INERT under all three (a forward guard
+    on the message shape, not what carries the row)."""
+    root = _symlinked_project_root(tmp_path)
+    spec_folder = root / "specs" / "s1"
+    spec_folder.mkdir(parents=True)
+    canonical = root.resolve() / "specs" / "s1"
+    refuse_to_resolve(monkeypatch, spec_folder)
+
+    with pytest.raises(stories.StoriesError) as excinfo:
+        stories.relativize_spec_folder(root, str(spec_folder))
+
+    msg = str(excinfo.value)
+    assert f"cannot canonicalize the spec folder {str(spec_folder)!r}" in msg
+    assert "Run `bmad-loop validate` for what this host is doing." in msg
+    assert f"{str(canonical)!r}" not in msg, "the raw spelling, not the dereferenced one"
+
+
+def test_relativize_spec_folder_never_answers_a_parent_escaping_path(tmp_path, monkeypatch):
+    """A `..`-spelled spec folder with both operands refused. Written for the
+    degrade era, where it was the proof that no answer climbed out of the root it
+    claimed to be relative to: `relative_to` strips a *textual* prefix, so two
+    un-dereferenced operands could leave the `..` standing, and
+    `StoriesEngine._stories_folder` would then join `../proj/specs/s1` against the
+    unit worktree — a sibling directory nobody configured.
+
+    Restated, not silently repurposed: under the refusal there is no answer to
+    inspect, so what this row pins now is that the parent-escaping shape is
+    *unreachable* — the leg returns nothing at all. Its first assertion stays the
+    control showing a healthy host collapses the `..` and rebases normally, so the
+    refusal below cannot be blamed on the `..` being unusual.
+
+    Measured ablations:
+    - B1: FAILS at `with pytest.raises(stories.StoriesError)` (`DID NOT RAISE
+      StoriesError`). Note what B1 actually returns here — `raw.as_posix()`, the
+      absolute `.../proj/../proj/specs/s1` — and NOT the leading-`..` string this
+      row was originally written against: that shape belonged to the
+      rebase-anyway degrade the PR had already retired. B1 is caught by the
+      missing raise, not by an escaping answer.
+    - B2: green. B3: green."""
+    project = tmp_path / "proj"
+    (project / "specs" / "s1").mkdir(parents=True)
+    spelled_up = project / ".." / project.name / "specs" / "s1"
+
+    # control: on a host that can canonicalize, the `..` collapses and the
+    # folder rebases normally.
+    assert stories.relativize_spec_folder(project, str(spelled_up)) == "specs/s1"
+
+    refuse_to_resolve(monkeypatch, project, spelled_up)
+
+    with pytest.raises(stories.StoriesError) as excinfo:
+        stories.relativize_spec_folder(project, str(spelled_up))
+
+    assert "Run `bmad-loop validate` for what this host is doing." in str(excinfo.value)
+
+
+def test_relativize_spec_folder_outside_project_tree_stays_absolute(tmp_path):
+    """The `ValueError` leg — and the proof this change is a SPLIT and not a
+    blanket raise. An absolute spec folder genuinely outside the project tree, on
+    a host that canonicalizes both sides without complaint: an external spec
+    folder is a supported layout (`[stories] source`, `policy.py`), so it is kept
+    verbatim and must stay that way.
+
+    Measured ablations:
+    - B2 (widen the raise arm to `(OSError, RuntimeError, ValueError)`): this row
+      FAILS ALONE, at `rel = stories.relativize_spec_folder(project,
+      str(outside))` — the call itself raises `StoriesError: cannot canonicalize
+      the spec folder ...: '...' is not in the subpath of '...'`, so neither
+      assertion below is reached. Every other row in this section faults with
+      `OSError` or does not fault at all, which is why B2 reddens nothing else.
+    - B1: green — the collapsed degrade still returns the absolute path, so only
+      B2 can pin this contract. B3: green."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    outside = tmp_path / "elsewhere" / "s1"
+    outside.mkdir(parents=True)
+
+    rel = stories.relativize_spec_folder(project, str(outside))
+
+    assert rel == outside.as_posix()
+    assert Path(rel).is_absolute()

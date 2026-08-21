@@ -42,6 +42,16 @@ breaking changes may land in a minor release.
   now pin to the calling pane via `TMUX_PANE`, and answer `None` without spawning when that value
   is absent or not pane-shaped.
 
+- **An unresolvable restore-patch or spec-folder path is now a named refusal, not a bare
+  `[Errno ...]` (#560).** `_resolve_restore_patch` (`cli --restore-patch`) and
+  `relativize_spec_folder` (`--spec`, `[stories] source`) each called `.resolve()` outside the
+  exception type their handler caught, so a host that cannot canonicalize the path — a dead UNC
+  provider (`WinError 64`), a symlink loop on the 3.11/3.12 floor — escaped by a route neither
+  describes. Both now refuse by name and point at `bmad-loop validate`: the restore patch returns
+  its sibling rejected-latch shape, the spec folder raises `stories.StoriesError`, and `--dry-run`
+  reports it before exiting 1. A spec folder that merely lies outside the project tree still comes
+  back verbatim — that is a supported layout, and only the canonicalization leg refuses.
+
 ## [0.11.0] — 2026-08-19
 
 ### Added

@@ -2613,6 +2613,135 @@ def test_resolve_restore_patch_outside_project_rejected(tmp_path, monkeypatch, c
     assert task.phase == Phase.ESCALATED and task.restore_patch is None  # not re-armed
 
 
+def test_resolve_restore_patch_unresolvable_rejected(tmp_path, monkeypatch, capsys):
+    """A restore patch path whose `.resolve()` faults (WinError 64 on a dead UNC
+    provider, or a symlink loop on the 3.11/3.12 floor, #560) escaped this
+    function's own try/except (scoped to `bmadconfig.BmadConfigError`) and fell
+    through to `main()`'s generic backstop, which reports a bare `[Errno ...]`
+    string instead of naming the restore-patch path or what failed. Pin the
+    specific message this function now returns, in the shape its five sibling
+    rejection reasons use.
+
+    Measured ablation (delete the `except (OSError, RuntimeError)` arm from
+    `_resolve_restore_patch`, leaving the bare `.resolve()`): this row fails, at
+    `assert f"cannot canonicalize the restore patch path {str(patch)!r}" in err`.
+    Only the two message assertions carry it. The unguarded `OSError` reaches
+    `main()`'s generic `except Exception` backstop, which prints `error: {e}` to
+    stderr and returns `ExitCode.FAILURE` — so ablated, `rc == 1`,
+    `UNRESOLVABLE in err`, `called == []` and both halves of the
+    phase/restore_patch assertion still pass; measured `err` is exactly
+    `error: [Errno 0] stubbed: the provider is registered but not serving`, and
+    with only those two message lines commented out the ablated row goes GREEN.
+    `UNRESOLVABLE in err` can never discriminate this regression — the guard
+    interpolates `{e}` and the backstop prints `{e}` bare, so it is the same
+    substring on both sides. Loosening the message assertion to it would make
+    this row a false green."""
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    spec = tmp_path / "spec.md"
+    spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+    _write_bmad_config(tmp_path)
+    run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
+    called: list = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: called.append(rd) or 0)
+    patch = tmp_path / "whatever.patch"
+    refuse_to_resolve(monkeypatch, patch)
+
+    rc = cli.main(
+        [
+            "resolve",
+            "--project",
+            str(tmp_path),
+            "r1",
+            "--no-interactive",
+            "--restore-patch",
+            str(patch),
+            "--resume",
+        ]
+    )
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert f"cannot canonicalize the restore patch path {str(patch)!r}" in err
+    assert UNRESOLVABLE in err
+    assert "Run `bmad-loop validate` for what this host is doing." in err
+    assert called == []  # never resumed
+    task = load_state(run_dir).tasks["s1"]
+    assert task.phase == Phase.ESCALATED and task.restore_patch is None  # not re-armed
+
+
+def test_resolve_restore_patch_unresolvable_from_resolution_json_rejected(
+    tmp_path, monkeypatch, capsys
+):
+    """The same `.resolve()` guard, reached from the OTHER caller. `cmd_resolve`
+    validates an explicit `--restore-patch` flag BEFORE the interactive session,
+    but a `restore_patch` the agent recorded in resolution.json only exists once
+    that session has written it — so this arm cannot be hoisted, and its abort
+    lands after a whole agent conversation. The sibling flag-arm row above cannot
+    stand in for it: that row passes `--no-interactive`, which short-circuits the
+    resolution.json read (`if raw is None and args.interactive`), leaving `raw`
+    None so `if not raw: return None, None` fires and the guarded `.resolve()` is
+    never reached from this side. `ran == ["s1"]` is what pins that difference —
+    an identity assertion for the row, not a guard assertion (see below). The
+    patch here is a real file under the configured implementation_artifacts root,
+    i.e. an otherwise-honorable restore whose only defect is that this host cannot
+    canonicalize its path.
+
+    Measured ablation (delete the `except (OSError, RuntimeError)` arm from
+    `_resolve_restore_patch`, leaving the bare `.resolve()`): this row fails, at
+    `assert f"cannot canonicalize the restore patch path {str(patch)!r}" in err`.
+    Only the two message assertions carry it — with just those two lines removed
+    the ablated row goes GREEN. The unguarded `OSError` unwinds `cmd_resolve` into
+    `main()`'s generic `except Exception` backstop, which prints `error: {e}` to
+    stderr and returns `ExitCode.FAILURE`, so ablated `rc == 1`, `ran == ["s1"]`
+    (the session had already run), `UNRESOLVABLE in err`, `called == []` and both
+    halves of the phase/restore_patch assertion all still pass; measured `err` is
+    exactly `error: [Errno 0] stubbed: the provider is registered but not
+    serving`. As in the flag-arm row, `UNRESOLVABLE in err` can never discriminate
+    this regression — the guard interpolates `{e}` and the backstop prints `{e}`
+    bare, so it is the same substring on both sides."""
+    from bmad_loop import resolve
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    spec = tmp_path / "spec.md"
+    spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+    _write_bmad_config(tmp_path)
+    patch = tmp_path / "artifacts" / "attempt.patch"  # a legitimate restore target
+    patch.parent.mkdir(parents=True)
+    patch.write_text("diff", encoding="utf-8")
+    run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
+    ran: list = []
+
+    def fake_session(adapter, project, rd, story_key, *, model=""):
+        # the resolve agent records a restore_patch in its output marker
+        ran.append(story_key)
+        marker = resolve.resolution_path(rd, story_key)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps({"restore_patch": str(patch)}), encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
+    monkeypatch.setattr(resolve, "build_context", lambda *a, **k: None)
+    monkeypatch.setattr(resolve, "run_session", fake_session)
+    called: list = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: called.append(rd) or 0)
+    refuse_to_resolve(monkeypatch, patch)
+
+    # interactive is the default, and is required: this arm reads the marker the
+    # session writes, so --no-interactive would short-circuit it before the guard
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--resume"])
+    assert rc == 1
+    assert ran == ["s1"]  # the session really ran: this abort is post-session
+    err = capsys.readouterr().err
+    assert f"cannot canonicalize the restore patch path {str(patch)!r}" in err
+    assert UNRESOLVABLE in err
+    assert "Run `bmad-loop validate` for what this host is doing." in err
+    assert called == []  # never resumed
+    task = load_state(run_dir).tasks["s1"]
+    assert task.phase == Phase.ESCALATED and task.restore_patch is None  # not re-armed
+
+
 def test_resolve_restore_patch_in_outside_project_artifacts_allowed(tmp_path, monkeypatch):
     """Artifact dirs configured OUTSIDE the project tree are a supported layout
     (bmadconfig keeps them absolute; verify special-cases them throughout), and
@@ -5768,6 +5897,43 @@ def test_dry_run_stories_relativizes_absolute_folder(project, capsys):
     out = capsys.readouterr().out
     assert "Spec folder: _bmad-output/epic-1. Story id: 1." in out
     assert f"Spec folder: {abs_folder}" not in out  # not the raw absolute path
+
+
+def test_dry_run_stories_unresolvable_absolute_folder_refused(project, monkeypatch, capsys):
+    """`relativize_spec_folder` reaches the CLI only here, and the refusal it
+    now raises (#560) is the one answer the dry-run cannot render: an absolute
+    `--spec` inside the project whose `.resolve()` faults has no knowable
+    location, so there is no folder string to preview. Print the reason and exit
+    1, in the shape of its `story_rows` sibling just below — minus that sibling's
+    `(spec folder: ...)` suffix, which would be a third printing of a path the
+    reason already names twice (this leg is reachable only from the absolute
+    branch, where `folder` is `spec_folder` re-spelled).
+
+    Measured ablations:
+    - B3 (delete the `try`/`except stories_mod.StoriesError` around the
+      `relativize_spec_folder` call in `cli._dry_run_stories`): FAILS at `assert
+      cli._dry_run(project, pol, args, True, abs_folder) == 1` — the
+      `StoriesError` propagates out of `_dry_run` uncaught, so the row errors on
+      that line and the two stderr assertions are never reached. That line alone
+      carries this row.
+    - B1 (collapse `relativize_spec_folder` back to one degrade arm): FAILS on
+      the same line with `assert 0 == 1`, and the captured stdout is the
+      regression itself — a rendered `BMAD_LOOP_SPEC_FOLDER=<absolute path into
+      the main checkout>` previewed as runnable.
+    - B2 (blanket raise): green — this row travels the `OSError` leg, which B2
+      leaves refusing."""
+    _setup_stories_fixture(project, [_stories_entry("1")])
+    abs_folder = str(project.project / STORIES_SPEC_FOLDER)
+    pol = policy_mod.loads("")
+    args = argparse.Namespace(spec=abs_folder, epic=None, story=None, max_stories=None)
+    refuse_to_resolve(monkeypatch, Path(abs_folder))
+
+    assert cli._dry_run(project, pol, args, True, abs_folder) == 1
+
+    cap = capsys.readouterr()
+    assert f"stories mode: cannot canonicalize the spec folder {abs_folder!r}" in cap.err
+    assert "Run `bmad-loop validate` for what this host is doing." in cap.err
+    assert "linear schedule" not in cap.out  # no preview of a folder we cannot place
 
 
 # --------------- `bmad-loop mux`: backend listing + persisted choice (issue #87) ----

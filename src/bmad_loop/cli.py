@@ -1917,8 +1917,17 @@ def _dry_run_stories(
     _warn_preflight_would_abort(paths, pol, require_stories=True)
     folder = stories_mod.resolve_spec_folder(paths.project, spec_folder)
     # The real dispatch always uses the project-relative folder (the engine
-    # relativizes it); render the identical string here so dry-run and run agree.
-    rel = stories_mod.relativize_spec_folder(paths.project, spec_folder)
+    # relativizes it); render the identical string here so dry-run and run agree —
+    # including the refusal, which is the one answer `run` would not survive. No
+    # `(spec folder: ...)` suffix like the sibling below: the reason already names
+    # the spec folder and the project root, and on this leg `folder` is only
+    # `spec_folder` re-spelled (the raise is reachable from the absolute branch
+    # alone), so the suffix would print the same path a third time.
+    try:
+        rel = stories_mod.relativize_spec_folder(paths.project, spec_folder)
+    except stories_mod.StoriesError as e:
+        print(f"stories mode: {e}", file=sys.stderr)
+        return 1
     try:
         rows = stories_mod.story_rows(folder, selector=args.story, max_stories=args.max_stories)
     except stories_mod.StoriesError as e:
@@ -2444,8 +2453,18 @@ def _resolve_restore_patch(
         return None, err
     # `.resolve()` on top of the shared normalizer: this is the one consumer that
     # feeds a containment check (spec_within_roots), which needs `..`/symlinks
-    # collapsed. The resolved absolute path is what gets latched.
-    patch = verify.resolve_restore_path(raw, project).resolve()
+    # collapsed. The resolved absolute path is what gets latched, so this stays a
+    # bare `.resolve()` rather than `resolve_or_lexical`: a degraded, non-canonical
+    # answer here could pass containment on the wrong directory.
+    try:
+        patch = verify.resolve_restore_path(raw, project).resolve()
+    except (OSError, RuntimeError) as e:
+        return None, (
+            f"cannot canonicalize the restore patch path {raw!r}: {e} — whether it "
+            "lies inside or outside the project tree cannot be determined, so the "
+            "restore cannot be latched. Run `bmad-loop validate` for what this host "
+            "is doing."
+        )
     # Same trusted-roots shape as the frontmatter reconcile's spec_within_roots:
     # bmad-build-auto saves the patch under implementation_artifacts, and artifact
     # dirs configured OUTSIDE the project tree are a supported layout — a bare
