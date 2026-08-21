@@ -42,6 +42,19 @@ breaking changes may land in a minor release.
   now pin to the calling pane via `TMUX_PANE`, and answer `None` without spawning when that value
   is absent or not pane-shaped.
 
+- **Unresolvable restore-patch and spec-folder paths no longer escape their own handler (#560).**
+  `_resolve_restore_patch` (`cli --restore-patch`) and `relativize_spec_folder` (`--spec`,
+  `[stories] source`) each called `.resolve()` outside the exception type their local handler
+  caught, so a host that cannot canonicalize the path (a dead UNC provider, `WinError 64`; a
+  symlink loop on the 3.11/3.12 floor) left the function by a route it does not describe. The
+  restore-patch half is a rejection, and now returns the sibling rejected-latch shape — naming the
+  path and pointing at `bmad-loop validate` — where the fault used to surface as a bare
+  `[Errno ...]` from the top-level backstop. The spec-folder half rejects nothing and reports
+  nothing: it widens its own handler to the `(OSError, RuntimeError, ValueError)` house guard —
+  the guard `verify._stories_relpaths` already puts around the same relativization of the same
+  folder — and keeps the path verbatim, because a location the host cannot canonicalize must not
+  be rebased onto the project root.
+
 ## [0.11.0] — 2026-08-19
 
 ### Added
@@ -229,17 +242,6 @@ breaking changes may land in a minor release.
 - **Reject mismatched TOML scalar types for every `limits.*` policy field (#278).**
   Quoted booleans and other coercible values now raise `PolicyError` instead of silently changing
   the configured limit or enabling a disabled behavior.
-
-- **Unresolvable restore-patch and spec-folder paths no longer bypass their own rejection
-  message (#560).** `_resolve_restore_patch` (`cli --restore-patch`) and
-  `relativize_spec_folder` (`--spec`, `[stories] source`) each called `.resolve()` outside the
-  exception type their local handler caught, so a host that cannot canonicalize the path (a dead
-  UNC provider, `WinError 64`; a symlink loop on the 3.11/3.12 floor) fell through to a generic,
-  unscoped error instead of the specific one the rest of the function reports. The restore-patch
-  path now returns the same rejected-latch shape as its sibling checks; the spec-folder path
-  widens its own handler to the `(OSError, RuntimeError, ValueError)` house guard and keeps the
-  path verbatim, the answer `verify._stories_relpaths` already gives for the same folder — a
-  location the host cannot canonicalize must not be rebased onto the project root.
 
 - **Attempt-owned spec-only retries no longer demand a false manual rollback (#123).** A
   bound plain attempt whose only residue is its lifecycle flip is restored to its pre-attempt
