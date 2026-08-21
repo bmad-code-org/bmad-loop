@@ -894,22 +894,30 @@ def head_blob(repo: Path, rel: str) -> bytes | None:
     dumps the raw tree object, where `cat-file blob` refuses. A literal pathspec also
     keeps a board whose name carries git magic from being reinterpreted (#577).
 
-    One `None` for every "HEAD has no such blob" shape, because the callers treat them
-    alike: an unborn HEAD, an untracked or ignored path, a path that names a tree, and
-    a git failure are all "git holds no prior content here to compare against".
+    One `None` for every shape where git PROVED HEAD carries no blob here, because the
+    callers treat those alike: a path HEAD does not record, an untracked or ignored
+    one, and a path that names a tree are all "there is no prior content to compare
+    against".
+
+    An observation that FAILED is not one of those, and raises — a git timeout, a spawn
+    failure, an unborn HEAD, a damaged object database. `ls-tree` is what separates
+    them: it reports absence as an empty SUCCESS and keeps every fault as a non-zero
+    command. The split is the caller's entire safety margin, because `None` there means
+    "no baseline exists, proceed" and authorizes the bookkeeping commit; a fault
+    degraded into it would commit an operator's edits with ownership never proved.
+    Observation may degrade, repair writes must raise, and this gates a repair write.
 
     Reads stdout as BYTES (`git_bytes`), never a decode: a board or ledger is arbitrary
     file content, and a strict decode would raise on a path the caller is only trying
     to compare (#377). Comparison is what bytes are for; nothing here needs the text."""
-    try:
-        entry = _entry_at_revision(repo, "HEAD", rel)
-    except GitError:
-        return None
+    entry = _entry_at_revision(repo, "HEAD", rel)
     if entry is None or entry[1] != "blob":
         return None
-    proc = git_bytes(repo, "cat-file", "--filters", f"--path={rel}", entry[2])
+    oid = entry[2]
+    proc = git_bytes(repo, "cat-file", "--filters", f"--path={rel}", oid)
     if proc.returncode != 0:
-        return None
+        detail = (proc.stdout + proc.stderr).decode("utf-8", "replace").strip()
+        raise GitError(f"git cat-file --filters {oid[:12]} for {rel!r} failed in {repo}: {detail}")
     return proc.stdout
 
 

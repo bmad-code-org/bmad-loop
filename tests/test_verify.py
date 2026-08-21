@@ -3378,7 +3378,13 @@ def test_head_blob_is_none_for_every_path_head_does_not_carry(project):
 
     assert verify.head_blob(repo, "stray.txt") is None
     assert verify.head_blob(repo, "never_existed.txt") is None
-    assert verify.head_blob(repo, "nested/f.txt") == b"in a tree\n"  # the tree is real...
+    # Terminator-normalized, because the answer is in the working-tree domain: under
+    # Git-for-Windows' system `core.autocrlf` the smudge hands back CRLF for this LF
+    # blob, while the file itself was written LF and never re-checked-out, so neither a
+    # literal nor `read_bytes()` is right on both hosts. What this pair grades is that a
+    # blob path yields bytes where a tree path yields None — not the line ending.
+    blob = verify.head_blob(repo, "nested/f.txt")
+    assert blob is not None and blob.replace(b"\r\n", b"\n") == b"in a tree\n"
     assert verify.head_blob(repo, "nested") is None  # ...and naming it yields no blob
 
 
@@ -3410,6 +3416,25 @@ def test_head_blob_answers_in_the_working_tree_domain_on_an_eol_normalizing_repo
     assert not verify.dirty_paths(repo)  # and git calls the tree clean regardless
 
     assert verify.head_blob(repo, "board.yaml") == on_disk
+
+
+def test_head_blob_raises_rather_than_degrading_when_the_lookup_fails(tmp_path):
+    """A failed observation must not answer as "there is no baseline" (#618).
+
+    The caller reads None as "git holds no prior content here, proceed" and authorizes
+    the bookkeeping commit on the strength of it, so a fault degraded into None would
+    commit an operator's edits with ownership never proved — observation may degrade,
+    repair writes must raise. An unborn HEAD is the cheapest reachable failure; a git
+    timeout, a spawn failure and a damaged object database all leave by the same route.
+    Proven absence is what stays None, and `ls-tree` is what separates the two: it
+    reports an absent path as an empty SUCCESS and keeps every fault non-zero.
+    """
+    repo = tmp_path / "unborn"
+    repo.mkdir()
+    git(repo, "init", "-q", ".")
+
+    with pytest.raises(verify.GitError):
+        verify.head_blob(repo, "board.yaml")
 
 
 def test_path_tracked_reports_index_membership(project):
