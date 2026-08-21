@@ -875,25 +875,39 @@ def path_tracked_file(repo: Path, rel: str) -> bool:
 
 
 def head_blob(repo: Path, rel: str) -> bytes | None:
-    """The bytes HEAD records at repo-relative posix ``rel``, or None when it records
-    nothing there.
+    """The bytes HEAD records at repo-relative posix ``rel``, in the form the WORKING
+    TREE would hold them, or None when HEAD records nothing there.
 
-    The RAW blob, not the working-tree form: `cat-file` runs no smudge filter and no
-    eol conversion, so on a repo that normalizes line endings this answer differs from
-    the checked-out file for reasons no author is responsible for. That makes it a
-    BASELINE, never a dirt oracle — :func:`dirty_paths` is git's own answer to "did
-    anyone touch this", and a caller that reaches for a byte compare instead will
-    refuse a pristine checkout on such a repo. Use this only to ask what dirt git has
-    ALREADY reported is made of.
+    Filtered rather than raw (`cat-file --filters --path=`), because every caller
+    compares this against a file read off disk, and the raw blob is the wrong domain
+    for that compare. On a repo that normalizes line endings — Git for Windows under
+    `core.autocrlf=true` is the ordinary case, not an exotic one — a pristine CRLF
+    checkout differs from its own LF blob on every line, so a raw baseline reports
+    "somebody else wrote this" about a file nobody has touched. That is not a
+    tolerable skew for a caller deciding whether to commit: it refuses a crashed
+    pass's own advance, which is the one carry the replay leg exists to finish (#618).
+    :func:`worktree_file_bytes_at_revision` splits the same two domains for recovery,
+    and for the same reason.
+
+    Resolved through :func:`_entry_at_revision`, not `HEAD:<rel>`, so a path naming a
+    TREE is discriminated by type instead of by luck: `--filters` on a tree exits 0 and
+    dumps the raw tree object, where `cat-file blob` refuses. A literal pathspec also
+    keeps a board whose name carries git magic from being reinterpreted (#577).
 
     One `None` for every "HEAD has no such blob" shape, because the callers treat them
     alike: an unborn HEAD, an untracked or ignored path, a path that names a tree, and
-    a rev-parse failure are all "git holds no prior content here to compare against".
+    a git failure are all "git holds no prior content here to compare against".
 
     Reads stdout as BYTES (`git_bytes`), never a decode: a board or ledger is arbitrary
     file content, and a strict decode would raise on a path the caller is only trying
     to compare (#377). Comparison is what bytes are for; nothing here needs the text."""
-    proc = git_bytes(repo, "cat-file", "blob", f"HEAD:{rel}")
+    try:
+        entry = _entry_at_revision(repo, "HEAD", rel)
+    except GitError:
+        return None
+    if entry is None or entry[1] != "blob":
+        return None
+    proc = git_bytes(repo, "cat-file", "--filters", f"--path={rel}", entry[2])
     if proc.returncode != 0:
         return None
     return proc.stdout

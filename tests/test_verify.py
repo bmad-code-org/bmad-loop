@@ -3382,6 +3382,36 @@ def test_head_blob_is_none_for_every_path_head_does_not_carry(project):
     assert verify.head_blob(repo, "nested") is None  # ...and naming it yields no blob
 
 
+def test_head_blob_answers_in_the_working_tree_domain_on_an_eol_normalizing_repo(project):
+    """A pristine checkout is never "somebody else's edit", however git stores it (#618).
+
+    `cat-file blob` runs no eol conversion, so on a repo that normalizes line endings
+    HEAD's raw bytes differ from the checked-out file on every line. The caller byte-
+    compares this answer against a file it is about to commit, so a raw baseline would
+    call a board nobody touched foreign and refuse a crashed pass's own carry — the one
+    the replay leg exists to finish. `.gitattributes` reproduces on every platform what
+    `core.autocrlf=true` does to an ordinary Git for Windows checkout.
+    """
+    repo = project.project
+    (repo / ".gitattributes").write_bytes(b"board.yaml text eol=crlf\n")
+    (repo / "board.yaml").write_bytes(b"development_status:\n  1-1-a: backlog\n")
+    git(repo, "add", "--", ".gitattributes", "board.yaml")
+    git(repo, "commit", "-q", "-m", "an eol-normalizing board")
+    # Let git itself materialize the working-tree form, rather than asserting against a
+    # spelling the test chose: the smudge filter is the thing under test.
+    (repo / "board.yaml").unlink()
+    git(repo, "checkout", "--", "board.yaml")
+
+    on_disk = (repo / "board.yaml").read_bytes()
+    assert b"\r\n" in on_disk  # the checkout is CRLF...
+    assert verify.file_bytes_at_revision(repo, "HEAD", "board.yaml") == on_disk.replace(
+        b"\r\n", b"\n"
+    )  # ...while the blob git stores is LF, so the two domains really do differ here
+    assert not verify.dirty_paths(repo)  # and git calls the tree clean regardless
+
+    assert verify.head_blob(repo, "board.yaml") == on_disk
+
+
 def test_path_tracked_reports_index_membership(project):
     """The basic contract: an index entry is True, an untracked file is False."""
     repo = project.project
