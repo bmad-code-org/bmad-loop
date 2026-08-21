@@ -2451,9 +2451,10 @@ def _resolve_restore_patch(
         patch = verify.resolve_restore_path(raw, project).resolve()
     except (OSError, RuntimeError) as e:
         return None, (
-            f"cannot canonicalize the restore patch path {raw!r}: {e}, so whether it "
-            "lies inside or outside the project tree cannot be determined, and the "
-            "restore cannot be latched"
+            f"cannot canonicalize the restore patch path {raw!r}: {e} — whether it "
+            "lies inside or outside the project tree cannot be determined, so the "
+            "restore cannot be latched. Run `bmad-loop validate` for what this host "
+            "is doing."
         )
     # Same trusted-roots shape as the frontmatter reconcile's spec_within_roots:
     # bmad-build-auto saves the patch under implementation_artifacts, and artifact
