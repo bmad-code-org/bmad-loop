@@ -45,20 +45,12 @@ breaking changes may land in a minor release.
 - **An unresolvable restore-patch or spec-folder path is now a named refusal, not a bare
   `[Errno ...]` (#560).** `_resolve_restore_patch` (`cli --restore-patch`) and
   `relativize_spec_folder` (`--spec`, `[stories] source`) each called `.resolve()` outside the
-  exception type their local handler caught, so a host that cannot canonicalize the path (a dead
-  UNC provider, `WinError 64`; a symlink loop on the 3.11/3.12 floor) left the function by a route
-  it does not describe. The restore-patch half is a rejection, and now returns the sibling
-  rejected-latch shape — naming the path and pointing at `bmad-loop validate` — where the fault
-  used to surface as a bare `[Errno ...]` from the top-level backstop. The spec-folder half now
-  refuses on the same terms, raising `stories.StoriesError` with both operands named, which the
-  `--dry-run` preview reports before exiting 1. Only the canonicalization leg refuses — a spec
-  folder that simply lies outside the project tree still comes back verbatim, because an external
-  spec folder is a supported layout. Degrading the uncertain leg to the raw absolute spelling was
-  the first shape and is wrong at the sink: `BMAD_LOOP_SPEC_FOLDER`, the dev prompt,
-  `RunState.spec_folder` and the post-session verification all take the string as given, and only
-  a project-_relative_ answer is anchored on the live workspace root — so under
-  `isolation = "worktree"` an absolute one would point a story's reads and writes at the main
-  checkout instead of its own unit worktree.
+  exception type their handler caught, so a host that cannot canonicalize the path — a dead UNC
+  provider (`WinError 64`), a symlink loop on the 3.11/3.12 floor — escaped by a route neither
+  describes. Both now refuse by name and point at `bmad-loop validate`: the restore patch returns
+  its sibling rejected-latch shape, the spec folder raises `stories.StoriesError`, and `--dry-run`
+  reports it before exiting 1. A spec folder that merely lies outside the project tree still comes
+  back verbatim — that is a supported layout, and only the canonicalization leg refuses.
 
 ## [0.11.0] — 2026-08-19
 
