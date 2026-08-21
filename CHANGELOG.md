@@ -82,6 +82,12 @@ breaking changes may land in a minor release.
   fast-forward — where nothing merged, the target checkout is untouched, and there are no markers
   to find. Those now raise `verify.MergePreflightError` (a `GitError` subclass, so every existing
   handler is unchanged) and escalate describing that state, with git's own text naming the cause.
+  A third state needed its own type. A `--no-ff` that merges cleanly and is then refused at the
+  COMMIT — a `pre-merge-commit` or `commit-msg` hook, or a `commit.gpgsign` that cannot sign —
+  leaves no unmerged stages but does leave `MERGE_HEAD`, so reading the index alone called a
+  started merge a pre-flight refusal and sent you to clear a clash that does not exist.
+  `verify.MergeCommitRefusedError` now names it: the merge is aborted, the checkout restored, and
+  the escalation points at the policy that declined rather than at a tree with nothing wrong.
 - **A refused `squash` merge no longer destroys the uncommitted work in your main checkout
   (#619).** `--squash` has no `--abort`, so the recovery is `git reset --hard HEAD` — gated on a
   tree-state probe read _after_ the merge and used to answer "did the squash act". A checkout

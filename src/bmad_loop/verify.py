@@ -106,6 +106,26 @@ class MergePreflightError(GitError):
     resolve a content conflict that never happened (#619)."""
 
 
+class MergeCommitRefusedError(GitError):
+    """The merge itself ran and resolved; git would not COMMIT the result.
+
+    Measured causes: a `pre-merge-commit` or `commit-msg` hook exiting non-zero,
+    and a `commit.gpgsign` that cannot produce a signature. Neither sibling's
+    remedy fits — there is no content conflict to resolve and no target state to
+    clear, only a policy or a key the operator's own repo configures — which is
+    the whole reason this is a third type rather than either of theirs.
+
+    `_index_unmerged` cannot see this state: a merge that resolved cleanly leaves
+    no unmerged stages whether or not the commit that would have sealed it was
+    allowed. MERGE_HEAD is what parts it from a genuine pre-flight refusal, and
+    `merge_branch` reads that BEFORE its abort rather than only to decide whether
+    to abort at all.
+
+    `merge_branch` does abort before raising, so the tree the operator finds is
+    restored. What the `MergePreflightError` framing gets wrong here is "nothing
+    was merged", not "something is left behind" (#619)."""
+
+
 @overload
 def _run_git(
     cmd: list[str],
@@ -2019,10 +2039,23 @@ def merge_branch(
     overwrite, a staged change on an incoming path, a file/directory shape clash,
     an `--ff-only` target that cannot fast-forward — never started a merge and
     left the tree untouched, so it raises the `MergePreflightError` subclass with
-    git's own text passed through verbatim (#619). The discriminator is
-    `_index_unmerged`, NOT MERGE_HEAD: a conflicted `--squash` leaves unmerged
-    index stages and no MERGE_HEAD, so the earlier "no MERGE_HEAD created"
-    framing was wrong about the squash leg.
+    git's own text passed through verbatim (#619).
+
+    Three states, and it takes BOTH probes to tell them apart. `_index_unmerged`
+    leads and answers CONTENT: unmerged stages mean the merge ran and collided.
+    Its absence does not mean the merge never ran — a `--no-ff` whose commit was
+    refused leaves a cleanly merged index, no unmerged stages, and MERGE_HEAD set
+    (measured for `pre-merge-commit`, `commit-msg`, and an unsignable
+    `commit.gpgsign`). MERGE_HEAD is the second question and parts those two,
+    which is why it is read BEFORE the abort that erases it rather than only to
+    decide whether to abort at all.
+
+    MERGE_HEAD alone would be wrong in the other direction — the error the old
+    "no MERGE_HEAD created" framing made — because a conflicted `--squash` leaves
+    unmerged stages and no MERGE_HEAD. The squash leg cannot reach the third state
+    at all: `--squash` stops before committing by design, so no commit hook runs
+    and no signature is made (measured: rc 0 with a rejecting `pre-merge-commit`
+    hook installed), which is why only the `merge` leg is three-way below.
 
     ``allow_empty_squash`` is recovery-only: re-running a squash that committed
     before a host loss stages nothing because the target already has the merged
@@ -2039,18 +2072,27 @@ def merge_branch(
         msg = message or f"Merge branch '{branch}'"
         rc, out = _git(repo, "merge", "--no-ff", "-m", msg, branch)
         if rc != 0:
-            # Two different questions, in this order. What went wrong is answered
-            # by the index stages, which must be read BEFORE the abort clears
-            # them; whether there is anything to abort is MERGE_HEAD's to answer.
+            # Both questions BEFORE the abort, which erases the evidence for each.
+            # The index stages say whether content collided; MERGE_HEAD says whether
+            # a merge started at all, and it is asked here rather than inline below
+            # so that one reading serves both the classification and the abort.
             unmerged = _index_unmerged(repo)
-            kind = "conflict" if unmerged else "refused before starting"
+            started = _merge_in_progress(repo)
+            if unmerged:
+                kind = "conflict"
+            elif started:
+                kind = "merged, but git refused the commit"
+            else:
+                kind = "refused before starting"
             detail = f"git merge --no-ff {branch} failed in {repo} ({kind}): {out}"
-            if _merge_in_progress(repo):  # only abort a merge that actually started
+            if started:  # only abort a merge that actually started
                 abort_rc, abort_out = _git(repo, "merge", "--abort")  # restore pre-merge HEAD
                 if abort_rc != 0:
                     detail += f"; AND git merge --abort failed (repo left mid-merge): {abort_out}"
             if unmerged:
                 raise GitError(detail)
+            if started:
+                raise MergeCommitRefusedError(detail)
             raise MergePreflightError(detail)
         return
     if strategy == "squash":

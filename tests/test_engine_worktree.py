@@ -3404,7 +3404,15 @@ def test_merge_env_fault_during_target_clean_keeps_branch_and_escalates(
                 "overwritten by merge:\n\tleak.cs"
             ),
             "refused by git before it started",
-            "content conflict",
+            ("content conflict", "refused to COMMIT"),
+        ),
+        (
+            lambda: verify.MergeCommitRefusedError(
+                "git merge --no-ff feat failed in /repo (merged, but git refused the "
+                "commit): error: gpg failed to sign the data"
+            ),
+            "refused to COMMIT",
+            ("content conflict", "refused by git before it started"),
         ),
         (
             lambda: verify.GitError(
@@ -3412,10 +3420,10 @@ def test_merge_env_fault_during_target_clean_keeps_branch_and_escalates(
                 "CONFLICT (content): Merge conflict in src.txt"
             ),
             "content conflict",
-            "refused by git before it started",
+            ("refused by git before it started", "refused to COMMIT"),
         ),
     ],
-    ids=["preflight-refusal", "content-conflict"],
+    ids=["preflight-refusal", "commit-refused", "content-conflict"],
 )
 def test_merge_failure_escalation_tells_a_preflight_refusal_from_a_conflict(
     project, monkeypatch, make_exc, present, absent
@@ -3427,14 +3435,21 @@ def test_merge_failure_escalation_tells_a_preflight_refusal_from_a_conflict(
     conflict that does not exist. `MergePreflightError` is a GitError subclass, so
     the two arms must be ordered subclass-first for the split to exist at all.
 
-    Both rows assert one phrase PRESENT and the other's phrase ABSENT. The absence
-    half is the discriminator: a single catch-all arm still makes each row's own
-    phrase appear on one of them, and only the cross-check catches the collapse.
+    Each row asserts its own phrase PRESENT and BOTH neighbours' phrases ABSENT.
+    The absence half is the discriminator: a single catch-all arm still makes each
+    row's own phrase appear on one of them, and only the cross-check catches the
+    collapse. Both neighbours rather than one, because with three arms a pair could
+    collapse into each other while the third stayed distinct.
 
-    Ablation: delete the `except verify.MergePreflightError` arm from `merge_local`
-    and the preflight-refusal row fails on both halves while content-conflict stays
-    green — and every verify-layer row stays green too, because this is the wiring
-    axis and those are the predicate axis."""
+    `commit-refused` is the third state (#619): git merged cleanly and then declined
+    to COMMIT — a `pre-merge-commit`/`commit-msg` hook or a signing step. Its arm
+    exists because neither neighbour's remedy fits it, so both of their phrases have
+    to stay off its escalation.
+
+    Ablation: delete any one of the two subclass arms from `merge_local` and that
+    row fails on both halves while the others stay green — and every verify-layer
+    row stays green too, because this is the wiring axis and those are the predicate
+    axis."""
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
     engine, _ = make_engine(
         project,
@@ -3452,7 +3467,8 @@ def test_merge_failure_escalation_tells_a_preflight_refusal_from_a_conflict(
     assert engine.state.tasks["1-1-a"].phase == Phase.ESCALATED
     reason = engine.state.paused_reason or ""
     assert present in reason
-    assert absent not in reason
+    for phrase in absent:
+        assert phrase not in reason
     assert str(exc).splitlines()[0] in reason  # git's own text is passed through
     # branch kept for manual merge — the unit's work is not stranded either way
     assert branch_exists(project.project, "bmad-loop/test-run/1-1-a")

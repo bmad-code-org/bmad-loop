@@ -389,6 +389,62 @@ def test_merge_content_conflict_is_not_a_preflight_refusal(project, tmp_path, st
     assert not isinstance(ei.value, verify.MergePreflightError)
 
 
+def _cleanly_mergeable_branch(repo, tmp_path):
+    """A `feat` branch that merges into main with nothing to reconcile: it adds one
+    path neither main nor the working tree carries. Deliberately NOT `_branch_with`,
+    which mirrors its dirt into the main checkout on purpose — here the merge has to
+    SUCCEED at content, so that whatever fails after it is the commit and not the
+    merge."""
+    wt = tmp_path / "clean-wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    (wt / "feature.txt").write_text("feature\n")
+    git(wt, "add", "-A")
+    git(wt, "commit", "-q", "-m", "feat work")
+    verify.worktree_remove(repo, wt, force=True)
+
+
+def test_merge_whose_commit_git_refused_is_not_a_preflight_refusal(project, tmp_path):
+    """#619's THIRD state, and the one `_index_unmerged` alone cannot see.
+
+    A `--no-ff` whose COMMIT is declined — by a `pre-merge-commit` or `commit-msg`
+    hook, or by a signing step that cannot sign — has already merged: the index holds
+    the resolved tree and MERGE_HEAD exists. Nothing conflicted, so it leaves no
+    unmerged stages, and a classifier reading only the index calls it "refused before
+    starting". `merge_local` then tells the operator that nothing was merged and that
+    a target-state clash must be cleared — every clause false, and the clash they are
+    sent to find does not exist.
+
+    Staged through `gpg.program` rather than a hook file on purpose: it needs no
+    shell, no exec bit and no gpg installed, so the row grades identically on the
+    Windows legs. A rejecting `pre-merge-commit` hook reaches the same state (rc 1
+    rather than 128, MERGE_HEAD set, no unmerged stages), and so does `commit-msg`.
+    Both config writes are repo-LOCAL, so nothing outside this sandbox signs anything.
+
+    The `not isinstance` assertion carries the row: `GitError` alone passes for all
+    three states, `MergePreflightError` being a subclass too.
+
+    Ablation: drop the `started` arm from `merge_branch`'s discriminator and this row
+    fails on that assertion, while every pre-flight and conflict row above stays
+    green — those cannot reach this state.
+    """
+    repo = project.project
+    _cleanly_mergeable_branch(repo, tmp_path)
+    head_before = git(repo, "rev-parse", "HEAD")
+    git(repo, "config", "commit.gpgsign", "true")
+    git(repo, "config", "gpg.program", "bmad-loop-no-such-signer")
+
+    with pytest.raises(verify.MergeCommitRefusedError) as ei:
+        verify.merge_branch(repo, "feat", strategy="merge")
+
+    assert not isinstance(ei.value, verify.MergePreflightError)
+    assert "refused before starting" not in str(ei.value)
+    # it really merged, and was rolled back rather than never started: the incoming
+    # path reached the tree and the abort took it away again.
+    assert not verify._merge_in_progress(repo)
+    assert not (repo / "feature.txt").exists()
+    assert git(repo, "rev-parse", "HEAD") == head_before
+
+
 @pytest.mark.parametrize("diverged", [False, True], ids=["ff-able", "diverged"])
 def test_squash_preflight_refusal_never_resets_a_tree_it_found_dirty(project, tmp_path, diverged):
     """DATA-SAFETY PIN. `--squash` has no `--abort`, so its restore is
