@@ -71,7 +71,8 @@ breaking changes may land in a minor release.
   the leg exists for. It now asks whether the board holds HEAD's content plus this pass's
   advance — git's own question, so a board spelled CRLF by one host and LF by another still
   answers yes — and proves the index too, since the carry's `git add` overwrites it as well as
-  the working tree. That guards the commit, which is one write too late for the story's OWN row:
+  the working tree; an ABSENT index entry counts as a staged untracking (`git rm --cached`) rather
+  than as nothing to lose. That guards the commit, which is one write too late for the OWN row:
   `advance` would already have replaced the edit with the target, leaving precisely the bytes the
   proof accepts. So that row is now checked BEFORE the advance, and a status that is neither
   HEAD's nor this pass's own refuses it. Either refusal journals `board-advance-carry-foreign-dirt`.

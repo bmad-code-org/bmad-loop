@@ -968,10 +968,18 @@ def index_holds_no_foreign_content(repo: Path, rel: str, data: bytes) -> bool:
     HEAD and from disk, and the tree reads clean, the bytes surviving only as a dangling
     blob (#618).
 
-    True when the index holds no entry, or holds HEAD's own content, or already holds
-    ``data`` — the first two lose nothing that git cannot still reach, and the third is
-    the write itself. Unmerged stages raise rather than answer: a half-resolved index is
-    not a state this can prove anything about.
+    True when the index holds HEAD's own content, or already holds ``data``, or holds
+    no entry for a path HEAD does not carry either — the first loses nothing git cannot
+    still reach, the second is the write itself, and the third is empty in both places
+    at once. Unmerged stages raise rather than answer: a half-resolved index is not a
+    state this can prove anything about.
+
+    An absent entry is NOT by itself "nothing to overwrite", which is why HEAD is
+    consulted before accepting one. With HEAD carrying the path, no index entry is a
+    staged DELETION — `git rm --cached`, the operator untracking a board they are
+    about to gitignore, which is a shape this project documents rather than an exotic
+    one — and the carry's `git add` restores the entry, leaving that intent nowhere:
+    not in HEAD, which never had it, and not in the index that just lost it. Measured.
 
     CONTENT is the whole of what this proves, and that ceiling is deliberate.
     ``ls-files -s`` reports the entry's MODE too and this reads only the oid beside
@@ -989,17 +997,19 @@ def index_holds_no_foreign_content(repo: Path, rel: str, data: bytes) -> bool:
     if proc.returncode != 0:
         detail = (proc.stdout + proc.stderr).decode("utf-8", "replace").strip()
         raise GitError(f"git ls-files -s -- {rel} failed in {repo}: {detail}")
+    # Read once, up here: BOTH branches below need HEAD, because whether an index
+    # state is safe to overwrite is never answerable from the index alone.
+    head = _entry_at_revision(repo, "HEAD", rel)
+    head_oid = head[2] if head is not None and head[1] == "blob" else None
     records = [r for r in proc.stdout.split(b"\0") if r]
     if not records:
-        return True  # nothing staged here to overwrite
+        return head_oid is None  # empty in both places; otherwise a staged deletion
     if len(records) != 1:
         raise GitError(f"git ls-files -s returned unmerged stages for {rel!r} in {repo}")
     fields = records[0].split(b"\t", 1)[0].decode("ascii", "strict").split()
     if len(fields) != 3:
         raise GitError(f"git ls-files -s returned a malformed entry for {rel!r} in {repo}")
     staged = fields[1]
-    head = _entry_at_revision(repo, "HEAD", rel)
-    head_oid = head[2] if head is not None and head[1] == "blob" else None
     return staged in {head_oid, _blob_oid_for_bytes(repo, rel, data)}
 
 

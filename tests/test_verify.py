@@ -3426,6 +3426,40 @@ def test_index_holds_no_foreign_content_guards_the_half_the_working_tree_cannot(
     assert verify.index_holds_no_foreign_content(repo, "never-staged.yaml", advance)
 
 
+def test_index_holds_no_foreign_content_refuses_a_staged_untracking(project):
+    """An ABSENT index entry is not by itself "nothing to overwrite".
+
+    With HEAD carrying the path, no entry is a staged DELETION — `git rm --cached`,
+    which is how an operator untracks a board they are about to gitignore, and this
+    project documents both board shapes rather than treating that as exotic. The
+    carry's `git add` restores the entry, and the intent then exists nowhere: not in
+    HEAD, which never had it, and not in the index that just lost it. `git status`
+    reads clean afterwards, so nothing surfaces the reversal.
+
+    Reachable in earnest, unlike a bare truth-table hole: the probe that gates this
+    check reports the path (`??`, the file being on disk and no longer in the index),
+    so the ownership proof really is asked and really does answer.
+
+    The sibling row above ends on `never-staged.yaml` — no entry and no HEAD blob —
+    which is the case this must NOT break, and is why the answer keys on HEAD rather
+    than on refusing every empty index.
+
+    Ablation: restore `if not records: return True` and this row fails while that
+    sibling stays green."""
+    repo = project.project
+    head_bytes = b"development_status:\n  1-1-a: ready-for-dev\n"
+    (repo / "board.yaml").write_bytes(head_bytes)
+    git(repo, "add", "--", "board.yaml")
+    git(repo, "commit", "-q", "-m", "board")
+    advance = head_bytes.replace(b"ready-for-dev", b"done")
+
+    git(repo, "rm", "--cached", "-q", "--", "board.yaml")  # untracked, still on disk
+    assert git(repo, "ls-files", "-s", "--", "board.yaml") == ""  # no entry at all
+    assert "board.yaml" in verify.dirty_paths(repo)  # ...and the gate above still asks
+
+    assert not verify.index_holds_no_foreign_content(repo, "board.yaml", advance)
+
+
 def test_file_holds_content_raises_rather_than_answering_when_git_cannot_hash(project):
     """An id it could not compute must not read as a verdict either way.
 
