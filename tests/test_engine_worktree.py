@@ -3140,6 +3140,70 @@ def test_merge_env_fault_during_target_clean_keeps_branch_and_escalates(
     assert branch_exists(project.project, "bmad-loop/test-run/1-1-a")
 
 
+@pytest.mark.parametrize(
+    "make_exc, present, absent",
+    [
+        (
+            lambda: verify.MergePreflightError(
+                "git merge --squash feat failed in /repo (refused before starting): "
+                "error: The following untracked working tree files would be "
+                "overwritten by merge:\n\tleak.cs"
+            ),
+            "refused by git before it started",
+            "content conflict",
+        ),
+        (
+            lambda: verify.GitError(
+                "git merge --no-ff feat failed in /repo (conflict): "
+                "CONFLICT (content): Merge conflict in src.txt"
+            ),
+            "content conflict",
+            "refused by git before it started",
+        ),
+    ],
+    ids=["preflight-refusal", "content-conflict"],
+)
+def test_merge_failure_escalation_tells_a_preflight_refusal_from_a_conflict(
+    project, monkeypatch, make_exc, present, absent
+):
+    """#619: `merge_local` caught every `verify.GitError` out of `merge_branch` and
+    told the operator to resolve "a content conflict against the target". Most of
+    those failures are git declining at pre-flight — nothing merged, the checkout
+    untouched, no markers anywhere — so the guidance sent them looking for a
+    conflict that does not exist. `MergePreflightError` is a GitError subclass, so
+    the two arms must be ordered subclass-first for the split to exist at all.
+
+    Both rows assert one phrase PRESENT and the other's phrase ABSENT. The absence
+    half is the discriminator: a single catch-all arm still makes each row's own
+    phrase appear on one of them, and only the cross-check catches the collapse.
+
+    Ablation: delete the `except verify.MergePreflightError` arm from `merge_local`
+    and the preflight-refusal row fails on both halves while content-conflict stays
+    green — and every verify-layer row stays green too, because this is the wiring
+    axis and those are the predicate axis."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
+    )
+    exc = make_exc()
+
+    def refuse_merge(*a, **kw):
+        raise exc
+
+    monkeypatch.setattr(verify, "merge_branch", refuse_merge)
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and not summary.crashed
+    assert engine.state.tasks["1-1-a"].phase == Phase.ESCALATED
+    reason = engine.state.paused_reason or ""
+    assert present in reason
+    assert absent not in reason
+    assert str(exc).splitlines()[0] in reason  # git's own text is passed through
+    # branch kept for manual merge — the unit's work is not stranded either way
+    assert branch_exists(project.project, "bmad-loop/test-run/1-1-a")
+
+
 def test_spec_paths_serialize_relative_to_worktree_or_preserve_absolute_paths():
     """Both spec paths stay portable without rewriting paths the worktree does not own."""
     task = StoryTask(story_key="1-1-a", epic=1, phase=Phase.DEFERRED)

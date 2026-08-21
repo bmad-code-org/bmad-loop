@@ -1569,13 +1569,32 @@ class WorktreeFlow:
                 message=self.merge_message(task),
                 allow_empty_squash=replay,
             )
+        except verify.MergePreflightError as e:
+            # Subclass arm, so it must precede the GitError one below. git declined
+            # before the merge began: nothing was merged and the target checkout is
+            # exactly as it was. Describe that STATE rather than prescribing one
+            # remedy — the same refusal covers an untracked file the merge would
+            # overwrite, a staged change on an incoming path, a file/directory shape
+            # clash, and a target that cannot fast-forward — and let the appended raw
+            # git error name the cause and the paths (#619).
+            reason = (
+                f"merge of {unit.branch} into {target} was refused by git before it "
+                f"started: nothing was merged, the target checkout is unchanged, and "
+                f"there is no conflict to resolve. The target's state clashes with the "
+                f"incoming commit; git's own message below names the cause and the "
+                f"paths. Clear that clash, then `bmad-loop resume {self.state.run_id}`. "
+                f"{e}"
+            )
+            self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
+            return  # defensive: never fall through to the success teardown below
         except verify.GitError as e:
             # genuine content conflict against the target: keep the branch for
             # manual merge. The unit committed cleanly (phase is already DONE,
             # which has no legal transition), so escalate directly.
             reason = (
                 f"merge of {unit.branch} into {target} failed "
-                f"(content conflict against the target): {e}"
+                f"(content conflict against the target): resolve it by hand, then "
+                f"`bmad-loop resume {self.state.run_id}`. {e}"
             )
             self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
             return  # defensive: never fall through to the success teardown below
@@ -1602,8 +1621,9 @@ class WorktreeFlow:
 
     def keep_branch_and_escalate(self, task: StoryTask, unit: UnitWorkspace, reason: str) -> None:
         """Preserve a DONE unit's branch (no delete, kept for manual merge) and
-        escalate. Shared by the two merge-back failure paths: a target dirtied
-        with stray work, and a genuine content conflict."""
+        escalate. Shared by the three merge-back failure paths: a target dirtied
+        with stray work, a merge git refused at pre-flight, and a genuine content
+        conflict."""
         close_unit_workspace(
             unit,
             success=False,
