@@ -472,22 +472,38 @@ def resolve_spec_folder(project: Path, spec_folder: str) -> Path:
 def relativize_spec_folder(project: Path, spec_folder: str) -> str:
     """The project-relative posix form of ``spec_folder`` — what the orchestrator
     actually dispatches (``BMAD_LOOP_SPEC_FOLDER`` / the ``Spec folder:`` prompt).
+    The one place this lives so the engine's real dispatch and the CLI dry-run
+    render the identical folder string.
 
-    An absolute path inside the project tree is rebased to the project root;
-    anything else is kept verbatim (the contract allows an absolute spec folder,
-    though we never author one) — including an in-tree one on a host that cannot
-    canonicalize either side, whose location is not knowable here. The one place
-    this lives so the engine's real dispatch and the CLI dry-run render the
-    identical folder string."""
+    Three answers and one refusal. A relative spelling is kept verbatim; an
+    absolute one inside the project tree is rebased onto the root; an absolute one
+    genuinely outside it is kept verbatim too — an external spec folder is a
+    supported layout (``[stories] source``), though we never author one. A host
+    that cannot canonicalize either operand raises :class:`StoriesError`
+    (#552/#560) instead of answering: the location is unknowable, and every sink
+    takes the string as given — ``BMAD_LOOP_SPEC_FOLDER``, the dev prompt,
+    ``RunState.spec_folder`` and the post-session verification all consume it
+    verbatim, and ``StoriesEngine._stories_folder`` anchors only a *relative*
+    answer on the live workspace root. Handing back an unverified absolute path
+    would therefore skip the anchor entirely and point an isolated story's reads
+    and writes at the main checkout; refusing costs a run that could not have been
+    dispatched correctly anyway."""
     raw = Path(spec_folder)
     if not raw.is_absolute():
         return raw.as_posix()
     try:
         return raw.resolve().relative_to(project.resolve()).as_posix()
-    except (OSError, RuntimeError, ValueError):
-        # Outside the project tree, or a host that cannot canonicalize either side
-        # (#552/#560) — an uncertain location must not be rebased.
+    except ValueError:
+        # Both sides canonicalized and simply share no prefix: genuinely outside
+        # the project tree, which the contract allows — keep it verbatim.
         return raw.as_posix()
+    except (OSError, RuntimeError) as e:
+        raise StoriesError(
+            f"cannot canonicalize the spec folder {spec_folder!r} against the project "
+            f"root {str(project)!r}: {e} — whether it lies inside or outside the "
+            "project tree cannot be determined, so no run can safely dispatch it. "
+            "Run `bmad-loop validate` for what this host is doing."
+        ) from e
 
 
 def is_plan_halt_leg(spec_checkpoint: bool, state: StoryState) -> bool:

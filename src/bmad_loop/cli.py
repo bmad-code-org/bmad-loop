@@ -1917,8 +1917,17 @@ def _dry_run_stories(
     _warn_preflight_would_abort(paths, pol, require_stories=True)
     folder = stories_mod.resolve_spec_folder(paths.project, spec_folder)
     # The real dispatch always uses the project-relative folder (the engine
-    # relativizes it); render the identical string here so dry-run and run agree.
-    rel = stories_mod.relativize_spec_folder(paths.project, spec_folder)
+    # relativizes it); render the identical string here so dry-run and run agree —
+    # including the refusal, which is the one answer `run` would not survive. No
+    # `(spec folder: ...)` suffix like the sibling below: the reason already names
+    # the spec folder and the project root, and on this leg `folder` is only
+    # `spec_folder` re-spelled (the raise is reachable from the absolute branch
+    # alone), so the suffix would print the same path a third time.
+    try:
+        rel = stories_mod.relativize_spec_folder(paths.project, spec_folder)
+    except stories_mod.StoriesError as e:
+        print(f"stories mode: {e}", file=sys.stderr)
+        return 1
     try:
         rows = stories_mod.story_rows(folder, selector=args.story, max_stories=args.max_stories)
     except stories_mod.StoriesError as e:
