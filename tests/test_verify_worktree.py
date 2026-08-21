@@ -517,6 +517,129 @@ def test_squash_preflight_refusal_never_resets_a_tree_it_found_dirty(project, tm
     assert (repo / "leak.cs").read_text() == "operator\n"
 
 
+def _branch_whose_checkout_dies_partway(repo, tmp_path):
+    """Cut a `feat` branch git cannot finish CHECKING OUT, and arm the failure.
+
+    A **required** filter that cannot run is the portable way to kill a merge in
+    the middle of its checkout: it needs no shell, no exec bit, no special file
+    mode and no chmod, so this grades identically on the Windows legs — git runs
+    filter commands through its own bundled sh, where a command that does not
+    exist fails exactly as it does here. Same argument as the `gpg.program`
+    staging used by the commit-refused row above.
+
+    Both filenames are load-bearing, and so is their ORDER. git materializes the
+    incoming paths in index order, so `aaa.txt` — which no attribute matches — is
+    written into the working tree BEFORE `zzz.dat` reaches the filter and kills
+    the merge. Rename either side of that boundary and git dies before writing
+    anything, which is a genuine pre-flight refusal and not this shape at all.
+
+    `.gitattributes` is committed BEFORE the branch is cut, so both sides carry it
+    and it is in force in the TARGET at merge time; the filter config is armed
+    AFTER the branch is built, so the branch's own `git add` never runs it. Both
+    config writes are repo-LOCAL, so nothing outside this sandbox filters anything.
+    """
+    (repo / ".gitattributes").write_text("*.dat filter=boom\n")
+    # `-A` and not the path would sweep in whatever stray the CALLER staged the
+    # scene with, and one row's whole point is a stray that stays untracked.
+    git(repo, "add", "--", ".gitattributes")
+    git(repo, "commit", "-q", "-m", "attributes")
+    wt = tmp_path / "partway-wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    (wt / "aaa.txt").write_text("incoming aaa\n")
+    (wt / "zzz.dat").write_text("incoming zzz\n")
+    git(wt, "add", "-A")
+    git(wt, "commit", "-q", "-m", "feat work")
+    verify.worktree_remove(repo, wt, force=True)
+    git(repo, "config", "filter.boom.smudge", "bmad-loop-no-such-filter")
+    git(repo, "config", "filter.boom.clean", "cat")
+    git(repo, "config", "filter.boom.required", "true")
+
+
+@pytest.mark.parametrize("strategy", ["merge", "squash"])
+@pytest.mark.parametrize("diverged", [False, True], ids=["ff-able", "diverged"])
+def test_merge_that_died_partway_through_checkout_is_not_a_preflight_refusal(
+    project, tmp_path, strategy, diverged
+):
+    """The FOURTH #619 shape, and the one no index- or HEAD-based probe can see.
+
+    git can die in the middle of writing the incoming files out. When it does it
+    rolls the INDEX back and stops, leaving the files it already wrote in the
+    working tree as UNTRACKED — so `ls-files -u` is empty, `MERGE_HEAD` is absent,
+    and `git diff --quiet HEAD --` exits 0 because an untracked file is in neither
+    HEAD nor the index. Every probe the classifier had said "refused before
+    starting", and `merge_local` then told the operator their checkout was
+    unchanged while the residue sat there.
+
+    The residue is the harm, not the wording: it is exactly the shape git refuses
+    the NEXT merge over (`untracked working tree files would be overwritten`), so
+    the run fails identically on every resume, over paths no message had named.
+    Neither restore reaches it — `git reset --hard` and `git merge --abort` both
+    leave untracked files alone (measured) — which is why this is classified and
+    reported rather than cleaned.
+
+    Both strategies, because both legs check out and both were affected; both
+    topologies, because the refusal renders differently when the merge would have
+    been a fast-forward.
+
+    The `not isinstance` assertion carries the row: `GitError` alone passes for all
+    four states and `MergePreflightError` is a subclass of neither. The `paths`
+    assertion is the second half — a correct class carrying nothing to act on
+    leaves the operator exactly as stuck.
+
+    Ablation (predicate axis): drop the `materialized` arm from `merge_branch`'s
+    discriminator and exactly these five rows fail, every other verify-layer row
+    staying green. Dropping the DELTA instead is a different ablation with a wider
+    blast radius — see the row below, which is the one that pins it."""
+    repo = project.project
+    _branch_whose_checkout_dies_partway(repo, tmp_path)
+    if diverged:
+        commit(repo, "m.txt", "m\n", "main work")
+    head_before = git(repo, "rev-parse", "HEAD")
+
+    with pytest.raises(verify.MergeHalfAppliedError) as ei:
+        verify.merge_branch(repo, "feat", strategy=strategy)
+
+    assert not isinstance(ei.value, verify.MergePreflightError)
+    assert "refused before starting" not in str(ei.value)
+    assert ei.value.paths == ("aaa.txt",)  # written before the filter killed the merge
+    # ...and it really is on disk, untracked, and survives the leg's own restore
+    assert (repo / "aaa.txt").read_text() == "incoming aaa\n"
+    assert "aaa.txt" in git(repo, "ls-files", "--others", "--exclude-standard").split()
+    assert git(repo, "rev-parse", "HEAD") == head_before  # nothing landed
+    assert not verify._merge_in_progress(repo)
+
+
+def test_partway_checkout_failure_names_only_what_git_wrote(project, tmp_path):
+    """The residue is reported as a before/after DELTA, so the operator's own
+    pre-existing strays are never handed to them as git's doing.
+
+    An absolute post-merge reading of `ls-files --others` would name every
+    untracked file in the checkout — and the message tells the operator to clear
+    what it names, over a checkout the guard deliberately tolerates strays in
+    (#460). Naming one is how a correct fix to the classification would have
+    become a worse bug than the one it replaced.
+
+    Ablation: drop the `- pre_untracked` subtraction and this row fails on the
+    equality — and so, measured, do SIX pre-existing rows that predate this fix:
+    both `untracked-overwrite` shapes, both `shape-clash` shapes, and both
+    topologies of the reset data-safety pin. That is not incidental breakage, it is
+    the second half of the same defect: each of those stages a genuine pre-flight
+    refusal with an untracked stray already in the checkout, so an absolute reading
+    finds that stray afterwards and reclassifies a merge git refused without
+    touching a byte as one that half-applied. The subtraction is what keeps the two
+    classes disjoint, not merely what keeps this row's message tidy."""
+    repo = project.project
+    (repo / "operator-notes.txt").write_text("mine\n")  # untracked, predates the merge
+    _branch_whose_checkout_dies_partway(repo, tmp_path)
+
+    with pytest.raises(verify.MergeHalfAppliedError) as ei:
+        verify.merge_branch(repo, "feat", strategy="squash")
+
+    assert ei.value.paths == ("aaa.txt",)
+    assert "operator-notes.txt" not in str(ei.value)
+    assert (repo / "operator-notes.txt").read_text() == "mine\n"  # and left alone
+
+
 def test_squash_replay_ignores_preexisting_unstaged_dirt(project, tmp_path):
     """`allow_empty_squash` recognises a replay by "the squash staged nothing" — the
     target already carries the merged tree. Asking that of the WORKING TREE let a

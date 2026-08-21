@@ -122,7 +122,7 @@ class MergeCommitRefusedError(GitError):
     to abort at all.
 
     ``restored`` says whether the abort that follows actually put the checkout back.
-    It is an attribute rather than a fourth exception type because the operator's
+    It is an attribute rather than a type of its own because the operator's
     CAUSE is the same either way — a policy declined the commit — and only the first
     step of their remedy differs: a checkout left mid-merge has to be recovered
     before fixing that policy is worth anything, and a resume attempted before then
@@ -133,6 +133,38 @@ class MergeCommitRefusedError(GitError):
     def __init__(self, message: str, *, restored: bool = True) -> None:
         super().__init__(message)
         self.restored = restored
+
+
+class MergeHalfAppliedError(GitError):
+    """Git died PART-WAY through checking the merge out: some incoming files are
+    already sitting in the target checkout, and no restore removes them.
+
+    A sibling of `MergePreflightError`, never a subclass, because it falsifies
+    that class's central claim — the working tree was never touched. Measured
+    cause (git 2.55.0, both `--no-ff` and `--squash`): a **required** clean/smudge
+    filter that fails. git materializes the incoming paths in index order, so the
+    ones sorting before the filtered path are written to the working tree and the
+    ones after it are not; git then rolls the INDEX back and exits, leaving the
+    written files behind as UNTRACKED. Nothing in the failure's own shape
+    distinguishes it from a genuine pre-flight refusal: no unmerged stages, no
+    MERGE_HEAD, and — because `git diff --quiet HEAD --` cannot see untracked
+    files — a tree that reads clean against HEAD.
+
+    That residue is why this is a type and not a message tweak. It blocks the
+    NEXT merge as an untracked-overwrite pre-flight refusal, so a run told its
+    checkout was unchanged fails the same way on every resume, over paths the
+    error never named.
+
+    ``paths`` carries the untracked paths that appeared, as a before/after delta
+    rather than an absolute reading, so the operator's own pre-existing strays are
+    not attributed to git. Deliberately not cleaned: `reset --hard` and
+    `merge --abort` both leave untracked files alone (measured), and deleting them
+    is precisely the destruction #619's before-snapshot exists to prevent — the
+    delta proves git wrote *a* path, not that the bytes there are git's."""
+
+    def __init__(self, message: str, *, paths: tuple[str, ...] = ()) -> None:
+        super().__init__(message)
+        self.paths = paths
 
 
 @overload
@@ -2030,6 +2062,43 @@ def _index_dirty_vs_head(repo: Path) -> bool:
     return rc != 0
 
 
+def _untracked_paths(repo: Path) -> frozenset[str]:
+    """The repo's untracked, non-ignored paths — the one dirt axis both
+    `_tree_dirty_vs_head` and `_index_dirty_vs_head` are blind to.
+
+    Neither of those is a substitute: a merge that dies part-way through checkout
+    rolls its INDEX back but leaves the files it already wrote in the working
+    tree, and an untracked file is by definition absent from HEAD and from the
+    index, so both diffs read CLEAN over it. Sampled before and after the merge
+    and differenced, so the answer is "git wrote this", not "this is here" — the
+    same before/after discipline `pre_dirty` uses, and for the same reason: an
+    absolute post-merge reading would attribute the operator's own strays to git.
+
+    `--exclude-standard` deliberately keeps ignored files out. They are not
+    residue this can act on: an ignored path is invisible to the next merge's
+    pre-flight too, so it cannot produce the resume failure this probe exists to
+    name, and reporting one would send the operator after a file their own
+    `.gitignore` says is theirs.
+
+    stdout alone (`_git_out`), not `_git`'s merged stream: git writes advisories
+    to stderr at rc 0, and against the merge a warning line becomes a phantom
+    path in the set (#442).
+
+    RAISES on a failed read rather than degrading to the empty set the way its
+    neighbour `_index_unmerged` does, and the difference is the differencing: that
+    one is a single reading, where "could not tell" and "nothing there" pick the
+    same error class and neither mutates anything. This is one half of a PAIR, so
+    a silent empty set is not a neutral answer — an empty BEFORE against a real
+    AFTER reports every stray already in the checkout as something git just wrote,
+    and the message tells the operator to clear what it names. Failing the merge
+    outright is the smaller harm, and the before-read that would produce that
+    asymmetry runs while nothing has been mutated yet."""
+    rc, out, detail = _git_out(repo, "ls-files", "--others", "--exclude-standard")
+    if rc != 0:
+        raise GitError(f"git ls-files --others failed in {repo}: {detail}")
+    return frozenset(line.strip() for line in out.splitlines() if line.strip())
+
+
 def _index_unmerged(repo: Path) -> bool:
     """True when the index carries unmerged stages — i.e. a merge really ran and
     left a content conflict to resolve.
@@ -2076,21 +2145,35 @@ def merge_branch(
     left the tree untouched, so it raises the `MergePreflightError` subclass with
     git's own text passed through verbatim (#619).
 
-    Three states, and it takes BOTH probes to tell them apart. `_index_unmerged`
-    leads and answers CONTENT: unmerged stages mean the merge ran and collided.
-    Its absence does not mean the merge never ran — a `--no-ff` whose commit was
-    refused leaves a cleanly merged index, no unmerged stages, and MERGE_HEAD set
-    (measured for `pre-merge-commit`, `commit-msg`, and an unsignable
-    `commit.gpgsign`). MERGE_HEAD is the second question and parts those two,
-    which is why it is read BEFORE the abort that erases it rather than only to
-    decide whether to abort at all.
+    Four states, and no one probe orders them. `_index_unmerged` leads and answers
+    CONTENT: unmerged stages mean the merge ran and collided. Its absence does not
+    mean the merge never ran — a `--no-ff` whose commit was refused leaves a
+    cleanly merged index, no unmerged stages, and MERGE_HEAD set (measured for
+    `pre-merge-commit`, `commit-msg`, and an unsignable `commit.gpgsign`).
+    MERGE_HEAD is the second question and parts those two, which is why it is read
+    BEFORE the abort that erases it rather than only to decide whether to abort at
+    all.
 
     MERGE_HEAD alone would be wrong in the other direction — the error the old
     "no MERGE_HEAD created" framing made — because a conflicted `--squash` leaves
-    unmerged stages and no MERGE_HEAD. The squash leg cannot reach the third state
-    at all: `--squash` stops before committing by design, so no commit hook runs
-    and no signature is made (measured: rc 0 with a rejecting `pre-merge-commit`
-    hook installed), which is why only the `merge` leg is three-way below.
+    unmerged stages and no MERGE_HEAD. The squash leg cannot reach the commit-
+    refused state at all: `--squash` stops before committing by design, so no
+    commit hook runs and no signature is made (measured: rc 0 with a rejecting
+    `pre-merge-commit` hook installed), which is why only the `merge` leg is
+    three-way below.
+
+    The fourth state is the one BOTH legs reach and neither index probe can see:
+    git dying part-way through the checkout, which leaves no unmerged stages, no
+    MERGE_HEAD, and an index rolled back to HEAD, while the incoming files it had
+    already written stay in the tree as UNTRACKED (measured under a required
+    smudge filter, both strategies). Every index- and HEAD-based reading calls
+    that "refused before starting" and tells the operator their checkout is
+    untouched; the residue then blocks the next merge's pre-flight, so the run
+    fails identically on every resume over paths nothing named. `_untracked_paths`
+    is the third probe, sampled before the merge and differenced after, and it
+    raises `MergeHalfAppliedError` — a SIBLING of `MergePreflightError`, since the
+    two are mutually exclusive by construction (a refusal git makes at pre-flight
+    is made before any file is written).
 
     ``allow_empty_squash`` is recovery-only: re-running a squash that committed
     before a host loss stages nothing because the target already has the merged
@@ -2105,21 +2188,30 @@ def merge_branch(
         return
     if strategy == "merge":
         msg = message or f"Merge branch '{branch}'"
+        # Sampled before and differenced after — see the squash leg for why.
+        pre_untracked = _untracked_paths(repo)
         rc, out = _git(repo, "merge", "--no-ff", "-m", msg, branch)
         if rc != 0:
-            # Both questions BEFORE the abort, which erases the evidence for each.
+            # All three questions BEFORE the abort, which erases the evidence for each.
             # The index stages say whether content collided; MERGE_HEAD says whether
             # a merge started at all, and it is asked here rather than inline below
-            # so that one reading serves both the classification and the abort.
+            # so that one reading serves both the classification and the abort. The
+            # untracked delta answers a question neither can: whether git wrote any
+            # incoming file to the tree before dying (#619).
             unmerged = _index_unmerged(repo)
             started = _merge_in_progress(repo)
+            materialized = tuple(sorted(_untracked_paths(repo) - pre_untracked))
             if unmerged:
                 kind = "conflict"
             elif started:
                 kind = "merged, but git refused the commit"
+            elif materialized:
+                kind = "failed part-way through checkout"
             else:
                 kind = "refused before starting"
             detail = f"git merge --no-ff {branch} failed in {repo} ({kind}): {out}"
+            if materialized and not unmerged and not started:
+                detail += f"; left untracked in {repo}: {', '.join(materialized)}"
             restored = True
             if started:  # only abort a merge that actually started
                 abort_rc, abort_out = _git(repo, "merge", "--abort")  # restore pre-merge HEAD
@@ -2133,6 +2225,8 @@ def merge_branch(
                 raise GitError(detail)
             if started:
                 raise MergeCommitRefusedError(detail, restored=restored)
+            if materialized:
+                raise MergeHalfAppliedError(detail, paths=materialized)
             raise MergePreflightError(detail)
         return
     if strategy == "squash":
@@ -2143,17 +2237,34 @@ def merge_branch(
         # a checkout already carrying an unstaged edit reads dirty even when git
         # refused and touched nothing, and the reset would destroy it (#619).
         pre_dirty = _tree_dirty_vs_head(repo)
+        # A second snapshot, on the axis `pre_dirty` cannot see. Both diffs read a
+        # part-way merge as CLEAN — git rolls the index back and the files it already
+        # wrote are untracked, so they are in neither HEAD nor the index — which is
+        # exactly how such a failure came to be labelled "refused before starting".
+        # Differenced rather than read absolutely, for `pre_dirty`'s own reason: the
+        # operator's pre-existing strays are not git's doing.
+        pre_untracked = _untracked_paths(repo)
         rc, out = _git(repo, "merge", "--squash", branch)
         if rc != 0:
             unmerged = _index_unmerged(repo)  # read before any reset clears the stages
-            kind = "conflict" if unmerged else "refused before starting"
+            materialized = tuple(sorted(_untracked_paths(repo) - pre_untracked))
+            if unmerged:
+                kind = "conflict"
+            elif materialized:
+                kind = "failed part-way through checkout"
+            else:
+                kind = "refused before starting"
             detail = f"git merge --squash {branch} failed in {repo} ({kind}): {out}"
+            if materialized and not unmerged:
+                detail += f"; left untracked in {repo}: {', '.join(materialized)}"
             if not pre_dirty and _tree_dirty_vs_head(repo):
                 reset_rc, reset_out = _git(repo, "reset", "--hard", "HEAD")
                 if reset_rc != 0:
                     detail += f"; AND git reset --hard HEAD failed (tree not restored): {reset_out}"
             if unmerged:
                 raise GitError(detail)
+            if materialized:
+                raise MergeHalfAppliedError(detail, paths=materialized)
             raise MergePreflightError(detail)
         if allow_empty_squash and not _index_dirty_vs_head(repo):
             return

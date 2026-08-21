@@ -1699,6 +1699,38 @@ class WorktreeFlow:
                 )
             self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
             return  # defensive: never fall through to the success teardown below
+        except verify.MergeHalfAppliedError as e:
+            # Sibling of the pre-flight arm above, not a subclass of it, so it is a
+            # separate arm rather than a branch inside one — and like its neighbours it
+            # must precede the bare `GitError` arm. git died PART-WAY through the
+            # checkout: the pre-flight sentence above is false in its load-bearing
+            # clause ("the target checkout is unchanged"), because the incoming files
+            # git had already written are still there, untracked. Naming them is the
+            # whole point — they are what makes the next attempt fail, as an
+            # untracked-overwrite refusal over paths no earlier message mentioned.
+            #
+            # No `merge-preflight-refused` companion here even when `tolerated` is set:
+            # that event is the #623 corrective for a guard that called a path harmless
+            # and then watched git refuse over that same path. This failure is not about
+            # the tolerated paths at all — it is incoming content failing to check out —
+            # so pairing it with the guard's decision would assert a link that is not there.
+            residue = ", ".join(e.paths) if e.paths else "(none recorded)"
+            reason = (
+                f"merge of {unit.branch} into {target} failed PART-WAY THROUGH: git had "
+                f"already written some incoming files into {target}'s checkout when it "
+                f"stopped, so nothing was committed but the checkout is NOT as it was. "
+                f"Those files are left untracked and neither `git merge --abort` nor "
+                f"`git reset --hard` removes them: {residue}. Until they are gone the "
+                f"next attempt fails again — as a pre-flight refusal over those very "
+                f"paths, not with the error below — so clear them first (check the "
+                f"contents before deleting; the run can prove git wrote each path, not "
+                f"that the bytes there are git's). Then fix what stopped the checkout, "
+                f"which git's own message below names — a required clean/smudge filter "
+                f"that cannot run is the measured cause — and "
+                f"`bmad-loop resume {self.state.run_id}`. {e}"
+            )
+            self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
+            return  # defensive: never fall through to the success teardown below
         except verify.MergeCommitRefusedError as e:
             # Sibling of the arm above and equally a GitError subclass, so it too must
             # precede the arm below. Neither neighbour's remedy applies here: the merge

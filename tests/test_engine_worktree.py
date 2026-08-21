@@ -3397,11 +3397,55 @@ def test_merge_env_fault_during_target_clean_keeps_branch_and_escalates(
 # One phrase per escalation shape. The test asserts its own row's phrase present and
 # every OTHER row's absent, so the set is written once here rather than as a per-row
 # exclusion list that silently stops covering a shape the moment one is added.
+def test_half_applied_merge_escalation_names_the_residue_from_the_exception_paths(
+    project, monkeypatch
+):
+    """The half-applied arm names the leftover files from the exception's `paths`
+    attribute, not by echoing git's text.
+
+    Both channels normally carry the same names, which is exactly why the matrix
+    row above cannot test this: its pass-through assertion (`git's own text is in
+    the reason`) stays true even if the arm ignores `paths` entirely. So this row
+    stages an exception whose MESSAGE never mentions the file and whose `paths`
+    does — the only shape where the two channels disagree — and asserts the name
+    reaches the operator anyway.
+
+    It is worth an arm of its own because the name is the actionable half. The
+    residue blocks every subsequent attempt as a pre-flight refusal, so an
+    escalation that says "some files were left behind" without saying WHICH sends
+    the operator to diff a checkout the run has been told to tolerate strays in.
+
+    Ablation: replace `residue` with a fixed phrase, or build it from `str(e)`
+    instead of `e.paths`, and this row fails alone — every matrix row above stays
+    green, since there the two channels agree."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
+    )
+    exc = verify.MergeHalfAppliedError(
+        "git merge --squash feat failed in /repo (failed part-way through checkout): "
+        "fatal: smudge filter boom failed",  # deliberately names no path
+        paths=("Assets/Generated.cs", "notes.txt"),
+    )
+
+    def refuse_merge(*a, **kw):
+        raise exc
+
+    monkeypatch.setattr(verify, "merge_branch", refuse_merge)
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and not summary.crashed
+    reason = engine.state.paused_reason or ""
+    assert "Assets/Generated.cs" in reason and "notes.txt" in reason
+
+
 _MERGE_FAILURE_PHRASES = (
     "refused by git before it started",
     "the target checkout is back as it was",
     "left MID-MERGE",
     "content conflict",
+    "failed PART-WAY THROUGH",
 )
 
 
@@ -3439,8 +3483,23 @@ _MERGE_FAILURE_PHRASES = (
             ),
             "content conflict",
         ),
+        (
+            lambda: verify.MergeHalfAppliedError(
+                "git merge --squash feat failed in /repo (failed part-way through "
+                "checkout): fatal: zzz.dat: smudge filter boom failed; left untracked "
+                "in /repo: aaa.txt",
+                paths=("aaa.txt",),
+            ),
+            "failed PART-WAY THROUGH",
+        ),
     ],
-    ids=["preflight-refusal", "commit-refused", "commit-refused-unrestored", "content-conflict"],
+    ids=[
+        "preflight-refusal",
+        "commit-refused",
+        "commit-refused-unrestored",
+        "content-conflict",
+        "half-applied",
+    ],
 )
 def test_merge_failure_escalation_tells_a_preflight_refusal_from_a_conflict(
     project, monkeypatch, make_exc, present
@@ -3467,6 +3526,13 @@ def test_merge_failure_escalation_tells_a_preflight_refusal_from_a_conflict(
     FIRST: a resume over a mid-merge checkout dies on the merge state however well
     they fix the hook, so a message claiming the checkout was restored costs them
     the one step that unblocks it.
+
+    `half-applied` is the fourth state: git died part-way through the checkout and
+    left incoming files behind, untracked. It reaches `merge_local` as a SIBLING of
+    the pre-flight error rather than a subclass, so it needs an arm of its own —
+    and it is the row the cross-check matters most for, since the phrase it must
+    never carry is the pre-flight arm's "the target checkout is unchanged" claim,
+    which is false here in the exact clause the operator acts on.
 
     Ablation: delete either subclass arm from `merge_local` and its rows fail on
     both halves while the others stay green; collapse the `e.restored` branch to the

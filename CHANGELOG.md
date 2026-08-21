@@ -16,6 +16,21 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **A merge that died part-way through its checkout is no longer reported as "nothing happened" (#619).**
+  git materializes the incoming files in index order, so a failure partway — measured under a
+  **required** clean/smudge filter that cannot run, on both `--no-ff` and `--squash` — rolls the
+  index back but leaves the files it already wrote in the target checkout, untracked. That state
+  is invisible to every probe the classifier had: no unmerged stages, no `MERGE_HEAD`, and a tree
+  that reads clean against HEAD, since an untracked file is in neither HEAD nor the index. So it
+  was labelled a pre-flight refusal and the escalation told you the checkout was unchanged — while
+  the residue sat there and refused the next merge as an untracked-overwrite, identically on every
+  resume, over paths no message had named. `merge_branch` now samples the untracked set **before**
+  the merge and differences it after, raising a fourth type, `MergeHalfAppliedError`, that names
+  what git wrote; the escalation says the checkout is not as it was, lists the files, and notes
+  that neither `git merge --abort` nor `git reset --hard` removes them. The delta is what keeps
+  the two classes disjoint: an absolute reading would reclassify every genuine pre-flight refusal
+  that happens to have an untracked stray in the checkout, which is the tolerated-stray case
+  (#460) and therefore the common one. Nothing is cleaned for you.
 - **psmux: a hand-back that succeeded no longer reports as failed — or undoes itself (#659).**
   `switch_client` read its verdict off the session's attached-client count, which a same-session
   move cannot change — and same-session is the common shape for the return path, so a correct
