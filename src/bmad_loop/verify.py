@@ -96,6 +96,16 @@ class RollbackPreflightError(GitError):
     """Rollback cleanup paths could not be proven safe before mutation."""
 
 
+class MergePreflightError(GitError):
+    """Git refused a merge BEFORE starting it: the working tree was never
+    touched, no merge is in progress, and there is nothing to resolve. Covers an
+    untracked file the merge would overwrite, a staged change on an incoming
+    path, a file/directory shape clash, and an `--ff-only` target that cannot
+    fast-forward. A GitError so every existing `except verify.GitError` guard is
+    unchanged; a distinct type so a caller can stop telling the operator to
+    resolve a content conflict that never happened (#619)."""
+
+
 @overload
 def _run_git(
     cmd: list[str],
@@ -1820,6 +1830,30 @@ def _tree_dirty_vs_head(repo: Path) -> bool:
     return rc != 0
 
 
+def _index_unmerged(repo: Path) -> bool:
+    """True when the index carries unmerged stages — i.e. a merge really ran and
+    left a content conflict to resolve.
+
+    Deliberately NOT `.git/MERGE_HEAD`: a conflicted `git merge --squash` writes
+    three unmerged stages and conflict markers while creating no MERGE_HEAD at
+    all, so MERGE_HEAD would call every squash conflict a pre-flight refusal.
+    `ls-files -u` discriminates across the whole matrix — empty for every
+    pre-flight refusal and for success, three stages for a content conflict under
+    both `--no-ff` and `--squash`. Neither git's exit code nor its wording can
+    stand in: the same refusal shape yields rc 2 or rc 1 depending on whether the
+    merge was fast-forwardable, rc 1 is also a content conflict, and one message
+    line covers three distinct causes and is fully translated (#619).
+
+    Read from stdout alone (#442): this is an emptiness read, and git writes
+    advisories to stderr while still exiting 0, which against `_git`'s merged
+    stream would read as unmerged entries. A probe that itself fails prints
+    nothing and so reads as "no conflict" — this value only picks the raised
+    error's class, never whether anything is mutated.
+    """
+    _rc, value, _diag = _git_out(repo, "ls-files", "-u")
+    return bool(value)
+
+
 def merge_branch(
     repo: Path,
     branch: str,
@@ -1834,9 +1868,16 @@ def merge_branch(
     "squash" (collapse to one commit). Raises GitError on conflict or when an
     ff-only merge can't fast-forward, restoring the tree to its pre-merge state.
     Expects the target checkout to be clean; the worktree pipeline reconciles
-    Editor-induced dirt first via `clean_incoming_collisions`. When git refuses
-    a merge at pre-flight (no MERGE_HEAD created) the tree was never touched, so
-    no abort/reset is attempted and the raw git error is raised verbatim.
+    Editor-induced dirt first via `clean_incoming_collisions`.
+
+    A failure git raised at PRE-FLIGHT — an untracked file the merge would
+    overwrite, a staged change on an incoming path, a file/directory shape clash,
+    an `--ff-only` target that cannot fast-forward — never started a merge and
+    left the tree untouched, so it raises the `MergePreflightError` subclass with
+    git's own text passed through verbatim (#619). The discriminator is
+    `_index_unmerged`, NOT MERGE_HEAD: a conflicted `--squash` leaves unmerged
+    index stages and no MERGE_HEAD, so the earlier "no MERGE_HEAD created"
+    framing was wrong about the squash leg.
 
     ``allow_empty_squash`` is recovery-only: re-running a squash that committed
     before a host loss stages nothing because the target already has the merged
@@ -1846,30 +1887,42 @@ def merge_branch(
     if strategy == "ff":
         rc, out = _git(repo, "merge", "--ff-only", branch)
         if rc != 0:
-            raise GitError(f"git merge --ff-only {branch} failed in {repo}: {out}")
+            # --ff-only either fast-forwards or declines; it never starts a merge.
+            raise MergePreflightError(f"git merge --ff-only {branch} failed in {repo}: {out}")
         return
     if strategy == "merge":
         msg = message or f"Merge branch '{branch}'"
         rc, out = _git(repo, "merge", "--no-ff", "-m", msg, branch)
         if rc != 0:
-            detail = f"git merge --no-ff {branch} failed in {repo} (conflict?): {out}"
+            # Two different questions, in this order. What went wrong is answered
+            # by the index stages, which must be read BEFORE the abort clears
+            # them; whether there is anything to abort is MERGE_HEAD's to answer.
+            unmerged = _index_unmerged(repo)
+            kind = "conflict" if unmerged else "refused before starting"
+            detail = f"git merge --no-ff {branch} failed in {repo} ({kind}): {out}"
             if _merge_in_progress(repo):  # only abort a merge that actually started
                 abort_rc, abort_out = _git(repo, "merge", "--abort")  # restore pre-merge HEAD
                 if abort_rc != 0:
                     detail += f"; AND git merge --abort failed (repo left mid-merge): {abort_out}"
-            raise GitError(detail)
+            if unmerged:
+                raise GitError(detail)
+            raise MergePreflightError(detail)
         return
     if strategy == "squash":
         rc, out = _git(repo, "merge", "--squash", branch)
         if rc != 0:
-            detail = f"git merge --squash {branch} failed in {repo} (conflict?): {out}"
+            unmerged = _index_unmerged(repo)  # read before any reset clears the stages
+            kind = "conflict" if unmerged else "refused before starting"
+            detail = f"git merge --squash {branch} failed in {repo} ({kind}): {out}"
             # squash leaves no MERGE_HEAD; only reset if it actually modified the
             # tree/index (a pre-flight refusal leaves HEAD's tree untouched).
             if _tree_dirty_vs_head(repo):
                 reset_rc, reset_out = _git(repo, "reset", "--hard", "HEAD")
                 if reset_rc != 0:
                     detail += f"; AND git reset --hard HEAD failed (tree not restored): {reset_out}"
-            raise GitError(detail)
+            if unmerged:
+                raise GitError(detail)
+            raise MergePreflightError(detail)
         if allow_empty_squash and not _tree_dirty_vs_head(repo):
             return
         msg = message or f"Squash-merge branch '{branch}'"

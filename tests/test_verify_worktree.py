@@ -213,13 +213,18 @@ def test_merge_ff(project, tmp_path):
 
 
 def test_merge_ff_diverged_raises(project, tmp_path):
+    """`--ff-only` either fast-forwards or declines — it never starts a merge, so a
+    diverged target is a pre-flight refusal with nothing to resolve (#619).
+
+    Ablation: put this leg back on a bare `GitError` and this fails alone; the
+    conflict rows below stay green."""
     repo = project.project
     wt = tmp_path / "wt"
     verify.worktree_add(repo, wt, "feat", "main")
     commit(wt, "f.txt", "f\n", "feat work")
     commit(repo, "m.txt", "m\n", "main work")  # main diverges → no ff possible
 
-    with pytest.raises(verify.GitError):
+    with pytest.raises(verify.MergePreflightError):
         verify.merge_branch(repo, "feat", strategy="ff")
 
 
@@ -298,6 +303,111 @@ def test_merge_preflight_refused_no_abort_tail(project, tmp_path):
     assert "would be overwritten by merge" in msg
     assert "repo left mid-merge" not in msg
     assert not verify._merge_in_progress(repo)  # nothing to abort was ever started
+
+
+# ------------------------------------------- #619 merge failure taxonomy
+#
+# `merge_branch` fails for two materially different reasons and used to label
+# both a content conflict. These rows pin the split. The helpers below are the
+# three pre-flight shapes git refuses on; `_branch_with` (defined further down)
+# cuts the `feat` branch each one merges.
+
+
+def _preflight_untracked_overwrite(repo, tmp_path):
+    """The incoming commit adds a path that already sits UNTRACKED in the target."""
+    _branch_with(repo, tmp_path, adds={"leak.cs": "branch\n"})
+    (repo / "leak.cs").write_text("operator\n")
+
+
+def _preflight_staged_on_incoming_path(repo, tmp_path):
+    """The target holds a STAGED edit to a file the incoming commit rewrites."""
+    _branch_with(repo, tmp_path, modifies={"src.txt": "branch\n"})
+    (repo / "src.txt").write_text("operator staged\n")
+    git(repo, "add", "src.txt")
+
+
+def _preflight_shape_clash(repo, tmp_path):
+    """An untracked FILE stands where the incoming commit needs a DIRECTORY."""
+    _branch_with(repo, tmp_path, adds={"Assets/Tests/Leak.cs": "branch\n"})
+    (repo / "Assets").write_text("operator\n")
+
+
+_PREFLIGHT_SHAPES = [
+    (_preflight_untracked_overwrite, "untracked-overwrite"),
+    (_preflight_staged_on_incoming_path, "staged-on-incoming-path"),
+    (_preflight_shape_clash, "shape-clash"),
+]
+
+
+@pytest.mark.parametrize("strategy", ["merge", "squash"])
+@pytest.mark.parametrize(
+    "setup", [fn for fn, _ in _PREFLIGHT_SHAPES], ids=[name for _, name in _PREFLIGHT_SHAPES]
+)
+def test_merge_preflight_refusals_raise_merge_preflight_error(project, tmp_path, strategy, setup):
+    """Every shape git declines BEFORE the merge begins raises the subclass, under
+    both strategies. Nothing was merged and there is nothing to resolve, so calling
+    these a content conflict sends the operator hunting for markers that do not
+    exist (#619).
+
+    The HEAD assertion is not decoration: it is what makes "pre-flight" a claim
+    about the repo rather than about the exception's name.
+
+    Ablation: make every `merge_branch` failure raise a bare `GitError` and all six
+    rows fail; the conflict rows below stay green."""
+    repo = project.project
+    setup(repo, tmp_path)
+    head_before = git(repo, "rev-parse", "HEAD")
+
+    with pytest.raises(verify.MergePreflightError):
+        verify.merge_branch(repo, "feat", strategy=strategy)
+
+    assert git(repo, "rev-parse", "HEAD") == head_before  # nothing landed
+    assert not verify._merge_in_progress(repo)  # and nothing is mid-flight
+
+
+@pytest.mark.parametrize("strategy", ["merge", "squash"])
+def test_merge_content_conflict_is_not_a_preflight_refusal(project, tmp_path, strategy):
+    """The other side of the split: both branches commit a different change to the
+    same file, git really merges, and the failure IS a conflict to resolve.
+
+    The `not isinstance` assertion carries the whole test — `GitError` alone would
+    pass for the pre-flight rows too, since `MergePreflightError` is a subclass.
+
+    Ablation: classify with `_merge_in_progress` instead of `_index_unmerged` and
+    the squash row fails alone — a conflicted `--squash` writes unmerged index
+    stages but no MERGE_HEAD, so MERGE_HEAD reads every squash conflict as a
+    refusal. The `merge` row cannot catch that: MERGE_HEAD is exact there."""
+    repo = project.project
+    _branch_with(repo, tmp_path, modifies={"src.txt": "branch\n"})
+    commit(repo, "src.txt", "main change\n", "main edits src")
+
+    with pytest.raises(verify.GitError) as ei:
+        verify.merge_branch(repo, "feat", strategy=strategy)
+
+    assert not isinstance(ei.value, verify.MergePreflightError)
+
+
+def test_no_ff_conflict_with_preexisting_dirt_aborts_and_keeps_it(project, tmp_path):
+    """The `merge` leg's restore is `git merge --abort`, which — unlike the squash
+    leg's `reset --hard` — leaves an unstaged edit to an untouched tracked file
+    alone. So a genuine conflict still aborts even with the checkout dirty, and the
+    operator keeps both their edit and the conflict to resolve (#619).
+
+    Ablation: none of the #619 guards can redden this row; it is the control that
+    proves the squash-leg fix did not have to be applied here too."""
+    repo = project.project
+    commit(repo, "other.txt", "committed\n", "add other.txt")
+    _branch_with(repo, tmp_path, modifies={"src.txt": "branch\n"})
+    commit(repo, "src.txt", "main change\n", "main edits src")
+    (repo / "other.txt").write_text("operator edit\n")  # neither side touches it
+
+    with pytest.raises(verify.GitError) as ei:
+        verify.merge_branch(repo, "feat", strategy="merge")
+
+    assert not isinstance(ei.value, verify.MergePreflightError)
+    assert not verify._merge_in_progress(repo)  # the abort ran
+    assert (repo / "other.txt").read_text() == "operator edit\n"
+    assert (repo / "src.txt").read_text() == "main change\n"  # conflict markers rolled back
 
 
 # ---------------------------------------------------- dirty_paths / incoming
