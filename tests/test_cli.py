@@ -2619,8 +2619,23 @@ def test_resolve_restore_patch_unresolvable_rejected(tmp_path, monkeypatch, caps
     function's own try/except (scoped to `bmadconfig.BmadConfigError`) and fell
     through to `main()`'s generic backstop, which reports a bare `[Errno ...]`
     string instead of naming the restore-patch path or what failed. Pin the
-    specific message this function now returns, matching its other three
-    rejection reasons."""
+    specific message this function now returns, in the shape its five sibling
+    rejection reasons use.
+
+    Measured ablation (delete the `except (OSError, RuntimeError)` arm from
+    `_resolve_restore_patch`, leaving the bare `.resolve()`): this row fails, at
+    `assert f"cannot canonicalize the restore patch path {str(patch)!r}" in err`.
+    Only the two message assertions carry it. The unguarded `OSError` reaches
+    `main()`'s generic `except Exception` backstop, which prints `error: {e}` to
+    stderr and returns `ExitCode.FAILURE` — so ablated, `rc == 1`,
+    `UNRESOLVABLE in err`, `called == []` and both halves of the
+    phase/restore_patch assertion still pass; measured `err` is exactly
+    `error: [Errno 0] stubbed: the provider is registered but not serving`, and
+    with only those two message lines commented out the ablated row goes GREEN.
+    `UNRESOLVABLE in err` can never discriminate this regression — the guard
+    interpolates `{e}` and the backstop prints `{e}` bare, so it is the same
+    substring on both sides. Loosening the message assertion to it would make
+    this row a false green."""
     from bmad_loop.journal import load_state
     from bmad_loop.model import Phase
 
@@ -2647,8 +2662,81 @@ def test_resolve_restore_patch_unresolvable_rejected(tmp_path, monkeypatch, caps
     )
     assert rc == 1
     err = capsys.readouterr().err
-    assert "cannot canonicalize the restore patch path" in err
+    assert f"cannot canonicalize the restore patch path {str(patch)!r}" in err
     assert UNRESOLVABLE in err
+    assert "Run `bmad-loop validate` for what this host is doing." in err
+    assert called == []  # never resumed
+    task = load_state(run_dir).tasks["s1"]
+    assert task.phase == Phase.ESCALATED and task.restore_patch is None  # not re-armed
+
+
+def test_resolve_restore_patch_unresolvable_from_resolution_json_rejected(
+    tmp_path, monkeypatch, capsys
+):
+    """The same `.resolve()` guard, reached from the OTHER caller. `cmd_resolve`
+    validates an explicit `--restore-patch` flag BEFORE the interactive session,
+    but a `restore_patch` the agent recorded in resolution.json only exists once
+    that session has written it — so this arm cannot be hoisted, and its abort
+    lands after a whole agent conversation. The sibling flag-arm row above cannot
+    stand in for it: that row passes `--no-interactive`, which short-circuits the
+    resolution.json read (`if raw is None and args.interactive`), leaving `raw`
+    None so `if not raw: return None, None` fires and the guarded `.resolve()` is
+    never reached from this side. `ran == ["s1"]` is what pins that difference —
+    an identity assertion for the row, not a guard assertion (see below). The
+    patch here is a real file under the configured implementation_artifacts root,
+    i.e. an otherwise-honorable restore whose only defect is that this host cannot
+    canonicalize its path.
+
+    Measured ablation (delete the `except (OSError, RuntimeError)` arm from
+    `_resolve_restore_patch`, leaving the bare `.resolve()`): this row fails, at
+    `assert f"cannot canonicalize the restore patch path {str(patch)!r}" in err`.
+    Only the two message assertions carry it — with just those two lines removed
+    the ablated row goes GREEN. The unguarded `OSError` unwinds `cmd_resolve` into
+    `main()`'s generic `except Exception` backstop, which prints `error: {e}` to
+    stderr and returns `ExitCode.FAILURE`, so ablated `rc == 1`, `ran == ["s1"]`
+    (the session had already run), `UNRESOLVABLE in err`, `called == []` and both
+    halves of the phase/restore_patch assertion all still pass; measured `err` is
+    exactly `error: [Errno 0] stubbed: the provider is registered but not
+    serving`. As in the flag-arm row, `UNRESOLVABLE in err` can never discriminate
+    this regression — the guard interpolates `{e}` and the backstop prints `{e}`
+    bare, so it is the same substring on both sides."""
+    from bmad_loop import resolve
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    spec = tmp_path / "spec.md"
+    spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+    _write_bmad_config(tmp_path)
+    patch = tmp_path / "artifacts" / "attempt.patch"  # a legitimate restore target
+    patch.parent.mkdir(parents=True)
+    patch.write_text("diff", encoding="utf-8")
+    run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
+    ran: list = []
+
+    def fake_session(adapter, project, rd, story_key, *, model=""):
+        # the resolve agent records a restore_patch in its output marker
+        ran.append(story_key)
+        marker = resolve.resolution_path(rd, story_key)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps({"restore_patch": str(patch)}), encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
+    monkeypatch.setattr(resolve, "build_context", lambda *a, **k: None)
+    monkeypatch.setattr(resolve, "run_session", fake_session)
+    called: list = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: called.append(rd) or 0)
+    refuse_to_resolve(monkeypatch, patch)
+
+    # interactive is the default, and is required: this arm reads the marker the
+    # session writes, so --no-interactive would short-circuit it before the guard
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--resume"])
+    assert rc == 1
+    assert ran == ["s1"]  # the session really ran: this abort is post-session
+    err = capsys.readouterr().err
+    assert f"cannot canonicalize the restore patch path {str(patch)!r}" in err
+    assert UNRESOLVABLE in err
+    assert "Run `bmad-loop validate` for what this host is doing." in err
     assert called == []  # never resumed
     task = load_state(run_dir).tasks["s1"]
     assert task.phase == Phase.ESCALATED and task.restore_patch is None  # not re-armed
