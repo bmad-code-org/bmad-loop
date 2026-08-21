@@ -3343,98 +3343,63 @@ def _metachar_pair(repo, meta: str, victim: str):
     return repo / meta / "f.md", repo / victim / "f.md"
 
 
-def test_head_blob_reads_the_committed_bytes_not_the_working_tree(project):
-    """The baseline contract: HEAD's bytes, unaffected by whatever the tree now holds.
+def test_file_holds_content_accepts_a_pristine_board_in_either_eol_domain(project):
+    """Sameness here is GIT's question, and a byte compare cannot ask it (#618).
 
-    Its caller compares the answer against a file it is about to commit in order to
-    decide whether that file holds anyone else's edits. An implementation that read
-    the working tree instead would answer "mine" for every edit ever made, which is
-    the exact failure the comparison exists to prevent.
+    A board git checked out under a normalizing config is CRLF; one an editor or a
+    byte-writing tool left is LF; git reports the tree clean for both. A byte compare
+    against HEAD therefore has to guess which end of the round trip the file sits at,
+    and each guess refuses a pristine board on the hosts the other guess serves — a raw
+    baseline refuses (a), a smudged baseline refuses (b). Hashing both sides through the
+    path's clean filter draws exactly the distinction git draws.
+
+    (c) is what keeps that from being a rubber stamp: cleaning collapses terminators,
+    never content, so an operator's added row is still not this run's advance.
     """
     repo = project.project
-    committed = (repo / "src.txt").read_bytes()
-    (repo / "src.txt").write_bytes(committed + b"operator was here\n")
-
-    assert verify.head_blob(repo, "src.txt") == committed
-
-
-def test_head_blob_is_none_for_every_path_head_does_not_carry(project):
-    """One None for untracked, absent, and directory paths alike.
-
-    The caller reads None as "git holds no prior content here to compare against" and
-    lets the pre-existing behaviour stand, so these three must not be separable — an
-    untracked board is committed by the carry exactly as it was before (#460), and a
-    board git has never heard of has nothing to protect.
-    """
-    repo = project.project
-    (repo / "stray.txt").write_bytes(b"untracked\n")
-    # A directory that is REALLY in HEAD, committed here because the sandbox template
-    # tracks none: git stores no empty tree, so asserting against an absent name would
-    # pass for the "never_existed" reason and grade nothing.
-    (repo / "nested").mkdir()
-    (repo / "nested" / "f.txt").write_bytes(b"in a tree\n")
-    git(repo, "add", "--", "nested/f.txt")
-    git(repo, "commit", "-q", "-m", "nested")
-
-    assert verify.head_blob(repo, "stray.txt") is None
-    assert verify.head_blob(repo, "never_existed.txt") is None
-    # Terminator-normalized, because the answer is in the working-tree domain: under
-    # Git-for-Windows' system `core.autocrlf` the smudge hands back CRLF for this LF
-    # blob, while the file itself was written LF and never re-checked-out, so neither a
-    # literal nor `read_bytes()` is right on both hosts. What this pair grades is that a
-    # blob path yields bytes where a tree path yields None — not the line ending.
-    blob = verify.head_blob(repo, "nested/f.txt")
-    assert blob is not None and blob.replace(b"\r\n", b"\n") == b"in a tree\n"
-    assert verify.head_blob(repo, "nested") is None  # ...and naming it yields no blob
-
-
-def test_head_blob_answers_in_the_working_tree_domain_on_an_eol_normalizing_repo(project):
-    """A pristine checkout is never "somebody else's edit", however git stores it (#618).
-
-    `cat-file blob` runs no eol conversion, so on a repo that normalizes line endings
-    HEAD's raw bytes differ from the checked-out file on every line. The caller byte-
-    compares this answer against a file it is about to commit, so a raw baseline would
-    call a board nobody touched foreign and refuse a crashed pass's own carry — the one
-    the replay leg exists to finish. `.gitattributes` reproduces on every platform what
-    `core.autocrlf=true` does to an ordinary Git for Windows checkout.
-    """
-    repo = project.project
-    (repo / ".gitattributes").write_bytes(b"board.yaml text eol=crlf\n")
+    # `core.autocrlf=true` rather than an `eol=crlf` attribute: it is Git-for-Windows'
+    # system default, and it is the config under which BOTH spellings below read clean.
+    # An explicit `eol=crlf` is stricter and reports the LF file as ` M`, so case (a)
+    # could not arise there at all.
+    git(repo, "config", "core.autocrlf", "true")
     (repo / "board.yaml").write_bytes(b"development_status:\n  1-1-a: backlog\n")
-    git(repo, "add", "--", ".gitattributes", "board.yaml")
+    git(repo, "add", "--", "board.yaml")
     git(repo, "commit", "-q", "-m", "an eol-normalizing board")
-    # Let git itself materialize the working-tree form, rather than asserting against a
-    # spelling the test chose: the smudge filter is the thing under test.
-    (repo / "board.yaml").unlink()
+    head = verify.file_bytes_at_revision(repo, "HEAD", "board.yaml")
+    assert head is not None and b"\r\n" not in head  # git stores the LF twin
+    board = repo / "board.yaml"
+
+    # (a) the LF form a byte-writing tool leaves. Ordered FIRST because it is only
+    # reachable before a checkout has smudged the path: git re-reads the file through
+    # the clean filter here and calls it identical, where overwriting an already-CRLF
+    # checkout with LF instead reports ` M` and never reaches this comparison at all.
+    assert b"\r\n" not in board.read_bytes()
+    git(repo, "update-index", "--refresh")  # no stat-cache false green
+    assert not verify.dirty_paths(repo)
+    assert verify.file_holds_content(repo, "board.yaml", board, head)
+
+    # (b) the CRLF form git itself materializes on checkout — equally clean, and the
+    # byte compare that serves (a) refuses this one.
+    board.unlink()
     git(repo, "checkout", "--", "board.yaml")
+    assert b"\r\n" in board.read_bytes()
+    assert not verify.dirty_paths(repo)
+    assert verify.file_holds_content(repo, "board.yaml", board, head)
 
-    on_disk = (repo / "board.yaml").read_bytes()
-    assert b"\r\n" in on_disk  # the checkout is CRLF...
-    assert verify.file_bytes_at_revision(repo, "HEAD", "board.yaml") == on_disk.replace(
-        b"\r\n", b"\n"
-    )  # ...while the blob git stores is LF, so the two domains really do differ here
-    assert not verify.dirty_paths(repo)  # and git calls the tree clean regardless
-
-    assert verify.head_blob(repo, "board.yaml") == on_disk
+    # (c) content is still compared: an operator's row is not this pass's advance
+    board.write_bytes(board.read_bytes() + b"  9-9-operator: backlog\r\n")
+    assert not verify.file_holds_content(repo, "board.yaml", board, head)
 
 
-def test_head_blob_raises_rather_than_degrading_when_the_lookup_fails(tmp_path):
-    """A failed observation must not answer as "there is no baseline" (#618).
+def test_file_holds_content_raises_rather_than_answering_when_git_cannot_hash(project):
+    """An id it could not compute must not read as a verdict either way.
 
-    The caller reads None as "git holds no prior content here, proceed" and authorizes
-    the bookkeeping commit on the strength of it, so a fault degraded into None would
-    commit an operator's edits with ownership never proved — observation may degrade,
-    repair writes must raise. An unborn HEAD is the cheapest reachable failure; a git
-    timeout, a spawn failure and a damaged object database all leave by the same route.
-    Proven absence is what stays None, and `ls-tree` is what separates the two: it
-    reports an absent path as an empty SUCCESS and keeps every fault non-zero.
+    The caller gates a repair write on this, so the answer has to be git's or nobody's.
     """
-    repo = tmp_path / "unborn"
-    repo.mkdir()
-    git(repo, "init", "-q", ".")
+    repo = project.project
 
-    with pytest.raises(verify.GitError):
-        verify.head_blob(repo, "board.yaml")
+    with pytest.raises(verify.GitError, match="hash-object"):
+        verify.file_holds_content(repo, "board.yaml", repo / "never-written.yaml", b"x")
 
 
 def test_path_tracked_reports_index_membership(project):

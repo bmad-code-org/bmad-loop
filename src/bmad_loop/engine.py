@@ -6133,14 +6133,13 @@ class Engine:
         why it is a separate frame: a moment later this run's write is on the path and
         "was anybody else here" has stopped being answerable.
 
-        ``dirty_paths`` — git's own answer — and nothing else decides whether the byte
-        compare in the sibling below runs at all. That ordering is load-bearing rather
-        than an optimization: it is what keeps the compare from being asked about a
-        board nobody has written, where the only honest answer is git's. It is NOT what
-        makes the compare safe on a repo that normalizes line endings — ``head_blob``
-        answers in the working-tree domain for that, since gating a skewed compare would
-        still have refused a crashed pass's own advance, the one carry this leg exists
-        to finish.
+        ``dirty_paths`` — git's own answer — and nothing else decides whether the
+        comparison in the sibling below runs at all. That ordering is load-bearing
+        rather than an optimization: it is what keeps the comparison from being asked
+        about a board nobody has written, where the only honest answer is git's. It is
+        NOT what makes the comparison safe on a repo that normalizes line endings —
+        ``file_holds_content`` hashes both sides through the path's clean filter for
+        that, so no eol domain has to be guessed at either end.
 
         Fail CLOSED. A probe that could not run has not ruled an operator out, and the
         write it gates is the one that leaves no trace of what it took. The cost of the
@@ -6187,6 +6186,14 @@ class Engine:
         committed its board — and a second frame drawing it elsewhere would make the
         pair unreadable.
 
+        Sameness is GIT's question here, not a byte compare's (``file_holds_content``).
+        The baseline is HEAD's raw blob, and the board on disk may be its CRLF twin or
+        its LF one depending on nothing the run controls — git calls the tree clean
+        either way, so a byte compare would have to guess, and either guess refuses a
+        pristine board on the hosts the other guess serves. Both sides hashed through
+        the path's clean filter answers the only question worth asking, and still parts
+        an operator's added row from this pass's advance.
+
         Fail CLOSED, like its sibling and for its reason, and that covers
         ``advanced_bytes`` returning None: a row missing from HEAD's board leaves nothing
         to compare against, and "I could not compute the intended content" must not read
@@ -6196,11 +6203,11 @@ class Engine:
         repo = self.paths.repo_root
         try:
             rel = board.resolve().relative_to(repo.resolve()).as_posix()
-            head = verify.head_blob(repo, rel)
+            head = verify.file_bytes_at_revision(repo, "HEAD", rel)
             if head is None:
                 return True
             intended = sprint_advanced_bytes(head, story_key, target)
-            return intended is not None and board.read_bytes() == intended
+            return intended is not None and verify.file_holds_content(repo, rel, board, intended)
         except (verify.GitError, OSError, RuntimeError, ValueError):
             return False
 

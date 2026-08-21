@@ -68,9 +68,11 @@ breaking changes may land in a minor release.
   merge was already journaled `unit-merged`, the replay falls through to the carry commits with no
   pre-flight in front of them. The carry cannot simply refuse on dirt, because a crashed pass's
   own half-written advance is dirt on exactly that path and finishing it is what the leg exists
-  for. It now asks whether the board's bytes are HEAD's blob plus this pass's advance: a crashed
-  pass's write matches, an operator's edit does not, and foreign bytes skip the commit and journal
-  `board-advance-carry-foreign-dirt` — the status is already on disk where scheduling reads it.
+  for. It now asks whether the board holds HEAD's content plus this pass's advance — git's own
+  question, so a board spelled CRLF by one host and LF by another still answers yes: a crashed
+  pass's write matches, an operator's edit does not, and foreign content skips the commit and
+  journals `board-advance-carry-foreign-dirt`, the status already being on disk where scheduling
+  reads it.
 - **A merge git refused before it started no longer sends you to resolve a conflict that does not
   exist (#619).** Every `GitError` out of the merge was labelled "content conflict against the
   target", but most are git declining at pre-flight — an untracked file the merge would overwrite,

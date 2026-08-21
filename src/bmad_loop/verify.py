@@ -874,51 +874,50 @@ def path_tracked_file(repo: Path, rel: str) -> bool:
     return {entry for entry in proc.stdout.split(b"\0") if entry} == {os.fsencode(rel)}
 
 
-def head_blob(repo: Path, rel: str) -> bytes | None:
-    """The bytes HEAD records at repo-relative posix ``rel``, in the form the WORKING
-    TREE would hold them, or None when HEAD records nothing there.
+def _blob_oid_for_file(repo: Path, rel: str, path: Path) -> str:
+    """The object id git would record for the bytes in ``path``, taken as content for
+    repo-relative posix ``rel``.
 
-    Filtered rather than raw (`cat-file --filters --path=`), because every caller
-    compares this against a file read off disk, and the raw blob is the wrong domain
-    for that compare. On a repo that normalizes line endings — Git for Windows under
-    `core.autocrlf=true` is the ordinary case, not an exotic one — a pristine CRLF
-    checkout differs from its own LF blob on every line, so a raw baseline reports
-    "somebody else wrote this" about a file nobody has touched. That is not a
-    tolerable skew for a caller deciding whether to commit: it refuses a crashed
-    pass's own advance, which is the one carry the replay leg exists to finish (#618).
-    :func:`worktree_file_bytes_at_revision` splits the same two domains for recovery,
-    and for the same reason.
+    `--path=` is what makes ``path`` and ``rel`` separable: it drives the attribute
+    lookup, so a file living anywhere — a shadow copy outside the repo included — is
+    hashed under the rules that govern ``rel``. Verified load-bearing at git 2.55.0:
+    with `board.yaml text eol=crlf`, a CRLF twin named something else hashes to HEAD's
+    id with the flag and to a different id without it.
 
-    Resolved through :func:`_entry_at_revision`, not `HEAD:<rel>`, so a path naming a
-    TREE is discriminated by type instead of by luck: `--filters` on a tree exits 0 and
-    dumps the raw tree object, where `cat-file blob` refuses. A literal pathspec also
-    keeps a board whose name carries git magic from being reinterpreted (#577).
-
-    One `None` for every shape where git PROVED HEAD carries no blob here, because the
-    callers treat those alike: a path HEAD does not record, an untracked or ignored
-    one, and a path that names a tree are all "there is no prior content to compare
-    against".
-
-    An observation that FAILED is not one of those, and raises — a git timeout, a spawn
-    failure, an unborn HEAD, a damaged object database. `ls-tree` is what separates
-    them: it reports absence as an empty SUCCESS and keeps every fault as a non-zero
-    command. The split is the caller's entire safety margin, because `None` there means
-    "no baseline exists, proceed" and authorizes the bookkeeping commit; a fault
-    degraded into it would commit an operator's edits with ownership never proved.
-    Observation may degrade, repair writes must raise, and this gates a repair write.
-
-    Reads stdout as BYTES (`git_bytes`), never a decode: a board or ledger is arbitrary
-    file content, and a strict decode would raise on a path the caller is only trying
-    to compare (#377). Comparison is what bytes are for; nothing here needs the text."""
-    entry = _entry_at_revision(repo, "HEAD", rel)
-    if entry is None or entry[1] != "blob":
-        return None
-    oid = entry[2]
-    proc = git_bytes(repo, "cat-file", "--filters", f"--path={rel}", oid)
+    Raises rather than answering a sentinel. The one caller gates a repair write on the
+    comparison, and an id it could not compute must not read as "these differ" any more
+    than as "these match"."""
+    proc = git_bytes(repo, "hash-object", "-t", "blob", f"--path={rel}", "--", str(path))
     if proc.returncode != 0:
         detail = (proc.stdout + proc.stderr).decode("utf-8", "replace").strip()
-        raise GitError(f"git cat-file --filters {oid[:12]} for {rel!r} failed in {repo}: {detail}")
-    return proc.stdout
+        raise GitError(f"git hash-object --path={rel} for {path} failed in {repo}: {detail}")
+    return proc.stdout.decode("ascii", "strict").strip()
+
+
+def file_holds_content(repo: Path, rel: str, path: Path, data: bytes) -> bool:
+    """Whether the file at ``path`` holds ``data``, as GIT counts sameness for ``rel``.
+
+    Asks git's own question instead of guessing a domain. A byte compare has to know
+    which end of the checkin/checkout round trip the file on disk sits at, and there is
+    no answer that holds: under `core.autocrlf=true` — Git for Windows' system default,
+    which the suite deliberately leaves reachable — a freshly checked-out board is CRLF
+    while one an editor or a byte-writing tool left is LF, and git calls the tree clean
+    either way. Measured both ways at git 2.55.0: a baseline read raw refuses the CRLF
+    checkout, a baseline read through the smudge refuses the LF one, and the two
+    failures are the same mistake pointing opposite directions. Hashing both sides
+    through the CLEAN filter collapses that distinction, because it is precisely the
+    distinction git itself does not draw.
+
+    What it does NOT collapse is content: an operator's added row survives cleaning and
+    still answers False, which is the only discrimination the caller wants.
+
+    ``data`` is hashed from a shadow file rather than stdin because the git chokepoint
+    spawns without one, and widening it for a single caller would put a stdin path
+    through every git call in the module."""
+    with tempfile.TemporaryDirectory() as tmp:
+        shadow = Path(tmp) / "intended"
+        shadow.write_bytes(data)
+        return _blob_oid_for_file(repo, rel, shadow) == _blob_oid_for_file(repo, rel, path)
 
 
 def path_ignored(repo: Path, path: Path) -> bool:
