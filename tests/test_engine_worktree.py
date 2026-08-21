@@ -1448,6 +1448,7 @@ def test_host_loss_after_merge_before_evidence_replays_gitignored_harvest(
 
     monkeypatch.setattr(engine.journal, "append", real_append)
     replay_collision_refs: list[str] = []
+    replay_protected: list[object] = []
     replay_merge_refs: list[str] = []
     replay_strategies: list[str] = []
     real_clean = verify.clean_incoming_collisions
@@ -1456,7 +1457,11 @@ def test_host_loss_after_merge_before_evidence_replays_gitignored_harvest(
     def record_collision_ref(repo, target, merge_ref, **kwargs):
         replay_collision_refs.append(merge_ref)
         # forward the keywords rather than dropping them: dropping `on_tolerated`
-        # would silently disable the journal event on the replay path (#460).
+        # would silently disable the journal event on the replay path (#460), and
+        # dropping `protected` would silently disable the carry-path guard there
+        # (#618). Recorded, not just forwarded, so the assertion below catches both
+        # a stub that swallows the keyword and a call site that stops passing it.
+        replay_protected.append(kwargs.get("protected"))
         return real_clean(repo, target, merge_ref, **kwargs)
 
     def record_merge_ref(repo, merge_ref, **kwargs):
@@ -1479,6 +1484,13 @@ def test_host_loss_after_merge_before_evidence_replays_gitignored_harvest(
     assert summary.done == 1 and not summary.crashed and not summary.paused
     assert rev_parse_head(project.project) == landed_head
     assert replay_collision_refs == [crashed.commit_sha]
+    # The replay reaches `merge_local` by its own route, so the carry-path guard has
+    # to be wired inside it rather than at the live-run caller. Pinned as the exact
+    # tuple: a `protected=()` that reached here would satisfy "was passed" while
+    # guarding nothing. The board alone, not the ledger — this row gitignores the
+    # ledger, and an artifact git does not track has no committed baseline for the
+    # carry to diverge from, so the wiring omits it (`_carried_artifact_rels`).
+    assert replay_protected == [(project.sprint_status.relative_to(project.project).as_posix(),)]
     assert replay_merge_refs == [crashed.commit_sha]
     assert replay_strategies == [merge_strategy]
     assert "unit-merge-started" in journal_kinds(resumed)
@@ -2988,26 +3000,43 @@ def test_merge_auto_recovers_editor_dirtied_target(project):
     assert cleaned["paths"] == ["Leak.cs"]
 
 
-def _operator_edit_dev_effect(project, story_key, *, rel_path, marker):
+def _operator_edit_dev_effect(project, story_key, *, rel_path, marker, stage):
     """A dev effect that does the normal worktree work AND appends `marker` to a
     TRACKED file in the *main* checkout that the branch never touches — the operator
     editing their own working copy mid-run. Appends rather than overwrites so the
     edit stays inert in whatever file it lands on.
 
-    The append is STAGED, which is what makes it block (#618): an edit git holds only
-    in the working tree cannot reach the merge's commit and is tolerated, so an
-    unstaged fixture here would grade the tolerance path instead of the refusal this
-    caller is about."""
+    ``stage`` picks which half of #618's split the fixture grades, and callers must
+    pass it deliberately: STAGED is the refusal (git can fold a staged stray into a
+    fast-forwardable squash), UNSTAGED is the tolerance (an edit git holds only in
+    the working tree can reach no merge commit at all). A caller that wants one and
+    writes the other grades the opposite path and still goes green, which is how the
+    pre-#618 version of this helper came to pin the wrong row.
+    """
     base = wt_dev_effect(project, story_key)
 
     def effect(spec):
         result = base(spec)
         fp = project.project / rel_path
         fp.write_text(fp.read_text(encoding="utf-8") + marker, encoding="utf-8")
-        git(project.project, "add", "--", rel_path)
+        if stage:
+            git(project.project, "add", "--", rel_path)
         return result
 
     return effect
+
+
+def _committed_versions(project, rel: str) -> list[str]:
+    """Every committed version of `rel` reachable from HEAD, read out of git history.
+
+    The working tree cannot answer "did this land in a commit?". A pathspec carry
+    that swept an operator's edit into its own commit leaves the tree CLEAN and the
+    file's bytes unchanged on disk — the substitution is invisible from there, and
+    that invisibility is the whole hazard. `rev-list -- <rel>` names the commits that
+    touched the path; `show <sha>:<rel>` reads the blob each one recorded.
+    """
+    shas = git(project.project, "rev-list", "HEAD", "--", rel).splitlines()
+    return [git(project.project, "show", f"{sha}:{rel}") for sha in shas]
 
 
 def test_merge_stray_dirt_escalates_with_clear_message(project):
@@ -3031,7 +3060,7 @@ def test_merge_stray_dirt_escalates_with_clear_message(project):
         project,
         [
             _operator_edit_dev_effect(
-                project, "1-1-a", rel_path=".gitignore", marker="# operator edit\n"
+                project, "1-1-a", rel_path=".gitignore", marker="# operator edit\n", stage=True
             ),
             wt_review_effect(project, "1-1-a", clean=True),
         ],
@@ -3194,6 +3223,125 @@ def test_merge_shape_clash_journals_the_corrective_refusal(project, incoming_pat
     assert stray.is_file() and stray.read_text() == "operator\n"
     assert branch_exists(project.project, "bmad-loop/test-run/1-1-a")
     assert "merge-target-cleaned" not in kinds
+
+
+def test_merge_tolerates_unstaged_tracked_stray_in_main_checkout(project):
+    """#618's headline row, and the engine-layer twin of
+    `test_merge_stray_dirt_escalates_with_clear_message`: the SAME file, the SAME
+    edit, differing only in whether git holds it in the index.
+
+    Before #618 an unstaged tracked stray escalated the story and paused an
+    unattended run. It should not: a merge writes only paths that differ between
+    target and branch, and it commits only what is STAGED, so an edit living solely
+    in the working tree can be neither overwritten by the merge nor written into its
+    commit. Measured across both topologies and both strategies (#618).
+
+    The history assertion is the half the working tree cannot make. `worktree_clean`
+    is False here either way — the operator's edit is still uncommitted, which is the
+    point — so "the bytes are still on disk" would pass just as well if a commit had
+    also taken a copy of them. Reading every committed version of the path is what
+    pins that no commit on the target branch carries the edit.
+
+    The run must reach `done`, not merely avoid raising: `escalated == 0` and a DONE
+    phase are what separate a tolerated stray from one that quietly deferred the unit.
+    """
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    # The target must really be tracked, or this row silently degrades into the
+    # untracked case above. `git` raises on a nonzero rc.
+    git(project.project, "ls-files", "--error-unmatch", ".gitignore")
+    engine, _ = make_engine(
+        project,
+        [
+            _operator_edit_dev_effect(
+                project, "1-1-a", rel_path=".gitignore", marker="# operator edit\n", stage=False
+            ),
+            wt_review_effect(project, "1-1-a", clean=True),
+        ],
+    )
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused and summary.escalated == 0
+    assert engine.state.tasks["1-1-a"].phase == Phase.DONE
+    kinds = journal_kinds(engine)
+    assert "unit-merged" in kinds and "story-escalated" not in kinds
+    # tolerated, NOT cleaned: the guard never touches a stray it decided to let through
+    assert (project.project / ".gitignore").read_text().endswith("# operator edit\n")
+    assert "merge-target-cleaned" not in kinds
+    # ...and no commit on the target branch took a copy of it on the way past. The
+    # non-empty check is not decoration: `any()` over an empty history is False, so
+    # a read that silently found no commits would pass this line for the wrong reason.
+    versions = _committed_versions(project, ".gitignore")
+    assert versions and not any("# operator edit" in v for v in versions)
+    # walking past operator dirt is journaled, exactly as cleaning a leak is
+    tolerated = next(e for e in engine.journal.entries() if e["kind"] == "merge-target-tolerated")
+    assert tolerated["paths"] == [".gitignore"]
+    assert tolerated["story_key"] == "1-1-a"
+    assert tolerated["branch"] == "bmad-loop/test-run/1-1-a"
+    assert "merge-preflight-refused" not in kinds
+
+
+def test_merge_refuses_dirt_on_a_path_the_run_commits_for_itself(project):
+    """The data-safety half of #618. An unstaged edit is inert for the MERGE and is
+    tolerated by the row above — but not when it sits on a path the RUN itself
+    commits after the merge, and the sprint board is one of those.
+
+    `_carry_board_advance` calls `verify.commit_paths`, which runs
+    `git add -- :(literal)<board>` and then a pathspec commit, so it takes whatever
+    the working tree holds at that path no matter who wrote it. Left tolerated, the
+    operator's private edit rides out under `chore(sprint-status): carry 1-1-a to
+    done` — their bytes, the run's name, and a CLEAN tree afterwards, which is
+    exactly why nothing surfaces it.
+
+    Reaching that requires the board to be dirty in the main checkout AND outside the
+    branch's incoming set, and this row's setup is the shape that produces it rather
+    than decoration:
+
+    * the board is committed with the row ALREADY at the target, so the unit
+      worktree checks that out, `_post_dev_state_sync`'s advance writes nothing there
+      and the board never enters `finalize_commit`'s `git add -A`. It is a stray, not
+      an incoming collision — the ordinary tracked board rides the merge instead, and
+      a stray inside the incoming set would be restored rather than swept.
+    * the operator reopens the row in their own checkout WITHOUT committing, which is
+      what `_pick_next` (main board, on disk) reads to pick the story at all, and
+      appends a private note beside it.
+
+    The last assertion reads git history, not the working tree, and that is the whole
+    point: the measured failure leaves the tree clean and the file's bytes unchanged
+    on disk, so "the edit is still there" is true in BOTH the safe and the unsafe
+    outcome. Only the committed blobs tell them apart.
+    """
+    marker = "# operator: reopened locally, do not ship\n"
+    commit_sprint(project, {"1-1-a": "done"})
+    board = project.sprint_status
+    rel = board.relative_to(project.project).as_posix()
+    set_sprint(project, "1-1-a", "ready-for-dev")
+    board.write_text(board.read_text(encoding="utf-8") + marker, encoding="utf-8")
+    before = board.read_text(encoding="utf-8")
+    engine, _ = make_engine(project, [wt_dev_effect(project, "1-1-a", followup_review=False)])
+
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.done == 0
+    assert engine.state.tasks["1-1-a"].phase == Phase.ESCALATED
+    reason = engine.state.paused_reason or ""
+    # the carry clause, not the staged-changes one: unstaging is no remedy for a path
+    # this run is going to commit either way.
+    assert "bookkeeping commit" in reason and "staged changes" not in reason
+    assert rel in reason
+    # the operator's bytes are byte-intact — the guard refuses, it never repairs
+    assert board.read_text(encoding="utf-8") == before
+    # ...and no commit on the target branch carries them. `_committed_versions` is
+    # non-empty here (commit_sprint committed the board), so this is not the vacuous
+    # pass an empty history would give.
+    versions = _committed_versions(project, rel)
+    assert versions and not any(marker.strip() in v for v in versions)
+    assert not any(
+        "chore(sprint-status)" in s for s in git(project.project, "log", "--format=%s").splitlines()
+    )
+    # branch kept for manual merge; nothing was cleaned or walked past
+    assert branch_exists(project.project, "bmad-loop/test-run/1-1-a")
+    kinds = journal_kinds(engine)
+    assert "merge-target-cleaned" not in kinds and "merge-target-tolerated" not in kinds
 
 
 @pytest.mark.parametrize(

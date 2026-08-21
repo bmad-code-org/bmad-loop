@@ -6170,8 +6170,11 @@ class Engine:
         write, because ``advance`` cannot report whether it wrote (a never-regress
         echo returns the target too) — an unchanged board simply gives
         ``commit_paths`` nothing to commit, and ``clean_incoming_collisions`` has
-        just restored any unrelated dirt on a tracked board, so there is none to
-        sweep in.
+        just accounted for any unrelated dirt on it: inside the branch's incoming
+        set it was restored, and outside that set it REFUSED the merge, this frame
+        among everything else it precedes (the board is one of the two paths
+        ``merge_local`` passes as ``protected``, precisely because the pathspec
+        stage below would otherwise commit it). So there is none to sweep in.
 
         What ``advance`` CAN report is that the row did not REACH ``target``, and
         that is a different question from whether it wrote — the one this method has

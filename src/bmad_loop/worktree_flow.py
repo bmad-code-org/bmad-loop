@@ -1464,6 +1464,77 @@ class WorktreeFlow:
                 patch=str(patch) if patch else None,
             )
 
+    def _carried_artifact_rels(self, repo: Path) -> tuple[str, ...]:
+        """The repo-relative posix paths the RUN commits for itself after the merge —
+        ``clean_incoming_collisions``' ``protected`` operand (#618).
+
+        The sprint board and the deferred-work ledger, because those are the two
+        files the four post-merge carries name: ``_carry_harvested_deferrals``,
+        ``_carry_review_budget_followups`` and ``_carry_story_deferred_closes`` pass
+        ``paths.deferred_work`` and ``_carry_board_advance`` passes
+        ``paths.sprint_status``, all four to ``verify.commit_paths`` against this same
+        ``repo``. That call stages by PATHSPEC — `git add -- :(literal)<path>` — so
+        whatever the working tree holds at that path is committed no matter who wrote
+        it, and a merge that walked past an operator's edit there hands the run its
+        own bytes to commit under a `chore(...)` message. The blast radius is strictly
+        same-path (`git commit -- <pathspec>` is implicitly `--only`), which is why
+        this is an exact path set and not a policy.
+
+        ``self.paths``, not ``self.workspace.paths``: the carries read the MAIN
+        checkout's copies (their docstrings say so explicitly), and this is the
+        checkout the merge lands in.
+
+        Relativized exactly as ``commit_paths`` relativizes its own operands
+        (``resolve().relative_to(repo.resolve()).as_posix()``) — that is what makes
+        each entry the same string the carry will later hand ``git add``, and the same
+        key shape ``verify.dirty_paths`` returns, so the guard's membership test is an
+        equality it cannot get subtly wrong. Resolving is load-bearing rather than
+        defensive: through a symlinked artifacts dir the unresolved rel names the LINK
+        while both git and ``commit_paths`` name the target.
+
+        A path that cannot be expressed relative to ``repo`` is dropped, not raised
+        on: it cannot be dirty in this checkout, and ``commit_paths`` filters the same
+        ``ValueError`` and so would never commit it either. ``_ledger_seed``'s
+        three-way catch for the same reason — an unresolvable path (the WSL UNC
+        provider fault, a symlink loop) omits only itself.
+
+        TRACKED ONLY, and that is the whole boundary of the hazard rather than a
+        precaution. What makes the carry dangerous is committing a DIVERGENCE from a
+        baseline somebody else authored: on a tracked board, an operator's local
+        reopen of a story row rides out under `chore(sprint-status): carry ...` with
+        the tree left clean and nothing to read it back from. An UNTRACKED artifact
+        has no such baseline — git reports the whole file as dirt because git has
+        never seen it, the orchestrator has been reading that exact file as its own
+        all along, and committing it is how a non-ignored board first reaches git at
+        all (#350's carry). Protecting it would refuse the merge on EVERY isolated run
+        of any project that has yet to commit its board — measured: an untracked,
+        non-ignored board with no operator dirt anywhere ends the run
+        `done=0 paused=True escalated=1` — which is the unattended-halt class #460 and
+        #618 exist to remove, in exchange for a "hazard" that loses nothing (the bytes
+        are committed, not overwritten). A gitignored artifact never reaches the
+        question: ``dirty_paths`` does not report ignored files and ``git add`` refuses
+        an ignored pathspec, so the carry degrades instead of committing.
+
+        A trackedness probe that cannot answer keeps the path, the direction
+        ``path_tracked``'s own callers degrade in: uncertainty must not be what
+        authorizes writing an operator's bytes into the run's commit. The cost of
+        being wrong that way is a refusal the operator can act on; the other way it is
+        silent.
+        """
+        rels: list[str] = []
+        for artifact in (self.paths.sprint_status, self.paths.deferred_work):
+            try:
+                rel = artifact.resolve().relative_to(repo.resolve()).as_posix()
+            except (OSError, RuntimeError, ValueError):
+                continue
+            try:
+                tracked = verify.path_tracked(repo, rel)
+            except verify.GitError:
+                tracked = True
+            if tracked:
+                rels.append(rel)
+        return tuple(rels)
+
     def merge_local(
         self,
         task: StoryTask,
@@ -1500,10 +1571,13 @@ class WorktreeFlow:
         # checkout (see the unity plugin's worktree setup), dirtying the target with the very
         # files this branch already committed. Reconcile that first: clean only
         # the leaked copies of incoming files; nothing outside this branch's path set is
-        # ever touched. Outside it, trackedness decides whether the merge proceeds (#460):
-        # untracked dirt cannot be overwritten or staged in, so it is tolerated and
-        # journaled; uncommitted changes to tracked files can be folded into this story's
-        # commit, so they escalate.
+        # ever touched. Outside it two questions decide whether the merge proceeds. What
+        # the MERGE can commit is what git has staged (#618), so an unstaged stray is
+        # inert and is tolerated and journaled while a staged one escalates. What the RUN
+        # can commit is the second question, and `protected` is what asks it: the
+        # post-merge carry stages the board and the ledger BY PATHSPEC, so any dirt on
+        # them — staged or not, whoever wrote it — would ride the run's own bookkeeping
+        # commit. Inert-under-merge and safe-to-proceed are not the same predicate.
         tolerated: list[str] = []
 
         def note_tolerated(paths: list[str]) -> None:
@@ -1532,6 +1606,7 @@ class WorktreeFlow:
                 repo,
                 target,
                 merge_ref,
+                protected=self._carried_artifact_rels(repo),
                 on_tolerated=note_tolerated,
             )
         except (verify.GitError, OSError, RuntimeError) as e:
