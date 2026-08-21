@@ -215,8 +215,12 @@ def test_merge_ff(project, tmp_path):
 
 
 def test_merge_ff_diverged_raises(project, tmp_path):
-    """`--ff-only` either fast-forwards or declines — it never starts a merge, so a
-    diverged target is a pre-flight refusal with nothing to resolve (#619).
+    """A diverged target is a pre-flight refusal with nothing to resolve (#619).
+
+    Narrower than it looks, and deliberately so. `--ff-only` declines the TOPOLOGY
+    question before touching anything, which is what this row pins; it does NOT
+    follow that the flag never touches the tree, and the row further down that
+    kills a fast-forward mid-checkout is the counterexample.
 
     Ablation: put this leg back on a bare `GitError` and this fails alone; the
     conflict rows below stay green."""
@@ -517,7 +521,7 @@ def test_squash_preflight_refusal_never_resets_a_tree_it_found_dirty(project, tm
     assert (repo / "leak.cs").read_text() == "operator\n"
 
 
-def _branch_whose_checkout_dies_partway(repo, tmp_path):
+def _branch_whose_checkout_dies_partway(repo, tmp_path, *, tracked=False):
     """Cut a `feat` branch git cannot finish CHECKING OUT, and arm the failure.
 
     A **required** filter that cannot run is the portable way to kill a merge in
@@ -533,15 +537,27 @@ def _branch_whose_checkout_dies_partway(repo, tmp_path):
     the merge. Rename either side of that boundary and git dies before writing
     anything, which is a genuine pre-flight refusal and not this shape at all.
 
+    ``tracked`` decides which residue axis the failure leaves behind: False adds
+    `aaa.txt` on the branch only (it lands untracked, and nothing restores it),
+    True commits it on main first so the branch REWRITES it (` M aaa.txt`, which
+    `reset --hard HEAD` undoes).
+
     `.gitattributes` is committed BEFORE the branch is cut, so both sides carry it
     and it is in force in the TARGET at merge time; the filter config is armed
     AFTER the branch is built, so the branch's own `git add` never runs it. Both
     config writes are repo-LOCAL, so nothing outside this sandbox filters anything.
     """
     (repo / ".gitattributes").write_text("*.dat filter=boom\n")
-    # `-A` and not the path would sweep in whatever stray the CALLER staged the
+    seed = [".gitattributes"]
+    if tracked:
+        # The residue axis flips with this: an incoming path the target ALREADY
+        # tracks is rewritten in place (` M aaa.txt`) instead of appearing as an
+        # untracked add, and only the tracked axis is restorable.
+        (repo / "aaa.txt").write_text("original aaa\n")
+        seed.append("aaa.txt")
+    # `-A` and not the paths would sweep in whatever stray the CALLER staged the
     # scene with, and one row's whole point is a stray that stays untracked.
-    git(repo, "add", "--", ".gitattributes")
+    git(repo, "add", "--", *seed)
     git(repo, "commit", "-q", "-m", "attributes")
     wt = tmp_path / "partway-wt"
     verify.worktree_add(repo, wt, "feat", "main")
@@ -607,6 +623,88 @@ def test_merge_that_died_partway_through_checkout_is_not_a_preflight_refusal(
     assert "aaa.txt" in git(repo, "ls-files", "--others", "--exclude-standard").split()
     assert git(repo, "rev-parse", "HEAD") == head_before  # nothing landed
     assert not verify._merge_in_progress(repo)
+
+
+@pytest.mark.parametrize("strategy", ["ff", "merge", "squash"])
+def test_partway_checkout_restores_the_tracked_files_it_rewrote(project, tmp_path, strategy):
+    """The residue's SECOND axis, and the one the untracked delta is blind to by
+    construction.
+
+    An incoming path the target does not already track lands as an untracked add.
+    An incoming path it DOES track is rewritten in place, so `ls-files --others`
+    never mentions it and the delta is empty — while the checkout now holds
+    incoming content on a tracked path. That is the same harm in a different
+    shape: git refuses the next merge over it ("Your local changes to the
+    following files would be overwritten by merge"), so a run told its checkout
+    was unchanged fails on every resume.
+
+    Unlike the untracked axis, this one IS restorable, and `reset --hard HEAD`
+    under #619's clean-tree gate is what restores it. So the row asserts both
+    halves: the classification is `MergeHalfAppliedError` (the CAUSE is a stopped
+    checkout, not a target-state clash, and the remedies differ), and the tree is
+    genuinely put back.
+
+    All three strategies, because all three check out. `ff` is the row that
+    matters most: its leg carried an explicit "--ff-only never starts a merge"
+    premise and did no residue detection at all, so a fast-forward killed
+    mid-checkout left the target rewritten with nothing to restore it.
+
+    Ablation (predicate): force `tracked_dirtied` False in `_merge_residue` and
+    these three rows fail on the class. Ablation (repair): drop the
+    `_restore_tracked_residue` call from all three legs and they fail instead on
+    the file contents, which is the half a classification-only fix would have
+    missed. Measured, BOTH also redden `test_merge_squash_conflict_restores`, and
+    that is worth knowing rather than trimming out of the record: `tracked_dirtied`
+    is the same value that gates #619's pre-existing squash-conflict restore, so
+    the two behaviours share one predicate and a change to it moves both. The
+    untracked rows above stay green under either, having no tracked residue to
+    see."""
+    repo = project.project
+    _branch_whose_checkout_dies_partway(repo, tmp_path, tracked=True)
+    head_before = git(repo, "rev-parse", "HEAD")
+
+    with pytest.raises(verify.MergeHalfAppliedError) as ei:
+        verify.merge_branch(repo, "feat", strategy=strategy, message="m")
+
+    assert not isinstance(ei.value, verify.MergePreflightError)
+    assert "refused before starting" not in str(ei.value)
+    assert ei.value.paths == ()  # nothing untracked was left, so nothing to hand over
+    assert ei.value.restored  # ...and the tracked rewrite was rolled back
+    assert (repo / "aaa.txt").read_text() == "original aaa\n"
+    assert git(repo, "status", "--porcelain") == ""
+    assert git(repo, "rev-parse", "HEAD") == head_before
+
+
+def test_ff_only_killed_mid_checkout_is_not_a_preflight_refusal(project, tmp_path):
+    """`--ff-only` declines the TOPOLOGY question before touching anything — which
+    is true, and was over-read into "so it never touches the tree", which is not.
+
+    Once the fast-forward IS possible git checks the incoming tree out like any
+    other merge, and a failure during that write leaves residue with HEAD still
+    where it was. This leg had no residue detection at all and an explicit comment
+    asserting it needed none, so every such failure was a flat
+    `MergePreflightError`.
+
+    The untracked axis is the one asserted here because it is the one nothing can
+    restore: the operator is handed the path or they never learn it. The tracked
+    axis for this same leg is covered by the row above.
+
+    Ablation: restore the bare `raise MergePreflightError(...)` on the `ff` leg and
+    exactly two rows fail — this one and the tracked-axis row's `ff` case, i.e. both
+    residue axes for this leg and nothing else. `test_merge_ff_diverged_raises`
+    stays green throughout, which is the point: it pins the topology refusal, and
+    that one really does decline before reaching a checkout."""
+    repo = project.project
+    _branch_whose_checkout_dies_partway(repo, tmp_path)  # untracked axis
+    head_before = git(repo, "rev-parse", "HEAD")
+
+    with pytest.raises(verify.MergeHalfAppliedError) as ei:
+        verify.merge_branch(repo, "feat", strategy="ff")
+
+    assert not isinstance(ei.value, verify.MergePreflightError)
+    assert ei.value.paths == ("aaa.txt",)
+    assert (repo / "aaa.txt").read_text() == "incoming aaa\n"  # really left behind
+    assert git(repo, "rev-parse", "HEAD") == head_before  # and the ff never landed
 
 
 def test_partway_checkout_failure_names_only_what_git_wrote(project, tmp_path):

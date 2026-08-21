@@ -17,20 +17,32 @@ breaking changes may land in a minor release.
 ### Fixed
 
 - **A merge that died part-way through its checkout is no longer reported as "nothing happened" (#619).**
-  git materializes the incoming files in index order, so a failure partway — measured under a
-  **required** clean/smudge filter that cannot run, on both `--no-ff` and `--squash` — rolls the
-  index back but leaves the files it already wrote in the target checkout, untracked. That state
-  is invisible to every probe the classifier had: no unmerged stages, no `MERGE_HEAD`, and a tree
-  that reads clean against HEAD, since an untracked file is in neither HEAD nor the index. So it
-  was labelled a pre-flight refusal and the escalation told you the checkout was unchanged — while
-  the residue sat there and refused the next merge as an untracked-overwrite, identically on every
-  resume, over paths no message had named. `merge_branch` now samples the untracked set **before**
-  the merge and differences it after, raising a fourth type, `MergeHalfAppliedError`, that names
-  what git wrote; the escalation says the checkout is not as it was, lists the files, and notes
-  that neither `git merge --abort` nor `git reset --hard` removes them. The delta is what keeps
-  the two classes disjoint: an absolute reading would reclassify every genuine pre-flight refusal
-  that happens to have an untracked stray in the checkout, which is the tolerated-stray case
-  (#460) and therefore the common one. Nothing is cleaned for you.
+  git materializes the incoming files in index order, so a failure partway — measured on git
+  2.55.0 under a **required** clean/smudge filter that cannot run — stops with HEAD unchanged
+  but the tree already partly rewritten. That state was invisible to every probe the classifier
+  had: no unmerged stages, no `MERGE_HEAD`, and an index rolled back to HEAD. So it was labelled
+  a pre-flight refusal and the escalation told you the checkout was unchanged — while the residue
+  refused the next merge over those same paths, identically on every resume, over paths no
+  message had named. It affects **all three** strategies. `--ff-only` is not exempt, and the
+  "it never starts a merge" premise this module carried was simply wrong: `--ff-only` declines
+  the _topology_ question only, and once the fast-forward is possible it checks the incoming tree
+  out like any other merge.
+  The residue has two axes and they need different answers. An incoming path the target did not
+  already track lands **untracked**, and no restore reaches it — `git reset --hard` and
+  `git merge --abort` both leave untracked files alone, and the latter exits 128 here besides —
+  so it is named for you to clear. An incoming path the target **did** track is rewritten in
+  place, which `git reset --hard HEAD` does undo, so it is now undone automatically on every leg,
+  under the same clean-tree gate #619 put on the squash leg: a tree that was already dirty is
+  still never reset. Both raise a fourth type, `MergeHalfAppliedError`, carrying the untracked
+  paths and whether the tracked half was rolled back; the escalation asks only for the residue
+  that actually survived. Nothing untracked is ever cleaned for you.
+  The untracked axis is measured as a **delta** across the merge, not read absolutely: an
+  absolute reading would reclassify every genuine pre-flight refusal that happens to have an
+  untracked stray in the checkout, which is the stray the #460 guard deliberately tolerates and
+  therefore the common case. Ceiling worth knowing: on a checkout that was _already_ dirty the
+  tracked axis cannot be attributed to git at all, so such a failure is still reported as a plain
+  pre-flight refusal — "cannot tell" and "git did nothing" deliberately fail to the same side,
+  because the alternative is resetting an operator's uncommitted work.
 - **psmux: a hand-back that succeeded no longer reports as failed — or undoes itself (#659).**
   `switch_client` read its verdict off the session's attached-client count, which a same-session
   move cannot change — and same-session is the common shape for the return path, so a correct

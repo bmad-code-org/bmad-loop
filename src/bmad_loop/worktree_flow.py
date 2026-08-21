@@ -1714,20 +1714,45 @@ class WorktreeFlow:
             # and then watched git refuse over that same path. This failure is not about
             # the tolerated paths at all — it is incoming content failing to check out —
             # so pairing it with the guard's decision would assert a link that is not there.
-            residue = ", ".join(e.paths) if e.paths else "(none recorded)"
+            # Two residue axes, two different asks, and the operator needs whichever
+            # ones actually apply — so the middle of this message is composed rather
+            # than picked from a fixed set. An incoming path the target did not track
+            # lands untracked and no restore reaches it, so it is theirs to clear; one
+            # it DID track was modified in place and `merge_branch` has already reset
+            # it, unless that reset failed too.
+            steps: list[str] = []
+            if e.paths:
+                steps.append(
+                    f"Some incoming files are left UNTRACKED in the checkout and no "
+                    f"restore removes them — not `git merge --abort`, not "
+                    f"`git reset --hard`: {', '.join(e.paths)}. Clear those first, "
+                    f"checking the contents before you delete: the run can prove git "
+                    f"wrote each path, not that the bytes now there are git's."
+                )
+            if not e.restored:
+                steps.append(
+                    f"The tracked files git had already rewritten could NOT be rolled "
+                    f"back — that failure is in the message below too — so {target} is "
+                    f"still holding incoming content on those paths. Restore it "
+                    f"(`git reset --hard HEAD` in {target}) before anything else."
+                )
+            elif not e.paths:
+                steps.append(
+                    "The tracked files git had already rewritten have been rolled "
+                    "back, so the checkout itself needs nothing from you."
+                )
             reason = (
-                f"merge of {unit.branch} into {target} failed PART-WAY THROUGH: git had "
-                f"already written some incoming files into {target}'s checkout when it "
-                f"stopped, so nothing was committed but the checkout is NOT as it was. "
-                f"Those files are left untracked and neither `git merge --abort` nor "
-                f"`git reset --hard` removes them: {residue}. Until they are gone the "
-                f"next attempt fails again — as a pre-flight refusal over those very "
-                f"paths, not with the error below — so clear them first (check the "
-                f"contents before deleting; the run can prove git wrote each path, not "
-                f"that the bytes there are git's). Then fix what stopped the checkout, "
-                f"which git's own message below names — a required clean/smudge filter "
-                f"that cannot run is the measured cause — and "
-                f"`bmad-loop resume {self.state.run_id}`. {e}"
+                f"merge of {unit.branch} into {target} failed PART-WAY THROUGH: git got "
+                f"far enough to start writing the incoming files into {target}'s "
+                f"checkout before it stopped, so nothing was committed and this is not a "
+                f"clash between the target and the incoming commit. "
+                + " ".join(steps)
+                + f" Whatever residue is left refuses the NEXT attempt over those same "
+                f"paths rather than with the error below, which is why a resume before "
+                f"clearing it fails on the tree instead of on the cause. Then fix what "
+                f"stopped the checkout — git's own message below names it, and a "
+                f"required clean/smudge filter that cannot run is the measured cause — "
+                f"and `bmad-loop resume {self.state.run_id}`. {e}"
             )
             self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
             return  # defensive: never fall through to the success teardown below
@@ -1799,9 +1824,10 @@ class WorktreeFlow:
 
     def keep_branch_and_escalate(self, task: StoryTask, unit: UnitWorkspace, reason: str) -> None:
         """Preserve a DONE unit's branch (no delete, kept for manual merge) and
-        escalate. Shared by the three merge-back failure paths: a target dirtied
-        with stray work, a merge git refused at pre-flight, and a genuine content
-        conflict."""
+        escalate. Shared by every merge-back failure path: a target dirtied with
+        stray work, a merge git refused at pre-flight, a merge that died part-way
+        through its checkout, a merge whose COMMIT git refused, and a genuine
+        content conflict."""
         close_unit_workspace(
             unit,
             success=False,

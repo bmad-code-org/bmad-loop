@@ -3397,6 +3397,62 @@ def test_merge_env_fault_during_target_clean_keeps_branch_and_escalates(
 # One phrase per escalation shape. The test asserts its own row's phrase present and
 # every OTHER row's absent, so the set is written once here rather than as a per-row
 # exclusion list that silently stops covering a shape the moment one is added.
+@pytest.mark.parametrize(
+    "paths, restored, present, absent",
+    [
+        (("Assets/Gen.cs",), True, "Clear those first", "needs nothing from you"),
+        ((), True, "needs nothing from you", "Clear those first"),
+        ((), False, "could NOT be rolled back", "needs nothing from you"),
+    ],
+    ids=["untracked-residue", "tracked-restored", "tracked-restore-failed"],
+)
+def test_half_applied_escalation_asks_only_for_the_residue_that_survives(
+    project, monkeypatch, paths, restored, present, absent
+):
+    """A half-applied checkout leaves residue on two axes, and only one of them is
+    ever the operator's job — so this escalation composes its middle instead of
+    stating both every time.
+
+    An incoming path the target did not track lands untracked and no restore
+    reaches it, so they clear it. One it DID track was rewritten in place and
+    `merge_branch` has already reset it, so asking them to clear anything would
+    send them to a checkout that is already correct. The third row is that same
+    tracked case with the reset ALSO failed, which inverts the instruction: the
+    tree is still holding incoming content and has to be restored before the cause
+    is worth fixing, exactly as `MergeCommitRefusedError.restored` does for its own
+    neighbour.
+
+    Each row asserts its phrase present AND another row's absent, because presence
+    alone passes for a message that simply says everything unconditionally — which
+    is the failure mode a composed message has and a fixed one does not.
+
+    Ablation: drop the `e.restored` branch and keep only the `e.paths` clause, and
+    the two tracked rows fail on the presence half; make every clause
+    unconditional instead and all three fail on the absence half."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
+    )
+    exc = verify.MergeHalfAppliedError(
+        "git merge --ff-only feat failed in /repo (failed part-way through checkout): "
+        "fatal: smudge filter boom failed",
+        paths=paths,
+        restored=restored,
+    )
+
+    def refuse_merge(*a, **kw):
+        raise exc
+
+    monkeypatch.setattr(verify, "merge_branch", refuse_merge)
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and not summary.crashed
+    reason = engine.state.paused_reason or ""
+    assert present in reason
+    assert absent not in reason
+
+
 def test_half_applied_merge_escalation_names_the_residue_from_the_exception_paths(
     project, monkeypatch
 ):
