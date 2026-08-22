@@ -1255,3 +1255,50 @@ def test_a_planted_fifo_is_not_counted_as_this_runs_log_output(project, tmp_path
 
     group = next(g for g in diag.runs[0].files if g.category == "logs")
     assert (group.count, group.total_bytes, group.total_lines) == (1, 8, 2)
+
+
+def test_env_git_version_is_recorded(monkeypatch):
+    """The field a floor refusal is read against: a dump has to be able to say which
+    git ran, since `verify.GIT_FLOOR` is what `run` aborts below."""
+    import subprocess
+
+    from bmad_loop import verify
+
+    monkeypatch.setattr(
+        verify,
+        "git_bytes",
+        lambda *a, **k: subprocess.CompletedProcess(
+            args=["git", "version"], returncode=0, stdout=b"git version 2.34.1\n", stderr=b""
+        ),
+    )
+
+    env = diagnostics.collect_env(ANY_PROJECT)
+    assert env.git_version == "git version 2.34.1"
+
+
+def test_env_git_version_is_none_when_the_probe_fails(monkeypatch):
+    """`verify.git_bytes` ANSWERS a non-zero rc rather than raising, so a failed
+    probe reaches the fold with whatever it wrote to stdout.
+
+    Recording that as the version would put a fabricated fact in a dump read
+    precisely to explain a refusal — worse than the honest `None`, because a
+    plausible-looking version is not obviously absent. The stdout here is
+    deliberately version-SHAPED: an empty one would pass on `or None` even with the
+    rc guard gone, which is the vacuous form of this test.
+
+    Ablation: drop the `probed.returncode == 0` guard in `collect_env` and this
+    fails — the dump reports `git version 9.9.9`."""
+    import subprocess
+
+    from bmad_loop import verify
+
+    monkeypatch.setattr(
+        verify,
+        "git_bytes",
+        lambda *a, **k: subprocess.CompletedProcess(
+            args=["git", "version"], returncode=128, stdout=b"git version 9.9.9\n", stderr=b"fatal"
+        ),
+    )
+
+    env = diagnostics.collect_env(ANY_PROJECT)
+    assert env.git_version is None

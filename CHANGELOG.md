@@ -9,46 +9,22 @@ breaking changes may land in a minor release.
 
 ### Added
 
-- **git 2.34 or newer is now a declared prerequisite.** git is the tool every unit of work moves
-  through, and it was the one prerequisite the project never stated — absent from the README's
-  Requirements and the setup guide's platform list, with the only version number anywhere a 2.20
-  _capability_ gate belonging to one feature, which the rest of the codebase had quietly started
-  citing as the supported range. 2.34 is Ubuntu 22.04 LTS's stock git, keeping that LTS supported
-  to its April 2027 EOL while dropping Ubuntu 20.04 (2.25) and Debian 11 (2.30), both at or past
-  end of standard support. It is a **support** floor, deliberately above the capability floor:
-  nothing in bmad-loop's git argv needs 2.34 — the highest capability in use is `git config
---worktree`, from 2.20 — and the point is to stop the project writing code against gits it does
-  not test. Not operator-configurable, so there is no policy key and no settings entry.
-- **`bmad-loop validate` checks it, as `git.version`.** Reports the version git named itself, and
-  on a supported host is an ok finding that leaves the exit code alone. It stays silent when git
-  cannot be reached at all — `git.probe` immediately above already owns that fault, and one dead
-  binary should not produce two findings.
-- **`bmad-loop diagnose` records the host's git version.** New `git_version` field in the
-  Environment block, beside `tmux` — additive, so no `schema_version` bump — scrubbed and folded on
-  the same order as the multiplexer probe. Which git ran a session is now the first thing a dump
-  can answer about a floor refusal, and it is recorded raw rather than as a verdict: a dump is
-  evidence, and the floor it gets read against can move after the dump was written.
+- **git 2.34 or newer is now a declared prerequisite**, and the first one the orchestrator
+  enforces. Set to keep Ubuntu 22.04 LTS (stock git 2.34) supported; Ubuntu 20.04 (2.25) and
+  Debian 11 (2.30) fall below it. This is a support floor, not a capability one — nothing
+  bmad-loop runs needs 2.34 — so the project can stop carrying workarounds for untested git.
+  - `bmad-loop validate` checks it, as `git.version`.
+  - `bmad-loop diagnose` records the host's git version in its Environment block.
 
 ### Changed
 
-- **`run`, `sweep` and `resume` refuse to start below git 2.34, and `validate` now exits 1 there.**
-  The refusal prints the version git reported and what is required, and returns exit 1; it leads
-  the configuration refusals, because an under-floor git is a fact about the machine that no edit
-  to `policy.toml` can answer. The auto-triggered child sweep raises instead, having no exit-code
-  channel, which leaves its parent's trigger unspent. `validate` reports the same condition as a
-  **problem** rather than a warning, from the same wording, so its verdict cannot disagree with the
-  abort — this is what changes `validate`'s exit code on an under-floor host, and it holds the
-  `--json` contract: one document on stdout, verdict in its own `ok` field. All three arms fail
-  closed — a git that cannot be spawned, times out, or answers unparseably is refused exactly like
-  one that is simply too old, since the failure a floor must not have is the generous one.
-- **The git-add shield's version gate moves from 2.20 to the project floor.** It used to carry a
-  floor of its own and refuse with a capability claim — "needs git 2.20 for
-  `extensions.worktreeConfig` and `git config --worktree`" — which would be false at 2.34, since
-  git 2.25 has both. The gate now refuses as policy: bmad-loop supports git 2.34 and newer, and the
-  enable is a permanent repo-format change that is not made on an unsupported git. With the run
-  refusal in place no supported entry point reaches this gate with an old git, so what it still
-  catches on a current host is the unreadable-answer arm. 2.20 survives as a comment recording when
-  those two capabilities landed — a fact that is still true, and simply no longer a threshold.
+- **`run`, `sweep` and `resume` refuse to start below git 2.34, and `validate` now exits 1
+  there** — a change of exit code on an under-floor host. A git that cannot be run, times out,
+  or answers unparseably is refused the same way. `--dry-run` names the refusal in its
+  "NOT runnable" banner instead of previewing a run that cannot start.
+- **The git-add shield's version gate moves from 2.20 to the project floor.** It now refuses as
+  an unsupported-version policy rather than claiming a missing capability, which would be false
+  at 2.34 — git 2.25 has everything the shield uses.
 
 ### Removed
 

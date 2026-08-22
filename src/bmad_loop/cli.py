@@ -229,6 +229,14 @@ def _reject_under_floor_git(project: Path) -> int | None:
     human from `cmd_run`, `cmd_sweep` and `_resume_paused_run`, and a raise from the
     auto-triggered child sweep in `_sweep_factory`, which has no rc channel.
 
+    Takes the PROJECT root, not `paths.repo_root`. `git version` answers for the
+    git BINARY and reads no repository, so the directory only has to exist — and
+    `repo_root` is an operator-set config key that need not, while `project` is what
+    `_project()` already resolved. Probing the configurable one would spend this
+    refusal on a mistyped `repo_root`, reporting a broken git to someone whose git
+    is fine and burying the isolation refusal that names the real fault. `validate`
+    and `diagnose` probe the project root for the same reason.
+
     FAIL CLOSED on both arms. An unparseable `git version` is refused by
     `verify.git_below_floor`, and a git that could not be run at all — absent,
     unspawnable, timed out — is refused here: a run that cannot ask git its version
@@ -1037,10 +1045,18 @@ def _warn_preflight_would_abort(
     shim's interactive migration gate.
 
     Mirrors the refusals the dry-run's early return skips past, and only those:
-    the finding list `_require_base_skills` gates on, the #414 isolation conflict
+    the under-floor git `_reject_under_floor_git` refuses first, the finding list
+    `_require_base_skills` gates on, the #414 isolation conflict
     `_reject_isolation_conflict` refuses ahead of it, and the unregistered adapter
     kind `make_adapters` aborts on (`_unknown_adapter_kinds` — a preview reads none
-    of the fields that would give the misconfiguration away). Reading the same
+    of the fields that would give the misconfiguration away).
+
+    The git floor belongs here for the reason the dirty-tree and queue gates do
+    NOT: it is a fact about the HOST, so it cannot come true between this preview
+    and the real command the way cleaning a tree can. Both of its arms are
+    mirrored — too old, and could not be run at all — because `cmd_run` aborts on
+    each, and a banner silent on the second would promise a run guaranteed to
+    exit 1. Reading the same
     sources as the gates themselves is what keeps the preview from disagreeing with
     the real command about what "runnable" means. Severity-filtered to `problem`
     for that same reason — `_require_base_skills` ignores warnings, so reporting one
@@ -1066,6 +1082,11 @@ def _warn_preflight_would_abort(
     conflict = bmadconfig.worktree_isolation_conflict(paths, pol.scm.isolation)
     if conflict is not None:
         problems.insert(0, conflict)
+    try:
+        if (found := verify.git_below_floor(paths.project)) is not None:
+            problems.insert(0, under_floor_git_message(found))
+    except verify.GitError as e:
+        problems.insert(0, f"git is required but could not be run: {e}")
     problems += _unknown_adapter_kinds(paths.project, pol)
     if not problems:
         return
@@ -1812,7 +1833,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     # about the machine that no edit to policy.toml can answer, so telling the
     # operator to fix their isolation setting first would send them at the wrong
     # problem. Everything else in this block would be refused again anyway.
-    if (rc := _reject_under_floor_git(paths.repo_root)) is not None:
+    if (rc := _reject_under_floor_git(paths.project)) is not None:
         return rc
 
     # First of the configuration refusals (`_reject_bad_run_id` and the two loaders
@@ -2169,7 +2190,7 @@ def _sweep_factory(project: Path, paths: bmadconfig.ProjectPaths, trusted_digest
         # as the two above it. A `GitError` here needs no arm of its own: it is
         # already an exception, and this factory's contract is that any raise before
         # `started` leaves the parent's trigger unspent.
-        if (found := verify.git_below_floor(paths.repo_root)) is not None:
+        if (found := verify.git_below_floor(paths.project)) is not None:
             raise RuntimeError(under_floor_git_message(found))
         _start_sweep(
             project,
@@ -2196,7 +2217,7 @@ def cmd_sweep(args: argparse.Namespace) -> int:
     if args.dry_run:
         return _sweep_dry_run(paths, pol)
 
-    if (rc := _reject_under_floor_git(paths.repo_root)) is not None:
+    if (rc := _reject_under_floor_git(paths.project)) is not None:
         return rc
 
     if (rc := _reject_isolation_conflict(paths, pol)) is not None:
@@ -2269,7 +2290,7 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
     # before the override was added must not finish its remaining stories through
     # provisioning the preflight would now refuse. The git floor rides along for the
     # same reason: a run started on a supported git can be resumed after a downgrade.
-    if (rc := _reject_under_floor_git(paths.repo_root)) is not None:
+    if (rc := _reject_under_floor_git(paths.project)) is not None:
         return rc
     if (rc := _reject_isolation_conflict(paths, pol)) is not None:
         return rc

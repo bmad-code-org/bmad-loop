@@ -474,8 +474,16 @@ def git_version_at_least(reported: str, want: tuple[int, int]) -> bool:
     use this to gate something they must not do optimistically — abort a run, or make
     a PERMANENT repo-format change — so the failure it must not have is the generous
     one. A git that will not say what it is does not clear the floor.
+
+    The minor must END at a delimiter, which is what keeps that promise against
+    trailing garbage: without the lookahead `git version 2.34broken` reads as 2.34
+    and CLEARS the floor, exactly the generous failure above. A dot or whitespace
+    covers every real form — the vendor tails all continue `.` (`2.44.0.windows.1`)
+    or break to a space (`2.39.5 (Apple Git-154)`), and a bare `2.34` ends the
+    string. Anything else is refused rather than guessed at, which for an unknown
+    vendor spelling is a visible refusal instead of a silent pass.
     """
-    match = re.match(r"git version (\d+)\.(\d+)", reported.strip())
+    match = re.match(r"git version (\d+)\.(\d+)(?=[.\s]|$)", reported.strip())
     return match is not None and (int(match[1]), int(match[2])) >= want
 
 

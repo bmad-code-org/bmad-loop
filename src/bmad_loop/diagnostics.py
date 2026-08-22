@@ -351,8 +351,13 @@ def collect_env(project: Path) -> EnvInfo:
         # but a vendor build is free to say more and the bound is what makes that
         # safe. Reported RAW rather than as a verdict — a dump is evidence, and the
         # floor it is read against can move after the dump was written.
+        # `git_bytes` ANSWERS with a non-zero rc rather than raising, so the rc is
+        # checked here for the same reason `git_below_floor` checks it: stdout on a
+        # failed probe is not a version, and folding it would put a fabricated
+        # answer in the dump. `None` — "could not be asked" — is the honest value.
         probed = verify.git_bytes(project, "version")
-        git_v = fold_version(sanitize.scrub_text(os.fsdecode(probed.stdout))) or None
+        if probed.returncode == 0:
+            git_v = fold_version(sanitize.scrub_text(os.fsdecode(probed.stdout))) or None
     except Exception:  # nosec B110 - env probe is best-effort; absent git is fine
         pass
 

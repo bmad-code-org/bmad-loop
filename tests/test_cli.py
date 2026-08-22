@@ -8764,3 +8764,77 @@ def test_validate_passes_the_git_floor_on_a_current_host(project, capsys, monkey
 
     findings = _validate_findings(project, capsys)
     assert findings["git.version"]["severity"] == "ok"
+
+
+def test_auto_sweep_factory_raises_on_an_under_floor_git(project, monkeypatch):
+    """The child sweep's arm of the same refusal, and the one that cannot report an
+    rc: `_sweep_factory` runs under the engine, so it RAISES — the disposition the
+    #414 isolation conflict already uses there.
+
+    `launched == []` is the load-bearing half. A refusal that still reached
+    `_start_sweep` would spawn the very session it exists to prevent, and the
+    exception alone cannot tell those apart: the factory's contract is that any
+    raise BEFORE `started` leaves the parent's trigger unspent, so the assertion
+    has to prove the launch did not happen, not merely that something was raised.
+
+    Ablation: delete the `git_below_floor` check in `_sweep_factory` and this fails
+    — the factory launches a child sweep on a 2.25 host."""
+    factory, launched = _pinned_sweep_factory(project, monkeypatch)
+    _fake_git_version(monkeypatch, UNDER_FLOOR_GIT)
+
+    with pytest.raises(RuntimeError, match="2\\.25\\.1"):
+        factory("epic-boundary", started=_never_started)
+    assert launched == []
+
+
+def test_resume_refuses_an_under_floor_git(project, capsys, monkeypatch):
+    """Resume re-reads config.yaml and policy.toml off disk, so it is a second
+    entrypoint into the same engine and takes the same refusal — a run started on a
+    supported git must not finish its remaining stories after a downgrade.
+
+    The gate sits ahead of the kill/journal work on purpose, so this asserts the rc
+    and the message rather than stubbing `runs.kill_session`: reaching that call at
+    all would already be the bug.
+
+    Ablation: delete the `_reject_under_floor_git` call in `_resume_paused_run` and
+    this fails — the resume proceeds past the gate."""
+    install_bmad_config(project)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    run_dir = _make_run_with_state(
+        project.project,
+        "20990101-000000-beef",
+        paused_reason="spec approval",
+        paused_stage="spec-approval",
+    )
+    _fake_git_version(monkeypatch, UNDER_FLOOR_GIT)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 1
+    err = capsys.readouterr().err
+    assert "2.25.1" in err
+    assert verify.git_floor_text() in err
+
+
+def test_dry_run_banner_names_an_under_floor_git(project, capsys, monkeypatch):
+    """`--dry-run` returns BEFORE `_reject_under_floor_git`, so without this the
+    preview renders a plausible schedule for a command guaranteed to exit 1.
+
+    The git floor belongs in this banner where the dirty-tree and queue gates
+    deliberately do not: those are transient tree state an operator can fix between
+    the preview and the run, while an under-floor git is a fact about the host that
+    the preview cannot honestly print around.
+
+    Ablation: drop the `git_below_floor` probe from `_warn_preflight_would_abort`
+    and this fails — the preview goes out with no banner at all."""
+    from conftest import install_base_skills
+
+    install_base_skills(project)
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    _write_policy(project.project)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    args = argparse.Namespace(epic=None, story=None, max_stories=None)
+    _fake_git_version(monkeypatch, UNDER_FLOOR_GIT)
+
+    assert cli._dry_run(project, pol, args) == 0
+    err = capsys.readouterr().err
+    assert "NOT runnable" in err
+    assert "2.25.1" in err and verify.git_floor_text() in err

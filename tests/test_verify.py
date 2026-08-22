@@ -5449,6 +5449,12 @@ def test_engine_written_is_keyword_only_on_all_dev_verifiers():
         ("git version 2.44.0.windows.1\n", True),
         ("git version 2.39.5 (Apple Git-154)\n", True),
         ("git version 3.0\n", True),
+        ("git version 2.34\n", True),  # bare major.minor: the end-of-string arm
+        # Trailing garbage where a delimiter belongs. Load-bearing because the DIGITS
+        # clear the floor: without the lookahead this parses as 2.34 and authorizes
+        # both a run and the shield's permanent repo-format write off an answer no
+        # git ever produced. The fail-closed doctrine has to reach it.
+        ("git version 2.34broken\n", False),
         ("", False),  # nothing at all: a spawn that produced no stdout
         ("fatal: not a git repository\n", False),
         # No `git version` prefix. Refused deliberately: a bare-number answer is not
