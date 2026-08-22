@@ -36,7 +36,7 @@ from typing import Any
 from . import policy as policy_mod
 from .plugins import load_plugins
 from .plugins.model import SettingSpec as PluginSettingSpec
-from .tui.settings import STAGES
+from .policy import STAGES
 
 # plugin [[settings]] types -> settings-screen widget kinds. The screen knows
 # switch/int/float/str/select; a plugin declares bool/int/float/str/select.

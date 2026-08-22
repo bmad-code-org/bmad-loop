@@ -17,7 +17,11 @@ import tomlkit
 from .. import policy as policy_mod
 from ..platform_util import atomic_write_text
 
-STAGES = ("dev", "review", "triage")
+# STAGES now lives in policy.py (#679) so the settings schema can reach it
+# without importing this tomlkit-backed module. Re-exported here because
+# `settings.STAGES` is this module's historical name for it; the pin is
+# load-bearing — without it ruff F401 autofix deletes the re-export.
+from ..policy import STAGES  # noqa: F401 — re-export
 
 
 class PolicyDoc:

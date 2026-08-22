@@ -107,6 +107,9 @@ else:
 # (a) the core CLI module imports with the extra absent
 import bmad_loop.cli
 
+# (b) so does the settings schema, which used to reach tui.settings for STAGES
+import bmad_loop.settings_schema
+
 # (c) `list` answers from the core dependencies alone
 rc = bmad_loop.cli.main(["list", "--project", sys.argv[1]])
 if rc != 0:
@@ -132,6 +135,10 @@ def test_extra_less_install_core_works_and_tui_hints(tmp_path):
 
     Ablation: restore cmd_list's ``from .tui.data import discover_runs`` and (c)
     fails -- the blocked ``pyte`` import escapes and ``list`` exits nonzero.
+
+    Ablation (#679): restore settings_schema's ``from .tui.settings import STAGES``
+    and (b) fails on the blocked ``tomlkit`` -- tui/settings.py imports it at module
+    scope, so the core settings schema drags the extra in behind it.
 
     Ablation (#678): narrow cmd_tui's guard back to the ``("textual", "tomlkit")``
     allowlist and the stderr-hint assertion fails -- ``rich`` imports before

@@ -9,7 +9,7 @@ README](../README.md#the-tui).
 ## Installation and launch
 
 ```bash
-uv sync --extra tui        # adds textual + tomlkit; the core stays pyyaml-only
+uv sync --extra tui        # adds textual + tomlkit + pyte + rich; core stays pyyaml-only
 cd /path/to/your/bmad/project
 bmad-loop tui              # or: bmad-loop tui --project /path/to/project
 ```
