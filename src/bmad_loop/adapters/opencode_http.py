@@ -1074,6 +1074,23 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     timeout_expired_clock=expired,
                     budget_weighted=budget_weighted,
                 )
+            # Hard-stop poll (#319), per-iteration and deliberately NOT inside the
+            # heartbeat throttle below: the loop blocks up to `POLL_TICK_S` (5s)
+            # per tick, so worst-case abort latency stays inside `stop_run`'s 10s
+            # grace window. Mirror the timeout arm exactly — without `_abort` the
+            # in-flight HTTP turn keeps running until teardown. Return the verdict;
+            # never raise `RunStopped` here, and never unlink the request file: the
+            # engine consumes it and attributes the stop.
+            if self._hard_stop_requested():
+                self._note_lifecycle(handle.task_id, "stop-abort-fired")
+                self._abort(sess)
+                transcript = self._capture_usage(handle, sess)
+                return SessionResult(
+                    status="aborted",
+                    session_id=session_id,
+                    transcript_path=transcript,
+                    budget_weighted=budget_weighted,
+                )
             now = time.monotonic()
             if last_heartbeat is None or now - last_heartbeat >= HEARTBEAT_INTERVAL_S:
                 last_heartbeat = now

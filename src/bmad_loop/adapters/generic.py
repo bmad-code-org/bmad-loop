@@ -176,11 +176,12 @@ class _ResultFileMixin:
     skill-written result dict and fold it into the session's final
     ``SessionResult``. Transport-agnostic — shared by the tmux adapters and
     any adapter whose skill writes ``tasks/<task_id>/result.json``; needs
-    only ``self.tasks_dir``."""
+    only ``self.tasks_dir`` and ``self.run_dir``."""
 
-    # Set by the concrete adapter's __init__; bare annotation (no runtime effect)
-    # tells the type checker the host attribute this mixin reads.
+    # Set by the concrete adapter's __init__; bare annotations (no runtime
+    # effect) tell the type checker the host attributes this mixin reads.
     tasks_dir: Path
+    run_dir: Path
 
     # Whether `_final` applies the #261 proof-of-work gate to its read-back. False
     # here, and that is not a conservative default — it is the correct answer for
@@ -191,6 +192,19 @@ class _ResultFileMixin:
     # `_DevSynthesisMixin`, whose read-back scans a directory shared with every
     # concurrent run — the one place a result can belong to somebody else.
     _READBACK_NEEDS_PROOF_OF_WORK = False
+
+    def _hard_stop_requested(self) -> bool:
+        """Has an operator lodged a *hard* stop request for this run (#319)?
+
+        Polled once per wait-loop iteration by both real adapters, so a
+        ``bmad-loop stop`` is honored mid-session on platforms where the
+        engine's SIGTERM path is unreachable. Read-only by contract: the
+        adapter never unlinks ``stop-request.json`` — the engine consumes it
+        when it raises, and must still see it to attribute the stop. A torn or
+        modeless read already leans ``"graceful"`` inside
+        ``read_stop_request_mode``, so this can never abort a session
+        spuriously."""
+        return runs.read_stop_request_mode(self.run_dir) == "hard"
 
     def _result_json(self, handle: SessionHandle, spec: SessionSpec, *, wait: bool) -> dict | None:
         """Acquire this session's result dict. Base behavior: read the
@@ -627,6 +641,23 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     transcript_path=transcript_path,
                     timeout_fired_at=time.time(),
                     timeout_expired_clock=expired,
+                    budget_weighted=budget_weighted,
+                    stop_seen=stop_seen,
+                )
+            # Hard-stop poll (#319), per-iteration and deliberately NOT inside
+            # the heartbeat throttle below: the loop blocks up to 5s per tick
+            # (`watcher.wait_for(..., timeout_s=min(remaining, 5.0))`), so worst-
+            # case abort latency stays inside `stop_run`'s 10s grace window, while
+            # riding the 30s HEARTBEAT_INTERVAL_S would be worse than the status
+            # quo. Return the verdict — never raise `RunStopped` here: that would
+            # skip `run()`'s finally-kill + `_post_kill_reconcile`. The file is
+            # left on disk for the engine to consume and attribute the stop.
+            if self._hard_stop_requested():
+                self._note_lifecycle(handle.task_id, "stop-abort-fired")
+                return SessionResult(
+                    status="aborted",
+                    session_id=session_id,
+                    transcript_path=transcript_path,
                     budget_weighted=budget_weighted,
                     stop_seen=stop_seen,
                 )
@@ -1822,9 +1853,20 @@ class _DevSynthesisMixin(_ResultFileMixin):
         cap-exhausted injected-workflow stall whose marker landed before the
         kill is rescued by the same trust model. ``over_budget`` joins the set
         (#158): an artifact the wrap-up nudge flushed at kill-time is honored
-        the same way."""
+        the same way.
+
+        ``aborted`` joins it too (#319): an operator's hard stop kills the
+        window mid-wait, so a Stop event that had already landed — or was one
+        tick away — is never read, leaving exactly the same evidence problem.
+        The same trust model settles it: a provably dead window plus a
+        self-consistent *successful* terminal plus proof-of-work means the
+        session did finish, and discarding that work would misreport what
+        happened rather than be cautious about it. The upgrade to
+        ``completed`` does NOT resume the run — the engine re-reads the
+        hard-stop file after saving the rescued session and stops there, so a
+        rescue records the finished work and still honors the stop."""
         if (
-            result.status not in ("stalled", "timeout", "over_budget")
+            result.status not in ("stalled", "timeout", "over_budget", "aborted")
             or result.result_json is not None
         ):
             return result
