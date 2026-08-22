@@ -18,40 +18,28 @@ breaking changes may land in a minor release.
 
 - **A policy field of the wrong TOML type now raises `PolicyError` naming `section.key`
   (#440).** `loads()` coerced with bare `int()`/`float()`/`bool()`/`str()` outside the
-  `PolicyError` funnel, so a wrong-typed value escaped as a raw `ValueError` or
-  `TypeError` — past every `except (PolicyError, OSError)` degrade handler in the
-  codebase. `_configure_mux` runs before dispatch on _every_ command, so one bad
-  character in `.bmad-loop/policy.toml` traced back at you instead of being reported;
-  the TUI died at construction rather than falling back to defaults; and `validate --json`
-  exited before printing the document its one-object contract promises, which is now
-  emitted with the fault as an ordinary `policy` finding. #587 had fixed `[limits]` this
-  way; this finishes the sweep across `[verify]`, `[sweep]`, `[scm]`, `[cleanup]`,
-  `[notify]`, `[review]`, `[gates]`, `[stories]`, `[dev]`, `[adapter]` and its stage
-  tables, `[tui]`, `[operator]`, `[mux]`, and `[plugins]`, and `[limits]`' own messages
-  are unchanged. Two of these never announced themselves at all: `notify.desktop = "false"`
-  is a truthy string, so it turned the feature **on** (the hazard #278 recorded), and
-  `verify.commands = "pytest"` iterated a bare string into six one-character commands
-  that read back as applied configuration — both now refuse. Fields with an allowlist
-  (`gates.mode`, `review.trigger`, `mux.backend`, …) keep it and blame the type first
-  rather than reporting a coerced value that was never written. Valid policies parse
-  identically; `usage_grace_s = 30` is still a legal float, and an unset `extra_args`
-  still means "inherit the profile's flags" where `[]` means "none".
-- **An undecodable or unreadable profile overlay or plugin manifest is a typed error
-  naming the file, not a traceback (#473).** `load_profiles` and the plugin loader read
-  each `*.toml` with `read_text(encoding="utf-8")` in the _argument expression_ of the
-  parse call — ahead of the conversion funnel that wraps parsing, so widening that funnel
-  could never have caught it. A non-UTF-8 file therefore escaped as a raw
-  `UnicodeDecodeError` past consumers that all key on the domain error: `validate --json`
-  printed a bare `error:` line and an empty stdout instead of an `adapter.profile`
-  finding, `get_profile` backs every adapter resolution so the same escape reached
-  run/sweep preflight, and a non-UTF-8 project `plugin.toml` walked through the settings
-  screen's `except (PolicyError, PluginError)` and took that surface down at
-  construction. Both loaders now raise `ProfileError`/`PluginError` naming the offending
-  path, and both arms are covered — a file that is present but unreadable (permissions,
-  a dead mount) was leaking a bare `OSError` on the same route, since the existing
-  `is_dir()`/`is_file()` checks rule out absence and nothing else. The packaged built-ins
-  read through the same guard: they are trusted, but a corrupt install is a packaging bug
-  and should say so.
+  `PolicyError` funnel, so a wrong-typed value escaped every handler written to degrade on
+  one: `_configure_mux` runs before dispatch on _every_ command, so one bad character in
+  `.bmad-loop/policy.toml` traced back at you; the TUI died at construction instead of
+  falling back to defaults; and `validate --json` exited before printing the document its
+  one-object contract promises, which now carries the fault as an ordinary `policy` finding.
+  Two of these never announced themselves at all: `notify.desktop = "false"` is a truthy
+  string, so it turned the feature **on** (the hazard #278 recorded), and
+  `verify.commands = "pytest"` exploded into six one-character commands that read back as
+  applied configuration. Extends #587's `[limits]` sweep to every remaining section, with
+  `[limits]`' own messages unchanged; allowlisted fields blame the type first. Valid policies
+  parse identically — an unset `extra_args` still means "inherit the profile's flags" where
+  `[]` means "none".
+- **An undecodable or unreadable profile overlay or plugin manifest is a typed error naming
+  the file, not a traceback (#473).** `load_profiles` and the plugin loader read each
+  `*.toml` outside the funnel that converts parse faults, so a non-UTF-8 file escaped as a
+  raw `UnicodeDecodeError` past consumers that all key on the domain error: `validate --json`
+  printed a bare `error:` line and empty stdout instead of an `adapter.profile` finding,
+  `get_profile` carried it into run/sweep preflight, and a bad project `plugin.toml` took the
+  settings screen down at construction. Both loaders now raise `ProfileError`/`PluginError`
+  naming the path, on both arms — a file present but unreadable (permissions, a dead mount)
+  was leaking a bare `OSError` on the same route. The packaged built-ins read through the
+  same guard: a corrupt install is a packaging bug and should say so.
 
 - **Merge-back failures are classified from the measured tree state, and the catch-all stopped
   inventing a conflict (#619).** A merge that died part-way through its checkout — all three
