@@ -308,7 +308,7 @@ def test_merge_preflight_refused_no_abort_tail(project, tmp_path):
     msg = str(ei.value)
     assert "would be overwritten by merge" in msg
     assert "repo left mid-merge" not in msg
-    assert not verify._merge_in_progress(repo)  # nothing to abort was ever started
+    assert verify._merge_in_progress(repo) == (False, None)  # nothing to abort was ever started
 
 
 # ------------------------------------------- #619 merge failure taxonomy
@@ -368,7 +368,7 @@ def test_merge_preflight_refusals_raise_merge_preflight_error(project, tmp_path,
         verify.merge_branch(repo, "feat", strategy=strategy)
 
     assert git(repo, "rev-parse", "HEAD") == head_before  # nothing landed
-    assert not verify._merge_in_progress(repo)  # and nothing is mid-flight
+    assert verify._merge_in_progress(repo) == (False, None)  # and nothing is mid-flight
 
 
 @pytest.mark.parametrize("strategy", ["merge", "squash"])
@@ -449,7 +449,7 @@ def test_merge_whose_commit_git_refused_is_not_a_preflight_refusal(project, tmp_
     assert "refused before starting" not in str(ei.value)
     # it really merged, and was rolled back rather than never started: the incoming
     # path reached the tree and the abort took it away again.
-    assert not verify._merge_in_progress(repo)
+    assert verify._merge_in_progress(repo) == (False, None)
     assert not (repo / "feature.txt").exists()
     assert git(repo, "rev-parse", "HEAD") == head_before
     assert ei.value.restored is True  # the abort ran and worked; the sibling row is the other half
@@ -494,7 +494,7 @@ def test_merge_commit_refusal_whose_abort_also_failed_reports_the_tree_unrestore
 
     assert ei.value.restored is False
     assert "repo left mid-merge" in str(ei.value)
-    assert verify._merge_in_progress(repo)  # the tree really is unrestored
+    assert verify._merge_in_progress(repo) == (True, None)  # the tree really is unrestored
 
 
 def test_squash_commit_refusal_is_classified_and_rolled_back(project, tmp_path):
@@ -739,7 +739,7 @@ def test_merge_that_died_partway_through_checkout_is_not_a_preflight_refusal(
     assert (repo / "aaa.txt").read_text() == "incoming aaa\n"
     assert "aaa.txt" in git(repo, "ls-files", "--others", "--exclude-standard").split()
     assert git(repo, "rev-parse", "HEAD") == head_before  # nothing landed
-    assert not verify._merge_in_progress(repo)
+    assert verify._merge_in_progress(repo) == (False, None)
 
 
 @pytest.mark.parametrize("strategy", ["ff", "merge", "squash"])
@@ -919,7 +919,7 @@ def test_partway_checkout_with_a_dead_probe_is_reported_unverified(
     assert "refused before starting" not in msg
     assert "left untracked" not in msg  # unread — so nothing is (mis)reported either
     assert git(repo, "rev-parse", "HEAD") == head_before
-    assert not verify._merge_in_progress(repo)
+    assert verify._merge_in_progress(repo) == (False, None)
     # the safe side of the degrade: the residue survives, unread rather than reset
     assert (repo / "aaa.txt").read_text() == "incoming aaa\n"
 
@@ -953,9 +953,180 @@ def test_commit_refusal_with_a_dead_probe_still_aborts_the_merge(project, tmp_pa
         verify.merge_branch(repo, "feat", strategy="merge")
 
     assert ei.value.restored is True
-    assert not verify._merge_in_progress(repo)  # the abort still ran
+    assert verify._merge_in_progress(repo) == (False, None)  # the abort still ran
     assert not (repo / "feature.txt").exists()
     assert git(repo, "rev-parse", "HEAD") == head_before
+
+
+def _index_probe_that_dies(monkeypatch):
+    """Kill `_index_unmerged`'s underlying read (`ls-files -u`) through the
+    `_git_out` seam, argv-matched so every other caller keeps working — the
+    raise exercises the catch INSIDE the probe, the same axis `_run_git`'s
+    timeout/spawn/decode faults arrive on. No count is needed: unlike the
+    residue pair this probe has no pre-merge reading to spare."""
+    real = verify._git_out
+
+    def dying(repo, *args, env=None):
+        if args == ("ls-files", "-u"):
+            raise verify.GitError(f"git ls-files timed out after 1s in {repo}: index probe boom")
+        return real(repo, *args, env=env)
+
+    monkeypatch.setattr(verify, "_git_out", dying)
+
+
+def _merge_state_probe_that_dies(monkeypatch):
+    """Kill `_merge_in_progress`'s underlying read (`rev-parse --verify
+    MERGE_HEAD`) through the `_git` seam, argv-matched. A `GitSpawnError` on
+    purpose: the catch must hold for the taxonomy's subclasses, not just the
+    root."""
+    real = verify._git
+
+    def dying(repo, *args):
+        if args == ("rev-parse", "-q", "--verify", "MERGE_HEAD"):
+            raise verify.GitSpawnError(f"git rev-parse failed to spawn in {repo}: state probe boom")
+        return real(repo, *args)
+
+    monkeypatch.setattr(verify, "_git", dying)
+
+
+@pytest.mark.parametrize("strategy", ["merge", "squash"])
+def test_conflict_with_a_dead_index_probe_is_reported_unverified(
+    project, tmp_path, strategy, monkeypatch
+):
+    """The index reading picks the CLASS between conflict and every sibling, so
+    with it dead no class may stand on "did not collide" — the honest answer is
+    unverified, naming the reading that died. The scene is a genuine conflict,
+    which is what makes the old silent False a mislabel and not a rounding: it
+    dressed this exact state as commit-refused (`merge`: MERGE_HEAD is set) or
+    half-applied (`squash`: the markers dirty a pre-clean tree).
+
+    The cleanup is NOT skipped with the classification: the abort stays gated
+    on the still-live merge-state reading and the squash reset on the proven
+    pre/post attribution, so both run here exactly as they would for the
+    classified conflict.
+
+    Ablation (wrap axis): re-raise instead of catch in `_index_unmerged` and
+    both rows fail on the raised type — the probe's own `GitError` escapes,
+    and on the `merge` row MERGE_HEAD survives the escape. Ablation (claim
+    axis): drop `index_unread is None` from the `merge` leg's commit-refused
+    claim and ITS row fails on `MergeCommitRefusedError`; drop it from the
+    half-applied gates and the `squash` row fails on `MergeHalfAppliedError` —
+    each mislabel lands in a different sibling, which is why one scene grades
+    both legs."""
+    repo = project.project
+    _branch_with(repo, tmp_path, modifies={"src.txt": "branch\n"})
+    commit(repo, "src.txt", "main change\n", "main edits src")
+    head_before = git(repo, "rev-parse", "HEAD")
+    _index_probe_that_dies(monkeypatch)
+
+    with pytest.raises(verify.MergeResidueUnreadError) as ei:
+        verify.merge_branch(repo, "feat", strategy=strategy)
+
+    msg = str(ei.value)
+    assert "checkout state unverified" in msg
+    assert "AND the index probe failed" in msg and "index probe boom" in msg
+    assert "(conflict)" not in msg  # unread — the conflict is not claimed either
+    assert "refused the commit" not in msg
+    assert git(repo, "rev-parse", "HEAD") == head_before
+    # the cleanup still ran: the merge leg aborted the started merge, the squash
+    # leg reset the attributed dirt — read through the test's own git, since the
+    # module's index probe is dead by construction here.
+    assert verify._merge_in_progress(repo) == (False, None)
+    assert git(repo, "ls-files", "-u") == ""
+    assert (repo / "src.txt").read_text() == "main change\n"
+
+
+def test_commit_refusal_with_a_dead_index_probe_still_aborts_the_merge(
+    project, tmp_path, monkeypatch
+):
+    """The claim half of the same wrap, on the state the dead reading cannot
+    part from a conflict: MERGE_HEAD alone says a merge started, not whether
+    its content collided — a `--no-ff` conflict sits mid-merge too — so
+    `started` may not claim commit-refused over a dead index reading, and the
+    class degrades to unverified while the abort, gated on the still-live
+    merge-state reading, runs anyway.
+
+    Ablation (claim axis): drop `index_unread is None` from the commit-refused
+    claim and this row fails on the raised type (`MergeCommitRefusedError`),
+    while the dead-RESIDUE sibling above stays green — its index reading is
+    live, which is what parts the two rows. Ablation (wrap axis): re-raise in
+    `_index_unmerged` and it fails twice over — the type collapses to the
+    probe's `GitError` and MERGE_HEAD survives the escape."""
+    repo = project.project
+    _cleanly_mergeable_branch(repo, tmp_path)
+    head_before = git(repo, "rev-parse", "HEAD")
+    git(repo, "config", "commit.gpgsign", "true")
+    git(repo, "config", "gpg.program", "bmad-loop-no-such-signer")
+    _index_probe_that_dies(monkeypatch)
+
+    with pytest.raises(verify.MergeResidueUnreadError) as ei:
+        verify.merge_branch(repo, "feat", strategy="merge")
+
+    msg = str(ei.value)
+    assert "checkout state unverified" in msg
+    assert "AND the index probe failed" in msg and "index probe boom" in msg
+    assert "refused the commit" not in msg
+    assert verify._merge_in_progress(repo) == (False, None)  # the abort still ran
+    assert not (repo / "feature.txt").exists()
+    assert git(repo, "rev-parse", "HEAD") == head_before
+
+
+def test_commit_refusal_with_a_dead_merge_state_probe_skips_the_abort_and_says_so(
+    project, tmp_path, monkeypatch
+):
+    """The one probe whose reading gates a REPAIR, so its unread half is the
+    inverse of its neighbours': uncertainty must not authorize a repair write —
+    the standing rule for `reset --hard`, applied to `merge --abort` — so the
+    unread case attempts NO abort, raises unverified, and says both. The repo
+    really is left mid-merge; the message hands the operator the reading the
+    run could not take instead of a restore claim it cannot back.
+
+    Degraded silently instead (False with no marker), this scene half-applies:
+    "neither collided nor started" stands unmeasured, the class collapses to
+    `MergeHalfAppliedError`, and the half-applied arm's `reset --hard` fires
+    over a mid-merge checkout it was never meant to touch.
+
+    Ablation (wrap axis): re-raise in `_merge_in_progress` and this fails on
+    the raised type — the probe's own `GitSpawnError` escapes. Ablation
+    (silent-degrade axis): return `(False, None)` from its except arm and it
+    fails on the type as above, plus the reset erases the merge state the
+    no-abort assertion pins."""
+    repo = project.project
+    _cleanly_mergeable_branch(repo, tmp_path)
+    git(repo, "config", "commit.gpgsign", "true")
+    git(repo, "config", "gpg.program", "bmad-loop-no-such-signer")
+    _merge_state_probe_that_dies(monkeypatch)
+
+    with pytest.raises(verify.MergeResidueUnreadError) as ei:
+        verify.merge_branch(repo, "feat", strategy="merge")
+
+    msg = str(ei.value)
+    assert "checkout state unverified" in msg
+    assert "no `git merge --abort` was attempted" in msg and "state probe boom" in msg
+    assert "refused the commit" not in msg
+    # no abort was attempted on an unread gate: the merge state is still there
+    # for the operator's own `git status` — read through the test's own git,
+    # since the module's merge-state probe is dead by construction here.
+    assert git(repo, "rev-parse", "-q", "--verify", "MERGE_HEAD") != ""
+
+
+def test_probe_helpers_read_an_environment_fault_as_unread(tmp_path):
+    """The rc axis of the same honesty: both probes spend return codes outside
+    their answer set on an unread marker, never on a silent "no". `git -C` a
+    non-repo is the portable rc-128 environment fault; `rev-parse -q --verify`
+    keeps rc 1 as the legitimate no (measured: 1 for a missing MERGE_HEAD, 128
+    for this), which the in-repo rows everywhere above pin as `(False, None)`.
+
+    Ablation (rc axis): read only rc 0 vs everything-else in either helper and
+    its half fails here — no other row exercises a probe whose git RAN and
+    failed, the monkeypatched rows all arriving on the raise axis."""
+    unmerged, unread = verify._index_unmerged(tmp_path)
+    assert unmerged is False and unread is not None
+    assert "git ls-files -u failed" in str(unread)
+
+    started, unread = verify._merge_in_progress(tmp_path)
+    assert started is False and unread is not None
+    assert "git rev-parse --verify MERGE_HEAD failed" in str(unread)
 
 
 def test_squash_replay_ignores_preexisting_unstaged_dirt(project, tmp_path):
@@ -997,7 +1168,7 @@ def test_no_ff_conflict_with_preexisting_dirt_aborts_and_keeps_it(project, tmp_p
         verify.merge_branch(repo, "feat", strategy="merge")
 
     assert not isinstance(ei.value, verify.MergePreflightError)
-    assert not verify._merge_in_progress(repo)  # the abort ran
+    assert verify._merge_in_progress(repo) == (False, None)  # the abort ran
     assert (repo / "other.txt").read_text() == "operator edit\n"
     assert (repo / "src.txt").read_text() == "main change\n"  # conflict markers rolled back
 

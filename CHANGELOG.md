@@ -21,9 +21,11 @@ breaking changes may land in a minor release.
   strategies, `--ff-only` included — now raises `MergeHalfAppliedError` instead of "refused
   before starting": untracked residue is named for you to clear (measured as a before/after
   delta, so your own strays are never attributed to git), and a tracked rewrite is reset
-  automatically under the existing clean-tree gate. A residue probe that itself fails no longer
-  bypasses the merge cleanup or impersonates a verdict: the abort still runs and the failure
-  raises `MergeResidueUnreadError` — checkout state unverified, run `git status`. A refused
+  automatically under the existing clean-tree gate. A post-merge probe that itself fails — the
+  residue pair, the unmerged-stages reading, or the MERGE_HEAD reading — no longer bypasses the
+  merge cleanup or impersonates a verdict: cleanup not gated on the dead reading still runs, the
+  failure raises `MergeResidueUnreadError` (checkout state unverified, run `git status`), and an
+  unread MERGE_HEAD skips the abort it gates and says so. A refused
   **squash commit** now raises `MergeCommitRefusedError` like the `--no-ff` leg — the squash leg
   seals its result with its own `git commit`, where commit hooks and signing do run — rolled back
   by `git reset --hard HEAD` under the same clean-tree gate (a dirty checkout is never reset; the

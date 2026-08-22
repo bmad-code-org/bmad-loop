@@ -239,12 +239,17 @@ class MergeResidueUnreadError(GitError):
     can no longer back. Both neighbours state what was measured; this class
     states that the measurement is missing.
 
-    Reachable only from the corner where nothing else answered: unmerged stages
-    (conflict) and MERGE_HEAD (commit refused) are read independently of the
-    residue pair, so either still claims its own class over a dead probe. Only
-    the choice between "refused before starting" and "failed part-way through
-    checkout" rests on the residue reading, and with that reading gone the
-    honest answer is neither.
+    Reachable from the corner where nothing else answered. Over a dead RESIDUE
+    pair, unmerged stages (conflict) and MERGE_HEAD (commit refused) are read
+    independently, so either still claims its own class — only the choice
+    between "refused before starting" and "failed part-way through checkout"
+    rests on that reading, and with it gone the honest answer is neither. The
+    index and merge-state readings can die in the same window (#619): a dead
+    index reading surrenders every class resting on "did not collide" —
+    commit-refused and half-applied as much as pre-flight, since a state it
+    cannot rule a conflict out of must not be dressed as either — and a dead
+    merge-state reading additionally skips the abort it gates, with the
+    message saying so, because uncertainty never authorizes a repair write.
 
     No repair rides on it: `reset --hard` stays gated on a PROVEN
     tracked-residue attribution, because uncertainty must not be what authorizes
@@ -2117,12 +2122,29 @@ def clean_incoming_collisions(
     return cleaned
 
 
-def _merge_in_progress(repo: Path) -> bool:
-    """True when a merge is mid-flight (MERGE_HEAD exists). A merge git refused at
-    pre-flight (e.g. untracked files would be overwritten) leaves no MERGE_HEAD,
-    so there is nothing to `--abort`."""
-    rc, _ = _git(repo, "rev-parse", "-q", "--verify", "MERGE_HEAD")
-    return rc == 0
+def _merge_in_progress(repo: Path) -> tuple[bool, GitError | None]:
+    """`(a merge is mid-flight — MERGE_HEAD exists, the probe failure when the
+    reading itself failed)`. A merge git refused at pre-flight (e.g. untracked
+    files would be overwritten) leaves no MERGE_HEAD, so there is nothing to
+    `--abort`.
+
+    `-q --verify` spends rc 1 on exactly "the name does not resolve" — the
+    legitimate no — and the environment-fault family lands at 128 (measured),
+    so rc 0 and rc 1 are the answers and anything else is an unread, as are
+    the three faults `_run_git` raises with no rc at all (#343/#377/#156).
+    Read in the same post-mutation window as `_index_unmerged`, and degrading
+    for the same reason: a raise here escapes `merge_branch` between the
+    failed merge and its cleanup. False WITH the marker set means unmeasured,
+    not "no merge" — and the caller must not let it authorize the abort this
+    value gates: `merge --abort` is a repair write, and uncertainty never
+    authorizes one, so the unread case skips the abort and says so."""
+    try:
+        rc, out = _git(repo, "rev-parse", "-q", "--verify", "MERGE_HEAD")
+    except GitError as unread:
+        return False, unread
+    if rc in (0, 1):
+        return rc == 0, None
+    return False, GitError(f"git rev-parse --verify MERGE_HEAD failed in {repo}: {out}")
 
 
 def _tree_dirty_vs_head(repo: Path) -> bool:
@@ -2182,15 +2204,15 @@ def _untracked_paths(repo: Path) -> frozenset[str]:
     has: git writes warnings to stderr at rc 0, and against `_git`'s merge a
     warning line would become a phantom path in the set.
 
-    RAISES on a failed read rather than degrading to the empty set the way its
-    neighbour `_index_unmerged` does, and the difference is the differencing: that
-    one is a single reading, where "could not tell" and "nothing there" pick the
-    same error class and neither mutates anything. This is one half of a PAIR, so
-    a silent empty set is not a neutral answer — an empty BEFORE against a real
-    AFTER reports every stray already in the checkout as something git just wrote,
-    and the message tells the operator to clear what it names. Failing the merge
-    outright is the smaller harm, and the before-read that would produce that
-    asymmetry runs while nothing has been mutated yet.
+    RAISES on a failed read rather than degrading the way its neighbours
+    `_index_unmerged` and `_merge_in_progress` do (each hands back an unread
+    marker), and the difference is position, not importance: this is one half
+    of a PAIR, so a silent empty set is not a neutral answer — an empty BEFORE
+    against a real AFTER reports every stray already in the checkout as
+    something git just wrote, and the message tells the operator to clear what
+    it names. Failing the merge outright is the smaller harm, and the
+    before-read that would produce that asymmetry runs while nothing has been
+    mutated yet.
 
     That argument covers only the BEFORE reading, which is why the AFTER reading
     goes through `_merge_residue`: post-merge, this same raise would bypass the
@@ -2261,9 +2283,10 @@ def _restore_tracked_residue(repo: Path) -> tuple[bool, str]:
     return True, ""
 
 
-def _index_unmerged(repo: Path) -> bool:
-    """True when the index carries unmerged stages — i.e. a merge really ran and
-    left a content conflict to resolve.
+def _index_unmerged(repo: Path) -> tuple[bool, GitError | None]:
+    """`(the index carries unmerged stages — i.e. a merge really ran and left a
+    content conflict to resolve, the probe failure when the reading itself
+    failed)`.
 
     Deliberately NOT `.git/MERGE_HEAD`: a conflicted `git merge --squash` writes
     three unmerged stages and conflict markers while creating no MERGE_HEAD at
@@ -2277,12 +2300,26 @@ def _index_unmerged(repo: Path) -> bool:
 
     Read from stdout alone (#442): this is an emptiness read, and git writes
     advisories to stderr while still exiting 0, which against `_git`'s merged
-    stream would read as unmerged entries. A probe that itself fails prints
-    nothing and so reads as "no conflict" — this value only picks the raised
-    error's class, never whether anything is mutated.
-    """
-    _rc, value, _diag = _git_out(repo, "ls-files", "-u")
-    return bool(value)
+    stream would read as unmerged entries.
+
+    A failed reading DEGRADES to `(False, the failure)` rather than raising or
+    silently answering "no conflict". The raise would escape `merge_branch`
+    between the failed merge and its cleanup — the same post-mutation window
+    `_merge_residue` already degrades in — and the silent False this used to
+    give is no better: every NEGATIVE arm of the classification (commit-
+    refused, half-applied, pre-flight) rests on `not unmerged`, so an
+    unmeasured "no" lets a probe failure pick one of their classes. rc != 0 is
+    the same unread — an `ls-files` that failed printed nothing, and an
+    emptiness read over nothing is not a measurement. False WITH the marker
+    set means unmeasured; callers claim no class resting on this reading and
+    route to `MergeResidueUnreadError` instead."""
+    try:
+        rc, value, diag = _git_out(repo, "ls-files", "-u")
+    except GitError as unread:
+        return False, unread
+    if rc != 0:
+        return False, GitError(f"git ls-files -u failed in {repo}: {diag}")
+    return bool(value), None
 
 
 def merge_branch(
@@ -2359,12 +2396,19 @@ def merge_branch(
     since the two are mutually exclusive by construction (a refusal git makes at
     pre-flight is made before any file is written).
 
-    The terminal fallback is a residue reading that itself FAILED, post-merge:
-    only the choice between "refused before starting" and "failed part-way"
-    rests on that reading, so with it gone the classification claims neither and
-    raises `MergeResidueUnreadError` instead — conflict and commit-refused stand
-    on their own measurements over a dead probe, and the probe's raise is caught
-    (`_merge_residue`) rather than allowed to escape ahead of the abort.
+    The terminal fallback is a post-merge reading that itself FAILED. Every
+    probe in that window degrades to an unread marker rather than raising —
+    the raise would escape between the failed merge and its cleanup — and a
+    verdict may only stand on readings that are live. A dead residue pair
+    surrenders only the choice between "refused before starting" and "failed
+    part-way" (conflict and commit-refused stand on their own measurements
+    over it). A dead index reading surrenders every claim resting on "did not
+    collide" — commit-refused, half-applied, and pre-flight alike. A dead
+    merge-state reading additionally skips the abort, which that reading
+    gates: `merge --abort` is a repair write, and uncertainty never
+    authorizes one, so the message says none was attempted. Whatever cannot
+    be claimed raises `MergeResidueUnreadError`, and every dead probe is
+    named in the message whichever class raises.
 
     ``allow_empty_squash`` is recovery-only: re-running a squash that committed
     before a host loss stages nothing because the target already has the merged
@@ -2413,22 +2457,36 @@ def merge_branch(
             # a merge started at all, and it is asked here rather than inline below
             # so that one reading serves both the classification and the abort. The
             # untracked delta answers a question neither can: whether git wrote any
-            # incoming file to the tree before dying (#619).
-            unmerged = _index_unmerged(repo)
-            started = _merge_in_progress(repo)
+            # incoming file to the tree before dying (#619). All three degrade to an
+            # unread marker rather than raising — they stand between the failed
+            # merge and its cleanup, where an escape strands a started merge.
+            unmerged, index_unread = _index_unmerged(repo)
+            started, head_unread = _merge_in_progress(repo)
             materialized, tracked_dirtied, unread = _merge_residue(repo, pre_dirty, pre_untracked)
             # Only a failure that neither collided nor started can be a half-applied
             # checkout: a conflict and a refused commit both leave residue too, but
             # each already has a restore of its own below (`merge --abort`) and a
-            # remedy of its own, so neither may be re-routed through this arm.
-            half_applied = bool(not unmerged and not started and (materialized or tracked_dirtied))
+            # remedy of its own, so neither may be re-routed through this arm. The
+            # two unread gates are that same rule asked negatively: with either
+            # reading dead, "neither collided nor started" is a claim nothing
+            # measured.
+            half_applied = bool(
+                index_unread is None
+                and head_unread is None
+                and not unmerged
+                and not started
+                and (materialized or tracked_dirtied)
+            )
             if unmerged:
                 kind = "conflict"
-            elif started:
+            elif index_unread is None and started:
+                # `started` alone cannot claim this over a dead index reading: a
+                # `--no-ff` conflict sits mid-merge too, and parting the two is
+                # exactly the reading that failed.
                 kind = "merged, but git refused the commit"
             elif half_applied:
                 kind = "failed part-way through checkout"
-            elif unread is not None:
+            elif index_unread is not None or head_unread is not None or unread is not None:
                 kind = "checkout state unverified"
             else:
                 kind = "refused before starting"
@@ -2450,14 +2508,30 @@ def merge_branch(
                     # Carry that, rather than letting the classification imply it.
                     restored = False
                     detail += f"; AND git merge --abort failed (repo left mid-merge): {abort_out}"
+            # Every dead probe is named in whatever raises, not only in the unread
+            # class: a verdict standing on its own live measurement still owes the
+            # operator which reading it does NOT have.
+            if index_unread is not None:
+                detail += f"; AND the index probe failed: {index_unread}"
+            if head_unread is not None:
+                # The abort is gated on the reading that just died, and uncertainty
+                # must not authorize a repair write — so none was attempted, and the
+                # message says that instead of implying a restore.
+                detail += (
+                    "; AND the merge-state probe failed, so no `git merge --abort` was"
+                    " attempted — if `git status` shows a merge in progress, run it by"
+                    f" hand: {head_unread}"
+                )
+            if unread is not None:
+                detail += f"; AND the residue probe failed: {unread}"
             if unmerged:
                 raise MergeConflictError(detail)
-            if started:
+            if index_unread is None and started:
                 raise MergeCommitRefusedError(detail, restored=restored)
             if half_applied:
                 raise MergeHalfAppliedError(detail, paths=materialized, restored=restored)
-            if unread is not None:
-                raise MergeResidueUnreadError(f"{detail}; AND the residue probe failed: {unread}")
+            if index_unread is not None or head_unread is not None or unread is not None:
+                raise MergeResidueUnreadError(detail)
             raise MergePreflightError(detail)
         return
     if strategy == "squash":
@@ -2476,16 +2550,20 @@ def merge_branch(
         pre_dirty, pre_untracked = _residue_snapshot(repo)
         rc, out = _git(repo, "merge", "--squash", branch)
         if rc != 0:
-            unmerged = _index_unmerged(repo)  # read before any reset clears the stages
+            unmerged, index_unread = _index_unmerged(repo)  # before any reset clears the stages
             materialized, tracked_dirtied, unread = _merge_residue(repo, pre_dirty, pre_untracked)
             # A conflict keeps its own class and its own remedy even though it leaves
-            # residue too — it is still reset below, exactly as before.
-            half_applied = bool(not unmerged and (materialized or tracked_dirtied))
+            # residue too — it is still reset below, exactly as before. The unread
+            # gate is the conflict question asked negatively: with the index reading
+            # dead, "did not collide" is a claim nothing measured.
+            half_applied = bool(
+                index_unread is None and not unmerged and (materialized or tracked_dirtied)
+            )
             if unmerged:
                 kind = "conflict"
             elif half_applied:
                 kind = "failed part-way through checkout"
-            elif unread is not None:
+            elif index_unread is not None or unread is not None:
                 kind = "checkout state unverified"
             else:
                 kind = "refused before starting"
@@ -2494,14 +2572,22 @@ def merge_branch(
                 detail += f"; left untracked in {repo}: {', '.join(materialized)}"
             restored = True
             if tracked_dirtied:
+                # Gated on the proven pre/post attribution, not on the class — so it
+                # still runs when the index reading died and the class degraded: the
+                # same reset a classified conflict gets, authorized by the same
+                # measurement.
                 restored, note = _restore_tracked_residue(repo)
                 detail += note
+            if index_unread is not None:
+                detail += f"; AND the index probe failed: {index_unread}"
+            if unread is not None:
+                detail += f"; AND the residue probe failed: {unread}"
             if unmerged:
                 raise MergeConflictError(detail)
             if half_applied:
                 raise MergeHalfAppliedError(detail, paths=materialized, restored=restored)
-            if unread is not None:
-                raise MergeResidueUnreadError(f"{detail}; AND the residue probe failed: {unread}")
+            if index_unread is not None or unread is not None:
+                raise MergeResidueUnreadError(detail)
             raise MergePreflightError(detail)
         if allow_empty_squash and not _index_dirty_vs_head(repo):
             return
