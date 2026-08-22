@@ -26,6 +26,16 @@ breaking changes may land in a minor release.
 - **The git-add shield's version gate moves from 2.20 to the project floor.** It now refuses as
   an unsupported-version policy rather than claiming a missing capability, which would be false
   at 2.34 — git 2.25 has everything the shield uses.
+- **The git-add shield's activation check has git name the winning scope (#692).** The shield
+  already refused to trust a `core.excludesFile` write it could not confirm git reads; the
+  degrade reason now says _which_ configuration scope won, from the same single probe
+  (`git config --show-scope`, git 2.26 — inside the 2.34 floor, which is what unblocked it):
+  an ambient command-scope override (`git -c`, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`)
+  now reads differently from a worktree write git does not see at all, which is a different
+  repair. An rc-0 answer that names no scope is a new fail-closed degrade rather than a
+  mismatch mislabelled. The decision is unchanged — a byte-identical answer still activates
+  whatever scope supplied it, every unconfirmed answer still degrades, and the repo-format
+  flag is still rolled back.
 
 ### Removed
 

@@ -3650,6 +3650,13 @@ def test_shield_degrades_when_a_command_scope_excludesfile_outranks_it(
     never appears in our environment at all. An enumeration would have had to track
     every one of those moves. The fix names none of them.
 
+    Since #692 the shield asks with `--show-scope`, and git answers the SAME token —
+    `command` — for both channels in the table and for the `git -c` that never reaches
+    our environment, so the reason below is git's own attribution rather than this
+    suite's inference. That is what the assertion keys on, and it is why the parametrize
+    still buys something: one token covering both arms is a claim about git, so both
+    arms are still run against it rather than one being taken as proof of the other.
+
     `'k=v'` is the encoding used below because it is honored at both ends of that table,
     so this case pins the same behavior it pinned before the floor moved.
 
@@ -3692,7 +3699,7 @@ def test_shield_degrades_when_a_command_scope_excludesfile_outranks_it(
         assert git(wt, "config", "--type=path", "--get", "core.excludesFile") == str(operator)
 
     assert reason is not None
-    assert "another configuration scope outranks it" in reason
+    assert "command-scope override" in reason
     # The reason renders the path with `!r`, deliberately — a legal POSIX path can
     # carry edge whitespace or control bytes, and only the repr discloses them. So
     # compare against the REPR, not the raw string: on Windows `repr()` doubles every
@@ -3766,11 +3773,15 @@ def test_shield_degrades_when_git_will_not_confirm_the_activation(
     knowing whether the written key is the one git resolves has exactly the standing of
     knowing it is not.
 
-    THE FAKE MUST TELL THE TWO READS APART BY STATE, not by argv, and that is the trap
-    this test exists on top of. The seed read and the verification read use byte-identical
-    arguments — real git distinguishes them only by what has been written in between — so
-    a fake keyed on the arguments alone would fault the SEED instead and this would pass
-    while testing a completely different arm.
+    THE FAKE TELLS THE TWO READS APART BY STATE, not by argv, and deliberately keeps
+    doing so. The two used to be byte-identical in argv — real git distinguished them
+    only by what had been written in between — and a fake keyed on the arguments alone
+    would have faulted the SEED instead, passing while testing a completely different
+    arm. Since #692 the verification carries `--show-scope` and the seed read must not,
+    so argv WOULD now separate them; keying on state anyway is what keeps this test
+    honest if that ever stops being true, and it means this test asserts nothing about
+    the flag's presence. That is pinned separately, by
+    `test_shield_degrades_when_a_lower_scope_answers_after_the_write`.
 
     Parametrized over both classes because `GitSpawnError` is a subclass, so a
     `GitError`-only test would keep passing against a handler narrowed to the parent.
@@ -3815,11 +3826,15 @@ def test_shield_degrades_when_the_activation_read_back_is_unreadable(
 
     Ablation: treat any rc as an answer. THE DELETION DOES NOT FALL THROUGH TO SUCCESS,
     which is why the assertions below are on the wording rather than on
-    `reason is not None` — measured, not predicted: an unread stdout is `b""`, which
-    compares unequal to the written path, so the mismatch arm one line down still
-    degrades and still returns a reason. It just returns the WRONG one, claiming another
-    scope outranks us and naming `''` as what git reads. A reason-is-not-None assertion
-    would pass against that bug."""
+    `reason is not None` — measured, not predicted, and RE-measured after #692 moved
+    where that deletion lands. An unread stdout is `b""`, which carries no seam NUL, so
+    it is the missing-separator branch that catches it now: the shield still degrades and
+    still returns a reason, but the reason reads `git answered the activation check
+    without naming a scope (b'')` — blaming an unparseable answer for what was actually a
+    refused call. Before #692 the same deletion fell one arm further down, into the
+    mismatch branch, blaming another scope and naming `''` as what git reads. The arm
+    moved; the conclusion did not. Either way the reason is WRONG about the fault, and
+    either way a reason-is-not-None assertion would pass against the bug."""
     repo = project.project
     wt = tmp_path / "wt"
     verify.worktree_add(repo, wt, "feat", "main")
@@ -3847,6 +3862,270 @@ def test_shield_degrades_when_the_activation_read_back_is_unreadable(
     assert reason is not None
     assert "would not confirm which excludes file now applies" in reason
     assert "bad config line 1" in reason
+
+
+def test_shield_degrades_when_a_lower_scope_answers_after_the_write(project, tmp_path, monkeypatch):
+    """A scope BELOW `worktree` answering the verification is the pathology the
+    `--show-scope` adoption made legible (#692): the worktree-scoped write reported rc 0
+    and git still resolves the key from `local`, so the write is not outranked — it is
+    not in force AT ALL. That is a different repair from an ambient override (the
+    operator's `extensions.worktreeConfig` never took effect, or the write landed in a
+    config git is not reading) and the reason has to say so, because the two send an
+    operator to opposite places.
+
+    Before the scope was answered this arm and the command-scope arm shared one
+    message — "another configuration scope outranks it" — which is precisely the wrong
+    thing to tell someone whose worktree config is inert: it sends them hunting an
+    ambient override that does not exist.
+
+    This is also where the flag itself is pinned. The verification's argv is captured
+    and asserted to carry `--show-scope`, and this is the ONE test that does that: the
+    fault-injection tests above key on STATE deliberately (their own docstrings say
+    why), so none of them would notice the flag being dropped, and every wording
+    assertion in this family would keep passing against a probe that never asked for the
+    scope — the fake supplies the scope-prefixed answer regardless.
+
+    Ablation: fold this arm into the command arm's message and this fails on the
+    wording."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    real = install_mod.git_bytes
+    activated = []
+    verified = []
+
+    def lower_scope_after_activation(worktree, *args):
+        if args[:2] == ("config", "--worktree"):
+            activated.append(args)
+            return real(worktree, *args)
+        if activated and "--get" in args and "core.excludesFile" in args:
+            verified.append(args)
+            return subprocess.CompletedProcess(
+                args=["git", *args],
+                returncode=0,
+                stdout=b"local\0/somewhere/else\0",
+                stderr=b"",
+            )
+        return real(worktree, *args)
+
+    monkeypatch.setattr(install_mod, "git_bytes", lower_scope_after_activation)
+
+    reason = _worktree_local_exclude(wt, ["/probe-384"])
+
+    assert activated, "the fake never saw the activation — it answered the seed read instead"
+    assert reason is not None
+    assert "not in force at all" in reason
+    # the token git supplied, in the slot the message interpolates it into — not merely
+    # the substring "local", which a temp path could supply on its own
+    assert "from local scope" in reason
+    # repr, not the raw string, for the reason the command-scope test above records
+    assert repr("/somewhere/else")[1:-1] in reason
+    # THE flag pin for this family: the probe really asked git to name the scope
+    assert verified and "--show-scope" in verified[0]
+    # the permanent format change does not outlive a shield that never activated
+    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
+
+
+def test_shield_degrades_when_worktree_scope_answers_a_different_value(
+    project, tmp_path, monkeypatch
+):
+    """`worktree` scope answering a value that is not the one just written to
+    `worktree` scope. Nothing outranks anything here — the scope we wrote is the scope
+    that answered, and it answered something else — so both of the other mismatch
+    messages would be lies, and the reason says only what was measured: git reads a
+    different value from the same scope.
+
+    Unreachable through any operator configuration, which is why it is faked rather
+    than staged: it takes a concurrent writer, a config git parses differently from the
+    one it wrote, or a bug in this helper's own path computation. Kept as a live branch
+    rather than folded into the fallthrough because it is the one mismatch that
+    indicts THIS code rather than the environment, and an operator reading
+    "another scope outranks it" would go looking outward for a fault that is inward.
+
+    Ablation (measured): delete this arm and it falls through to the unknown-scope one,
+    which then reports `a scope this code does not know, 'worktree'` — this code
+    disowning the very scope it just wrote to."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    real = install_mod.git_bytes
+    activated = []
+
+    def worktree_scope_after_activation(worktree, *args):
+        if args[:2] == ("config", "--worktree"):
+            activated.append(args)
+            return real(worktree, *args)
+        if activated and "--get" in args and "core.excludesFile" in args:
+            return subprocess.CompletedProcess(
+                args=["git", *args],
+                returncode=0,
+                stdout=b"worktree\0/not/what/we/wrote\0",
+                stderr=b"",
+            )
+        return real(worktree, *args)
+
+    monkeypatch.setattr(install_mod, "git_bytes", worktree_scope_after_activation)
+
+    reason = _worktree_local_exclude(wt, ["/probe-384"])
+
+    assert activated, "the fake never saw the activation — it answered the seed read instead"
+    assert reason is not None
+    assert "worktree scope answers a different value" in reason
+    assert repr("/not/what/we/wrote")[1:-1] in reason
+    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
+
+
+def test_shield_degrades_on_a_scope_token_it_does_not_know(project, tmp_path, monkeypatch):
+    """A scope token this code has no arm for. git documents five, and the adoption
+    hard-codes all five — so a sixth is either a git that grew one or an answer this
+    code has misread, and in both cases the honest reason is that the token is unknown,
+    quoted verbatim for whoever reads the journal.
+
+    This is a MESSAGE gate, not a DECISION gate, and the distinction is the point: the
+    value mismatched, so the shield degrades on the mismatch regardless of what the
+    token says. An unrecognized scope can never be the reason a shield activates, which
+    is what keeps a future git from widening this helper's proceed surface by adding a
+    scope name. The unknown-token arm only decides what the operator is told.
+
+    Ablation: reword the fallthrough to reuse the command arm's text and both
+    assertions fail — the journal would blame an ambient override for a token git
+    invented."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    real = install_mod.git_bytes
+    activated = []
+
+    def unknown_scope_after_activation(worktree, *args):
+        if args[:2] == ("config", "--worktree"):
+            activated.append(args)
+            return real(worktree, *args)
+        if activated and "--get" in args and "core.excludesFile" in args:
+            return subprocess.CompletedProcess(
+                args=["git", *args],
+                returncode=0,
+                stdout=b"futurescope\0/x\0",
+                stderr=b"",
+            )
+        return real(worktree, *args)
+
+    monkeypatch.setattr(install_mod, "git_bytes", unknown_scope_after_activation)
+
+    reason = _worktree_local_exclude(wt, ["/probe-384"])
+
+    assert activated, "the fake never saw the activation — it answered the seed read instead"
+    assert reason is not None
+    assert "a scope this code does not know" in reason
+    assert "'futurescope'" in reason
+    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
+
+
+def test_shield_degrades_when_the_scope_answer_is_unparseable(project, tmp_path, monkeypatch):
+    """rc 0 with no seam NUL. `-z --show-scope` emits `scope NUL value NUL` — measured
+    at git 2.34.1 and 2.55.0, both ends of the supported range — so an rc-0 answer
+    carrying no NUL at all is not an answer in the shape this code parses, and the only
+    safe reading of it is that which excludes file applies is unconfirmed.
+
+    THE BRANCH IS THE WHOLE TEST, because without it the parse does not fail loudly —
+    it fails QUIETLY and confidently. `partition` on a missing separator returns the
+    entire answer as the head, so the garbage becomes the scope token and the value
+    becomes empty; the empty value mismatches the written path, and the unknown-scope
+    arm then names the garbage as the scope that outranks us. That is a degrade either
+    way, so the decision is safe — but the reason is fabricated from a string git never
+    meant as a scope. Fail-closed AND honest is the bar here, not fail-closed alone.
+
+    Ablation (measured): drop the missing-separator branch and this fails on
+    `without naming a scope` — the reason becomes the unknown-scope one, blaming a
+    scope named `'garbage-with-no-nul'`."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    real = install_mod.git_bytes
+    activated = []
+
+    def unparseable_after_activation(worktree, *args):
+        if args[:2] == ("config", "--worktree"):
+            activated.append(args)
+            return real(worktree, *args)
+        if activated and "--get" in args and "core.excludesFile" in args:
+            return subprocess.CompletedProcess(
+                args=["git", *args],
+                returncode=0,
+                stdout=b"garbage-with-no-nul",
+                stderr=b"",
+            )
+        return real(worktree, *args)
+
+    monkeypatch.setattr(install_mod, "git_bytes", unparseable_after_activation)
+
+    reason = _worktree_local_exclude(wt, ["/probe-384"])
+
+    assert activated, "the fake never saw the activation — it answered the seed read instead"
+    assert reason is not None
+    assert "without naming a scope" in reason
+    # the raw answer is disclosed, repr'd as bytes: whoever reads the journal needs the
+    # thing git actually said, not this code's paraphrase of it
+    assert repr(b"garbage-with-no-nul") in reason
+    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
+
+
+def test_shield_accepts_a_command_scope_value_matching_its_own_write(
+    project, tmp_path, monkeypatch
+):
+    """The DECISION pin for #692: a byte-identical value activates the shield whatever
+    scope supplied it — including `command`, the scope every other test in this family
+    treats as the villain.
+
+    The post-condition this helper verifies is "git reads the file we wrote", and that
+    holds here: the ambient override names the shield's OWN private exclude, so the
+    patterns apply and the tool files are shielded. Refusing it for its PROVENANCE
+    would widen the degrade surface over a shield that demonstrably works, and the
+    natural shape of a scope-aware rewrite — `if scope != b"worktree": degrade` — does
+    exactly that. This test is what a future refactor hits.
+
+    Real git and a real environment channel rather than a fake, because the claim is
+    about what git resolves, and a fake that returns `command` plus the right path
+    would pin this code's arithmetic instead of git's precedence. `GIT_CONFIG_COUNT`
+    is the channel (it needs no quoting, so this runs on Windows too, unlike the
+    `GIT_CONFIG_PARAMETERS` arm above).
+
+    The private exclude's path is computed BEFORE the shield runs, because it is what
+    the override has to name — the shield writes and then re-reads it, so a path
+    composed after the fact would be reading the answer off the code under test.
+
+    NOTE, not a fault: the SEED read sees the override value too, since the override
+    points at the private exclude and the seed read runs before that file exists. It
+    therefore inherits nothing — which is correct, there being nothing yet to inherit —
+    and is why this test asserts the shield APPLIES rather than asserting on seeded
+    content.
+
+    Ablation: degrade whenever the answering scope is not `worktree` and this fails on
+    `reason is None` — a byte-identical answer refused for where it came from."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    private = _wt_private_exclude(wt)
+
+    with monkeypatch.context() as env:
+        env.setenv("GIT_CONFIG_COUNT", "1")
+        env.setenv("GIT_CONFIG_KEY_0", "core.excludesFile")
+        env.setenv("GIT_CONFIG_VALUE_0", str(private))
+
+        # Non-vacuity, inside the same environment and BEFORE the shield runs: the
+        # override really is in force and really is `command` scope. Without this the
+        # test would also pass on a git where the channel is inert — which is the exact
+        # failure mode that would make a proceed assertion meaningless.
+        assert (
+            git(wt, "config", "--show-scope", "--type=path", "--get", "core.excludesFile")
+            == f"command\t{private}"
+        )
+
+        reason = _worktree_local_exclude(wt, ["/probe-384"])
+
+    assert reason is None
+    # and the shield is really in force, not merely un-refused
+    (wt / "probe-384").write_text("noise\n", encoding="utf-8")
+    assert "probe-384" not in git(wt, "status", "--porcelain", "-uall")
 
 
 def test_shield_dies_with_the_worktree(project, tmp_path):
@@ -6356,18 +6635,31 @@ def test_worktree_local_exclude_undecodable_git_output_degrades(tmp_path, monkey
     # of the flag is what real git does not do, and it would hand the helper one
     # two-line "path" for each dir, making them equal and reading as a main checkout.
     #
-    # `core.excludesFile` is asked TWICE with byte-identical argv — once to seed the
-    # private file from whatever applies now, and once after the activation to verify
-    # the written key is the one git resolves. Real git tells them apart by STATE, not
-    # by the arguments, so the stub has to as well: unset before the activation (git's
+    # `core.excludesFile` is asked TWICE, and since #692 the two reads are no longer
+    # byte-identical in argv: the seed read asks plainly, the post-activation
+    # verification adds `--show-scope`. They are still told apart by STATE below,
+    # because that is how real git tells them apart — unset before the activation (git's
     # own rc 1, which sends the seed down its XDG branch) and the activated path after.
-    # A stub that answered one way for both would either strand the seed or fail the
-    # verification, and in each case for a reason having nothing to do with #374.
+    # The `--show-scope` arm is keyed on the flag only so it can answer in the SHAPE
+    # that read now parses; it must precede the plain arm, which would otherwise catch
+    # it. A stub that answered one way for both would either strand the seed or fail the
+    # verification, in each case for a reason having nothing to do with #374.
+    #
+    # That shape is `scope NUL value`, and the seam NUL is now REQUIRED: without it the
+    # verification reads the whole answer as a scope token and degrades as unparseable.
+    # So an un-updated stub reds the tail assertion with "could not activate … without
+    # naming a scope", which looks like a #374 regression and is not one.
+    #
     # No external commands — PATH is replaced below, so `cat` would not resolve;
-    # `read`, `printf` and `[` are shell builtins. Written without a trailing NUL on
-    # purpose: the reader splits on the first one and takes what precedes it, so
-    # emitting none leaves the whole payload, and `\000` through `printf` is not
-    # portable across the shells that may be /bin/sh here.
+    # `read`, `printf` and `[` are shell builtins. `printf '\000'` emitting a real NUL is
+    # MEASURED, not assumed, on both shells that can be `/bin/sh` where this test runs:
+    # bash, and the dash that is `/bin/sh` on the Ubuntu CI runner (measured in
+    # ubuntu:22.04 and ubuntu:latest). An earlier version of this comment asserted the
+    # opposite — that `\000` through `printf` was not portable here — which the
+    # measurement refutes; a shell that did drop it would red this test loudly on that
+    # seam, and the fallback is a `#!{sys.executable}` stub. The payload still carries no
+    # TRAILING NUL on purpose: the reader splits on the first one and takes what
+    # precedes it, so emitting none leaves the whole value.
     activated = os.fsencode(str(tmp_path / "activated"))
     stub.write_bytes(
         b'#!/bin/sh\nshift 2\ncase "$1" in\n'
@@ -6379,6 +6671,11 @@ def test_worktree_local_exclude_undecodable_git_output_degrades(tmp_path, monkey
         b'config) case "$*" in\n'
         b"  *--worktree*) printf '%s' \"$4\" > " + sq(activated) + b" ;;\n"
         b"  *extensions.worktreeConfig*) printf 'true\\n' ;;\n"
+        b"  *--show-scope*)\n"
+        b"      if [ -f " + sq(activated) + b" ]; then\n"
+        b"        printf 'worktree\\000'\n"
+        b"        IFS= read -r seen < " + sq(activated) + b'; printf %s "$seen"\n'
+        b"      else exit 1 ; fi ;;\n"
         b"  *core.excludesFile*)\n"
         b"      if [ -f " + sq(activated) + b" ]; then\n"
         b"        IFS= read -r seen < " + sq(activated) + b'; printf %s "$seen"\n'

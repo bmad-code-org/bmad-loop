@@ -2108,45 +2108,90 @@ def _shield_verify_activation(worktree: Path, exclude: Path) -> str | None:
     orchestrator was launched with — outranks `worktree`. So an operator carrying an
     ambient `core.excludesFile` gets a shield that reports success and whose private
     file is never read: the provisioned tool files stay stageable by the unit's
-    `git add -A`, with no degrade reason to journal.
+    `git add -A`, with no degrade reason to journal. The check has git NAME the winning
+    scope rather than leaving it inferred from the value that came back.
 
     So the post-condition is asked of git. Detecting the ORIGIN instead —
     `GIT_CONFIG_COUNT` and friends in `os.environ` — is the enumeration this function
-    exists to avoid: `GIT_CONFIG_PARAMETERS` is carried in two mutually incompatible
-    encodings across the supported range, `GIT_CONFIG_COUNT` is one more channel to
-    remember (it sits below `GIT_FLOOR`, so it is always present and always another
-    thing to read), and a `git -c` on a session's own command line never appears in
-    our environment at all. Asking git what it RESOLVED costs one call and
-    covers all of them, and whatever git adds next.
+    exists to avoid, and `--show-scope` strengthens that argument rather than retiring
+    it: nothing here reads `os.environ`, and git folds the whole channel family into
+    the single token `command` on the same single call, so every channel — and whatever
+    git adds next — arrives already LABELED, and the degrade reason names the family
+    without this code enumerating it. The evidence for why enumerating was never viable
+    stands: `GIT_CONFIG_PARAMETERS` is carried in two mutually incompatible encodings
+    across the supported range, `GIT_CONFIG_COUNT` is one more channel to remember (it
+    sits below `GIT_FLOOR`, so it is always present and always another thing to read),
+    and a `git -c` on a session's own command line never appears in our environment at
+    all. Asking git what it RESOLVED costs one call and covers all of them.
 
-    `--show-scope` would name the winning scope, and is not used HERE — but the
-    reason has expired. It is git 2.26, which was above the old 2.20 gate; at
-    `GIT_FLOOR` it is available on every supported git. Adopting it is a behavior
-    change inside a code path that authorizes an irreversible repo-format write, so
-    it is deliberately left to its own review: see #692.
+    `--show-scope` is git 2.26, which was above the old 2.20 gate this shield used to
+    carry; at `GIT_FLOOR` it is present on every supported git, which is what unblocked
+    it (#692). Under `-z` the answer is `scope NUL value NUL` — measured at BOTH ends of
+    the supported range, git 2.34.1 (the floor itself) and git 2.55.0, where the flag
+    also leaves the rc taxonomy alone: an absent key is still rc 1 with or without it.
+    The scope tokens git documents are `system`, `global`, `local`, `worktree` and
+    `command`. The scope refines the MESSAGE and nothing else: a byte-identical value
+    returns None whatever scope supplied it, since the post-condition is that git reads
+    the file we wrote and provenance is not a fault; every mismatch degrades; the scope
+    only decides what the reason tells the operator to go looking for.
 
     The read shape is the seed read's: `-z` because a legal POSIX path may carry edge
     whitespace, `--type=path` because that is how git itself resolves the key. Any
     non-zero rc is a fault here, not an ABSENT answer — this call asks about a key we
     have just written, so "there is no such key" is not good news about it. That is a
     DIFFERENT taxonomy from `_shield_inherited_excludes`, which reads a key the
-    operator may never have set; the two must not be unified.
+    operator may never have set; the two must not be unified. rc 0 carries a fault of
+    its own now: a well-formed `-z --show-scope` answer always holds the seam NUL
+    between scope and value, so an answer without one is not an answer and degrades
+    fail-closed rather than being parsed as a scope. Whatever shape an unmeasured git
+    might return lands there or in the unknown-token branch, and both degrade. The two
+    reads are also no longer byte-identical in ARGV — `--show-scope` is on this one
+    alone, retiring a trap the tests documented — and the seed read must NOT grow it,
+    since rc 1 there means ABSENT.
 
     The comparison is byte-exact and stays that way: `git config` round-trips a path
     verbatim through every hazard this shield has been burned by — edge whitespace,
     an embedded newline, a non-UTF-8 byte, an interior `~` — so loosening it would
     buy nothing and could only mask a real mismatch.
     """
-    resolved = git_bytes(worktree, "config", "-z", "--type=path", "--get", "core.excludesFile")
+    resolved = git_bytes(
+        worktree, "config", "-z", "--show-scope", "--type=path", "--get", "core.excludesFile"
+    )
     if resolved.returncode != 0:
         detail = os.fsdecode(resolved.stderr).strip() or f"git exited {resolved.returncode}"
         return f"git would not confirm which excludes file now applies: {detail}"
-    effective = resolved.stdout.split(b"\0", 1)[0]
+    scope, sep, rest = resolved.stdout.partition(b"\0")
+    if not sep:
+        return (
+            "git answered the activation check without naming a scope "
+            f"({resolved.stdout!r}), so which excludes file applies is unconfirmed"
+        )
+    effective = rest.split(b"\0", 1)[0]
     if effective == os.fsencode(str(exclude)):
         return None
+    shown = os.fsdecode(effective)
+    if scope == b"command":
+        return (
+            "the write succeeded but an ambient command-scope override — a `git -c` "
+            "this process was launched inside of, GIT_CONFIG_PARAMETERS, or "
+            f"GIT_CONFIG_COUNT — outranks it, so git reads {shown!r} instead and the "
+            "shield's patterns never apply"
+        )
+    if scope == b"worktree":
+        return (
+            "the write succeeded but worktree scope answers a different value, so git "
+            f"reads {shown!r} instead of the path just written and the shield's "
+            "patterns never apply"
+        )
+    if scope in (b"local", b"global", b"system"):
+        return (
+            "the write succeeded but git still resolves core.excludesFile from "
+            f"{os.fsdecode(scope)} scope — the worktree-scoped write is not in force "
+            f"at all, so git reads {shown!r} and the shield's patterns never apply"
+        )
     return (
-        "the write succeeded but another configuration scope outranks it, so git "
-        f"reads {os.fsdecode(effective)!r} instead and the shield's patterns never apply"
+        f"the write succeeded but a scope this code does not know, {os.fsdecode(scope)!r}, "
+        f"outranks it, so git reads {shown!r} instead and the shield's patterns never apply"
     )
 
 
