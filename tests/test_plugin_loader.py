@@ -12,6 +12,7 @@ from importlib import resources
 from pathlib import Path
 
 import pytest
+from conftest import fault_read_text
 
 from bmad_loop.plugins import (
     PluginError,
@@ -20,7 +21,7 @@ from bmad_loop.plugins import (
     get_plugin,
     load_plugins,
 )
-from bmad_loop.plugins.loader import USER_PLUGINS_REL
+from bmad_loop.plugins.loader import PLUGIN_FILE, USER_PLUGINS_REL
 from bmad_loop.plugins.manifest import load_manifest
 
 # --------------------------------------------------------------- helpers
@@ -228,6 +229,83 @@ def test_invalid_toml_rejected(tmp_path):
     write_plugin(tmp_path, "broken", "[plugin]\nname = \n")
     with pytest.raises(PluginError, match="invalid TOML"):
         load_plugins(tmp_path)
+
+
+# ------------------------------------------------------------ manifest reads
+
+
+def test_non_utf8_plugin_manifest_raises_plugin_error(tmp_path):
+    """The READ, not a value coercion. `load_manifest`'s CONVERSION_FAULTS funnel
+    cannot reach this one — it wraps the parse, and the decode happens in the
+    argument expression at the discovery call site, before `load_manifest` is
+    entered — so a non-UTF-8 `plugin.toml` escaped as a raw `UnicodeDecodeError`.
+    Asserting the TYPE is the point: `tui/settings.py` degrades on
+    `except (PolicyError, PluginError)`, and a `ValueError` escape walked through
+    it and took the settings surface down at construction. Sibling guard:
+    `adapters/profile.py`'s `_read_profile_text` (#473).
+
+    ABLATION: route the project read back through
+    `load_manifest(toml.read_text(encoding="utf-8"), ...)` and this raises
+    UnicodeDecodeError instead."""
+    pdir = write_plugin(tmp_path, "bad", MINIMAL.format(name="bad"))
+    manifest = pdir / PLUGIN_FILE
+    manifest.write_bytes(b'[plugin]\nname = "b\xffad"\napi_version = 1\n')
+    # Self-verify the fixture before trusting what it proves: a file that decoded
+    # fine would make the assertion below pass for the wrong reason.
+    with pytest.raises(UnicodeDecodeError):
+        manifest.read_text(encoding="utf-8")
+    with pytest.raises(PluginError, match="not valid UTF-8") as excinfo:
+        load_plugins(tmp_path)
+    assert str(manifest) in str(excinfo.value)  # the fault names the file at fault
+
+
+def test_unreadable_plugin_manifest_raises_plugin_error(tmp_path, monkeypatch):
+    """The OSError arm of the same guard: a manifest that is present but cannot be
+    read — permissions, an I/O error, a dead mount. Discovery's `is_file()` rules
+    out ABSENCE and nothing else, so this escaped as a bare OSError, which no
+    consumer of `load_plugins` catches.
+
+    `fault_read_text` rather than chmod for the reason its docstring gives, and
+    its targeting matters twice over: a blanket `Path.read_text` patch is answered
+    by the BUILTIN loop first, which would redden with this call site untouched.
+
+    ABLATION: route the project read back through `toml.read_text(...)` and this
+    raises PermissionError instead."""
+    pdir = write_plugin(tmp_path, "proj", MINIMAL.format(name="proj"))
+    manifest = pdir / PLUGIN_FILE
+    # Precondition: readable, this plugin loads — so the raise below is the fault
+    # being converted, not a manifest that was malformed all along.
+    assert load_plugins(tmp_path)["proj"].source == "project"
+    fault_read_text(monkeypatch, manifest)
+    with pytest.raises(PluginError, match="unreadable") as excinfo:
+        load_plugins(tmp_path)
+    assert str(manifest) in str(excinfo.value)
+
+
+def test_unreadable_builtin_plugin_manifest_raises_plugin_error(monkeypatch):
+    """The packaged built-ins are read through the same guard. They are trusted
+    content, so this is not the user-authored fault class the two tests above
+    cover — but a corrupt or unreadable install is a PACKAGING bug, and the loader
+    owes its callers the typed error that says so rather than a traceback:
+    `PluginRegistry.build` and the TUI settings screen both key on PluginError and
+    neither catches OSError.
+
+    Here because the two read sites are separate wiring axes, not one — the same
+    measurement `adapters/profile.py`'s packaged site forced. Reverting the
+    BUILTIN read to `toml.read_text(...)` leaves both project tests green; this is
+    the only test that reddens for it, and the project ablation leaves this one
+    green. Disjoint, which is the proof that neither site stands in for the
+    other."""
+    packaged = resources.files("bmad_loop.data").joinpath("plugins")
+    names = sorted(e.name for e in packaged.iterdir() if e.is_dir())
+    # Real path, not a zip member: `fault_read_text` targets `Path.read_text`, so a
+    # zipimported install would leave the fault unarmed. Asserted, not assumed.
+    victim = Path(str(packaged.joinpath(names[0], PLUGIN_FILE)))
+    assert victim.is_file()
+    fault_read_text(monkeypatch, victim)
+    with pytest.raises(PluginError, match="unreadable") as excinfo:
+        load_plugins()
+    assert f"{names[0]}/{PLUGIN_FILE}" in str(excinfo.value)
 
 
 # ----------------------------------------------------- discovery / overlay

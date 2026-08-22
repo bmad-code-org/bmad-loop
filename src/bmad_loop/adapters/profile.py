@@ -36,6 +36,7 @@ import importlib.metadata
 import tomllib
 from dataclasses import dataclass, field, replace
 from importlib import resources
+from importlib.resources.abc import Traversable
 from pathlib import Path
 
 import regex
@@ -449,6 +450,36 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
     return profile
 
 
+def _read_profile_text(entry: Traversable | Path, source: str) -> str:
+    """Read a profile TOML as text, converting a read fault into ProfileError.
+
+    Not part of `_load_toml`'s CONVERSION_FAULTS funnel and not reachable by
+    widening it: that funnel wraps `_parse_profile`, and the decode happens in
+    the *argument expression* at both of `load_profiles`' call sites, before
+    `_load_toml` is entered. So a non-UTF-8 overlay escaped as a raw
+    `UnicodeDecodeError` (a ValueError) while every consumer keys its fault
+    handling on ProfileError — `validate`'s role loop crashed before printing
+    its `--json` document instead of reporting an `adapter.profile` failure
+    naming the file, and `get_profile` backs every adapter resolution, so the
+    same escape reached run/sweep preflight (#473). Both-arms precedent:
+    `stories.py`'s manifest read; the decode-only twin is `policy.load`.
+
+    Takes the packaged built-ins too. They are trusted, but a corrupt package
+    is a packaging bug and should say so with a typed error rather than a
+    traceback. One helper covers both call shapes: an `importlib.resources`
+    Traversable and a `Path` each expose ``read_text(encoding=...)``.
+    """
+    try:
+        return entry.read_text(encoding="utf-8")
+    except UnicodeDecodeError as e:
+        raise ProfileError(f"profile {source}: not valid UTF-8: {e}") from e
+    except OSError as e:
+        # A profile that is present but cannot be read — permissions, an I/O
+        # error, a dead mount. The overlay's `is_dir()` + glob rule out ABSENCE
+        # and nothing else, so this escaped as a bare OSError.
+        raise ProfileError(f"profile {source}: unreadable: {e}") from e
+
+
 def _load_toml(text: str, source: str) -> CLIProfile:
     try:
         doc = tomllib.loads(text)
@@ -577,7 +608,7 @@ def load_profiles(project: Path | None = None) -> dict[str, CLIProfile]:
     packaged = resources.files("bmad_loop.data").joinpath("profiles")
     for entry in sorted(packaged.iterdir(), key=lambda e: e.name):
         if entry.name.endswith(".toml"):
-            profile = _load_toml(entry.read_text(encoding="utf-8"), entry.name)
+            profile = _load_toml(_read_profile_text(entry, entry.name), entry.name)
             # Stamped HERE and nowhere else: this loop is the only code that knows
             # a profile came out of the package rather than off a project's disk.
             profiles[profile.name] = replace(profile, packaged=True)
@@ -586,7 +617,7 @@ def load_profiles(project: Path | None = None) -> dict[str, CLIProfile]:
         user_dir = project / USER_PROFILES_REL
         if user_dir.is_dir():
             for path in sorted(user_dir.glob("*.toml")):
-                profile = _load_toml(path.read_text(encoding="utf-8"), str(path))
+                profile = _load_toml(_read_profile_text(path, str(path)), str(path))
                 profiles[profile.name] = profile
     return profiles
 
