@@ -512,7 +512,7 @@ Three frozen dataclasses cross the seam:
   window id, HTTP session id, …), `launched_ns` (wall-clock ns just before launch;
   the floor for hook events).
 - **`SessionResult`** (returned by `wait_for_completion`) — `status` (one of
-  `completed`, `stalled`, `timeout`, `crashed`, `over_budget`), `result_json`,
+  `completed`, `stalled`, `timeout`, `crashed`, `over_budget`, `aborted`), `result_json`,
   `session_id`, `transcript_path`, and the optional post-mortem forensics
   `env_fault` / `env_fault_evidence` (set by `_classify_env_fault` when a
   non-completed session is matched as a transport/API **environment fault** —
@@ -524,7 +524,16 @@ Required (abstract):
 
 - `start_session(spec) -> SessionHandle` — launch the session.
 - `wait_for_completion(handle, spec) -> SessionResult` — block until the session
-  ends (or stalls/times out), then report status.
+  ends (or stalls/times out), then report status. Poll
+  `runs.read_stop_request_mode(run_dir) == "hard"` once per loop iteration and
+  return `SessionResult(status="aborted")` when it is true (#319): that is what
+  makes `bmad-loop stop` land mid-session where a signal to the engine cannot be
+  delivered. Return the verdict — never raise, never unlink the file (the engine
+  consumes it and attributes the stop) — and keep the loop's blocking tick short
+  enough that the abort fits inside `stop_run`'s 10s grace window; both bundled
+  adapters block ≤5s and inherit the poll from `_ResultFileMixin`. Skipping it is
+  not fatal: the engine still honors the request at the next item boundary, which
+  is where an adapter without the poll leaves the operator waiting.
 
 The base class provides `run(spec)`, the template that chains
 `start_session` → `wait_for_completion` → `kill` (the kill runs in a `finally`).

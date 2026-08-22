@@ -36,6 +36,13 @@ breaking changes may land in a minor release.
   mismatch mislabelled. The decision is unchanged — a byte-identical answer still activates
   whatever scope supplied it, every unconfirmed answer still degrades, and the repo-format
   flag is still rolled back.
+- **A hard stop rides `stop-request.json` with `mode: "hard"` (#319).** It is lodged before the
+  engine is signalled — the atomic write also supersedes a pending graceful request — and honored
+  at item boundaries and mid-session, where both real adapter wait loops poll it once per tick
+  (worst case ~5s). SIGTERM remains the POSIX fast path rather than the mechanism, so a stop lands
+  on every platform and multiplexer backend. `status --json`'s `graceful_stop_pending` is now
+  mode-exact and reports only genuinely graceful requests; a modeless pre-#319 body still reads
+  graceful.
 
 ### Removed
 
@@ -192,6 +199,12 @@ breaking changes may land in a minor release.
   a traceback (#678)
 - The settings schema no longer reaches the `[tui]` extra at module scope, and CI now proves the
   core CLI works extra-less (#679)
+- **Native Windows: `bmad-loop stop` no longer burns the full 10s grace window into a blind
+  `taskkill /F` (#319).** An inter-process SIGTERM is never delivered to a native-Windows engine,
+  so the preferred path — the engine's own handler — could not fire, and every stop completed
+  through the external fallback: the run marked `stopped` from outside, `run-stop fallback=True`
+  journaled, and no engine teardown at all. The engine honors the stop request itself now, so it
+  is the single writer of `stopped` again and `fallback=True` means a genuinely wedged engine.
 
 ## [0.11.0] — 2026-08-19
 

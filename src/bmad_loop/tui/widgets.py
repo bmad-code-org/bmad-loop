@@ -95,9 +95,10 @@ def pause_label(stage: str) -> tuple[str, str]:
 
 
 def stopping_tag() -> Text:
-    """Compact tag for a run with a graceful stop pending, shown in the runs-table
-    note cell in place of a pause badge. The glyph + style match
-    STATUS_GLYPHS/STATUS_STYLES[STOPPED] — the end state a graceful stop lands in."""
+    """Compact tag for a run with a stop request pending — either mode (#319),
+    matching the mode-blind read behind it — shown in the runs-table note cell in
+    place of a pause badge. The glyph + style match
+    STATUS_GLYPHS/STATUS_STYLES[STOPPED] — the end state either stop lands in."""
     return Text("⏹ stop", style=STATUS_STYLES[data.STOPPED])
 
 

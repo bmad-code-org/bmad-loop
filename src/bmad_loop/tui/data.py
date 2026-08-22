@@ -96,10 +96,13 @@ class RunWatcher:
         return _classify(state.finished, state.paused, state.stopped, state.crashed, self.run_dir)
 
     def stopping(self) -> bool:
-        """True when a graceful-stop request is pending for this run (its control
-        file is present) — a bare existence read for the run-header pending line,
-        mirroring runs.graceful_stop_requested. The caller gates on a RUNNING
-        status so a file lingering on a stopped run doesn't read as still-stopping."""
+        """True when a stop request of *either* mode is pending for this run (its
+        control file is present) — a bare existence read for the run-header pending
+        line, mirroring runs.graceful_stop_requested. Deliberately mode-blind: a run
+        with a hard request lodged (#319) is stopping too, and the request is on disk
+        only for the seconds it takes the engine to honor it. The caller gates on a
+        RUNNING status so a file lingering on a stopped run doesn't read as
+        still-stopping."""
         return (self.run_dir / STOP_REQUEST_FILE).is_file()
 
     def attention(self) -> str:

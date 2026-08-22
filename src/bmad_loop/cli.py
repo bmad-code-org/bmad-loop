@@ -3284,7 +3284,8 @@ def cmd_stop(args: argparse.Namespace) -> int:
         return _cmd_cancel_graceful(run_dir, args.run_id)
     if args.graceful:
         return _cmd_request_graceful(run_dir, args.run_id)
-    # Hard stop (unchanged): SIGTERM the engine, kill its agent window, mark stopped.
+    # Hard stop: lodge a `mode: "hard"` stop request, signal the engine (the POSIX
+    # fast path), and let it tear the run down; kill its agent window either way.
     try:
         stopped = runs.stop_run(run_dir)
     except (runs.StopRunError, ProcessHostError) as e:
@@ -3298,11 +3299,17 @@ def cmd_stop(args: argparse.Namespace) -> int:
 
 
 def _cmd_cancel_graceful(run_dir: Path, run_id: str) -> int:
-    """`stop --cancel-graceful`: discard a pending request so the run keeps going."""
+    """`stop --cancel-graceful`: discard a pending request so the run keeps going.
+
+    Mode-neutral, like the clear it delegates to: the only hard request that can
+    still be on disk for a human to reach is one `stop_run` deliberately left
+    lodged after refusing to force-kill an unverifiable pid, and withdrawing that
+    is a legitimate thing to want. So the messages name a *stop request*, not a
+    graceful one (#319)."""
     if runs.clear_graceful_stop(run_dir):
-        print(f"run {run_id}: graceful stop request cancelled")
+        print(f"run {run_id}: stop request cancelled")
         return 0
-    print(f"run {run_id} has no graceful stop pending", file=sys.stderr)
+    print(f"run {run_id} has no stop request pending", file=sys.stderr)
     return 1
 
 
@@ -4268,7 +4275,7 @@ def main(argv: list[str] | None = None) -> int:
         "--graceful",
         action="store_true",
         help="finish the in-flight item (through commit), then stop cleanly and stay "
-        "resumable — instead of the hard SIGTERM stop; also suppresses pending auto-sweeps",
+        "resumable — instead of the default hard stop; also suppresses pending auto-sweeps",
     )
     stop_grp.add_argument(
         "--cancel-graceful",

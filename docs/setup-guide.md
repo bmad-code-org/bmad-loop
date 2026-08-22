@@ -50,7 +50,10 @@ of the README.
   not yet at the Linux/macOS/WSL support tier — the remaining native-Windows work (window
   hosting, attach/detach, Unity cache paths) is tracked in
   [the roadmap](ROADMAP.md#native-windows-multiplexer-backend); the port path is in
-  [Porting bmad-loop to a new OS](porting-to-a-new-os.md). Inside WSL, install with the
+  [Porting bmad-loop to a new OS](porting-to-a-new-os.md). Stopping a run is not part of
+  that gap: `bmad-loop stop` lodges its request in a control file the engine reads itself,
+  at item boundaries and mid-session, so it no longer depends on Windows signal delivery
+  (#319). Inside WSL, install with the
   **Linux** interpreter — a Windows-installed bmad-loop is reachable from the bash prompt
   and silently behaves as Windows
   ([why](multiplexer-backends.md#psmux-native-windows-experimental)). To check:

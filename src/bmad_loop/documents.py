@@ -243,9 +243,11 @@ def status_document(state: RunState, *, graceful_stop_pending: bool = False) -> 
     derived from state.json alone — never from live policy or other project
     files — so a consumer can reproduce the document, and the weight matches
     what the run actually enforced (see run_token_totals). The one exception is
-    ``graceful_stop_pending``: liveness plus the presence of the control file is
-    not in state.json, so the caller supplies it (default False keeps the
-    builder a pure projection); ``status`` itself is unaffected.
+    ``graceful_stop_pending``: liveness plus a *graceful*-mode stop-request
+    control file is not in state.json, so the caller supplies it (default False
+    keeps the builder a pure projection); ``status`` itself is unaffected. The
+    mode read is exact — a lodged hard request (#319) is a stop in flight, not a
+    graceful stop pending, and reports False here.
 
     Two adapter-identity keys (#153 phase 3), both derived from the snapshot and
     the recorded sessions — never live policy — and deliberately named apart:

@@ -130,7 +130,7 @@ class _Snapshot:
     has_run: bool = False
     run_id: str = ""
     status: str = data.UNKNOWN
-    stopping: bool = False  # selected run has a graceful stop pending (RUNNING only)
+    stopping: bool = False  # selected run has a stop request pending, either mode (RUNNING only)
     agent: data.ActiveAgent | None = None  # agent driving the selected run, live only
     state: RunState | None = None
     stories_mode: bool = False  # selected run is stories mode (source == "stories")
@@ -766,9 +766,10 @@ class DashboardScreen(Screen[None]):
                 snap.run_id = ctx.run_dir.name
                 snap.state = ctx.watcher.state()
                 snap.status = ctx.watcher.status()
-                # A graceful stop pending is the control file, meaningful while an
-                # engine is still around to consume it — RUNNING or UNKNOWN (an
-                # unverifiable pid still honors it, matching the CLI's != "dead").
+                # A pending stop is the control file's presence in either mode,
+                # meaningful while an engine is still around to consume it — RUNNING
+                # or UNKNOWN (an unverifiable pid still honors it, matching the CLI's
+                # != "dead").
                 snap.stopping = (
                     snap.status in (data.RUNNING, data.UNKNOWN) and ctx.watcher.stopping()
                 )

@@ -65,9 +65,10 @@ _INVALID_PID_IDENTITY = -1.0  # impossible process start/create time; forces "no
 
 
 class StopRunError(Exception):
-    """A live run could not be stopped — the engine ignored SIGTERM and its pid's
-    identity can no longer be verified, so force-killing would risk an unrelated
-    (reused) pid. The caller surfaces this rather than silently marking stopped."""
+    """A live run could not be stopped — the engine honored neither channel (the
+    lodged stop request nor SIGTERM) and its pid's identity can no longer be
+    verified, so force-killing would risk an unrelated (reused) pid. The caller
+    surfaces this rather than silently marking stopped."""
 
 
 class GracefulStopError(Exception):
@@ -1000,7 +1001,7 @@ def clear_graceful_stop(run_dir: Path) -> bool:
 def request_graceful_stop(run_dir: Path) -> str:
     """Ask a live run to stop gracefully: finish the in-flight item (story ->
     dev/review/commit, or a sweep bundle through commit) cleanly, then finalize and
-    stop — resumable, unlike the hard SIGTERM :func:`stop_run` delivers.
+    stop — resumable, unlike the hard stop :func:`stop_run` delivers.
 
     Delivery is the :data:`STOP_REQUEST_FILE` control file, written atomically (tmp
     + ``atomic_replace``) so a concurrent engine read never sees a partial file.
@@ -1104,9 +1105,9 @@ def stop_run(run_dir: Path) -> bool:
                 # can stop it, and discarding it here would retract a request the
                 # operator made while we decline to enforce it ourselves.
                 raise StopRunError(
-                    f"run {run_dir.name}: engine pid {pid} ignored SIGTERM and its "
-                    "identity can no longer be verified; refusing to force-kill a "
-                    "possibly-reused pid"
+                    f"run {run_dir.name}: engine pid {pid} honored neither the "
+                    "lodged stop request nor SIGTERM, and its identity can no longer "
+                    "be verified; refusing to force-kill a possibly-reused pid"
                 )
         # the engine clears its agent window itself, but kill the session as a
         # backstop in case it died before tearing it down

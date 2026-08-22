@@ -2109,7 +2109,7 @@ def test_stop_cancel_graceful_clears_pending(tmp_path, capsys):
 def test_stop_cancel_graceful_without_pending_errors(tmp_path, capsys):
     _make_run_with_state(tmp_path, "r1")  # nothing on disk to cancel
     assert cli.main(["stop", "--project", str(tmp_path), "r1", "--cancel-graceful"]) == 1
-    assert "no graceful stop pending" in capsys.readouterr().err
+    assert "no stop request pending" in capsys.readouterr().err
 
 
 def test_stop_graceful_and_cancel_are_mutually_exclusive(tmp_path):
