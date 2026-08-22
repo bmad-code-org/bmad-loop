@@ -31,7 +31,7 @@ breaking changes may land in a minor release.
   parse identically — an unset `extra_args` still means "inherit the profile's flags" where
   `[]` means "none".
 - **An undecodable or unreadable profile overlay or plugin manifest is a typed error naming
-  the file, not a traceback (#473).** `load_profiles` and the plugin loader read each
+  the file, not a traceback (#473, #689).** `load_profiles` and the plugin loader read each
   `*.toml` outside the funnel that converts parse faults, so a non-UTF-8 file escaped as a
   raw `UnicodeDecodeError` past consumers that all key on the domain error: `validate --json`
   printed a bare `error:` line and empty stdout instead of an `adapter.profile` finding,
