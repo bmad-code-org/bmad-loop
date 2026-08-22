@@ -428,6 +428,13 @@ def _snapshot_extra_args(raw: Any) -> tuple[str, ...] | None:
     # asdict() turns the extra_args tuple into a list and json keeps it a list;
     # rebuild the tuple so a reconstructed AdapterPolicy compares equal to a
     # freshly-parsed one (the #189 tuple-vs-list trap). None stays None.
+    #
+    # Deliberately keeps the lenient coercion `_typed_str_tuple` replaced in
+    # `loads()`: the input here is not user TOML but a json round-tripped
+    # `asdict(Policy)` whose extra_args was already validated on the way in, and
+    # the caller wraps this in `except Exception: return None` because it feeds
+    # status/TUI display surfaces that must never crash. Raising a PolicyError
+    # here would only be swallowed, at the cost of blanking the display.
     if raw is None:
         return None
     return tuple(str(a) for a in raw)
