@@ -2408,13 +2408,13 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
     # different problem with no fix at equal privilege — #571.
     state.trusted_config_digest = new_digest
     state.clear_pause()
-    # A resume is fresh user intent: discard any graceful-stop request left over from
-    # a prior stopped-gracefully run so the re-armed engine does not consume it at the
+    # A resume is fresh user intent: discard any stop request left over from a prior
+    # stopped run — either mode — so the re-armed engine does not consume it at the
     # first item boundary and immediately re-stop. Fire before write_pid — the moment
     # the pid lands the engine is "live" and a lingering request becomes honorable.
     if runs.clear_graceful_stop(run_dir):
         print(
-            f"run {run_dir.name}: discarded a stale graceful-stop request before resuming",
+            f"run {run_dir.name}: discarded a stale stop request before resuming",
             file=sys.stderr,
         )
     runs.write_pid(run_dir)
@@ -3149,11 +3149,14 @@ def cmd_status(args: argparse.Namespace) -> int:
     state = load_state(run_dir)
     # A pending graceful stop is not in state.json (it's the control file + a live
     # engine), so derive it here and hand it to the builder / text branch. Order the
-    # `and` so the cheap file check gates the engine_liveness probe: skip it when the
-    # run is already concluded or no request is on disk.
+    # `and` so the cheap file read gates the engine_liveness probe: skip it when the
+    # run is already concluded or no request is on disk. The mode check is exact —
+    # a lodged `mode: hard` request is a stop in flight, not a *graceful* stop
+    # pending, and reporting it as one would promise an operator the current item
+    # still finishes. Absent and hard both read False here; only "graceful" is True.
     graceful_pending = (
         not (state.finished or state.paused or state.stopped or state.crashed)
-        and runs.graceful_stop_requested(run_dir)
+        and runs.read_stop_request_mode(run_dir) == "graceful"
         and runs.engine_liveness(run_dir) != "dead"
     )
     if args.json:

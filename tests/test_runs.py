@@ -1,11 +1,14 @@
 """Run-directory helper tests."""
 
+import contextlib
 import json
 import os
 import re
 import subprocess
 import sys
 import tarfile
+import threading
+import time
 from pathlib import Path
 from unittest import mock
 
@@ -407,19 +410,201 @@ def test_stop_run_dead_pid_falls_back(tmp_path, monkeypatch):
 
 
 def test_stop_run_signals_live_process(tmp_path, monkeypatch):
+    # Bound the grace window: this child is settled either way, and the default
+    # 10s is pure dead time here. It is also burned on *every* platform, not just
+    # win32 — the exited child stays an unreaped zombie while this test holds its
+    # Popen handle, and a zombie answers the POSIX `os.kill(pid, 0)` liveness
+    # probe as alive.
+    monkeypatch.setattr(runs, "_STOP_WAIT_S", 2.0)
+    monkeypatch.setattr(runs, "_STOP_POLL_S", 0.05)
     monkeypatch.setattr(runs, "kill_session", lambda _rid: None)
     run_dir = _make_state_run(tmp_path, "r1")
     proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     try:
         (run_dir / "engine.pid").write_text(str(proc.pid))
         assert runs.stop_run(run_dir) is True
-        # the process received SIGTERM and is gone
+        # the process is gone. On POSIX it took the SIGTERM; on win32 `taskkill`
+        # without /F posts a WM_CLOSE a console child has no window to receive, so
+        # there it is force-killed after the bounded wait instead. Either way
+        # stop_run settles the run — which is the whole point of the file channel.
         assert proc.poll() is not None or proc.wait(timeout=5) is not None
         assert load_state(run_dir).stopped is True
     finally:
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=10)
+
+
+def test_stop_run_lodges_hard_request_before_signalling(tmp_path, monkeypatch):
+    """The hard request is on disk *before* terminate() is called. That ordering is
+    the guarantee: an engine that is signal-deaf, or that dies to the signal before
+    reading anything, can never exit having missed a request written only after it
+    was signalled. Read from inside the host at terminate time so the assertion
+    cannot be satisfied by a write that lands later."""
+    monkeypatch.setattr(runs, "kill_session", lambda _rid: None)
+    run_dir = _make_state_run(tmp_path, "r1")
+    (run_dir / "engine.pid").write_text("4242 100.0")
+
+    seen: list[str | None] = []
+
+    def _read_at_terminate(_pid):
+        seen.append(runs.read_stop_request_mode(run_dir))
+        st = load_state(run_dir)  # emulate the engine honoring it, then exiting
+        st.stopped = True
+        save_state(run_dir, st)
+
+    host = _FakeHost(alive=False, identity=100.0, on_terminate=_read_at_terminate)
+    monkeypatch.setattr(runs, "get_process_host", lambda: host)
+    assert runs.stop_run(run_dir) is True
+    assert seen == ["hard"]
+    assert host.force_killed == []  # the engine settled it — no escalation
+
+
+def test_stop_run_stops_sigterm_immune_child_via_stop_request_file(tmp_path, monkeypatch):
+    """THE #319 acceptance test: a stand-in engine that cannot be reached by signal
+    stops *itself* off the control file, and stop_run confirms rather than blindly
+    force-killing it.
+
+    The child ignores SIGTERM, modelling a native-Windows engine — which never
+    receives an inter-process SIGTERM at all, and whose `taskkill` "graceful" step
+    posts a WM_CLOSE that a console process has no window to receive. So the only
+    channel that can reach it is the `mode: hard` request stop_run lodges before
+    signalling. It polls for that file, marks the run stopped exactly as the
+    engine's own handler does, and exits 0. Before #319 this was unreachable: every
+    Windows stop burned the full grace window into a blind force-kill and `stopped`
+    was written by the external fallback, so the engine-is-single-writer invariant
+    held only by fallback.
+
+    The reaper thread clears the exited child so the liveness probe stops reading it
+    as alive: `os.kill(pid, 0)` answers True for an unreaped zombie, and this test
+    holds the Popen handle. Production never has that problem — the engine is not
+    the CLI's child — so without the reaper the assertions below would still pass
+    but take the whole (shortened) wait window, hiding the speed this fixes.
+
+    Ablation: with `_write_stop_request(run_dir, "hard")` deleted from stop_run, the
+    child never sees a request, burns the wait, and is SIGKILLed — returncode -9
+    instead of 0, plus a `fallback: true` journal entry. Run once against the
+    ablated source, confirmed failing on both, then restored.
+    """
+    monkeypatch.setattr(runs, "kill_session", lambda _rid: None)
+    monkeypatch.setattr(runs, "_STOP_WAIT_S", 5.0)
+    monkeypatch.setattr(runs, "_STOP_POLL_S", 0.02)
+    run_dir = _make_state_run(tmp_path, "r1")
+    request = run_dir / runs.STOP_REQUEST_FILE
+    state_path = run_dir / "state.json"
+    ready = run_dir / "child-ready"
+
+    # A stand-in engine: deaf to SIGTERM, awake to the control file. Marks the run
+    # stopped itself — the engine is the single writer of `stopped`, and this test
+    # exists to prove that stays true when no signal can be delivered. The ready
+    # file is published only after the handler is installed; see the wait below.
+    child = (
+        "import json, pathlib, signal, sys, time\n"
+        "try:\n"
+        "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "except (AttributeError, OSError, ValueError):\n"
+        "    pass\n"  # a platform that refuses the handler still can't reach us
+        "req, state = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])\n"
+        "pathlib.Path(sys.argv[3]).write_text('ready')\n"
+        "deadline = time.monotonic() + 60\n"
+        "while time.monotonic() < deadline:\n"
+        "    if req.exists():\n"
+        "        d = json.loads(state.read_text())\n"
+        "        d['stopped'] = True\n"
+        "        state.write_text(json.dumps(d))\n"
+        "        sys.exit(0)\n"
+        "    time.sleep(0.05)\n"
+        "sys.exit(3)\n"  # never saw a request — the outcome the ablation produces
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", child, str(request), str(state_path), str(ready)]
+    )
+
+    def _reap():
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=90)
+
+    reaper = threading.Thread(target=_reap, daemon=True)
+    reaper.start()
+    try:
+        # Wait for SIG_IGN to be installed before stopping. Interpreter startup is
+        # tens of milliseconds and stop_run signals immediately, so without this the
+        # SIGTERM lands on a child still importing and kills it by default action —
+        # rc -15, and the test would be measuring the race instead of the channel.
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and not ready.exists():
+            time.sleep(0.02)
+        assert ready.exists(), "stand-in engine never became SIGTERM-immune"
+
+        (run_dir / "engine.pid").write_text(str(proc.pid))
+        assert runs.stop_run(run_dir) is True
+        reaper.join(timeout=30)
+        # the child exited ITSELF: rc 0, not -15 (SIGTERM), -9 (SIGKILL) or a
+        # taskkill /F status. This is the assertion the whole issue is about.
+        assert proc.returncode == 0
+        assert load_state(run_dir).stopped is True
+        # ...and stop_run trusted it, rather than marking the run stopped behind it
+        journal = run_dir / "journal.jsonl"
+        assert not journal.exists() or "fallback" not in journal.read_text()
+        assert runs.read_stop_request_mode(run_dir) is None  # request consumed
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
+
+
+def test_stop_run_fallback_clears_hard_request(tmp_path, monkeypatch):
+    """On the mark-stopped fallback nothing is left alive to consume the request, so
+    stop_run discards what it lodged. A file outliving the run it asked to stop is a
+    trap: the next resume would find it and stop again at the first item."""
+    monkeypatch.setattr(runs, "kill_session", lambda _rid: None)
+    run_dir = _make_state_run(tmp_path, "r1")  # no engine.pid -> straight to fallback
+    assert runs.stop_run(run_dir) is True
+    assert load_state(run_dir).stopped is True
+    assert runs.read_stop_request_mode(run_dir) is None
+    assert '"fallback": true' in (run_dir / "journal.jsonl").read_text()
+
+
+def test_stop_run_engine_confirmed_leaves_nothing_pending(tmp_path, monkeypatch):
+    """When the engine confirms the stop itself the request is consumed too. The
+    engine normally clears it on the way out; this is the belt-and-braces half, and
+    it is what keeps a confirmed stop from stranding a request on disk."""
+    monkeypatch.setattr(runs, "kill_session", lambda _rid: None)
+    run_dir = _make_state_run(tmp_path, "r1")
+    (run_dir / "engine.pid").write_text("4242 100.0")
+
+    def _mark_stopped(_pid):
+        st = load_state(run_dir)
+        st.stopped = True
+        save_state(run_dir, st)
+
+    host = _FakeHost(alive=False, identity=100.0, on_terminate=_mark_stopped)
+    monkeypatch.setattr(runs, "get_process_host", lambda: host)
+    assert runs.stop_run(run_dir) is True
+    assert runs.read_stop_request_mode(run_dir) is None
+    journal = run_dir / "journal.jsonl"
+    assert not journal.exists() or "fallback" not in journal.read_text()
+
+
+def test_stop_run_refusal_leaves_hard_request_lodged(tmp_path, monkeypatch):
+    """StopRunError is the one path that leaves the request on disk. We refused to
+    force-kill a pid whose identity we can no longer verify — but if it *is* still
+    our engine, the file is now the only channel that can stop it. Clearing it here
+    would retract the operator's request while simultaneously declining to enforce
+    it, leaving a live run nobody asked to keep running."""
+    monkeypatch.setattr(runs, "kill_session", lambda _rid: None)
+    monkeypatch.setattr(runs, "_STOP_WAIT_S", 0.05)
+    monkeypatch.setattr(runs, "_STOP_POLL_S", 0.01)
+    run_dir = _make_state_run(tmp_path, "r1")
+    (run_dir / "engine.pid").write_text("4242 123.0")
+
+    identities = iter([123.0, 999.0])  # identity changes mid-grace -> possible reuse
+    host = _FakeHost(alive=True, identity=lambda: next(identities))
+    monkeypatch.setattr(runs, "get_process_host", lambda: host)
+    with pytest.raises(runs.StopRunError):
+        runs.stop_run(run_dir)
+    assert host.force_killed == []
+    assert runs.read_stop_request_mode(run_dir) == "hard"
 
 
 def test_stop_run_respects_engine_written_stopped(tmp_path, monkeypatch):
@@ -587,6 +772,51 @@ def test_request_graceful_stop_unknown_liveness_is_unverifiable(tmp_path, monkey
     assert runs.graceful_stop_requested(run_dir)
 
 
+def test_read_stop_request_mode_matrix(tmp_path):
+    """The mode reader answers ``None`` for *absent*, and only absent. Every other
+    state of a file that is present reads "graceful".
+
+    The asymmetry is deliberate and load-bearing: "hard" aborts a live session
+    mid-flight, so no torn, odd, or unreadable file may be able to produce it. A
+    misread graceful costs at most one more item before the run stops."""
+    run_dir = _make_run(tmp_path, "r1")
+    path = run_dir / runs.STOP_REQUEST_FILE
+
+    assert runs.read_stop_request_mode(run_dir) is None  # nothing pending
+
+    path.write_text('{"requested_at": "now", "mode": "graceful"}', encoding="utf-8")
+    assert runs.read_stop_request_mode(run_dir) == "graceful"
+
+    path.write_text('{"requested_at": "now", "mode": "hard"}', encoding="utf-8")
+    assert runs.read_stop_request_mode(run_dir) == "hard"
+
+    # Back-compat pin: every pre-#319 writer — and the fixtures still written by
+    # hand across this suite — produced a body with no mode at all. It must keep
+    # reading as the graceful request it was, not fall through to a hard abort.
+    path.write_text("{}", encoding="utf-8")
+    assert runs.read_stop_request_mode(run_dir) == "graceful"
+
+    path.write_text('{"mode": "har', encoding="utf-8")  # torn mid-write
+    assert runs.read_stop_request_mode(run_dir) == "graceful"
+
+    path.write_text('["hard"]', encoding="utf-8")  # valid JSON, but not an object
+    assert runs.read_stop_request_mode(run_dir) == "graceful"
+
+    path.write_text('"hard"', encoding="utf-8")  # a bare JSON scalar
+    assert runs.read_stop_request_mode(run_dir) == "graceful"
+
+    path.write_bytes(b"\xff\xfe\x00 not utf-8")  # undecodable bytes
+    assert runs.read_stop_request_mode(run_dir) == "graceful"
+
+    # A read that fails outright, standing in for the win32 sharing violation a
+    # concurrent atomic_replace raises: a directory in the file's place is an
+    # OSError on every platform (IsADirectoryError on POSIX, PermissionError on
+    # win32) and must not be mistaken for absence.
+    path.unlink()
+    path.mkdir()
+    assert runs.read_stop_request_mode(run_dir) == "graceful"
+
+
 def test_clear_graceful_stop_removes_or_noops(tmp_path):
     run_dir = _make_run(tmp_path, "r1")
     assert runs.clear_graceful_stop(run_dir) is False  # nothing pending → no-op, never raises
@@ -596,16 +826,33 @@ def test_clear_graceful_stop_removes_or_noops(tmp_path):
     assert runs.clear_graceful_stop(run_dir) is False  # already gone → no-op again
 
 
-def test_stop_run_clears_pending_graceful_request(tmp_path, monkeypatch):
-    """A hard stop supersedes a pending graceful request: the control file is
-    cleared even on the no-live-engine mark-stopped fallback path, so a later
-    resume doesn't re-honor the stop the operator escalated past."""
+def test_stop_run_supersedes_pending_graceful_request(tmp_path, monkeypatch):
+    """A hard stop supersedes a pending graceful request by *overwriting* it, not by
+    clearing it. The atomic replace escalates the mode in one step, so there is no
+    instant in which the operator has asked for a stop and nothing at all is pending
+    for the engine to find. Nothing is left on disk once the run is settled, so a
+    later resume can't re-honor the stop the operator escalated past."""
     monkeypatch.setattr(runs, "kill_session", lambda _rid: None)
-    run_dir = _make_state_run(tmp_path, "r1")  # no engine.pid → mark-stopped fallback
-    (run_dir / runs.STOP_REQUEST_FILE).write_text("{}")  # a graceful request pending
+    run_dir = _make_state_run(tmp_path, "r1")
+    (run_dir / "engine.pid").write_text("4242 100.0")
+    (run_dir / runs.STOP_REQUEST_FILE).write_text(
+        '{"requested_at": "old", "mode": "graceful"}', encoding="utf-8"
+    )
+
+    seen: list[str | None] = []
+
+    def _read_at_terminate(_pid):
+        seen.append(runs.read_stop_request_mode(run_dir))
+        st = load_state(run_dir)
+        st.stopped = True
+        save_state(run_dir, st)
+
+    host = _FakeHost(alive=False, identity=100.0, on_terminate=_read_at_terminate)
+    _use_host(monkeypatch, host)
     assert runs.stop_run(run_dir) is True
     assert load_state(run_dir).stopped is True
-    assert not runs.graceful_stop_requested(run_dir)
+    assert seen == ["hard"]  # escalated in place — never a gap with nothing pending
+    assert not runs.graceful_stop_requested(run_dir)  # and nothing pending after
 
 
 # ---------------------------------------------------------------- prune sessions

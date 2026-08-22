@@ -2142,6 +2142,53 @@ def test_status_json_graceful_stop_pending_true(tmp_path, monkeypatch, capsys):
     assert doc["schema_version"] == 1  # additive field — no schema bump
 
 
+def _pending_hard_run(tmp_path, run_id="r1", **state_kwargs):
+    """A run with a HARD-mode stop request on disk — what `bmad-loop stop` lodges
+    before signalling, still unconsumed because the engine has not reached a
+    boundary (or, on native Windows, was never reachable by the signal at all)."""
+    from bmad_loop import runs
+
+    run_dir = _make_run_with_state(tmp_path, run_id, **state_kwargs)
+    (run_dir / runs.STOP_REQUEST_FILE).write_text(
+        '{"requested_at": "now", "mode": "hard"}', encoding="utf-8"
+    )
+    return run_dir
+
+
+def test_status_json_graceful_stop_pending_false_for_hard_request(tmp_path, monkeypatch, capsys):
+    """A hard stop in flight is not a *graceful* stop pending. The field is
+    mode-exact, not an existence check: reporting True here would promise an
+    operator that the in-flight item still finishes, when a hard request stops the
+    run as soon as the engine sees it.
+
+    Ablation: reverting cli.py's derivation to `runs.graceful_stop_requested`
+    (bare existence) turns this True and fails the assertion — confirmed, restored.
+    """
+    from bmad_loop import runs
+
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive")
+    _pending_hard_run(tmp_path)
+    doc = machine_json(["status", "--project", str(tmp_path), "r1", "--json"], capsys)
+    assert doc["graceful_stop_pending"] is False
+    assert doc["schema_version"] == 1  # same field, same type — narrowed, not bumped
+
+
+def test_status_text_does_not_claim_graceful_for_hard_request(tmp_path, monkeypatch, capsys):
+    """The text branch reads the same derivation, so it inherits the fix: no
+    "will stop after the current item" promise for a hard request.
+
+    Ablation: with the bare-existence derivation restored this prints the graceful
+    line and fails — confirmed, restored."""
+    from bmad_loop import runs
+
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive")
+    _pending_hard_run(tmp_path)
+    assert cli.main(["status", "--project", str(tmp_path), "r1"]) == 0
+    out = capsys.readouterr().out
+    assert "graceful stop pending" not in out
+    assert "in progress" in out  # still reported live — only the promise is gone
+
+
 def test_status_json_graceful_stop_pending_false_without_request(tmp_path, capsys):
     # no control file -> the cheap existence check short-circuits the liveness probe
     _make_run_with_state(tmp_path, "r1")
@@ -3805,8 +3852,8 @@ def test_resume_under_an_unchanged_host_exec_config_reports_no_security_change(
 
 
 def test_resume_discards_stale_graceful_stop_request(project, monkeypatch, capsys):
-    """A resume is fresh user intent: a graceful-stop request left over from the
-    prior stopped-gracefully run must be cleared before write_pid re-arms the
+    """A resume is fresh user intent: a stop request left over from the prior
+    stopped run — either mode — must be cleared before write_pid re-arms the
     engine, or the re-driven loop would consume it at the first item boundary and
     immediately re-stop. The clear is noted on stderr."""
     from bmad_loop import runs
@@ -3820,7 +3867,7 @@ def test_resume_discards_stale_graceful_stop_request(project, monkeypatch, capsy
     assert cli._resume_paused_run(project.project, run_dir) == 0
 
     assert not (run_dir / runs.STOP_REQUEST_FILE).exists()  # consumed before the engine ran
-    assert "discarded a stale graceful-stop request" in capsys.readouterr().err
+    assert "discarded a stale stop request" in capsys.readouterr().err
 
 
 def test_resume_refuses_live_run(tmp_path, monkeypatch, capsys):
