@@ -628,6 +628,127 @@ def test_array_policy_fields_keep_unset_distinct_from_empty():
     assert policy.loads('[verify]\ncommands = ["pytest -q"]\n').verify.commands == ("pytest -q",)
 
 
+# The two silent-coercion grids below share their field lists with their positive
+# twin, so the "still parses" claim is made about the same keys the rejection grid
+# names rather than a hand-picked subset of them.
+_BOOLEAN_POLICY_FIELDS = [
+    ("notify", "desktop"),
+    ("notify", "file"),
+    ("review", "enabled"),
+    ("adapter", "cleanup_session_on_finish"),
+    ("sweep", "repeat"),
+    ("scm", "delete_branch"),
+    ("scm", "keep_failed"),
+    ("scm", "rollback_on_failure"),
+    ("scm", "failed_diff_unlimited"),
+    ("scm", "seed_adapter_defaults"),
+    ("cleanup", "trim_artifacts"),
+    ("cleanup", "archive_old"),
+    ("cleanup", "auto_clean_on_finish"),
+    ("cleanup", "clean_tmp"),
+    ("tui", "low_frame_rate"),
+    ("operator", "enabled"),
+]
+
+
+@pytest.mark.parametrize("bad", ['"false"', "1", "[true]"])
+@pytest.mark.parametrize(("section", "key"), _BOOLEAN_POLICY_FIELDS)
+def test_boolean_policy_fields_reject_non_boolean(section, key, bad):
+    """The silent half of #440: unlike the raw `int()` fields, a bare `bool()` never
+    raised at all — it accepted every one of these and rewrote the knob. `"false"` is
+    the hazard #278 was filed for, because a non-empty string is truthy, so the one
+    spelling a user reaches for to turn a feature OFF turned it ON; `1` and `[true]`
+    are the other two truthy shapes TOML can produce here. No degrade handler ever
+    saw a fault, because there was no fault to see — the run just behaved differently
+    from its configuration.
+
+    Ablation: delete `_typed_bool`'s conditional and raise, retaining `return value`;
+    every row fails because each bad value is returned unchanged and truthy."""
+    with pytest.raises(policy.PolicyError, match=rf"{section}\.{key} must be a boolean"):
+        policy.loads(f"[{section}]\n{key} = {bad}\n")
+
+
+@pytest.mark.parametrize(("section", "key"), _BOOLEAN_POLICY_FIELDS)
+def test_boolean_policy_fields_accept_a_real_toml_false(section, key):
+    """The guard rejects wrong TYPES, not falsy values — a real TOML `false` is how
+    every one of these knobs is legitimately turned off, and it must still parse to
+    `False` rather than tripping the new check."""
+    pol = policy.loads(f"[{section}]\n{key} = false\n")
+    assert getattr(getattr(pol, section), key) is False
+
+
+@pytest.mark.parametrize("bad", ["5", "true"])
+@pytest.mark.parametrize(
+    ("section", "key"),
+    [
+        ("gates", "mode"),
+        ("gates", "on_escalation"),
+        ("gates", "retrospective"),
+        ("review", "trigger"),
+        ("review", "on_timeout"),
+        ("review", "on_status_contradiction"),
+        ("stories", "source"),
+        ("stories", "spec_folder"),
+        ("dev", "skill"),
+        ("adapter", "name"),
+        ("adapter", "model"),
+        ("adapter.dev", "name"),
+        ("adapter.dev", "model"),
+        ("adapter.review", "name"),
+        ("adapter.review", "model"),
+        ("sweep", "auto"),
+        ("scm", "isolation"),
+        ("scm", "branch_per"),
+        ("scm", "target_branch"),
+        ("scm", "merge_strategy"),
+        ("scm", "commit_message_template"),
+        ("mux", "backend"),
+    ],
+)
+def test_string_policy_fields_reject_non_string(section, key, bad):
+    """`str()` never raises either, so a wrong-typed value became its `repr` and was
+    then judged as a string. Two outcomes, both wrong: the fields with a downstream
+    allowlist blamed the VALUE for a TYPE fault ("gates.mode must be one of [...]: got
+    '5'", naming a quoted 5 the file does not contain), and the free-form ones
+    (`scm.target_branch`, `scm.commit_message_template`, `adapter.model`) took the
+    stringified value silently. The allowlist and regex checks still run — they just
+    run second now.
+
+    Ablation: two disjoint conditionals. Delete `_typed_str`'s and raise, retaining
+    `return value`; every row fails except the four `adapter.dev`/`adapter.review`
+    ones, which are the per-stage overrides and go through `_opt_typed_str` — delete
+    that one instead and exactly those four fail."""
+    with pytest.raises(policy.PolicyError, match=rf"{re.escape(section)}\.{key} must be a string"):
+        policy.loads(f"[{section}]\n{key} = {bad}\n")
+
+
+@pytest.mark.parametrize("bad", ["5", "true", "[]"])
+def test_plugins_enabled_entries_reject_non_strings(bad):
+    """The list SHAPE was already typed; its entries were not, so `[str(n) for n in
+    raw_enabled]` turned any scalar into a plugin name that no loader can resolve —
+    `enabled = [5]` asked for a plugin literally named "5". The sibling entry guard on
+    `scm.worktree_seed` is the precedent this matches.
+
+    Ablation: delete the isinstance conditional and its raise, retaining the append;
+    all rows fail because every entry is collected whatever its type."""
+    with pytest.raises(policy.PolicyError, match=r"plugins\.enabled entries must be strings"):
+        policy.loads(f"[plugins]\nenabled = [{bad}]\n")
+
+
+@pytest.mark.parametrize("bad", ["5", "true"])
+def test_deprecated_engine_name_rejects_non_string(bad):
+    """The deprecated `[engine]` fold reads `name` to decide which plugin to enable,
+    so a wrong-typed one stringified into a bogus plugin name on the way out of a
+    block that is already warning the user it is going away. The DeprecationWarning
+    still fires: the type check runs after it, not instead of it.
+
+    Ablation: delete `_typed_str`'s conditional and raise; both rows fail because the
+    name is stringified and enables a plugin named "5"/"True"."""
+    with pytest.warns(DeprecationWarning):
+        with pytest.raises(policy.PolicyError, match=r"engine\.name must be a string"):
+            policy.loads(f"[engine]\nname = {bad}\n")
+
+
 @pytest.mark.parametrize("bad", ["true", '"0.5"'])
 def test_cache_read_weight_rejects_non_number(bad):
     """Ablation: delete `_typed_float`'s conditional and raise; both rows fail

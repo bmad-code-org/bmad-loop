@@ -666,8 +666,8 @@ def _stage_adapter(adapter_d: dict[str, Any], key: str) -> StageAdapterPolicy:
     if not isinstance(raw, dict):
         raise PolicyError(f"[adapter.{key}] must be a table")
     return StageAdapterPolicy(
-        name=None if raw.get("name") is None else str(raw["name"]),
-        model=None if raw.get("model") is None else str(raw["model"]),
+        name=_opt_typed_str(raw, f"adapter.{key}", "name"),
+        model=_opt_typed_str(raw, f"adapter.{key}", "model"),
         extra_args=_typed_str_tuple(raw, f"adapter.{key}", "extra_args"),
         usage_grace_s=_opt_grace(raw, f"adapter.{key}"),
         stop_without_result_nudges=_opt_nudges(raw, f"adapter.{key}"),
@@ -734,6 +734,18 @@ def _typed_bool(d: dict[str, Any], where: str, key: str, default: bool) -> bool:
 
 def _typed_str(d: dict[str, Any], where: str, key: str, default: str) -> str:
     value = d.get(key, default)
+    if not isinstance(value, str):
+        raise PolicyError(f"{where}.{key} must be a string: got {value!r}")
+    return value
+
+
+def _opt_typed_str(d: dict[str, Any], where: str, key: str) -> str | None:
+    """The `_typed_str` shape for a key whose unset state is None rather than a
+    default — the per-stage `[adapter.<stage>]` overrides inherit from the parent
+    `[adapter]` table when absent, so they cannot express "unset" as a value."""
+    value = d.get(key)
+    if value is None:
+        return None
     if not isinstance(value, str):
         raise PolicyError(f"{where}.{key} must be a string: got {value!r}")
     return value
@@ -810,9 +822,9 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
     mux_d = _section(doc, "mux")
 
     gates = GatesPolicy(
-        mode=str(gates_d.get("mode", GatesPolicy.mode)),
-        on_escalation=str(gates_d.get("on_escalation", GatesPolicy.on_escalation)),
-        retrospective=str(gates_d.get("retrospective", GatesPolicy.retrospective)),
+        mode=_typed_str(gates_d, "gates", "mode", GatesPolicy.mode),
+        on_escalation=_typed_str(gates_d, "gates", "on_escalation", GatesPolicy.on_escalation),
+        retrospective=_typed_str(gates_d, "gates", "retrospective", GatesPolicy.retrospective),
     )
     if gates.mode not in GATE_MODES:
         raise PolicyError(f"gates.mode must be one of {sorted(GATE_MODES)}: got {gates.mode!r}")
@@ -937,15 +949,15 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
     if verify.stream_capture_kb < 0:
         raise PolicyError(f"verify.stream_capture_kb must be >= 0: got {verify.stream_capture_kb}")
     notify = NotifyPolicy(
-        desktop=bool(notify_d.get("desktop", NotifyPolicy.desktop)),
-        file=bool(notify_d.get("file", NotifyPolicy.file)),
+        desktop=_typed_bool(notify_d, "notify", "desktop", NotifyPolicy.desktop),
+        file=_typed_bool(notify_d, "notify", "file", NotifyPolicy.file),
     )
     review = ReviewPolicy(
-        enabled=bool(review_d.get("enabled", ReviewPolicy.enabled)),
-        trigger=str(review_d.get("trigger", ReviewPolicy.trigger)).strip(),
-        on_timeout=str(review_d.get("on_timeout", ReviewPolicy.on_timeout)).strip(),
-        on_status_contradiction=str(
-            review_d.get("on_status_contradiction", ReviewPolicy.on_status_contradiction)
+        enabled=_typed_bool(review_d, "review", "enabled", ReviewPolicy.enabled),
+        trigger=_typed_str(review_d, "review", "trigger", ReviewPolicy.trigger).strip(),
+        on_timeout=_typed_str(review_d, "review", "on_timeout", ReviewPolicy.on_timeout).strip(),
+        on_status_contradiction=_typed_str(
+            review_d, "review", "on_status_contradiction", ReviewPolicy.on_status_contradiction
         ).strip(),
     )
     if review.trigger not in REVIEW_TRIGGER_MODES:
@@ -964,8 +976,10 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
             f" got {review.on_status_contradiction!r}"
         )
     stories = StoriesPolicy(
-        source=str(stories_d.get("source", StoriesPolicy.source)).strip(),
-        spec_folder=str(stories_d.get("spec_folder", StoriesPolicy.spec_folder)).strip(),
+        source=_typed_str(stories_d, "stories", "source", StoriesPolicy.source).strip(),
+        spec_folder=_typed_str(
+            stories_d, "stories", "spec_folder", StoriesPolicy.spec_folder
+        ).strip(),
     )
     if stories.source not in STORIES_SOURCES:
         raise PolicyError(
@@ -976,7 +990,7 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
     # at run time — no error, so switching source back and forth keeps the path.
     if stories.source == "stories" and not stories.spec_folder:
         raise PolicyError('stories.source = "stories" requires stories.spec_folder to be set')
-    dev = DevPolicy(skill=str(dev_d.get("skill", DevPolicy.skill)))
+    dev = DevPolicy(skill=_typed_str(dev_d, "dev", "skill", DevPolicy.skill))
     if dev.skill not in DEV_SKILLS:
         raise PolicyError(
             f"dev.skill must be one of {sorted(DEV_SKILLS)}: got {dev.skill!r}. This is the "
@@ -991,11 +1005,14 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         if legacy in adapter_d:
             raise PolicyError(f"adapter.{legacy} was removed — use {replacement} instead")
     adapter = AdapterPolicy(
-        name=str(adapter_d.get("name", AdapterPolicy.name)),
-        model=str(adapter_d.get("model", AdapterPolicy.model)),
+        name=_typed_str(adapter_d, "adapter", "name", AdapterPolicy.name),
+        model=_typed_str(adapter_d, "adapter", "model", AdapterPolicy.model),
         extra_args=_typed_str_tuple(adapter_d, "adapter", "extra_args"),
-        cleanup_session_on_finish=bool(
-            adapter_d.get("cleanup_session_on_finish", AdapterPolicy.cleanup_session_on_finish)
+        cleanup_session_on_finish=_typed_bool(
+            adapter_d,
+            "adapter",
+            "cleanup_session_on_finish",
+            AdapterPolicy.cleanup_session_on_finish,
         ),
         usage_grace_s=_opt_grace(adapter_d, "adapter"),
         stop_without_result_nudges=_opt_nudges(adapter_d, "adapter"),
@@ -1004,7 +1021,7 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         triage=_stage_adapter(adapter_d, "triage"),
     )
     sweep = SweepPolicy(
-        auto=str(sweep_d.get("auto", SweepPolicy.auto)),
+        auto=_typed_str(sweep_d, "sweep", "auto", SweepPolicy.auto),
         max_bundles=_typed_int(sweep_d, "sweep", "max_bundles", SweepPolicy.max_bundles),
         max_triage_attempts=_typed_int(
             sweep_d, "sweep", "max_triage_attempts", SweepPolicy.max_triage_attempts
@@ -1012,7 +1029,7 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         max_migration_attempts=_typed_int(
             sweep_d, "sweep", "max_migration_attempts", SweepPolicy.max_migration_attempts
         ),
-        repeat=bool(sweep_d.get("repeat", SweepPolicy.repeat)),
+        repeat=_typed_bool(sweep_d, "sweep", "repeat", SweepPolicy.repeat),
         max_cycles=_typed_int(sweep_d, "sweep", "max_cycles", SweepPolicy.max_cycles),
     )
     if sweep.auto not in SWEEP_AUTO_MODES:
@@ -1053,27 +1070,29 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
     if not all(isinstance(s, str) for s in raw_seed):
         raise PolicyError(f"scm.worktree_seed entries must be strings: got {list(raw_seed)!r}")
     scm = ScmPolicy(
-        isolation=str(scm_d.get("isolation", ScmPolicy.isolation)),
-        branch_per=str(scm_d.get("branch_per", ScmPolicy.branch_per)),
-        target_branch=str(scm_d.get("target_branch", ScmPolicy.target_branch)),
-        merge_strategy=str(scm_d.get("merge_strategy", ScmPolicy.merge_strategy)),
-        delete_branch=bool(scm_d.get("delete_branch", ScmPolicy.delete_branch)),
-        keep_failed=bool(scm_d.get("keep_failed", ScmPolicy.keep_failed)),
-        rollback_on_failure=bool(scm_d.get("rollback_on_failure", ScmPolicy.rollback_on_failure)),
+        isolation=_typed_str(scm_d, "scm", "isolation", ScmPolicy.isolation),
+        branch_per=_typed_str(scm_d, "scm", "branch_per", ScmPolicy.branch_per),
+        target_branch=_typed_str(scm_d, "scm", "target_branch", ScmPolicy.target_branch),
+        merge_strategy=_typed_str(scm_d, "scm", "merge_strategy", ScmPolicy.merge_strategy),
+        delete_branch=_typed_bool(scm_d, "scm", "delete_branch", ScmPolicy.delete_branch),
+        keep_failed=_typed_bool(scm_d, "scm", "keep_failed", ScmPolicy.keep_failed),
+        rollback_on_failure=_typed_bool(
+            scm_d, "scm", "rollback_on_failure", ScmPolicy.rollback_on_failure
+        ),
         preserve_keep=preserve_keep,
         failed_diff_max_mb=_typed_int(
             scm_d, "scm", "failed_diff_max_mb", ScmPolicy.failed_diff_max_mb
         ),
-        failed_diff_unlimited=bool(
-            scm_d.get("failed_diff_unlimited", ScmPolicy.failed_diff_unlimited)
+        failed_diff_unlimited=_typed_bool(
+            scm_d, "scm", "failed_diff_unlimited", ScmPolicy.failed_diff_unlimited
         ),
-        commit_message_template=str(
-            scm_d.get("commit_message_template", ScmPolicy.commit_message_template)
+        commit_message_template=_typed_str(
+            scm_d, "scm", "commit_message_template", ScmPolicy.commit_message_template
         ),
         # Phase 5 parallel fan-out is unbuilt: clamp to 1 so the knob is inert.
         max_parallel=min(requested_parallel, 1),
-        seed_adapter_defaults=bool(
-            scm_d.get("seed_adapter_defaults", ScmPolicy.seed_adapter_defaults)
+        seed_adapter_defaults=_typed_bool(
+            scm_d, "scm", "seed_adapter_defaults", ScmPolicy.seed_adapter_defaults
         ),
         worktree_seed=tuple(raw_seed),
     )
@@ -1133,12 +1152,14 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         retention_days=_typed_int(
             cleanup_d, "cleanup", "retention_days", CleanupPolicy.retention_days
         ),
-        trim_artifacts=bool(cleanup_d.get("trim_artifacts", CleanupPolicy.trim_artifacts)),
-        archive_old=bool(cleanup_d.get("archive_old", CleanupPolicy.archive_old)),
-        auto_clean_on_finish=bool(
-            cleanup_d.get("auto_clean_on_finish", CleanupPolicy.auto_clean_on_finish)
+        trim_artifacts=_typed_bool(
+            cleanup_d, "cleanup", "trim_artifacts", CleanupPolicy.trim_artifacts
         ),
-        clean_tmp=bool(cleanup_d.get("clean_tmp", CleanupPolicy.clean_tmp)),
+        archive_old=_typed_bool(cleanup_d, "cleanup", "archive_old", CleanupPolicy.archive_old),
+        auto_clean_on_finish=_typed_bool(
+            cleanup_d, "cleanup", "auto_clean_on_finish", CleanupPolicy.auto_clean_on_finish
+        ),
+        clean_tmp=_typed_bool(cleanup_d, "cleanup", "clean_tmp", CleanupPolicy.clean_tmp),
     )
     if cleanup.run_retention < 0:
         raise PolicyError(f"cleanup.run_retention must be >= 0: got {cleanup.run_retention}")
@@ -1147,7 +1168,11 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
     raw_enabled = plugins_d.get("enabled", ())
     if isinstance(raw_enabled, str) or not isinstance(raw_enabled, (list, tuple)):
         raise PolicyError("plugins.enabled must be a list of plugin names")
-    enabled = [str(n) for n in raw_enabled]
+    enabled: list[str] = []
+    for n in raw_enabled:
+        if not isinstance(n, str):
+            raise PolicyError(f"plugins.enabled entries must be strings: got {n!r}")
+        enabled.append(n)
     # Every key under [plugins] other than `enabled` that is a table is a
     # per-plugin settings sub-table ([plugins.<name>]).
     plugin_settings = {
@@ -1163,14 +1188,16 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
             _validate_plugin_settings(name, raw_settings, plugin_schemas.get(name))
     plugins = PluginsPolicy(enabled=tuple(enabled), settings=plugin_settings)
     tui = TuiPolicy(
-        low_frame_rate=bool(tui_d.get("low_frame_rate", TuiPolicy.low_frame_rate)),
+        low_frame_rate=_typed_bool(tui_d, "tui", "low_frame_rate", TuiPolicy.low_frame_rate),
         left_width=_tui_dim(tui_d, "left_width"),
         runs_height=_tui_dim(tui_d, "runs_height"),
         deferred_height=_tui_dim(tui_d, "deferred_height"),
         tasks_height=_tui_dim(tui_d, "tasks_height"),
     )
-    operator = OperatorPolicy(enabled=bool(operator_d.get("enabled", OperatorPolicy.enabled)))
-    mux = MuxPolicy(backend=str(mux_d.get("backend", MuxPolicy.backend)).strip())
+    operator = OperatorPolicy(
+        enabled=_typed_bool(operator_d, "operator", "enabled", OperatorPolicy.enabled)
+    )
+    mux = MuxPolicy(backend=_typed_str(mux_d, "mux", "backend", MuxPolicy.backend).strip())
     if mux.backend and not _MUX_NAME_RE.match(mux.backend):
         raise PolicyError(
             f"mux.backend must be a backend name (letters, digits, . _ -): got {mux.backend!r}"
@@ -1213,7 +1240,7 @@ def _fold_deprecated_engine(
         DeprecationWarning,
         stacklevel=3,
     )
-    name = str(engine_d.get("name", "")).strip()
+    name = _typed_str(engine_d, "engine", "name", "").strip()
     if not name:
         return
     if name not in enabled:

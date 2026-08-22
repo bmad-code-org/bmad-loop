@@ -4325,6 +4325,38 @@ async def test_dashboard_survives_undecodable_policy_bytes(project):
         assert not screen._left_frozen and not screen._detail_frozen
 
 
+async def test_dashboard_survives_a_wrong_typed_policy_value(project):
+    """The same `except (PolicyError, OSError)` handler, reached by a policy file that
+    is perfectly readable — valid UTF-8, valid TOML — and wrong only in a VALUE.
+
+    The two siblings above fault at the FILE level (a monkeypatched OSError raiser,
+    then undecodable bytes). This is the first one to fault at a KEY. `max_parallel`
+    was a bare `int()` until #440, so `"x"` left `policy.load` as a raw ValueError,
+    and a ValueError is neither a PolicyError nor an OSError — it walked past this
+    handler exactly as the undecodable bytes did, crashing at app CONSTRUCTION before
+    run_test could mount a screen. Note the fault sits in [scm], a section the
+    dashboard never reads: `load` parses the whole document, so a wrong-typed key
+    anywhere in the file took the TUI down."""
+    text = '[tui]\nleft_width = 50\n[scm]\nmax_parallel = "x"\n'
+    # Precondition: decodable AND well-formed TOML — that is what makes this a value
+    # test rather than a second copy of the two above.
+    assert tomllib.loads(text)["scm"]["max_parallel"] == "x"
+    # Precondition: the [tui] half alone would seed a 50-column sidebar, so asserting
+    # the CSS default below shows the file was REFUSED, not that it was inert.
+    assert policy_mod.loads("[tui]\nleft_width = 50\n").tui.left_width == 50
+    with pytest.raises(policy_mod.PolicyError):  # and the whole document is refused
+        policy_mod.loads(text)
+    bmad = project.project / ".bmad-loop"
+    bmad.mkdir(parents=True, exist_ok=True)
+    (bmad / "policy.toml").write_text(text, encoding="utf-8")
+    app = BmadLoopApp(project.project)
+    async with app.run_test(size=(120, 40)) as pilot:
+        screen = await _seeded(pilot, app)
+        assert screen._tui_policy == policy_mod.TuiPolicy()
+        assert screen.query_one("#left").size.width == 34  # CSS default, not the file's 50
+        assert not screen._left_frozen and not screen._detail_frozen
+
+
 async def test_first_geometry_save_writes_only_tui_keys(project):
     """A geometry save on a project without policy.toml must create a minimal
     [tui]-only file — not materialise POLICY_TEMPLATE, which would freeze every
