@@ -10698,6 +10698,212 @@ def test_graceful_stop_on_resume_finishes_inflight_then_stops(project, monkeypat
     assert stops and stops[-1]["graceful"] is True
 
 
+# ----------------------------------------------------------- hard stop (#319)
+#
+# The same stop-request.json control file, written with `mode: "hard"` by
+# `runs.stop_run`, carries a stop the signal path cannot deliver: a native-Windows
+# engine never receives an inter-process SIGTERM. The engine honors it in three
+# places — the item boundary (`_check_stop_request`) and the two `_run_session`
+# raise sites: an `"aborted"` result handed back by the adapter's in-session poll
+# (site A), and a hard file still on disk once a session has been recorded and
+# saved (site B, the `_post_kill_reconcile`-rescued case). All three take the HARD
+# arm: unconditional teardown, `run-stop` carrying `via="stop-request"` and no
+# `graceful` flag. These tests lodge the control file directly, exactly as the
+# graceful ones do.
+
+
+def _lodge_hard_stop_request(run_dir: Path) -> None:
+    """Drop the control file `runs.stop_run` writes before it signals — the hard
+    sibling of :func:`_lodge_stop_request`."""
+    (run_dir / STOP_REQUEST_FILE).write_text(
+        '{"requested_at": "2026-07-20T00:00:00", "mode": "hard"}', encoding="utf-8"
+    )
+
+
+def _lodge_hard_after(inner, run_dir: Path):
+    """Wrap a scripted effect so a HARD request lands as ``inner`` returns — i.e.
+    in the window between the adapter's last poll and the engine's post-session
+    check, the gap raise site B exists to cover."""
+
+    def effect(spec):
+        result = inner(spec)
+        _lodge_hard_stop_request(run_dir)
+        return result
+
+    return effect
+
+
+def test_session_abort_status_unwinds_run_stopped(project, monkeypatch):
+    """RAISE SITE A. An adapter whose wait loop saw the hard file tears its window
+    down and hands back `status="aborted"`; the engine unwinds that into a hard
+    RunStopped *before* any SessionRecord exists, so an abort is never mistaken for
+    a session outcome and no further session is launched. The paired session-end is
+    still journaled — through the `finally`, which is why the raise sits inside the
+    try.
+
+    Ablation: delete the `result.status == "aborted"` gate in `_run_session` and the
+    abort is recorded as an ordinary session; the run drives on into the review leg
+    and this test fails (verified)."""
+    killed = []
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: killed.append(rid))
+    write_sprint(project, {"1-1-a": "ready-for-dev", "1-2-b": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [SessionResult(status="aborted"), review_effect(project, "1-1-a", clean=True)],
+    )
+
+    engine.run()
+
+    saved = load_state(engine.run_dir)
+    assert saved.stopped is True and saved.finished is False
+    assert killed == ["test-run"]  # hard arm's unconditional teardown
+    assert len(adapter.sessions) == 1  # nothing launched after the abort...
+    assert len(adapter.script) == 1  # ...the review entry is still unspent
+    assert saved.tasks["1-1-a"].sessions == []  # no SessionRecord for the abort
+    entries = engine.journal.entries()
+    assert "run-complete" not in [e["kind"] for e in entries]
+    starts = [e for e in entries if e["kind"] == "session-start"]
+    ends = [e for e in entries if e["kind"] == "session-end"]
+    assert len(starts) == 1 and len(ends) == 1  # paired through the finally
+    assert ends[0]["task_id"] == starts[0]["task_id"]
+    assert ends[0]["status"] == "aborted"
+    stops = [e for e in entries if e["kind"] == "run-stop"]
+    assert stops and stops[-1]["via"] == "stop-request"
+    assert "graceful" not in stops[-1]
+
+
+def test_hard_stop_after_completed_session_stops_before_next_leg(project, monkeypatch):
+    """RAISE SITE B. A hard request landing too late for the in-session poll — here
+    as the dev session returns `completed` — still stops the run. This is also the
+    rescued-completion shape: `_post_kill_reconcile` can upgrade an aborted session
+    back to `completed`, and without this site the run would carry straight on into
+    verify/review on the strength of that rescue. The session is fully recorded and
+    saved first, so the run stays resumable from a complete record.
+
+    Ablation: delete raise site B (the post-`_save()` hard-file check in
+    `_run_session`) and the run drives the review leg — `adapter.sessions` grows to
+    2 and this test fails (verified)."""
+    killed = []
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: killed.append(rid))
+    write_sprint(project, {"1-1-a": "ready-for-dev", "1-2-b": "ready-for-dev"})
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    engine, adapter = make_engine(
+        project,
+        [
+            _lodge_hard_after(dev_effect(project, "1-1-a"), run_dir),
+            review_effect(project, "1-1-a", clean=True),
+        ],
+    )
+
+    engine.run()
+
+    saved = load_state(engine.run_dir)
+    assert saved.stopped is True and saved.finished is False
+    assert killed == ["test-run"]
+    assert len(adapter.sessions) == 1  # the review leg never started...
+    assert len(adapter.script) == 1  # ...its script entry is still unspent
+    # the completed session IS on the record — durable before the stop unwound
+    records = saved.tasks["1-1-a"].sessions
+    assert len(records) == 1 and records[0].status == "completed"
+    assert not graceful_stop_requested(run_dir)  # consumed before the raise
+    entries = engine.journal.entries()
+    kinds = [e["kind"] for e in entries]
+    assert "run-complete" not in kinds
+    assert "stop-request-discarded" not in kinds  # honored, not discarded as stale
+    ends = [e for e in entries if e["kind"] == "session-end"]
+    assert len(ends) == 1 and ends[0]["status"] == "completed"
+    stops = [e for e in entries if e["kind"] == "run-stop"]
+    assert stops and stops[-1]["via"] == "stop-request"
+    assert "graceful" not in stops[-1]
+
+
+def test_boundary_hard_file_takes_hard_arm(project, monkeypatch):
+    """A hard request that lands after the story's last session — lodged at
+    `post_story`, past raise site B — is honored at the next item boundary and takes
+    the HARD arm there: unconditional teardown, no clean-finish subset, `run-stop`
+    with `via="stop-request"` and no `graceful` flag. The in-flight story still ran
+    to completion, exactly as the graceful sibling does; only the arm differs."""
+    killed = []
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: killed.append(rid))
+    write_sprint(project, {"1-1-a": "ready-for-dev", "1-2-b": "ready-for-dev"})
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    engine, adapter = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+    )
+
+    post_run_stages = []
+    original_emit = engine._emit
+
+    def spy_emit(stage, *args, **kwargs):
+        if stage == "post_run":
+            post_run_stages.append(stage)
+        if stage == "post_story":
+            # the operator's `bmad-loop stop` lands between story 1 and story 2
+            _lodge_hard_stop_request(run_dir)
+        return original_emit(stage, *args, **kwargs)
+
+    engine._emit = spy_emit
+
+    engine.run()
+
+    saved = load_state(engine.run_dir)
+    assert saved.tasks["1-1-a"].phase == Phase.DONE  # in-flight story finished
+    assert "1-2-b" not in saved.tasks  # the next story was never dispatched
+    assert saved.stopped is True and saved.finished is False
+    assert len(adapter.sessions) == 2  # dev + review, nothing after the boundary
+    assert not graceful_stop_requested(run_dir)  # consumed at the boundary
+    assert killed == ["test-run"]  # hard arm, not the policy-gated graceful teardown
+    assert post_run_stages == []  # hard path skips the clean-finish subset
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "run-complete" not in kinds
+    assert "stop-request-discarded" not in kinds  # honored, not discarded as stale
+    stops = [e for e in engine.journal.entries() if e["kind"] == "run-stop"]
+    assert stops and stops[-1]["via"] == "stop-request"
+    assert "graceful" not in stops[-1] and "remaining" not in stops[-1]
+
+
+def test_boundary_modeless_file_reads_graceful(project, monkeypatch):
+    """BACK-COMPAT PIN. A bare `{}` stop-request body — what every pre-#319 writer
+    and fixture lodged — still takes the GRACEFUL arm: `read_stop_request_mode`
+    reads any present-but-modeless file as graceful, so raise site B ignores it
+    mid-story and the boundary finalizes cleanly with `graceful=True` and no
+    `via`."""
+    killed = []
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: killed.append(rid))
+    write_sprint(project, {"1-1-a": "ready-for-dev", "1-2-b": "ready-for-dev"})
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+
+    def lodge_modeless(inner):
+        def effect(spec):
+            result = inner(spec)
+            (run_dir / STOP_REQUEST_FILE).write_text("{}", encoding="utf-8")
+            return result
+
+        return effect
+
+    engine, adapter = make_engine(
+        project,
+        [
+            lodge_modeless(dev_effect(project, "1-1-a")),
+            review_effect(project, "1-1-a", clean=True),
+        ],
+    )
+
+    engine.run()
+
+    saved = load_state(engine.run_dir)
+    # the modeless file did NOT abort mid-story: the review leg still ran
+    assert len(adapter.sessions) == 2
+    assert saved.tasks["1-1-a"].phase == Phase.DONE
+    assert "1-2-b" not in saved.tasks
+    assert saved.stopped is True and saved.finished is False
+    assert not graceful_stop_requested(run_dir)
+    stops = [e for e in engine.journal.entries() if e["kind"] == "run-stop"]
+    assert stops and stops[-1]["graceful"] is True
+    assert "via" not in stops[-1]
+
+
 # ------------------------------- review.on_timeout = "salvage-if-done" (#271)
 
 

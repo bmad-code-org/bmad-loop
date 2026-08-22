@@ -568,7 +568,7 @@ class SweepEngine(Engine):
             # request during a cycle is caught before the next _run_bundle (see
             # _cycle); one landing between cycles stops here before cycle N+1
             # re-triages.
-            self._check_graceful_stop()
+            self._check_stop_request()
             self.state.sweep_cycle = cycle
             self._save()
             text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
@@ -693,7 +693,7 @@ class SweepEngine(Engine):
             # bundles run. Mid-cycle stop is resume-safe: sweep_cycle is
             # persisted, triage.json is cached, closes are idempotent, and
             # terminal tasks are skipped on re-drive.
-            self._check_graceful_stop()
+            self._check_stop_request()
             self._run_bundle(bundle, cycle)
         bundles_done = sum(
             1
