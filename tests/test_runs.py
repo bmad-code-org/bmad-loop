@@ -460,6 +460,62 @@ def test_stop_run_lodges_hard_request_before_signalling(tmp_path, monkeypatch):
     assert host.force_killed == []  # the engine settled it — no escalation
 
 
+def test_stop_run_still_signals_when_the_lodge_fails(tmp_path, monkeypatch):
+    """A run dir that rejects the write must not cost the signal path too.
+
+    The lodge goes first (see the test above), so before it was guarded an OSError
+    escaped `stop_run` ahead of `terminate` and left alive a POSIX run the pre-#319
+    code would have killed — a stop that does nothing at all, replacing one that
+    worked. Reachable without exotic setup: every session tees its pane into
+    `run_dir/logs/`, so a long run can fill the very directory the request must be
+    written to, and then `stop` is what fails.
+
+    Degrading is right *here* specifically because the hard stop is delivered two
+    ways at once. `request_graceful_stop` has only the file, so its write still
+    raises — that asymmetry is the point, and `test_request_graceful_stop_*` holds
+    the other side."""
+    monkeypatch.setattr(runs, "kill_session", lambda _rid: None)
+    run_dir = _make_state_run(tmp_path, "r1")
+    (run_dir / "engine.pid").write_text("4242 100.0")
+
+    def _enospc(_run_dir, _mode):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(runs, "_write_stop_request", _enospc)
+    host = _FakeHost(alive=False, identity=100.0)
+    monkeypatch.setattr(runs, "get_process_host", lambda: host)
+
+    assert runs.stop_run(run_dir) is True
+    assert host.terminated == [4242]  # the signal went out despite the failed lodge
+    assert load_state(run_dir).stopped is True  # and the run is settled
+
+
+def test_stop_run_refusal_says_nothing_is_pending_when_the_lodge_failed(tmp_path, monkeypatch):
+    """The force-kill refusal justifies itself by the file still being lodged — "the
+    only channel left that can stop it". When the lodge failed that sentence is
+    false: nothing is pending, and the operator is declining a force-kill on top of
+    a request that was never written. The message has to say so, or they wait on a
+    stop that can never arrive."""
+    monkeypatch.setattr(runs, "kill_session", lambda _rid: None)
+    monkeypatch.setattr(runs, "_STOP_WAIT_S", 0.0)  # expire the grace window at once
+    run_dir = _make_state_run(tmp_path, "r1")
+    (run_dir / "engine.pid").write_text("4242 100.0")
+
+    def _enospc(_run_dir, _mode):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(runs, "_write_stop_request", _enospc)
+    # Alive throughout, and the identity goes unreadable right after the stop-time
+    # read: the grace window expires and the pid-reuse guard then refuses to kill.
+    identities = iter([100.0] + [None] * 50)
+    host = _FakeHost(alive=True, identity=lambda: next(identities))
+    monkeypatch.setattr(runs, "get_process_host", lambda: host)
+
+    with pytest.raises(runs.StopRunError, match="could not be written"):
+        runs.stop_run(run_dir)
+    assert host.force_killed == []  # still refuses to kill an unverifiable pid
+
+
 def test_stop_run_stops_sigterm_immune_child_via_stop_request_file(tmp_path, monkeypatch):
     """THE #319 acceptance test: a stand-in engine that cannot be reached by signal
     stops *itself* off the control file, and stop_run confirms rather than blindly
@@ -733,8 +789,47 @@ def test_request_graceful_stop_writes_file_when_alive(tmp_path, monkeypatch):
     body = json.loads((run_dir / runs.STOP_REQUEST_FILE).read_text())
     assert body["mode"] == "graceful"
     assert body["requested_at"]  # an ISO timestamp is stamped
-    # written atomically — no staging temp left behind
-    assert not (run_dir / (runs.STOP_REQUEST_FILE + ".tmp")).exists()
+    # written atomically — no staging temp left behind. Globbed, not a fixed
+    # `.tmp`: the temp is mkstemp-named now, so naming one spelling would assert
+    # nothing (see test_write_stop_request_survives_an_interleaved_concurrent_writer).
+    assert [p.name for p in run_dir.glob(runs.STOP_REQUEST_FILE + "*")] == [runs.STOP_REQUEST_FILE]
+
+
+def test_write_stop_request_survives_an_interleaved_concurrent_writer(tmp_path, monkeypatch):
+    """Two `stop` invocations against one run stage at the same time — the only
+    control file with genuinely concurrent writers.
+
+    With a fixed `<name>.tmp` sibling the second writer's staging file overwrote the
+    first's, one `os.replace` consumed the single name, and the loser raised
+    `FileNotFoundError`. On the hard path that aborts `stop_run` *before* it signals,
+    so a collision between two operators cost the stop entirely. A per-writer
+    `mkstemp` temp removes the collision: both calls return, the survivor is a
+    complete body, and neither leaves a staging file behind.
+
+    Patched on both namespaces so reverting `_write_stop_request` to the hand-rolled
+    `tmp + atomic_replace` still routes through the interleave — that ablation must
+    redden this test."""
+    from bmad_loop import platform_util
+
+    run_dir = _make_state_run(tmp_path, "r1")
+    real_replace = platform_util.atomic_replace
+    nested: list[str] = []
+
+    def _interleave(tmp, target):
+        if not nested:  # inside writer A's replace, run writer B end to end
+            nested.append("b")
+            runs._write_stop_request(run_dir, "graceful")
+        real_replace(tmp, target)
+
+    monkeypatch.setattr(platform_util, "atomic_replace", _interleave)
+    monkeypatch.setattr(runs, "atomic_replace", _interleave)
+
+    runs._write_stop_request(run_dir, "hard")  # writer A — must not raise
+
+    assert nested == ["b"]  # the interleave really happened
+    body = json.loads((run_dir / runs.STOP_REQUEST_FILE).read_text())
+    assert body["mode"] == "hard"  # A replaced last, so A wins — never a torn body
+    assert [p.name for p in run_dir.glob(runs.STOP_REQUEST_FILE + "*")] == [runs.STOP_REQUEST_FILE]
 
 
 def test_request_graceful_stop_idempotent_keeps_timestamp(tmp_path, monkeypatch):

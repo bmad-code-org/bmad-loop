@@ -969,17 +969,29 @@ def read_stop_request_mode(run_dir: Path) -> str | None:
 
 def _write_stop_request(run_dir: Path, mode: str) -> None:
     """Lodge a stop request of ``mode`` on the control-file channel, written
-    atomically (tmp + ``atomic_replace``) so a concurrent engine read never sees a
-    partial body.
+    atomically so a concurrent engine read never sees a partial body.
 
     The atomic replace *is* the supersede: writing ``"hard"`` over a pending
     ``"graceful"`` escalates the request in one step, with no window in which
-    nothing is pending for the engine to find."""
-    path = run_dir / STOP_REQUEST_FILE
-    tmp = path.with_name(path.name + ".tmp")
+    nothing is pending for the engine to find.
+
+    Goes through :func:`platform_util.atomic_write_text` rather than a hand-rolled
+    ``tmp + atomic_replace``, for the reason ``operatoractions`` was migrated under
+    #379: this is the one control file with genuinely *concurrent* writers — two
+    ``stop`` invocations against the same run, in either mode — and a fixed ``.tmp``
+    sibling is exactly what two writers of the same key collide on. Interleaved,
+    both stage over one name and the loser's ``os.replace`` raises
+    ``FileNotFoundError`` after the winner's consumed it; on the hard path that
+    would abort ``stop_run`` *before* it ever signals. A ``mkstemp`` temp per writer
+    removes the collision: the last replace wins and neither writer errors.
+
+    ``follow_symlinks=False`` preserves what the bare ``os.replace`` did — it never
+    dereferenced this destination — and matches what the file is: machine-minted
+    control state under a run dir a driven session can reach. It now lands at
+    ``mkstemp``'s ``0600`` instead of ``0644 & ~umask``; nothing reads it
+    cross-user."""
     body = json.dumps({"requested_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "mode": mode})
-    tmp.write_text(body, encoding="utf-8")
-    atomic_replace(tmp, path)
+    atomic_write_text(run_dir / STOP_REQUEST_FILE, body, follow_symlinks=False)
 
 
 def clear_graceful_stop(run_dir: Path) -> bool:
@@ -1003,8 +1015,8 @@ def request_graceful_stop(run_dir: Path) -> str:
     dev/review/commit, or a sweep bundle through commit) cleanly, then finalize and
     stop — resumable, unlike the hard stop :func:`stop_run` delivers.
 
-    Delivery is the :data:`STOP_REQUEST_FILE` control file, written atomically (tmp
-    + ``atomic_replace``) so a concurrent engine read never sees a partial file.
+    Delivery is the :data:`STOP_REQUEST_FILE` control file, written atomically by
+    :func:`_write_stop_request` so a concurrent engine read never sees a partial file.
     Never signals the process and never writes ``journal.jsonl`` (engine-owned
     single-writer). Returns a status token for the caller to message on:
 
@@ -1067,7 +1079,19 @@ def stop_run(run_dir: Path) -> bool:
     # Lodge the hard request before signalling. The atomic replace also supersedes a
     # pending *graceful* request in the same step: the operator escalated past it, and
     # a stronger request must never leave a window where nothing at all is pending.
-    _write_stop_request(run_dir, "hard")
+    #
+    # Degrade rather than abort when the lodge fails (read-only run dir, ENOSPC — and
+    # the run's own session logs tee into this very directory, so a run can fill the
+    # disk that then blocks stopping it). The doctrine's unit is the *repair*, not the
+    # syscall: this stop is "delivered two ways at once" per the docstring above, so
+    # failing the whole thing because one of two redundant channels failed would leave
+    # a run alive that the pre-#319 signal path could still have killed. Keep the
+    # signal, and stay loud where it actually matters — see the refusal branch below.
+    try:
+        _write_stop_request(run_dir, "hard")
+        lodged = True
+    except OSError:
+        lodged = False
 
     host = get_process_host()
     pid, identity = read_pid_identity(run_dir)  # identity recorded at run start, not sampled now
@@ -1104,10 +1128,24 @@ def stop_run(run_dir: Path) -> bool:
                 # pid *is* still our engine, the file is the only channel left that
                 # can stop it, and discarding it here would retract a request the
                 # operator made while we decline to enforce it ourselves.
+                #
+                # That reasoning only holds while the lodge succeeded. If it did not,
+                # nothing at all is pending and we are declining to force-kill on top
+                # of that — the operator must be told, or they are left believing a
+                # request is in flight that was never written.
+                if lodged:
+                    raise StopRunError(
+                        f"run {run_dir.name}: engine pid {pid} honored neither the "
+                        "lodged stop request nor SIGTERM, and its identity can no "
+                        "longer be verified; refusing to force-kill a possibly-reused "
+                        "pid"
+                    )
                 raise StopRunError(
-                    f"run {run_dir.name}: engine pid {pid} honored neither the "
-                    "lodged stop request nor SIGTERM, and its identity can no longer "
-                    "be verified; refusing to force-kill a possibly-reused pid"
+                    f"run {run_dir.name}: the stop request could not be written to "
+                    f"the run directory and engine pid {pid} did not honor SIGTERM; "
+                    "its identity can no longer be verified, so it will not be "
+                    "force-killed. No stop is pending — free space in the run "
+                    "directory and retry, or stop the process yourself"
                 )
         # the engine clears its agent window itself, but kill the session as a
         # backstop in case it died before tearing it down
