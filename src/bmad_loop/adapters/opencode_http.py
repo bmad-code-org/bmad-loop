@@ -1075,12 +1075,23 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     budget_weighted=budget_weighted,
                 )
             # Hard-stop poll (#319), per-iteration and deliberately NOT inside the
-            # heartbeat throttle below: the loop blocks up to `POLL_TICK_S` (5s)
-            # per tick, so worst-case abort latency stays inside `stop_run`'s 10s
-            # grace window. Mirror the timeout arm exactly — without `_abort` the
-            # in-flight HTTP turn keeps running until teardown. Return the verdict;
-            # never raise `RunStopped` here, and never unlink the request file: the
-            # engine consumes it and attributes the stop.
+            # heartbeat throttle below: the loop blocks up to `POLL_TICK_S` (5s) per
+            # tick, so *detection* is bounded well inside `stop_run`'s 10s grace
+            # window. Unlike the generic adapter's arm — which returns immediately
+            # and so genuinely stays inside that window — this one then makes two
+            # HTTP round-trips against a server that may itself be wedged, and the
+            # client's 10s per-phase timeout applies to each. So the arm is NOT
+            # bounded by the grace window, by design: it gives the engine its best
+            # chance to tear itself down cleanly, and when the server will not answer
+            # it degrades to `stop_run`'s force-kill backstop — the same outcome
+            # every native-Windows stop had before #319, never a worse one. Don't
+            # "fix" this by trimming the timeouts: the same two calls serve the
+            # timeout arm, where the transcript is the whole diagnostic payload.
+            #
+            # Mirror the timeout arm exactly — without `_abort` the in-flight HTTP
+            # turn keeps running until teardown. Return the verdict; never raise
+            # `RunStopped` here, and never unlink the request file: the engine
+            # consumes it and attributes the stop.
             if self._hard_stop_requested():
                 self._note_lifecycle(handle.task_id, "stop-abort-fired")
                 self._abort(sess)

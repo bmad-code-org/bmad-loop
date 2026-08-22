@@ -42,7 +42,10 @@ breaking changes may land in a minor release.
   (worst case ~5s). SIGTERM remains the POSIX fast path rather than the mechanism, so a stop lands
   on every platform and multiplexer backend. `status --json`'s `graceful_stop_pending` is now
   mode-exact and reports only genuinely graceful requests; a modeless pre-#319 body still reads
-  graceful.
+  graceful. A run directory that rejects the write — read-only, or out of space, which a long
+  run can cause itself since session logs tee into that same directory — degrades to the signal
+  path with the stop still delivered, rather than failing the stop outright; where the pid-reuse
+  guard then also declines to force-kill, the error says nothing is pending.
 
 ### Removed
 
@@ -53,6 +56,21 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **Two `stop` invocations against one run no longer collide on a staging temp (#319).** The
+  stop-request write staged through a fixed `stop-request.json.tmp`, so interleaved writers
+  overwrote each other's staging file and the loser's rename raised `FileNotFoundError` once the
+  winner had consumed the name. Now written through the same `atomic_write_text` helper
+  `operatoractions` moved to under #379, which stages under a per-writer `mkstemp` name: the last
+  write wins and neither caller errors. This is the one control file with genuinely concurrent
+  writers, and on the hard path the raise would land before the engine was signalled.
+- **`resume` no longer re-arms a run whose stale stop request it could not remove (#319).**
+  `clear_graceful_stop` never raises — several callers depend on that — so it answered False for
+  "nothing was pending" and "could not remove it" alike. Resume read the second as the first,
+  wrote the pid, and the engine then consumed the surviving request at its first item boundary
+  and stopped again, with nothing printed to say why; resuming repeated it. Resume now re-reads,
+  refuses before the pid lands, and names the file. `stop --cancel-graceful` likewise stops
+  reporting "no stop request pending" for a request still on disk and still honorable — same
+  exit code, accurate message.
 - **A policy field of the wrong TOML type now raises `PolicyError` naming `section.key`
   (#440).** `loads()` coerced with bare `int()`/`float()`/`bool()`/`str()` outside the
   `PolicyError` funnel, so a wrong-typed value escaped every handler written to degrade on
