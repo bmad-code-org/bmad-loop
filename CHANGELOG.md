@@ -19,16 +19,21 @@ breaking changes may land in a minor release.
 - **Merge-back failures are classified from the measured tree state, and the catch-all stopped
   inventing a conflict (#619).** A merge that died part-way through its checkout — all three
   strategies, `--ff-only` included — now raises `MergeHalfAppliedError` instead of "refused
-  before starting": untracked residue is named for you to clear (measured as a before/after
-  delta, so your own strays are never attributed to git), and a tracked rewrite is reset
-  automatically under the existing clean-tree gate. A post-merge probe that itself fails — the
-  residue pair, the unmerged-stages reading, or the MERGE_HEAD reading — no longer bypasses the
+  before starting": untracked residue is named for you to clear, and a tracked rewrite is
+  restored automatically by `git checkout HEAD --` over exactly the affected paths.
+  Attribution is per path — before/after deltas intersected with the branch's incoming set —
+  so neither your pre-existing dirt nor an edit you make while the merge is failing is ever
+  called git's: the repo-wide dirtiness reading this replaces classified that concurrent-edit
+  scene "failed part-way through checkout" and its repo-wide `reset --hard HEAD` destroyed
+  the edit. A post-merge probe that itself fails — the
+  residue probes, the unmerged-stages reading, or the MERGE_HEAD reading — no longer bypasses the
   merge cleanup or impersonates a verdict: cleanup not gated on the dead reading still runs, the
   failure raises `MergeResidueUnreadError` (checkout state unverified, run `git status`), and an
   unread MERGE_HEAD skips the abort it gates and says so. A refused
   **squash commit** now raises `MergeCommitRefusedError` like the `--no-ff` leg — the squash leg
   seals its result with its own `git commit`, where commit hooks and signing do run — rolled back
-  by `git reset --hard HEAD` under the same clean-tree gate (a dirty checkout is never reset; the
+  by `git reset --hard HEAD` gated on the pre-merge reading having found the tree clean (a dirty
+  checkout is never reset; the
   escalation then names the staged result and clearing it as your first step). A content conflict
   is typed too (`MergeConflictError`), so anything unclassified escalates saying just that — run
   `git status`, git's text names the cause — instead of "resolve the conflict by hand".
@@ -69,7 +74,7 @@ breaking changes may land in a minor release.
   back verbatim — that is a supported layout, and only the canonicalization leg refuses.
 - **An unstaged edit in your main checkout no longer escalates the story and pauses an unattended
   run (#618).** Under `[scm] isolation = "worktree"` the merge pre-flight refused over any dirty
-  _tracked_ path outside the unit branch's incoming set, so a porcelain ` M` — modified in the
+  _tracked_ path outside the unit branch's incoming set, so a worktree-only porcelain `M` — modified in the
   working tree, nothing staged — stopped the run over a hazard git itself does not have. The axis
   is the index column, not trackedness: such a stray is now tolerated and journaled
   `merge-target-tolerated` alongside untracked dirt. A **staged** stray still escalates.

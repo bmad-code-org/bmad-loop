@@ -611,19 +611,25 @@ def test_squash_commit_refusal_whose_reset_also_failed_reports_staged(
 
 @pytest.mark.parametrize("diverged", [False, True], ids=["ff-able", "diverged"])
 def test_squash_preflight_refusal_never_resets_a_tree_it_found_dirty(project, tmp_path, diverged):
-    """DATA-SAFETY PIN. `--squash` has no `--abort`, so its restore is
-    `reset --hard HEAD` — which discards the operator's uncommitted work along with
-    the merge's. The old guard asked `_tree_dirty_vs_head` AFTER the squash and read
-    a checkout that was already dirty as "the squash acted", so a merge git refused
-    without touching a byte still triggered the reset and destroyed an unstaged edit
-    to a file no branch involved ever mentions (#619).
+    """DATA-SAFETY PIN. The original #619 guard replaced a restore fired on an
+    ABSOLUTE post-squash dirtiness reading, which read a checkout that was already
+    dirty as "the squash acted" — so a merge git refused without touching a byte
+    still triggered a repo-wide `reset --hard HEAD` and destroyed an unstaged edit
+    to a file no branch involved ever mentions. The guard is per PATH now (a
+    before/after delta intersected with the incoming set) and the restore is
+    path-scoped, but what this row pins is unchanged: a refusal over a dirty tree
+    writes nothing over the operator's edit.
 
     Both topologies are covered because the refusal renders differently when the
-    merge would have been a fast-forward, and neither rendering may reset.
+    merge would have been a fast-forward, and neither rendering may restore.
 
-    Ablation: restore the unconditional `if _tree_dirty_vs_head(repo)` reset and
-    both rows fail on the last assertion — with the operator's bytes gone, which is
-    the point: this test exists to make that destruction loud."""
+    Ablation (measured): drop the `- pre_untracked` subtraction and both rows
+    fail on the raised class — the stray `leak.cs`, sitting on an incoming path,
+    is read as materialized residue, which is the one shape the intersection
+    cannot shield. The operator's `src.txt` edit itself now survives even that
+    ablation (outside the incoming set), so the destruction pin has become a
+    class pin — the destruction axes have their own rows among the concurrent
+    tests below."""
     repo = project.project
     _branch_with(repo, tmp_path, adds={"leak.cs": "branch\n"})
     if diverged:
@@ -720,9 +726,10 @@ def test_merge_that_died_partway_through_checkout_is_not_a_preflight_refusal(
     leaves the operator exactly as stuck.
 
     Ablation (predicate axis): drop the `materialized` arm from `merge_branch`'s
-    discriminator and exactly these five rows fail, every other verify-layer row
-    staying green. Dropping the DELTA instead is a different ablation with a wider
-    blast radius — see the row below, which is the one that pins it."""
+    discriminator and exactly six rows fail — these four, the `ff` sibling below,
+    and the names-only row, whose expected class collapses with the arm — every
+    other verify-layer row staying green (measured). Dropping the DELTA instead
+    is a different ablation with a different witness set — see the row below."""
     repo = project.project
     _branch_whose_checkout_dies_partway(repo, tmp_path)
     if diverged:
@@ -755,27 +762,28 @@ def test_partway_checkout_restores_the_tracked_files_it_rewrote(project, tmp_pat
     following files would be overwritten by merge"), so a run told its checkout
     was unchanged fails on every resume.
 
-    Unlike the untracked axis, this one IS restorable, and `reset --hard HEAD`
-    under #619's clean-tree gate is what restores it. So the row asserts both
-    halves: the classification is `MergeHalfAppliedError` (the CAUSE is a stopped
-    checkout, not a target-state clash, and the remedies differ), and the tree is
-    genuinely put back.
+    Unlike the untracked axis, this one IS restorable, and a path-scoped
+    `git checkout HEAD --` over exactly the attributed paths is what restores it
+    — never a repo-wide reset, whose blast radius is the seventh shape's rows
+    below. So the row asserts both halves: the classification is
+    `MergeHalfAppliedError` (the CAUSE is a stopped checkout, not a target-state
+    clash, and the remedies differ), and the tree is genuinely put back.
 
     All three strategies, because all three check out. `ff` is the row that
     matters most: its leg carried an explicit "--ff-only never starts a merge"
     premise and did no residue detection at all, so a fast-forward killed
     mid-checkout left the target rewritten with nothing to restore it.
 
-    Ablation (predicate): force `tracked_dirtied` False in `_merge_residue` and
-    these three rows fail on the class. Ablation (repair): drop the
-    `_restore_tracked_residue` call from all three legs and they fail instead on
-    the file contents, which is the half a classification-only fix would have
-    missed. Measured, BOTH also redden `test_merge_squash_conflict_restores`, and
-    that is worth knowing rather than trimming out of the record: `tracked_dirtied`
-    is the same value that gates #619's pre-existing squash-conflict restore, so
-    the two behaviours share one predicate and a change to it moves both. The
-    untracked rows above stay green under either, having no tracked residue to
-    see."""
+    Ablation (repair): sever the `_restore_rewritten_paths` call from all three
+    legs and exactly nine rows fail (measured) — these three on the file
+    contents (the half a classification-only fix would have missed), the three
+    concurrent-edit compound rows below, the restore-failure row, AND two rows
+    that predate the axis: `test_merge_squash_conflict_restores` and the dead-
+    index-probe squash row. That last pair is worth keeping in the record:
+    `rewritten` is the same attributed value that gates #619's pre-existing
+    squash-conflict restore, so the two behaviours share one predicate and a
+    change to it moves both. The untracked rows above stay green, having no
+    tracked residue to see."""
     repo = project.project
     _branch_whose_checkout_dies_partway(repo, tmp_path, tracked=True)
     head_before = git(repo, "rev-parse", "HEAD")
@@ -786,7 +794,8 @@ def test_partway_checkout_restores_the_tracked_files_it_rewrote(project, tmp_pat
     assert not isinstance(ei.value, verify.MergePreflightError)
     assert "refused before starting" not in str(ei.value)
     assert ei.value.paths == ()  # nothing untracked was left, so nothing to hand over
-    assert ei.value.restored  # ...and the tracked rewrite was rolled back
+    assert ei.value.rewritten == ("aaa.txt",)  # the tracked rewrite, named
+    assert ei.value.restored  # ...and rolled back
     assert (repo / "aaa.txt").read_text() == "original aaa\n"
     assert git(repo, "status", "--porcelain") == ""
     assert git(repo, "rev-parse", "HEAD") == head_before
@@ -825,24 +834,28 @@ def test_ff_only_killed_mid_checkout_is_not_a_preflight_refusal(project, tmp_pat
 
 
 def test_partway_checkout_failure_names_only_what_git_wrote(project, tmp_path):
-    """The residue is reported as a before/after DELTA, so the operator's own
-    pre-existing strays are never handed to them as git's doing.
+    """The residue is reported as a before/after DELTA intersected with the
+    incoming set, so the operator's own pre-existing strays are never handed to
+    them as git's doing.
 
-    An absolute post-merge reading of `ls-files --others` would name every
+    An absolute, unintersected reading of `ls-files --others` would name every
     untracked file in the checkout — and the message tells the operator to clear
     what it names, over a checkout the guard deliberately tolerates strays in
     (#460). Naming one is how a correct fix to the classification would have
     become a worse bug than the one it replaced.
 
-    Ablation: drop the `- pre_untracked` subtraction and this row fails on the
-    equality — and so, measured, do SIX pre-existing rows that predate this fix:
-    both `untracked-overwrite` shapes, both `shape-clash` shapes, and both
-    topologies of the reset data-safety pin. That is not incidental breakage, it is
-    the second half of the same defect: each of those stages a genuine pre-flight
-    refusal with an untracked stray already in the checkout, so an absolute reading
-    finds that stray afterwards and reclassifies a merge git refused without
-    touching a byte as one that half-applied. The subtraction is what keeps the two
-    classes disjoint, not merely what keeps this row's message tidy."""
+    For a stray OUTSIDE the incoming set — this row's `operator-notes.txt` — the
+    two proofs deliberately OVERLAP: measured, dropping the `- pre_untracked`
+    subtraction alone leaves this row green (the intersection shields it) and so
+    does dropping the intersection alone (the delta shields it). Neither ablation
+    is inert, their witnesses are just DISJOINT: the subtraction alone holds the
+    strays the intersection cannot shield (a stray already sitting on an incoming
+    path — the untracked-overwrite pre-flight rows and both topologies of the
+    dirty-tree data-safety pin redden, measured), and the intersection alone
+    holds the writes the delta cannot (everything landing mid-window — the
+    concurrent rows below). What reddens THIS row alone is the predicate: drop
+    the `materialized` arm from the discriminator and the class this equality
+    sits behind collapses."""
     repo = project.project
     (repo / "operator-notes.txt").write_text("mine\n")  # untracked, predates the merge
     _branch_whose_checkout_dies_partway(repo, tmp_path)
@@ -853,6 +866,216 @@ def test_partway_checkout_failure_names_only_what_git_wrote(project, tmp_path):
     assert ei.value.paths == ("aaa.txt",)
     assert "operator-notes.txt" not in str(ei.value)
     assert (repo / "operator-notes.txt").read_text() == "mine\n"  # and left alone
+
+
+def _operator_who_writes_mid_merge(monkeypatch, repo, rel="src.txt", content=None):
+    """Land an operator's write inside the MERGE WINDOW: after `_residue_snapshot`'s
+    pre-merge reading, before the failure is classified. Staged by delegating
+    through the `_git` seam and writing just as the merge argv itself reaches git —
+    the one moment both samples of the before/after pair have to disagree about.
+    Argv-matched to the three merge invocations so the `merge` leg's own
+    `merge --abort` never re-fires it."""
+    real = verify._git
+
+    def racing(r, *args):
+        if args and args[0] == "merge" and args[1] in ("--ff-only", "--no-ff", "--squash"):
+            (repo / rel).write_text(content if content is not None else "operator mid-merge\n")
+        return real(r, *args)
+
+    monkeypatch.setattr(verify, "_git", racing)
+
+
+@pytest.mark.parametrize("strategy", ["ff", "merge", "squash"])
+def test_concurrent_edit_during_a_refused_merge_is_neither_attributed_nor_destroyed(
+    project, tmp_path, strategy, monkeypatch
+):
+    """The SEVENTH mislabeled git state: a concurrent operator edit landing during
+    the merge window, attributed to git by a repo-WIDE dirtiness reading.
+
+    The tracked half of the residue answer used to be one boolean — "the tree was
+    clean before and is dirty now" — so an edit to ANY tracked file between the
+    two readings made it True. Here the base state is a genuine untracked-overwrite
+    pre-flight refusal (git touched nothing), and the mid-window edit lands on
+    `src.txt`, a file the incoming branch never mentions: the old classifier called
+    that "failed part-way through checkout" (fiction) and its restore — a repo-wide
+    `reset --hard HEAD` — DESTROYED the edit, on all three legs alike (measured).
+
+    Attribution is now per PATH: the dirty-tracked set is sampled before and after
+    and differenced, and only the part of that delta lying INSIDE the branch's
+    incoming set — the only paths the merge can write — is git's. A bystander edit
+    is outside it by construction, so the class stays pre-flight and no restore
+    fires over the operator's bytes.
+
+    Ablation (attribution axis): drop the `& incoming` intersection in
+    `_merge_residue` and all three rows fail twice over — the class collapses to
+    `MergeHalfAppliedError` and the edit is gone from disk. Ablation (delta axis):
+    drop the `- pre_dirty_paths` subtraction instead and these rows stay green
+    (the edit lands inside the window, so the delta never excluded it) — the
+    staged-on-incoming pre-flight rows are what hold that axis (measured: exactly
+    those two redden, a pre-existing staged edit on an incoming path being the
+    one tracked dirt the intersection cannot shield)."""
+    repo = project.project
+    _preflight_untracked_overwrite(repo, tmp_path)
+    head_before = git(repo, "rev-parse", "HEAD")
+    _operator_who_writes_mid_merge(monkeypatch, repo, "src.txt", "operator mid-merge\n")
+
+    with pytest.raises(verify.MergePreflightError) as ei:
+        verify.merge_branch(repo, "feat", strategy=strategy, message="m")
+
+    msg = str(ei.value)
+    assert "refused before starting" in msg
+    assert "failed part-way" not in msg
+    assert "src.txt" not in msg  # the bystander is not named as git's residue
+    assert (repo / "src.txt").read_text() == "operator mid-merge\n"  # and survives
+    assert git(repo, "rev-parse", "HEAD") == head_before
+
+
+@pytest.mark.parametrize("strategy", ["ff", "merge", "squash"])
+def test_concurrent_edit_during_a_partway_checkout_is_parted_from_gits_residue(
+    project, tmp_path, strategy, monkeypatch
+):
+    """The same race compounded with a GENUINE part-way checkout: git really did
+    rewrite an incoming tracked path (`aaa.txt`) before dying, and the operator's
+    bystander edit (`src.txt`) lands in the same window.
+
+    Both halves of the claim are asserted per path: the class holds (this IS
+    half-applied), git's own rewrite is restored — by `git checkout HEAD --` over
+    exactly the attributed paths, never a repo-wide reset — and the operator's
+    edit is neither restored away nor named in the message. The old repo-wide
+    boolean could not say WHICH paths were git's, so its restore was all-or-nothing
+    and this scene lost the edit.
+
+    Ablation (restore-scope axis): put the repo-wide `reset --hard HEAD` back as
+    the half-applied restore and these three rows fail on the operator's bytes —
+    the class and `aaa.txt` both stay correct, which is why the scope needs its
+    own rows. Ablation (attribution axis): dropping `& incoming` reddens these on
+    the message naming `src.txt` and on its bytes."""
+    repo = project.project
+    _branch_whose_checkout_dies_partway(repo, tmp_path, tracked=True)
+    head_before = git(repo, "rev-parse", "HEAD")
+    _operator_who_writes_mid_merge(monkeypatch, repo, "src.txt", "operator mid-merge\n")
+
+    with pytest.raises(verify.MergeHalfAppliedError) as ei:
+        verify.merge_branch(repo, "feat", strategy=strategy, message="m")
+
+    assert ei.value.rewritten == ("aaa.txt",)  # git's rewrite, attributed by path
+    assert ei.value.restored is True
+    assert "src.txt" not in str(ei.value)
+    assert (repo / "aaa.txt").read_text() == "original aaa\n"  # git's half: restored
+    assert (repo / "src.txt").read_text() == "operator mid-merge\n"  # theirs: kept
+    assert git(repo, "rev-parse", "HEAD") == head_before
+
+
+def test_concurrent_untracked_file_during_a_refused_merge_is_not_reported(
+    project, tmp_path, monkeypatch
+):
+    """The untracked axis of the same window: an operator dropping a scratch file
+    mid-merge used to flip a genuine pre-flight refusal into "failed part-way
+    through checkout" and hand them their own file with an instruction to clear
+    it — the delta proves the path is NEW, not that git wrote it. The incoming
+    set is what proves that, so the materialized reading is intersected with it
+    exactly as the tracked one is.
+
+    Ablation: intersect only the tracked half and this row fails alone on the
+    class and the named path, the tracked rows above staying green."""
+    repo = project.project
+    _preflight_untracked_overwrite(repo, tmp_path)
+    _operator_who_writes_mid_merge(monkeypatch, repo, "scratch.txt", "operator notes\n")
+
+    with pytest.raises(verify.MergePreflightError) as ei:
+        verify.merge_branch(repo, "feat", strategy="merge")
+
+    assert "scratch.txt" not in str(ei.value)
+    assert (repo / "scratch.txt").read_text() == "operator notes\n"  # left alone
+
+
+def test_partway_checkout_with_a_dead_incoming_probe_is_reported_unverified(
+    project, tmp_path, monkeypatch
+):
+    """The incoming-set reading is a post-merge probe like its three siblings, so
+    a failure there must degrade to the same unread marker: without the incoming
+    set the delta cannot be attributed in either direction, and claiming
+    pre-flight ("git touched nothing") or half-applied (with a restore riding on
+    it) would both stand on a reading that died. It is also read LAZILY — only a
+    non-empty delta needs attributing — so a refusal over an unresolvable ref
+    still classifies as the pre-flight refusal it is instead of dying on a probe
+    the clean scene never needed.
+
+    Ablation (wrap axis): re-raise in `_merge_residue` and this fails on the
+    raised type. Ablation (lazy axis): read the incoming set unconditionally and
+    the row below fails instead — the clean-delta scene starts consulting a ref
+    that cannot answer."""
+    repo = project.project
+    _branch_whose_checkout_dies_partway(repo, tmp_path, tracked=True)
+
+    def dead_incoming(r, branch):
+        raise verify.GitError(f"git diff --name-only HEAD {branch} failed in {r}: incoming boom")
+
+    monkeypatch.setattr(verify, "_incoming_paths", dead_incoming)
+
+    with pytest.raises(verify.MergeResidueUnreadError) as ei:
+        verify.merge_branch(repo, "feat", strategy="squash")
+
+    msg = str(ei.value)
+    assert "checkout state unverified" in msg
+    assert "AND the residue probe failed" in msg and "incoming boom" in msg
+    assert "failed part-way" not in msg
+    # nothing was restored on an unattributable delta: the residue survives, unread
+    assert (repo / "aaa.txt").read_text() == "incoming aaa\n"
+
+
+def test_refusal_with_a_clean_delta_never_reads_the_incoming_set(project, tmp_path, monkeypatch):
+    """The lazy half of the incoming probe's contract, pinned from the scene that
+    motivated it: a pre-flight refusal that left NO new dirt needs no attribution,
+    so the incoming set is never read — and a monkeypatched probe that would die
+    proves it was not consulted. This is what keeps refusals over an unresolvable
+    ref (`branch_exists` raced away, unrelated histories) classifying as the
+    pre-flight refusals they are rather than as unread."""
+    repo = project.project
+    _preflight_untracked_overwrite(repo, tmp_path)
+
+    def dead_incoming(r, branch):
+        raise verify.GitError("incoming probe consulted on a clean delta")
+
+    monkeypatch.setattr(verify, "_incoming_paths", dead_incoming)
+
+    with pytest.raises(verify.MergePreflightError):
+        verify.merge_branch(repo, "feat", strategy="merge")
+
+
+def test_half_applied_restore_failure_reports_the_rewritten_paths_unrestored(
+    project, tmp_path, monkeypatch
+):
+    """The path-scoped restore is a repair write like the reset it replaced, so
+    its failure must be carried, not implied away: `restored` flips False, the
+    note names the failure, and `rewritten` still hands the caller the exact
+    paths — which is what lets the escalation prescribe a path-scoped recovery
+    instead of the repo-wide `reset --hard` whose blast radius this fix removed.
+
+    Failed through the `_git` seam by argv, like the reset sibling above: there
+    is no portable way to make a real `git checkout HEAD --` fail on demand.
+
+    Ablation: hardcode `restored=True` past the failed restore and this row
+    fails on the flag and the note while the restoring sibling stays green."""
+    repo = project.project
+    _branch_whose_checkout_dies_partway(repo, tmp_path, tracked=True)
+    real_git = verify._git
+
+    def failing_checkout(r, *args):
+        if args[:2] == ("checkout", "HEAD"):
+            return 1, "fatal: could not restore"
+        return real_git(r, *args)
+
+    monkeypatch.setattr(verify, "_git", failing_checkout)
+
+    with pytest.raises(verify.MergeHalfAppliedError) as ei:
+        verify.merge_branch(repo, "feat", strategy="ff")
+
+    assert ei.value.restored is False
+    assert ei.value.rewritten == ("aaa.txt",)
+    assert "tracked residue not restored" in str(ei.value)
+    # the tree really is unrestored: the incoming rewrite is still in place
+    assert (repo / "aaa.txt").read_text() == "incoming aaa\n"
 
 
 def _probe_that_dies_on_its_second_reading(monkeypatch):
@@ -1001,8 +1224,8 @@ def test_conflict_with_a_dead_index_probe_is_reported_unverified(
     half-applied (`squash`: the markers dirty a pre-clean tree).
 
     The cleanup is NOT skipped with the classification: the abort stays gated
-    on the still-live merge-state reading and the squash reset on the proven
-    pre/post attribution, so both run here exactly as they would for the
+    on the still-live merge-state reading and the squash restore on the proven
+    per-path attribution, so both run here exactly as they would for the
     classified conflict.
 
     Ablation (wrap axis): re-raise instead of catch in `_index_unmerged` and
@@ -1029,8 +1252,8 @@ def test_conflict_with_a_dead_index_probe_is_reported_unverified(
     assert "refused the commit" not in msg
     assert git(repo, "rev-parse", "HEAD") == head_before
     # the cleanup still ran: the merge leg aborted the started merge, the squash
-    # leg reset the attributed dirt — read through the test's own git, since the
-    # module's index probe is dead by construction here.
+    # leg restored the attributed dirt — read through the test's own git, since
+    # the module's index probe is dead by construction here.
     assert verify._merge_in_progress(repo) == (False, None)
     assert git(repo, "ls-files", "-u") == ""
     assert (repo / "src.txt").read_text() == "main change\n"
@@ -1083,8 +1306,8 @@ def test_commit_refusal_with_a_dead_merge_state_probe_skips_the_abort_and_says_s
 
     Degraded silently instead (False with no marker), this scene half-applies:
     "neither collided nor started" stands unmeasured, the class collapses to
-    `MergeHalfAppliedError`, and the half-applied arm's `reset --hard` fires
-    over a mid-merge checkout it was never meant to touch.
+    `MergeHalfAppliedError`, and the half-applied arm's restore fires over a
+    mid-merge checkout it was never meant to touch.
 
     Ablation (wrap axis): re-raise in `_merge_in_progress` and this fails on
     the raised type — the probe's own `GitSpawnError` escapes. Ablation
@@ -1136,8 +1359,9 @@ def test_squash_replay_ignores_preexisting_unstaged_dirt(project, tmp_path):
     skipped, `git commit` found nothing staged, and a host-loss recovery was reported
     as a failed merge. The index is the honest question (#619).
 
-    Ablation: put the gate back on `_tree_dirty_vs_head` and this fails with a
-    GitError naming "no changes added to commit"."""
+    Ablation: gate the early return on a worktree-dirtiness reading
+    (`git diff --quiet HEAD`) again and this fails with a GitError naming
+    "no changes added to commit"."""
     repo = project.project
     _branch_with(repo, tmp_path, adds={"f.txt": "branch\n"})
     verify.merge_branch(repo, "feat", strategy="squash", message="squash feat")  # the lost commit
@@ -1151,10 +1375,11 @@ def test_squash_replay_ignores_preexisting_unstaged_dirt(project, tmp_path):
 
 
 def test_no_ff_conflict_with_preexisting_dirt_aborts_and_keeps_it(project, tmp_path):
-    """The `merge` leg's restore is `git merge --abort`, which — unlike the squash
-    leg's `reset --hard` — leaves an unstaged edit to an untouched tracked file
-    alone. So a genuine conflict still aborts even with the checkout dirty, and the
-    operator keeps both their edit and the conflict to resolve (#619).
+    """The `merge` leg's restore is `git merge --abort`, which — like the
+    path-scoped restore the squash leg uses now, and unlike the repo-wide
+    `reset --hard` it used to — leaves an unstaged edit to an untouched tracked
+    file alone. So a genuine conflict still aborts even with the checkout dirty,
+    and the operator keeps both their edit and the conflict to resolve (#619).
 
     Ablation: none of the #619 guards can redden this row; it is the control that
     proves the squash-leg fix did not have to be applied here too."""

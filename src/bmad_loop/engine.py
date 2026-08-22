@@ -6213,11 +6213,16 @@ class Engine:
         ``board-advance-carry-failed`` already names that outcome.
 
         Fail CLOSED on git, like both siblings and for their reason. The board's own
-        parse is deliberately NOT caught: ``advance`` raises ``SprintStatusError`` out
-        of the caller for a board that is missing or carries no ``development_status``
-        map, and reading the live row FIRST leaves that raise exactly where it was
-        rather than quietly converting it into a refusal. A path HEAD does not carry
-        accepts — the #460 boundary the sibling draws, drawn once for both.
+        parse is deliberately NOT caught: for a board that carries no
+        ``development_status`` map (or is not YAML at all) the live read here raises
+        ``SprintStatusError`` exactly as ``advance`` would have raised it one call
+        later, and quietly converting that into a refusal would dress a corrupt
+        board as an operator's edit. A MISSING board is a different case and never
+        reaches this frame: over one, ``advance`` returns None where this read's
+        ``load`` raises — the two disagree, which is why the caller refuses the
+        shape up front (``board-advance-carry-failed``) rather than letting the
+        probe die on a file the writer would have shrugged at. A path HEAD does not
+        carry accepts — the #460 boundary the sibling draws, drawn once for both.
         """
         live = sprint_story_status(board, story_key)
         if live is None or _at_or_past(live, target):
@@ -6363,12 +6368,16 @@ class Engine:
         that is a different question from whether it wrote — the one this method has
         to ask before naming its outcome ``board-advance-carried``. It answers
         below-target in two shapes, both of them a carry that did not happen: `None`
-        when the main board or the story's row is gone (deleted or renamed while the
-        isolated session held its own copy, or before a merge-to-carry replay), and
+        when the story's row is gone (deleted or renamed while the isolated session
+        held its own copy, or before a merge-to-carry replay), and
         the current status when the row is there but ``_set_mapping_value``'s line
         regex could not rewrite it — a quoted or block-scalar key, which
         ``story_status``'s full YAML parse resolves and the writer then declines.
-        Latching either as carried would file a success for a main board still
+        A whole board that is gone is the shape ``advance`` cannot be allowed to
+        answer for at all: it returns None over a missing file, but the pre-advance
+        row probe's own read raises ``SprintStatusError`` there — so the caller
+        refuses it before either runs, on the same journal row. Latching any of
+        these as carried would file a success for a main board still
         sitting in ``ACTIONABLE_STATUSES``, and the run would tear the worktree
         holding the advanced copy down on the strength of that record. It journals
         ``board-advance-carry-failed`` instead and skips the commit, which has
@@ -6381,6 +6390,22 @@ class Engine:
         if not target:
             return
         board = self.paths.sprint_status
+        if not board.is_file():
+            # A board that is GONE is refused here, before the ownership probes:
+            # `advance` answers None over a missing file, but the foreign-row
+            # probe's own live read (`sprint_story_status` → `load`) raises
+            # `SprintStatusError` for it — and a deleted TRACKED board is exactly
+            # the shape that turns proving on (` D` in `dirty_paths`), so on the
+            # replay leg that raise escaped `_replay_unlatched_ledger_carries`
+            # and killed every resume before `_loop()`. The is_file-to-advance
+            # window this leaves is #686's TOCTOU, not this guard's.
+            self.journal.append(
+                "board-advance-carry-failed",
+                story_key=task.story_key,
+                target=target,
+                status=None,
+            )
+            return
         prove = self._board_carry_must_prove_ownership(board)
         if prove:
             # `is not None`, not truthiness: an empty status is still somebody's edit.

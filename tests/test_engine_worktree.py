@@ -3497,6 +3497,44 @@ def test_half_applied_escalation_with_both_residues_orders_restore_first(project
     assert "Assets/Gen.cs" in reason
 
 
+def test_half_applied_escalation_prescribes_a_path_scoped_restore(project, monkeypatch):
+    """The failed-restore clause hands the operator the SAME path-scoped write the
+    run itself attempted — `git checkout HEAD --` over `e.rewritten` — never the
+    repo-wide `git reset --hard HEAD` it used to prescribe. That advice went stale
+    the moment the restore became per-path: the restore can now fail with the
+    operator's own uncommitted work elsewhere in the tree (per-path attribution is
+    what allows it to run over such a tree at all), so following the old
+    prescription would flatten exactly the work the attribution spared.
+
+    Ablation: put the `git reset --hard HEAD` wording back in the clause and this
+    row fails on both command assertions; drop the `e.rewritten` interpolation
+    and it fails on the path."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
+    )
+    exc = verify.MergeHalfAppliedError(
+        "git merge --ff-only feat failed in /repo (failed part-way through checkout): "
+        "fatal: smudge filter boom; AND git checkout HEAD -- <paths> failed "
+        "(tracked residue not restored): fatal: could not restore",
+        restored=False,
+        rewritten=("boards/sprint.yaml",),
+    )
+
+    def refuse_merge(*a, **kw):
+        raise exc
+
+    monkeypatch.setattr(verify, "merge_branch", refuse_merge)
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and not summary.crashed
+    reason = engine.state.paused_reason or ""
+    assert "`git checkout HEAD -- boards/sprint.yaml`" in reason
+    assert "reset --hard HEAD` in" not in reason  # the repo-wide advice is gone
+    assert "never a repo-wide `git reset --hard`" in reason
+
+
 def test_half_applied_merge_escalation_names_the_residue_from_the_exception_paths(
     project, monkeypatch
 ):
@@ -4900,6 +4938,61 @@ def test_replayed_board_carry_still_commits_a_crashed_passs_own_advance(project)
     assert "board-advance-carried" in kinds
     assert "board-advance-carry-foreign-dirt" not in kinds
     assert "board-advance-carry-uncommitted" not in kinds
+
+
+def test_replayed_board_carry_with_a_deleted_board_journals_failed_not_a_crash(project):
+    """A tracked board DELETED while the host was down, on the replay leg — the
+    shape where the carry's own docstring promise (`board-advance-carry-failed`
+    for "a board that is gone") and its probes' behavior used to disagree.
+
+    Deletion is dirt (` D` in `dirty_paths`), so it turns proving ON — and the
+    pre-advance row probe's live read (`sprint_story_status` → `load`) RAISES
+    `SprintStatusError` over a missing file, where `advance`, whose behavior the
+    no-catch rationale was written against, returns None. That raise escaped
+    `_replay_unlatched_ledger_carries` (which catches only `RunPaused`), so every
+    resume died before `_loop()` — the one caller every resume runs through, on a
+    shape a retry cannot repair. The carry now refuses a missing board up front,
+    on the journal row already named for it.
+
+    Driven through `_replay_unlatched_ledger_carries` itself so the raise, when
+    the guard is ablated, is the failure graded — a full `resumed.run()` would
+    also trip over the missing board in `_pick_next` and muddy the axis.
+
+    Ablation: drop the `board.is_file()` guard and this row dies on
+    `SprintStatusError: sprint status file not found` at the replay call — the
+    measured pre-fix behavior — while the foreign-dirt and own-advance siblings
+    above stay green, their boards being present in every scene."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    board = project.sprint_status
+    rel = board.relative_to(project.project).as_posix()
+    engine, _ = make_engine(project, [wt_dev_effect(project, "1-1-a", followup_review=False)])
+    crash_at_merge_back(engine, after="merge")
+
+    assert engine.run().crashed
+    assert "unit-merged" in journal_kinds(engine)
+    crashed = load_state(engine.run_dir).tasks["1-1-a"]
+    assert crashed.phase == Phase.DONE and not crashed.isolated_ledger_carried
+    assert crashed.board_advance_intended == "done"
+
+    board.unlink()  # the operator's window is the crash itself
+    assert verify.dirty_paths(project.project).get(rel, "").strip() == "D"  # proving turns ON
+
+    state = load_state(engine.run_dir)
+    state.clear_pause()
+    resumed = Engine(
+        paths=project,
+        policy=engine.policy,
+        adapter=MockAdapter([]),
+        run_dir=engine.run_dir,
+        journal=engine.journal,
+        state=state,
+    )
+    resumed._replay_unlatched_ledger_carries()  # must not raise
+
+    kinds = journal_kinds(resumed)
+    assert "board-advance-carry-failed" in kinds
+    assert "board-advance-carried" not in kinds
+    assert not board.exists()  # refused, never recreated or half-written
 
 
 def test_board_advance_carried_twice_by_a_crash_before_its_latch_is_a_no_op(project):

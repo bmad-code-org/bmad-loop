@@ -1718,19 +1718,29 @@ class WorktreeFlow:
             # ones actually apply — so the middle of this message is composed rather
             # than picked from a fixed set. An incoming path the target did not track
             # lands untracked and no restore reaches it, so it is theirs to clear; one
-            # it DID track was modified in place and `merge_branch` has already reset
-            # it, unless that reset failed too.
+            # it DID track was modified in place and `merge_branch` has already
+            # restored it path-scoped, unless that restore failed too.
             # The restore clause LEADS when both apply: it says "before anything
             # else" and means it — a resume dies on the tracked residue first —
             # so the untracked clause defers to it ("then") rather than both
             # claiming first place in one message.
+            # The prescription is path-scoped for the reason the restore itself is:
+            # only the named paths are proven git's, and a repo-wide
+            # `git reset --hard HEAD` would flatten the operator's own uncommitted
+            # work alongside them — the destruction the per-path attribution exists
+            # to prevent.
             steps: list[str] = []
             if not e.restored:
+                rewritten = (
+                    " ".join(e.rewritten) if e.rewritten else "<the paths git's message names>"
+                )
                 steps.append(
                     f"The tracked files git had already rewritten could NOT be rolled "
                     f"back — that failure is in the message below too — so {target} is "
-                    f"still holding incoming content on those paths. Restore it "
-                    f"(`git reset --hard HEAD` in {target}) before anything else."
+                    f"still holding incoming content on those paths. Restore exactly "
+                    f"those paths (`git checkout HEAD -- {rewritten}` in {target}, "
+                    f"never a repo-wide `git reset --hard`, which would flatten your "
+                    f"own uncommitted work too) before anything else."
                 )
             if e.paths:
                 steps.append(
