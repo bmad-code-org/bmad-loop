@@ -738,6 +738,109 @@ def test_partway_checkout_failure_names_only_what_git_wrote(project, tmp_path):
     assert (repo / "operator-notes.txt").read_text() == "mine\n"  # and left alone
 
 
+def _probe_that_dies_on_its_second_reading(monkeypatch):
+    """Fail `_untracked_paths` on its POST-merge reading only.
+
+    Reading number two is the one `_merge_residue` takes after the merge has
+    failed; number one is `_residue_snapshot`'s, which runs while nothing has
+    been mutated and deliberately KEEPS its raise — failing it would abort the
+    merge outright and never reach the classification these rows pin. Counted
+    rather than argv-matched because both readings run the same git command;
+    only their position tells them apart."""
+    real_probe = verify._untracked_paths
+    reads = {"n": 0}
+
+    def dying_probe(repo):
+        reads["n"] += 1
+        if reads["n"] >= 2:
+            raise verify.GitError(f"git ls-files --others failed in {repo}: probe boom")
+        return real_probe(repo)
+
+    monkeypatch.setattr(verify, "_untracked_paths", dying_probe)
+
+
+@pytest.mark.parametrize("strategy", ["ff", "merge", "squash"])
+def test_partway_checkout_with_a_dead_probe_is_reported_unverified(
+    project, tmp_path, strategy, monkeypatch
+):
+    """The classification's terminal state: the merge failed AND the post-merge
+    residue reading failed, so no verdict exists — and the raise says THAT,
+    rather than letting the probe error escape or its empty degrade impersonate
+    a verdict.
+
+    Unwrapped, the probe's raise escapes `merge_branch` as its own `GitError`
+    wearing a probe error's text, which `merge_local`'s last arm reads as a
+    content conflict. Degraded silently, the empty reading lands in
+    `MergePreflightError`, whose load-bearing clause — the checkout was never
+    touched — is exactly what stopped being known. `MergeResidueUnreadError` is
+    the honest remainder: it carries git's own failure text AND the probe's, and
+    claims nothing about the tree.
+
+    The scene is a genuine part-way checkout (the rows above prove what it
+    leaves behind), so these rows also pin the safe side of the degrade: the
+    residue that IS there goes unreported rather than misreported, and nothing
+    is reset on an unproven attribution.
+
+    Ablation (wrap axis): re-raise instead of catch in `_merge_residue` and
+    these three rows fail on the raised type — the probe's own `GitError`
+    escapes. Ablation (claim axis): route the unread case to
+    `MergePreflightError` instead and they fail on the phrase assertions. The
+    commit-refused row below stays green through the claim ablation, which is
+    what parts the wrap from the claim."""
+    repo = project.project
+    _branch_whose_checkout_dies_partway(repo, tmp_path)
+    head_before = git(repo, "rev-parse", "HEAD")
+    _probe_that_dies_on_its_second_reading(monkeypatch)
+
+    with pytest.raises(verify.MergeResidueUnreadError) as ei:
+        verify.merge_branch(repo, "feat", strategy=strategy)
+
+    assert not isinstance(ei.value, verify.MergePreflightError)
+    msg = str(ei.value)
+    assert "checkout state unverified" in msg
+    assert "AND the residue probe failed" in msg and "probe boom" in msg
+    assert "refused before starting" not in msg
+    assert "left untracked" not in msg  # unread — so nothing is (mis)reported either
+    assert git(repo, "rev-parse", "HEAD") == head_before
+    assert not verify._merge_in_progress(repo)
+    # the safe side of the degrade: the residue survives, unread rather than reset
+    assert (repo / "aaa.txt").read_text() == "incoming aaa\n"
+
+
+def test_commit_refusal_with_a_dead_probe_still_aborts_the_merge(project, tmp_path, monkeypatch):
+    """The cleanup half of the wrap, and the scenario that motivated it: the
+    residue probe dies AFTER `--no-ff` has already created MERGE_HEAD. Unwrapped,
+    that raise escapes BEFORE the abort block runs, so the target is stranded
+    mid-merge — over a commit git had already refused for an unrelated reason —
+    and every resume then dies on the merge state instead of the policy.
+
+    The classification owes nothing to the residue pair here: MERGE_HEAD was
+    read before the probe, so the commit-refused verdict stands on its own
+    measurement, and this row pins that a dead probe changes NEITHER the class
+    NOR the abort. Only the choice between pre-flight and half-applied ever
+    rested on the residue reading (the rows above).
+
+    Ablation: re-raise instead of catch in `_merge_residue` and this row fails
+    twice over — the type collapses to the probe's `GitError` and MERGE_HEAD
+    survives the escape. The claim-axis ablation (unread routed to pre-flight)
+    leaves it green, which is what makes it the wrap's row rather than the
+    claim's."""
+    repo = project.project
+    _cleanly_mergeable_branch(repo, tmp_path)
+    head_before = git(repo, "rev-parse", "HEAD")
+    git(repo, "config", "commit.gpgsign", "true")
+    git(repo, "config", "gpg.program", "bmad-loop-no-such-signer")
+    _probe_that_dies_on_its_second_reading(monkeypatch)
+
+    with pytest.raises(verify.MergeCommitRefusedError) as ei:
+        verify.merge_branch(repo, "feat", strategy="merge")
+
+    assert ei.value.restored is True
+    assert not verify._merge_in_progress(repo)  # the abort still ran
+    assert not (repo / "feature.txt").exists()
+    assert git(repo, "rev-parse", "HEAD") == head_before
+
+
 def test_squash_replay_ignores_preexisting_unstaged_dirt(project, tmp_path):
     """`allow_empty_squash` recognises a replay by "the squash staged nothing" — the
     target already carries the merged tree. Asking that of the WORKING TREE let a

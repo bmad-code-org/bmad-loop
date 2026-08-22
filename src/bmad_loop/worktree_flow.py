@@ -1756,6 +1756,26 @@ class WorktreeFlow:
             )
             self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
             return  # defensive: never fall through to the success teardown below
+        except verify.MergeResidueUnreadError as e:
+            # The terminal arm's caller-side half, and another sibling that must
+            # precede the bare `GitError` arm. Neither neighbour's sentence can be
+            # borrowed: the pre-flight arm's "the target checkout is unchanged" is
+            # exactly the claim the dead probe can no longer back, and the
+            # half-applied arm names residue this run never read. Say what IS known
+            # — the merge failed, git's text below names why — and send the operator
+            # to the one reading the run could not take, which their own `git
+            # status` still can.
+            reason = (
+                f"merge of {unit.branch} into {target} failed, AND the after-the-fact "
+                f"probe that verifies the checkout failed too, so whether {target}'s "
+                f"checkout still holds incoming residue is UNVERIFIED. Run `git "
+                f"status` in {target}: clear any residue it names that is not yours "
+                f"(files from {unit.branch} left untracked or rewritten), fix what "
+                f"stopped the merge — git's message below names it — then "
+                f"`bmad-loop resume {self.state.run_id}`. {e}"
+            )
+            self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
+            return  # defensive: never fall through to the success teardown below
         except verify.MergeCommitRefusedError as e:
             # Sibling of the arm above and equally a GitError subclass, so it too must
             # precede the arm below. Neither neighbour's remedy applies here: the merge

@@ -3502,6 +3502,7 @@ _MERGE_FAILURE_PHRASES = (
     "left MID-MERGE",
     "content conflict",
     "failed PART-WAY THROUGH",
+    "UNVERIFIED",
 )
 
 
@@ -3548,6 +3549,14 @@ _MERGE_FAILURE_PHRASES = (
             ),
             "failed PART-WAY THROUGH",
         ),
+        (
+            lambda: verify.MergeResidueUnreadError(
+                "git merge --squash feat failed in /repo (checkout state unverified): "
+                "fatal: zzz.dat: smudge filter boom failed; AND the residue probe "
+                "failed: git ls-files --others failed in /repo: probe boom"
+            ),
+            "UNVERIFIED",
+        ),
     ],
     ids=[
         "preflight-refusal",
@@ -3555,6 +3564,7 @@ _MERGE_FAILURE_PHRASES = (
         "commit-refused-unrestored",
         "content-conflict",
         "half-applied",
+        "residue-unread",
     ],
 )
 def test_merge_failure_escalation_tells_a_preflight_refusal_from_a_conflict(
@@ -3589,6 +3599,14 @@ def test_merge_failure_escalation_tells_a_preflight_refusal_from_a_conflict(
     and it is the row the cross-check matters most for, since the phrase it must
     never carry is the pre-flight arm's "the target checkout is unchanged" claim,
     which is false here in the exact clause the operator acts on.
+
+    `residue-unread` is the terminal state: the merge failed and the post-merge
+    residue reading failed too, so neither the pre-flight claim (the checkout is
+    unchanged) nor the half-applied one (these files were left) is available. Its
+    arm says the state is UNVERIFIED and sends the operator to their own
+    `git status` — the reading the run could not take. Without the arm it falls
+    to the content-conflict catch-all, which is the #619 defect wearing a probe
+    error's text.
 
     Ablation: delete either subclass arm from `merge_local` and its rows fail on
     both halves while the others stay green; collapse the `e.restored` branch to the

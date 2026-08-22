@@ -43,6 +43,15 @@ breaking changes may land in a minor release.
   tracked axis cannot be attributed to git at all, so such a failure is still reported as a plain
   pre-flight refusal — "cannot tell" and "git did nothing" deliberately fail to the same side,
   because the alternative is resetting an operator's uncommitted work.
+  The residue probes are themselves git reads, and their own failure no longer bypasses the
+  cleanup: a probe that died on its post-merge reading used to escape before the `merge --abort`,
+  stranding a started `--no-ff` merge mid-merge and surfacing as a content conflict. The probe
+  raise is now caught, the abort still runs, and conflict and commit-refusal keep their verdicts —
+  they stand on their own measurements. Only the choice those probes existed to make, refusal
+  versus half-applied, rested on the dead reading, so that case raises a fifth type,
+  `MergeResidueUnreadError`: the checkout state is **unverified**, and the escalation sends you to
+  the one reading the run could not take — your own `git status` — instead of claiming a state it
+  never measured.
 - **psmux: a hand-back that succeeded no longer reports as failed — or undoes itself (#659).**
   `switch_client` read its verdict off the session's attached-client count, which a same-session
   move cannot change — and same-session is the common shape for the return path, so a correct
