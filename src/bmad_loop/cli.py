@@ -3584,7 +3584,12 @@ def cmd_tui(args: argparse.Namespace) -> int:
     try:
         from .tui.app import run_tui
     except ModuleNotFoundError as e:
-        if (e.name or "").partition(".")[0] in ("textual", "tomlkit"):
+        # Failure-gated, not allowlisted (#678): ANY missing third-party module on
+        # the TUI import chain (rich and pyte import before textual; a future dep
+        # would too) means the [tui] extra is absent. Only a missing bmad_loop.*
+        # submodule — a packaging defect, not an install state the hint can fix —
+        # re-raises.
+        if (e.name or "").partition(".")[0] != "bmad_loop":
             print(
                 "error: the TUI requires optional dependencies — uv tool install 'bmad-loop[tui]'",
                 file=sys.stderr,

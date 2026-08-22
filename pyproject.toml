@@ -28,7 +28,7 @@ dependencies = [
 bmad-loop = "bmad_loop.cli:main"
 
 [project.optional-dependencies]
-tui = ["textual>=8.0,<9", "tomlkit>=0.13", "pyte>=0.8.2"]
+tui = ["textual>=8.0,<9", "tomlkit>=0.13", "pyte>=0.8.2", "rich>=14.2"]
 # macOS opt-in for psutil (identity/force-kill niceties); win32 gets it as a core
 # dep above, Linux stays dep-free. `pip install bmad-loop[non-linux]` on macOS.
 non-linux = ["psutil>=7.2.2"]

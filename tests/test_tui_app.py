@@ -1571,20 +1571,46 @@ async def test_resume_confirm_rechecks_liveness(project, monkeypatch):
         assert calls == []  # the callback re-checked and refused; nothing launched
 
 
-def test_cli_tui_hint_without_textual(project, monkeypatch, capsys):
-    """`bmad-loop tui` prints the install hint when the extra is missing."""
-    import builtins
+@pytest.mark.parametrize("blocked", ["textual", "rich", "tomlkit", "pyte"])
+def test_cli_tui_hint_without_extra_dependency(project, monkeypatch, capsys, blocked):
+    """`bmad-loop tui` prints the install hint whichever `[tui]` dependency is missing.
 
+    The guard is failure-gated rather than allowlisted (#678): `rich` and `pyte`
+    import *before* `textual` on the TUI chain, so an allowlist naming only textual
+    and tomlkit let those two escape as a traceback.
+
+    Evicting the whole `bmad_loop.tui.*` subtree is load-bearing, not tidiness: the
+    rich/pyte/tomlkit chains run through `tui.data`/`tui.settings`/`tui.screens.*`,
+    which this file's own module-level imports have already cached, and a cached
+    module returns without re-executing -- no third-party import would ever fire.
+
+    INVERSE ablation: restore the ("textual", "tomlkit") allowlist and the rich/pyte
+    params redden -- the error escapes to main's broad backstop as "No module named
+    'rich.text'" / "No module named 'pyte'" with no hint, while textual/tomlkit stay
+    green (rc stays 1 either way, which is why the hint is the assertion that matters).
+    """
+    import builtins
+    import sys
+
+    import bmad_loop
     from bmad_loop import cli
 
     real_import = builtins.__import__
 
     def fake_import(name, *args, **kwargs):
-        if name.partition(".")[0] == "textual":
+        if name.partition(".")[0] == blocked:
             raise ModuleNotFoundError(f"No module named '{name}'", name=name)
         return real_import(name, *args, **kwargs)
 
-    monkeypatch.delitem(__import__("sys").modules, "bmad_loop.tui.app", raising=False)
+    # Evicting the subtree alone leaks: re-importing `bmad_loop.tui` rebinds the
+    # `tui` attribute on the *parent package object* to the new (doomed) module, and
+    # restoring sys.modules does not undo that rebinding. Pin the attribute through
+    # monkeypatch so the original comes back with it -- otherwise every later
+    # `monkeypatch.setattr("bmad_loop.tui.app....")` in this file resolves against a
+    # package that no longer has an `app` attribute.
+    monkeypatch.setattr(bmad_loop, "tui", sys.modules["bmad_loop.tui"])
+    for mod in [m for m in sys.modules if m == "bmad_loop.tui" or m.startswith("bmad_loop.tui.")]:
+        monkeypatch.delitem(sys.modules, mod, raising=False)
     monkeypatch.setattr(builtins, "__import__", fake_import)
     rc = cli.main(["tui", "--project", str(project.project)])
     assert rc == 1

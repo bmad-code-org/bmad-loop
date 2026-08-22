@@ -34,6 +34,7 @@ opencode = [
 ]
 tui = [
     { name = "pyte" },
+    { name = "rich" },
     { name = "textual" },
     { name = "tomlkit" },
 ]
@@ -56,6 +57,7 @@ requires-dist = [
     { name = "pyte", marker = "extra == 'tui'", specifier = ">=0.8.2" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "regex", specifier = ">=2024.11.6" },
+    { name = "rich", marker = "extra == 'tui'", specifier = ">=14.2" },
     { name = "textual", marker = "extra == 'tui'", specifier = ">=8.0,<9" },
     { name = "tomlkit", marker = "extra == 'tui'", specifier = ">=0.13" },
 ]

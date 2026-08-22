@@ -111,6 +111,11 @@ import bmad_loop.cli
 rc = bmad_loop.cli.main(["list", "--project", sys.argv[1]])
 if rc != 0:
     sys.exit("list returned rc %r, expected 0" % rc)
+
+# (d) `tui` -- which genuinely needs the extra -- degrades to the install hint
+rc = bmad_loop.cli.main(["tui", "--project", sys.argv[1]])
+if rc != 1:
+    sys.exit("tui returned rc %r, expected 1" % rc)
 """
 
 
@@ -127,6 +132,13 @@ def test_extra_less_install_core_works_and_tui_hints(tmp_path):
 
     Ablation: restore cmd_list's ``from .tui.data import discover_runs`` and (c)
     fails -- the blocked ``pyte`` import escapes and ``list`` exits nonzero.
+
+    Ablation (#678): narrow cmd_tui's guard back to the ``("textual", "tomlkit")``
+    allowlist and the stderr-hint assertion fails -- ``rich`` imports before
+    ``textual`` on the TUI chain, so the error escapes the allowlist arm and reaches
+    main's broad backstop, which prints ``error: No module named 'rich'``. (d) itself
+    still passes: the backstop also returns 1, which is why the hint is asserted
+    separately from the rc.
     """
     project = tmp_path / "project"
     project.mkdir()
@@ -140,6 +152,7 @@ def test_extra_less_install_core_works_and_tui_hints(tmp_path):
     )
     assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
     assert "no runs found" in proc.stdout
+    assert "bmad-loop[tui]" in proc.stderr
 
 
 # ------------------------------------------------------- exit-code characterization
