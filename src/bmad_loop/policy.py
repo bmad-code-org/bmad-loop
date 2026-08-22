@@ -30,6 +30,9 @@ SWEEP_AUTO_MODES = {"never", "per-epic", "run-end"}
 REVIEW_TRIGGER_MODES = {"always", "recommended"}
 REVIEW_ON_TIMEOUT_MODES = {"retry", "salvage-if-done", "defer"}
 REVIEW_ON_STATUS_CONTRADICTION_MODES = {"escalate", "retry"}
+# Session stages, in run order. Lives here rather than in the TUI because
+# settings_schema's expand_stages loop fans a template section out over it.
+STAGES = ("dev", "review", "triage")
 # Where the run gets its story queue. "sprint-status" (default) is the classic
 # flow — bmad-sprint-planning writes sprint-status.yaml from prose epics.
 # "stories" is the opt-in folder+id dispatch flow (BMAD-METHOD #2549): a typed,

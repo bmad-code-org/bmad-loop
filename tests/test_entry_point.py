@@ -73,6 +73,95 @@ def test_module_validate_json_smoke(tmp_path):
     assert doc["ok"] is False
 
 
+# The child of test_extra_less_install_core_works_and_tui_hints. Kept as a module
+# constant so later assertions can be appended to one numbered list; sys.argv[1] is
+# an empty project dir the parent creates.
+_EXTRA_LESS_PROGRAM = r"""
+import sys
+
+BLOCKED = {"pyte", "rich", "textual", "tomlkit"}
+
+
+class _Blocker:
+    def find_spec(self, fullname, path=None, target=None):
+        # RAISE rather than return None: returning None only defers to the next
+        # finder, and the dev venv HAS these installed -- every assertion below
+        # would then pass vacuously against the real packages.
+        if fullname.partition(".")[0] in BLOCKED:
+            raise ModuleNotFoundError("No module named %r" % fullname, name=fullname)
+        return None
+
+
+for _name in [m for m in sys.modules if m.partition(".")[0] in BLOCKED]:
+    del sys.modules[_name]
+sys.meta_path.insert(0, _Blocker())
+
+# Vacuity floor: if the blocker is not biting, nothing below proves anything.
+try:
+    import pyte
+except ModuleNotFoundError:
+    pass
+else:
+    sys.exit("VACUOUS: the blocker did not stop `import pyte`")
+
+# (a) the core CLI module imports with the extra absent
+import bmad_loop.cli
+
+# (b) so does the settings schema, which used to reach tui.settings for STAGES
+import bmad_loop.settings_schema
+
+# (c) `list` answers from the core dependencies alone
+rc = bmad_loop.cli.main(["list", "--project", sys.argv[1]])
+if rc != 0:
+    sys.exit("list returned rc %r, expected 0" % rc)
+
+# (d) `tui` -- which genuinely needs the extra -- degrades to the install hint
+rc = bmad_loop.cli.main(["tui", "--project", sys.argv[1]])
+if rc != 1:
+    sys.exit("tui returned rc %r, expected 1" % rc)
+"""
+
+
+def test_extra_less_install_core_works_and_tui_hints(tmp_path):
+    """The core CLI surface works with the ``[tui]`` extra absent (#650).
+
+    A core-only ``uv tool install bmad-loop`` has no pyte/rich/textual/tomlkit, but
+    every test job installs ``--all-extras`` and the packaging job's isolated wheel
+    run only calls ``--version`` — which argparse answers before any subcommand code
+    imports. That blind spot let ``ls`` crash on a missing ``pyte`` for 23 releases.
+    So: a fresh interpreter (the subprocess *is* the test, per this module's header)
+    installs an import-system blocker for those four packages, proves the blocker
+    bites, then runs the paths a core-only install actually takes.
+
+    Ablation: restore cmd_list's ``from .tui.data import discover_runs`` and (c)
+    fails -- the blocked ``pyte`` import escapes and ``list`` exits nonzero.
+
+    Ablation (#679): restore settings_schema's ``from .tui.settings import STAGES``
+    and (b) fails on the blocked ``tomlkit`` -- tui/settings.py imports it at module
+    scope, so the core settings schema drags the extra in behind it.
+
+    Ablation (#678): narrow cmd_tui's guard back to the ``("textual", "tomlkit")``
+    allowlist and the stderr-hint assertion fails -- ``rich`` imports before
+    ``textual`` on the TUI chain, so the error escapes the allowlist arm and reaches
+    main's broad backstop, which prints ``error: No module named 'rich'``. (d) itself
+    still passes: the backstop also returns 1, which is why the hint is asserted
+    separately from the rc.
+    """
+    project = tmp_path / "project"
+    project.mkdir()
+    proc = subprocess.run(
+        [sys.executable, "-c", _EXTRA_LESS_PROGRAM, str(project)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=60,
+        cwd=str(tmp_path),
+    )
+    assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    assert "no runs found" in proc.stdout
+    assert "bmad-loop[tui]" in proc.stderr
+
+
 # ------------------------------------------------------- exit-code characterization
 
 

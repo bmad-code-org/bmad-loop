@@ -156,6 +156,12 @@ breaking changes may land in a minor release.
   by _path_ can still clash with it by _shape_ — a file where the merge needs a directory, or the
   reverse — and git then refuses over the very path the event called harmless. The refusal path
   now appends a corrective `merge-preflight-refused` naming the same paths and carrying git's text.
+- `bmad-loop ls` on a core-only install lists runs again instead of crashing on a missing `pyte`
+  — the run-inventory reader moved into core (#650)
+- A missing `[tui]` extra now prints the install hint whichever dependency fails first, instead of
+  a traceback (#678)
+- The settings schema no longer reaches the `[tui]` extra at module scope, and CI now proves the
+  core CLI works extra-less (#679)
 
 ## [0.11.0] — 2026-08-19
 

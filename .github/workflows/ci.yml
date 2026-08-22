@@ -292,6 +292,14 @@ jobs:
         # wheel cannot satisfy fails here instead of at a user's install.
         run: uv run --isolated --no-project --with dist/*.whl -- bmad-loop --version
 
+      - name: Run `bmad-loop list` from the built wheel (core install, no extras)
+        # Pins #650 at the packaging level: `list` must answer from the core
+        # dependencies alone. --version cannot stand in — argparse answers it
+        # before any subcommand code imports.
+        run: |
+          mkdir -p "$RUNNER_TEMP/empty-project"
+          uv run --isolated --no-project --with dist/*.whl -- bmad-loop list --project "$RUNNER_TEMP/empty-project"
+
       - name: Check the wheel carries every packaged data file
         # The step above cannot stand in for this one: argparse answers --version
         # from `__version__` before anything touches `bmad_loop.data`, so it exits

@@ -46,8 +46,8 @@ if TYPE_CHECKING:
     from .checks import ValidationReport
     from .model import RunState
     from .operatoractions import ParkedStory
+    from .runs import RunInfo
     from .sweep import Decision
-    from .tui.data import RunInfo
 
 
 VALIDATE_SCHEMA_VERSION = 1

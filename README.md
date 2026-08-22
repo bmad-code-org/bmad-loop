@@ -111,7 +111,7 @@ partial — the tail after the last `-` (e.g. `a1b2`), shortened to any prefix t
 ## The TUI
 
 ```bash
-uv sync --extra tui       # textual + tomlkit + pyte
+uv sync --extra tui       # textual + tomlkit + pyte + rich
 bmad-loop tui
 ```
 
