@@ -1,4 +1,8 @@
+from importlib import resources
+from pathlib import Path
+
 import pytest
+from conftest import fault_read_text
 
 from bmad_loop.adapters import profile as profile_mod
 from bmad_loop.adapters.profile import (
@@ -538,6 +542,79 @@ def test_every_toml_value_type_parses_or_raises_profile_error(tmp_path, key, val
         load_profiles(tmp_path)
     except ProfileError:
         pass
+
+
+def test_non_utf8_overlay_raises_profile_error(tmp_path):
+    """#473: the READ, not a value coercion. `CONVERSION_FAULTS` cannot reach this
+    one — the funnel wraps `_parse_profile`, and the decode happens in `_load_toml`'s
+    argument expression, before the funnel is entered — so a non-UTF-8 overlay
+    escaped as a raw `UnicodeDecodeError`. Asserting the TYPE is the point: every
+    consumer keys its fault handling on ProfileError, and a `ValueError` escape took
+    `validate` down before it printed any document.
+
+    ABLATION: route the overlay read back through
+    `_load_toml(path.read_text(encoding="utf-8"), str(path))` and this raises
+    UnicodeDecodeError instead."""
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    bad = profiles_dir / "bad.toml"
+    bad.write_bytes(b'name = "b\xffad"\n')
+    # Self-verify the fixture before trusting what it proves: a file that decoded
+    # fine would make the assertion below pass for the wrong reason.
+    with pytest.raises(UnicodeDecodeError):
+        bad.read_text(encoding="utf-8")
+    with pytest.raises(ProfileError, match="not valid UTF-8") as excinfo:
+        load_profiles(tmp_path)
+    assert str(bad) in str(excinfo.value)  # the fault names the file at fault
+
+
+def test_unreadable_overlay_raises_profile_error(tmp_path, monkeypatch):
+    """The OSError arm of the same guard: a profile that is present but cannot be
+    read — permissions, an I/O error, a dead mount. `user_dir.is_dir()` and the glob
+    rule out ABSENCE and nothing else, so this escaped as a bare OSError.
+
+    `fault_read_text` rather than chmod for the reason its docstring gives, and its
+    targeting matters twice over here: a blanket `Path.read_text` patch is answered
+    by the PACKAGED loop first, which would redden with this call site untouched.
+
+    ABLATION: route the overlay read back through `path.read_text(...)` and this
+    raises PermissionError instead."""
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    bad = profiles_dir / "bad.toml"
+    bad.write_text(MINIMAL_PROFILE)
+    # Precondition: readable, this overlay loads — so the raise below is the fault
+    # being converted, not a profile that was malformed all along.
+    assert load_profiles(tmp_path)["mycli"].binary == "mycli"
+    fault_read_text(monkeypatch, bad)
+    with pytest.raises(ProfileError, match="unreadable") as excinfo:
+        load_profiles(tmp_path)
+    assert str(bad) in str(excinfo.value)
+
+
+def test_unreadable_packaged_profile_raises_profile_error(monkeypatch):
+    """The packaged built-ins are read through the same guard. They are trusted
+    content, so this is not #473's user-authored fault class — but a corrupt or
+    unreadable install is a PACKAGING bug, and the loader owes its callers the typed
+    error that says so instead of a traceback: `validate`, `install` and
+    `_require_base_skills` all key on ProfileError and none of them catches OSError.
+
+    Here because the two read sites are separate wiring axes, not one. Measured:
+    reverting the PACKAGED read to `entry.read_text(...)` leaves all three overlay
+    tests green — that site had no oracle at all, and this is the only test that
+    reddens for it. (Reverting the OVERLAY read reddens the other three and leaves
+    this one green: disjoint, which is the proof that neither stands in for the
+    other.)"""
+    packaged = resources.files("bmad_loop.data").joinpath("profiles")
+    names = sorted(e.name for e in packaged.iterdir() if e.name.endswith(".toml"))
+    # Real path, not a zip member: `fault_read_text` targets `Path.read_text`, so a
+    # zipimported install would leave the fault unarmed. Asserted, not assumed.
+    victim = Path(str(packaged.joinpath(names[0])))
+    assert victim.is_file()
+    fault_read_text(monkeypatch, victim)
+    with pytest.raises(ProfileError, match="unreadable") as excinfo:
+        load_profiles()
+    assert victim.name in str(excinfo.value)
 
 
 # --------------------------------------------------------------------------- #

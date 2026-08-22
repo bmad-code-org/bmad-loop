@@ -5436,6 +5436,33 @@ def test_validate_reports_an_undecodable_bmad_config_instead_of_crashing(project
     assert "not valid UTF-8" in finding["message"]
 
 
+def test_validate_reports_an_undecodable_profile_overlay_instead_of_crashing(project, capsys):
+    """#473: the third loader, same conversion. `load_profiles` reads each overlay in
+    `.bmad-loop/profiles/` with `read_text(encoding="utf-8")`, so a non-UTF-8 file
+    raised `UnicodeDecodeError` — a ValueError, not a `ProfileError` — while the role
+    loop here catches only `ProfileError`. It is not the policy leg over again: these
+    are separate loaders with separate typed errors, and `get_profile` backs every
+    adapter resolution, so the raw escape also reached run/sweep preflight.
+
+    Routed through `machine_json` deliberately, for the reason the policy leg gives:
+    `main`'s bare `except Exception` backstop also returns 1, so an rc-only assertion
+    is green with the conversion reverted. What bites is the document — stderr carries
+    the backstop's line and stdout carries nothing to parse."""
+    _write_policy(project.project, '[adapter]\nname = "badcli"\nmodel = "opus"\n')
+    profiles = project.project / ".bmad-loop" / "profiles"
+    profiles.mkdir(parents=True, exist_ok=True)
+    overlay = profiles / "badcli.toml"
+    overlay.write_bytes(b'name = "b\xffad"\n')
+    with pytest.raises(UnicodeDecodeError):  # the fixture is genuinely undecodable
+        overlay.read_text(encoding="utf-8")
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    finding = next(f for f in doc["findings"] if f["check"] == "adapter.profile")
+    assert finding["severity"] == "problem"
+    assert "not valid UTF-8" in finding["message"]
+    assert str(overlay) in finding["message"]  # the finding names the file at fault
+
+
 def test_validate_json_counts_and_ok_agree_with_findings(project, capsys):
     """`ok` mirrors the exit code exactly: problems clear it, warnings never do."""
     install_bmad_config(project)
