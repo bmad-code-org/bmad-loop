@@ -110,6 +110,18 @@ class GitSpawnError(GitError):
     (#343). The underlying errno stays reachable via ``exc.__cause__.errno``."""
 
 
+class GitTimeoutError(GitError):
+    """The git child was spawned but never returned inside the deadline (a
+    `subprocess.TimeoutExpired` out of `_run_git`). Same shape and same reason as
+    `GitSpawnError`: a GitError so every existing guard is unchanged, a distinct
+    type so a caller that is about to spawn ANOTHER git can tell "git ran and
+    said no" — a non-zero rc, which the next command will answer promptly — from
+    "git does not return", which the next command will pay the full timeout for
+    all over again. `cmd_validate` is that caller: three probes in a row against
+    one hung binary cost three deadlines, and only the first one told the
+    operator anything."""
+
+
 class RollbackPreflightError(GitError):
     """Rollback cleanup paths could not be proven safe before mutation."""
 
@@ -343,9 +355,11 @@ def _run_git(
     spawn-level OSError (#343), and a strict-decode fault on the child's output
     (#377) — so left uncaught any of them would bypass every `except GitError`
     guard and crash the run. All are translated here into the GitError taxonomy
-    — observation guards degrade, unguarded paths fail typed — with the spawn
-    class marked as `GitSpawnError` for the callers that must distinguish an
-    environment fault from git refusing.
+    — observation guards degrade, unguarded paths fail typed — with the two that
+    mean the binary never answered marked as `GitSpawnError` and
+    `GitTimeoutError` for the callers that must distinguish an environment fault
+    from git refusing. The decode fault carries no class of its own: git ran and
+    returned, so it is a fact about the repository's bytes, not about the host.
 
     The decode fault is real, not theoretical: POSIX filenames are arbitrary
     bytes, and while `core.quotePath` C-quotes them to ASCII for ordinary
@@ -379,7 +393,9 @@ def _run_git(
             env={**(env if env is not None else os.environ), "LC_ALL": "C"},
         )
     except subprocess.TimeoutExpired as exc:
-        raise GitError(f"git {cmd[3]} timed out after {effective_timeout_s}s in {repo}") from exc
+        raise GitTimeoutError(
+            f"git {cmd[3]} timed out after {effective_timeout_s}s in {repo}"
+        ) from exc
     except UnicodeDecodeError as exc:
         raise GitError(f"git {cmd[3]} returned undecodable output in {repo}: {exc}") from exc
     except OSError as exc:
@@ -506,10 +522,10 @@ def git_below_floor(repo: Path, floor: tuple[int, int] = GIT_FLOOR) -> str | Non
     for the git BINARY, never for the repo. A non-zero rc is therefore already a
     fault, and is reported as an unreadable answer rather than swallowed.
 
-    Raises `GitError`/`GitSpawnError` untouched when git could not be run at all
-    (absent, unspawnable, timed out). That is a different fact from "too old" and
-    each caller dispositions it differently, so it is deliberately not folded in
-    here."""
+    Raises `GitError` untouched when git could not be run at all — absent or
+    unspawnable as `GitSpawnError`, hung as `GitTimeoutError`. That is a different
+    fact from "too old" and each caller dispositions it differently, so it is
+    deliberately not folded in here."""
     probed = git_bytes(repo, "version")
     reported = os.fsdecode(probed.stdout).strip()
     if probed.returncode != 0:

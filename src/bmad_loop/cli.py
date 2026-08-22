@@ -427,6 +427,17 @@ def cmd_validate(args: argparse.Namespace) -> int:
             except sprintstatus.SprintStatusError as e:
                 report.fail("queue.sprint-status", str(e))
 
+    # `git_answers` carries ONE fact from this probe to the two below it: not
+    # whether the tree was clean, but whether the binary answered at all. A
+    # non-zero rc IS an answer and leaves it True — the next git command will fail
+    # just as promptly, and the version probe is the one that names WHY the host is
+    # refused, so an rc-level fault here (dubious ownership, a corrupt index, a
+    # directory that is not a repo) must not cost the operator that second finding.
+    # Spawn and timeout are the opposite: git is not going to start, or is not
+    # going to return, and each further probe re-pays the entire `GIT_TIMEOUT_S` to
+    # learn what this one already reported. Three probes against one hung git is
+    # three deadlines — on the 120s default, six minutes to print one line.
+    git_answers = True
     try:
         if not verify.worktree_clean(project):
             report.fail(
@@ -435,6 +446,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
         else:
             report.ok("git.worktree-clean", "git worktree clean")
     except verify.GitError as e:
+        git_answers = not isinstance(e, (verify.GitSpawnError, verify.GitTimeoutError))
         report.fail("git.probe", f"git check failed: {e}")
 
     # A `problem`, not a warning, and deliberately so: `_reject_under_floor_git`
@@ -447,29 +459,33 @@ def cmd_validate(args: argparse.Namespace) -> int:
     # Silent on `GitError`: `git.probe` immediately above already owns "git did not
     # answer" — worktree_clean runs first and raises the same taxonomy from the same
     # binary, so a second line would double-report one fault. Same disposition as
-    # `git.render-tracked` below.
-    try:
-        if (found := verify.git_below_floor(project)) is not None:
-            report.fail("git.version", under_floor_git_message(found), {"reported": found})
-        else:
-            report.ok("git.version", f"git {verify.git_floor_text()}+ satisfied")
-    except verify.GitError:
-        pass
+    # `git.render-tracked` below. The `git_answers` skip is that same disposition
+    # made cheap, not a new one: what it skips is exactly the branch that was
+    # already silent, so the report reads identically either way.
+    if git_answers:
+        try:
+            if (found := verify.git_below_floor(project)) is not None:
+                report.fail("git.version", under_floor_git_message(found), {"reported": found})
+            else:
+                report.ok("git.version", f"git {verify.git_floor_text()}+ satisfied")
+        except verify.GitError:
+            pass
 
     # An ignore/exclude cannot shield renderer output that is already in the index.
     # This is advisory: tracked output causes churn but does not prevent a session
     # from running. A failed git probe stays silent rather than fabricating an OK.
-    try:
-        if verify.path_tracked(project, install.RENDER_DIR_REL):
-            report.warn(
-                "git.render-tracked",
-                f"{install.RENDER_DIR_REL}/ is tracked by git; run "
-                f"`git rm -r --cached {install.RENDER_DIR_REL}` and commit once to stop "
-                "committing rendered skill output",
-                {"path": install.RENDER_DIR_REL},
-            )
-    except verify.GitError:
-        pass
+    if git_answers:
+        try:
+            if verify.path_tracked(project, install.RENDER_DIR_REL):
+                report.warn(
+                    "git.render-tracked",
+                    f"{install.RENDER_DIR_REL}/ is tracked by git; run "
+                    f"`git rm -r --cached {install.RENDER_DIR_REL}` and commit once to stop "
+                    "committing rendered skill output",
+                    {"path": install.RENDER_DIR_REL},
+                )
+        except verify.GitError:
+            pass
 
     report.extend(_platform_preflight(project))
 

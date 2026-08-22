@@ -8766,6 +8766,79 @@ def test_validate_passes_the_git_floor_on_a_current_host(project, capsys, monkey
     assert findings["git.version"]["severity"] == "ok"
 
 
+def test_validate_pays_a_hung_git_once(project, capsys, monkeypatch):
+    """`cmd_validate` spawns three git children in a row and `_run_git` gives each
+    one the whole `GIT_TIMEOUT_S`, so against a binary that never returns the two
+    probes AFTER the first spend two more deadlines to learn what `git.probe`
+    already reported — six minutes, on the 120s default, for a command whose only
+    job is to answer quickly.
+
+    The findings are asserted alongside the counters because the skip must cost the
+    operator nothing: both skipped branches were already silent on a git fault, so
+    the report has to read exactly as it did before. A cheaper validate that also
+    dropped a finding would be a different change.
+
+    Ablation: remove the `git_answers` guard from either probe and that probe's
+    counter goes to 1."""
+    _make_validate_pass(project, monkeypatch, capsys)
+
+    def hung(*_args, **_kwargs):
+        raise verify.GitTimeoutError(f"git status timed out after 120s in {project.project}")
+
+    version_probes = []
+    render_probes = []
+
+    def counted_version(_repo, *args, timeout_s=None):
+        version_probes.append(args)
+        return subprocess.CompletedProcess(
+            args=["git", *args], returncode=0, stdout=b"git version 2.55.0\n", stderr=b""
+        )
+
+    def counted_tracked(_repo, rel):
+        render_probes.append(rel)
+        return False
+
+    monkeypatch.setattr(verify, "worktree_clean", hung)
+    monkeypatch.setattr(verify, "git_bytes", counted_version)
+    monkeypatch.setattr(verify, "path_tracked", counted_tracked)
+
+    findings = _validate_findings(project, capsys, rc=1)
+    assert version_probes == [], "the version probe re-paid the deadline git already spent"
+    assert render_probes == [], "the render-tracked probe re-paid it a third time"
+    assert findings["git.probe"]["severity"] == "problem"
+    assert "timed out" in findings["git.probe"]["message"]
+    assert "git.version" not in findings  # silent before the skip, silent after
+    assert "git.render-tracked" not in findings
+
+
+def test_validate_still_reports_the_git_version_when_git_ran_and_failed(
+    project, capsys, monkeypatch
+):
+    """The skip is narrow on purpose, and this is the leg that pins it. A non-zero
+    rc — dubious ownership, a corrupt index, a directory that is not a repo — is git
+    ANSWERING: the next probe returns just as promptly, and it is the only finding
+    that names the host fact `run` will abort on. Dropping it to save a deadline
+    that was never going to be paid would send an operator whose git is both broken
+    here AND below the floor back for a second round trip.
+
+    Ablation: widen the `git_answers` guard to any `GitError` and `git.version`
+    vanishes from the report."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    _fake_git_version(monkeypatch, UNDER_FLOOR_GIT)
+
+    def refused(*_args, **_kwargs):
+        raise verify.GitError(
+            f"git status failed in {project.project}: fatal: detected dubious ownership"
+        )
+
+    monkeypatch.setattr(verify, "worktree_clean", refused)
+
+    findings = _validate_findings(project, capsys, rc=1)
+    assert "dubious ownership" in findings["git.probe"]["message"]
+    assert findings["git.version"]["severity"] == "problem"
+    assert findings["git.version"]["detail"]["reported"] == "git version 2.25.1"
+
+
 def test_auto_sweep_factory_raises_on_an_under_floor_git(project, monkeypatch):
     """The child sweep's arm of the same refusal, and the one that cannot report an
     rc: `_sweep_factory` runs under the engine, so it RAISES — the disposition the

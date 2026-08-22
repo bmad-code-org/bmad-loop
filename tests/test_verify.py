@@ -511,6 +511,26 @@ def test_git_bytes_timeout_still_becomes_git_error(project, monkeypatch):
         verify.git_bytes(project.project, "config", "--get", "core.excludesFile")
 
 
+def test_git_timeout_carries_its_own_type(project, monkeypatch):
+    """A hung git raises `GitTimeoutError` — a `GitError` like every other fault, so
+    no existing guard changes, and a distinct type so the one caller that is about
+    to spawn ANOTHER git can tell "git answered non-zero" (the next command answers
+    just as fast) from "git does not return" (the next command pays the whole
+    deadline again). `cli.cmd_validate` is that caller; the class is the only thing
+    that separates the two, since both arrive as a bare `GitError` message today.
+
+    Both halves are asserted deliberately: the subclass relation is what keeps the
+    taxonomy backward compatible, and losing it would silently break every
+    `except GitError` guard in the tree.
+
+    Ablation: raise a bare `GitError` from `_run_git`'s `TimeoutExpired` arm and the
+    type assertion fails while the `isinstance(..., GitError)` one stays green."""
+    monkeypatch.setattr(verify.subprocess, "run", _timing_out_run)
+    with pytest.raises(verify.GitTimeoutError, match=r"git config timed out after \d+s") as excinfo:
+        verify.git_bytes(project.project, "config", "--get", "core.excludesFile")
+    assert isinstance(excinfo.value, verify.GitError)
+
+
 def test_git_bytes_spawn_oserror_still_becomes_git_spawn_error(project, monkeypatch):
     """Same for a spawn-level OSError — GitSpawnError, errno still reachable.
 
