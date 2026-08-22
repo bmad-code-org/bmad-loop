@@ -16,6 +16,7 @@ from textual.widgets import Collapsible, Input, Select, Switch
 
 from bmad_loop import policy as policy_mod
 from bmad_loop.plugins import load_plugins
+from bmad_loop.plugins.loader import PLUGIN_FILE, USER_PLUGINS_REL
 from bmad_loop.policy import POLICY_FILE, POLICY_TEMPLATE
 from bmad_loop.tui import settings as settings_mod
 from bmad_loop.tui.app import BmadLoopApp
@@ -196,6 +197,39 @@ def test_validate_with_project_accepts_valid_coupling(tmp_path):
     doc.set("plugins.unity", "editor_mode", "per_worktree")
     doc.set("scm", "isolation", "worktree")  # valid per_worktree combo
     assert doc.validate(schemas, project=tmp_path) is None
+
+
+def test_validate_survives_an_undecodable_plugin_manifest(tmp_path):
+    """The consumer half of `plugins/loader.py`'s read guard, and the reason that
+    guard is not loader hygiene. `validate(project=...)` degrades on
+    `except (PolicyError, PluginError)` and hands the message to the settings
+    screen to render, but a non-UTF-8 project `plugin.toml` reached it as a raw
+    `UnicodeDecodeError` — a ValueError, outside that tuple — so the settings
+    surface died at construction instead of naming the file to fix.
+
+    Not the coupling tests over again: those raise PluginError out of a plugin's
+    own `validate()`, the *second* half of this try block. This one raises it out
+    of `PluginRegistry.build`'s `load_plugins`, the half nothing graded. And
+    `build` loads EVERY discovered plugin, not just the enabled ones, so the drop
+    alone arms it — `plugins.enabled` is deliberately left untouched.
+
+    ABLATION: revert the project read in `_discover_project` to
+    `load_manifest(toml.read_text(encoding="utf-8"), ...)` and `validate` raises
+    UnicodeDecodeError instead of returning a string."""
+    pdir = tmp_path / USER_PLUGINS_REL / "bad"
+    pdir.mkdir(parents=True)
+    manifest = pdir / PLUGIN_FILE
+    manifest.write_bytes(b'[plugin]\nname = "b\xffad"\napi_version = 1\n')
+    # Self-verify the fixture before trusting what it proves: a file that decoded
+    # fine would make the assertion below pass for the wrong reason.
+    with pytest.raises(UnicodeDecodeError):
+        manifest.read_text(encoding="utf-8")
+
+    doc = PolicyDoc.load(tmp_path / "missing.toml")  # template-backed, valid
+    assert doc.validate() is None  # the POLICY is fine; only the plugin read is not
+    error = doc.validate(project=tmp_path)
+    assert error is not None and "not valid UTF-8" in error
+    assert str(manifest) in error  # the operator is told which file to fix
 
 
 def test_validate_with_project_skips_disabled_plugin_coupling(tmp_path):
