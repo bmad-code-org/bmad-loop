@@ -22,14 +22,20 @@ breaking changes may land in a minor release.
   before starting": untracked residue is named for you to clear, and a tracked rewrite is
   restored automatically by `git checkout HEAD --` over exactly the affected paths.
   Attribution is per path — before/after deltas intersected with the branch's incoming set —
-  so neither your pre-existing dirt nor an edit you make while the merge is failing is ever
-  called git's: the repo-wide dirtiness reading this replaces classified that concurrent-edit
-  scene "failed part-way through checkout" and its repo-wide `reset --hard HEAD` destroyed
-  the edit. A post-merge probe that itself fails — the
+  so neither your pre-existing dirt nor an edit you make outside that incoming set while the
+  merge is failing is ever called git's: the repo-wide dirtiness reading this replaces
+  classified that concurrent-edit scene "failed part-way through checkout" and its repo-wide
+  `reset --hard HEAD` destroyed the edit. (An edit racing the very paths the merge is
+  rewriting is indistinguishable from git's write and is restored with them — the stated
+  ceiling.) A post-merge probe that itself fails — the
   residue probes, the unmerged-stages reading, or the MERGE_HEAD reading — no longer bypasses the
   merge cleanup or impersonates a verdict: cleanup not gated on the dead reading still runs, the
   failure raises `MergeResidueUnreadError` (checkout state unverified, run `git status`), and an
-  unread MERGE_HEAD skips the abort it gates and says so. A refused
+  unread MERGE_HEAD skips the abort it gates and says so. The squash **replay** reading gets the
+  same honesty on the far side of success: unreadable, it used to answer "dirty", and the doomed
+  `git commit` that followed dressed the probe failure as a commit refusal with a
+  `reset --hard HEAD` riding on it — now nothing is committed, nothing is reset, and the
+  escalation names the dead reading. A refused
   **squash commit** now raises `MergeCommitRefusedError` like the `--no-ff` leg — the squash leg
   seals its result with its own `git commit`, where commit hooks and signing do run — rolled back
   by `git reset --hard HEAD` gated on the pre-merge reading having found the tree clean (a dirty

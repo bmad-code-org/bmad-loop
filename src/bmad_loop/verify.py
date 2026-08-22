@@ -254,7 +254,7 @@ class MergeHalfAppliedError(GitError):
 
 
 class MergeResidueUnreadError(GitError):
-    """The merge failed AND the post-merge residue reading failed too, so the
+    """A post-merge reading the classification rests on failed, so the
     checkout's state is UNVERIFIED — neither sibling's claim survives.
 
     The terminal arm of the classification, present so a probe failure can never
@@ -278,6 +278,10 @@ class MergeResidueUnreadError(GitError):
     cannot rule a conflict out of must not be dressed as either — and a dead
     merge-state reading additionally skips the abort it gates, with the
     message saying so, because uncertainty never authorizes a repair write.
+    The squash replay reading joins from the far side of a merge that
+    SUCCEEDED: with `allow_empty_squash`'s staged-result reading dead, neither
+    the no-op return nor a result to commit can be claimed, so nothing is
+    committed, nothing is reset, and the message names the dead reading.
 
     No repair rides on it: `reset --hard` stays gated on a PROVEN
     tracked-residue attribution, because uncertainty must not be what authorizes
@@ -2209,9 +2213,20 @@ def _index_dirty_vs_head(repo: Path) -> bool:
     UNSTAGED edits in the checkout, which are none of a replay's business: with
     such an edit present the tree probe reports dirt a valid `allow_empty_squash`
     replay never staged, so the clean early return is skipped and the ensuing
-    `git commit` fails with "no changes added to commit" (#619)."""
-    rc, _ = _git(repo, "diff", "--cached", "--quiet", "HEAD")
-    return rc != 0
+    `git commit` fails with "no changes added to commit" (#619).
+
+    `--quiet` rides `--exit-code`'s contract, which spends rc 1 on exactly
+    "there are differences" — so rc 0 and rc 1 are the answers and anything
+    else RAISES, like the snapshot siblings: read as "dirty", an unreadable
+    index skipped the replay's no-op return, and the doomed `git commit` that
+    followed dressed the probe failure as a commit refusal, with
+    `_reset_hard_head`'s rollback riding on the fiction. The one caller reads
+    post-merge and catches, degrading to `MergeResidueUnreadError` — nothing
+    committed, nothing reset."""
+    rc, out = _git(repo, "diff", "--cached", "--quiet", "HEAD")
+    if rc in (0, 1):
+        return rc == 1
+    raise GitError(f"git diff --cached HEAD failed in {repo}: {out}")
 
 
 def _untracked_paths(repo: Path) -> frozenset[str]:
@@ -2735,8 +2750,24 @@ def merge_branch(
             if index_unread is not None or unread is not None:
                 raise MergeResidueUnreadError(detail)
             raise MergePreflightError(detail)
-        if allow_empty_squash and not _index_dirty_vs_head(repo):
-            return
+        if allow_empty_squash:
+            # Post-mutation read on the far side of SUCCESS: an escaping raise
+            # would land in the caller's unclassified arm, and pressing on with
+            # the reading dead manufactures a "nothing to commit" refusal plus
+            # its rollback. Neither the no-op return nor the commit can be
+            # claimed; say so and stop.
+            try:
+                staged = _index_dirty_vs_head(repo)
+            except GitError as unread:
+                raise MergeResidueUnreadError(
+                    f"git merge --squash {branch} succeeded in {repo}, but the index"
+                    f" reading that tells a no-op replay from a result to commit failed"
+                    f" (index state unverified): nothing was committed and nothing was"
+                    f" reset — any staged squash result is left in place; run"
+                    f" `git status`: {unread}"
+                ) from unread
+            if not staged:
+                return
         msg = message or f"Squash-merge branch '{branch}'"
         rc, out = _git(repo, "commit", "-m", msg)
         if rc != 0:

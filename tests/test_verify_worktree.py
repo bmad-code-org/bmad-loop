@@ -1334,14 +1334,19 @@ def test_commit_refusal_with_a_dead_merge_state_probe_skips_the_abort_and_says_s
 
 
 def test_probe_helpers_read_an_environment_fault_as_unread(tmp_path):
-    """The rc axis of the same honesty: both probes spend return codes outside
-    their answer set on an unread marker, never on a silent "no". `git -C` a
-    non-repo is the portable rc-128 environment fault; `rev-parse -q --verify`
-    keeps rc 1 as the legitimate no (measured: 1 for a missing MERGE_HEAD, 128
-    for this), which the in-repo rows everywhere above pin as `(False, None)`.
+    """The rc axis of the same honesty: each probe spends return codes outside
+    its answer set on an unread marker — or, for the replay reading, a RAISE
+    its one caller catches — never on a silent answer. `git -C` a non-repo is
+    the portable rc-128 environment fault; `rev-parse -q --verify` keeps rc 1
+    as the legitimate no (measured: 1 for a missing MERGE_HEAD, 128 for this),
+    which the in-repo rows everywhere above pin as `(False, None)`, and
+    `diff --cached --quiet` keeps rc 1 as "there are differences". The marker
+    vs raise split is position, not importance: the first two are read between
+    a failed merge and its cleanup, the replay reading after a succeeded one,
+    where nothing below it needs to run.
 
-    Ablation (rc axis): read only rc 0 vs everything-else in either helper and
-    its half fails here — no other row exercises a probe whose git RAN and
+    Ablation (rc axis): read only rc 0 vs everything-else in any helper and
+    its stanza fails here — no other row exercises a probe whose git RAN and
     failed, the monkeypatched rows all arriving on the raise axis."""
     unmerged, unread = verify._index_unmerged(tmp_path)
     assert unmerged is False and unread is not None
@@ -1350,6 +1355,10 @@ def test_probe_helpers_read_an_environment_fault_as_unread(tmp_path):
     started, unread = verify._merge_in_progress(tmp_path)
     assert started is False and unread is not None
     assert "git rev-parse --verify MERGE_HEAD failed" in str(unread)
+
+    with pytest.raises(verify.GitError) as ei:
+        verify._index_dirty_vs_head(tmp_path)
+    assert "git diff --cached HEAD failed" in str(ei.value)
 
 
 def test_squash_replay_ignores_preexisting_unstaged_dirt(project, tmp_path):
@@ -1372,6 +1381,49 @@ def test_squash_replay_ignores_preexisting_unstaged_dirt(project, tmp_path):
 
     assert git(repo, "rev-parse", "HEAD") == head_before  # no empty commit manufactured
     assert (repo / "src.txt").read_text() == "operator edit\n"
+
+
+def test_squash_replay_with_a_dead_index_reading_is_unverified_not_commit_refused(
+    project, tmp_path, monkeypatch
+):
+    """`--exit-code` spends rc 1 on exactly "there are differences", so any
+    other nonzero from the replay's staged-result reading is a probe failure,
+    not an answer. Read as "dirty" it skipped the no-op return, and the doomed
+    `git commit` that followed dressed the failure as a hook/signing refusal —
+    with `_reset_hard_head`'s rollback riding on the fiction over a tree the
+    probe never measured. The honest class is unverified: nothing committed,
+    nothing reset, the dead reading named.
+
+    Ablation (rc axis): read `rc != 0` as dirty in `_index_dirty_vs_head`
+    again and this fails on the raised type — `MergeCommitRefusedError`, the
+    manufactured refusal — with the reset spy recording the rollback that rode
+    on it. Ablation (wiring axis): change the call-site catch to `except ()`
+    and it fails on the probe's bare `GitError` escaping unclassified."""
+    repo = project.project
+    _branch_with(repo, tmp_path, adds={"f.txt": "branch\n"})
+    verify.merge_branch(repo, "feat", strategy="squash", message="squash feat")  # already landed
+    head_before = git(repo, "rev-parse", "HEAD")
+    real = verify._git
+
+    def faulted(repo_arg, *args):
+        if args == ("diff", "--cached", "--quiet", "HEAD"):
+            return 128, "fatal: unable to read index: replay probe boom"
+        return real(repo_arg, *args)
+
+    monkeypatch.setattr(verify, "_git", faulted)
+    resets = []
+    real_reset = verify._reset_hard_head
+    monkeypatch.setattr(verify, "_reset_hard_head", lambda r: (resets.append(r), real_reset(r))[1])
+
+    with pytest.raises(verify.MergeResidueUnreadError) as ei:
+        verify.merge_branch(repo, "feat", strategy="squash", allow_empty_squash=True)
+
+    msg = str(ei.value)
+    assert "index state unverified" in msg
+    assert "replay probe boom" in msg
+    assert "refused the commit" not in msg
+    assert git(repo, "rev-parse", "HEAD") == head_before  # no empty commit manufactured
+    assert resets == []  # uncertainty authorized no rollback
 
 
 def test_no_ff_conflict_with_preexisting_dirt_aborts_and_keeps_it(project, tmp_path):
