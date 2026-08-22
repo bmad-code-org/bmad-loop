@@ -44,7 +44,6 @@ from bmad_loop.install import (
     SNAPSHOT_TOKEN_RE,
     _absent_renderer_sources,
     _copy_traversable,
-    _git_version_at_least,
     _is_dev_primitive_shim,
     _register_hooks,
     _shield_undo_extension,
@@ -3633,7 +3632,12 @@ def test_shield_degrades_when_a_command_scope_excludesfile_outranks_it(
 
     PARAMETRIZED BECAUSE THE ENUMERATION FIX WOULD PASS ONE AND FAIL THE OTHER, which is
     the whole argument for verifying the post-condition instead of detecting the
-    override's origin. The channels themselves differ across the supported git range:
+    override's origin. Both arms run unconditionally: `GIT_CONFIG_COUNT` arrived in git
+    2.31, below `verify.GIT_FLOOR`, so on every supported git both channels exist and
+    both defeat a shield that only checked its own write succeeded.
+
+    The table is a HISTORICAL measurement — the evidence for that argument, not a claim
+    about the supported range, since 2.20.4 now sits far below the floor:
 
                                         git 2.20.4        git 2.55.0
         GIT_CONFIG_COUNT/KEY_n/VALUE_n  inert (2.31)      shield defeated
@@ -3641,13 +3645,13 @@ def test_shield_degrades_when_a_command_scope_excludesfile_outranks_it(
         GIT_CONFIG_PARAMETERS 'k'='v'   fatal: bogus      shield defeated
         what `git -c` itself emits      'k=v'             'k'='v'
 
-    So the channel the finding named does not exist at this shield's own 2.20 floor,
-    the one that does exist there uses an encoding the newer git rewrote, and a `git -c`
-    on a session's own command line is a third that never appears in our environment at
-    all. The fix names none of them.
+    Read across it: WHICH channels exist, and the encoding each one carries, both moved
+    under git's feet — and a `git -c` on a session's own command line is a third that
+    never appears in our environment at all. An enumeration would have had to track
+    every one of those moves. The fix names none of them.
 
-    `'k=v'` is the encoding used below because it is the only one honored at BOTH ends;
-    the newer `'k'='v'` form is `fatal: bogus format in GIT_CONFIG_PARAMETERS` at 2.20.4.
+    `'k=v'` is the encoding used below because it is honored at both ends of that table,
+    so this case pins the same behavior it pinned before the floor moved.
 
     The reason string is the discriminator here, and deliberately so: `git status` shows
     the tool file with the bug AND with the fix; what changes is whether the operator is
@@ -3662,10 +3666,6 @@ def test_shield_degrades_when_a_command_scope_excludesfile_outranks_it(
     `reason is not None` — the shield reports success while `git status` in the worktree
     still shows `probe-384`."""
     repo = project.project
-    if channel == "GIT_CONFIG_COUNT" and not install_mod._git_version_at_least(
-        git(repo, "version"), (2, 31)
-    ):
-        pytest.skip("GIT_CONFIG_COUNT is git 2.31; the GIT_CONFIG_PARAMETERS case covers older git")
     if channel == "GIT_CONFIG_PARAMETERS" and sys.platform == "win32":
         # POSIX-only: the pre-2.31 encoding is sq-quoted, so a Windows path's
         # backslashes would be exercising git's own quoting rules rather than this
@@ -3721,8 +3721,6 @@ def test_shield_outranked_degrade_leaves_no_permanent_repo_format_change(
     Ablation: drop the `needs_enable` rollback and the first assertion fails —
     `worktreeConfig` survives a degrade that shielded nothing."""
     repo = project.project
-    if not install_mod._git_version_at_least(git(repo, "version"), (2, 31)):
-        pytest.skip("GIT_CONFIG_COUNT is git 2.31")
     wt = tmp_path / "wt"
     verify.worktree_add(repo, wt, "feat", "main")
     shared = repo / ".git" / "config"
@@ -4292,30 +4290,6 @@ def test_shield_keeps_edge_whitespace_in_the_common_dir(tmp_path):
     assert not (tmp_path / "common").exists()  # no stripped sibling was created
 
 
-@pytest.mark.parametrize(
-    ("reported", "supported"),
-    [
-        ("git version 2.20.0\n", True),  # the boundary itself
-        ("git version 2.19.4\n", False),  # one minor below it
-        ("git version 2.9.5\n", False),  # numeric, not lexicographic: "9" > "20" as text
-        ("git version 2.44.0.windows.1\n", True),
-        ("git version 2.39.5 (Apple Git-154)\n", True),
-        ("git version 3.0\n", True),
-        ("", False),  # nothing at all: a spawn that produced no stdout
-        ("fatal: not a git repository\n", False),
-        # No `git version` prefix. Refused deliberately: a bare-number answer is
-        # not this program's output, and the caller is about to make a permanent
-        # repo-format change on the strength of it.
-        ("2.55.0\n", False),
-    ],
-)
-def test_git_version_at_least_reads_only_a_git_version_line(reported, supported):
-    """The parse behind the shield's 2.20 gate. Unreadable answers must come back
-    False, because the caller reads False as "do not touch this repository" — an
-    optimistic parse is the only failure mode that costs anything."""
-    assert _git_version_at_least(reported, (2, 20)) is supported
-
-
 def test_shield_refuses_when_the_core_worktree_probe_cannot_answer(project, tmp_path, monkeypatch):
     """A safety probe that could not be ANSWERED must not read as "that key is unset".
     `core.worktree` is genuinely set here, and the shield must refuse exactly as it
@@ -4372,9 +4346,10 @@ def test_shield_refuses_when_the_core_bare_probe_cannot_answer(project, tmp_path
     both, and a fix applied to one arm only would leave this one open.
 
     `--type=bool` gives this probe a second way to fail that the plain read has not:
-    across the supported git range, `--type=bool` over a non-bool value exits 128
-    (the wording differs by version — "bad numeric config value" at the floor, "bad
-    boolean config value" at current — same rc). Note that no STATIC config value
+    across the supported git range, `--type=bool` over a non-bool value exits 128. The
+    MESSAGE is deliberately not relied on — older git says "bad numeric config value"
+    where current git says "bad boolean config value" — and the rc being the stable
+    half is exactly why the code keys on it. Note that no STATIC config value
     can reach that: a repo whose
     `core.bare` is a non-bool fatals the caller's earlier `rev-parse` first (measured
     128 at both). What reaches here is a transient fault inside the caller's lock.
@@ -4454,21 +4429,42 @@ def test_shield_refuses_when_the_extension_probe_cannot_answer(project, tmp_path
     assert not _wt_private_exclude(wt).exists()
 
 
+def _shield_on_git(monkeypatch, reported):
+    """Run the shield against a faked `git version`, with the format-change write
+    booby-trapped. Every other call reaches the real repo, so the callers' assertions
+    read the actual shared config rather than a stub's log — and the enable RAISES
+    rather than no-oping, because "the key is absent afterwards" would also hold if
+    the write had merely failed.
+
+    Patches BOTH bindings on purpose. `install.py` does `from .verify import
+    git_bytes`, which is a separate name from `verify.git_bytes`: the version probe
+    now runs inside `verify.git_below_floor` and resolves the latter, while the
+    booby-trapped config write runs in `install` and resolves the former. Patching
+    one alone leaves the other live — silently, and in the direction that fakes
+    nothing."""
+    real = verify.git_bytes
+
+    def ancient(worktree, *args, timeout_s=None):
+        if args == ("version",):
+            return subprocess.CompletedProcess(
+                args=["git", "version"], returncode=0, stdout=reported.encode(), stderr=b""
+            )
+        if args[:1] == ("config",) and "extensions.worktreeConfig" in args and "--get" not in args:
+            raise AssertionError(f"made a permanent format change on {reported!r}: {args}")
+        return real(worktree, *args)
+
+    monkeypatch.setattr(verify, "git_bytes", ancient)
+    monkeypatch.setattr(install_mod, "git_bytes", ancient)
+
+
 def test_shield_refuses_to_enable_extension_over_old_git(project, tmp_path, monkeypatch):
-    """`extensions.worktreeConfig` and `git config --worktree` are both git 2.20.
-    Below that the write buys a PERMANENT repo-format change that shields nothing —
-    and git-worktree(1) says older git refuses a repository carrying the extension.
-    So the version is checked before any of it.
+    """A git far below the floor never reaches the permanent repo-format change.
 
-    The gate also sits above the two probes underneath it on purpose: `--type=` is
-    git 2.18, so on an older git the `core.bare` read exits non-zero and is read as
-    "not bare" — the safety gate opening silently. Refusing here keeps that pair
-    unreachable.
-
-    Only the `version` call is faked; every other call runs against the real repo,
-    so the assertion below reads the actual shared config rather than a stub's log.
-    The enable is ALSO made to raise, because "the key is absent afterwards" would
-    hold if the write merely failed.
+    2.19.4 also predates the features themselves (`extensions.worktreeConfig` and
+    `git config --worktree` are git 2.20, `--type=` is 2.18), so this case was
+    refused before the floor moved and is refused after — it pins the FLOOR-INDEPENDENT
+    half. `test_shield_refuses_to_enable_extension_at_the_old_capability_floor` is the
+    one that proves the floor itself moved.
 
     Ablation: delete the version gate in `_shield_enable_worktree_config` and this
     fails — the enable fires, the fake raises, and the key lands in the config."""
@@ -4476,27 +4472,44 @@ def test_shield_refuses_to_enable_extension_over_old_git(project, tmp_path, monk
     wt = tmp_path / "wt"
     verify.worktree_add(repo, wt, "feat", "main")
     shared_before = (repo / ".git" / "info" / "exclude").read_bytes()
-    real = install_mod.git_bytes
-
-    def ancient(worktree, *args):
-        if args == ("version",):
-            return subprocess.CompletedProcess(
-                args=["git", "version"], returncode=0, stdout=b"git version 2.19.4\n", stderr=b""
-            )
-        if args[:1] == ("config",) and "extensions.worktreeConfig" in args and "--get" not in args:
-            raise AssertionError(f"made a permanent format change on git 2.19.4: {args}")
-        return real(worktree, *args)
-
-    monkeypatch.setattr(install_mod, "git_bytes", ancient)
+    _shield_on_git(monkeypatch, "git version 2.19.4\n")
 
     reason = _worktree_local_exclude(wt, ["/probe-384"])
 
-    assert reason is not None and "2.19.4" in reason and "git 2.20" in reason
+    assert reason is not None and "2.19.4" in reason and verify.git_floor_text() in reason
     # the repo's own format is untouched. Read as TEXT for the reason the sibling
     # refusal tests give: conftest's git() is check=True and an unset key exits 1.
     assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
     assert not _wt_private_exclude(wt).exists()
     assert (repo / ".git" / "info" / "exclude").read_bytes() == shared_before
+
+
+def test_shield_refuses_to_enable_extension_at_the_old_capability_floor(
+    project, tmp_path, monkeypatch
+):
+    """git 2.25 HAS `extensions.worktreeConfig`, `git config --worktree` and
+    `--type=`. The shield would work on it. It is refused anyway, because the gate is
+    the PROJECT support floor rather than a capability threshold — this is the
+    behavior the floor bump actually changed, and the 2.19.4 sibling above cannot
+    show it (that one was refused under the old 2.20 gate too).
+
+    The message must read as a POLICY refusal. A capability sentence here would be
+    false: 2.25 is not missing anything the shield uses.
+
+    Ablation: point the gate back at (2, 20) — restore a local constant or pass it
+    explicitly — and this fails: 2.25 clears 2.20, the enable fires, the fake
+    raises."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    _shield_on_git(monkeypatch, "git version 2.25.1\n")
+
+    reason = _worktree_local_exclude(wt, ["/probe-384"])
+
+    assert reason is not None and "2.25.1" in reason and verify.git_floor_text() in reason
+    assert "supports git" in reason  # policy wording, not a capability claim
+    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
+    assert not _wt_private_exclude(wt).exists()
 
 
 def test_shield_degrade_leaves_no_permanent_repo_format_change(project, tmp_path, monkeypatch):
@@ -5936,10 +5949,9 @@ def test_shield_honors_an_explicitly_empty_excludesfile(project, tmp_path, monke
     status` shows it untracked. The mechanism is in git's source rather than inferred —
     `dir.c::setup_standard_excludes` guards the XDG fallback on `if (!excludes_file)`, a
     NULL POINTER, while an empty value resolves through `interpolate_path("")` to a
-    non-NULL empty string, and that guard is unchanged from this shield's 2.20 floor to
-    current. It is undocumented: `core.adoc` says only "Defaults to
-    $XDG_CONFIG_HOME/git/ignore" — the same standing as the relative-value behavior
-    the sibling test above pins.
+    non-NULL empty string, and that guard is unchanged from git 2.20 to current. It is
+    undocumented: `core.adoc` says only "Defaults to $XDG_CONFIG_HOME/git/ignore" — the
+    same standing as the relative-value behavior the sibling test above pins.
 
     `GIT_CONFIG_NOSYSTEM` is deliberately NOT pinned, unlike the XDG sibling: a
     repo-LOCAL key already outranks a global one, so there is nothing to suppress, and
@@ -6335,7 +6347,7 @@ def test_worktree_local_exclude_undecodable_git_output_degrades(tmp_path, monkey
     # Dispatches on the subcommand, because the shield asks git several questions
     # now and a stub that answered them all identically would not get past the
     # first. `shift 2` drops the `-C <worktree>` every call carries. The version
-    # clears the 2.20 gate and the extension reads as already enabled, so the stub is
+    # clears the version gate and the extension reads as already enabled, so the stub is
     # never asked to change repo state.
     #
     # `rev-parse` dispatches one level further, on the FLAG, because the shield asks

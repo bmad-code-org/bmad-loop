@@ -5435,3 +5435,108 @@ def test_engine_written_is_keyword_only_on_all_dev_verifiers():
         parameter = inspect.signature(fn).parameters["engine_written"]
         assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
     assert "operator_park" in inspect.signature(verify.verify_dev).parameters
+
+
+# --------------------------------------------------- the git support floor (GIT_FLOOR)
+
+
+@pytest.mark.parametrize(
+    ("reported", "supported"),
+    [
+        ("git version 2.34.0\n", True),  # the boundary itself
+        ("git version 2.33.8\n", False),  # one minor below it
+        ("git version 2.9.5\n", False),  # numeric, not lexicographic: "9" > "34" as text
+        ("git version 2.44.0.windows.1\n", True),
+        ("git version 2.39.5 (Apple Git-154)\n", True),
+        ("git version 3.0\n", True),
+        ("", False),  # nothing at all: a spawn that produced no stdout
+        ("fatal: not a git repository\n", False),
+        # No `git version` prefix. Refused deliberately: a bare-number answer is not
+        # this program's output, and the callers read False as "abort the run" and
+        # "do not touch this repository".
+        ("2.55.0\n", False),
+    ],
+)
+def test_git_version_at_least_reads_only_a_git_version_line(reported, supported):
+    """The PREDICATE behind every floor refusal. Unreadable answers must come back
+    False: both callers read False as a refusal, so an optimistic parse is the only
+    failure mode that costs anything."""
+    assert verify.git_version_at_least(reported, (2, 34)) is supported
+
+
+def test_git_version_at_least_is_inclusive_of_the_floor():
+    """`GIT_FLOOR` is INCLUSIVE — the constant's own docstring says so, because the
+    neighbouring psmux `_LAST_UNSUPPORTED` is exclusive and reads identically."""
+    floor = f"git version {verify.GIT_FLOOR[0]}.{verify.GIT_FLOOR[1]}.0\n"
+    assert verify.git_version_at_least(floor, verify.GIT_FLOOR) is True
+
+
+def test_git_floor_text_renders_the_constant():
+    """One formatter, so the four messages naming the floor cannot drift from it."""
+    assert verify.git_floor_text() == f"{verify.GIT_FLOOR[0]}.{verify.GIT_FLOOR[1]}"
+    assert verify.git_floor_text((2, 7)) == "2.7"
+
+
+def _fake_git_version(monkeypatch, stdout, returncode=0):
+    """Drive `git_below_floor`'s WIRING without touching the real git (2.55 here)."""
+
+    def fake(repo, *args, timeout_s=None):
+        assert args == ("version",)
+        return subprocess.CompletedProcess(
+            args=["git", "version"], returncode=returncode, stdout=stdout.encode(), stderr=b""
+        )
+
+    monkeypatch.setattr(verify, "git_bytes", fake)
+
+
+def test_git_below_floor_passes_a_current_git(project, monkeypatch):
+    _fake_git_version(monkeypatch, "git version 2.55.0\n")
+    assert verify.git_below_floor(project.project) is None
+
+
+def test_git_below_floor_reports_the_version_it_refused(project, monkeypatch):
+    """The REPORTED TEXT, not a bool — every caller names the version in its own
+    message, and a bool would leave them saying only "too old"."""
+    _fake_git_version(monkeypatch, "git version 2.25.1\n")
+    assert verify.git_below_floor(project.project) == "git version 2.25.1"
+
+
+def test_git_below_floor_refuses_an_unparseable_answer(project, monkeypatch):
+    """Fail closed. A git that will not say what it is does not clear the floor —
+    this is the arm that still fires on a perfectly current host."""
+    _fake_git_version(monkeypatch, "2.55.0\n")
+    assert verify.git_below_floor(project.project) == "2.55.0"
+
+
+def test_git_below_floor_refuses_a_non_zero_rc(project, monkeypatch):
+    """`git version` does no repository setup, so a bad rc is a broken binary rather
+    than a repo answer — and an unanswerable probe must refuse, not pass."""
+    _fake_git_version(monkeypatch, "", returncode=127)
+    assert verify.git_below_floor(project.project) == "git exited 127"
+
+
+def test_git_below_floor_refuses_an_empty_answer(project, monkeypatch):
+    """rc 0 with no stdout is still no answer. Tested apart from the rc arm because
+    they reach the refusal down different branches."""
+    _fake_git_version(monkeypatch, "\n")
+    assert verify.git_below_floor(project.project) == "no version reported"
+
+
+def test_git_below_floor_lets_a_spawn_failure_through(project, monkeypatch):
+    """ "Too old" and "could not be run" are different facts and each caller
+    dispositions them differently, so the raise is deliberately not folded in."""
+
+    def boom(repo, *args, timeout_s=None):
+        raise verify.GitSpawnError("git failed to spawn")
+
+    monkeypatch.setattr(verify, "git_bytes", boom)
+    with pytest.raises(verify.GitSpawnError):
+        verify.git_below_floor(project.project)
+
+
+def test_git_below_floor_honours_the_floor_argument(project, monkeypatch):
+    """The floor is a parameter so the predicate and the wiring can be ablated
+    separately (#464) — and so this test does not have to move when GIT_FLOOR does."""
+    _fake_git_version(monkeypatch, "git version 2.30.0\n")
+    assert verify.git_below_floor(project.project, (2, 20)) is None
+    assert verify.git_below_floor(project.project, (2, 40)) == "git version 2.30.0"

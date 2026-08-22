@@ -20,6 +20,13 @@ of the README.
 ## Platform prerequisites
 
 - **Python 3.11+** and a supported coding CLI (`claude` by default).
+- **git 2.34 or newer** — every unit of work moves through git, so this one is enforced
+  rather than advised: `bmad-loop run`, `sweep` and `resume` refuse to start below it, and
+  `bmad-loop validate` reports it as a problem (`git.version`, exit 1). It is a **support**
+  floor rather than a capability one — no git command bmad-loop issues needs 2.34 — set so
+  the project stops carrying accommodations for releases it does not test against. 2.34 is
+  Ubuntu 22.04 LTS's stock git; Ubuntu 20.04 (2.25) and Debian 11 (2.30) are below it.
+  `git --version` reports what is on your `PATH`.
 - **A terminal multiplexer** — the orchestrator drives agent sessions through a terminal
   multiplexer: **tmux** (POSIX) and the experimental **psmux** (native Windows) ship
   bundled, and further backends install as separate packages that register themselves

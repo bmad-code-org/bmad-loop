@@ -200,6 +200,11 @@ class EnvInfo:
     package_version: str
     multiplexer: str
     tmux_version: str | None
+    # The host's git, as git names itself — `verify.GIT_FLOOR` is the floor a run is
+    # refused below, so "which git ran this" is the first thing a dump has to answer
+    # about a refusal. `None` when git could not be asked at all, which is itself the
+    # finding: the same probe that fails here is the one that aborts a run.
+    git_version: str | None
     # `platform.system()` above says "Windows" for both a native shell and a WSL
     # interop launch. `sys_platform` carries the raw token instead, so a dump can be
     # matched character-for-character against validate's `platform default for {token}`
@@ -318,6 +323,7 @@ def collect_env(project: Path) -> EnvInfo:
     passing it. Same
     reason ``sys.executable`` is absent despite naming the exact mismatch: the venv
     path carries the project name past the redactor."""
+    from . import verify
     from .adapters.multiplexer import fold_version, get_multiplexer
     from .platform_util import is_wsl_unc_path
 
@@ -336,6 +342,20 @@ def collect_env(project: Path) -> EnvInfo:
         tmux_v = fold_version(sanitize.scrub_text(raw)) if raw else None
     except Exception:  # nosec B110 - env probe is best-effort; absent mux is fine
         pass
+
+    git_v = None
+    try:
+        # Same scrub-then-fold order as the mux probe above, for the same #321
+        # reason: folding first can cut a home path mid-way, leaving a fragment
+        # `redact_home` no longer matches. `git version` is one short line today,
+        # but a vendor build is free to say more and the bound is what makes that
+        # safe. Reported RAW rather than as a verdict — a dump is evidence, and the
+        # floor it is read against can move after the dump was written.
+        probed = verify.git_bytes(project, "version")
+        git_v = fold_version(sanitize.scrub_text(os.fsdecode(probed.stdout))) or None
+    except Exception:  # nosec B110 - env probe is best-effort; absent git is fine
+        pass
+
     return EnvInfo(
         os=platform.system(),
         os_release=sanitize.scrub_text(platform.release()),
@@ -343,6 +363,7 @@ def collect_env(project: Path) -> EnvInfo:
         package_version=__version__,
         multiplexer=mux,
         tmux_version=tmux_v,
+        git_version=git_v,
         sys_platform=sys.platform,
         win32_on_wsl_path=sys.platform == "win32" and is_wsl_unc_path(project),
     )
@@ -842,6 +863,7 @@ def render_markdown(
     out.append(_fmt_kv("win32 on WSL distro path", "yes" if e.win32_on_wsl_path else "no"))
     out.append(_fmt_kv("multiplexer", e.multiplexer))
     out.append(_fmt_kv("tmux", e.tmux_version or "—"))
+    out.append(_fmt_kv("git", e.git_version or "—"))
     out.append(_fmt_kv("schema / generated", f"v{d.schema_version} @ {d.generated_at}"))
     out.append("")
 

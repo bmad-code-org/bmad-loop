@@ -6,6 +6,7 @@ import json
 import ntpath
 import os
 import shutil
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -36,7 +37,7 @@ from conftest import (
 from bmad_loop import cli, platform_util
 from bmad_loop import policy as policy_mod
 from bmad_loop import probe as probe_mod
-from bmad_loop import runsetup
+from bmad_loop import runsetup, verify
 from bmad_loop.adapters import multiplexer as mux_mod
 
 STORIES_SPEC_FOLDER = "_bmad-output/epic-1"
@@ -8652,3 +8653,114 @@ def test_project_degrades_on_a_real_unc_refusal(spelling, monkeypatch, capsys):
     assert str(got) == spelling, "absolute() must hand an already-absolute path back whole"
     assert platform_util.is_wsl_unc_path(got) is True
     assert "cannot canonicalize" in capsys.readouterr().err
+
+
+# ------------------------------------------------- the git support floor (GIT_FLOOR)
+
+
+def _fake_git_version(monkeypatch, reported, *, rc=0):
+    """Fake `git version` at the PREDICATE seam — `verify.git_bytes` — so the whole
+    chain under test (`git_below_floor` -> `git_version_at_least` -> the caller's
+    branch) runs for real. Patching `verify.git_below_floor` instead would fake the
+    predicate away and leave only the wiring proven; the two are separate ablation
+    axes and each needs its own seam."""
+    real = verify.git_bytes
+
+    def fake(repo, *args, timeout_s=None):
+        if args == ("version",):
+            return subprocess.CompletedProcess(
+                args=["git", "version"], returncode=rc, stdout=reported.encode(), stderr=b""
+            )
+        return real(repo, *args, timeout_s=timeout_s)
+
+    monkeypatch.setattr(verify, "git_bytes", fake)
+
+
+UNDER_FLOOR_GIT = "git version 2.25.1\n"
+
+
+def test_run_refuses_an_under_floor_git(project, capsys, monkeypatch):
+    """A host below `verify.GIT_FLOOR` never reaches the engine.
+
+    2.25 is the load-bearing choice: it HAS every git feature bmad-loop uses, so a
+    capability check would wave it through. Only a support-floor gate refuses it.
+
+    Ablation: delete the `_reject_under_floor_git` call in `cmd_run` and this fails
+    — the run proceeds past the gate. (Wiring axis; the predicate axis is
+    `tests/test_verify.py::test_git_version_at_least_reads_only_a_git_version_line`.)"""
+    install_bmad_config(project)
+    _fake_git_version(monkeypatch, UNDER_FLOOR_GIT)
+
+    assert cli.main(["run", "--project", str(project.project)]) == 1
+    err = capsys.readouterr().err
+    assert "2.25.1" in err
+    assert verify.git_floor_text() in err
+
+
+def test_run_refuses_when_git_cannot_be_run_at_all(project, capsys, monkeypatch):
+    """ "Absent/unspawnable" is a different fact from "too old", and it is refused
+    too. A run that cannot ask git its version has no business reaching `git
+    worktree add` — the gate must not degrade to "assume it's fine"."""
+    install_bmad_config(project)
+
+    def boom(repo, *args, timeout_s=None):
+        raise verify.GitSpawnError("git failed to spawn in /x: [Errno 2] No such file")
+
+    monkeypatch.setattr(verify, "git_bytes", boom)
+
+    assert cli.main(["run", "--project", str(project.project)]) == 1
+    assert "could not be run" in capsys.readouterr().err
+
+
+def test_run_gate_admits_a_git_exactly_at_the_floor(project, monkeypatch):
+    """The boundary is INCLUSIVE. Asserted on the helper rather than through a whole
+    run, so the pass leg cannot be green for some later gate's reason."""
+    _fake_git_version(monkeypatch, f"git version {verify.git_floor_text()}.0\n")
+    assert cli._reject_under_floor_git(project.project) is None
+
+
+def test_sweep_refuses_an_under_floor_git(project, capsys, monkeypatch):
+    """The refusal covers every Engine-construction entrypoint, not just `run`."""
+    install_bmad_config(project)
+    _fake_git_version(monkeypatch, UNDER_FLOOR_GIT)
+
+    assert cli.main(["sweep", "--project", str(project.project)]) == 1
+    assert verify.git_floor_text() in capsys.readouterr().err
+
+
+def test_validate_reports_an_under_floor_git_as_a_problem(project, capsys, monkeypatch):
+    """A `problem`, not a warning — `validate` exits 1 on the same host `run` aborts
+    on. The severity IS the contract here: a `report.warn` would still emit the
+    finding, so asserting only its presence would stay green through the regression
+    this guards.
+
+    Ablation: change the `report.fail` to `report.warn` and this fails on the rc."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    _fake_git_version(monkeypatch, UNDER_FLOOR_GIT)
+
+    findings = _validate_findings(project, capsys, rc=1)
+    assert findings["git.version"]["severity"] == "problem"
+    assert findings["git.version"]["detail"]["reported"] == "git version 2.25.1"
+
+
+def test_validate_and_run_agree_on_an_under_floor_git(project, capsys, monkeypatch):
+    """The point of making this a `problem`: one host state, one verdict. `validate`
+    reporting green while `run` aborts is the disagreement `cmd_validate` is built to
+    avoid, and it is invisible unless both are asserted together."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    _fake_git_version(monkeypatch, UNDER_FLOOR_GIT)
+
+    validate_rc = cli.main(["validate", "--project", str(project.project)])
+    capsys.readouterr()
+    run_rc = cli.main(["run", "--project", str(project.project)])
+    assert (validate_rc, run_rc) == (1, 1)
+
+
+def test_validate_passes_the_git_floor_on_a_current_host(project, capsys, monkeypatch):
+    """The ok leg, pinned rather than left to the machine: without the fake this row
+    would pass or fail by whatever git the box has."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    _fake_git_version(monkeypatch, "git version 2.55.0\n")
+
+    findings = _validate_findings(project, capsys)
+    assert findings["git.version"]["severity"] == "ok"
