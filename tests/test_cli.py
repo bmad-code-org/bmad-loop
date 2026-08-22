@@ -2112,6 +2112,42 @@ def test_stop_cancel_graceful_without_pending_errors(tmp_path, capsys):
     assert "no stop request pending" in capsys.readouterr().err
 
 
+def test_stop_cancel_clears_a_pending_hard_request(tmp_path, capsys):
+    """`--cancel-graceful` is mode-neutral by contract (#319): the one hard request a
+    human can still reach is the one `stop_run` deliberately leaves lodged after
+    refusing to force-kill an unverifiable pid, and withdrawing that is a legitimate
+    thing to want. The graceful twin above proves the wiring for one mode only — the
+    function is named `clear_graceful_stop` while its contract is mode-neutral, so
+    mode-gating the clear is a live regression, and this is what reddens on it."""
+    from bmad_loop import runs
+
+    run_dir = _pending_hard_run(tmp_path)
+    assert cli.main(["stop", "--project", str(tmp_path), "r1", "--cancel-graceful"]) == 0
+    assert "cancelled" in capsys.readouterr().out
+    assert not (run_dir / runs.STOP_REQUEST_FILE).exists()
+
+
+def test_stop_cancel_reports_a_request_it_could_not_remove(tmp_path, monkeypatch, capsys):
+    """`clear_graceful_stop` never raises — five callers depend on that — so it
+    answers False for "nothing was pending" and "could not remove it" alike. Cancel
+    must not read the second as the first and tell the operator their request is gone
+    while it is still on disk and still honorable. Exit stays 1 either way; only the
+    message moves."""
+    from bmad_loop import runs
+
+    run_dir = _pending_graceful_run(tmp_path)
+
+    def _refuse(_path):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(runs, "retrying_unlink", _refuse)
+    assert cli.main(["stop", "--project", str(tmp_path), "r1", "--cancel-graceful"]) == 1
+    err = capsys.readouterr().err
+    assert "still pending" in err
+    assert "no stop request pending" not in err  # the misleading line, specifically
+    assert (run_dir / runs.STOP_REQUEST_FILE).exists()  # and it really did survive
+
+
 def test_stop_graceful_and_cancel_are_mutually_exclusive(tmp_path):
     # argparse rejects the pair at parse time, before cmd_stop runs — no run needed.
     with pytest.raises(SystemExit) as exc:
@@ -3868,6 +3904,57 @@ def test_resume_discards_stale_graceful_stop_request(project, monkeypatch, capsy
 
     assert not (run_dir / runs.STOP_REQUEST_FILE).exists()  # consumed before the engine ran
     assert "discarded a stale stop request" in capsys.readouterr().err
+
+
+def test_resume_discards_a_stale_hard_stop_request(project, monkeypatch, capsys):
+    """The mode-neutral half of the docstring above, which the graceful test alone
+    could not prove. A hard request survives `stop_run`'s refusal to force-kill an
+    unverifiable pid, and `_resume_paused_run` gates on `finished`, not `stopped`, so
+    such a run is genuinely resumable with a hard file still on disk.
+
+    Ablation: mode-gate the clear at its call site to
+    `read_stop_request_mode(...) == "graceful"` — this reddens and its graceful twin
+    stays green."""
+    from bmad_loop import runs
+
+    run_dir = _paused_run_for_resume(project, monkeypatch)
+    (run_dir / runs.STOP_REQUEST_FILE).write_text(
+        '{"requested_at": "old", "mode": "hard"}', encoding="utf-8"
+    )
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+
+    assert not (run_dir / runs.STOP_REQUEST_FILE).exists()
+    assert "discarded a stale stop request" in capsys.readouterr().err
+
+
+def test_resume_refuses_when_a_stale_request_cannot_be_discarded(project, monkeypatch, capsys):
+    """Fail closed. The clear conflates "nothing pending" with "could not remove it",
+    so on a removal failure the discard notice never prints and resume used to arm
+    the pid anyway — the engine then consumed the surviving request at the very first
+    item boundary and re-stopped, with nothing on stderr to say why. Resuming again
+    repeats it: a livelock, not a one-shot annoyance.
+
+    The refusal has to land *before* write_pid, or the run is already re-armed."""
+    from bmad_loop import runs
+
+    run_dir = _paused_run_for_resume(project, monkeypatch)
+    (run_dir / runs.STOP_REQUEST_FILE).write_text(
+        '{"requested_at": "old", "mode": "hard"}', encoding="utf-8"
+    )
+
+    def _refuse(_path):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(runs, "retrying_unlink", _refuse)
+    started: list[str] = []
+    monkeypatch.setattr(runs, "write_pid", lambda _d: started.append("armed"))
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 1
+    assert started == []  # refused before the engine was re-armed
+    assert "could not be discarded" in capsys.readouterr().err
 
 
 def test_resume_refuses_live_run(tmp_path, monkeypatch, capsys):

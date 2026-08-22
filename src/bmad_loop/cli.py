@@ -2417,6 +2417,20 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
             f"run {run_dir.name}: discarded a stale stop request before resuming",
             file=sys.stderr,
         )
+    elif runs.graceful_stop_requested(run_dir):
+        # The clear is never-raise by contract (five callers depend on that), so it
+        # answers False for "nothing was pending" and "could not remove it" alike.
+        # Re-read to tell them apart: a request that survived the clear would be
+        # consumed at the very first item boundary and re-stop the run, and because
+        # the print above never fired the operator would see no reason why — then
+        # resume again, to the same end. Refuse before write_pid re-arms the engine.
+        print(
+            f"run {run_dir.name}: a stale stop request could not be discarded "
+            f"({runs.STOP_REQUEST_FILE} is not removable); resuming would stop again "
+            "at the first item. Remove it and retry.",
+            file=sys.stderr,
+        )
+        return 1
     runs.write_pid(run_dir)
     # Persist before the engine starts: status, the TUI and diagnose only ever
     # read state.json, and Engine._save() may not fire for minutes. write_pid
@@ -3309,6 +3323,17 @@ def _cmd_cancel_graceful(run_dir: Path, run_id: str) -> int:
     if runs.clear_graceful_stop(run_dir):
         print(f"run {run_id}: stop request cancelled")
         return 0
+    if runs.graceful_stop_requested(run_dir):
+        # The clear answers False for "nothing pending" and "could not remove it"
+        # alike; re-read so we never tell an operator their request is gone while it
+        # is still on disk and still honorable. Exit 1 either way — only the message
+        # differs, so no caller's exit-code expectation moves.
+        print(
+            f"run {run_id}: stop request could not be cancelled "
+            f"({runs.STOP_REQUEST_FILE} is not removable) — it is still pending",
+            file=sys.stderr,
+        )
+        return 1
     print(f"run {run_id} has no stop request pending", file=sys.stderr)
     return 1
 
