@@ -5400,6 +5400,26 @@ def test_validate_reports_an_undecodable_policy_instead_of_crashing(project, cap
     assert "not valid UTF-8" in finding["message"]
 
 
+def test_validate_reports_a_wrong_typed_policy_field_instead_of_crashing(project, capsys):
+    """The undecodable-file leg's twin one layer in (#440, carried by #474): the file
+    decodes and parses as TOML, but a *value* has the wrong type. `int()` on it raised
+    a raw ValueError — again not an OSError, again straight past every
+    `except (PolicyError, OSError)`, including `_configure_mux`'s, which runs before
+    argument dispatch on EVERY command. `_typed_int` converts it, so the offending
+    `section.key` is a named finding like any other bad policy.
+
+    Routed through `machine_json` for the same reason as the leg above: `main`'s bare
+    `except Exception` backstop also returns 1, so an rc-only assertion stays green
+    with the conversion reverted. What bites is the document — stderr carries the
+    backstop's line and stdout carries nothing to parse."""
+    _write_policy(project.project, CLAUDE_ONLY_POLICY + '[scm]\nmax_parallel = "x"\n')
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    finding = next(f for f in doc["findings"] if f["check"] == "policy")
+    assert finding["severity"] == "problem"
+    assert "scm.max_parallel must be an integer" in finding["message"]
+
+
 def test_validate_reports_an_undecodable_bmad_config_instead_of_crashing(project, capsys):
     """The `config.yaml` half of the same conversion. Separate from the policy leg
     because they are separate loaders with separate typed errors, and the callers that

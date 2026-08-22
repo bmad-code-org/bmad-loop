@@ -615,9 +615,14 @@ def _section(doc: dict[str, Any], name: str) -> dict[str, Any]:
 
 
 def _opt_grace(d: dict[str, Any], where: str) -> float | None:
+    """An optional per-stage override; ``None`` means "inherit", which is why this
+    cannot take `_typed_float`'s default. The type guard is the same one, inline:
+    a TOML int is a legal number here (``usage_grace_s = 30``), a bool is not."""
     raw = d.get("usage_grace_s")
     if raw is None:
         return None
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise PolicyError(f"{where}.usage_grace_s must be a number: got {raw!r}")
     value = float(raw)
     if value < 0:
         raise PolicyError(f"{where}.usage_grace_s must be >= 0: got {value}")
@@ -625,9 +630,12 @@ def _opt_grace(d: dict[str, Any], where: str) -> float | None:
 
 
 def _opt_nudges(d: dict[str, Any], where: str) -> int | None:
+    """The `_opt_grace` shape for the integer knob; see there for why it is inline."""
     raw = d.get("stop_without_result_nudges")
     if raw is None:
         return None
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise PolicyError(f"{where}.stop_without_result_nudges must be an integer: got {raw!r}")
     value = int(raw)
     if value < 0:
         raise PolicyError(f"{where}.stop_without_result_nudges must be >= 0: got {value}")
@@ -650,11 +658,10 @@ def _stage_adapter(adapter_d: dict[str, Any], key: str) -> StageAdapterPolicy:
     raw = adapter_d.get(key, {})
     if not isinstance(raw, dict):
         raise PolicyError(f"[adapter.{key}] must be a table")
-    raw_extra = raw.get("extra_args")
     return StageAdapterPolicy(
         name=None if raw.get("name") is None else str(raw["name"]),
         model=None if raw.get("model") is None else str(raw["model"]),
-        extra_args=None if raw_extra is None else tuple(str(a) for a in raw_extra),
+        extra_args=_typed_str_tuple(raw, f"adapter.{key}", "extra_args"),
         usage_grace_s=_opt_grace(raw, f"adapter.{key}"),
         stop_without_result_nudges=_opt_nudges(raw, f"adapter.{key}"),
     )
@@ -687,32 +694,60 @@ def _validate_plugin_settings(name: str, raw: dict[str, Any], specs: Any) -> Non
             )
 
 
-def _limit_int(raw: dict[str, Any], key: str, default: int) -> int:
-    value = raw.get(key, default)
+# The typed readers every user-TOML section coerces through. `where` is the
+# section label the message names ("limits", "scm", "adapter.dev", ...), so one
+# definition serves every section instead of a per-section family; a bare
+# `int()`/`bool()` in their place raises a raw ValueError/TypeError, which is
+# neither a PolicyError nor an OSError and so escapes every degrade handler in
+# the codebase (#440, and #278 for the [limits] leg these grew out of).
+
+
+def _typed_int(d: dict[str, Any], where: str, key: str, default: int) -> int:
+    value = d.get(key, default)
+    # bool is a subclass of int; a TOML `true` would read as 1 and silently
+    # rewrite the knob, so reject it before the isinstance check passes it.
     if isinstance(value, bool) or not isinstance(value, int):
-        raise PolicyError(f"limits.{key} must be an integer: got {value!r}")
+        raise PolicyError(f"{where}.{key} must be an integer: got {value!r}")
     return value
 
 
-def _limit_float(raw: dict[str, Any], key: str, default: float) -> float:
-    value = raw.get(key, default)
+def _typed_float(d: dict[str, Any], where: str, key: str, default: float) -> float:
+    value = d.get(key, default)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise PolicyError(f"limits.{key} must be a number: got {value!r}")
+        raise PolicyError(f"{where}.{key} must be a number: got {value!r}")
     return float(value)
 
 
-def _limit_bool(raw: dict[str, Any], key: str, default: bool) -> bool:
-    value = raw.get(key, default)
+def _typed_bool(d: dict[str, Any], where: str, key: str, default: bool) -> bool:
+    value = d.get(key, default)
     if not isinstance(value, bool):
-        raise PolicyError(f"limits.{key} must be a boolean: got {value!r}")
+        raise PolicyError(f"{where}.{key} must be a boolean: got {value!r}")
     return value
 
 
-def _limit_str(raw: dict[str, Any], key: str, default: str) -> str:
-    value = raw.get(key, default)
+def _typed_str(d: dict[str, Any], where: str, key: str, default: str) -> str:
+    value = d.get(key, default)
     if not isinstance(value, str):
-        raise PolicyError(f"limits.{key} must be a string: got {value!r}")
+        raise PolicyError(f"{where}.{key} must be a string: got {value!r}")
     return value
+
+
+def _typed_str_tuple(d: dict[str, Any], where: str, key: str) -> tuple[str, ...] | None:
+    """An optional TOML array of strings, or None when the key is absent.
+
+    Shape before entries, for the reason `scm.worktree_seed` states below: a bare
+    string is iterable, so `tuple(str(a) for a in raw)` explodes it per character
+    into one-character entries that each look like a valid argument, and a scalar
+    raises a bare TypeError out of `loads` where every other malformed value here
+    raises PolicyError."""
+    raw = d.get(key)
+    if raw is None:
+        return None
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, (list, tuple)):
+        raise PolicyError(f"{where}.{key} must be an array of strings: got {raw!r}")
+    if not all(isinstance(a, str) for a in raw):
+        raise PolicyError(f"{where}.{key} must be an array of strings: got {list(raw)!r}")
+    return tuple(raw)
 
 
 def load(path: Path | None) -> Policy:
@@ -780,44 +815,57 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         )
 
     limits = LimitsPolicy(
-        max_review_cycles=_limit_int(limits_d, "max_review_cycles", LimitsPolicy.max_review_cycles),
-        max_dev_attempts=_limit_int(limits_d, "max_dev_attempts", LimitsPolicy.max_dev_attempts),
-        max_followup_reviews=_limit_int(
-            limits_d, "max_followup_reviews", LimitsPolicy.max_followup_reviews
+        max_review_cycles=_typed_int(
+            limits_d, "limits", "max_review_cycles", LimitsPolicy.max_review_cycles
         ),
-        session_timeout_min=_limit_int(
-            limits_d, "session_timeout_min", LimitsPolicy.session_timeout_min
+        max_dev_attempts=_typed_int(
+            limits_d, "limits", "max_dev_attempts", LimitsPolicy.max_dev_attempts
         ),
-        git_timeout_s=_limit_int(limits_d, "git_timeout_s", LimitsPolicy.git_timeout_s),
-        teardown_grace_s=_limit_int(limits_d, "teardown_grace_s", LimitsPolicy.teardown_grace_s),
-        stop_without_result_nudges=_limit_int(
-            limits_d, "stop_without_result_nudges", LimitsPolicy.stop_without_result_nudges
+        max_followup_reviews=_typed_int(
+            limits_d, "limits", "max_followup_reviews", LimitsPolicy.max_followup_reviews
         ),
-        dev_stall_grace_s=_limit_int(limits_d, "dev_stall_grace_s", LimitsPolicy.dev_stall_grace_s),
-        dev_stall_nudges=_limit_int(limits_d, "dev_stall_nudges", LimitsPolicy.dev_stall_nudges),
-        dev_stall_nudges_cap=_limit_int(
-            limits_d, "dev_stall_nudges_cap", LimitsPolicy.dev_stall_nudges_cap
+        session_timeout_min=_typed_int(
+            limits_d, "limits", "session_timeout_min", LimitsPolicy.session_timeout_min
         ),
-        workflow_stall_nudges_cap=_limit_int(
-            limits_d, "workflow_stall_nudges_cap", LimitsPolicy.workflow_stall_nudges_cap
+        git_timeout_s=_typed_int(limits_d, "limits", "git_timeout_s", LimitsPolicy.git_timeout_s),
+        teardown_grace_s=_typed_int(
+            limits_d, "limits", "teardown_grace_s", LimitsPolicy.teardown_grace_s
         ),
-        dev_contract_nudge=_limit_bool(
-            limits_d, "dev_contract_nudge", LimitsPolicy.dev_contract_nudge
+        stop_without_result_nudges=_typed_int(
+            limits_d,
+            "limits",
+            "stop_without_result_nudges",
+            LimitsPolicy.stop_without_result_nudges,
         ),
-        max_tokens_per_story=_limit_int(
-            limits_d, "max_tokens_per_story", LimitsPolicy.max_tokens_per_story
+        dev_stall_grace_s=_typed_int(
+            limits_d, "limits", "dev_stall_grace_s", LimitsPolicy.dev_stall_grace_s
         ),
-        cache_read_weight=_limit_float(
-            limits_d, "cache_read_weight", LimitsPolicy.cache_read_weight
+        dev_stall_nudges=_typed_int(
+            limits_d, "limits", "dev_stall_nudges", LimitsPolicy.dev_stall_nudges
         ),
-        session_budget_mode=_limit_str(
-            limits_d, "session_budget_mode", LimitsPolicy.session_budget_mode
+        dev_stall_nudges_cap=_typed_int(
+            limits_d, "limits", "dev_stall_nudges_cap", LimitsPolicy.dev_stall_nudges_cap
         ),
-        max_tokens_per_session=_limit_int(
-            limits_d, "max_tokens_per_session", LimitsPolicy.max_tokens_per_session
+        workflow_stall_nudges_cap=_typed_int(
+            limits_d, "limits", "workflow_stall_nudges_cap", LimitsPolicy.workflow_stall_nudges_cap
         ),
-        session_budget_grace_s=_limit_int(
-            limits_d, "session_budget_grace_s", LimitsPolicy.session_budget_grace_s
+        dev_contract_nudge=_typed_bool(
+            limits_d, "limits", "dev_contract_nudge", LimitsPolicy.dev_contract_nudge
+        ),
+        max_tokens_per_story=_typed_int(
+            limits_d, "limits", "max_tokens_per_story", LimitsPolicy.max_tokens_per_story
+        ),
+        cache_read_weight=_typed_float(
+            limits_d, "limits", "cache_read_weight", LimitsPolicy.cache_read_weight
+        ),
+        session_budget_mode=_typed_str(
+            limits_d, "limits", "session_budget_mode", LimitsPolicy.session_budget_mode
+        ),
+        max_tokens_per_session=_typed_int(
+            limits_d, "limits", "max_tokens_per_session", LimitsPolicy.max_tokens_per_session
+        ),
+        session_budget_grace_s=_typed_int(
+            limits_d, "limits", "session_budget_grace_s", LimitsPolicy.session_budget_grace_s
         ),
     )
     if limits.max_review_cycles < 1 or limits.max_dev_attempts < 1:
@@ -874,8 +922,10 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         )
 
     verify = VerifyPolicy(
-        commands=tuple(str(c) for c in verify_d.get("commands", ())),
-        stream_capture_kb=int(verify_d.get("stream_capture_kb", VerifyPolicy.stream_capture_kb)),
+        commands=_typed_str_tuple(verify_d, "verify", "commands") or (),
+        stream_capture_kb=_typed_int(
+            verify_d, "verify", "stream_capture_kb", VerifyPolicy.stream_capture_kb
+        ),
     )
     if verify.stream_capture_kb < 0:
         raise PolicyError(f"verify.stream_capture_kb must be >= 0: got {verify.stream_capture_kb}")
@@ -933,11 +983,10 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
     ):
         if legacy in adapter_d:
             raise PolicyError(f"adapter.{legacy} was removed — use {replacement} instead")
-    raw_extra = adapter_d.get("extra_args")
     adapter = AdapterPolicy(
         name=str(adapter_d.get("name", AdapterPolicy.name)),
         model=str(adapter_d.get("model", AdapterPolicy.model)),
-        extra_args=None if raw_extra is None else tuple(str(a) for a in raw_extra),
+        extra_args=_typed_str_tuple(adapter_d, "adapter", "extra_args"),
         cleanup_session_on_finish=bool(
             adapter_d.get("cleanup_session_on_finish", AdapterPolicy.cleanup_session_on_finish)
         ),
@@ -949,15 +998,15 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
     )
     sweep = SweepPolicy(
         auto=str(sweep_d.get("auto", SweepPolicy.auto)),
-        max_bundles=int(sweep_d.get("max_bundles", SweepPolicy.max_bundles)),
-        max_triage_attempts=int(
-            sweep_d.get("max_triage_attempts", SweepPolicy.max_triage_attempts)
+        max_bundles=_typed_int(sweep_d, "sweep", "max_bundles", SweepPolicy.max_bundles),
+        max_triage_attempts=_typed_int(
+            sweep_d, "sweep", "max_triage_attempts", SweepPolicy.max_triage_attempts
         ),
-        max_migration_attempts=int(
-            sweep_d.get("max_migration_attempts", SweepPolicy.max_migration_attempts)
+        max_migration_attempts=_typed_int(
+            sweep_d, "sweep", "max_migration_attempts", SweepPolicy.max_migration_attempts
         ),
         repeat=bool(sweep_d.get("repeat", SweepPolicy.repeat)),
-        max_cycles=int(sweep_d.get("max_cycles", SweepPolicy.max_cycles)),
+        max_cycles=_typed_int(sweep_d, "sweep", "max_cycles", SweepPolicy.max_cycles),
     )
     if sweep.auto not in SWEEP_AUTO_MODES:
         raise PolicyError(
@@ -976,14 +1025,13 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
             "sweep.max_bundles, sweep.max_triage_attempts, "
             "sweep.max_migration_attempts and sweep.max_cycles must be >= 1"
         )
-    requested_parallel = int(scm_d.get("max_parallel", ScmPolicy.max_parallel))
+    requested_parallel = _typed_int(scm_d, "scm", "max_parallel", ScmPolicy.max_parallel)
     if requested_parallel < 1:
         raise PolicyError(f"scm.max_parallel must be >= 1: got {requested_parallel}")
-    preserve_keep = scm_d.get("preserve_keep", ScmPolicy.preserve_keep)
-    # strict on purpose, unlike the sibling int knobs: a TOML `true` (int(True)=1)
-    # or `1.9` coercing through int() would silently shrink a safety-net budget
-    if isinstance(preserve_keep, bool) or not isinstance(preserve_keep, int):
-        raise PolicyError(f"scm.preserve_keep must be an integer: got {preserve_keep!r}")
+    # This one was strict before its sibling int knobs were (a TOML `true`, with
+    # int(True) == 1, or a `1.9` coercing through int() would silently shrink a
+    # safety-net budget); `_typed_int` is that same guard, message included.
+    preserve_keep = _typed_int(scm_d, "scm", "preserve_keep", ScmPolicy.preserve_keep)
     if preserve_keep < 0:
         raise PolicyError(f"scm.preserve_keep must be >= 0: got {preserve_keep}")
     # Shape before entries, because `tuple(str(s) for s in raw)` silently accepts
@@ -1006,7 +1054,9 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         keep_failed=bool(scm_d.get("keep_failed", ScmPolicy.keep_failed)),
         rollback_on_failure=bool(scm_d.get("rollback_on_failure", ScmPolicy.rollback_on_failure)),
         preserve_keep=preserve_keep,
-        failed_diff_max_mb=int(scm_d.get("failed_diff_max_mb", ScmPolicy.failed_diff_max_mb)),
+        failed_diff_max_mb=_typed_int(
+            scm_d, "scm", "failed_diff_max_mb", ScmPolicy.failed_diff_max_mb
+        ),
         failed_diff_unlimited=bool(
             scm_d.get("failed_diff_unlimited", ScmPolicy.failed_diff_unlimited)
         ),
@@ -1070,8 +1120,12 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
                 f"scm.worktree_seed entries must be project-relative paths: got {seed!r}"
             )
     cleanup = CleanupPolicy(
-        run_retention=int(cleanup_d.get("run_retention", CleanupPolicy.run_retention)),
-        retention_days=int(cleanup_d.get("retention_days", CleanupPolicy.retention_days)),
+        run_retention=_typed_int(
+            cleanup_d, "cleanup", "run_retention", CleanupPolicy.run_retention
+        ),
+        retention_days=_typed_int(
+            cleanup_d, "cleanup", "retention_days", CleanupPolicy.retention_days
+        ),
         trim_artifacts=bool(cleanup_d.get("trim_artifacts", CleanupPolicy.trim_artifacts)),
         archive_old=bool(cleanup_d.get("archive_old", CleanupPolicy.archive_old)),
         auto_clean_on_finish=bool(

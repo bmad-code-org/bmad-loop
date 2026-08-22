@@ -1,4 +1,5 @@
 import json
+import re
 import sys
 
 import pytest
@@ -493,7 +494,7 @@ def test_dev_contract_nudge_default_parse_and_template():
 
 
 def test_dev_contract_nudge_rejects_non_boolean():
-    """Ablation: delete `_limit_bool`'s conditional and raise, retaining
+    """Ablation: delete `_typed_bool`'s conditional and raise, retaining
     `return value`; this test fails because the string is returned unchanged."""
     with pytest.raises(policy.PolicyError, match=r"limits\.dev_contract_nudge must be a boolean"):
         policy.loads('[limits]\ndev_contract_nudge = "false"\n')
@@ -520,16 +521,116 @@ def test_dev_contract_nudge_rejects_non_boolean():
     ],
 )
 def test_limits_integer_fields_reject_non_integer(key, bad):
-    """Ablation: delete `_limit_int`'s conditional and raise, retaining
+    """Ablation: delete `_typed_int`'s conditional and raise, retaining
     `return value`; all rows fail because bad scalars are accepted or reach
     downstream validation without the required integer `PolicyError`."""
     with pytest.raises(policy.PolicyError, match=rf"limits\.{key} must be an integer"):
         policy.loads(f"[limits]\n{key} = {bad}\n")
 
 
+@pytest.mark.parametrize("bad", ["true", "1.5", '"1"'])
+@pytest.mark.parametrize(
+    ("section", "key"),
+    [
+        ("verify", "stream_capture_kb"),
+        ("sweep", "max_bundles"),
+        ("sweep", "max_triage_attempts"),
+        ("sweep", "max_migration_attempts"),
+        ("sweep", "max_cycles"),
+        ("scm", "max_parallel"),
+        ("scm", "failed_diff_max_mb"),
+        ("cleanup", "run_retention"),
+        ("cleanup", "retention_days"),
+    ],
+)
+def test_numeric_policy_fields_reject_non_integer(section, key, bad):
+    """The [limits] grid above, for the sections #587 did not reach. Every one of
+    these was a bare `int()`: `"1"` and `1.5` came back as a raw ValueError and
+    `true` came back as 1, none of them a PolicyError, so all three walked past the
+    `except (PolicyError, OSError)` handlers that exist to degrade to defaults.
+
+    Ablation: delete `_typed_int`'s conditional and raise, retaining `return value`;
+    every row fails — the quoted and float rows raise ValueError instead of
+    PolicyError, and `true` is accepted outright."""
+    with pytest.raises(policy.PolicyError, match=rf"{section}\.{key} must be an integer"):
+        policy.loads(f"[{section}]\n{key} = {bad}\n")
+
+
+@pytest.mark.parametrize("table", ["adapter", "adapter.review"])
+@pytest.mark.parametrize(
+    ("key", "kind", "bad"),
+    [
+        ("usage_grace_s", "a number", "true"),
+        ("usage_grace_s", "a number", '"3"'),
+        ("stop_without_result_nudges", "an integer", "true"),
+        ("stop_without_result_nudges", "an integer", "2.5"),
+        ("stop_without_result_nudges", "an integer", '"1"'),
+    ],
+)
+def test_adapter_timing_knobs_reject_non_numeric(table, key, kind, bad):
+    """`_opt_grace`/`_opt_nudges` return None for "inherit from the profile", so they
+    cannot take `_typed_*`'s default — they carry the same guard inline. Before it,
+    `usage_grace_s = true` resolved to a 1.0-second grace and the quoted rows raised
+    a raw ValueError past every degrade handler.
+
+    Ablation: delete the isinstance conditional in the named helper (singly),
+    retaining the coercion below it; that helper's rows fail on both tables."""
+    with pytest.raises(policy.PolicyError, match=rf"{re.escape(table)}\.{key} must be {kind}"):
+        policy.loads(f"[{table}]\n{key} = {bad}\n")
+
+
+@pytest.mark.parametrize("table", ["adapter", "adapter.review"])
+def test_usage_grace_s_accepts_a_toml_integer(table):
+    """A grace in whole seconds is the natural spelling and stays legal — the guard
+    rejects wrong TYPES, not int-shaped numbers (`limits.cache_read_weight` above
+    makes the same promise)."""
+    pol = policy.loads(f"[{table}]\nusage_grace_s = 30\n")
+    stage = pol.adapter if table == "adapter" else pol.adapter.review
+    assert stage.usage_grace_s == 30.0
+    assert isinstance(stage.usage_grace_s, float)
+
+
+@pytest.mark.parametrize("bad", ['"pytest"', "5", "[1]"])
+@pytest.mark.parametrize(
+    ("table", "key"),
+    [
+        ("verify", "commands"),
+        ("adapter", "extra_args"),
+        ("adapter.dev", "extra_args"),
+    ],
+)
+def test_array_policy_fields_reject_scalars(table, key, bad):
+    """The `scm.worktree_seed` trap, in the three argv-shaped fields that still had
+    it. `tuple(str(a) for a in raw)` accepts anything iterable, so a bare TOML string
+    exploded CHARACTER-WISE — `commands = "pytest"` became six one-character commands
+    while reading as applied configuration — and a scalar int raised a bare TypeError
+    out of `loads`, untyped, where every other malformed value here raises
+    PolicyError. `[1]` is the third shape: right container, wrong entries, silently
+    stringified.
+
+    Ablation: delete `_typed_str_tuple`'s two conditionals (singly); the shape check
+    fails the string and int rows, the entry check fails the `[1]` rows."""
+    with pytest.raises(
+        policy.PolicyError, match=rf"{re.escape(table)}\.{key} must be an array of strings"
+    ):
+        policy.loads(f"[{table}]\n{key} = {bad}\n")
+
+
+def test_array_policy_fields_keep_unset_distinct_from_empty():
+    """`extra_args` is a tri-state: unset (None) inherits the profile's arguments,
+    `[]` is an explicit "no arguments". The shape guard must not fold one into the
+    other — `verify.commands` is not optional and normalizes both to ()."""
+    assert policy.loads("").adapter.extra_args is None
+    assert policy.loads("").adapter.dev.extra_args is None
+    assert policy.loads("[adapter]\nextra_args = []\n").adapter.extra_args == ()
+    assert policy.loads('[adapter]\nextra_args = ["-p"]\n').adapter.extra_args == ("-p",)
+    assert policy.loads("").verify.commands == ()
+    assert policy.loads('[verify]\ncommands = ["pytest -q"]\n').verify.commands == ("pytest -q",)
+
+
 @pytest.mark.parametrize("bad", ["true", '"0.5"'])
 def test_cache_read_weight_rejects_non_number(bad):
-    """Ablation: delete `_limit_float`'s conditional and raise; both rows fail
+    """Ablation: delete `_typed_float`'s conditional and raise; both rows fail
     because `float` accepts the boolean and quoted-number values."""
     with pytest.raises(policy.PolicyError, match=r"limits\.cache_read_weight must be a number"):
         policy.loads(f"[limits]\ncache_read_weight = {bad}\n")
@@ -559,7 +660,7 @@ def test_invalid_session_budget_mode():
 
 
 def test_session_budget_mode_rejects_non_string():
-    """Ablation: delete `_limit_str`'s conditional and raise; this test fails
+    """Ablation: delete `_typed_str`'s conditional and raise; this test fails
     because the downstream options check raises a different `PolicyError`."""
     with pytest.raises(policy.PolicyError, match=r"limits\.session_budget_mode must be a string"):
         policy.loads("[limits]\nsession_budget_mode = 1\n")
