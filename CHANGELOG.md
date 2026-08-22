@@ -7,6 +7,26 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Added
+
+- **git 2.34 or newer is now a declared prerequisite**, and the first one the orchestrator
+  enforces. Set to keep Ubuntu 22.04 LTS (stock git 2.34) supported; Ubuntu 20.04 (2.25) and
+  Debian 11 (2.30) fall below it. This is a support floor, not a capability one — nothing
+  bmad-loop runs needs 2.34 — so the project can stop carrying workarounds for untested git.
+  - `bmad-loop validate` checks it, as `git.version`.
+  - `bmad-loop diagnose` records the host's git version in its Environment block.
+
+### Changed
+
+- **`run`, `sweep` and `resume` refuse to start below git 2.34, and `validate` now exits 1
+  there** — a change of exit code on an under-floor host. A git that cannot be run, times out,
+  or answers unparseably is refused the same way. `--dry-run` names the refusal in its
+  "NOT runnable" banner instead of previewing a run that cannot start, and the TUI's
+  pre-launch guard toasts it instead of opening a pane that dies.
+- **The git-add shield's version gate moves from 2.20 to the project floor.** It now refuses as
+  an unsupported-version policy rather than claiming a missing capability, which would be false
+  at 2.34 — git 2.25 has everything the shield uses.
+
 ### Removed
 
 - **`verify.same_commit` is gone — nothing called it.** #645's `_canonical_commit_oid` displaced

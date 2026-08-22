@@ -1255,3 +1255,86 @@ def test_a_planted_fifo_is_not_counted_as_this_runs_log_output(project, tmp_path
 
     group = next(g for g in diag.runs[0].files if g.category == "logs")
     assert (group.count, group.total_bytes, group.total_lines) == (1, 8, 2)
+
+
+def test_env_git_version_is_recorded(monkeypatch):
+    """The field a floor refusal is read against: a dump has to be able to say which
+    git ran, since `verify.GIT_FLOOR` is what `run` aborts below."""
+    import subprocess
+
+    from bmad_loop import verify
+
+    monkeypatch.setattr(
+        verify,
+        "git_bytes",
+        lambda *a, **k: subprocess.CompletedProcess(
+            args=["git", "version"], returncode=0, stdout=b"git version 2.34.1\n", stderr=b""
+        ),
+    )
+
+    env = diagnostics.collect_env(ANY_PROJECT)
+    assert env.git_version == "git version 2.34.1"
+
+
+def test_env_git_version_probe_is_bounded(monkeypatch):
+    """The probe carries its own short deadline instead of inheriting the engine's
+    `GIT_TIMEOUT_S`. `diagnose` is the command an operator reaches for once the host
+    is already broken, and a git that hangs is one of the states it has to stay
+    usable in — on the engine bound it sat silent for two minutes and then swallowed
+    the fault anyway, so the entire wait bought the same `None` a five-second bound
+    reaches. Asserted through the seam rather than by timing anything, so the row
+    cannot go flaky on a loaded box.
+
+    Both halves matter: `is not None` catches a probe that went back to inheriting,
+    and the comparison catches a "bound" that is no bound at all.
+
+    Ablation: drop `timeout_s=5` in `collect_env` and this fails on the first
+    assertion."""
+    import subprocess
+
+    from bmad_loop import verify
+
+    seen = {}
+
+    def probe(_project, *args, timeout_s=None):
+        seen["args"] = args
+        seen["timeout_s"] = timeout_s
+        return subprocess.CompletedProcess(
+            args=["git", "version"], returncode=0, stdout=b"git version 2.34.1\n", stderr=b""
+        )
+
+    monkeypatch.setattr(verify, "git_bytes", probe)
+
+    env = diagnostics.collect_env(ANY_PROJECT)
+    assert env.git_version == "git version 2.34.1"  # the probe still answers
+    assert seen["args"] == ("version",)
+    assert seen["timeout_s"] is not None, "the probe inherits the engine's git deadline"
+    assert seen["timeout_s"] < verify.GIT_TIMEOUT_S
+
+
+def test_env_git_version_is_none_when_the_probe_fails(monkeypatch):
+    """`verify.git_bytes` ANSWERS a non-zero rc rather than raising, so a failed
+    probe reaches the fold with whatever it wrote to stdout.
+
+    Recording that as the version would put a fabricated fact in a dump read
+    precisely to explain a refusal — worse than the honest `None`, because a
+    plausible-looking version is not obviously absent. The stdout here is
+    deliberately version-SHAPED: an empty one would pass on `or None` even with the
+    rc guard gone, which is the vacuous form of this test.
+
+    Ablation: drop the `probed.returncode == 0` guard in `collect_env` and this
+    fails — the dump reports `git version 9.9.9`."""
+    import subprocess
+
+    from bmad_loop import verify
+
+    monkeypatch.setattr(
+        verify,
+        "git_bytes",
+        lambda *a, **k: subprocess.CompletedProcess(
+            args=["git", "version"], returncode=128, stdout=b"git version 9.9.9\n", stderr=b"fatal"
+        ),
+    )
+
+    env = diagnostics.collect_env(ANY_PROJECT)
+    assert env.git_version is None

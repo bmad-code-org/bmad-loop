@@ -200,6 +200,11 @@ class EnvInfo:
     package_version: str
     multiplexer: str
     tmux_version: str | None
+    # The host's git, as git names itself — `verify.GIT_FLOOR` is the floor a run is
+    # refused below, so "which git ran this" is the first thing a dump has to answer
+    # about a refusal. `None` when git could not be asked at all, which is itself the
+    # finding: the same probe that fails here is the one that aborts a run.
+    git_version: str | None
     # `platform.system()` above says "Windows" for both a native shell and a WSL
     # interop launch. `sys_platform` carries the raw token instead, so a dump can be
     # matched character-for-character against validate's `platform default for {token}`
@@ -318,6 +323,7 @@ def collect_env(project: Path) -> EnvInfo:
     passing it. Same
     reason ``sys.executable`` is absent despite naming the exact mismatch: the venv
     path carries the project name past the redactor."""
+    from . import verify
     from .adapters.multiplexer import fold_version, get_multiplexer
     from .platform_util import is_wsl_unc_path
 
@@ -336,6 +342,34 @@ def collect_env(project: Path) -> EnvInfo:
         tmux_v = fold_version(sanitize.scrub_text(raw)) if raw else None
     except Exception:  # nosec B110 - env probe is best-effort; absent mux is fine
         pass
+
+    git_v = None
+    try:
+        # Same scrub-then-fold order as the mux probe above, for the same #321
+        # reason: folding first can cut a home path mid-way, leaving a fragment
+        # `redact_home` no longer matches. `git version` is one short line today,
+        # but a vendor build is free to say more and the bound is what makes that
+        # safe. Reported RAW rather than as a verdict — a dump is evidence, and the
+        # floor it is read against can move after the dump was written.
+        # `git_bytes` ANSWERS with a non-zero rc rather than raising, so the rc is
+        # checked here for the same reason `git_below_floor` checks it: stdout on a
+        # failed probe is not a version, and folding it would put a fabricated
+        # answer in the dump. `None` — "could not be asked" — is the honest value.
+        # Bounded rather than inheriting the engine's `GIT_TIMEOUT_S` (120s), via
+        # the #390 per-call seam the other two best-effort probes already use
+        # (`install`'s init hint, the TUI's commit-subject render). `diagnose` is a
+        # FOREGROUND recovery aid — the command you reach for when the host is
+        # already broken — and a git that hangs is one of the states it exists to
+        # be usable in. Inheriting the engine bound made it sit silent for two
+        # minutes and then swallow the fault anyway, so the whole wait bought a
+        # `None` this returns in five seconds. The dump is worth far more than the
+        # one line this probe fills.
+        probed = verify.git_bytes(project, "version", timeout_s=5)
+        if probed.returncode == 0:
+            git_v = fold_version(sanitize.scrub_text(os.fsdecode(probed.stdout))) or None
+    except Exception:  # nosec B110 - env probe is best-effort; absent git is fine
+        pass
+
     return EnvInfo(
         os=platform.system(),
         os_release=sanitize.scrub_text(platform.release()),
@@ -343,6 +377,7 @@ def collect_env(project: Path) -> EnvInfo:
         package_version=__version__,
         multiplexer=mux,
         tmux_version=tmux_v,
+        git_version=git_v,
         sys_platform=sys.platform,
         win32_on_wsl_path=sys.platform == "win32" and is_wsl_unc_path(project),
     )
@@ -842,6 +877,7 @@ def render_markdown(
     out.append(_fmt_kv("win32 on WSL distro path", "yes" if e.win32_on_wsl_path else "no"))
     out.append(_fmt_kv("multiplexer", e.multiplexer))
     out.append(_fmt_kv("tmux", e.tmux_version or "—"))
+    out.append(_fmt_kv("git", e.git_version or "—"))
     out.append(_fmt_kv("schema / generated", f"v{d.schema_version} @ {d.generated_at}"))
     out.append("")
 

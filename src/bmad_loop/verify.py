@@ -41,6 +41,24 @@ from .sprintstatus import STATUS_ORDER, story_status
 GIT_TIMEOUT_S = 120
 COMMAND_TIMEOUT_S = 30 * 60
 
+# The oldest git bmad-loop SUPPORTS — the version this project tests against, writes
+# code against, and will help you with. INCLUSIVE: 2.34 itself clears it. (The
+# neighbouring multiplexer constant is not the same shape — psmux's
+# `_LAST_UNSUPPORTED` names the newest REFUSED build, exclusive. Do not read one as
+# the other.)
+#
+# This is a SUPPORT floor, deliberately above the capability floor. Nothing in this
+# module's git argv needs 2.34; the highest capability in use is `git config
+# --worktree`, which arrived in 2.20. The floor exists so the project stops carrying
+# accommodations for gits nobody here runs — every version claim below may assume it,
+# and code need not degrade to reach older git.
+#
+# Enforced in two places, both fail-closed: `cli._reject_under_floor_git` aborts a
+# run/sweep/resume, and `install._shield_enable_worktree_config` refuses the
+# git-add shield's permanent repo-format write. `bmad-loop validate` reports it as a
+# `git.version` problem, and `bmad-loop diagnose` records the host's version.
+GIT_FLOOR = (2, 34)
+
 # Current bound on a single git subprocess. Module state rather than a per-call
 # parameter so the ~40 git helpers need no threading; the engine overrides it
 # from `limits.git_timeout_s` at startup, everything else keeps the default.
@@ -90,6 +108,18 @@ class GitSpawnError(GitError):
     every existing guard treats it like any other git failure; a distinct type
     so the rare caller can tell "git said no" from "the machine is broken"
     (#343). The underlying errno stays reachable via ``exc.__cause__.errno``."""
+
+
+class GitTimeoutError(GitError):
+    """The git child was spawned but never returned inside the deadline (a
+    `subprocess.TimeoutExpired` out of `_run_git`). Same shape and same reason as
+    `GitSpawnError`: a GitError so every existing guard is unchanged, a distinct
+    type so a caller that is about to spawn ANOTHER git can tell "git ran and
+    said no" — a non-zero rc, which the next command will answer promptly — from
+    "git does not return", which the next command will pay the full timeout for
+    all over again. `cmd_validate` is that caller: three probes in a row against
+    one hung binary cost three deadlines, and only the first one told the
+    operator anything."""
 
 
 class RollbackPreflightError(GitError):
@@ -325,9 +355,11 @@ def _run_git(
     spawn-level OSError (#343), and a strict-decode fault on the child's output
     (#377) — so left uncaught any of them would bypass every `except GitError`
     guard and crash the run. All are translated here into the GitError taxonomy
-    — observation guards degrade, unguarded paths fail typed — with the spawn
-    class marked as `GitSpawnError` for the callers that must distinguish an
-    environment fault from git refusing.
+    — observation guards degrade, unguarded paths fail typed — with the two that
+    mean the binary never answered marked as `GitSpawnError` and
+    `GitTimeoutError` for the callers that must distinguish an environment fault
+    from git refusing. The decode fault carries no class of its own: git ran and
+    returned, so it is a fact about the repository's bytes, not about the host.
 
     The decode fault is real, not theoretical: POSIX filenames are arbitrary
     bytes, and while `core.quotePath` C-quotes them to ASCII for ordinary
@@ -361,7 +393,9 @@ def _run_git(
             env={**(env if env is not None else os.environ), "LC_ALL": "C"},
         )
     except subprocess.TimeoutExpired as exc:
-        raise GitError(f"git {cmd[3]} timed out after {effective_timeout_s}s in {repo}") from exc
+        raise GitTimeoutError(
+            f"git {cmd[3]} timed out after {effective_timeout_s}s in {repo}"
+        ) from exc
     except UnicodeDecodeError as exc:
         raise GitError(f"git {cmd[3]} returned undecodable output in {repo}: {exc}") from exc
     except OSError as exc:
@@ -442,6 +476,100 @@ def git_bytes(
     `GitError`, a spawn failure as `GitSpawnError` — since neither can be
     expressed as a `CompletedProcess`."""
     return _run_git(["git", "-C", str(repo), *args], repo, binary=True, timeout_s=timeout_s)
+
+
+def git_version_at_least(reported: str, want: tuple[int, int]) -> bool:
+    """Is this `git version …` line at least `want`? Anything unreadable is NO.
+
+    Only `major.minor` is compared, and only from a line that actually starts
+    `git version` — the tail is vendor soup (`2.44.0.windows.1`,
+    `2.39.5 (Apple Git-154)`) and searching the whole string for the first two
+    dotted numbers would happily read a version out of a build tag.
+
+    Refusing an unparseable answer is the point rather than a fallback: both callers
+    use this to gate something they must not do optimistically — abort a run, or make
+    a PERMANENT repo-format change — so the failure it must not have is the generous
+    one. A git that will not say what it is does not clear the floor.
+
+    The minor must END at a delimiter, which is what keeps that promise against
+    trailing garbage: without the lookahead `git version 2.34broken` reads as 2.34
+    and CLEARS the floor, exactly the generous failure above. A dot or whitespace
+    covers every real form — the vendor tails all continue `.` (`2.44.0.windows.1`)
+    or break to a space (`2.39.5 (Apple Git-154)`), and a bare `2.34` ends the
+    string. Anything else is refused rather than guessed at, which for an unknown
+    vendor spelling is a visible refusal instead of a silent pass.
+    """
+    match = re.match(r"git version (\d+)\.(\d+)(?=[.\s]|$)", reported.strip())
+    return match is not None and (int(match[1]), int(match[2])) >= want
+
+
+def git_below_floor(
+    repo: Path, floor: tuple[int, int] = GIT_FLOOR, *, timeout_s: int | None = None
+) -> str | None:
+    """What git called itself, when that is below `floor` or unreadable — else None.
+
+    Returning the REPORTED TEXT rather than a bool is what lets every caller name the
+    version it refused in its own message; `None` is the only "fine" answer, so
+    callers test `is not None` and never truthiness (an empty-but-present answer is a
+    refusal, not a pass).
+
+    Split from :func:`git_version_at_least` on purpose. This is the WIRING — probe,
+    decode, delegate — and that is the PREDICATE. A test that fakes this one proves a
+    call site is reached; a test that drives that one proves the comparison is right.
+    Ablating either leaves the other's test green (#464), so they need separate seams
+    to be separately provable.
+
+    `git version` is safe against any path: it does no repository setup, so it exits
+    0 where `rev-parse` fatals 128 on a malformed `.git/config` — the probe answers
+    for the git BINARY, never for the repo. A non-zero rc is therefore already a
+    fault, and is reported as an unreadable answer rather than swallowed.
+
+    Raises `GitError` untouched when git could not be run at all — absent or
+    unspawnable as `GitSpawnError`, hung as `GitTimeoutError`. That is a different
+    fact from "too old" and each caller dispositions it differently, so it is
+    deliberately not folded in here.
+
+    `timeout_s` is the #390 per-call seam, forwarded verbatim: the CLI gates keep
+    the engine bound, while a caller that must not stall — the TUI guard, on the
+    event loop — asks with its own short deadline and treats the resulting
+    `GitTimeoutError` as "could not look" rather than as a refusal, since a bound
+    the CLI does not share must not decide a launch."""
+    probed = git_bytes(repo, "version", timeout_s=timeout_s)
+    reported = os.fsdecode(probed.stdout).strip()
+    if probed.returncode != 0:
+        return reported or f"git exited {probed.returncode}"
+    return None if git_version_at_least(reported, floor) else (reported or "no version reported")
+
+
+def git_floor_text(floor: tuple[int, int] = GIT_FLOOR) -> str:
+    """`GIT_FLOOR` as operators read it — `"2.34"`. One formatter so the four
+    messages that name the floor cannot drift apart from each other or from the
+    constant."""
+    return f"{floor[0]}.{floor[1]}"
+
+
+def under_floor_git_message(found: str) -> str:
+    """The one wording for "this git is below `GIT_FLOOR`", rendered by every
+    surface that says it: `cli._reject_under_floor_git`'s abort, `validate`'s
+    `git.version` finding, `--dry-run`'s "NOT runnable" banner, and the TUI's
+    pre-launch guard.
+
+    Shared on purpose — those four dispositions (abort, report, preview, toast) are
+    verdicts about ONE host fact, and must not read as different findings about it.
+    Lives here rather than in `cli` because that is what lets the TUI render it: the
+    TUI is an observer over the core modules and importing the CLI into it would
+    invert the layering, so the alternative was a second copy of the sentence, which
+    is the drift this function exists to make impossible. `GIT_FLOOR`,
+    `git_floor_text` and `git_below_floor` are all here too."""
+    # `found` is git's own answer, verbatim — usually a whole `git version 2.25.1`
+    # line, but also `git exited 127` or `no version reported` when the probe could
+    # not read one. Quoted and introduced rather than dropped mid-sentence, so all
+    # three shapes read as English (and so "git git version …" cannot happen).
+    return (
+        f"git reported {found!r}, which is below the floor bmad-loop supports — "
+        f"git {git_floor_text()} or newer is required. Install a newer git "
+        "and re-run (`git --version` reports what is on PATH)."
+    )
 
 
 def rev_parse_head(repo: Path) -> str:
@@ -922,8 +1050,8 @@ def _exclude_specs(dirs: tuple[str, ...]) -> list[str]:
     `[…]`/`?` collision reaches a sibling FILE only, because the pathspec has to match
     the whole path. Both magic words go in ONE comma-separated `:(...)` prefix — the
     global `--literal-pathspecs` / `GIT_LITERAL_PATHSPECS` form would disarm the
-    `:(exclude)` magic too and silently stop excluding anything at all. Stable from the
-    git 2.20 floor `install._WORKTREE_CONFIG_GIT` declares to current."""
+    `:(exclude)` magic too and silently stop excluding anything at all. Stable across
+    the supported range, `GIT_FLOOR` to current."""
     return [f":(exclude,literal){d}" for d in dirs]
 
 
@@ -999,7 +1127,7 @@ def path_tracked(repo: Path, rel: str) -> bool:
     prefix, so `_bmad/render` still lists everything beneath it (`cmd_validate`'s
     render-tracked warning), and it additionally disarms a ``rel`` that itself begins
     with `:`, which git would otherwise parse as magic and answer the empty set for.
-    Stable from the git 2.20 floor `install._WORKTREE_CONFIG_GIT` declares to current;
+    Stable across the supported range, `GIT_FLOOR` to current;
     below a version that understands the prefix it would read as a literal FILENAME,
     match nothing and answer False, which is the one direction that authorizes a
     delete.

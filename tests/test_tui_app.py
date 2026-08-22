@@ -2202,6 +2202,92 @@ async def test_unreadable_policy_falls_through_the_isolation_guard(project, monk
         assert not any("isolation" in m for m in notifications(app))
 
 
+def _fake_tui_git_version(monkeypatch, reported=None, *, boom=None):
+    """Answer `git version` at the `git_bytes` seam and pass every other git call
+    through to the real one. Both halves are load-bearing: `_commit_subject` shares
+    this seam, and the guard's own clean-tree gate has to keep working or a blocked
+    launch could be blocked for the wrong reason."""
+    real = verify.git_bytes
+
+    def fake(repo, *args, timeout_s=None):
+        if args == ("version",):
+            if boom is not None:
+                raise boom
+            return subprocess.CompletedProcess(
+                args=["git", "version"], returncode=0, stdout=reported.encode(), stderr=b""
+            )
+        return real(repo, *args, timeout_s=timeout_s)
+
+    monkeypatch.setattr(verify, "git_bytes", fake)
+
+
+async def test_an_under_floor_git_blocks_launch(project, monkeypatch):
+    """The host floor, mirrored where the other pre-launch refusals already are.
+    The detached CLI refuses this too and is the authority; without the mirror the
+    operator's only signal was the dashboard's generic "launch may have failed"
+    toast 10s later, which names neither git nor the floor.
+
+    Asserted against the sole producer of the text rather than a literal, like the
+    #414 sibling above — that is what keeps the toast and the CLI's abort from
+    drifting into two different findings about one host.
+
+    The fixture carries the #414 conflicting pair AND leaves the tree dirty, so
+    this pins the ORDER too: either of those gates speaking first would send the
+    operator to fix a project when the problem is the machine."""
+    calls = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "start_run_detached", lambda *a, **kw: calls.append(a))
+    _split_root_tui_project(project)
+    _fake_tui_git_version(monkeypatch, "git version 2.25.1\n")
+    expected = verify.under_floor_git_message("git version 2.25.1")
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("r")
+        await until(pilot, lambda: isinstance(app.screen, StartRunModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        await until(pilot, lambda: expected in notifications(app))
+        assert not any("isolation" in m for m in notifications(app))
+        assert not any("not clean" in m for m in notifications(app))
+        assert not calls
+
+
+async def test_a_git_that_cannot_be_probed_falls_through_the_floor_guard(project, monkeypatch):
+    """The guard's deliberate blind spot, and the reason it has one: this probe runs
+    on the event loop, so it carries a 5s bound the detached CLI does not share. A
+    git slow enough to miss that bound but fast enough for the CLI's would be
+    refused by a toast on a host that runs fine, so "could not look" falls through
+    and lets the CLI answer — where `_reject_under_floor_git` fails CLOSED on the
+    same fault, in the process that actually matters.
+
+    `probes` is the positive control: `calls` alone would go green if the guard
+    stopped probing at all, which is the opposite change."""
+    probes = []
+    calls = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "start_run_detached", lambda *a, **kw: calls.append(a))
+
+    real = verify.git_bytes
+
+    def hung(repo, *args, timeout_s=None):
+        if args == ("version",):
+            probes.append(timeout_s)
+            raise verify.GitTimeoutError("git version timed out after 5s")
+        return real(repo, *args, timeout_s=timeout_s)
+
+    monkeypatch.setattr(verify, "git_bytes", hung)
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("r")
+        await until(pilot, lambda: isinstance(app.screen, StartRunModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        await until(pilot, lambda: bool(calls))
+        assert probes == [5], "the guard must ask, and must ask with its own deadline"
+
+
 async def test_live_run_asks_for_confirmation(project, monkeypatch):
     calls = []
     monkeypatch.setattr(launch, "mux_available", lambda: True)
