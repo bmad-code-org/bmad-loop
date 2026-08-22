@@ -314,8 +314,8 @@ Doctrine:
   every CI job that installs the project), so an environment missing it is a broken dev setup
   that should fail loudly, not a legitimate configuration that silently runs ~300 fewer tests
   (the two Pilot files, and `test_tui_data.py` via its `pyte`/`rich` imports —
-  `test_cleanup.py` left that set in #650, when the run-inventory reader it needs
-  moved to `runs.py`).
+  `test_cleanup.py` left that set in #650, when the run-inventory reader it
+  depends on moved to `runs.py`).
 - **Snapshot testing is rejected, with revisit triggers.** `pytest-textual-snapshot` is
   unverified against the textual 8 line this repo pins, and every TUI gap observed so far has
   been behavioral (data, argv, wiring, liveness gates) — exactly what snapshots do not catch,
