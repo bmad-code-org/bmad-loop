@@ -1551,10 +1551,11 @@ def test_status_document_library_call_matches_the_cli(project, capsys):
 
 
 def test_list_document_library_call_matches_the_cli(project, capsys):
-    # cmd_list sources its RunInfos the same lazy way — data.py has no textual
-    # imports, so this does not drag the TUI into a library consumer's process.
+    # cmd_list sources its RunInfos from the same core reader (#650): the run
+    # inventory lives in bmad_loop.runs, so a library consumer gets identical
+    # documents without the [tui] extra installed.
     from bmad_loop.documents import list_document
-    from bmad_loop.tui.data import discover_runs
+    from bmad_loop.runs import discover_runs
 
     # Deterministic statuses only: running/interrupted probe pid liveness and
     # would flake (see _make_list_run).

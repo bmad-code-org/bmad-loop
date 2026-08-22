@@ -2316,7 +2316,7 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
     # Persist before the engine starts: status, the TUI and diagnose only ever
     # read state.json, and Engine._save() may not fire for minutes. write_pid
     # runs FIRST so no observer catches a window of "not paused + dead pid",
-    # which tui.data classifies as INTERRUPTED.
+    # which runs.discover_runs classifies as INTERRUPTED.
     save_state(run_dir, state)
     # The adapter build + engine selection (sweep vs stories vs plain, from
     # persisted state) lives in runsetup; the re-stamp/pid/save bookkeeping above
@@ -3114,10 +3114,8 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_list(args: argparse.Namespace) -> int:
-    from .tui.data import discover_runs  # import-safe: data.py has no textual imports
-
     project = _project(args)
-    infos = discover_runs(project)  # oldest first
+    infos = runs.discover_runs(project)  # oldest first
     if args.json:
         machine.emit(list_document(infos))
         return 0

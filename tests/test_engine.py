@@ -10145,7 +10145,7 @@ def test_run_crash_after_finish_clears_finished(project, monkeypatch):
     """A post-loop step that throws after finished=True is recorded as a crash
     and the finished flag is cleared, so status classification reads CRASHED
     rather than FINISHED (which it checks first)."""
-    from bmad_loop.tui import data
+    from bmad_loop import runs
 
     monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: None)
     engine, _ = make_engine(project, [])  # loop completes → sets finished=True
@@ -10165,8 +10165,8 @@ def test_run_crash_after_finish_clears_finished(project, monkeypatch):
     assert summary.crashed is True
     # the real payoff: it classifies as CRASHED, not FINISHED
     assert (
-        data._classify(state.finished, state.paused, state.stopped, state.crashed, engine.run_dir)
-        == data.CRASHED
+        runs._classify(state.finished, state.paused, state.stopped, state.crashed, engine.run_dir)
+        == runs.CRASHED
     )
 
 

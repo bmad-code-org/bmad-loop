@@ -14,10 +14,11 @@ import stat
 import sys
 import tarfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from . import devcontract, envvars, verify
-from .adapters.multiplexer import MultiplexerError, get_multiplexer
+from .adapters.multiplexer import MultiplexerError, get_multiplexer, mux_usable
 from .journal import STATE_FILE, VERIFY_DIR, Journal, load_state, save_state
 from .model import PAUSE_ESCALATION, Phase, RunState, StoryTask
 from .platform_util import (
@@ -30,7 +31,7 @@ from .platform_util import (
     retrying_unlink,
     safe_segment,
 )
-from .process_host import get_process_host
+from .process_host import ProcessHostError, get_process_host
 
 RUNS_DIR = Path(".bmad-loop") / "runs"
 ARCHIVE_DIR = Path(".bmad-loop") / "archive"
@@ -586,7 +587,7 @@ def read_named_pid_identity(pidfile: Path) -> tuple[int | None, float | None]:
 
 def engine_alive(run_dir: Path) -> bool:
     """True only when a local engine pid is provably alive **and still our engine**
-    (identity-checked, so a reused pid reads as dead). Mirrors tui.data.liveness
+    (identity-checked, so a reused pid reads as dead). Mirrors :func:`liveness`
     minus the tmux fallback — callers here want a definite 'is something running'
     answer, and 'unknown' must not block stop/delete."""
     pid, identity = read_pid_identity(run_dir)
@@ -608,13 +609,163 @@ def engine_liveness(run_dir: Path) -> str:
 
 def probe_liveness(pid: int, identity: float | None) -> str:
     """Tri-state probe of an already-read ``(pid, identity)`` — the shared body of
-    :func:`engine_liveness` and ``tui.data.liveness``, so both read the pid file once.
+    :func:`engine_liveness` and :func:`liveness`, so both read the pid file once.
     A probe failure degrades to ``'unknown'``, never a false ``'dead'``."""
     host = get_process_host()  # ProcessHostError (misconfig) propagates, not masked as unknown
     try:
         return host.liveness_of(pid, identity)
     except Exception:
         return "unknown"
+
+
+# ------------------------------------------------- run inventory / classification
+
+
+# Run statuses reported by `bmad-loop list` and the dashboard.
+RUNNING = "running"
+PAUSED = "paused"
+FINISHED = "finished"
+STOPPED = "stopped"
+CRASHED = "crashed"
+INTERRUPTED = "interrupted"
+UNKNOWN = "unknown"
+
+_StatSig = tuple[int, int, int]
+
+
+def _stat_sig(path: Path) -> _StatSig | None:
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    # st_ino joins (mtime_ns, size): the engine rewrites state.json atomically
+    # (temp + os.replace), so every write lands on a fresh inode. That catches a
+    # same-size rewrite within one coarse mtime tick (e.g. WSL2 drvfs, or any fast
+    # rewrite on a low-resolution mtime) that (mtime_ns, size) alone would miss and
+    # serve stale from cache.
+    return (st.st_mtime_ns, st.st_size, st.st_ino)
+
+
+def liveness(run_dir: Path) -> str:
+    """'alive' | 'dead' | 'unknown' for the engine that owns run_dir.
+
+    engine.pid is authoritative (written at run/sweep/resume start, never
+    deleted). Legacy runs without one fall back to the per-run agent session —
+    but that session only exists while an agent session runs, so its absence
+    proves nothing: 'unknown', never falsely dead. Pid checks are local-only;
+    runs on other hosts always come back 'unknown'.
+    """
+    pid, identity = read_pid_identity(run_dir)
+    if pid is None:
+        return _session_liveness(run_dir.name)
+    # Probe the pid we just read (shared body with engine_liveness) rather than
+    # re-reading it, so a non-atomic pid rewrite can't split the two reads and flash
+    # a false 'dead' between "pid present" here and a re-read seeing an empty file.
+    try:
+        return probe_liveness(pid, identity)
+    except ProcessHostError:
+        # A misconfigured host (bad BMAD_LOOP_PROCESS_HOST) stays a hard error on
+        # CLI decision paths, but the display layer must degrade, not crash: the
+        # dashboard poll worker has no except and would take the whole app down.
+        return "unknown"
+
+
+def _session_liveness(run_id: str) -> str:
+    # An absent multiplexer / dead query proves nothing about a legacy run, so the
+    # only positive signal is a live session; everything else is 'unknown'.
+    mux = get_multiplexer()
+    if not mux_usable(mux):  # forced-aware, like every other observer gate
+        return "unknown"
+    try:
+        return "alive" if mux.has_session(session_name(run_id)) else "unknown"
+    except (OSError, MultiplexerError):
+        # The seam raises MultiplexerError (not OSError) on a backend failure; a
+        # dead query proves nothing about a legacy run, so degrade to 'unknown'
+        # rather than crashing the TUI poll.
+        return "unknown"
+
+
+def _classify(finished: bool, paused: bool, stopped: bool, crashed: bool, run_dir: Path) -> str:
+    if finished:
+        return FINISHED
+    if paused:
+        return PAUSED
+    # a deliberate stop leaves a dead pid — check it before liveness so it does
+    # not read as INTERRUPTED (a crash).
+    if stopped:
+        return STOPPED
+    # a recorded crash leaves a dead pid too — surface it as a distinct CRASHED
+    # before liveness, where it would otherwise read as a generic INTERRUPTED.
+    if crashed:
+        return CRASHED
+    live = liveness(run_dir)
+    if live == "alive":
+        return RUNNING
+    if live == "dead":
+        return INTERRUPTED
+    return UNKNOWN
+
+
+@dataclass(frozen=True)
+class RunInfo:
+    run_id: str
+    run_dir: Path
+    run_type: str
+    started_at: str
+    status: str
+    paused_stage: str = ""  # RunState.paused_stage when PAUSED, else ""; drives the badge
+    stopping: bool = False  # a graceful stop is pending (control file present) while RUNNING
+
+
+# state.json path -> (stat sig, header fields tuple)
+_HeaderFields = tuple[str, str, bool, bool, bool, bool, str]
+_header_cache: dict[Path, tuple[_StatSig, _HeaderFields]] = {}
+
+
+def discover_runs(project: Path) -> list[RunInfo]:
+    """One RunInfo per run dir, oldest first; [] when the runs dir is missing.
+
+    Parses only the state.json header fields (cached on stat); a state file
+    that fails to parse yields status 'unknown' rather than crashing — it is
+    transient, the engine writes atomically.
+    """
+    out: list[RunInfo] = []
+    for run_dir in list_run_dirs(project):
+        state_path = run_dir / STATE_FILE
+        sig = _stat_sig(state_path)
+        cached = _header_cache.get(state_path)
+        if sig is not None and cached is not None and cached[0] == sig:
+            run_type, started_at, finished, paused, stopped, crashed, paused_stage = cached[1]
+        else:
+            try:
+                doc = json.loads(state_path.read_text(encoding="utf-8"))
+                run_type = str(doc.get("run_type", "story"))
+                started_at = str(doc.get("started_at", ""))
+                finished = bool(doc.get("finished", False))
+                paused = doc.get("paused_reason") is not None
+                stopped = bool(doc.get("stopped", False))
+                crashed = bool(doc.get("crashed", False))
+                paused_stage = str(doc.get("paused_stage") or "")
+            except (OSError, json.JSONDecodeError):
+                out.append(RunInfo(run_dir.name, run_dir, "?", "", UNKNOWN))
+                continue
+            if sig is not None:
+                _header_cache[state_path] = (
+                    sig,
+                    (run_type, started_at, finished, paused, stopped, crashed, paused_stage),
+                )
+        status = _classify(finished, paused, stopped, crashed, run_dir)
+        # paused_stage is advisory: only meaningful while the run is actually PAUSED
+        # (a resumed run keeps the last stage in state until it re-pauses/finishes).
+        stage = paused_stage if status == PAUSED else ""
+        # A pending graceful stop is the control file's presence, but only while an
+        # engine is still around to honor it — RUNNING or UNKNOWN (an unverifiable
+        # pid still consumes the file). The engine discards the file at the stop
+        # boundary, so a lingering file on an already-concluded run is not "stopping":
+        # STOPPED/FINISHED/CRASHED classify before liveness, so they never read UNKNOWN.
+        stopping = status in (RUNNING, UNKNOWN) and (run_dir / STOP_REQUEST_FILE).is_file()
+        out.append(RunInfo(run_dir.name, run_dir, run_type, started_at, status, stage, stopping))
+    return out
 
 
 # ----------------------------------------------------------- stop / delete / archive

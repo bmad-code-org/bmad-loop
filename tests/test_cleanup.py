@@ -10,7 +10,6 @@ from conftest import install_bmad_config, machine_json
 from bmad_loop import cli, runs, verify
 from bmad_loop.journal import VERIFY_DIR, save_state
 from bmad_loop.model import RunState
-from bmad_loop.tui import data
 
 
 def _state_run(project, run_id, **kw):
@@ -191,7 +190,7 @@ def test_trim_run_dir_keeps_run_viewable(tmp_path):
     assert (run_dir / "state.json").is_file()
     assert (run_dir / "journal.jsonl").is_file()
     # the run still discovers + lists in the dashboard
-    infos = data.discover_runs(tmp_path)
+    infos = runs.discover_runs(tmp_path)
     assert [i.run_id for i in infos] == ["20260101-000000-aaaa"]
 
 
@@ -227,7 +226,7 @@ def test_trim_run_dir_reclaims_the_verifier_stream_store(tmp_path):
     # the TUI-visible core the trim exists to preserve
     assert (run_dir / "state.json").is_file()
     assert (run_dir / "journal.jsonl").is_file()
-    infos = data.discover_runs(tmp_path)
+    infos = runs.discover_runs(tmp_path)
     assert [i.run_id for i in infos] == ["20260101-000000-aaaa"]
 
 

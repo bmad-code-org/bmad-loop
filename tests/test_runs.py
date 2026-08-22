@@ -2097,3 +2097,252 @@ def test_reconcile_orphan_state_dirs_skips_an_entry_it_cannot_resolve(tmp_path, 
 
     assert runs.reconcile_orphan_state_dirs(tmp_path) == [good]
     assert not good.exists() and bad.is_dir()
+
+
+# ---- run inventory (moved from tui/data.py, #650)
+# discover_runs and its status/liveness closure are core now: `bmad-loop list`
+# reads them and must not drag the [tui] extra in. The RunWatcher halves of the
+# split tests stay in test_tui_data.py.
+
+
+def test_discover_runs_missing_dir(tmp_path):
+    assert runs.discover_runs(tmp_path) == []
+
+
+def test_discover_runs_classification(tmp_path):
+    _make_state_run(tmp_path, "20260611-100000-aaaa", finished=True)
+    _make_state_run(tmp_path, "20260611-110000-bbbb", paused_reason="escalation")
+    alive_dir = _make_state_run(tmp_path, "20260611-120000-cccc")
+    runs.write_pid(alive_dir)  # test process pid: alive
+    gone_dir = _make_state_run(tmp_path, "20260611-130000-dddd", run_type="sweep")
+    (gone_dir / "engine.pid").write_text(str(_dead_pid()))
+
+    infos = runs.discover_runs(tmp_path)
+    assert [i.status for i in infos] == [
+        runs.FINISHED,
+        runs.PAUSED,
+        runs.RUNNING,
+        runs.INTERRUPTED,
+    ]
+    assert infos[0].started_at == "2026-06-11T10:00:00"
+    assert [i.run_type for i in infos] == ["story", "story", "story", "sweep"]
+    # statuses re-classify on a second (cached-header) pass
+    assert [i.status for i in runs.discover_runs(tmp_path)] == [i.status for i in infos]
+
+
+def test_live_pid_with_unreadable_identity_is_unknown_not_interrupted(tmp_path, monkeypatch):
+
+    run_dir = _make_state_run(tmp_path, "20260611-100000-aaaa")
+    (run_dir / "engine.pid").write_text("4242 123.0")
+
+    class Host:
+        def liveness_of(self, pid, identity):
+            return "unknown"
+
+    # liveness reads the host seam through probe_liveness; patch get_process_host
+    # in this module to exercise the full delegation path.
+    monkeypatch.setattr(runs, "get_process_host", lambda: Host())
+    assert runs.liveness(run_dir) == "unknown"
+    assert runs.discover_runs(tmp_path)[0].status == runs.UNKNOWN
+
+
+def test_process_host_misconfig_degrades_to_unknown(tmp_path, monkeypatch):
+    # A ProcessHostError from get_process_host (bad BMAD_LOOP_PROCESS_HOST) must not
+    # escape the display layer: the dashboard poll worker has no except and would
+    # take the whole app down. The status column degrades to 'unknown' instead.
+    from bmad_loop.process_host import ProcessHostError
+
+    run_dir = _make_state_run(tmp_path, "20260611-100000-aaaa")
+    (run_dir / "engine.pid").write_text("4242 123.0")
+
+    def boom():
+        raise ProcessHostError("BMAD_LOOP_PROCESS_HOST matches no registered host")
+
+    monkeypatch.setattr(runs, "get_process_host", boom)
+    assert runs.liveness(run_dir) == "unknown"
+    assert runs.discover_runs(tmp_path)[0].status == runs.UNKNOWN
+
+
+def test_finished_beats_stopped(tmp_path):
+    _make_state_run(tmp_path, "20260611-100000-aaaa", finished=True, stopped=True)
+    assert runs.discover_runs(tmp_path)[0].status == runs.FINISHED
+
+
+def test_discover_runs_marks_graceful_stop_pending_while_running(tmp_path):
+    from bmad_loop.runs import STOP_REQUEST_FILE
+
+    run_dir = _make_state_run(tmp_path, "20260611-120000-cccc")
+    runs.write_pid(run_dir)  # test process pid: alive -> RUNNING
+    assert runs.discover_runs(tmp_path)[0].stopping is False  # no request yet
+    (run_dir / STOP_REQUEST_FILE).write_text("{}", encoding="utf-8")
+    info = runs.discover_runs(tmp_path)[0]
+    assert info.status == runs.RUNNING
+    assert info.stopping is True
+
+
+def test_discover_runs_marks_graceful_stop_pending_while_unknown(tmp_path, monkeypatch):
+    # An unverifiable ('unknown') pid still has an engine that can consume the control
+    # file, so the "stopping" badge shows for an UNKNOWN-status run too — matching the
+    # CLI's graceful_stop_pending, which projects the request on liveness != "dead".
+    from bmad_loop.runs import STOP_REQUEST_FILE
+
+    run_dir = _make_state_run(tmp_path, "20260611-100000-aaaa")
+    (run_dir / "engine.pid").write_text("4242 123.0")
+
+    class Host:
+        def liveness_of(self, pid, identity):
+            return "unknown"
+
+    monkeypatch.setattr(runs, "get_process_host", lambda: Host())
+    assert runs.discover_runs(tmp_path)[0].stopping is False  # no request yet
+    (run_dir / STOP_REQUEST_FILE).write_text("{}", encoding="utf-8")
+    info = runs.discover_runs(tmp_path)[0]
+    assert info.status == runs.UNKNOWN
+    assert info.stopping is True
+
+
+def test_stopping_ignored_on_a_non_running_run(tmp_path):
+    # The engine consumes the control file at the stop boundary; a file lingering
+    # on an already-stopped or finished run must not read as still-stopping.
+    from bmad_loop.runs import STOP_REQUEST_FILE
+
+    stopped = _make_state_run(tmp_path, "20260611-100000-aaaa", stopped=True)
+    (stopped / "engine.pid").write_text(str(_dead_pid()))
+    (stopped / STOP_REQUEST_FILE).write_text("{}", encoding="utf-8")
+    finished = _make_state_run(tmp_path, "20260611-110000-bbbb", finished=True)
+    (finished / STOP_REQUEST_FILE).write_text("{}", encoding="utf-8")
+    infos = {i.run_id: i for i in runs.discover_runs(tmp_path)}
+    assert infos["20260611-100000-aaaa"].status == runs.STOPPED
+    assert infos["20260611-100000-aaaa"].stopping is False
+    assert infos["20260611-110000-bbbb"].status == runs.FINISHED
+    assert infos["20260611-110000-bbbb"].stopping is False
+
+
+def test_discover_runs_legacy_no_pid_is_unknown(tmp_path, monkeypatch):
+    _make_state_run(tmp_path, "20260611-100000-aaaa")
+    # legacy liveness now flows through the multiplexer backend; patch its seam.
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda _: None)
+    assert runs.discover_runs(tmp_path)[0].status == runs.UNKNOWN
+
+
+@pytest.mark.usefixtures("force_tmux_backend")  # asserts tmux liveness through the seam
+def test_legacy_run_with_live_tmux_session_is_running(tmp_path, monkeypatch):
+    run_dir = _make_state_run(tmp_path, "20260611-100000-aaaa")
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda _: "/usr/bin/tmux")
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+
+        class Proc:
+            returncode = 0
+
+        return Proc()
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake_run)
+    assert runs.discover_runs(tmp_path)[0].status == runs.RUNNING
+    assert calls[0][:3] == ["tmux", "has-session", "-t"]
+    assert calls[0][3] == f"=bmad-loop-{run_dir.name}"
+
+
+def test_legacy_run_liveness_unknown_when_backend_query_fails(tmp_path, monkeypatch):
+    """A timed-out / failing has-session surfaces as a MultiplexerError at the seam,
+    not a raw subprocess error: a dead query proves nothing about a legacy run, so it
+    degrades to 'unknown' instead of escaping discover_runs() and crashing the TUI."""
+    _make_state_run(tmp_path, "20260611-100000-aaaa")
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda _: "/usr/bin/tmux")
+
+    def boom(argv, **kwargs):
+        raise tmux_base.subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", boom)
+    assert runs.discover_runs(tmp_path)[0].status == runs.UNKNOWN
+
+
+def test_discover_runs_corrupt_state_is_unknown_not_crash(tmp_path):
+    run_dir = _make_state_run(tmp_path, "20260611-100000-aaaa")
+    (run_dir / "state.json").write_text("{ not json")
+    infos = runs.discover_runs(tmp_path)
+    assert [i.status for i in infos] == [runs.UNKNOWN]
+    assert infos[0].run_id == "20260611-100000-aaaa"
+
+
+def test_discover_runs_reports_pause_stage(tmp_path):
+    from bmad_loop.model import PAUSE_PLAN_CHECKPOINT
+
+    _make_state_run(
+        tmp_path,
+        "20260101-000000-aaaa",
+        paused_reason="plan checkpoint for 1",
+        paused_stage=PAUSE_PLAN_CHECKPOINT,
+    )
+    info = runs.discover_runs(tmp_path)[0]
+    assert info.status == runs.PAUSED
+    assert info.paused_stage == PAUSE_PLAN_CHECKPOINT
+
+
+def test_discover_runs_pause_stage_blank_when_not_paused(tmp_path):
+    # a finished run keeps its last paused_stage in state; it must not badge.
+    _make_state_run(tmp_path, "20260101-000000-aaaa", finished=True, paused_stage="plan-checkpoint")
+    info = runs.discover_runs(tmp_path)[0]
+    assert info.status == runs.FINISHED
+    assert info.paused_stage == ""
+
+
+def test_stat_sig_includes_inode_for_same_size_rewrite(tmp_path):
+    # The engine rewrites state.json atomically (temp + os.replace), landing a
+    # fresh inode. A same-size rewrite with an identical (forced) mtime must still
+    # change the signature — otherwise a coarse-mtime filesystem (WSL2 drvfs) would
+    # serve a stale parse from cache. st_ino is what catches it.
+    target = tmp_path / "state.json"
+    target.write_text("AAAA", encoding="utf-8")
+    before = runs._stat_sig(target)
+    original = target.stat()
+
+    replacement = tmp_path / "state.json.tmp"
+    replacement.write_text("BBBB", encoding="utf-8")  # same size, different content
+    os.replace(replacement, target)
+    os.utime(target, ns=(original.st_atime_ns, original.st_mtime_ns))  # pin mtime
+
+    after = runs._stat_sig(target)
+    same_size = before[1] == after[1]
+    same_mtime = before[0] == after[0]
+    assert same_size and same_mtime  # (mtime_ns, size) alone could not tell these apart
+    assert before != after  # ...but the inode did
+
+
+def test_stopped_run_classifies_as_stopped_not_interrupted(tmp_path):
+    # a deliberate stop leaves a dead pid; it must read STOPPED, not INTERRUPTED
+    run_dir = _make_state_run(tmp_path, "20260611-100000-aaaa", stopped=True)
+    (run_dir / "engine.pid").write_text(str(_dead_pid()))
+    assert runs.discover_runs(tmp_path)[0].status == runs.STOPPED
+
+
+def test_classify_crashed(tmp_path):
+    # a recorded crash classifies as CRASHED (distinct from a generic INTERRUPTED),
+    # checked before liveness so the dead pid does not override it.
+    assert (
+        runs._classify(
+            finished=False,
+            paused=False,
+            stopped=False,
+            crashed=True,
+            run_dir=tmp_path,
+        )
+        == runs.CRASHED
+    )
+    # a state.json carrying crashed=True surfaces through discover_runs
+    run_dir = _make_state_run(tmp_path, "20260611-100000-aaaa", crashed=True)
+    (run_dir / "engine.pid").write_text(str(_dead_pid()))
+    assert runs.discover_runs(tmp_path)[0].status == runs.CRASHED
+
+
+def test_classify_legacy_crash_stays_interrupted(tmp_path):
+    # a pre-feature run has no crashed flag; a dead pid reads as INTERRUPTED, not
+    # CRASHED — backward compatible.
+    run_dir = _make_state_run(tmp_path, "20260611-100000-aaaa")
+    doc = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+    doc.pop("crashed", None)
+    (run_dir / "state.json").write_text(json.dumps(doc), encoding="utf-8")
+    (run_dir / "engine.pid").write_text(str(_dead_pid()))
+    assert runs.discover_runs(tmp_path)[0].status == runs.INTERRUPTED
