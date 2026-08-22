@@ -106,6 +106,22 @@ class MergePreflightError(GitError):
     resolve a content conflict that never happened (#619)."""
 
 
+class MergeConflictError(GitError):
+    """The merge ran and the CONTENT collided: unmerged index stages exist (or
+    did, before the leg's own rollback), and resolving them by hand is the
+    remedy.
+
+    Measured, not inferred: `_index_unmerged` (`ls-files -u`) is what earns this
+    class, under both `--no-ff` and `--squash` — the one probe that answers
+    content for both, since a conflicted `--squash` writes three unmerged stages
+    while creating no MERGE_HEAD at all. A GitError so every existing
+    `except verify.GitError` guard is unchanged; a distinct type so the caller's
+    LAST arm no longer has to read "bare GitError" as "conflict" — with the
+    conflict typed, whatever arrives untyped is a state nothing measured, and
+    the caller can say that instead of prescribing conflict resolution for it
+    (#619)."""
+
+
 class MergeCommitRefusedError(GitError):
     """The merge itself ran and resolved; git would not COMMIT the result.
 
@@ -115,24 +131,42 @@ class MergeCommitRefusedError(GitError):
     clear, only a policy or a key the operator's own repo configures — which is
     the whole reason this is a third type rather than either of theirs.
 
-    `_index_unmerged` cannot see this state: a merge that resolved cleanly leaves
-    no unmerged stages whether or not the commit that would have sealed it was
-    allowed. MERGE_HEAD is what parts it from a genuine pre-flight refusal, and
-    `merge_branch` reads that BEFORE its abort rather than only to decide whether
-    to abort at all.
+    Two legs reach it, through different commits. `--no-ff` is refused at the
+    merge's own commit and leaves MERGE_HEAD, which is what parts it from a
+    genuine pre-flight refusal — `merge_branch` reads that BEFORE its abort
+    rather than only to decide whether to abort at all. (`_index_unmerged`
+    cannot see this state: a merge that resolved cleanly leaves no unmerged
+    stages whether or not the commit that would have sealed it was allowed.)
+    The squash leg is refused at its OWN plain `git commit`, after
+    `merge --squash` already staged the result — hooks and signing run there
+    like anywhere else — so no MERGE_HEAD is involved and no classification is
+    needed: the merge step succeeded, and the failed call identifies the state
+    by itself.
 
-    ``restored`` says whether the abort that follows actually put the checkout back.
+    ``restored`` says whether the rollback that follows actually put the
+    checkout back — `merge --abort` on the `--no-ff` leg, `reset --hard HEAD`
+    on the squash leg (gated on the leg's pre-merge dirtiness snapshot: a
+    checkout that already carried uncommitted work is never reset, #619).
     It is an attribute rather than a type of its own because the operator's
     CAUSE is the same either way — a policy declined the commit — and only the first
     step of their remedy differs: a checkout left mid-merge has to be recovered
     before fixing that policy is worth anything, and a resume attempted before then
     fails again on the merge state rather than on the policy. A caller that ignores
     the flag still gets a true statement of the cause; one that reads it can order
-    the two steps (#619)."""
+    the two steps (#619).
 
-    def __init__(self, message: str, *, restored: bool = True) -> None:
+    ``staged`` names WHERE an unrestored checkout stands, because the two legs
+    strand differently and the operator's first step differs with them: False
+    means mid-merge (MERGE_HEAD set, `git merge --abort` recovers it), True
+    means the squash result is still sitting staged (`reset --hard HEAD` clears
+    it — after their own uncommitted work, if that is what blocked the rollback,
+    is stashed or committed). Always False when ``restored`` is True: a checkout
+    that was put back holds nothing."""
+
+    def __init__(self, message: str, *, restored: bool = True, staged: bool = False) -> None:
         super().__init__(message)
         self.restored = restored
+        self.staged = staged
 
 
 class MergeHalfAppliedError(GitError):
@@ -2218,8 +2252,9 @@ def _restore_tracked_residue(repo: Path) -> tuple[bool, str]:
     """`reset --hard HEAD` over dirt a merge caused. Returns `(restored, note)`,
     the note being the clause to append to the raised message when it failed — so
     the error never claims a repair that did not happen. Callers must gate this on
-    `_merge_residue`'s tracked flag; it is unconditional here on purpose, so the
-    gate lives at one readable place per leg rather than inside the write."""
+    a proven attribution — `_merge_residue`'s tracked flag, or the squash commit
+    step's pre-merge clean reading — and it is unconditional here on purpose, so
+    the gate lives at one readable place per leg rather than inside the write."""
     rc, out = _git(repo, "reset", "--hard", "HEAD")
     if rc != 0:
         return False, f"; AND git reset --hard HEAD failed (tree not restored): {out}"
@@ -2261,8 +2296,9 @@ def merge_branch(
     """Merge `branch` into the branch currently checked out in `repo`.
 
     strategy: "ff" (fast-forward only), "merge" (always a merge commit), or
-    "squash" (collapse to one commit). Raises GitError on conflict or when an
-    ff-only merge can't fast-forward, restoring the tree to its pre-merge state.
+    "squash" (collapse to one commit). Raises MergeConflictError on conflict and
+    MergePreflightError when an ff-only merge can't fast-forward, restoring the
+    tree to its pre-merge state.
     Expects the target checkout to be clean; the worktree pipeline reconciles
     Editor-induced dirt first via `clean_incoming_collisions`.
 
@@ -2276,7 +2312,9 @@ def merge_branch(
 
     Four measured states, one terminal fallback, and no one probe orders them.
     `_index_unmerged` leads and answers
-    CONTENT: unmerged stages mean the merge ran and collided. Its absence does not
+    CONTENT: unmerged stages mean the merge ran and collided (raised as
+    `MergeConflictError`, so the caller never has to read "bare GitError" as
+    "conflict"). Its absence does not
     mean the merge never ran — a `--no-ff` whose commit was refused leaves a
     cleanly merged index, no unmerged stages, and MERGE_HEAD set (measured for
     `pre-merge-commit`, `commit-msg`, and an unsignable `commit.gpgsign`).
@@ -2286,11 +2324,17 @@ def merge_branch(
 
     MERGE_HEAD alone would be wrong in the other direction — the error the old
     "no MERGE_HEAD created" framing made — because a conflicted `--squash` leaves
-    unmerged stages and no MERGE_HEAD. The squash leg cannot reach the commit-
-    refused state at all: `--squash` stops before committing by design, so no
-    commit hook runs and no signature is made (measured: rc 0 with a rejecting
-    `pre-merge-commit` hook installed), which is why only the `merge` leg is
-    three-way below.
+    unmerged stages and no MERGE_HEAD. The squash MERGE INVOCATION cannot be
+    commit-refused — `--squash` stops before committing by design (measured:
+    rc 0 with a rejecting `pre-merge-commit` hook installed) — which is why only
+    the `merge` leg reads MERGE_HEAD below. The LEG still reaches that state:
+    it seals the staged result with its own plain `git commit`, where hooks and
+    `commit.gpgsign` run like anywhere else, and a refusal there raises the same
+    `MergeCommitRefusedError` — rolled back by `reset --hard HEAD` under the
+    leg's pre-merge dirtiness gate rather than by an abort, and reported
+    ``staged`` when that gate or the reset itself declines. The scope error to
+    not repeat: "no hook runs" was measured of the merge invocation and is false
+    of the leg, whose commit step is a second, later place git can say no.
 
     The fourth state is the one ALL THREE legs reach and no index probe can see:
     git dying part-way through the CHECKOUT. It leaves no unmerged stages, no
@@ -2407,7 +2451,7 @@ def merge_branch(
                     restored = False
                     detail += f"; AND git merge --abort failed (repo left mid-merge): {abort_out}"
             if unmerged:
-                raise GitError(detail)
+                raise MergeConflictError(detail)
             if started:
                 raise MergeCommitRefusedError(detail, restored=restored)
             if half_applied:
@@ -2453,7 +2497,7 @@ def merge_branch(
                 restored, note = _restore_tracked_residue(repo)
                 detail += note
             if unmerged:
-                raise GitError(detail)
+                raise MergeConflictError(detail)
             if half_applied:
                 raise MergeHalfAppliedError(detail, paths=materialized, restored=restored)
             if unread is not None:
@@ -2464,7 +2508,33 @@ def merge_branch(
         msg = message or f"Squash-merge branch '{branch}'"
         rc, out = _git(repo, "commit", "-m", msg)
         if rc != 0:
-            raise GitError(f"git commit (squash {branch}) failed in {repo}: {out}")
+            # The leg's own commit — hooks and commit.gpgsign run HERE, not at the
+            # `merge --squash` above, so this is where the squash reaches the
+            # commit-refused state. No probe is needed to classify it: the merge
+            # step already succeeded, so the failed call names the state by
+            # itself. What needs deciding is the rollback, and the gate is the
+            # same pre-merge reading the failure arm uses: the staged result sits
+            # in a tree `reset --hard HEAD` would flatten, so only a tree proven
+            # clean beforehand may be reset — over a dirty one the operator's own
+            # uncommitted work is in the blast radius, and the result is left
+            # staged and SAID so instead (#619).
+            detail = (
+                f"git commit (squash {branch}) failed in {repo} "
+                f"(merged, but git refused the commit): {out}"
+            )
+            if pre_dirty:
+                restored = False
+                detail += (
+                    "; the squash result is left staged (not rolled back: the "
+                    "checkout already carried uncommitted work, which "
+                    "`reset --hard` would destroy with it)"
+                )
+            else:
+                restored, note = _restore_tracked_residue(repo)
+                detail += note
+                if not restored:
+                    detail += "; the squash result is left staged"
+            raise MergeCommitRefusedError(detail, restored=restored, staged=not restored)
         return
     raise GitError(f"unknown merge strategy: {strategy!r}")
 

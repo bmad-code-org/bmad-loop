@@ -3453,6 +3453,50 @@ def test_half_applied_escalation_asks_only_for_the_residue_that_survives(
     assert absent not in reason
 
 
+def test_half_applied_escalation_with_both_residues_orders_restore_first(project, monkeypatch):
+    """When BOTH residue axes survive — untracked paths to clear AND a tracked
+    rewrite whose rollback failed — the two asks must agree on an order. The
+    restore leads: a resume dies on the tracked residue first, and its clause
+    says "before anything else" and has to mean it. The untracked clause then
+    defers ("Then clear those") instead of also claiming first place — the
+    composed message used to say "Clear those first" and "before anything else"
+    about two different steps in the same breath.
+
+    Both `.index` calls double as presence asserts (ValueError = red), so the
+    row pins composition AND order in one place.
+
+    Ablation: swap the two `steps.append` blocks back and this row fails on the
+    order; make the untracked clause unconditional "Clear those first" and it
+    fails on the phrase. The three matrix rows above stay green — none of them
+    stages both residues at once, which is why this row exists."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
+    )
+    exc = verify.MergeHalfAppliedError(
+        "git merge --ff-only feat failed in /repo (failed part-way through checkout): "
+        "fatal: smudge filter boom failed; AND git reset --hard HEAD failed "
+        "(tree not restored): fatal: could not reset",
+        paths=("Assets/Gen.cs",),
+        restored=False,
+    )
+
+    def refuse_merge(*a, **kw):
+        raise exc
+
+    monkeypatch.setattr(verify, "merge_branch", refuse_merge)
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and not summary.crashed
+    reason = engine.state.paused_reason or ""
+    assert "Clear those first" not in reason  # the restore is first; this may not claim it
+    restore_at = reason.index("could NOT be rolled back")
+    clear_at = reason.index("Then clear those")
+    assert restore_at < clear_at
+    assert "Assets/Gen.cs" in reason
+
+
 def test_half_applied_merge_escalation_names_the_residue_from_the_exception_paths(
     project, monkeypatch
 ):
@@ -3500,9 +3544,11 @@ _MERGE_FAILURE_PHRASES = (
     "refused by git before it started",
     "the target checkout is back as it was",
     "left MID-MERGE",
+    "left STAGED",
     "content conflict",
     "failed PART-WAY THROUGH",
     "UNVERIFIED",
+    "was not classified",
 )
 
 
@@ -3534,7 +3580,18 @@ _MERGE_FAILURE_PHRASES = (
             "left MID-MERGE",
         ),
         (
-            lambda: verify.GitError(
+            lambda: verify.MergeCommitRefusedError(
+                "git commit (squash feat) failed in /repo (merged, but git refused "
+                "the commit): error: gpg failed to sign the data; the squash result "
+                "is left staged (not rolled back: the checkout already carried "
+                "uncommitted work, which `reset --hard` would destroy with it)",
+                restored=False,
+                staged=True,
+            ),
+            "left STAGED",
+        ),
+        (
+            lambda: verify.MergeConflictError(
                 "git merge --no-ff feat failed in /repo (conflict): "
                 "CONFLICT (content): Merge conflict in src.txt"
             ),
@@ -3557,14 +3614,22 @@ _MERGE_FAILURE_PHRASES = (
             ),
             "UNVERIFIED",
         ),
+        (
+            lambda: verify.GitError(
+                "git merge --no-ff feat failed in /repo: fatal: some state no probe " "measured"
+            ),
+            "was not classified",
+        ),
     ],
     ids=[
         "preflight-refusal",
         "commit-refused",
         "commit-refused-unrestored",
+        "commit-refused-staged",
         "content-conflict",
         "half-applied",
         "residue-unread",
+        "unclassified",
     ],
 )
 def test_merge_failure_escalation_tells_a_preflight_refusal_from_a_conflict(
@@ -3592,6 +3657,24 @@ def test_merge_failure_escalation_tells_a_preflight_refusal_from_a_conflict(
     FIRST: a resume over a mid-merge checkout dies on the merge state however well
     they fix the hook, so a message claiming the checkout was restored costs them
     the one step that unblocks it.
+
+    `commit-refused-staged` is the squash leg's strand of that same state: its
+    commit is the leg's own `git commit` after the merge already staged the
+    result, so there is no MERGE_HEAD and "recover the merge" would be fiction —
+    the squash result is sitting STAGED and clearing it is the first step. The
+    `staged` flag is what parts the two unrestored wordings, which is the row's
+    whole point.
+
+    `content-conflict` pins the TYPED conflict arm: the conflict is measured
+    (unmerged stages) and raised as `MergeConflictError`, so the resolve-by-hand
+    wording rides the measurement rather than the absence of a better match.
+
+    `unclassified` pins the demoted catch-all. A bare `GitError` is a state
+    nothing measured, and the arm now says so — run `git status`, git's text
+    names the cause — instead of prescribing conflict resolution for it. Six
+    mislabeled git states in a row reached operators through the old wording;
+    this row is what turns a hypothetical seventh into a vague-but-true message
+    instead of a precise fiction.
 
     `half-applied` is the fourth state: git died part-way through the checkout and
     left incoming files behind, untracked. It reaches `merge_local` as a SIBLING of

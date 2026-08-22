@@ -16,42 +16,20 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
-- **A merge that died part-way through its checkout is no longer reported as "nothing happened" (#619).**
-  git materializes the incoming files in index order, so a failure partway — measured on git
-  2.55.0 under a **required** clean/smudge filter that cannot run — stops with HEAD unchanged
-  but the tree already partly rewritten. That state was invisible to every probe the classifier
-  had: no unmerged stages, no `MERGE_HEAD`, and an index rolled back to HEAD. So it was labelled
-  a pre-flight refusal and the escalation told you the checkout was unchanged — while the residue
-  refused the next merge over those same paths, identically on every resume, over paths no
-  message had named. It affects **all three** strategies. `--ff-only` is not exempt, and the
-  "it never starts a merge" premise this module carried was simply wrong: `--ff-only` declines
-  the _topology_ question only, and once the fast-forward is possible it checks the incoming tree
-  out like any other merge.
-  The residue has two axes and they need different answers. An incoming path the target did not
-  already track lands **untracked**, and no restore reaches it — `git reset --hard` and
-  `git merge --abort` both leave untracked files alone, and the latter exits 128 here besides —
-  so it is named for you to clear. An incoming path the target **did** track is rewritten in
-  place, which `git reset --hard HEAD` does undo, so it is now undone automatically on every leg,
-  under the same clean-tree gate #619 put on the squash leg: a tree that was already dirty is
-  still never reset. Both raise a fourth type, `MergeHalfAppliedError`, carrying the untracked
-  paths and whether the tracked half was rolled back; the escalation asks only for the residue
-  that actually survived. Nothing untracked is ever cleaned for you.
-  The untracked axis is measured as a **delta** across the merge, not read absolutely: an
-  absolute reading would reclassify every genuine pre-flight refusal that happens to have an
-  untracked stray in the checkout, which is the stray the #460 guard deliberately tolerates and
-  therefore the common case. Ceiling worth knowing: on a checkout that was _already_ dirty the
-  tracked axis cannot be attributed to git at all, so such a failure is still reported as a plain
-  pre-flight refusal — "cannot tell" and "git did nothing" deliberately fail to the same side,
-  because the alternative is resetting an operator's uncommitted work.
-  The residue probes are themselves git reads, and their own failure no longer bypasses the
-  cleanup: a probe that died on its post-merge reading used to escape before the `merge --abort`,
-  stranding a started `--no-ff` merge mid-merge and surfacing as a content conflict. The probe
-  raise is now caught, the abort still runs, and conflict and commit-refusal keep their verdicts —
-  they stand on their own measurements. Only the choice those probes existed to make, refusal
-  versus half-applied, rested on the dead reading, so that case raises a fifth type,
-  `MergeResidueUnreadError`: the checkout state is **unverified**, and the escalation sends you to
-  the one reading the run could not take — your own `git status` — instead of claiming a state it
-  never measured.
+- **Merge-back failures are classified from the measured tree state, and the catch-all stopped
+  inventing a conflict (#619).** A merge that died part-way through its checkout — all three
+  strategies, `--ff-only` included — now raises `MergeHalfAppliedError` instead of "refused
+  before starting": untracked residue is named for you to clear (measured as a before/after
+  delta, so your own strays are never attributed to git), and a tracked rewrite is reset
+  automatically under the existing clean-tree gate. A residue probe that itself fails no longer
+  bypasses the merge cleanup or impersonates a verdict: the abort still runs and the failure
+  raises `MergeResidueUnreadError` — checkout state unverified, run `git status`. A refused
+  **squash commit** now raises `MergeCommitRefusedError` like the `--no-ff` leg — the squash leg
+  seals its result with its own `git commit`, where commit hooks and signing do run — rolled back
+  by `git reset --hard HEAD` under the same clean-tree gate (a dirty checkout is never reset; the
+  escalation then names the staged result and clearing it as your first step). A content conflict
+  is typed too (`MergeConflictError`), so anything unclassified escalates saying just that — run
+  `git status`, git's text names the cause — instead of "resolve the conflict by hand".
 - **psmux: a hand-back that succeeded no longer reports as failed — or undoes itself (#659).**
   `switch_client` read its verdict off the session's attached-client count, which a same-session
   move cannot change — and same-session is the common shape for the return path, so a correct

@@ -1720,15 +1720,11 @@ class WorktreeFlow:
             # lands untracked and no restore reaches it, so it is theirs to clear; one
             # it DID track was modified in place and `merge_branch` has already reset
             # it, unless that reset failed too.
+            # The restore clause LEADS when both apply: it says "before anything
+            # else" and means it — a resume dies on the tracked residue first —
+            # so the untracked clause defers to it ("then") rather than both
+            # claiming first place in one message.
             steps: list[str] = []
-            if e.paths:
-                steps.append(
-                    f"Some incoming files are left UNTRACKED in the checkout and no "
-                    f"restore removes them — not `git merge --abort`, not "
-                    f"`git reset --hard`: {', '.join(e.paths)}. Clear those first, "
-                    f"checking the contents before you delete: the run can prove git "
-                    f"wrote each path, not that the bytes now there are git's."
-                )
             if not e.restored:
                 steps.append(
                     f"The tracked files git had already rewritten could NOT be rolled "
@@ -1736,7 +1732,16 @@ class WorktreeFlow:
                     f"still holding incoming content on those paths. Restore it "
                     f"(`git reset --hard HEAD` in {target}) before anything else."
                 )
-            elif not e.paths:
+            if e.paths:
+                steps.append(
+                    f"Some incoming files are left UNTRACKED in the checkout and no "
+                    f"restore removes them — not `git merge --abort`, not "
+                    f"`git reset --hard`: {', '.join(e.paths)}. "
+                    + ("Clear those first, " if e.restored else "Then clear those, ")
+                    + "checking the contents before you delete: the run can prove git "
+                    "wrote each path, not that the bytes now there are git's."
+                )
+            if e.restored and not e.paths:
                 steps.append(
                     "The tracked files git had already rewritten have been rolled "
                     "back, so the checkout itself needs nothing from you."
@@ -1778,26 +1783,46 @@ class WorktreeFlow:
             return  # defensive: never fall through to the success teardown below
         except verify.MergeCommitRefusedError as e:
             # Sibling of the arm above and equally a GitError subclass, so it too must
-            # precede the arm below. Neither neighbour's remedy applies here: the merge
+            # precede the last arm. Neither neighbour's remedy applies here: the merge
             # RAN and resolved, so there is no target-state clash to clear, and it
             # resolved cleanly, so there is no conflict to resolve either. `merge_branch`
-            # aborted it, so the checkout is back where it started and the operator is
-            # sent to the policy that declined the commit rather than to the tree (#619).
+            # rolled it back — `merge --abort` on the `--no-ff` leg, `reset --hard` on
+            # the squash leg's own commit — so the checkout is back where it started and
+            # the operator is sent to the policy that declined the commit (#619). The
+            # unrestored wording branches on WHERE the checkout stands, because the two
+            # legs strand differently and the first step differs with them.
             if e.restored:
                 reason = (
                     f"merge of {unit.branch} into {target} resolved cleanly, but git "
-                    f"refused to COMMIT it, so the merge was aborted and the target "
+                    f"refused to COMMIT it, so the merge was rolled back and the target "
                     f"checkout is back as it was. There is no conflict to resolve and "
                     f"nothing to clear from the tree: a `pre-merge-commit` or "
                     f"`commit-msg` hook, or commit signing, declined it — git's own "
                     f"message below names which. Fix that, then "
                     f"`bmad-loop resume {self.state.run_id}`. {e}"
                 )
+            elif e.staged:
+                # The squash leg's strand: no MERGE_HEAD exists, so "recover the
+                # merge" would be fiction — the squash result is sitting STAGED,
+                # either because the rollback failed or because the checkout also
+                # carries the operator's own uncommitted work, which the rollback
+                # refuses to flatten. The exception's text says which.
+                reason = (
+                    f"merge of {unit.branch} into {target} resolved cleanly, git "
+                    f"refused to COMMIT it, and the squash result is left STAGED in "
+                    f"{target}'s checkout — the message below says why it was not "
+                    f"rolled back for you. Stash or commit anything in {target} that "
+                    f"is yours, then clear the staged result "
+                    f"(`git reset --hard HEAD` in {target}). Only then fix whatever "
+                    f"declined the commit: a `pre-merge-commit` or `commit-msg` hook, "
+                    f"or commit signing. Then `bmad-loop resume {self.state.run_id}`. "
+                    f"{e}"
+                )
             else:
-                # The abort failed too, so the sentence above would be a lie about the
-                # one thing the operator has to act on FIRST: a resume attempted over a
-                # mid-merge checkout dies on the merge state, not on the policy, and
-                # keeps doing so however well they fix the hook.
+                # The abort failed too, so the restored sentence would be a lie about
+                # the one thing the operator has to act on FIRST: a resume attempted
+                # over a mid-merge checkout dies on the merge state, not on the
+                # policy, and keeps doing so however well they fix the hook.
                 reason = (
                     f"merge of {unit.branch} into {target} resolved cleanly, git refused "
                     f"to COMMIT it, and the abort meant to undo that failed as well — so "
@@ -1810,13 +1835,33 @@ class WorktreeFlow:
                 )
             self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
             return  # defensive: never fall through to the success teardown below
-        except verify.GitError as e:
-            # genuine content conflict against the target: keep the branch for
-            # manual merge. The unit committed cleanly (phase is already DONE,
-            # which has no legal transition), so escalate directly.
+        except verify.MergeConflictError as e:
+            # genuine content conflict against the target, measured (unmerged index
+            # stages): keep the branch for manual merge. The unit committed cleanly
+            # (phase is already DONE, which has no legal transition), so escalate
+            # directly.
             reason = (
                 f"merge of {unit.branch} into {target} failed "
                 f"(content conflict against the target): resolve it by hand, then "
+                f"`bmad-loop resume {self.state.run_id}`. {e}"
+            )
+            self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
+            return  # defensive: never fall through to the success teardown below
+        except verify.GitError as e:
+            # Every state the classification MEASURED has a typed arm above, so a
+            # bare GitError is a state nothing measured. This arm used to claim the
+            # most specific diagnosis — "content conflict, resolve it by hand" — for
+            # exactly the failures it knew least about, which is how six mislabeled
+            # git states in a row reached the operator wearing a fictional remedy
+            # (#619). It now claims only what it knows: the merge failed, the run
+            # cannot say what state the checkout is in, and git's text names the
+            # cause. An unforeseen shape lands here as a vague-but-true message
+            # rather than a precise fiction.
+            reason = (
+                f"merge of {unit.branch} into {target} failed, and the failure was "
+                f"not classified: the run cannot say what state {target}'s checkout "
+                f"is in. Run `git status` in {target} and put the checkout right — "
+                f"git's own message below names the cause — then "
                 f"`bmad-loop resume {self.state.run_id}`. {e}"
             )
             self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
@@ -1846,8 +1891,8 @@ class WorktreeFlow:
         """Preserve a DONE unit's branch (no delete, kept for manual merge) and
         escalate. Shared by every merge-back failure path: a target dirtied with
         stray work, a merge git refused at pre-flight, a merge that died part-way
-        through its checkout, a merge whose COMMIT git refused, and a genuine
-        content conflict."""
+        through its checkout, a merge whose COMMIT git refused, a genuine content
+        conflict, and a failure nothing classified."""
         close_unit_workspace(
             unit,
             success=False,

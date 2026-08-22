@@ -376,18 +376,23 @@ def test_merge_content_conflict_is_not_a_preflight_refusal(project, tmp_path, st
     """The other side of the split: both branches commit a different change to the
     same file, git really merges, and the failure IS a conflict to resolve.
 
-    The `not isinstance` assertion carries the whole test — `GitError` alone would
-    pass for the pre-flight rows too, since `MergePreflightError` is a subclass.
+    The raised type carries the whole test: a conflict is `MergeConflictError`,
+    measured from the unmerged stages, so the caller's last arm never has to read
+    "bare GitError" as "conflict" — whatever arrives untyped there is a state
+    nothing measured, and gets an honest minimum instead of this class's
+    resolve-by-hand remedy (#619).
 
-    Ablation: classify with `_merge_in_progress` instead of `_index_unmerged` and
-    the squash row fails alone — a conflicted `--squash` writes unmerged index
-    stages but no MERGE_HEAD, so MERGE_HEAD reads every squash conflict as a
-    refusal. The `merge` row cannot catch that: MERGE_HEAD is exact there."""
+    Ablation (typing): put the conflict raise back on bare `GitError` and both
+    rows fail on the raised type. Ablation (probe): classify with
+    `_merge_in_progress` instead of `_index_unmerged` and the squash row fails
+    alone — a conflicted `--squash` writes unmerged index stages but no
+    MERGE_HEAD, so MERGE_HEAD reads every squash conflict as a refusal. The
+    `merge` row cannot catch that: MERGE_HEAD is exact there."""
     repo = project.project
     _branch_with(repo, tmp_path, modifies={"src.txt": "branch\n"})
     commit(repo, "src.txt", "main change\n", "main edits src")
 
-    with pytest.raises(verify.GitError) as ei:
+    with pytest.raises(verify.MergeConflictError) as ei:
         verify.merge_branch(repo, "feat", strategy=strategy)
 
     assert not isinstance(ei.value, verify.MergePreflightError)
@@ -490,6 +495,118 @@ def test_merge_commit_refusal_whose_abort_also_failed_reports_the_tree_unrestore
     assert ei.value.restored is False
     assert "repo left mid-merge" in str(ei.value)
     assert verify._merge_in_progress(repo)  # the tree really is unrestored
+
+
+def test_squash_commit_refusal_is_classified_and_rolled_back(project, tmp_path):
+    """The commit-refused state's SECOND door, and the sixth mislabeled git state
+    this classification produced: the squash leg's own `git commit`.
+
+    "The squash leg cannot reach the commit-refused state" was measured of the
+    MERGE invocation — `merge --squash` exits 0 under a rejecting
+    `pre-merge-commit` hook — and over-read onto the leg, whose own plain
+    `git commit` runs hooks and `commit.gpgsign` like any other. A refusal there
+    raised bare `GitError`, which the caller's last arm dressed as a content
+    conflict, with the squash result silently left STAGED: no unmerged stages
+    exist and no MERGE_HEAD ever did, so nothing else claimed it either.
+
+    Same portable staging as the `--no-ff` rows above: `gpg.program` pointing at
+    a program that does not exist, repo-LOCAL, no shell, no exec bit, no gpg.
+
+    The tree assertions carry the restore half: the pre-merge reading found the
+    checkout clean, so `reset --hard HEAD` may and does clear the staged result,
+    leaving the checkout exactly as before the squash.
+
+    Ablation (classify): put the commit raise back on bare `GitError` and this
+    row and its two siblings below fail on the type; every `--no-ff`
+    commit-refused row above stays green — different call site. Ablation (gate):
+    force the rollback off (`if pre_dirty` → always) and this row fails on
+    `restored`/the clean tree while the dirty-tree sibling stays green."""
+    repo = project.project
+    _cleanly_mergeable_branch(repo, tmp_path)
+    head_before = git(repo, "rev-parse", "HEAD")
+    git(repo, "config", "commit.gpgsign", "true")
+    git(repo, "config", "gpg.program", "bmad-loop-no-such-signer")
+
+    with pytest.raises(verify.MergeCommitRefusedError) as ei:
+        verify.merge_branch(repo, "feat", strategy="squash")
+
+    assert not isinstance(ei.value, verify.MergePreflightError)
+    assert "refused before starting" not in str(ei.value)
+    assert "merged, but git refused the commit" in str(ei.value)
+    assert ei.value.restored is True
+    assert ei.value.staged is False  # nothing left staged once the rollback ran
+    # the rollback really ran: the staged squash result is gone, tree pristine
+    assert not (repo / "feature.txt").exists()
+    assert git(repo, "status", "--porcelain") == ""
+    assert git(repo, "rev-parse", "HEAD") == head_before
+
+
+def test_squash_commit_refusal_never_resets_a_tree_it_found_dirty(project, tmp_path):
+    """DATA-SAFETY PIN, the commit step's half. The rollback for a refused squash
+    commit is `reset --hard HEAD`, which flattens the operator's uncommitted work
+    together with the staged result — so it stays gated on the same pre-merge
+    dirtiness reading the failure arm uses, and a checkout that already carried
+    an unstaged edit is never reset. The result is left STAGED instead, the
+    exception says so (`staged`), and the operator's edit survives.
+
+    Ablation: reset unconditionally at the commit step and this row fails on the
+    operator's bytes — destruction made loud — while the clean-tree sibling
+    above stays green."""
+    repo = project.project
+    _cleanly_mergeable_branch(repo, tmp_path)
+    (repo / "src.txt").write_text("operator edit\n")  # unstaged, tracked, outside `feat`
+    git(repo, "config", "commit.gpgsign", "true")
+    git(repo, "config", "gpg.program", "bmad-loop-no-such-signer")
+
+    with pytest.raises(verify.MergeCommitRefusedError) as ei:
+        verify.merge_branch(repo, "feat", strategy="squash")
+
+    assert ei.value.restored is False
+    assert ei.value.staged is True
+    assert "left staged" in str(ei.value)
+    assert (repo / "src.txt").read_text() == "operator edit\n"  # the edit survives
+    # ...and the squash result really is still sitting staged
+    assert "feature.txt" in git(repo, "diff", "--cached", "--name-only").split()
+
+
+def test_squash_commit_refusal_whose_reset_also_failed_reports_staged(
+    project, tmp_path, monkeypatch
+):
+    """The repair write can fail here too, exactly as the `--no-ff` abort can —
+    and then `restored` must report the tree's true state rather than the
+    branch the code took, with `staged` naming WHERE the checkout stands: no
+    MERGE_HEAD exists on this leg, so "recover the merge" would be fiction and
+    the honest first step is clearing the staged result.
+
+    The reset is failed through the `_git` seam for its sibling's reason: there
+    is no portable way to make a real `git reset --hard HEAD` fail on demand.
+    Delegation by argv, not call count, so it stays pinned to the reset.
+
+    Ablation: hardcode `staged=False` at the raise and this row and the
+    dirty-tree sibling fail on the flag; the clean-tree sibling stays green —
+    its rollback worked, so it never claims a staged result."""
+    repo = project.project
+    _cleanly_mergeable_branch(repo, tmp_path)
+    git(repo, "config", "commit.gpgsign", "true")
+    git(repo, "config", "gpg.program", "bmad-loop-no-such-signer")
+    real_git = verify._git
+
+    def failing_reset(r, *args):
+        if args[:2] == ("reset", "--hard"):
+            return 1, "fatal: could not reset"
+        return real_git(r, *args)
+
+    monkeypatch.setattr(verify, "_git", failing_reset)
+
+    with pytest.raises(verify.MergeCommitRefusedError) as ei:
+        verify.merge_branch(repo, "feat", strategy="squash")
+
+    assert ei.value.restored is False
+    assert ei.value.staged is True
+    assert "tree not restored" in str(ei.value)
+    assert "left staged" in str(ei.value)
+    # the tree really is unrestored: the squash result still sits staged
+    assert "feature.txt" in git(repo, "diff", "--cached", "--name-only").split()
 
 
 @pytest.mark.parametrize("diverged", [False, True], ids=["ff-able", "diverged"])
