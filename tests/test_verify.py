@@ -5560,6 +5560,42 @@ def test_git_below_floor_lets_a_spawn_failure_through(project, monkeypatch):
         verify.git_below_floor(project.project)
 
 
+def test_git_below_floor_forwards_a_per_call_timeout(project, monkeypatch):
+    """The #390 seam, forwarded rather than swallowed. The CLI gates keep the engine
+    bound; the TUI guard runs on the event loop and must ask with its own short
+    deadline, which it cannot do if this drops the argument on the floor.
+
+    Both rows are here because a signature that ACCEPTS `timeout_s` and ignores it
+    reads identically at the call site: the None row pins the default the CLI gates
+    depend on, and would stay green on a hard-coded 5.
+
+    Ablation: drop `timeout_s=timeout_s` from the `git_bytes` call and the second
+    row fails."""
+    seen = []
+
+    def fake(repo, *args, timeout_s=None):
+        seen.append(timeout_s)
+        return subprocess.CompletedProcess(
+            args=["git", "version"], returncode=0, stdout=b"git version 2.55.0\n", stderr=b""
+        )
+
+    monkeypatch.setattr(verify, "git_bytes", fake)
+
+    assert verify.git_below_floor(project.project) is None
+    assert verify.git_below_floor(project.project, timeout_s=5) is None
+    assert seen == [None, 5]
+
+
+def test_under_floor_git_message_names_the_floor_and_the_answer(project):
+    """One sentence for four surfaces — the CLI's abort, `validate`'s finding, the
+    dry-run banner and the TUI toast — so they cannot read as different findings
+    about one host. Pinned to the constant rather than to "2.34": the floor is
+    allowed to move, the drift is not."""
+    message = verify.under_floor_git_message("git version 2.25.1")
+    assert "git version 2.25.1" in message
+    assert verify.git_floor_text() in message
+
+
 def test_git_below_floor_honours_the_floor_argument(project, monkeypatch):
     """The floor is a parameter so the predicate and the wiring can be ablated
     separately (#464) — and so this test does not have to move when GIT_FLOOR does."""

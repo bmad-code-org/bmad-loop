@@ -355,7 +355,16 @@ def collect_env(project: Path) -> EnvInfo:
         # checked here for the same reason `git_below_floor` checks it: stdout on a
         # failed probe is not a version, and folding it would put a fabricated
         # answer in the dump. `None` — "could not be asked" — is the honest value.
-        probed = verify.git_bytes(project, "version")
+        # Bounded rather than inheriting the engine's `GIT_TIMEOUT_S` (120s), via
+        # the #390 per-call seam the other two best-effort probes already use
+        # (`install`'s init hint, the TUI's commit-subject render). `diagnose` is a
+        # FOREGROUND recovery aid — the command you reach for when the host is
+        # already broken — and a git that hangs is one of the states it exists to
+        # be usable in. Inheriting the engine bound made it sit silent for two
+        # minutes and then swallow the fault anyway, so the whole wait bought a
+        # `None` this returns in five seconds. The dump is worth far more than the
+        # one line this probe fills.
+        probed = verify.git_bytes(project, "version", timeout_s=5)
         if probed.returncode == 0:
             git_v = fold_version(sanitize.scrub_text(os.fsdecode(probed.stdout))) or None
     except Exception:  # nosec B110 - env probe is best-effort; absent git is fine

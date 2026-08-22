@@ -21,7 +21,8 @@ breaking changes may land in a minor release.
 - **`run`, `sweep` and `resume` refuse to start below git 2.34, and `validate` now exits 1
   there** — a change of exit code on an under-floor host. A git that cannot be run, times out,
   or answers unparseably is refused the same way. `--dry-run` names the refusal in its
-  "NOT runnable" banner instead of previewing a run that cannot start.
+  "NOT runnable" banner instead of previewing a run that cannot start, and the TUI's
+  pre-launch guard toasts it instead of opening a pane that dies.
 - **The git-add shield's version gate moves from 2.20 to the project floor.** It now refuses as
   an unsupported-version policy rather than claiming a missing capability, which would be false
   at 2.34 — git 2.25 has everything the shield uses.

@@ -201,25 +201,6 @@ def _reject_isolation_conflict(paths: bmadconfig.ProjectPaths, pol) -> int | Non
     return 1
 
 
-def under_floor_git_message(found: str) -> str:
-    """The one wording for "this git is below `verify.GIT_FLOOR`", shared by the
-    refusal and by `validate`'s `git.version` finding.
-
-    Shared on purpose: `_reject_under_floor_git` aborts and `cmd_validate` reports,
-    and the two verdicts must not read as different findings about the same host
-    (the reason `cmd_validate` builds its gates "exactly the way run/sweep's real
-    preflight builds it"). One string, two dispositions."""
-    # `found` is git's own answer, verbatim — usually a whole `git version 2.25.1`
-    # line, but also `git exited 127` or `no version reported` when the probe could
-    # not read one. Quoted and introduced rather than dropped mid-sentence, so all
-    # three shapes read as English (and so "git git version …" cannot happen).
-    return (
-        f"git reported {found!r}, which is below the floor bmad-loop supports — "
-        f"git {verify.git_floor_text()} or newer is required. Install a newer git "
-        "and re-run (`git --version` reports what is on PATH)."
-    )
-
-
 def _reject_under_floor_git(project: Path) -> int | None:
     """Refuse to start against a git older than `verify.GIT_FLOOR`. Returns
     `ExitCode.FAILURE` to abort, None to proceed — the `_reject_bad_run_id` shape.
@@ -252,7 +233,7 @@ def _reject_under_floor_git(project: Path) -> int | None:
         return ExitCode.FAILURE
     if found is None:
         return None
-    print(f"error: {under_floor_git_message(found)}", file=sys.stderr)
+    print(f"error: {verify.under_floor_git_message(found)}", file=sys.stderr)
     return ExitCode.FAILURE
 
 
@@ -453,7 +434,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
     # aborts run/sweep/resume on exactly this condition, and validate's verdict and
     # their abort must not disagree (the reason the adapter/profile block below is
     # built the way run's real preflight builds it). Both render
-    # `under_floor_git_message`, so the two surfaces cannot drift apart in wording
+    # `verify.under_floor_git_message`, so the surfaces cannot drift apart in wording
     # either.
     #
     # Silent on `GitError`: `git.probe` immediately above already owns "git did not
@@ -465,7 +446,9 @@ def cmd_validate(args: argparse.Namespace) -> int:
     if git_answers:
         try:
             if (found := verify.git_below_floor(project)) is not None:
-                report.fail("git.version", under_floor_git_message(found), {"reported": found})
+                report.fail(
+                    "git.version", verify.under_floor_git_message(found), {"reported": found}
+                )
             else:
                 report.ok("git.version", f"git {verify.git_floor_text()}+ satisfied")
         except verify.GitError:
@@ -1100,7 +1083,7 @@ def _warn_preflight_would_abort(
         problems.insert(0, conflict)
     try:
         if (found := verify.git_below_floor(paths.project)) is not None:
-            problems.insert(0, under_floor_git_message(found))
+            problems.insert(0, verify.under_floor_git_message(found))
     except verify.GitError as e:
         problems.insert(0, f"git is required but could not be run: {e}")
     problems += _unknown_adapter_kinds(paths.project, pol)
@@ -2207,7 +2190,7 @@ def _sweep_factory(project: Path, paths: bmadconfig.ProjectPaths, trusted_digest
         # already an exception, and this factory's contract is that any raise before
         # `started` leaves the parent's trigger unspent.
         if (found := verify.git_below_floor(paths.project)) is not None:
-            raise RuntimeError(under_floor_git_message(found))
+            raise RuntimeError(verify.under_floor_git_message(found))
         _start_sweep(
             project,
             paths,

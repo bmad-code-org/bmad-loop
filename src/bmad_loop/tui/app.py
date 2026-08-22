@@ -179,9 +179,32 @@ class BmadLoopApp(App[None]):
             return False, None
 
     def _guarded(self, go: Callable[[], None]) -> None:
-        """Pre-launch guard mirroring the CLI: the #414 isolation/repo_root conflict
-        refused first, then a clean worktree required, plus a confirm when another
-        engine is already live."""
+        """Pre-launch guard mirroring the CLI: the git support floor refused first,
+        then the #414 isolation/repo_root conflict, then a clean worktree required,
+        plus a confirm when another engine is already live."""
+        # First, in `cmd_run`'s own order, and for the reason that order exists: this
+        # is a fact about the HOST, so every other answer here would be advice about
+        # the wrong thing. Without it the operator got the generic "launch may have
+        # failed — attach to control session" toast the dashboard raises 10s later,
+        # which names neither git nor the floor and points at a pane to go read.
+        #
+        # `timeout_s` because this runs on the event loop — the same reason the
+        # commit-subject probe below carries one (`_commit_subject`) — and
+        # that bound is exactly why a `GitError` here FALLS THROUGH to launch instead
+        # of refusing: 5s is not the deadline the detached CLI applies, so a merely
+        # slow git would otherwise be refused by a toast on a host the CLI would run
+        # on. The guard never authorizes anything — `_reject_under_floor_git` fails
+        # closed on that same fault a moment later, in the process that matters —
+        # so declining to PRE-EMPT a refusal costs nothing but a slower message.
+        # Same disposition, same reasoning, as the unreadable-policy fall-through
+        # below: the guard cannot tell "fine" from "could not look".
+        try:
+            found = verify.git_below_floor(self.project, timeout_s=5)
+        except verify.GitError:
+            found = None
+        if found is not None:
+            self.notify(verify.under_floor_git_message(found), severity="error")
+            return
         # The detached CLI refuses this combination too, and it is the authority —
         # this only turns a pane that dies immediately into a toast. Ordered ahead of
         # the clean-tree gate for the same reason `cmd_run` orders it ahead: this one

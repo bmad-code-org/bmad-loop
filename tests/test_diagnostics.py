@@ -1276,6 +1276,42 @@ def test_env_git_version_is_recorded(monkeypatch):
     assert env.git_version == "git version 2.34.1"
 
 
+def test_env_git_version_probe_is_bounded(monkeypatch):
+    """The probe carries its own short deadline instead of inheriting the engine's
+    `GIT_TIMEOUT_S`. `diagnose` is the command an operator reaches for once the host
+    is already broken, and a git that hangs is one of the states it has to stay
+    usable in — on the engine bound it sat silent for two minutes and then swallowed
+    the fault anyway, so the entire wait bought the same `None` a five-second bound
+    reaches. Asserted through the seam rather than by timing anything, so the row
+    cannot go flaky on a loaded box.
+
+    Both halves matter: `is not None` catches a probe that went back to inheriting,
+    and the comparison catches a "bound" that is no bound at all.
+
+    Ablation: drop `timeout_s=5` in `collect_env` and this fails on the first
+    assertion."""
+    import subprocess
+
+    from bmad_loop import verify
+
+    seen = {}
+
+    def probe(_project, *args, timeout_s=None):
+        seen["args"] = args
+        seen["timeout_s"] = timeout_s
+        return subprocess.CompletedProcess(
+            args=["git", "version"], returncode=0, stdout=b"git version 2.34.1\n", stderr=b""
+        )
+
+    monkeypatch.setattr(verify, "git_bytes", probe)
+
+    env = diagnostics.collect_env(ANY_PROJECT)
+    assert env.git_version == "git version 2.34.1"  # the probe still answers
+    assert seen["args"] == ("version",)
+    assert seen["timeout_s"] is not None, "the probe inherits the engine's git deadline"
+    assert seen["timeout_s"] < verify.GIT_TIMEOUT_S
+
+
 def test_env_git_version_is_none_when_the_probe_fails(monkeypatch):
     """`verify.git_bytes` ANSWERS a non-zero rc rather than raising, so a failed
     probe reaches the fold with whatever it wrote to stdout.

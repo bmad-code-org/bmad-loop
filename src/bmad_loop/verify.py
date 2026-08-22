@@ -503,7 +503,9 @@ def git_version_at_least(reported: str, want: tuple[int, int]) -> bool:
     return match is not None and (int(match[1]), int(match[2])) >= want
 
 
-def git_below_floor(repo: Path, floor: tuple[int, int] = GIT_FLOOR) -> str | None:
+def git_below_floor(
+    repo: Path, floor: tuple[int, int] = GIT_FLOOR, *, timeout_s: int | None = None
+) -> str | None:
     """What git called itself, when that is below `floor` or unreadable — else None.
 
     Returning the REPORTED TEXT rather than a bool is what lets every caller name the
@@ -525,8 +527,14 @@ def git_below_floor(repo: Path, floor: tuple[int, int] = GIT_FLOOR) -> str | Non
     Raises `GitError` untouched when git could not be run at all — absent or
     unspawnable as `GitSpawnError`, hung as `GitTimeoutError`. That is a different
     fact from "too old" and each caller dispositions it differently, so it is
-    deliberately not folded in here."""
-    probed = git_bytes(repo, "version")
+    deliberately not folded in here.
+
+    `timeout_s` is the #390 per-call seam, forwarded verbatim: the CLI gates keep
+    the engine bound, while a caller that must not stall — the TUI guard, on the
+    event loop — asks with its own short deadline and treats the resulting
+    `GitTimeoutError` as "could not look" rather than as a refusal, since a bound
+    the CLI does not share must not decide a launch."""
+    probed = git_bytes(repo, "version", timeout_s=timeout_s)
     reported = os.fsdecode(probed.stdout).strip()
     if probed.returncode != 0:
         return reported or f"git exited {probed.returncode}"
@@ -538,6 +546,30 @@ def git_floor_text(floor: tuple[int, int] = GIT_FLOOR) -> str:
     messages that name the floor cannot drift apart from each other or from the
     constant."""
     return f"{floor[0]}.{floor[1]}"
+
+
+def under_floor_git_message(found: str) -> str:
+    """The one wording for "this git is below `GIT_FLOOR`", rendered by every
+    surface that says it: `cli._reject_under_floor_git`'s abort, `validate`'s
+    `git.version` finding, `--dry-run`'s "NOT runnable" banner, and the TUI's
+    pre-launch guard.
+
+    Shared on purpose — those four dispositions (abort, report, preview, toast) are
+    verdicts about ONE host fact, and must not read as different findings about it.
+    Lives here rather than in `cli` because that is what lets the TUI render it: the
+    TUI is an observer over the core modules and importing the CLI into it would
+    invert the layering, so the alternative was a second copy of the sentence, which
+    is the drift this function exists to make impossible. `GIT_FLOOR`,
+    `git_floor_text` and `git_below_floor` are all here too."""
+    # `found` is git's own answer, verbatim — usually a whole `git version 2.25.1`
+    # line, but also `git exited 127` or `no version reported` when the probe could
+    # not read one. Quoted and introduced rather than dropped mid-sentence, so all
+    # three shapes read as English (and so "git git version …" cannot happen).
+    return (
+        f"git reported {found!r}, which is below the floor bmad-loop supports — "
+        f"git {git_floor_text()} or newer is required. Install a newer git "
+        "and re-run (`git --version` reports what is on PATH)."
+    )
 
 
 def rev_parse_head(repo: Path) -> str:
