@@ -1464,6 +1464,77 @@ class WorktreeFlow:
                 patch=str(patch) if patch else None,
             )
 
+    def _carried_artifact_rels(self, repo: Path) -> tuple[str, ...]:
+        """The repo-relative posix paths the RUN commits for itself after the merge —
+        ``clean_incoming_collisions``' ``protected`` operand (#618).
+
+        The sprint board and the deferred-work ledger, because those are the two
+        files the four post-merge carries name: ``_carry_harvested_deferrals``,
+        ``_carry_review_budget_followups`` and ``_carry_story_deferred_closes`` pass
+        ``paths.deferred_work`` and ``_carry_board_advance`` passes
+        ``paths.sprint_status``, all four to ``verify.commit_paths`` against this same
+        ``repo``. That call stages by PATHSPEC — `git add -- :(literal)<path>` — so
+        whatever the working tree holds at that path is committed no matter who wrote
+        it, and a merge that walked past an operator's edit there hands the run its
+        own bytes to commit under a `chore(...)` message. The blast radius is strictly
+        same-path (`git commit -- <pathspec>` is implicitly `--only`), which is why
+        this is an exact path set and not a policy.
+
+        ``self.paths``, not ``self.workspace.paths``: the carries read the MAIN
+        checkout's copies (their docstrings say so explicitly), and this is the
+        checkout the merge lands in.
+
+        Relativized exactly as ``commit_paths`` relativizes its own operands
+        (``resolve().relative_to(repo.resolve()).as_posix()``) — that is what makes
+        each entry the same string the carry will later hand ``git add``, and the same
+        key shape ``verify.dirty_paths`` returns, so the guard's membership test is an
+        equality it cannot get subtly wrong. Resolving is load-bearing rather than
+        defensive: through a symlinked artifacts dir the unresolved rel names the LINK
+        while both git and ``commit_paths`` name the target.
+
+        A path that cannot be expressed relative to ``repo`` is dropped, not raised
+        on: it cannot be dirty in this checkout, and ``commit_paths`` filters the same
+        ``ValueError`` and so would never commit it either. ``_ledger_seed``'s
+        three-way catch for the same reason — an unresolvable path (the WSL UNC
+        provider fault, a symlink loop) omits only itself.
+
+        TRACKED ONLY, and that is the whole boundary of the hazard rather than a
+        precaution. What makes the carry dangerous is committing a DIVERGENCE from a
+        baseline somebody else authored: on a tracked board, an operator's local
+        reopen of a story row rides out under `chore(sprint-status): carry ...` with
+        the tree left clean and nothing to read it back from. An UNTRACKED artifact
+        has no such baseline — git reports the whole file as dirt because git has
+        never seen it, the orchestrator has been reading that exact file as its own
+        all along, and committing it is how a non-ignored board first reaches git at
+        all (#350's carry). Protecting it would refuse the merge on EVERY isolated run
+        of any project that has yet to commit its board — measured: an untracked,
+        non-ignored board with no operator dirt anywhere ends the run
+        `done=0 paused=True escalated=1` — which is the unattended-halt class #460 and
+        #618 exist to remove, in exchange for a "hazard" that loses nothing (the bytes
+        are committed, not overwritten). A gitignored artifact never reaches the
+        question: ``dirty_paths`` does not report ignored files and ``git add`` refuses
+        an ignored pathspec, so the carry degrades instead of committing.
+
+        A trackedness probe that cannot answer keeps the path, the direction
+        ``path_tracked``'s own callers degrade in: uncertainty must not be what
+        authorizes writing an operator's bytes into the run's commit. The cost of
+        being wrong that way is a refusal the operator can act on; the other way it is
+        silent.
+        """
+        rels: list[str] = []
+        for artifact in (self.paths.sprint_status, self.paths.deferred_work):
+            try:
+                rel = artifact.resolve().relative_to(repo.resolve()).as_posix()
+            except (OSError, RuntimeError, ValueError):
+                continue
+            try:
+                tracked = verify.path_tracked(repo, rel)
+            except verify.GitError:
+                tracked = True
+            if tracked:
+                rels.append(rel)
+        return tuple(rels)
+
     def merge_local(
         self,
         task: StoryTask,
@@ -1500,21 +1571,43 @@ class WorktreeFlow:
         # checkout (see the unity plugin's worktree setup), dirtying the target with the very
         # files this branch already committed. Reconcile that first: clean only
         # the leaked copies of incoming files; nothing outside this branch's path set is
-        # ever touched. Outside it, trackedness decides whether the merge proceeds (#460):
-        # untracked dirt cannot be overwritten or staged in, so it is tolerated and
-        # journaled; uncommitted changes to tracked files can be folded into this story's
-        # commit, so they escalate.
+        # ever touched. Outside it two questions decide whether the merge proceeds. What
+        # the MERGE can commit is what git has staged (#618), so an unstaged stray is
+        # inert and is tolerated and journaled while a staged one escalates. What the RUN
+        # can commit is the second question, and `protected` is what asks it: the
+        # post-merge carry stages the board and the ledger BY PATHSPEC, so any dirt on
+        # them — staged or not, whoever wrote it — would ride the run's own bookkeeping
+        # commit. Inert-under-merge and safe-to-proceed are not the same predicate.
+        tolerated: list[str] = []
+
+        def note_tolerated(paths: list[str]) -> None:
+            """Journal the guard's decision AND keep the paths for the arms below.
+
+            The event stays here, before the merge, because it records what the
+            GUARD decided; emitting it only on success would lose the trace in
+            exactly the run worth debugging. But "tolerated" is a claim about the
+            path SET, and a stray outside that set by path can still clash with it
+            structurally — a file where the merge needs a directory, or the reverse
+            — so git may refuse the merge over a path this event just called
+            harmless. Holding the list lets the pre-flight arm correct the record
+            instead of leaving it asserting the run merged past a path that in fact
+            stopped it (#623).
+            """
+            tolerated.extend(paths)
+            self.journal.append(
+                "merge-target-tolerated",
+                story_key=task.story_key,
+                branch=unit.branch,
+                paths=paths,
+            )
+
         try:
             cleaned = verify.clean_incoming_collisions(
                 repo,
                 target,
                 merge_ref,
-                on_tolerated=lambda paths: self.journal.append(
-                    "merge-target-tolerated",
-                    story_key=task.story_key,
-                    branch=unit.branch,
-                    paths=paths,
-                ),
+                protected=self._carried_artifact_rels(repo),
+                on_tolerated=note_tolerated,
             )
         except (verify.GitError, OSError, RuntimeError) as e:
             # OSError/RuntimeError join GitError because clean_incoming_collisions
@@ -1531,11 +1624,17 @@ class WorktreeFlow:
                     f"fault, then `bmad-loop resume {self.state.run_id}`"
                 )
             else:
+                # The outer sentence names the HAZARD, never the mechanism: since #618
+                # there are two, and only the inner clause knows which applies to which
+                # path. Saying "a merge or squash would fold them" out here attributed
+                # every refusal to the merge, including one raised because the run's own
+                # post-merge carry would sweep a path it commits for itself.
                 reason = (
                     f"merge of {unit.branch} into {target} blocked: the target checkout has "
-                    f"uncommitted changes to tracked files outside this branch — a merge or "
-                    f"squash would fold them into this story's commit. Commit, stash or revert "
-                    f"them, then `bmad-loop resume {self.state.run_id}`. One cause is a "
+                    f"uncommitted changes to tracked files outside this branch that this run "
+                    f"could commit under the story's name — the clause below names the paths, "
+                    f"the mechanism, and what each one needs. Commit, stash or revert them, "
+                    f"then `bmad-loop resume {self.state.run_id}`. One cause is a "
                     f"per_worktree engine Editor writing into the main checkout; another is "
                     f"ordinary local work. {e}"
                 )
@@ -1569,13 +1668,211 @@ class WorktreeFlow:
                 message=self.merge_message(task),
                 allow_empty_squash=replay,
             )
-        except verify.GitError as e:
-            # genuine content conflict against the target: keep the branch for
-            # manual merge. The unit committed cleanly (phase is already DONE,
-            # which has no legal transition), so escalate directly.
+        except verify.MergePreflightError as e:
+            # Subclass arm, so it must precede the GitError one below. git declined
+            # before the merge began: nothing was merged and the target checkout is
+            # exactly as it was. Describe that STATE rather than prescribing one
+            # remedy — the same refusal covers an untracked file the merge would
+            # overwrite, a staged change on an incoming path, a file/directory shape
+            # clash, and a target that cannot fast-forward — and let the appended raw
+            # git error name the cause and the paths (#619).
+            reason = (
+                f"merge of {unit.branch} into {target} was refused by git before it "
+                f"started: nothing was merged, the target checkout is unchanged, and "
+                f"there is no conflict to resolve. The target's state clashes with the "
+                f"incoming commit; git's own message below names the cause and the "
+                f"paths. Clear that clash, then `bmad-loop resume {self.state.run_id}`. "
+                f"{e}"
+            )
+            if tolerated:
+                # Corrective, not duplicative: only this arm knows the merge died at
+                # git's pre-flight, and only the callback above knows which paths the
+                # guard waved through. One of them may be the cause — git's text names
+                # it — so pair the two rather than making either infer the other. Rides
+                # phase 1's typed error: one discriminator, two consumers (#623).
+                self.journal.append(
+                    "merge-preflight-refused",
+                    story_key=task.story_key,
+                    branch=unit.branch,
+                    tolerated=tolerated,
+                    error=str(e),
+                )
+            self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
+            return  # defensive: never fall through to the success teardown below
+        except verify.MergeHalfAppliedError as e:
+            # Sibling of the pre-flight arm above, not a subclass of it, so it is a
+            # separate arm rather than a branch inside one — and like its neighbours it
+            # must precede the bare `GitError` arm. git died PART-WAY through the
+            # checkout: the pre-flight sentence above is false in its load-bearing
+            # clause ("the target checkout is unchanged"), because the incoming files
+            # git had already written are still there, untracked. Naming them is the
+            # whole point — they are what makes the next attempt fail, as an
+            # untracked-overwrite refusal over paths no earlier message mentioned.
+            #
+            # No `merge-preflight-refused` companion here even when `tolerated` is set:
+            # that event is the #623 corrective for a guard that called a path harmless
+            # and then watched git refuse over that same path. This failure is not about
+            # the tolerated paths at all — it is incoming content failing to check out —
+            # so pairing it with the guard's decision would assert a link that is not there.
+            # Two residue axes, two different asks, and the operator needs whichever
+            # ones actually apply — so the middle of this message is composed rather
+            # than picked from a fixed set. An incoming path the target did not track
+            # lands untracked and no restore reaches it, so it is theirs to clear; one
+            # it DID track was modified in place and `merge_branch` has already
+            # restored it path-scoped, unless that restore failed too.
+            # The restore clause LEADS when both apply: it says "before anything
+            # else" and means it — a resume dies on the tracked residue first —
+            # so the untracked clause defers to it ("then") rather than both
+            # claiming first place in one message.
+            # The prescription is path-scoped for the reason the restore itself is:
+            # only the named paths are proven git's, and a repo-wide
+            # `git reset --hard HEAD` would flatten the operator's own uncommitted
+            # work alongside them — the destruction the per-path attribution exists
+            # to prevent.
+            steps: list[str] = []
+            if not e.restored:
+                rewritten = (
+                    " ".join(e.rewritten) if e.rewritten else "<the paths git's message names>"
+                )
+                steps.append(
+                    f"The tracked files git had already rewritten could NOT be rolled "
+                    f"back — that failure is in the message below too — so {target} is "
+                    f"still holding incoming content on those paths. Restore exactly "
+                    f"those paths (`git checkout HEAD -- {rewritten}` in {target}, "
+                    f"never a repo-wide `git reset --hard`, which would flatten your "
+                    f"own uncommitted work too) before anything else."
+                )
+            if e.paths:
+                steps.append(
+                    f"Some incoming files are left UNTRACKED in the checkout and no "
+                    f"restore removes them — not `git merge --abort`, not "
+                    f"`git reset --hard`: {', '.join(e.paths)}. "
+                    + ("Clear those first, " if e.restored else "Then clear those, ")
+                    + "checking the contents before you delete: the run can prove git "
+                    "wrote each path, not that the bytes now there are git's."
+                )
+            if e.restored and not e.paths:
+                steps.append(
+                    "The tracked files git had already rewritten have been rolled "
+                    "back, so the checkout itself needs nothing from you."
+                )
+            reason = (
+                f"merge of {unit.branch} into {target} failed PART-WAY THROUGH: git got "
+                f"far enough to start writing the incoming files into {target}'s "
+                f"checkout before it stopped, so nothing was committed and this is not a "
+                f"clash between the target and the incoming commit. "
+                + " ".join(steps)
+                + f" Whatever residue is left refuses the NEXT attempt over those same "
+                f"paths rather than with the error below, which is why a resume before "
+                f"clearing it fails on the tree instead of on the cause. Then fix what "
+                f"stopped the checkout — git's own message below names it, and a "
+                f"required clean/smudge filter that cannot run is the measured cause — "
+                f"and `bmad-loop resume {self.state.run_id}`. {e}"
+            )
+            self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
+            return  # defensive: never fall through to the success teardown below
+        except verify.MergeResidueUnreadError as e:
+            # The terminal arm's caller-side half, and another sibling that must
+            # precede the bare `GitError` arm. Neither neighbour's sentence can be
+            # borrowed: the pre-flight arm's "the target checkout is unchanged" is
+            # exactly the claim the dead probe can no longer back, and the
+            # half-applied arm names residue this run never read. Say what IS known
+            # — the merge failed, git's text below names why — and send the operator
+            # to the one reading the run could not take, which their own `git
+            # status` still can.
+            reason = (
+                f"merge of {unit.branch} into {target} failed, AND the after-the-fact "
+                f"probe that verifies the checkout failed too, so whether {target}'s "
+                f"checkout still holds incoming residue is UNVERIFIED. Run `git "
+                f"status` in {target}: clear any residue it names that is not yours "
+                f"(files from {unit.branch} left untracked or rewritten), fix what "
+                f"stopped the merge — git's message below names it — then "
+                f"`bmad-loop resume {self.state.run_id}`. {e}"
+            )
+            self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
+            return  # defensive: never fall through to the success teardown below
+        except verify.MergeCommitRefusedError as e:
+            # Sibling of the arm above and equally a GitError subclass, so it too must
+            # precede the last arm. Neither neighbour's remedy applies here: the merge
+            # RAN and resolved, so there is no target-state clash to clear, and it
+            # resolved cleanly, so there is no conflict to resolve either. `merge_branch`
+            # rolled it back — `merge --abort` on the `--no-ff` leg, `reset --hard` on
+            # the squash leg's own commit — so the checkout is back where it started and
+            # the operator is sent to the policy that declined the commit (#619). The
+            # unrestored wording branches on WHERE the checkout stands, because the two
+            # legs strand differently and the first step differs with them.
+            if e.restored:
+                reason = (
+                    f"merge of {unit.branch} into {target} resolved cleanly, but git "
+                    f"refused to COMMIT it, so the merge was rolled back and the target "
+                    f"checkout is back as it was. There is no conflict to resolve and "
+                    f"nothing to clear from the tree: a `pre-merge-commit` or "
+                    f"`commit-msg` hook, or commit signing, declined it — git's own "
+                    f"message below names which. Fix that, then "
+                    f"`bmad-loop resume {self.state.run_id}`. {e}"
+                )
+            elif e.staged:
+                # The squash leg's strand: no MERGE_HEAD exists, so "recover the
+                # merge" would be fiction — the squash result is sitting STAGED,
+                # either because the rollback failed or because the checkout also
+                # carries the operator's own uncommitted work, which the rollback
+                # refuses to flatten. The exception's text says which.
+                reason = (
+                    f"merge of {unit.branch} into {target} resolved cleanly, git "
+                    f"refused to COMMIT it, and the squash result is left STAGED in "
+                    f"{target}'s checkout — the message below says why it was not "
+                    f"rolled back for you. Stash or commit anything in {target} that "
+                    f"is yours, then clear the staged result "
+                    f"(`git reset --hard HEAD` in {target}). Only then fix whatever "
+                    f"declined the commit: a `pre-merge-commit` or `commit-msg` hook, "
+                    f"or commit signing. Then `bmad-loop resume {self.state.run_id}`. "
+                    f"{e}"
+                )
+            else:
+                # The abort failed too, so the restored sentence would be a lie about
+                # the one thing the operator has to act on FIRST: a resume attempted
+                # over a mid-merge checkout dies on the merge state, not on the
+                # policy, and keeps doing so however well they fix the hook.
+                reason = (
+                    f"merge of {unit.branch} into {target} resolved cleanly, git refused "
+                    f"to COMMIT it, and the abort meant to undo that failed as well — so "
+                    f"the target checkout is left MID-MERGE and has to be recovered "
+                    f"first (`git merge --abort`, or reset it to the pre-merge commit). "
+                    f"Only then fix whatever declined the commit: a `pre-merge-commit` "
+                    f"or `commit-msg` hook, or commit signing. git's own message below "
+                    f"names both failures. Then `bmad-loop resume {self.state.run_id}`. "
+                    f"{e}"
+                )
+            self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
+            return  # defensive: never fall through to the success teardown below
+        except verify.MergeConflictError as e:
+            # genuine content conflict against the target, measured (unmerged index
+            # stages): keep the branch for manual merge. The unit committed cleanly
+            # (phase is already DONE, which has no legal transition), so escalate
+            # directly.
             reason = (
                 f"merge of {unit.branch} into {target} failed "
-                f"(content conflict against the target): {e}"
+                f"(content conflict against the target): resolve it by hand, then "
+                f"`bmad-loop resume {self.state.run_id}`. {e}"
+            )
+            self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
+            return  # defensive: never fall through to the success teardown below
+        except verify.GitError as e:
+            # Every state the classification MEASURED has a typed arm above, so a
+            # bare GitError is a state nothing measured. This arm used to claim the
+            # most specific diagnosis — "content conflict, resolve it by hand" — for
+            # exactly the failures it knew least about, which is how six mislabeled
+            # git states in a row reached the operator wearing a fictional remedy
+            # (#619). It now claims only what it knows: the merge failed, the run
+            # cannot say what state the checkout is in, and git's text names the
+            # cause. An unforeseen shape lands here as a vague-but-true message
+            # rather than a precise fiction.
+            reason = (
+                f"merge of {unit.branch} into {target} failed, and the failure was "
+                f"not classified: the run cannot say what state {target}'s checkout "
+                f"is in. Run `git status` in {target} and put the checkout right — "
+                f"git's own message below names the cause — then "
+                f"`bmad-loop resume {self.state.run_id}`. {e}"
             )
             self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
             return  # defensive: never fall through to the success teardown below
@@ -1602,8 +1899,10 @@ class WorktreeFlow:
 
     def keep_branch_and_escalate(self, task: StoryTask, unit: UnitWorkspace, reason: str) -> None:
         """Preserve a DONE unit's branch (no delete, kept for manual merge) and
-        escalate. Shared by the two merge-back failure paths: a target dirtied
-        with stray work, and a genuine content conflict."""
+        escalate. Shared by every merge-back failure path: a target dirtied with
+        stray work, a merge git refused at pre-flight, a merge that died part-way
+        through its checkout, a merge whose COMMIT git refused, a genuine content
+        conflict, and a failure nothing classified."""
         close_unit_workspace(
             unit,
             success=False,

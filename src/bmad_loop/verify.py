@@ -96,6 +96,200 @@ class RollbackPreflightError(GitError):
     """Rollback cleanup paths could not be proven safe before mutation."""
 
 
+class MergePreflightError(GitError):
+    """Git refused a merge BEFORE starting it: the working tree was never
+    touched, no merge is in progress, and there is nothing to resolve. Covers an
+    untracked file the merge would overwrite, a staged change on an incoming
+    path, a file/directory shape clash, and an `--ff-only` target that cannot
+    fast-forward. A GitError so every existing `except verify.GitError` guard is
+    unchanged; a distinct type so a caller can stop telling the operator to
+    resolve a content conflict that never happened (#619)."""
+
+
+class MergeConflictError(GitError):
+    """The merge ran and the CONTENT collided: unmerged index stages exist (or
+    did, before the leg's own rollback), and resolving them by hand is the
+    remedy.
+
+    Measured, not inferred: `_index_unmerged` (`ls-files -u`) is what earns this
+    class, under both `--no-ff` and `--squash` — the one probe that answers
+    content for both, since a conflicted `--squash` writes three unmerged stages
+    while creating no MERGE_HEAD at all. A GitError so every existing
+    `except verify.GitError` guard is unchanged; a distinct type so the caller's
+    LAST arm no longer has to read "bare GitError" as "conflict" — with the
+    conflict typed, whatever arrives untyped is a state nothing measured, and
+    the caller can say that instead of prescribing conflict resolution for it
+    (#619)."""
+
+
+class MergeCommitRefusedError(GitError):
+    """The merge itself ran and resolved; git would not COMMIT the result.
+
+    Measured causes: a `pre-merge-commit` or `commit-msg` hook exiting non-zero,
+    and a `commit.gpgsign` that cannot produce a signature. Neither sibling's
+    remedy fits — there is no content conflict to resolve and no target state to
+    clear, only a policy or a key the operator's own repo configures — which is
+    the whole reason this is a third type rather than either of theirs.
+
+    Two legs reach it, through different commits. `--no-ff` is refused at the
+    merge's own commit and leaves MERGE_HEAD, which is what parts it from a
+    genuine pre-flight refusal — `merge_branch` reads that BEFORE its abort
+    rather than only to decide whether to abort at all. (`_index_unmerged`
+    cannot see this state: a merge that resolved cleanly leaves no unmerged
+    stages whether or not the commit that would have sealed it was allowed.)
+    The squash leg is refused at its OWN plain `git commit`, after
+    `merge --squash` already staged the result — hooks and signing run there
+    like anywhere else — so no MERGE_HEAD is involved and no classification is
+    needed: the merge step succeeded, and the failed call identifies the state
+    by itself.
+
+    ``restored`` says whether the rollback that follows actually put the
+    checkout back — `merge --abort` on the `--no-ff` leg, `reset --hard HEAD`
+    on the squash leg (gated on the leg's pre-merge dirtiness snapshot: a
+    checkout that already carried uncommitted work is never reset, #619). The
+    squash rollback is deliberately whole-tree — it is undoing a SUCCEEDED
+    merge whose staged result spans the entire incoming set — which leaves one
+    stated ceiling: an operator edit landing after the pre-merge reading found
+    the tree clean sits inside the reset's blast radius (see
+    `_reset_hard_head`).
+    It is an attribute rather than a type of its own because the operator's
+    CAUSE is the same either way — a policy declined the commit — and only the first
+    step of their remedy differs: a checkout left mid-merge has to be recovered
+    before fixing that policy is worth anything, and a resume attempted before then
+    fails again on the merge state rather than on the policy. A caller that ignores
+    the flag still gets a true statement of the cause; one that reads it can order
+    the two steps (#619).
+
+    ``staged`` names WHERE an unrestored checkout stands, because the two legs
+    strand differently and the operator's first step differs with them: False
+    means mid-merge (MERGE_HEAD set, `git merge --abort` recovers it), True
+    means the squash result is still sitting staged (`reset --hard HEAD` clears
+    it — after their own uncommitted work, if that is what blocked the rollback,
+    is stashed or committed). Always False when ``restored`` is True: a checkout
+    that was put back holds nothing."""
+
+    def __init__(self, message: str, *, restored: bool = True, staged: bool = False) -> None:
+        super().__init__(message)
+        self.restored = restored
+        self.staged = staged
+
+
+class MergeHalfAppliedError(GitError):
+    """Git died PART-WAY through checking the merge out: some incoming files are
+    already sitting in the target checkout, and no restore removes them.
+
+    A sibling of `MergePreflightError`, never a subclass, because it falsifies
+    that class's central claim — the working tree was never touched. Measured
+    cause (git 2.55.0, both `--no-ff` and `--squash`): a **required** clean/smudge
+    filter that fails. git materializes the incoming paths in index order, so the
+    ones sorting before the filtered path are written to the working tree and the
+    ones after it are not; git then rolls the INDEX back and exits, leaving the
+    written files behind as UNTRACKED. Nothing in the failure's own shape
+    distinguishes it from a genuine pre-flight refusal: no unmerged stages, no
+    MERGE_HEAD, and — because `git diff --quiet HEAD --` cannot see untracked
+    files — a tree that reads clean against HEAD.
+
+    That residue is why this is a type and not a message tweak. It blocks the
+    NEXT merge as an untracked-overwrite pre-flight refusal, so a run told its
+    checkout was unchanged fails the same way on every resume, over paths the
+    error never named.
+
+    The residue has TWO axes and they are not interchangeable. An incoming path
+    the target did not already track lands as an untracked file, which no restore
+    reaches. An incoming path it DID track is modified in place, which a
+    path-scoped `git checkout HEAD --` over exactly the attributed paths does
+    undo. So the tracked axis is repaired and the untracked axis is reported, and
+    the class carries one field for each — plus ``rewritten``, naming the tracked
+    paths the repair covered (or failed to).
+
+    Attribution, on both axes, is a per-path AND of two proofs: the path changed
+    during the merge window (a before/after delta, never an absolute reading) AND
+    the merge could have written it (the branch's incoming set). Each proof rules
+    out the misattribution the other cannot: the delta keeps the operator's
+    pre-existing strays and edits out, the intersection keeps their CONCURRENT
+    writes out — an edit landing on a bystander path mid-merge was once swept
+    into a repo-wide "the tree is dirty now" reading and destroyed by the
+    repo-wide reset riding on it. Two ceilings remain, per path: a path already
+    dirty before the merge stays unattributable, and a concurrent write to a
+    path INSIDE the incoming set is indistinguishable from git's and is restored
+    with it.
+
+    ``paths`` carries the untracked residue — what the operator still has to
+    clear. Deliberately not cleaned: `reset --hard` and `merge --abort` both
+    leave untracked files alone (measured), and deleting them is precisely the
+    destruction #619's before-snapshot exists to prevent — the attribution
+    proves git wrote *a* path, not that the bytes there are git's.
+
+    ``rewritten`` carries the tracked residue — the paths whose restore
+    ``restored`` reports on, so a failed repair can be finished by hand
+    path-scoped (`git checkout HEAD -- <path>`) instead of by the repo-wide
+    reset whose blast radius the attribution exists to avoid.
+
+    ``restored`` says whether the TRACKED half was rolled back, and is True when
+    there was none to roll back. It matters because it changes the operator's
+    FIRST step, exactly as its namesake on `MergeCommitRefusedError` does: a
+    checkout still holding incoming content on tracked paths refuses the next
+    merge over those paths ("Your local changes would be overwritten"), so a resume
+    attempted before restoring it fails on the tree rather than on whatever stopped
+    the checkout.
+
+    An empty ``paths`` with ``restored`` True is still this class and not
+    `MergePreflightError`. The checkout ends up in the same place, but the CAUSE
+    the operator has to act on is a different one — something stopped git mid-write,
+    not a target-state clash — and sending them to clear a clash that does not
+    exist is the #619 defect this taxonomy exists to prevent."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        paths: tuple[str, ...] = (),
+        restored: bool = True,
+        rewritten: tuple[str, ...] = (),
+    ) -> None:
+        super().__init__(message)
+        self.paths = paths
+        self.restored = restored
+        self.rewritten = rewritten
+
+
+class MergeResidueUnreadError(GitError):
+    """A post-merge reading the classification rests on failed, so the
+    checkout's state is UNVERIFIED — neither sibling's claim survives.
+
+    The terminal arm of the classification, present so a probe failure can never
+    impersonate a verdict. Unwrapped, the probe's raise escapes between the
+    failed merge and its cleanup — stranding a started `--no-ff` mid-merge with
+    MERGE_HEAD set — and lands in the caller's content-conflict arm wearing a
+    probe error's text, with a remedy that is fiction here. Degraded SILENTLY
+    instead, the empty reading routes to `MergePreflightError`, whose
+    load-bearing clause — the working tree was never touched — the dead probe
+    can no longer back. Both neighbours state what was measured; this class
+    states that the measurement is missing.
+
+    Reachable from the corner where nothing else answered. Over dead RESIDUE
+    readings, unmerged stages (conflict) and MERGE_HEAD (commit refused) are read
+    independently, so either still claims its own class — only the choice
+    between "refused before starting" and "failed part-way through checkout"
+    rests on that reading, and with it gone the honest answer is neither. The
+    index and merge-state readings can die in the same window (#619): a dead
+    index reading surrenders every class resting on "did not collide" —
+    commit-refused and half-applied as much as pre-flight, since a state it
+    cannot rule a conflict out of must not be dressed as either — and a dead
+    merge-state reading additionally skips the abort it gates, with the
+    message saying so, because uncertainty never authorizes a repair write.
+    The squash replay reading joins from the far side of a merge that
+    SUCCEEDED: with `allow_empty_squash`'s staged-result reading dead, neither
+    the no-op return nor a result to commit can be claimed, so nothing is
+    committed, nothing is reset, and the message names the dead reading.
+
+    No repair rides on it: `reset --hard` stays gated on a PROVEN
+    tracked-residue attribution, because uncertainty must not be what authorizes
+    rewriting the operator's checkout. Their own `git status` is not degraded —
+    the message carries the probe's failure alongside git's own and sends them
+    there."""
+
+
 @overload
 def _run_git(
     cmd: list[str],
@@ -862,6 +1056,116 @@ def path_tracked_file(repo: Path, rel: str) -> bool:
         merged = (proc.stdout + proc.stderr).decode("utf-8", "replace").strip()
         raise GitError(f"git ls-files -z -- {rel} failed in {repo}: {merged}")
     return {entry for entry in proc.stdout.split(b"\0") if entry} == {os.fsencode(rel)}
+
+
+def _blob_oid_for_file(repo: Path, rel: str, path: Path) -> str:
+    """The object id git would record for the bytes in ``path``, taken as content for
+    repo-relative posix ``rel``.
+
+    `--path=` is what makes ``path`` and ``rel`` separable: it drives the attribute
+    lookup, so a file living anywhere — a shadow copy outside the repo included — is
+    hashed under the rules that govern ``rel``. Verified load-bearing at git 2.55.0:
+    with `board.yaml text eol=crlf`, a CRLF twin named something else hashes to HEAD's
+    id with the flag and to a different id without it.
+
+    Raises rather than answering a sentinel. The one caller gates a repair write on the
+    comparison, and an id it could not compute must not read as "these differ" any more
+    than as "these match"."""
+    proc = git_bytes(repo, "hash-object", "-t", "blob", f"--path={rel}", "--", str(path))
+    if proc.returncode != 0:
+        detail = (proc.stdout + proc.stderr).decode("utf-8", "replace").strip()
+        raise GitError(f"git hash-object --path={rel} for {path} failed in {repo}: {detail}")
+    return proc.stdout.decode("ascii", "strict").strip()
+
+
+def file_holds_content(repo: Path, rel: str, path: Path, data: bytes) -> bool:
+    """Whether the file at ``path`` holds ``data``, as GIT counts sameness for ``rel``.
+
+    Asks git's own question instead of guessing a domain. A byte compare has to know
+    which end of the checkin/checkout round trip the file on disk sits at, and there is
+    no answer that holds: under `core.autocrlf=true` — Git for Windows' system default,
+    which the suite deliberately leaves reachable — a freshly checked-out board is CRLF
+    while one an editor or a byte-writing tool left is LF, and git calls the tree clean
+    either way. Measured both ways at git 2.55.0: a baseline read raw refuses the CRLF
+    checkout, a baseline read through the smudge refuses the LF one, and the two
+    failures are the same mistake pointing opposite directions. Hashing both sides
+    through the CLEAN filter collapses that distinction, because it is precisely the
+    distinction git itself does not draw.
+
+    What it does NOT collapse is content: an operator's added row survives cleaning and
+    still answers False, which is the only discrimination the caller wants.
+
+    ``data`` is hashed from a shadow file rather than stdin because the git chokepoint
+    spawns without one, and widening it for a single caller would put a stdin path
+    through every git call in the module."""
+    return _blob_oid_for_file(repo, rel, path) == _blob_oid_for_bytes(repo, rel, data)
+
+
+def _blob_oid_for_bytes(repo: Path, rel: str, data: bytes) -> str:
+    """``_blob_oid_for_file`` for bytes that are not on disk, via a shadow copy — the
+    git chokepoint spawns without a stdin, and widening it for one caller would put a
+    stdin path through every git call in the module."""
+    with tempfile.TemporaryDirectory() as tmp:
+        shadow = Path(tmp) / "intended"
+        shadow.write_bytes(data)
+        return _blob_oid_for_file(repo, rel, shadow)
+
+
+def index_holds_no_foreign_content(repo: Path, rel: str, data: bytes) -> bool:
+    """Whether the INDEX entry for ``rel`` is safe to overwrite with ``data``.
+
+    Git holds a path in two places and `commit_paths` writes both: `git add` copies the
+    WORKING TREE into the commit and overwrites the INDEX in place. A staged version
+    distinct from both HEAD and ``data`` therefore exists nowhere afterwards — not in
+    the commit, which took the working tree, and not on disk — so proving only the
+    working tree is not proving the carry destroys nothing. Measured: with the operator's
+    edit staged and the working tree restored, the carry commits, the row is absent from
+    HEAD and from disk, and the tree reads clean, the bytes surviving only as a dangling
+    blob (#618).
+
+    True when the index holds HEAD's own content, or already holds ``data``, or holds
+    no entry for a path HEAD does not carry either — the first loses nothing git cannot
+    still reach, the second is the write itself, and the third is empty in both places
+    at once. Unmerged stages raise rather than answer: a half-resolved index is not a
+    state this can prove anything about.
+
+    An absent entry is NOT by itself "nothing to overwrite", which is why HEAD is
+    consulted before accepting one. With HEAD carrying the path, no index entry is a
+    staged DELETION — `git rm --cached`, the operator untracking a board they are
+    about to gitignore, which is a shape this project documents rather than an exotic
+    one — and the carry's `git add` restores the entry, leaving that intent nowhere:
+    not in HEAD, which never had it, and not in the index that just lost it. Measured.
+
+    CONTENT is the whole of what this proves, and that ceiling is deliberate.
+    ``ls-files -s`` reports the entry's MODE too and this reads only the oid beside
+    it, so an operator who stages nothing but an exec-bit flip
+    (``update-index --chmod=+x``) leaves the blob identical, is approved here, and has
+    that staged mode reset by the carry's ``git add``. 100644/100755 is the only pair
+    that can reach it — a symlink entry (120000) carries a different blob, which the
+    oid compare already catches — so the exposure is exactly an exec bit on a YAML
+    data file that nothing reads and nothing runs. Widening the proof to index
+    metadata no workflow here sets would protect nothing and hand the carry one more
+    way to refuse an ordinary board. A caller must not read this as "the index entry
+    is untouched"; it says "the index holds no content this write would lose".
+    """
+    proc = git_bytes(repo, "ls-files", "-s", "-z", "--", *_literal_specs([rel]))
+    if proc.returncode != 0:
+        detail = (proc.stdout + proc.stderr).decode("utf-8", "replace").strip()
+        raise GitError(f"git ls-files -s -- {rel} failed in {repo}: {detail}")
+    # Read once, up here: BOTH branches below need HEAD, because whether an index
+    # state is safe to overwrite is never answerable from the index alone.
+    head = _entry_at_revision(repo, "HEAD", rel)
+    head_oid = head[2] if head is not None and head[1] == "blob" else None
+    records = [r for r in proc.stdout.split(b"\0") if r]
+    if not records:
+        return head_oid is None  # empty in both places; otherwise a staged deletion
+    if len(records) != 1:
+        raise GitError(f"git ls-files -s returned unmerged stages for {rel!r} in {repo}")
+    fields = records[0].split(b"\t", 1)[0].decode("ascii", "strict").split()
+    if len(fields) != 3:
+        raise GitError(f"git ls-files -s returned a malformed entry for {rel!r} in {repo}")
+    staged = fields[1]
+    return staged in {head_oid, _blob_oid_for_bytes(repo, rel, data)}
 
 
 def path_ignored(repo: Path, path: Path) -> bool:
@@ -1720,6 +2024,7 @@ def clean_incoming_collisions(
     target: str,
     branch: str,
     *,
+    protected: tuple[str, ...] = (),
     on_tolerated: Callable[[list[str]], None] | None = None,
 ) -> list[str]:
     """Reconcile a target checkout dirtied by a per-worktree Unity Editor so the
@@ -1735,39 +2040,84 @@ def clean_incoming_collisions(
 
     Guard: only paths that lie within the branch's incoming set are cleaned. A dirty
     path *outside* that set is real operator work and is never touched. Whether it also
-    BLOCKS the merge depends on trackedness (#460): the merge writes only paths that
-    differ between `target` and `branch`, so an untracked stray can be neither
-    overwritten nor staged into the commit — it is tolerated and the merge proceeds.
-    Uncommitted changes to TRACKED files outside the set do threaten the commit — git
-    refuses a merge outright when the change is staged, and `merge --squash` + `commit`
-    folds it into the story's commit either way — so those still raise GitError naming
-    the paths, without touching anything.
+    BLOCKS the merge is decided per path by the INDEX column, not by trackedness
+    (#618): the merge writes only paths that differ between `target` and `branch`, so
+    a stray git has nothing staged for — untracked, or tracked and edited in the
+    working tree only — can be neither overwritten by the merge nor written into its
+    commit. Measured on both topologies and both strategies: rc 0, the edit survives
+    uncommitted, and it is absent from the resulting commit. A STAGED stray is the
+    real hazard, and it is one under both strategies — `merge --no-ff` refuses it
+    outright, and so does `merge --squash` against a diverged target; only a
+    fast-forwardable `--squash` accepts it, and that one FOLDS the operator's staged
+    work into the story's commit.
 
-    ``on_tolerated``, when given, is called once with the sorted list of untracked
-    stray paths the guard walked past — the mirror of the returned ``cleaned`` list,
-    so a merge that proceeded over operator dirt leaves the same kind of trace as one
-    that cleaned a leak. Not called when there are no such paths.
+    ``protected`` names repo-relative posix paths the ORCHESTRATOR itself commits
+    after the merge, and a stray among them blocks whatever its index column says.
+    The merge's own inertness does not protect them, because the merge is not what
+    would commit them: ``commit_paths`` runs `git add -- :(literal)<path>` and then a
+    pathspec commit, so ANY working-tree change to a named path is committed no
+    matter who wrote it. The run's carry bookkeeping passes the sprint board and the
+    deferred-work ledger through that call — ``_carry_board_advance``
+    unconditionally — so an operator's private unstaged edit to one of those files
+    lands in git history under a `chore(sprint-status): carry ...` message, leaving
+    the tree clean and no trace of the substitution. The blast radius is strictly
+    SAME-PATH: `git commit -- <pathspec>` is implicitly `--only`, so dirt on any
+    other path is never swept in, which is why this list is a set of exact paths and
+    not a policy. Default empty — the wiring is the caller's.
+
+    ``on_tolerated``, when given, is called once with the sorted list of stray paths
+    the guard walked past — the exact complement of the blocking ones within the
+    strays, and the mirror of the returned ``cleaned`` list — so a merge that
+    proceeded over operator dirt leaves the same kind of trace as one that cleaned a
+    leak. Not called when there are no such paths.
     """
     dirty = dirty_paths(repo)
     if not dirty:
         return []
     incoming = branch_incoming_paths(repo, target, branch)
     stray = sorted(p for p in dirty if p not in incoming)
-    # A merge writes only paths that differ between `target` and `branch`, so a dirty
-    # path outside `incoming` can never be created or overwritten by it, and git never
-    # stages an untracked file into a merge or squash commit. Untracked strays are
-    # therefore inert and are left exactly where they are (#460) — refusing over one
-    # stopped unattended runs at the first story with no hazard to point at.
-    # Tracked dirt is NOT inert: a staged change makes `git merge` refuse outright, and
-    # `merge --squash` + `git commit` folds it into the story's commit. That half keeps
-    # refusing.
-    blocking = [p for p in stray if not dirty[p].startswith("??")]
+    # Trackedness was the wrong axis (#618). What a merge can write into its commit is
+    # what git has STAGED, so the index column alone decides: a stray with nothing
+    # staged is inert under both strategies and both topologies, and refusing over one
+    # stopped unattended runs with no hazard to point at. Everything else this method
+    # can see is a hazard the operator has to resolve first — a staged change, and the
+    # unmerged stages of a half-resolved conflict, which carry a letter in that column
+    # for every one of git's seven combinations.
+    #
+    # `protected` is the second half, and it is not about the merge at all: the run's
+    # own post-merge carry commits those paths by pathspec, sweeping in whatever the
+    # working tree holds. Inert-under-merge and safe-to-proceed stopped being the same
+    # question the moment a path was on both lists.
+    guarded = set(protected)
+    staged = [p for p in stray if dirty[p][0] not in " ?"]
+    blocking = [p for p in stray if dirty[p][0] not in " ?" or p in guarded]
     if blocking:
-        raise GitError(
-            "the target checkout has uncommitted changes to tracked files outside "
-            f"this branch's files (not introduced by the merge): {', '.join(blocking)}"
-        )
-    tolerated = [p for p in stray if dirty[p].startswith("??")]
+        # One raise, two remedies: staged work has to be committed or unstaged, while
+        # dirt on a carried path has to leave the path entirely. A single undifferentiated
+        # list would send the operator to the wrong one.
+        clauses: list[str] = []
+        if staged:
+            clauses.append(
+                "staged changes to tracked files outside this branch's files "
+                f"(not introduced by the merge): {', '.join(staged)}"
+            )
+        # Membership in `guarded`, NOT the `staged` complement. A path can be both,
+        # and the two clauses carry DIFFERENT remedies — so subtracting the staged ones
+        # here would name a staged-and-carried path under "commit or unstage it" alone,
+        # which does not remove the hazard: the carry stages whatever the working tree
+        # holds either way. Overlap means it is listed twice, which is the honest answer.
+        swept = [p for p in blocking if p in guarded]
+        if swept:
+            clauses.append(
+                "uncommitted changes to paths this run commits for itself after the "
+                f"merge, which it would sweep into its own bookkeeping commit: {', '.join(swept)}"
+            )
+        raise GitError("the target checkout has " + "; and ".join(clauses))
+    # Every stray that survives the raise above is tolerated — the exact complement of
+    # `blocking`, not a second independent predicate. Recomputing one here is how the
+    # two lists drift: an unstaged tracked stray answering neither test would proceed
+    # with no journal trace at all, which is the silent half of #618.
+    tolerated = list(stray)
     if tolerated and on_tolerated is not None:
         on_tolerated(tolerated)
     # Resolve every untracked cleanup parent before deleting or checking out any
@@ -1804,20 +2154,315 @@ def clean_incoming_collisions(
     return cleaned
 
 
-def _merge_in_progress(repo: Path) -> bool:
-    """True when a merge is mid-flight (MERGE_HEAD exists). A merge git refused at
-    pre-flight (e.g. untracked files would be overwritten) leaves no MERGE_HEAD,
-    so there is nothing to `--abort`."""
-    rc, _ = _git(repo, "rev-parse", "-q", "--verify", "MERGE_HEAD")
-    return rc == 0
+def _merge_in_progress(repo: Path) -> tuple[bool, GitError | None]:
+    """`(a merge is mid-flight — MERGE_HEAD exists, the probe failure when the
+    reading itself failed)`. A merge git refused at pre-flight (e.g. untracked
+    files would be overwritten) leaves no MERGE_HEAD, so there is nothing to
+    `--abort`.
+
+    `-q --verify` spends rc 1 on exactly "the name does not resolve" — the
+    legitimate no — and the environment-fault family lands at 128 (measured),
+    so rc 0 and rc 1 are the answers and anything else is an unread, as are
+    the three faults `_run_git` raises with no rc at all (#343/#377/#156).
+    Read in the same post-mutation window as `_index_unmerged`, and degrading
+    for the same reason: a raise here escapes `merge_branch` between the
+    failed merge and its cleanup. False WITH the marker set means unmeasured,
+    not "no merge" — and the caller must not let it authorize the abort this
+    value gates: `merge --abort` is a repair write, and uncertainty never
+    authorizes one, so the unread case skips the abort and says so."""
+    try:
+        rc, out = _git(repo, "rev-parse", "-q", "--verify", "MERGE_HEAD")
+    except GitError as unread:
+        return False, unread
+    if rc in (0, 1):
+        return rc == 0, None
+    return False, GitError(f"git rev-parse --verify MERGE_HEAD failed in {repo}: {out}")
 
 
-def _tree_dirty_vs_head(repo: Path) -> bool:
-    """True when tracked tree/index differs from HEAD — i.e. a squash actually
-    touched things and needs a reset. A pre-flight-refused squash leaves HEAD's
-    tree intact, so this stays False and we skip the bogus reset."""
-    rc, _ = _git(repo, "diff", "--quiet", "HEAD", "--")
-    return rc != 0
+def _dirty_tracked_paths(repo: Path) -> frozenset[str]:
+    """The tracked paths whose working-tree content differs from HEAD.
+
+    A TREE-STATE probe, not a did-the-merge-act probe. A path carrying a
+    pre-existing unstaged edit is in this set whether or not git touched it,
+    so a single post-merge reading cannot tell a refused merge from one that
+    half-applied — which is why `merge_branch` samples it BEFORE the merge and
+    differences after, per PATH (#619). The set form is what makes the answer
+    per-path at all: the boolean this used to be (`git diff --quiet HEAD`)
+    attributed a concurrent operator edit to ANY tracked file to git, and the
+    repo-wide `reset --hard` riding on that attribution destroyed it.
+
+    `--no-renames` so both samples spell a rename as its delete and its add —
+    two names, each usable as a pathspec — rather than whichever single name
+    rename detection happens to keep. NUL-delimited verbatim stdout for
+    `_untracked_paths`'s reason: these names are compared as sets, handed to
+    the operator, and passed back to git as pathspecs, so a C-quoted or
+    stripped name is one the restore cannot act on. RAISES on a failed read
+    like its snapshot sibling; the post-merge caller (`_merge_residue`)
+    catches and degrades."""
+    proc = _run_git(
+        ["git", "-C", str(repo), "diff", "--name-only", "-z", "--no-renames", "HEAD", "--"], repo
+    )
+    if proc.returncode != 0:
+        raise GitError(f"git diff --name-only HEAD failed in {repo}: {proc.stderr.strip()}")
+    return frozenset(rel for rel in proc.stdout.split("\0") if rel)
+
+
+def _index_dirty_vs_head(repo: Path) -> bool:
+    """True when the INDEX differs from HEAD — i.e. a squash actually staged
+    something to commit. Blind, unlike `_dirty_tracked_paths`, to pre-existing
+    UNSTAGED edits in the checkout, which are none of a replay's business: with
+    such an edit present the tree probe reports dirt a valid `allow_empty_squash`
+    replay never staged, so the clean early return is skipped and the ensuing
+    `git commit` fails with "no changes added to commit" (#619).
+
+    `--quiet` rides `--exit-code`'s contract, which spends rc 1 on exactly
+    "there are differences" — so rc 0 and rc 1 are the answers and anything
+    else RAISES, like the snapshot siblings: read as "dirty", an unreadable
+    index skipped the replay's no-op return, and the doomed `git commit` that
+    followed dressed the probe failure as a commit refusal, with
+    `_reset_hard_head`'s rollback riding on the fiction. The one caller reads
+    post-merge and catches, degrading to `MergeResidueUnreadError` — nothing
+    committed, nothing reset."""
+    rc, out = _git(repo, "diff", "--cached", "--quiet", "HEAD")
+    if rc in (0, 1):
+        return rc == 1
+    raise GitError(f"git diff --cached HEAD failed in {repo}: {out}")
+
+
+def _untracked_paths(repo: Path) -> frozenset[str]:
+    """The repo's untracked, non-ignored paths — the one dirt axis both
+    `_dirty_tracked_paths` and `_index_dirty_vs_head` are blind to.
+
+    Neither of those is a substitute: a merge that dies part-way through checkout
+    rolls its INDEX back but leaves the files it already wrote in the working
+    tree, and an untracked file is by definition absent from HEAD and from the
+    index, so both diffs read CLEAN over it. Sampled before and after the merge
+    and differenced, so the answer is "git wrote this", not "this is here" — the
+    same before/after discipline the tracked half uses, and for the same reason:
+    an absolute post-merge reading would attribute the operator's own strays to
+    git.
+
+    `--exclude-standard` deliberately keeps ignored files out. They are not
+    residue this can act on: an ignored path is invisible to the next merge's
+    pre-flight too, so it cannot produce the resume failure this probe exists to
+    name, and reporting one would send the operator after a file their own
+    `.gitignore` says is theirs.
+
+    NUL-delimited, and read through `_run_git` directly for the same reason
+    `capture_diff` does: this needs stdout VERBATIM and stderr for the error text,
+    which no single `_git*` wrapper hands back together. `ls-files --others`
+    applies `core.quotePath` C-quoting to non-ASCII paths, and a line-splitting
+    read with `.strip()` also eats leading and trailing spaces from a filename —
+    harmless to the delta, since both samples would be mangled identically, but
+    not to the ANSWER: these names are handed to the operator with an instruction
+    to clear them, and a quoted or trimmed name is one they cannot act on. Two
+    distinct paths can also strip to the same string, which would let a
+    pre-existing stray mask a real materialization. `dirty_paths` and
+    `branch_incoming_paths` already read path lists this way.
+
+    Taking stdout verbatim also covers the #442 advisory hazard the merged stream
+    has: git writes warnings to stderr at rc 0, and against `_git`'s merge a
+    warning line would become a phantom path in the set.
+
+    RAISES on a failed read rather than degrading the way its neighbours
+    `_index_unmerged` and `_merge_in_progress` do (each hands back an unread
+    marker), and the difference is position, not importance: this is one half
+    of a PAIR, so a silent empty set is not a neutral answer — an empty BEFORE
+    against a real AFTER reports every stray already in the checkout as
+    something git just wrote, and the message tells the operator to clear what
+    it names. Failing the merge outright is the smaller harm, and the
+    before-read that would produce that asymmetry runs while nothing has been
+    mutated yet.
+
+    That argument covers only the BEFORE reading, which is why the AFTER reading
+    goes through `_merge_residue`: post-merge, this same raise would bypass the
+    cleanup it stands ahead of, so that caller catches it and hands it back as
+    an unread marker instead of letting it escape or answer empty."""
+    proc = _run_git(
+        ["git", "-C", str(repo), "ls-files", "-z", "--others", "--exclude-standard"], repo
+    )
+    if proc.returncode != 0:
+        raise GitError(f"git ls-files --others failed in {repo}: {proc.stderr.strip()}")
+    return frozenset(rel for rel in proc.stdout.split("\0") if rel)
+
+
+def _incoming_paths(repo: Path, branch: str) -> frozenset[str]:
+    """The paths a merge of `branch` could have WRITTEN: everything that differs
+    between HEAD and `branch`'s tip (`git diff --name-only HEAD <branch>`).
+
+    The attribution boundary `_merge_residue` intersects its deltas with: a merge
+    updates a working-tree path only where the merge result differs from HEAD,
+    and the result can differ from HEAD only where `branch` does — a path both
+    sides changed identically is already at the result — so this two-dot diff is
+    a superset of what any of the three strategies can touch, with no merge base
+    consulted (criss-cross topologies and `branch_incoming_paths`'s two-dot
+    precedent both argue for tips over a base). A concurrent operator edit landing
+    on a path INSIDE this set during the merge window is indistinguishable from
+    git's own write — that residual ceiling is `_merge_residue`'s to state.
+
+    `--no-renames` and NUL-delimited verbatim stdout for `_dirty_tracked_paths`'s
+    reasons: a rename must contribute BOTH its names (the deleted old name is
+    exactly the kind of tracked residue a mid-checkout death leaves), and these
+    names gate a repair write. Read only through `_merge_residue`'s catch — this
+    runs post-merge, where a raise would bypass the cleanup — and only LAZILY,
+    when there is a non-empty delta to attribute: a refusal that left no new dirt
+    never consults `branch` at all, so an unresolvable ref (a raced-away branch,
+    unrelated histories) still classifies as the pre-flight refusal it is."""
+    proc = _run_git(
+        ["git", "-C", str(repo), "diff", "--name-only", "-z", "--no-renames", "HEAD", branch, "--"],
+        repo,
+    )
+    if proc.returncode != 0:
+        raise GitError(
+            f"git diff --name-only HEAD {branch} failed in {repo}: {proc.stderr.strip()}"
+        )
+    return frozenset(rel for rel in proc.stdout.split("\0") if rel)
+
+
+def _residue_snapshot(repo: Path) -> tuple[frozenset[str], frozenset[str]]:
+    """The pre-merge reading every leg takes: `(dirty tracked paths, untracked
+    paths)`.
+
+    Two axes because a failed checkout leaves two kinds of residue, and neither
+    probe sees the other's. Taken BEFORE the merge for the reason #619 established
+    on the squash leg: a checkout already carrying an unstaged edit reads dirty
+    whether or not git touched a byte, so only a before/after comparison can say
+    what GIT did — and only paths proven clean beforehand may be restored. Both
+    halves are path SETS so that comparison is per path: one operator edit
+    anywhere no longer surrenders the whole tracked axis, and — the other way
+    around — a concurrent edit is no longer swept into a repo-wide attribution."""
+    return _dirty_tracked_paths(repo), _untracked_paths(repo)
+
+
+def _merge_residue(
+    repo: Path, branch: str, pre_dirty_paths: frozenset[str], pre_untracked: frozenset[str]
+) -> tuple[tuple[str, ...], tuple[str, ...], GitError | None]:
+    """What a failed merge left behind: `(untracked paths git wrote, tracked
+    paths git rewrote, the probe failure when a reading itself failed)`.
+
+    Attribution is a per-path AND of two proofs, and both are load-bearing. The
+    before/after DELTA proves a path changed during the merge window — without
+    it every pre-existing stray and edit is git's. The INCOMING-set intersection
+    proves the merge could have written it — without it a concurrent operator
+    edit landing during the window is git's too, and the restore riding on the
+    tracked half destroys it (the seventh mislabeled state; measured on all
+    three legs). Both readings fail to the same, safe side: a path this cannot
+    attribute is reported to nobody and restored over never.
+
+    Two ceilings survive, stated rather than patched around. A path already
+    dirty BEFORE the merge stays unattributable — per path now, not per tree —
+    because the delta cannot say which bytes are whose. And a concurrent edit
+    to a path INSIDE the incoming set is indistinguishable from git's own
+    write, so it is attributed and restored; an edit racing the very paths a
+    merge is rewriting has no safe reading at all, and the alternative —
+    trusting nothing — would strand genuine residue on every half-applied
+    checkout.
+
+    The POST-mutation reading this is, a probe failure here must DEGRADE, never
+    raise: the raise would escape `merge_branch` between the failed merge and its
+    cleanup — stranding a started merge mid-flight with MERGE_HEAD set — and
+    reach `merge_local`'s content-conflict arm wearing a probe error's text.
+    Degrading does not mean going silent, which would route the empty reading to
+    `MergePreflightError` and claim a tree nothing verified: the caught error is
+    handed back so the terminal arm raises `MergeResidueUnreadError` instead,
+    and both residue axes fail to the no-action side — nothing reported, nothing
+    restored. The incoming read shares the catch and is taken LAZILY, only when
+    a delta exists to attribute (see `_incoming_paths`). The BEFORE reading
+    (`_residue_snapshot`) keeps its raise: it runs while nothing has been
+    mutated yet, where failing the merge outright is the smaller harm."""
+    try:
+        materialized = _untracked_paths(repo) - pre_untracked
+        rewritten = _dirty_tracked_paths(repo) - pre_dirty_paths
+        if materialized or rewritten:
+            incoming = _incoming_paths(repo, branch)
+            materialized &= incoming
+            rewritten &= incoming
+    except GitError as unread:
+        return (), (), unread
+    return tuple(sorted(materialized)), tuple(sorted(rewritten)), None
+
+
+def _restore_rewritten_paths(repo: Path, paths: tuple[str, ...]) -> tuple[bool, str]:
+    """`git checkout HEAD -- <paths>` over the tracked paths a merge rewrote.
+    Returns `(restored, note)`, the note being the clause to append to the raised
+    message when it failed — so the error never claims a repair that did not
+    happen. Path-scoped ON PURPOSE, never `reset --hard`: the attribution that
+    authorizes this write is per path, so the write must be too — a repo-wide
+    reset would flatten the operator's own dirt on every path the attribution
+    deliberately left alone. `:(literal)` because these names came out of git
+    verbatim and go back in as pathspecs — a `*` or leading `:` in a filename
+    must match itself, not glob. Restores the index entry along with the
+    working-tree bytes, which is the same path-scoped claim `reset --hard HEAD`
+    made repo-wide, and resolves an unmerged entry to HEAD's version exactly as
+    the reset did (measured; a path HEAD does not carry fails the whole write
+    instead, and the note carries that). Callers must gate this on
+    `_merge_residue`'s proven attribution; it is unconditional here on purpose,
+    so the gate lives at one readable place per leg rather than inside the
+    write."""
+    rc, out = _git(repo, "checkout", "HEAD", "--", *(f":(literal){p}" for p in paths))
+    if rc != 0:
+        return False, (
+            f"; AND git checkout HEAD -- <paths> failed (tracked residue not restored): {out}"
+        )
+    return True, ""
+
+
+def _reset_hard_head(repo: Path) -> tuple[bool, str]:
+    """`reset --hard HEAD`, the squash COMMIT step's rollback — the one remaining
+    caller, and the one place a whole-tree write is still the right shape: the
+    thing being rolled back is a SUCCEEDED `merge --squash`, whose staged result
+    spans the entire incoming set, and the gate is the leg's pre-merge clean
+    reading. Returns `(restored, note)` like its path-scoped sibling above.
+
+    The ceiling that gate leaves, stated: a concurrent operator edit landing
+    AFTER the pre-merge reading found the tree clean — during the squash or its
+    commit attempt — sits inside this reset's blast radius and is flattened with
+    the staged result. Narrowing that would mean unpicking a successful merge
+    path by path against an attribution the commit step never takes; the bound
+    is the deliberate trade, not an oversight."""
+    rc, out = _git(repo, "reset", "--hard", "HEAD")
+    if rc != 0:
+        return False, f"; AND git reset --hard HEAD failed (tree not restored): {out}"
+    return True, ""
+
+
+def _index_unmerged(repo: Path) -> tuple[bool, GitError | None]:
+    """`(the index carries unmerged stages — i.e. a merge really ran and left a
+    content conflict to resolve, the probe failure when the reading itself
+    failed)`.
+
+    Deliberately NOT `.git/MERGE_HEAD`: a conflicted `git merge --squash` writes
+    three unmerged stages and conflict markers while creating no MERGE_HEAD at
+    all, so MERGE_HEAD would call every squash conflict a pre-flight refusal.
+    `ls-files -u` discriminates across the whole matrix — empty for every
+    pre-flight refusal and for success, three stages for a content conflict under
+    both `--no-ff` and `--squash`. Neither git's exit code nor its wording can
+    stand in: the same refusal shape yields rc 2 or rc 1 depending on whether the
+    merge was fast-forwardable, rc 1 is also a content conflict, and one message
+    line covers three distinct causes and is fully translated (#619).
+
+    Read from stdout alone (#442): this is an emptiness read, and git writes
+    advisories to stderr while still exiting 0, which against `_git`'s merged
+    stream would read as unmerged entries.
+
+    A failed reading DEGRADES to `(False, the failure)` rather than raising or
+    silently answering "no conflict". The raise would escape `merge_branch`
+    between the failed merge and its cleanup — the same post-mutation window
+    `_merge_residue` already degrades in — and the silent False this used to
+    give is no better: every NEGATIVE arm of the classification (commit-
+    refused, half-applied, pre-flight) rests on `not unmerged`, so an
+    unmeasured "no" lets a probe failure pick one of their classes. rc != 0 is
+    the same unread — an `ls-files` that failed printed nothing, and an
+    emptiness read over nothing is not a measurement. False WITH the marker
+    set means unmeasured; callers claim no class resting on this reading and
+    route to `MergeResidueUnreadError` instead."""
+    try:
+        rc, value, diag = _git_out(repo, "ls-files", "-u")
+    except GitError as unread:
+        return False, unread
+    if rc != 0:
+        return False, GitError(f"git ls-files -u failed in {repo}: {diag}")
+    return bool(value), None
 
 
 def merge_branch(
@@ -1831,12 +2476,89 @@ def merge_branch(
     """Merge `branch` into the branch currently checked out in `repo`.
 
     strategy: "ff" (fast-forward only), "merge" (always a merge commit), or
-    "squash" (collapse to one commit). Raises GitError on conflict or when an
-    ff-only merge can't fast-forward, restoring the tree to its pre-merge state.
+    "squash" (collapse to one commit). Raises MergeConflictError on conflict and
+    MergePreflightError when an ff-only merge can't fast-forward, restoring the
+    tree to its pre-merge state.
     Expects the target checkout to be clean; the worktree pipeline reconciles
-    Editor-induced dirt first via `clean_incoming_collisions`. When git refuses
-    a merge at pre-flight (no MERGE_HEAD created) the tree was never touched, so
-    no abort/reset is attempted and the raw git error is raised verbatim.
+    Editor-induced dirt first via `clean_incoming_collisions`.
+
+    A failure git raised at PRE-FLIGHT — an untracked file the merge would
+    overwrite, a staged change on an incoming path, a file/directory shape clash,
+    an `--ff-only` target that cannot fast-forward — never started a merge and
+    left the tree untouched, so it raises the `MergePreflightError` subclass with
+    git's own text passed through verbatim (#619). "git said no" is not enough to
+    earn that class, though; see the fourth state below, where git says no after
+    having already written part of the incoming tree.
+
+    Four measured states, one terminal fallback, and no one probe orders them.
+    `_index_unmerged` leads and answers
+    CONTENT: unmerged stages mean the merge ran and collided (raised as
+    `MergeConflictError`, so the caller never has to read "bare GitError" as
+    "conflict"). Its absence does not
+    mean the merge never ran — a `--no-ff` whose commit was refused leaves a
+    cleanly merged index, no unmerged stages, and MERGE_HEAD set (measured for
+    `pre-merge-commit`, `commit-msg`, and an unsignable `commit.gpgsign`).
+    MERGE_HEAD is the second question and parts those two, which is why it is read
+    BEFORE the abort that erases it rather than only to decide whether to abort at
+    all.
+
+    MERGE_HEAD alone would be wrong in the other direction — the error the old
+    "no MERGE_HEAD created" framing made — because a conflicted `--squash` leaves
+    unmerged stages and no MERGE_HEAD. The squash MERGE INVOCATION cannot be
+    commit-refused — `--squash` stops before committing by design (measured:
+    rc 0 with a rejecting `pre-merge-commit` hook installed) — which is why only
+    the `merge` leg reads MERGE_HEAD below. The LEG still reaches that state:
+    it seals the staged result with its own plain `git commit`, where hooks and
+    `commit.gpgsign` run like anywhere else, and a refusal there raises the same
+    `MergeCommitRefusedError` — rolled back by `reset --hard HEAD` under the
+    leg's pre-merge dirtiness gate rather than by an abort, and reported
+    ``staged`` when that gate or the reset itself declines. The scope error to
+    not repeat: "no hook runs" was measured of the merge invocation and is false
+    of the leg, whose commit step is a second, later place git can say no.
+
+    The fourth state is the one ALL THREE legs reach and no index probe can see:
+    git dying part-way through the CHECKOUT. It leaves no unmerged stages, no
+    MERGE_HEAD, and an index rolled back to HEAD, so every index- and HEAD-based
+    reading calls it "refused before starting" and tells the operator their
+    checkout is untouched — while the residue blocks the next merge's pre-flight,
+    and the run fails identically on every resume over paths nothing named.
+    `--ff-only` is not exempt, and the "it never starts a merge" premise this
+    module used to carry was simply wrong: `--ff-only` declines the TOPOLOGY
+    question only, and once the fast-forward is possible it checks the incoming
+    tree out like any other merge (measured under a required smudge filter, all
+    three strategies; HEAD does not move).
+
+    The residue has two axes, which is why `_residue_snapshot` reads two probes
+    and not one — and attribution on both is per PATH: a before/after delta
+    intersected with the branch's incoming set, so neither the operator's
+    pre-existing dirt nor a CONCURRENT edit of theirs landing during the merge
+    window is ever called git's (the latter was the seventh mislabeled state: a
+    repo-wide dirtiness boolean attributed the bystander edit to git and the
+    repo-wide reset riding on it destroyed the edit — measured on all three
+    legs). An incoming path the target did not already track lands as an
+    UNTRACKED file, which no restore reaches — `reset --hard` and `merge --abort`
+    both leave untracked files alone, and the latter exits 128 here besides, there
+    being no merge to abort — so it is reported for the operator to clear. An
+    incoming path the target DID track is modified in place, which a path-scoped
+    `git checkout HEAD --` over exactly the attributed paths does undo.
+    Either axis raises `MergeHalfAppliedError` — a SIBLING of `MergePreflightError`,
+    since the two are mutually exclusive by construction (a refusal git makes at
+    pre-flight is made before any file is written).
+
+    The terminal fallback is a post-merge reading that itself FAILED. Every
+    probe in that window degrades to an unread marker rather than raising —
+    the raise would escape between the failed merge and its cleanup — and a
+    verdict may only stand on readings that are live. Dead residue readings —
+    either delta's, or the incoming set's that attributes them — surrender
+    only the choice between "refused before starting" and "failed
+    part-way" (conflict and commit-refused stand on their own measurements
+    over it). A dead index reading surrenders every claim resting on "did not
+    collide" — commit-refused, half-applied, and pre-flight alike. A dead
+    merge-state reading additionally skips the abort, which that reading
+    gates: `merge --abort` is a repair write, and uncertainty never
+    authorizes one, so the message says none was attempted. Whatever cannot
+    be claimed raises `MergeResidueUnreadError`, and every dead probe is
+    named in the message whichever class raises.
 
     ``allow_empty_squash`` is recovery-only: re-running a squash that committed
     before a host loss stages nothing because the target already has the merged
@@ -1844,38 +2566,242 @@ def merge_branch(
     commit; ordinary squash calls keep commit failures strict.
     """
     if strategy == "ff":
+        pre_dirty_paths, pre_untracked = _residue_snapshot(repo)
         rc, out = _git(repo, "merge", "--ff-only", branch)
         if rc != 0:
-            raise GitError(f"git merge --ff-only {branch} failed in {repo}: {out}")
+            # "--ff-only either fast-forwards or declines, so it never touches the
+            # tree" was the standing premise here, and it is FALSE: `--ff-only`
+            # declines only the topology question. Once the fast-forward IS possible
+            # it checks the incoming tree out, and a failure during that write —
+            # measured under a required smudge filter — leaves HEAD where it was and
+            # the residue behind. There are no index stages and no MERGE_HEAD to read,
+            # so the residue snapshot is this leg's ONLY discriminator.
+            materialized, rewritten, unread = _merge_residue(
+                repo, branch, pre_dirty_paths, pre_untracked
+            )
+            half_applied = bool(materialized or rewritten)
+            if half_applied:
+                kind = "failed part-way through checkout"
+            elif unread is not None:
+                kind = "checkout state unverified"
+            else:
+                kind = "refused before starting"
+            detail = f"git merge --ff-only {branch} failed in {repo} ({kind}): {out}"
+            restored = True
+            if rewritten:
+                restored, note = _restore_rewritten_paths(repo, rewritten)
+                detail += note
+            if materialized:
+                detail += f"; left untracked in {repo}: {', '.join(materialized)}"
+            if half_applied:
+                raise MergeHalfAppliedError(
+                    detail, paths=materialized, restored=restored, rewritten=rewritten
+                )
+            if unread is not None:
+                raise MergeResidueUnreadError(f"{detail}; AND the residue probe failed: {unread}")
+            raise MergePreflightError(detail)
         return
     if strategy == "merge":
         msg = message or f"Merge branch '{branch}'"
+        pre_dirty_paths, pre_untracked = _residue_snapshot(repo)
         rc, out = _git(repo, "merge", "--no-ff", "-m", msg, branch)
         if rc != 0:
-            detail = f"git merge --no-ff {branch} failed in {repo} (conflict?): {out}"
-            if _merge_in_progress(repo):  # only abort a merge that actually started
+            # All three questions BEFORE the abort, which erases the evidence for each.
+            # The index stages say whether content collided; MERGE_HEAD says whether
+            # a merge started at all, and it is asked here rather than inline below
+            # so that one reading serves both the classification and the abort. The
+            # residue deltas answer a question neither can: whether git wrote any
+            # incoming file to the tree before dying (#619). All three degrade to an
+            # unread marker rather than raising — they stand between the failed
+            # merge and its cleanup, where an escape strands a started merge.
+            unmerged, index_unread = _index_unmerged(repo)
+            started, head_unread = _merge_in_progress(repo)
+            materialized, rewritten, unread = _merge_residue(
+                repo, branch, pre_dirty_paths, pre_untracked
+            )
+            # Only a failure that neither collided nor started can be a half-applied
+            # checkout: a conflict and a refused commit both leave residue too, but
+            # each already has a restore of its own below (`merge --abort`) and a
+            # remedy of its own, so neither may be re-routed through this arm. The
+            # two unread gates are that same rule asked negatively: with either
+            # reading dead, "neither collided nor started" is a claim nothing
+            # measured.
+            half_applied = bool(
+                index_unread is None
+                and head_unread is None
+                and not unmerged
+                and not started
+                and (materialized or rewritten)
+            )
+            if unmerged:
+                kind = "conflict"
+            elif index_unread is None and started:
+                # `started` alone cannot claim this over a dead index reading: a
+                # `--no-ff` conflict sits mid-merge too, and parting the two is
+                # exactly the reading that failed.
+                kind = "merged, but git refused the commit"
+            elif half_applied:
+                kind = "failed part-way through checkout"
+            elif index_unread is not None or head_unread is not None or unread is not None:
+                kind = "checkout state unverified"
+            else:
+                kind = "refused before starting"
+            detail = f"git merge --no-ff {branch} failed in {repo} ({kind}): {out}"
+            restored = True
+            if half_applied and rewritten:
+                # This leg has no `--abort` to reach for — that needs a MERGE_HEAD,
+                # and there is none — so the restore is the path-scoped checkout,
+                # over exactly the paths `_merge_residue` attributed.
+                restored, note = _restore_rewritten_paths(repo, rewritten)
+                detail += note
+            if materialized and half_applied:
+                detail += f"; left untracked in {repo}: {', '.join(materialized)}"
+            if started:  # only abort a merge that actually started
                 abort_rc, abort_out = _git(repo, "merge", "--abort")  # restore pre-merge HEAD
                 if abort_rc != 0:
+                    # The repair write failed, so the claim the caller's message would
+                    # otherwise make — "the checkout is back as it was" — is now false.
+                    # Carry that, rather than letting the classification imply it.
+                    restored = False
                     detail += f"; AND git merge --abort failed (repo left mid-merge): {abort_out}"
-            raise GitError(detail)
+            # Every dead probe is named in whatever raises, not only in the unread
+            # class: a verdict standing on its own live measurement still owes the
+            # operator which reading it does NOT have.
+            if index_unread is not None:
+                detail += f"; AND the index probe failed: {index_unread}"
+            if head_unread is not None:
+                # The abort is gated on the reading that just died, and uncertainty
+                # must not authorize a repair write — so none was attempted, and the
+                # message says that instead of implying a restore.
+                detail += (
+                    "; AND the merge-state probe failed, so no `git merge --abort` was"
+                    " attempted — if `git status` shows a merge in progress, run it by"
+                    f" hand: {head_unread}"
+                )
+            if unread is not None:
+                detail += f"; AND the residue probe failed: {unread}"
+            if unmerged:
+                raise MergeConflictError(detail)
+            if index_unread is None and started:
+                raise MergeCommitRefusedError(detail, restored=restored)
+            if half_applied:
+                raise MergeHalfAppliedError(
+                    detail, paths=materialized, restored=restored, rewritten=rewritten
+                )
+            if index_unread is not None or head_unread is not None or unread is not None:
+                raise MergeResidueUnreadError(detail)
+            raise MergePreflightError(detail)
         return
     if strategy == "squash":
+        # `--squash` has no `--abort`, so the restore is a path-scoped
+        # `checkout HEAD --` over whatever the residue deltas attribute to git.
+        # A single post-merge dirtiness reading cannot say whether the squash
+        # caused the dirt it sees, so both axes are read BEFORE and differenced
+        # after: a checkout already carrying an unstaged edit reads dirty even
+        # when git refused and touched nothing, and a restore fired on that
+        # reading destroyed it (#619). The untracked half covers the axis the
+        # tracked one cannot see: a part-way merge rolls the index back and the
+        # files it already wrote are untracked, so they are in neither HEAD nor
+        # the index — which is exactly how such a failure came to be labelled
+        # "refused before starting".
+        pre_dirty_paths, pre_untracked = _residue_snapshot(repo)
         rc, out = _git(repo, "merge", "--squash", branch)
         if rc != 0:
-            detail = f"git merge --squash {branch} failed in {repo} (conflict?): {out}"
-            # squash leaves no MERGE_HEAD; only reset if it actually modified the
-            # tree/index (a pre-flight refusal leaves HEAD's tree untouched).
-            if _tree_dirty_vs_head(repo):
-                reset_rc, reset_out = _git(repo, "reset", "--hard", "HEAD")
-                if reset_rc != 0:
-                    detail += f"; AND git reset --hard HEAD failed (tree not restored): {reset_out}"
-            raise GitError(detail)
-        if allow_empty_squash and not _tree_dirty_vs_head(repo):
-            return
+            unmerged, index_unread = _index_unmerged(repo)  # before any restore clears the stages
+            materialized, rewritten, unread = _merge_residue(
+                repo, branch, pre_dirty_paths, pre_untracked
+            )
+            # A conflict keeps its own class and its own remedy even though it leaves
+            # residue too — its attributed paths are still restored below, exactly as
+            # before. The unread gate is the conflict question asked negatively: with
+            # the index reading dead, "did not collide" is a claim nothing measured.
+            half_applied = bool(
+                index_unread is None and not unmerged and (materialized or rewritten)
+            )
+            if unmerged:
+                kind = "conflict"
+            elif half_applied:
+                kind = "failed part-way through checkout"
+            elif index_unread is not None or unread is not None:
+                kind = "checkout state unverified"
+            else:
+                kind = "refused before starting"
+            detail = f"git merge --squash {branch} failed in {repo} ({kind}): {out}"
+            if materialized and half_applied:
+                detail += f"; left untracked in {repo}: {', '.join(materialized)}"
+            restored = True
+            if rewritten:
+                # Gated on the proven per-path attribution, not on the class — so it
+                # still runs when the index reading died and the class degraded: the
+                # same restore a classified conflict gets, authorized by the same
+                # measurement.
+                restored, note = _restore_rewritten_paths(repo, rewritten)
+                detail += note
+            if index_unread is not None:
+                detail += f"; AND the index probe failed: {index_unread}"
+            if unread is not None:
+                detail += f"; AND the residue probe failed: {unread}"
+            if unmerged:
+                raise MergeConflictError(detail)
+            if half_applied:
+                raise MergeHalfAppliedError(
+                    detail, paths=materialized, restored=restored, rewritten=rewritten
+                )
+            if index_unread is not None or unread is not None:
+                raise MergeResidueUnreadError(detail)
+            raise MergePreflightError(detail)
+        if allow_empty_squash:
+            # Post-mutation read on the far side of SUCCESS: an escaping raise
+            # would land in the caller's unclassified arm, and pressing on with
+            # the reading dead manufactures a "nothing to commit" refusal plus
+            # its rollback. Neither the no-op return nor the commit can be
+            # claimed; say so and stop.
+            try:
+                staged = _index_dirty_vs_head(repo)
+            except GitError as unread:
+                raise MergeResidueUnreadError(
+                    f"git merge --squash {branch} succeeded in {repo}, but the index"
+                    f" reading that tells a no-op replay from a result to commit failed"
+                    f" (index state unverified): nothing was committed and nothing was"
+                    f" reset — any staged squash result is left in place; run"
+                    f" `git status`: {unread}"
+                ) from unread
+            if not staged:
+                return
         msg = message or f"Squash-merge branch '{branch}'"
         rc, out = _git(repo, "commit", "-m", msg)
         if rc != 0:
-            raise GitError(f"git commit (squash {branch}) failed in {repo}: {out}")
+            # The leg's own commit — hooks and commit.gpgsign run HERE, not at the
+            # `merge --squash` above, so this is where the squash reaches the
+            # commit-refused state. No probe is needed to classify it: the merge
+            # step already succeeded, so the failed call names the state by
+            # itself. What needs deciding is the rollback — the deliberate undo
+            # of a merge that SUCCEEDED, whose staged result spans the whole
+            # incoming set, so it stays `reset --hard HEAD` rather than the
+            # failure arm's path-scoped restore — and the gate is the snapshot's
+            # tracked half: the staged result sits in a tree that reset would
+            # flatten, so only a tree proven clean beforehand may be reset —
+            # over a dirty one the operator's own uncommitted work is in the
+            # blast radius, and the result is left staged and SAID so instead
+            # (#619). The ceiling that gate leaves — an edit landing AFTER the
+            # clean reading rides the reset — is `_reset_hard_head`'s to state.
+            detail = (
+                f"git commit (squash {branch}) failed in {repo} "
+                f"(merged, but git refused the commit): {out}"
+            )
+            if pre_dirty_paths:
+                restored = False
+                detail += (
+                    "; the squash result is left staged (not rolled back: the "
+                    "checkout already carried uncommitted work, which "
+                    "`reset --hard` would destroy with it)"
+                )
+            else:
+                restored, note = _reset_hard_head(repo)
+                detail += note
+                if not restored:
+                    detail += "; the squash result is left staged"
+            raise MergeCommitRefusedError(detail, restored=restored, staged=not restored)
         return
     raise GitError(f"unknown merge strategy: {strategy!r}")
 

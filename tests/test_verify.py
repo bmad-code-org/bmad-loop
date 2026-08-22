@@ -3343,6 +3343,134 @@ def _metachar_pair(repo, meta: str, victim: str):
     return repo / meta / "f.md", repo / victim / "f.md"
 
 
+def test_file_holds_content_accepts_a_pristine_board_in_either_eol_domain(project):
+    """Sameness here is GIT's question, and a byte compare cannot ask it (#618).
+
+    A board git checked out under a normalizing config is CRLF; one an editor or a
+    byte-writing tool left is LF; git reports the tree clean for both. A byte compare
+    against HEAD therefore has to guess which end of the round trip the file sits at,
+    and each guess refuses a pristine board on the hosts the other guess serves — a raw
+    baseline refuses (a), a smudged baseline refuses (b). Hashing both sides through the
+    path's clean filter draws exactly the distinction git draws.
+
+    (c) is what keeps that from being a rubber stamp: cleaning collapses terminators,
+    never content, so an operator's added row is still not this run's advance.
+    """
+    repo = project.project
+    # `core.autocrlf=true` rather than an `eol=crlf` attribute: it is Git-for-Windows'
+    # system default, and it is the config under which BOTH spellings below read clean.
+    # An explicit `eol=crlf` is stricter and reports the LF file as ` M`, so case (a)
+    # could not arise there at all.
+    git(repo, "config", "core.autocrlf", "true")
+    (repo / "board.yaml").write_bytes(b"development_status:\n  1-1-a: backlog\n")
+    git(repo, "add", "--", "board.yaml")
+    git(repo, "commit", "-q", "-m", "an eol-normalizing board")
+    head = verify.file_bytes_at_revision(repo, "HEAD", "board.yaml")
+    assert head is not None and b"\r\n" not in head  # git stores the LF twin
+    board = repo / "board.yaml"
+
+    # (a) the LF form a byte-writing tool leaves. Ordered FIRST because it is only
+    # reachable before a checkout has smudged the path: git re-reads the file through
+    # the clean filter here and calls it identical, where overwriting an already-CRLF
+    # checkout with LF instead reports ` M` and never reaches this comparison at all.
+    assert b"\r\n" not in board.read_bytes()
+    git(repo, "update-index", "--refresh")  # no stat-cache false green
+    assert not verify.dirty_paths(repo)
+    assert verify.file_holds_content(repo, "board.yaml", board, head)
+
+    # (b) the CRLF form git itself materializes on checkout — equally clean, and the
+    # byte compare that serves (a) refuses this one.
+    board.unlink()
+    git(repo, "checkout", "--", "board.yaml")
+    assert b"\r\n" in board.read_bytes()
+    assert not verify.dirty_paths(repo)
+    assert verify.file_holds_content(repo, "board.yaml", board, head)
+
+    # (c) content is still compared: an operator's row is not this pass's advance
+    board.write_bytes(board.read_bytes() + b"  9-9-operator: backlog\r\n")
+    assert not verify.file_holds_content(repo, "board.yaml", board, head)
+
+
+def test_index_holds_no_foreign_content_guards_the_half_the_working_tree_cannot(project):
+    """A staged edit is destroyed by the carry, not committed by it (#618).
+
+    `commit_paths` runs `git add` for the path, which copies the WORKING TREE into the
+    commit and overwrites the INDEX in place. So an operator who staged an edit and then
+    restored the working copy loses those bytes to a carry that proved only the working
+    tree: absent from the commit, which took the other content, and absent from disk.
+    Nothing surfaces it — the tree reads clean afterwards.
+
+    HEAD's own content and the advance itself are both safe to overwrite: the first is
+    still in history, the second is the write being authorized.
+    """
+    repo = project.project
+    head_bytes = b"development_status:\n  1-1-a: ready-for-dev\n"
+    (repo / "board.yaml").write_bytes(head_bytes)
+    git(repo, "add", "--", "board.yaml")
+    git(repo, "commit", "-q", "-m", "board")
+    advance = head_bytes.replace(b"ready-for-dev", b"done")
+
+    assert verify.index_holds_no_foreign_content(repo, "board.yaml", advance)  # HEAD's own
+
+    (repo / "board.yaml").write_bytes(advance)
+    git(repo, "add", "--", "board.yaml")
+    assert verify.index_holds_no_foreign_content(repo, "board.yaml", advance)  # the advance
+
+    # the operator's own bytes, staged — reachable nowhere else once `git add` runs
+    (repo / "board.yaml").write_bytes(head_bytes + b"  9-9-operator: backlog\n")
+    git(repo, "add", "--", "board.yaml")
+    (repo / "board.yaml").write_bytes(advance)  # ...working tree restored over them
+    assert not verify.index_holds_no_foreign_content(repo, "board.yaml", advance)
+
+    # an untracked, unstaged path has nothing to overwrite
+    assert verify.index_holds_no_foreign_content(repo, "never-staged.yaml", advance)
+
+
+def test_index_holds_no_foreign_content_refuses_a_staged_untracking(project):
+    """An ABSENT index entry is not by itself "nothing to overwrite".
+
+    With HEAD carrying the path, no entry is a staged DELETION — `git rm --cached`,
+    which is how an operator untracks a board they are about to gitignore, and this
+    project documents both board shapes rather than treating that as exotic. The
+    carry's `git add` restores the entry, and the intent then exists nowhere: not in
+    HEAD, which never had it, and not in the index that just lost it. `git status`
+    reads clean afterwards, so nothing surfaces the reversal.
+
+    Reachable in earnest, unlike a bare truth-table hole: the probe that gates this
+    check reports the path (`??`, the file being on disk and no longer in the index),
+    so the ownership proof really is asked and really does answer.
+
+    The sibling row above ends on `never-staged.yaml` — no entry and no HEAD blob —
+    which is the case this must NOT break, and is why the answer keys on HEAD rather
+    than on refusing every empty index.
+
+    Ablation: restore `if not records: return True` and this row fails while that
+    sibling stays green."""
+    repo = project.project
+    head_bytes = b"development_status:\n  1-1-a: ready-for-dev\n"
+    (repo / "board.yaml").write_bytes(head_bytes)
+    git(repo, "add", "--", "board.yaml")
+    git(repo, "commit", "-q", "-m", "board")
+    advance = head_bytes.replace(b"ready-for-dev", b"done")
+
+    git(repo, "rm", "--cached", "-q", "--", "board.yaml")  # untracked, still on disk
+    assert git(repo, "ls-files", "-s", "--", "board.yaml") == ""  # no entry at all
+    assert "board.yaml" in verify.dirty_paths(repo)  # ...and the gate above still asks
+
+    assert not verify.index_holds_no_foreign_content(repo, "board.yaml", advance)
+
+
+def test_file_holds_content_raises_rather_than_answering_when_git_cannot_hash(project):
+    """An id it could not compute must not read as a verdict either way.
+
+    The caller gates a repair write on this, so the answer has to be git's or nobody's.
+    """
+    repo = project.project
+
+    with pytest.raises(verify.GitError, match="hash-object"):
+        verify.file_holds_content(repo, "board.yaml", repo / "never-written.yaml", b"x")
+
+
 def test_path_tracked_reports_index_membership(project):
     """The basic contract: an index entry is True, an untracked file is False."""
     repo = project.project

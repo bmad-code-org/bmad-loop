@@ -16,6 +16,33 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **Merge-back failures are classified from the measured tree state, and the catch-all stopped
+  inventing a conflict (#619).** A merge that died part-way through its checkout — all three
+  strategies, `--ff-only` included — now raises `MergeHalfAppliedError` instead of "refused
+  before starting": untracked residue is named for you to clear, and a tracked rewrite is
+  restored automatically by `git checkout HEAD --` over exactly the affected paths.
+  Attribution is per path — before/after deltas intersected with the branch's incoming set —
+  so neither your pre-existing dirt nor an edit you make outside that incoming set while the
+  merge is failing is ever called git's: the repo-wide dirtiness reading this replaces
+  classified that concurrent-edit scene "failed part-way through checkout" and its repo-wide
+  `reset --hard HEAD` destroyed the edit. (An edit racing the very paths the merge is
+  rewriting is indistinguishable from git's write and is restored with them — the stated
+  ceiling.) A post-merge probe that itself fails — the
+  residue probes, the unmerged-stages reading, or the MERGE_HEAD reading — no longer bypasses the
+  merge cleanup or impersonates a verdict: cleanup not gated on the dead reading still runs, the
+  failure raises `MergeResidueUnreadError` (checkout state unverified, run `git status`), and an
+  unread MERGE_HEAD skips the abort it gates and says so. The squash **replay** reading gets the
+  same honesty on the far side of success: unreadable, it used to answer "dirty", and the doomed
+  `git commit` that followed dressed the probe failure as a commit refusal with a
+  `reset --hard HEAD` riding on it — now nothing is committed, nothing is reset, and the
+  escalation names the dead reading. A refused
+  **squash commit** now raises `MergeCommitRefusedError` like the `--no-ff` leg — the squash leg
+  seals its result with its own `git commit`, where commit hooks and signing do run — rolled back
+  by `git reset --hard HEAD` gated on the pre-merge reading having found the tree clean (a dirty
+  checkout is never reset; the
+  escalation then names the staged result and clearing it as your first step). A content conflict
+  is typed too (`MergeConflictError`), so anything unclassified escalates saying just that — run
+  `git status`, git's text names the cause — instead of "resolve the conflict by hand".
 - **psmux: a hand-back that succeeded no longer reports as failed — or undoes itself (#659).**
   `switch_client` read its verdict off the session's attached-client count, which a same-session
   move cannot change — and same-session is the common shape for the return path, so a correct
@@ -51,6 +78,59 @@ breaking changes may land in a minor release.
   its sibling rejected-latch shape, the spec folder raises `stories.StoriesError`, and `--dry-run`
   reports it before exiting 1. A spec folder that merely lies outside the project tree still comes
   back verbatim — that is a supported layout, and only the canonicalization leg refuses.
+- **An unstaged edit in your main checkout no longer escalates the story and pauses an unattended
+  run (#618).** Under `[scm] isolation = "worktree"` the merge pre-flight refused over any dirty
+  _tracked_ path outside the unit branch's incoming set, so a worktree-only porcelain `M` — modified in the
+  working tree, nothing staged — stopped the run over a hazard git itself does not have. The axis
+  is the index column, not trackedness: such a stray is now tolerated and journaled
+  `merge-target-tolerated` alongside untracked dirt. A **staged** stray still escalates.
+- **Dirt on a path the run commits for itself now blocks the merge whatever its index column
+  (#618).** The post-merge carries stage the sprint board and the deferred-work ledger by
+  pathspec, which takes whatever the working tree holds no matter who wrote it, so narrowing the
+  pre-flight to staged strays alone would have let an operator's private edit land in history
+  under a `chore(sprint-status): carry ...` message with the tree left clean. Both paths are now
+  passed to the pre-flight as protected, and a stray among them escalates with its own remedy —
+  such dirt has to leave the path, not merely be unstaged. Tracked artifacts only.
+- **A resumed run no longer commits — or overwrites — board edits you made while it was down
+  (#618).** When the merge was already journaled `unit-merged`, the replay falls through to the
+  carry commits with no pre-flight in front of them. The carry cannot simply refuse on dirt: a
+  crashed pass's own half-written advance is dirt on exactly that path and finishing it is what
+  the leg exists for. It now asks whether the board holds HEAD's content plus this pass's
+  advance — git's own question, so a board spelled CRLF by one host and LF by another still
+  answers yes — and proves the index too, since the carry's `git add` overwrites it as well as
+  the working tree; an ABSENT index entry counts as a staged untracking (`git rm --cached`) rather
+  than as nothing to lose. That guards the commit, which is one write too late for the OWN row:
+  `advance` would already have replaced the edit with the target, leaving precisely the bytes the
+  proof accepts. So that row is now checked BEFORE the advance, and a status that is neither
+  HEAD's nor this pass's own refuses it. Either refusal journals `board-advance-carry-foreign-dirt`.
+- **A merge git refused before it started no longer sends you to resolve a conflict that does not
+  exist (#619).** Every `GitError` out of the merge was labelled "content conflict against the
+  target", but most are git declining at pre-flight — an untracked file the merge would overwrite,
+  a staged change on an incoming path, a file/directory shape clash, an `ff` target that cannot
+  fast-forward — where nothing merged, the target checkout is untouched, and there are no markers
+  to find. Those now raise `verify.MergePreflightError` (a `GitError` subclass, so every existing
+  handler is unchanged) and escalate describing that state, with git's own text naming the cause.
+  A third state needed its own type. A `--no-ff` that merges cleanly and is then refused at the
+  COMMIT — a `pre-merge-commit` or `commit-msg` hook, or a `commit.gpgsign` that cannot sign —
+  leaves no unmerged stages but does leave `MERGE_HEAD`, so reading the index alone called a
+  started merge a pre-flight refusal and sent you to clear a clash that does not exist.
+  `verify.MergeCommitRefusedError` now names it: the merge is aborted and the escalation points at
+  the policy that declined rather than at a tree with nothing wrong. Where the abort ITSELF fails,
+  it says so and sends you to recover the mid-merge checkout first — a resume attempted before
+  that dies on the merge state however well the hook is fixed.
+- **A refused `squash` merge no longer destroys the uncommitted work in your main checkout
+  (#619).** `--squash` has no `--abort`, so the recovery is `git reset --hard HEAD` — gated on a
+  tree-state probe read _after_ the merge and used to answer "did the squash act". A checkout
+  already carrying an unstaged edit reads dirty whether or not git touched a byte, so a merge git
+  refused at pre-flight fired the reset and discarded work the merge never went near. The probe is
+  now read once _before_ the squash and a tree found dirty is never reset. The same root cause
+  corrupted the replay gate that recognises "the squash staged nothing", which now asks the index.
+- **The journal no longer records a path as tolerated when that path is what stopped the merge
+  (#623).** `merge-target-tolerated` is written from inside the pre-flight guard, strictly before
+  the merge runs, so it can only record what the guard decided. A stray outside the incoming set
+  by _path_ can still clash with it by _shape_ — a file where the merge needs a directory, or the
+  reverse — and git then refuses over the very path the event called harmless. The refusal path
+  now appends a corrective `merge-preflight-refused` naming the same paths and carrying git's text.
 
 ## [0.11.0] — 2026-08-19
 
