@@ -39,13 +39,15 @@ breaking changes may land in a minor release.
 - **A hard stop rides `stop-request.json` with `mode: "hard"` (#319).** It is lodged before the
   engine is signalled — the atomic write also supersedes a pending graceful request — and honored
   at item boundaries and mid-session, where both real adapter wait loops poll it once per tick
-  (worst case ~5s). SIGTERM remains the POSIX fast path rather than the mechanism, so a stop lands
-  on every platform and multiplexer backend. `status --json`'s `graceful_stop_pending` is now
-  mode-exact and reports only genuinely graceful requests; a modeless pre-#319 body still reads
-  graceful. A run directory that rejects the write — read-only, or out of space, which a long
-  run can cause itself since session logs tee into that same directory — degrades to the signal
-  path with the stop still delivered, rather than failing the stop outright; where the pid-reuse
-  guard then also declines to force-kill, the error says nothing is pending.
+  (worst case ~5s). SIGTERM is now the POSIX fast path rather than the mechanism, so a hard stop
+  lands on every platform and multiplexer backend, and reaches a nested auto-sweep through the
+  owning run's channel — hard-only; `stop <child-id>` is unchanged. A run directory that rejects
+  the write degrades to the signal path with the stop still delivered.
+- **`status --json`'s `graceful_stop_pending` is now mode-exact (#319)** — it reports only
+  genuinely graceful requests. A modeless pre-#319 request body still reads graceful.
+- **`stop --graceful` and the TUI report an already-pending request without calling it graceful
+  (#319).** The request standing on disk may be a hard one — `stop` leaves one lodged when it
+  could not prove the engine dead — and the idempotency answer is deliberately mode-blind.
 
 ### Removed
 
@@ -56,86 +58,33 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
-- **Two `stop` invocations against one run no longer collide on a staging temp (#319).** The
-  stop-request write staged through a fixed `stop-request.json.tmp`, so interleaved writers
-  overwrote each other's staging file and the loser's rename raised `FileNotFoundError` once the
-  winner had consumed the name. Now written through the same `atomic_write_text` helper
-  `operatoractions` moved to under #379, which stages under a per-writer `mkstemp` name: the last
-  write wins and neither caller errors. This is the one control file with genuinely concurrent
-  writers, and on the hard path the raise would land before the engine was signalled.
-- **`resume` no longer re-arms a run whose stale stop request it could not remove (#319).**
-  `clear_graceful_stop` never raises — several callers depend on that — so it answered False for
-  "nothing was pending" and "could not remove it" alike. Resume read the second as the first,
-  wrote the pid, and the engine then consumed the surviving request at its first item boundary
-  and stopped again, with nothing printed to say why; resuming repeated it. Resume now re-reads,
-  refuses before the pid lands, and names the file. `stop --cancel-graceful` likewise stops
-  reporting "no stop request pending" for a request still on disk and still honorable — same
-  exit code, accurate message.
-- **A hard stop of a parent run now reaches a nested auto-sweep mid-session (#319).** An
-  auto-sweep runs synchronously inside its parent but mints its own run id and dir, so
-  `stop <parent-id>` lodged a request in a dir the child's adapter never read — and on native
-  Windows, where the shared SIGTERM cannot land, the parent stop fell back to force-killing the
-  whole process blind. The outermost run now publishes its dir as the owning run, which the
-  adapter poll and the post-session check both consult alongside their own. The child never
-  consumes the parent's file: the parent's hard arm still has to find it to record and attribute
-  the stop. Hard-only — a graceful stop already keeps a child sweep from starting, and lets one
-  in flight finish. `stop <child-id>` keeps working unchanged.
-- **`stop --graceful` no longer downgrades a hard request that landed while it ran (#319).** Its
-  "already pending?" check was separated from its write by a pid read, a liveness probe and an
-  fsync — ~1.3 ms on a journalling filesystem — and the channel is last-writer-wins, so a
-  concurrent `stop` lodging `mode: "hard"` in that window was silently replaced with `graceful`,
-  costing the abort the operator asked for. The graceful lodge is now an `O_CREAT | O_EXCL`
-  create, which fuses "is one pending?" to "lodge mine" as one atomic step and answers
-  "already pending" for anything already there: a stronger stop already stands. Two concurrent
-  graceful asks resolve the same way, which is the documented idempotency. The escalation
-  direction keeps its unconditional replace — `stop_run` depends on it — so the asymmetry
-  between the two writers is deliberate, and a planted symlink at the path is now refused
-  rather than followed.
-- **`stop` keeps the lodged request when it never proved the engine dead (#319).** The fallback
-  that marks a run stopped from outside also discarded the hard request it had just lodged —
-  including on the paths where it had no evidence of death: a `terminate` refused with
-  `PermissionError`, a `force_kill` refused the same way, or a `taskkill /F /T` that failed
-  silently, since win32 shells it with `check=False`. That threw away the only channel left to
-  stop a live engine, on the platform the channel exists for, while reporting the run stopped.
-  Death is now distinguished from refusal — `ProcessLookupError` still discards, since it is
-  proof — and a clean kill is confirmed by re-probing after it settles rather than assumed. Where
-  the engine may still be running the request stays lodged and the stop is genuinely still in
-  flight; the run cannot be resumed into a stale request until that engine exits anyway.
-- **A signalled stop no longer journals the request that caused it as stale debris (#319).**
-  Since `stop_run` lodges the hard request _before_ it signals, and the signal path reads no
-  control file, every routine POSIX stop reached the hard arm with the file still on disk — and
-  `run()`'s finally then discarded it as stale and wrote `stop-request-discarded` alongside
-  `run-stop`. The hard arm now consumes a pending _hard_ request the way the boundary and
-  in-session sites already do. A pending _graceful_ request is genuinely superseded and still
-  journals the discard.
-- **A hard stop arriving as the last item finishes stops the run instead of completing it
-  (#319).** On the exhausted-queue return path none of the three raise sites apply — two live
-  inside the session path an empty queue never enters, and the run-end auto-sweep predicate is
-  mode-blind, so it suppresses and returns rather than raising. The run recorded `finished`,
-  which outranks `stopped` in the status projection, so an honored hard stop was reported as a
-  completed run and `stop_run` then journalled `fallback=True` against an engine that was
-  responsive throughout — the one thing that flag is now supposed to rule out. Checked once
-  where the loop returns, which covers `max-stories-reached` too. Mode-exact: a graceful
-  request at an exhausted queue still finishes truthfully.
-- **The engine takes a stop request off the channel in one atomic step (#319).** The item-boundary
-  check read the mode and then unlinked the file, so a `stop` escalating to `mode: "hard"` between
-  the two was deleted unread while the engine routed on the stale `graceful` it already held. Only
-  that direction can lose anything — the mode lattice is monotone, so a stale `hard` read is still
-  true — and it is now closed by consuming through a rename, which answers for the very file it
-  removed. Re-reading the mode before the unlink was measured and rejected: over 4000 injected
-  races it made the loss _more_ likely, not less, because the extra read widens the interval the
-  escalation has to land in. A hard request arriving after the take is a new request against a run
-  already stopping, so it stays on the channel to be journalled as `stop-request-discarded` rather
-  than vanishing. This also settles the win32 variant, where a torn read of a single `stop` could
-  answer `graceful` and then delete it.
-- **A resume refused over an unremovable stop request no longer re-blesses the config it never
-  ran (#319).** That refusal returns, and it sat below two persistent writes: the `run-resume`
-  journal entry, and the host-exec integrity re-stamp. The re-stamp is the one that lasted — it
-  writes the file the _next_ resume reads back as its baseline, so a refused attempt rebaselined
-  the pin and inverted the advisory: the config-changed warning fired on the resume that stopped
-  and stayed silent on the one that armed an engine, for a change the operator never accepted.
-  The check moves above both writes, and stays below the profile resolution that raises, so a
-  resume that aborts on a bad profile no longer destroys the operator's lodged request either.
+- **Native Windows: `bmad-loop stop` no longer burns the full 10s grace window into a blind
+  `taskkill /F` (#319).** An inter-process SIGTERM is never delivered to a native-Windows engine,
+  so every stop completed through the external fallback with no engine teardown at all. The engine
+  honors the stop request itself now, so it is the single writer of `stopped` again and
+  `run-stop fallback=True` means a genuinely wedged engine.
+- **Two concurrent `stop` invocations against one run no longer collide on a staging temp (#319).**
+  The write staged through a fixed `stop-request.json.tmp`, so the loser's rename raised
+  `FileNotFoundError`. It now stages under a per-writer name: the last write wins and neither
+  caller errors.
+- **`resume` no longer re-arms a run whose stale stop request it could not remove (#319).** It read
+  "could not remove it" as "nothing was pending", wrote the pid, and stopped again at the first
+  item boundary with nothing printed to say why. Resume now refuses before the pid lands and names
+  the file, without re-stamping the host-exec integrity pin for a run it never started.
+  `stop --cancel-graceful` likewise stops reporting "no stop request pending" for a request still
+  on disk and still honorable — same exit code, accurate message.
+- **A `stop` that never proved the engine dead keeps its request lodged (#319).** A `terminate` or
+  `force_kill` refused with `PermissionError`, or a `taskkill /F /T` that failed silently,
+  discarded the hard request while reporting the run stopped — throwing away the only channel left
+  to stop a live engine. Death is now distinguished from refusal, so the stop stays genuinely in
+  flight.
+- **A hard stop arriving as the last item finishes stops the run instead of reporting it completed
+  (#319).** Covers `max-stories-reached` too; a graceful request at an exhausted queue still
+  finishes truthfully.
+- **`stop --graceful` no longer downgrades a hard request that landed while it ran (#319).** The
+  graceful lodge is now an atomic `O_CREAT | O_EXCL` create that answers "already pending" for
+  anything already there, and a symlink planted at the path is refused rather than followed. Two
+  concurrent graceful asks resolve the same way, which is the documented idempotency.
 - **A policy field of the wrong TOML type now raises `PolicyError` naming `section.key`
   (#440).** `loads()` coerced with bare `int()`/`float()`/`bool()`/`str()` outside the
   `PolicyError` funnel, so a wrong-typed value escaped every handler written to degrade on
@@ -282,12 +231,6 @@ breaking changes may land in a minor release.
   a traceback (#678)
 - The settings schema no longer reaches the `[tui]` extra at module scope, and CI now proves the
   core CLI works extra-less (#679)
-- **Native Windows: `bmad-loop stop` no longer burns the full 10s grace window into a blind
-  `taskkill /F` (#319).** An inter-process SIGTERM is never delivered to a native-Windows engine,
-  so the preferred path — the engine's own handler — could not fire, and every stop completed
-  through the external fallback: the run marked `stopped` from outside, `run-stop fallback=True`
-  journaled, and no engine teardown at all. The engine honors the stop request itself now, so it
-  is the single writer of `stopped` again and `fallback=True` means a genuinely wedged engine.
 
 ## [0.11.0] — 2026-08-19
 

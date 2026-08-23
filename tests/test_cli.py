@@ -2092,9 +2092,37 @@ def test_stop_graceful_is_idempotent(tmp_path, monkeypatch, capsys):
     run_dir = _pending_graceful_run(tmp_path)  # request already on disk
     before = (run_dir / runs.STOP_REQUEST_FILE).read_text()
     assert cli.main(["stop", "--project", str(tmp_path), "r1", "--graceful"]) == 0
-    assert "already has a graceful stop pending" in capsys.readouterr().out
+    assert "already has a stop request pending" in capsys.readouterr().out
     # left untouched — the original request's timestamp stands
     assert (run_dir / runs.STOP_REQUEST_FILE).read_text() == before
+
+
+def test_stop_graceful_reports_a_pending_hard_request_without_calling_it_graceful(
+    tmp_path, monkeypatch, capsys
+):
+    """A lodged *hard* request answers "already-pending" too, and the message must
+    not describe it as graceful — that reports a strictly stronger stop as a weaker
+    one. Reachable with no race at all: `stop_run` leaves a hard request lodged when
+    it could not prove the engine dead, and it sits there at rest.
+
+    Written directly rather than through `_pending_graceful_run`, which hardcodes
+    the graceful mode.
+    """
+    from bmad_loop import runs
+
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive")
+    run_dir = _make_run_with_state(tmp_path, "r1")
+    (run_dir / runs.STOP_REQUEST_FILE).write_text(
+        '{"requested_at": "now", "mode": "hard"}', encoding="utf-8"
+    )
+    before = (run_dir / runs.STOP_REQUEST_FILE).read_text()
+    assert cli.main(["stop", "--project", str(tmp_path), "r1", "--graceful"]) == 0
+    out = capsys.readouterr().out
+    assert "already has a stop request pending" in out
+    assert "graceful stop pending" not in out  # the hard request is not a graceful one
+    # and the stronger request still stands, unchanged and un-downgraded
+    assert (run_dir / runs.STOP_REQUEST_FILE).read_text() == before
+    assert runs.read_stop_request_mode(run_dir) == "hard"
 
 
 def test_stop_cancel_graceful_clears_pending(tmp_path, capsys):

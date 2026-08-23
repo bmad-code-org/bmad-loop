@@ -3367,7 +3367,12 @@ def _cmd_request_graceful(run_dir: Path, run_id: str) -> int:
         print(str(e), file=sys.stderr)
         return 1
     if outcome == "already-pending":
-        print(f"run {run_id} already has a graceful stop pending")
+        # Mode-neutral for the same reason `--cancel-graceful` is: the pending
+        # request may be a *hard* one (a `stop` that could not prove the engine
+        # dead leaves it lodged at rest), and the token is deliberately mode-blind.
+        # Naming it "graceful" would report a strictly stronger stop as a weaker
+        # one (#319).
+        print(f"run {run_id} already has a stop request pending")
         return 0
     if outcome == "requested-unverifiable":
         print(

@@ -1158,9 +1158,12 @@ def request_graceful_stop(run_dir: Path) -> str:
 
     - ``"requested"`` — file written; a provably-live engine will honor it.
     - ``"already-pending"`` — a request was already on disk; left untouched so its
-      original ``requested_at`` stands (idempotent — a second ask is a no-op). Also
-      the answer when a *hard* request landed while this call was in flight: a
-      stronger stop stands, and it must not be downgraded to graceful.
+      original ``requested_at`` stands (idempotent — a second ask is a no-op). The
+      token is mode-blind, and the pending request is not necessarily graceful: a
+      *hard* one sits there at rest whenever a `stop` could not prove the engine
+      dead, and one can also land while this call is in flight. A stronger stop
+      stands either way and must not be downgraded — so callers message this token
+      as a *stop request*, never as a graceful one (#319).
     - ``"requested-unverifiable"`` — file written, but engine liveness read
       ``'unknown'`` (e.g. a win32 access-denied pid): the request stands and fires
       if an engine is in fact running; the caller warns that it can't confirm.

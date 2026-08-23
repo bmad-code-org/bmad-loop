@@ -985,7 +985,9 @@ class BmadLoopApp(App[None]):
             self.call_from_thread(self.notify, str(e), severity="error")
             return
         if outcome == "already-pending":
-            self.call_from_thread(self.notify, f"run {run_id} already has a graceful stop pending")
+            # Mode-neutral: the pending request may be a hard one, and this token
+            # cannot tell (#319) — same wording as the CLI's `stop --graceful`.
+            self.call_from_thread(self.notify, f"run {run_id} already has a stop request pending")
             return
         if outcome == "requested-unverifiable":
             self.call_from_thread(

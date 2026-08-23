@@ -3635,7 +3635,7 @@ async def test_graceful_stop_requests_via_helper(project, monkeypatch):
 @pytest.mark.parametrize(
     "token, needle",
     [
-        ("already-pending", "already has a graceful stop pending"),
+        ("already-pending", "already has a stop request pending"),
         ("requested-unverifiable", "could not confirm a live engine"),
     ],
 )
