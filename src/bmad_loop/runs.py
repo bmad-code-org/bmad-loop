@@ -987,8 +987,15 @@ def read_stop_request_mode(run_dir: Path) -> str | None:
     misread graceful costs at most one more item before the run stops; a spurious
     ``"hard"`` would abort a live session — so a torn read must never be able to
     produce one."""
+    return _stop_request_mode_of(run_dir / STOP_REQUEST_FILE)
+
+
+def _stop_request_mode_of(path: Path) -> str | None:
+    """The parse half of :func:`read_stop_request_mode`, split out so
+    :func:`consume_stop_request` can answer for the file it *took* rather than for
+    whatever currently answers to the channel name."""
     try:
-        raw = (run_dir / STOP_REQUEST_FILE).read_text(encoding="utf-8")
+        raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return None
     except (OSError, ValueError):
@@ -1093,6 +1100,50 @@ def clear_graceful_stop(run_dir: Path) -> bool:
         # way nothing was discarded, and the caller must not see an exception.
         return False
     return True
+
+
+def consume_stop_request(run_dir: Path) -> str | None:
+    """Take the pending request off the channel and answer the mode of the very file
+    removed, or ``None`` when none was pending.
+
+    The reader-side counterpart of :func:`_create_stop_request`'s
+    ``O_CREAT | O_EXCL``: the rename *is* the consume, so "what mode is pending?"
+    and "take it" cannot disagree. A read followed by an unlink can, and the gap is
+    not academic — a concurrent ``stop`` escalating to ``"hard"`` in between is
+    deleted unread while the caller routes on the stale ``"graceful"`` it already
+    holds.
+
+    Only that direction can lose anything, because the mode lattice is monotone:
+    the graceful writer refuses to overwrite an existing request and the hard writer
+    only ever writes ``"hard"``, so ``absent < graceful < hard`` until consumed. A
+    stale ``"hard"`` read is therefore always still true; a stale ``"graceful"`` may
+    not be.
+
+    Re-reading the mode immediately before the unlink does NOT fix this, and is a
+    trap worth naming: measured over 4000 injected races it made the loss *more*
+    likely, not less (164 -> 929 swallowed), because the extra read lengthens the
+    interval an escalation has to land in. Narrowing a window is not closing it —
+    only one atomic step is.
+
+    A hard request lodged *after* the take is a new request against a run already
+    stopping. It stays at the canonical name for ``run()``'s finally to discard and
+    journal as ``stop-request-discarded`` — a record, not a silent loss."""
+    src = run_dir / STOP_REQUEST_FILE
+    taken = run_dir / (STOP_REQUEST_FILE + ".consumed")
+    try:
+        atomic_replace(src, taken)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        # Could not take it (read-only dir, a sharing violation past its retries).
+        # Leave it on the channel and answer from the canonical name: the next
+        # boundary re-asks, which is strictly better than losing the request.
+        return read_stop_request_mode(run_dir)
+    try:
+        return _stop_request_mode_of(taken)
+    finally:
+        with contextlib.suppress(OSError):
+            retrying_unlink(taken)
 
 
 def request_graceful_stop(run_dir: Path) -> str:

@@ -1141,6 +1141,50 @@ def test_request_graceful_stop_cannot_downgrade_a_hard_request_at_any_instant(
     assert runs.read_stop_request_mode(run_dir) == "hard"  # not downgraded
 
 
+def test_consume_stop_request_never_removes_a_request_it_did_not_read(tmp_path, monkeypatch):
+    """The reader-side half of the arbitration. A `stop` escalating to hard while the
+    engine is consuming must not be deleted unread: a read followed by an unlink
+    removes whatever answers to the name *now*, which may not be the request whose
+    mode the caller is about to route on.
+
+    Only this direction can lose anything — the mode lattice is monotone (graceful
+    refuses to overwrite, hard only ever writes hard), so a stale "hard" read is
+    still true while a stale "graceful" may not be.
+
+    ⚠️ Re-reading the mode just before the unlink does NOT fix this and measurably
+    worsens it (164 -> 929 swallowed over 4000 injected races): the extra read
+    widens the interval the escalation has to land in. Narrowing is not closing.
+
+    Ablation, two axes, and axis 2 is what proves this is not the shape-2 guard
+    wearing a new hat:
+      1. Revert `consume_stop_request` to `read_stop_request_mode` + a
+         `clear_graceful_stop` unlink -> the FIRST assert fails, returning "hard":
+         with no take, the mode answered is whatever the name resolves to at read
+         time, which the escalation has already changed, and the unlink then removes
+         that one too. Read and consume disagree about which request was handled,
+         which is the whole defect; the channel is left empty, so the second assert
+         would fail as well were it reached.
+      2. Revert `_create_stop_request` to an unconditional
+         `_write_stop_request(run_dir, "graceful")`, undoing the writer-side fix,
+         but keep the atomic take -> this test still PASSES. The two axes redden
+         disjoint sets, which is the proof the two guards are independent."""
+    runs._create_stop_request(tmp_path)  # operator: stop --graceful
+    real = runs._stop_request_mode_of
+    escalated: list[str] = []
+
+    def _escalate_then_read(path):
+        if not escalated:  # once — the take happens before this, which is the point
+            escalated.append("hard")
+            runs._write_stop_request(tmp_path, "hard")  # concurrent `bmad-loop stop`
+        return real(path)
+
+    monkeypatch.setattr(runs, "_stop_request_mode_of", _escalate_then_read)
+
+    assert runs.consume_stop_request(tmp_path) == "graceful"  # the body we took
+    assert escalated == ["hard"]  # the interleave really happened
+    assert runs.read_stop_request_mode(tmp_path) == "hard"  # NOT swallowed
+
+
 def test_request_graceful_stop_keeps_escalation_unconditional(tmp_path, monkeypatch):
     """The mirror direction, which the refusal above must not have cost. A hard
     request landing *after* the graceful file exists still supersedes it — that is

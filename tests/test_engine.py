@@ -33,7 +33,7 @@ from conftest import (
     write_sprint,
 )
 
-from bmad_loop import deferredwork, platform_util, verify
+from bmad_loop import deferredwork, platform_util, runs, verify
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.engine import Engine, RunPaused, RunStopped, _digest_of, _run_depth
@@ -10406,6 +10406,58 @@ def test_graceful_stop_finishes_current_story_then_stops(project, monkeypatch):
     stops = [e for e in engine.journal.entries() if e["kind"] == "run-stop"]
     assert stops and stops[-1]["graceful"] is True
     assert stops[-1]["remaining"] == 1  # 1-2-b still actionable, never picked
+
+
+def test_boundary_consume_does_not_swallow_a_concurrent_escalation(project, monkeypatch):
+    """WIRING, not predicate. `runs.consume_stop_request` being atomic proves nothing
+    unless the boundary check actually calls it — a revert of this call site to
+    read-then-unlink is a separate regression with its own ablation axis.
+
+    An escalating `stop` landing while the boundary consumes must survive as a
+    record. This engine routes on the graceful body it took (correct — that is the
+    request it holds), and the hard request that arrived afterwards is a new request
+    against a run already stopping: `run()`'s finally discards it and journals
+    `stop-request-discarded`, so it is accounted for rather than vanishing.
+
+    Ablation: revert `_check_stop_request` to `read_stop_request_mode` +
+    `clear_graceful_stop`. The escalation is then injected into a take that never
+    happens, so `escalated` stays empty and the test reddens on that assert — which
+    IS the wiring proof: no atomic consume, no `.consumed` read to hook. Keep the
+    take but drop the survival and the `stop-request-discarded` assert is what
+    catches it instead."""
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: None)
+    write_sprint(project, {"1-1-a": "ready-for-dev", "1-2-b": "ready-for-dev"})
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    engine, _ = make_engine(
+        project,
+        [
+            _lodge_after(dev_effect(project, "1-1-a"), run_dir),
+            review_effect(project, "1-1-a", clean=True),
+        ],
+    )
+
+    real = runs._stop_request_mode_of
+    escalated: list[str] = []
+
+    def _escalate_then_read(path):
+        # only the read of the TAKEN file, which is the consume and nothing else —
+        # raise site B reads the canonical name and must not be perturbed here
+        if path.name.endswith(".consumed") and not escalated:
+            escalated.append("hard")
+            runs._write_stop_request(run_dir, "hard")
+        return real(path)
+
+    monkeypatch.setattr(runs, "_stop_request_mode_of", _escalate_then_read)
+    engine.run()
+
+    assert escalated == ["hard"]  # the interleave really happened
+    saved = load_state(engine.run_dir)
+    assert saved.stopped is True and saved.finished is False
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    stops = [e for e in engine.journal.entries() if e["kind"] == "run-stop"]
+    assert stops and stops[-1]["graceful"] is True  # routed on the body it took
+    # the escalation was not swallowed: it survived the consume to be recorded
+    assert "stop-request-discarded" in kinds
 
 
 def test_graceful_stop_runs_clean_finalization_and_notifies(project, monkeypatch):

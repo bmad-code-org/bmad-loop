@@ -117,6 +117,17 @@ breaking changes may land in a minor release.
   responsive throughout — the one thing that flag is now supposed to rule out. Checked once
   where the loop returns, which covers `max-stories-reached` too. Mode-exact: a graceful
   request at an exhausted queue still finishes truthfully.
+- **The engine takes a stop request off the channel in one atomic step (#319).** The item-boundary
+  check read the mode and then unlinked the file, so a `stop` escalating to `mode: "hard"` between
+  the two was deleted unread while the engine routed on the stale `graceful` it already held. Only
+  that direction can lose anything — the mode lattice is monotone, so a stale `hard` read is still
+  true — and it is now closed by consuming through a rename, which answers for the very file it
+  removed. Re-reading the mode before the unlink was measured and rejected: over 4000 injected
+  races it made the loss _more_ likely, not less, because the extra read widens the interval the
+  escalation has to land in. A hard request arriving after the take is a new request against a run
+  already stopping, so it stays on the channel to be journalled as `stop-request-discarded` rather
+  than vanishing. This also settles the win32 variant, where a torn read of a single `stop` could
+  answer `graceful` and then delete it.
 - **A resume refused over an unremovable stop request no longer re-blesses the config it never
   ran (#319).** That refusal returns, and it sat below two persistent writes: the `run-resume`
   journal entry, and the host-exec integrity re-stamp. The re-stamp is the one that lasted — it

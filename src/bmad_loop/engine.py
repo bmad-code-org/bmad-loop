@@ -60,6 +60,7 @@ from .policy import Policy
 from .recovery_flow import RecoveryFlow
 from .runs import (
     clear_graceful_stop,
+    consume_stop_request,
     events_dir_for,
     graceful_stop_requested,
     kill_session,
@@ -1017,13 +1018,15 @@ class Engine:
         deferred to the adapter's in-session poll — aborting at the boundary is
         both faster and cleaner than launching the next session only to abort it
         mid-flight."""
-        mode = read_stop_request_mode(self.run_dir)
+        # One atomic take, never a read then an unlink: a `stop` escalating to
+        # "hard" between the two would be deleted unread while this engine routed
+        # on the stale graceful mode it already held. Consuming on BOTH arms is
+        # still required — `run()`'s finally discards any surviving file as *stale*
+        # and journals `stop-request-discarded`, which would misreport a request
+        # this engine just honored.
+        mode = consume_stop_request(self.run_dir)
         if mode is None:
             return
-        # Consume before raising, on both arms: `run()`'s finally discards any
-        # surviving file as *stale* and journals `stop-request-discarded`, which
-        # would misreport a request this engine just honored.
-        clear_graceful_stop(self.run_dir)
         if mode == "hard":
             raise RunStopped(via="stop-request")
         raise RunStopped(graceful=True)
