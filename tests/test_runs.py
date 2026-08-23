@@ -953,6 +953,34 @@ def test_stop_run_supersedes_pending_graceful_request(tmp_path, monkeypatch):
 # ---------------------------------------------------------------- prune sessions
 
 
+def test_request_graceful_stop_refuses_to_downgrade_a_concurrent_hard_request(
+    tmp_path, monkeypatch
+):
+    """A hard request landing inside the check -> write window is not downgraded.
+
+    `request_graceful_stop` clears its existence check, then spends a pid-file read,
+    a liveness probe, a mkstemp and an fsync before its replace — wide enough for a
+    concurrent `stop` to lodge `"hard"` in between. The channel is last-writer-wins,
+    so without the re-read the graceful write silently supersedes the stronger stop
+    and costs the operator the abort they asked for. Driving the concurrent lodge
+    from `engine_liveness` puts it exactly in that window.
+
+    Ablation: delete the `read_stop_request_mode(...) == "hard"` guard and both
+    assertions fail — the call returns "requested" and the file reads "graceful"."""
+    run_dir = _make_state_run(tmp_path, "r1")
+    (run_dir / "engine.pid").write_text("4242 100.0")
+
+    def _lodge_hard_then_report_alive(_run_dir):
+        runs._write_stop_request(run_dir, "hard")
+        return "alive"
+
+    monkeypatch.setattr(runs, "engine_liveness", _lodge_hard_then_report_alive)
+
+    # the same answer a request found at entry gets: a stronger stop already stands
+    assert runs.request_graceful_stop(run_dir) == "already-pending"
+    assert runs.read_stop_request_mode(run_dir) == "hard"  # not downgraded
+
+
 def test_mux_sessions_no_tmux(monkeypatch):
     # mux_sessions now delegates to the multiplexer backend; patch its seam.
     monkeypatch.setattr(tmux_base.shutil, "which", lambda _name: None)

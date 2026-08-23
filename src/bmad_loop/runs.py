@@ -975,6 +975,14 @@ def _write_stop_request(run_dir: Path, mode: str) -> None:
     ``"graceful"`` escalates the request in one step, with no window in which
     nothing is pending for the engine to find.
 
+    That is the only direction this function arbitrates. The channel is otherwise
+    last-writer-wins, so the *reverse* — a graceful write landing on a pending hard
+    request and downgrading it — is refused by the caller instead:
+    :func:`request_graceful_stop` re-reads the mode immediately before calling here
+    and answers ``"already-pending"``. The guard belongs there and not in this
+    function because ``stop_run`` shares it and its escalation must stay
+    unconditional.
+
     Goes through :func:`platform_util.atomic_write_text` rather than a hand-rolled
     ``tmp + atomic_replace``, for the reason ``operatoractions`` was migrated under
     #379: this is the one control file with genuinely *concurrent* writers — two
@@ -1022,7 +1030,9 @@ def request_graceful_stop(run_dir: Path) -> str:
 
     - ``"requested"`` — file written; a provably-live engine will honor it.
     - ``"already-pending"`` — a request was already on disk; left untouched so its
-      original ``requested_at`` stands (idempotent — a second ask is a no-op).
+      original ``requested_at`` stands (idempotent — a second ask is a no-op). Also
+      the answer when a *hard* request landed while this call was in flight: a
+      stronger stop stands, and it must not be downgraded to graceful.
     - ``"requested-unverifiable"`` — file written, but engine liveness read
       ``'unknown'`` (e.g. a win32 access-denied pid): the request stands and fires
       if an engine is in fact running; the caller warns that it can't confirm.
@@ -1041,6 +1051,18 @@ def request_graceful_stop(run_dir: Path) -> str:
             f"run {run_dir.name} has no live engine — a graceful stop request would "
             f"never be consumed; use `bmad-loop resume {run_dir.name}` to continue it"
         )
+    # Last read before the replace. The existence check above is separated from this
+    # write by a pid-file read, a liveness probe, a mkstemp and an fsync — wide enough
+    # for a concurrent `stop` to lodge `"hard"` in between, and the channel is
+    # last-writer-wins, so without this a graceful write would silently *downgrade* it
+    # and cost the abort the operator asked for. Answering "already-pending" is the
+    # same answer the check at the top of this function gives for a pending request,
+    # and it is the right one either way: a lodged hard request is a *stronger* stop
+    # already standing. This narrows the race to one read → one replace; it does not
+    # close it (nothing short of arbitration could — see `_write_stop_request`), and
+    # it cannot regress the escalation direction, which `stop_run` still needs.
+    if read_stop_request_mode(run_dir) == "hard":
+        return "already-pending"
     _write_stop_request(run_dir, "graceful")
     return "requested" if liveness == "alive" else "requested-unverifiable"
 

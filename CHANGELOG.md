@@ -71,6 +71,12 @@ breaking changes may land in a minor release.
   refuses before the pid lands, and names the file. `stop --cancel-graceful` likewise stops
   reporting "no stop request pending" for a request still on disk and still honorable — same
   exit code, accurate message.
+- **`stop --graceful` no longer downgrades a hard request that landed while it ran (#319).** Its
+  "already pending?" check is separated from its write by a pid read, a liveness probe and an
+  fsync, and the channel is last-writer-wins — so a concurrent `stop` lodging `mode: "hard"` in
+  that window was silently replaced with `graceful`, costing the abort the operator asked for.
+  The mode is re-read immediately before the write and a pending hard request answers
+  "already pending": a stronger stop already stands. The escalation direction is untouched.
 - **A policy field of the wrong TOML type now raises `PolicyError` naming `section.key`
   (#440).** `loads()` coerced with bare `int()`/`float()`/`bool()`/`str()` outside the
   `PolicyError` funnel, so a wrong-typed value escaped every handler written to degrade on
