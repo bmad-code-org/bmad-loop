@@ -77,6 +77,22 @@ breaking changes may land in a minor release.
   that window was silently replaced with `graceful`, costing the abort the operator asked for.
   The mode is re-read immediately before the write and a pending hard request answers
   "already pending": a stronger stop already stands. The escalation direction is untouched.
+- **A signalled stop no longer journals the request that caused it as stale debris (#319).**
+  Since `stop_run` lodges the hard request _before_ it signals, and the signal path reads no
+  control file, every routine POSIX stop reached the hard arm with the file still on disk — and
+  `run()`'s finally then discarded it as stale and wrote `stop-request-discarded` alongside
+  `run-stop`. The hard arm now consumes a pending _hard_ request the way the boundary and
+  in-session sites already do. A pending _graceful_ request is genuinely superseded and still
+  journals the discard.
+- **A hard stop arriving as the last item finishes stops the run instead of completing it
+  (#319).** On the exhausted-queue return path none of the three raise sites apply — two live
+  inside the session path an empty queue never enters, and the run-end auto-sweep predicate is
+  mode-blind, so it suppresses and returns rather than raising. The run recorded `finished`,
+  which outranks `stopped` in the status projection, so an honored hard stop was reported as a
+  completed run and `stop_run` then journalled `fallback=True` against an engine that was
+  responsive throughout — the one thing that flag is now supposed to rule out. Checked once
+  where the loop returns, which covers `max-stories-reached` too. Mode-exact: a graceful
+  request at an exhausted queue still finishes truthfully.
 - **A policy field of the wrong TOML type now raises `PolicyError` naming `section.key`
   (#440).** `loads()` coerced with bare `int()`/`float()`/`bool()`/`str()` outside the
   `PolicyError` funnel, so a wrong-typed value escaped every handler written to degrade on

@@ -637,6 +637,23 @@ class Engine:
                 self._prune_preserve_refs()
                 self._replay_unlatched_ledger_carries()
                 self._loop()
+                # A hard request that landed after `_loop`'s head check reaches none
+                # of the raise sites on an exhausted-queue return: sites A and B live
+                # inside `_run_session`, which the `story is None` branch never
+                # enters, and the run-end auto-sweep predicate is mode-blind, so it
+                # *suppresses* and returns rather than raising. Without this the run
+                # would record `finished` — which `documents.py` ranks above
+                # `stopped` — while the operator's hard stop went unhonored, and
+                # `stop_run`'s fallback would then journal `fallback=True` against a
+                # perfectly responsive engine, contradicting what that flag now means.
+                # Covering it here rather than at the suppression site closes every
+                # `_loop` return path at once (including `max-stories-reached`) and
+                # keeps the per-epic sweep caller untouched. Mode-exact on purpose: a
+                # *graceful* request at an exhausted queue finishes truthfully, which
+                # is long-documented, separately tested behavior this must not disturb.
+                if read_stop_request_mode(self.run_dir) == "hard":
+                    clear_graceful_stop(self.run_dir)
+                    raise RunStopped(via="stop-request")
                 self.state.finished = True
                 self._gc_run_worktrees()
                 self._emit("post_run")
@@ -694,6 +711,17 @@ class Engine:
                     if self._is_nested:
                         raise  # nested auto-sweep: let the owner record the stop
                     self.state.stopped = True
+                    # The signal path consumes nothing on its way here, and `stop_run`
+                    # now lodges a hard request *before* it signals — so on POSIX the
+                    # file is still on disk for every routine stop. `run()`'s finally
+                    # would then discard it as *stale* and journal
+                    # `stop-request-discarded`, misreporting the very request this
+                    # stop delivers. Consume it here, on the same rule the boundary and
+                    # in-session sites already follow. Mode-exact: a pending *graceful*
+                    # request really is superseded by a hard stop, so it is left for
+                    # the finally to discard and journal, as it always has been.
+                    if read_stop_request_mode(self.run_dir) == "hard":
+                        clear_graceful_stop(self.run_dir)
                     # `via` rides only when the control file delivered the stop;
                     # the signal path keeps journaling a bare `run-stop` (precedent:
                     # the KeyboardInterrupt arm's `reason=` extra below).
@@ -757,11 +785,16 @@ class Engine:
                 ):  # nosec B110 - journal write is best-effort; crash.txt + state flag already persisted
                     pass
             finally:
-                # Any pending stop-request control file that outlived this run
-                # (the run finished/paused/crashed, or a hard stop superseded it,
-                # before an item boundary consumed it) is discarded here so a later
-                # resume does not re-honor a stale request. The graceful arm already
-                # consumed its own file, so this only fires for a superseded one.
+                # Any pending stop-request control file that outlived this run is
+                # discarded here so a later resume does not re-honor a stale request.
+                # Every arm that *honors* a request consumes its own file first — the
+                # boundary and in-session sites, and the hard arm above, which has to
+                # because `stop_run` lodges before it signals and the signal path
+                # reads nothing. So this fires only for a request no arm honored: the
+                # run finished, paused or crashed with one pending, or a hard stop
+                # superseded a *graceful* one. Journaling those as discarded is
+                # accurate; journaling a request that just stopped the run would not
+                # be, which is the whole reason the honoring arms consume.
                 if clear_graceful_stop(self.run_dir):
                     with contextlib.suppress(Exception):
                         self.journal.append("stop-request-discarded")

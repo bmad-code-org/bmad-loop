@@ -10577,6 +10577,94 @@ def test_hard_stop_wins_over_pending_graceful_stop(project, monkeypatch):
     assert "stop-request-discarded" in [e["kind"] for e in engine.journal.entries()]
 
 
+def test_signal_stop_consumes_the_lodged_hard_request(project, monkeypatch):
+    """A bare ``RunStopped()`` — the signal handler's shape — with the hard request
+    ``stop_run`` lodges before signalling: the file is consumed, not journaled as
+    stale debris.
+
+    ``stop_run`` lodges *before* it signals, so on POSIX every routine stop reaches
+    the hard arm with the file still on disk; nothing on the signal path consumes it.
+    Left there, ``run()``'s finally discards it as stale and journals
+    ``stop-request-discarded``, misreporting the very request that caused the stop.
+    Contrast :func:`test_hard_stop_wins_over_pending_graceful_stop`: a *graceful*
+    request really is superseded by a hard stop, and still journals the discard.
+
+    The gate here is the absent journal entry, not the absent file — the finally
+    clears the file either way, so that assertion holds with the guard ablated."""
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: None)
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    engine, _ = make_engine(project, [])
+
+    def stopping_loop():
+        _lodge_hard_stop_request(run_dir)
+        raise RunStopped()  # hard (graceful=False), as the signal handler raises
+
+    monkeypatch.setattr(engine, "_loop", stopping_loop)
+    engine.run()
+
+    assert load_state(engine.run_dir).stopped
+    assert not graceful_stop_requested(run_dir)
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "stop-request-discarded" not in kinds  # honored, not stale debris
+    stops = [e for e in engine.journal.entries() if e["kind"] == "run-stop"]
+    # the signal delivered this stop, so it keeps journaling a bare `run-stop` —
+    # consuming the co-lodged file must not start attributing it to the channel.
+    assert stops and "via" not in stops[-1]
+
+
+def test_hard_request_at_an_exhausted_queue_stops_instead_of_finishing(project, monkeypatch):
+    """A hard request landing on the exhausted-queue return path stops the run.
+
+    None of the three raise sites reach it: A and B are inside ``_run_session``,
+    which an empty queue never enters, and the run-end auto-sweep predicate is
+    mode-blind, so it suppresses and *returns* rather than raising. Uncovered, the
+    run records ``finished`` — which ``documents.py`` ranks above ``stopped`` — while
+    the operator's hard stop went unhonored, and ``stop_run`` would then journal
+    ``fallback=True`` against a perfectly responsive engine."""
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: None)
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    engine, _ = make_engine(project, [])
+
+    def empty_loop():
+        # the queue drained, and the request lands before `_loop` returns — i.e.
+        # after its own head check has already run, which is the whole window.
+        _lodge_hard_stop_request(run_dir)
+
+    monkeypatch.setattr(engine, "_loop", empty_loop)
+    engine.run()
+
+    saved = load_state(engine.run_dir)
+    assert saved.stopped is True and saved.finished is False
+    assert not graceful_stop_requested(run_dir)  # consumed before the raise
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "run-complete" not in kinds
+    assert "stop-request-discarded" not in kinds  # honored, not stale
+    stops = [e for e in engine.journal.entries() if e["kind"] == "run-stop"]
+    assert stops and stops[-1]["via"] == "stop-request"
+
+
+def test_graceful_request_at_an_exhausted_queue_still_finishes(project, monkeypatch):
+    """The mode-exact half of the guard above, and its second ablation axis.
+
+    A *graceful* request on that same return path finishes truthfully: the story
+    queue is empty, so there is nothing left to stop before, and the finally discards
+    the superseded file. Widening the new check to ``is not None`` reddens exactly
+    this test and leaves its hard twin green."""
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: None)
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    engine, _ = make_engine(project, [])
+
+    monkeypatch.setattr(engine, "_loop", lambda: _lodge_stop_request(run_dir))
+    engine.run()
+
+    saved = load_state(engine.run_dir)
+    assert saved.finished is True and saved.stopped is False
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "run-complete" in kinds
+    assert "stop-request-discarded" in kinds  # superseded nothing — genuinely stale
+    assert "run-stop" not in kinds
+
+
 def test_crash_wins_over_pending_graceful_stop(project, monkeypatch):
     """An unexpected crash while a stop is pending wins; the crash arm records and
     the finally discards the stale control file (no run-stop)."""
