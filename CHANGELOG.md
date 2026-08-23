@@ -71,6 +71,15 @@ breaking changes may land in a minor release.
   refuses before the pid lands, and names the file. `stop --cancel-graceful` likewise stops
   reporting "no stop request pending" for a request still on disk and still honorable — same
   exit code, accurate message.
+- **A hard stop of a parent run now reaches a nested auto-sweep mid-session (#319).** An
+  auto-sweep runs synchronously inside its parent but mints its own run id and dir, so
+  `stop <parent-id>` lodged a request in a dir the child's adapter never read — and on native
+  Windows, where the shared SIGTERM cannot land, the parent stop fell back to force-killing the
+  whole process blind. The outermost run now publishes its dir as the owning run, which the
+  adapter poll and the post-session check both consult alongside their own. The child never
+  consumes the parent's file: the parent's hard arm still has to find it to record and attribute
+  the stop. Hard-only — a graceful stop already keeps a child sweep from starting, and lets one
+  in flight finish. `stop <child-id>` keeps working unchanged.
 - **`stop --graceful` no longer downgrades a hard request that landed while it ran (#319).** Its
   "already pending?" check is separated from its write by a pid read, a liveness probe and an
   fsync, and the channel is last-writer-wins — so a concurrent `stop` lodging `mode: "hard"` in

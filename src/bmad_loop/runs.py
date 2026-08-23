@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import hashlib
 import json
 import math
@@ -926,6 +927,35 @@ def prune_sessions(
         for run_id in prunable:
             kill_session(run_id)
     return prunable, live, unknown
+
+
+# The run dir of the OUTERMOST engine in this call stack (#319). A nested auto-sweep
+# runs synchronously in its parent's thread but mints its own run id and dir, so its
+# adapters would poll a control file no operator ever writes to: `bmad-loop stop
+# <parent-id>` lodges in the parent's dir. This carries the owning run dir down to
+# them. A ContextVar, mirroring `engine._run_depth`, because the nesting it tracks is
+# same-thread by construction; set once by the outermost `Engine.run()` and reset by
+# token, so a later top-level run in the same process is never poisoned.
+_owner_run_dir: contextvars.ContextVar[Path | None] = contextvars.ContextVar(
+    "bmad_loop_owner_run_dir", default=None
+)
+
+
+def set_owner_run_dir(run_dir: Path) -> contextvars.Token[Path | None]:
+    """Claim ``run_dir`` as the owning run for this call stack. Returns the token the
+    caller must hand to :func:`reset_owner_run_dir` from a ``finally``."""
+    return _owner_run_dir.set(run_dir)
+
+
+def reset_owner_run_dir(token: contextvars.Token[Path | None]) -> None:
+    """Release the claim made by :func:`set_owner_run_dir`."""
+    _owner_run_dir.reset(token)
+
+
+def owner_run_dir() -> Path | None:
+    """The outermost engine's run dir, or None outside any run — which is what a
+    standalone adapter (tests, probes) reads, so callers fall back to their own."""
+    return _owner_run_dir.get()
 
 
 def graceful_stop_requested(run_dir: Path) -> bool:

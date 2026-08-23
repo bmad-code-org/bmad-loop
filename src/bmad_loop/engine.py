@@ -63,7 +63,10 @@ from .runs import (
     events_dir_for,
     graceful_stop_requested,
     kill_session,
+    owner_run_dir,
     read_stop_request_mode,
+    reset_owner_run_dir,
+    set_owner_run_dir,
 )
 from .sprintstatus import ACTIONABLE_STATUSES, STATUS_ORDER, SprintStatusError
 from .sprintstatus import advance as sprint_advance
@@ -613,9 +616,19 @@ class Engine:
         depth = _run_depth.get()
         self._is_nested = depth > 0
         token = _run_depth.set(depth + 1)
+        # Publish this run dir as the owner for everything below, so a nested
+        # auto-sweep's adapters poll the file an operator can actually write to
+        # (#319): `stop <parent-id>` lodges here, while the child's own dir stays
+        # empty. Gated on depth, not on `_owns_signals` — a top-level run off the
+        # main thread installs no handlers yet still owns the channel. Reset by
+        # token in the same finally, ahead of the depth, so the nested re-raise arms
+        # unwind through both.
+        owner_token = None if self._is_nested else set_owner_run_dir(self.run_dir)
         try:
             return self._run_inner()
         finally:
+            if owner_token is not None:
+                reset_owner_run_dir(owner_token)
             _run_depth.reset(token)
 
     def _run_inner(self) -> RunSummary:
@@ -5089,6 +5102,20 @@ class Engine:
         if read_stop_request_mode(self.run_dir) == "hard":
             clear_graceful_stop(self.run_dir)
             raise RunStopped(via="stop-request")
+        # The same check against the *owning* run, for a nested auto-sweep child
+        # whose own dir is empty because the operator stopped the parent. Without
+        # it the fix above is inert on exactly the shape it exists for: the child's
+        # adapter aborts off the parent's file, `_post_kill_reconcile` rescues that
+        # `aborted` back to `completed`, so raise site A never fires — and the child
+        # would carry on into verify/review on the strength of the rescued result.
+        # Deliberately does NOT consume: the file is the parent's, and the parent's
+        # own hard arm must still find it to record and attribute the stop. The
+        # nested re-raise below hands this exception up before that arm consumes
+        # anything, and `via` rides the exception rather than the file.
+        if self._is_nested:
+            owner = owner_run_dir()
+            if owner is not None and read_stop_request_mode(owner) == "hard":
+                raise RunStopped(via="stop-request")
         self._emit(
             "post_session",
             task,

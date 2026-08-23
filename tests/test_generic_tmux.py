@@ -1961,6 +1961,84 @@ def test_wait_aborts_on_hard_stop_request(tmp_path, monkeypatch):
     assert request.is_file()
 
 
+def _lodge_owner_stop_request(tmp_path, mode: str) -> Path:
+    """Lodge a stop request in a *different* run dir and publish it as the owning
+    run, the way `stop <parent-id>` reaches a nested auto-sweep child: the request
+    lands in the parent's dir while the child's own stays empty."""
+    owner = tmp_path / ".bmad-loop" / "runs" / "parent-run"
+    owner.mkdir(parents=True, exist_ok=True)
+    (owner / runs.STOP_REQUEST_FILE).write_text(
+        json.dumps({"requested_at": "2026-08-22T00:00:00", "mode": mode}), encoding="utf-8"
+    )
+    return owner
+
+
+def test_wait_aborts_on_owning_runs_hard_stop_request(tmp_path, monkeypatch):
+    """A nested auto-sweep child aborts on the *parent's* hard request (#319).
+
+    The child mints its own run dir, so `stop <parent-id>` writes a file this
+    adapter would otherwise never read — and on native Windows, where the shared
+    SIGTERM cannot land, that left the parent stop force-killing blind. The poll now
+    reads the owning run's channel too.
+
+    Ablation: drop the owner leg from `_hard_stop_requested` and the clock runs the
+    session to its scripted `timeout` verdict instead."""
+    adapter, clock = _timeout_clock_adapter(tmp_path, monkeypatch)
+    owner = _lodge_owner_stop_request(tmp_path, "hard")
+    assert not (adapter.run_dir / runs.STOP_REQUEST_FILE).exists()  # child's own is empty
+
+    def advance(call_n):
+        clock["mono"] += 11.0  # only reached if the owner leg is gone
+
+    adapter.watcher = _ScriptedWatcher([], on_call=advance)
+
+    token = runs.set_owner_run_dir(owner)
+    try:
+        result = adapter.wait_for_completion(_dev_handle(), _short_spec(tmp_path))
+    finally:
+        runs.reset_owner_run_dir(token)
+
+    assert result.status == "aborted"
+    assert result.result_json is None
+    assert adapter.watcher.calls == 0
+    # The child never consumes the parent's file — the parent's own hard arm must
+    # still find it to record and attribute the stop.
+    assert (owner / runs.STOP_REQUEST_FILE).is_file()
+
+
+def test_wait_ignores_owning_runs_graceful_stop_request(tmp_path, monkeypatch):
+    """The mode-exact twin of the owner leg: graceful already suppresses a child
+    sweep from *starting*, and letting one already in flight finish is what graceful
+    means — so a graceful request on the owning run must not abort this session.
+
+    Ablation: widen the owner leg to `is not None` and this reddens alone."""
+    adapter, clock = _timeout_clock_adapter(tmp_path, monkeypatch)
+    owner = _lodge_owner_stop_request(tmp_path, "graceful")
+
+    def advance(call_n):
+        clock["mono"] += 11.0
+
+    adapter.watcher = _ScriptedWatcher([], on_call=advance)
+
+    token = runs.set_owner_run_dir(owner)
+    try:
+        result = adapter.wait_for_completion(_dev_handle(), _short_spec(tmp_path))
+    finally:
+        runs.reset_owner_run_dir(token)
+
+    assert result.status == "timeout"  # ran on, exactly as with no request at all
+
+
+def test_hard_stop_requested_falls_back_to_own_dir_outside_any_run(tmp_path, monkeypatch):
+    """With no owning run published — a standalone adapter, as in probes and most
+    tests — the predicate is its own dir alone, and answers without raising."""
+    adapter, _clock = _timeout_clock_adapter(tmp_path, monkeypatch)
+    assert runs.owner_run_dir() is None
+    assert adapter._hard_stop_requested() is False
+    _lodge_stop_request(adapter, "hard")
+    assert adapter._hard_stop_requested() is True
+
+
 def test_wait_ignores_graceful_stop_request(tmp_path, monkeypatch):
     """Graceful means *finish the in-flight item*, so a graceful request pending
     on the same channel must not touch a running session — only ``hard`` aborts.

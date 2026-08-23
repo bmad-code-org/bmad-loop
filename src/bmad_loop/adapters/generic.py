@@ -194,7 +194,8 @@ class _ResultFileMixin:
     _READBACK_NEEDS_PROOF_OF_WORK = False
 
     def _hard_stop_requested(self) -> bool:
-        """Has an operator lodged a *hard* stop request for this run (#319)?
+        """Has an operator lodged a *hard* stop request that this session must
+        honor (#319)? Either this run's own, or the owning run's.
 
         Polled once per wait-loop iteration by both real adapters, so a
         ``bmad-loop stop`` is honored mid-session on platforms where the
@@ -203,8 +204,25 @@ class _ResultFileMixin:
         when it raises, and must still see it to attribute the stop. A torn or
         modeless read already leans ``"graceful"`` inside
         ``read_stop_request_mode``, so this can never abort a session
-        spuriously."""
-        return runs.read_stop_request_mode(self.run_dir) == "hard"
+        spuriously.
+
+        Both dirs are read because a nested auto-sweep is a first-class run *and*
+        somebody else's child: it mints its own id and appears in ``list``, so
+        ``stop <child-id>`` must still reach it, while ``stop <parent-id>`` lodges
+        in a dir this adapter would otherwise never look at. The owner leg is
+        hard-only, like this whole predicate — a graceful request already
+        suppresses a child sweep from *starting*, and letting one already in flight
+        finish is exactly what graceful means."""
+        if runs.read_stop_request_mode(self.run_dir) == "hard":
+            return True
+        owner = runs.owner_run_dir()
+        # `!=` is a cheap dedupe for the common top-level case, not a correctness
+        # dependency: two spellings of one dir cost a redundant read, same answer.
+        return (
+            owner is not None
+            and owner != self.run_dir
+            and runs.read_stop_request_mode(owner) == "hard"
+        )
 
     def _result_json(self, handle: SessionHandle, spec: SessionSpec, *, wait: bool) -> dict | None:
         """Acquire this session's result dict. Base behavior: read the

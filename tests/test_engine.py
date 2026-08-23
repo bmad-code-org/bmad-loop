@@ -67,7 +67,14 @@ from bmad_loop.policy import (
     SweepPolicy,
     VerifyPolicy,
 )
-from bmad_loop.runs import STOP_REQUEST_FILE, graceful_stop_requested, rearm_escalation
+from bmad_loop.runs import (
+    STOP_REQUEST_FILE,
+    graceful_stop_requested,
+    owner_run_dir,
+    rearm_escalation,
+    reset_owner_run_dir,
+    set_owner_run_dir,
+)
 from bmad_loop.sprintstatus import story_status
 from bmad_loop.verify import (
     GitError,
@@ -10798,6 +10805,12 @@ def test_graceful_stop_on_resume_finishes_inflight_then_stops(project, monkeypat
 # arm: unconditional teardown, `run-stop` carrying `via="stop-request"` and no
 # `graceful` flag. These tests lodge the control file directly, exactly as the
 # graceful ones do.
+#
+# A nested auto-sweep child reads a second channel: the OWNING run's dir, published
+# by the outermost `run()` and polled by the adapter and by site B's owner leg. That
+# leg never consumes — the file belongs to the parent, whose own hard arm has to
+# find it to record and attribute the stop — and a nested engine re-raises rather
+# than recording, so those tests assert on the propagated exception.
 
 
 def _lodge_hard_stop_request(run_dir: Path) -> None:
@@ -10858,6 +10871,126 @@ def test_session_abort_status_unwinds_run_stopped(project, monkeypatch):
     stops = [e for e in entries if e["kind"] == "run-stop"]
     assert stops and stops[-1]["via"] == "stop-request"
     assert "graceful" not in stops[-1]
+
+
+def test_nested_child_stops_on_the_owning_runs_hard_request(project, monkeypatch):
+    """RAISE SITE B, OWNER LEG. A nested auto-sweep child honors the *parent's* hard
+    request even when its own session came back `completed`.
+
+    This is the nested form of the rescued-completion trap. `stop <parent-id>` lodges
+    in the parent's dir, so the child's own channel is empty; its adapter aborts off
+    the owner leg, and `_post_kill_reconcile` can then upgrade that `aborted` back to
+    `completed` — at which point raise site A never fires. Without the owner leg here
+    the child would carry straight on into its review leg on the strength of the
+    rescue, which is exactly what #319 closed at top level.
+
+    The child must NOT consume the parent's file: the parent's own hard arm has to
+    find it to record and attribute the stop, and `via` rides the exception anyway.
+    A nested engine re-raises `RunStopped` rather than recording it, so the owner
+    sees it — hence `pytest.raises` and no `stopped` flag on the child's state.
+
+    Ablation: delete the owner leg at raise site B and the child drives its review
+    leg — `adapter.sessions` grows to 2 and this fails."""
+    killed = []
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: killed.append(rid))
+    write_sprint(project, {"1-1-a": "ready-for-dev", "1-2-b": "ready-for-dev"})
+    child_run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    owner = project.project / ".bmad-loop" / "runs" / "parent-run"
+    owner.mkdir(parents=True, exist_ok=True)
+    (owner / STOP_REQUEST_FILE).write_text(
+        '{"requested_at": "2026-08-22T00:00:00", "mode": "hard"}', encoding="utf-8"
+    )
+
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),  # returns `completed` — no abort to see
+            review_effect(project, "1-1-a", clean=True),
+        ],
+    )
+
+    depth_token = _run_depth.set(1)  # simulate the parent's run() frame
+    owner_token = set_owner_run_dir(owner)
+    try:
+        with pytest.raises(RunStopped) as caught:
+            engine.run()
+    finally:
+        reset_owner_run_dir(owner_token)
+        _run_depth.reset(depth_token)
+
+    assert caught.value.via == "stop-request"
+    assert len(adapter.sessions) == 1  # the review leg never started...
+    assert len(adapter.script) == 1  # ...its script entry is still unspent
+    assert killed == ["test-run"]  # the child tore its own session down
+    # the parent's request survives the child untouched — the owner consumes it
+    assert (owner / STOP_REQUEST_FILE).is_file()
+    assert not graceful_stop_requested(child_run_dir)  # child's own was always empty
+    # a nested child re-raises instead of recording: the owner writes `stopped`
+    assert load_state(engine.run_dir).stopped is False
+
+
+def test_nested_child_ignores_the_owning_runs_graceful_request(project, monkeypatch):
+    """The mode-exact twin: graceful means *finish the in-flight item*, and for a
+    nested sweep that means letting the child finish. A graceful request on the
+    owning run must not stop the child mid-flight — the parent suppresses the next
+    child from starting instead.
+
+    Ablation: widen the owner leg at raise site B to `is not None` and this reddens
+    alone, leaving its hard twin green."""
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: None)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    owner = project.project / ".bmad-loop" / "runs" / "parent-run"
+    owner.mkdir(parents=True, exist_ok=True)
+    (owner / STOP_REQUEST_FILE).write_text(
+        '{"requested_at": "2026-08-22T00:00:00", "mode": "graceful"}', encoding="utf-8"
+    )
+
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),
+            review_effect(project, "1-1-a", clean=True),
+        ],
+    )
+
+    depth_token = _run_depth.set(1)
+    owner_token = set_owner_run_dir(owner)
+    try:
+        engine.run()  # runs to completion, no RunStopped
+    finally:
+        reset_owner_run_dir(owner_token)
+        _run_depth.reset(depth_token)
+
+    assert len(adapter.sessions) == 2  # dev AND review — the child finished its item
+
+
+def test_run_publishes_the_owner_run_dir_and_resets_it(project, monkeypatch):
+    """`run()` publishes its run dir as the owning run for everything below and
+    releases it on the way out, by token — so a later top-level run in the same
+    process/thread is never poisoned by a previous one. A nested frame must not
+    overwrite the owner it inherited."""
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: None)
+    engine, _ = make_engine(project, [])
+
+    seen = []
+    monkeypatch.setattr(engine, "_loop", lambda: seen.append(owner_run_dir()))
+
+    assert owner_run_dir() is None
+    engine.run()
+    assert seen == [engine.run_dir]  # published for the duration
+    assert owner_run_dir() is None  # and released again
+
+    # a nested frame leaves the inherited owner alone
+    outer = project.project / ".bmad-loop" / "runs" / "outer-run"
+    depth_token = _run_depth.set(1)
+    owner_token = set_owner_run_dir(outer)
+    seen.clear()
+    try:
+        engine.run()
+    finally:
+        reset_owner_run_dir(owner_token)
+        _run_depth.reset(depth_token)
+    assert seen == [outer]  # the child inherited, it did not republish its own
 
 
 def test_hard_stop_after_completed_session_stops_before_next_leg(project, monkeypatch):
