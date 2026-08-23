@@ -519,6 +519,76 @@ def test_stop_run_refusal_says_nothing_is_pending_when_the_lodge_failed(tmp_path
     assert host.force_killed == []  # still refuses to kill an unverifiable pid
 
 
+def test_stop_run_refuses_when_the_lodge_failed_and_the_signal_was_refused(tmp_path, monkeypatch):
+    """Neither channel delivered: nothing written, nothing signalled, nothing proved.
+
+    The refusal above only fires from inside the `pid is not None` arm. A `terminate`
+    we were *refused* clears `pid` and skips that arm entirely, so this combination
+    used to reach the fallback and report success — writing `stopped=True` and
+    stamping `fallback=True` over a run whose engine may still be mutating the
+    project, with no request on disk for it to honor.
+
+    Not a regression: on the merge-base every refused signal ended here, because
+    `stop_run` cleared the request as its first statement. What does not survive is
+    the *justification* for reporting success — that the request stays lodged, so the
+    stop is still in flight. When the lodge failed, nothing is in flight.
+
+    Ablation: delete the `engine_may_live and not lodged` branch -> this reddens on
+    the `pytest.raises` itself ("DID NOT RAISE"), not on the asserts below it, which
+    are never reached; `stop_run` falls through to the fallback and returns True. The
+    twin below is the position axis, and stays green under this one."""
+    killed = []
+    monkeypatch.setattr(runs, "kill_session", lambda rid: killed.append(rid))
+    run_dir = _make_state_run(tmp_path, "r1")
+    (run_dir / "engine.pid").write_text("4242 123.0")
+
+    def _enospc(_run_dir, _mode):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(runs, "_write_stop_request", _enospc)
+    host = _FakeHost(alive=True, identity=123.0, on_terminate=_raise(PermissionError()))
+    monkeypatch.setattr(runs, "get_process_host", lambda: host)
+
+    with pytest.raises(runs.StopRunError, match="no stop is pending"):
+        runs.stop_run(run_dir)
+    assert killed == ["r1"]  # the session backstop still runs, ahead of the refusal
+    assert load_state(run_dir).stopped is False  # never claimed a stop it did not make
+    journal = (run_dir / "journal.jsonl").read_text()
+    assert "run-stop-undelivered" in journal  # the attempt is on the record
+    assert '"fallback": true' not in journal  # and not as a completed stop
+
+
+def test_stop_run_still_trusts_an_engine_written_stop_when_the_lodge_failed(tmp_path, monkeypatch):
+    """The placement ablation for the refusal above: it must sit *after* the
+    `state.stopped` return, not before it.
+
+    Same failed lodge and same refused signal, but the engine already honored an
+    earlier stop and recorded it. `stop` is then reporting a stop that genuinely
+    happened, so it must return True — raising here would turn a settled run into a
+    CLI failure on the operator's second `stop`.
+
+    Ablation: move the refusal ahead of the `if state.stopped:` branch -> this test
+    raises while the one above still passes. Both are needed: the pair pins the
+    branch's presence *and* its position."""
+    killed = []
+    monkeypatch.setattr(runs, "kill_session", lambda rid: killed.append(rid))
+    run_dir = _make_state_run(tmp_path, "r1")
+    st = load_state(run_dir)
+    st.stopped = True  # an earlier stop the engine honored and recorded itself
+    save_state(run_dir, st)
+    (run_dir / "engine.pid").write_text("4242 123.0")
+
+    def _enospc(_run_dir, _mode):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(runs, "_write_stop_request", _enospc)
+    host = _FakeHost(alive=True, identity=123.0, on_terminate=_raise(PermissionError()))
+    monkeypatch.setattr(runs, "get_process_host", lambda: host)
+
+    assert runs.stop_run(run_dir) is True
+    assert killed == ["r1"]
+
+
 def test_stop_run_stops_sigterm_immune_child_via_stop_request_file(tmp_path, monkeypatch):
     """THE #319 acceptance test: a stand-in engine that cannot be reached by signal
     stops *itself* off the control file, and stop_run confirms rather than blindly

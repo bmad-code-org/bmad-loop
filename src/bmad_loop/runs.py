@@ -1383,6 +1383,30 @@ def stop_run(run_dir: Path) -> bool:
         clear_graceful_stop(run_dir)
         return True
 
+    # Neither channel was delivered: nothing is lodged, and we never proved the engine
+    # dead. This is the one outcome `stop` must not report as success — the operator is
+    # left believing a request is in flight that was never written, while an engine we
+    # could not signal keeps mutating the project. The pid-reuse guard above already
+    # refuses for its own path; these are its siblings, and the only reason they stayed
+    # quiet is that they clear `pid` and skip that block. Not a regression — on the
+    # merge-base this was the state of *every* refused signal, because `stop_run` cleared
+    # the request as its first statement — but the earlier decision to report success
+    # rested on the request being retained, which is exactly what did not happen here.
+    #
+    # Placement is load-bearing, twice over. It sits *after* the session backstop
+    # because refusing to report a stop is no reason to leak the window, and *after* the
+    # `state.stopped` return because a run the engine already honored must not be
+    # reported as a failure. Journal the attempt before raising: the `run-stop` append
+    # below is skipped, and an unrecorded stop attempt is its own trap.
+    if engine_may_live and not lodged:
+        Journal(run_dir).append("run-stop-undelivered", pid=pid)
+        raise StopRunError(
+            f"run {run_dir.name}: the stop request could not be written to the run "
+            "directory and the engine could not be proved dead, so no stop is pending. "
+            "Its agent session was killed as a backstop. Free space in the run directory "
+            "and retry, or stop the process yourself"
+        )
+
     # Fallback: no live engine (or it never confirmed). Mark it stopped here. Discard
     # the request first — nothing is left alive to consume it, and a file outliving
     # the run it asked to stop is a trap for the next resume.

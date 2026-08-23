@@ -66,6 +66,11 @@ breaking changes may land in a minor release.
   honors the stop request itself now, so it is the single writer of `stopped` again and
   `run-stop fallback=True` is no longer stamped on a stop the engine recorded itself — it marks
   one this tool had to complete from outside.
+- **`bmad-loop stop` no longer reports success when it delivered neither channel (#319).** A run
+  directory that rejects the request write, followed by a signal the OS refuses, left the CLI
+  saying the run had stopped — and stamping `run-stop fallback=True` — over an engine that may
+  still be running with nothing on disk to stop it. It now kills the agent session as a backstop,
+  records the undelivered attempt, and exits non-zero naming the retry.
 - **Two concurrent `stop` invocations against one run no longer collide on a staging temp (#319).**
   The write staged through a fixed `stop-request.json.tmp`, so the loser's rename raised
   `FileNotFoundError`. It now stages under a per-writer name: the last write wins and neither
