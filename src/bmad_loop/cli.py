@@ -3366,6 +3366,21 @@ def _cmd_request_graceful(run_dir: Path, run_id: str) -> int:
     except runs.GracefulStopError as e:
         print(str(e), file=sys.stderr)
         return 1
+    except OSError as e:
+        # The lodge creates the file first and writes the body into it, and it
+        # deliberately does not roll back a failed write (see _create_stop_request:
+        # an unlink there resolves the *name*, so it could delete a hard request a
+        # concurrent `stop` escalated onto it). So a write that failed part-way
+        # still leaves a request standing, and a short body reads as graceful —
+        # the mode we were asked for. Say so rather than reporting a clean failure
+        # the operator would act on by asking again (#319).
+        print(
+            f"run {run_id}: stop request could not be written ({e}) — a graceful "
+            f"request may still be pending; check `bmad-loop status {run_id}` and "
+            f"use `bmad-loop stop {run_id} --cancel-graceful` to withdraw it",
+            file=sys.stderr,
+        )
+        return 1
     if outcome == "already-pending":
         # Mode-neutral for the same reason `--cancel-graceful` is: the pending
         # request may be a *hard* one (a `stop` that could not prove the engine

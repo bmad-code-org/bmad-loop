@@ -84,7 +84,10 @@ breaking changes may land in a minor release.
 - **`stop --graceful` no longer downgrades a hard request that landed while it ran (#319).** The
   graceful lodge is now an atomic `O_CREAT | O_EXCL` create that answers "already pending" for
   anything already there, and a symlink planted at the path is refused rather than followed. Two
-  concurrent graceful asks resolve the same way, which is the documented idempotency.
+  concurrent graceful asks resolve the same way, which is the documented idempotency. A write that
+  fails part-way leaves the request standing instead of rolling back — an unlink there resolves the
+  path, not the file the call created, so it could remove a hard request escalated onto it — and
+  `stop --graceful` reports it as possibly pending rather than as a clean failure.
 - **A policy field of the wrong TOML type now raises `PolicyError` naming `section.key`
   (#440).** `loads()` coerced with bare `int()`/`float()`/`bool()`/`str()` outside the
   `PolicyError` funnel, so a wrong-typed value escaped every handler written to degrade on

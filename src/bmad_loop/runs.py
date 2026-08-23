@@ -1067,22 +1067,36 @@ def _create_stop_request(run_dir: Path) -> bool:
 
     Refuses a planted symlink rather than following it — ``O_EXCL`` never
     dereferences — which is stricter than the ``follow_symlinks=False`` replace it
-    replaces."""
+    replaces.
+
+    A failed write is deliberately NOT rolled back, and that is load-bearing rather
+    than sloppy. ``unlink`` resolves a *name*, not the inode this call created, so a
+    rollback here would delete whatever occupies the path at that moment — including
+    a ``"hard"`` request a concurrent ``stop`` escalated onto it while this write was
+    in flight. That is a ``hard -> absent`` drop, the one descent the mode lattice
+    :func:`consume_stop_request` documents must never happen, and on native Windows
+    it would silently withdraw the only channel that can stop the engine. Guarding it
+    is not available: an "unlink only if still my inode" step does not exist as one
+    atomic operation, and both check-then-unlink shapes measure *worse* than no guard
+    at all — the check moves the decision earlier and the destructive act later by
+    its own cost, shifting the window rather than narrowing it (inode compare 1.39x,
+    mode compare 2.30x, over a rendezvous-synchronised escalation sweep on btrfs).
+
+    What a failed write leaves behind is a short or empty body, which
+    :func:`read_stop_request_mode` reads as ``"graceful"`` — exactly the mode this
+    function was asked to lodge, for the one caller (``stop --graceful``) that an
+    operator drove. It does not wedge the channel: a later graceful ask answers
+    "already-pending", a later *hard* stop supersedes it unconditionally, and
+    ``stop --cancel-graceful`` or ``resume`` withdraws it. Leaving a graceful request
+    standing is the bounded direction this channel already leans on everywhere else."""
     body = json.dumps({"requested_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "mode": "graceful"})
     path = run_dir / STOP_REQUEST_FILE
     try:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
         return False  # a request is already pending — a planted link included
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(body)
-    except BaseException:
-        # never leave an empty file behind: it would read as a pending graceful
-        # request that no operator asked for, and block every later lodge.
-        with contextlib.suppress(OSError):
-            path.unlink()
-        raise
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(body)
     return True
 
 
@@ -1118,6 +1132,13 @@ def consume_stop_request(run_dir: Path) -> str | None:
     only ever writes ``"hard"``, so ``absent < graceful < hard`` until consumed. A
     stale ``"hard"`` read is therefore always still true; a stale ``"graceful"`` may
     not be.
+
+    Monotone requires that no writer *descends* either, which is why
+    :func:`_create_stop_request` has no rollback on a failed write: an ``unlink``
+    keyed on the path rather than the inode it created is a ``hard -> absent`` drop,
+    and it would put a second way to lose a hard request in a *writer* — leaving the
+    three read-then-unlink sites in ``engine.py`` that rely on this argument resting
+    on something untrue.
 
     Re-reading the mode immediately before the unlink does NOT fix this, and is a
     trap worth naming: measured over 4000 injected races it made the loss *more*

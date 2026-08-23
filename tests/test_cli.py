@@ -2125,6 +2125,25 @@ def test_stop_graceful_reports_a_pending_hard_request_without_calling_it_gracefu
     assert runs.read_stop_request_mode(run_dir) == "hard"
 
 
+def test_stop_graceful_reports_a_failed_write_as_possibly_pending(tmp_path, monkeypatch, capsys):
+    """The lodge deliberately does not roll back a failed write — an unlink there
+    resolves the name and could delete a hard request a concurrent `stop` escalated
+    onto it. So a request can be standing even though the write raised, and saying
+    "failed" flatly would invite the operator to ask again for something already
+    pending. Same exit code; accurate message."""
+    from bmad_loop import runs
+
+    def _boom(_run_dir):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(runs, "request_graceful_stop", _boom)
+    _make_run_with_state(tmp_path, "r1")
+    assert cli.main(["stop", "--project", str(tmp_path), "r1", "--graceful"]) == 1
+    err = capsys.readouterr().err
+    assert "may still be pending" in err
+    assert "--cancel-graceful" in err  # names the way to withdraw it
+
+
 def test_stop_cancel_graceful_clears_pending(tmp_path, capsys):
     from bmad_loop import runs
 

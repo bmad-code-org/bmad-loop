@@ -1185,6 +1185,83 @@ def test_consume_stop_request_never_removes_a_request_it_did_not_read(tmp_path, 
     assert runs.read_stop_request_mode(tmp_path) == "hard"  # NOT swallowed
 
 
+def test_create_stop_request_failed_write_never_deletes_a_concurrent_hard_request(
+    tmp_path, monkeypatch
+):
+    """The writer's *rollback* path is the third way a hard request could be lost,
+    and it is the one the monotone-lattice argument did not cover: that argument
+    enumerates the readers and the writers' success paths, and concludes only a
+    reader acting on a stale "graceful" can lose anything.
+
+    `_create_stop_request` creates the file with `O_EXCL` and then writes the body
+    into it, so a failed write once rolled back with `path.unlink()`. `unlink`
+    resolves the *name*, not the inode this call created — so a `stop` escalating to
+    `mode: "hard"` onto that name while the write was in flight was deleted by the
+    cleanup of a graceful lodge that never completed. That is a `hard -> absent`
+    drop, below both rungs of the lattice, and on native Windows it withdraws the
+    only channel that can stop the engine while `stop_run` still reports the request
+    lodged.
+
+    Closed by subtraction: there is no rollback. A short or empty body reads as
+    "graceful", which is the mode this call was asked to lodge anyway.
+
+    ⚠️ Guarding the unlink instead does NOT fix this and measurably worsens it, the
+    same trap `consume_stop_request` documents: the check moves the decision earlier
+    and the destructive act later by its own cost, shifting the window rather than
+    narrowing it (inode compare 1.39x, mode compare 2.30x worse over a
+    rendezvous-synchronised escalation sweep). There is also no atomic
+    "unlink only if still my inode" to reach for, and `st_ino` is 0 on several
+    Windows filesystems, which would make the compare a false *equal*.
+
+    Ablation: restore the `except BaseException: path.unlink(); raise` cleanup ->
+    the last assert fails with the mode `None`, because the escalation this test
+    injects is exactly what that unlink removes."""
+    escalated: list[str] = []
+    real_fdopen = os.fdopen
+
+    def _escalate_then_fail(fd, *a, **kw):
+        if escalated:  # nested use by the hard writer's own staged write
+            return real_fdopen(fd, *a, **kw)
+        escalated.append("hard")
+        os.close(fd)  # the graceful file exists and is empty, as O_EXCL left it
+        runs._write_stop_request(tmp_path, "hard")  # concurrent `bmad-loop stop`
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(os, "fdopen", _escalate_then_fail)
+
+    with pytest.raises(OSError):
+        runs._create_stop_request(tmp_path)
+    assert escalated == ["hard"]  # the interleave really happened
+    assert runs.read_stop_request_mode(tmp_path) == "hard"  # NOT swallowed
+
+
+def test_create_stop_request_failed_write_leaves_a_graceful_request_standing(tmp_path, monkeypatch):
+    """The other half of removing the rollback, stated as its own behavior rather
+    than left implicit: a write that fails part-way leaves the request pending.
+
+    That is the bounded direction. The one production caller is `stop --graceful`,
+    which an operator drove, so the standing request is the one they asked for; a
+    short body reads as "graceful"; a later hard stop supersedes it unconditionally
+    and a later graceful ask answers "already-pending", so the channel is never
+    wedged; and `--cancel-graceful` or `resume` withdraws it. The CLI says so
+    instead of reporting a clean failure.
+
+    Ablation: restore the cleanup -> the file is gone and the mode is `None`."""
+    real_fdopen = os.fdopen
+
+    def _fail(fd, *a, **kw):
+        os.close(fd)
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(os, "fdopen", _fail)
+    with pytest.raises(OSError):
+        runs._create_stop_request(tmp_path)
+    monkeypatch.setattr(os, "fdopen", real_fdopen)
+
+    assert (tmp_path / runs.STOP_REQUEST_FILE).is_file()
+    assert runs.read_stop_request_mode(tmp_path) == "graceful"
+
+
 def test_request_graceful_stop_keeps_escalation_unconditional(tmp_path, monkeypatch):
     """The mirror direction, which the refusal above must not have cost. A hard
     request landing *after* the graceful file exists still supersedes it — that is
