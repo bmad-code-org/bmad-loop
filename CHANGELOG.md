@@ -60,6 +60,13 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **A queued release publish can no longer be evicted by a newer push (#468)** — the
+  repo-wide `release-publish` concurrency group now sets `queue: max`; the default
+  single-slot queue cancels an older _pending_ run when a newer one queues, so a
+  maintenance-branch publish could be silently discarded by an unrelated `main` push.
+  Also pins `cmd_publish`'s `check=False` with a regression test (the lost-race swallow
+  was one revert away from dead code with the suite still green) and corrects a comment
+  that still described the group as keying on `github.ref`.
 - TUI: story-gate and epic-boundary pauses open a pause-reason viewer naming the blocking
   entries and the remedy, instead of an empty spec pane (#515)
 - **Provisioning refuses an unparseable seeded hook config instead of silently replacing it

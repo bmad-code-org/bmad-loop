@@ -543,13 +543,14 @@ def cmd_publish(args: argparse.Namespace) -> int:
     if proc.returncode != 0:
         # The `tag_exists` probe above reads the *checkout's* refs, and nothing
         # fetches between it and this call — so it answers for tag state at
-        # checkout time, not for the remote now. Since release.yml fires on
-        # `main` and on `release/*`, and its concurrency group keys on
-        # `github.ref` (two branches ⇒ two groups), two runs carrying the same
-        # version can both pass the probe and both land here. Losing that race
-        # is not a failure: the winner created this exact tag from this exact
-        # CHANGELOG section, so the desired end state already holds. Anything
-        # else is a real error and still dies loudly.
+        # checkout time, not for the remote now. release.yml serializes its own
+        # runs (one repo-wide `release-publish` concurrency group), but that
+        # group covers only CI: a publisher outside it — a manual
+        # `release.py publish`, a hand-cut release — can create this tag after
+        # our checkout and before this call. Losing that race is not a failure:
+        # the winner created this exact tag from this exact CHANGELOG section,
+        # so the desired end state already holds. Anything else is a real error
+        # and still dies loudly.
         if _already_exists(proc.stderr):
             print(f"{tag} was created concurrently — nothing to publish")
             return 0
