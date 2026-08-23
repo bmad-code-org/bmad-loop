@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import hashlib
 import json
 import math
@@ -36,11 +37,21 @@ from .process_host import ProcessHostError, get_process_host
 RUNS_DIR = Path(".bmad-loop") / "runs"
 ARCHIVE_DIR = Path(".bmad-loop") / "archive"
 PID_FILE = "engine.pid"
-# Cross-process channel for a graceful-stop request: a control file the requester
-# (CLI/TUI) writes and the engine polls at item boundaries. Distinct from the hard
-# SIGTERM stop_run delivers — there is no SIGUSR1 on Windows/psmux and SIGTERM
-# already means "hard stop". The engine stays the single writer of journal.jsonl;
-# requesters only ever touch this file.
+# Cross-process channel for a stop request: a control file the requester (CLI/TUI)
+# writes and the engine reads. The body carries a `mode` — "graceful" or "hard".
+#
+#   graceful (`stop --graceful`): finish the in-flight item, then finalize and stop.
+#     Honored at item boundaries only; resumable.
+#   hard (`stop`): stop now. Lodged by stop_run *before* it signals, honored by the
+#     engine at item boundaries and mid-session by the adapter wait loop.
+#
+# The file exists because signals are not a portable stop channel: there is no
+# SIGUSR1 on Windows/psmux, and an inter-process SIGTERM is never delivered to a
+# native-Windows engine at all, so the win32 "graceful" terminate is a no-op that
+# only ever burned _STOP_WAIT_S into a force-kill (#319). SIGTERM remains the POSIX
+# fast path — the file is what makes a stop work everywhere else. The engine stays
+# the single writer of journal.jsonl, and the single *consumer* of this file;
+# requesters only ever write it, adapters only ever read it.
 STOP_REQUEST_FILE = "stop-request.json"
 # The host-exec config baseline's name inside a run's state dir (see
 # `config_digest_path_for`). A bare hex digest, not JSON: one opaque token, and a
@@ -55,9 +66,10 @@ _INVALID_PID_IDENTITY = -1.0  # impossible process start/create time; forces "no
 
 
 class StopRunError(Exception):
-    """A live run could not be stopped — the engine ignored SIGTERM and its pid's
-    identity can no longer be verified, so force-killing would risk an unrelated
-    (reused) pid. The caller surfaces this rather than silently marking stopped."""
+    """A live run could not be stopped — the engine honored neither channel (the
+    lodged stop request nor SIGTERM) and its pid's identity can no longer be
+    verified, so force-killing would risk an unrelated (reused) pid. The caller
+    surfaces this rather than silently marking stopped."""
 
 
 class GracefulStopError(Exception):
@@ -76,6 +88,13 @@ class LiveSessionError(Exception):
 # marking the run stopped itself.
 _STOP_WAIT_S = 10.0
 _STOP_POLL_S = 0.1
+# How long stop_run lets a force-kill settle before deciding it failed. A kill that
+# returns cleanly is not proof of death — win32 shells `taskkill /F /T` with
+# `check=False`, so a refused kill raises nothing — but the pid can also linger for a
+# moment after a delivered SIGKILL, and `is_alive` is a bare existence probe that
+# reads a not-yet-reaped process as alive. Long enough to outlast that, short enough
+# that a genuinely surviving engine is still noticed while the operator waits.
+_KILL_CONFIRM_S = 0.5
 
 
 def new_run_id() -> str:
@@ -910,19 +929,184 @@ def prune_sessions(
     return prunable, live, unknown
 
 
+# The run dir of the OUTERMOST engine in this call stack (#319). A nested auto-sweep
+# runs synchronously in its parent's thread but mints its own run id and dir, so its
+# adapters would poll a control file no operator ever writes to: `bmad-loop stop
+# <parent-id>` lodges in the parent's dir. This carries the owning run dir down to
+# them. A ContextVar, mirroring `engine._run_depth`, because the nesting it tracks is
+# same-thread by construction; set once by the outermost `Engine.run()` and reset by
+# token, so a later top-level run in the same process is never poisoned.
+_owner_run_dir: contextvars.ContextVar[Path | None] = contextvars.ContextVar(
+    "bmad_loop_owner_run_dir", default=None
+)
+
+
+def set_owner_run_dir(run_dir: Path) -> contextvars.Token[Path | None]:
+    """Claim ``run_dir`` as the owning run for this call stack. Returns the token the
+    caller must hand to :func:`reset_owner_run_dir` from a ``finally``."""
+    return _owner_run_dir.set(run_dir)
+
+
+def reset_owner_run_dir(token: contextvars.Token[Path | None]) -> None:
+    """Release the claim made by :func:`set_owner_run_dir`."""
+    _owner_run_dir.reset(token)
+
+
+def owner_run_dir() -> Path | None:
+    """The outermost engine's run dir, or None outside any run — which is what a
+    standalone adapter (tests, probes) reads, so callers fall back to their own."""
+    return _owner_run_dir.get()
+
+
 def graceful_stop_requested(run_dir: Path) -> bool:
-    """True when a graceful-stop request is pending for this run (its control file
-    is present). The single definition of "requested" the engine checks at item
-    boundaries and the CLI/TUI surface — a bare existence read, never raising."""
+    """True when *some* stop request is pending for this run — either mode. A bare
+    existence read of the control file, never raising and deliberately never parsing.
+
+    Every consumer wants exactly that existence question, not the mode: the
+    ``stopping`` projection and the TUI badge (a run with a hard request lodged is
+    stopping too), the ``--graceful`` idempotency check (a lodged hard request means
+    a *stronger* stop already stands — "already-pending" is the right answer), the
+    stories done-checkpoint skip, and auto-sweep suppression. Only ``status``'s
+    ``graceful_stop_pending`` field is mode-exact; it calls
+    :func:`read_stop_request_mode` instead."""
     return (run_dir / STOP_REQUEST_FILE).is_file()
 
 
+def read_stop_request_mode(run_dir: Path) -> str | None:
+    """The mode of this run's pending stop request: ``"hard"``, ``"graceful"``, or
+    ``None`` when none is pending.
+
+    ``None`` means *absent*, and only absent — it is returned for
+    ``FileNotFoundError`` alone. Everything else about a file that is *present*
+    reads ``"graceful"``: a modeless body (every pre-#319 writer and test fixture
+    wrote one — this is the back-compat pin), unparseable or non-object JSON, and a
+    transient read failure such as the win32 sharing violation a concurrent
+    ``atomic_replace`` raises mid-write.
+
+    Leaning graceful on every ambiguity is load-bearing, not defensive habit. A
+    misread graceful costs at most one more item before the run stops; a spurious
+    ``"hard"`` would abort a live session — so a torn read must never be able to
+    produce one."""
+    return _stop_request_mode_of(run_dir / STOP_REQUEST_FILE)
+
+
+def _stop_request_mode_of(path: Path) -> str | None:
+    """The parse half of :func:`read_stop_request_mode`, split out so
+    :func:`consume_stop_request` can answer for the file it *took* rather than for
+    whatever currently answers to the channel name."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        # present but unreadable this tick (sharing violation, undecodable bytes) —
+        # answer for the file we know is there, never escalate on a failed read.
+        return "graceful"
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        return "graceful"
+    if isinstance(body, dict) and body.get("mode") == "hard":
+        return "hard"
+    return "graceful"
+
+
+def _write_stop_request(run_dir: Path, mode: str) -> None:
+    """Lodge a stop request of ``mode`` on the control-file channel, written
+    atomically so a concurrent engine read never sees a partial body.
+
+    The atomic replace *is* the supersede: writing ``"hard"`` over a pending
+    ``"graceful"`` escalates the request in one step, with no window in which
+    nothing is pending for the engine to find.
+
+    That is the only direction this function arbitrates, and the only one it may:
+    ``stop_run`` shares it and its escalation must stay unconditional. The channel is
+    otherwise last-writer-wins, so the *reverse* — a graceful write landing on a
+    pending hard request and downgrading it — is refused by a different writer
+    entirely: :func:`_create_stop_request`, which lodges the graceful mode with
+    ``O_CREAT | O_EXCL`` so "is one pending?" and "lodge mine" are a single atomic
+    step. Splitting the two directions across two functions is what lets this one
+    stay an unconditional replace.
+
+    Goes through :func:`platform_util.atomic_write_text` rather than a hand-rolled
+    ``tmp + atomic_replace``, for the reason ``operatoractions`` was migrated under
+    #379: this is the one control file with genuinely *concurrent* writers — two
+    ``stop`` invocations against the same run, in either mode — and a fixed ``.tmp``
+    sibling is exactly what two writers of the same key collide on. Interleaved,
+    both stage over one name and the loser's ``os.replace`` raises
+    ``FileNotFoundError`` after the winner's consumed it; on the hard path that
+    would abort ``stop_run`` *before* it ever signals. A ``mkstemp`` temp per writer
+    removes the collision: the last replace wins and neither writer errors.
+
+    ``follow_symlinks=False`` preserves what the bare ``os.replace`` did — it never
+    dereferenced this destination — and matches what the file is: machine-minted
+    control state under a run dir a driven session can reach. It now lands at
+    ``mkstemp``'s ``0600`` instead of ``0644 & ~umask``; nothing reads it
+    cross-user."""
+    body = json.dumps({"requested_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "mode": mode})
+    atomic_write_text(run_dir / STOP_REQUEST_FILE, body, follow_symlinks=False)
+
+
+def _create_stop_request(run_dir: Path) -> bool:
+    """Lodge a *graceful* request only if none is pending; False when one already is.
+
+    ``O_CREAT | O_EXCL`` is the arbitration. It makes "is a request pending?" and
+    "lodge mine" one atomic step against the destination name, so a hard request
+    landing at any instant either already exists — we refuse, leaving it standing —
+    or replaces what we wrote, which is escalation, the direction
+    :func:`_write_stop_request` owns. A re-read immediately before an unconditional
+    replace could only ever *narrow* that window (~1.3ms on a journalling
+    filesystem, where the fsync dominates); this closes it.
+
+    Graceful-ONLY by construction, and that is what makes the non-atomic body safe.
+    The bytes are written *into* the created file rather than replaced in, so a
+    concurrent reader can catch it empty — and :func:`read_stop_request_mode`
+    answers ``"graceful"`` for a present-but-unparseable body, which is the very
+    mode being written. The invariant that matters is untouched: a torn read must
+    never produce ``"hard"``, so a hard writer must keep the atomic replace.
+
+    Refuses a planted symlink rather than following it — ``O_EXCL`` never
+    dereferences — which is stricter than the ``follow_symlinks=False`` replace it
+    replaces.
+
+    A failed write is deliberately NOT rolled back, and that is load-bearing rather
+    than sloppy. ``unlink`` resolves a *name*, not the inode this call created, so a
+    rollback here would delete whatever occupies the path at that moment — including
+    a ``"hard"`` request a concurrent ``stop`` escalated onto it while this write was
+    in flight. That is a ``hard -> absent`` drop, the one descent the mode lattice
+    :func:`consume_stop_request` documents must never happen, and on native Windows
+    it would silently withdraw the only channel that can stop the engine. Guarding it
+    is not available: an "unlink only if still my inode" step does not exist as one
+    atomic operation, and both check-then-unlink shapes measure *worse* than no guard
+    at all — the check moves the decision earlier and the destructive act later by
+    its own cost, shifting the window rather than narrowing it (inode compare 1.39x,
+    mode compare 2.30x, over a rendezvous-synchronised escalation sweep on btrfs).
+
+    What a failed write leaves behind is a short or empty body, which
+    :func:`read_stop_request_mode` reads as ``"graceful"`` — exactly the mode this
+    function was asked to lodge, for the one caller (``stop --graceful``) that an
+    operator drove. It does not wedge the channel: a later graceful ask answers
+    "already-pending", a later *hard* stop supersedes it unconditionally, and
+    ``stop --cancel-graceful`` or ``resume`` withdraws it. Leaving a graceful request
+    standing is the bounded direction this channel already leans on everywhere else."""
+    body = json.dumps({"requested_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "mode": "graceful"})
+    path = run_dir / STOP_REQUEST_FILE
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return False  # a request is already pending — a planted link included
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(body)
+    return True
+
+
 def clear_graceful_stop(run_dir: Path) -> bool:
-    """Consume a pending graceful-stop request, returning True iff one was present
-    and removed. Never raises: a hard stop and a resume both call this to cancel a
-    superseded request, and a missing file (already consumed by the engine, or
-    never written) or an unremovable one must not wedge those paths. Uses the same
-    win32 sharing-violation retry the atomic write pairs with."""
+    """Consume a pending stop request of *either* mode, returning True iff one was
+    present and removed. Never raises: the engine calls this the moment it honors a
+    request, a resume calls it to discard a stale one, and stop_run calls it on the
+    paths where nothing is left alive to read what it lodged — a missing file
+    (already consumed) or an unremovable one must not wedge any of them. Uses the
+    same win32 sharing-violation retry the atomic write pairs with."""
     try:
         retrying_unlink(run_dir / STOP_REQUEST_FILE)
     except OSError:
@@ -932,19 +1116,75 @@ def clear_graceful_stop(run_dir: Path) -> bool:
     return True
 
 
+def consume_stop_request(run_dir: Path) -> str | None:
+    """Take the pending request off the channel and answer the mode of the very file
+    removed, or ``None`` when none was pending.
+
+    The reader-side counterpart of :func:`_create_stop_request`'s
+    ``O_CREAT | O_EXCL``: the rename *is* the consume, so "what mode is pending?"
+    and "take it" cannot disagree. A read followed by an unlink can, and the gap is
+    not academic — a concurrent ``stop`` escalating to ``"hard"`` in between is
+    deleted unread while the caller routes on the stale ``"graceful"`` it already
+    holds.
+
+    Only that direction can lose anything, because the mode lattice is monotone:
+    the graceful writer refuses to overwrite an existing request and the hard writer
+    only ever writes ``"hard"``, so ``absent < graceful < hard`` until consumed. A
+    stale ``"hard"`` read is therefore always still true; a stale ``"graceful"`` may
+    not be.
+
+    Monotone requires that no writer *descends* either, which is why
+    :func:`_create_stop_request` has no rollback on a failed write: an ``unlink``
+    keyed on the path rather than the inode it created is a ``hard -> absent`` drop,
+    and it would put a second way to lose a hard request in a *writer* — leaving the
+    three read-then-unlink sites in ``engine.py`` that rely on this argument resting
+    on something untrue.
+
+    Re-reading the mode immediately before the unlink does NOT fix this, and is a
+    trap worth naming: measured over 4000 injected races it made the loss *more*
+    likely, not less (164 -> 929 swallowed), because the extra read lengthens the
+    interval an escalation has to land in. Narrowing a window is not closing it —
+    only one atomic step is.
+
+    A hard request lodged *after* the take is a new request against a run already
+    stopping. It stays at the canonical name for ``run()``'s finally to discard and
+    journal as ``stop-request-discarded`` — a record, not a silent loss."""
+    src = run_dir / STOP_REQUEST_FILE
+    taken = run_dir / (STOP_REQUEST_FILE + ".consumed")
+    try:
+        atomic_replace(src, taken)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        # Could not take it (read-only dir, a sharing violation past its retries).
+        # Leave it on the channel and answer from the canonical name: the next
+        # boundary re-asks, which is strictly better than losing the request.
+        return read_stop_request_mode(run_dir)
+    try:
+        return _stop_request_mode_of(taken)
+    finally:
+        with contextlib.suppress(OSError):
+            retrying_unlink(taken)
+
+
 def request_graceful_stop(run_dir: Path) -> str:
     """Ask a live run to stop gracefully: finish the in-flight item (story ->
     dev/review/commit, or a sweep bundle through commit) cleanly, then finalize and
-    stop — resumable, unlike the hard SIGTERM :func:`stop_run` delivers.
+    stop — resumable, unlike the hard stop :func:`stop_run` delivers.
 
-    Delivery is the :data:`STOP_REQUEST_FILE` control file, written atomically (tmp
-    + ``atomic_replace``) so a concurrent engine read never sees a partial file.
+    Delivery is the :data:`STOP_REQUEST_FILE` control file, written atomically by
+    :func:`_write_stop_request` so a concurrent engine read never sees a partial file.
     Never signals the process and never writes ``journal.jsonl`` (engine-owned
     single-writer). Returns a status token for the caller to message on:
 
     - ``"requested"`` — file written; a provably-live engine will honor it.
     - ``"already-pending"`` — a request was already on disk; left untouched so its
-      original ``requested_at`` stands (idempotent — a second ask is a no-op).
+      original ``requested_at`` stands (idempotent — a second ask is a no-op). The
+      token is mode-blind, and the pending request is not necessarily graceful: a
+      *hard* one sits there at rest whenever a `stop` could not prove the engine
+      dead, and one can also land while this call is in flight. A stronger stop
+      stands either way and must not be downgraded — so callers message this token
+      as a *stop request*, never as a graceful one (#319).
     - ``"requested-unverifiable"`` — file written, but engine liveness read
       ``'unknown'`` (e.g. a win32 access-denied pid): the request stands and fires
       if an engine is in fact running; the caller warns that it can't confirm.
@@ -963,33 +1203,74 @@ def request_graceful_stop(run_dir: Path) -> str:
             f"run {run_dir.name} has no live engine — a graceful stop request would "
             f"never be consumed; use `bmad-loop resume {run_dir.name}` to continue it"
         )
-    path = run_dir / STOP_REQUEST_FILE
-    tmp = path.with_name(path.name + ".tmp")
-    body = json.dumps({"requested_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "mode": "graceful"})
-    tmp.write_text(body, encoding="utf-8")
-    atomic_replace(tmp, path)
+    # The write IS the check. The existence test at the top of this function is
+    # separated from here by a pid-file read, a liveness probe and (formerly) a
+    # mkstemp and an fsync — measured at ~1.3ms median on btrfs, wide enough for a
+    # concurrent `stop` to lodge `"hard"` in between — and the channel is
+    # last-writer-wins, so an unconditional replace here would silently *downgrade*
+    # it and cost the abort the operator asked for. A re-read just before the replace
+    # narrows that window; a create-if-absent removes it, because there is no longer
+    # a gap between deciding and writing. "already-pending" is the same answer the
+    # check at the top gives, and the right one either way: a lodged hard request is
+    # a *stronger* stop already standing. Two concurrent *graceful* asks resolve the
+    # same way, which is the documented idempotency — the first one's timestamp
+    # stands. The escalation direction is untouched and stays unconditional.
+    if not _create_stop_request(run_dir):
+        return "already-pending"
     return "requested" if liveness == "alive" else "requested-unverifiable"
 
 
 def stop_run(run_dir: Path) -> bool:
     """Stop a live run. Returns False if it was already finished.
 
-    Prefers the engine's own SIGTERM handler so the engine stays the single
-    writer of `stopped` (it marks the run, kills its in-flight agent window, and
-    exits). Falls back to an external kill + mark when there is no live engine
-    pid, it is a legacy run, or it does not exit in time. A wedged engine that
-    ignores SIGTERM past the grace window is force-killed — but only while we can
-    still prove the pid is the same process we signalled (a pid-reuse guard);
-    otherwise we raise StopRunError rather than risk killing an unrelated process.
+    The request is delivered two ways at once, and the engine wins whichever race
+    it can: a ``mode: hard`` :data:`STOP_REQUEST_FILE` is lodged *first*, then the
+    engine is signalled. SIGTERM is the POSIX fast path — the handler stops the run
+    within the tick. The file is what makes the stop work where the signal cannot
+    land: a native-Windows engine never receives an inter-process SIGTERM, so before
+    #319 every Windows stop burned the full grace window into a blind force-kill.
+    Now the engine reads the file at its next item boundary, or mid-session in the
+    adapter wait loop, and performs its own teardown either way.
+
+    That ordering is the whole point: lodging before signalling means the engine can
+    never exit the signal path having missed a request that was only written after.
+
+    Either way the engine stays the single writer of `stopped` (it marks the run,
+    kills its in-flight agent window, and exits). Falls back to an external kill +
+    mark when there is no live engine pid, it is a legacy run, or it does not exit
+    in time. A wedged engine that ignores both channels past the grace window is
+    force-killed — but only while we can still prove the pid is the same process we
+    signalled (a pid-reuse guard); otherwise we raise StopRunError rather than risk
+    killing an unrelated process.
+
+    The lodged file is consumed by whoever settles the run: the engine when it
+    honors the request, or this function on the paths where nothing is left alive to
+    read it. Both exceptions to that turn on the same question — did we ever *prove*
+    the engine dead? Where we did not, the file stays lodged, because it is then the
+    only channel that can still stop it: the StopRunError refusal below (we decline
+    to force-kill an unverifiable pid), and the ``engine_may_live`` paths where the
+    signal or the kill was refused outright rather than racing us to exit.
     """
     state = load_state(run_dir)
     if state.finished:
         return False
 
-    # A hard stop always supersedes a pending graceful request — cancel it so a
-    # later resume doesn't re-honor a stop the operator escalated past (covers the
-    # signalled, force-kill, and mark-stopped fallback paths below alike).
-    clear_graceful_stop(run_dir)
+    # Lodge the hard request before signalling. The atomic replace also supersedes a
+    # pending *graceful* request in the same step: the operator escalated past it, and
+    # a stronger request must never leave a window where nothing at all is pending.
+    #
+    # Degrade rather than abort when the lodge fails (read-only run dir, ENOSPC — and
+    # the run's own session logs tee into this very directory, so a run can fill the
+    # disk that then blocks stopping it). The doctrine's unit is the *repair*, not the
+    # syscall: this stop is "delivered two ways at once" per the docstring above, so
+    # failing the whole thing because one of two redundant channels failed would leave
+    # a run alive that the pre-#319 signal path could still have killed. Keep the
+    # signal, and stay loud where it actually matters — see the refusal branch below.
+    try:
+        _write_stop_request(run_dir, "hard")
+        lodged = True
+    except OSError:
+        lodged = False
 
     host = get_process_host()
     pid, identity = read_pid_identity(run_dir)  # identity recorded at run start, not sampled now
@@ -997,11 +1278,24 @@ def stop_run(run_dir: Path) -> bool:
         # the pid we recorded is already gone, or was reused by an unrelated
         # process before stop_run ran — never signal a stranger; mark stopped below.
         pid = None
+    # Whether this call ever proved the engine dead. Only a confirmed death licenses
+    # the fallback below to discard the request we lodged: while the engine may still
+    # be running, that file is the one channel left that can stop it (on native
+    # Windows it is the *only* one), so retracting it would throw away the very
+    # repair #319 exists to deliver.
+    engine_may_live = False
     if pid is not None:
         try:
             host.terminate(pid)
-        except (ProcessLookupError, PermissionError, OSError):
-            pid = None  # already gone / not ours — go straight to fallback
+        except ProcessLookupError:
+            pid = None  # provably gone — the fallback's discard is correct
+        except (PermissionError, OSError):
+            # We could not signal it and it was `alive_and_ours` a moment ago, so it
+            # may well still be running (an EPERM mismatch, or a win32 taskkill that
+            # errored). Skip the wait — there is nothing to wait for — but keep the
+            # request lodged so the engine can still stop itself off the file.
+            engine_may_live = True
+            pid = None
     if pid is not None:
         deadline = time.monotonic() + _STOP_WAIT_S
         while time.monotonic() < deadline:
@@ -1019,23 +1313,112 @@ def stop_run(run_dir: Path) -> bool:
             if guard is not None and host.identity(pid) == guard:
                 try:
                     host.force_kill(pid)
-                except (ProcessLookupError, PermissionError, OSError):
+                except ProcessLookupError:
                     pass  # raced us to exit — that's the outcome we wanted
+                except (PermissionError, OSError):
+                    # Unlike ESRCH above, this is the opposite news: the process is
+                    # there and we were refused. Keep the request lodged.
+                    engine_may_live = True
+                else:
+                    # A kill that returned cleanly is not a death certificate — on
+                    # win32 `force_kill` shells `taskkill /F /T` with `check=False`,
+                    # so a refused kill raises nothing at all, and win32 is the
+                    # platform this whole channel exists for. Confirm rather than
+                    # infer, since the answer decides whether we discard the request.
+                    # Let it settle first: a delivered SIGKILL is immediate but the
+                    # pid can linger a moment before it is reaped, and reading that
+                    # as "still alive" would strand the file on the ordinary
+                    # wedged-engine path.
+                    confirm_deadline = time.monotonic() + _KILL_CONFIRM_S
+                    while host.is_alive(pid) and time.monotonic() < confirm_deadline:
+                        time.sleep(_STOP_POLL_S)
+                    engine_may_live = host.is_alive(pid)
             else:
+                # Refusing to kill leaves the hard request lodged on purpose: if that
+                # pid *is* still our engine, the file is the only channel left that
+                # can stop it, and discarding it here would retract a request the
+                # operator made while we decline to enforce it ourselves.
+                #
+                # That reasoning only holds while the lodge succeeded. If it did not,
+                # nothing at all is pending and we are declining to force-kill on top
+                # of that — the operator must be told, or they are left believing a
+                # request is in flight that was never written.
+                if lodged:
+                    raise StopRunError(
+                        f"run {run_dir.name}: engine pid {pid} honored neither the "
+                        "lodged stop request nor SIGTERM, and its identity can no "
+                        "longer be verified; refusing to force-kill a possibly-reused "
+                        "pid"
+                    )
                 raise StopRunError(
-                    f"run {run_dir.name}: engine pid {pid} ignored SIGTERM and its "
-                    "identity can no longer be verified; refusing to force-kill a "
-                    "possibly-reused pid"
+                    f"run {run_dir.name}: the stop request could not be written to "
+                    f"the run directory and engine pid {pid} did not honor SIGTERM; "
+                    "its identity can no longer be verified, so it will not be "
+                    "force-killed. No stop is pending — free space in the run "
+                    "directory and retry, or stop the process yourself"
                 )
-        # the engine clears its agent window itself, but kill the session as a
-        # backstop in case it died before tearing it down
-        kill_session(run_dir.name)
-        if load_state(run_dir).stopped:
-            return True
-
-    # Fallback: no live engine (or it never confirmed). Mark it stopped here.
+    # the engine clears its agent window itself, but kill the session as a backstop
+    # in case it died before tearing it down. Ahead of everything below, because both
+    # exits from here need it — an engine that honored the stop and died before
+    # tearing its window down leaks the session just as surely as one we killed.
     kill_session(run_dir.name)
     state = load_state(run_dir)
+    if state.stopped:
+        # The engine honored the stop and is gone, and its own `run-stop` already
+        # stands in the journal. Stamping `fallback=True` on top would describe an
+        # engine that did its own teardown as one that had to be stopped from
+        # outside. This check deliberately sits out here rather than inside the
+        # `pid is not None` arm it used to live in: every path that clears `pid`
+        # early — a pid that is no longer ours, a `terminate` that raced the exit
+        # and got `ProcessLookupError`, a refusal that could not verify it — skipped
+        # it and fell straight through to the append. The plainest case needs no race
+        # at all: `stop` on a run a previous `stop` already stopped (`stopped` is set,
+        # `finished` is not, so the guard at the top does not fire).
+        #
+        # It normally consumes the file on the way out; clear it belt-and-braces so a
+        # run that is later resumed can never find our request still lodged and
+        # re-stop at its first item. Safe on the `engine_may_live` paths too: a
+        # written `stopped` *is* the engine reporting it honored the request, so
+        # there is no live consumer left to strand.
+        clear_graceful_stop(run_dir)
+        return True
+
+    # Neither channel was delivered: nothing is lodged, and we never proved the engine
+    # dead. This is the one outcome `stop` must not report as success — the operator is
+    # left believing a request is in flight that was never written, while an engine we
+    # could not signal keeps mutating the project. The pid-reuse guard above already
+    # refuses for its own path; these are its siblings, and the only reason they stayed
+    # quiet is that they clear `pid` and skip that block. Not a regression — on the
+    # merge-base this was the state of *every* refused signal, because `stop_run` cleared
+    # the request as its first statement — but the earlier decision to report success
+    # rested on the request being retained, which is exactly what did not happen here.
+    #
+    # Placement is load-bearing, twice over. It sits *after* the session backstop
+    # because refusing to report a stop is no reason to leak the window, and *after* the
+    # `state.stopped` return because a run the engine already honored must not be
+    # reported as a failure. Journal the attempt before raising: the `run-stop` append
+    # below is skipped, and an unrecorded stop attempt is its own trap.
+    if engine_may_live and not lodged:
+        Journal(run_dir).append("run-stop-undelivered", pid=pid)
+        raise StopRunError(
+            f"run {run_dir.name}: the stop request could not be written to the run "
+            "directory and the engine could not be proved dead, so no stop is pending. "
+            "Its agent session was killed as a backstop. Free space in the run directory "
+            "and retry, or stop the process yourself"
+        )
+
+    # Fallback: no live engine (or it never confirmed). Mark it stopped here. Discard
+    # the request first — nothing is left alive to consume it, and a file outliving
+    # the run it asked to stop is a trap for the next resume.
+    #
+    # Unless we never actually proved that. Where the engine may still be running,
+    # the request stays lodged and the stop is genuinely still in flight: the engine
+    # honors the file at its next poll and writes `stopped` itself. Discarding it here
+    # would leave a live engine with no channel left while we report the run stopped —
+    # the stale-request trap above is the lesser of the two, and it only bites a run
+    # that is later resumed, which this one cannot be until that engine exits.
+    if not engine_may_live:
+        clear_graceful_stop(run_dir)
     state.stopped = True
     save_state(run_dir, state)
     Journal(run_dir).append("run-stop", pid=pid, fallback=True)

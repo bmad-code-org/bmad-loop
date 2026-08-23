@@ -33,7 +33,7 @@ from conftest import (
     write_sprint,
 )
 
-from bmad_loop import deferredwork, platform_util, verify
+from bmad_loop import deferredwork, platform_util, runs, verify
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.engine import Engine, RunPaused, RunStopped, _digest_of, _run_depth
@@ -67,7 +67,14 @@ from bmad_loop.policy import (
     SweepPolicy,
     VerifyPolicy,
 )
-from bmad_loop.runs import STOP_REQUEST_FILE, graceful_stop_requested, rearm_escalation
+from bmad_loop.runs import (
+    STOP_REQUEST_FILE,
+    graceful_stop_requested,
+    owner_run_dir,
+    rearm_escalation,
+    reset_owner_run_dir,
+    set_owner_run_dir,
+)
 from bmad_loop.sprintstatus import story_status
 from bmad_loop.verify import (
     GitError,
@@ -10401,6 +10408,58 @@ def test_graceful_stop_finishes_current_story_then_stops(project, monkeypatch):
     assert stops[-1]["remaining"] == 1  # 1-2-b still actionable, never picked
 
 
+def test_boundary_consume_does_not_swallow_a_concurrent_escalation(project, monkeypatch):
+    """WIRING, not predicate. `runs.consume_stop_request` being atomic proves nothing
+    unless the boundary check actually calls it — a revert of this call site to
+    read-then-unlink is a separate regression with its own ablation axis.
+
+    An escalating `stop` landing while the boundary consumes must survive as a
+    record. This engine routes on the graceful body it took (correct — that is the
+    request it holds), and the hard request that arrived afterwards is a new request
+    against a run already stopping: `run()`'s finally discards it and journals
+    `stop-request-discarded`, so it is accounted for rather than vanishing.
+
+    Ablation: revert `_check_stop_request` to `read_stop_request_mode` +
+    `clear_graceful_stop`. The escalation is then injected into a take that never
+    happens, so `escalated` stays empty and the test reddens on that assert — which
+    IS the wiring proof: no atomic consume, no `.consumed` read to hook. Keep the
+    take but drop the survival and the `stop-request-discarded` assert is what
+    catches it instead."""
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: None)
+    write_sprint(project, {"1-1-a": "ready-for-dev", "1-2-b": "ready-for-dev"})
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    engine, _ = make_engine(
+        project,
+        [
+            _lodge_after(dev_effect(project, "1-1-a"), run_dir),
+            review_effect(project, "1-1-a", clean=True),
+        ],
+    )
+
+    real = runs._stop_request_mode_of
+    escalated: list[str] = []
+
+    def _escalate_then_read(path):
+        # only the read of the TAKEN file, which is the consume and nothing else —
+        # raise site B reads the canonical name and must not be perturbed here
+        if path.name.endswith(".consumed") and not escalated:
+            escalated.append("hard")
+            runs._write_stop_request(run_dir, "hard")
+        return real(path)
+
+    monkeypatch.setattr(runs, "_stop_request_mode_of", _escalate_then_read)
+    engine.run()
+
+    assert escalated == ["hard"]  # the interleave really happened
+    saved = load_state(engine.run_dir)
+    assert saved.stopped is True and saved.finished is False
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    stops = [e for e in engine.journal.entries() if e["kind"] == "run-stop"]
+    assert stops and stops[-1]["graceful"] is True  # routed on the body it took
+    # the escalation was not swallowed: it survived the consume to be recorded
+    assert "stop-request-discarded" in kinds
+
+
 def test_graceful_stop_runs_clean_finalization_and_notifies(project, monkeypatch):
     """Unlike a hard stop, the graceful arm runs worktree GC + the post_run hook +
     the policy-gated session teardown, and the trailing notify is worded for a
@@ -10577,6 +10636,94 @@ def test_hard_stop_wins_over_pending_graceful_stop(project, monkeypatch):
     assert "stop-request-discarded" in [e["kind"] for e in engine.journal.entries()]
 
 
+def test_signal_stop_consumes_the_lodged_hard_request(project, monkeypatch):
+    """A bare ``RunStopped()`` — the signal handler's shape — with the hard request
+    ``stop_run`` lodges before signalling: the file is consumed, not journaled as
+    stale debris.
+
+    ``stop_run`` lodges *before* it signals, so on POSIX every routine stop reaches
+    the hard arm with the file still on disk; nothing on the signal path consumes it.
+    Left there, ``run()``'s finally discards it as stale and journals
+    ``stop-request-discarded``, misreporting the very request that caused the stop.
+    Contrast :func:`test_hard_stop_wins_over_pending_graceful_stop`: a *graceful*
+    request really is superseded by a hard stop, and still journals the discard.
+
+    The gate here is the absent journal entry, not the absent file — the finally
+    clears the file either way, so that assertion holds with the guard ablated."""
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: None)
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    engine, _ = make_engine(project, [])
+
+    def stopping_loop():
+        _lodge_hard_stop_request(run_dir)
+        raise RunStopped()  # hard (graceful=False), as the signal handler raises
+
+    monkeypatch.setattr(engine, "_loop", stopping_loop)
+    engine.run()
+
+    assert load_state(engine.run_dir).stopped
+    assert not graceful_stop_requested(run_dir)
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "stop-request-discarded" not in kinds  # honored, not stale debris
+    stops = [e for e in engine.journal.entries() if e["kind"] == "run-stop"]
+    # the signal delivered this stop, so it keeps journaling a bare `run-stop` —
+    # consuming the co-lodged file must not start attributing it to the channel.
+    assert stops and "via" not in stops[-1]
+
+
+def test_hard_request_at_an_exhausted_queue_stops_instead_of_finishing(project, monkeypatch):
+    """A hard request landing on the exhausted-queue return path stops the run.
+
+    None of the three raise sites reach it: A and B are inside ``_run_session``,
+    which an empty queue never enters, and the run-end auto-sweep predicate is
+    mode-blind, so it suppresses and *returns* rather than raising. Uncovered, the
+    run records ``finished`` — which ``documents.py`` ranks above ``stopped`` — while
+    the operator's hard stop went unhonored, and ``stop_run`` would then journal
+    ``fallback=True`` against a perfectly responsive engine."""
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: None)
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    engine, _ = make_engine(project, [])
+
+    def empty_loop():
+        # the queue drained, and the request lands before `_loop` returns — i.e.
+        # after its own head check has already run, which is the whole window.
+        _lodge_hard_stop_request(run_dir)
+
+    monkeypatch.setattr(engine, "_loop", empty_loop)
+    engine.run()
+
+    saved = load_state(engine.run_dir)
+    assert saved.stopped is True and saved.finished is False
+    assert not graceful_stop_requested(run_dir)  # consumed before the raise
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "run-complete" not in kinds
+    assert "stop-request-discarded" not in kinds  # honored, not stale
+    stops = [e for e in engine.journal.entries() if e["kind"] == "run-stop"]
+    assert stops and stops[-1]["via"] == "stop-request"
+
+
+def test_graceful_request_at_an_exhausted_queue_still_finishes(project, monkeypatch):
+    """The mode-exact half of the guard above, and its second ablation axis.
+
+    A *graceful* request on that same return path finishes truthfully: the story
+    queue is empty, so there is nothing left to stop before, and the finally discards
+    the superseded file. Widening the new check to ``is not None`` reddens exactly
+    this test and leaves its hard twin green."""
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: None)
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    engine, _ = make_engine(project, [])
+
+    monkeypatch.setattr(engine, "_loop", lambda: _lodge_stop_request(run_dir))
+    engine.run()
+
+    saved = load_state(engine.run_dir)
+    assert saved.finished is True and saved.stopped is False
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "run-complete" in kinds
+    assert "stop-request-discarded" in kinds  # superseded nothing — genuinely stale
+    assert "run-stop" not in kinds
+
+
 def test_crash_wins_over_pending_graceful_stop(project, monkeypatch):
     """An unexpected crash while a stop is pending wins; the crash arm records and
     the finally discards the stale control file (no run-stop)."""
@@ -10696,6 +10843,338 @@ def test_graceful_stop_on_resume_finishes_inflight_then_stops(project, monkeypat
     assert [s.role for s in adapter.sessions] == ["review"]  # only the in-flight review ran
     stops = [e for e in resumed.journal.entries() if e["kind"] == "run-stop"]
     assert stops and stops[-1]["graceful"] is True
+
+
+# ----------------------------------------------------------- hard stop (#319)
+#
+# The same stop-request.json control file, written with `mode: "hard"` by
+# `runs.stop_run`, carries a stop the signal path cannot deliver: a native-Windows
+# engine never receives an inter-process SIGTERM. The engine honors it in three
+# places — the item boundary (`_check_stop_request`) and the two `_run_session`
+# raise sites: an `"aborted"` result handed back by the adapter's in-session poll
+# (site A), and a hard file still on disk once a session has been recorded and
+# saved (site B, the `_post_kill_reconcile`-rescued case). All three take the HARD
+# arm: unconditional teardown, `run-stop` carrying `via="stop-request"` and no
+# `graceful` flag. These tests lodge the control file directly, exactly as the
+# graceful ones do.
+#
+# A nested auto-sweep child reads a second channel: the OWNING run's dir, published
+# by the outermost `run()` and polled by the adapter and by site B's owner leg. That
+# leg never consumes — the file belongs to the parent, whose own hard arm has to
+# find it to record and attribute the stop — and a nested engine re-raises rather
+# than recording, so those tests assert on the propagated exception.
+
+
+def _lodge_hard_stop_request(run_dir: Path) -> None:
+    """Drop the control file `runs.stop_run` writes before it signals — the hard
+    sibling of :func:`_lodge_stop_request`."""
+    (run_dir / STOP_REQUEST_FILE).write_text(
+        '{"requested_at": "2026-07-20T00:00:00", "mode": "hard"}', encoding="utf-8"
+    )
+
+
+def _lodge_hard_after(inner, run_dir: Path):
+    """Wrap a scripted effect so a HARD request lands as ``inner`` returns — i.e.
+    in the window between the adapter's last poll and the engine's post-session
+    check, the gap raise site B exists to cover."""
+
+    def effect(spec):
+        result = inner(spec)
+        _lodge_hard_stop_request(run_dir)
+        return result
+
+    return effect
+
+
+def test_session_abort_status_unwinds_run_stopped(project, monkeypatch):
+    """RAISE SITE A. An adapter whose wait loop saw the hard file tears its window
+    down and hands back `status="aborted"`; the engine unwinds that into a hard
+    RunStopped *before* any SessionRecord exists, so an abort is never mistaken for
+    a session outcome and no further session is launched. The paired session-end is
+    still journaled — through the `finally`, which is why the raise sits inside the
+    try.
+
+    Ablation: delete the `result.status == "aborted"` gate in `_run_session` and the
+    abort is recorded as an ordinary session; the run drives on into the review leg
+    and this test fails (verified)."""
+    killed = []
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: killed.append(rid))
+    write_sprint(project, {"1-1-a": "ready-for-dev", "1-2-b": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [SessionResult(status="aborted"), review_effect(project, "1-1-a", clean=True)],
+    )
+
+    engine.run()
+
+    saved = load_state(engine.run_dir)
+    assert saved.stopped is True and saved.finished is False
+    assert killed == ["test-run"]  # hard arm's unconditional teardown
+    assert len(adapter.sessions) == 1  # nothing launched after the abort...
+    assert len(adapter.script) == 1  # ...the review entry is still unspent
+    assert saved.tasks["1-1-a"].sessions == []  # no SessionRecord for the abort
+    entries = engine.journal.entries()
+    assert "run-complete" not in [e["kind"] for e in entries]
+    starts = [e for e in entries if e["kind"] == "session-start"]
+    ends = [e for e in entries if e["kind"] == "session-end"]
+    assert len(starts) == 1 and len(ends) == 1  # paired through the finally
+    assert ends[0]["task_id"] == starts[0]["task_id"]
+    assert ends[0]["status"] == "aborted"
+    stops = [e for e in entries if e["kind"] == "run-stop"]
+    assert stops and stops[-1]["via"] == "stop-request"
+    assert "graceful" not in stops[-1]
+
+
+def test_nested_child_stops_on_the_owning_runs_hard_request(project, monkeypatch):
+    """RAISE SITE B, OWNER LEG. A nested auto-sweep child honors the *parent's* hard
+    request even when its own session came back `completed`.
+
+    This is the nested form of the rescued-completion trap. `stop <parent-id>` lodges
+    in the parent's dir, so the child's own channel is empty; its adapter aborts off
+    the owner leg, and `_post_kill_reconcile` can then upgrade that `aborted` back to
+    `completed` — at which point raise site A never fires. Without the owner leg here
+    the child would carry straight on into its review leg on the strength of the
+    rescue, which is exactly what #319 closed at top level.
+
+    The child must NOT consume the parent's file: the parent's own hard arm has to
+    find it to record and attribute the stop, and `via` rides the exception anyway.
+    A nested engine re-raises `RunStopped` rather than recording it, so the owner
+    sees it — hence `pytest.raises` and no `stopped` flag on the child's state.
+
+    Ablation: delete the owner leg at raise site B and the child drives its review
+    leg — `adapter.sessions` grows to 2 and this fails."""
+    killed = []
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: killed.append(rid))
+    write_sprint(project, {"1-1-a": "ready-for-dev", "1-2-b": "ready-for-dev"})
+    child_run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    owner = project.project / ".bmad-loop" / "runs" / "parent-run"
+    owner.mkdir(parents=True, exist_ok=True)
+    (owner / STOP_REQUEST_FILE).write_text(
+        '{"requested_at": "2026-08-22T00:00:00", "mode": "hard"}', encoding="utf-8"
+    )
+
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),  # returns `completed` — no abort to see
+            review_effect(project, "1-1-a", clean=True),
+        ],
+    )
+
+    depth_token = _run_depth.set(1)  # simulate the parent's run() frame
+    owner_token = set_owner_run_dir(owner)
+    try:
+        with pytest.raises(RunStopped) as caught:
+            engine.run()
+    finally:
+        reset_owner_run_dir(owner_token)
+        _run_depth.reset(depth_token)
+
+    assert caught.value.via == "stop-request"
+    assert len(adapter.sessions) == 1  # the review leg never started...
+    assert len(adapter.script) == 1  # ...its script entry is still unspent
+    assert killed == ["test-run"]  # the child tore its own session down
+    # the parent's request survives the child untouched — the owner consumes it
+    assert (owner / STOP_REQUEST_FILE).is_file()
+    assert not graceful_stop_requested(child_run_dir)  # child's own was always empty
+    # a nested child re-raises instead of recording: the owner writes `stopped`
+    assert load_state(engine.run_dir).stopped is False
+
+
+def test_nested_child_ignores_the_owning_runs_graceful_request(project, monkeypatch):
+    """The mode-exact twin: graceful means *finish the in-flight item*, and for a
+    nested sweep that means letting the child finish. A graceful request on the
+    owning run must not stop the child mid-flight — the parent suppresses the next
+    child from starting instead.
+
+    Ablation: widen the owner leg at raise site B to `is not None` and this reddens
+    alone, leaving its hard twin green."""
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: None)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    owner = project.project / ".bmad-loop" / "runs" / "parent-run"
+    owner.mkdir(parents=True, exist_ok=True)
+    (owner / STOP_REQUEST_FILE).write_text(
+        '{"requested_at": "2026-08-22T00:00:00", "mode": "graceful"}', encoding="utf-8"
+    )
+
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),
+            review_effect(project, "1-1-a", clean=True),
+        ],
+    )
+
+    depth_token = _run_depth.set(1)
+    owner_token = set_owner_run_dir(owner)
+    try:
+        engine.run()  # runs to completion, no RunStopped
+    finally:
+        reset_owner_run_dir(owner_token)
+        _run_depth.reset(depth_token)
+
+    assert len(adapter.sessions) == 2  # dev AND review — the child finished its item
+
+
+def test_run_publishes_the_owner_run_dir_and_resets_it(project, monkeypatch):
+    """`run()` publishes its run dir as the owning run for everything below and
+    releases it on the way out, by token — so a later top-level run in the same
+    process/thread is never poisoned by a previous one. A nested frame must not
+    overwrite the owner it inherited."""
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: None)
+    engine, _ = make_engine(project, [])
+
+    seen = []
+    monkeypatch.setattr(engine, "_loop", lambda: seen.append(owner_run_dir()))
+
+    assert owner_run_dir() is None
+    engine.run()
+    assert seen == [engine.run_dir]  # published for the duration
+    assert owner_run_dir() is None  # and released again
+
+    # a nested frame leaves the inherited owner alone
+    outer = project.project / ".bmad-loop" / "runs" / "outer-run"
+    depth_token = _run_depth.set(1)
+    owner_token = set_owner_run_dir(outer)
+    seen.clear()
+    try:
+        engine.run()
+    finally:
+        reset_owner_run_dir(owner_token)
+        _run_depth.reset(depth_token)
+    assert seen == [outer]  # the child inherited, it did not republish its own
+
+
+def test_hard_stop_after_completed_session_stops_before_next_leg(project, monkeypatch):
+    """RAISE SITE B. A hard request landing too late for the in-session poll — here
+    as the dev session returns `completed` — still stops the run. This is also the
+    rescued-completion shape: `_post_kill_reconcile` can upgrade an aborted session
+    back to `completed`, and without this site the run would carry straight on into
+    verify/review on the strength of that rescue. The session is fully recorded and
+    saved first, so the run stays resumable from a complete record.
+
+    Ablation: delete raise site B (the post-`_save()` hard-file check in
+    `_run_session`) and the run drives the review leg — `adapter.sessions` grows to
+    2 and this test fails (verified)."""
+    killed = []
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: killed.append(rid))
+    write_sprint(project, {"1-1-a": "ready-for-dev", "1-2-b": "ready-for-dev"})
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    engine, adapter = make_engine(
+        project,
+        [
+            _lodge_hard_after(dev_effect(project, "1-1-a"), run_dir),
+            review_effect(project, "1-1-a", clean=True),
+        ],
+    )
+
+    engine.run()
+
+    saved = load_state(engine.run_dir)
+    assert saved.stopped is True and saved.finished is False
+    assert killed == ["test-run"]
+    assert len(adapter.sessions) == 1  # the review leg never started...
+    assert len(adapter.script) == 1  # ...its script entry is still unspent
+    # the completed session IS on the record — durable before the stop unwound
+    records = saved.tasks["1-1-a"].sessions
+    assert len(records) == 1 and records[0].status == "completed"
+    assert not graceful_stop_requested(run_dir)  # consumed before the raise
+    entries = engine.journal.entries()
+    kinds = [e["kind"] for e in entries]
+    assert "run-complete" not in kinds
+    assert "stop-request-discarded" not in kinds  # honored, not discarded as stale
+    ends = [e for e in entries if e["kind"] == "session-end"]
+    assert len(ends) == 1 and ends[0]["status"] == "completed"
+    stops = [e for e in entries if e["kind"] == "run-stop"]
+    assert stops and stops[-1]["via"] == "stop-request"
+    assert "graceful" not in stops[-1]
+
+
+def test_boundary_hard_file_takes_hard_arm(project, monkeypatch):
+    """A hard request that lands after the story's last session — lodged at
+    `post_story`, past raise site B — is honored at the next item boundary and takes
+    the HARD arm there: unconditional teardown, no clean-finish subset, `run-stop`
+    with `via="stop-request"` and no `graceful` flag. The in-flight story still ran
+    to completion, exactly as the graceful sibling does; only the arm differs."""
+    killed = []
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: killed.append(rid))
+    write_sprint(project, {"1-1-a": "ready-for-dev", "1-2-b": "ready-for-dev"})
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    engine, adapter = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+    )
+
+    post_run_stages = []
+    original_emit = engine._emit
+
+    def spy_emit(stage, *args, **kwargs):
+        if stage == "post_run":
+            post_run_stages.append(stage)
+        if stage == "post_story":
+            # the operator's `bmad-loop stop` lands between story 1 and story 2
+            _lodge_hard_stop_request(run_dir)
+        return original_emit(stage, *args, **kwargs)
+
+    engine._emit = spy_emit
+
+    engine.run()
+
+    saved = load_state(engine.run_dir)
+    assert saved.tasks["1-1-a"].phase == Phase.DONE  # in-flight story finished
+    assert "1-2-b" not in saved.tasks  # the next story was never dispatched
+    assert saved.stopped is True and saved.finished is False
+    assert len(adapter.sessions) == 2  # dev + review, nothing after the boundary
+    assert not graceful_stop_requested(run_dir)  # consumed at the boundary
+    assert killed == ["test-run"]  # hard arm, not the policy-gated graceful teardown
+    assert post_run_stages == []  # hard path skips the clean-finish subset
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "run-complete" not in kinds
+    assert "stop-request-discarded" not in kinds  # honored, not discarded as stale
+    stops = [e for e in engine.journal.entries() if e["kind"] == "run-stop"]
+    assert stops and stops[-1]["via"] == "stop-request"
+    assert "graceful" not in stops[-1] and "remaining" not in stops[-1]
+
+
+def test_boundary_modeless_file_reads_graceful(project, monkeypatch):
+    """BACK-COMPAT PIN. A bare `{}` stop-request body — what every pre-#319 writer
+    and fixture lodged — still takes the GRACEFUL arm: `read_stop_request_mode`
+    reads any present-but-modeless file as graceful, so raise site B ignores it
+    mid-story and the boundary finalizes cleanly with `graceful=True` and no
+    `via`."""
+    killed = []
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: killed.append(rid))
+    write_sprint(project, {"1-1-a": "ready-for-dev", "1-2-b": "ready-for-dev"})
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+
+    def lodge_modeless(inner):
+        def effect(spec):
+            result = inner(spec)
+            (run_dir / STOP_REQUEST_FILE).write_text("{}", encoding="utf-8")
+            return result
+
+        return effect
+
+    engine, adapter = make_engine(
+        project,
+        [
+            lodge_modeless(dev_effect(project, "1-1-a")),
+            review_effect(project, "1-1-a", clean=True),
+        ],
+    )
+
+    engine.run()
+
+    saved = load_state(engine.run_dir)
+    # the modeless file did NOT abort mid-story: the review leg still ran
+    assert len(adapter.sessions) == 2
+    assert saved.tasks["1-1-a"].phase == Phase.DONE
+    assert "1-2-b" not in saved.tasks
+    assert saved.stopped is True and saved.finished is False
+    assert not graceful_stop_requested(run_dir)
+    stops = [e for e in engine.journal.entries() if e["kind"] == "run-stop"]
+    assert stops and stops[-1]["graceful"] is True
+    assert "via" not in stops[-1]
 
 
 # ------------------------------- review.on_timeout = "salvage-if-done" (#271)

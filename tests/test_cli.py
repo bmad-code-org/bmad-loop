@@ -2092,9 +2092,56 @@ def test_stop_graceful_is_idempotent(tmp_path, monkeypatch, capsys):
     run_dir = _pending_graceful_run(tmp_path)  # request already on disk
     before = (run_dir / runs.STOP_REQUEST_FILE).read_text()
     assert cli.main(["stop", "--project", str(tmp_path), "r1", "--graceful"]) == 0
-    assert "already has a graceful stop pending" in capsys.readouterr().out
+    assert "already has a stop request pending" in capsys.readouterr().out
     # left untouched — the original request's timestamp stands
     assert (run_dir / runs.STOP_REQUEST_FILE).read_text() == before
+
+
+def test_stop_graceful_reports_a_pending_hard_request_without_calling_it_graceful(
+    tmp_path, monkeypatch, capsys
+):
+    """A lodged *hard* request answers "already-pending" too, and the message must
+    not describe it as graceful — that reports a strictly stronger stop as a weaker
+    one. Reachable with no race at all: `stop_run` leaves a hard request lodged when
+    it could not prove the engine dead, and it sits there at rest.
+
+    Written directly rather than through `_pending_graceful_run`, which hardcodes
+    the graceful mode.
+    """
+    from bmad_loop import runs
+
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive")
+    run_dir = _make_run_with_state(tmp_path, "r1")
+    (run_dir / runs.STOP_REQUEST_FILE).write_text(
+        '{"requested_at": "now", "mode": "hard"}', encoding="utf-8"
+    )
+    before = (run_dir / runs.STOP_REQUEST_FILE).read_text()
+    assert cli.main(["stop", "--project", str(tmp_path), "r1", "--graceful"]) == 0
+    out = capsys.readouterr().out
+    assert "already has a stop request pending" in out
+    assert "graceful stop pending" not in out  # the hard request is not a graceful one
+    # and the stronger request still stands, unchanged and un-downgraded
+    assert (run_dir / runs.STOP_REQUEST_FILE).read_text() == before
+    assert runs.read_stop_request_mode(run_dir) == "hard"
+
+
+def test_stop_graceful_reports_a_failed_write_as_possibly_pending(tmp_path, monkeypatch, capsys):
+    """The lodge deliberately does not roll back a failed write — an unlink there
+    resolves the name and could delete a hard request a concurrent `stop` escalated
+    onto it. So a request can be standing even though the write raised, and saying
+    "failed" flatly would invite the operator to ask again for something already
+    pending. Same exit code; accurate message."""
+    from bmad_loop import runs
+
+    def _boom(_run_dir):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(runs, "request_graceful_stop", _boom)
+    _make_run_with_state(tmp_path, "r1")
+    assert cli.main(["stop", "--project", str(tmp_path), "r1", "--graceful"]) == 1
+    err = capsys.readouterr().err
+    assert "may still be pending" in err
+    assert "--cancel-graceful" in err  # names the way to withdraw it
 
 
 def test_stop_cancel_graceful_clears_pending(tmp_path, capsys):
@@ -2109,7 +2156,43 @@ def test_stop_cancel_graceful_clears_pending(tmp_path, capsys):
 def test_stop_cancel_graceful_without_pending_errors(tmp_path, capsys):
     _make_run_with_state(tmp_path, "r1")  # nothing on disk to cancel
     assert cli.main(["stop", "--project", str(tmp_path), "r1", "--cancel-graceful"]) == 1
-    assert "no graceful stop pending" in capsys.readouterr().err
+    assert "no stop request pending" in capsys.readouterr().err
+
+
+def test_stop_cancel_clears_a_pending_hard_request(tmp_path, capsys):
+    """`--cancel-graceful` is mode-neutral by contract (#319): the one hard request a
+    human can still reach is the one `stop_run` deliberately leaves lodged after
+    refusing to force-kill an unverifiable pid, and withdrawing that is a legitimate
+    thing to want. The graceful twin above proves the wiring for one mode only — the
+    function is named `clear_graceful_stop` while its contract is mode-neutral, so
+    mode-gating the clear is a live regression, and this is what reddens on it."""
+    from bmad_loop import runs
+
+    run_dir = _pending_hard_run(tmp_path)
+    assert cli.main(["stop", "--project", str(tmp_path), "r1", "--cancel-graceful"]) == 0
+    assert "cancelled" in capsys.readouterr().out
+    assert not (run_dir / runs.STOP_REQUEST_FILE).exists()
+
+
+def test_stop_cancel_reports_a_request_it_could_not_remove(tmp_path, monkeypatch, capsys):
+    """`clear_graceful_stop` never raises — five callers depend on that — so it
+    answers False for "nothing was pending" and "could not remove it" alike. Cancel
+    must not read the second as the first and tell the operator their request is gone
+    while it is still on disk and still honorable. Exit stays 1 either way; only the
+    message moves."""
+    from bmad_loop import runs
+
+    run_dir = _pending_graceful_run(tmp_path)
+
+    def _refuse(_path):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(runs, "retrying_unlink", _refuse)
+    assert cli.main(["stop", "--project", str(tmp_path), "r1", "--cancel-graceful"]) == 1
+    err = capsys.readouterr().err
+    assert "still pending" in err
+    assert "no stop request pending" not in err  # the misleading line, specifically
+    assert (run_dir / runs.STOP_REQUEST_FILE).exists()  # and it really did survive
 
 
 def test_stop_graceful_and_cancel_are_mutually_exclusive(tmp_path):
@@ -2140,6 +2223,53 @@ def test_status_json_graceful_stop_pending_true(tmp_path, monkeypatch, capsys):
     doc = machine_json(["status", "--project", str(tmp_path), "r1", "--json"], capsys)
     assert doc["graceful_stop_pending"] is True
     assert doc["schema_version"] == 1  # additive field — no schema bump
+
+
+def _pending_hard_run(tmp_path, run_id="r1", **state_kwargs):
+    """A run with a HARD-mode stop request on disk — what `bmad-loop stop` lodges
+    before signalling, still unconsumed because the engine has not reached a
+    boundary (or, on native Windows, was never reachable by the signal at all)."""
+    from bmad_loop import runs
+
+    run_dir = _make_run_with_state(tmp_path, run_id, **state_kwargs)
+    (run_dir / runs.STOP_REQUEST_FILE).write_text(
+        '{"requested_at": "now", "mode": "hard"}', encoding="utf-8"
+    )
+    return run_dir
+
+
+def test_status_json_graceful_stop_pending_false_for_hard_request(tmp_path, monkeypatch, capsys):
+    """A hard stop in flight is not a *graceful* stop pending. The field is
+    mode-exact, not an existence check: reporting True here would promise an
+    operator that the in-flight item still finishes, when a hard request stops the
+    run as soon as the engine sees it.
+
+    Ablation: reverting cli.py's derivation to `runs.graceful_stop_requested`
+    (bare existence) turns this True and fails the assertion — confirmed, restored.
+    """
+    from bmad_loop import runs
+
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive")
+    _pending_hard_run(tmp_path)
+    doc = machine_json(["status", "--project", str(tmp_path), "r1", "--json"], capsys)
+    assert doc["graceful_stop_pending"] is False
+    assert doc["schema_version"] == 1  # same field, same type — narrowed, not bumped
+
+
+def test_status_text_does_not_claim_graceful_for_hard_request(tmp_path, monkeypatch, capsys):
+    """The text branch reads the same derivation, so it inherits the fix: no
+    "will stop after the current item" promise for a hard request.
+
+    Ablation: with the bare-existence derivation restored this prints the graceful
+    line and fails — confirmed, restored."""
+    from bmad_loop import runs
+
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive")
+    _pending_hard_run(tmp_path)
+    assert cli.main(["status", "--project", str(tmp_path), "r1"]) == 0
+    out = capsys.readouterr().out
+    assert "graceful stop pending" not in out
+    assert "in progress" in out  # still reported live — only the promise is gone
 
 
 def test_status_json_graceful_stop_pending_false_without_request(tmp_path, capsys):
@@ -3805,8 +3935,8 @@ def test_resume_under_an_unchanged_host_exec_config_reports_no_security_change(
 
 
 def test_resume_discards_stale_graceful_stop_request(project, monkeypatch, capsys):
-    """A resume is fresh user intent: a graceful-stop request left over from the
-    prior stopped-gracefully run must be cleared before write_pid re-arms the
+    """A resume is fresh user intent: a stop request left over from the prior
+    stopped run — either mode — must be cleared before write_pid re-arms the
     engine, or the re-driven loop would consume it at the first item boundary and
     immediately re-stop. The clear is noted on stderr."""
     from bmad_loop import runs
@@ -3820,7 +3950,101 @@ def test_resume_discards_stale_graceful_stop_request(project, monkeypatch, capsy
     assert cli._resume_paused_run(project.project, run_dir) == 0
 
     assert not (run_dir / runs.STOP_REQUEST_FILE).exists()  # consumed before the engine ran
-    assert "discarded a stale graceful-stop request" in capsys.readouterr().err
+    assert "discarded a stale stop request" in capsys.readouterr().err
+
+
+def test_resume_discards_a_stale_hard_stop_request(project, monkeypatch, capsys):
+    """The mode-neutral half of the docstring above, which the graceful test alone
+    could not prove. A hard request survives `stop_run`'s refusal to force-kill an
+    unverifiable pid, and `_resume_paused_run` gates on `finished`, not `stopped`, so
+    such a run is genuinely resumable with a hard file still on disk.
+
+    Ablation: mode-gate the clear at its call site to
+    `read_stop_request_mode(...) == "graceful"` — this reddens and its graceful twin
+    stays green."""
+    from bmad_loop import runs
+
+    run_dir = _paused_run_for_resume(project, monkeypatch)
+    (run_dir / runs.STOP_REQUEST_FILE).write_text(
+        '{"requested_at": "old", "mode": "hard"}', encoding="utf-8"
+    )
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+
+    assert not (run_dir / runs.STOP_REQUEST_FILE).exists()
+    assert "discarded a stale stop request" in capsys.readouterr().err
+
+
+def test_resume_refuses_when_a_stale_request_cannot_be_discarded(project, monkeypatch, capsys):
+    """Fail closed. The clear conflates "nothing pending" with "could not remove it",
+    so on a removal failure the discard notice never prints and resume used to arm
+    the pid anyway — the engine then consumed the surviving request at the very first
+    item boundary and re-stopped, with nothing on stderr to say why. Resuming again
+    repeats it: a livelock, not a one-shot annoyance.
+
+    The refusal has to land *before* write_pid, or the run is already re-armed."""
+    from bmad_loop import runs
+
+    run_dir = _paused_run_for_resume(project, monkeypatch)
+    (run_dir / runs.STOP_REQUEST_FILE).write_text(
+        '{"requested_at": "old", "mode": "hard"}', encoding="utf-8"
+    )
+
+    def _refuse(_path):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(runs, "retrying_unlink", _refuse)
+    started: list[str] = []
+    monkeypatch.setattr(runs, "write_pid", lambda _d: started.append("armed"))
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 1
+    assert started == []  # refused before the engine was re-armed
+    assert "could not be discarded" in capsys.readouterr().err
+
+
+def test_refused_resume_leaves_the_pin_and_the_journal_untouched(project, monkeypatch, capsys):
+    """A refusal past this function's commit point must leave no trace of a resume
+    that did not happen. `_require_base_skills` used to be the last early exit here,
+    so the stale-request refusal above is the first branch that returns from *below*
+    the journal append and the integrity re-stamp — and both of those are persistent
+    writes, not in-memory state.
+
+    The pin is the one that lasts. `write_trusted_config_digest` writes the exact
+    file the next resume reads back as `pinned`, so re-baselining it on a refusal
+    inverts the advisory it feeds: the warning fires on the attempt that stopped and
+    goes silent on the attempt that actually arms an engine — for a config change the
+    operator never accepted by resuming. The re-stamp's stated justification is that
+    the engine this process is about to arm re-reads the config; a path that arms
+    nothing does not earn it.
+
+    Ablation: move the clear/refuse block back below
+    `runs.write_trusted_config_digest`. Both assertions redden, on two independent
+    axes — the pin becomes the freshly computed sha256, and one `run-resume` entry
+    appears — while `test_resume_refuses_when_a_stale_request_cannot_be_discarded`
+    above stays green, which is what separates this guard from that one."""
+    from bmad_loop import runs
+
+    run_dir = _paused_run_for_resume(project, monkeypatch)
+    (run_dir / runs.STOP_REQUEST_FILE).write_text(
+        '{"requested_at": "old", "mode": "hard"}', encoding="utf-8"
+    )
+    # A sentinel the re-stamp cannot reproduce: the real digest is a sha256, so
+    # equality against this is a positive assertion, not "some value is present" —
+    # which `is not None` would have been, and which would survive the ablation.
+    runs.write_trusted_config_digest(project.project, run_dir.name, "OLDPIN")
+
+    def _refuse(_path):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(runs, "retrying_unlink", _refuse)
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 1
+    assert "could not be discarded" in capsys.readouterr().err
+    assert runs.read_trusted_config_digest(project.project, run_dir.name) == "OLDPIN"
+    assert _resume_entries(run_dir) == []
 
 
 def test_resume_refuses_live_run(tmp_path, monkeypatch, capsys):

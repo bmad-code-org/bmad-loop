@@ -1074,6 +1074,37 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     timeout_expired_clock=expired,
                     budget_weighted=budget_weighted,
                 )
+            # Hard-stop poll (#319), per-iteration and deliberately NOT inside the
+            # heartbeat throttle below: the loop blocks up to `POLL_TICK_S` (5s) per
+            # tick, so *detection* normally lands well inside `stop_run`'s 10s
+            # grace window — the common case, not a bound: the dispatch legs below
+            # the wait are bounded only by the client's own timeouts, and the
+            # generic adapter is no better off (its `_await_result` waits
+            # RESULT_GRACE_S on a healthy box). Beyond detection, this arm then
+            # makes two
+            # HTTP round-trips against a server that may itself be wedged, and the
+            # client's 10s per-phase timeout applies to each. So the arm is NOT
+            # bounded by the grace window, by design: it gives the engine its best
+            # chance to tear itself down cleanly, and when the server will not answer
+            # it degrades to `stop_run`'s force-kill backstop — the same outcome
+            # every native-Windows stop had before #319, never a worse one. Don't
+            # "fix" this by trimming the timeouts: the same two calls serve the
+            # timeout arm, where the transcript is the whole diagnostic payload.
+            #
+            # Mirror the timeout arm exactly — without `_abort` the in-flight HTTP
+            # turn keeps running until teardown. Return the verdict; never raise
+            # `RunStopped` here, and never unlink the request file: the engine
+            # consumes it and attributes the stop.
+            if self._hard_stop_requested():
+                self._note_lifecycle(handle.task_id, "stop-abort-fired")
+                self._abort(sess)
+                transcript = self._capture_usage(handle, sess)
+                return SessionResult(
+                    status="aborted",
+                    session_id=session_id,
+                    transcript_path=transcript,
+                    budget_weighted=budget_weighted,
+                )
             now = time.monotonic()
             if last_heartbeat is None or now - last_heartbeat >= HEARTBEAT_INTERVAL_S:
                 last_heartbeat = now
@@ -1209,6 +1240,25 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             if event is not None:
                 last_seen = time.monotonic()
 
+            # Second poll (#319) — see the arm at the top of the loop. What follows
+            # here is the dispatch: `_probe_completion`'s two GETs, which are NOT
+            # throttled (once a turn goes quiet past SILENCE_THRESHOLD_S they run on
+            # every tick), a `_session_status` GET, or `_result_json(wait=True)`'s
+            # RESULT_GRACE_S wait. Each is bounded only by the client's own timeouts,
+            # so a single iteration can outlast `stop_run`'s 10s grace. Polling here
+            # keeps at most one leg between two checks. It cannot bound an in-flight
+            # socket read, so when one does outlast the window the stop degrades to
+            # the force-kill backstop exactly as it did before #319.
+            if self._hard_stop_requested():
+                self._note_lifecycle(handle.task_id, "stop-abort-fired")
+                self._abort(sess)
+                transcript = self._capture_usage(handle, sess)
+                return SessionResult(
+                    status="aborted",
+                    session_id=session_id,
+                    transcript_path=transcript,
+                    budget_weighted=budget_weighted,
+                )
             if event == "error":
                 # session.error may precede a retry, not a turn-end (status
                 # "retry" exists); only a PROVABLY settled session reads as a

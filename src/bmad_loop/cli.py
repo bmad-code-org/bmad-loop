@@ -2310,6 +2310,48 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
     # does — `_sweep_factory(..., new_digest)` — so the same reasoning applies.
     profiles = _launch_profiles(pol, project)
     new_digest = _trusted_config_digest(pol, project, profiles=profiles)
+    # Discard any stop request left over from a prior stopped run — either mode — so
+    # the re-armed engine does not consume it at the first item boundary and
+    # immediately re-stop. A resume is fresh user intent, which is what makes a
+    # request lodged against the previous one stale.
+    #
+    # Placed here, and not beside write_pid with the rest of the arming, because this
+    # branch RETURNS. `_require_base_skills` above used to be this function's last
+    # early exit — everything below it ran straight through — so a refusal sited
+    # further down leaves persistent side effects behind for a resume that never
+    # happened: the `run-resume` journal entry, and the re-stamped integrity pin.
+    # The pin is the one that bites. `write_trusted_config_digest` below writes the
+    # exact file the NEXT resume reads back as `pinned`, so re-baselining it on a
+    # refusal inverts the advisory: it fires on the attempt that stopped and goes
+    # silent on the attempt that actually armed an engine. The re-stamp's own
+    # justification — that the engine this process is about to arm re-reads the
+    # config from there — is false on a path that arms nothing.
+    #
+    # No earlier than here either: `_launch_profiles` and `_trusted_config_digest`
+    # above both raise SystemExit on a bad profile, and clearing ahead of them would
+    # destroy the operator's lodged request on a resume that then aborts. This window
+    # is the only one past every raise site and ahead of both writes — and it is
+    # still before write_pid, the constraint that governs correctness: the moment the
+    # pid lands the engine is "live" and a lingering request becomes honorable.
+    if runs.clear_graceful_stop(run_dir):
+        print(
+            f"run {run_dir.name}: discarded a stale stop request before resuming",
+            file=sys.stderr,
+        )
+    elif runs.graceful_stop_requested(run_dir):
+        # The clear is never-raise by contract (five callers depend on that), so it
+        # answers False for "nothing was pending" and "could not remove it" alike.
+        # Re-read to tell them apart: a request that survived the clear would be
+        # consumed at the very first item boundary and re-stop the run, and because
+        # the print above never fired the operator would see no reason why — then
+        # resume again, to the same end.
+        print(
+            f"run {run_dir.name}: a stale stop request could not be discarded "
+            f"({runs.STOP_REQUEST_FILE} is not removable); resuming would stop again "
+            "at the first item. Remove it and retry.",
+            file=sys.stderr,
+        )
+        return 1
     # #461 point 4, human-present half. A resume IS a deliberate human choice, so
     # the on-disk config is re-blessed (new_digest is re-stamped below) and the run
     # proceeds — the auto-sweep child is the only path that refuses. But the issue's
@@ -2408,15 +2450,6 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
     # different problem with no fix at equal privilege — #571.
     state.trusted_config_digest = new_digest
     state.clear_pause()
-    # A resume is fresh user intent: discard any graceful-stop request left over from
-    # a prior stopped-gracefully run so the re-armed engine does not consume it at the
-    # first item boundary and immediately re-stop. Fire before write_pid — the moment
-    # the pid lands the engine is "live" and a lingering request becomes honorable.
-    if runs.clear_graceful_stop(run_dir):
-        print(
-            f"run {run_dir.name}: discarded a stale graceful-stop request before resuming",
-            file=sys.stderr,
-        )
     runs.write_pid(run_dir)
     # Persist before the engine starts: status, the TUI and diagnose only ever
     # read state.json, and Engine._save() may not fire for minutes. write_pid
@@ -3149,11 +3182,14 @@ def cmd_status(args: argparse.Namespace) -> int:
     state = load_state(run_dir)
     # A pending graceful stop is not in state.json (it's the control file + a live
     # engine), so derive it here and hand it to the builder / text branch. Order the
-    # `and` so the cheap file check gates the engine_liveness probe: skip it when the
-    # run is already concluded or no request is on disk.
+    # `and` so the cheap file read gates the engine_liveness probe: skip it when the
+    # run is already concluded or no request is on disk. The mode check is exact —
+    # a lodged `mode: hard` request is a stop in flight, not a *graceful* stop
+    # pending, and reporting it as one would promise an operator the current item
+    # still finishes. Absent and hard both read False here; only "graceful" is True.
     graceful_pending = (
         not (state.finished or state.paused or state.stopped or state.crashed)
-        and runs.graceful_stop_requested(run_dir)
+        and runs.read_stop_request_mode(run_dir) == "graceful"
         and runs.engine_liveness(run_dir) != "dead"
     )
     if args.json:
@@ -3281,7 +3317,8 @@ def cmd_stop(args: argparse.Namespace) -> int:
         return _cmd_cancel_graceful(run_dir, args.run_id)
     if args.graceful:
         return _cmd_request_graceful(run_dir, args.run_id)
-    # Hard stop (unchanged): SIGTERM the engine, kill its agent window, mark stopped.
+    # Hard stop: lodge a `mode: "hard"` stop request, signal the engine (the POSIX
+    # fast path), and let it tear the run down; kill its agent window either way.
     try:
         stopped = runs.stop_run(run_dir)
     except (runs.StopRunError, ProcessHostError) as e:
@@ -3295,11 +3332,28 @@ def cmd_stop(args: argparse.Namespace) -> int:
 
 
 def _cmd_cancel_graceful(run_dir: Path, run_id: str) -> int:
-    """`stop --cancel-graceful`: discard a pending request so the run keeps going."""
+    """`stop --cancel-graceful`: discard a pending request so the run keeps going.
+
+    Mode-neutral, like the clear it delegates to: the only hard request that can
+    still be on disk for a human to reach is one `stop_run` deliberately left
+    lodged after refusing to force-kill an unverifiable pid, and withdrawing that
+    is a legitimate thing to want. So the messages name a *stop request*, not a
+    graceful one (#319)."""
     if runs.clear_graceful_stop(run_dir):
-        print(f"run {run_id}: graceful stop request cancelled")
+        print(f"run {run_id}: stop request cancelled")
         return 0
-    print(f"run {run_id} has no graceful stop pending", file=sys.stderr)
+    if runs.graceful_stop_requested(run_dir):
+        # The clear answers False for "nothing pending" and "could not remove it"
+        # alike; re-read so we never tell an operator their request is gone while it
+        # is still on disk and still honorable. Exit 1 either way — only the message
+        # differs, so no caller's exit-code expectation moves.
+        print(
+            f"run {run_id}: stop request could not be cancelled "
+            f"({runs.STOP_REQUEST_FILE} is not removable) — it is still pending",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"run {run_id} has no stop request pending", file=sys.stderr)
     return 1
 
 
@@ -3312,8 +3366,28 @@ def _cmd_request_graceful(run_dir: Path, run_id: str) -> int:
     except runs.GracefulStopError as e:
         print(str(e), file=sys.stderr)
         return 1
+    except OSError as e:
+        # The lodge creates the file first and writes the body into it, and it
+        # deliberately does not roll back a failed write (see _create_stop_request:
+        # an unlink there resolves the *name*, so it could delete a hard request a
+        # concurrent `stop` escalated onto it). So a write that failed part-way
+        # still leaves a request standing, and a short body reads as graceful —
+        # the mode we were asked for. Say so rather than reporting a clean failure
+        # the operator would act on by asking again (#319).
+        print(
+            f"run {run_id}: stop request could not be written ({e}) — a graceful "
+            f"request may still be pending; check `bmad-loop status {run_id}` and "
+            f"use `bmad-loop stop {run_id} --cancel-graceful` to withdraw it",
+            file=sys.stderr,
+        )
+        return 1
     if outcome == "already-pending":
-        print(f"run {run_id} already has a graceful stop pending")
+        # Mode-neutral for the same reason `--cancel-graceful` is: the pending
+        # request may be a *hard* one (a `stop` that could not prove the engine
+        # dead leaves it lodged at rest), and the token is deliberately mode-blind.
+        # Naming it "graceful" would report a strictly stronger stop as a weaker
+        # one (#319).
+        print(f"run {run_id} already has a stop request pending")
         return 0
     if outcome == "requested-unverifiable":
         print(
@@ -4265,7 +4339,7 @@ def main(argv: list[str] | None = None) -> int:
         "--graceful",
         action="store_true",
         help="finish the in-flight item (through commit), then stop cleanly and stay "
-        "resumable — instead of the hard SIGTERM stop; also suppresses pending auto-sweeps",
+        "resumable — instead of the default hard stop; also suppresses pending auto-sweeps",
     )
     stop_grp.add_argument(
         "--cancel-graceful",

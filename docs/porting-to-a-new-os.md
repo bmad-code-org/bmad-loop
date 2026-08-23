@@ -230,7 +230,10 @@ register_process_host("windows", lambda platform: platform == "win32", WindowsPr
 
 - `terminate(pid)` — politely stop it (POSIX `SIGTERM` / Windows `taskkill`). Raise
   the `OSError` family (`ProcessLookupError` / `PermissionError`) so callers keep
-  their "already gone / not ours" handling.
+  their "already gone / not ours" handling. This is the polite fast path, not the
+  stop guarantee: `bmad-loop stop` also lodges a hard `stop-request.json` the engine
+  reads itself, so a port whose `terminate` cannot actually be delivered still stops
+  runs (#319).
 - `force_kill(pid)` — escalation when `terminate` is ignored (POSIX `SIGKILL` /
   Windows `taskkill /F /T`). Only ever called once identity is confirmed.
 - `is_alive(pid)` — read-only liveness probe, no signal sent.

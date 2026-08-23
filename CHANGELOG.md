@@ -36,6 +36,20 @@ breaking changes may land in a minor release.
   mismatch mislabelled. The decision is unchanged — a byte-identical answer still activates
   whatever scope supplied it, every unconfirmed answer still degrades, and the repo-format
   flag is still rolled back.
+- **A hard stop rides `stop-request.json` with `mode: "hard"` (#319).** It is lodged before the
+  engine is signalled — the atomic write also supersedes a pending graceful request — and honored
+  at item boundaries and mid-session, where both real adapter wait loops poll it twice per iteration,
+  which normally lands well inside the 10s grace window. An iteration blocked on a transport call
+  or waiting for an artifact can exceed it, and the stop then degrades to the force-kill backstop —
+  the pre-#319 outcome, never a worse one. SIGTERM is now the POSIX fast path rather than the mechanism, so a hard stop
+  lands on every platform and multiplexer backend, and reaches a nested auto-sweep through the
+  owning run's channel — hard-only; `stop <child-id>` is unchanged. A run directory that rejects
+  the write degrades to the signal path with the stop still delivered.
+- **`status --json`'s `graceful_stop_pending` is now mode-exact (#319)** — it reports only
+  genuinely graceful requests. A modeless pre-#319 request body still reads graceful.
+- **`stop --graceful` and the TUI report an already-pending request without calling it graceful
+  (#319).** The request standing on disk may be a hard one — `stop` leaves one lodged when it
+  could not prove the engine dead — and the idempotency answer is deliberately mode-blind.
 
 ### Removed
 
@@ -46,6 +60,42 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **Native Windows: `bmad-loop stop` no longer burns the full 10s grace window into a blind
+  `taskkill /F` (#319).** An inter-process SIGTERM is never delivered to a native-Windows engine,
+  so every stop completed through the external fallback with no engine teardown at all. The engine
+  honors the stop request itself now, so it is the single writer of `stopped` again and
+  `run-stop fallback=True` is no longer stamped on a stop the engine recorded itself — it marks
+  one this tool had to complete from outside.
+- **`bmad-loop stop` no longer reports success when it delivered neither channel (#319).** A run
+  directory that rejects the request write, followed by a signal the OS refuses, left the CLI
+  saying the run had stopped — and stamping `run-stop fallback=True` — over an engine that may
+  still be running with nothing on disk to stop it. It now kills the agent session as a backstop,
+  records the undelivered attempt, and exits non-zero naming the retry.
+- **Two concurrent `stop` invocations against one run no longer collide on a staging temp (#319).**
+  The write staged through a fixed `stop-request.json.tmp`, so the loser's rename raised
+  `FileNotFoundError`. It now stages under a per-writer name: the last write wins and neither
+  caller errors.
+- **`resume` no longer re-arms a run whose stale stop request it could not remove (#319).** It read
+  "could not remove it" as "nothing was pending", wrote the pid, and stopped again at the first
+  item boundary with nothing printed to say why. Resume now refuses before the pid lands and names
+  the file, without re-stamping the host-exec integrity pin for a run it never started.
+  `stop --cancel-graceful` likewise stops reporting "no stop request pending" for a request still
+  on disk and still honorable — same exit code, accurate message.
+- **A `stop` that never proved the engine dead keeps its request lodged (#319).** A `terminate` or
+  `force_kill` refused with `PermissionError`, or a `taskkill /F /T` that failed silently,
+  discarded the hard request while reporting the run stopped — throwing away the only channel left
+  to stop a live engine. Death is now distinguished from refusal, so the stop stays genuinely in
+  flight.
+- **A hard stop arriving as the last item finishes stops the run instead of reporting it completed
+  (#319).** Covers `max-stories-reached` too; a graceful request at an exhausted queue still
+  finishes truthfully.
+- **`stop --graceful` no longer downgrades a hard request that landed while it ran (#319).** The
+  graceful lodge is now an atomic `O_CREAT | O_EXCL` create that answers "already pending" for
+  anything already there, and a symlink planted at the path is refused rather than followed. Two
+  concurrent graceful asks resolve the same way, which is the documented idempotency. A write that
+  fails part-way leaves the request standing instead of rolling back — an unlink there resolves the
+  path, not the file the call created, so it could remove a hard request escalated onto it — and
+  `stop --graceful` reports it as possibly pending rather than as a clean failure.
 - **A policy field of the wrong TOML type now raises `PolicyError` naming `section.key`
   (#440).** `loads()` coerced with bare `int()`/`float()`/`bool()`/`str()` outside the
   `PolicyError` funnel, so a wrong-typed value escaped every handler written to degrade on

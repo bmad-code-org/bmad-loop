@@ -24,6 +24,7 @@ from pathlib import Path
 import pytest
 from conftest import write_script_launcher
 
+from bmad_loop import runs
 from bmad_loop.adapters import generic, opencode_http
 from bmad_loop.adapters.base import SessionHandle, SessionResult, SessionSpec
 from bmad_loop.adapters.generic import BUDGET_NUDGE_TEXT, NUDGE_TEXT, STALL_NUDGE_TEXT
@@ -2032,6 +2033,185 @@ def test_timeout_wall_clock_step_back_cannot_extend_deadline(tmp_path, monkeypat
     assert result.status == "timeout"
     assert result.timeout_expired_clock == "monotonic"
     assert ticks["n"] == 3  # same tick count as an untouched wall clock
+
+
+# ---------------------------- in-session hard-stop poll (#319)
+#
+# Contract parity: tests/test_generic_tmux.py carries the identically named pair
+# over the tmux transport. `bmad-loop stop` lodges a mode-aware stop-request.json
+# before it signals; the wait loop reads it twice per iteration and returns the
+# non-completion `aborted` verdict, cancelling the in-flight HTTP turn exactly as
+# the timeout arm does. The adapter never unlinks the file — the engine consumes
+# it, and must still see it to attribute the stop.
+
+
+class _AbortRecordingClient:
+    """Minimal opencode HTTP client stand-in: records every POST path so a test
+    can prove the abort really went out, and answers the usage GET
+    `_capture_usage` makes on the way out."""
+
+    def __init__(self):
+        self.posts: list[str] = []
+
+    def get(self, path):
+        class _Resp:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return [{"info": {"role": "assistant", "tokens": {"input": 10, "output": 5}}}]
+
+        return _Resp()
+
+    def post(self, path):
+        self.posts.append(path)
+
+        class _Resp:
+            status_code = 200
+
+        return _Resp()
+
+    def close(self):
+        pass
+
+
+def _lodge_stop_request(adapter, mode: str) -> Path:
+    """Lodge a stop request of ``mode`` on this run's control-file channel, as
+    ``bmad-loop stop`` does."""
+    adapter.run_dir.mkdir(parents=True, exist_ok=True)
+    path = adapter.run_dir / runs.STOP_REQUEST_FILE
+    path.write_text(
+        json.dumps({"requested_at": "2026-08-22T00:00:00", "mode": mode}), encoding="utf-8"
+    )
+    return path
+
+
+def test_wait_aborts_on_hard_stop_request(tmp_path, monkeypatch):
+    """A hard stop pending on the channel ends the wait on its very next
+    iteration with the non-completion `aborted` verdict, and takes the timeout
+    arm's exit shape: `_abort` cancels the in-flight turn, then `_capture_usage`
+    reads usage back before teardown. Without the abort the HTTP turn would keep
+    running server-side until the session is torn down.
+
+    The verdict fires before the loop ever polls its event queue, so the
+    steerable clock never advances: the pass is deterministic, not a race.
+
+    Ablation: delete the `_hard_stop_requested()` arm from `wait_for_completion`
+    and the clock runs the session to its scripted `timeout` verdict instead —
+    proven red once, then restored.
+    """
+    adapter = make_adapter(tmp_path)
+    clock = _install_clock(monkeypatch)
+    (adapter.tasks_dir / "t-1").mkdir(parents=True)
+    request = _lodge_stop_request(adapter, "hard")
+
+    ticks = {"n": 0}
+
+    def advance():
+        ticks["n"] += 1
+        clock["mono"] += 11.0  # only reached if the abort arm is gone
+
+    sess = _timeout_driven_session(adapter, advance)
+    sess.client = _AbortRecordingClient()
+
+    result = adapter.wait_for_completion(
+        SessionHandle(task_id="t-1", native_id="ses_1"), _timeout_spec(tmp_path)
+    )
+
+    assert result.status == "aborted"
+    assert result.result_json is None  # an abort is never a completion path
+    assert ticks["n"] == 0  # aborted before the first event-queue poll
+    assert sess.client.posts == ["/session/ses_1/abort"]
+    assert result.transcript_path == str(adapter.tasks_dir / "t-1" / "messages.json")
+    fired = [ln for ln in _lifecycle_lines(adapter) if ln["event"] == "stop-abort-fired"]
+    assert len(fired) == 1
+    # The engine consumes the request when it raises; an adapter that unlinked it
+    # would leave the engine unable to attribute the stop.
+    assert request.is_file()
+
+
+def test_wait_polls_the_hard_stop_channel_after_the_event_queue_too(tmp_path, monkeypatch):
+    """The arm at the top of the loop is not enough by itself. Below the event-queue
+    wait sit the dispatch legs — `_probe_completion`'s two GETs (not throttled: once
+    a turn goes quiet past SILENCE_THRESHOLD_S they run every tick), a
+    `_session_status` GET, or `_result_json(wait=True)`'s grace wait — each bounded
+    only by the client's own timeouts. One iteration can outlast `stop_run`'s 10s
+    grace window, and on native Windows that is the force-kill this issue exists to
+    avoid. A second poll straight after the queue wait leaves at most one leg between
+    two checks.
+
+    The request is lodged *inside* the queue poll, so it is absent at the top-of-loop
+    check and present immediately after — the interval the second poll covers.
+
+    This does not make the interval unconditionally short, and the prose no longer
+    claims it does: an in-flight socket read cannot be interrupted from this thread.
+
+    Ablation: delete the second `_hard_stop_requested()` arm (below the queue wait)
+    -> `_probe_completion` is called, because the loop enters the silent-turn
+    dispatch leg and only notices the request on its next iteration. The verdict
+    stays `aborted` either way, which is why the probe spy carries the proof and the
+    status does not."""
+    adapter = make_adapter(tmp_path)
+    clock = _install_clock(monkeypatch)
+    (adapter.tasks_dir / "t-1").mkdir(parents=True)
+    adapter.silence_threshold_s = 0.0  # the quiet-turn leg fires on every tick
+
+    probes: list[int] = []
+    monkeypatch.setattr(
+        type(adapter), "_probe_completion", lambda self, sess: (probes.append(1), False)[1]
+    )
+
+    lodged: list[str] = []
+
+    def advance():
+        if not lodged:  # absent at the top-of-loop check, present right after
+            lodged.append("hard")
+            _lodge_stop_request(adapter, "hard")
+        clock["mono"] += 11.0  # makes the turn read as silent below the wait
+
+    sess = _timeout_driven_session(adapter, advance)
+    sess.client = _AbortRecordingClient()
+
+    result = adapter.wait_for_completion(
+        SessionHandle(task_id="t-1", native_id="ses_1"), _timeout_spec(tmp_path)
+    )
+
+    assert lodged == ["hard"]  # the interleave really happened
+    assert result.status == "aborted"
+    assert sess.client.posts == ["/session/ses_1/abort"]  # took the abort exit shape
+    assert probes == []  # never entered the dispatch leg below the wait
+
+
+def test_wait_ignores_graceful_stop_request(tmp_path, monkeypatch):
+    """Graceful means *finish the in-flight item*, so a graceful request pending
+    on the same channel must not touch a running session — only `hard` aborts.
+    Every pre-#319 (modeless) body reads graceful, so this pins the back-compat
+    case for the HTTP transport too.
+
+    Ablation: widen the adapter's check to any pending request (drop the
+    ``== "hard"`` comparison in `_hard_stop_requested`) and this test reddens
+    with an `aborted` verdict.
+    """
+    adapter = make_adapter(tmp_path)
+    clock = _install_clock(monkeypatch)
+    (adapter.tasks_dir / "t-1").mkdir(parents=True)
+    _lodge_stop_request(adapter, "graceful")
+
+    def advance():
+        clock["mono"] += 11.0
+
+    sess = _timeout_driven_session(adapter, advance)
+    sess.client = _AbortRecordingClient()
+
+    result = adapter.wait_for_completion(
+        SessionHandle(task_id="t-1", native_id="ses_1"), _timeout_spec(tmp_path)
+    )
+
+    # the loop ran on to its scripted verdict rather than aborting
+    assert result.status == "timeout"
+    events = [ln["event"] for ln in _lifecycle_lines(adapter)]
+    assert "stop-abort-fired" not in events
+    assert events.count("timeout-fired") == 1
 
 
 # -------------------------- launch-stall transport parity (#411/#470)

@@ -139,7 +139,7 @@ One row per run dir under `.bmad-loop/runs/`, oldest first (run ids are
 `YYYYMMDD-HHMMSS-<hex>` and sort chronologically). Columns: `st` (status
 glyph, see below), `run` (the id), `type` (`story` or `sweep`), `note` (a
 colored pause-kind badge on a paused run — `plan` / `story` / `spec` / `epic` /
-`gate` / `esc`, or `⏹ stop` when a running run has a graceful stop pending).
+`gate` / `esc`, or `⏹ stop` when a running run has a stop request pending).
 When any run is paused awaiting a human the pane's title shows
 a global **`⚑ N need attention`** count. On first load the newest run is
 auto-selected; arrow keys or mouse select another. A run you just launched is
@@ -221,7 +221,11 @@ situational banners:
 - `⏹ graceful stop pending — will stop after the current item` — a graceful
   stop was requested (`S`, or `bmad-loop stop --graceful`); the run finishes the
   in-flight story/bundle through commit (or, mid-sweep-triage, lets triage
-  complete and starts no bundles), then finalizes and stops (resumable).
+  complete and starts no bundles), then finalizes and stops (resumable). The
+  underlying read is the control file's presence, not its mode, so the same line
+  shows for as long as a **hard** stop's request sits on disk before the engine
+  honors it — usually seconds, longer if the session is blocked in a transport
+  call — and there the current item does not finish.
 - `✖ engine gone — run was interrupted · press e to resume` — the recorded
   engine pid is dead.
 - `⚑ decision needed: DW-<n> — <question> / press a to attach and answer` —
@@ -336,7 +340,7 @@ Journal kinds are styled by substring, first match wins:
 | `R`      | resolve a run paused at an escalation (interactive, then re-arm)           |
 | `d`      | answer deferred-work decisions past sweeps left unanswered (modal walk)    |
 | `a`      | attach to the selected run's live session or orchestrator window           |
-| `x`      | stop the selected live run immediately (confirm modal)                     |
+| `x`      | stop the selected live run, abandoning the in-flight item (confirm modal)  |
 | `S`      | graceful stop: finish the in-flight item, then finalize & stop (confirm)   |
 | `D`      | delete the selected run's directory (confirm modal)                        |
 | `A`      | archive the selected run to `.bmad-loop/archive` (confirm modal)           |

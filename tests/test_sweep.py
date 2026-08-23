@@ -4355,6 +4355,70 @@ def test_graceful_stop_between_cycles_skips_next_triage(project):
     assert stops[-1]["remaining"] == 1  # DW-2, generated in cycle 1, still open
 
 
+def test_hard_stop_between_bundles_takes_hard_arm(project, monkeypatch):
+    """Sibling of the graceful bundle-boundary test for the HARD mode (#319): the
+    same control file carrying `mode: "hard"` is honored at the same boundary, but
+    takes the hard arm — unconditional teardown, no clean-finish subset, `run-stop`
+    with `via="stop-request"` and no `graceful` flag. Lodged at `post_bundle`, so
+    it lands after bundle 1 is fully done and past `_run_session`'s own hard-file
+    check; the boundary before bundle 2 is what sees it."""
+    killed = []
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: killed.append(rid))
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    run_dir = project.project / ".bmad-loop" / "runs" / "sweep-run"
+    plan = triage_result(
+        ["DW-1", "DW-2"],
+        bundles=[
+            {"name": "first-fix", "dw_ids": ["DW-1"], "intent": "a"},
+            {"name": "second-fix", "dw_ids": ["DW-2"], "intent": "b"},
+        ],
+    )
+    engine, adapter = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "first-fix", ["DW-1"]),
+            bundle_review_effect(project, "first-fix"),
+        ],
+    )
+
+    post_run_stages = []
+    original_emit = engine._emit
+
+    def spy_emit(stage, *args, **kwargs):
+        if stage == "post_run":
+            post_run_stages.append(stage)
+        if stage == "post_bundle":
+            # the operator's `bmad-loop stop` lands between bundle 1 and bundle 2
+            (run_dir / runs.STOP_REQUEST_FILE).write_text(
+                '{"requested_at": "2026-07-20T00:00:00", "mode": "hard"}', encoding="utf-8"
+            )
+        return original_emit(stage, *args, **kwargs)
+
+    engine._emit = spy_emit
+
+    summary = engine.run()
+
+    assert not summary.paused
+    tasks = engine.state.tasks
+    assert tasks["dw-first-fix"].phase == Phase.DONE and tasks["dw-first-fix"].commit_sha
+    assert "dw-second-fix" not in tasks  # bundle 2 never dispatched
+    assert len(adapter.sessions) == 3  # triage + bundle-1 dev + bundle-1 review
+    saved = load_state(engine.run_dir)
+    assert saved.stopped is True and saved.finished is False
+    assert not runs.graceful_stop_requested(engine.run_dir)  # consumed at the boundary
+    assert killed == ["sweep-run"]  # hard arm's unconditional teardown
+    assert post_run_stages == []  # hard path skips the clean-finish subset
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "run-complete" not in kinds
+    assert "stop-request-discarded" not in kinds  # honored, not discarded as stale
+    stops = [e for e in engine.journal.entries() if e["kind"] == "run-stop"]
+    assert stops and stops[-1]["via"] == "stop-request"
+    assert "graceful" not in stops[-1]
+    entries = ledger_entries(project)
+    assert entries["DW-1"].status.startswith("done") and entries["DW-2"].open
+
+
 def test_bundle_dispatch_does_not_pin_expected_spec(project, tmp_path):
     """A sweep bundle's fresh dispatch points at `intent.md`, never at a spec — the
     session is free to CREATE one, and #161 has it legitimately adopting a

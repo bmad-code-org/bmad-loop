@@ -58,7 +58,17 @@ from .platform_util import atomic_replace, atomic_write_text, retrying_unlink, s
 from .plugins import HookBus, HookContext, PluginRegistry
 from .policy import Policy
 from .recovery_flow import RecoveryFlow
-from .runs import clear_graceful_stop, events_dir_for, graceful_stop_requested, kill_session
+from .runs import (
+    clear_graceful_stop,
+    consume_stop_request,
+    events_dir_for,
+    graceful_stop_requested,
+    kill_session,
+    owner_run_dir,
+    read_stop_request_mode,
+    reset_owner_run_dir,
+    set_owner_run_dir,
+)
 from .sprintstatus import ACTIONABLE_STATUSES, STATUS_ORDER, SprintStatusError
 from .sprintstatus import advance as sprint_advance
 from .sprintstatus import advanced_bytes as sprint_advanced_bytes
@@ -160,19 +170,28 @@ class RunStopped(Exception):
 
     Two flavors, distinguished by ``graceful``:
 
-    - ``graceful=False`` (default) — a *hard* stop from the SIGTERM/SIGINT handler.
-      The loop is interrupted mid-session, so the in-flight agent window is still
-      live and must be torn down unconditionally.
+    - ``graceful=False`` (default) — a *hard* stop: the SIGTERM/SIGINT handler, or
+      a ``mode: "hard"`` stop request the engine honored at an item boundary
+      (:meth:`Engine._check_stop_request`) or on either side of a session
+      (:meth:`Engine._run_session`). The loop may have been interrupted
+      mid-session, so the in-flight agent window can still be live and must be
+      torn down unconditionally.
     - ``graceful=True`` — a stop requested via the ``stop-request.json`` control
-      file and detected at an item boundary (:meth:`Engine._check_graceful_stop`).
-      The in-flight item already completed through commit, so ``run()`` runs the
-      wanted subset of the clean-finish path (worktree GC + ``post_run`` +
-      policy-gated session teardown) rather than a hard kill, and the run stays
-      resumable."""
+      file in its default ``graceful`` mode and detected at an item boundary
+      (:meth:`Engine._check_stop_request`). The in-flight item already completed
+      through commit, so ``run()`` runs the wanted subset of the clean-finish path
+      (worktree GC + ``post_run`` + policy-gated session teardown) rather than a
+      hard kill, and the run stays resumable.
 
-    def __init__(self, graceful: bool = False):
+    ``via`` names the channel a hard stop arrived on — ``"stop-request"`` for the
+    control file, ``None`` for a signal — and rides the ``run-stop`` journal entry.
+    It is the only evidence that separates the two on a native-Windows run, where
+    the signal path cannot fire at all (#319)."""
+
+    def __init__(self, graceful: bool = False, via: str | None = None):
         super().__init__("graceful stop" if graceful else "stopped")
         self.graceful = graceful
+        self.via = via
 
 
 class SweepFactory(Protocol):
@@ -598,9 +617,19 @@ class Engine:
         depth = _run_depth.get()
         self._is_nested = depth > 0
         token = _run_depth.set(depth + 1)
+        # Publish this run dir as the owner for everything below, so a nested
+        # auto-sweep's adapters poll the file an operator can actually write to
+        # (#319): `stop <parent-id>` lodges here, while the child's own dir stays
+        # empty. Gated on depth, not on `_owns_signals` — a top-level run off the
+        # main thread installs no handlers yet still owns the channel. Reset by
+        # token in the same finally, ahead of the depth, so the nested re-raise arms
+        # unwind through both.
+        owner_token = None if self._is_nested else set_owner_run_dir(self.run_dir)
         try:
             return self._run_inner()
         finally:
+            if owner_token is not None:
+                reset_owner_run_dir(owner_token)
             _run_depth.reset(token)
 
     def _run_inner(self) -> RunSummary:
@@ -622,6 +651,23 @@ class Engine:
                 self._prune_preserve_refs()
                 self._replay_unlatched_ledger_carries()
                 self._loop()
+                # A hard request that landed after `_loop`'s head check reaches none
+                # of the raise sites on an exhausted-queue return: sites A and B live
+                # inside `_run_session`, which the `story is None` branch never
+                # enters, and the run-end auto-sweep predicate is mode-blind, so it
+                # *suppresses* and returns rather than raising. Without this the run
+                # would record `finished` — which `documents.py` ranks above
+                # `stopped` — while the operator's hard stop went unhonored, and
+                # `stop_run`'s fallback would then journal `fallback=True` against a
+                # perfectly responsive engine, contradicting what that flag now means.
+                # Covering it here rather than at the suppression site closes every
+                # `_loop` return path at once (including `max-stories-reached`) and
+                # keeps the per-epic sweep caller untouched. Mode-exact on purpose: a
+                # *graceful* request at an exhausted queue finishes truthfully, which
+                # is long-documented, separately tested behavior this must not disturb.
+                if read_stop_request_mode(self.run_dir) == "hard":
+                    clear_graceful_stop(self.run_dir)
+                    raise RunStopped(via="stop-request")
                 self.state.finished = True
                 self._gc_run_worktrees()
                 self._emit("post_run")
@@ -645,7 +691,7 @@ class Engine:
             except RunStopped as stop:
                 if stop.graceful:
                     # Graceful stop: the request was consumed at an item boundary
-                    # (_check_graceful_stop), so the in-flight item already ran to
+                    # (_check_stop_request), so the in-flight item already ran to
                     # completion through commit — nothing mid-session to kill. Run
                     # the wanted subset of the clean-finish path so a resumable
                     # `stopped` run is finalized as tidily as a finished one.
@@ -671,14 +717,30 @@ class Engine:
                     if self._owns_signals and self.policy.adapter.cleanup_session_on_finish:
                         kill_session(self.state.run_id)
                 else:
-                    # Hard stop: the loop was interrupted inside adapter.run(), so
-                    # the agent window is still live — tear the whole run session
-                    # down.
+                    # Hard stop: the loop was interrupted inside adapter.run() (a
+                    # signal), or unwound on either side of it because a hard stop
+                    # request was honored — so the agent window may still be live.
+                    # Tear the whole run session down.
                     kill_session(self.state.run_id)
                     if self._is_nested:
                         raise  # nested auto-sweep: let the owner record the stop
                     self.state.stopped = True
-                    self.journal.append("run-stop")
+                    # The signal path consumes nothing on its way here, and `stop_run`
+                    # now lodges a hard request *before* it signals — so on POSIX the
+                    # file is still on disk for every routine stop. `run()`'s finally
+                    # would then discard it as *stale* and journal
+                    # `stop-request-discarded`, misreporting the very request this
+                    # stop delivers. Consume it here, on the same rule the boundary and
+                    # in-session sites already follow. Mode-exact: a pending *graceful*
+                    # request really is superseded by a hard stop, so it is left for
+                    # the finally to discard and journal, as it always has been.
+                    if read_stop_request_mode(self.run_dir) == "hard":
+                        clear_graceful_stop(self.run_dir)
+                    # `via` rides only when the control file delivered the stop;
+                    # the signal path keeps journaling a bare `run-stop` (precedent:
+                    # the KeyboardInterrupt arm's `reason=` extra below).
+                    extras = {"via": stop.via} if stop.via is not None else {}
+                    self.journal.append("run-stop", **extras)
             except KeyboardInterrupt:
                 # Some Windows console/control events can still surface as a raw
                 # KeyboardInterrupt without routing through the installed signal
@@ -737,11 +799,16 @@ class Engine:
                 ):  # nosec B110 - journal write is best-effort; crash.txt + state flag already persisted
                     pass
             finally:
-                # Any pending stop-request control file that outlived this run
-                # (the run finished/paused/crashed, or a hard stop superseded it,
-                # before an item boundary consumed it) is discarded here so a later
-                # resume does not re-honor a stale request. The graceful arm already
-                # consumed its own file, so this only fires for a superseded one.
+                # Any pending stop-request control file that outlived this run is
+                # discarded here so a later resume does not re-honor a stale request.
+                # Every arm that *honors* a request consumes its own file first — the
+                # boundary and in-session sites, and the hard arm above, which has to
+                # because `stop_run` lodges before it signals and the signal path
+                # reads nothing. So this fires only for a request no arm honored: the
+                # run finished, paused or crashed with one pending, or a hard stop
+                # superseded a *graceful* one. Journaling those as discarded is
+                # accurate; journaling a request that just stopped the run would not
+                # be, which is the whole reason the honoring arms consume.
                 if clear_graceful_stop(self.run_dir):
                     with contextlib.suppress(Exception):
                         self.journal.append("stop-request-discarded")
@@ -931,21 +998,38 @@ class Engine:
         except Exception:  # a hint must never break the stop
             return None
 
-    def _check_graceful_stop(self) -> None:
-        """Honor a pending graceful-stop request at an item boundary.
+    def _check_stop_request(self) -> None:
+        """Honor a pending stop request at an item boundary, in the mode it asks for.
 
         Consumes (deletes) the ``stop-request.json`` control file and raises
-        :class:`RunStopped` with ``graceful=True`` so ``run()`` unwinds into the
-        clean-finalization arm. An exception, not a sentinel return, because the
-        sweep check fires two frames below ``_loop`` (inside ``_cycle``) where a
-        return could not stop the loop. Called as the first statement of the loop
-        body (and, in the sweep engine, before each bundle): by the time control
-        reaches here the in-flight item has already completed through commit, so
-        the stop takes effect cleanly at the next boundary and the run stays
-        resumable."""
-        if graceful_stop_requested(self.run_dir):
-            clear_graceful_stop(self.run_dir)
-            raise RunStopped(graceful=True)
+        :class:`RunStopped` — ``graceful=True`` for a ``graceful`` request (the
+        default mode, and every pre-#319 modeless body, which
+        :func:`runs.read_stop_request_mode` deliberately reads as graceful) so
+        ``run()`` unwinds into the clean-finalization arm; ``via="stop-request"``
+        for a ``hard`` one so it takes the hard arm instead. An exception, not a
+        sentinel return, because the sweep check fires two frames below ``_loop``
+        (inside ``_cycle``) where a return could not stop the loop. Called as the
+        first statement of the loop body (and, in the sweep engine, before each
+        bundle): by the time control reaches here the in-flight item has already
+        completed through commit, so the stop takes effect cleanly at the next
+        boundary and the run stays resumable.
+
+        A *hard* request that reaches a boundary is honored right here rather than
+        deferred to the adapter's in-session poll — aborting at the boundary is
+        both faster and cleaner than launching the next session only to abort it
+        mid-flight."""
+        # One atomic take, never a read then an unlink: a `stop` escalating to
+        # "hard" between the two would be deleted unread while this engine routed
+        # on the stale graceful mode it already held. Consuming on BOTH arms is
+        # still required — `run()`'s finally discards any surviving file as *stale*
+        # and journals `stop-request-discarded`, which would misreport a request
+        # this engine just honored.
+        mode = consume_stop_request(self.run_dir)
+        if mode is None:
+            return
+        if mode == "hard":
+            raise RunStopped(via="stop-request")
+        raise RunStopped(graceful=True)
 
     def _loop(self) -> None:
         self._finish_inflight()
@@ -954,7 +1038,7 @@ class Engine:
             # boundary this base loop reaches — between stories, right after
             # _finish_inflight on resume, and the epic boundary + run-end (the
             # StoriesEngine has no _loop override, so it is covered here too).
-            self._check_graceful_stop()
+            self._check_stop_request()
             if self.max_stories is not None and self._dispatched_count() >= self.max_stories:
                 self.journal.append("max-stories-reached", count=self._dispatched_count())
                 return
@@ -4919,6 +5003,20 @@ class Engine:
                 task.ledger_changed_before_harvest = (
                     self._ledger_digest() != task.baseline_ledger_digest
                 )
+            # A hard stop honored *inside* the session: the adapter's wait loop
+            # saw a `mode: "hard"` stop-request.json, tore its window down and
+            # returned this abort verdict. Position is load-bearing at both ends.
+            # Inside the `try`, so the `finally` below journals the paired
+            # session-end with status="aborted" — the same literal the exception
+            # path writes there. Before `record_session`, so NO SessionRecord is
+            # written: an abort is not a session outcome, and this matches the
+            # signal-path hard stop, which interrupts inside `adapter.run()` and
+            # records nothing either. "aborted" therefore never escapes this
+            # method — no downstream status set (env-fault, retry, escalation)
+            # needs to learn it.
+            if result.status == "aborted":
+                clear_graceful_stop(self.run_dir)
+                raise RunStopped(via="stop-request")
             task.record_session(
                 SessionRecord(
                     task_id=task_id,
@@ -4994,6 +5092,33 @@ class Engine:
                     pass
         self._save()
         self._note_story_token_budget(task)
+        # A hard stop request that raise site A could not see as an abort: it
+        # landed in the gap after the wait loop's last poll, or the session DID
+        # abort and `_post_kill_reconcile` rescued it back to `completed` (the
+        # abort tore the window down before a landed Stop event was read). This
+        # check fires regardless of status, and that rescue is exactly why:
+        # without it a hard-stopped run would silently carry on into verify /
+        # review / retry on the strength of a rescued result. The session is fully
+        # recorded, saved and accounted for first, leaving the run byte-equivalent
+        # to the replayable host-death-after-save state documented above — a
+        # resume picks up from a complete session record, not a torn one.
+        if read_stop_request_mode(self.run_dir) == "hard":
+            clear_graceful_stop(self.run_dir)
+            raise RunStopped(via="stop-request")
+        # The same check against the *owning* run, for a nested auto-sweep child
+        # whose own dir is empty because the operator stopped the parent. Without
+        # it the fix above is inert on exactly the shape it exists for: the child's
+        # adapter aborts off the parent's file, `_post_kill_reconcile` rescues that
+        # `aborted` back to `completed`, so raise site A never fires — and the child
+        # would carry on into verify/review on the strength of the rescued result.
+        # Deliberately does NOT consume: the file is the parent's, and the parent's
+        # own hard arm must still find it to record and attribute the stop. The
+        # nested re-raise below hands this exception up before that arm consumes
+        # anything, and `via` rides the exception rather than the file.
+        if self._is_nested:
+            owner = owner_run_dir()
+            if owner is not None and read_stop_request_mode(owner) == "hard":
+                raise RunStopped(via="stop-request")
         self._emit(
             "post_session",
             task,

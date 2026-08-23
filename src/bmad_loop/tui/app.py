@@ -937,12 +937,13 @@ class BmadLoopApp(App[None]):
     def action_graceful_stop_run(self) -> None:
         """Ask the selected live run to stop *gracefully*: finish the in-flight item
         (story dev/review/commit, or a sweep bundle through commit), then finalize
-        cleanly and stop — resumable, unlike the hard SIGTERM `x` delivers.
+        cleanly and stop — resumable, unlike the hard stop `x` delivers, which
+        abandons the in-flight item.
 
         Deliberately no `_mux_missing` gate: unlike `x` (which kills the agent
-        window) this touches no multiplexer — the request is a control file the
-        engine polls at item boundaries — so it must work even with the backend
-        down. The liveness gate is also deliberately looser than `x`'s: it rejects
+        window) this touches no multiplexer — the request rides the same control
+        file a hard stop uses, in its graceful mode, read by the engine at item
+        boundaries — so it must work even with the backend down. The liveness gate is also deliberately looser than `x`'s: it rejects
         only a *provably dead* engine, so an unverifiable (`unknown`) pid — a win32
         access-denied pid, a psmux backend, a run on another host — still lodges the
         request, matching `runs.request_graceful_stop`'s `requested-unverifiable`
@@ -964,7 +965,8 @@ class BmadLoopApp(App[None]):
                 "graceful stop",
                 f"stop run {run_id} after the current item finishes?\n"
                 "the in-flight story/bundle completes through commit, then the run "
-                "finalizes and stops (resumable). `x` stops immediately instead.",
+                "finalizes and stops (resumable). `x` instead abandons the "
+                "in-flight item.",
                 confirm_label="graceful stop",
             ),
             done,
@@ -983,7 +985,9 @@ class BmadLoopApp(App[None]):
             self.call_from_thread(self.notify, str(e), severity="error")
             return
         if outcome == "already-pending":
-            self.call_from_thread(self.notify, f"run {run_id} already has a graceful stop pending")
+            # Mode-neutral: the pending request may be a hard one, and this token
+            # cannot tell (#319) — same wording as the CLI's `stop --graceful`.
+            self.call_from_thread(self.notify, f"run {run_id} already has a stop request pending")
             return
         if outcome == "requested-unverifiable":
             self.call_from_thread(

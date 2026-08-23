@@ -22,7 +22,7 @@ from pathlib import Path
 import pytest
 import regex
 
-from bmad_loop import devcontract
+from bmad_loop import devcontract, runs
 from bmad_loop.adapters import env_fault, generic, tmux_base
 from bmad_loop.adapters.base import SessionHandle, SessionResult, SessionSpec, SpecSnapshot
 from bmad_loop.adapters.generic import GenericDevAdapter, GenericTmuxAdapter
@@ -1903,6 +1903,213 @@ def test_lifecycle_and_heartbeat_write_failure_is_swallowed(tmp_path):
     adapter._write_heartbeat("3-1-dev-1", {"ts": 0.0})  # must not raise
 
 
+# ------------------------------ in-session hard-stop poll (#319)
+#
+# `bmad-loop stop` lodges a mode-aware stop-request.json before it signals, so a
+# stop reaches a session on platforms where the engine's SIGTERM never arrives.
+# The wait loop reads that file twice per iteration and returns the non-completion
+# `aborted` verdict; the engine raises RunStopped off it. The adapter never
+# unlinks the file — the engine consumes it, and must still see it to attribute
+# the stop.
+#
+# Contract parity: test_opencode_http.py holds the same pair over the HTTP
+# transport. A behavior change here must land in both or record the divergence.
+
+
+def _lodge_stop_request(adapter, mode: str) -> Path:
+    """Lodge a stop request of ``mode`` on this run's control-file channel, as
+    ``bmad-loop stop`` does. Written directly rather than through
+    ``runs._write_stop_request`` so the adapter's read stays pinned to the
+    on-disk shape, not to the writer's guards."""
+    adapter.run_dir.mkdir(parents=True, exist_ok=True)
+    path = adapter.run_dir / runs.STOP_REQUEST_FILE
+    path.write_text(
+        json.dumps({"requested_at": "2026-08-22T00:00:00", "mode": mode}), encoding="utf-8"
+    )
+    return path
+
+
+def test_wait_aborts_on_hard_stop_request(tmp_path, monkeypatch):
+    """A hard stop pending on the channel ends the wait on its very next
+    iteration with the non-completion ``aborted`` verdict — no artifact
+    read-back (that rescue is `_post_kill_reconcile`'s job) and no timeout burn.
+
+    The abort fires before the loop ever reaches its event source, so the
+    steerable clock never advances: the pass is deterministic, not a race.
+
+    Ablation: delete the `_hard_stop_requested()` arm from `wait_for_completion`
+    and the clock runs the session to its scripted `timeout` verdict instead —
+    proven red once, then restored.
+    """
+    adapter, clock = _timeout_clock_adapter(tmp_path, monkeypatch)
+    request = _lodge_stop_request(adapter, "hard")
+
+    def advance(call_n):
+        clock["mono"] += 11.0  # only reached if the abort arm is gone
+
+    adapter.watcher = _ScriptedWatcher([], on_call=advance)
+
+    result = adapter.wait_for_completion(_dev_handle(), _short_spec(tmp_path))
+
+    assert result.status == "aborted"
+    assert result.result_json is None  # an abort is never a completion path
+    assert adapter.watcher.calls == 0  # aborted before the first event wait
+    fired = [ln for ln in _lifecycle_lines(adapter) if ln["event"] == "stop-abort-fired"]
+    assert len(fired) == 1
+    # The engine consumes the request when it raises; an adapter that unlinked it
+    # would leave the engine unable to attribute the stop.
+    assert request.is_file()
+
+
+def test_wait_polls_the_hard_stop_channel_after_the_event_wait_too(tmp_path, monkeypatch):
+    """The arm at the top of the loop is not enough by itself. Between it and its
+    next run sit the loop's own 5s wait *and* whichever dispatch leg the event
+    selects — a `_window_alive` or `send_text` bounded only by TMUX_TIMEOUT_S (30s),
+    or a `_result_json(wait=True)` that waits RESULT_GRACE_S (15s) for an artifact.
+    That last one outlasts `stop_run`'s 10s grace window on a perfectly healthy box.
+    Polling again straight after the wait leaves at most one leg between two checks.
+
+    The request is lodged *during* the event wait, so it is absent at the
+    top-of-loop check and present immediately after — the exact interval this
+    second poll exists to cover.
+
+    It does not make the interval unconditionally short, and the prose no longer
+    claims it does: an in-flight subprocess cannot be interrupted from this thread,
+    so a leg that outlasts the window still degrades to the force-kill backstop.
+
+    Ablation: delete the second `_hard_stop_requested()` arm (the one just below
+    `watcher.wait_for`) -> `_window_alive` is called, because the loop enters the
+    `event is None` dispatch leg and only notices the request on its next
+    iteration. The verdict stays `aborted` either way, which is exactly why the
+    dispatch spy is the assertion carrying the proof and the status is not."""
+    adapter, _clock = _timeout_clock_adapter(tmp_path, monkeypatch)
+    alive_calls: list[int] = []
+    adapter._window_alive = lambda handle: (alive_calls.append(1), True)[1]
+
+    lodged: list[str] = []
+
+    def _lodge_during_the_wait(_call_n):
+        if not lodged:
+            lodged.append("hard")
+            _lodge_stop_request(adapter, "hard")
+
+    adapter.watcher = _ScriptedWatcher([], on_call=_lodge_during_the_wait)
+
+    result = adapter.wait_for_completion(_dev_handle(), _short_spec(tmp_path))
+
+    assert result.status == "aborted"
+    assert lodged == ["hard"]  # the interleave really happened
+    assert adapter.watcher.calls == 1  # caught on the same iteration, not the next
+    assert alive_calls == []  # never entered the dispatch leg below the wait
+
+
+def _lodge_owner_stop_request(tmp_path, mode: str) -> Path:
+    """Lodge a stop request in a *different* run dir and publish it as the owning
+    run, the way `stop <parent-id>` reaches a nested auto-sweep child: the request
+    lands in the parent's dir while the child's own stays empty."""
+    owner = tmp_path / ".bmad-loop" / "runs" / "parent-run"
+    owner.mkdir(parents=True, exist_ok=True)
+    (owner / runs.STOP_REQUEST_FILE).write_text(
+        json.dumps({"requested_at": "2026-08-22T00:00:00", "mode": mode}), encoding="utf-8"
+    )
+    return owner
+
+
+def test_wait_aborts_on_owning_runs_hard_stop_request(tmp_path, monkeypatch):
+    """A nested auto-sweep child aborts on the *parent's* hard request (#319).
+
+    The child mints its own run dir, so `stop <parent-id>` writes a file this
+    adapter would otherwise never read — and on native Windows, where the shared
+    SIGTERM cannot land, that left the parent stop force-killing blind. The poll now
+    reads the owning run's channel too.
+
+    Ablation: drop the owner leg from `_hard_stop_requested` and the clock runs the
+    session to its scripted `timeout` verdict instead."""
+    adapter, clock = _timeout_clock_adapter(tmp_path, monkeypatch)
+    owner = _lodge_owner_stop_request(tmp_path, "hard")
+    assert not (adapter.run_dir / runs.STOP_REQUEST_FILE).exists()  # child's own is empty
+
+    def advance(call_n):
+        clock["mono"] += 11.0  # only reached if the owner leg is gone
+
+    adapter.watcher = _ScriptedWatcher([], on_call=advance)
+
+    token = runs.set_owner_run_dir(owner)
+    try:
+        result = adapter.wait_for_completion(_dev_handle(), _short_spec(tmp_path))
+    finally:
+        runs.reset_owner_run_dir(token)
+
+    assert result.status == "aborted"
+    assert result.result_json is None
+    assert adapter.watcher.calls == 0
+    # The child never consumes the parent's file — the parent's own hard arm must
+    # still find it to record and attribute the stop.
+    assert (owner / runs.STOP_REQUEST_FILE).is_file()
+
+
+def test_wait_ignores_owning_runs_graceful_stop_request(tmp_path, monkeypatch):
+    """The mode-exact twin of the owner leg: graceful already suppresses a child
+    sweep from *starting*, and letting one already in flight finish is what graceful
+    means — so a graceful request on the owning run must not abort this session.
+
+    Ablation: widen the owner leg to `is not None` and this reddens alone."""
+    adapter, clock = _timeout_clock_adapter(tmp_path, monkeypatch)
+    owner = _lodge_owner_stop_request(tmp_path, "graceful")
+
+    def advance(call_n):
+        clock["mono"] += 11.0
+
+    adapter.watcher = _ScriptedWatcher([], on_call=advance)
+
+    token = runs.set_owner_run_dir(owner)
+    try:
+        result = adapter.wait_for_completion(_dev_handle(), _short_spec(tmp_path))
+    finally:
+        runs.reset_owner_run_dir(token)
+
+    assert result.status == "timeout"  # ran on, exactly as with no request at all
+
+
+def test_hard_stop_requested_falls_back_to_own_dir_outside_any_run(tmp_path, monkeypatch):
+    """With no owning run published — a standalone adapter, as in probes and most
+    tests — the predicate is its own dir alone, and answers without raising."""
+    adapter, _clock = _timeout_clock_adapter(tmp_path, monkeypatch)
+    assert runs.owner_run_dir() is None
+    assert adapter._hard_stop_requested() is False
+    _lodge_stop_request(adapter, "hard")
+    assert adapter._hard_stop_requested() is True
+
+
+def test_wait_ignores_graceful_stop_request(tmp_path, monkeypatch):
+    """Graceful means *finish the in-flight item*, so a graceful request pending
+    on the same channel must not touch a running session — only ``hard`` aborts.
+    Since every pre-#319 (modeless) body reads graceful, this is the back-compat
+    pin for the in-session poll as well.
+
+    Ablation: widen the adapter's check to any pending request (drop the
+    ``== "hard"`` comparison in `_hard_stop_requested`) and this test reddens
+    with an `aborted` verdict.
+    """
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    monkeypatch.setattr(generic, "RESULT_POLL_S", 0.0)
+    adapter, impl = make_dev_adapter(tmp_path)
+    adapter._window_alive = lambda handle: True
+    _lodge_stop_request(adapter, "graceful")
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+    )
+    adapter.watcher = _ScriptedWatcher([_stop_event("3-1-dev-1", "sess", "/t.jsonl")])
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert result.result_json["status"] == "done"
+    assert not _lifecycle_lines(adapter) or not [
+        ln for ln in _lifecycle_lines(adapter) if ln["event"] == "stop-abort-fired"
+    ]
+
+
 # ------------------------------ mid-session token-budget guard (#158)
 #
 # The wait loop samples cumulative weighted usage on the heartbeat cadence and
@@ -2468,6 +2675,32 @@ def test_post_kill_reconcile_no_artifact_keeps_stall(tmp_path):
     adapter._window_alive = lambda handle: False
     original = _unvouched()
     assert adapter._post_kill_reconcile(_dev_handle(), _dev_spec(tmp_path), original) is original
+
+
+def test_post_kill_reconcile_rescues_aborted(tmp_path):
+    """An operator's hard stop (#319) kills the window mid-wait, so a Stop event
+    that had already landed is never read — the same lost-vouching problem
+    `stalled` and `timeout` have, settled by the same trust model.
+
+    The upgrade to `completed` does NOT resume the run: the engine re-reads the
+    hard-stop file after saving the rescued session and stops there. So this
+    rescue records the finished work *and* the stop is still honored — the pair
+    is pinned engine-side by
+    `test_engine.py::test_hard_stop_after_completed_session_stops_before_next_leg`.
+
+    Ablation: drop `"aborted"` from the rescue tuple and the verdict stands
+    unrescued.
+    """
+    adapter, impl = make_dev_adapter(tmp_path)
+    adapter._window_alive = lambda handle: False
+    (impl / "spec-3-1-foo.md").write_text(_DONE_SPEC)
+    result = adapter._post_kill_reconcile(_dev_handle(), _dev_spec(tmp_path), _unvouched("aborted"))
+    assert result.status == "completed"
+    assert result.result_json["status"] == "done"
+    assert result.result_json["post_kill_reconciled"] is True
+    # the abort verdict's identity is preserved on the rescued result
+    assert result.session_id == "sess"
+    assert result.transcript_path == "/t.jsonl"
 
 
 def test_post_kill_reconcile_ignores_pre_launch_artifact(tmp_path):
@@ -4730,6 +4963,29 @@ def test_proof_of_work_gates_post_kill_reconcile(tmp_path, monkeypatch):
 
     _pane_log(adapter, "3-1-dev-1", generic.PROOF_OF_WORK_MIN_LOG_BYTES + 1)
     rescued = adapter._post_kill_reconcile(_dev_handle(), _dev_spec(tmp_path), stalled)
+    assert rescued.status == "completed"
+    assert rescued.result_json["post_kill_reconciled"] is True
+
+
+def test_proof_of_work_gates_the_aborted_rescue(tmp_path, monkeypatch):
+    """The #261 gate covers the abort leg (#319) exactly as it covers the others:
+    a session a hard stop killed before it did anything produced nothing, so a
+    qualifying artifact on disk is not its output and the `aborted` verdict
+    stands. With proof-of-work the same artifact rescues it.
+
+    Ablation: delete the `_produced_work` gate in `_post_kill_reconcile` and the
+    first arm reddens with a `completed` rescue.
+    """
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    adapter._window_alive = lambda handle: False
+    (impl / "spec-3-1-foo.md").write_text(_DONE_SPEC)
+    _pane_log(adapter, "3-1-dev-1", 0)
+    aborted = SessionResult(status="aborted")
+    assert adapter._post_kill_reconcile(_dev_handle(), _dev_spec(tmp_path), aborted) is aborted
+
+    _pane_log(adapter, "3-1-dev-1", generic.PROOF_OF_WORK_MIN_LOG_BYTES + 1)
+    rescued = adapter._post_kill_reconcile(_dev_handle(), _dev_spec(tmp_path), aborted)
     assert rescued.status == "completed"
     assert rescued.result_json["post_kill_reconciled"] is True
 

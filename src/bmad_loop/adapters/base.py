@@ -117,7 +117,12 @@ class SessionHandle:
 
 @dataclass(frozen=True)
 class SessionResult:
-    status: str  # "completed" | "stalled" | "timeout" | "crashed" | "over_budget"
+    # "aborted" is the in-session hard-stop verdict (#319): the wait loop saw a
+    # `mode: "hard"` stop-request.json and tore the session down. It is an abort,
+    # NEVER a completion — sessions complete only on hook Stop events or window
+    # death (AGENTS.md) — and it never escapes `Engine._run_session`, which
+    # unwinds it as a RunStopped before any SessionRecord is written.
+    status: str  # "completed" | "stalled" | "timeout" | "crashed" | "over_budget" | "aborted"
     result_json: dict[str, Any] | None = None
     session_id: str | None = None
     transcript_path: str | None = None
