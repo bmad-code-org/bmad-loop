@@ -60,6 +60,8 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- TUI: story-gate and epic-boundary pauses open a pause-reason viewer naming the blocking
+  entries and the remedy, instead of an empty spec pane (#515)
 - **Provisioning refuses an unparseable seeded hook config instead of silently replacing it
   (#592).** An isolated worktree's seeded `.claude/settings.json` that failed to parse was read
   as an empty document, so the relay merge always ran against a blank baseline and published a

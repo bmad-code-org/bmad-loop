@@ -46,6 +46,7 @@ from .screens.modals import (
     ConfirmResumeModal,
     DecisionModal,
     EscalationModal,
+    PauseReasonModal,
     SpecReviewModal,
     StartRunModal,
     StartSweepModal,
@@ -623,21 +624,39 @@ class BmadLoopApp(App[None]):
         self.push_screen(modal, done)
 
     def _review_gate(self, run_id: str, run_dir: Path, state: RunState) -> None:
-        labels = {
-            PAUSE_SPEC_APPROVAL: "spec-approval gate",
-            PAUSE_EPIC_BOUNDARY: "epic gate",
-            PAUSE_STORY_GATE: "story gate",
-        }
+        label = widgets.pause_label(state.paused_stage or "")[0] or "gate"
         spec_path, spec_text = self._paused_spec(state)
+
+        def done(verb: str | None) -> None:
+            if verb == "resume":
+                self._do_resume(run_id)
+
+        if spec_path is None:
+            # Spec-less gates: story-gate fires before the story is registered in
+            # state.tasks (deliberate, so a resume re-picks and re-asks the ledger)
+            # and epic-boundary has no story key. The pause reason is the payload.
+            subtitle = (
+                self._story_subtitle(state)
+                if state.paused_story_key
+                else Text(f"run {run_id}", style="bold")
+            )
+            self.push_screen(
+                PauseReasonModal(
+                    title=f"{label} — pause reason",
+                    subtitle=subtitle,
+                    reason=state.paused_reason or "",
+                ),
+                done,
+            )
+            return
         modal = SpecReviewModal(
-            # paused_stage may be None; dict.get tolerates a None key (returns the default).
-            title=f"{labels.get(state.paused_stage, 'gate')} — review the finalized spec",  # pyright: ignore[reportArgumentType, reportCallIssue]
+            title=f"{label} — review the finalized spec",
             subtitle=self._story_subtitle(state),
             spec_path=spec_path,
             spec_text=spec_text,
             actions=[("resume", "Approve & resume", "primary")],
         )
-        self.push_screen(modal, lambda verb: self._do_resume(run_id) if verb == "resume" else None)
+        self.push_screen(modal, done)
 
     @staticmethod
     def _checkpoint_gate_line(review_cycle: int) -> str:
