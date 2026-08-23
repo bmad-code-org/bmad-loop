@@ -689,6 +689,41 @@ def test_stop_run_respects_engine_written_stopped(tmp_path, monkeypatch):
     assert not journal.exists() or "fallback" not in journal.read_text()
 
 
+def test_stop_run_does_not_stamp_fallback_on_an_already_stopped_run(tmp_path, monkeypatch):
+    """`fallback=True` says this tool completed the stop from outside. An engine that
+    honored a stop and exited must never collect that stamp on a later `stop`.
+
+    The check that trusts an engine-written `stopped` used to sit *inside* the
+    `pid is not None` arm, so every path that clears the pid early skipped it and
+    fell straight through to the append: a pid that is no longer ours, a `terminate`
+    that raced the exit into `ProcessLookupError`, or a refusal that could not verify
+    it. This case needs no race at all — `stopped` is set and `finished` is not, so
+    the guard at the top of `stop_run` does not fire — which is why the check now
+    sits outside that arm, where every path reaches it.
+
+    The session backstop must still run: an engine that honored the stop and died
+    before tearing its window down leaks the session exactly like one we killed.
+
+    Ablation: delete the hoisted `if state.stopped:` branch -> a second `run-stop`
+    carrying `"fallback": true` is appended and the last assert fails."""
+    killed = []
+    monkeypatch.setattr(runs, "kill_session", lambda rid: killed.append(rid))
+    run_dir = _make_state_run(tmp_path, "r1")
+    st = load_state(run_dir)
+    st.stopped = True  # an earlier stop the engine honored and recorded itself
+    save_state(run_dir, st)
+    (run_dir / "engine.pid").write_text("4242 123.0")
+
+    host = _FakeHost(alive=False)  # the engine is gone
+    monkeypatch.setattr(runs, "get_process_host", lambda: host)
+
+    assert runs.stop_run(run_dir) is True
+    assert host.terminated == [] and host.force_killed == []  # nothing left to signal
+    assert killed == ["r1"]  # the session backstop still runs
+    journal = run_dir / "journal.jsonl"
+    assert not journal.exists() or '"fallback": true' not in journal.read_text()
+
+
 def _raise(exc):
     """A `_FakeHost` hook that refuses the kill instead of performing it."""
 

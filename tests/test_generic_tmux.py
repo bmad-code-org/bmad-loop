@@ -1961,6 +1961,48 @@ def test_wait_aborts_on_hard_stop_request(tmp_path, monkeypatch):
     assert request.is_file()
 
 
+def test_wait_polls_the_hard_stop_channel_after_the_event_wait_too(tmp_path, monkeypatch):
+    """The arm at the top of the loop is not enough by itself. Between it and its
+    next run sit the loop's own 5s wait *and* whichever dispatch leg the event
+    selects — a `_window_alive` or `send_text` bounded only by TMUX_TIMEOUT_S (30s),
+    or a `_result_json(wait=True)` that waits RESULT_GRACE_S (15s) for an artifact.
+    That last one outlasts `stop_run`'s 10s grace window on a perfectly healthy box.
+    Polling again straight after the wait leaves at most one leg between two checks.
+
+    The request is lodged *during* the event wait, so it is absent at the
+    top-of-loop check and present immediately after — the exact interval this
+    second poll exists to cover.
+
+    It does not make the interval unconditionally short, and the prose no longer
+    claims it does: an in-flight subprocess cannot be interrupted from this thread,
+    so a leg that outlasts the window still degrades to the force-kill backstop.
+
+    Ablation: delete the second `_hard_stop_requested()` arm (the one just below
+    `watcher.wait_for`) -> `_window_alive` is called, because the loop enters the
+    `event is None` dispatch leg and only notices the request on its next
+    iteration. The verdict stays `aborted` either way, which is exactly why the
+    dispatch spy is the assertion carrying the proof and the status is not."""
+    adapter, _clock = _timeout_clock_adapter(tmp_path, monkeypatch)
+    alive_calls: list[int] = []
+    adapter._window_alive = lambda handle: (alive_calls.append(1), True)[1]
+
+    lodged: list[str] = []
+
+    def _lodge_during_the_wait(_call_n):
+        if not lodged:
+            lodged.append("hard")
+            _lodge_stop_request(adapter, "hard")
+
+    adapter.watcher = _ScriptedWatcher([], on_call=_lodge_during_the_wait)
+
+    result = adapter.wait_for_completion(_dev_handle(), _short_spec(tmp_path))
+
+    assert result.status == "aborted"
+    assert lodged == ["hard"]  # the interleave really happened
+    assert adapter.watcher.calls == 1  # caught on the same iteration, not the next
+    assert alive_calls == []  # never entered the dispatch leg below the wait
+
+
 def _lodge_owner_stop_request(tmp_path, mode: str) -> Path:
     """Lodge a stop request in a *different* run dir and publish it as the owning
     run, the way `stop <parent-id>` reaches a nested auto-sweep child: the request

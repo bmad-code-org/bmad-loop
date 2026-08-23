@@ -38,8 +38,10 @@ breaking changes may land in a minor release.
   flag is still rolled back.
 - **A hard stop rides `stop-request.json` with `mode: "hard"` (#319).** It is lodged before the
   engine is signalled — the atomic write also supersedes a pending graceful request — and honored
-  at item boundaries and mid-session, where both real adapter wait loops poll it once per tick
-  (worst case ~5s). SIGTERM is now the POSIX fast path rather than the mechanism, so a hard stop
+  at item boundaries and mid-session, where both real adapter wait loops poll it once per tick,
+  which normally lands well inside the 10s grace window. An iteration blocked on a transport call
+  or waiting for an artifact can exceed it, and the stop then degrades to the force-kill backstop —
+  the pre-#319 outcome, never a worse one. SIGTERM is now the POSIX fast path rather than the mechanism, so a hard stop
   lands on every platform and multiplexer backend, and reaches a nested auto-sweep through the
   owning run's channel — hard-only; `stop <child-id>` is unchanged. A run directory that rejects
   the write degrades to the signal path with the stop still delivered.
@@ -62,7 +64,8 @@ breaking changes may land in a minor release.
   `taskkill /F` (#319).** An inter-process SIGTERM is never delivered to a native-Windows engine,
   so every stop completed through the external fallback with no engine teardown at all. The engine
   honors the stop request itself now, so it is the single writer of `stopped` again and
-  `run-stop fallback=True` means an engine that honored neither channel.
+  `run-stop fallback=True` is no longer stamped on a stop the engine recorded itself — it marks
+  one this tool had to complete from outside.
 - **Two concurrent `stop` invocations against one run no longer collide on a staging temp (#319).**
   The write staged through a fixed `stop-request.json.tmp`, so the loser's rename raised
   `FileNotFoundError`. It now stages under a per-writer name: the last write wins and neither

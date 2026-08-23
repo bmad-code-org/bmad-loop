@@ -663,11 +663,15 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     stop_seen=stop_seen,
                 )
             # Hard-stop poll (#319), per-iteration and deliberately NOT inside
-            # the heartbeat throttle below: the loop blocks up to 5s per tick
-            # (`watcher.wait_for(..., timeout_s=min(remaining, 5.0))`), so worst-
-            # case abort latency stays inside `stop_run`'s 10s grace window, while
-            # riding the 30s HEARTBEAT_INTERVAL_S would be worse than the status
-            # quo. Return the verdict — never raise `RunStopped` here: that would
+            # the heartbeat throttle below: the loop's own wait is capped at 5s
+            # (`watcher.wait_for(..., timeout_s=min(remaining, 5.0))`), so a stop
+            # normally lands well inside `stop_run`'s 10s grace window, while riding
+            # the 30s HEARTBEAT_INTERVAL_S would be worse than the status quo. Read
+            # that as the common case, not a bound: an iteration that goes on to
+            # wait RESULT_GRACE_S for an artifact, or to block on a tmux call under
+            # TMUX_TIMEOUT_S, exceeds the grace window on its own. See the second
+            # poll after the wait below for how the interval is split, and why it
+            # still cannot be made unconditionally short. Return the verdict — never raise `RunStopped` here: that would
             # skip `run()`'s finally-kill + `_post_kill_reconcile`. The file is
             # left on disk for the engine to consume and attribute the stop.
             if self._hard_stop_requested():
@@ -821,6 +825,27 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 timeout_s=min(remaining, 5.0),
                 since_ns=handle.launched_ns,
             )
+            # Second poll, and the reason there are two (#319). The arm at the top of
+            # the loop is separated from its next run by everything between: the 5s
+            # wait above, plus whichever dispatch leg the event selects — a
+            # `_window_alive` or `send_text` bounded only by TMUX_TIMEOUT_S (30s), or
+            # a `_result_json(wait=True)` that waits RESULT_GRACE_S (15s) for an
+            # artifact. The last of those alone outlasts `stop_run`'s 10s grace on a
+            # perfectly healthy box, with no transport fault anywhere. Polling here
+            # splits the iteration so at most one leg sits between two checks. It
+            # cannot make the interval unconditionally short — an in-flight
+            # subprocess is not interruptible from this thread — so a leg that does
+            # outlast the window still degrades to `stop_run`'s force-kill backstop:
+            # the pre-#319 outcome, never a worse one.
+            if self._hard_stop_requested():
+                self._note_lifecycle(handle.task_id, "stop-abort-fired")
+                return SessionResult(
+                    status="aborted",
+                    session_id=session_id,
+                    transcript_path=transcript_path,
+                    budget_weighted=budget_weighted,
+                    stop_seen=stop_seen,
+                )
             if event is None:
                 try:
                     alive = self._window_alive(handle)

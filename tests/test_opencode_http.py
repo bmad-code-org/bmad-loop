@@ -2130,6 +2130,58 @@ def test_wait_aborts_on_hard_stop_request(tmp_path, monkeypatch):
     assert request.is_file()
 
 
+def test_wait_polls_the_hard_stop_channel_after_the_event_queue_too(tmp_path, monkeypatch):
+    """The arm at the top of the loop is not enough by itself. Below the event-queue
+    wait sit the dispatch legs — `_probe_completion`'s two GETs (not throttled: once
+    a turn goes quiet past SILENCE_THRESHOLD_S they run every tick), a
+    `_session_status` GET, or `_result_json(wait=True)`'s grace wait — each bounded
+    only by the client's own timeouts. One iteration can outlast `stop_run`'s 10s
+    grace window, and on native Windows that is the force-kill this issue exists to
+    avoid. A second poll straight after the queue wait leaves at most one leg between
+    two checks.
+
+    The request is lodged *inside* the queue poll, so it is absent at the top-of-loop
+    check and present immediately after — the interval the second poll covers.
+
+    This does not make the interval unconditionally short, and the prose no longer
+    claims it does: an in-flight socket read cannot be interrupted from this thread.
+
+    Ablation: delete the second `_hard_stop_requested()` arm (below the queue wait)
+    -> `_probe_completion` is called, because the loop enters the silent-turn
+    dispatch leg and only notices the request on its next iteration. The verdict
+    stays `aborted` either way, which is why the probe spy carries the proof and the
+    status does not."""
+    adapter = make_adapter(tmp_path)
+    clock = _install_clock(monkeypatch)
+    (adapter.tasks_dir / "t-1").mkdir(parents=True)
+    adapter.silence_threshold_s = 0.0  # the quiet-turn leg fires on every tick
+
+    probes: list[int] = []
+    monkeypatch.setattr(
+        type(adapter), "_probe_completion", lambda self, sess: (probes.append(1), False)[1]
+    )
+
+    lodged: list[str] = []
+
+    def advance():
+        if not lodged:  # absent at the top-of-loop check, present right after
+            lodged.append("hard")
+            _lodge_stop_request(adapter, "hard")
+        clock["mono"] += 11.0  # makes the turn read as silent below the wait
+
+    sess = _timeout_driven_session(adapter, advance)
+    sess.client = _AbortRecordingClient()
+
+    result = adapter.wait_for_completion(
+        SessionHandle(task_id="t-1", native_id="ses_1"), _timeout_spec(tmp_path)
+    )
+
+    assert lodged == ["hard"]  # the interleave really happened
+    assert result.status == "aborted"
+    assert sess.client.posts == ["/session/ses_1/abort"]  # took the abort exit shape
+    assert probes == []  # never entered the dispatch leg below the wait
+
+
 def test_wait_ignores_graceful_stop_request(tmp_path, monkeypatch):
     """Graceful means *finish the in-flight item*, so a graceful request pending
     on the same channel must not touch a running session — only `hard` aborts.

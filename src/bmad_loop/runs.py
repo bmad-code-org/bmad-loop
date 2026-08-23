@@ -1357,15 +1357,31 @@ def stop_run(run_dir: Path) -> bool:
                     "force-killed. No stop is pending — free space in the run "
                     "directory and retry, or stop the process yourself"
                 )
-        # the engine clears its agent window itself, but kill the session as a
-        # backstop in case it died before tearing it down
-        kill_session(run_dir.name)
-        if load_state(run_dir).stopped:
-            # The engine honored the stop and is gone. It normally consumes the file
-            # on the way out; clear it belt-and-braces so a run that is later resumed
-            # can never find our request still lodged and re-stop at its first item.
-            clear_graceful_stop(run_dir)
-            return True
+    # the engine clears its agent window itself, but kill the session as a backstop
+    # in case it died before tearing it down. Ahead of everything below, because both
+    # exits from here need it — an engine that honored the stop and died before
+    # tearing its window down leaks the session just as surely as one we killed.
+    kill_session(run_dir.name)
+    state = load_state(run_dir)
+    if state.stopped:
+        # The engine honored the stop and is gone, and its own `run-stop` already
+        # stands in the journal. Stamping `fallback=True` on top would describe an
+        # engine that did its own teardown as one that had to be stopped from
+        # outside. This check deliberately sits out here rather than inside the
+        # `pid is not None` arm it used to live in: every path that clears `pid`
+        # early — a pid that is no longer ours, a `terminate` that raced the exit
+        # and got `ProcessLookupError`, a refusal that could not verify it — skipped
+        # it and fell straight through to the append. The plainest case needs no race
+        # at all: `stop` on a run a previous `stop` already stopped (`stopped` is set,
+        # `finished` is not, so the guard at the top does not fire).
+        #
+        # It normally consumes the file on the way out; clear it belt-and-braces so a
+        # run that is later resumed can never find our request still lodged and
+        # re-stop at its first item. Safe on the `engine_may_live` paths too: a
+        # written `stopped` *is* the engine reporting it honored the request, so
+        # there is no live consumer left to strand.
+        clear_graceful_stop(run_dir)
+        return True
 
     # Fallback: no live engine (or it never confirmed). Mark it stopped here. Discard
     # the request first — nothing is left alive to consume it, and a file outliving
@@ -1379,8 +1395,6 @@ def stop_run(run_dir: Path) -> bool:
     # that is later resumed, which this one cannot be until that engine exits.
     if not engine_may_live:
         clear_graceful_stop(run_dir)
-    kill_session(run_dir.name)
-    state = load_state(run_dir)
     state.stopped = True
     save_state(run_dir, state)
     Journal(run_dir).append("run-stop", pid=pid, fallback=True)
