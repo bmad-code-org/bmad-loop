@@ -577,13 +577,83 @@ def test_run_isolated_escalates_provisioning_root_failure_before_result_probes(
         flow.run_isolated(task, lambda candidate: drove.append(candidate))
 
     assert task.phase == Phase.ESCALATED
-    assert "provisioning root could not be resolved" in excinfo.value.reason
+    # The wrapper names the unit; the inner GitError names the cause (#592).
+    assert "cannot safely provision the worktree for" in excinfo.value.reason
+    assert "cannot resolve worktree provisioning roots safely" in excinfo.value.reason
     assert flow.journal.events() == ["worktree-opened", "story-escalated"]
     assert flow.calls.saves == 1
     assert flow.calls.pauses == [(excinfo.value.reason, "1-1")]
     assert drove == []
     assert task.worktree_path == str(wt)
     assert wt.is_dir()  # retained for inspection; no integration/teardown ran
+
+
+def test_run_isolated_escalates_an_unparseable_hook_config(tmp_path, monkeypatch):
+    """#592: the refusal `provision_worktree` raises over a seeded config that will
+    not parse routes to the SAME escalation the root-resolve failure takes — CRITICAL
+    notify, run paused, worktree kept — rather than crashing the loop or being
+    swallowed into a hooks-only rewrite.
+
+    The raise site is unit-covered in test_install.py; this pins the routing, and that
+    the generalized wrapper carries the inner message through INTACT. That message is
+    the whole diagnostic — it names the file the operator has to fix — so a wrapper
+    that summarized instead of quoting would leave the pause unactionable.
+
+    Ablation: delete the provisioning ``GitError`` catch in ``run_isolated`` and this
+    escapes without marking ESCALATED, notifying, saving, or pausing.
+    """
+    import bmad_loop.worktree_flow as worktree_flow
+
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    repo.mkdir()
+    wt.mkdir()
+    paths = ProjectPaths(
+        project=repo,
+        implementation_artifacts=repo / "_bmad-output/implementation-artifacts",
+        planning_artifacts=repo / "_bmad-output/planning-artifacts",
+    )
+    unit = UnitWorkspace(
+        workspace=Workspace(root=wt, paths=paths.rebased(wt)),
+        repo_root=repo,
+        branch="bmad-loop/run-1/1-1",
+        path=wt,
+        baseline="abc123",
+    )
+    config_path = wt / ".claude" / "settings.json"
+    parse_refusal = (
+        f"seeded hook config {config_path} cannot be parsed (Expecting ',' delimiter: "
+        "line 4 column 3 (char 84)); an unparseable config is evidence of an earlier "
+        "fault, not a blank slate — provisioning refuses rather than replace the "
+        "operator's allowlist, env, and MCP settings with a hooks-only file; fix or "
+        "remove it, then resume (#592)"
+    )
+
+    def unparseable_hook_config(*_args, **_kwargs):
+        raise verify.GitError(parse_refusal)
+
+    monkeypatch.setattr(worktree_flow, "provision_worktree", unparseable_hook_config)
+    state = SimpleNamespace(target_branch="main", run_id="run-1", source="sprint", tasks={})
+    flow = _make_flow(
+        tmp_path,
+        paths=paths,
+        state=state,
+        open_unit_workspace=lambda *_args, **_kwargs: unit,
+    )
+    task = StoryTask(story_key="1-1", epic=1)
+    drove = []
+
+    with pytest.raises(_Pause) as excinfo:
+        flow.run_isolated(task, lambda candidate: drove.append(candidate))
+
+    assert task.phase == Phase.ESCALATED
+    assert "cannot safely provision the worktree for 1-1" in excinfo.value.reason
+    assert parse_refusal in excinfo.value.reason  # verbatim, not summarized
+    assert flow.journal.events() == ["worktree-opened", "story-escalated"]
+    assert flow.calls.saves == 1
+    assert flow.calls.pauses == [(excinfo.value.reason, "1-1")]
+    assert drove == []  # drive body never ran
+    assert "CRITICAL escalation: 1-1" in (tmp_path / ATTENTION_FILE).read_text()
+    assert wt.is_dir()  # retained for inspection
 
 
 def test_escalate_unit_marks_escalated_notifies_and_pauses(tmp_path):

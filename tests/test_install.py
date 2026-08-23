@@ -11,7 +11,7 @@ import stat
 import subprocess
 import sys
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 from conftest import (
@@ -1117,6 +1117,323 @@ def test_provision_worktree_write_failure_raises_and_leaves_the_config_entire(
         "house": {"command": "node", "args": ["mcp.js"]}
     }
     assert "bmad_loop_hook" not in config.read_text(encoding="utf-8")  # the lost mutation
+
+
+def test_provision_worktree_refuses_an_unparseable_hook_config(tmp_path):
+    """#592: a seeded config that will not parse stops provisioning; it is never read
+    as an empty document.
+
+    The swallowed `config = {}` this replaces was not a degrade but a destructive
+    write. `baseline_config` deep-copies whatever the parse produced, so an empty dict
+    GUARANTEES the `config != baseline_config` gate fires and the merge publishes a
+    hooks-only file over the allowlist, `env` and MCP entries the isolated session
+    needs — silently, and over the very evidence of the earlier fault that tore it.
+    `_register_hooks` has always refused this exact shape
+    (`test_a_truncated_hook_config_makes_the_next_init_refuse`); one file format, one
+    policy.
+
+    Truncated at `"env"` rather than at a fraction of the length: what a torn write
+    publishes is a prefix of the object, and JSON has no partial read.
+
+    Ablation: restore `config = {}` in the `except` and this reddens — no raise, and
+    the relay marker lands in a file that no longer holds HOUSE_TOKEN."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    repo.mkdir()
+    claude = get_profile("claude")
+    config = wt / claude.hooks.config_path
+    config.parent.mkdir(parents=True)
+    config.write_text(_OPERATOR_SETTINGS[: _OPERATOR_SETTINGS.index('"env"')], encoding="utf-8")
+    before = config.read_bytes()  # snapshot AFTER the write: Windows translates newlines
+
+    with pytest.raises(verify.GitError, match="cannot be parsed") as excinfo:
+        provision_worktree(wt, [claude], repo)
+
+    assert config.read_bytes() == before  # the operator's bytes, left for inspection
+    assert "bmad_loop_hook" not in config.read_text(encoding="utf-8")  # nothing published
+    # Nothing seeded this copy, so the remedy sends the repair to the branch rather
+    # than to a main-checkout file that never supplied these bytes (the seeded lane
+    # is pinned by test_provision_worktree_refusal_sends_the_repair_to_the_main_checkout).
+    assert "commit a repaired" in str(excinfo.value)
+    assert "target branch" in str(excinfo.value)
+
+
+def test_provision_worktree_refuses_an_undecodable_hook_config(tmp_path):
+    """The same refusal for bytes that are not UTF-8 at all — the second member of the
+    `except` tuple, and the reason it is a tuple.
+
+    `read_text(encoding="utf-8")` raises `UnicodeDecodeError`, which is not a
+    `JSONDecodeError` and which `run_isolated` — catching only `GitError` — does not
+    handle either. Before this it left the parse site as an uncaught crash of the
+    engine loop rather than an escalation of the story; the tuple turns that crash
+    into the same clean refusal as the row above.
+
+    Written with `write_bytes` because there is no text form of these bytes.
+
+    Ablation: drop `UnicodeDecodeError` from the tuple and this reddens with the raw
+    `UnicodeDecodeError` while the truncated row above stays green."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    repo.mkdir()
+    claude = get_profile("claude")
+    config = wt / claude.hooks.config_path
+    config.parent.mkdir(parents=True)
+    config.write_bytes(b'{"permissions": \xff}')
+    before = config.read_bytes()
+
+    with pytest.raises(verify.GitError, match="cannot be parsed"):
+        provision_worktree(wt, [claude], repo)
+
+    assert config.read_bytes() == before
+    assert b"bmad_loop_hook" not in config.read_bytes()
+
+
+def test_provision_worktree_refusal_sends_the_repair_to_the_main_checkout(tmp_path):
+    """#592: when the unparseable copy really was SEEDED, the refusal names the
+    main-checkout file it was seeded from and sends the repair there.
+
+    The worktree is disposable and repairing it is not what un-escalates the story:
+    `Phase.ESCALATED` is terminal with no transition out (`statemachine.py`), so the
+    only way back into the run is a re-arm — and a re-arm discards this worktree
+    (`engine._finish_inflight` -> `discard_worktree`) and mounts a fresh one, whose
+    copy-when-absent seeding pulls this config from `repo_root` again. A repair
+    applied only to the copy the parse read is therefore thrown away before the next
+    drive, and the identical refusal recurs.
+
+    Seeded for real rather than hand-placed: the destination is absent, so the seed
+    loop actually copies and records the entry, which is what the message reads.
+
+    Ablation: remove the `_record_seeded(...)` after the direct-file arm's
+    `seeded.append(rel)` and this reddens, falling back to target-branch guidance —
+    together with the whole-tree directory row and the failed-`copy2` row, which
+    reach the same call. The recursion and glob rows stay green, each having its
+    own."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    wt.mkdir()
+    claude = get_profile("claude")
+    truncated = _OPERATOR_SETTINGS[: _OPERATOR_SETTINGS.index('"env"')]
+    source = repo / claude.hooks.config_path  # the only copy; seeding carries it in
+    source.parent.mkdir(parents=True)
+    source.write_text(truncated, encoding="utf-8")
+
+    with pytest.raises(verify.GitError, match="cannot be parsed") as excinfo:
+        provision_worktree(wt, [claude], repo, seed_files=[claude.hooks.config_path])
+
+    message = str(excinfo.value)
+    assert str(source) in message  # where a durable repair has to land
+    assert "in the main checkout" in message
+    assert "re-arm" in message  # not a bare resume: a terminal story is skipped
+    assert "bmad-loop resolve <run-id> --no-interactive" in message  # runnable as given
+    assert source.read_text(encoding="utf-8") == truncated  # the source is never touched
+
+
+def test_provision_worktree_refusal_does_not_blame_a_config_it_never_seeded(tmp_path):
+    """#592: EXISTENCE IS NOT PROVENANCE. Seeding is copy-when-absent, so a config the
+    project tracks is skipped as an occupied destination and arrives with the branch
+    checkout — the main-checkout counterpart never supplied these bytes.
+
+    Reading a counterpart's mere existence as provenance sends the operator to repair
+    a file that can already be correct, exactly as it is here: the main checkout holds
+    the GOOD settings while the worktree copy is torn. Worse, the repair would not
+    take — a re-arm mounts a fresh worktree from the branch, checking the committed
+    (still torn) version out again. So this lane is told to commit on the target
+    branch, and the main-checkout path is not named at all.
+
+    Ablation: swap the `seeded_from` lookup back to an existence test
+    (`_is_file(repo_root / seed_rel)`) and this row reddens on all three assertions
+    while the seeded row above stays green."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    claude = get_profile("claude")
+    source = repo / claude.hooks.config_path  # exists, and is perfectly valid
+    source.parent.mkdir(parents=True)
+    source.write_text(_OPERATOR_SETTINGS, encoding="utf-8")
+    config = wt / claude.hooks.config_path  # occupied -> the seed loop skips it
+    config.parent.mkdir(parents=True)
+    config.write_text(_OPERATOR_SETTINGS[: _OPERATOR_SETTINGS.index('"env"')], encoding="utf-8")
+
+    with pytest.raises(verify.GitError, match="cannot be parsed") as excinfo:
+        provision_worktree(wt, [claude], repo, seed_files=[claude.hooks.config_path])
+
+    message = str(excinfo.value)
+    assert "commit a repaired" in message  # the branch supplies it, so commit there
+    assert "target branch" in message
+    assert "in the main checkout" not in message  # never seeded from there
+    assert str(source) not in message  # and that file is not the one to repair
+
+
+def test_provision_worktree_refusal_names_a_config_seeded_as_a_directory_child(tmp_path):
+    """#592: the config need not be the seed ENTRY to have been seeded — a directory
+    entry carries it in as a child, and the refusal still names the file it came from.
+
+    `seeded` cannot answer this: a directory entry appends its own rel and nothing
+    else, so `.claude/settings.json` is missing from a ledger that recorded
+    `.claude` — even though seeding is exactly what wrote it. The seed list is not
+    fixed either; `.claude` reaches `seed_files` through the policy's own
+    `[scm] worktree_seed`, which is appended OUTSIDE the `seed_adapter_defaults`
+    block that appends `config_path`.
+
+    Ablation: read provenance from `seed_rel in seeded` again and this reddens on all
+    three assertions — it advises committing the file on the branch — while the
+    entry-seeded row above stays green."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    wt.mkdir()
+    claude = get_profile("claude")
+    seed_dir = str(PurePosixPath(claude.hooks.config_path).parent)  # ".claude"
+    truncated = _OPERATOR_SETTINGS[: _OPERATOR_SETTINGS.index('"env"')]
+    source = repo / claude.hooks.config_path
+    source.parent.mkdir(parents=True)
+    source.write_text(truncated, encoding="utf-8")
+
+    with pytest.raises(verify.GitError, match="cannot be parsed") as excinfo:
+        provision_worktree(wt, [claude], repo, seed_files=[seed_dir])
+
+    message = str(excinfo.value)
+    assert str(source) in message  # the file that really supplied the bytes
+    assert "in the main checkout" in message
+    assert "commit a repaired" not in message  # the branch never carried it
+    assert source.read_text(encoding="utf-8") == truncated  # the source is never touched
+
+
+def test_provision_worktree_refusal_names_a_config_seeded_into_an_existing_dir(tmp_path):
+    """The same lane through the OTHER directory arm: seeding recursed into a
+    destination that already existed and copied this config as a missing child.
+
+    `.claude` is only copied WHOLESALE when the worktree lacks it entirely (the row
+    above). A real worktree checks its tracked children out, so the directory is
+    normally already there and the entry takes the child-by-child recursion instead —
+    a separate call site, with its own provenance record. Distinguishing them matters
+    because it is the arm that skips occupied children, which is what the row below
+    grades.
+
+    Ablation: remove the `_record_seeded(...)` after the recursion arm's
+    `seeded.append(rel)` and this reddens alone — the whole-tree and glob rows go on
+    passing, since each records through its own call."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    claude = get_profile("claude")
+    seed_dir = str(PurePosixPath(claude.hooks.config_path).parent)
+    truncated = _OPERATOR_SETTINGS[: _OPERATOR_SETTINGS.index('"env"')]
+    source = repo / claude.hooks.config_path
+    source.parent.mkdir(parents=True)
+    source.write_text(truncated, encoding="utf-8")
+    # the destination dir exists (a checkout carries its tracked children) but the
+    # gitignored config does not -> recursion copies exactly that child in
+    (wt / seed_dir).mkdir(parents=True)
+    (wt / seed_dir / "tracked.json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(verify.GitError, match="cannot be parsed") as excinfo:
+        provision_worktree(wt, [claude], repo, seed_files=[seed_dir])
+
+    message = str(excinfo.value)
+    assert str(source) in message
+    assert "in the main checkout" in message
+    assert "commit a repaired" not in message
+
+
+def test_provision_worktree_refusal_names_a_config_seeded_by_a_glob(tmp_path):
+    """And through the third seeding arm: a `seed_globs` pattern whose expansion
+    supplied the config.
+
+    Each arm records its own copies, so each needs its own row — a plugin pulling a
+    generated tree in by pattern gets the same honest provenance as an explicit
+    entry, rather than the branch-lane advice to commit a gitignored file.
+
+    Ablation: remove the `_record_seeded(...)` after `seeded.append(rel.as_posix())`
+    and this reddens alone."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    wt.mkdir()
+    claude = get_profile("claude")
+    seed_dir = str(PurePosixPath(claude.hooks.config_path).parent)
+    truncated = _OPERATOR_SETTINGS[: _OPERATOR_SETTINGS.index('"env"')]
+    source = repo / claude.hooks.config_path
+    source.parent.mkdir(parents=True)
+    source.write_text(truncated, encoding="utf-8")
+
+    with pytest.raises(verify.GitError, match="cannot be parsed") as excinfo:
+        provision_worktree(wt, [claude], repo, seed_globs=[f"{seed_dir}/*.json"])
+
+    message = str(excinfo.value)
+    assert str(source) in message
+    assert "in the main checkout" in message
+    assert "commit a repaired" not in message
+
+
+def test_provision_worktree_refusal_does_not_blame_a_skipped_child_of_a_seeded_dir(tmp_path):
+    """#592: a directory entry in `seeded` proves at least ONE child landed, never
+    that THIS one did — so provenance is recorded per path written, never inferred
+    from the parent.
+
+    The distinguishing case, and the reason the ledger had to become exact rather
+    than parent-aware: `_copy_traversable` runs `skip_existing=True`, so the occupied
+    config is skipped one child at a time while its absent sibling lands. The entry
+    is a partial seed and is duly recorded, yet the bytes that failed to parse came
+    from the checkout. Blaming the seed here would tell the operator to commit a
+    gitignored settings file — the one that holds their tokens and MCP credentials —
+    and the repair would not take anyway, since a re-arm mounts a fresh worktree that
+    seeds this config in from a main checkout that is perfectly valid.
+
+    Ablation: widen the gate to accept the parent (`str(PurePosixPath(seed_rel).parent)
+    in seeded`) and this reddens on all four assertions while the directory-child row
+    above stays green."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    claude = get_profile("claude")
+    seed_dir = str(PurePosixPath(claude.hooks.config_path).parent)
+    healthy = repo / claude.hooks.config_path  # the main checkout's copy is fine
+    healthy.parent.mkdir(parents=True)
+    healthy.write_text(_OPERATOR_SETTINGS, encoding="utf-8")
+    (repo / seed_dir / "mcp.json").write_text('{"servers": {}}', encoding="utf-8")
+    torn = wt / claude.hooks.config_path  # occupied -> the seed loop skips this child
+    torn.parent.mkdir(parents=True)
+    torn.write_text(_OPERATOR_SETTINGS[: _OPERATOR_SETTINGS.index('"env"')], encoding="utf-8")
+
+    with pytest.raises(verify.GitError, match="cannot be parsed") as excinfo:
+        provision_worktree(wt, [claude], repo, seed_files=[seed_dir])
+
+    message = str(excinfo.value)
+    # the entry really did seed something, which is what makes the parent ambiguous
+    assert (wt / seed_dir / "mcp.json").is_file()
+    assert "commit a repaired" in message  # the branch supplies it, so commit there
+    assert "target branch" in message
+    assert "in the main checkout" not in message
+    assert str(healthy) not in message  # never named: it supplied nothing
+
+
+def test_provision_worktree_refusal_survives_a_failed_copy2_on_the_seeded_config(
+    tmp_path, monkeypatch
+):
+    """#592: the copy that supplied these bytes counts even when it ended in an
+    OSError, because `shutil.copy2` writes the content BEFORE the `copystat` that a
+    destination filesystem can refuse.
+
+    The caller-side consequence of the helper row
+    `test_copy_traversable_records_a_file_a_failed_copy2_left_behind`, and the reason
+    that row matters: the config really is here, really is unparseable, and really
+    came from the main checkout — but a copy recorded only on the success path leaves
+    no provenance behind, so the refusal falls to the branch lane and asks the
+    operator to commit a gitignored settings file. Re-arming then re-seeds the same
+    malformed source and the refusal repeats, with the advice unchanged.
+
+    Ablation: restore the bare `continue` in `_copy_traversable`'s `except OSError`
+    and this reddens on all three message assertions."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    wt.mkdir()
+    claude = get_profile("claude")
+    truncated = _OPERATOR_SETTINGS[: _OPERATOR_SETTINGS.index('"env"')]
+    source = repo / claude.hooks.config_path
+    source.parent.mkdir(parents=True)
+    source.write_text(truncated, encoding="utf-8")
+
+    def refuse_metadata(*_args, **_kwargs):
+        raise OSError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(shutil, "copystat", refuse_metadata)
+
+    with pytest.raises(verify.GitError, match="cannot be parsed") as excinfo:
+        provision_worktree(wt, [claude], repo, seed_files=[claude.hooks.config_path])
+
+    # the copy did land, which is what makes the lost provenance a real misdirection
+    assert (wt / claude.hooks.config_path).read_text(encoding="utf-8") == truncated
+    message = str(excinfo.value)
+    assert str(source) in message
+    assert "in the main checkout" in message
+    assert "commit a repaired" not in message
 
 
 def test_provision_worktree_empty_profiles_is_noop(tmp_path):
@@ -7749,6 +8066,113 @@ def test_copy_traversable_skip_existing_reports_total_noop(tmp_path):
 
     assert _copy_traversable(src, dst, skip_existing=True) is False
     assert (dst / "d" / "f.txt").read_text() == "ON_DISK"
+
+
+def test_copy_traversable_records_the_paths_it_actually_wrote(tmp_path):
+    """`copied_paths` answers per PATH what the boolean only answers per CALL.
+
+    That gap is the whole reason for the parameter: under `skip_existing` a True
+    result means "at least one descendant landed", so a caller asking whether one
+    NAMED path was copied cannot read it off the boolean — and cannot read it off the
+    entry either, since the skipped child and the written one live under the same
+    directory. `provision_worktree` reads this to name the source of an unparseable
+    hook config, where inferring from the parent blames a file that supplied nothing
+    (#592). The list is append-only and the boolean stays exactly `bool(record)`.
+
+    Ablation: drop the `copied_paths.append(target)` in the file leg and the first
+    scenario reddens; drop the one in `visit_dir` and the second does."""
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    (src / "d").mkdir(parents=True)
+    (src / "d" / "kept.txt").write_text("FROM_SRC", encoding="utf-8")
+    (src / "d" / "new.txt").write_text("FROM_SRC", encoding="utf-8")
+    (dst / "d").mkdir(parents=True)
+    (dst / "d" / "kept.txt").write_text("ON_DISK", encoding="utf-8")
+
+    record: list[Path] = []
+    assert _copy_traversable(src, dst, skip_existing=True, copied_paths=record) is True
+
+    # the occupied sibling is absent from the ledger the True result covers
+    assert record == [dst / "d" / "new.txt"]
+    assert (dst / "d" / "kept.txt").read_text(encoding="utf-8") == "ON_DISK"
+
+    # nothing left to copy -> False AND an untouched list: the two agree
+    again: list[Path] = []
+    assert _copy_traversable(src, dst, skip_existing=True, copied_paths=again) is False
+    assert again == []
+
+    # a fresh destination records the directories it creates as well as the files
+    fresh = tmp_path / "fresh"
+    made: list[Path] = []
+    assert _copy_traversable(src, fresh, skip_existing=True, copied_paths=made) is True
+    assert made == [
+        fresh,
+        fresh / "d",
+        fresh / "d" / "kept.txt",
+        fresh / "d" / "new.txt",
+    ]
+
+
+def test_copy_traversable_records_a_file_a_failed_copy2_left_behind(tmp_path, monkeypatch):
+    """`shutil.copy2` is `copyfile` FOLLOWED BY `copystat`, so a destination that
+    refuses the utime/chmod raises with the bytes already fully written — measured,
+    not assumed: the probe below leaves the complete content on disk.
+
+    Degrading that to "nothing happened" would under-report a file the run really did
+    write: the entry reads as a no-op seed and loses its `git add -A` shield, and its
+    provenance is missing, so an unparseable hook config seeding supplied would be
+    blamed on the branch (#592). Deleting the survivor is the wrong repair in the
+    other direction — the CONTENT copied fine and only its metadata was refused, so
+    dropping it recreates the absent-config stall (#471).
+
+    Only reachable through the degrading `worktree=` leg; with no worktree the
+    OSError re-raises and nothing is recorded either way.
+
+    Ablation: restore the bare `continue` in the `except OSError` and this reddens on
+    the boolean, as does
+    `test_provision_worktree_refusal_survives_a_failed_copy2_on_the_seeded_config`."""
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    src.mkdir()
+    dst.mkdir()  # pre-made, so the result is about the FILE leg and not a new directory
+    (src / "settings.json").write_text("REAL BYTES", encoding="utf-8")
+
+    def refuse_metadata(*_args, **_kwargs):
+        raise OSError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(shutil, "copystat", refuse_metadata)
+
+    record: list[Path] = []
+    assert _copy_traversable(src, dst, worktree=tmp_path, copied_paths=record) is True
+
+    landed = dst / "settings.json"
+    assert landed.read_text(encoding="utf-8") == "REAL BYTES"  # the bytes really landed
+    assert record == [landed]  # so the ledger the True result covers names them
+
+
+def test_copy_traversable_ignores_a_target_a_failed_copy_never_created(tmp_path, monkeypatch):
+    """The other side of the same branch: when the copy leaves NOTHING at the
+    destination the entry is still a no-op, so the survivor check cannot be a blanket
+    "an OSError counts anyway".
+
+    `copyfile` itself failing is the ordinary shape — an unreadable source, a full
+    disk — and it writes no destination.
+
+    Ablation: drop the `if not _occupied(target)` guard so every OSError counts, and
+    this reddens on both assertions."""
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    src.mkdir()
+    dst.mkdir()  # same isolation as the row above: the FILE leg is what is graded
+    (src / "settings.json").write_text("REAL BYTES", encoding="utf-8")
+
+    def refuse_copy(*_args, **_kwargs):
+        raise OSError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr(shutil, "copy2", refuse_copy)
+
+    record: list[Path] = []
+    assert _copy_traversable(src, dst, worktree=tmp_path, copied_paths=record) is False
+
+    assert not (dst / "settings.json").exists()
+    assert record == []
 
 
 def test_copy_traversable_skip_existing_never_mkdirs_over_file(tmp_path):
