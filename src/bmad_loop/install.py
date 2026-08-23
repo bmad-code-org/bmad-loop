@@ -1408,6 +1408,7 @@ def _copy_traversable(
     skip_existing: bool = False,
     worktree: Path | None = None,
     repo_root: Path | None = None,
+    copied_paths: list[Path] | None = None,
 ) -> bool:
     """Recursively copy a Traversable tree, optionally confined to a worktree.
 
@@ -1422,6 +1423,17 @@ def _copy_traversable(
     dangling links, and refused entries therefore have no copy/read path. Directory
     visits preserve main's existing empty-directory behavior and its boolean result:
     true means at least one directory or file actually landed, false means total no-op.
+
+    ``copied_paths``, when supplied, receives every destination path that actually
+    landed — each file written and each directory this call created — in walk order.
+    The boolean answers the whole call, which under ``skip_existing`` is only ever
+    "at least one descendant landed"; a caller that must know whether ONE named path
+    landed cannot recover that from the boolean, and must not infer it from the
+    entry's presence in a copied-something ledger either, because the no-clobber legs
+    above skip occupied destinations one at a time and silently. Recording per path is
+    what makes that question answerable: the returned boolean is exactly
+    ``bool(appended entries)``, and membership is exact rather than parent-scoped
+    (#592). Appends only — the caller owns the list and may share one across calls.
     """
     copied = False
     no_clobber = skip_existing or worktree is not None
@@ -1471,6 +1483,8 @@ def _copy_traversable(
             return False
         if not existed:
             copied = True
+            if copied_paths is not None:
+                copied_paths.append(target)
         return True
 
     for rel, child in _walk_traversable_files(
@@ -1497,6 +1511,8 @@ def _copy_traversable(
                 raise
             continue
         copied = True
+        if copied_paths is not None:
+            copied_paths.append(target)
     return copied
 
 

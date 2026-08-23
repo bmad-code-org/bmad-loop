@@ -283,6 +283,28 @@ def _seed_bmad_tree(worktree: Path, repo_root: Path) -> list[str]:
     return [BMAD_DIR] if not had_bmad else seeded
 
 
+def _record_seeded(
+    seeded_from: dict[Path, Path],
+    landed: Sequence[Path],
+    src: Path,
+    dst: Path,
+) -> None:
+    """Record where each path a seed entry just wrote was copied FROM.
+
+    `_copy_traversable` reproduces the source tree's shape under ``dst``, so a landed
+    path's rel against ``dst`` is also its source's rel against ``src``; the root of a
+    file entry gives ``Path(".")``, which pathlib drops, mapping ``dst`` to ``src``.
+
+    ``src`` is the RESOLVED source, so a seed entry reached through a symlink names
+    the file that really holds the bytes rather than the link the operator listed.
+    First writer wins: nothing overwrites an earlier entry, because a path is only
+    ever written once — copy-when-absent makes the second entry naming it a skip, and
+    a skip lands nothing to record (#592).
+    """
+    for path in landed:
+        seeded_from.setdefault(path, src / path.relative_to(dst))
+
+
 def _bmad_scripts_seed_incomplete(worktree: Path, repo_root: Path) -> bool:
     """Whether a required repo renderer unit member missed the worktree.
 
@@ -606,7 +628,10 @@ def provision_worktree(
     cannot be parsed refuses provisioning outright — `verify.GitError`, which the
     caller escalates as CRITICAL and pauses the run — rather than being replaced by
     a hooks-only file: an unparseable config is evidence of an earlier fault, and the
-    operator's bytes are left intact for inspection (#592).
+    operator's bytes are left intact for inspection. The refusal sends the repair to
+    whichever source supplied those bytes — read from the per-path record of what
+    seeding actually wrote, never inferred from the seed entry that covers the path
+    (#592).
 
     The repo's `_bmad/` surface is also merge-seeded, excluding generated render
     output. Renderer and upstream-skill completeness failures share the return
@@ -635,6 +660,15 @@ def provision_worktree(
     # project gitignored MCP/CLI configs: copy from the main repo when absent.
     # Resolve-and-contain guards against an `..`/absolute entry escaping either tree.
     seeded: list[str] = []
+    # Which source supplied each path seeding actually WROTE, keyed by where it
+    # landed. `seeded` answers per ENTRY and cannot be read per FILE: a directory
+    # entry records only its own rel below, and copy-when-absent skips occupied
+    # children one at a time, so a dir rel here means "at least one child landed",
+    # never "this child did". The hook step reads this map to name the real source of
+    # an unparseable config, where guessing sends the operator to repair the wrong
+    # file (#592). `_copy_traversable` mirrors the source layout under `dst`, so each
+    # landed path's rel is its source's rel too.
+    seeded_from: dict[Path, Path] = {}
     # Entries that named a real source but copied nothing, because every path they
     # name already exists. Reported to the caller (this function is quiet by
     # contract — it runs under a TUI) because the no-op is otherwise silent: an
@@ -672,12 +706,14 @@ def provision_worktree(
             # checkout carries some tracked child, so the whole entry used to be a
             # no-op — including the gitignored children that are absent and would
             # clobber nothing. Recurse instead, copying only what is missing.
+            landed: list[Path] = []
             if not _copy_traversable(
                 src,
                 raw,
                 skip_existing=True,
                 worktree=worktree,
                 repo_root=repo_root,
+                copied_paths=landed,
             ):
                 # every child was already present: still a total no-op, still
                 # reported. Only a PARTIAL seed stops being reported.
@@ -688,20 +724,24 @@ def provision_worktree(
             # `git add -A`. Excluding the whole dir is safe — an exclude does not
             # untrack the tracked children that were already there.
             seeded.append(rel)
+            _record_seeded(seeded_from, landed, src, raw)
             continue
         # `resolve()` is non-strict, so a dangling leaf or parent link answers for
         # its target. Never mkdir/copy through it. Existing live links were handled
         # by the skip arm above, preserving copy-when-absent reporting.
         if dst != raw:
             continue
+        landed = []
         if _copy_traversable(
             src,
             raw,
             skip_existing=True,
             worktree=worktree,
             repo_root=repo_root,
+            copied_paths=landed,
         ):
             seeded.append(rel)
+            _record_seeded(seeded_from, landed, src, raw)
 
     # glob-seeded trees (e.g. an engine plugin's MCP skill dirs): expand each
     # pattern against the main repo and copy matches in, same contain guard +
@@ -722,16 +762,19 @@ def provision_worktree(
                 continue
             if dst != raw:
                 continue
+            landed = []
             if not _copy_traversable(
                 src,
                 raw,
                 skip_existing=True,
                 worktree=worktree,
                 repo_root=repo_root,
+                copied_paths=landed,
             ):
                 continue
             # as_posix so the exclude pattern anchors on Windows too (os.sep would not)
             seeded.append(rel.as_posix())
+            _record_seeded(seeded_from, landed, src, raw)
 
     # Renderer-backed skills are handed the worktree as their project root. Merge
     # the repo's project-local BMAD surface after explicit seeds (operator intent wins
@@ -861,25 +904,32 @@ def provision_worktree(
                 # this file: the worktree is disposable, an escalated story re-enters
                 # the run only through a re-arm, and that discards the worktree
                 # (`engine._finish_inflight` -> `discard_worktree`) and provisions a
-                # fresh one. `seeded` answers which source that is POSITIVELY — an
-                # actual copy this run made, not the mere existence of a counterpart.
-                # That distinction is load-bearing: seeding is copy-when-absent, so a
-                # config the project TRACKS is skipped as an occupied destination and
-                # arrives with the branch checkout instead (the call site says so at
-                # the `config_path` seed). Reading existence as provenance would send
-                # the tracked lane to repair a main-checkout file that may already be
-                # correct, while the fresh worktree checks the committed version out
-                # again and the refusal recurs — so that lane is told to commit.
+                # fresh one. `seeded_from` answers which source that is POSITIVELY —
+                # keyed on THIS path, and populated only where a copy actually landed.
+                # Both halves are load-bearing. Existence of a main-checkout
+                # counterpart proves nothing: seeding is copy-when-absent, so a config
+                # the project TRACKS is skipped as an occupied destination and arrives
+                # with the branch checkout instead (the call site says so at the
+                # `config_path` seed), and repairing the counterpart would not take —
+                # the fresh worktree checks the committed version out again and the
+                # refusal recurs, so that lane is told to commit. Nor can provenance
+                # come from the seed ENTRY that covers this path: a directory entry is
+                # recorded once, for the parent, while its children are skipped
+                # individually, so a config landing under a seeded `.claude/` and one
+                # merely sitting there beside a seeded sibling are indistinguishable
+                # at that granularity — and misreading the second as seeded advises
+                # committing a gitignored file that may carry credentials.
                 # ESCALATED is terminal with no transition out (`statemachine.py`),
                 # and `resolve` takes a required `run_id` (`cli.py:4232`), so the
                 # remedy names the re-arm in a form that actually runs.
                 seed_rel = profile.hooks.config_path
-                if seed_rel in seeded:
+                seeded_source = seeded_from.get(config_path)
+                if seeded_source is not None:
                     src_note = (
-                        f"this copy was seeded from {repo_root / seed_rel}, which a "
+                        f"this copy was seeded from {seeded_source}, which a "
                         "re-arm seeds in again, so"
                     )
-                    remedy = f"repair or remove {repo_root / seed_rel} in the main checkout"
+                    remedy = f"repair or remove {seeded_source} in the main checkout"
                 else:
                     src_note = (
                         "nothing seeded this copy — it arrived with the branch "

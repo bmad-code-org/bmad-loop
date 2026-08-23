@@ -67,7 +67,10 @@ breaking changes may land in a minor release.
   message and no backup. #590 made that write atomic; the parse still substituted `{}`, and
   that swallow is what this closes. Provisioning now raises, escalating the story as CRITICAL
   and pausing the run with the bytes untouched — the policy `init` has always applied to an
-  unparseable config. Invalid UTF-8 joins the same lane, having previously crashed the engine
+  unparseable config. The refusal names whichever source actually supplied the bytes — read from
+  the seed bookkeeping, which now records each path copied rather than each entry attempted, so a
+  config carried in as a child of a seeded directory is told apart from one merely sitting beside
+  a seeded sibling. Invalid UTF-8 joins the same lane, having previously crashed the engine
   rather than escalating.
 - **Native Windows: `bmad-loop stop` no longer burns the full 10s grace window into a blind
   `taskkill /F` (#319).** An inter-process SIGTERM is never delivered to a native-Windows engine,
