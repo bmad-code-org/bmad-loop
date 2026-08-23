@@ -1907,7 +1907,7 @@ def test_lifecycle_and_heartbeat_write_failure_is_swallowed(tmp_path):
 #
 # `bmad-loop stop` lodges a mode-aware stop-request.json before it signals, so a
 # stop reaches a session on platforms where the engine's SIGTERM never arrives.
-# The wait loop reads that file once per iteration and returns the non-completion
+# The wait loop reads that file twice per iteration and returns the non-completion
 # `aborted` verdict; the engine raises RunStopped off it. The adapter never
 # unlinks the file — the engine consumes it, and must still see it to attribute
 # the stop.

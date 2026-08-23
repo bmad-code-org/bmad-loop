@@ -197,7 +197,8 @@ class _ResultFileMixin:
         """Has an operator lodged a *hard* stop request that this session must
         honor (#319)? Either this run's own, or the owning run's.
 
-        Polled once per wait-loop iteration by both real adapters, so a
+        Polled twice per wait-loop iteration by both real adapters — on either
+        side of the loop's own blocking wait — so a
         ``bmad-loop stop`` is honored mid-session on platforms where the
         engine's SIGTERM path is unreachable. Read-only by contract: the
         adapter never unlinks ``stop-request.json`` — the engine consumes it

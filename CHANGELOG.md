@@ -38,7 +38,7 @@ breaking changes may land in a minor release.
   flag is still rolled back.
 - **A hard stop rides `stop-request.json` with `mode: "hard"` (#319).** It is lodged before the
   engine is signalled — the atomic write also supersedes a pending graceful request — and honored
-  at item boundaries and mid-session, where both real adapter wait loops poll it once per tick,
+  at item boundaries and mid-session, where both real adapter wait loops poll it twice per iteration,
   which normally lands well inside the 10s grace window. An iteration blocked on a transport call
   or waiting for an artifact can exceed it, and the stop then degrades to the force-kill backstop —
   the pre-#319 outcome, never a worse one. SIGTERM is now the POSIX fast path rather than the mechanism, so a hard stop

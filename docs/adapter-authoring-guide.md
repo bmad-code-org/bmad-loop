@@ -525,13 +525,16 @@ Required (abstract):
 - `start_session(spec) -> SessionHandle` — launch the session.
 - `wait_for_completion(handle, spec) -> SessionResult` — block until the session
   ends (or stalls/times out), then report status. Poll
-  `runs.read_stop_request_mode(run_dir) == "hard"` once per loop iteration and
-  return `SessionResult(status="aborted")` when it is true (#319): that is what
-  makes `bmad-loop stop` land mid-session where a signal to the engine cannot be
-  delivered. Return the verdict — never raise, never unlink the file (the engine
-  consumes it and attributes the stop) — and keep the loop's blocking tick short
-  enough that the abort fits inside `stop_run`'s 10s grace window; both bundled
-  adapters block ≤5s and inherit the poll from `_ResultFileMixin`. Skipping it is
+  `runs.read_stop_request_mode(run_dir) == "hard"` on both sides of the loop's
+  own blocking wait and return `SessionResult(status="aborted")` when it is true
+  (#319): that is what makes `bmad-loop stop` land mid-session where a signal to
+  the engine cannot be delivered. Return the verdict — never raise, never unlink
+  the file (the engine consumes it and attributes the stop). Keep that wait
+  short — both bundled adapters cap theirs at 5s and inherit the poll from
+  `_ResultFileMixin` — but do not read it as a bound on the stop: a dispatch leg
+  that waits out an artifact grace or blocks on a transport call outlasts
+  `stop_run`'s 10s grace window on its own, and the force-kill backstop is what
+  catches that. Skipping it is
   not fatal: the engine still honors the request at the next item boundary, which
   is where an adapter without the poll leaves the operator waiting.
 

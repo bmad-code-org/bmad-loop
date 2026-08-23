@@ -223,8 +223,9 @@ situational banners:
   in-flight story/bundle through commit (or, mid-sweep-triage, lets triage
   complete and starts no bundles), then finalizes and stops (resumable). The
   underlying read is the control file's presence, not its mode, so the same line
-  flashes up for the few seconds a **hard** stop's request sits on disk before
-  the engine honors it — there the current item does not finish.
+  shows for as long as a **hard** stop's request sits on disk before the engine
+  honors it — usually seconds, longer if the session is blocked in a transport
+  call — and there the current item does not finish.
 - `✖ engine gone — run was interrupted · press e to resume` — the recorded
   engine pid is dead.
 - `⚑ decision needed: DW-<n> — <question> / press a to attach and answer` —

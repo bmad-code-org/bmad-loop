@@ -2039,7 +2039,7 @@ def test_timeout_wall_clock_step_back_cannot_extend_deadline(tmp_path, monkeypat
 #
 # Contract parity: tests/test_generic_tmux.py carries the identically named pair
 # over the tmux transport. `bmad-loop stop` lodges a mode-aware stop-request.json
-# before it signals; the wait loop reads it once per iteration and returns the
+# before it signals; the wait loop reads it twice per iteration and returns the
 # non-completion `aborted` verdict, cancelling the in-flight HTTP turn exactly as
 # the timeout arm does. The adapter never unlinks the file — the engine consumes
 # it, and must still see it to attribute the stop.
