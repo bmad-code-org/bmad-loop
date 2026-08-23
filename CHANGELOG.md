@@ -77,6 +77,16 @@ breaking changes may land in a minor release.
   that window was silently replaced with `graceful`, costing the abort the operator asked for.
   The mode is re-read immediately before the write and a pending hard request answers
   "already pending": a stronger stop already stands. The escalation direction is untouched.
+- **`stop` keeps the lodged request when it never proved the engine dead (#319).** The fallback
+  that marks a run stopped from outside also discarded the hard request it had just lodged —
+  including on the paths where it had no evidence of death: a `terminate` refused with
+  `PermissionError`, a `force_kill` refused the same way, or a `taskkill /F /T` that failed
+  silently, since win32 shells it with `check=False`. That threw away the only channel left to
+  stop a live engine, on the platform the channel exists for, while reporting the run stopped.
+  Death is now distinguished from refusal — `ProcessLookupError` still discards, since it is
+  proof — and a clean kill is confirmed by re-probing after it settles rather than assumed. Where
+  the engine may still be running the request stays lodged and the stop is genuinely still in
+  flight; the run cannot be resumed into a stale request until that engine exits anyway.
 - **A signalled stop no longer journals the request that caused it as stale debris (#319).**
   Since `stop_run` lodges the hard request _before_ it signals, and the signal path reads no
   control file, every routine POSIX stop reached the hard arm with the file still on disk — and

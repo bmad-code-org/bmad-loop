@@ -87,6 +87,13 @@ class LiveSessionError(Exception):
 # marking the run stopped itself.
 _STOP_WAIT_S = 10.0
 _STOP_POLL_S = 0.1
+# How long stop_run lets a force-kill settle before deciding it failed. A kill that
+# returns cleanly is not proof of death — win32 shells `taskkill /F /T` with
+# `check=False`, so a refused kill raises nothing — but the pid can also linger for a
+# moment after a delivered SIGKILL, and `is_alive` is a bare existence probe that
+# reads a not-yet-reaped process as alive. Long enough to outlast that, short enough
+# that a genuinely surviving engine is still noticed while the operator waits.
+_KILL_CONFIRM_S = 0.5
 
 
 def new_run_id() -> str:
@@ -1092,7 +1099,11 @@ def stop_run(run_dir: Path) -> bool:
 
     The lodged file is consumed by whoever settles the run: the engine when it
     honors the request, or this function on the paths where nothing is left alive to
-    read it. The one deliberate exception is StopRunError — see there.
+    read it. Both exceptions to that turn on the same question — did we ever *prove*
+    the engine dead? Where we did not, the file stays lodged, because it is then the
+    only channel that can still stop it: the StopRunError refusal below (we decline
+    to force-kill an unverifiable pid), and the ``engine_may_live`` paths where the
+    signal or the kill was refused outright rather than racing us to exit.
     """
     state = load_state(run_dir)
     if state.finished:
@@ -1121,11 +1132,24 @@ def stop_run(run_dir: Path) -> bool:
         # the pid we recorded is already gone, or was reused by an unrelated
         # process before stop_run ran — never signal a stranger; mark stopped below.
         pid = None
+    # Whether this call ever proved the engine dead. Only a confirmed death licenses
+    # the fallback below to discard the request we lodged: while the engine may still
+    # be running, that file is the one channel left that can stop it (on native
+    # Windows it is the *only* one), so retracting it would throw away the very
+    # repair #319 exists to deliver.
+    engine_may_live = False
     if pid is not None:
         try:
             host.terminate(pid)
-        except (ProcessLookupError, PermissionError, OSError):
-            pid = None  # already gone / not ours — go straight to fallback
+        except ProcessLookupError:
+            pid = None  # provably gone — the fallback's discard is correct
+        except (PermissionError, OSError):
+            # We could not signal it and it was `alive_and_ours` a moment ago, so it
+            # may well still be running (an EPERM mismatch, or a win32 taskkill that
+            # errored). Skip the wait — there is nothing to wait for — but keep the
+            # request lodged so the engine can still stop itself off the file.
+            engine_may_live = True
+            pid = None
     if pid is not None:
         deadline = time.monotonic() + _STOP_WAIT_S
         while time.monotonic() < deadline:
@@ -1143,8 +1167,26 @@ def stop_run(run_dir: Path) -> bool:
             if guard is not None and host.identity(pid) == guard:
                 try:
                     host.force_kill(pid)
-                except (ProcessLookupError, PermissionError, OSError):
+                except ProcessLookupError:
                     pass  # raced us to exit — that's the outcome we wanted
+                except (PermissionError, OSError):
+                    # Unlike ESRCH above, this is the opposite news: the process is
+                    # there and we were refused. Keep the request lodged.
+                    engine_may_live = True
+                else:
+                    # A kill that returned cleanly is not a death certificate — on
+                    # win32 `force_kill` shells `taskkill /F /T` with `check=False`,
+                    # so a refused kill raises nothing at all, and win32 is the
+                    # platform this whole channel exists for. Confirm rather than
+                    # infer, since the answer decides whether we discard the request.
+                    # Let it settle first: a delivered SIGKILL is immediate but the
+                    # pid can linger a moment before it is reaped, and reading that
+                    # as "still alive" would strand the file on the ordinary
+                    # wedged-engine path.
+                    confirm_deadline = time.monotonic() + _KILL_CONFIRM_S
+                    while host.is_alive(pid) and time.monotonic() < confirm_deadline:
+                        time.sleep(_STOP_POLL_S)
+                    engine_may_live = host.is_alive(pid)
             else:
                 # Refusing to kill leaves the hard request lodged on purpose: if that
                 # pid *is* still our engine, the file is the only channel left that
@@ -1182,7 +1224,15 @@ def stop_run(run_dir: Path) -> bool:
     # Fallback: no live engine (or it never confirmed). Mark it stopped here. Discard
     # the request first — nothing is left alive to consume it, and a file outliving
     # the run it asked to stop is a trap for the next resume.
-    clear_graceful_stop(run_dir)
+    #
+    # Unless we never actually proved that. Where the engine may still be running,
+    # the request stays lodged and the stop is genuinely still in flight: the engine
+    # honors the file at its next poll and writes `stopped` itself. Discarding it here
+    # would leave a live engine with no channel left while we report the run stopped —
+    # the stale-request trap above is the lesser of the two, and it only bites a run
+    # that is later resumed, which this one cannot be until that engine exits.
+    if not engine_may_live:
+        clear_graceful_stop(run_dir)
     kill_session(run_dir.name)
     state = load_state(run_dir)
     state.stopped = True

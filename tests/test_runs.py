@@ -62,10 +62,11 @@ class _FakeHost(ProcessHost):
     are inherited, so these tests exercise the production decision table instead
     of a hand-copied mirror that could silently drift."""
 
-    def __init__(self, *, alive, identity=1.0, on_terminate=None):
+    def __init__(self, *, alive, identity=1.0, on_terminate=None, on_force_kill=None):
         self._alive = alive
         self._identity = identity
         self.on_terminate = on_terminate
+        self.on_force_kill = on_force_kill
         self.terminated: list[int] = []
         self.force_killed: list[int] = []
 
@@ -76,6 +77,8 @@ class _FakeHost(ProcessHost):
 
     def force_kill(self, pid):
         self.force_killed.append(pid)
+        if self.on_force_kill is not None:
+            self.on_force_kill(pid)
 
     def is_alive(self, pid):
         return self._alive() if callable(self._alive) else self._alive
@@ -684,6 +687,127 @@ def test_stop_run_respects_engine_written_stopped(tmp_path, monkeypatch):
     # trusted the engine: no fallback journal entry written
     journal = run_dir / "journal.jsonl"
     assert not journal.exists() or "fallback" not in journal.read_text()
+
+
+def _raise(exc):
+    """A `_FakeHost` hook that refuses the kill instead of performing it."""
+
+    def _hook(_pid):
+        raise exc
+
+    return _hook
+
+
+def test_stop_run_keeps_the_hard_request_when_the_signal_is_refused(tmp_path, monkeypatch):
+    """A `terminate` we were *refused* leaves the lodged request on disk.
+
+    The pid was `alive_and_ours` a moment earlier and we could not signal it, so it
+    may well still be running — and on native Windows the control file is then the
+    only channel that can still stop it. Discarding it here would retract the repair
+    #319 exists to deliver, while reporting the run stopped. Contrast the
+    ProcessLookupError twin below: that one is proof of death, so the file goes."""
+    monkeypatch.setattr(runs, "kill_session", lambda _rid: None)
+    run_dir = _make_state_run(tmp_path, "r1")
+    (run_dir / "engine.pid").write_text("4242 123.0")
+
+    host = _FakeHost(alive=True, identity=123.0, on_terminate=_raise(PermissionError()))
+    _use_host(monkeypatch, host)
+
+    assert runs.stop_run(run_dir) is True
+    assert runs.read_stop_request_mode(run_dir) == "hard"  # still lodged, still honorable
+    assert host.force_killed == []  # unsignalable — never escalated to a kill
+    assert load_state(run_dir).stopped is True
+
+
+def test_stop_run_discards_the_hard_request_when_the_signal_proves_it_gone(tmp_path, monkeypatch):
+    """The mode-exact twin, and the second ablation axis: `ProcessLookupError` from
+    `terminate` says the process is *gone*, so nothing is left to consume the request
+    and leaving it would trap the next resume. Collapsing the two excepts back into
+    one reddens exactly one of this pair, whichever way it is collapsed."""
+    monkeypatch.setattr(runs, "kill_session", lambda _rid: None)
+    run_dir = _make_state_run(tmp_path, "r1")
+    (run_dir / "engine.pid").write_text("4242 123.0")
+
+    host = _FakeHost(alive=True, identity=123.0, on_terminate=_raise(ProcessLookupError()))
+    _use_host(monkeypatch, host)
+
+    assert runs.stop_run(run_dir) is True
+    assert not runs.graceful_stop_requested(run_dir)  # provably dead — discarded
+    assert load_state(run_dir).stopped is True
+
+
+def test_stop_run_keeps_the_hard_request_when_the_force_kill_is_refused(tmp_path, monkeypatch):
+    """A `force_kill` that raises `PermissionError` is the opposite of a race: the
+    process is there and we were refused. The request stays lodged."""
+    monkeypatch.setattr(runs, "kill_session", lambda _rid: None)
+    monkeypatch.setattr(runs, "_STOP_WAIT_S", 0.05)
+    monkeypatch.setattr(runs, "_STOP_POLL_S", 0.01)
+    run_dir = _make_state_run(tmp_path, "r1")
+    (run_dir / "engine.pid").write_text("4242 123.0")
+
+    host = _FakeHost(alive=True, identity=123.0, on_force_kill=_raise(PermissionError()))
+    _use_host(monkeypatch, host)
+
+    assert runs.stop_run(run_dir) is True
+    assert host.force_killed == [4242]  # we did try
+    assert runs.read_stop_request_mode(run_dir) == "hard"  # and kept the channel
+
+
+def test_stop_run_keeps_the_hard_request_when_a_clean_force_kill_did_not_take(
+    tmp_path, monkeypatch
+):
+    """A force-kill that returns cleanly is not a death certificate.
+
+    `WindowsProcessHost.force_kill` shells `taskkill /F /T` with `check=False`, so a
+    refused kill raises nothing at all — and win32 is the platform this channel
+    exists for. The engine is re-probed after the kill settles, and a survivor keeps
+    its request."""
+    monkeypatch.setattr(runs, "kill_session", lambda _rid: None)
+    monkeypatch.setattr(runs, "_STOP_WAIT_S", 0.05)
+    monkeypatch.setattr(runs, "_STOP_POLL_S", 0.01)
+    monkeypatch.setattr(runs, "_KILL_CONFIRM_S", 0.05)
+    run_dir = _make_state_run(tmp_path, "r1")
+    (run_dir / "engine.pid").write_text("4242 123.0")
+
+    # never dies: the silent-taskkill-failure shape
+    host = _FakeHost(alive=True, identity=123.0)
+    _use_host(monkeypatch, host)
+
+    assert runs.stop_run(run_dir) is True
+    assert host.force_killed == [4242]
+    assert runs.read_stop_request_mode(run_dir) == "hard"
+
+
+def test_stop_run_discards_the_hard_request_once_the_force_kill_confirms(tmp_path, monkeypatch):
+    """The settle window's positive control: a pid that disappears once the kill
+    lands reads as dead, so the request is discarded rather than stranded on the
+    ordinary wedged-engine path. Without the settle loop an immediate sample of a
+    not-yet-reaped pid would keep the file here and trap the next resume."""
+    monkeypatch.setattr(runs, "kill_session", lambda _rid: None)
+    monkeypatch.setattr(runs, "_STOP_WAIT_S", 0.05)
+    monkeypatch.setattr(runs, "_STOP_POLL_S", 0.01)
+    monkeypatch.setattr(runs, "_KILL_CONFIRM_S", 1.0)
+    run_dir = _make_state_run(tmp_path, "r1")
+    (run_dir / "engine.pid").write_text("4242 123.0")
+
+    lingering = {"ticks": 3}  # still in the pid table for a few probes after the kill
+
+    def _alive():
+        if killed["yes"] and lingering["ticks"] > 0:
+            lingering["ticks"] -= 1
+        return not killed["yes"] or lingering["ticks"] > 0
+
+    killed = {"yes": False}
+
+    def _on_force_kill(_pid):
+        killed["yes"] = True
+
+    host = _FakeHost(alive=_alive, identity=123.0, on_force_kill=_on_force_kill)
+    _use_host(monkeypatch, host)
+
+    assert runs.stop_run(run_dir) is True
+    assert host.force_killed == [4242]
+    assert not runs.graceful_stop_requested(run_dir)  # confirmed dead — discarded
 
 
 def test_stop_run_force_kills_wedged_engine(tmp_path, monkeypatch):
