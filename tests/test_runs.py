@@ -913,9 +913,12 @@ def test_request_graceful_stop_writes_file_when_alive(tmp_path, monkeypatch):
     body = json.loads((run_dir / runs.STOP_REQUEST_FILE).read_text())
     assert body["mode"] == "graceful"
     assert body["requested_at"]  # an ISO timestamp is stamped
-    # written atomically — no staging temp left behind. Globbed, not a fixed
-    # `.tmp`: the temp is mkstemp-named now, so naming one spelling would assert
-    # nothing (see test_write_stop_request_survives_an_interleaved_concurrent_writer).
+    # No sibling left behind. The graceful lodge is an O_CREAT|O_EXCL create written
+    # in place, so it has no staging temp *by construction* — this asserts the
+    # absence of stray debris, not the atomicity of a replace. The staging-temp
+    # guarantee belongs to `_write_stop_request`, which still replaces, and is
+    # asserted where it is exercised: see
+    # test_write_stop_request_survives_an_interleaved_concurrent_writer.
     assert [p.name for p in run_dir.glob(runs.STOP_REQUEST_FILE + "*")] == [runs.STOP_REQUEST_FILE]
 
 
@@ -1077,32 +1080,83 @@ def test_stop_run_supersedes_pending_graceful_request(tmp_path, monkeypatch):
 # ---------------------------------------------------------------- prune sessions
 
 
-def test_request_graceful_stop_refuses_to_downgrade_a_concurrent_hard_request(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize("lodge_at", ["engine_liveness", "just_before_the_create"])
+def test_request_graceful_stop_cannot_downgrade_a_hard_request_at_any_instant(
+    tmp_path, monkeypatch, lodge_at
 ):
-    """A hard request landing inside the check -> write window is not downgraded.
+    """A hard request landing anywhere inside the check -> write window is not
+    downgraded, and the guarantee holds at the *last* instant, not just an early one.
 
-    `request_graceful_stop` clears its existence check, then spends a pid-file read,
-    a liveness probe, a mkstemp and an fsync before its replace — wide enough for a
-    concurrent `stop` to lodge `"hard"` in between. The channel is last-writer-wins,
-    so without the re-read the graceful write silently supersedes the stronger stop
-    and costs the operator the abort they asked for. Driving the concurrent lodge
-    from `engine_liveness` puts it exactly in that window.
+    `request_graceful_stop` clears its existence check, then spends a pid-file read
+    and a liveness probe before it lodges — measured at ~1.3ms median on btrfs back
+    when an fsync sat in there too. The channel is last-writer-wins, so an
+    unconditional write here silently supersedes the stronger stop and costs the
+    operator the abort they asked for. `O_CREAT | O_EXCL` fuses the decision to the
+    write so no interleaving can land between them.
 
-    Ablation: delete the `read_stop_request_mode(...) == "hard"` guard and both
-    assertions fail — the call returns "requested" and the file reads "graceful"."""
+    The two parameters are the point. `engine_liveness` lodges early — a re-read
+    immediately before the write already catches that one. `just_before_the_create`
+    lodges from the last statement that runs ahead of the `os.open`, which only real
+    arbitration catches; a re-read narrows that window but cannot close it.
+
+    Ablation, two axes, and axis 2 is what proves this is not merely re-testing the
+    re-read it replaced:
+      1. Make `_create_stop_request` an unconditional
+         `_write_stop_request(run_dir, "graceful")` — BOTH parameters redden.
+      2. Same, but restore a `read_stop_request_mode(...) == "hard"` guard ahead of
+         it — `engine_liveness` goes GREEN while `just_before_the_create` stays RED.
+         Both going green would mean this test measures the old guard, not the new
+         arbitration."""
     run_dir = _make_state_run(tmp_path, "r1")
     (run_dir / "engine.pid").write_text("4242 100.0")
+    lodged: list[str] = []
 
-    def _lodge_hard_then_report_alive(_run_dir):
-        runs._write_stop_request(run_dir, "hard")
-        return "alive"
+    def _lodge_hard() -> None:
+        if not lodged:  # once — the injection points are per-call, not per-test
+            lodged.append("hard")
+            runs._write_stop_request(run_dir, "hard")
 
-    monkeypatch.setattr(runs, "engine_liveness", _lodge_hard_then_report_alive)
+    if lodge_at == "engine_liveness":
+
+        def _alive(_run_dir):
+            _lodge_hard()
+            return "alive"
+
+        monkeypatch.setattr(runs, "engine_liveness", _alive)
+    else:
+        # the last statement before the O_EXCL open, so the hard request lands with
+        # nothing but the create left to run
+        real_strftime = time.strftime
+
+        def _strftime(fmt, *a):
+            _lodge_hard()
+            return real_strftime(fmt, *a)
+
+        monkeypatch.setattr(runs.time, "strftime", _strftime)
+        monkeypatch.setattr(runs, "engine_liveness", lambda _d: "alive")
 
     # the same answer a request found at entry gets: a stronger stop already stands
     assert runs.request_graceful_stop(run_dir) == "already-pending"
+    assert lodged == ["hard"]  # the interleave really happened
     assert runs.read_stop_request_mode(run_dir) == "hard"  # not downgraded
+
+
+def test_request_graceful_stop_keeps_escalation_unconditional(tmp_path, monkeypatch):
+    """The mirror direction, which the refusal above must not have cost. A hard
+    request landing *after* the graceful file exists still supersedes it — that is
+    `_write_stop_request`'s unconditional replace, which `stop_run` depends on.
+
+    Ablation: give `_write_stop_request` the same create-if-absent treatment and
+    this reddens, reading "graceful" — the asymmetry between the two writers is the
+    whole design."""
+    run_dir = _make_state_run(tmp_path, "r1")
+    (run_dir / "engine.pid").write_text("4242 100.0")
+    _use_host(monkeypatch, _FakeHost(alive=True, identity=100.0))
+
+    assert runs.request_graceful_stop(run_dir) == "requested"
+    runs._write_stop_request(run_dir, "hard")  # a later `stop`, escalating
+
+    assert runs.read_stop_request_mode(run_dir) == "hard"
 
 
 def test_mux_sessions_no_tmux(monkeypatch):

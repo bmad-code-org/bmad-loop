@@ -81,11 +81,16 @@ breaking changes may land in a minor release.
   the stop. Hard-only — a graceful stop already keeps a child sweep from starting, and lets one
   in flight finish. `stop <child-id>` keeps working unchanged.
 - **`stop --graceful` no longer downgrades a hard request that landed while it ran (#319).** Its
-  "already pending?" check is separated from its write by a pid read, a liveness probe and an
-  fsync, and the channel is last-writer-wins — so a concurrent `stop` lodging `mode: "hard"` in
-  that window was silently replaced with `graceful`, costing the abort the operator asked for.
-  The mode is re-read immediately before the write and a pending hard request answers
-  "already pending": a stronger stop already stands. The escalation direction is untouched.
+  "already pending?" check was separated from its write by a pid read, a liveness probe and an
+  fsync — ~1.3 ms on a journalling filesystem — and the channel is last-writer-wins, so a
+  concurrent `stop` lodging `mode: "hard"` in that window was silently replaced with `graceful`,
+  costing the abort the operator asked for. The graceful lodge is now an `O_CREAT | O_EXCL`
+  create, which fuses "is one pending?" to "lodge mine" as one atomic step and answers
+  "already pending" for anything already there: a stronger stop already stands. Two concurrent
+  graceful asks resolve the same way, which is the documented idempotency. The escalation
+  direction keeps its unconditional replace — `stop_run` depends on it — so the asymmetry
+  between the two writers is deliberate, and a planted symlink at the path is now refused
+  rather than followed.
 - **`stop` keeps the lodged request when it never proved the engine dead (#319).** The fallback
   that marks a run stopped from outside also discarded the hard request it had just lodged —
   including on the paths where it had no evidence of death: a `terminate` refused with

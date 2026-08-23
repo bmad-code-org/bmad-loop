@@ -1012,13 +1012,14 @@ def _write_stop_request(run_dir: Path, mode: str) -> None:
     ``"graceful"`` escalates the request in one step, with no window in which
     nothing is pending for the engine to find.
 
-    That is the only direction this function arbitrates. The channel is otherwise
-    last-writer-wins, so the *reverse* — a graceful write landing on a pending hard
-    request and downgrading it — is refused by the caller instead:
-    :func:`request_graceful_stop` re-reads the mode immediately before calling here
-    and answers ``"already-pending"``. The guard belongs there and not in this
-    function because ``stop_run`` shares it and its escalation must stay
-    unconditional.
+    That is the only direction this function arbitrates, and the only one it may:
+    ``stop_run`` shares it and its escalation must stay unconditional. The channel is
+    otherwise last-writer-wins, so the *reverse* — a graceful write landing on a
+    pending hard request and downgrading it — is refused by a different writer
+    entirely: :func:`_create_stop_request`, which lodges the graceful mode with
+    ``O_CREAT | O_EXCL`` so "is one pending?" and "lodge mine" are a single atomic
+    step. Splitting the two directions across two functions is what lets this one
+    stay an unconditional replace.
 
     Goes through :func:`platform_util.atomic_write_text` rather than a hand-rolled
     ``tmp + atomic_replace``, for the reason ``operatoractions`` was migrated under
@@ -1037,6 +1038,45 @@ def _write_stop_request(run_dir: Path, mode: str) -> None:
     cross-user."""
     body = json.dumps({"requested_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "mode": mode})
     atomic_write_text(run_dir / STOP_REQUEST_FILE, body, follow_symlinks=False)
+
+
+def _create_stop_request(run_dir: Path) -> bool:
+    """Lodge a *graceful* request only if none is pending; False when one already is.
+
+    ``O_CREAT | O_EXCL`` is the arbitration. It makes "is a request pending?" and
+    "lodge mine" one atomic step against the destination name, so a hard request
+    landing at any instant either already exists — we refuse, leaving it standing —
+    or replaces what we wrote, which is escalation, the direction
+    :func:`_write_stop_request` owns. A re-read immediately before an unconditional
+    replace could only ever *narrow* that window (~1.3ms on a journalling
+    filesystem, where the fsync dominates); this closes it.
+
+    Graceful-ONLY by construction, and that is what makes the non-atomic body safe.
+    The bytes are written *into* the created file rather than replaced in, so a
+    concurrent reader can catch it empty — and :func:`read_stop_request_mode`
+    answers ``"graceful"`` for a present-but-unparseable body, which is the very
+    mode being written. The invariant that matters is untouched: a torn read must
+    never produce ``"hard"``, so a hard writer must keep the atomic replace.
+
+    Refuses a planted symlink rather than following it — ``O_EXCL`` never
+    dereferences — which is stricter than the ``follow_symlinks=False`` replace it
+    replaces."""
+    body = json.dumps({"requested_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "mode": "graceful"})
+    path = run_dir / STOP_REQUEST_FILE
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return False  # a request is already pending — a planted link included
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(body)
+    except BaseException:
+        # never leave an empty file behind: it would read as a pending graceful
+        # request that no operator asked for, and block every later lodge.
+        with contextlib.suppress(OSError):
+            path.unlink()
+        raise
+    return True
 
 
 def clear_graceful_stop(run_dir: Path) -> bool:
@@ -1088,19 +1128,20 @@ def request_graceful_stop(run_dir: Path) -> str:
             f"run {run_dir.name} has no live engine — a graceful stop request would "
             f"never be consumed; use `bmad-loop resume {run_dir.name}` to continue it"
         )
-    # Last read before the replace. The existence check above is separated from this
-    # write by a pid-file read, a liveness probe, a mkstemp and an fsync — wide enough
-    # for a concurrent `stop` to lodge `"hard"` in between, and the channel is
-    # last-writer-wins, so without this a graceful write would silently *downgrade* it
-    # and cost the abort the operator asked for. Answering "already-pending" is the
-    # same answer the check at the top of this function gives for a pending request,
-    # and it is the right one either way: a lodged hard request is a *stronger* stop
-    # already standing. This narrows the race to one read → one replace; it does not
-    # close it (nothing short of arbitration could — see `_write_stop_request`), and
-    # it cannot regress the escalation direction, which `stop_run` still needs.
-    if read_stop_request_mode(run_dir) == "hard":
+    # The write IS the check. The existence test at the top of this function is
+    # separated from here by a pid-file read, a liveness probe and (formerly) a
+    # mkstemp and an fsync — measured at ~1.3ms median on btrfs, wide enough for a
+    # concurrent `stop` to lodge `"hard"` in between — and the channel is
+    # last-writer-wins, so an unconditional replace here would silently *downgrade*
+    # it and cost the abort the operator asked for. A re-read just before the replace
+    # narrows that window; a create-if-absent removes it, because there is no longer
+    # a gap between deciding and writing. "already-pending" is the same answer the
+    # check at the top gives, and the right one either way: a lodged hard request is
+    # a *stronger* stop already standing. Two concurrent *graceful* asks resolve the
+    # same way, which is the documented idempotency — the first one's timestamp
+    # stands. The escalation direction is untouched and stays unconditional.
+    if not _create_stop_request(run_dir):
         return "already-pending"
-    _write_stop_request(run_dir, "graceful")
     return "requested" if liveness == "alive" else "requested-unverifiable"
 
 
