@@ -60,6 +60,7 @@ from bmad_loop.tui.screens.modals import (
     DecisionModal,
     DeferredEntryModal,
     EscalationModal,
+    PauseReasonModal,
     SpecReviewModal,
     StartRunModal,
     StartSweepModal,
@@ -1839,6 +1840,7 @@ _MIN_SIZE_CASES = (
     "deferred-entry",
     "story-checkpoint",
     "escalation",
+    "pause-reason",
     "text-output",
 )
 
@@ -1899,6 +1901,12 @@ def _minimum_size_case(name: str, project):
             ),
             ("#act-resolve", "#act-rearm", "#cancel", "#hint"),
             "#body",
+        )
+    if name == "pause-reason":
+        return (
+            PauseReasonModal(title="t", subtitle="s", reason="line\n" * 80),
+            ("#act-resume", "#cancel"),
+            "#reason",
         )
     assert name == "text-output", name
     return TextOutputModal("validate", 0, "out\n" * 40), ("#ok",), "#output"
@@ -3179,9 +3187,16 @@ def test_pause_tag_and_label_render():
     assert pause_tag("plan-checkpoint").plain == "plan"
     assert pause_tag("story-checkpoint").plain == "story"
     assert pause_tag("escalation").plain == "esc"
+    assert pause_tag("story-gate").plain == "gate"
+    assert pause_tag("epic-boundary").plain == "epic"
     assert pause_tag("").plain == ""  # not paused → no tag
     label, style = pause_label("escalation")
     assert label == "escalation" and "red" in style
+    # the gate viewers title themselves from pause_label, so these three strings
+    # are load-bearing UI, not just badge text (#515)
+    assert pause_label("story-gate") == ("story gate", "yellow")
+    assert pause_label("epic-boundary")[0] == "epic gate"
+    assert pause_label("spec-approval")[0] == "spec-approval gate"
 
 
 def test_stopping_tag_renders():
@@ -4012,6 +4027,118 @@ async def test_gate_pause_resume(project, monkeypatch):
         await _open_review(app, pilot, SpecReviewModal)
         await pilot.click(await ready(pilot, "#act-resume"))
         await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
+
+
+# ------------------------------- #515: spec-less gate pauses show the reason
+#
+# A story gate fires BEFORE the story is registered in state.tasks (deliberate —
+# a resume re-picks the story and re-asks the ledger) and an epic boundary has no
+# story key at all, so _paused_spec returns (None, "") and the spec viewer had
+# nothing to show. These pin that the pause reason — which names the blocking
+# entries and the remedy — is what the operator gets instead.
+
+_GATE_REASON = (
+    "1-1 is gated by unlanded deferred work: DW-1 (gate: 1-1) — close the entry in "
+    "deferred-work.md, or clear its gate, then resume."
+)
+
+
+@pytest.mark.parametrize(
+    ("story_key", "tasks"),
+    [
+        # the engine gate: the story is not in state.tasks yet at all
+        ("1-1", {}),
+        # sweep's ledger-migration gate (sweep.py): the task IS registered, it just
+        # has no spec_file — the other arm of _paused_spec's (None, "") return
+        ("sweep-migrate", {"sweep-migrate": StoryTask(story_key="sweep-migrate", epic=0)}),
+    ],
+    ids=["task-unregistered", "task-without-spec-file"],
+)
+async def test_story_gate_pause_shows_reason_and_resumes(project, monkeypatch, story_key, tasks):
+    calls: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    make_run(
+        project.project,
+        "20260611-100000-aaaa",
+        paused_stage="story-gate",
+        paused_reason=_GATE_REASON,
+        paused_story_key=story_key,
+        tasks=tasks,
+    )
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, PauseReasonModal)  # routed away from the spec viewer
+        await ready(pilot, "#reason Static")
+        body = render(app.screen.query_one("#reason Static", Static).content)
+        assert "gated by unlanded deferred work" in body
+        assert "DW-1" in body, "the reason names the blocking entry, not a blank pane"
+        await pilot.click(await ready(pilot, "#act-resume"))
+        await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
+
+
+async def test_epic_boundary_pause_shows_reason_and_run_id_subtitle(project, monkeypatch):
+    """An epic boundary raises with no story key, so the old viewer subtitled it
+    "?". The run id is the only identity there is — assert it positively, so a
+    regression back to _story_subtitle's placeholder reddens this."""
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    make_run(
+        project.project,
+        "20260611-100000-aaaa",
+        paused_stage="epic-boundary",
+        paused_reason="epic 1 boundary — `bmad-loop resume <id>` to continue with epic 2",
+        paused_story_key=None,
+        tasks={},
+    )
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, PauseReasonModal)
+        await ready(pilot, "#reason Static")
+        assert "epic 1 boundary" in render(app.screen.query_one("#reason Static", Static).content)
+        subtitle = render(app.screen.query_one("#subtitle", Static).content)
+        assert "run 20260611-100000-aaaa" in subtitle
+
+
+async def test_spec_approval_unreadable_spec_still_uses_spec_viewer(project, monkeypatch):
+    """An unreadable spec file returns (path, "") from _paused_spec — a spec that
+    exists in the task and cannot be read, not a spec-less gate. It keeps the spec
+    viewer (path line + "(empty spec)"), which pins the branch as `spec_path is
+    None` rather than `not spec_text`."""
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    task = StoryTask(story_key="1-1-a", epic=1, phase=Phase.DEV_VERIFY)
+    task.spec_file = str(project.project / "gone" / "spec-1-1-a.md")
+    make_run(
+        project.project,
+        "20260611-100000-aaaa",
+        paused_stage="spec-approval",
+        paused_reason="awaiting spec approval",
+        paused_story_key="1-1-a",
+        tasks={"1-1-a": task},
+    )
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+
+
+async def test_story_gate_empty_reason_renders_fallback(project, monkeypatch):
+    """RunState.paused is `paused_reason is not None`, so an empty reason is a
+    reachable pause — the viewer says so rather than showing an empty pane."""
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    make_run(
+        project.project,
+        "20260611-100000-aaaa",
+        paused_stage="story-gate",
+        paused_reason="",
+        paused_story_key="1-1",
+        tasks={},
+    )
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, PauseReasonModal)
+        await ready(pilot, "#reason Static")
+        body = render(app.screen.query_one("#reason Static", Static).content)
+        assert "(no pause reason recorded)" in body
 
 
 async def test_start_run_modal_stories_source_launches(project, monkeypatch):

@@ -505,7 +505,7 @@ class SpecReviewModal(BaseDialog):
     """Read-only story-spec viewer with a configurable action row.
 
     Shared by the plan-checkpoint viewer (Approve & resume / Request replan) and
-    the spec-approval / epic gate viewer (Approve & resume). Dismisses with the
+    the spec-approval gate viewer (Approve & resume). Dismisses with the
     chosen action verb, or None on close/escape. The spec path is shown
     prominently with a copy-path action; the spec body is LLM-written markdown so
     it renders as plain Text, never markup. The modal owns no logic — the caller
@@ -573,6 +573,44 @@ class SpecReviewModal(BaseDialog):
             self.dismiss(bid[len("act-") :])
             return
         self.dismiss(None)
+
+
+class PauseReasonModal(BaseDialog):
+    """Spec-less gate viewer: a story gate fires before its story is registered
+    and an epic boundary has no story at all, so the pause reason IS the payload
+    — it names the blocking entries and the remedy. Dismisses with 'resume', or
+    None on close/escape. Reasons are arbitrary engine text → plain Text, never
+    markup. The modal owns no logic — the caller maps the verb to _do_resume."""
+
+    DEFAULT_CSS = """
+    PauseReasonModal #reason {
+        height: auto;
+        max-height: 60%;
+    }
+    """
+
+    def __init__(self, *, title: str, subtitle: str | Text, reason: str):
+        super().__init__()
+        self._title = title
+        self._subtitle = subtitle if isinstance(subtitle, Text) else Text(subtitle)
+        self._reason = reason
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label(self._title, classes="title")
+            yield Static(self._subtitle, id="subtitle")
+            with VerticalScroll(id="reason"):
+                body = self._reason.strip()
+                yield Static(
+                    Text(body) if body else Text("(no pause reason recorded)", style="dim")
+                )
+            with Horizontal(classes="buttons"):
+                yield Button("Resume", variant="primary", id="act-resume")
+                yield Button("close", id="cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        bid = event.button.id or ""
+        self.dismiss(bid[len("act-") :] if bid.startswith("act-") else None)
 
 
 class StoryCheckpointModal(BaseDialog):

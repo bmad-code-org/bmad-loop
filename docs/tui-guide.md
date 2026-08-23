@@ -486,11 +486,13 @@ artifacts the engine already wrote.
   interactive agent as `R`; **Re-arm & resume** (offered once the resolve agent has
   recorded a resolution) re-arms and resumes — deleting a sentinel with a preserved
   copy for a clean re-dispatch. Both refuse a still-live engine.
-- **Spec-approval / epic / story gate** — reuses the spec viewer (view the finalized
-  spec, then **Approve & resume**), so the pre-existing sprint-mode gates inherit the
-  same richer surface. A story gate fires before the story is recorded, so it has no
-  spec to show; read its reason — which names the blocking entries and the remedy — in
-  the run-header banner or the resume confirmation.
+- **Spec-approval / epic / story gate** — a spec-approval gate reuses the spec viewer
+  (view the finalized spec, then **Approve & resume**), so the pre-existing sprint-mode
+  gate inherits the same richer surface. Story-gate and epic-boundary pauses have no
+  spec to show — a story gate fires before the story is recorded, an epic boundary has
+  no story at all — so they open a compact pause-reason viewer instead: the reason names
+  the blocking entries and the remedy, and **Resume** re-picks the story and re-asks the
+  ledger, so a gate that is still open legitimately re-pauses.
 
 `p` and `R` overlap for an escalation (both reach Resolve); `p` also exposes
 Re-arm & resume inline once a resolution exists. Pause badges in the run list and
