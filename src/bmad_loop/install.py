@@ -1509,7 +1509,20 @@ def _copy_traversable(
         except OSError:
             if worktree is None:
                 raise
-            continue
+            # `copy2` is `copyfile` FOLLOWED BY `copystat`, so a destination
+            # filesystem that refuses the utime/chmod raises with the bytes already
+            # fully written (measured). Reading that as "nothing happened"
+            # under-reports twice: the entry is journaled as a no-op seed and loses
+            # its `git add -A` shield, and the file's provenance goes missing — so an
+            # unparseable config seeding really did supply would be blamed on the
+            # branch (#592). Deleting the survivor instead would be worse: the
+            # content is correct and only its metadata was refused, and dropping it
+            # is the absent-config stall (#471). Count whatever survived — the
+            # no-clobber leg above proved this slot was empty, so anything here now
+            # is ours. A partial `write_bytes` on the zip leg counts too: the bytes
+            # came from that source, and a re-arm re-seeds them whole.
+            if not _occupied(target):
+                continue
         copied = True
         if copied_paths is not None:
             copied_paths.append(target)
