@@ -3957,6 +3957,49 @@ def test_resume_refuses_when_a_stale_request_cannot_be_discarded(project, monkey
     assert "could not be discarded" in capsys.readouterr().err
 
 
+def test_refused_resume_leaves_the_pin_and_the_journal_untouched(project, monkeypatch, capsys):
+    """A refusal past this function's commit point must leave no trace of a resume
+    that did not happen. `_require_base_skills` used to be the last early exit here,
+    so the stale-request refusal above is the first branch that returns from *below*
+    the journal append and the integrity re-stamp — and both of those are persistent
+    writes, not in-memory state.
+
+    The pin is the one that lasts. `write_trusted_config_digest` writes the exact
+    file the next resume reads back as `pinned`, so re-baselining it on a refusal
+    inverts the advisory it feeds: the warning fires on the attempt that stopped and
+    goes silent on the attempt that actually arms an engine — for a config change the
+    operator never accepted by resuming. The re-stamp's stated justification is that
+    the engine this process is about to arm re-reads the config; a path that arms
+    nothing does not earn it.
+
+    Ablation: move the clear/refuse block back below
+    `runs.write_trusted_config_digest`. Both assertions redden, on two independent
+    axes — the pin becomes the freshly computed sha256, and one `run-resume` entry
+    appears — while `test_resume_refuses_when_a_stale_request_cannot_be_discarded`
+    above stays green, which is what separates this guard from that one."""
+    from bmad_loop import runs
+
+    run_dir = _paused_run_for_resume(project, monkeypatch)
+    (run_dir / runs.STOP_REQUEST_FILE).write_text(
+        '{"requested_at": "old", "mode": "hard"}', encoding="utf-8"
+    )
+    # A sentinel the re-stamp cannot reproduce: the real digest is a sha256, so
+    # equality against this is a positive assertion, not "some value is present" —
+    # which `is not None` would have been, and which would survive the ablation.
+    runs.write_trusted_config_digest(project.project, run_dir.name, "OLDPIN")
+
+    def _refuse(_path):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(runs, "retrying_unlink", _refuse)
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 1
+    assert "could not be discarded" in capsys.readouterr().err
+    assert runs.read_trusted_config_digest(project.project, run_dir.name) == "OLDPIN"
+    assert _resume_entries(run_dir) == []
+
+
 def test_resume_refuses_live_run(tmp_path, monkeypatch, capsys):
     from bmad_loop import runs
 

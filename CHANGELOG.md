@@ -112,6 +112,14 @@ breaking changes may land in a minor release.
   responsive throughout — the one thing that flag is now supposed to rule out. Checked once
   where the loop returns, which covers `max-stories-reached` too. Mode-exact: a graceful
   request at an exhausted queue still finishes truthfully.
+- **A resume refused over an unremovable stop request no longer re-blesses the config it never
+  ran (#319).** That refusal returns, and it sat below two persistent writes: the `run-resume`
+  journal entry, and the host-exec integrity re-stamp. The re-stamp is the one that lasted — it
+  writes the file the _next_ resume reads back as its baseline, so a refused attempt rebaselined
+  the pin and inverted the advisory: the config-changed warning fired on the resume that stopped
+  and stayed silent on the one that armed an engine, for a change the operator never accepted.
+  The check moves above both writes, and stays below the profile resolution that raises, so a
+  resume that aborts on a bad profile no longer destroys the operator's lodged request either.
 - **A policy field of the wrong TOML type now raises `PolicyError` naming `section.key`
   (#440).** `loads()` coerced with bare `int()`/`float()`/`bool()`/`str()` outside the
   `PolicyError` funnel, so a wrong-typed value escaped every handler written to degrade on

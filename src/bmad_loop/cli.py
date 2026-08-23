@@ -2310,6 +2310,48 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
     # does — `_sweep_factory(..., new_digest)` — so the same reasoning applies.
     profiles = _launch_profiles(pol, project)
     new_digest = _trusted_config_digest(pol, project, profiles=profiles)
+    # Discard any stop request left over from a prior stopped run — either mode — so
+    # the re-armed engine does not consume it at the first item boundary and
+    # immediately re-stop. A resume is fresh user intent, which is what makes a
+    # request lodged against the previous one stale.
+    #
+    # Placed here, and not beside write_pid with the rest of the arming, because this
+    # branch RETURNS. `_require_base_skills` above used to be this function's last
+    # early exit — everything below it ran straight through — so a refusal sited
+    # further down leaves persistent side effects behind for a resume that never
+    # happened: the `run-resume` journal entry, and the re-stamped integrity pin.
+    # The pin is the one that bites. `write_trusted_config_digest` below writes the
+    # exact file the NEXT resume reads back as `pinned`, so re-baselining it on a
+    # refusal inverts the advisory: it fires on the attempt that stopped and goes
+    # silent on the attempt that actually armed an engine. The re-stamp's own
+    # justification — that the engine this process is about to arm re-reads the
+    # config from there — is false on a path that arms nothing.
+    #
+    # No earlier than here either: `_launch_profiles` and `_trusted_config_digest`
+    # above both raise SystemExit on a bad profile, and clearing ahead of them would
+    # destroy the operator's lodged request on a resume that then aborts. This window
+    # is the only one past every raise site and ahead of both writes — and it is
+    # still before write_pid, the constraint that governs correctness: the moment the
+    # pid lands the engine is "live" and a lingering request becomes honorable.
+    if runs.clear_graceful_stop(run_dir):
+        print(
+            f"run {run_dir.name}: discarded a stale stop request before resuming",
+            file=sys.stderr,
+        )
+    elif runs.graceful_stop_requested(run_dir):
+        # The clear is never-raise by contract (five callers depend on that), so it
+        # answers False for "nothing was pending" and "could not remove it" alike.
+        # Re-read to tell them apart: a request that survived the clear would be
+        # consumed at the very first item boundary and re-stop the run, and because
+        # the print above never fired the operator would see no reason why — then
+        # resume again, to the same end.
+        print(
+            f"run {run_dir.name}: a stale stop request could not be discarded "
+            f"({runs.STOP_REQUEST_FILE} is not removable); resuming would stop again "
+            "at the first item. Remove it and retry.",
+            file=sys.stderr,
+        )
+        return 1
     # #461 point 4, human-present half. A resume IS a deliberate human choice, so
     # the on-disk config is re-blessed (new_digest is re-stamped below) and the run
     # proceeds — the auto-sweep child is the only path that refuses. But the issue's
@@ -2408,29 +2450,6 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
     # different problem with no fix at equal privilege — #571.
     state.trusted_config_digest = new_digest
     state.clear_pause()
-    # A resume is fresh user intent: discard any stop request left over from a prior
-    # stopped run — either mode — so the re-armed engine does not consume it at the
-    # first item boundary and immediately re-stop. Fire before write_pid — the moment
-    # the pid lands the engine is "live" and a lingering request becomes honorable.
-    if runs.clear_graceful_stop(run_dir):
-        print(
-            f"run {run_dir.name}: discarded a stale stop request before resuming",
-            file=sys.stderr,
-        )
-    elif runs.graceful_stop_requested(run_dir):
-        # The clear is never-raise by contract (five callers depend on that), so it
-        # answers False for "nothing was pending" and "could not remove it" alike.
-        # Re-read to tell them apart: a request that survived the clear would be
-        # consumed at the very first item boundary and re-stop the run, and because
-        # the print above never fired the operator would see no reason why — then
-        # resume again, to the same end. Refuse before write_pid re-arms the engine.
-        print(
-            f"run {run_dir.name}: a stale stop request could not be discarded "
-            f"({runs.STOP_REQUEST_FILE} is not removable); resuming would stop again "
-            "at the first item. Remove it and retry.",
-            file=sys.stderr,
-        )
-        return 1
     runs.write_pid(run_dir)
     # Persist before the engine starts: status, the TUI and diagnose only ever
     # read state.json, and Engine._save() may not fire for minutes. write_pid
