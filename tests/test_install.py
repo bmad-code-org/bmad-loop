@@ -1150,10 +1150,11 @@ def test_provision_worktree_refuses_an_unparseable_hook_config(tmp_path):
 
     assert config.read_bytes() == before  # the operator's bytes, left for inspection
     assert "bmad_loop_hook" not in config.read_text(encoding="utf-8")  # nothing published
-    # No main-checkout counterpart exists, so the remedy stays generic rather than
-    # sending the operator to a file that is not there (the other arm is pinned by
-    # test_provision_worktree_refusal_sends_the_repair_to_the_main_checkout).
-    assert "repair or remove it," in str(excinfo.value)
+    # Nothing seeded this copy, so the remedy sends the repair to the branch rather
+    # than to a main-checkout file that never supplied these bytes (the seeded lane
+    # is pinned by test_provision_worktree_refusal_sends_the_repair_to_the_main_checkout).
+    assert "commit a repaired" in str(excinfo.value)
+    assert "target branch" in str(excinfo.value)
 
 
 def test_provision_worktree_refuses_an_undecodable_hook_config(tmp_path):
@@ -1186,40 +1187,70 @@ def test_provision_worktree_refuses_an_undecodable_hook_config(tmp_path):
 
 
 def test_provision_worktree_refusal_sends_the_repair_to_the_main_checkout(tmp_path):
-    """#592: when the unparseable copy was SEEDED, the refusal names the main-checkout
-    source and sends the repair there — naming only the worktree copy would send the
-    operator to a file their repair cannot survive.
+    """#592: when the unparseable copy really was SEEDED, the refusal names the
+    main-checkout file it was seeded from and sends the repair there.
 
     The worktree is disposable and repairing it is not what un-escalates the story:
     `Phase.ESCALATED` is terminal with no transition out (`statemachine.py`), so the
     only way back into the run is a re-arm — and a re-arm discards this worktree
     (`engine._finish_inflight` -> `discard_worktree`) and mounts a fresh one, whose
-    copy-when-absent seeding pulls this config from `repo_root` again. A repair applied
-    only to the copy the parse actually read is therefore thrown away before the next
-    drive, and the identical refusal recurs. Both paths are named: the one that failed
-    to parse, and the one a repair has to land on.
+    copy-when-absent seeding pulls this config from `repo_root` again. A repair
+    applied only to the copy the parse read is therefore thrown away before the next
+    drive, and the identical refusal recurs.
 
-    Ablation: drop the `_is_file(source)` arm (always take the generic `remedy`) and
-    this reddens on the source path, while the two rows above stay green."""
+    Seeded for real rather than hand-placed: the destination is absent, so the seed
+    loop actually copies and records the entry, which is what the message reads."""
     wt, repo = tmp_path / "wt", tmp_path / "repo"
+    wt.mkdir()
     claude = get_profile("claude")
     truncated = _OPERATOR_SETTINGS[: _OPERATOR_SETTINGS.index('"env"')]
-    source = repo / claude.hooks.config_path  # what seeding copied FROM
+    source = repo / claude.hooks.config_path  # the only copy; seeding carries it in
     source.parent.mkdir(parents=True)
     source.write_text(truncated, encoding="utf-8")
-    config = wt / claude.hooks.config_path  # the seeded copy the parse reads
-    config.parent.mkdir(parents=True)
-    config.write_text(truncated, encoding="utf-8")
 
     with pytest.raises(verify.GitError, match="cannot be parsed") as excinfo:
-        provision_worktree(wt, [claude], repo)
+        provision_worktree(wt, [claude], repo, seed_files=[claude.hooks.config_path])
 
     message = str(excinfo.value)
     assert str(source) in message  # where a durable repair has to land
-    assert str(config) in message  # and where the parse actually failed
     assert "in the main checkout" in message
     assert "re-arm" in message  # not a bare resume: a terminal story is skipped
+    assert "bmad-loop resolve <run-id> --no-interactive" in message  # runnable as given
     assert source.read_text(encoding="utf-8") == truncated  # the source is never touched
+
+
+def test_provision_worktree_refusal_does_not_blame_a_config_it_never_seeded(tmp_path):
+    """#592: EXISTENCE IS NOT PROVENANCE. Seeding is copy-when-absent, so a config the
+    project tracks is skipped as an occupied destination and arrives with the branch
+    checkout — the main-checkout counterpart never supplied these bytes.
+
+    Reading a counterpart's mere existence as provenance sends the operator to repair
+    a file that can already be correct, exactly as it is here: the main checkout holds
+    the GOOD settings while the worktree copy is torn. Worse, the repair would not
+    take — a re-arm mounts a fresh worktree from the branch, checking the committed
+    (still torn) version out again. So this lane is told to commit on the target
+    branch, and the main-checkout path is not named at all.
+
+    Ablation: swap the `seed_rel in seeded` gate back to an existence test
+    (`_is_file(repo_root / seed_rel)`) and this row reddens on all three assertions
+    while the seeded row above stays green."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    claude = get_profile("claude")
+    source = repo / claude.hooks.config_path  # exists, and is perfectly valid
+    source.parent.mkdir(parents=True)
+    source.write_text(_OPERATOR_SETTINGS, encoding="utf-8")
+    config = wt / claude.hooks.config_path  # occupied -> the seed loop skips it
+    config.parent.mkdir(parents=True)
+    config.write_text(_OPERATOR_SETTINGS[: _OPERATOR_SETTINGS.index('"env"')], encoding="utf-8")
+
+    with pytest.raises(verify.GitError, match="cannot be parsed") as excinfo:
+        provision_worktree(wt, [claude], repo, seed_files=[claude.hooks.config_path])
+
+    message = str(excinfo.value)
+    assert "commit a repaired" in message  # the branch supplies it, so commit there
+    assert "target branch" in message
+    assert "in the main checkout" not in message  # never seeded from there
+    assert str(source) not in message  # and that file is not the one to repair
 
 
 def test_provision_worktree_empty_profiles_is_noop(tmp_path):

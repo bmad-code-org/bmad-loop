@@ -857,31 +857,44 @@ def provision_worktree(
                 # resume without duplicating its work (pinned by
                 # test_shield_reprovision_does_not_duplicate_patterns).
                 #
-                # Name the MAIN-checkout copy as well when this one was seeded from
-                # it, and send the repair there. This worktree is disposable: the
-                # only thing that puts an escalated story back in the run is a
-                # re-arm, and that discards the worktree
-                # (`engine._finish_inflight` -> `discard_worktree`) and mounts a
-                # fresh one, which seeds this config from `repo_root` again — so a
-                # repair applied only to the copy read here is thrown away before
-                # the next drive and the refusal simply recurs. ESCALATED is
-                # terminal with no transition out (`statemachine.py`), so the
-                # remedy names the re-arm rather than a bare resume.
-                source = repo_root / profile.hooks.config_path
-                if _is_file(source):
-                    origin = f", seeded from {source}"
-                    remedy = f"repair or remove {source} in the main checkout"
+                # Send the repair to whatever SUPPLIES these bytes, which is never
+                # this file: the worktree is disposable, an escalated story re-enters
+                # the run only through a re-arm, and that discards the worktree
+                # (`engine._finish_inflight` -> `discard_worktree`) and provisions a
+                # fresh one. `seeded` answers which source that is POSITIVELY — an
+                # actual copy this run made, not the mere existence of a counterpart.
+                # That distinction is load-bearing: seeding is copy-when-absent, so a
+                # config the project TRACKS is skipped as an occupied destination and
+                # arrives with the branch checkout instead (the call site says so at
+                # the `config_path` seed). Reading existence as provenance would send
+                # the tracked lane to repair a main-checkout file that may already be
+                # correct, while the fresh worktree checks the committed version out
+                # again and the refusal recurs — so that lane is told to commit.
+                # ESCALATED is terminal with no transition out (`statemachine.py`),
+                # and `resolve` takes a required `run_id` (`cli.py:4232`), so the
+                # remedy names the re-arm in a form that actually runs.
+                seed_rel = profile.hooks.config_path
+                if seed_rel in seeded:
+                    src_note = (
+                        f"this copy was seeded from {repo_root / seed_rel}, which a "
+                        "re-arm seeds in again, so"
+                    )
+                    remedy = f"repair or remove {repo_root / seed_rel} in the main checkout"
                 else:
-                    origin = ""
-                    remedy = "repair or remove it"
+                    src_note = (
+                        "nothing seeded this copy — it arrived with the branch "
+                        "checkout, which a re-arm checks out again, so"
+                    )
+                    remedy = f"commit a repaired {seed_rel} on the target branch"
                 raise verify.GitError(
-                    f"seeded hook config {config_path}{origin} cannot be parsed "
-                    f"({e}); an unparseable config is evidence of an earlier fault, "
-                    "not a blank slate — provisioning refuses rather than replace "
-                    "the operator's allowlist, env, and MCP settings with a "
-                    f"hooks-only file; {remedy}, then re-arm this escalation with "
-                    "`bmad-loop resolve` — ESCALATED is terminal, so repairing the "
-                    "file alone does not put the story back in the run (#592)"
+                    f"hook config {config_path} cannot be parsed ({e}); an "
+                    "unparseable config is evidence of an earlier fault, not a blank "
+                    "slate — provisioning refuses rather than replace the operator's "
+                    "allowlist, env, and MCP settings with a hooks-only file. "
+                    f"{src_note} {remedy}, then re-arm this escalation with "
+                    "`bmad-loop resolve <run-id> --no-interactive`: ESCALATED is "
+                    "terminal, so repairing the file alone does not put the story "
+                    "back in the run (#592)"
                 ) from e
         host = get_process_host()
         interp = host.hook_interpreter()
