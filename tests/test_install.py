@@ -1145,11 +1145,15 @@ def test_provision_worktree_refuses_an_unparseable_hook_config(tmp_path):
     config.write_text(_OPERATOR_SETTINGS[: _OPERATOR_SETTINGS.index('"env"')], encoding="utf-8")
     before = config.read_bytes()  # snapshot AFTER the write: Windows translates newlines
 
-    with pytest.raises(verify.GitError, match="cannot be parsed"):
+    with pytest.raises(verify.GitError, match="cannot be parsed") as excinfo:
         provision_worktree(wt, [claude], repo)
 
     assert config.read_bytes() == before  # the operator's bytes, left for inspection
     assert "bmad_loop_hook" not in config.read_text(encoding="utf-8")  # nothing published
+    # No main-checkout counterpart exists, so the remedy stays generic rather than
+    # sending the operator to a file that is not there (the other arm is pinned by
+    # test_provision_worktree_refusal_sends_the_repair_to_the_main_checkout).
+    assert "repair or remove it," in str(excinfo.value)
 
 
 def test_provision_worktree_refuses_an_undecodable_hook_config(tmp_path):
@@ -1179,6 +1183,43 @@ def test_provision_worktree_refuses_an_undecodable_hook_config(tmp_path):
 
     assert config.read_bytes() == before
     assert b"bmad_loop_hook" not in config.read_bytes()
+
+
+def test_provision_worktree_refusal_sends_the_repair_to_the_main_checkout(tmp_path):
+    """#592: when the unparseable copy was SEEDED, the refusal names the main-checkout
+    source and sends the repair there — naming only the worktree copy would send the
+    operator to a file their repair cannot survive.
+
+    The worktree is disposable and repairing it is not what un-escalates the story:
+    `Phase.ESCALATED` is terminal with no transition out (`statemachine.py`), so the
+    only way back into the run is a re-arm — and a re-arm discards this worktree
+    (`engine._finish_inflight` -> `discard_worktree`) and mounts a fresh one, whose
+    copy-when-absent seeding pulls this config from `repo_root` again. A repair applied
+    only to the copy the parse actually read is therefore thrown away before the next
+    drive, and the identical refusal recurs. Both paths are named: the one that failed
+    to parse, and the one a repair has to land on.
+
+    Ablation: drop the `_is_file(source)` arm (always take the generic `remedy`) and
+    this reddens on the source path, while the two rows above stay green."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    claude = get_profile("claude")
+    truncated = _OPERATOR_SETTINGS[: _OPERATOR_SETTINGS.index('"env"')]
+    source = repo / claude.hooks.config_path  # what seeding copied FROM
+    source.parent.mkdir(parents=True)
+    source.write_text(truncated, encoding="utf-8")
+    config = wt / claude.hooks.config_path  # the seeded copy the parse reads
+    config.parent.mkdir(parents=True)
+    config.write_text(truncated, encoding="utf-8")
+
+    with pytest.raises(verify.GitError, match="cannot be parsed") as excinfo:
+        provision_worktree(wt, [claude], repo)
+
+    message = str(excinfo.value)
+    assert str(source) in message  # where a durable repair has to land
+    assert str(config) in message  # and where the parse actually failed
+    assert "in the main checkout" in message
+    assert "re-arm" in message  # not a bare resume: a terminal story is skipped
+    assert source.read_text(encoding="utf-8") == truncated  # the source is never touched
 
 
 def test_provision_worktree_empty_profiles_is_noop(tmp_path):

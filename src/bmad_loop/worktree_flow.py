@@ -856,12 +856,32 @@ def provision_worktree(
                 # safe: the escalation pauses the run, and provisioning re-runs on
                 # resume without duplicating its work (pinned by
                 # test_shield_reprovision_does_not_duplicate_patterns).
+                #
+                # Name the MAIN-checkout copy as well when this one was seeded from
+                # it, and send the repair there. This worktree is disposable: the
+                # only thing that puts an escalated story back in the run is a
+                # re-arm, and that discards the worktree
+                # (`engine._finish_inflight` -> `discard_worktree`) and mounts a
+                # fresh one, which seeds this config from `repo_root` again — so a
+                # repair applied only to the copy read here is thrown away before
+                # the next drive and the refusal simply recurs. ESCALATED is
+                # terminal with no transition out (`statemachine.py`), so the
+                # remedy names the re-arm rather than a bare resume.
+                source = repo_root / profile.hooks.config_path
+                if _is_file(source):
+                    origin = f", seeded from {source}"
+                    remedy = f"repair or remove {source} in the main checkout"
+                else:
+                    origin = ""
+                    remedy = "repair or remove it"
                 raise verify.GitError(
-                    f"seeded hook config {config_path} cannot be parsed ({e}); "
-                    "an unparseable config is evidence of an earlier fault, not a "
-                    "blank slate — provisioning refuses rather than replace the "
-                    "operator's allowlist, env, and MCP settings with a hooks-only "
-                    "file; fix or remove it, then resume (#592)"
+                    f"seeded hook config {config_path}{origin} cannot be parsed "
+                    f"({e}); an unparseable config is evidence of an earlier fault, "
+                    "not a blank slate — provisioning refuses rather than replace "
+                    "the operator's allowlist, env, and MCP settings with a "
+                    f"hooks-only file; {remedy}, then re-arm this escalation with "
+                    "`bmad-loop resolve` — ESCALATED is terminal, so repairing the "
+                    "file alone does not put the story back in the run (#592)"
                 ) from e
         host = get_process_host()
         interp = host.hook_interpreter()
