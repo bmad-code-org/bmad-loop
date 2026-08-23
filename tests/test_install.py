@@ -1119,6 +1119,68 @@ def test_provision_worktree_write_failure_raises_and_leaves_the_config_entire(
     assert "bmad_loop_hook" not in config.read_text(encoding="utf-8")  # the lost mutation
 
 
+def test_provision_worktree_refuses_an_unparseable_hook_config(tmp_path):
+    """#592: a seeded config that will not parse stops provisioning; it is never read
+    as an empty document.
+
+    The swallowed `config = {}` this replaces was not a degrade but a destructive
+    write. `baseline_config` deep-copies whatever the parse produced, so an empty dict
+    GUARANTEES the `config != baseline_config` gate fires and the merge publishes a
+    hooks-only file over the allowlist, `env` and MCP entries the isolated session
+    needs — silently, and over the very evidence of the earlier fault that tore it.
+    `_register_hooks` has always refused this exact shape
+    (`test_a_truncated_hook_config_makes_the_next_init_refuse`); one file format, one
+    policy.
+
+    Truncated at `"env"` rather than at a fraction of the length: what a torn write
+    publishes is a prefix of the object, and JSON has no partial read.
+
+    Ablation: restore `config = {}` in the `except` and this reddens — no raise, and
+    the relay marker lands in a file that no longer holds HOUSE_TOKEN."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    repo.mkdir()
+    claude = get_profile("claude")
+    config = wt / claude.hooks.config_path
+    config.parent.mkdir(parents=True)
+    config.write_text(_OPERATOR_SETTINGS[: _OPERATOR_SETTINGS.index('"env"')], encoding="utf-8")
+    before = config.read_bytes()  # snapshot AFTER the write: Windows translates newlines
+
+    with pytest.raises(verify.GitError, match="cannot be parsed"):
+        provision_worktree(wt, [claude], repo)
+
+    assert config.read_bytes() == before  # the operator's bytes, left for inspection
+    assert "bmad_loop_hook" not in config.read_text(encoding="utf-8")  # nothing published
+
+
+def test_provision_worktree_refuses_an_undecodable_hook_config(tmp_path):
+    """The same refusal for bytes that are not UTF-8 at all — the second member of the
+    `except` tuple, and the reason it is a tuple.
+
+    `read_text(encoding="utf-8")` raises `UnicodeDecodeError`, which is not a
+    `JSONDecodeError` and which `run_isolated` — catching only `GitError` — does not
+    handle either. Before this it left the parse site as an uncaught crash of the
+    engine loop rather than an escalation of the story; the tuple turns that crash
+    into the same clean refusal as the row above.
+
+    Written with `write_bytes` because there is no text form of these bytes.
+
+    Ablation: drop `UnicodeDecodeError` from the tuple and this reddens with the raw
+    `UnicodeDecodeError` while the truncated row above stays green."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    repo.mkdir()
+    claude = get_profile("claude")
+    config = wt / claude.hooks.config_path
+    config.parent.mkdir(parents=True)
+    config.write_bytes(b'{"permissions": \xff}')
+    before = config.read_bytes()
+
+    with pytest.raises(verify.GitError, match="cannot be parsed"):
+        provision_worktree(wt, [claude], repo)
+
+    assert config.read_bytes() == before
+    assert b"bmad_loop_hook" not in config.read_bytes()
+
+
 def test_provision_worktree_empty_profiles_is_noop(tmp_path):
     provision_worktree(tmp_path / "wt", [], tmp_path / "repo")
     assert not (tmp_path / "wt").exists()

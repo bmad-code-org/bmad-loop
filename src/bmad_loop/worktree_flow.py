@@ -602,7 +602,11 @@ def provision_worktree(
     real content rather than being created empty. Its relay entry is replaced, not
     kept: the seeded copy carries the main repo's $CLAUDE_PROJECT_DIR-relative relay
     command, which resolves to the worktree, so the hook step strips it and registers
-    its own absolute command in its place (#352).
+    its own absolute command in its place (#352). A config that is already there but
+    cannot be parsed refuses provisioning outright — `verify.GitError`, which the
+    caller escalates as CRITICAL and pauses the run — rather than being replaced by
+    a hooks-only file: an unparseable config is evidence of an earlier fault, and the
+    operator's bytes are left intact for inspection (#592).
 
     The repo's `_bmad/` surface is also merge-seeded, excluding generated render
     output. Renderer and upstream-skill completeness failures share the return
@@ -836,8 +840,29 @@ def provision_worktree(
         if _is_file(config_path):
             try:
                 config = json.loads(config_path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
-                config = {}
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                # Refuse, exactly as `_register_hooks` does at init
+                # (install.py:1244-1248): same file, same merge, one policy (#592).
+                # JSON has no partial read, so a config that will not parse is
+                # evidence of an earlier fault rather than a blank slate — and
+                # swallowing it to `{}` is not a degrade but a destructive write:
+                # `baseline_config` below deep-copies that `{}`, so the change gate
+                # always fires and publishes a hooks-only file over the operator's
+                # allowlist, env and MCP entries, erasing the very evidence.
+                # UnicodeDecodeError rides along because `read_text` raises it on
+                # invalid UTF-8 — the same "operator file unreadable as content"
+                # family, and uncaught it crashes the engine instead of escalating.
+                # Raising mid-loop, after earlier profiles were provisioned, is
+                # safe: the escalation pauses the run, and provisioning re-runs on
+                # resume without duplicating its work (pinned by
+                # test_shield_reprovision_does_not_duplicate_patterns).
+                raise verify.GitError(
+                    f"seeded hook config {config_path} cannot be parsed ({e}); "
+                    "an unparseable config is evidence of an earlier fault, not a "
+                    "blank slate — provisioning refuses rather than replace the "
+                    "operator's allowlist, env, and MCP settings with a hooks-only "
+                    "file; fix or remove it, then resume (#592)"
+                ) from e
         host = get_process_host()
         interp = host.hook_interpreter()
         registrations = {
@@ -1269,10 +1294,11 @@ class WorktreeFlow:
                 on_degraded=lambda msg: self._exclude_degraded(task.story_key, msg),
             )
         except verify.GitError as e:
-            reason = (
-                f"cannot safely provision the worktree for {task.story_key} because "
-                f"a provisioning root could not be resolved: {e}"
-            )
+            # Every provisioning refusal carries its own cause — an unresolvable
+            # root, a config pin that could not be recorded, an unparseable seeded
+            # hook config (#592) — so the wrapper names the unit and defers the
+            # "why" to the inner message rather than asserting one of the three.
+            reason = f"cannot safely provision the worktree for {task.story_key}: {e}"
             self.escalate_unit(task, reason)  # always raises RunPaused
         if skipped_seeds:
             # A seed entry whose destination already exists is a no-op. Harmless for

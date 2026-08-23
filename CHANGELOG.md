@@ -60,6 +60,15 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **Provisioning refuses an unparseable seeded hook config instead of silently replacing it
+  (#592).** An isolated worktree's seeded `.claude/settings.json` that failed to parse was read
+  as an empty document, so the relay merge always ran against a blank baseline and published a
+  hooks-only file — the operator's permission allowlist, `env` and MCP entries gone, with no
+  message and no backup. #590 made that write atomic; the parse still substituted `{}`, and
+  that swallow is what this closes. Provisioning now raises, escalating the story as CRITICAL
+  and pausing the run with the bytes untouched — the policy `init` has always applied to an
+  unparseable config. Invalid UTF-8 joins the same lane, having previously crashed the engine
+  rather than escalating.
 - **Native Windows: `bmad-loop stop` no longer burns the full 10s grace window into a blind
   `taskkill /F` (#319).** An inter-process SIGTERM is never delivered to a native-Windows engine,
   so every stop completed through the external fallback with no engine teardown at all. The engine
