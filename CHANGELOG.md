@@ -62,7 +62,7 @@ breaking changes may land in a minor release.
   `taskkill /F` (#319).** An inter-process SIGTERM is never delivered to a native-Windows engine,
   so every stop completed through the external fallback with no engine teardown at all. The engine
   honors the stop request itself now, so it is the single writer of `stopped` again and
-  `run-stop fallback=True` means a genuinely wedged engine.
+  `run-stop fallback=True` means an engine that honored neither channel.
 - **Two concurrent `stop` invocations against one run no longer collide on a staging temp (#319).**
   The write staged through a fixed `stop-request.json.tmp`, so the loser's rename raised
   `FileNotFoundError`. It now stages under a per-writer name: the last write wins and neither
