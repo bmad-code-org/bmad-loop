@@ -547,10 +547,13 @@ def cmd_publish(args: argparse.Namespace) -> int:
         # runs (one repo-wide `release-publish` concurrency group), but that
         # group covers only CI: a publisher outside it — a manual
         # `release.py publish`, a hand-cut release — can create this tag after
-        # our checkout and before this call. Losing that race is not a failure:
-        # the winner created this exact tag from this exact CHANGELOG section,
-        # so the desired end state already holds. Anything else is a real error
-        # and still dies loudly.
+        # our checkout and before this call. Losing that race is not a failure
+        # for the flow this script drives: every publisher running it derives
+        # both the tag and the notes from the checkout's canonical version, so
+        # the winner made the release we would have made. That is an argument
+        # from the flow, not a proof — nothing here re-reads the remote, so a
+        # release hand-cut under this tag from another commit passes unchecked
+        # (#704). Anything else is a real error and still dies loudly.
         if _already_exists(proc.stderr):
             print(f"{tag} was created concurrently — nothing to publish")
             return 0
