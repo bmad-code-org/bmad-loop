@@ -19,6 +19,7 @@ from bmad_loop import verify
 from bmad_loop.bmadconfig import ProjectPaths
 from bmad_loop.gates import ATTENTION_FILE
 from bmad_loop.model import Phase, StoryTask
+from bmad_loop.platform_util import UnconfinedWriteError
 from bmad_loop.policy import GatesPolicy, LimitsPolicy, NotifyPolicy, Policy, ScmPolicy
 from bmad_loop.recovery_flow import PRESERVE_REF_PROBE_LIMIT, RecoveryFlow
 from bmad_loop.verify import GitError, rev_parse_head
@@ -1006,6 +1007,78 @@ def test_post_reset_authority_failure_reports_completed_rollback(project, tmp_pa
     assert "rollback-auto" in flow.journal.events()
     assert "any rollback already completed" in str(raised.value)
     assert "left untouched" not in str(raised.value)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="directory symlinks may need elevation")
+def test_resolved_redrive_normalization_confines_to_the_project_not_workspace_root(
+    project, tmp_path, monkeypatch
+):
+    """The supported `repo_root` override (isolation = "none") makes
+    `workspace.root` the separate CODE repo while the attempt binding resolves
+    under `workspace.paths.project`. Threading `workspace.root` as
+    `confine_root` made an in-project spec fail the chokepoint's
+    `is_relative_to` test and silently take the plain arm, whose parent
+    directories are resolved by NAME — so a parent swapped after
+    `_attempt_owned_spec` validated the binding sent the post-reset route
+    repair outside the project. The recovery sites now thread
+    `workspace.paths.project` (equal to `workspace.root` under worktree
+    isolation via `ProjectPaths.rebased`, so only the override shape moves).
+    This drives the bare-normalize site of the `resolved` unwind — the one arm
+    where the confined walk is the ONLY parent authority: no byte restore runs
+    there to re-validate the path.
+
+    Ablation: thread `workspace.root` back at that site and this fails on
+    `DID NOT RAISE UnconfinedWriteError` — measured with the gate ablated, the
+    decoy behind the swapped parent is rewritten to `ready-for-dev` (content
+    escaping the project through the parent link)."""
+    code_repo = tmp_path / "code-repo"
+    code_repo.mkdir()
+    git(code_repo, "init")
+    git(code_repo, "config", "user.email", "t@t")
+    git(code_repo, "config", "user.name", "t")
+    (code_repo / "src.txt").write_text("baseline\n")
+    git(code_repo, "add", "-A")
+    git(code_repo, "commit", "-q", "-m", "code baseline")
+
+    parent = project.implementation_artifacts / "override-retarget"
+    parent.mkdir(parents=True, exist_ok=True)
+    spec = parent / "owned.md"
+    spec.write_bytes(b"---\nstatus: done\n---\n\nescalated attempt\n")
+
+    override = ProjectPaths(
+        project=project.project,
+        implementation_artifacts=project.implementation_artifacts,
+        planning_artifacts=project.planning_artifacts,
+        output_folder=project.output_folder,
+        repo_root=code_repo,
+    )
+    workspace = Workspace.default(override)
+    assert workspace.root == code_repo  # the override shape this row exists for
+    flow = _make_flow(workspace=workspace, policy=_policy(rollback_on_failure=False))
+
+    task = _task(code_repo)
+    task.dispatched_spec_file = str(spec.resolve())
+    (code_repo / "src.txt").write_text("failed attempt residue\n")  # real dirt to undo
+
+    victim_parent = tmp_path / "external-victim"
+    victim_parent.mkdir()
+    decoy = b"---\nstatus: done\n---\n\nexternal victim\n"
+    (victim_parent / "owned.md").write_bytes(decoy)
+    real_safe_reset = flow.safe_reset
+
+    def retarget_after_reset(reset_task, *, preserve=()):
+        real_safe_reset(reset_task, preserve=preserve)
+        spec.unlink()
+        parent.rmdir()
+        parent.symlink_to(victim_parent, target_is_directory=True)
+
+    monkeypatch.setattr(flow, "safe_reset", retarget_after_reset)
+
+    with pytest.raises(UnconfinedWriteError):
+        flow.rollback_or_pause(task, cause="resolved")
+
+    assert parent.is_symlink()
+    assert (victim_parent / "owned.md").read_bytes() == decoy  # nothing escaped
 
 
 @pytest.mark.parametrize("git_invisible", ["baseline-untracked", "ignored"])

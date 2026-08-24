@@ -176,13 +176,19 @@ class RecoveryFlow:
     ) -> None:
         """Write and verify the lifecycle route recovery promises to dispatch.
 
-        ``confine_root`` is the checkout the binding was resolved under
-        (``workspace.root``), threaded down rather than re-derived here: this is a
-        staticmethod on purpose, and `_workspace_get` is a live getter precisely
-        because a unit worktree swaps the root mid-run. It reaches the spec-writer
-        chokepoint rule stated in `frontmatter.set_frontmatter_status` — an
-        artifacts folder configured outside the checkout is a trusted repair
-        target here (`_attempt_owned_spec`) and keeps the plain no-follow write."""
+        ``confine_root`` is the project that owns the binding
+        (``workspace.paths.project`` — the same root `_attempt_owned_spec`
+        resolves candidates under), threaded down rather than re-derived here:
+        this is a staticmethod on purpose, and `_workspace_get` is a live getter
+        precisely because a unit worktree swaps the root mid-run (``rebased``
+        makes ``paths.project`` the worktree root there). It must NOT be
+        ``workspace.root``: under the `repo_root` override that is the separate
+        code repo, an in-project spec fails its `is_relative_to` test, and the
+        chokepoint silently takes the plain arm — dropping the parent walk the
+        confinement exists for. It reaches the spec-writer chokepoint rule
+        stated in `frontmatter.set_frontmatter_status` — an artifacts folder
+        configured outside the project is a trusted repair target here
+        (`_attempt_owned_spec`) and keeps the plain no-follow write."""
         verify.set_frontmatter_status(spec_path, target_status, confine_root=confine_root)
         if verify.status_of(verify.read_frontmatter(spec_path)) != target_status:
             raise verify.FrontmatterWriteError(
@@ -648,12 +654,14 @@ class RecoveryFlow:
                                 spec_path,
                                 task.dispatched_spec_snapshot,
                                 target_status,
-                                confine_root=workspace.root,
+                                confine_root=workspace.paths.project,
                             )
                             owned_snapshot_restored = True
                         else:
                             self._normalize_attempt_owned_spec(
-                                spec_path, target_status, confine_root=workspace.root
+                                spec_path,
+                                target_status,
+                                confine_root=workspace.paths.project,
                             )
                         normalized_status = target_status
 
@@ -883,7 +891,7 @@ class RecoveryFlow:
                         owned_spec[0],
                         task.dispatched_spec_snapshot,
                         target_status,
-                        confine_root=workspace.root,
+                        confine_root=workspace.paths.project,
                     )
                 else:
                     self._restore_attempt_owned_spec_bytes(
@@ -927,7 +935,7 @@ class RecoveryFlow:
                             owned_spec[0],
                             task.dispatched_spec_snapshot,
                             target_status,
-                            confine_root=workspace.root,
+                            confine_root=workspace.paths.project,
                         )
                     except _OwnedSpecAuthorityError as exc:
                         self.pause_for_owned_spec_recovery(
@@ -937,7 +945,9 @@ class RecoveryFlow:
                         )
                 else:
                     self._normalize_attempt_owned_spec(
-                        owned_spec[0], target_status, confine_root=workspace.root
+                        owned_spec[0],
+                        target_status,
+                        confine_root=workspace.paths.project,
                     )
                 try:
                     checkout_dirty = verify.attempt_dirty(
