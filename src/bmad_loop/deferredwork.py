@@ -1077,10 +1077,18 @@ def _close_date(entry: DWEntry) -> str | None:
     if not entry.done:
         return None
     parts = entry.status.split()
-    if len(parts) < 2:
+    if len(parts) != 2:  # exactly `done YYYY-MM-DD` — extra tokens are not a close date
         return None
     date_str = parts[1]
-    return date_str if _ISO_DATE_RE.fullmatch(date_str) else None
+    if not _ISO_DATE_RE.fullmatch(date_str):
+        return None
+    try:
+        # The regex alone admits well-shaped impossible days (2026-02-30) that
+        # no calendar carries — the same half of `_require_iso_date`.
+        calendar_date.fromisoformat(date_str)
+    except ValueError:
+        return None
+    return date_str
 
 
 def archive_closed(
@@ -1147,20 +1155,33 @@ def archive_closed(
     # Append an `archived:` line after each entry's status line. The status
     # span is body-relative, so the insertion works within the body slice —
     # same offset math as `_insert_after_status`, applied to the body.
+    #
+    # Crash recovery: the archive is written BEFORE the ledger (see below), so
+    # a crash between the two writes leaves the ledger with full entries whose
+    # bodies are already in the archive. A retry must still stub those ledger
+    # entries (completing the interrupted operation) but must NOT append their
+    # bodies again — an append-only archive accumulating duplicates. Entries
+    # whose heading is already present in the existing archive text are
+    # therefore skipped here and only replaced with stubs below.
     archive_blocks: list[str] = []
     for entry, _ in to_archive:
+        if f"### {entry.id}:" in existing:
+            continue  # body already archived by a crashed prior run
         body = entry.body
         assert entry.status_span is not None  # done with a date implies a status line
         pos = entry.status_span[1]
         body = body[:pos] + f"\narchived: {stamp}" + body[pos:]
         archive_blocks.append(body)
-    if existing == "" or existing.endswith("\n\n"):
-        sep = ""
-    elif existing.endswith("\n"):
-        sep = "\n"
+    if archive_blocks:
+        if existing == "" or existing.endswith("\n\n"):
+            sep = ""
+        elif existing.endswith("\n"):
+            sep = "\n"
+        else:
+            sep = "\n\n"
+        archive_content = existing + sep + "".join(archive_blocks)
     else:
-        sep = "\n\n"
-    archive_content = existing + sep + "".join(archive_blocks)
+        archive_content = existing  # pure crash-recovery pass: only stub the ledger
     # Replace each archived entry's span with a stub, working backwards so
     # earlier spans are unaffected by later replacements — the same
     # text-surgery pattern as `_apply_done`, applied to multiple entries.

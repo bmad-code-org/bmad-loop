@@ -2608,3 +2608,66 @@ def test_archive_before_boundary_excludes_cutoff_date(tmp_path):
     path = write_ledger(tmp_path, text)
     archived = archive_closed(path, before="2026-06-01", archive_date="2026-08-24")
     assert archived == ["DW-2"]  # DW-1 is ON the cutoff, excluded by strict <
+
+
+def test_archive_rejects_status_with_extra_tokens(tmp_path):
+    """A status like `done 2026-05-25 junk` is not a close date — exactly two
+    tokens are required, so the entry is skipped rather than archived on a
+    garbage date (#706 review)."""
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: extra tokens\n\norigin: a\nstatus: done 2026-05-25 junk\n\n"
+        "### DW-2: clean close\n\norigin: b\nstatus: done 2026-05-25\n"
+    )
+    path = write_ledger(tmp_path, text)
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-2"]
+    entries = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}
+    assert "origin: a" in entries["DW-1"].body  # untouched
+
+
+def test_archive_rejects_impossible_calendar_date(tmp_path):
+    """A well-shaped impossible day (2026-02-30) passes the ISO regex but no
+    calendar carries it — skipped, not archived (#706 review)."""
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: feb 30\n\norigin: a\nstatus: done 2026-02-30\n\n"
+        "### DW-2: real date\n\norigin: b\nstatus: done 2026-05-25\n"
+    )
+    path = write_ledger(tmp_path, text)
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-2"]
+    entries = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}
+    assert "origin: a" in entries["DW-1"].body  # untouched
+
+
+def test_archive_crash_recovery_no_duplicate_bodies(tmp_path):
+    """Crash between the archive write and the ledger write leaves full entries
+    in the ledger with bodies already archived. A retry must stub the ledger
+    entries (completing the operation) without appending duplicate bodies
+    (#706 review)."""
+    path = write_ledger(tmp_path)
+    # Simulate the crashed first run: the body landed in the archive, but the
+    # ledger was never trimmed (still holds the full DW-2 entry).
+    archive_path = path.parent / ARCHIVE_REL
+    archive_path.write_text(
+        "### DW-2: Old closed item\n\n"
+        "origin: code review of spec-1-1.md, 2026-05-20\n"
+        "location: src/foo.py:10\n"
+        "reason: pre-existing.\n"
+        "status: done 2026-05-25\n"
+        "archived: 2026-08-24\n",
+        encoding="utf-8",
+    )
+    archived = archive_closed(path, archive_date="2026-08-25")
+    assert archived == ["DW-2"]  # the operation completes: stub written
+
+    # The ledger now holds the stub...
+    entries = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}
+    assert entries["DW-2"].done
+    assert "origin: code review" not in entries["DW-2"].body
+
+    # ...and the archive carries the body exactly once, with the FIRST run's
+    # stamp preserved — no duplicate append, no re-stamp.
+    archive_text = archive_path.read_text(encoding="utf-8")
+    assert archive_text.count("### DW-2:") == 1
+    assert "archived: 2026-08-24" in archive_text
+    assert "archived: 2026-08-25" not in archive_text
