@@ -3934,6 +3934,138 @@ def test_shield_excludes_only_inside_the_worktree(project, tmp_path):
     assert git(wt, "diff", "--cached", "--name-only") == ""
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="a trailing space is not a legal Windows path")
+def test_shield_escapes_trailing_space_seed(project, tmp_path):
+    """#476: a seed rel ending in a SPACE renders as a pattern naming another path.
+    Git drops a pattern's unescaped trailing whitespace, so `/kept ` shields `kept/`
+    and leaves the seeded `kept /` fully stageable — the orchestrator's own config
+    rides into the story commit, which is the one harm the shield exists to prevent
+    (#384). Escaped per gitignore(5), `/kept\\ ` keeps the space and names the real
+    directory. Measured identical on git 2.20.4 (the shield's floor) and 2.55.0.
+
+    Ablation: render `sorted(patterns)` again in `worktree_flow.provision_worktree`,
+    dropping the `_escape_exclude_pattern` call, and the staged-files assertion
+    reddens — `kept /conf.json` leaks into the index."""
+    repo = project.project
+    claude = get_profile("claude")
+    seed = "kept "
+    (repo / seed).mkdir()
+    (repo / seed / "conf.json").write_text("{}\n", encoding="utf-8")
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    provision_worktree(wt, [claude], repo, seed_files=[seed])
+
+    # the seed landed, so there is something for the shield to be wrong about
+    assert (wt / seed / "conf.json").is_file()
+    git(wt, "add", "-A")
+    staged = git(wt, "diff", "--cached", "--name-only").splitlines()
+
+    assert not [p for p in staged if p.startswith(f"{seed}/")]  # the harm
+    exclude = _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
+    assert "/kept\\ " in exclude  # the mechanism
+
+
+def test_shield_escapes_wildmatch_class_seed(project, tmp_path):
+    """#476 on the wildmatch axis: `[env]` in a seed rel is a CHARACTER CLASS, so the
+    rendered `/cfg[env]` matches `cfge`, `cfgn` and `cfgv` and never the literal
+    `cfg[env]` it was built from — the seeded directory stays stageable. Reachable
+    without exotic config: a `seed_globs` expansion over a tree holding `config/[env].json`
+    yields exactly this rel.
+
+    `/cfg\\[env]` names it. `]` needs no escape of its own — it is not special without
+    an opening `[`, which the renderer escapes.
+
+    Ablation: render `sorted(patterns)` again in `worktree_flow.provision_worktree`,
+    dropping the `_escape_exclude_pattern` call, and the staged-files assertion
+    reddens — `cfg[env]/conf.json` leaks into the index."""
+    repo = project.project
+    claude = get_profile("claude")
+    seed = "cfg[env]"
+    (repo / seed).mkdir()
+    (repo / seed / "conf.json").write_text("{}\n", encoding="utf-8")
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    provision_worktree(wt, [claude], repo, seed_files=[seed])
+
+    assert (wt / seed / "conf.json").is_file()
+    git(wt, "add", "-A")
+    staged = git(wt, "diff", "--cached", "--name-only").splitlines()
+
+    assert not [p for p in staged if p.startswith(f"{seed}/")]  # the harm
+    exclude = _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
+    assert "/cfg\\[env]" in exclude  # the mechanism
+
+
+def test_shield_escaped_class_does_not_hide_neighbour(project, tmp_path):
+    """The OTHER direction of the same defect (#401, consolidated into #476): a broken
+    pattern does not merely fail to shield ours, it silently hides someone else's. The
+    unescaped `/foo[1].json` matches `foo1.json` — a file that is not the
+    orchestrator's to hide — so the unit's own `git add -A` skipped it and the story
+    commit went out incomplete, with nothing in the diff able to say why.
+
+    Both assertions are needed and they are the pairing that matters: shielding ours
+    must not cost theirs. A renderer that simply stopped emitting the pattern would
+    satisfy the neighbour row while leaking the seeded file.
+
+    Ablation: render `sorted(patterns)` again in `worktree_flow.provision_worktree`,
+    dropping the `_escape_exclude_pattern` call, and the neighbour assertion reddens —
+    the class hides `foo1.json`, which never reaches the index."""
+    repo = project.project
+    claude = get_profile("claude")
+    (repo / "foo[1].json").write_text("{}\n", encoding="utf-8")
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    provision_worktree(wt, [claude], repo, seed_files=["foo[1].json"])
+
+    # The neighbour is written into the WORKTREE, not the repo: a linked checkout
+    # materializes only tracked paths, and the file this stands for is one the unit
+    # creates during its own session and means to commit.
+    (wt / "foo1.json").write_text("{}\n", encoding="utf-8")
+    git(wt, "add", "-A")
+    staged = git(wt, "diff", "--cached", "--name-only").splitlines()
+
+    assert "foo1.json" in staged  # not ours to hide
+    assert "foo[1].json" not in staged  # ours, and still shielded
+    exclude = _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
+    assert "/foo\\[1].json" in exclude
+
+
+def test_shield_ordinary_patterns_render_byte_identical(project, tmp_path):
+    """Escaping (#476) is a no-op on every path the shield has ever written: an
+    ordinary rel carries no wildmatch special and no trailing space, so its line is
+    byte-identical to the pre-escape spelling. Pinned because the escape runs over
+    EVERY pattern — a renderer that also quoted `.`, `/` or `-` would silently stop
+    shielding the tool dirs the whole mechanism exists for, and no other shield test
+    would notice.
+
+    Compared against the file's tail rather than by containment: the writer is
+    append-only and sorts what it adds, so the shield's own lines are exactly the last
+    three, which keeps this exact even where an operator's inherited excludes ride in
+    the prefix.
+
+    INVERSE ablation: deleting the escape cannot redden this — that is the property.
+    Add `"."` to `_escape_exclude_pattern`'s specials tuple instead and all three lines
+    move to their `/\\.claude...` spellings, reddening here and on the neighbour test's
+    mechanism row (its pattern carries a `.` too) while every HARM row above stays
+    green: `\\.` still matches a literal dot, so the over-escaped shield goes on
+    shielding. Only this test sees the over-reach."""
+    repo = project.project
+    claude = get_profile("claude")
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    provision_worktree(wt, [claude], repo)
+
+    lines = _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
+    assert lines[-3:] == sorted(
+        [f"/{claude.hooks.config_path}", f"/{claude.skill_tree}", f"/{RENDER_DIR_REL}/"]
+    )
+    assert not [ln for ln in lines[-3:] if "\\" in ln]
+
+
 @pytest.mark.parametrize("channel", ["GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"])
 def test_shield_degrades_when_a_command_scope_excludesfile_outranks_it(
     project, tmp_path, monkeypatch, channel

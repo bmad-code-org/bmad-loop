@@ -60,6 +60,9 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Escape gitignore pattern syntax (wildmatch specials, trailing spaces) when rendering
+  worktree shield patterns, so a seed path carrying such syntax is shielded and its broken
+  pattern can no longer hide an unrelated file (#476)
 - **A queued release publish can no longer be evicted by a newer push (#468)** — the
   repo-wide `release-publish` concurrency group now sets `queue: max`; the default
   single-slot queue cancels an older _pending_ run when a newer one queues, so a

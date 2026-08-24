@@ -118,6 +118,42 @@ def _required_worktree_skills(repo_root: Path, tree: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys((dev_primitive_or_default(repo_root, tree), *review_skills)))
 
 
+def _escape_exclude_pattern(pattern: str) -> str:
+    """Render one shield pattern so it names the literal path it spells (#476).
+
+    Patterns are built as ``f"/{rel}"`` from real on-disk rels, but git reads them
+    as gitignore(5) patterns, so a rel carrying pattern syntax names something
+    else entirely — and it goes wrong in both directions at once. Measured on git
+    2.55.0, identical at 2.20.4 (the shield's floor):
+
+    * ``/cfg[env]`` leaves ``cfg[env]/conf.json`` STAGEABLE. The path we seeded is
+      never shielded, which is the one job the shield has (#476).
+    * The same line hides ``cfge/`` and ``cfgn/``, because ``[env]`` is a class
+      over ``e``/``n``/``v``. A broken pattern silently hides an UNRELATED file
+      that the unit meant to commit (#401, consolidated into #476).
+
+    An unescaped trailing space does both in one line: git drops it, so ``/kept``
+    plus a space shields ``kept/`` and leaves ``kept /`` visible.
+
+    gitignore(5)'s own escape rule is the fix — a backslash before a wildmatch
+    special (``*``, ``?``, ``[``, and the backslash itself) or before a trailing
+    space makes git match that character literally. ``]`` is deliberately left
+    alone: it is not special without an opening ``[``, which this escapes. ``!``
+    and ``#`` matter only at line start, and every pattern starts with ``/``.
+
+    One trailing ``/`` is split off and re-appended unescaped: it is the MUSTBEDIR
+    marker (``RENDER_DIR_REL``), not part of the name.
+
+    Ordinary rels come back byte-identical, which is what makes this inert for
+    every path the shield has ever written.
+    """
+    body, suffix = (pattern[:-1], "/") if pattern.endswith("/") else (pattern, "")
+    for special in ("\\", "*", "?", "["):
+        body = body.replace(special, "\\" + special)
+    stripped = body.rstrip(" ")
+    return stripped + "\\ " * (len(body) - len(stripped)) + suffix
+
+
 def _drop_inert_tracked_file_patterns(
     worktree: Path, patterns: set[str]
 ) -> tuple[set[str], str | None]:
@@ -1016,7 +1052,10 @@ def provision_worktree(
     patterns, tracked_degrade = _drop_inert_tracked_file_patterns(worktree, patterns)
     if tracked_degrade is not None and on_degraded is not None:
         on_degraded(tracked_degrade)
-    reason = _worktree_local_exclude(worktree, sorted(patterns))
+    # Escaping is the LAST transform: `_drop_inert_tracked_file_patterns` strips the
+    # leading "/" and probes git with the LITERAL rel, so it has to keep seeing raw
+    # patterns — escaping must stay downstream of the tracked-pattern transform.
+    reason = _worktree_local_exclude(worktree, sorted(_escape_exclude_pattern(p) for p in patterns))
     if reason is not None and on_degraded is not None:
         on_degraded(reason)
     return skipped
