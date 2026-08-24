@@ -188,10 +188,14 @@ pass straight through to the base). It carried a second such translation on
 `select_window` until its 3.3.8 floor made the server resolve a scoped id itself
 (psmux/psmux#497). Where the composed grammar cannot carry the value at all, the
 backend degrades uniformly across every seam that mints or lists the id, so the
-pairings still line up under the fallback. Those pairings are not a closed set: a
-new one appears whenever a caller compares two id-producing seams to each other,
-so treat the rule as the contract and each documented pairing as an instance of
-it. Every way of getting it wrong is quiet: a mint/list split reads every live
+pairings still line up under the fallback — but the fallback is lossy, not a free
+escape hatch: a bare psmux id routes by the _caller's_ server, so the degrade
+condition must stay the narrow one the grammar forces (#221), never a
+convenience. Those pairings are not a closed set: a new one appears whenever a
+caller compares two id-producing seams to each other, so treat the rule as the
+contract and each documented pairing as an instance of it. Every way of getting
+the _form_ wrong is quiet — these are id-shape faults, never transport faults,
+which `list_window_ids` must still raise: a mint/list split reads every live
 window as instantly dead; a `list_windows`/`current_window_id` split makes the
 ctl-window prune kill the window it is running in (#291); a
 `list_windows`/`list_window_ids` split reports every kill candidate as verifiably
