@@ -460,7 +460,7 @@ class SettingsScreen(Screen[None]):
             self._show_errors(error)
             return
         try:
-            self._doc.save(self._path)
+            self._doc.save(self._path, confine_root=self._project)
         except OSError as e:
             self._show_errors(f"save failed: {e}")
             return

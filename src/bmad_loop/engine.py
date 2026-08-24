@@ -54,7 +54,13 @@ from .model import (
     StoryTask,
     VerifyOutcome,
 )
-from .platform_util import atomic_replace, atomic_write_text, retrying_unlink, safe_segment
+from .platform_util import (
+    atomic_replace,
+    atomic_write_text,
+    atomic_write_text_confined,
+    retrying_unlink,
+    safe_segment,
+)
 from .plugins import HookBus, HookContext, PluginRegistry
 from .policy import Policy
 from .recovery_flow import RecoveryFlow
@@ -2696,8 +2702,9 @@ class Engine:
             # Repair-write doctrine: these raise on an unreadable spec rather
             # than silently proceeding stale (see _reset_spec_for_repair).
             reset_from = fm_status
-            devcontract.reset_spec_status(spec_path, "done")
-            devcontract.strip_auto_run_result(spec_path)
+            confine_root = self.workspace.paths.project
+            devcontract.reset_spec_status(spec_path, "done", confine_root=confine_root)
+            devcontract.strip_auto_run_result(spec_path, confine_root=confine_root)
         # A timed-out review can still have recorded new frontmatter findings.
         # Normalize first so the success-status gate sees `done`, then mirror the
         # normal review path before deterministic verification and commit.
@@ -3077,15 +3084,24 @@ class Engine:
         record as an entry owing nothing — a park silently discharged by a
         rollback of the commit it was written for.
 
-        `OSError` stays the guard, and stays wide enough BECAUSE of
-        `follow_symlinks=False`: no-follow skips `Path.resolve` entirely, so the
+        `OSError` stays the guard, and stays wide enough BECAUSE the put-back
+        never resolves: the confined writer walks the components below the
+        project root with `O_NOFOLLOW` and never calls `Path.resolve`, so the
         pre-3.13 `RuntimeError`-on-symlink-loop that forced
         `_restore_deferred_closes` (and `tui.launch`) to widen to `Exception`
         cannot arise on this path. That widening is a property of the resolve,
-        not of the helper — do not copy it back here. The no-follow itself is
-        right for the same reason it is right in `operatoractions.record_park`,
-        which writes this exact file: machine-minted, under a project root a
-        driven session writes all run long.
+        not of the helper — do not copy it back here. `UnconfinedWriteError` is
+        an `OSError` subclass precisely so a refusal arrives in this guard and
+        gets journaled rather than escaping as a type nothing catches.
+
+        Confined to `self.workspace.paths.project` — the WORKTREE root when one
+        is mounted, matching `_write_park_record`, since that is the tree this
+        record was written into — for the reason `operatoractions.record_park`
+        is (#593): refusing a link at the record itself left the directories
+        above it resolved by name, so a link planted at `.bmad-loop/` redirected
+        the put-back out of the project entirely. `require_writable_target=True`
+        (#597) keeps this writer's semantics identical to the other two writers
+        of this same file; a read-only record is answered, not routed around.
 
         A failure is journaled rather than dropped, matching the model above:
         `validate` reports a board parked with no record but never a record left
@@ -3102,7 +3118,12 @@ class Engine:
                 if parent.is_dir() and not any(parent.iterdir()):
                     parent.rmdir()
             else:
-                atomic_write_text(path, prior, follow_symlinks=False)
+                atomic_write_text_confined(
+                    path,
+                    prior,
+                    confine_root=self.workspace.paths.project,
+                    require_writable_target=True,
+                )
         except OSError as e:
             with contextlib.suppress(Exception):
                 self.journal.append(
@@ -3363,7 +3384,9 @@ class Engine:
         # Repair-write doctrine: the False arm is "nothing to change" only. A status
         # the reader can see but no line edit can move raises instead, and that raise
         # is deliberately left uncaught (see _reset_spec_for_repair).
-        if not devcontract.reset_spec_status(spec_path, success_status):
+        if not devcontract.reset_spec_status(
+            spec_path, success_status, confine_root=self.workspace.paths.project
+        ):
             return fm_status
         # Keep the in-place result_json the rest of _dev_phase reads consistent with
         # the now-reconciled spec (the followup flag is only carried on a done exit).
@@ -3455,7 +3478,12 @@ class Engine:
             f"without appending its marker)."
         )
         try:
-            repaired = devcontract.append_auto_run_result(spec_path, fm_status, detail=detail)
+            repaired = devcontract.append_auto_run_result(
+                spec_path,
+                fm_status,
+                confine_root=self.workspace.paths.project,
+                detail=detail,
+            )
         except (OSError, UnicodeDecodeError) as e:
             # UnicodeDecodeError as well as OSError: the writer reads the spec's raw
             # bytes and, by contract, raises on an undecodable spec (the same
@@ -5472,8 +5500,9 @@ class Engine:
         # Repair-write doctrine: raising beats dispatching a repair at a charged
         # attempt against a spec still reading `done` — step-01 would ingest it as
         # context and not resume, re-wedging silently (cf. runs.rearm_escalation).
-        devcontract.reset_spec_status(resolved, "in-progress")
-        devcontract.strip_auto_run_result(resolved)
+        confine_root = self.workspace.paths.project
+        devcontract.reset_spec_status(resolved, "in-progress", confine_root=confine_root)
+        devcontract.strip_auto_run_result(resolved, confine_root=confine_root)
 
     def _reset_spec_for_review(self, task: StoryTask) -> SpecSnapshot | None:
         """Strip the prior pass's stale `## Auto Run Result` before a review launch,
@@ -5548,7 +5577,7 @@ class Engine:
             raise RuntimeError(
                 "recorded spec became unsafe before review prompt construction"
             ) from exc
-        devcontract.strip_auto_run_result(resolved)
+        devcontract.strip_auto_run_result(resolved, confine_root=self.workspace.paths.project)
         try:
             raw = resolved.read_bytes()
             mtime_ns = resolved.stat().st_mtime_ns

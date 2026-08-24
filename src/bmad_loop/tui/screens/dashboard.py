@@ -647,7 +647,7 @@ class DashboardScreen(Screen[None]):
             doc.set("tui", "runs_height", self.runs_height if self._left_frozen else None)
             doc.set("tui", "deferred_height", self.deferred_height if self._left_frozen else None)
             doc.set("tui", "tasks_height", self.tasks_height if self._detail_frozen else None)
-            doc.save(path)
+            doc.save(path, confine_root=self.project)
         except (OSError, tomlkit.exceptions.TOMLKitError) as e:
             self.notify(f"could not save layout: {e}", severity="warning")
 

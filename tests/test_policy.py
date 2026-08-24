@@ -4,7 +4,7 @@ import sys
 
 import pytest
 
-from bmad_loop import policy
+from bmad_loop import platform_util, policy
 
 
 def test_defaults_when_file_missing(tmp_path):
@@ -1269,7 +1269,7 @@ def test_template_mux_block_parses_to_defaults():
 
 def test_write_mux_backend_uncomments_template_anchor(tmp_path):
     p = tmp_path / "policy.toml"
-    policy.write_mux_backend(p, "psmux")
+    policy.write_mux_backend(p, "psmux", confine_root=tmp_path)
     text = p.read_text(encoding="utf-8")
     assert 'backend = "psmux"' in text
     assert policy.load(p).mux.backend == "psmux"
@@ -1279,9 +1279,9 @@ def test_write_mux_backend_uncomments_template_anchor(tmp_path):
 
 def test_write_mux_backend_replaces_existing_value(tmp_path):
     p = tmp_path / "policy.toml"
-    policy.write_mux_backend(p, "psmux")
+    policy.write_mux_backend(p, "psmux", confine_root=tmp_path)
     before = p.read_text(encoding="utf-8")
-    policy.write_mux_backend(p, "tmux")
+    policy.write_mux_backend(p, "tmux", confine_root=tmp_path)
     after = p.read_text(encoding="utf-8")
     assert policy.load(p).mux.backend == "tmux"
     # a targeted line replace: everything but the anchor line is byte-identical
@@ -1291,8 +1291,8 @@ def test_write_mux_backend_replaces_existing_value(tmp_path):
 
 def test_write_mux_backend_clear_recomments(tmp_path):
     p = tmp_path / "policy.toml"
-    policy.write_mux_backend(p, "psmux")
-    policy.write_mux_backend(p, None)
+    policy.write_mux_backend(p, "psmux", confine_root=tmp_path)
+    policy.write_mux_backend(p, None, confine_root=tmp_path)
     assert policy.load(p).mux.backend == ""
     assert '# backend = "tmux"' in p.read_text(encoding="utf-8")
 
@@ -1301,7 +1301,7 @@ def test_write_mux_backend_appends_table_to_legacy_file(tmp_path):
     p = tmp_path / "policy.toml"
     legacy = '# my notes\n[gates]\nmode = "none"\n'
     p.write_text(legacy, encoding="utf-8")
-    policy.write_mux_backend(p, "psmux")
+    policy.write_mux_backend(p, "psmux", confine_root=tmp_path)
     text = p.read_text(encoding="utf-8")
     assert text.startswith(legacy)  # untouched prefix, table appended at EOF
     pol = policy.load(p)
@@ -1312,7 +1312,7 @@ def test_write_mux_backend_appends_table_to_legacy_file(tmp_path):
 def test_write_mux_backend_reinserts_deleted_key_line(tmp_path):
     p = tmp_path / "policy.toml"
     p.write_text("[mux]\n# hand-trimmed file: no key line\n", encoding="utf-8")
-    policy.write_mux_backend(p, "tmux")
+    policy.write_mux_backend(p, "tmux", confine_root=tmp_path)
     assert policy.load(p).mux.backend == "tmux"
 
 
@@ -1320,7 +1320,7 @@ def test_write_mux_backend_preserves_hand_edits(tmp_path):
     p = tmp_path / "policy.toml"
     hand = '[limits]\nmax_dev_attempts = 7  # keep my comment\n\n[mux]\nbackend = "old"\n'
     p.write_text(hand, encoding="utf-8")
-    policy.write_mux_backend(p, "new")
+    policy.write_mux_backend(p, "new", confine_root=tmp_path)
     pol = policy.load(p)
     assert pol.mux.backend == "new"
     assert pol.limits.max_dev_attempts == 7
@@ -1332,7 +1332,7 @@ def test_write_mux_backend_preserves_trailing_comment_on_anchor_line(tmp_path):
     'preserving every other byte' includes the anchor line's own comment."""
     p = tmp_path / "policy.toml"
     p.write_text('[mux]\nbackend = "old"  # pinned per teammate X\n', encoding="utf-8")
-    policy.write_mux_backend(p, "new")
+    policy.write_mux_backend(p, "new", confine_root=tmp_path)
     text = p.read_text(encoding="utf-8")
     assert 'backend = "new"  # pinned per teammate X\n' in text
     assert policy.load(p).mux.backend == "new"
@@ -1342,7 +1342,7 @@ def test_write_mux_backend_clear_preserves_trailing_comment(tmp_path):
     """Clearing re-comments the line but keeps the hand-added trailing comment."""
     p = tmp_path / "policy.toml"
     p.write_text('[mux]\nbackend = "old"  # pinned per teammate X\n', encoding="utf-8")
-    policy.write_mux_backend(p, None)
+    policy.write_mux_backend(p, None, confine_root=tmp_path)
     text = p.read_text(encoding="utf-8")
     assert '# backend = "tmux"  # pinned per teammate X\n' in text
     assert policy.load(p).mux.backend == ""
@@ -1351,7 +1351,7 @@ def test_write_mux_backend_clear_preserves_trailing_comment(tmp_path):
 def test_write_mux_backend_preserves_crlf_line_ending(tmp_path):
     p = tmp_path / "policy.toml"
     p.write_bytes(b'[mux]\r\nbackend = "old"\r\n')
-    policy.write_mux_backend(p, "new")
+    policy.write_mux_backend(p, "new", confine_root=tmp_path)
     assert b'backend = "new"\r\n' in p.read_bytes()
 
 
@@ -1366,22 +1366,22 @@ def test_write_mux_backend_hands_the_helper_bytes(tmp_path, monkeypatch):
     binding is WRAPPED rather than replaced so the real write still happens and the
     surrounding round-trip behaviour is unchanged.
 
-    Ablation: swap `atomic_write_bytes` for `atomic_write_text` in
+    Ablation: swap `atomic_write_bytes_confined` for `atomic_write_text_confined` in
     `write_mux_backend` (dropping the `.encode`) and this reddens on every platform,
     on the `isinstance(..., bytes)` row. The exact-length assertion also pins
     "exactly one write", so a retry loop cannot creep in unnoticed."""
     seen: list[bytes] = []
-    real = policy.atomic_write_bytes
+    real = policy.atomic_write_bytes_confined
 
-    def record(path, data, *, follow_symlinks=True):
+    def record(path, data, *, confine_root, require_writable_target=False):
         seen.append(data)
-        real(path, data, follow_symlinks=follow_symlinks)
+        real(path, data, confine_root=confine_root, require_writable_target=require_writable_target)
 
-    monkeypatch.setattr(policy, "atomic_write_bytes", record)
+    monkeypatch.setattr(policy, "atomic_write_bytes_confined", record)
     p = tmp_path / "policy.toml"
     p.write_bytes(b'[mux]\r\nbackend = "old"\r\n')
 
-    policy.write_mux_backend(p, "new")
+    policy.write_mux_backend(p, "new", confine_root=tmp_path)
 
     assert len(seen) == 1
     assert isinstance(seen[0], bytes)
@@ -1390,27 +1390,34 @@ def test_write_mux_backend_hands_the_helper_bytes(tmp_path, monkeypatch):
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
 def test_write_mux_backend_replaces_a_planted_symlink(tmp_path):
-    """#363. The one row that grades this SITE's `follow_symlinks=False` argument
-    rather than the helper's implementation of it — everything else about no-follow
-    is pinned in test_platform_util.py, where the helper is called directly.
+    """#363. The one row that grades this SITE's choice of a writer that replaces
+    the NAME rather than the helper's implementation of it — everything else about
+    no-follow is pinned in test_platform_util.py, where the helper is called
+    directly. The site no longer spells that choice as `follow_symlinks=False`:
+    since #593 it calls `atomic_write_bytes_confined`, which is no-follow by
+    construction — the anchored arm publishes with a dir_fd-relative `os.replace`
+    that does not dereference its destination, and the win32 arm passes the
+    no-follow itself.
 
-    It is behaviour-preserving first: `os.replace` never dereferenced this
-    destination either, so passing the default True here would have CHANGED what
-    the function does, not merely relaxed it. It is also the security choice —
-    `runsetup` states a driven session can write `.bmad-loop/policy.toml`, so
-    writing THROUGH a link planted at that name would hand the session a host-side
-    write to any operator-writable path.
+    Behaviour-preserving first: `os.replace` never dereferenced this destination
+    either, so a follow-the-link writer here would have CHANGED what the function
+    does, not merely relaxed it. It is also the security choice — `runsetup`
+    states a driven session can write `.bmad-loop/policy.toml`, so writing
+    THROUGH a link planted at that name would hand the session a host-side write
+    to any operator-writable path.
 
-    Ablation: drop `follow_symlinks=False` at the `write_mux_backend` call and this
-    reddens alone (the link survives and the planted target is rewritten). Without
-    this row that mutation is a KNOWN GREEN ablation — no other consumer test
-    plants a symlink at the paths these five sites write."""
+    Ablation: swap `write_mux_backend`'s writer for `atomic_write_bytes(path, ...)`
+    at its follow-the-link default and this reddens on the link surviving and the
+    planted target rewritten (the confined-parent and binding-pin rows redden with
+    it — the swap removes the call they patch and the guard they raise on). This
+    is still the one row that reddens on the LINK: no other consumer test plants a
+    symlink at the paths these five sites write."""
     real = tmp_path / "someone-elses-file"
     real.write_bytes(b'[mux]\nbackend = "old"\n')
     link = tmp_path / "policy.toml"
     link.symlink_to(real)
 
-    policy.write_mux_backend(link, "new")
+    policy.write_mux_backend(link, "new", confine_root=tmp_path)
 
     assert not link.is_symlink()  # the NAME was replaced
     assert policy.load(link).mux.backend == "new"
@@ -1429,19 +1436,20 @@ def test_write_mux_backend_write_failure_raises_and_keeps_the_file(tmp_path, mon
 
     Ablation A5: revert `write_mux_backend` to `tmp.write_bytes(...)` +
     `atomic_replace` and this reddens together with the bytes pin above — both as
-    an AttributeError from `monkeypatch.setattr`, since the `atomic_write_bytes`
-    binding they share disappears with the revert. The pre-existing CRLF row stays
-    green, which is the point of the bytes pin: CRLF alone does not grade this."""
+    an AttributeError from `monkeypatch.setattr`, since the
+    `atomic_write_bytes_confined` binding they share disappears with the revert. The
+    pre-existing CRLF row stays green, which is the point of the bytes pin: CRLF
+    alone does not grade this."""
     p = tmp_path / "policy.toml"
     p.write_bytes(b'[mux]\nbackend = "old"\n')
     before = p.read_bytes()
 
-    def boom(path, data, *, follow_symlinks=True):
+    def boom(path, data, *, confine_root, require_writable_target=False):
         raise OSError("disk full")
 
-    monkeypatch.setattr(policy, "atomic_write_bytes", boom)
+    monkeypatch.setattr(policy, "atomic_write_bytes_confined", boom)
     with pytest.raises(OSError, match="disk full"):
-        policy.write_mux_backend(p, "new")
+        policy.write_mux_backend(p, "new", confine_root=tmp_path)
 
     assert p.read_bytes() == before
     assert b'backend = "new"' not in p.read_bytes()  # the mutation that must not land
@@ -1450,7 +1458,7 @@ def test_write_mux_backend_write_failure_raises_and_keeps_the_file(tmp_path, mon
 def test_write_mux_backend_rejects_bad_name(tmp_path):
     p = tmp_path / "policy.toml"
     with pytest.raises(policy.PolicyError, match="mux.backend"):
-        policy.write_mux_backend(p, "bad name!")
+        policy.write_mux_backend(p, "bad name!", confine_root=tmp_path)
     assert not p.exists()  # rejected before any write
 
 
@@ -1458,5 +1466,85 @@ def test_write_mux_backend_refuses_broken_file(tmp_path):
     p = tmp_path / "policy.toml"
     p.write_text("[gates\nmode = ", encoding="utf-8")
     with pytest.raises(policy.PolicyError):
-        policy.write_mux_backend(p, "tmux")
+        policy.write_mux_backend(p, "tmux", confine_root=tmp_path)
     assert p.read_text(encoding="utf-8") == "[gates\nmode = "  # never half-writes
+
+
+# ------------------------------------- the confined policy write (#593, #597)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_write_mux_backend_refuses_a_symlinked_policy_parent(tmp_path):
+    """The escape #593 names, at this site. `follow_symlinks=False` refused a link
+    planted at `policy.toml` itself and nothing above it, so a link at `.bmad-loop/`
+    left every directory component resolved by NAME: `mkstemp(dir=...)` and
+    `os.replace`'s destination both walked it, and the temp and the published
+    policy.toml landed wherever the link pointed. `write_mux_backend`'s own
+    `mkdir(parents=True, exist_ok=True)` ACCEPTS a symlink-to-a-directory, so the
+    planted parent survives the setup step rather than being replaced by it.
+
+    That matters here because `runsetup` states a driven session can write
+    `.bmad-loop/policy.toml` — so the redirect is a session's choice, and honouring
+    it turns `bmad-loop mux set` into a host-side write to any operator-writable
+    path outside the project.
+
+    The second assertion is the load-bearing one: raising is worth nothing if the
+    bytes already landed outside the project.
+
+    Ablation: revert the call to
+    `atomic_write_bytes(path, result.encode("utf-8"), follow_symlinks=False)` and
+    this fails `DID NOT RAISE`, with a full policy.toml sitting in `outside/`."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (tmp_path / ".bmad-loop").symlink_to(outside, target_is_directory=True)
+    p = tmp_path / ".bmad-loop" / "policy.toml"
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        policy.write_mux_backend(p, "psmux", confine_root=tmp_path)
+
+    assert list(outside.iterdir()) == []  # nothing escaped the project
+
+
+def test_write_mux_backend_creates_a_real_policy_parent(tmp_path):
+    """The positive control for the refusal above, in the same `.bmad-loop/`
+    shape. Without it that test passes for a `write_mux_backend` wired to refuse
+    every write, which is one of the reasons a file could be absent from
+    `outside/` — and for one that refuses whenever the parent does not exist yet,
+    which is `bmad-loop mux set` on a project that has never been configured.
+
+    The parent is deliberately NOT pre-created: the confined helper requires an
+    existing parent, so this also grades the site's own `mkdir` running first."""
+    p = tmp_path / ".bmad-loop" / "policy.toml"
+
+    policy.write_mux_backend(p, "psmux", confine_root=tmp_path)
+
+    assert p.parent.is_dir() and not p.parent.is_symlink()  # a real dir, freshly made
+    assert policy.load(p).mux.backend == "psmux"
+
+
+def test_write_mux_backend_refuses_a_read_only_policy_file(tmp_path):
+    """#597 at this site. policy.toml is the operator's own orchestration config,
+    hand-edited and sometimes deliberately chmod'ed read-only; a bare
+    `Path.write_bytes` refused that write as a side effect of opening the file.
+    Going atomic dropped the refusal silently — a temp-and-replace never opens the
+    target, and `os.replace` needs write permission on the DIRECTORY, so 0444 was
+    routed around and the file came back rewritten and still reading 0444.
+
+    The mode is restored in a `finally` because Windows rmtree refuses a READONLY
+    file at cleanup; 0444 sets that attribute there too, which is why this row has
+    no `skipif` — `O_WRONLY` is denied on both platforms.
+
+    Ablation: drop `require_writable_target=True` from the `write_mux_backend`
+    call and this fails `DID NOT RAISE`, with `backend = "new"` on disk."""
+    p = tmp_path / "policy.toml"
+    before = b'[mux]\nbackend = "old"\n'
+    p.write_bytes(before)
+    p.chmod(0o444)
+    try:
+        with pytest.raises(PermissionError):
+            policy.write_mux_backend(p, "new", confine_root=tmp_path)
+    finally:
+        p.chmod(0o644)
+
+    assert p.read_bytes() == before  # the rewrite never landed
+    assert list(tmp_path.glob("*.tmp")) == []  # and a refusal stages nothing

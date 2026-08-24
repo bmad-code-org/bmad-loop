@@ -34,7 +34,7 @@ from .frontmatter import (
     status_of,
 )
 from .model import StoryTask, VerifyOutcome
-from .platform_util import atomic_write_bytes
+from .platform_util import atomic_write_bytes, atomic_write_bytes_confined
 from .policy import POLICY_FILE, Policy
 from .sprintstatus import STATUS_ORDER, story_status
 
@@ -2000,14 +2000,26 @@ def safe_rollback(
             # their orchestration config on top of it — and a truncated policy.toml
             # is not a smaller config but a parse error the next `bmad-loop run`
             # refuses on, which is the failure the whole restore exists to avoid.
-            # `follow_symlinks=False` is a real change here (a bare `write_bytes`
-            # opens the name and so writes THROUGH a link), and it is the right
-            # one twice over: `policy.write_mux_backend` already replaces this same
-            # file by name, so no link at this path survives the orchestrator
-            # anyway; and `runsetup` states a driven session can write
+            # Refusing to follow a link was a real change here (a bare
+            # `write_bytes` opens the name and so writes THROUGH one), and it is
+            # the right one twice over: `policy.write_mux_backend` already replaces
+            # this same file by name, so no link at this path survives the
+            # orchestrator anyway; and `runsetup` states a driven session can write
             # `.bmad-loop/policy.toml`, so honouring a link planted there would aim
-            # a host-side write at a path of that session's choosing.
-            atomic_write_bytes(policy_path, policy_content, follow_symlinks=False)
+            # a host-side write at a path of that session's choosing. Confined to
+            # `repo` (#593) because that refusal stopped at the final component:
+            # `policy_path` is built lexically from `repo` at the capture above, so
+            # the walk re-derives exactly the components that join was spelled
+            # from, and a link planted at `.bmad-loop/` no longer redirects the
+            # restore out of the repo. require_writable_target (#597) gives back
+            # the PermissionError a bare `write_bytes` raised on an operator's
+            # read-only policy.toml — this is their config, not machine state.
+            atomic_write_bytes_confined(
+                policy_path,
+                policy_content,
+                confine_root=repo,
+                require_writable_target=True,
+            )
     for target in cleanup.targets:
         try:
             target.path.unlink(missing_ok=True)
@@ -3035,7 +3047,7 @@ def capture_diff(repo: Path, baseline: str, *, max_file_bytes: int | None = None
     return "".join(parts)
 
 
-def set_frontmatter_field(path: Path, key: str, value: str) -> bool:
+def set_frontmatter_field(path: Path, key: str, value: str, *, confine_root: Path) -> bool:
     """Rewrite (or insert) a scalar ``<key>:`` line in a spec's `---`…`---`
     frontmatter block.
 
@@ -3063,9 +3075,16 @@ def set_frontmatter_field(path: Path, key: str, value: str) -> bool:
     Windows) by a write contracted to move one field. The INSERTED line takes the
     block's own ending, not a bare ``\\n``.
 
-    Atomic on the same terms too (#379) — `platform_util.atomic_write_bytes`,
-    ``follow_symlinks=False``, matching what `devcontract._atomic_write_spec`
-    already does to the same files. Use the BYTES helper and not the text one:
+    Atomic on the same terms too (#379), and CONFINED on the same terms (#593):
+    the spec-writer chokepoint rule — confined write in-tree, plain no-follow
+    write for an artifacts folder configured outside the checkout — is stated
+    once, in `frontmatter.set_frontmatter_status`, and this site implements it
+    identically. ``confine_root`` is required for the reason it is required
+    there. So is ``require_writable_target=True`` (#597): this rewrites an
+    operator-editable spec, and a read-only one is answered rather than routed
+    around by a replace that only needs the directory writable.
+
+    Use the BYTES helper and not the text one:
     `atomic_write_text` keeps ``Path.write_text``'s translating newline default,
     which would relay ``\\n``→``\\r\\n`` on Windows and undo the paragraph above.
     """
@@ -3079,7 +3098,13 @@ def set_frontmatter_field(path: Path, key: str, value: str) -> bool:
     edited = _edit_frontmatter_block(block, key, value, insert=True)
     if edited is None:
         return False
-    atomic_write_bytes(path, (before + edited + after).encode("utf-8"), follow_symlinks=False)
+    payload = (before + edited + after).encode("utf-8")
+    if path.is_relative_to(confine_root):
+        atomic_write_bytes_confined(
+            path, payload, confine_root=confine_root, require_writable_target=True
+        )
+    else:
+        atomic_write_bytes(path, payload, follow_symlinks=False, require_writable_target=True)
     return True
 
 

@@ -7,6 +7,61 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Added
+
+- **Atomic writers gain an opt-in `require_writable_target` refusal** (#597). Callers over
+  operator-curated files can ask for the `PermissionError` a plain `Path.write_text` used to
+  raise on a read-only target. Off by default — what the other callers do today is a
+  compatibility contract. The probe opens non-blocking, so a planted reader-less FIFO cannot
+  park the orchestrator.
+
+### Changed
+
+- **A published run archive now lands at mode `0600`** instead of a umask-derived mode (#591).
+  It is staged through a file the orchestrator creates itself rather than one `tarfile` opens
+  by name, so it inherits the private mode the rest of the `.bmad-loop` write path uses.
+- **A read-only operator file is refused again instead of being rewritten** (#597).
+  `os.replace` needs write permission on the parent _directory_, never on the entry it
+  replaces, so marking `sprint-status.yaml`, `policy.toml`, a hook `settings.json`, a story
+  spec, a park record or the decisions store read-only stopped meaning anything once those
+  writes became atomic. Their writers now refuse with the `PermissionError` a plain
+  `write_text` used to raise. Machine-minted state (run archives, stop requests, the
+  config-digest stamp) is unaffected.
+
+### Fixed
+
+- **TUI: a graceful-stop request that cannot be written is reported, not fatal.** The `S`
+  worker caught only the helper's own refusals; an `OSError` from the write itself escaped,
+  and Textual's default `exit_on_error` took the dashboard down with it. It now surfaces
+  the same "may still be pending" guidance as `stop --graceful`.
+- **A denied publish no longer leaks its staging temp on Windows** (#597). The temp had
+  already taken a read-only target's READONLY bit when the replace was denied, and Windows
+  refuses to delete a READONLY file, so the cleanup was denied too and the temp survived.
+  It now clears the bit and retries.
+
+### Security
+
+- **The run-archive staging temp is minted by `mkstemp` beside the destination — exclusive,
+  `0600`, freshly named per attempt** (#591). The fixed temp name was created and unlinked by
+  name, so a symlink planted there was followed and the cleanup could remove a concurrent
+  archiver's in-flight temp; the exclusive create closes both, and the unpredictable
+  per-attempt name keeps a temp stranded by a kill — or a file planted at a guessable name —
+  from denying every later archive. The staged tarball is also `fsync`ed before publish,
+  since the run dir it came from is removed immediately after.
+- **Confined atomic writers anchor a file's parent with a directory descriptor instead of
+  resolving it by name** (#593). `follow_symlinks=False` refuses a link planted at the file
+  itself, but every directory above it was still looked up by name, so a link planted at
+  `.bmad-loop/` redirected the staging and the publish both. `atomic_write_text_confined` and
+  `atomic_write_bytes_confined` walk the components `O_NOFOLLOW` and write through the
+  resulting descriptor; a refusal raises `UnconfinedWriteError`, an `OSError`. Windows has no
+  `*at()` family and degrades to the documented check-then-write.
+- **The orchestrator's own writers under session-writable roots adopted those confined
+  helpers** (#593): the decisions store, park records, the stop-request channel (the graceful
+  lodge keeps its exclusive-create arbitration, now anchored at the walked parent), sweep
+  decisions, `policy.toml`, the story-spec writers, and the run's config-digest stamp. A
+  story spec in an artifacts folder configured _outside_ the checkout keeps the plain
+  no-follow write — supported configuration a confined write cannot vouch for.
+
 ## [0.11.1] — 2026-08-23
 
 ### Added

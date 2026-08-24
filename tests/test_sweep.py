@@ -2,6 +2,7 @@
 
 import json
 import re
+import sys
 from pathlib import Path
 
 import pytest
@@ -24,7 +25,7 @@ from conftest import (
     write_spec,
 )
 
-from bmad_loop import deferredwork, runs
+from bmad_loop import deferredwork, platform_util, runs
 from bmad_loop import sweep as sweep_mod
 from bmad_loop import verify
 from bmad_loop.adapters.base import SessionResult
@@ -2679,17 +2680,19 @@ def test_preanswered_keep_open_suppresses_prompt_and_persists(project):
 
 # ------------------------------- the two per-run `decisions.json` writes (cf. #363)
 #
-# `sweep.atomic_write_text` is ONE module binding shared by FOUR call sites: the
-# `_ensure_migration` ledger restore, the two `_decisions_phase` writes below, and
-# `_write_bundle_intent`. A bare module-wide boom would make the "revert this site"
-# ablation pass for the WRONG REASON — the run still crashes on "disk full", just
-# raised from somewhere else — so both stubs below filter on the FILENAME and
-# delegate otherwise, and both plans carry ZERO bundles so the bundle-intent write
-# is unreachable too.
+# `sweep.atomic_write_text_confined` (#593) is the binding the two `_decisions_phase`
+# writes below share. The module's OTHER two writers — the `_ensure_migration` ledger
+# restore and `_write_bundle_intent` — kept the plain `sweep.atomic_write_text`, so
+# splitting the adoption narrowed what these patches can reach. The FILENAME filter
+# and the delegate-otherwise arm stay anyway: a bare module-wide boom would make the
+# "revert this site" ablation pass for the WRONG REASON — the run still crashes on
+# "disk full", just raised from somewhere else — and the filter is what keeps that
+# true if a third site in this module ever adopts the confined helper. Both plans
+# carry ZERO bundles so the bundle-intent write is unreachable too.
 #
 # The filter is safe against the project-level pre-answer store, which is also named
-# `decisions.json`: that goes through `decisions.atomic_write_text`, a different
-# module's binding, which these patches do not touch.
+# `decisions.json`: that goes through `decisions.atomic_write_text_confined`, a
+# different module's binding, which these patches do not touch.
 
 
 def test_seeded_decisions_write_failure_strands_nothing(project, monkeypatch):
@@ -2740,14 +2743,14 @@ def test_seeded_decisions_write_failure_strands_nothing(project, monkeypatch):
     )
     engine, _ = make_sweep(project, [triage_effect(plan)], prompting=False)
 
-    real = sweep_mod.atomic_write_text
+    real = sweep_mod.atomic_write_text_confined
 
-    def boom(path, text, *, follow_symlinks=True):
+    def boom(path, text, *, confine_root, require_writable_target=False):
         if Path(path).name == "decisions.json":
             raise OSError("disk full")
-        real(path, text, follow_symlinks=follow_symlinks)
+        real(path, text, confine_root=confine_root, require_writable_target=require_writable_target)
 
-    monkeypatch.setattr(sweep_mod, "atomic_write_text", boom)
+    monkeypatch.setattr(sweep_mod, "atomic_write_text_confined", boom)
     summary = engine.run()
 
     assert summary.crashed and "disk full" in str(summary.crash_error)
@@ -2786,14 +2789,14 @@ def test_interactive_decision_write_failure_strands_nothing(project, monkeypatch
     )
     engine, _ = make_sweep(project, [triage_effect(plan)], answers=["1"], prompting=True)
 
-    real = sweep_mod.atomic_write_text
+    real = sweep_mod.atomic_write_text_confined
 
-    def boom(path, text, *, follow_symlinks=True):
+    def boom(path, text, *, confine_root, require_writable_target=False):
         if Path(path).name == "decisions.json":
             raise OSError("disk full")
-        real(path, text, follow_symlinks=follow_symlinks)
+        real(path, text, confine_root=confine_root, require_writable_target=require_writable_target)
 
-    monkeypatch.setattr(sweep_mod, "atomic_write_text", boom)
+    monkeypatch.setattr(sweep_mod, "atomic_write_text_confined", boom)
     summary = engine.run()
 
     journal = journal_text(engine)
@@ -2802,6 +2805,107 @@ def test_interactive_decision_write_failure_strands_nothing(project, monkeypatch
     assert '"decision-answered"' not in journal  # the raise landed AT the write
     assert not (engine.run_dir / "decisions.json").exists()
     assert list(engine.run_dir.glob("decisions*.tmp")) == []  # no stranded temp
+
+
+def test_decisions_phase_keys_on_the_run_dir_project_not_workspace_root(project, tmp_path):
+    """The supported `repo_root` override (`_bmad/bmm/config.yaml`, honoured only
+    with `isolation = "none"` — worktree isolation refuses the divergence) puts
+    `workspace.root` at the separate CODE repo while the per-run `decisions.json`
+    and the project-level pre-answer store stay under the PROJECT. Keying this
+    phase on `workspace.root` therefore made every pre-answer seed — and the
+    first interactive answer — raise `UnconfinedWriteError`, and aimed the
+    pre-answer READ at a store that does not exist. All three now key on the
+    project that owns `run_dir` (`runs._project_of_run_dir`), which no workspace
+    swap moves.
+
+    The divergence is installed at the exact seam the override reaches:
+    `workspace` is a plain attribute the bundle pipeline itself swaps, and
+    `_decisions_phase` runs outside that pipeline by contract. The divergent
+    root is a real empty git repo so the phase's ledger-commit tail stays a
+    no-op rather than a spawn error.
+
+    Ablations, each reddening its own assertion: point the pre-answer read back
+    at `self.workspace.root` → the seeded answer is missing; point the seeded
+    write's `confine_root` back → `UnconfinedWriteError` before any assertion;
+    point the interactive write's back → the same raise at the DW-2 answer."""
+    from bmad_loop import decisions
+    from bmad_loop.workspace import Workspace
+
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    decisions.record_pre_answer(
+        project.project,
+        "DW-1",
+        DecisionOption(key="2", label="Keep", effect="keep-open"),
+        date="2026-06-12",
+    )
+    options = [
+        {"key": "1", "label": "Build", "effect": "build", "intent": "x"},
+        {"key": "2", "label": "Keep", "effect": "keep-open"},
+    ]
+    rj = triage_result(
+        ["DW-1", "DW-2"],
+        decisions=[
+            _decision("DW-1", options, recommendation="2"),
+            _decision("DW-2", options, recommendation="2"),
+        ],
+    )
+    plan, errors = validate_triage(rj, {"DW-1", "DW-2"})
+    assert errors == []
+    engine, _ = make_sweep(project, [], answers=["2"], prompting=True)
+    elsewhere = tmp_path / "code-repo"
+    elsewhere.mkdir()
+    git(elsewhere, "init")
+    engine.workspace = Workspace(root=elsewhere, paths=engine.workspace.paths)
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+
+    answers, closed = engine._decisions_phase(plan)
+
+    assert answers["DW-1"]["effect"] == "keep-open"  # the READ found the project store
+    assert answers["DW-2"]["key"] == "2"  # the interactive write landed too
+    stored = json.loads((engine.run_dir / "decisions.json").read_text(encoding="utf-8"))
+    assert set(stored) == {"DW-1", "DW-2"}
+    assert closed == 0
+    assert list(elsewhere.rglob("decisions*")) == []  # nothing leaked into the code repo
+
+
+def test_prune_pre_answers_keys_on_the_run_dir_project_not_workspace_root(project, tmp_path):
+    """`_prune_pre_answers` is the fourth workspace-rooted call in the family
+    the test above pins (read, seeded write, interactive write): under the
+    `repo_root` override it pruned against `workspace.root` — the separate CODE
+    repo, whose store does not exist — so the prune silently dropped nothing
+    and a consumed pre-answer survived in the PROJECT store, suppressing
+    `pending_missed_decisions` for its id and standing ready to re-apply if the
+    id ever returns to the open set. It now keys on `runs._project_of_run_dir`,
+    the same root the load reads. The ledger read is deliberately untouched:
+    `deferred_work` hangs off `implementation_artifacts`, which stays
+    project-rooted under the override.
+
+    Ablation: point the prune back at `self.workspace.root` → DW-1 survives in
+    the project store and the pruned journal line never lands."""
+    from bmad_loop import decisions
+    from bmad_loop.workspace import Workspace
+
+    write_ledger(project, {"DW-2": "open"})  # DW-1 consumed: absent from the open set
+    for dw in ("DW-1", "DW-2"):
+        decisions.record_pre_answer(
+            project.project,
+            dw,
+            DecisionOption(key="2", label="Keep", effect="keep-open"),
+            date="2026-06-12",
+        )
+    engine, _ = make_sweep(project, [])
+    elsewhere = tmp_path / "code-repo"
+    elsewhere.mkdir()
+    git(elsewhere, "init")
+    engine.workspace = Workspace(root=elsewhere, paths=engine.workspace.paths)
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+
+    engine._prune_pre_answers()
+
+    # DW-1 dropped from the PROJECT store; the still-open keep-open answer kept
+    assert set(decisions.load_pre_answers(project.project)) == {"DW-2"}
+    assert '"decision-preanswers-pruned"' in journal_text(engine)
+    assert list(elsewhere.rglob("decisions*")) == []  # the code repo was never the store
 
 
 def test_max_bundles_truncation(project):
@@ -4594,3 +4698,142 @@ def test_bundle_harvest_alone_is_not_proof_of_work(project):
     assert engine.state.tasks["dw-fix-things"].phase == Phase.DEFERRED
     harvested = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
     assert len(harvested) == 1 and harvested[0]["dw_ids"] == ["DW-2"]
+
+
+# ------------------------- the per-run decisions writes, confined to the project (#593)
+
+
+def _redirect_the_run_dir(project, tmp_path):
+    """Plant a link at the run directory `make_sweep` will use, pointing OUT of the
+    project, and hand back where it points.
+
+    The link goes at the run dir rather than at `.bmad-loop/` deliberately: the
+    engine writes its journal, state and triage records into this same directory
+    through the ordinary (unconfined) writers, and those must keep working so the
+    run reaches the decisions phase at all. Only the two confined writes walk the
+    components from the project root, so only they refuse — which makes the
+    refusal attributable to the site under test rather than to a broken run."""
+    run_dir = project.project / ".bmad-loop" / "runs" / "sweep-run"
+    run_dir.parent.mkdir(parents=True, exist_ok=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    run_dir.symlink_to(outside, target_is_directory=True)
+    return outside
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_the_seeded_decisions_write_refuses_a_redirected_run_dir(project, tmp_path):
+    """The escape #593 names, on the pre-answer-seeded write. `follow_symlinks=False`
+    refused a link planted at `decisions.json`; it never refused one planted at any
+    directory ABOVE it, and this file sits three deep under the project root
+    (`.bmad-loop/runs/<id>/`), so a link at any of those three redirected both the
+    temp and the published file out of the project.
+
+    The `decision-preanswered` journal line is the PRECONDITION, exactly as in the
+    disk-full twin above: it is appended before the write, so without it the
+    "nothing escaped" assertion would pass for the entirely different reason that
+    the phase was never entered.
+
+    Ablation: revert this site to `atomic_write_text(..., follow_symlinks=False)`
+    and this fails — the run stops crashing and `decisions.json` appears in
+    `outside/`."""
+    from bmad_loop import decisions
+    from bmad_loop.sweep import DecisionOption
+
+    outside = _redirect_the_run_dir(project, tmp_path)
+    write_ledger(project, {"DW-1": "open"})
+    decisions.record_pre_answer(
+        project.project,
+        "DW-1",
+        DecisionOption(key="2", label="Keep", effect="keep-open"),
+        date="2026-06-12",
+    )
+    plan = triage_result(  # keep-open only: no bundle, so no bundle-intent write
+        ["DW-1"],
+        decisions=[
+            _decision(
+                "DW-1",
+                [
+                    {"key": "1", "label": "Build", "effect": "build", "intent": "x"},
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+                recommendation="2",
+            )
+        ],
+    )
+    engine, _ = make_sweep(project, [triage_effect(plan)], prompting=False)
+
+    summary = engine.run()
+
+    assert summary.crashed
+    assert platform_util.UnconfinedWriteError.__name__ in str(summary.crash_error)
+    assert '"decision-preanswered"' in journal_text(engine)  # PRECONDITION: site reached
+    assert not (outside / "decisions.json").exists()  # nothing escaped the project
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_the_interactive_decisions_write_refuses_a_redirected_run_dir(project, tmp_path):
+    """The interactive write's own refusal — the same file, a few lines further
+    down, and a separate row for the reason its disk-full twin is separate: the two
+    writes are reached by different paths, and one adopted without the other would
+    leave half the file's writers unconfined.
+
+    Two preconditions, as in that twin. `decision-pending` is appended before
+    `prompter.ask`, proving the phase was entered; `decision-answered` is appended
+    AFTER the write, so its ABSENCE places the refusal at the site under test
+    rather than upstream of it.
+
+    Ablation: revert this site and this fails — the run completes and
+    `decisions.json` appears in `outside/`."""
+    outside = _redirect_the_run_dir(project, tmp_path)
+    write_ledger(project, {"DW-1": "open"})
+    plan = triage_result(  # close-only: no bundle, so no bundle-intent write
+        ["DW-1"],
+        decisions=[
+            _decision(
+                "DW-1",
+                [
+                    {"key": "1", "label": "Close it", "effect": "close", "resolution": "moot"},
+                    {"key": "2", "label": "Keep open", "effect": "keep-open"},
+                ],
+            )
+        ],
+    )
+    engine, _ = make_sweep(project, [triage_effect(plan)], answers=["1"], prompting=True)
+
+    summary = engine.run()
+
+    journal = journal_text(engine)
+    assert summary.crashed
+    assert platform_util.UnconfinedWriteError.__name__ in str(summary.crash_error)
+    assert '"decision-pending"' in journal  # PRECONDITION: the prompt was reached
+    assert '"decision-answered"' not in journal  # the refusal landed AT the write
+    assert not (outside / "decisions.json").exists()  # nothing escaped the project
+
+
+def test_the_decisions_writes_land_on_a_clean_tree(project):
+    """The positive control for both refusals above. Without it they pass for a
+    `_decisions_phase` wired to crash on anything, which is every reason
+    `decisions.json` could be absent from `outside/` — and the run dir under test
+    there is a symlink, so this row also pins that an ORDINARY run dir still gets
+    its file."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = triage_result(
+        ["DW-1"],
+        decisions=[
+            _decision(
+                "DW-1",
+                [
+                    {"key": "1", "label": "Close it", "effect": "close", "resolution": "moot"},
+                    {"key": "2", "label": "Keep open", "effect": "keep-open"},
+                ],
+            )
+        ],
+    )
+    engine, _ = make_sweep(project, [triage_effect(plan)], answers=["1"], prompting=True)
+
+    summary = engine.run()
+
+    assert not summary.crashed
+    landed = json.loads((engine.run_dir / "decisions.json").read_text(encoding="utf-8"))
+    assert landed["DW-1"]["effect"] == "close"

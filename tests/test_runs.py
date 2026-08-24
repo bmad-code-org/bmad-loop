@@ -7,6 +7,7 @@ import re
 import subprocess
 import sys
 import tarfile
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -1038,23 +1039,28 @@ def test_write_stop_request_survives_an_interleaved_concurrent_writer(tmp_path, 
     `mkstemp` temp removes the collision: both calls return, the survivor is a
     complete body, and neither leaves a staging file behind.
 
-    Patched on both namespaces so reverting `_write_stop_request` to the hand-rolled
-    `tmp + atomic_replace` still routes through the interleave — that ablation must
-    redden this test."""
-    from bmad_loop import platform_util
+    Patched at `os.replace` rather than on the two `atomic_replace` namespaces:
+    the confined writer's anchored arm publishes with a bare dir_fd-relative
+    `os.replace` and never reaches `atomic_replace` (#593), so patching that name
+    would fire on nothing and the test would pass having interleaved nobody. One
+    seam still covers the ablation the old dual patch existed for, and covers it
+    better — `atomic_replace` is itself a wrapper around `os.replace`, so
+    reverting `_write_stop_request` to the hand-rolled `tmp + atomic_replace`
+    routes through this same patch and must still redden this test.
 
+    Filtered to the stop-request name so an unrelated replace during the test is
+    not collateral."""
     run_dir = _make_state_run(tmp_path, "r1")
-    real_replace = platform_util.atomic_replace
+    real_replace = os.replace
     nested: list[str] = []
 
-    def _interleave(tmp, target):
-        if not nested:  # inside writer A's replace, run writer B end to end
-            nested.append("b")
+    def _interleave(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
+        if not nested and str(dst).endswith(runs.STOP_REQUEST_FILE):
+            nested.append("b")  # inside writer A's replace, run writer B end to end
             runs._write_stop_request(run_dir, "graceful")
-        real_replace(tmp, target)
+        return real_replace(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
 
-    monkeypatch.setattr(platform_util, "atomic_replace", _interleave)
-    monkeypatch.setattr(runs, "atomic_replace", _interleave)
+    monkeypatch.setattr(os, "replace", _interleave)
 
     runs._write_stop_request(run_dir, "hard")  # writer A — must not raise
 
@@ -1338,6 +1344,32 @@ def test_create_stop_request_failed_write_never_deletes_a_concurrent_hard_reques
         runs._create_stop_request(tmp_path)
     assert escalated == ["hard"]  # the interleave really happened
     assert runs.read_stop_request_mode(tmp_path) == "hard"  # NOT swallowed
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_create_stop_request_refuses_a_redirected_runs_dir(tmp_path):
+    """#593's parent half at the graceful lodge. `O_EXCL` never dereferences the
+    FINAL name, but `.bmad-loop/`, `runs/` and the run's own directory were still
+    resolved by name, so a link planted at any of them aimed the request outside
+    the project — the hole the confined `_write_stop_request` next door had
+    already closed. The lodge now walks the parents through
+    `create_exclusive_confined`, whose own rows in test_platform_util grade the
+    walk; what this row grades is the adoption, at the site.
+
+    Ablation: revert `_create_stop_request` to the bare `os.open` and this
+    reddens twice over — no raise, and the request file lands in `outside/`."""
+    project = tmp_path / "project"
+    outside = tmp_path / "outside"
+    run_id = "20260611-100000-aaaa"
+    (project / ".bmad-loop").mkdir(parents=True)
+    (outside / run_id).mkdir(parents=True)
+    (project / ".bmad-loop" / "runs").symlink_to(outside, target_is_directory=True)
+    run_dir = project / ".bmad-loop" / "runs" / run_id
+
+    with pytest.raises(platform_util.UnconfinedWriteError, match="without a redirect"):
+        runs._create_stop_request(run_dir)
+
+    assert list((outside / run_id).iterdir()) == []  # nothing landed outside
 
 
 def test_create_stop_request_failed_write_leaves_a_graceful_request_standing(tmp_path, monkeypatch):
@@ -1960,13 +1992,16 @@ def test_read_trusted_config_digest_does_not_follow_a_planted_symlink(tmp_path):
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
 def test_write_trusted_config_digest_replaces_a_planted_symlink(tmp_path):
-    """`follow_symlinks=False`, and the reason is that this record lives under a
-    root whose path the driven session is handed — the engine exports the sibling
-    events dir as `BMAD_LOOP_EVENTS_DIR`. Following a link planted at the digest's
-    name would aim an orchestrator write at a path of the session's choosing.
+    """A writer that replaces the NAME, and the reason is that this record lives
+    under a root whose path the driven session is handed — the engine exports the
+    sibling events dir as `BMAD_LOOP_EVENTS_DIR`. Following a link planted at the
+    digest's name would aim an orchestrator write at a path of the session's
+    choosing. The site no longer spells that choice as `follow_symlinks=False`:
+    since #593 it calls `atomic_write_text_confined`, which is no-follow by
+    construction.
 
-    ABLATION: drop `follow_symlinks=False` and the target below is what gets
-    written."""
+    ABLATION: swap the writer for `atomic_write_text(path, ...)` at its
+    follow-the-link default and the target below is what gets written."""
     project = tmp_path / "proj"
     project.mkdir()
     target = tmp_path / "outside.txt"
@@ -1979,6 +2014,89 @@ def test_write_trusted_config_digest_replaces_a_planted_symlink(tmp_path):
 
     assert target.read_text() == "untouched"
     assert not path.is_symlink()
+    assert runs.read_trusted_config_digest(project, "r1") == "abc123"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_write_trusted_config_digest_refuses_a_symlinked_state_dir_component(tmp_path, monkeypatch):
+    """The escape #593 names, at this site. The row above grades
+    `follow_symlinks=False`, which stopped at the FINAL component only: the two
+    components BELOW the state root — `<project tag>/` and `<run id>/` — were still
+    resolved by name at both the `mkstemp` and the `os.replace`, and the
+    `mkdir(parents=True, exist_ok=True)` on the line before the write ACCEPTS a
+    symlinked directory, so a link planted at either survived the setup step and
+    aimed the stamp wherever it pointed.
+
+    The confinement root is the STATE ROOT, not the digest's parent: the walk
+    covers the components strictly below the root, so rooting this at
+    `path.parent` would check neither of the two components a session could reach
+    and this row would stay green with the escape open. It is also not the
+    project — this record deliberately lives OUT of the tree the baseline exists
+    to police (`test_config_digest_is_stamped_under_the_state_root_not_in_the_project`).
+
+    The mkdir runs first and walks THROUGH the planted link, so an empty `r1/`
+    legitimately appears outside; what must not appear is content. That is what the
+    last assertion says.
+
+    Ablation: revert the call to
+    `atomic_write_text(path, digest + chr(10), follow_symlinks=False)` and this
+    fails `DID NOT RAISE`, with the digest published out in `outside/`."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    root = tmp_path / "state"
+    root.mkdir()
+    monkeypatch.setenv(envvars.STATE_DIR, str(root))
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / runs.project_tag(project)).symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        runs.write_trusted_config_digest(project, "r1", "abc123")
+
+    # the mkdir walked through the link, so the run dir is out here; nothing else
+    # may be, and in particular no digest and no staging temp
+    assert [p.name for p in outside.iterdir()] == ["r1"]
+    assert list((outside / "r1").iterdir()) == []
+
+
+def test_write_trusted_config_digest_lands_under_a_clean_state_root(tmp_path, monkeypatch):
+    """The positive control for the refusal above: with no link planted, the
+    anchored walk opens both components and the stamp lands where the reader looks.
+
+    Wrapped rather than stubbed, so the real write still happens, and the CONFINED
+    binding is the one wrapped — `runs.atomic_write_text` no longer exists here, so
+    a stale patch of that name would fail loudly rather than record nothing.
+
+    `seen` records the ROOT, not merely that a write happened: `confine_root` is
+    the one component the anchored walk starts from rather than checks, so a root
+    naming the digest's own parent would be lexically confined and behaviourally
+    inert. Both this row and the refusal above redden under that ablation, from
+    opposite directions — this one on the recorded value, that one on the escape
+    it lets through.
+
+    Ablation: point `confine_root` at `path.parent` and this fails on `seen`."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    root = tmp_path / "state"
+    root.mkdir()
+    monkeypatch.setenv(envvars.STATE_DIR, str(root))
+    seen: list[Path] = []
+    real = runs.atomic_write_text_confined
+
+    def record(path, text, *, confine_root, require_writable_target=False):
+        seen.append(Path(confine_root))
+        real(
+            path,
+            text,
+            confine_root=confine_root,
+            require_writable_target=require_writable_target,
+        )
+
+    monkeypatch.setattr(runs, "atomic_write_text_confined", record)
+
+    runs.write_trusted_config_digest(project, "r1", "abc123")
+
+    assert seen == [root]  # the state root itself, not the run dir
     assert runs.read_trusted_config_digest(project, "r1") == "abc123"
 
 
@@ -2550,22 +2668,25 @@ def test_archive_run(tmp_path):
 def test_archive_run_names_its_temp_after_the_destination(tmp_path, monkeypatch):
     """#363's filename half, and it needs its own test because NOTHING else grades
     it: on the happy path `atomic_replace` consumes the temp under either spelling,
-    and the new `except BaseException` guard unlinks it whatever it is named — so
-    reverting the fix reddens no other row in this file. Recording the name handed to
-    `os.replace` is the only place the spelling is observable.
+    and the `except BaseException` guard unlinks it whatever it is named — so a
+    wrongly named temp reddens no other row in this file. Recording the name handed
+    to `os.replace` is the only place the spelling is observable.
 
-    `dest.with_suffix(".tar.gz.tmp")` yielded `<id>.tar.tar.gz.tmp`, because
-    `with_suffix` replaces only the LAST suffix and `<id>.tar.gz` has stem
-    `<id>.tar` — not the name the docstring implied, and not one any cleanup could
-    have been written against.
+    The historical bug: `dest.with_suffix(".tar.gz.tmp")` yielded
+    `<id>.tar.tar.gz.tmp`, because `with_suffix` replaces only the LAST suffix and
+    `<id>.tar.gz` has stem `<id>.tar`. The name now flows from
+    `_mkstemp_beside(dest)`'s prefix, so the contract is prefix+suffix — the temp
+    is recognisably this destination's staging file and ends in `.tmp` — with
+    mkstemp's random token in between.
 
     `run_dir` is built BEFORE the patch on purpose: `save_state` writes through the
     same `os.replace`, and building it after would pollute `seen` with a call that
     has nothing to do with the archive.
 
-    Ablation A9: restore `dest.with_suffix(".tar.gz.tmp")` and this reddens alone —
-    `test_archive_run` and the guard test below stay GREEN, which is exactly why
-    this row exists rather than being folded into either."""
+    Ablation A9: stage beside a different name (`_mkstemp_beside(dest.parent /
+    "x")`) and this reddens alone — `test_archive_run` and the guard test below
+    stay GREEN, which is exactly why this row exists rather than being folded into
+    either."""
     run_dir = _make_state_run(tmp_path, "20260611-100000-aaaa")
     seen: list[str] = []
     real = os.replace
@@ -2577,9 +2698,10 @@ def test_archive_run_names_its_temp_after_the_destination(tmp_path, monkeypatch)
     monkeypatch.setattr(platform_util.os, "replace", record)
     dest = runs.archive_run(tmp_path, run_dir)
 
-    # an exact list, so it also pins "exactly one replace" — a retry loop or a second
-    # write creeping in here would redden rather than pass on a substring match
-    assert seen == [dest.name + ".tmp"]
+    # exactly one replace — a retry loop or a second write creeping in would redden
+    assert len(seen) == 1
+    assert seen[0].startswith(dest.name + ".")
+    assert seen[0].endswith(".tmp")
 
 
 def test_archive_run_failed_replace_strands_no_temp(tmp_path, monkeypatch):
@@ -2611,6 +2733,132 @@ def test_archive_run_failed_replace_strands_no_temp(tmp_path, monkeypatch):
 
     assert (run_dir / "state.json").is_file()  # the run survives a failed archive
     assert list((tmp_path / ".bmad-loop" / "archive").iterdir()) == []  # no temp left
+
+
+def test_archive_run_temp_is_created_exclusively_at_0600(tmp_path, monkeypatch):
+    """#591. The staging create must be exclusive — that is the whole license for
+    the `except BaseException` unlink below it, which would otherwise remove a name
+    this process never owned. The site delegates to `_mkstemp_beside`, whose own
+    rows in test_platform_util grade the `O_EXCL` `0600` create and the NAME_MAX
+    ladder, so what THIS row grades is the delegation: the spy is the only place
+    the choice of writer is visible on the happy path, where `atomic_replace`
+    consumes the temp whichever writer staged it. The spy mirrors
+    `tempfile.mkstemp`'s exact keyword signature on purpose — it doubles as the
+    call-shape pin.
+
+    `os.umask(0o022)` is the point of the bracket, not hygiene — the same trap
+    `test_file_lock_is_created_owner_only` documents. Under a 0o077 umask a
+    mode-less create produces 0o600 by accident and the on-disk assertion goes
+    inert, so the bracket is what makes this row's ablation bite on any box rather
+    than only where the ambient umask happens to cooperate.
+
+    Ablation: revert the staging to a fixed-name `os.open(tmp, O_CREAT | O_EXCL |
+    O_WRONLY, 0o600)` and this reddens alone on the spy staying empty — the
+    behavioural rows below redden on the denial, not the writer."""
+    run_dir = _make_state_run(tmp_path, "20260611-100000-aaaa")
+    seen: list[tuple[str, str, str]] = []
+    real_mkstemp = tempfile.mkstemp
+
+    def spy(*, dir, prefix, suffix):
+        seen.append((dir, prefix, suffix))
+        return real_mkstemp(dir=dir, prefix=prefix, suffix=suffix)
+
+    monkeypatch.setattr(platform_util.tempfile, "mkstemp", spy)
+    previous = os.umask(0o022)
+    try:
+        dest = runs.archive_run(tmp_path, run_dir)
+    finally:
+        os.umask(previous)
+
+    assert seen == [
+        (str(dest.parent), "20260611-100000-aaaa.tar.gz.", ".tmp")
+    ]  # exactly one staging create, minted beside the destination
+    if sys.platform != "win32":
+        published = dest.stat().st_mode & 0o777
+        assert published == 0o600, oct(published)
+
+
+def test_archive_run_survives_a_stale_temp_and_leaves_it(tmp_path):
+    """#591's ownership pin, in the shape the fresh-name staging gives it. A FIXED
+    `O_EXCL` name turned any survivor at `<id>.tar.gz.tmp` — a temp stranded by a
+    kill between create and publish, or a file planted at the guessable spelling —
+    into a permanent `FileExistsError` denial of every later archive attempt,
+    where the pre-#591 truncate-and-reuse completed. Staging under a per-attempt
+    mkstemp name makes the survivor inert: the archive completes beside it, and
+    the cleanup can only ever unlink a name this process itself minted, so the
+    foreign bytes survive byte-identical.
+
+    Ablation: revert the staging to the fixed-name `os.open(tmp, O_CREAT | O_EXCL
+    | O_WRONLY, 0o600)` create and this reddens on the `FileExistsError`."""
+    run_dir = _make_state_run(tmp_path, "20260611-100000-aaaa")
+    archive_dir = tmp_path / ".bmad-loop" / "archive"
+    archive_dir.mkdir(parents=True)
+    stale = archive_dir / "20260611-100000-aaaa.tar.gz.tmp"
+    sentinel = b"a temp stranded by a killed archiver"
+    stale.write_bytes(sentinel)
+
+    dest = runs.archive_run(tmp_path, run_dir)
+
+    assert dest.is_file()  # the stale temp no longer denies the archive
+    assert stale.read_bytes() == sentinel  # never ours, never unlinked
+    assert not run_dir.exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_archive_run_never_writes_through_a_planted_symlink(tmp_path):
+    """#591. Before the fix `tarfile.open(tmp, "w:gz")` followed a link planted at
+    the predictable temp name and truncated the victim. Staging through mkstemp
+    closes that two ways at once: the per-attempt name is not guessable to plant
+    at, and the create is `O_EXCL` (plus `O_NOFOLLOW` where defined), which never
+    opens a name something else already holds — so a link at the old predictable
+    spelling is simply bypassed, untouched, while the archive completes.
+
+    The victim is a plain file in the project root rather than anything bmad-loop
+    reads, so the test grades only the follow, not a second effect.
+
+    Ablation: revert the staging to the pre-#591 `tarfile.open(tmp, "w:gz")` by
+    name and this reddens on the victim's bytes."""
+    run_dir = _make_state_run(tmp_path, "20260611-100000-aaaa")
+    victim = tmp_path / "victim.txt"
+    victim.write_bytes(b"do not clobber me")
+    archive_dir = tmp_path / ".bmad-loop" / "archive"
+    archive_dir.mkdir(parents=True)
+    planted = archive_dir / "20260611-100000-aaaa.tar.gz.tmp"
+    planted.symlink_to(victim)
+
+    dest = runs.archive_run(tmp_path, run_dir)
+
+    assert victim.read_bytes() == b"do not clobber me"  # not followed, not truncated
+    assert planted.is_symlink()  # not ours, so not unlinked either
+    assert dest.is_file()
+
+
+def test_archive_run_fsyncs_before_the_replace(tmp_path, monkeypatch):
+    """#591. This is the one writer in the atomic-write family where a missing fsync
+    is DATA LOSS rather than staleness: `shutil.rmtree(run_dir)` removes the only
+    other copy of the run right after the publish, so a crash with the tarball still
+    in page cache destroys the run outright.
+
+    Ordering is the assertion, not the mere presence of an fsync — an fsync after the
+    replace would protect nothing that a crash between them could still lose."""
+    run_dir = _make_state_run(tmp_path, "20260611-100000-aaaa")
+    order: list[str] = []
+    real_fsync = os.fsync
+    real_replace = os.replace
+
+    def record_fsync(fd):
+        order.append("fsync")
+        return real_fsync(fd)
+
+    def record_replace(src, dst):
+        order.append("replace")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(runs.os, "fsync", record_fsync)
+    monkeypatch.setattr(platform_util.os, "replace", record_replace)
+    runs.archive_run(tmp_path, run_dir)
+
+    assert order == ["fsync", "replace"]
 
 
 def test_archive_run_refuses_while_the_agent_session_is_live(tmp_path, monkeypatch):
@@ -3120,3 +3368,105 @@ def test_classify_legacy_crash_stays_interrupted(tmp_path):
     (run_dir / "state.json").write_text(json.dumps(doc), encoding="utf-8")
     (run_dir / "engine.pid").write_text(str(_dead_pid()))
     assert runs.discover_runs(tmp_path)[0].status == runs.INTERRUPTED
+
+
+# ------------------------------- the stop-request channel's confined write (#593)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_the_stop_request_refuses_a_symlinked_bmad_loop(tmp_path):
+    """The escape #593 names, at this site. Refusing a link at
+    `stop-request.json` covered the final component only: `.bmad-loop/`, `runs/`
+    and the run's own directory were all still looked up by name, so a link
+    planted at any of them aimed both the temp and the published control file
+    wherever it pointed — and this is a directory a driven session can reach.
+
+    The run dir is arranged so the unconfined write would SUCCEED: `outside/`
+    already holds the `runs/r1` chain the link resolves to, so the second
+    assertion measures a write that had somewhere to land rather than one that
+    failed for want of a parent.
+
+    Ablation: revert `_write_stop_request` to
+    `atomic_write_text(..., follow_symlinks=False)` and this fails
+    `DID NOT RAISE`, with `stop-request.json` sitting in `outside/runs/r1/`."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    outside = tmp_path / "outside"
+    landing = outside / "runs" / "r1"
+    landing.mkdir(parents=True)
+    (proj / ".bmad-loop").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        runs._write_stop_request(proj / ".bmad-loop" / "runs" / "r1", "hard")
+
+    assert list(landing.iterdir()) == []  # nothing escaped the project
+
+
+def test_the_stop_request_lands_on_a_clean_tree(tmp_path):
+    """The positive control for the refusal above — without it that test passes
+    for a `_write_stop_request` wired to refuse everything, which is every reason
+    a file could be absent from `outside/`."""
+    run_dir = _make_state_run(tmp_path, "r1")
+
+    runs._write_stop_request(run_dir, "hard")
+
+    assert json.loads((run_dir / runs.STOP_REQUEST_FILE).read_text(encoding="utf-8"))["mode"] == (
+        "hard"
+    )
+
+
+def test_stop_run_still_signals_when_the_lodge_is_refused_as_unconfined(tmp_path, monkeypatch):
+    """`UnconfinedWriteError` subclasses `OSError` FOR THIS CALLER, and this is the
+    row that says so. `stop_run` lodges the hard request and then signals, and it
+    degrades rather than aborts when the lodge fails — the stop is delivered two
+    ways at once, so losing one redundant channel must not cost the other. A
+    refusal that escaped as a fresh exception type would abort `stop_run` BEFORE
+    it ever signalled, leaving a run alive that the signal path could have killed.
+
+    The sibling `_enospc` rows grade the degrade for a disk error; this one grades
+    it for the confinement refusal specifically, which is the failure the #593
+    adoption newly introduced at this call site.
+
+    Ablation: make `UnconfinedWriteError` inherit from `Exception` instead of
+    `OSError` and this fails — the refusal escapes `stop_run`'s `except OSError`
+    and no signal goes out."""
+    monkeypatch.setattr(runs, "kill_session", lambda _rid: None)
+    run_dir = _make_state_run(tmp_path, "r1")
+    (run_dir / "engine.pid").write_text("4242 100.0")
+
+    def _unconfined(_run_dir, _mode):
+        raise platform_util.UnconfinedWriteError("cannot reach the run dir without a redirect")
+
+    monkeypatch.setattr(runs, "_write_stop_request", _unconfined)
+    host = _FakeHost(alive=False, identity=100.0)
+    monkeypatch.setattr(runs, "get_process_host", lambda: host)
+
+    assert runs.stop_run(run_dir) is True
+    assert host.terminated == [4242]  # the signal went out despite the refused lodge
+    assert load_state(run_dir).stopped is True
+
+
+def test_project_of_a_run_dir_too_shallow_refuses_rather_than_indexing_off_the_end(tmp_path):
+    """The confinement root is derived by counting `RUNS_DIR` levels up from the
+    run directory, so a path too shallow to HAVE that ancestor would index off the
+    end of `Path.parents`. `IndexError` is not an `OSError`: it would escape
+    `stop_run`'s degrade and abort the stop before it signalled — the exact
+    failure the row above exists to prevent. So the guard refuses in the currency
+    every caller here already handles.
+
+    Ablation: drop the `len(parents) <= depth` check in `_project_of_run_dir` and
+    this fails with `IndexError` instead of `UnconfinedWriteError`."""
+    shallow = Path(tmp_path.anchor) / "one"
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        runs._project_of_run_dir(shallow)
+
+
+def test_project_of_a_real_run_dir_is_the_project_root(tmp_path):
+    """The positive control for the guard above: on a run dir this module actually
+    built, the derivation returns the project root rather than refusing. Without
+    it, `_project_of_run_dir` could refuse everything and the row above would
+    still pass."""
+    run_dir = _make_state_run(tmp_path, "r1")
+
+    assert runs._project_of_run_dir(run_dir) == tmp_path

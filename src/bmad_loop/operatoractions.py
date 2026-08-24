@@ -59,7 +59,7 @@ from pathlib import Path
 from . import devcontract, sprintstatus, verify
 from .bmadconfig import ProjectPaths
 from .frontmatter import operator_actions_of, read_frontmatter, status_of
-from .platform_util import atomic_write_text, safe_segment
+from .platform_util import atomic_write_text_confined, safe_segment
 
 RECORDS_REL = Path(".bmad-loop") / "operator"
 LEGACY_STORE_REL = Path(".bmad-loop") / "operator-actions.json"
@@ -158,11 +158,25 @@ def record_park(
     blocks that were never written, which :func:`load` reads as an entry owing
     nothing while the board still says a human owes something.
 
-    ``follow_symlinks=False`` preserves what the bare ``os.replace`` did (it never
-    dereferenced this destination) and matches what the record is: machine-minted,
-    under a project root a driven session can write. The record now lands at
-    ``mkstemp``'s ``0600`` rather than the hand-rolled temp's ``0644``; git carries
-    no mode but the exec bit, so nothing downstream of the commit notices."""
+    Refusing a link at the record itself preserved what the bare ``os.replace``
+    did (it never dereferenced this destination) and matched what the record is:
+    machine-minted, under a project root a driven session can write. The write is
+    now confined to ``project`` (#593), because that refusal stopped at the final
+    component: ``mkdir(parents=True, exist_ok=True)`` on the line below accepts a
+    symlink-to-a-directory, so a link planted at ``.bmad-loop/`` survived the
+    setup step and redirected both the temp and the publish to wherever it
+    pointed. The confined writer walks the components below ``project``
+    ``O_NOFOLLOW`` and writes through the descriptor that walk produced. The
+    record still lands at ``mkstemp``'s ``0600`` rather than the hand-rolled
+    temp's ``0644`` — no-follow never inherited a mode either, so confining it
+    changes no permissions; git carries no mode but the exec bit, so nothing
+    downstream of the commit notices.
+
+    ``require_writable_target=True`` (#597) for consistency with the OTHER two
+    writers of this same file — ``Engine._restore_park_record`` and ``confirm``'s
+    prune — since write semantics belong to the FILE, not to whichever code path
+    reached it last. An operator who marks a park record read-only gets the
+    ``PermissionError`` a bare ``Path.write_text`` raised before #379."""
     path = record_path(project, story_key)
     path.parent.mkdir(parents=True, exist_ok=True)
     record = {
@@ -172,7 +186,12 @@ def record_park(
         "run_id": run_id,
         "parked_at": parked_at,
     }
-    atomic_write_text(path, json.dumps(record, indent=2, sort_keys=True), follow_symlinks=False)
+    atomic_write_text_confined(
+        path,
+        json.dumps(record, indent=2, sort_keys=True),
+        confine_root=project,
+        require_writable_target=True,
+    )
     return path
 
 
@@ -222,14 +241,26 @@ def _drop_legacy(project: Path, story_key: str) -> bool:
     run's preflight and the epic-boundary auto-sweep, over a prune of a store
     nothing writes. The helper's temp carries a random infix, so even that
     surviving name is no longer one a second `drop` of a different key collides
-    on mid-write."""
+    on mid-write.
+
+    Confined to `project` and refusing a read-only target for the same reasons
+    `record_park` is (#593, #597) — this writes an operator-curated file under the
+    same session-writable `.bmad-loop/`. There is no `mkdir` here and none is
+    needed: the write is reached only when `_load_legacy` found an entry to
+    prune, so the file — and therefore the parent the confinement walk must reach
+    — already exists."""
     path = legacy_store_path(project)
     data = _load_legacy(project)
     if story_key not in data:
         return False
     del data[story_key]
     if data:
-        atomic_write_text(path, json.dumps(data, indent=2, sort_keys=True), follow_symlinks=False)
+        atomic_write_text_confined(
+            path,
+            json.dumps(data, indent=2, sort_keys=True),
+            confine_root=project,
+            require_writable_target=True,
+        )
     else:
         path.unlink(missing_ok=True)
     return True

@@ -171,9 +171,25 @@ class RecoveryFlow:
         return spec_path, rel if rel and rel != "." else None
 
     @staticmethod
-    def _normalize_attempt_owned_spec(spec_path: Path, target_status: str) -> None:
-        """Write and verify the lifecycle route recovery promises to dispatch."""
-        verify.set_frontmatter_status(spec_path, target_status)
+    def _normalize_attempt_owned_spec(
+        spec_path: Path, target_status: str, *, confine_root: Path
+    ) -> None:
+        """Write and verify the lifecycle route recovery promises to dispatch.
+
+        ``confine_root`` is the project that owns the binding
+        (``workspace.paths.project`` — the same root `_attempt_owned_spec`
+        resolves candidates under), threaded down rather than re-derived here:
+        this is a staticmethod on purpose, and `_workspace_get` is a live getter
+        precisely because a unit worktree swaps the root mid-run (``rebased``
+        makes ``paths.project`` the worktree root there). It must NOT be
+        ``workspace.root``: under the `repo_root` override that is the separate
+        code repo, an in-project spec fails its `is_relative_to` test, and the
+        chokepoint silently takes the plain arm — dropping the parent walk the
+        confinement exists for. It reaches the spec-writer chokepoint rule
+        stated in `frontmatter.set_frontmatter_status` — an artifacts folder
+        configured outside the project is a trusted repair target here
+        (`_attempt_owned_spec`) and keeps the plain no-follow write."""
+        verify.set_frontmatter_status(spec_path, target_status, confine_root=confine_root)
         if verify.status_of(verify.read_frontmatter(spec_path)) != target_status:
             raise verify.FrontmatterWriteError(
                 f"could not normalize attempt-owned spec {spec_path} "
@@ -217,7 +233,15 @@ class RecoveryFlow:
             raise _OwnedSpecAuthorityError(
                 f"attempt-owned spec target could not be revalidated: {spec_path}"
             ) from exc
-        atomic_write_bytes(spec_path, snapshot, follow_symlinks=False)
+        # `require_writable_target=True` (#597): the spec this puts back is
+        # operator-editable, and a temp-and-replace write needs write permission on
+        # the PARENT DIRECTORY, never on the entry it replaces — so a spec marked
+        # read-only was rewritten anyway. NOT the confined writer: the authority
+        # walk above is stricter than the cohort walk (it demands
+        # `resolve(strict=True)` fixed points for the parent and the target, which
+        # refuses a link ANYWHERE above, inside the checkout as well as out), so a
+        # confined write would relax this site rather than harden it.
+        atomic_write_bytes(spec_path, snapshot, follow_symlinks=False, require_writable_target=True)
         if spec_path.read_bytes() != snapshot:
             raise verify.FrontmatterWriteError(
                 f"could not restore pre-attempt contents of owned spec {spec_path}"
@@ -229,13 +253,15 @@ class RecoveryFlow:
         spec_path: Path,
         snapshot: bytes,
         target_status: str,
+        *,
+        confine_root: Path,
     ) -> None:
         """Restore exact pre-attempt bytes, then verify the promised route."""
         cls._restore_attempt_owned_spec_bytes(spec_path, snapshot)
         # The durable snapshot should already carry this route. Keep the status
         # repair as a fail-safe for a legacy or externally edited state record;
         # it is the only permitted difference from the exact snapshot.
-        cls._normalize_attempt_owned_spec(spec_path, target_status)
+        cls._normalize_attempt_owned_spec(spec_path, target_status, confine_root=confine_root)
 
     def pause_for_owned_spec_recovery(
         self,
@@ -628,10 +654,15 @@ class RecoveryFlow:
                                 spec_path,
                                 task.dispatched_spec_snapshot,
                                 target_status,
+                                confine_root=workspace.paths.project,
                             )
                             owned_snapshot_restored = True
                         else:
-                            self._normalize_attempt_owned_spec(spec_path, target_status)
+                            self._normalize_attempt_owned_spec(
+                                spec_path,
+                                target_status,
+                                confine_root=workspace.paths.project,
+                            )
                         normalized_status = target_status
 
                         # The exclusion answered only whether anything besides the
@@ -860,6 +891,7 @@ class RecoveryFlow:
                         owned_spec[0],
                         task.dispatched_spec_snapshot,
                         target_status,
+                        confine_root=workspace.paths.project,
                     )
                 else:
                     self._restore_attempt_owned_spec_bytes(
@@ -903,6 +935,7 @@ class RecoveryFlow:
                             owned_spec[0],
                             task.dispatched_spec_snapshot,
                             target_status,
+                            confine_root=workspace.paths.project,
                         )
                     except _OwnedSpecAuthorityError as exc:
                         self.pause_for_owned_spec_recovery(
@@ -911,7 +944,11 @@ class RecoveryFlow:
                             f"its path became unsafe after the baseline reset ({exc})",
                         )
                 else:
-                    self._normalize_attempt_owned_spec(owned_spec[0], target_status)
+                    self._normalize_attempt_owned_spec(
+                        owned_spec[0],
+                        target_status,
+                        confine_root=workspace.paths.project,
+                    )
                 try:
                     checkout_dirty = verify.attempt_dirty(
                         workspace.root,
