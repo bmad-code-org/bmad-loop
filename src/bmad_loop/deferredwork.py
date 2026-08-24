@@ -1161,11 +1161,14 @@ def archive_closed(
     # bodies are already in the archive. A retry must still stub those ledger
     # entries (completing the interrupted operation) but must NOT append their
     # bodies again — an append-only archive accumulating duplicates. Entries
-    # whose heading is already present in the existing archive text are
-    # therefore skipped here and only replaced with stubs below.
+    # whose parsed archive twin carries a live (non-fenced) ``archived:``
+    # field are therefore skipped here and only replaced with stubs below.
     archive_blocks: list[str] = []
+    already_archived = {
+        e.id for e in parse_ledger(existing) if _is_archived(e)
+    }  # fence-aware: a quoted example in the archive is not a real body
     for entry, _ in to_archive:
-        if f"### {entry.id}:" in existing:
+        if entry.id in already_archived:
             continue  # body already archived by a crashed prior run
         body = entry.body
         assert entry.status_span is not None  # done with a date implies a status line

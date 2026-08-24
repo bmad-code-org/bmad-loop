@@ -2671,3 +2671,30 @@ def test_archive_crash_recovery_no_duplicate_bodies(tmp_path):
     assert archive_text.count("### DW-2:") == 1
     assert "archived: 2026-08-24" in archive_text
     assert "archived: 2026-08-25" not in archive_text
+
+
+def test_archive_crash_recovery_fenced_example_does_not_suppress(tmp_path):
+    """A fenced worked example in the archive quoting `### DW-2:` is not a
+    real archived body — the crash-recovery skip must be fence-aware, so the
+    live DW-2 is still archived rather than silently kept (#706 review)."""
+    path = write_ledger(tmp_path)
+    # An archive whose only DW-2 mention is inside a fenced example entry:
+    # the example carries no live `archived:` field, so it must not count.
+    archive_path = path.parent / ARCHIVE_REL
+    archive_path.write_text(
+        "# Archived Deferred Work\n\n"
+        "```markdown\n"
+        "### DW-2: Old closed item\n\n"
+        "origin: quoted example, not a real body\n"
+        "status: done 2026-05-25\n"
+        "```\n",
+        encoding="utf-8",
+    )
+    archived = archive_closed(path, archive_date="2026-08-24")
+    assert archived == ["DW-2"]  # not suppressed by the fenced heading
+
+    # The real body was appended; the fenced example survives verbatim above it
+    archive_text = archive_path.read_text(encoding="utf-8")
+    assert archive_text.count("### DW-2:") == 2  # quoted + real
+    assert "origin: code review of spec-1-1.md" in archive_text
+    assert "quoted example" in archive_text
