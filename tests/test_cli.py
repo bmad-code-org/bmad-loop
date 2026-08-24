@@ -9152,15 +9152,28 @@ def test_sweep_archive_rejects_bad_before_date(project, capsys):
 
 
 def test_sweep_archive_dry_run(project, capsys):
+    """--dry-run previews and writes nothing.
+
+    The "would archive" wording branches on ``args.dry_run``, not on whether
+    anything was written, so the message alone is a vacuous oracle: drop
+    ``dry_run=`` from the ``archive_closed`` call and the preview still reads
+    the same while the ledger is rewritten under it. The file asserts are what
+    make this test decide the wiring (#711 review).
+    """
     from conftest import write_ledger
+
+    from bmad_loop import deferredwork
 
     install_bmad_config(project)
     write_ledger(project, {"DW-1": "open", "DW-2": "done 2026-06-01"}, commit=False)
+    before = project.deferred_work.read_text(encoding="utf-8")
     rc = cli.main(["sweep", "--archive", "--dry-run", "--project", str(project.project)])
     assert rc == 0
     out = capsys.readouterr().out
     assert "would archive 1 entry" in out
     assert "DW-2" in out
+    assert not (project.deferred_work.parent / deferredwork.ARCHIVE_REL).exists()
+    assert project.deferred_work.read_text(encoding="utf-8") == before
 
 
 def test_sweep_archive_writes_ledger_and_archive(project, capsys):
