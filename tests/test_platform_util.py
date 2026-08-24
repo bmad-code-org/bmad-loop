@@ -928,15 +928,23 @@ def _exceed_range() -> OSError:
     return exceeded
 
 
-def _failing_mkstemp(prefixes: list[str], fail_first: int):
+def _too_long() -> OSError:
+    """POSIX's "the name does not fit" — the errno arm of `_is_name_too_long`."""
+    return OSError(errno.ENAMETOOLONG, "File name too long")
+
+
+def _failing_mkstemp(prefixes: list[str], fail_first: int, error=_exceed_range):
     """A `mkstemp` that records each prefix it is handed and refuses the first
-    `fail_first` attempts with win32's too-long error, then delegates."""
+    `fail_first` attempts with a too-long error, then delegates.
+
+    `error` defaults to win32's spelling, which is what the retry rows above need;
+    pass `_too_long` for the POSIX one (see the #596 floor row)."""
     real_mkstemp = tempfile.mkstemp
 
     def fake_mkstemp(*, dir, prefix, suffix):
         prefixes.append(prefix)
         if len(prefixes) <= fail_first:
-            raise _exceed_range()
+            raise error()
         return real_mkstemp(dir=dir, prefix=prefix, suffix=suffix)
 
     return fake_mkstemp
@@ -1050,6 +1058,44 @@ def test_atomic_write_bytes_ends_the_ladder_at_a_bare_temp(tmp_path, monkeypatch
     assert [len(p) for p in prefixes] == sorted((len(p) for p in prefixes), reverse=True)
     assert len(set(prefixes)) == 3
     assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_mkstemp_beside_floor_failure_propagates_loudly(tmp_path, monkeypatch):
+    """#596: a DESIGNED limit, pinned so a future "fix" has to re-argue the trade
+    rather than quietly take it.
+
+    `mkstemp` will not generate a name below 12 characters — 8 random plus the
+    `.tmp` this helper needs to stay out of `devcontract`'s `*.md` scans — so once
+    the ladder reaches its bare rung, what does not fit is the directory PLUS those
+    12. A target with a shorter basename can still clear a direct write there, which
+    is why the refusal is narrower than "the directory is too long". Going below the
+    floor means abandoning `mkstemp`, and with it the entropy that keeps a staged
+    name unguessable where a less-trusted writer can reach it (#591 is the cost of a
+    guessable temp name). The recorded decision is to keep the entropy and let the
+    last rung raise.
+
+    So this row asserts the LOUDNESS, not a repair: the error propagates verbatim,
+    nothing is staged, and the target keeps its old bytes. Any change that swallows
+    or works around the floor reddens it.
+
+    All three rungs fail with the POSIX spelling here — the win32 arm is already
+    covered by the rows above, and #596's floor is stated in characters, which is
+    the POSIX per-component limit's currency."""
+    target = tmp_path / ("s" * 40 + ".md")
+    target.write_bytes(b"original")
+    prefixes: list[str] = []
+    monkeypatch.setattr(
+        platform_util.tempfile, "mkstemp", _failing_mkstemp(prefixes, 3, error=_too_long)
+    )
+
+    with pytest.raises(OSError) as caught:
+        platform_util.atomic_write_bytes(target, b"payload")
+
+    assert caught.value.errno == errno.ENAMETOOLONG  # the real error, not a substitute
+    assert len(prefixes) == 3  # the whole ladder was walked before giving up
+    assert prefixes[-1] == ""  # and it gave up at the bare rung, the shortest there is
+    assert target.read_bytes() == b"original"  # the target is untouched by a refusal
+    assert list(tmp_path.glob("*.tmp")) == []  # nothing staged survives it
 
 
 def test_atomic_write_bytes_propagates_a_staging_error_that_is_not_a_long_name(

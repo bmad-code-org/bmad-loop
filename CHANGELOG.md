@@ -7,6 +7,22 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Changed
+
+- **A published run archive now lands at mode `0600`** instead of a umask-derived mode (#591).
+  It is staged through a file the orchestrator creates itself rather than one `tarfile` opens
+  by name, so it inherits the private mode the rest of the `.bmad-loop` write path uses.
+
+### Security
+
+- **The run-archive staging temp is created exclusively (`O_EXCL`) at `0600`, and unlinked only
+  when this process owns it** (#591). The fixed temp name was created non-exclusively and by
+  name, so a symlink planted there was followed and the cleanup unlinked whatever held the
+  name — including a concurrent archiver's in-flight temp. The exclusive create is itself the
+  no-follow guard, and a loser of the race now raises `FileExistsError` before the `try` it
+  would have cleaned up from. The staged tarball is also `fsync`ed before publish, since the
+  run dir it came from is removed immediately after.
+
 ## [0.11.1] — 2026-08-23
 
 ### Added

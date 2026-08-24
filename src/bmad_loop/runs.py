@@ -1583,13 +1583,33 @@ def archive_run(project: Path, run_dir: Path, *, force: bool = False) -> Path:
     # it — the same exposure `decisions._write_store`, `policy.write_mux_backend` and
     # `tui.settings.PolicyDoc.save` had. (Not the sweep's two `decisions.json`
     # writes, which look like the same fix but write under the ignored run dir.)
+    #
+    # #591: because the name is fixed and predictable, the cleanup below may only
+    # remove a temp this process created — so the create is exclusive, and that is
+    # what licenses the unlink. `O_CREAT|O_EXCL` also fails EEXIST when the name is a
+    # symlink, whatever it points at (dangling included), so the create *is* the
+    # no-follow guard here; no `O_NOFOLLOW` is needed (the same property
+    # `_write_stop_request` leans on). It sits outside the `try` on purpose: a loser
+    # of the race raises `FileExistsError` from here and structurally cannot reach the
+    # cleanup, so the winner's in-flight temp survives. `O_BINARY` per the
+    # `read_trusted_config_digest` precedent — gzip bytes do not survive a win32
+    # text-mode fd.
+    fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0), 0o600)
     try:
-        with tarfile.open(tmp, "w:gz") as tar:
-            tar.add(run_dir, arcname=run_dir.name)
+        with os.fdopen(fd, "wb") as raw:
+            with tarfile.open(fileobj=raw, mode="w:gz") as tar:
+                tar.add(run_dir, arcname=run_dir.name)
+            # Flushed and fsynced before the publish, and unlike the rest of this
+            # family that is not about staleness but about data loss: `shutil.rmtree`
+            # below removes the only other copy of the run, so a crash with the
+            # tarball still in page cache destroys it outright. Ordered inside the
+            # fdopen context so the gzip trailer `tar.close()` just wrote is included.
+            raw.flush()
+            os.fsync(raw.fileno())
         atomic_replace(tmp, dest)
     except BaseException:
         with contextlib.suppress(OSError):
-            tmp.unlink(missing_ok=True)
+            tmp.unlink(missing_ok=True)  # provably ours: the O_EXCL create above won
         raise
     shutil.rmtree(run_dir)
     _discard_state_dir(project, run_dir.name)  # same tail as delete_run

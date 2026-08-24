@@ -2613,6 +2613,127 @@ def test_archive_run_failed_replace_strands_no_temp(tmp_path, monkeypatch):
     assert list((tmp_path / ".bmad-loop" / "archive").iterdir()) == []  # no temp left
 
 
+def test_archive_run_temp_is_created_exclusively_at_0600(tmp_path, monkeypatch):
+    """#591. The temp name is fixed and predictable, so the create must be exclusive:
+    that is the whole license for the `except BaseException` unlink below it, which
+    would otherwise remove a name this process never owned.
+
+    Grades the flags handed to `os.open` rather than only the outcome, because the
+    outcome is nearly unobservable on the happy path — `atomic_replace` consumes the
+    temp either way, so dropping `O_EXCL` reddens nothing else here. The recorded
+    call is the only place exclusivity is visible when no competitor exists.
+
+    The mode argument is asserted on both platforms (it is a recorded call argument,
+    not a filesystem fact); only the published file's on-disk bits are POSIX-only.
+
+    `os.umask(0o022)` is the point of the bracket, not hygiene — the same trap
+    `test_file_lock_is_created_owner_only` documents. Under a 0o077 umask the
+    mode-less create produces 0o600 by accident and the on-disk assertion goes inert,
+    so the bracket is what makes this row's ablation bite on any box rather than only
+    where the ambient umask happens to cooperate."""
+    run_dir = _make_state_run(tmp_path, "20260611-100000-aaaa")
+    seen: list[tuple[int, int]] = []
+    real = os.open
+
+    def record(path, flags, mode=0o777, **kwargs):
+        if str(path).endswith(".tar.gz.tmp"):
+            seen.append((flags, mode))
+        return real(path, flags, mode, **kwargs)
+
+    monkeypatch.setattr(runs.os, "open", record)
+    previous = os.umask(0o022)
+    try:
+        dest = runs.archive_run(tmp_path, run_dir)
+    finally:
+        os.umask(previous)
+
+    assert len(seen) == 1  # also pins "exactly one create" — no retry loop crept in
+    flags, mode = seen[0]
+    assert flags & os.O_EXCL
+    assert flags & os.O_CREAT
+    assert flags & os.O_WRONLY
+    assert mode == 0o600
+    if sys.platform != "win32":
+        published = dest.stat().st_mode & 0o777
+        assert published == 0o600, oct(published)
+
+
+def test_archive_run_refuses_a_preexisting_temp_and_leaves_it(tmp_path):
+    """#591's ownership pin, and the row that grades the `os.open` PLACEMENT rather
+    than its flags: with the create inside the `try`, the loser of the race would
+    reach the `except BaseException` cleanup and unlink the winner's in-flight
+    tarball. Here the planted bytes stand in for that tarball, and surviving
+    byte-identical is the assertion.
+
+    Two failures are therefore graded together and must not be conflated — raising is
+    the flags half (`O_EXCL`), leaving the file alone is the placement half."""
+    run_dir = _make_state_run(tmp_path, "20260611-100000-aaaa")
+    archive_dir = tmp_path / ".bmad-loop" / "archive"
+    archive_dir.mkdir(parents=True)
+    tmp = archive_dir / "20260611-100000-aaaa.tar.gz.tmp"
+    sentinel = b"another archiver's in-flight tarball"
+    tmp.write_bytes(sentinel)
+
+    with pytest.raises(FileExistsError):
+        runs.archive_run(tmp_path, run_dir)
+
+    assert tmp.read_bytes() == sentinel  # never ours, never unlinked
+    assert (run_dir / "state.json").is_file()  # the run survives the refusal
+    assert not (archive_dir / "20260611-100000-aaaa.tar.gz").exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_archive_run_refuses_a_symlink_at_the_temp_name(tmp_path):
+    """#591. `O_CREAT|O_EXCL` fails EEXIST when the name is a symlink whatever it
+    points at, so the exclusive create IS the no-follow guard and no `O_NOFOLLOW` is
+    needed — the same property `_write_stop_request` leans on. Before the fix
+    `tarfile.open(tmp, "w:gz")` followed the link and truncated the victim.
+
+    The victim is a plain file in the project root rather than anything bmad-loop
+    reads, so the test grades only the follow, not a second effect."""
+    run_dir = _make_state_run(tmp_path, "20260611-100000-aaaa")
+    victim = tmp_path / "victim.txt"
+    victim.write_bytes(b"do not clobber me")
+    archive_dir = tmp_path / ".bmad-loop" / "archive"
+    archive_dir.mkdir(parents=True)
+    tmp = archive_dir / "20260611-100000-aaaa.tar.gz.tmp"
+    tmp.symlink_to(victim)
+
+    with pytest.raises(FileExistsError):
+        runs.archive_run(tmp_path, run_dir)
+
+    assert victim.read_bytes() == b"do not clobber me"  # not followed, not truncated
+    assert tmp.is_symlink()  # not ours, so not unlinked either
+
+
+def test_archive_run_fsyncs_before_the_replace(tmp_path, monkeypatch):
+    """#591. This is the one writer in the atomic-write family where a missing fsync
+    is DATA LOSS rather than staleness: `shutil.rmtree(run_dir)` removes the only
+    other copy of the run right after the publish, so a crash with the tarball still
+    in page cache destroys the run outright.
+
+    Ordering is the assertion, not the mere presence of an fsync — an fsync after the
+    replace would protect nothing that a crash between them could still lose."""
+    run_dir = _make_state_run(tmp_path, "20260611-100000-aaaa")
+    order: list[str] = []
+    real_fsync = os.fsync
+    real_replace = os.replace
+
+    def record_fsync(fd):
+        order.append("fsync")
+        return real_fsync(fd)
+
+    def record_replace(src, dst):
+        order.append("replace")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(runs.os, "fsync", record_fsync)
+    monkeypatch.setattr(platform_util.os, "replace", record_replace)
+    runs.archive_run(tmp_path, run_dir)
+
+    assert order == ["fsync", "replace"]
+
+
 def test_archive_run_refuses_while_the_agent_session_is_live(tmp_path, monkeypatch):
     """Same backstop as delete (#419), and it runs before the tarball is written —
     a refusal must not leave a half-archived run behind for the operator to find."""
