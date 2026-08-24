@@ -3168,11 +3168,13 @@ def test_safe_rollback_restores_the_policy_through_the_atomic_helper(project, mo
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
 def test_safe_rollback_replaces_a_policy_symlink_by_name(project):
-    """#379. The one row that grades this SITE's `follow_symlinks=False` argument.
-    Unlike the other writers moved to the helper on this branch, the expression
-    replaced here was a direct `write_bytes` — which opens the name and so writes
-    THROUGH a planted link — so no-follow is a genuine change of behaviour, not a
-    preservation of what `os.replace` already did.
+    """#379. The one row that grades this SITE's choice of a writer that replaces
+    the NAME — since #593 the put-back calls `atomic_write_bytes_confined`, which
+    is no-follow by construction; the row below grades the confinement half of
+    that same call. Unlike the other writers moved to the helper on this branch,
+    the expression replaced here was a direct `write_bytes` — which opens the name
+    and so writes THROUGH a planted link — so replacing the name is a genuine
+    change of behaviour, not a preservation of what `os.replace` already did.
 
     It is still the right change. `policy.write_mux_backend` already replaces this
     same file by name, so a link at `.bmad-loop/policy.toml` does not survive the
@@ -3183,8 +3185,11 @@ def test_safe_rollback_replaces_a_policy_symlink_by_name(project):
     the redirect has to aim at a tracked in-repo file — which the reset then
     reverts and this write immediately clobbers with policy bytes.
 
-    Ablation: drop `follow_symlinks=False` and this reddens alone — the link
-    survives and `shared.toml` is the file that gets rewritten."""
+    Ablation: swap the put-back's writer for `atomic_write_bytes(policy_path, ...)`
+    at its follow-the-link default and this reddens on the link surviving and
+    `shared.toml` rewritten (the confined-refusal row below reddens with it, on
+    its `DID NOT RAISE`). It is still the one row here that plants a link at the
+    policy's own name."""
     repo = project.project
     shared = repo / "shared.toml"  # tracked, and NOT the operator's policy
     shared.write_bytes(b"[scm]\nrollback_on_failure = false\n")

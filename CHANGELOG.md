@@ -15,7 +15,9 @@ breaking changes may land in a minor release.
   restored the `0444` afterwards, leaving nothing in the permission bits to record the change.
   Callers over operator-curated files can now ask for the `PermissionError` a plain
   `Path.write_text` used to raise. Off by default: what the other callers do today is a
-  compatibility contract.
+  compatibility contract. The probe opens non-blocking, so a reader-less FIFO planted at the
+  target answers `ENXIO` — the write then replaces the name — instead of parking the
+  orchestrator until a reader appears.
 
 ### Changed
 
@@ -48,10 +50,12 @@ breaking changes may land in a minor release.
   the setup step too. `atomic_write_text_confined` and `atomic_write_bytes_confined` walk the
   components `O_NOFOLLOW` and write through the descriptor that walk produced, which a later swap
   of any name no longer reaches. Windows has no `*at()` family and degrades to the documented
-  check-then-write. A refusal raises `UnconfinedWriteError`, an `OSError`.
+  check-then-write. A refusal raises `UnconfinedWriteError`, an `OSError`. Anchored staging names
+  walk the same shortening ladder as the path-based writers, so a basename that fills the
+  filesystem's limit stages through either arm (#595's guarantee, carried over).
 - **The orchestrator's own writers under session-writable roots adopted those confined helpers**
   (#593): the decisions store, the three park-record writers, the stop-request channel, the two
-  per-run sweep decision writes, all three `policy.toml` writers, the three story-spec writers
+  per-run sweep decision writes, all three `policy.toml` writers, the story-spec writers
   (`devcontract`'s four repair writers plus both frontmatter field writers), and the run's
   config-digest stamp. A story spec in an artifacts folder configured _outside_ the checkout keeps
   the plain no-follow write — that is supported configuration, and a confined write cannot vouch

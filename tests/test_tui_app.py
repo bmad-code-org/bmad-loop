@@ -3407,7 +3407,7 @@ async def test_plan_checkpoint_replan_resets_and_resumes(project, monkeypatch):
 
     calls: list[str] = []
     resets: list[tuple] = []
-    strips: list[Path] = []
+    strips: list[tuple[Path, Path]] = []
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")

@@ -1306,21 +1306,27 @@ def test_atomic_write_spec_hands_the_helper_bytes_not_text(tmp_path, monkeypatch
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
 def test_atomic_write_spec_replaces_a_planted_symlink(tmp_path):
-    """The row that grades this SITE's `follow_symlinks=False` argument rather than
-    the helper's implementation of it (pinned in test_platform_util.py, where the
-    helper is called directly).
+    """The row that grades this SITE's choice of a writer that replaces the NAME,
+    rather than the helper's implementation of it (pinned in test_platform_util.py,
+    where the helper is called directly). An in-tree spec no longer spells that
+    choice as `follow_symlinks=False`: since #593 `_atomic_write_spec` routes it to
+    `atomic_write_bytes_confined`, which is no-follow by construction. The
+    out-of-tree arm keeps the plain no-follow write — the chokepoint rows below
+    grade that routing.
 
     Behaviour-preserving, not a tightening: the `atomic_replace` this replaced never
-    dereferenced its destination either, so passing the default True would have
+    dereferenced its destination either, so a follow-the-link writer would have
     CHANGED what these four rewriters do. It is also the security choice — the spec
     path reaches them from a scan of a directory a driven session owns, so writing
     THROUGH a link planted at that name would hand the session a host-side write to
     any operator-writable path.
 
-    Ablation: drop `follow_symlinks=False` in `_atomic_write_spec` and this reddens
-    alone — alone in both directions, since it does not reach the two
-    `frontmatter`-side writers of these same specs. Each of those passes its own
-    literal and carries its own row (tests/test_frontmatter.py,
+    Ablation: swap the in-tree arm of `_atomic_write_spec` for
+    `atomic_write_bytes(spec_path, payload)` at its follow-the-link default and
+    this reddens on the link surviving and the planted target rewritten — and only
+    among `devcontract`'s rows, since the mutation does not reach the two
+    `frontmatter`-side writers of these same specs. Each of those makes its own
+    routing choice and carries its own row (tests/test_frontmatter.py,
     tests/test_resolve.py)."""
     original = "---\nstatus: done\n---\n\nbody\n"
     real = _write(tmp_path, "someone-elses-file", original)

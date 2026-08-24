@@ -308,17 +308,25 @@ def test_set_frontmatter_field_hands_the_helper_bytes_not_text(tmp_path, monkeyp
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
 def test_set_frontmatter_field_replaces_a_planted_symlink(tmp_path):
-    """The row that grades this SITE's `follow_symlinks=False` argument rather than
-    the helper's implementation of it (pinned in test_platform_util.py, where the
-    helper is called directly).
+    """The row that grades this SITE's choice of a writer that replaces the NAME,
+    rather than the helper's implementation of it (pinned in test_platform_util.py,
+    where the helper is called directly). An in-tree spec no longer spells that
+    choice as `follow_symlinks=False`: since #593 it routes to
+    `atomic_write_bytes_confined`, which is no-follow by construction. The
+    out-of-tree arm keeps the plain no-follow write — the else-arm row below
+    grades that routing.
 
-    Same reasoning as the two sibling writers of these files: no-follow matches the
-    name-replacing `atomic_replace` `devcontract._atomic_write_spec` already used,
-    and the spec path reaches this writer from a scan of a directory a driven session
-    owns — writing THROUGH a planted link would hand that session a host-side write
-    to any operator-writable path.
+    Same reasoning as the two sibling writers of these files: replacing the name
+    matches the name-replacing `atomic_replace` `devcontract._atomic_write_spec`
+    already used, and the spec path reaches this writer from a scan of a directory
+    a driven session owns — writing THROUGH a planted link would hand that session
+    a host-side write to any operator-writable path.
 
-    Ablation: drop `follow_symlinks=False` at the call and this reddens alone."""
+    Ablation: swap the in-tree arm's writer for `atomic_write_bytes(path, payload)`
+    at its follow-the-link default and this reddens on the link surviving and the
+    planted target rewritten (the confined-parent rows below redden with it — the
+    swap un-guards them too). No other row in this file plants a symlink at the
+    spec's own name."""
     real = tmp_path / "someone-elses-file"
     real.write_text(SPEC, encoding="utf-8")
     link = tmp_path / "spec.md"

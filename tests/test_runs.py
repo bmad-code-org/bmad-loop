@@ -1965,13 +1965,16 @@ def test_read_trusted_config_digest_does_not_follow_a_planted_symlink(tmp_path):
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
 def test_write_trusted_config_digest_replaces_a_planted_symlink(tmp_path):
-    """`follow_symlinks=False`, and the reason is that this record lives under a
-    root whose path the driven session is handed — the engine exports the sibling
-    events dir as `BMAD_LOOP_EVENTS_DIR`. Following a link planted at the digest's
-    name would aim an orchestrator write at a path of the session's choosing.
+    """A writer that replaces the NAME, and the reason is that this record lives
+    under a root whose path the driven session is handed — the engine exports the
+    sibling events dir as `BMAD_LOOP_EVENTS_DIR`. Following a link planted at the
+    digest's name would aim an orchestrator write at a path of the session's
+    choosing. The site no longer spells that choice as `follow_symlinks=False`:
+    since #593 it calls `atomic_write_text_confined`, which is no-follow by
+    construction.
 
-    ABLATION: drop `follow_symlinks=False` and the target below is what gets
-    written."""
+    ABLATION: swap the writer for `atomic_write_text(path, ...)` at its
+    follow-the-link default and the target below is what gets written."""
     project = tmp_path / "proj"
     project.mkdir()
     target = tmp_path / "outside.txt"

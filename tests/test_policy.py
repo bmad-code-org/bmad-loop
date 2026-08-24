@@ -1390,21 +1390,28 @@ def test_write_mux_backend_hands_the_helper_bytes(tmp_path, monkeypatch):
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
 def test_write_mux_backend_replaces_a_planted_symlink(tmp_path):
-    """#363. The one row that grades this SITE's `follow_symlinks=False` argument
-    rather than the helper's implementation of it — everything else about no-follow
-    is pinned in test_platform_util.py, where the helper is called directly.
+    """#363. The one row that grades this SITE's choice of a writer that replaces
+    the NAME rather than the helper's implementation of it — everything else about
+    no-follow is pinned in test_platform_util.py, where the helper is called
+    directly. The site no longer spells that choice as `follow_symlinks=False`:
+    since #593 it calls `atomic_write_bytes_confined`, which is no-follow by
+    construction — the anchored arm publishes with a dir_fd-relative `os.replace`
+    that does not dereference its destination, and the win32 arm passes the
+    no-follow itself.
 
-    It is behaviour-preserving first: `os.replace` never dereferenced this
-    destination either, so passing the default True here would have CHANGED what
-    the function does, not merely relaxed it. It is also the security choice —
-    `runsetup` states a driven session can write `.bmad-loop/policy.toml`, so
-    writing THROUGH a link planted at that name would hand the session a host-side
-    write to any operator-writable path.
+    Behaviour-preserving first: `os.replace` never dereferenced this destination
+    either, so a follow-the-link writer here would have CHANGED what the function
+    does, not merely relaxed it. It is also the security choice — `runsetup`
+    states a driven session can write `.bmad-loop/policy.toml`, so writing
+    THROUGH a link planted at that name would hand the session a host-side write
+    to any operator-writable path.
 
-    Ablation: drop `follow_symlinks=False` at the `write_mux_backend` call and this
-    reddens alone (the link survives and the planted target is rewritten). Without
-    this row that mutation is a KNOWN GREEN ablation — no other consumer test
-    plants a symlink at the paths these five sites write."""
+    Ablation: swap `write_mux_backend`'s writer for `atomic_write_bytes(path, ...)`
+    at its follow-the-link default and this reddens on the link surviving and the
+    planted target rewritten (the confined-parent and binding-pin rows redden with
+    it — the swap removes the call they patch and the guard they raise on). This
+    is still the one row that reddens on the LINK: no other consumer test plants a
+    symlink at the paths these five sites write."""
     real = tmp_path / "someone-elses-file"
     real.write_bytes(b'[mux]\nbackend = "old"\n')
     link = tmp_path / "policy.toml"

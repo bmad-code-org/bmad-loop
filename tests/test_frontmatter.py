@@ -551,18 +551,26 @@ def test_set_frontmatter_status_hands_the_helper_bytes_not_text(tmp_path, monkey
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
 def test_set_frontmatter_status_replaces_a_planted_symlink(tmp_path):
-    """The row that grades this SITE's `follow_symlinks=False` argument rather than
-    the helper's implementation of it (pinned in test_platform_util.py, where the
-    helper is called directly).
+    """The row that grades this SITE's choice of a writer that replaces the NAME,
+    rather than the helper's implementation of it (pinned in test_platform_util.py,
+    where the helper is called directly). An in-tree spec no longer spells that
+    choice as `follow_symlinks=False`: since #593 it routes to
+    `atomic_write_bytes_confined`, which is no-follow by construction. The
+    out-of-tree arm keeps the plain no-follow write — the three-row chokepoint
+    section below grades that routing.
 
     Behaviour-preserving first: `devcontract._atomic_write_spec` writes these same
-    specs through a name-replacing `atomic_replace`, so the no-follow default is the
+    specs through a name-replacing `atomic_replace`, so replacing the name is the
     family's existing semantics, not a tightening. It is also the security choice —
     the spec path reaches this writer from a scan of a directory a driven session
     owns, so writing THROUGH a link planted at that name would hand the session a
     host-side write to any operator-writable path.
 
-    Ablation: drop `follow_symlinks=False` at the call and this reddens alone."""
+    Ablation: swap the in-tree arm's writer for `atomic_write_bytes(path, payload)`
+    at its follow-the-link default and this reddens on the link surviving and the
+    planted target rewritten (the confined-parent rows below redden with it — the
+    swap un-guards them too). No other row in this file plants a symlink at the
+    spec's own name."""
     real = _spec(tmp_path, _PLAIN, name="someone-elses-file")
     link = tmp_path / "spec.md"
     link.symlink_to(real)
