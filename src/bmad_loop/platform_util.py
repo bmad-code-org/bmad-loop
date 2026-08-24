@@ -495,6 +495,33 @@ def _is_name_too_long(exc: OSError) -> bool:
     return getattr(exc, "winerror", None) == _WINERROR_FILENAME_EXCED_RANGE
 
 
+def _stage_shortening(name: str, attempt: Callable[[str], tuple[int, str]]) -> tuple[int, str]:
+    """Walk ``attempt`` down the staging-prefix ladder :func:`_mkstemp_beside`
+    documents: the target's readable name, then a fixed-width digest of it where
+    that strictly shortens, then no prefix at all. A rung that raises the
+    platform's "name too long" (:func:`_is_name_too_long`) falls to the next;
+    anything else propagates, and only the bare last rung's failure escapes.
+
+    Shared by both staging families — ``mkstemp`` beside a path and the ``O_EXCL``
+    create relative to a descriptor — because the guarantee is one guarantee: a
+    basename the target itself is legal at must stage, whichever writer the
+    caller reached (#595). The confined adoption briefly split them, and a spec
+    name near ``NAME_MAX`` wrote fine through the plain helper while the anchored
+    one died appending its suffix to the full name."""
+    digest = hashlib.blake2b(os.fsencode(name), digest_size=8).hexdigest()
+    rungs = [name + "."]
+    if len(digest) < len(name):
+        rungs.append(digest + ".")
+    rungs.append("")
+    for prefix in rungs[:-1]:
+        try:
+            return attempt(prefix)
+        except OSError as e:
+            if not _is_name_too_long(e):
+                raise
+    return attempt(rungs[-1])
+
+
 def _mkstemp_beside(target: Path) -> tuple[int, str]:
     """``mkstemp`` in ``target``'s own directory, prefixed with its name so the
     temp is recognisably that target's staging file — and so it ends in ``.tmp``
@@ -550,18 +577,10 @@ def _mkstemp_beside(target: Path) -> tuple[int, str]:
     name unpredictable where a less-trusted writer can reach it — see #591 for the
     cost of a guessable temp name."""
     directory = str(target.parent)
-    digest = hashlib.blake2b(os.fsencode(target.name), digest_size=8).hexdigest()
-    rungs = [target.name + "."]
-    if len(digest) < len(target.name):
-        rungs.append(digest + ".")
-    rungs.append("")
-    for prefix in rungs[:-1]:
-        try:
-            return tempfile.mkstemp(dir=directory, prefix=prefix, suffix=".tmp")
-        except OSError as e:
-            if not _is_name_too_long(e):
-                raise
-    return tempfile.mkstemp(dir=directory, prefix=rungs[-1], suffix=".tmp")
+    return _stage_shortening(
+        target.name,
+        lambda prefix: tempfile.mkstemp(dir=directory, prefix=prefix, suffix=".tmp"),
+    )
 
 
 def _refuse_unwritable_target(target: Path, *, follow_symlinks: bool) -> None:
@@ -597,6 +616,16 @@ def _refuse_unwritable_target(target: Path, *, follow_symlinks: bool) -> None:
       disconnected share. Refusing here would replace the write's own, more
       accurate error with a permission story that is not what happened.
 
+    ``O_NONBLOCK`` is what keeps the third case reachable for a FIFO. Opening a
+    reader-less FIFO ``O_WRONLY`` does not fail — it WAITS for a reader that a
+    planted FIFO will never have, wedging the probe (and the loop driving it)
+    forever, and ``O_NOFOLLOW`` is no help because a FIFO is not a symlink.
+    Non-blocking turns that wait into ``ENXIO``, which the third case returns on,
+    and the write then replaces the FIFO's name like any other. For the regular
+    files this probe exists for the flag changes nothing: POSIX gives it no
+    effect on a regular-file open or on the permission check, and win32 — which
+    has no ``O_NONBLOCK`` — has no path-visible FIFOs to block on either.
+
     This honours an operator's stated intent; it is NOT a boundary against a
     same-uid writer. The answer is stale the moment it returns — a ``chmod``
     between probe and replace still lands the write — and whoever can chmod the
@@ -605,8 +634,9 @@ def _refuse_unwritable_target(target: Path, *, follow_symlinks: bool) -> None:
     no_follow = getattr(os, "O_NOFOLLOW", 0)  # POSIX-only; win32 cannot ask
     if not follow_symlinks and not no_follow and is_link_like(target):
         return  # win32: no O_NOFOLLOW, so the probe would read through the link
+    non_block = getattr(os, "O_NONBLOCK", 0)  # POSIX-only; win32 has no FIFOs here
     try:
-        fd = os.open(target, os.O_WRONLY | (0 if follow_symlinks else no_follow))
+        fd = os.open(target, os.O_WRONLY | (0 if follow_symlinks else no_follow) | non_block)
     except PermissionError:
         raise  # the refusal this flag exists for
     except OSError:
@@ -921,6 +951,27 @@ def atomic_write_bytes_at(dir_fd: int, name: str, data: bytes) -> None:
     _atomic_write_at(dir_fd, name, data, mode="wb", encoding=None)
 
 
+def _open_exclusive_at(dir_fd: int, prefix: str, name: str) -> tuple[int, str]:
+    """One ``mkstemp``'s worth of anchored staging: ``O_EXCL``-create
+    ``{prefix}<pid>.<random>.tmp`` relative to ``dir_fd`` and return the open fd
+    with the name it landed at. The ``.tmp`` suffix keeps the temp out of
+    ``devcontract``'s ``*.md`` artifact scans, exactly as `_mkstemp_beside`'s
+    suffix does.
+
+    ``os.urandom``, not ``random``: this name is created in a directory a
+    less-trusted writer can reach, and a predictable one lets them pre-create it
+    and fail every record write (``O_EXCL`` turns the collision into a refusal
+    rather than a clobber, so the harm is a stuck hint rather than a redirect —
+    but an unguessable name removes even that, #591)."""
+    for _ in range(_TMP_NAME_ATTEMPTS):
+        tmp = f"{prefix}{os.getpid():x}.{os.urandom(4).hex()}.tmp"
+        try:
+            return os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=dir_fd), tmp
+        except FileExistsError:
+            continue  # astronomically unlikely; costs one more draw
+    raise OSError(f"no free temp name beside {name!r} after {_TMP_NAME_ATTEMPTS} tries")
+
+
 def _atomic_write_at(
     dir_fd: int, name: str, payload: str | bytes, *, mode: str, encoding: str | None
 ) -> None:
@@ -930,21 +981,14 @@ def _atomic_write_at(
     ``encoding`` doubles as the text/bytes discriminator, as it does in
     :func:`_atomic_write`: the text arm is opened with it plus ``newline=""``,
     the bytes arm with neither, because ``os.fdopen`` refuses both in binary mode
-    and a byte-verbatim payload has nothing to translate anyway."""
-    for _ in range(_TMP_NAME_ATTEMPTS):
-        # os.urandom, not `random`: this name is created in a directory a
-        # less-trusted writer can reach, and a predictable one lets them
-        # pre-create it and fail every record write (O_EXCL turns the collision
-        # into a refusal rather than a clobber, so the harm is a stuck hint
-        # rather than a redirect — but an unguessable name removes even that).
-        tmp = f"{name}.{os.getpid():x}.{os.urandom(4).hex()}.tmp"
-        try:
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=dir_fd)
-        except FileExistsError:
-            continue  # astronomically unlikely; costs one more draw
-        break
-    else:
-        raise OSError(f"no free temp name beside {name!r} after {_TMP_NAME_ATTEMPTS} tries")
+    and a byte-verbatim payload has nothing to translate anyway.
+
+    Staging walks :func:`_stage_shortening`'s ladder, the same one
+    ``_mkstemp_beside`` walks, so a target basename near ``NAME_MAX`` stages here
+    exactly where the path-based writer stages it (#595) — without the ladder the
+    confined adoption reintroduced the long-basename failure for every spec it
+    moved onto this arm."""
+    fd, tmp = _stage_shortening(name, lambda prefix: _open_exclusive_at(dir_fd, prefix, name))
     try:
         staged = (
             os.fdopen(fd, mode)
@@ -970,9 +1014,11 @@ def _refuse_unwritable_target_at(dir_fd: int, name: str) -> None:
     was actually walked, not about a name a concurrent writer may since have
     redirected. ``O_NOFOLLOW`` always, because the write this guards replaces the
     NAME — the same reasoning as the no-follow arm there, ``ELOOP`` included.
+    ``O_NONBLOCK`` for the reason the path-based probe gives: a reader-less FIFO
+    planted at the name answers ``ENXIO`` instead of wedging the probe forever.
     POSIX by construction: only :data:`DIR_FD_ANCHORED_WRITES` reaches here."""
     try:
-        fd = os.open(name, os.O_WRONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+        fd = os.open(name, os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
     except PermissionError:
         raise  # the refusal this flag exists for
     except OSError:

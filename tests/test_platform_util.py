@@ -14,6 +14,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 from contextlib import contextmanager
 from pathlib import Path, PureWindowsPath
 
@@ -921,6 +922,53 @@ def test_atomic_write_bytes_stages_a_basename_that_fills_name_max(tmp_path, monk
     assert list(tmp_path.glob("*.tmp")) == []
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX pathconf(PC_NAME_MAX)")
+def test_confined_write_stages_a_basename_that_fills_name_max(tmp_path, monkeypatch):
+    """#595's guarantee, carried onto the anchored arm. The anchored staging name
+    appends `.<pid hex>.<8 hex>.tmp` to the full target name and originally
+    retried nothing but `FileExistsError`, so a basename the target itself is
+    perfectly legal at raised `ENAMETOOLONG` through the confined writer — while
+    the plain no-follow writer those callers were moved OFF OF staged the same
+    spec through `_mkstemp_beside`'s digest fallback. Both arms now walk the one
+    `_stage_shortening` ladder, and this row is the anchored twin of the
+    path-based row above.
+
+    Reachable exactly where it hurts: specs are named by BMAD's planning skills,
+    nothing bounds that name, and an in-checkout spec routes to this arm.
+
+    The staged name is recorded and asserted legal rather than compared to the
+    digest, for the sibling row's reason: what has to hold is that the temp fits,
+    not which rung produced it.
+
+    Ablation: bypass the ladder — have `_atomic_write_at` call
+    `_open_exclusive_at(dir_fd, name + ".", name)` directly — and this reddens
+    alone, on `OSError: [Errno 36] File name too long` raised before any
+    assertion. The path-based row above stays green under it, which is the split
+    that proves the two arms stage independently."""
+    root = tmp_path / "checkout"
+    artifacts = root / "artifacts"
+    artifacts.mkdir(parents=True)
+    name_max = os.pathconf(str(artifacts), "PC_NAME_MAX")
+    target = artifacts / ("s" * (name_max - len(".md")) + ".md")
+    assert len(os.fsencode(target.name)) == name_max  # PRECONDITION: the limit itself
+    staged: list[str] = []
+    real_replace = os.replace
+
+    def record(src, dst, **kwargs):
+        staged.append(os.path.basename(str(src)))
+        real_replace(src, dst, **kwargs)
+
+    monkeypatch.setattr(platform_util.os, "replace", record)
+
+    platform_util.atomic_write_bytes_confined(target, b"payload", confine_root=root)
+
+    assert target.read_bytes() == b"payload"
+    assert len(staged) == 1
+    assert len(os.fsencode(staged[0])) <= name_max
+    assert staged[0].endswith(".tmp")  # devcontract's *.md scans must skip it
+    assert list(artifacts.glob("*.tmp")) == []
+
+
 def _exceed_range() -> OSError:
     """Win32's "the name does not fit", which arrives as ENOENT and is told apart
     from a missing directory only by `.winerror` — see `_is_name_too_long`."""
@@ -1774,7 +1822,7 @@ def test_atomic_write_text_at_lands_a_private_mode(tmp_path):
     documents — and note that docstring's "this box is 0o077" claim is not
     universal, which is exactly why the value is forced here).
 
-    Ablation: drop the `0o600` argument from the `os.open` in `_atomic_write_at`
+    Ablation: drop the `0o600` argument from the `os.open` in `_open_exclusive_at`
     and this fails reporting 0o644."""
     previous = os.umask(0o022)
     try:
@@ -2321,3 +2369,77 @@ def test_atomic_write_text_confined_refuses_a_readonly_target(tmp_path):
 
     assert target.read_text(encoding="utf-8") == "before"
     assert list(parent.glob("*.tmp")) == []  # a refusal stages nothing
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX FIFOs")
+def test_writable_target_probe_answers_a_planted_fifo_without_blocking(tmp_path):
+    """`O_WRONLY` against a reader-less FIFO does not fail — it WAITS for a reader
+    that a planted FIFO will never have, wedging the probe (and the control loop
+    driving it) forever. `O_NOFOLLOW` is no help: a FIFO is not a symlink, so the
+    #591 threat model reaches this with one `mkfifo` at a name a driven session
+    may write. The probe opens `O_NONBLOCK`, the kernel answers `ENXIO` at once,
+    the probe's any-other-`OSError` arm returns, and the write replaces the
+    FIFO's NAME the same way it replaces any other name it does not follow.
+
+    Threaded with a bounded join so the ablated failure mode is a red assertion
+    within the timeout, not a test run hung until the runner kills it.
+
+    Ablation: drop `| non_block` from `_refuse_unwritable_target`'s open and this
+    reddens alone, on `t.is_alive()` — the writer thread is still parked inside
+    `os.open` waiting for a reader. The read-only rows above stay green: a
+    regular file's permission check never blocks."""
+    target = tmp_path / "policy.toml"
+    os.mkfifo(target)
+    failures: list[BaseException] = []
+
+    def write() -> None:
+        try:
+            platform_util.atomic_write_bytes(
+                target, b"payload", follow_symlinks=False, require_writable_target=True
+            )
+        except BaseException as e:  # pragma: no cover — reported by the asserts below
+            failures.append(e)
+
+    t = threading.Thread(target=write, daemon=True)
+    t.start()
+    t.join(timeout=10)
+
+    assert not t.is_alive()  # the probe answered instead of waiting for a reader
+    assert failures == []
+    assert stat.S_ISREG(target.lstat().st_mode)  # the FIFO name was replaced
+    assert target.read_bytes() == b"payload"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX FIFOs")
+def test_confined_writable_target_probe_answers_a_planted_fifo_without_blocking(tmp_path):
+    """The anchored probe shares the wedge and the fix: `_refuse_unwritable_target_at`
+    opens the entry `O_WRONLY` dir_fd-relative, and a FIFO planted there parks it
+    just as surely — the descriptor anchoring changes WHERE the name is opened,
+    not what opening a reader-less FIFO for writing does.
+
+    Ablation: drop `| os.O_NONBLOCK` from `_refuse_unwritable_target_at`'s open
+    and this reddens alone, the same way as the path-based row above — the two
+    probes are separate `os.open` calls, so neither row covers the other."""
+    root = tmp_path / "project"
+    parent = root / ".bmad-loop"
+    parent.mkdir(parents=True)
+    target = parent / "policy.toml"
+    os.mkfifo(target)
+    failures: list[BaseException] = []
+
+    def write() -> None:
+        try:
+            platform_util.atomic_write_bytes_confined(
+                target, b"payload", confine_root=root, require_writable_target=True
+            )
+        except BaseException as e:  # pragma: no cover — reported by the asserts below
+            failures.append(e)
+
+    t = threading.Thread(target=write, daemon=True)
+    t.start()
+    t.join(timeout=10)
+
+    assert not t.is_alive()  # the probe answered instead of waiting for a reader
+    assert failures == []
+    assert stat.S_ISREG(target.lstat().st_mode)  # the FIFO name was replaced
+    assert target.read_bytes() == b"payload"
