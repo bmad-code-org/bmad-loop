@@ -7,6 +7,16 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Changed
+
+- **Document the qualified-id obligation once for adapter authors (#311).**
+  `docs/adapter-authoring-guide.md` states the general rule a native-id backend must follow —
+  an id minted in anything but the bare native form binds every seam core compares it against to
+  the identical form, and every verb it is replayed through to accepting it — instead of leaving
+  it to be inferred from psmux's per-seam specifics, which shrink to the instances they are.
+  `TerminalMultiplexer.new_parked_window` now says its id is opaque and MAY be qualified, matching
+  `new_window`. Documentation only; no behavior change.
+
 ## [0.11.1] — 2026-08-23
 
 ### Added
