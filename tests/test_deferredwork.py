@@ -16,6 +16,7 @@ from bmad_loop.deferredwork import (
     classify,
     field_line_present,
     field_severity,
+    gates,
     has_legacy,
     mark_done,
     mark_done_many,
@@ -2374,7 +2375,10 @@ def test_archive_all_done(tmp_path):
     # The stub still parses as done, with the original close date
     assert entries["DW-2"].done
     assert entries["DW-2"].status == "done 2026-05-25"
-    assert "origin: code review" not in entries["DW-2"].body  # body was moved
+    assert "reason: pre-existing." not in entries["DW-2"].body  # body was moved
+    assert "location: src/foo.py:10" not in entries["DW-2"].body
+    # Load-bearing field lines survive in the stub (engine replay dedupe)
+    assert "origin: code review of spec-1-1.md" in entries["DW-2"].body
     assert entries["DW-2"].title == "Old closed item"  # heading preserved
     assert "archived: 2026-08-24" in entries["DW-2"].body  # stub marker
     # Open entries untouched
@@ -2407,7 +2411,8 @@ def test_archive_before_cutoff(tmp_path):
 
     entries = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}
     assert entries["DW-1"].done  # stub
-    assert "origin: a" not in entries["DW-1"].body
+    assert "archived: 2026-08-24" in entries["DW-1"].body
+    assert "origin: a" in entries["DW-1"].body  # preserved field line
     # July entry untouched — not before the cutoff
     assert entries["DW-2"].status == "done 2026-07-01"
     assert "origin: b" in entries["DW-2"].body
@@ -2663,7 +2668,7 @@ def test_archive_crash_recovery_no_duplicate_bodies(tmp_path):
     # The ledger now holds the stub...
     entries = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}
     assert entries["DW-2"].done
-    assert "origin: code review" not in entries["DW-2"].body
+    assert "reason: pre-existing." not in entries["DW-2"].body  # body was moved, stub left
 
     # ...and the archive carries the body exactly once, with the FIRST run's
     # stamp preserved — no duplicate append, no re-stamp.
@@ -2698,3 +2703,180 @@ def test_archive_crash_recovery_fenced_example_does_not_suppress(tmp_path):
     assert archive_text.count("### DW-2:") == 2  # quoted + real
     assert "origin: code review of spec-1-1.md" in archive_text
     assert "quoted example" in archive_text
+
+
+# ------------------------------------------- archive follow-up review (#706, pass 2)
+
+
+def test_archive_stub_preserves_gate_origin_source_spec(tmp_path):
+    """The stub keeps gate:/origin:/source_spec: lines — validate's closed-gate
+    report and the engine's status-agnostic replay dedupe both key on them
+    regardless of status."""
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: gated close\n\n"
+        "origin: spec-harvest fingerprint-abc\n"
+        "source_spec: specs/spec-1-1.md\n"
+        "gate: 1-2\n"
+        "location: src/foo.py\n"
+        "status: done 2026-05-25\n"
+    )
+    path = write_ledger(tmp_path, text)
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-1"]
+    stub = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}["DW-1"]
+    assert "gate: 1-2" in stub.body
+    assert "origin: spec-harvest fingerprint-abc" in stub.body
+    assert "source_spec: specs/spec-1-1.md" in stub.body
+    assert "location: src/foo.py" not in stub.body  # the rest moved
+    assert gates(stub).tokens == ("1-2",)  # still speaks for validate
+
+
+def test_archive_stub_preserves_reopenable_undo_tail(tmp_path):
+    """A reopenable close's resolution/resolution-undo tail survives into the
+    stub, so a later sweep-bundle rollback can still undo the close."""
+    text = "# Deferred Work\n\n### DW-1: bundle close\n\norigin: a\nlocation: b\nstatus: open\n"
+    path = write_ledger(tmp_path, text)
+    mark_done_many_reopenable(path, ["DW-1"], "2026-05-25", "sweep bundle", "op-1")
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-1"]
+    # The stub still reads done...
+    stub_ledger = path.read_text(encoding="utf-8")
+    assert "DW-1" not in open_ids(stub_ledger)
+    # ...and mark_open can still undo it (the tail is intact and adjacent)
+    assert mark_open(path, "DW-1", "sweep bundle", "op-1") is True
+    assert "DW-1" in open_ids(path.read_text(encoding="utf-8"))
+
+
+def test_archive_hand_written_archived_line_still_archives(tmp_path):
+    """A done entry carrying a stray unfenced `archived:` line but a real body
+    is NOT mistaken for a stub — shape, not one line, decides (#706 pass 2)."""
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: real entry, stray field\n\n"
+        "origin: a\nlocation: src/x.py\nreason: still real work\n"
+        "status: done 2026-05-25\narchived: 2026-01-01\n"
+    )
+    path = write_ledger(tmp_path, text)
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-1"]
+    assert "reason: still real work" in (path.parent / ARCHIVE_REL).read_text(encoding="utf-8")
+
+
+def test_archive_is_archived_fence_filter_pinned(tmp_path):
+    """A done entry documenting `archived:` only inside a fenced example is
+    not treated as already-archived — the `_quoted` filter is load-bearing."""
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: documents the field\n\n"
+        "origin: a\nlocation: b\n"
+        "```\n"
+        "archived: 2026-01-01\n"
+        "```\n"
+        "status: done 2026-05-25\n"
+    )
+    path = write_ledger(tmp_path, text)
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-1"]
+    stub = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}["DW-1"]
+    assert "archived: 2026-08-24" in stub.body  # real stamp, not the quoted one
+
+
+def test_archive_legacy_entries_untouched(tmp_path):
+    """Legacy (flat/pre-DW-format) content is never modified by archiving."""
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: done canonical\n\norigin: a\nstatus: done 2026-05-25\n\n"
+        "- source_spec: specs/spec-2-1.md — legacy flat finding, RESOLVED 2026-04-01\n\n"
+        "## Deferred from: review of spec-2-1.md\n\n"
+        "Some legacy freeform prose that predates the DW format.\n"
+    )
+    path = write_ledger(tmp_path, text)
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-1"]
+    after = path.read_text(encoding="utf-8")
+    assert "- source_spec: specs/spec-2-1.md — legacy flat finding, RESOLVED 2026-04-01" in after
+    assert "## Deferred from: review of spec-2-1.md" in after
+    assert "legacy freeform prose" in after
+
+
+def test_archive_stub_is_grep_resolvable_and_classifies_clean(tmp_path):
+    """The stub keeps the heading so `grep DW-2` finds it, and a post-archive
+    ledger classifies with no malformed entries."""
+    path = write_ledger(tmp_path)
+    archive_closed(path, archive_date="2026-08-24")
+    text = path.read_text(encoding="utf-8")
+    assert "DW-2" in text  # grep-resolvable
+    declared = classify(text, ids=["DW-2"])
+    assert declared.malformed == ()  # stub reads done, not malformed
+    assert "DW-2" in declared.already_done
+
+
+def test_archive_reclose_after_archive_appends_new_body(tmp_path):
+    """An entry reopened and re-closed after its first body was archived gets
+    its second body appended — id equivalence alone must not suppress it."""
+    text = "# Deferred Work\n\n### DW-1: closes twice\n\norigin: a\nstatus: done 2026-05-25\n"
+    path = write_ledger(tmp_path, text)
+    archive_closed(path, archive_date="2026-06-01")
+    # Reopen (undo the stub) and re-close with a different date and body
+    reopened = text.replace("status: done 2026-05-25", "status: open\nreason: reopened")
+    reopened = reopened.replace("archived: 2026-06-01\n", "")
+    path.write_text(reopened, encoding="utf-8")
+    mark_done(path, "DW-1", "2026-07-01", "second close")
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-1"]
+    archive_text = (path.parent / ARCHIVE_REL).read_text(encoding="utf-8")
+    assert archive_text.count("### DW-1:") == 2  # both closures preserved
+    assert "status: done 2026-07-01" in archive_text
+
+
+def test_archive_crash_recovery_edited_entry_keeps_both_bodies(tmp_path):
+    """Crash-recovery skip keys on id AND close date: an entry edited between
+    the crash and the retry is re-archived, not silently dropped."""
+    path = write_ledger(tmp_path)
+    # First (crashed) run archived the original body
+    archive_path = path.parent / ARCHIVE_REL
+    archive_path.write_text(
+        "### DW-2: Old closed item\n\n"
+        "origin: code review of spec-1-1.md, 2026-05-20\n"
+        "location: src/foo.py:10\n"
+        "reason: pre-existing.\n"
+        "status: done 2026-05-25\n"
+        "archived: 2026-08-24\n",
+        encoding="utf-8",
+    )
+    # The ledger entry was then re-closed later (different close date)
+    edited = LEDGER.replace("status: done 2026-05-25", "status: done 2026-06-10")
+    path.write_text(edited, encoding="utf-8")
+    assert archive_closed(path, archive_date="2026-08-25") == ["DW-2"]
+    archive_text = archive_path.read_text(encoding="utf-8")
+    assert archive_text.count("### DW-2:") == 2
+    assert "status: done 2026-06-10" in archive_text
+
+
+def test_archive_default_date_flake_fixed(tmp_path):
+    """`today` sampled BEFORE the call, so a midnight rollover mid-call cannot
+    fail the assertion (docs/testing.md flake policy)."""
+    from datetime import date as calendar_date
+
+    path = write_ledger(tmp_path)
+    today = calendar_date.today().isoformat()
+    archive_closed(path)
+    assert f"archived: {today}" in (path.parent / ARCHIVE_REL).read_text(encoding="utf-8")
+
+
+def test_archive_fenced_heading_in_archive_does_not_suppress_reclose(tmp_path):
+    """A `### DW-2:` mention inside an archived body's fenced example must not
+    read as that id's archived twin — the false-positive direction of the
+    crash-recovery membership check."""
+    path = write_ledger(tmp_path)
+    # An archive holding a fenced worked example that quotes DW-2's heading
+    archive_path = path.parent / ARCHIVE_REL
+    archive_path.write_text(
+        "### DW-9: documents the format\n\n"
+        "```\n"
+        "### DW-2: quoted example\n"
+        "status: done 2026-05-25\n"
+        "archived: 2026-01-01\n"
+        "```\n"
+        "status: done 2026-01-02\n"
+        "archived: 2026-01-03\n",
+        encoding="utf-8",
+    )
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-2"]
+    archive_text = archive_path.read_text(encoding="utf-8")
+    assert "origin: code review of spec-1-1.md" in archive_text  # real body landed

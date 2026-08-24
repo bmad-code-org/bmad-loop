@@ -8602,9 +8602,9 @@ def test_auto_sweep_launches_the_profile_bytes_the_gate_validated(project, monke
     # the gate saw the honest bytes and passed
     factory("epic-boundary", started=lambda: signalled.append("started"))
 
-    assert (
-        profile_mod.get_profile("mycli", project.project).binary == "rogue-cli"
-    ), "the swap must actually have landed on disk, or this test proves nothing"
+    assert profile_mod.get_profile("mycli", project.project).binary == "rogue-cli", (
+        "the swap must actually have landed on disk, or this test proves nothing"
+    )
     assert captured["adapter"].profile.binary == "mycli"
     assert signalled == ["started"]  # #501: the child composed, so the parent may latch
     run_id = captured["state"].run_id
@@ -8681,9 +8681,9 @@ def test_run_pins_the_profile_bytes_it_launches(project, monkeypatch):
 
     assert cli.main(["run", "--project", str(project.project)]) == 0
 
-    assert (
-        profile_mod.get_profile("mycli", project.project).binary == "rogue-cli"
-    ), "the swap must actually have landed on disk, or this test proves nothing"
+    assert profile_mod.get_profile("mycli", project.project).binary == "rogue-cli", (
+        "the swap must actually have landed on disk, or this test proves nothing"
+    )
     assert captured["adapter"].profile.binary == "mycli"
     run_id = captured["state"].run_id
     assert runs.read_trusted_config_digest(project.project, run_id) == pin
@@ -8741,9 +8741,9 @@ def test_resume_pins_the_profile_bytes_it_launches(project, monkeypatch):
 
     assert cli._resume_paused_run(project.project, run_dir) == 0
 
-    assert (
-        profile_mod.get_profile("mycli", project.project).binary == "rogue-cli"
-    ), "the swap must actually have landed on disk, or this test proves nothing"
+    assert profile_mod.get_profile("mycli", project.project).binary == "rogue-cli", (
+        "the swap must actually have landed on disk, or this test proves nothing"
+    )
     assert captured["adapter"].profile.binary == "mycli"
     assert runs.read_trusted_config_digest(project.project, run_dir.name) == pin
 
@@ -9157,5 +9157,90 @@ def test_sweep_archive_dry_run(project, capsys):
     rc = cli.main(["sweep", "--archive", "--dry-run", "--project", str(project.project)])
     assert rc == 0
     out = capsys.readouterr().out
-    assert "would archive 1 entries" in out
+    assert "would archive 1 entry" in out
     assert "DW-2" in out
+
+
+def test_sweep_archive_writes_ledger_and_archive(project, capsys):
+    """The writing path is observed on disk: bodies move, stubs land, open
+    entries stay (#706 pass 2 — a plumbing regression must not ship green)."""
+    from bmad_loop import deferredwork
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open", "DW-2": "done 2026-06-01"}, commit=False)
+    rc = cli.main(["sweep", "--archive", "--project", str(project.project)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "archived 1 entry" in out
+    assert "commit them to make the move durable" in out
+    ledger_path = project.deferred_work
+    archive_path = ledger_path.parent / "deferred-work-archive.md"
+    text = ledger_path.read_text(encoding="utf-8")
+    entries = {e.id: e for e in deferredwork.parse_ledger(text)}
+    assert entries["DW-2"].done  # stub parses as done
+    assert entries["DW-1"].open  # open entry untouched
+    assert "DW-2" in text  # grep-resolvable
+    assert archive_path.is_file()
+    assert "### DW-2:" in archive_path.read_text(encoding="utf-8")
+
+
+def test_sweep_archive_before_without_archive_refused(project, capsys):
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    rc = cli.main(["sweep", "--before", "2026-06-01", "--project", str(project.project)])
+    assert rc == 1
+    assert "--before requires --archive" in capsys.readouterr().err
+
+
+def test_sweep_archive_conflicting_flags_refused(project, capsys):
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    rc = cli.main(["sweep", "--archive", "--no-prompt", "--project", str(project.project)])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "--archive cannot combine with" in err
+    assert "--no-prompt" in err
+
+
+def test_sweep_archive_empty_before_without_archive_refused(project, capsys):
+    """`--before ""` is a provided value, not an absent one — the guard must
+    not test truthiness (#706 pass 2)."""
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    rc = cli.main(["sweep", "--before", "", "--project", str(project.project)])
+    assert rc == 1
+    assert "--before requires --archive" in capsys.readouterr().err
+
+
+def test_sweep_archive_missing_ledger_named(project, capsys):
+    """A missing ledger is named, not reported as a clean nothing-to-archive."""
+    install_bmad_config(project)
+    rc = cli.main(["sweep", "--archive", "--project", str(project.project)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "no deferred-work ledger at" in out
+    assert "no closed entries" not in out
+
+
+def test_sweep_archive_refuses_while_run_live(project, monkeypatch, capsys):
+    """The out-of-band ledger writer refuses when any engine run is live —
+    a concurrent close between its read and writes would be lost (#706 pass 2)."""
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open", "DW-2": "done 2026-06-01"}, commit=False)
+    run_dir = project.project / ".bmad-loop" / "runs" / "20260824-100000-aaaa"
+    run_dir.mkdir(parents=True)
+    (run_dir / "state.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(cli.runs, "engine_liveness", lambda _dir: "alive")
+    rc = cli.main(["sweep", "--archive", "--project", str(project.project)])
+    assert rc == 1
+    assert "is live" in capsys.readouterr().err
+    assert "DW-2" in project.deferred_work.read_text(encoding="utf-8")  # nothing written

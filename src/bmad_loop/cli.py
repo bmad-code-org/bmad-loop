@@ -2211,7 +2211,7 @@ def cmd_sweep(args: argparse.Namespace) -> int:
     project = _project(args)
     paths = bmadconfig.load_paths(project)
 
-    if args.before and not args.archive:
+    if args.before is not None and not args.archive:
         print("--before requires --archive", file=sys.stderr)
         return ExitCode.FAILURE
 
@@ -2221,14 +2221,16 @@ def cmd_sweep(args: argparse.Namespace) -> int:
             or args.repeat is not None
             or args.max_bundles is not None
             or args.max_cycles is not None
+            or args.no_prompt
+            or args.run_id is not None
         ):
             print(
                 "--archive cannot combine with --decisions-only, --repeat, "
-                "--max-bundles, or --max-cycles",
+                "--max-bundles, --max-cycles, --no-prompt, or --run-id",
                 file=sys.stderr,
             )
             return ExitCode.FAILURE
-        return _sweep_archive(paths, args)
+        return _sweep_archive(project, paths, args)
 
     pol = policy_mod.load(_policy_path(project))
 
@@ -2264,31 +2266,47 @@ def cmd_sweep(args: argparse.Namespace) -> int:
     )
 
 
-def _sweep_archive(paths: bmadconfig.ProjectPaths, args: argparse.Namespace) -> int:
+def _sweep_archive(project: Path, paths: bmadconfig.ProjectPaths, args: argparse.Namespace) -> int:
     """`bmad-loop sweep --archive`: move closed deferred-work entries to a
     sibling archive file. A self-contained sub-mode — no worktree, no
-    preflight, no LLM."""
+    preflight, no LLM. Refuses while any engine run is live: this is the one
+    out-of-band ledger writer, and a concurrent close or harvest landing
+    between its read and its writes would be silently clobbered."""
+    for run_dir in runs.list_run_dirs(project):
+        if runs.engine_liveness(run_dir) == "alive":
+            print(
+                f"run {run_dir.name} is live — stop it before archiving ledger entries",
+                file=sys.stderr,
+            )
+            return ExitCode.FAILURE
+    ledger = paths.deferred_work
+    if not ledger.is_file():
+        print(f"no deferred-work ledger at {ledger}")
+        return ExitCode.OK
     try:
         archived = deferredwork.archive_closed(
-            paths.deferred_work,
+            ledger,
             before=args.before,
             dry_run=args.dry_run,
         )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return ExitCode.FAILURE
-    archive_path = paths.deferred_work.parent / deferredwork.ARCHIVE_REL
+    archive_path = ledger.parent / deferredwork.ARCHIVE_REL
     if not archived:
         print("no closed entries to archive")
-    elif args.dry_run:
-        print(f"would archive {len(archived)} entries:")
+        return ExitCode.OK
+    noun = "entry" if len(archived) == 1 else "entries"
+    if args.dry_run:
+        print(f"would archive {len(archived)} {noun}:")
         for dw_id in archived:
             print(f"  {dw_id}")
-    else:
-        print(f"archived {len(archived)} entries to {archive_path}:")
-        for dw_id in archived:
-            print(f"  {dw_id}")
-    return 0
+        return ExitCode.OK
+    print(f"archived {len(archived)} {noun} to {archive_path}:")
+    for dw_id in archived:
+        print(f"  {dw_id}")
+    print("note: the ledger and archive are tracked files — commit them to make the move durable")
+    return ExitCode.OK
 
 
 def _sweep_dry_run(paths: bmadconfig.ProjectPaths, pol) -> int:
@@ -4265,15 +4283,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     sweep_p.add_argument("--max-cycles", type=int, help="override [sweep] max_cycles")
     sweep_p.add_argument(
-        "--dry-run", action="store_true", help="list open ledger entries, spawn nothing"
+        "--dry-run",
+        action="store_true",
+        help="list open ledger entries, spawn nothing; with --archive: list the "
+        "entries that would move, write nothing",
     )
     sweep_p.add_argument(
         "--archive",
         action="store_true",
-        help="move closed (status: done) deferred-work entries to a sibling "
-        "deferred-work-archive.md, leaving a minimal stub in the live ledger; "
-        "use --before DATE to archive only entries closed before that date, "
-        "and --dry-run to preview",
+        help="move closed (status: done <ISO date>) deferred-work entries to a "
+        "sibling deferred-work-archive.md, leaving a minimal stub in the live "
+        "ledger; use --before DATE to archive only entries closed before that "
+        "date, and --dry-run to preview",
     )
     sweep_p.add_argument(
         "--before",

@@ -3,7 +3,9 @@
 The ledger (`{implementation_artifacts}/deferred-work.md`) is append-only
 markdown in the canonical form documented at
 bmad-loop-sweep/deferred-work-format.md: `### DW-<seq>: <title>` headings with
-`origin:`/`location:`/`reason:`/`status:` field lines. Pre-#2651 dev primitives
+`origin:`/`location:`/`reason:`/`status:` field lines. The one sanctioned
+rewrite is :func:`archive_closed`, which moves closed entries verbatim to a
+sibling archive file and leaves id-preserving stubs. Pre-#2651 dev primitives
 and the attended `bmad-build` append flatter entries here directly, which the
 orchestrator normalizes on sweep; the current unattended primitive records its
 findings in the spec's frontmatter instead and the engine harvests them into
@@ -675,6 +677,26 @@ def _one_line(value: str) -> str:
     return LINE_BREAK_RE.sub(" ", value).strip()
 
 
+def _iso_date_or_none(value: str) -> str | None:
+    """`value` when it is a strict ISO ``YYYY-MM-DD`` calendar date, else None.
+
+    The shared shape of the ledger's two date checks, so a skip-not-raise caller
+    (:func:`_close_date`) and a raise caller (:func:`_require_iso_date`) cannot
+    drift apart on what counts as a close date. The regex is not redundant with
+    ``date.fromisoformat``: since 3.11 that also accepts ``20260611`` and ISO
+    week dates, neither of which the ledger's own readers recognize, and it is
+    the regex — via ``[0-9]`` — that pins the digits to ASCII. ``fromisoformat``
+    in turn rejects the well-shaped impossible day (``2026-02-30``) that no
+    pattern can catch."""
+    if not _ISO_DATE_RE.fullmatch(value):
+        return None
+    try:
+        calendar_date.fromisoformat(value)
+    except ValueError:
+        return None
+    return value
+
+
 def _require_iso_date(value: str) -> None:
     """Raise unless `value` is a strict ISO `YYYY-MM-DD` calendar date.
 
@@ -682,19 +704,9 @@ def _require_iso_date(value: str) -> None:
     (`Engine._today()`), never model-authored, so a bad value is a programmer
     bug. Letting it through writes a `status:` line that reads as neither open
     nor done, which `classify` reports as malformed and `open_ids` drops — the
-    entry silently leaves the sweep's world.
-
-    The regex is not redundant with `date.fromisoformat`: since 3.11 that also
-    accepts `20260611` and ISO week dates, neither of which the ledger's own
-    readers recognize, and it is the regex — via `[0-9]` — that pins the digits
-    to ASCII. `fromisoformat` in turn rejects the well-shaped impossible day
-    (`2026-02-30`) that no pattern can catch."""
-    if not _ISO_DATE_RE.fullmatch(value):
+    entry silently leaves the sweep's world."""
+    if _iso_date_or_none(value) is None:
         raise ValueError(f"date must be YYYY-MM-DD: {value!r}")
-    try:
-        calendar_date.fromisoformat(value)
-    except ValueError as exc:
-        raise ValueError(f"date must be YYYY-MM-DD: {value!r}") from exc
 
 
 def _require_canonical_status(status: str) -> None:
@@ -1054,7 +1066,8 @@ _ARCHIVED_FIELD_RE = re.compile(r"^archived:", re.MULTILINE)
 
 def _is_archived(entry: DWEntry) -> bool:
     """Whether the entry carries a live ``archived:`` field line (not a quoted
-    example), marking it as a stub from a prior :func:`archive_closed` run.
+    example), marking it as touched by :func:`archive_closed` — a stub in the
+    live ledger, or an archived body in the archive file.
 
     Reads through :func:`_quoted` for the same reason every gate scan does:
     an entry documenting the archive field in a fenced example carries the
@@ -1062,6 +1075,57 @@ def _is_archived(entry: DWEntry) -> bool:
     check a quoted ``archived:`` would be mistaken for the real thing.
     """
     return any(not _quoted(entry, m.start()) for m in _ARCHIVED_FIELD_RE.finditer(entry.body))
+
+
+# Field lines a stub must carry when the archived body had them, because
+# downstream readers key on them regardless of status: `gate:` (validate's
+# closed-entry gate report deliberately keeps speaking), `origin:` +
+# `source_spec:` (the engine's status-agnostic harvest-replay dedupe), and the
+# reopenable-close undo tail (`mark_open`'s adjacency requirement).
+_PRESERVED_FIELD_RE = re.compile(r"^(gate:.*|origin:.*|source_spec:.*)$", re.MULTILINE)
+
+# The exact stub shape :func:`archive_closed` leaves in the live ledger.
+# A done entry that merely carries a hand-written `archived:` line does NOT
+# match — it is a real entry, not a stub, and must still be archived.
+_STUB_BODY_RE = re.compile(
+    r"### .*: .*\n\n"
+    r"status: done [0-9]{4}-[0-9]{2}-[0-9]{2}\n"
+    r"(?:resolution: [^\n]*\nresolution-undo: [0-9a-f]{64} [^\n]*\n)?"
+    r"(?:(?:gate:|origin:|source_spec:)[^\n]*\n)*"
+    r"archived: [^\n]*\n"
+    r"\n?"
+)
+
+
+def _is_stub(entry: DWEntry) -> bool:
+    """Whether the entry is a stub left by a prior :func:`archive_closed` run.
+
+    Shape-based rather than `archived:`-line-based: a done entry a human
+    annotated with a stray unfenced ``archived:`` line is a real entry whose
+    body still belongs in the live ledger — skipping it forever on the strength
+    of one line would silently exclude it from every future archive.
+    """
+    return entry.done and _STUB_BODY_RE.fullmatch(entry.body.rstrip("\n") + "\n") is not None
+
+
+def _preserved_stub_lines(entry: DWEntry) -> list[str]:
+    """The load-bearing field lines a stub must keep from the archived body.
+
+    Scanned fence-aware like every field read in this module: a fenced example
+    documenting `origin:` is not a declaration. The undo tail is read with the
+    same adjacency regex :func:`mark_open` will later use against the stub, so
+    what qualifies here is exactly what remains undoable there.
+    """
+    lines = [
+        entry.body[m.start() : m.end()]
+        for m in _PRESERVED_FIELD_RE.finditer(entry.body)
+        if not _quoted(entry, m.start())
+    ]
+    if entry.status_span is not None:
+        tail = _MARK_DONE_TAIL_RE.match(entry.body, entry.status_span[1])
+        if tail is not None:
+            lines = [tail.group(0).lstrip("\n")] + lines
+    return lines
 
 
 def _close_date(entry: DWEntry) -> str | None:
@@ -1079,16 +1143,9 @@ def _close_date(entry: DWEntry) -> str | None:
     parts = entry.status.split()
     if len(parts) != 2:  # exactly `done YYYY-MM-DD` — extra tokens are not a close date
         return None
-    date_str = parts[1]
-    if not _ISO_DATE_RE.fullmatch(date_str):
-        return None
-    try:
-        # The regex alone admits well-shaped impossible days (2026-02-30) that
-        # no calendar carries — the same half of `_require_iso_date`.
-        calendar_date.fromisoformat(date_str)
-    except ValueError:
-        return None
-    return date_str
+    # Same shape check as `_require_iso_date` (well-formed regex AND a real
+    # calendar day), skip-not-raise: a hand-edited close is data, not a bug.
+    return _iso_date_or_none(parts[1])
 
 
 def archive_closed(
@@ -1110,8 +1167,12 @@ def archive_closed(
     with an ``archived: <date>`` field line appended after the entry's status
     line. The stub left in the live ledger keeps the heading, a ``status:
     done <date>`` line (so :func:`parse_ledger` reads it as done and
-    :func:`open_ids` drops it), and an ``archived: <date>`` line (so a
-    subsequent run skips it rather than re-archiving the stub).
+    :func:`open_ids` drops it), an ``archived: <date>`` line (so a subsequent
+    run skips it rather than re-archiving the stub), and the entry's
+    load-bearing field lines — ``gate:``, ``origin:``/``source_spec:``, and
+    the reopenable-close undo tail — because downstream readers key on those
+    regardless of status (validate's closed-gate report, the engine's
+    harvest-replay dedupe, and sweep bundle rollback respectively).
 
     ``before`` (ISO ``YYYY-MM-DD``) archives only entries closed strictly
     *before* that date. Entries with ``status: done`` (no date) are always
@@ -1125,7 +1186,7 @@ def archive_closed(
     :func:`atomic_write_text`, the same primitive every ledger writer uses.
     The archive file accumulates on repeat runs: new entries are appended to
     the existing file, never overwritten, and stubs from a prior run are
-    skipped by their ``archived:`` line.
+    skipped by their exact stub shape.
     """
     if before is not None:
         _require_iso_date(before)
@@ -1141,7 +1202,7 @@ def archive_closed(
             continue  # not done, or done without a date
         if before is not None and close_date >= before:
             continue  # closed on or after the cutoff
-        if _is_archived(entry):
+        if _is_stub(entry):
             continue  # stub from a prior archive_closed run
         to_archive.append((entry, close_date))
     if not to_archive:
@@ -1165,11 +1226,11 @@ def archive_closed(
     # field are therefore skipped here and only replaced with stubs below.
     archive_blocks: list[str] = []
     already_archived = {
-        e.id for e in parse_ledger(existing) if _is_archived(e)
+        e.id: _close_date(e) for e in parse_ledger(existing) if _is_archived(e)
     }  # fence-aware: a quoted example in the archive is not a real body
-    for entry, _ in to_archive:
-        if entry.id in already_archived:
-            continue  # body already archived by a crashed prior run
+    for entry, close_date in to_archive:
+        if already_archived.get(entry.id) == close_date:
+            continue  # this closure's body is already archived (crashed prior run)
         body = entry.body
         assert entry.status_span is not None  # done with a date implies a status line
         pos = entry.status_span[1]
@@ -1189,7 +1250,13 @@ def archive_closed(
     # earlier spans are unaffected by later replacements — the same
     # text-surgery pattern as `_apply_done`, applied to multiple entries.
     for entry, close_date in reversed(to_archive):
-        stub = f"### {entry.id}: {entry.title}\n\nstatus: done {close_date}\narchived: {stamp}\n\n"
+        preserved = "".join(f"{line}\n" for line in _preserved_stub_lines(entry))
+        stub = (
+            f"### {entry.id}: {entry.title}\n\n"
+            f"status: done {close_date}\n"
+            f"{preserved}"
+            f"archived: {stamp}\n\n"
+        )
         start, end = entry.span
         text = text[:start] + stub + text[end:]
     # Write the archive BEFORE the ledger: a crash between writes leaves the
