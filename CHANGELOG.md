@@ -9,66 +9,51 @@ breaking changes may land in a minor release.
 
 ### Added
 
-- **Atomic writers gain an opt-in `require_writable_target` refusal** (#597). `os.replace` needs
-  write permission on the parent _directory_, not on the file it replaces, so a temp-and-replace
-  write silently overwrote a target an operator had marked read-only — and, where it inherits mode,
-  restored the `0444` afterwards, leaving nothing in the permission bits to record the change.
-  Callers over operator-curated files can now ask for the `PermissionError` a plain
-  `Path.write_text` used to raise. Off by default: what the other callers do today is a
-  compatibility contract. The probe opens non-blocking, so a reader-less FIFO planted at the
-  target answers `ENXIO` — the write then replaces the name — instead of parking the
-  orchestrator until a reader appears.
+- **Atomic writers gain an opt-in `require_writable_target` refusal** (#597). Callers over
+  operator-curated files can ask for the `PermissionError` a plain `Path.write_text` used to
+  raise on a read-only target. Off by default — what the other callers do today is a
+  compatibility contract. The probe opens non-blocking, so a planted reader-less FIFO cannot
+  park the orchestrator.
 
 ### Changed
 
 - **A published run archive now lands at mode `0600`** instead of a umask-derived mode (#591).
   It is staged through a file the orchestrator creates itself rather than one `tarfile` opens
   by name, so it inherits the private mode the rest of the `.bmad-loop` write path uses.
-- **A read-only operator file is refused again instead of being rewritten** (#597). Marking
-  `sprint-status.yaml`, `policy.toml`, a hook `settings.json`, a story spec, a park record or the
-  decisions store read-only stopped meaning anything when those writes became atomic: `os.replace`
-  needs write permission on the parent _directory_, never on the entry it replaces, so the file was
-  overwritten and — where mode is inherited — came back reading `0444`, with nothing in the
-  permission bits to record the change. Those writers now ask for the `PermissionError` a plain
-  `write_text` used to raise. Machine-minted state (run archives, stop requests, the config-digest
-  stamp) is unaffected.
+- **A read-only operator file is refused again instead of being rewritten** (#597).
+  `os.replace` needs write permission on the parent _directory_, never on the entry it
+  replaces, so marking `sprint-status.yaml`, `policy.toml`, a hook `settings.json`, a story
+  spec, a park record or the decisions store read-only stopped meaning anything once those
+  writes became atomic. Their writers now refuse with the `PermissionError` a plain
+  `write_text` used to raise. Machine-minted state (run archives, stop requests, the
+  config-digest stamp) is unaffected.
 
 ### Fixed
 
-- **A denied publish no longer leaks its staging temp on Windows** (#597). Where mode is
-  inherited, the temp had already taken a read-only target's READONLY bit when `MoveFileExW`
-  denied the replace — and `DeleteFile` refuses a READONLY file, so the cleanup's unlink was
-  denied too and the temp survived beside the target. The cleanup now clears the bit and
-  retries once; POSIX never takes that arm, since unlink consults the parent directory.
+- **A denied publish no longer leaks its staging temp on Windows** (#597). The temp had
+  already taken a read-only target's READONLY bit when the replace was denied, and Windows
+  refuses to delete a READONLY file, so the cleanup was denied too and the temp survived.
+  It now clears the bit and retries.
 
 ### Security
 
-- **The run-archive staging temp is created exclusively (`O_EXCL`) at `0600`, and unlinked only
-  when this process owns it** (#591). The fixed temp name was created non-exclusively and by
-  name, so a symlink planted there was followed and the cleanup unlinked whatever held the
-  name — including a concurrent archiver's in-flight temp. The exclusive create is itself the
-  no-follow guard, and a loser of the race now raises `FileExistsError` before the `try` it
-  would have cleaned up from. The staged tarball is also `fsync`ed before publish, since the
-  run dir it came from is removed immediately after.
+- **The run-archive staging temp is created exclusively (`O_EXCL`) at `0600`** (#591). The
+  fixed temp name was created and unlinked by name, so a symlink planted there was followed
+  and the cleanup could remove a concurrent archiver's in-flight temp; the exclusive create
+  refuses both. The staged tarball is also `fsync`ed before publish, since the run dir it
+  came from is removed immediately after.
 - **Confined atomic writers anchor a file's parent with a directory descriptor instead of
   resolving it by name** (#593). `follow_symlinks=False` refuses a link planted at the file
-  itself, but the staging and the publish still looked every directory above it up by name, so a
-  link planted at `.bmad-loop/` redirected both and the no-follow bought nothing —
-  `mkdir(parents=True, exist_ok=True)` accepts a symlinked directory, so a planted parent survived
-  the setup step too. `atomic_write_text_confined` and `atomic_write_bytes_confined` walk the
-  components `O_NOFOLLOW` and write through the descriptor that walk produced, which a later swap
-  of any name no longer reaches. Windows has no `*at()` family and degrades to the documented
-  check-then-write. A refusal raises `UnconfinedWriteError`, an `OSError`. Anchored staging names
-  walk the same shortening ladder as the path-based writers, so a basename that fills the
-  filesystem's limit stages through either arm (#595's guarantee, carried over).
-- **The orchestrator's own writers under session-writable roots adopted those confined helpers**
-  (#593): the decisions store, the three park-record writers, the stop-request channel, the two
-  per-run sweep decision writes, all three `policy.toml` writers, the story-spec writers
-  (`devcontract`'s four repair writers plus both frontmatter field writers), and the run's
-  config-digest stamp. A story spec in an artifacts folder configured _outside_ the checkout keeps
-  the plain no-follow write — that is supported configuration, and a confined write cannot vouch
-  for a tree it was not given. `recovery_flow`'s snapshot put-back, `install`'s hook registration
-  and worktree provisioning keep their own stricter component walks unchanged.
+  itself, but every directory above it was still looked up by name, so a link planted at
+  `.bmad-loop/` redirected the staging and the publish both. `atomic_write_text_confined` and
+  `atomic_write_bytes_confined` walk the components `O_NOFOLLOW` and write through the
+  resulting descriptor; a refusal raises `UnconfinedWriteError`, an `OSError`. Windows has no
+  `*at()` family and degrades to the documented check-then-write.
+- **The orchestrator's own writers under session-writable roots adopted those confined
+  helpers** (#593): the decisions store, park records, the stop-request channel, sweep
+  decisions, `policy.toml`, the story-spec writers, and the run's config-digest stamp. A
+  story spec in an artifacts folder configured _outside_ the checkout keeps the plain
+  no-follow write — supported configuration a confined write cannot vouch for.
 
 ## [0.11.1] — 2026-08-23
 
