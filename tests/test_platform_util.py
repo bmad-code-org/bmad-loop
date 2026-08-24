@@ -2275,6 +2275,7 @@ def test_atomic_write_bytes_refuses_a_readonly_target(tmp_path, monkeypatch):
     assert calls == []
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="win32's own replace denies it — row below")
 def test_default_still_replaces_a_readonly_target(tmp_path):
     """The compatibility pin, and the reason the flag is opt-in at all.
 
@@ -2283,6 +2284,12 @@ def test_default_still_replaces_a_readonly_target(tmp_path):
     everyone would convert a semantic loosening into a hard refusal of writes that
     currently succeed — the wrong direction for a contract this many callers rely
     on. So the default must keep replacing, and this is what says so.
+
+    POSIX-only because the premise is: `os.replace` consults the parent
+    directory's permission there, so the 0444 target is replaced. Win32's
+    `MoveFileExW` denies a rename over a READONLY destination outright
+    (WinError 5), so the silent-overwrite hole #597 answers never existed on
+    win32 — the row below pins that platform's shape of the same default.
 
     Ablation: flip `require_writable_target`'s default to True and this fails,
     which is the whole warning it exists to give."""
@@ -2296,6 +2303,44 @@ def test_default_still_replaces_a_readonly_target(tmp_path):
         target.chmod(0o644)
 
     assert landed == "after"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="win32 READONLY semantics")
+def test_default_readonly_denial_on_win32_comes_from_the_replace(tmp_path, monkeypatch):
+    """The same compatibility pin, in the shape win32 allows it to take. There is
+    no silent overwrite to preserve on this platform: `MoveFileExW` denies a
+    rename over a READONLY destination with ERROR_ACCESS_DENIED, so the atomic
+    write always raised `PermissionError` here — at the replace, where the direct
+    `write_text` it succeeded raised at the open. What the default must preserve
+    is that the denial is the OS's own, not the opt-in probe's: the write still
+    STAGES — the mkstemp spy is that discriminator, since the raised type is
+    `PermissionError` either way — fails at the publish after
+    `_retry_on_sharing_violation`'s bounded backoff, and cleans its temp up.
+
+    Ablation: flip `require_writable_target`'s default to True and this reddens
+    on `calls` staying empty — `_refuse_unwritable_target` raises before
+    `_mkstemp_beside` runs, so nothing stages."""
+    target = tmp_path / "sprint-status.yaml"
+    target.write_text("before", encoding="utf-8")
+    target.chmod(0o444)
+    calls: list[str] = []
+    real_mkstemp = tempfile.mkstemp
+
+    def spy(*, dir, prefix, suffix):
+        calls.append(prefix)
+        return real_mkstemp(dir=dir, prefix=prefix, suffix=suffix)
+
+    monkeypatch.setattr(platform_util.tempfile, "mkstemp", spy)
+    try:
+        with pytest.raises(PermissionError):
+            platform_util.atomic_write_text(target, "after")
+        landed = target.read_text(encoding="utf-8")
+    finally:
+        target.chmod(0o644)
+
+    assert calls == ["sprint-status.yaml."]  # it STAGED — the denial came at the replace
+    assert landed == "before"  # the READONLY file is intact
+    assert list(tmp_path.glob("*.tmp")) == []  # and the staged temp was cleaned up
 
 
 def test_require_writable_target_allows_a_missing_target(tmp_path):
