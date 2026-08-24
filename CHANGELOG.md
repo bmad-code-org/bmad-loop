@@ -66,6 +66,9 @@ breaking changes may land in a minor release.
 - Tokenize settled exclude lines the way git does (`\n`-split, one trailing `\r` trimmed), so
   an operator line carrying a lone `\r` can no longer make the shield writer skip a needed
   pattern (#472)
+- Stop shielding a tracked tool directory whole: its pattern is replaced by per-file patterns
+  for the untracked files provisioning wrote, so its tracked children no longer read as ignored
+  to repo-hygiene gates (#484)
 - **A queued release publish can no longer be evicted by a newer push (#468)** — the
   repo-wide `release-publish` concurrency group now sets `queue: max`; the default
   single-slot queue cancels an older _pending_ run when a newer one queues, so a

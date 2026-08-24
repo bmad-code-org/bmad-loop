@@ -3280,47 +3280,104 @@ def test_shield_tracked_hook_config_leaves_no_residue_after_teardown(project, tm
     assert git(repo, "ls-files", "-ci", "--exclude-standard") == ""
 
 
-def test_shield_tracked_skill_tree_keeps_its_pattern(project, tmp_path):
-    """The other half of the same predicate, and the reason it is not simply "never
-    exclude a tracked path": a tracked DIRECTORY's pattern measurably DOES hide new
-    children, so dropping it would leak the orchestrator's seeded skills into the
-    story commit — the exact harm the shield exists to prevent.
+def _track_house_skill(repo, tree):
+    """Make ``tree`` a TRACKED tool directory the shield has to reconcile (#484).
 
-    Its tracked children still answer `ls-files -ci`, and no pattern shape avoids that
-    (measured: `dir/*`, `dir/**` and a trailing negation all behave like `dir`, since
-    gitignore cannot re-include under an excluded parent). That tradeoff is deliberate."""
-    repo = project.project
-    claude = get_profile("claude")
-    tree = claude.skill_tree
+    One tracked child is all it takes: `ls-files` answers with that child's path, so
+    the probe reads the tree as a directory rather than a file. Returns nothing — the
+    preconditions are asserted here so an ambient ignore that quietly leaves the tree
+    UNTRACKED fails LOUD in the caller instead of silently rerouting it through the
+    untracked branch, where every #484 assertion passes for the wrong reason.
+    `conftest` shadows the two out-of-repo ignore sources; this catches the third (a
+    system excludes file, which cannot be suppressed without breaking Windows
+    autocrlf)."""
     (repo / tree / "house-skill").mkdir(parents=True, exist_ok=True)
     (repo / tree / "house-skill" / "SKILL.md").write_text("# tracked\n", encoding="utf-8")
     git(repo, "add", "-A")
     git(repo, "commit", "-q", "-m", "track the skill tree")
+    assert verify.path_tracked(repo, tree)
+    assert not verify.path_tracked_file(repo, tree)
+
+
+def test_shield_tracked_skill_tree_substitutes_per_file_patterns(project, tmp_path):
+    """A TRACKED tool directory gets NO dir pattern. The shield substitutes one pattern
+    per untracked file provisioning actually wrote below it (#484, the maintainer
+    decision of 2026-08-08). This test is the deliberate re-pin of the assertion that
+    used to read `f"/{tree}" in exclude`.
+
+    Why the verdict reversed while the measurement stands: a dir pattern really does
+    hide new children, and no pattern SHAPE both hides them and keeps the report clean
+    — `dir/*`, `dir/**` and a trailing negation all behave like `dir`, since gitignore
+    cannot re-include under an excluded parent. But over a TRACKED tree that protection
+    is already mostly inert (every modification to a tracked child stages regardless),
+    so it bought new-child coverage alone at the price of reporting the whole tree as
+    tracked-and-ignored — the #392 reporter's own complaint, one step out. The fix
+    changes the PATHS, not the shape.
+
+    The `add -A` assertion is the surviving half of the old test and the anti-leak
+    guard: clearing the `-ci` report by weakening the shield is the failure mode the
+    issue's table documents — the one shape that did clear it leaked a new file into
+    the commit.
+
+    Ablation: restore `kept.add(pattern)` in `_reconcile_tracked_patterns`' `"dir"`
+    branch — the two `-ci` assertions redden on the tracked child.
+    INVERSE ablation: delete that branch's substitution line, keeping the drop — the
+    `add -A` assertion reddens on the leaked wheel skills."""
+    repo = project.project
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    _track_house_skill(repo, tree)
     wt = tmp_path / "wt"
     verify.worktree_add(repo, wt, "feat", "main")
 
     provision_worktree(wt, [claude], repo)
 
     exclude = _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
-    assert f"/{tree}" in exclude
-    # The shield still does its job: a file provisioning wrote is not stageable.
+    # #484's symptom first, in both checkouts: the tracked child no longer reads as
+    # ignored. Ordered ahead of the mechanism so the wide-pattern ablation reddens on
+    # the report the issue is about rather than on a pattern spelling.
+    assert git(wt, "ls-files", "-ci", "--exclude-standard") == ""
+    assert git(repo, "ls-files", "-ci", "--exclude-standard") == ""
+    assert f"/{tree}" not in exclude
+    # The shield still does its job: nothing provisioning wrote is stageable.
     git(wt, "add", "-A")
     staged = git(wt, "diff", "--cached", "--name-only").splitlines()
     assert not [p for p in staged if p.startswith(f"{tree}/")]
+    # And what replaced the dir pattern: one line per FILE the wheel copy landed.
+    assert (wt / tree / MODULE_SKILLS[0] / "SKILL.md").is_file()
+    assert f"/{tree}/{MODULE_SKILLS[0]}/SKILL.md" in exclude
+    # Never a directory. `_written_rels`' `_is_file` filter is the only thing keeping
+    # that true: `_copy_traversable`'s `copied_paths` records the directories it
+    # created as well as the files, and a dir rel here would reintroduce the very
+    # whole-directory shape #484 removes, one level down — invisible to every other
+    # row above, because the tracked child does not live under it.
+    # Ablation: drop that filter — `/{tree}/{MODULE_SKILLS[0]}` appears and this
+    # reddens alone.
+    assert not [ln for ln in exclude if ln.startswith(f"/{tree}/") and (wt / ln[1:]).is_dir()]
 
 
-def test_shield_keeps_patterns_when_tracked_probe_fails(project, tmp_path, monkeypatch):
-    """Uncertainty must keep the pattern, never drop it: a shield that stays too wide
-    is a cosmetic hygiene complaint, while one that drops a pattern on a fault leaks
-    seeded files into a story commit. The degrade is REPORTED so the wide shield is
-    not silent."""
+def test_shield_degrade_keeps_the_dir_pattern_not_the_substitution(project, tmp_path, monkeypatch):
+    """Uncertainty must keep the pattern in its ORIGINAL shape, never drop it and never
+    narrow it to the substitution. A shield that stays too wide is a cosmetic hygiene
+    complaint; one that drops or narrows a pattern on a fault leaks seeded files into a
+    story commit. The degrade is REPORTED so the wide shield is not silent.
+
+    Pinned over a tracked TREE rather than a tracked FILE, because #484 gave the
+    unprobed case a second wrong answer to avoid: substituting per-file patterns for
+    what `written` happens to hold would look like a fix while shielding strictly less
+    than the dir pattern does — and the run that could not answer the probe is exactly
+    the one whose bookkeeping deserves the least trust.
+
+    `path_tracked_kind` is the retargeted mutation site: since #484's phase 3 the
+    boolean `path_tracked_file` delegates to it, so failing the tri-state fails both
+    readers, which is why the hook-config pin degrades in the same run.
+
+    Ablation: degrade to the substitution (`kept |= {f"/{w}" ...}`) instead of
+    `kept.add(pattern)` in the `except` arm — the `f"/{tree}"` assertion reddens."""
     repo = project.project
     claude = get_profile("claude")
-    hook_rel = claude.hooks.config_path
-    (repo / hook_rel).parent.mkdir(parents=True, exist_ok=True)
-    (repo / hook_rel).write_text('{"hooks": {}}\n', encoding="utf-8")
-    git(repo, "add", "-A")
-    git(repo, "commit", "-q", "-m", "track the hook config")
+    tree = claude.skill_tree
+    _track_house_skill(repo, tree)
     wt = tmp_path / "wt"
     verify.worktree_add(repo, wt, "feat", "main")
 
@@ -3329,14 +3386,259 @@ def test_shield_keeps_patterns_when_tracked_probe_fails(project, tmp_path, monke
     def boom(_repo, _rel):
         raise verify.GitError("ls-files timed out")
 
-    monkeypatch.setattr(wtf.verify, "path_tracked_file", boom)
+    monkeypatch.setattr(wtf.verify, "path_tracked_kind", boom)
     msgs: list[str] = []
 
     provision_worktree(wt, [claude], repo, on_degraded=msgs.append)
 
     exclude = _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
-    assert f"/{hook_rel}" in exclude
+    assert f"/{tree}" in exclude
+    assert not [ln for ln in exclude if ln.startswith(f"/{tree}/")]
     assert any("could not check whether these paths are tracked" in m for m in msgs)
+
+
+def test_shield_tracked_dir_with_nothing_landed_drops_cleanly(project, tmp_path):
+    """A TRACKED tool directory that received nothing gets no pattern at all — not the
+    dir pattern, and no per-file substitutes either. There is nothing of OURS below it
+    to shield, so the shield has nothing to say about it, and saying it anyway is the
+    #484 false report for free.
+
+    Pre-copying every wheel MODULE_SKILL into the repo and committing is what makes
+    provisioning a total no-op there: copy-when-absent skips each destination one at a
+    time, so `written` records nothing under the tree.
+
+    Ablation: restore `kept.add(pattern)` in the `"dir"` branch — the `-ci` assertions
+    redden, on the wheel skills the project now tracks itself."""
+    from importlib import resources
+
+    repo = project.project
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    wheel = resources.files("bmad_loop.data").joinpath("skills")
+    for skill in MODULE_SKILLS:
+        _copy_traversable(wheel.joinpath(skill), repo / tree / skill)
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "the project tracks the wheel skills itself")
+    assert verify.path_tracked(repo, tree)
+    assert not verify.path_tracked_file(repo, tree)
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    provision_worktree(wt, [claude], repo)
+
+    exclude = _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
+    assert git(wt, "ls-files", "-ci", "--exclude-standard") == ""
+    assert git(repo, "ls-files", "-ci", "--exclude-standard") == ""
+    assert f"/{tree}" not in exclude
+    assert not [ln for ln in exclude if ln.startswith(f"/{tree}/")]
+
+
+def test_shield_untracked_skill_tree_keeps_dir_pattern_without_per_file_noise(project, tmp_path):
+    """An UNTRACKED tool directory keeps the ambient `/dir` pattern and gains nothing
+    else: substitution is the TRACKED branch's answer only. Byte-identical behavior to
+    before #484, which is half the decision — full protection is still available and is
+    still what an untracked tree gets, including for files the SESSION creates later.
+
+    The guard is against over-application: substituting here too would work (every
+    file we wrote would still be shielded) while quietly surrendering new-child
+    coverage for a tree that had no reason to give it up, and no `-ci` assertion
+    anywhere would notice, because an untracked tree has no tracked child to report.
+
+    Ablation: add the `"dir"` branch's substitution line to the `"untracked"` branch
+    too, alongside its `kept.add(pattern)` — the no-per-file-lines assertion reddens as
+    the wheel skills' own lines appear."""
+    repo = project.project
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    assert not verify.path_tracked(repo, tree)
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    provision_worktree(wt, [claude], repo)
+
+    exclude = _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
+    assert f"/{tree}" in exclude
+    assert not [ln for ln in exclude if ln.startswith(f"/{tree}/")]
+    git(wt, "add", "-A")
+    staged = git(wt, "diff", "--cached", "--name-only").splitlines()
+    assert not [p for p in staged if p.startswith(f"{tree}/")]
+
+
+def test_shield_tracked_bmad_keeps_render_carve_out(project, tmp_path):
+    """`_bmad` reaches #484's outcome by a different road, and the render carve-out has
+    to survive the trip. `_seed_bmad_tree` already collapses to the root ONLY when the
+    root was absent before seeding, so a tracked `_bmad` contributes per-file rels and
+    `f"/{BMAD_DIR}"` never enters `patterns` at all — the substitution branch is never
+    reached for it, and cannot be: a fresh checkout materializes every tracked path, so
+    "root absent AND tracked" does not arise.
+
+    What that means for the carve-out at the construction site: with no root pattern to
+    subsume it, `/{RENDER_DIR_REL}/` must still be added, or the renderer's generated
+    output — written AFTER provisioning returns — rides the unit's `git add -A`.
+
+    Ablation: drop the `if f"/{BMAD_DIR}" not in patterns` guard's body — the
+    `/{RENDER_DIR_REL}/` assertion reddens."""
+    repo = project.project
+    claude = get_profile("claude")
+    custom = repo / BMAD_DIR / "custom"
+    custom.mkdir(parents=True, exist_ok=True)
+    (custom / "x.toml").write_text("x = 1\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "track the bmad tree")
+    # Untracked, so the checkout does not carry it and the seed really lands it.
+    (custom / "local.toml").write_text("local = true\n", encoding="utf-8")
+    assert verify.path_tracked(repo, BMAD_DIR)
+    assert not verify.path_tracked_file(repo, BMAD_DIR)
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    provision_worktree(wt, [claude], repo)
+
+    exclude = _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
+    assert f"/{BMAD_DIR}" not in exclude
+    assert f"/{BMAD_DIR}/custom/local.toml" in exclude
+    assert f"/{RENDER_DIR_REL}/" in exclude
+    git(wt, "add", "-A")
+    staged = git(wt, "diff", "--cached", "--name-only").splitlines()
+    assert not [p for p in staged if p.startswith(f"{BMAD_DIR}/")]
+    assert git(wt, "ls-files", "-ci", "--exclude-standard") == ""
+    assert git(repo, "ls-files", "-ci", "--exclude-standard") == ""
+
+
+def test_shield_substituted_pattern_survives_gitignore_specials(project, tmp_path):
+    """#476's escaping and #484's substitution have to compose, and only their product
+    is exercised here: the substituted rels are new patterns that never existed before
+    this phase, and they reach the renderer by a path no #476 test walks.
+
+    Both harm directions live in one file name. Unescaped, `/{tree}/weird[1].md` is a
+    wildmatch class over `1`, so it shields nothing it names (the file we wrote leaks
+    into the story commit) while hiding neighbours it does not name. The escape at the
+    render is what makes the line mean the literal path — asked of git itself, since
+    the property under test is git's reading of the line, not its bytes.
+
+    Ablation: delete the `_escape_exclude_pattern` call at the render — the `add -A`
+    assertion reddens on the leaked file, and `check-ignore` answers rc 1 for the
+    literal name behind it."""
+    repo = project.project
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    _track_house_skill(repo, tree)
+    # Untracked in the main repo, so the checkout does not carry it and the seed entry
+    # (the tree itself, partially present) really copies it in.
+    weird = "weird[1].md"
+    (repo / tree / weird).write_text("# specials\n", encoding="utf-8")
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    provision_worktree(wt, [claude], repo, seed_files=[tree])
+
+    assert (wt / tree / weird).is_file()
+    exclude = _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
+    git(wt, "add", "-A")
+    staged = git(wt, "diff", "--cached", "--name-only").splitlines()
+    assert not [p for p in staged if p.startswith(f"{tree}/")]
+    # git's own reading of the substituted line, for the LITERAL name.
+    assert verify.git_bytes(wt, "check-ignore", "--", f"{tree}/{weird}").returncode == 0
+    # ...and the line it read.
+    assert f"/{tree}/weird\\[1].md" in exclude
+
+
+def test_shield_tracked_tree_hookless_profile_substitutes(project, tmp_path):
+    """Substitution over a tracked tree for a HOOKLESS profile (the opencode shape),
+    which has no `config_path` to contribute. The interplay worth pinning is with the
+    empty-rel carve-out: the reconcile loop keeps a pattern whose rel is empty rather
+    than probing it, so a profile that contributes no config must not come out of this
+    step having gained a bare `/` line — and must still get its per-file substitutes.
+
+    Ablation: drop the `if not p.hookless` filter at the pattern-construction site —
+    the empty `config_path` renders as a bare `/` and the first assertion reddens.
+    (Ablating the reconcile loop's `not rel` carve-out instead is NOT the honest
+    mutation: `ls-files` answers an empty pathspec with the whole index, so the pattern
+    would read as a tracked dir and be substituted away — a different bug, and this
+    test would still pass.)"""
+    repo = project.project
+    opencode = get_profile("opencode")
+    assert opencode.hookless and not opencode.hooks.config_path
+    tree = opencode.skill_tree
+    _track_house_skill(repo, tree)
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    provision_worktree(wt, [opencode], repo)
+
+    exclude = _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
+    assert "/" not in exclude
+    assert f"/{tree}" not in exclude
+    assert f"/{tree}/{MODULE_SKILLS[0]}/SKILL.md" in exclude
+    git(wt, "add", "-A")
+    staged = git(wt, "diff", "--cached", "--name-only").splitlines()
+    assert not [p for p in staged if p.startswith(f"{tree}/")]
+
+
+def test_shield_reprovision_tracked_tree_appends_no_duplicates(project, tmp_path):
+    """Re-provisioning the same worktree must leave the private exclude byte-identical
+    with substitution in play too. The second run lands nothing (copy-when-absent finds
+    every wheel skill present), so `written` is EMPTY and it offers no per-file pattern
+    at all — the first run's lines survive only because `_worktree_local_exclude` is
+    append-only, which is exactly the documented residue behavior read from the
+    harmless direction.
+
+    Re-provisioning the same worktree is a real arc, not a hypothetical: an
+    unparseable seeded hook config raises mid-loop, and the resume after that
+    escalation runs provisioning again over the paths already laid down (the
+    reasoning is recorded at `worktree_flow.py`'s hook-config `except`). Companion to
+    `test_shield_reprovision_does_not_duplicate_patterns`, which pins the same property
+    over the UNTRACKED tree's stable pattern set."""
+    repo = project.project
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    _track_house_skill(repo, tree)
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    msgs: list[str] = []
+
+    provision_worktree(wt, [claude], repo, on_degraded=msgs.append)
+    first = _wt_private_exclude(wt).read_bytes()
+    provision_worktree(wt, [claude], repo, on_degraded=msgs.append)
+
+    assert msgs == []
+    assert _wt_private_exclude(wt).read_bytes() == first
+    lines = first.decode("utf-8").splitlines()
+    per_file = [ln for ln in lines if ln.startswith(f"/{tree}/")]
+    assert per_file and len(set(per_file)) == len(per_file)
+    assert len(set(lines)) == len(lines)
+
+
+def test_shield_tracked_tree_session_created_file_is_staged(project, tmp_path):
+    """THE ACCEPTED RESIDUAL, pinned so nobody "fixes" it back to a dir pattern.
+
+    Maintainer decision on #484 (2026-08-08): a file the SESSION creates under a
+    TRACKED tool directory can be staged. That is the price of clearing the false
+    tracked-and-ignored report, and it is deliberate — it matches the project's own
+    decision to TRACK that tree, and everything the ORCHESTRATOR put there still has a
+    pattern of its own (pinned by
+    `test_shield_tracked_skill_tree_substitutes_per_file_patterns`).
+
+    Green-ablation record, not a guard: restoring `kept.add(pattern)` in the `"dir"`
+    branch makes this test FAIL — which is the point. It fails on a change that is
+    otherwise invisible except through `-ci`, so it is the line that forces the
+    reviewer back to the decision instead of letting the wide pattern quietly return.
+    Under the UNTRACKED tree the same file is hidden, which is
+    `test_shield_untracked_skill_tree_keeps_dir_pattern_without_per_file_noise`'s
+    `add -A` row."""
+    repo = project.project
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    _track_house_skill(repo, tree)
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    provision_worktree(wt, [claude], repo)
+    (wt / tree / "house-skill" / "SESSION-WROTE-THIS.md").write_text("# new\n", encoding="utf-8")
+
+    git(wt, "add", "-A")
+    staged = git(wt, "diff", "--cached", "--name-only").splitlines()
+    assert f"{tree}/house-skill/SESSION-WROTE-THIS.md" in staged
 
 
 def test_missing_stories_support_findings_split_absent_from_stale(tmp_path):
@@ -4038,20 +4340,22 @@ def test_shield_ordinary_patterns_render_byte_identical(project, tmp_path):
     ordinary rel carries no wildmatch special and no trailing space, so its line is
     byte-identical to the pre-escape spelling. Pinned because the escape runs over
     EVERY pattern — a renderer that also quoted `.`, `/` or `-` would silently stop
-    shielding the tool dirs the whole mechanism exists for, and no other shield test
-    would notice.
+    shielding the tool dirs the whole mechanism exists for.
 
     Compared against the file's tail rather than by containment: the writer is
     append-only and sorts what it adds, so the shield's own lines are exactly the last
-    three, which keeps this exact even where an operator's inherited excludes ride in
-    the prefix.
+    three. Still exact after #484 — substitution replaces a tracked tool directory's
+    pattern with per-file ones, and this fixture's tree is UNTRACKED, so the count is
+    unchanged.
 
     INVERSE ablation: deleting the escape cannot redden this — that is the property.
     Add `"."` to `_escape_exclude_pattern`'s specials tuple instead and all three lines
-    move to their `/\\.claude...` spellings, reddening here and on the neighbour test's
-    mechanism row (its pattern carries a `.` too) while every HARM row above stays
-    green: `\\.` still matches a literal dot, so the over-escaped shield goes on
-    shielding. Only this test sees the over-reach."""
+    move to their `/\\.claude...` spellings, reddening here while every HARM row above
+    stays green: `\\.` still matches a literal dot, so the over-escaped shield goes on
+    shielding. This test remains the only one whose SUBJECT is the over-reach, but it
+    is no longer the only witness — since #484 the substituted per-file patterns are
+    compared by raw spelling too, so the same mutation reddens most of the tracked-tree
+    tests as collateral."""
     repo = project.project
     claude = get_profile("claude")
     wt = tmp_path / "wt"
@@ -8440,14 +8744,47 @@ def test_seed_bmad_tree_merges_per_file_and_excludes_render_output(tmp_path):
     carried.parent.mkdir(parents=True)
     carried.write_text("[checkout]\n", encoding="utf-8")
 
-    seeded = _seed_bmad_tree(wt, repo)
+    shield_rels, written = _seed_bmad_tree(wt, repo)
 
     assert carried.read_text(encoding="utf-8") == "[checkout]\n"
     assert (wt / BMAD_SCRIPTS_SEED_REL / "render_skill.py").is_file()
     assert (wt / BMAD_DIR / "custom" / "style.toml").is_file()
     assert not (wt / RENDER_DIR_REL).exists()
-    assert seeded == [
+    landed = [
         f"{BMAD_DIR}/custom/style.toml",
+        f"{BMAD_SCRIPTS_SEED_REL}/config_utils.py",
+        f"{BMAD_SCRIPTS_SEED_REL}/render_skill.py",
+    ]
+    # The root PRE-EXISTED here (the checkout carries `carried`), so there is no
+    # collapse and both halves read the same. The half that always stays per-file is
+    # pinned where they differ, in the test below.
+    assert shield_rels == landed
+    assert written == landed
+
+
+def test_seed_bmad_tree_collapses_the_shield_rel_but_keeps_written_per_file(tmp_path):
+    """The two halves diverge exactly when the `_bmad` root was ABSENT before seeding:
+    the shield rel collapses to the root (one pattern covers a tree that is wholly
+    ours) while `written` stays per-file.
+
+    That second half is load-bearing since #484: if the tool directory turns out to be
+    TRACKED, the shield drops the whole-dir pattern and substitutes patterns for the
+    files this run wrote — a question the collapsed rel cannot answer. Returning the
+    collapse twice would silently shield nothing there.
+
+    (The pairing is belt-and-braces: a fresh worktree checkout materializes every
+    tracked path, so "root absent AND tracked" cannot actually arise. The contract is
+    pinned anyway, because the caller reads the two halves for different purposes.)"""
+    repo, wt = tmp_path / "repo", tmp_path / "wt"
+    _write_worktree_renderer_surface(repo)
+    wt.mkdir()
+
+    shield_rels, written = _seed_bmad_tree(wt, repo)
+
+    assert (wt / BMAD_DIR).is_dir()  # absent before the call; the seed created it
+    assert shield_rels == [BMAD_DIR]
+    assert written == [
+        CENTRAL_CONFIG_REL,
         f"{BMAD_SCRIPTS_SEED_REL}/config_utils.py",
         f"{BMAD_SCRIPTS_SEED_REL}/render_skill.py",
     ]
