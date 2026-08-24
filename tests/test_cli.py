@@ -9234,8 +9234,15 @@ def test_sweep_archive_missing_ledger_named(project, capsys):
 
 def test_sweep_archive_refuses_while_run_live(project, monkeypatch, capsys):
     """The out-of-band ledger writer refuses when any engine run is live —
-    a concurrent close between its read and writes would be lost (#706 pass 2)."""
+    a concurrent close between its read and writes would be lost (#706 pass 2).
+
+    "Nothing written" is asserted as byte equality plus an absent archive, not
+    as `"DW-2" in text`: archiving DW-2 *keeps* its heading in the ledger by
+    design, so the id-presence form passes just as well when the refusal never
+    happened (#711 review)."""
     from conftest import write_ledger
+
+    from bmad_loop import deferredwork
 
     install_bmad_config(project)
     write_ledger(project, {"DW-1": "open", "DW-2": "done 2026-06-01"}, commit=False)
@@ -9243,10 +9250,12 @@ def test_sweep_archive_refuses_while_run_live(project, monkeypatch, capsys):
     run_dir.mkdir(parents=True)
     (run_dir / "state.json").write_text("{}", encoding="utf-8")
     monkeypatch.setattr(cli.runs, "engine_liveness", lambda _dir: "alive")
+    before = project.deferred_work.read_text(encoding="utf-8")
     rc = cli.main(["sweep", "--archive", "--project", str(project.project)])
     assert rc == 1
     assert "may still be live" in capsys.readouterr().err
-    assert "DW-2" in project.deferred_work.read_text(encoding="utf-8")  # nothing written
+    assert not (project.deferred_work.parent / deferredwork.ARCHIVE_REL).exists()
+    assert project.deferred_work.read_text(encoding="utf-8") == before
 
 
 def test_sweep_archive_refuses_on_unknown_liveness(project, monkeypatch, capsys):
@@ -9254,13 +9263,103 @@ def test_sweep_archive_refuses_on_unknown_liveness(project, monkeypatch, capsys)
     must not run over a run it cannot prove is dead (#711 review)."""
     from conftest import write_ledger
 
+    from bmad_loop import deferredwork
+
     install_bmad_config(project)
     write_ledger(project, {"DW-1": "open", "DW-2": "done 2026-06-01"}, commit=False)
     run_dir = project.project / ".bmad-loop" / "runs" / "20260824-100000-aaaa"
     run_dir.mkdir(parents=True)
     (run_dir / "state.json").write_text("{}", encoding="utf-8")
     monkeypatch.setattr(cli.runs, "engine_liveness", lambda _dir: "unknown")
+    before = project.deferred_work.read_text(encoding="utf-8")
     rc = cli.main(["sweep", "--archive", "--project", str(project.project)])
     assert rc == 1
     assert "may still be live" in capsys.readouterr().err
-    assert "DW-2" in project.deferred_work.read_text(encoding="utf-8")  # ledger unchanged
+    assert not (project.deferred_work.parent / deferredwork.ARCHIVE_REL).exists()
+    assert project.deferred_work.read_text(encoding="utf-8") == before  # ledger unchanged
+
+
+def test_sweep_archive_refuses_run_dir_without_state_json(project, monkeypatch, capsys):
+    """A run whose state.json was removed still owns its `engine.pid` — and its
+    ledger writes. `runs.list_run_dirs` is state.json-gated (it answers "which
+    runs can I resume"), so a guard built on it walks past exactly the run an
+    operator is mid-recovery on and archives out from under it (#711 review).
+
+    Ablation: restore `runs.list_run_dirs` in `_sweep_archive` and this fails —
+    the archive proceeds and returns 0 with a live engine beside it."""
+    from conftest import write_ledger
+
+    from bmad_loop import deferredwork
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open", "DW-2": "done 2026-06-01"}, commit=False)
+    run_dir = project.project / ".bmad-loop" / "runs" / "20260824-100000-aaaa"
+    run_dir.mkdir(parents=True)
+    (run_dir / "engine.pid").write_text("4242", encoding="utf-8")  # live, but no state.json
+    monkeypatch.setattr(cli.runs, "engine_liveness", lambda _dir: "alive")
+    before = project.deferred_work.read_text(encoding="utf-8")
+
+    rc = cli.main(["sweep", "--archive", "--project", str(project.project)])
+    assert rc == 1
+    assert "may still be live" in capsys.readouterr().err
+    assert not (project.deferred_work.parent / deferredwork.ARCHIVE_REL).exists()
+    assert project.deferred_work.read_text(encoding="utf-8") == before
+
+
+def test_sweep_archive_proceeds_when_runs_are_dead(project, monkeypatch, capsys):
+    """The allow direction of the liveness gate: a run dir whose engine is dead
+    is not a reason to refuse, and the archive runs to completion.
+
+    Without this the three refusal tests are satisfied by a gate that refuses
+    unconditionally — every one of them would still pass (#711 review)."""
+    from conftest import write_ledger
+
+    from bmad_loop import deferredwork
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open", "DW-2": "done 2026-06-01"}, commit=False)
+    run_dir = project.project / ".bmad-loop" / "runs" / "20260824-100000-aaaa"
+    run_dir.mkdir(parents=True)
+    (run_dir / "state.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(cli.runs, "engine_liveness", lambda _dir: "dead")
+
+    rc = cli.main(["sweep", "--archive", "--project", str(project.project)])
+    assert rc == 0
+    assert "archived 1 entry" in capsys.readouterr().out
+    archive = project.deferred_work.parent / deferredwork.ARCHIVE_REL
+    assert archive.is_file()
+    assert "### DW-2:" in archive.read_text(encoding="utf-8")
+
+
+def test_sweep_archive_refuses_when_runs_dir_unreadable(project, capsys):
+    """An unreadable runs root answers nothing about liveness, and this write op
+    takes the conservative side — the same doctrine as an unverifiable pid.
+
+    A plain file where the runs dir belongs is the portable way to make the
+    listing fail: `os.scandir` raises `NotADirectoryError` (an `OSError`, not a
+    `FileNotFoundError`), which is the "learned nothing" arm of `_run_dir_names`
+    rather than its "no runs" arm.
+
+    Two ablation axes, and they redden different lines. Drop the `run_dirs is
+    None` arm and the message assert fails: iterating `None` raises, the CLI's
+    top-level handler still returns 1, and the operator is told `'NoneType'
+    object is not iterable` instead of what refused. Restore the
+    `state.json`-gated `runs.list_run_dirs` and the rc assert fails: a file
+    where the runs dir belongs is simply not a dir, so it lists nothing and the
+    archive proceeds."""
+    from conftest import write_ledger
+
+    from bmad_loop import deferredwork
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open", "DW-2": "done 2026-06-01"}, commit=False)
+    runs_root = project.project / ".bmad-loop" / "runs"
+    runs_root.parent.mkdir(parents=True, exist_ok=True)
+    runs_root.write_text("not a directory", encoding="utf-8")
+    before = project.deferred_work.read_text(encoding="utf-8")
+
+    rc = cli.main(["sweep", "--archive", "--project", str(project.project)])
+    assert rc == 1
+    assert "cannot list runs under" in capsys.readouterr().err
+    assert not (project.deferred_work.parent / deferredwork.ARCHIVE_REL).exists()
+    assert project.deferred_work.read_text(encoding="utf-8") == before

@@ -143,6 +143,28 @@ def list_run_dirs(project: Path) -> list[Path]:
     return sorted(d for d in runs.iterdir() if (d / "state.json").is_file())
 
 
+def all_run_dirs(project: Path) -> list[Path] | None:
+    """Every run dir under the runs root — ``state.json`` or not — oldest first,
+    or ``None`` when the listing could not be taken.
+
+    The ungated counterpart to :func:`list_run_dirs`, and the one to ask when the
+    question is "does a run still own its control plane" rather than "which runs
+    can I read". A run whose state.json was removed or corrupted still holds a
+    live ``engine.pid``, so the gated view walks straight past exactly the run an
+    operator is mid-recovery on — the hazard :func:`_run_dir_names` documents,
+    whose set this wraps rather than re-listing.
+
+    ``None`` is an unreadable runs root and means *nothing was learned*, which is
+    not the same answer as the empty list a missing root gives. Callers that act
+    on "no live runs" have to tell those apart; see :func:`_run_dir_names`.
+    """
+    names = _run_dir_names(project)
+    if names is None:
+        return None
+    root = project / RUNS_DIR
+    return sorted(root / name for name in names)
+
+
 def latest_run_dir(project: Path) -> Path | None:
     candidates = list_run_dirs(project)
     return candidates[-1] if candidates else None

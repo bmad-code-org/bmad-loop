@@ -3013,3 +3013,41 @@ def test_archive_tab_resolution_stub_converges(tmp_path):
     archive_text = (path.parent / ARCHIVE_REL).read_text(encoding="utf-8")
     assert archive_text.count("### DW-1:") == 1
     assert "archived: 2026-08-25" not in archive_text
+
+
+def test_archive_fenced_archived_line_in_twin_does_not_suppress(tmp_path):
+    """An archive entry whose ONLY `archived:` line sits inside a fenced example
+    is not an archived twin — the crash-recovery skip reads the field through the
+    fence filter, so the live entry is archived rather than stubbed over its own
+    body (#711 review, finding 5).
+
+    The twin's body is byte-identical to the ledger entry's, which is what makes
+    this test decide the fence filter and nothing else. Body equivalence is the
+    other half of the skip, and it is satisfied here in BOTH directions: with the
+    filter ablated the same fenced line is stripped from both sides, so the
+    bodies still compare equal and only `_is_archived` changes its answer.
+
+    Ablation: drop the `_quoted` guard from `_archived_line_spans` and the count
+    below reads 1 — the fenced example reads as a real stamp and the body never
+    reaches the archive."""
+    entry = (
+        "### DW-2: documents the archive field\n\n"
+        "origin: code review of spec-1-1.md, 2026-05-20\n"
+        "location: src/foo.py:10\n"
+        "reason: pre-existing.\n"
+        "```markdown\n"
+        "archived: 2026-01-01\n"
+        "```\n"
+        "status: done 2026-05-25\n"
+    )
+    path = write_ledger(tmp_path, "# Deferred Work\n\n" + entry)
+    archive_path = path.parent / ARCHIVE_REL
+    archive_path.write_text("# Archived Deferred Work\n\n" + entry, encoding="utf-8")
+
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-2"]
+    archive_text = archive_path.read_text(encoding="utf-8")
+    assert archive_text.count("### DW-2:") == 2  # the quoted stamp suppressed nothing
+    assert archive_text.count("archived: 2026-08-24") == 1  # the real stamp, once
+    # ...and the body left the ledger for the archive rather than being dropped.
+    stub = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}["DW-2"]
+    assert "reason: pre-existing." not in stub.body

@@ -2274,8 +2274,22 @@ def _sweep_archive(project: Path, paths: bmadconfig.ProjectPaths, args: argparse
     so: this is the one out-of-band ledger writer, and a concurrent close or
     harvest landing between its read and its writes would be silently
     clobbered. An unverifiable pid is treated as live — a write op takes the
-    conservative side, unlike the cleanup guards which only warn."""
-    for run_dir in runs.list_run_dirs(project):
+    conservative side, unlike the cleanup guards which only warn.
+
+    Run dirs are enumerated raw (:func:`runs.all_run_dirs`) rather than through
+    the ``state.json``-gated :func:`runs.list_run_dirs`: a run whose state file
+    was removed still owns its ``engine.pid`` and still writes this ledger, and
+    the gated view would report it as no run at all. An unreadable runs root
+    answers nothing, so it refuses too — same conservative side."""
+    run_dirs = runs.all_run_dirs(project)
+    if run_dirs is None:
+        print(
+            f"cannot list runs under {project / runs.RUNS_DIR} — "
+            "refusing to archive ledger entries",
+            file=sys.stderr,
+        )
+        return ExitCode.FAILURE
+    for run_dir in run_dirs:
         if runs.engine_liveness(run_dir) != "dead":
             print(
                 f"run {run_dir.name} may still be live — stop it before archiving ledger entries",
