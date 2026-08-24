@@ -9,18 +9,12 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
-- **psmux: a differently-named session's attached-client count can no longer vouch for a hand-back (#671).**
-  A `-t <session>` read resolves through that name's port and key files, and psmux does not check
-  that the server behind them owns the name — so a duplicated registry entry answers at exit 0 with
-  a real count belonging to a session nobody asked about. Since #659 that count also gates a targeted
-  `switch-client`, where a borrowed nonzero count would vouch for a switch that moved nobody:
-  `return_attached_client` reported `RETURNED` and cleared the return option for a human still
-  sitting where they were. The probe now asks for the session name alongside the count and refuses
-  any answer that names a different session; a `:`-bearing or empty session name is refused before
-  the spawn, the rule the module's other target-composing callers already applied. Names that
-  collide — a foreign server whose session carries the same name, or one differing only in
-  surrounding whitespace, which the seam normalizes away — are not separable by a name and remain
-  #531's subject.
+- Refuse a psmux attached-client count whose answer names a different session, so a duplicated
+  registry entry can no longer vouch for a `switch-client` that moved nobody — which
+  `return_attached_client` reported as `RETURNED`, clearing the return option for a human still
+  sitting there. Also refuse an empty or `:`-bearing session name before the probe spawns. A
+  same-named session on a foreign server, and one differing only by whitespace the seam
+  normalizes away, stay #531's subject (#671)
 
 ## [0.11.1] — 2026-08-23
 
