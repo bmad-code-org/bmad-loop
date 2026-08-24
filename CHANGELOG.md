@@ -7,6 +7,16 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Added
+
+- **Atomic writers gain an opt-in `require_writable_target` refusal** (#597). `os.replace` needs
+  write permission on the parent _directory_, not on the file it replaces, so a temp-and-replace
+  write silently overwrote a target an operator had marked read-only — and, where it inherits mode,
+  restored the `0444` afterwards, leaving nothing in the permission bits to record the change.
+  Callers over operator-curated files can now ask for the `PermissionError` a plain
+  `Path.write_text` used to raise. Off by default: what the other callers do today is a
+  compatibility contract.
+
 ### Changed
 
 - **A published run archive now lands at mode `0600`** instead of a umask-derived mode (#591).
@@ -22,6 +32,15 @@ breaking changes may land in a minor release.
   no-follow guard, and a loser of the race now raises `FileExistsError` before the `try` it
   would have cleaned up from. The staged tarball is also `fsync`ed before publish, since the
   run dir it came from is removed immediately after.
+- **Confined atomic writers anchor a file's parent with a directory descriptor instead of
+  resolving it by name** (#593). `follow_symlinks=False` refuses a link planted at the file
+  itself, but the staging and the publish still looked every directory above it up by name, so a
+  link planted at `.bmad-loop/` redirected both and the no-follow bought nothing —
+  `mkdir(parents=True, exist_ok=True)` accepts a symlinked directory, so a planted parent survived
+  the setup step too. `atomic_write_text_confined` and `atomic_write_bytes_confined` walk the
+  components `O_NOFOLLOW` and write through the descriptor that walk produced, which a later swap
+  of any name no longer reaches. Windows has no `*at()` family and degrades to the documented
+  check-then-write. A refusal raises `UnconfinedWriteError`, an `OSError`.
 
 ## [0.11.1] — 2026-08-23
 

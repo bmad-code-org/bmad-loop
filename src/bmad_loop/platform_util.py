@@ -367,7 +367,13 @@ def neutralize_surrogates(text: str) -> str:
     return _SURROGATES_RE.sub("�", text)
 
 
-def atomic_write_text(path: Path, text: str, *, follow_symlinks: bool = True) -> None:
+def atomic_write_text(
+    path: Path,
+    text: str,
+    *,
+    follow_symlinks: bool = True,
+    require_writable_target: bool = False,
+) -> None:
     """Replace ``path``'s contents with ``text`` atomically, preserving what the
     replacement would otherwise silently discard.
 
@@ -410,14 +416,35 @@ def atomic_write_text(path: Path, text: str, *, follow_symlinks: bool = True) ->
     would make the *rename* durable, and losing the rename just leaves the old
     contents in place — stale, never corrupt.
 
+    ``require_writable_target=True`` refuses the write when the target already
+    exists and the kernel will not open it for writing — the property a
+    temp-and-replace write otherwise loses, because ``os.replace`` needs write
+    permission on the *directory* and never opens the entry it replaces (#597).
+    Off by default: that is the behavior every caller has today, and turning it on
+    for all of them would refuse writes that currently succeed. See
+    :func:`_refuse_unwritable_target` for what the probe does and does not promise.
+
     The bytes sibling is :func:`atomic_write_bytes`; the two share every property
     above and differ only in the ``os.fdopen`` mode. Text mode's *newline*
     default (translating) is deliberate here — it matches the ``Path.write_text``
     this replaced, so a ledger's line endings do not change under Windows."""
-    _atomic_write(path, text, mode="w", encoding="utf-8", follow_symlinks=follow_symlinks)
+    _atomic_write(
+        path,
+        text,
+        mode="w",
+        encoding="utf-8",
+        follow_symlinks=follow_symlinks,
+        require_writable_target=require_writable_target,
+    )
 
 
-def atomic_write_bytes(path: Path, data: bytes, *, follow_symlinks: bool = True) -> None:
+def atomic_write_bytes(
+    path: Path,
+    data: bytes,
+    *,
+    follow_symlinks: bool = True,
+    require_writable_target: bool = False,
+) -> None:
     """Replace ``path``'s contents with ``data`` atomically — the byte-exact
     sibling of :func:`atomic_write_text`, whose docstring carries the shared
     contract (mode and xattrs preserved when the target already exists and
@@ -442,8 +469,17 @@ def atomic_write_bytes(path: Path, data: bytes, *, follow_symlinks: bool = True)
     round trip. Callers handling filesystem-derived content want this variant — a
     POSIX filename is arbitrary bytes, and an operator's git exclude file may be
     in any legacy encoding at all — as do callers who read bytes to preserve a
-    file's existing line endings (``policy.write_mux_backend``)."""
-    _atomic_write(path, data, mode="wb", encoding=None, follow_symlinks=follow_symlinks)
+    file's existing line endings (``policy.write_mux_backend``).
+
+    ``require_writable_target`` behaves exactly as it does in the text sibling."""
+    _atomic_write(
+        path,
+        data,
+        mode="wb",
+        encoding=None,
+        follow_symlinks=follow_symlinks,
+        require_writable_target=require_writable_target,
+    )
 
 
 def _is_name_too_long(exc: OSError) -> bool:
@@ -528,6 +564,56 @@ def _mkstemp_beside(target: Path) -> tuple[int, str]:
     return tempfile.mkstemp(dir=directory, prefix=rungs[-1], suffix=".tmp")
 
 
+def _refuse_unwritable_target(target: Path, *, follow_symlinks: bool) -> None:
+    """Re-raise the kernel's own ``PermissionError`` when ``target`` exists and
+    will not open for writing — the opt-in half of ``require_writable_target``.
+
+    A temp-and-replace write never opens the file it replaces, and ``os.replace``
+    needs write permission on the *directory*, not on the entry being replaced. So
+    a file an operator marked ``0444`` is overwritten anyway — and where mode is
+    inherited (``follow_symlinks=True``) it comes back reading ``0444``, with
+    nothing in the permission bits recording that it changed. Every writer here
+    that once spelled ``Path.write_text`` refused that write as a side effect of
+    opening the file; going atomic dropped the refusal silently (#597). This asks
+    for it back, per caller, over the files an operator actually curates.
+
+    An actual ``os.open``, not ``os.access``: access(2) answers for the REAL uid
+    and only approximates ACLs, while the open is the kernel's answer under the
+    same credentials the write will use, and reproduces the exact error the direct
+    write used to raise. On win32 a READONLY file denies ``O_WRONLY`` with
+    ``ERROR_ACCESS_DENIED``, which arrives as ``PermissionError``, so this arm is
+    real on both platforms rather than POSIX-only.
+
+    Three cases are deliberately NOT refusals, and all three simply return:
+
+    * **A missing target.** There is nothing to refuse — the write creates it, and
+      creation is what the flagged callers do on first run.
+    * **``ELOOP``**, i.e. a symlink at the name on the no-follow path. That write
+      replaces the NAME whatever it points at, on purpose, and a plantable link's
+      target mode is the planter's choice as much as anyone's (see
+      :func:`_atomic_write`). Win32 has no ``O_NOFOLLOW`` to raise ``ELOOP`` with,
+      so the same case is caught there by the :func:`is_link_like` pre-check below.
+    * **Any other ``OSError``** — a directory at the name, a full disk, a
+      disconnected share. Refusing here would replace the write's own, more
+      accurate error with a permission story that is not what happened.
+
+    This honours an operator's stated intent; it is NOT a boundary against a
+    same-uid writer. The answer is stale the moment it returns — a ``chmod``
+    between probe and replace still lands the write — and whoever can chmod the
+    file back can defeat it outright. :func:`_atomic_write` runs it BEFORE
+    ``_mkstemp_beside``, so a refusal stages nothing."""
+    no_follow = getattr(os, "O_NOFOLLOW", 0)  # POSIX-only; win32 cannot ask
+    if not follow_symlinks and not no_follow and is_link_like(target):
+        return  # win32: no O_NOFOLLOW, so the probe would read through the link
+    try:
+        fd = os.open(target, os.O_WRONLY | (0 if follow_symlinks else no_follow))
+    except PermissionError:
+        raise  # the refusal this flag exists for
+    except OSError:
+        return  # missing, a link at the name, or something the write itself reports
+    os.close(fd)
+
+
 def _atomic_write(
     path: Path,
     payload: str | bytes,
@@ -535,6 +621,7 @@ def _atomic_write(
     mode: str,
     encoding: str | None,
     follow_symlinks: bool = True,
+    require_writable_target: bool = False,
 ) -> None:
     """The shared body of the two public helpers above — see
     :func:`atomic_write_text` for the contract every step here implements.
@@ -561,8 +648,15 @@ def _atomic_write(
     the planter's choosing (the contents stay safe; ``os.replace`` still does not
     dereference). Taking no probe leaves no window to race, and ``mkstemp``'s
     private ``0600`` is the right mode for the machine-minted file this mode
-    exists for."""
+    exists for.
+
+    ``require_writable_target=True`` inserts :func:`_refuse_unwritable_target`
+    between the resolve and the staging, in that order on purpose: a refusal then
+    stages nothing, so a caller that declines to overwrite a read-only file also
+    leaves no temp behind to explain."""
     target = path.resolve() if follow_symlinks else path
+    if require_writable_target:
+        _refuse_unwritable_target(target, follow_symlinks=follow_symlinks)
     fd, tmp_name = _mkstemp_beside(target)
     tmp = Path(tmp_name)
     try:
@@ -632,6 +726,76 @@ def is_link_like(path: Path) -> bool:
         return getattr(os.lstat(path), "st_reparse_tag", 0) in _LINK_REPARSE_TAGS
     except OSError:
         return False
+
+
+class UnconfinedWriteError(OSError):
+    """A confined write refused: the path is not under its root, or a component
+    below that root is a link, is missing, or cannot be probed.
+
+    An ``OSError`` subclass on purpose. Every site that adopts a confined writer
+    already degrades on ``OSError`` from the same call — ``runs.stop_run``
+    swallows a failed stop-request write, the engine journals a failed park
+    rollback, the settings screen reports a failed save — so a refusal arrives in
+    the handling those callers already have rather than escaping as a new
+    exception type nobody catches. A caller that wants to tell a refusal apart
+    from a disk error can still catch this name specifically.
+
+    The read-only refusal (``require_writable_target``) is deliberately NOT this
+    class: it re-raises the kernel's own ``PermissionError``, which is exactly
+    what a bare ``Path.write_text`` raised before these writes went atomic."""
+
+
+def path_is_confined(root: Path, target: Path) -> bool:
+    """Whether ``target`` is reached from ``root`` without traversing a redirect
+    at any component below it.
+
+    The win32 half of :func:`open_dir_confined`, which anchors the POSIX side at
+    a descriptor instead. A check, not a race-free open: it is answered about a
+    NAME and is stale the moment it returns, so it removes the standing redirect
+    — plant a link, wait for a write — while a writer who re-plants inside the
+    window between check and write still wins. That residual is the platform's,
+    not this function's: win32 has no ``*at()`` family to anchor against.
+
+    Every component below ``root`` is checked and ``root`` itself is not: the
+    operator chooses where the project lives and may well keep it behind a link,
+    while everything under it is session-writable. That is the same split
+    :func:`open_dir_confined` makes by opening ``root`` without ``O_NOFOLLOW``.
+
+    ``lstat``-based throughout, so the walk never resolves through the thing it
+    is testing for — and an ``lstat`` that RAISES answers False, because a
+    component that cannot be probed is one this cannot vouch for. ``Path``'s own
+    predicates swallow that error and answer "not a link", which walks PAST the
+    component instead: the opposite of what a confinement check owes its caller.
+
+    Both link kinds count. ``S_ISLNK`` is the whole answer on POSIX; on win32 a
+    DIRECTORY JUNCTION redirects identically, is invisible to ``is_symlink()``,
+    and is the cheaper plant (``mklink /J`` needs neither elevation nor Developer
+    Mode). Recognised through :data:`_LINK_REPARSE_TAGS` rather than
+    ``os.path.isjunction``, which is 3.12+ while this package's floor is 3.11.
+
+    Narrower than ``tui/launch._run_dir_is_confined``, which refuses ANY reparse
+    point. Over-refusing is the cheap direction there — the cost is one unwritten
+    hint — but this backs writes an operator's own configuration depends on, so a
+    OneDrive placeholder or a dedup stub in the ancestry must not turn every
+    policy write into a failure.
+
+    Confinement is answered about the LEXICAL spelling handed in, exactly as
+    :func:`open_dir_confined` answers it; a caller building ``target`` out of
+    untrusted parts owes its own ``..`` check first (:func:`has_parent_ref`)."""
+    try:
+        if not target.is_relative_to(root):
+            return False
+        cursor = target
+        while cursor != root:
+            info = os.lstat(cursor)
+            if stat.S_ISLNK(info.st_mode):
+                return False
+            if getattr(info, "st_reparse_tag", 0) in _LINK_REPARSE_TAGS:  # win32-only field
+                return False
+            cursor = cursor.parent
+    except OSError:
+        return False  # a component we cannot probe is one we cannot vouch for
+    return True
 
 
 def walk_files_unlinked(top: Path) -> Iterator[Path]:
@@ -738,6 +902,35 @@ def atomic_write_text_at(dir_fd: int, name: str, text: str) -> None:
     No win32 sharing-violation retry, unlike :func:`atomic_replace`: there is no
     win32 here at all — the ``*at()`` family this is built on does not exist
     there, so a caller reaching this is on POSIX by construction."""
+    _atomic_write_at(dir_fd, name, text, mode="w", encoding="utf-8")
+
+
+def atomic_write_bytes_at(dir_fd: int, name: str, data: bytes) -> None:
+    """:func:`atomic_write_text_at`'s byte-exact sibling, whose docstring carries
+    the shared contract (a unique unguessable temp created ``O_EXCL`` at ``0600``,
+    every syscall relative to ``dir_fd``, fsync before the replace, temp removed
+    on any failure, no mode or xattrs inherited, POSIX by construction).
+
+    The one difference is the whole point: ``data`` lands byte-for-byte. No
+    encode and no newline translation, so a payload carrying CRLF keeps CRLF and
+    bytes that are not valid text in any codec survive the round trip. The
+    anchored cohort needs this variant for the same reason the path-based one
+    does — ``policy.write_mux_backend`` and the two frontmatter writers read
+    bytes precisely to preserve a file's existing line endings, and a text-only
+    anchored helper would have rewritten them (#593)."""
+    _atomic_write_at(dir_fd, name, data, mode="wb", encoding=None)
+
+
+def _atomic_write_at(
+    dir_fd: int, name: str, payload: str | bytes, *, mode: str, encoding: str | None
+) -> None:
+    """The shared body of the two anchored helpers above — see
+    :func:`atomic_write_text_at` for the contract every step here implements.
+
+    ``encoding`` doubles as the text/bytes discriminator, as it does in
+    :func:`_atomic_write`: the text arm is opened with it plus ``newline=""``,
+    the bytes arm with neither, because ``os.fdopen`` refuses both in binary mode
+    and a byte-verbatim payload has nothing to translate anyway."""
     for _ in range(_TMP_NAME_ATTEMPTS):
         # os.urandom, not `random`: this name is created in a directory a
         # less-trusted writer can reach, and a predictable one lets them
@@ -753,8 +946,13 @@ def atomic_write_text_at(dir_fd: int, name: str, text: str) -> None:
     else:
         raise OSError(f"no free temp name beside {name!r} after {_TMP_NAME_ATTEMPTS} tries")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
-            fh.write(text)
+        staged = (
+            os.fdopen(fd, mode)
+            if encoding is None
+            else os.fdopen(fd, mode, encoding=encoding, newline="")
+        )
+        with staged as fh:
+            fh.write(payload)
             fh.flush()  # userspace buffer -> kernel, so there is something to sync
             os.fsync(fh.fileno())
         os.replace(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
@@ -762,6 +960,138 @@ def atomic_write_text_at(dir_fd: int, name: str, text: str) -> None:
         with suppress(OSError):
             os.unlink(tmp, dir_fd=dir_fd)
         raise
+
+
+def _refuse_unwritable_target_at(dir_fd: int, name: str) -> None:
+    """:func:`_refuse_unwritable_target`, asked relative to an open descriptor.
+
+    The point of the anchored path is that it never names a path again, so the
+    probe must not either: ``dir_fd=`` asks about the entry in the directory that
+    was actually walked, not about a name a concurrent writer may since have
+    redirected. ``O_NOFOLLOW`` always, because the write this guards replaces the
+    NAME — the same reasoning as the no-follow arm there, ``ELOOP`` included.
+    POSIX by construction: only :data:`DIR_FD_ANCHORED_WRITES` reaches here."""
+    try:
+        fd = os.open(name, os.O_WRONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+    except PermissionError:
+        raise  # the refusal this flag exists for
+    except OSError:
+        return  # missing, a link at the name, or something the write itself reports
+    os.close(fd)
+
+
+def atomic_write_text_confined(
+    path: Path, text: str, *, confine_root: Path, require_writable_target: bool = False
+) -> None:
+    """:func:`atomic_write_text`, refusing to write through a redirected PARENT.
+
+    ``follow_symlinks=False`` stops a link planted at the file itself and nothing
+    more: ``mkstemp(dir=...)`` and ``os.replace``'s destination are still ordinary
+    path lookups, so a link planted at any DIRECTORY above the target lands both
+    the temp and the published file wherever that link points, and the no-follow
+    bought nothing (#593). ``mkdir(parents=True, exist_ok=True)`` accepts a
+    symlink-to-a-directory, so a planted parent survives the setup step the
+    callers run first. This closes that: the parent is established once, and the
+    write is aimed at what was established rather than at the name again.
+
+    A separate function rather than a ``confine_root=`` keyword on the plain
+    writer. That keyword would admit a combination with no meaning — confined AND
+    following symlinks — it would change ``_atomic_write`` for the dozen callers
+    who did not ask for it, and separate names keep the adopted cohort greppable.
+
+    ``path`` must be **lexically** under ``confine_root`` (``relative_to``, no
+    resolve — the confined spelling is the caller's own construction, and
+    resolving it would consult the very links this refuses). ``path.parent`` must
+    already EXIST: a confinement walk cannot vouch for a component that is not
+    there, so every adopter mkdirs or gates first.
+
+    POSIX walks the components with :func:`open_dir_confined` and writes through
+    the descriptor that walk produced, which a later swap of any name along the
+    way no longer reaches. Win32 has no ``*at()`` family, so it degrades to
+    :func:`path_is_confined` plus a no-follow write — check-then-write, which
+    removes the standing redirect but leaves the window between the check and the
+    write open (the precedent, and the same documented residual, as
+    ``tui/launch._record_ctl_window``). Either arm refuses by raising
+    :class:`UnconfinedWriteError`, which is an ``OSError``.
+
+    Mode and xattrs are NEVER inherited — the file lands at ``0600``, which is
+    exactly what ``follow_symlinks=False`` already gives this cohort, so adopting
+    this changes no file's permissions. The anchored arm writes UTF-8 with no
+    newline translation (identity on POSIX, where the translating default writes
+    ``\n`` unchanged) and the win32 arm keeps :func:`atomic_write_text`'s
+    translating default, so on each platform the bytes that land are the ones
+    that land today. A caller preserving a file's existing line endings wants
+    :func:`atomic_write_bytes_confined`, as it wants the bytes writer today.
+
+    ``require_writable_target`` behaves as it does in :func:`atomic_write_text`;
+    on the anchored arm the probe is asked dir_fd-relative, never by path."""
+    _atomic_write_confined(
+        path,
+        text,
+        mode="w",
+        encoding="utf-8",
+        confine_root=confine_root,
+        require_writable_target=require_writable_target,
+    )
+
+
+def atomic_write_bytes_confined(
+    path: Path, data: bytes, *, confine_root: Path, require_writable_target: bool = False
+) -> None:
+    """:func:`atomic_write_text_confined`'s byte-exact sibling, whose docstring
+    carries the shared contract (lexical ``confine_root`` gate, anchored parent on
+    POSIX and the documented check-then-write degrade on win32,
+    :class:`UnconfinedWriteError` on refusal, an existing parent required, ``0600``
+    with no mode or xattrs inherited).
+
+    ``data`` lands byte-for-byte on both arms: no encode, no newline translation.
+    That is what the byte-verbatim writers in this cohort exist for — they read
+    bytes precisely so a CRLF file keeps its line endings."""
+    _atomic_write_confined(
+        path,
+        data,
+        mode="wb",
+        encoding=None,
+        confine_root=confine_root,
+        require_writable_target=require_writable_target,
+    )
+
+
+def _atomic_write_confined(
+    path: Path,
+    payload: str | bytes,
+    *,
+    mode: str,
+    encoding: str | None,
+    confine_root: Path,
+    require_writable_target: bool,
+) -> None:
+    """The shared body of the two confined helpers above — see
+    :func:`atomic_write_text_confined` for the contract every step implements."""
+    if not path.is_relative_to(confine_root):
+        raise UnconfinedWriteError(f"{path} is not under {confine_root}")
+    unconfined = f"cannot reach {path.parent} from {confine_root} without a redirect"
+    if DIR_FD_ANCHORED_WRITES:
+        dir_fd = open_dir_confined(confine_root, path.parent)
+        if dir_fd is None:
+            raise UnconfinedWriteError(unconfined)
+        try:
+            if require_writable_target:
+                _refuse_unwritable_target_at(dir_fd, path.name)
+            _atomic_write_at(dir_fd, path.name, payload, mode=mode, encoding=encoding)
+        finally:
+            os.close(dir_fd)
+        return
+    if not path_is_confined(confine_root, path.parent):
+        raise UnconfinedWriteError(unconfined)
+    _atomic_write(
+        path,
+        payload,
+        mode=mode,
+        encoding=encoding,
+        follow_symlinks=False,
+        require_writable_target=require_writable_target,
+    )
 
 
 def retrying_unlink(path: Path) -> None:

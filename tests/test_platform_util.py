@@ -14,6 +14,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path, PureWindowsPath
 
 import pytest
@@ -1649,3 +1650,674 @@ def test_walk_files_unlinked_refuses_a_link_like_top(tmp_path, monkeypatch):
     monkeypatch.setattr(platform_util, "is_link_like", lambda q: Path(q) == outside)
 
     assert list(platform_util.walk_files_unlinked(outside)) == []
+
+
+# ------------------------------------------------------ open_dir_confined (#593)
+#
+# First direct coverage of this helper and of `atomic_write_text_at`: both shipped
+# for `tui/launch.py` and were graded only through that consumer, so a property
+# neither consumer happens to exercise had nothing pinning it. #593 adopts them
+# across a dozen more sites, which is a bad time to be inferring the contract.
+
+DIR_FD = pytest.mark.skipif(
+    not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
+)
+
+
+@DIR_FD
+def test_open_dir_confined_returns_a_descriptor_for_a_clean_chain(tmp_path):
+    """The positive control the refusals below need: an unplanted chain hands back
+    a descriptor for the directory that was asked for, not merely a non-None int.
+
+    Identified by inode rather than by name, because a name is the one thing this
+    helper deliberately stops consulting."""
+    root = tmp_path / "project"
+    nested = root / ".bmad-loop" / "runs"
+    nested.mkdir(parents=True)
+
+    fd = platform_util.open_dir_confined(root, nested)
+
+    assert fd is not None
+    try:
+        assert os.fstat(fd).st_ino == nested.stat().st_ino
+    finally:
+        os.close(fd)
+
+
+@DIR_FD
+def test_open_dir_confined_refuses_a_symlinked_component(tmp_path):
+    """A link at ANY component below the root fails the walk, not just at the last
+    one. That is the whole of #593: `follow_symlinks=False` refuses a link at the
+    final name while `mkstemp(dir=...)` still resolves every directory above it by
+    name, so a link planted at `.bmad-loop/` redirects the write and the no-follow
+    buys nothing."""
+    root = tmp_path / "project"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    (outside / "runs").mkdir(parents=True)
+    (root / ".bmad-loop").symlink_to(outside, target_is_directory=True)
+
+    assert platform_util.open_dir_confined(root, root / ".bmad-loop" / "runs") is None
+
+
+@DIR_FD
+def test_open_dir_confined_refuses_a_target_outside_the_root(tmp_path):
+    """Confinement is refused before a single directory is opened: a target that is
+    not under the root has no chain to walk, however clean its own ancestry is."""
+    root = tmp_path / "project"
+    root.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+
+    assert platform_util.open_dir_confined(root, elsewhere) is None
+
+
+@DIR_FD
+def test_open_dir_confined_refuses_a_missing_component(tmp_path):
+    """An absent directory is refused rather than created. The confined writers
+    lean on this: they require the parent to EXIST, because a walk cannot vouch
+    for a component that is not there yet, and a helper that made one would be
+    deciding the mode and the ancestry of a directory nobody checked."""
+    root = tmp_path / "project"
+    root.mkdir()
+
+    assert platform_util.open_dir_confined(root, root / "absent" / "deeper") is None
+
+
+@DIR_FD
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_open_dir_confined_accepts_a_root_behind_a_link(tmp_path):
+    """The root itself is opened WITHOUT `O_NOFOLLOW`, and that asymmetry is the
+    design: the operator chooses where the project lives and may keep it behind a
+    link (a checkout under a symlinked home, a `/var` that is really `/private/var`
+    on macOS), while everything below it is session-writable.
+
+    Ablation: add `O_NOFOLLOW` to the root open and this fails — the walk refuses a
+    perfectly ordinary layout, which would take the confined writers with it."""
+    real = tmp_path / "real-project"
+    (real / ".bmad-loop").mkdir(parents=True)
+    root = tmp_path / "project"
+    root.symlink_to(real, target_is_directory=True)
+
+    fd = platform_util.open_dir_confined(root, root / ".bmad-loop")
+
+    assert fd is not None
+    try:
+        assert os.fstat(fd).st_ino == (real / ".bmad-loop").stat().st_ino
+    finally:
+        os.close(fd)
+
+
+# -------------------------------------------------- anchored atomic writes (#593)
+
+
+@contextmanager
+def _dir_fd(directory: Path):
+    """The descriptor the anchored helpers take, closed on the way out."""
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        yield fd
+    finally:
+        os.close(fd)
+
+
+@DIR_FD
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
+def test_atomic_write_text_at_lands_a_private_mode(tmp_path):
+    """The anchored write states its mode rather than inheriting the umask's.
+
+    These records live under a session-writable root, so a umask-derived 0644 is
+    the difference between a private record and one the session that plants links
+    at it can also read. `os.umask(0o022)` is the point of the bracket, not
+    hygiene: under a 0o077 umask a mode-less create yields 0o600 by accident and
+    the ablation goes inert (the trap `test_file_lock_is_created_owner_only`
+    documents — and note that docstring's "this box is 0o077" claim is not
+    universal, which is exactly why the value is forced here).
+
+    Ablation: drop the `0o600` argument from the `os.open` in `_atomic_write_at`
+    and this fails reporting 0o644."""
+    previous = os.umask(0o022)
+    try:
+        with _dir_fd(tmp_path) as fd:
+            platform_util.atomic_write_text_at(fd, "record.json", '{"ok": true}')
+    finally:
+        os.umask(previous)
+
+    landed = tmp_path / "record.json"
+    assert landed.read_text(encoding="utf-8") == '{"ok": true}'
+    assert stat.S_IMODE(landed.stat().st_mode) == 0o600, oct(landed.stat().st_mode)
+
+
+@DIR_FD
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
+def test_atomic_write_bytes_at_lands_a_private_mode(tmp_path):
+    """Mirrored from the text case rather than parametrized, for the reason the
+    `atomic_write_bytes` banner gives: the two arms share a private tail that a
+    later edit could split without either public name changing."""
+    previous = os.umask(0o022)
+    try:
+        with _dir_fd(tmp_path) as fd:
+            platform_util.atomic_write_bytes_at(fd, "policy.toml", b"backend = 'tmux'\n")
+    finally:
+        os.umask(previous)
+
+    landed = tmp_path / "policy.toml"
+    assert landed.read_bytes() == b"backend = 'tmux'\n"
+    assert stat.S_IMODE(landed.stat().st_mode) == 0o600, oct(landed.stat().st_mode)
+
+
+@DIR_FD
+def test_atomic_write_bytes_at_preserves_crlf_verbatim(tmp_path):
+    """The reason a bytes-anchored variant had to exist at all (#593).
+
+    `atomic_write_text_at` is UTF-8 and text-mode; three of the sites adopting
+    confinement — `policy.write_mux_backend` and the two frontmatter writers —
+    read BYTES on purpose, so a CRLF file keeps its line endings. Routing them
+    through the text helper would have rewritten every line ending in the file as
+    a side effect of a hardening change.
+
+    The payload carries a byte that is not valid UTF-8 in any position as well as
+    CRLF, and deliberately: the CRLF half is only observable on win32 (POSIX text
+    mode translates nothing on write), so on a POSIX runner an implementation that
+    routed bytes through the text helper would pass a CRLF-only assertion. The
+    invalid byte is what makes the ablation bite on both platforms.
+
+    Ablation: reimplement this as `atomic_write_text_at(fd, name, data.decode())`
+    and it fails `UnicodeDecodeError`."""
+    payload = b"---\r\nstatus: caf\xe9\r\n---\r\n"  # latin-1 e-acute: not valid UTF-8
+    with _dir_fd(tmp_path) as fd:
+        platform_util.atomic_write_bytes_at(fd, "spec.md", payload)
+
+    assert (tmp_path / "spec.md").read_bytes() == payload
+
+
+@DIR_FD
+def test_atomic_write_text_at_removes_its_temp_when_the_write_fails(tmp_path, monkeypatch):
+    """A failed anchored write leaves the directory as it found it.
+
+    The temp is created `O_EXCL` under an unguessable name, so a stranded one is
+    not just litter: nothing ever reclaims it, and these directories are scanned.
+    The cleanup unlinks dir_fd-relative, like everything else here."""
+    target = tmp_path / "record.json"
+    target.write_text("before", encoding="utf-8")
+
+    def boom(fd):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(platform_util.os, "fsync", boom)
+    with _dir_fd(tmp_path) as fd:
+        with pytest.raises(OSError, match="No space left"):
+            platform_util.atomic_write_text_at(fd, "record.json", "after")
+
+    assert target.read_text(encoding="utf-8") == "before"  # the original survived
+    assert list(tmp_path.glob("*.tmp")) == []  # and nothing was stranded beside it
+
+
+@DIR_FD
+def test_atomic_write_bytes_at_removes_its_temp_when_the_write_fails(tmp_path, monkeypatch):
+    """The bytes arm's own cleanup pin — mirrored, per the banner's reasoning."""
+    target = tmp_path / "policy.toml"
+    target.write_bytes(b"before")
+
+    def boom(fd):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(platform_util.os, "fsync", boom)
+    with _dir_fd(tmp_path) as fd:
+        with pytest.raises(OSError, match="No space left"):
+            platform_util.atomic_write_bytes_at(fd, "policy.toml", b"after")
+
+    assert target.read_bytes() == b"before"
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+# ------------------------------------------------------- path_is_confined (#593)
+
+
+def test_path_is_confined_accepts_a_clean_chain(tmp_path):
+    """The positive control every refusal below needs: without it they all pass
+    for a predicate that answers False unconditionally."""
+    root = tmp_path / "project"
+    nested = root / ".bmad-loop" / "runs"
+    nested.mkdir(parents=True)
+
+    assert platform_util.path_is_confined(root, nested) is True
+    assert platform_util.path_is_confined(root, root) is True  # the root is confined in itself
+
+
+def test_path_is_confined_refuses_a_target_outside_the_root(tmp_path):
+    """The lexical gate, before any component is probed."""
+    root = tmp_path / "project"
+    root.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+
+    assert platform_util.path_is_confined(root, elsewhere) is False
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_path_is_confined_refuses_a_symlinked_component(tmp_path):
+    """The win32 fallback's half of #593, exercised from POSIX so it is not left
+    to the Windows legs alone: it still has to refuse an ancestor link, just with
+    the weaker (racy, and documented as such) check-then-write guarantee."""
+    root = tmp_path / "project"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / ".bmad-loop").symlink_to(outside, target_is_directory=True)
+
+    assert platform_util.path_is_confined(root, root / ".bmad-loop") is False
+
+
+def test_path_is_confined_refuses_a_reparse_tagged_component(tmp_path, monkeypatch):
+    """A Windows DIRECTORY JUNCTION redirects exactly as a symlink does, is False
+    for `Path.is_symlink()`, and is the cheaper plant — `mklink /J` needs neither
+    elevation nor Developer Mode. A guard written as `is_symlink()` would leave
+    that half open with no race to win.
+
+    Reachable only on Windows; the logic is driven here so it does not ship
+    unexercised (the `stat.IO_REPARSE_TAG_*` constants do not exist on POSIX,
+    hence the substituted tuple — the same idiom as
+    `test_is_link_like_refuses_a_reparse_tagged_dir`).
+
+    Ablation: delete the `st_reparse_tag` arm of `path_is_confined` and this fails
+    while the symlink sibling above stays green, so it bites on the junction arm
+    specifically."""
+    root = tmp_path / "project"
+    junction = root / ".bmad-loop"
+    junction.mkdir(parents=True)  # a real directory: is_symlink() is False, as for a junction
+    assert platform_util.path_is_confined(root, junction) is True  # positive control
+
+    # Patch the TAG TUPLE, which the predicate reads from module globals on every
+    # call, plus lstat itself — a junction's lstat reports a DIRECTORY mode.
+    real_lstat = os.lstat
+    monkeypatch.setattr(platform_util, "_LINK_REPARSE_TAGS", (_ReparseStat.st_reparse_tag,))
+    monkeypatch.setattr(
+        os,
+        "lstat",
+        lambda p, *a, **k: _ReparseStat() if str(p) == str(junction) else real_lstat(p),
+    )
+
+    assert platform_util.path_is_confined(root, junction) is False
+
+
+def test_path_is_confined_refuses_an_unprobeable_component(tmp_path, monkeypatch):
+    """A component that cannot be probed is one this cannot vouch for, so the
+    refusal is fail-CLOSED. `Path.is_symlink()` swallows that `OSError` and answers
+    "not a link", which walks PAST the component — the opposite of what a
+    confinement check owes its caller, and the quiet gap `launch.py` names.
+
+    Ablation: drop the `except OSError` arm and this fails with the PermissionError
+    escaping instead of being answered."""
+    root = tmp_path / "project"
+    nested = root / ".bmad-loop" / "runs"
+    nested.mkdir(parents=True)
+    unreadable = root / ".bmad-loop"
+
+    real_lstat = os.lstat
+
+    def refusing_lstat(p, *a, **k):
+        if str(p) == str(unreadable):
+            raise PermissionError(errno.EACCES, "Permission denied")
+        return real_lstat(p)
+
+    monkeypatch.setattr(os, "lstat", refusing_lstat)
+
+    assert platform_util.path_is_confined(root, nested) is False
+
+
+# ------------------------------------------------ confined atomic writes (#593)
+
+
+def test_unconfined_write_error_is_an_oserror(tmp_path):
+    """The refusal type is an `OSError` on purpose, and the adopters depend on it:
+    every one of them already degrades on `OSError` from this very call
+    (`runs.stop_run` swallows a failed stop-request write, the engine journals a
+    failed park rollback, the settings screen reports a failed save). A refusal
+    therefore lands in handling those sites already have.
+
+    Ablation: rebase the class on `Exception` and this fails — as, downstream,
+    would every adopter's degrade path, silently."""
+    assert issubclass(platform_util.UnconfinedWriteError, OSError)
+
+    root = tmp_path / "project"
+    root.mkdir()
+    stray = tmp_path / "stray.toml"
+
+    # The lexical gate, which needs no links and so runs on both platforms. Matched
+    # on ITS message, not merely on the type: the confinement walk below refuses an
+    # out-of-root path too, so without the match this row passes with the gate
+    # deleted — and the gate is what states the contract (`path` is under
+    # `confine_root` by the caller's own spelling) rather than inferring it.
+    with pytest.raises(OSError, match="is not under") as caught:
+        platform_util.atomic_write_text_confined(stray, "x = 1\n", confine_root=root)
+
+    assert isinstance(caught.value, platform_util.UnconfinedWriteError)
+    assert not stray.exists()
+
+
+def test_atomic_write_text_confined_writes_a_clean_tree(tmp_path):
+    """The positive control for the refusals below — without it they pass for a
+    writer that refuses everything."""
+    root = tmp_path / "project"
+    parent = root / ".bmad-loop"
+    parent.mkdir(parents=True)
+
+    platform_util.atomic_write_text_confined(parent / "policy.toml", "x = 1\n", confine_root=root)
+
+    assert (parent / "policy.toml").read_text(encoding="utf-8") == "x = 1\n"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
+def test_atomic_write_text_confined_lands_a_private_mode(tmp_path):
+    """0600, the same mode `follow_symlinks=False` already gives this cohort — so
+    adopting confinement changes no file's permissions. Bracketed umask for the
+    reason the anchored case gives."""
+    root = tmp_path / "project"
+    parent = root / ".bmad-loop"
+    parent.mkdir(parents=True)
+
+    previous = os.umask(0o022)
+    try:
+        platform_util.atomic_write_text_confined(
+            parent / "policy.toml", "x = 1\n", confine_root=root
+        )
+    finally:
+        os.umask(previous)
+
+    landed = parent / "policy.toml"
+    assert stat.S_IMODE(landed.stat().st_mode) == 0o600, oct(landed.stat().st_mode)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_atomic_write_text_confined_refuses_a_symlinked_parent(tmp_path):
+    """The escape #593 names, closed. `follow_symlinks=False` refuses a link at
+    `policy.toml`; it does not refuse one at `.bmad-loop/`, and
+    `mkdir(parents=True, exist_ok=True)` ACCEPTS a symlink-to-a-directory, so the
+    planted parent survives the setup step the callers run first.
+
+    The assertion that pins the fix is the second one: refusing loudly is worth
+    nothing if the write already landed somewhere else.
+
+    Ablation: delete the `open_dir_confined` arm's `None` check and this fails
+    `DID NOT RAISE`, with `policy.toml` sitting in `outside/`."""
+    root = tmp_path / "project"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / ".bmad-loop").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        platform_util.atomic_write_text_confined(
+            root / ".bmad-loop" / "policy.toml", "x = 1\n", confine_root=root
+        )
+
+    assert list(outside.iterdir()) == []  # nothing escaped the project
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_atomic_write_bytes_confined_refuses_a_symlinked_parent(tmp_path):
+    """The bytes arm's own refusal pin. Mirrored rather than parametrized: the two
+    reach the shared body through different public names, and #593's byte-verbatim
+    adopters are the ones a text-only helper would have quietly corrupted."""
+    root = tmp_path / "project"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / ".bmad-loop").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        platform_util.atomic_write_bytes_confined(
+            root / ".bmad-loop" / "policy.toml", b"x = 1\n", confine_root=root
+        )
+
+    assert list(outside.iterdir()) == []
+
+
+def test_atomic_write_bytes_confined_preserves_crlf_verbatim(tmp_path):
+    """Byte-for-byte on both arms — the property the adopting frontmatter and
+    policy writers read bytes to keep. Same payload reasoning as the anchored
+    sibling: the non-UTF-8 byte is what makes this observable on POSIX."""
+    root = tmp_path / "project"
+    parent = root / "specs"
+    parent.mkdir(parents=True)
+    payload = b"---\r\nstatus: caf\xe9\r\n---\r\n"
+
+    platform_util.atomic_write_bytes_confined(parent / "story.md", payload, confine_root=root)
+
+    assert (parent / "story.md").read_bytes() == payload
+
+
+@DIR_FD
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_atomic_write_confined_is_anchored_against_an_ancestor_swap(tmp_path, monkeypatch):
+    """The race a path check cannot close: the session re-plants the parent as a
+    link AFTER confinement is established. A preflight check is answered about a
+    path and is stale the moment it returns, so the write follows the new link;
+    the descriptor `open_dir_confined` hands back is bound to the directory it
+    actually walked, so the swap renames something the write no longer consults.
+
+    Forced rather than raced with threads — hooking the helper is the exact
+    interleaving an attacker who wins the window achieves, and it is
+    deterministic. The positive control is the second assertion: the write must
+    actually LAND (in the real, now-renamed-aside directory), so this cannot pass
+    by the write having simply failed."""
+    root = tmp_path / "project"
+    parent = root / ".bmad-loop"
+    parent.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    real_open = platform_util.open_dir_confined
+
+    def swap_after_the_walk(confine_root: Path, target: Path):
+        fd = real_open(confine_root, target)
+        # attacker wins: the name now points outside, the fd still points home
+        target.rename(tmp_path / "moved-aside")
+        target.symlink_to(outside, target_is_directory=True)
+        return fd
+
+    monkeypatch.setattr(platform_util, "open_dir_confined", swap_after_the_walk)
+    platform_util.atomic_write_text_confined(parent / "policy.toml", "x = 1\n", confine_root=root)
+
+    assert not (outside / "policy.toml").exists()  # nothing escaped
+    landed = tmp_path / "moved-aside" / "policy.toml"
+    assert landed.read_text(encoding="utf-8") == "x = 1\n"  # and the write did happen
+    assert parent.is_symlink()  # the swap really was in place for the write
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_atomic_write_text_confined_falls_back_without_dir_fd(tmp_path, monkeypatch):
+    """win32 has no `*at()` family to anchor against, so it keeps check-then-write.
+    Exercised here from POSIX so the fallback is not left to the Windows legs
+    alone: it still has to refuse an ancestor link, just with the weaker guarantee.
+
+    Ablation: delete the `path_is_confined` check and this fails `DID NOT RAISE`,
+    with the file landing in `outside/` exactly as the unguarded POSIX path did."""
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+    root = tmp_path / "project"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / ".bmad-loop").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        platform_util.atomic_write_text_confined(
+            root / ".bmad-loop" / "policy.toml", "x = 1\n", confine_root=root
+        )
+
+    assert list(outside.iterdir()) == []
+
+    # Positive control: the same fallback branch really does write when the tree is
+    # clean, so the refusal is a refusal rather than a write that never got as far
+    # as trying. Without this the test passes for a fallback wired to raise always.
+    (root / ".bmad-loop").unlink()
+    (root / ".bmad-loop").mkdir()
+    platform_util.atomic_write_text_confined(
+        root / ".bmad-loop" / "policy.toml", "x = 1\n", confine_root=root
+    )
+    assert (root / ".bmad-loop" / "policy.toml").read_text(encoding="utf-8") == "x = 1\n"
+
+
+# ------------------------------------------------- require_writable_target (#597)
+#
+# `os.replace` needs write permission on the DIRECTORY, not on the entry it
+# replaces, so a temp-and-replace write silently overwrites a file an operator
+# marked read-only — and where mode is inherited, restores the 0444 afterwards, so
+# nothing in the permission bits records that it changed. These rows pin the
+# opt-in refusal that gives the pre-#590 behaviour back, and the compat row pins
+# that the DEFAULT still does not refuse.
+#
+# 0o444 sets the READONLY attribute on win32 too, where O_WRONLY then fails with
+# ERROR_ACCESS_DENIED -> PermissionError, so the refusal rows run unskipped on both
+# platforms. Every chmod is on a file created in this test's own tmp_path and is
+# restored in a `finally` — never on the session `project` template (copytree
+# preserves modes), and Windows rmtree fails on a READONLY file left behind.
+
+
+def _mkstemp_spy(calls: list[str]):
+    """A `mkstemp` that records and refuses, to pin that a refusal STAGES NOTHING."""
+
+    def fake_mkstemp(*, dir, prefix, suffix):
+        calls.append(prefix)
+        raise AssertionError("staged a temp before refusing the write")
+
+    return fake_mkstemp
+
+
+def test_atomic_write_text_refuses_a_readonly_target(tmp_path, monkeypatch):
+    """The refusal #597 asks for: the operator marked this file read-only, and the
+    writer honours that instead of routing around it.
+
+    The `mkstemp` spy is the ORDERING pin, and it is the point of the test: the
+    probe runs between the resolve and the staging, so a refusal leaves no temp to
+    explain. Move `_refuse_unwritable_target` after `_mkstemp_beside` and this
+    fails on the spy rather than on the contents.
+
+    Ablation: delete the `require_writable_target` branch in `_atomic_write` and
+    this fails `DID NOT RAISE`, with `target` reading "after"."""
+    target = tmp_path / "sprint-status.yaml"
+    target.write_text("before", encoding="utf-8")
+    target.chmod(0o444)
+    calls: list[str] = []
+    monkeypatch.setattr(platform_util.tempfile, "mkstemp", _mkstemp_spy(calls))
+    try:
+        with pytest.raises(PermissionError):
+            platform_util.atomic_write_text(target, "after", require_writable_target=True)
+    finally:
+        target.chmod(0o644)  # win32 rmtree refuses a READONLY file
+
+    assert target.read_text(encoding="utf-8") == "before"
+    assert calls == []  # nothing was staged
+
+
+def test_atomic_write_bytes_refuses_a_readonly_target(tmp_path, monkeypatch):
+    """The bytes arm's own row — mirrored, per the `atomic_write_bytes` banner."""
+    target = tmp_path / "policy.toml"
+    target.write_bytes(b"before")
+    target.chmod(0o444)
+    calls: list[str] = []
+    monkeypatch.setattr(platform_util.tempfile, "mkstemp", _mkstemp_spy(calls))
+    try:
+        with pytest.raises(PermissionError):
+            platform_util.atomic_write_bytes(target, b"after", require_writable_target=True)
+    finally:
+        target.chmod(0o644)
+
+    assert target.read_bytes() == b"before"
+    assert calls == []
+
+
+def test_default_still_replaces_a_readonly_target(tmp_path):
+    """The compatibility pin, and the reason the flag is opt-in at all.
+
+    Roughly twenty call sites write through these helpers, and the owner of a
+    0444 file can legitimately replace it today. Turning the refusal on for
+    everyone would convert a semantic loosening into a hard refusal of writes that
+    currently succeed — the wrong direction for a contract this many callers rely
+    on. So the default must keep replacing, and this is what says so.
+
+    Ablation: flip `require_writable_target`'s default to True and this fails,
+    which is the whole warning it exists to give."""
+    target = tmp_path / "sprint-status.yaml"
+    target.write_text("before", encoding="utf-8")
+    target.chmod(0o444)
+    try:
+        platform_util.atomic_write_text(target, "after")
+        landed = target.read_text(encoding="utf-8")
+    finally:
+        target.chmod(0o644)
+
+    assert landed == "after"
+
+
+def test_require_writable_target_allows_a_missing_target(tmp_path):
+    """A file that does not exist yet is not a refusal — there is nothing to
+    refuse, and creating it is what every flagged caller does on first run.
+
+    Ablation: treat any failed probe as a refusal (drop the `except OSError`
+    return) and this fails with `FileNotFoundError`, which would break first-run
+    creation at every adopting site."""
+    target = tmp_path / "sprint-status.yaml"
+
+    platform_util.atomic_write_text(target, "first", require_writable_target=True)
+
+    assert target.read_text(encoding="utf-8") == "first"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_require_writable_target_no_follow_ignores_a_planted_link_mode(tmp_path):
+    """`follow_symlinks=False` replaces the NAME whatever it points at, so the mode
+    of a plantable link's target is not the operator's answer about this file — it
+    is the planter's, exactly as `_atomic_write` argues for mode inheritance. The
+    probe opens `O_NOFOLLOW`, gets `ELOOP`, and allows the write.
+
+    The second assertion is the one that matters: the victim is untouched. A
+    no-follow write that read the link's mode as a refusal would be usable as a
+    denial primitive — plant a link at a record, point it at any 0444 file, and
+    every write to that record fails.
+
+    Ablation: drop `O_NOFOLLOW` from the probe and this fails `PermissionError`,
+    because the probe then reads the victim's mode through the link."""
+    victim = tmp_path / "someone-elses-file"
+    victim.write_text("victim", encoding="utf-8")
+    victim.chmod(0o444)
+    record = tmp_path / "record.json"
+    record.symlink_to(victim)
+    try:
+        platform_util.atomic_write_text(
+            record, "after", follow_symlinks=False, require_writable_target=True
+        )
+    finally:
+        victim.chmod(0o644)
+
+    assert record.read_text(encoding="utf-8") == "after"
+    assert not record.is_symlink()  # the NAME was replaced, as no-follow promises
+    assert victim.read_text(encoding="utf-8") == "victim"  # and the link's target was not
+
+
+def test_atomic_write_text_confined_refuses_a_readonly_target(tmp_path):
+    """The two guards compose: confinement anchors the parent, and the flag still
+    refuses a read-only target underneath it.
+
+    On the anchored arm the probe is asked dir_fd-relative
+    (`os.open(name, ..., dir_fd=fd)`), never by path — a probe that re-named the
+    path would reopen the window the descriptor exists to close.
+
+    Ablation: drop the `require_writable_target` branch from
+    `_atomic_write_confined` and this fails `DID NOT RAISE`."""
+    root = tmp_path / "project"
+    parent = root / ".bmad-loop"
+    parent.mkdir(parents=True)
+    target = parent / "policy.toml"
+    target.write_text("before", encoding="utf-8")
+    target.chmod(0o444)
+    try:
+        with pytest.raises(PermissionError):
+            platform_util.atomic_write_text_confined(
+                target, "after", confine_root=root, require_writable_target=True
+            )
+    finally:
+        target.chmod(0o644)
+
+    assert target.read_text(encoding="utf-8") == "before"
+    assert list(parent.glob("*.tmp")) == []  # a refusal stages nothing
