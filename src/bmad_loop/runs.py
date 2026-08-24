@@ -28,6 +28,7 @@ from .platform_util import (
     _mkstemp_beside,
     atomic_replace,
     atomic_write_text_confined,
+    create_exclusive_confined,
     has_parent_ref,
     is_absolute_path,
     is_link_like,
@@ -1111,7 +1112,13 @@ def _create_stop_request(run_dir: Path) -> bool:
 
     Refuses a planted symlink rather than following it — ``O_EXCL`` never
     dereferences — which is stricter than the ``follow_symlinks=False`` replace it
-    replaces.
+    replaces. That refusal covers only the FINAL component, though, so the create
+    goes through :func:`platform_util.create_exclusive_confined` (#593): a link
+    planted at ``.bmad-loop/``, ``runs/`` or the run's own directory was still
+    resolved by name and aimed the request outside the project, exactly the hole
+    the confined :func:`_write_stop_request` next door already closed. The
+    anchored create keeps the exclusive arbitration this function is built on;
+    an unreachable parent raises ``UnconfinedWriteError``.
 
     A failed write is deliberately NOT rolled back, and that is load-bearing rather
     than sloppy. ``unlink`` resolves a *name*, not the inode this call created, so a
@@ -1136,7 +1143,7 @@ def _create_stop_request(run_dir: Path) -> bool:
     body = json.dumps({"requested_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "mode": "graceful"})
     path = run_dir / STOP_REQUEST_FILE
     try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        fd = create_exclusive_confined(path, confine_root=_project_of_run_dir(run_dir))
     except FileExistsError:
         return False  # a request is already pending — a planted link included
     with os.fdopen(fd, "w", encoding="utf-8") as fh:

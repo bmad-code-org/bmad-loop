@@ -1346,6 +1346,32 @@ def test_create_stop_request_failed_write_never_deletes_a_concurrent_hard_reques
     assert runs.read_stop_request_mode(tmp_path) == "hard"  # NOT swallowed
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_create_stop_request_refuses_a_redirected_runs_dir(tmp_path):
+    """#593's parent half at the graceful lodge. `O_EXCL` never dereferences the
+    FINAL name, but `.bmad-loop/`, `runs/` and the run's own directory were still
+    resolved by name, so a link planted at any of them aimed the request outside
+    the project — the hole the confined `_write_stop_request` next door had
+    already closed. The lodge now walks the parents through
+    `create_exclusive_confined`, whose own rows in test_platform_util grade the
+    walk; what this row grades is the adoption, at the site.
+
+    Ablation: revert `_create_stop_request` to the bare `os.open` and this
+    reddens twice over — no raise, and the request file lands in `outside/`."""
+    project = tmp_path / "project"
+    outside = tmp_path / "outside"
+    run_id = "20260611-100000-aaaa"
+    (project / ".bmad-loop").mkdir(parents=True)
+    (outside / run_id).mkdir(parents=True)
+    (project / ".bmad-loop" / "runs").symlink_to(outside, target_is_directory=True)
+    run_dir = project / ".bmad-loop" / "runs" / run_id
+
+    with pytest.raises(platform_util.UnconfinedWriteError, match="without a redirect"):
+        runs._create_stop_request(run_dir)
+
+    assert list((outside / run_id).iterdir()) == []  # nothing landed outside
+
+
 def test_create_stop_request_failed_write_leaves_a_graceful_request_standing(tmp_path, monkeypatch):
     """The other half of removing the rollback, stated as its own behavior rather
     than left implicit: a write that fails part-way leaves the request pending.

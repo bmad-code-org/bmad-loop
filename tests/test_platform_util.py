@@ -2127,6 +2127,102 @@ def test_atomic_write_confined_refuses_a_parent_ref_on_the_fallback_arm(tmp_path
     assert (root / "specs" / "ok.md").read_text(encoding="utf-8") == "clean"
 
 
+def test_create_exclusive_confined_creates_at_0600_and_arbitrates(tmp_path):
+    """The positive control and the arbitration in one row: the first create
+    hands back a writable fd at a private mode, the second raises
+    `FileExistsError` — the single-atomic-step "is one pending? lodge mine"
+    contract `_create_stop_request` is built on, which the temp-and-replace
+    confined writers cannot express."""
+    root = tmp_path / "project"
+    parent = root / ".bmad-loop"
+    parent.mkdir(parents=True)
+    target = parent / "stop-request.json"
+
+    previous = os.umask(0o022)
+    try:
+        fd = platform_util.create_exclusive_confined(target, confine_root=root)
+    finally:
+        os.umask(previous)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write("mine")
+
+    assert target.read_text(encoding="utf-8") == "mine"
+    if sys.platform != "win32":
+        assert target.stat().st_mode & 0o777 == 0o600
+    with pytest.raises(FileExistsError):
+        platform_util.create_exclusive_confined(target, confine_root=root)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_create_exclusive_confined_refuses_a_planted_link_at_the_name(tmp_path):
+    """`O_EXCL` never dereferences the final component, so a link planted at the
+    name — dangling included — reads as "already pending" rather than being
+    followed; the victim it points at is untouched. The parents are this
+    function's own half, the rows below."""
+    root = tmp_path / "project"
+    parent = root / ".bmad-loop"
+    parent.mkdir(parents=True)
+    victim = tmp_path / "victim.txt"
+    victim.write_text("theirs", encoding="utf-8")
+    (parent / "stop-request.json").symlink_to(victim)
+
+    with pytest.raises(FileExistsError):
+        platform_util.create_exclusive_confined(parent / "stop-request.json", confine_root=root)
+
+    assert victim.read_text(encoding="utf-8") == "theirs"  # not followed, not truncated
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_create_exclusive_confined_refuses_a_symlinked_parent(tmp_path, monkeypatch):
+    """The reason this helper exists over a bare `O_EXCL` open: exclusivity
+    covers only the final component, and every directory above it was resolved
+    by name. Both arms are graded here — the anchored walk, then the win32
+    check-then-create degrade driven from POSIX — with an inline positive
+    control on the fallback arm so its refusal grades as a refusal.
+
+    Ablation: replace the helper's body with the bare `os.open(path, flags,
+    0o600)` it hardens and both arms fail `DID NOT RAISE`, with the request
+    landing in `outside/` — while the arbitration and planted-link rows above
+    stay GREEN, which is what proves they grade `O_EXCL`, not confinement."""
+    root = tmp_path / "project"
+    (root / ".bmad-loop").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / ".bmad-loop" / "runs").symlink_to(outside, target_is_directory=True)
+    target = root / ".bmad-loop" / "runs" / "stop-request.json"
+
+    with pytest.raises(platform_util.UnconfinedWriteError, match="without a redirect"):
+        platform_util.create_exclusive_confined(target, confine_root=root)
+    assert list(outside.iterdir()) == []  # nothing landed outside
+
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+    with pytest.raises(platform_util.UnconfinedWriteError, match="without a redirect"):
+        platform_util.create_exclusive_confined(target, confine_root=root)
+    assert list(outside.iterdir()) == []
+
+    # Positive control for the fallback arm: a clean chain still creates.
+    fd = platform_util.create_exclusive_confined(root / ".bmad-loop" / "ok.json", confine_root=root)
+    os.close(fd)
+    assert (root / ".bmad-loop" / "ok.json").exists()
+
+
+def test_create_exclusive_confined_refuses_out_of_root_and_parent_refs(tmp_path):
+    """Message-matched on each gate's OWN words, per the confined writers' rows:
+    the lexical prefix gate is redundant with the walk by construction, so a
+    type-only assertion would grade a refusal for the wrong reason."""
+    root = tmp_path / "project"
+    (root / "specs").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    with pytest.raises(platform_util.UnconfinedWriteError, match="is not under"):
+        platform_util.create_exclusive_confined(outside / "f.json", confine_root=root)
+    dodgy = root / "specs" / ".." / ".." / "outside" / "f.json"
+    with pytest.raises(platform_util.UnconfinedWriteError, match="climbs back out"):
+        platform_util.create_exclusive_confined(dodgy, confine_root=root)
+    assert list(outside.iterdir()) == []  # neither refusal created anything
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
 def test_atomic_write_text_confined_lands_a_private_mode(tmp_path):
     """0600, the same mode `follow_symlinks=False` already gives this cohort — so

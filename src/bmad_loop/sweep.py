@@ -22,6 +22,7 @@ from .engine import Engine, RunPaused
 from .escalation import critical_escalations, env_fault_pause_reason, session_failure_reason
 from .model import PAUSE_STORY_GATE, Phase, StoryTask
 from .platform_util import atomic_write_text, atomic_write_text_confined, neutralize_surrogates
+from .runs import _project_of_run_dir
 from .statemachine import advance
 from .workspace import discard_worktree
 
@@ -1138,6 +1139,14 @@ class SweepEngine(Engine):
         from . import decisions as decisions_store  # lazy: decisions imports sweep
 
         decisions_path = self.run_dir / "decisions.json"
+        # The project that OWNS `run_dir`, not `self.workspace.root`: under the
+        # supported `repo_root` override (isolation = "none") the workspace root
+        # is the separate code repo while the run dir — and the project-level
+        # pre-answer store — stay under the PROJECT, so a workspace-rooted
+        # confinement refused every write here and a workspace-rooted read
+        # silently ignored the store. Derived from the run dir's own shape, which
+        # no workspace swap moves.
+        project_root = _project_of_run_dir(self.run_dir)
         answers: dict[str, dict[str, str]] = (
             _read_json(decisions_path) if decisions_path.is_file() else {}
         )
@@ -1146,7 +1155,7 @@ class SweepEngine(Engine):
         # unattended/abandoned sweep left). The ledger edits were already applied
         # when they answered, so here we only take the answer onboard — this run
         # won't re-prompt/re-skip and build answers materialize into bundles.
-        pre = decisions_store.load_pre_answers(self.workspace.root)
+        pre = decisions_store.load_pre_answers(project_root)
         seeded = False
         for decision in plan.decisions:
             if decision.id in answers or decision.id not in pre:
@@ -1169,13 +1178,15 @@ class SweepEngine(Engine):
             # would otherwise collide on. Confined to the project root (#593):
             # replacing the NAME, as the bare replace did, left `.bmad-loop/` and
             # `runs/` above it resolved by name, and a link planted at either
-            # aimed this write out of the project. The root has to be the PROJECT,
-            # not `self.run_dir` — a file confined against its own parent walks no
-            # components at all, which would refuse nothing.
+            # aimed this write out of the project. The root has to be the PROJECT
+            # (`project_root` above; its comment says why not
+            # `self.workspace.root`) — and not `self.run_dir` either: a file
+            # confined against its own parent walks no components at all, which
+            # would refuse nothing.
             atomic_write_text_confined(
                 decisions_path,
                 json.dumps(answers, indent=2),
-                confine_root=self.workspace.root,
+                confine_root=project_root,
             )
         pending = [d for d in plan.decisions if d.id not in answers]
         answered_interactively = False
@@ -1215,7 +1226,7 @@ class SweepEngine(Engine):
                 atomic_write_text_confined(  # same file, same reasoning as above (#363, #593)
                     decisions_path,
                     json.dumps(answers, indent=2),
-                    confine_root=self.workspace.root,
+                    confine_root=project_root,
                 )
                 self.journal.append(
                     "decision-answered",

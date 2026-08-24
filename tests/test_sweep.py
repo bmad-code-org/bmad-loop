@@ -2807,6 +2807,67 @@ def test_interactive_decision_write_failure_strands_nothing(project, monkeypatch
     assert list(engine.run_dir.glob("decisions*.tmp")) == []  # no stranded temp
 
 
+def test_decisions_phase_keys_on_the_run_dir_project_not_workspace_root(project, tmp_path):
+    """The supported `repo_root` override (`_bmad/bmm/config.yaml`, honoured only
+    with `isolation = "none"` — worktree isolation refuses the divergence) puts
+    `workspace.root` at the separate CODE repo while the per-run `decisions.json`
+    and the project-level pre-answer store stay under the PROJECT. Keying this
+    phase on `workspace.root` therefore made every pre-answer seed — and the
+    first interactive answer — raise `UnconfinedWriteError`, and aimed the
+    pre-answer READ at a store that does not exist. All three now key on the
+    project that owns `run_dir` (`runs._project_of_run_dir`), which no workspace
+    swap moves.
+
+    The divergence is installed at the exact seam the override reaches:
+    `workspace` is a plain attribute the bundle pipeline itself swaps, and
+    `_decisions_phase` runs outside that pipeline by contract. The divergent
+    root is a real empty git repo so the phase's ledger-commit tail stays a
+    no-op rather than a spawn error.
+
+    Ablations, each reddening its own assertion: point the pre-answer read back
+    at `self.workspace.root` → the seeded answer is missing; point the seeded
+    write's `confine_root` back → `UnconfinedWriteError` before any assertion;
+    point the interactive write's back → the same raise at the DW-2 answer."""
+    from bmad_loop import decisions
+    from bmad_loop.workspace import Workspace
+
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    decisions.record_pre_answer(
+        project.project,
+        "DW-1",
+        DecisionOption(key="2", label="Keep", effect="keep-open"),
+        date="2026-06-12",
+    )
+    options = [
+        {"key": "1", "label": "Build", "effect": "build", "intent": "x"},
+        {"key": "2", "label": "Keep", "effect": "keep-open"},
+    ]
+    rj = triage_result(
+        ["DW-1", "DW-2"],
+        decisions=[
+            _decision("DW-1", options, recommendation="2"),
+            _decision("DW-2", options, recommendation="2"),
+        ],
+    )
+    plan, errors = validate_triage(rj, {"DW-1", "DW-2"})
+    assert errors == []
+    engine, _ = make_sweep(project, [], answers=["2"], prompting=True)
+    elsewhere = tmp_path / "code-repo"
+    elsewhere.mkdir()
+    git(elsewhere, "init")
+    engine.workspace = Workspace(root=elsewhere, paths=engine.workspace.paths)
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+
+    answers, closed = engine._decisions_phase(plan)
+
+    assert answers["DW-1"]["effect"] == "keep-open"  # the READ found the project store
+    assert answers["DW-2"]["key"] == "2"  # the interactive write landed too
+    stored = json.loads((engine.run_dir / "decisions.json").read_text(encoding="utf-8"))
+    assert set(stored) == {"DW-1", "DW-2"}
+    assert closed == 0
+    assert list(elsewhere.rglob("decisions*")) == []  # nothing leaked into the code repo
+
+
 def test_max_bundles_truncation(project):
     write_ledger(project, {"DW-1": "open", "DW-2": "open", "DW-3": "open"})
     plan = triage_result(

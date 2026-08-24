@@ -1166,6 +1166,42 @@ def _atomic_write_confined(
     )
 
 
+def create_exclusive_confined(path: Path, *, confine_root: Path) -> int:
+    """``os.open(path, O_WRONLY | O_CREAT | O_EXCL, 0o600)``, the parent reached
+    the way the confined writers reach it (#593). Returns the open fd, which the
+    caller owns; raises ``FileExistsError`` when the name is already taken — a
+    planted link included, since ``O_EXCL`` never dereferences the final
+    component — and ``UnconfinedWriteError`` when the parent cannot be vouched
+    for (out of root, a ``..`` in the relative part, or a redirect at any
+    component below ``confine_root``).
+
+    Exists for exclusive-create ARBITRATION files (``runs._create_stop_request``),
+    where "is one pending?" and "lodge mine" must stay a single atomic step
+    against the destination name. The temp-and-replace confined writers cannot
+    express that — a replace is unconditional by design — so this shares only
+    their parent walk, not their staging. On POSIX the create is anchored at the
+    walked descriptor; win32 has no ``*at()`` family and degrades to the same
+    documented check-then-create as :func:`atomic_write_text_confined`'s
+    fallback arm."""
+    if not path.is_relative_to(confine_root):
+        raise UnconfinedWriteError(f"{path} is not under {confine_root}")
+    if has_parent_ref(path.relative_to(confine_root)):
+        raise UnconfinedWriteError(f"{path} climbs back out of {confine_root} through '..'")
+    unconfined = f"cannot reach {path.parent} from {confine_root} without a redirect"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if DIR_FD_ANCHORED_WRITES:
+        dir_fd = open_dir_confined(confine_root, path.parent)
+        if dir_fd is None:
+            raise UnconfinedWriteError(unconfined)
+        try:
+            return os.open(path.name, flags, 0o600, dir_fd=dir_fd)
+        finally:
+            os.close(dir_fd)
+    if not path_is_confined(confine_root, path.parent):
+        raise UnconfinedWriteError(unconfined)
+    return os.open(path, flags, 0o600)
+
+
 def retrying_unlink(path: Path) -> None:
     """``path.unlink()`` with the same win32 retry as :func:`atomic_replace`.
 

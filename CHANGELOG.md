@@ -52,7 +52,8 @@ breaking changes may land in a minor release.
   resulting descriptor; a refusal raises `UnconfinedWriteError`, an `OSError`. Windows has no
   `*at()` family and degrades to the documented check-then-write.
 - **The orchestrator's own writers under session-writable roots adopted those confined
-  helpers** (#593): the decisions store, park records, the stop-request channel, sweep
+  helpers** (#593): the decisions store, park records, the stop-request channel (the graceful
+  lodge keeps its exclusive-create arbitration, now anchored at the walked parent), sweep
   decisions, `policy.toml`, the story-spec writers, and the run's config-digest stamp. A
   story spec in an artifacts folder configured _outside_ the checkout keeps the plain
   no-follow write — supported configuration a confined write cannot vouch for.
