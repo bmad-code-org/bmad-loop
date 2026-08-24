@@ -9242,5 +9242,22 @@ def test_sweep_archive_refuses_while_run_live(project, monkeypatch, capsys):
     monkeypatch.setattr(cli.runs, "engine_liveness", lambda _dir: "alive")
     rc = cli.main(["sweep", "--archive", "--project", str(project.project)])
     assert rc == 1
-    assert "is live" in capsys.readouterr().err
+    assert "may still be live" in capsys.readouterr().err
     assert "DW-2" in project.deferred_work.read_text(encoding="utf-8")  # nothing written
+
+
+def test_sweep_archive_refuses_on_unknown_liveness(project, monkeypatch, capsys):
+    """An unverifiable pid is treated as live for this write op — the archive
+    must not run over a run it cannot prove is dead (#711 review)."""
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open", "DW-2": "done 2026-06-01"}, commit=False)
+    run_dir = project.project / ".bmad-loop" / "runs" / "20260824-100000-aaaa"
+    run_dir.mkdir(parents=True)
+    (run_dir / "state.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(cli.runs, "engine_liveness", lambda _dir: "unknown")
+    rc = cli.main(["sweep", "--archive", "--project", str(project.project)])
+    assert rc == 1
+    assert "may still be live" in capsys.readouterr().err
+    assert "DW-2" in project.deferred_work.read_text(encoding="utf-8")  # ledger unchanged

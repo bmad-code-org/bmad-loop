@@ -2269,13 +2269,15 @@ def cmd_sweep(args: argparse.Namespace) -> int:
 def _sweep_archive(project: Path, paths: bmadconfig.ProjectPaths, args: argparse.Namespace) -> int:
     """`bmad-loop sweep --archive`: move closed deferred-work entries to a
     sibling archive file. A self-contained sub-mode — no worktree, no
-    preflight, no LLM. Refuses while any engine run is live: this is the one
-    out-of-band ledger writer, and a concurrent close or harvest landing
-    between its read and its writes would be silently clobbered."""
+    preflight, no LLM. Refuses while any engine run is live or unverifiably
+    so: this is the one out-of-band ledger writer, and a concurrent close or
+    harvest landing between its read and its writes would be silently
+    clobbered. An unverifiable pid is treated as live — a write op takes the
+    conservative side, unlike the cleanup guards which only warn."""
     for run_dir in runs.list_run_dirs(project):
-        if runs.engine_liveness(run_dir) == "alive":
+        if runs.engine_liveness(run_dir) != "dead":
             print(
-                f"run {run_dir.name} is live — stop it before archiving ledger entries",
+                f"run {run_dir.name} may still be live — stop it before archiving ledger entries",
                 file=sys.stderr,
             )
             return ExitCode.FAILURE

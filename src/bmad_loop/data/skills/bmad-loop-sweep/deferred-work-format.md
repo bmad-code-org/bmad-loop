@@ -22,7 +22,8 @@ not split a multi-goal spec, it records a `multiple-goals` warning in the spec's
 
 The file is append-only — never rewrite or delete existing entries. The one
 sanctioned rewrite is operator-run archiving (below): closed entries move to
-`deferred-work-archive.md` verbatim, leaving a stub behind.
+`deferred-work-archive.md` — body preserved, with an `archived: <date>` marker
+appended after the status line — leaving a stub behind.
 
 ## Archiving (`bmad-loop sweep --archive`)
 

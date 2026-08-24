@@ -2848,15 +2848,23 @@ def test_archive_crash_recovery_edited_entry_keeps_both_bodies(tmp_path):
     assert "status: done 2026-06-10" in archive_text
 
 
-def test_archive_default_date_flake_fixed(tmp_path):
-    """`today` sampled BEFORE the call, so a midnight rollover mid-call cannot
-    fail the assertion (docs/testing.md flake policy)."""
-    from datetime import date as calendar_date
+def test_archive_default_date_flake_fixed(tmp_path, monkeypatch):
+    """`calendar_date` is patched to a fixed clock (both `today()` and
+    `fromisoformat()`), so a midnight rollover mid-call cannot fail the
+    assertion (docs/testing.md flake policy)."""
+    from datetime import date as real_date
 
+    class FixedDate(real_date):
+        @classmethod
+        def today(cls):
+            return cls(2026, 8, 24)
+
+    monkeypatch.setattr(deferredwork, "calendar_date", FixedDate)
     path = write_ledger(tmp_path)
-    today = calendar_date.today().isoformat()
     archive_closed(path)
-    assert f"archived: {today}" in (path.parent / ARCHIVE_REL).read_text(encoding="utf-8")
+    assert f"archived: {FixedDate.today().isoformat()}" in (path.parent / ARCHIVE_REL).read_text(
+        encoding="utf-8"
+    )
 
 
 def test_archive_fenced_heading_in_archive_does_not_suppress_reclose(tmp_path):
