@@ -154,6 +154,29 @@ def _escape_exclude_pattern(pattern: str) -> str:
     return stripped + "\\ " * (len(body) - len(stripped)) + suffix
 
 
+def _fits_one_exclude_line(pattern: str) -> bool:
+    """True when ``pattern`` survives a round trip through the exclude file.
+
+    The exclude is a line-oriented format with NO escape for its own line
+    boundary, so two characters in a real filename cannot be written as a pattern
+    at all — unlike the wildmatch specials, which :func:`_escape_exclude_pattern`
+    can quote. `_worktree_local_exclude` writes each pattern `\n`-terminated
+    (`install.py`), and git reads lines back the way #472 measured them at 2.55.0:
+    `\n` boundaries with exactly ONE trailing `\r` trimmed.
+
+    * An embedded ``\n`` SPLITS the pattern into two. Neither half names the file,
+      so it is not shielded — and the orphaned second half is a live, unanchored
+      pattern that can hide an UNRELATED file, which is #401's harm direction
+      arriving through the one character #476's escaping cannot quote.
+    * A TRAILING ``\r`` is eaten as the line terminator's other half, so the
+      pattern names the path WITHOUT it — #476's harm direction, same cause.
+
+    An embedded ``\r`` is content to git (`/hidden\rjunk` ignores nothing but a
+    file spelled that way), so it needs no exclusion here.
+    """
+    return "\n" not in pattern and not pattern.endswith("\r")
+
+
 def _reconcile_tracked_patterns(
     worktree: Path, patterns: set[str], written: Collection[str]
 ) -> tuple[set[str], str | None]:
@@ -218,6 +241,13 @@ def _reconcile_tracked_patterns(
     Patterns ending in `/` are directory-shaped by construction (`RENDER_DIR_REL`) and
     are never probed.
 
+    A substituted rel that cannot be spelled as ONE exclude line
+    (:func:`_fits_one_exclude_line`) sends the WHOLE directory back to its dir
+    pattern, journaled. That is the same trade as the degrade below and for the same
+    reason: no per-file pattern exists for such a name, so substituting would leave
+    the file stageable and — for a newline — write an orphan half-pattern that hides
+    unrelated files.
+
     Degrades by KEEPING every pattern it could not resolve, in its ORIGINAL shape —
     the dir shape included, never the substitution. A shield staying too wide is
     cosmetic, while dropping or narrowing a pattern on a guess can leak the
@@ -237,6 +267,7 @@ def _reconcile_tracked_patterns(
         return patterns, None
     kept: set[str] = set()
     unprobed: list[str] = []
+    unwritable: list[str] = []
     for pattern in patterns:
         rel = pattern.lstrip("/")
         if not rel or pattern.endswith("/"):
@@ -251,16 +282,39 @@ def _reconcile_tracked_patterns(
         if kind == "untracked":
             kept.add(pattern)
         elif kind == "dir":
-            kept |= {f"/{w}" for w in written if w.startswith(rel + "/")}
+            subs = {f"/{w}" for w in written if w.startswith(rel + "/")}
+            unrepresentable = sorted(s for s in subs if not _fits_one_exclude_line(s))
+            if unrepresentable:
+                # Substituting here would write a pattern the exclude cannot carry,
+                # leaving that file stageable AND (for a `\n`) loosing an unanchored
+                # orphan pattern on unrelated files. The dir pattern is the only shape
+                # that still covers it, so this degrades the way every other
+                # unanswerable case does: KEEP the original, journal the reason. Too
+                # wide is cosmetic — this tree keeps its tracked-and-ignored report —
+                # while dropping or half-substituting leaks provisioned work into the
+                # unit's commit.
+                kept.add(pattern)
+                unwritable.extend(unrepresentable)
+            else:
+                kept |= subs
         # "file": dropped. The pattern is measurably inert over a tracked file and
         # only feeds it to repo-hygiene gates as tracked-and-ignored (#392).
+    reasons: list[str] = []
     if unprobed:
-        return kept, (
+        reasons.append(
             "worktree git-add shield could not check whether these paths are tracked, "
             "so their patterns were kept as built; a tracked path among them will read "
             f"as ignored to repo-hygiene checks (#392, #484): {'; '.join(sorted(unprobed))}"
         )
-    return kept, None
+    if unwritable:
+        reasons.append(
+            "worktree git-add shield kept a tracked directory's whole-dir pattern "
+            "because a file provisioning wrote below it cannot be spelled as one "
+            "exclude line (a newline, or a trailing carriage return); that directory "
+            "will read as ignored to repo-hygiene checks (#484): "
+            f"{'; '.join(sorted(unwritable))}"
+        )
+    return kept, (" ".join(reasons) if reasons else None)
 
 
 def _pin_tracked_config_rewrite(worktree: Path, rel: str) -> str | None:

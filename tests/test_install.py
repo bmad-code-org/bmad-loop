@@ -63,6 +63,7 @@ from bmad_loop.install import (
 from bmad_loop.worktree_flow import (
     _bmad_scripts_seed_incomplete,
     _central_config_seed_incomplete,
+    _reconcile_tracked_patterns,
     _seed_bmad_tree,
     base_skills_seed_incomplete,
     module_skills_seed_undelivered,
@@ -3354,6 +3355,52 @@ def test_shield_tracked_skill_tree_substitutes_per_file_patterns(project, tmp_pa
     # Ablation: drop that filter — `/{tree}/{MODULE_SKILLS[0]}` appears and this
     # reddens alone.
     assert not [ln for ln in exclude if ln.startswith(f"/{tree}/") and (wt / ln[1:]).is_dir()]
+
+
+def test_shield_keeps_the_dir_pattern_when_a_written_rel_cannot_be_one_line(project, tmp_path):
+    """A provisioned file whose NAME cannot be spelled as one exclude line sends the
+    WHOLE tracked directory back to its dir pattern (#484).
+
+    The exclude is line-oriented with no escape for its own boundary, so two characters
+    defeat substitution in a way `_escape_exclude_pattern` cannot quote (#476 handles
+    the wildmatch specials, which CAN be escaped). `_worktree_local_exclude` writes each
+    pattern `\n`-terminated and git reads lines back `\n`-split with one trailing `\r`
+    trimmed — #472's measurement, in this same branch:
+
+    * an embedded `\n` SPLITS the substituted pattern in two. Neither half names the
+      file, so it is not shielded, and the orphan half is an UNANCHORED pattern that
+      hides an unrelated file at any depth (#401's direction, arriving through the one
+      character escaping cannot reach).
+    * a TRAILING `\r` is eaten as the terminator's other half, so the pattern names the
+      path WITHOUT it — shielding some other file and not this one (#476's direction).
+
+    Both are legal POSIX names and reach `written` verbatim: `_written_rels` renders
+    whatever the copy landed. The dir pattern this substitution replaces DID cover them,
+    so substituting regardless would trade a cosmetic report for a real leak. Keeping it
+    is the same trade the degrade below makes, for the same reason.
+
+    Ablation: drop the `unrepresentable` guard in `_reconcile_tracked_patterns`' `"dir"`
+    branch so it substitutes unconditionally — both bad arms redden (they get the
+    per-file set and a None reason). The CONTROL arm is what keeps that honest: the same
+    call with only representable rels must still substitute, so the guard cannot pass by
+    quietly disabling substitution altogether."""
+    repo = project.project
+    tree = get_profile("claude").skill_tree
+    _track_house_skill(repo, tree)
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    ok = f"{tree}/seeded/SKILL.md"
+
+    # Control arm: representable rels still substitute, on the identical call shape.
+    kept, reason = _reconcile_tracked_patterns(wt, {f"/{tree}"}, {ok})
+    assert kept == {f"/{ok}"}
+    assert reason is None
+
+    for bad in (f"{tree}/we\nird.md", f"{tree}/trailing\r"):
+        kept, reason = _reconcile_tracked_patterns(wt, {f"/{tree}"}, {ok, bad})
+        # The dir pattern comes back whole — not the per-file set, and not nothing.
+        assert kept == {f"/{tree}"}
+        assert reason is not None and f"/{bad}" in reason
 
 
 def test_shield_degrade_keeps_the_dir_pattern_not_the_substitution(project, tmp_path, monkeypatch):
