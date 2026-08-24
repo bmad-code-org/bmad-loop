@@ -2416,12 +2416,28 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
             #
             # BYTES, never decoded text: an exclude holds path patterns, POSIX paths
             # are arbitrary bytes, and an operator's own file may be in any legacy
-            # 8-bit encoding. `bytes.splitlines()` is also the git-CORRECT split —
-            # `str.splitlines()` breaks on \x0b, \x0c, \x1c, \x1d, \x1e and \x85, none
-            # of which git treats as a line boundary, so a legitimate pattern carrying
-            # one fragments into wrong dedupe keys.
+            # 8-bit encoding. `str.splitlines()` would also break on \x0b, \x0c, \x1c,
+            # \x1d, \x1e and \x85, none of which git treats as a line boundary, so a
+            # legitimate pattern carrying one fragments into wrong dedupe keys.
+            #
+            # SPLIT THE WAY GIT DOES (#472): \n boundaries, with exactly ONE trailing
+            # \r trimmed per line. `bytes.splitlines()` is CLOSE but not identical —
+            # it also breaks on a LONE \r, which git treats as ordinary content
+            # (measured, 2.55.0: `/hidden\rjunk` ignores nothing, while `/hidden\r\n`
+            # ignores `hidden` and `/hidden\r\r\n` does not). That difference is not
+            # cosmetic here: an operator line carrying an embedded \r fragments, and a
+            # fragment byte-equal to a wanted pattern reads as ALREADY PRESENT. Where
+            # that fragment sits after the last negation the settled rule below skips
+            # the append — the shield then writes a file that does not shield, with no
+            # degrade reason, because nothing failed. The mirror direction is benign
+            # (a fragmented key only ever costs a duplicate append; last match wins),
+            # so this split is chosen for the SKIP direction alone.
+            #
+            # A trailing b"" (the file ended in \n) rides along unfiltered: no wanted
+            # pattern is empty and b"" does not start with b"!", so it is inert in both
+            # consumers below.
             existing = exclude.read_bytes() if existed else _shield_inherited_excludes(worktree)
-            lines = existing.splitlines()
+            lines = [ln.removesuffix(b"\r") for ln in existing.split(b"\n")]
             # PRESENT IS NOT THE SAME AS EFFECTIVE (#384). gitignore is LAST MATCH
             # WINS, so a pattern this file already contains can be cancelled by a `!`
             # line below it, and a plain set-membership dedupe then declined to append

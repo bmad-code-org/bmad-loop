@@ -6355,9 +6355,11 @@ def test_shield_dedupe_does_not_split_on_non_git_line_breaks(project, tmp_path):
     `\\x85` as well as on newlines; git treats none of those as a line boundary, and
     every one of them is a legal byte in a POSIX filename. So a legitimate pattern
     containing one fragmented into two wrong dedupe keys, the identical pattern then
-    read as absent, and it was appended a second time. `bytes.splitlines()` splits on
-    `\\n`, `\\r` and `\\r\\n` only — git's own boundary set (it also strips a trailing
-    `\\r`, which is why `\\r` costs nothing here).
+    read as absent, and it was appended a second time. Splitting the bytes on `\\n`
+    keeps every one of those inside its line, which is what git does. (`bytes.splitlines()`
+    was the first cure and is close enough for THIS row, since it does not break on
+    `\\x0c` either — but it breaks on a lone `\\r`, which git does not, and that is a
+    separate fault with its own tests below (#472).)
 
     Asserted on the bytes rather than through `git status`: the subject is which
     dedupe KEY the pattern produces, and a `\\x0c` in a filename is POSIX-only
@@ -6376,6 +6378,102 @@ def test_shield_dedupe_does_not_split_on_non_git_line_breaks(project, tmp_path):
     assert _worktree_local_exclude(wt, ["weird\x0cpattern", "/probe-384"]) is None
 
     assert _wt_private_exclude(wt).read_bytes() == b"weird\x0cpattern\n/probe-384\n"
+
+
+def test_shield_dedupe_survives_lone_cr_operator_line(project, tmp_path):
+    """A lone `\\r` is CONTENT to git, not a line boundary (#472) — and the dedupe has to
+    agree with git or it skips an append the shield needs.
+
+    `bytes.splitlines()` breaks on a bare `\\r`, so an operator line spelled
+    `/.claude/skills\\rjunk` — which ignores NOTHING (measured, git 2.55.0) — fragmented
+    into a `/.claude/skills` dedupe key. The writer read its own pattern as ALREADY
+    PRESENT, declined to append it, and the shield produced a file that does not shield:
+    silent, because nothing failed and no degrade reason was reported. The settled-set
+    rule cannot save this one — the fragment sits after the last negation, which is
+    precisely the window that rule trusts.
+
+    Both halves are asserted and neither substitutes for the other: the exclude's bytes
+    say the append happened, and git's own answer says the seeded skills are unstageable.
+    A file whose content is right can still be pointed at by nothing.
+
+    Read as BYTES throughout: `Path.read_text()` normalizes a lone `\\r` to `\\n`, which
+    would launder the exact byte under test out of the fixture and the assertion alike.
+
+    Ablation (run): restore `lines = existing.splitlines()`. The append assertion is the
+    first to fail, on an exclude holding `/.claude/skills\\rjunk` and no plain spelling;
+    neutralize that line and THE HARM row fails too, staging the seeded
+    `.claude/skills/**/SKILL.md` files. Both were run — the harm is the reason, the
+    append assertion is only the earlier symptom."""
+    repo = project.project
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    pattern = os.fsencode(f"/{tree}")
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    users = tmp_path / "my-global-ignores"
+    operator = b"!x\n" + pattern + b"\rjunk\n"
+    # Non-vacuity, both directions, before anything runs: the fixture really does express
+    # the fault. The OLD tokenizer yields the wanted pattern as a settled fragment (so it
+    # skips), and the git-faithful one does not (so the append is genuinely owed).
+    assert pattern in operator.splitlines()[1:]
+    assert pattern not in operator.split(b"\n")
+    users.write_bytes(operator)
+    git(repo, "config", "core.excludesFile", str(users))
+
+    provision_worktree(wt, [claude], repo)
+
+    assert pattern in _wt_private_exclude(wt).read_bytes().split(b"\n")
+    # Non-vacuity: there is something under the tree to leak, so "nothing staged" below
+    # is the shield holding rather than an empty directory.
+    assert any((wt / tree).rglob("*"))
+    # THE HARM, through git's own answer.
+    git(wt, "add", "-A")
+    staged = git(wt, "diff", "--cached", "--name-only").splitlines()
+    assert not [p for p in staged if p.startswith(f"{tree}/")]
+
+
+def test_shield_dedupe_still_skips_a_settled_effective_line(project, tmp_path):
+    """The other direction of the same tokenizer (#472): a line git DOES read as the
+    wanted pattern must still dedupe, or every re-provision appends another copy and the
+    private exclude grows without bound.
+
+    The fixture is CRLF, which is the half of the tokenizer nothing else pins. Git trims
+    exactly ONE trailing `\\r` from an exclude line (measured, 2.55.0: `/hidden\\r\\n`
+    ignores `hidden`, `/hidden\\r\\r\\n` does not), so a CRLF `/.claude/skills` line IS the
+    wanted pattern and a second copy would be pure noise. An operator on Windows editing
+    their global ignores is the ordinary way to arrive here.
+
+    Occurrence-counted rather than compared against a whole expected file: the operator's
+    prefix rides along verbatim, and the subject is how many times this one pattern lands.
+
+    Ablation (run): drop the `removesuffix(b"\\r")` — the settled key keeps its `\\r`, the
+    pattern reads as absent, and this fails on the count with `/.claude/skills` present
+    twice. Note the byte-identical re-provision assertion does NOT redden under it: the
+    appended plain-spelled copy dedupes the SECOND run, so the count is what bites."""
+    repo = project.project
+    claude = get_profile("claude")
+    tree = claude.skill_tree
+    pattern = os.fsencode(f"/{tree}")
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    users = tmp_path / "my-global-ignores"
+    users.write_bytes(b"!x\r\n" + pattern + b"\r\n")
+    git(repo, "config", "core.excludesFile", str(users))
+    msgs: list[str] = []
+
+    provision_worktree(wt, [claude], repo, on_degraded=msgs.append)
+    first = _wt_private_exclude(wt).read_bytes()
+    provision_worktree(wt, [claude], repo, on_degraded=msgs.append)
+
+    assert msgs == []
+    assert _wt_private_exclude(wt).read_bytes() == first
+    # The operator's own line is the only occurrence: the dedupe skipped the append.
+    assert first.count(pattern) == 1
+    # ... and skipping was SAFE, because that line is effective. Asserted through git,
+    # since "present" and "effective" are the two things #384 proved are not the same.
+    git(wt, "add", "-A")
+    staged = git(wt, "diff", "--cached", "--name-only").splitlines()
+    assert not [p for p in staged if p.startswith(f"{tree}/")]
 
 
 def test_shield_appends_a_pattern_an_inherited_negation_would_cancel(project, tmp_path):
