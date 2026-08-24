@@ -1047,7 +1047,12 @@ def atomic_write_text_confined(
 
     ``path`` must be **lexically** under ``confine_root`` (``relative_to``, no
     resolve — the confined spelling is the caller's own construction, and
-    resolving it would consult the very links this refuses). ``path.parent`` must
+    resolving it would consult the very links this refuses) **and carry no ``..``
+    below it**: ``is_relative_to`` is a prefix test that ``root/specs/../../x``
+    passes while naming a path outside the root, and ``..`` is a real directory
+    entry the anchored walk would otherwise climb straight back out through
+    (``O_NOFOLLOW`` has no opinion on dot-dot). Either refusal raises before
+    anything is walked or staged. ``path.parent`` must
     already EXIST: a confinement walk cannot vouch for a component that is not
     there, so every adopter mkdirs or gates first.
 
@@ -1113,9 +1118,21 @@ def _atomic_write_confined(
     require_writable_target: bool,
 ) -> None:
     """The shared body of the two confined helpers above — see
-    :func:`atomic_write_text_confined` for the contract every step implements."""
+    :func:`atomic_write_text_confined` for the contract every step implements.
+
+    The ``has_parent_ref`` refusal is the debt :func:`path_is_confined`'s
+    docstring assigns to "a caller building ``target`` out of untrusted parts":
+    ``is_relative_to`` is a lexical PREFIX test, so ``root/specs/../../outside``
+    passes it while naming a path outside the root. Neither arm below catches
+    that on its own — ``..`` is a real directory entry, so the anchored walk
+    opens it (``O_NOFOLLOW`` has no opinion on dot-dot) and climbs back OUT of
+    the root, and the win32 walk ``lstat``s through it the same way. Checked over
+    the RELATIVE part only: the operator chooses ``confine_root``'s own spelling,
+    and the components below it are the session-reachable half."""
     if not path.is_relative_to(confine_root):
         raise UnconfinedWriteError(f"{path} is not under {confine_root}")
+    if has_parent_ref(path.relative_to(confine_root)):
+        raise UnconfinedWriteError(f"{path} climbs back out of {confine_root} through '..'")
     unconfined = f"cannot reach {path.parent} from {confine_root} without a redirect"
     if DIR_FD_ANCHORED_WRITES:
         dir_fd = open_dir_confined(confine_root, path.parent)

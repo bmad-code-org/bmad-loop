@@ -2056,6 +2056,77 @@ def test_atomic_write_text_confined_writes_a_clean_tree(tmp_path):
     assert (parent / "policy.toml").read_text(encoding="utf-8") == "x = 1\n"
 
 
+def test_atomic_write_confined_refuses_a_parent_ref_below_the_root(tmp_path):
+    """`is_relative_to` is a lexical PREFIX test, so `root/specs/../../outside/f`
+    passes it while naming a path outside the root — and `..` is a real directory
+    entry, not a link, so the anchored walk would open it (`O_NOFOLLOW` has no
+    opinion on dot-dot) and climb straight back OUT of the root; the win32 walk
+    `lstat`s through it the same way. The refusal is the `has_parent_ref` gate in
+    `_atomic_write_confined`, raised over the RELATIVE part before anything is
+    walked or staged.
+
+    This is the writer paying the debt `path_is_confined`'s docstring assigns to
+    "a caller building `target` out of untrusted parts": adopters hand these
+    writers spec paths read back from state a driven session can influence
+    (`runs.rearm_escalation` re-stamps whatever spec path the run recorded), so
+    the chokepoint owes the check rather than twenty call sites.
+
+    Matched on ITS message ("climbs back out"), not merely the type, for the
+    reason the out-of-root row gives: refusing for a different reason must not
+    grade as refusing for this one.
+
+    Ablation: delete the `has_parent_ref` gate and this fails `DID NOT RAISE` —
+    the anchored walk opens `specs`, then `..` twice, and publishes the payload
+    over `outside/victim.md`."""
+    root = tmp_path / "project"
+    (root / "specs").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "victim.md"
+    victim.write_text("theirs", encoding="utf-8")
+    dodgy = root / "specs" / ".." / ".." / "outside" / "victim.md"
+    assert dodgy.is_relative_to(root)  # PRECONDITION: the prefix gate alone passes it
+
+    with pytest.raises(OSError, match="climbs back out") as caught:
+        platform_util.atomic_write_text_confined(dodgy, "mine", confine_root=root)
+
+    assert isinstance(caught.value, platform_util.UnconfinedWriteError)
+    assert victim.read_text(encoding="utf-8") == "theirs"  # not rewritten
+    assert sorted(p.name for p in outside.iterdir()) == ["victim.md"]  # nor staged
+
+
+def test_atomic_write_confined_refuses_a_parent_ref_on_the_fallback_arm(tmp_path, monkeypatch):
+    """The same refusal with `DIR_FD_ANCHORED_WRITES` off: the gate sits ABOVE
+    the two arms, so the win32 check-then-write degrade is covered by the same
+    raise. It has to be — `path_is_confined` alone answers True for the `..`
+    spelling, since every lexical cursor on it `lstat`s through real directories
+    and none is a link.
+
+    Ablation: delete the `has_parent_ref` gate and this fails `DID NOT RAISE`,
+    with the payload landing over `outside/victim.md` through the plain no-follow
+    write."""
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+    root = tmp_path / "project"
+    (root / "specs").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "victim.md"
+    victim.write_text("theirs", encoding="utf-8")
+    dodgy = root / "specs" / ".." / ".." / "outside" / "victim.md"
+
+    with pytest.raises(platform_util.UnconfinedWriteError, match="climbs back out"):
+        platform_util.atomic_write_text_confined(dodgy, "mine", confine_root=root)
+
+    assert victim.read_text(encoding="utf-8") == "theirs"  # not rewritten
+    assert sorted(p.name for p in outside.iterdir()) == ["victim.md"]  # nor staged
+
+    # Positive control: the same fallback branch still writes a clean in-tree
+    # spelling, so the refusal above is a refusal rather than an arm that raises
+    # on everything.
+    platform_util.atomic_write_text_confined(root / "specs" / "ok.md", "clean", confine_root=root)
+    assert (root / "specs" / "ok.md").read_text(encoding="utf-8") == "clean"
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
 def test_atomic_write_text_confined_lands_a_private_mode(tmp_path):
     """0600, the same mode `follow_symlinks=False` already gives this cohort — so
