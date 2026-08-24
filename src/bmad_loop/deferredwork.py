@@ -908,7 +908,23 @@ def mark_open(path: Path, dw_id: str, note: str, operation_id: str) -> bool:
         return False
     start = entry.span[0] + entry.status_span[0]
     end = entry.span[0] + res_m.end()
-    atomic_write_text(path, text[:start] + previous_status_line + text[end:])
+    # Drop the entry's live `archived:` stamps along with the close they
+    # describe. A stub's stamp says "this body lives in the archive file"; once
+    # the close is undone the body is here and the line is a lie, and leaving it
+    # is not merely untidy — status + undo tail + stamp is the exact
+    # `_STUB_BODY_RE` shape, so the next reopenable close reconstitutes a stub
+    # `archive_closed` skips forever, stranding the entry outside every future
+    # archive (#711). Cuts are disjoint (an `^archived:` line cannot start
+    # inside the status line or its adjacent tail) and applied back-to-front so
+    # earlier offsets stay valid.
+    cuts = [(start, end, previous_status_line)]
+    cuts += [
+        (entry.span[0] + cut_start, entry.span[0] + cut_end, "")
+        for cut_start, cut_end in _archived_line_spans(entry)
+    ]
+    for cut_start, cut_end, replacement in sorted(cuts, reverse=True):
+        text = text[:cut_start] + replacement + text[cut_end:]
+    atomic_write_text(path, text)
     return True
 
 
@@ -1064,17 +1080,55 @@ ARCHIVE_REL = "deferred-work-archive.md"
 _ARCHIVED_FIELD_RE = re.compile(r"^archived:", re.MULTILINE)
 
 
-def _is_archived(entry: DWEntry) -> bool:
-    """Whether the entry carries a live ``archived:`` field line (not a quoted
-    example), marking it as touched by :func:`archive_closed` — a stub in the
-    live ledger, or an archived body in the archive file.
+def _archived_line_spans(entry: DWEntry) -> list[tuple[int, int]]:
+    """Body-relative spans of the entry's live ``archived:`` field lines, each
+    covering the whole line including its terminating newline.
 
     Reads through :func:`_quoted` for the same reason every gate scan does:
     an entry documenting the archive field in a fenced example carries the
     line in column 0, right where the anchor looks, and without the fence
-    check a quoted ``archived:`` would be mistaken for the real thing.
+    check a quoted ``archived:`` would be mistaken for the real thing. The one
+    place that rule is written, so the three questions asked about the field —
+    is this entry archived, what does its body say apart from the stamp, and
+    which bytes must a reopen drop — cannot answer it differently.
+
+    Whole lines rather than match starts because both cutting callers remove
+    the line, and a span ending at the anchor would leave the stamp's value
+    behind as orphaned text.
     """
-    return any(not _quoted(entry, m.start()) for m in _ARCHIVED_FIELD_RE.finditer(entry.body))
+    spans: list[tuple[int, int]] = []
+    for m in _ARCHIVED_FIELD_RE.finditer(entry.body):
+        if _quoted(entry, m.start()):
+            continue
+        line_end = entry.body.find("\n", m.end())
+        spans.append((m.start(), len(entry.body) if line_end == -1 else line_end + 1))
+    return spans
+
+
+def _is_archived(entry: DWEntry) -> bool:
+    """Whether the entry carries a live ``archived:`` field line (not a quoted
+    example), marking it as touched by :func:`archive_closed` — a stub in the
+    live ledger, or an archived body in the archive file.
+    """
+    return bool(_archived_line_spans(entry))
+
+
+def _body_without_archived(entry: DWEntry) -> str:
+    """The entry's body with its live ``archived:`` stamps and trailing blank
+    lines removed — the comparison key for :func:`archive_closed`'s
+    crash-recovery skip.
+
+    An archived twin is its ledger entry plus exactly one ``archived:`` line,
+    so the two are the same content only once that line is discounted; trailing
+    newlines go with it because they record where the entry sat in its file,
+    not what it says. Everything else is compared verbatim, deliberately: the
+    cheap wrong answer is archiving a body twice, and the expensive one is
+    deciding a divergent re-closure was already saved and dropping it (#711).
+    """
+    body = entry.body
+    for start, end in reversed(_archived_line_spans(entry)):
+        body = body[:start] + body[end:]
+    return body.rstrip("\n")
 
 
 # Field lines a stub must carry when the archived body had them, because
@@ -1090,7 +1144,11 @@ _PRESERVED_FIELD_RE = re.compile(r"^(gate:.*|origin:.*|source_spec:.*)$", re.MUL
 _STUB_BODY_RE = re.compile(
     r"### .*: .*\n\n"
     r"status: done [0-9]{4}-[0-9]{2}-[0-9]{2}\n"
-    r"(?:resolution: [^\n]*\nresolution-undo: [0-9a-f]{64} [^\n]*\n)?"
+    # Separators mirror `_MARK_DONE_TAIL_RE`, which tolerates tabs: that regex
+    # decides what `_preserved_stub_lines` copies into the stub verbatim, so a
+    # stricter shape here reads a stub this module just wrote as a live entry
+    # and re-archives it on every run, forever, appending nothing (#711).
+    r"(?:resolution:[ \t]*[^\n]*\nresolution-undo:[ \t]*[0-9a-f]{64}[ \t]+[^\n]*\n)?"
     r"(?:(?:gate:|origin:|source_spec:)[^\n]*\n)*"
     r"archived: [^\n]*\n"
     r"\n?"
@@ -1224,12 +1282,26 @@ def archive_closed(
     # bodies again — an append-only archive accumulating duplicates. Entries
     # whose parsed archive twin carries a live (non-fenced) ``archived:``
     # field are therefore skipped here and only replaced with stubs below.
+    #
+    # The twin must match in BODY, not merely in id and close date. A DW id is
+    # reusable across closures (`mark_open` reopens, a re-close follows) and a
+    # closed entry still accepts writes (`append_decision` does not read
+    # status), so id + date names a *closure slot*, not its content: reopened
+    # and re-closed the same day with a new resolution, or annotated with a
+    # decision after its body was archived, the ledger entry and its twin
+    # differ. Skipping on the slot alone stubbed that entry over its own
+    # content while reporting the id as archived — the body reached neither
+    # file (#711). A body that differs is appended instead; the archive holds
+    # several blocks per id by design, and over-archiving is recoverable where
+    # a silent drop is not.
     archive_blocks: list[str] = []
     already_archived = {
-        e.id: _close_date(e) for e in parse_ledger(existing) if _is_archived(e)
+        e.id: (_close_date(e), _body_without_archived(e))
+        for e in parse_ledger(existing)
+        if _is_archived(e)
     }  # fence-aware: a quoted example in the archive is not a real body
     for entry, close_date in to_archive:
-        if already_archived.get(entry.id) == close_date:
+        if already_archived.get(entry.id) == (close_date, _body_without_archived(entry)):
             continue  # this closure's body is already archived (crashed prior run)
         body = entry.body
         assert entry.status_span is not None  # done with a date implies a status line

@@ -2888,3 +2888,128 @@ def test_archive_fenced_heading_in_archive_does_not_suppress_reclose(tmp_path):
     assert archive_closed(path, archive_date="2026-08-24") == ["DW-2"]
     archive_text = archive_path.read_text(encoding="utf-8")
     assert "origin: code review of spec-1-1.md" in archive_text  # real body landed
+
+
+# --------------------------------------------- archive reopen cycle (#711 review)
+#
+# A DW id outlives any one closure: `mark_open` reopens, a re-close follows, and
+# `append_decision` writes to a closed entry without reading its status. The
+# crash-recovery skip therefore cannot key on id + close date alone, the stub
+# shape must survive the spacing `_MARK_DONE_TAIL_RE` tolerates, and a reopen
+# must drop the `archived:` stamp that no longer describes the entry.
+
+
+def test_archive_same_date_reclose_preserves_new_body(tmp_path):
+    """Reopened and re-closed on the SAME date with a new resolution, the entry
+    is archived again rather than stubbed over its own content — id + close date
+    names a closure slot, not the body that filled it (#711 review)."""
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: closes twice on one day\n\n"
+        "origin: a\nlocation: src/x.py:1\nreason: first pass\nstatus: open\n"
+    )
+    path = write_ledger(tmp_path, text)
+    close_reopenable(path, "DW-1", "first close")
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-1"]
+    assert mark_open(path, "DW-1", "first close", OPERATION_ID) is True
+    assert mark_done(path, "DW-1", "2026-06-11", "second close, a different note") is True
+
+    assert archive_closed(path, archive_date="2026-08-25") == ["DW-1"]
+    archive_text = (path.parent / ARCHIVE_REL).read_text(encoding="utf-8")
+    # The returned id is truthful: the second body really reached the archive.
+    assert "second close, a different note" in archive_text
+    assert archive_text.count("### DW-1:") == 2
+    # ...and it is not hiding in the ledger either — the stub carries no note.
+    stub = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}["DW-1"]
+    assert "second close, a different note" not in stub.body
+
+
+def test_archive_decision_on_stub_preserved(tmp_path):
+    """`append_decision` writes to a closed entry without reading its status, so
+    a decision can land on a stub; the next archive run must carry it across
+    instead of overwriting the stub with a fresh one (#711 review)."""
+    path = write_ledger(tmp_path)  # DW-2 is done 2026-05-25
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-2"]
+    assert append_decision(path, "DW-2", "2026-08-25", "keep", "still relevant") is True
+
+    assert archive_closed(path, archive_date="2026-08-26") == ["DW-2"]
+    archive_text = (path.parent / ARCHIVE_REL).read_text(encoding="utf-8")
+    assert "decision: 2026-08-25 keep — still relevant" in archive_text
+    assert archive_text.count("### DW-2:") == 2
+
+
+def test_mark_open_strips_archived_line(tmp_path):
+    """Reopening drops the entry's live `archived:` stamp — the body is back in
+    the ledger, so the line is a lie — while a fenced example of the field is
+    left alone (#711 review)."""
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: documents the field it also carries\n\n"
+        "origin: a\n"
+        "```\n"
+        "archived: 2026-01-01\n"
+        "```\n"
+        "status: open\n"
+    )
+    path = write_ledger(tmp_path, text)
+    close_reopenable(path, "DW-1", "bundle close")
+    # Stamp it the way a stub is stamped: after the close's undo tail.
+    closed = path.read_text(encoding="utf-8")
+    path.write_text(closed.rstrip("\n") + "\narchived: 2026-08-24\n", encoding="utf-8")
+
+    assert mark_open(path, "DW-1", "bundle close", OPERATION_ID) is True
+    entry = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}["DW-1"]
+    assert entry.open
+    assert "archived: 2026-08-24" not in entry.body  # the live stamp is gone
+    assert "archived: 2026-01-01" in entry.body  # the fenced example is not a stamp
+    assert "origin: a" in entry.body  # nothing else was cut
+
+
+def test_archive_reopened_stub_recloses_and_archives(tmp_path):
+    """Full cycle: archive, reopen, re-close reopenably at a later date. Without
+    the reopen-side strip the re-close rebuilds the exact stub shape and
+    `_is_stub` traps the entry outside every future archive (#711 review)."""
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: full reopen cycle\n\n"
+        "origin: a\nlocation: src/x.py:1\nreason: first pass\nstatus: open\n"
+    )
+    path = write_ledger(tmp_path, text)
+    close_reopenable(path, "DW-1", "first close")
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-1"]
+    assert mark_open(path, "DW-1", "first close", OPERATION_ID) is True
+    close_reopenable(path, "DW-1", "second close", date="2026-07-01")
+
+    entry = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}["DW-1"]
+    assert not deferredwork._is_stub(entry)  # the reopen cycle broke the stub shape
+    assert archive_closed(path, archive_date="2026-08-25") == ["DW-1"]
+    archive_text = (path.parent / ARCHIVE_REL).read_text(encoding="utf-8")
+    assert archive_text.count("### DW-1:") == 2  # both closures preserved
+    assert "status: done 2026-07-01" in archive_text
+    assert "resolution: second close" in archive_text
+
+
+def test_archive_tab_resolution_stub_converges(tmp_path):
+    """A tab-separated undo tail is copied into the stub verbatim, so the stub
+    shape must tolerate the spacing `_MARK_DONE_TAIL_RE` accepts. Otherwise the
+    stub reads as a live entry and every run re-archives it (#711 review)."""
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: tab-separated tail\n\n"
+        "origin: a\n"
+        "location: src/x.py:1\n"
+        "reason: prose that does not survive into the stub\n"
+        "status: done 2026-05-25\n"
+        "resolution:\ttabbed note\n"
+        "resolution-undo:\t" + "a" * 64 + "\t2026-05-25\t7374617475733a206f70656e\n"
+    )
+    path = write_ledger(tmp_path, text)
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-1"]
+    # The stub kept the tail verbatim, tabs and all...
+    stub = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}["DW-1"]
+    assert "resolution:\ttabbed note" in stub.body
+    # ...and a second run recognizes it as a stub and settles.
+    assert archive_closed(path, archive_date="2026-08-25") == []
+    archive_text = (path.parent / ARCHIVE_REL).read_text(encoding="utf-8")
+    assert archive_text.count("### DW-1:") == 1
+    assert "archived: 2026-08-25" not in archive_text
