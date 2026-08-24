@@ -7,6 +7,8 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+## [0.11.1] — 2026-08-23
+
 ### Added
 
 - **git 2.34 or newer is now a declared prerequisite**, and the first one the orchestrator
@@ -151,7 +153,6 @@ breaking changes may land in a minor release.
   naming the path, on both arms — a file present but unreadable (permissions, a dead mount)
   was leaking a bare `OSError` on the same route. The packaged built-ins read through the
   same guard: a corrupt install is a packaging bug and should say so.
-
 - **Merge-back failures are classified from the measured tree state, and the catch-all stopped
   inventing a conflict (#619).** A merge that died part-way through its checkout — all three
   strategies, `--ff-only` included — now raises `MergeHalfAppliedError` instead of "refused
@@ -204,7 +205,6 @@ breaking changes may land in a minor release.
   was running in, and the attach return could record a pane the human never came from. The probes
   now pin to the calling pane via `TMUX_PANE`, and answer `None` without spawning when that value
   is absent or not pane-shaped.
-
 - **An unresolvable restore-patch or spec-folder path is now a named refusal, not a bare
   `[Errno ...]` (#560).** `_resolve_restore_patch` (`cli --restore-patch`) and
   `relativize_spec_folder` (`--spec`, `[stories] source`) each called `.resolve()` outside the
@@ -3597,7 +3597,8 @@ enforced in CI.
   implementation phase, driven by a Python control loop with hook-based session transport and
   resumable on-disk run state.
 
-[Unreleased]: https://github.com/bmad-code-org/bmad-loop/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/bmad-code-org/bmad-loop/compare/v0.11.1...HEAD
+[0.11.1]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.11.1
 [0.11.0]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.11.0
 [0.10.0]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.10.0
 [0.9.1]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.9.1
