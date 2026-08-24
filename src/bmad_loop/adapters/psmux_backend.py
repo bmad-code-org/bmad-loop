@@ -44,9 +44,14 @@ reported version —
 see ``_LAST_UNSUPPORTED`` for what the floor buys and why it moves.
 ``has_session``
 is inherited unchanged, but one server per session gives it a residual the
-tmux path does not have: a ``-t`` read naming a session whose own server is
-gone can be answered by a different server, so a wrong ``True`` is reachable
-when a same-named session exists on a foreign one. For the lost-session probe
+tmux path does not have: a ``-t`` read resolves through the named port and key
+files, so a wrong ``True`` is reachable whenever that PAIR addresses some OTHER
+live server. Both halves are needed — the server rejects a key mismatch before
+running anything — so a merely recycled port does not reach it; a duplicated
+registry entry or a same-named session on a foreign server does. A server that
+is simply *gone* fails closed: measured on 3.3.8, both a removed port file and
+a stale one whose process was killed answer rc 1, ``no server running on
+session``. For the lost-session probe
 (#489) that is the safe direction — a wrong ``True`` drops the diagnosis
 rather than inventing one — and the collision it needs is an independently
 created session sharing a ``bmad-loop-<run-id>`` name: an operator's, or
@@ -842,13 +847,16 @@ class PsmuxMultiplexer(BaseTmuxBackend):
     #
     # Two costs are taken deliberately here, since both are the kind that go
     # unnoticed. The gate IS an absolute count, which the delta rule below
-    # forbids for good reason: the same server-fallback that makes "zero
-    # attached" meaningless (#315) can hand back a FOREIGN session's nonzero
-    # count, and a switch that exits 0 for its own reasons would then read as
-    # vouched-for. It is admitted only because the alternative — the delta — is
-    # blind to the same-session move this verb's main caller performs, and the
-    # damage directions are not equal: a wrong True here costs one unverified
-    # hand-back claim, where the delta cost a relocated human. And the rc rule
+    # forbids for good reason: a misrouted read (#315) can hand back a FOREIGN
+    # session's nonzero count, and a switch that exits 0 for its own reasons
+    # would then read as vouched-for. _attached_clients now refuses the answer
+    # that does not NAME the session it was asked about, so what is left is a
+    # foreign server whose session carries the same name — the #531 collision,
+    # which no read of a name can separate. It is admitted only because the
+    # alternative — the delta — is blind to the same-session move this verb's
+    # main caller performs, and the damage directions are not equal: a wrong
+    # True here costs one unverified hand-back claim, where the delta cost a
+    # relocated human. And the rc rule
     # assumes the admitted floor: psmux/psmux#483 lands in 3.3.8, so on a build
     # forced past ``available()`` (an explicit backend override) a ``-t`` that
     # moves nobody still exits 0 and is answered True.
@@ -858,10 +866,14 @@ class PsmuxMultiplexer(BaseTmuxBackend):
     # Neither can use rc — ``-l`` has no target form and carries no server reply
     # at all, and ``detach-client`` exits 0 with zero clients attached (a
     # flag-less detach is promoted server-side to detach-all). Never an absolute
-    # count: a read against a session whose server is gone answers from whichever
-    # server the fallback picks, so "zero attached" on its own proves nothing
-    # (#315). A drop cannot be manufactured that way — it needs two successful
-    # reads of the same session, the first of them nonzero.
+    # count: a misrouted read answers for a session nobody asked about, so "zero
+    # attached" on its own proves nothing (#315) — and the identity compare in
+    # _attached_clients narrows that to a same-name foreign server rather than
+    # closing it. Against a DIFFERENTLY-named server the delta is additionally
+    # safe: manufacturing a drop needs two successful reads, and the second one
+    # is refused by name. Against a same-NAME one it is not — that server's own
+    # client detaching between the two reads is a real drop, of a real client,
+    # in the wrong session. #531 is the only thing that closes it.
     #
     # The delta is why ``-t`` could not stay on it (#659): a switch whose target
     # lives in THIS session moves the client between windows without changing the
@@ -879,20 +891,71 @@ class PsmuxMultiplexer(BaseTmuxBackend):
     def _attached_clients(self, session: str) -> int | None:
         """Clients attached to ``session``, or None when psmux cannot say.
 
-        Self-detecting on purpose: an unsupported format field cannot answer a
-        plausible integer, so a psmux build that does not carry
-        ``#{session_attached}`` degrades to None instead of a wrong count.
+        Self-detecting on purpose, in two directions. An unsupported format
+        field cannot answer a plausible integer, so a build that does not carry
+        ``#{session_attached}`` degrades to None instead of a wrong count. And
+        the read reports the session it answered FOR: ``-t`` resolves through
+        the named port AND key files, so when that pair addresses some OTHER
+        live server the answer is that server's — rc 0, plausible count, wrong
+        session (measured on 3.3.8: port and key copied from a live session
+        answered ``0|alive`` for ``-t forged``, naming itself). Both files are
+        required — a key mismatch is rejected before the command runs — so this
+        is a duplicated registry entry, not a merely recycled port. Comparing
+        the answered name against the requested one is what refuses it. The seam's
+        ``={session}`` token cannot: psmux strips the ``=`` before it routes
+        anything (``parse_target`` → ``strip_exact_match_prefix``), so both
+        spellings were byte-identical in every probed state. What survives the
+        compare is a genuine same-NAME session on a foreign server, which no
+        name can separate — see the module docstring and #531.
+
+        The count comes FIRST in the format so the split is unambiguous: it is
+        all digits and so cannot contain the separator, which leaves the name
+        as the whole remainder even when the name contains one.
         """
+        # The #221 rule the sibling call sites already apply (see
+        # current_return_target): `a:b` parses as session `a`, window `b`, so a
+        # `:`-bearing name addresses something else entirely. Refuse before
+        # spawning rather than trusting what comes back.
+        if not session or ":" in session:
+            return None
         try:
             proc = self._run(
-                ["display-message", "-p", "-t", session, "#{session_attached}"], check=False
+                ["display-message", "-p", "-t", session, "#{session_attached}|#{session_name}"],
+                check=False,
             )
         except (subprocess.SubprocessError, OSError):
             return None
         if proc.returncode != 0:
             return None
-        text = proc.stdout.strip()
-        return int(text) if text.isdigit() else None
+        # `session` reaches here from `current_session`, which is
+        # `_display_message` and therefore ALREADY `.strip()`ped, so the name we
+        # ask with is the normalized one. That bounds what this compare can and
+        # cannot do, in both directions:
+        #
+        #   - A session whose REAL name carries surrounding whitespace is
+        #     unreachable through the normalized name anyway — the registry is
+        #     one file per name, so `-t ctl` finds no `ctl.port` for a session
+        #     named `" ctl"` and fails closed at rc 1. There is no own-count case
+        #     to protect here, which is why the answer is stripped the same way
+        #     rather than preserved.
+        #   - The converse is the hazard: with a real `"ctl"` also present,
+        #     `-t ctl` reaches THAT session and its count passes the compare.
+        #     Measured on 3.3.8 — `" ctl"` and `"ctl"` coexist as ` ctl.port` and
+        #     `ctl.port`, and the read answers `0|ctl`. A name cannot separate
+        #     names the seam has already merged; that is the #531 family, the
+        #     same ceiling the same-name foreign server sits under.
+        #
+        # Control characters need no handling: psmux escapes them in format
+        # output, so a session whose name ends in a real carriage return answers
+        # with the literal characters `\` and `r` and fails the compare like any
+        # other mismatch. Measured on 3.3.8 through the hardest route available —
+        # duplicate a live session's port and key under a second name, then
+        # rename the original to a CR-bearing name so the surviving alias reaches
+        # a server whose in-memory name differs only by the control character.
+        count, _, answered = proc.stdout.strip().partition("|")
+        if answered != session or not count.isdigit():
+            return None
+        return int(count)
 
     def _client_left(self, verb: list[str]) -> bool | None:
         """Run a client verb and answer whether a client left this session —

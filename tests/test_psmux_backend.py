@@ -1643,14 +1643,35 @@ def test_ctl_prune_scan_discriminates_projects_end_to_end(monkeypatch, tmp_path)
 # ---------------------------------------- client verbs: observed effect (#317)
 
 
-def _client_fake(monkeypatch, *, attached, session="ctl", verb_rc=0, drains_on_switch=False):
+#: The one format the attached-count probe asks for. The session NAME rides
+#: along with the count so the answer identifies which session it is about —
+#: a `-t` read can be served by another server (gh-671).
+ATTACHED_FMT = "#{session_attached}|#{session_name}"
+
+
+def _client_fake(
+    monkeypatch,
+    *,
+    attached,
+    session="ctl",
+    verb_rc=0,
+    drains_on_switch=False,
+    answered_session=None,
+):
     """Script the two probes the client verbs measure with.
 
-    ``attached`` is the successive answers to ``#{session_attached}``, consumed
-    in call order. The delta verbs (``-l``, ``detach-client``) take two each — a
-    detach that worked is ["1", "0"] and psmux's rc-0 no-op is ["1", "1"] — while
-    ``switch-client -t`` takes ONE, the gate count read before it. Every verb
-    exits ``verb_rc`` (0 by default), which only the ``-t`` leg reads.
+    ``attached`` is the successive COUNTS the probe answers, consumed in call
+    order; the harness pairs each with the answering session name, exactly as
+    ``ATTACHED_FMT`` makes psmux do. The delta verbs (``-l``, ``detach-client``)
+    take two each — a detach that worked is ["1", "0"] and psmux's rc-0 no-op is
+    ["1", "1"] — while ``switch-client -t`` takes ONE, the gate count read before
+    it. Every verb exits ``verb_rc`` (0 by default), which only the ``-t`` leg
+    reads.
+
+    ``answered_session`` is the name the probe REPORTS, defaulting to the
+    session we are in. Setting it apart from ``session`` is the misrouted read
+    (gh-671): another server answering at rc 0 with a plausible count of its
+    own.
 
     ``drains_on_switch`` makes the count answer ``"0"`` from the moment a
     ``switch-client`` has been seen, i.e. the session empties BECAUSE the verb
@@ -1661,16 +1682,17 @@ def _client_fake(monkeypatch, *, attached, session="ctl", verb_rc=0, drains_on_s
     monkeypatch.setenv("TMUX", "/tmp/psmux-1000/default,123,0")  # inside a pane
     monkeypatch.setenv("TMUX_PANE", "%9")  # the pane the probes pin to (gh-669)
     counts = list(attached)
+    answered = session if answered_session is None else answered_session
     calls: list[list] = []
 
     def fake(argv, **kwargs):
         calls.append(list(argv))
         if argv[1] == "display-message" and argv[-1] == "#{session_name}":
             return subprocess.CompletedProcess(argv, 0, stdout=f"{session}\n", stderr="")
-        if argv[1] == "display-message" and argv[-1] == "#{session_attached}":
+        if argv[1] == "display-message" and argv[-1] == ATTACHED_FMT:
             drained = drains_on_switch and any(c[1] == "switch-client" for c in calls[:-1])
             answer = "0" if drained else counts.pop(0)
-            return subprocess.CompletedProcess(argv, 0, stdout=f"{answer}\n", stderr="")
+            return subprocess.CompletedProcess(argv, 0, stdout=f"{answer}|{answered}\n", stderr="")
         return subprocess.CompletedProcess(argv, verb_rc, stdout="", stderr="")
 
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
@@ -1682,7 +1704,7 @@ def test_psmux_detach_reports_the_observed_drop(monkeypatch):
     assert PsmuxMultiplexer().detach_client() is True
     assert ["psmux", "detach-client"] in calls
     # both probes routed to the session, never left to the most-recent fallback
-    assert calls.count(["psmux", "display-message", "-p", "-t", "ctl", "#{session_attached}"]) == 2
+    assert calls.count(["psmux", "display-message", "-p", "-t", "ctl", ATTACHED_FMT]) == 2
 
 
 def test_psmux_detach_with_nothing_attached_is_false(monkeypatch):
@@ -1743,7 +1765,7 @@ def test_psmux_switch_reports_a_cross_session_move(monkeypatch):
     assert not any(c[1:3] == ["switch-client", "-l"] for c in calls)
     # One gate read, routed at this session — the #315-safe shape the detach
     # tests pin for the delta legs, and the arity a re-added `after` read breaks.
-    assert calls.count(["psmux", "display-message", "-p", "-t", "ctl", "#{session_attached}"]) == 1
+    assert calls.count(["psmux", "display-message", "-p", "-t", "ctl", ATTACHED_FMT]) == 1
 
 
 def test_psmux_switch_with_nothing_attached_cannot_vouch(monkeypatch):
@@ -2025,3 +2047,106 @@ def test_psmux_switch_fallback_transport_fault_on_an_empty_session_cannot_vouch(
     monkeypatch.setattr(tmux_base.subprocess, "run", boom)
     assert PsmuxMultiplexer().switch_client("ctl:%9", last_fallback=True) is None
     assert dispatched == [["psmux", "switch-client", "-l"]]
+
+
+# ------------------------------- attached-count identity (gh-671)
+
+
+def _count_fake(monkeypatch, *, rc=0, stdout=""):
+    """Answer whatever the attached-count probe asks with one canned reply, and
+    record every spawn — including the spawns that never happen, which is what
+    the pre-flight refusals are asserted on."""
+    calls: list[list] = []
+
+    def fake(argv, **kwargs):
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(argv, rc, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    return calls
+
+
+def test_attached_count_reads_its_own_session(monkeypatch):
+    calls = _count_fake(monkeypatch, stdout="2|ctl\n")
+    assert PsmuxMultiplexer()._attached_clients("ctl") == 2
+    assert calls == [["psmux", "display-message", "-p", "-t", "ctl", ATTACHED_FMT]]
+
+
+def test_attached_count_refuses_a_differently_named_sessions_answer(monkeypatch):
+    """A `-t` read resolves through the named port AND key files, so when that
+    pair addresses another LIVE server the answer is that server's: rc 0, a
+    plausible count, and a session nobody asked about. Measured on 3.3.8; both
+    files are needed, since a key mismatch is rejected before the command runs.
+    The name riding along with the count is the only thing that separates such
+    an answer from our own."""
+    _count_fake(monkeypatch, stdout="1|alive\n")
+    assert PsmuxMultiplexer()._attached_clients("ctl") is None
+
+
+def test_attached_count_refuses_an_unnamed_answer(monkeypatch):
+    """An empty name field is an absent identity, not a matching one."""
+    _count_fake(monkeypatch, stdout="2|\n")
+    assert PsmuxMultiplexer()._attached_clients("ctl") is None
+
+
+def test_attached_count_refuses_a_dead_server(monkeypatch):
+    """Both a removed port file and a stale one whose process was killed answer
+    `no server running on session` at rc 1 — measured, and the direction that
+    was already safe. Pinned so the identity compare cannot mask a regression
+    into rc 0 here.
+
+    The stdout is a WELL-FORMED matching answer on purpose: with an empty one
+    the parser refuses for its own reasons, so deleting the rc guard would leave
+    this test green and pin nothing."""
+    _count_fake(monkeypatch, rc=1, stdout="2|ctl\n")
+    assert PsmuxMultiplexer()._attached_clients("ctl") is None
+
+
+def test_attached_count_survives_a_separator_inside_the_session_name(monkeypatch):
+    """The count is all digits and so cannot contain the separator: splitting
+    once leaves the name whole, however many separators it carries."""
+    _count_fake(monkeypatch, stdout="2|we|ird\n")
+    assert PsmuxMultiplexer()._attached_clients("we|ird") == 2
+
+
+def test_attached_count_refuses_a_colon_bearing_session_without_spawning(monkeypatch):
+    """`a:b` parses as session `a`, window `b` (#221), so the read would address
+    something else entirely — the rule current_return_target already applies."""
+    calls = _count_fake(monkeypatch, stdout="2|foo\n")
+    assert PsmuxMultiplexer()._attached_clients("foo:bar") is None
+    assert calls == []
+
+
+def test_attached_count_refuses_an_empty_session_without_spawning(monkeypatch):
+    calls = _count_fake(monkeypatch, stdout="2|\n")
+    assert PsmuxMultiplexer()._attached_clients("") is None
+    assert calls == []
+
+
+def test_switch_client_will_not_vouch_with_another_sessions_count(monkeypatch):
+    """The gh-671 hazard at the verdict layer. Since #670 the gate count is read
+    in the NONZERO direction, so a borrowed nonzero count would vouch for an
+    rc-0 switch that moved nobody — a vacuous True that
+    tui.launch.return_attached_client turns into RETURNED and a cleared return
+    option. Unvouched must answer None, never True."""
+    _client_fake(monkeypatch, attached=["1"], answered_session="alive")
+    assert PsmuxMultiplexer().switch_client("ctl:%9") is None
+
+
+def test_detach_verdict_refuses_a_borrowed_delta(monkeypatch):
+    """The same substitution one layer down: a drop read off another session's
+    counts is not our client leaving."""
+    _client_fake(monkeypatch, attached=["1", "0"], answered_session="alive")
+    assert PsmuxMultiplexer().detach_client() is False
+
+
+def test_attached_count_refuses_a_name_differing_only_by_whitespace(monkeypatch):
+    """`" ctl"` is not `"ctl"`: different registry entries, different servers.
+    The requested name arrives pre-`.strip()`ped (`current_session` is
+    `_display_message`), so this is the shape a whitespace-bearing session takes
+    when some OTHER server answers for the normalized name — refuse it, exactly
+    as any other differing name. The reverse direction needs no guard: a session
+    really named `" ctl"` has no `ctl.port`, so the read fails closed at rc 1
+    before any compare."""
+    _count_fake(monkeypatch, stdout="1| ctl\n")
+    assert PsmuxMultiplexer()._attached_clients("ctl") is None
