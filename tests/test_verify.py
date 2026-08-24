@@ -3540,9 +3540,11 @@ def test_path_tracked_file_separates_a_file_from_a_directory_prefix(project):
     answers True for BOTH a tracked file and a tracked directory, and the worktree
     shield needs opposite behaviour for the two (#392).
 
-    Ablation: return `bool(entries)` instead of comparing the set and the directory
-    assertion flips to True — i.e. the shield would start dropping a tracked skill
-    tree's pattern, which measurably DOES shield new children."""
+    Ablation: return `bool(entries)` instead of comparing the set — the mechanics now
+    live in `path_tracked_kind`, which this delegates to — and the directory assertion
+    flips to True. The shield would then read a tracked skill tree as a tracked FILE and
+    drop its pattern outright, where #484 has it SUBSTITUTE one pattern per file
+    provisioning actually wrote; nothing would shield that tree at all."""
     repo = project.project
     (repo / "_bmad" / "render").mkdir(parents=True, exist_ok=True)
     (repo / "_bmad" / "render" / "render_skill.py").write_text("# renderer\n")
@@ -3582,7 +3584,8 @@ def test_path_tracked_file_reads_a_metachar_name_past_its_glob_neighbour(project
     then keeps an inert pattern and the #392 hygiene failure survives for any project
     whose hook config or skill tree carries `[`, `*` or `?`.
 
-    Ablation: drop the `:(literal)` prefix and the first assertion flips to False."""
+    Ablation: drop the `:(literal)` prefix — the spec now lives in `path_tracked_kind`,
+    which this delegates to — and the first assertion flips to False."""
     repo = project.project
     _metachar_pair(repo, "docs[a]", "docsa")  # both committed, and the glob collides
     assert verify.path_tracked_file(repo, "docs[a]/f.md")
@@ -3604,6 +3607,89 @@ def test_path_tracked_file_raises_on_git_failure(project, monkeypatch):
     monkeypatch.setattr(verify, "git_bytes", boom)
     with pytest.raises(verify.GitError):
         verify.path_tracked_file(repo, "src.txt")
+
+
+def test_path_tracked_kind_separates_untracked_file_and_dir(project):
+    """The tri-state the shield reads (#484). A tracked FILE, a tracked DIRECTORY prefix
+    and a path with no index entry want three different pattern treatments — drop,
+    substitute one pattern per file provisioning wrote, keep — and the boolean sibling
+    collapses the last two into a single False.
+
+    Ablation: in `path_tracked_kind`, discriminate on `bool(entries)` instead of
+    comparing the set against `{os.fsencode(rel)}`, and the directory case answers
+    "file" — the shield would read a tracked skill tree as a tracked file, drop its
+    pattern outright, and put nothing at all in its place."""
+    repo = project.project
+    (repo / "_bmad" / "render").mkdir(parents=True, exist_ok=True)
+    (repo / "_bmad" / "render" / "render_skill.py").write_text("# renderer\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "render")
+    (repo / "stray.txt").write_text("untracked\n")
+
+    assert verify.path_tracked_kind(repo, "src.txt") == "file"
+    assert verify.path_tracked_kind(repo, "_bmad/render/render_skill.py") == "file"
+    # A directory lists the entries BENEATH it, never its own name — at either depth.
+    assert verify.path_tracked_kind(repo, "_bmad/render") == "dir"
+    assert verify.path_tracked_kind(repo, "_bmad") == "dir"
+    # Both untracked directions, which `path_tracked` cannot separate either.
+    assert verify.path_tracked_kind(repo, "stray.txt") == "untracked"
+    assert verify.path_tracked_kind(repo, "never_existed.txt") == "untracked"
+
+
+def test_path_tracked_kind_reads_a_metachar_name_past_its_glob_neighbour(project):
+    """The literal-pathspec hazard, in the direction reading the output's TEXT cannot
+    refuse on its own.
+
+    When the metachar path IS a tracked file and its glob neighbour is tracked too, a
+    bare pathspec returns BOTH names. The set then exceeds the singleton and a genuine
+    tracked FILE reads "dir", so the shield substitutes per-file patterns for a tree it
+    never wrote — for any project whose hook config or skill tree carries `[`, `*` or
+    `?`.
+
+    Ablation: drop the `:(literal)` prefix from `path_tracked_kind`'s spec alone (inline
+    the bare rel in place of `_literal_specs`, so the sibling probes that share that
+    helper stay untouched) and the first assertion flips to "dir". The absent-path
+    assertion below flips too, to "dir" on the neighbour's name alone — where the
+    boolean sibling's own record notes that direction ablates GREEN there, because
+    `{neighbour} != {rel}` reads False whichever way it got there. Widening the answer
+    from two states to three is what gives the second direction teeth."""
+    repo = project.project
+    _metachar_pair(repo, "docs[a]", "docsa")  # both committed, and the glob collides
+    assert verify.path_tracked_kind(repo, "docs[a]/f.md") == "file"
+    assert verify.path_tracked_kind(repo, "docsa/f.md") == "file"
+    git(repo, "rm", "-r", "-q", "--cached", "--", ":(literal)docs[a]")
+    assert verify.path_tracked_kind(repo, "docs[a]/f.md") == "untracked"
+
+
+def test_path_tracked_kind_raises_on_git_failure(project, monkeypatch):
+    """Contracted to raise like every other probe here, so the shield's caller makes its
+    own keep-the-pattern decision rather than inheriting a silent answer. Of the three,
+    a silent "file" drops the pattern and leaks seeded files into a story commit and a
+    silent "dir" substitutes patterns for a tree provisioning never wrote; only
+    "untracked" happens to coincide with the degrade, and a probe must not depend on
+    which fault it draws.
+
+    Pins the rc≠0 branch specifically: `git_bytes` returns the returncode as an ANSWER
+    and never raises on it, so nothing but this check turns a failed spawn into a fault.
+
+    Ablation: delete the `if proc.returncode != 0` raise and the call returns
+    "untracked" — a failed probe reading as a clean answer. That same mutation leaves
+    `test_path_tracked_file_raises_on_git_failure` GREEN, because it monkeypatches
+    `git_bytes` to RAISE rather than to return a bad rc: the sibling pins propagation,
+    not the branch that manufactures the fault, and only this test covers the latter."""
+    repo = project.project
+
+    def failed(_repo, *_args, **_kwargs):
+        return subprocess.CompletedProcess(
+            args=["git"], returncode=128, stdout=b"", stderr=b"fatal: bad index file"
+        )
+
+    monkeypatch.setattr(verify, "git_bytes", failed)
+    with pytest.raises(verify.GitError) as excinfo:
+        verify.path_tracked_kind(repo, "src.txt")
+    # The BARE rel is the operator's informative half; the magic prefix is our plumbing.
+    assert "src.txt" in str(excinfo.value)
+    assert "fatal: bad index file" in str(excinfo.value)
 
 
 @RESERVED_IN_WINDOWS_FILENAMES

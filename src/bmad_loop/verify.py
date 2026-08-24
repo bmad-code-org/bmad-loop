@@ -1147,43 +1147,87 @@ def path_tracked(repo: Path, rel: str) -> bool:
     return bool(proc.stdout.strip())
 
 
-def path_tracked_file(repo: Path, rel: str) -> bool:
-    """True when repo-relative posix ``rel`` is tracked AND names a regular FILE rather
-    than a directory prefix.
+def path_tracked_kind(repo: Path, rel: str) -> Literal["untracked", "file", "dir"]:
+    """Which of three states repo-relative posix ``rel`` holds in the index: absent from
+    it, a tracked regular FILE, or a tracked DIRECTORY prefix.
 
     The distinction :func:`path_tracked` deliberately does not draw. Its literal
     pathspec matches a directory prefix too — that is load-bearing there, which is why
     `_bmad/render` answers True for the whole tree beneath it — so a caller that must
-    know *which* of the two it holds cannot get it from that boolean.
+    know *which* of the three it holds cannot get it from that boolean.
 
-    The one caller is the worktree git-add shield, where the two cases want OPPOSITE
-    treatment (#392). Measured, git 2.55.0:
+    ONE `ls-files` spawn answers all three, because the pathspec's literal comparison is
+    itself what separates them: a tracked file lists exactly the name asked for, a
+    tracked directory lists the entries BENEATH it (never the directory's own name), and
+    a path with no index entry lists nothing. So the empty set is "untracked", the
+    singleton `{rel}` is "file", and any other non-empty set is "dir". A D/F-conflicted
+    index — one name carrying both a file entry and entries beneath it — therefore
+    answers "dir", which degrades toward substituting per-file patterns for what
+    provisioning actually wrote: still a shield over our own files, and wrong in the
+    spare-a-pattern direction rather than the leaking one.
 
-    * An exclude pattern naming a tracked regular file suppresses NOTHING. git consults
+    The worktree git-add shield is what needs the three apart, because they want three
+    different treatments (#392, #484). Measured, git 2.55.0:
+
+    * An exclude pattern naming a tracked regular FILE suppresses NOTHING. git consults
       ignore rules only for untracked paths, so `git add -A` stages a modification to it
       regardless. The pattern's only effect is to make the file answer
       `ls-files -ci --exclude-standard`, i.e. read as tracked-and-ignored — which is a
       state repo-hygiene gates reject, and how a shield meant to keep the orchestrator's
-      files OUT of a story commit came to block one instead.
-    * The same pattern over a tracked DIRECTORY really does hide new children, so it
-      stays. There is no pattern shape that keeps that and clears the `-ci` report:
-      `dir/*`, `dir/**` and a trailing negation all measured identical to `dir`, because
-      gitignore cannot re-include anything under an excluded parent.
+      files OUT of a story commit came to block one instead. The pattern is dropped.
+    * The same pattern over a tracked DIRECTORY really does hide new children, and no
+      pattern shape keeps that AND clears the `-ci` report: `dir/*`, `dir/**` and a
+      trailing negation all measured identical to `dir`, because gitignore cannot
+      re-include anything under an excluded parent. That measurement stands; the verdict
+      it once carried — keep the dir pattern, accept the report — is REVERSED (#484).
+      Over a tracked directory the protection is already mostly inert, since
+      modifications to tracked children stage regardless, so the pattern was buying only
+      new-child coverage at the price of a false tracked-and-ignored report across the
+      whole tree. It is replaced by one pattern per untracked file provisioning wrote.
+      The residual — a session-created NEW child under a tracked tool directory can be
+      staged — is accepted, and matches the project's own decision to track that tree.
+    * An UNTRACKED path keeps its pattern unchanged: full protection, and nothing
+      beneath it can answer `-ci` in the first place.
 
-    `-z` and the BYTES accessor, unlike the sibling above. This reads the output's TEXT
-    rather than only its emptiness, so the sibling's reason for never looking —
-    `core.quotePath` mangling non-ASCII names — becomes this function's problem instead.
+    `-z` and the BYTES accessor, unlike :func:`path_tracked`. This reads the output's
+    TEXT rather than only its emptiness, so that function's reason for never looking —
+    `core.quotePath` mangling non-ASCII names — becomes this one's problem instead.
     NUL-delimited output is never quoted, and comparing `os.fsencode(rel)` keeps a POSIX
     name that is undecodable in the locale codec comparable rather than raising (#377).
 
+    The pathspec is forced LITERAL for BOTH directions of the metacharacter hazard, not
+    just the sibling's one. Reading the text already refuses a glob's false positive on
+    an ABSENT ``rel``: the stray match comes back under the NEIGHBOUR'S name, which is
+    not the name asked for, so the set differs whatever the pathspec. What needs
+    `:(literal)` is the opposite direction — when ``rel`` carries `[`, `]`, `*` or `?`
+    and a glob-colliding neighbour is tracked too, a bare pathspec returns BOTH names.
+    The set then exceeds the singleton and a genuine tracked FILE reads "dir", so the
+    shield substitutes patterns for a tree it never wrote, for any project whose hook
+    config or skill tree carries a metacharacter.
+
     Raises GitError like every other probe in this module; the shield's caller degrades
-    by KEEPING the pattern, since a leaked seed file in a story commit is the worse of
-    the two failures."""
+    by KEEPING the pattern it already holds, since a leaked seed file in a story commit
+    is the worse of the two failures."""
     proc = git_bytes(repo, "ls-files", "-z", "--", *_literal_specs([rel]))
     if proc.returncode != 0:
         merged = (proc.stdout + proc.stderr).decode("utf-8", "replace").strip()
         raise GitError(f"git ls-files -z -- {rel} failed in {repo}: {merged}")
-    return {entry for entry in proc.stdout.split(b"\0") if entry} == {os.fsencode(rel)}
+    entries = {entry for entry in proc.stdout.split(b"\0") if entry}
+    if not entries:
+        return "untracked"
+    return "file" if entries == {os.fsencode(rel)} else "dir"
+
+
+def path_tracked_file(repo: Path, rel: str) -> bool:
+    """True when repo-relative posix ``rel`` is tracked AND names a regular FILE rather
+    than a directory prefix.
+
+    The two-state read of :func:`path_tracked_kind`, which owns the mechanics and the
+    doctrine. Kept for `_pin_tracked_config_rewrite` (`worktree_flow`), whose question
+    really is yes/no: only a tracked file can carry the skip-worktree bit the pin
+    depends on, and both other kinds mean there is nothing to pin. A caller that has to
+    tell a tracked DIRECTORY from an untracked path asks the tri-state probe itself."""
+    return path_tracked_kind(repo, rel) == "file"
 
 
 def _blob_oid_for_file(repo: Path, rel: str, path: Path) -> str:
