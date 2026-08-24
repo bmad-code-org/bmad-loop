@@ -30,6 +30,10 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **TUI: a graceful-stop request that cannot be written is reported, not fatal.** The `S`
+  worker caught only the helper's own refusals; an `OSError` from the write itself escaped,
+  and Textual's default `exit_on_error` took the dashboard down with it. It now surfaces
+  the same "may still be pending" guidance as `stop --graceful`.
 - **A denied publish no longer leaks its staging temp on Windows** (#597). The temp had
   already taken a read-only target's READONLY bit when the replace was denied, and Windows
   refuses to delete a READONLY file, so the cleanup was denied too and the temp survived.

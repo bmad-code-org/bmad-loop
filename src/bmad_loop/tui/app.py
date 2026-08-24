@@ -1003,6 +1003,22 @@ class BmadLoopApp(App[None]):
         except runs.GracefulStopError as e:
             self.call_from_thread(self.notify, str(e), severity="error")
             return
+        except OSError as e:
+            # Mirrors the CLI's `stop --graceful` arm: the lodge does not roll
+            # back a failed write (see _create_stop_request), so a part-way
+            # failure can leave a graceful request standing — and a confined
+            # refusal (`UnconfinedWriteError`, #593) wrote nothing at all. Either
+            # way the worker must not raise: Textual workers default to
+            # exit_on_error=True, so an uncaught OSError here would take the
+            # whole dashboard down instead of reporting the refusal.
+            self.call_from_thread(
+                self.notify,
+                f"run {run_id}: stop request could not be written ({e}) — a graceful "
+                f"request may still be pending; check `bmad-loop status {run_id}` and "
+                f"use `bmad-loop stop {run_id} --cancel-graceful` to withdraw it",
+                severity="error",
+            )
+            return
         if outcome == "already-pending":
             # Mode-neutral: the pending request may be a hard one, and this token
             # cannot tell (#319) — same wording as the CLI's `stop --graceful`.

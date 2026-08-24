@@ -3679,6 +3679,33 @@ async def test_graceful_stop_token_messages(project, monkeypatch, token, needle)
         await until(pilot, lambda: any(needle in m for m in notifications(app)))
 
 
+async def test_graceful_stop_write_failure_notifies_instead_of_crashing(project, monkeypatch):
+    """The worker catches `OSError` the way the CLI's `stop --graceful` does. The
+    confined lodge (#593) raises `UnconfinedWriteError` — an `OSError` — on a
+    planted parent, and Textual workers default to `exit_on_error=True`, so
+    without the catch pressing `S` in that scenario tore the whole dashboard
+    down instead of reporting the refusal.
+
+    Ablation: drop the worker's `except OSError` arm and this reddens — the
+    worker error kills the app under run_test and the toast never arrives."""
+    from bmad_loop import runs
+
+    def boom(rd):
+        raise runs.UnconfinedWriteError("cannot reach .bmad-loop/runs without a redirect")
+
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "alive")
+    monkeypatch.setattr(runs, "request_graceful_stop", boom)
+    make_run(project.project, "20260611-100000-aaaa", alive=True)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: dashboard(app).selected_run_id == "20260611-100000-aaaa")
+        await pilot.press("S")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        await until(pilot, lambda: any("could not be written" in m for m in notifications(app)))
+        assert app.is_running  # the dashboard survived the refusal
+
+
 async def test_graceful_stop_not_live_warns_without_calling(project, monkeypatch):
     # Only a *provably dead* engine is refused at the liveness gate — the helper is
     # never called and no confirm modal opens. Unlike the hard-stop gate, an
