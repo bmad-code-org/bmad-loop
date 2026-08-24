@@ -35,6 +35,10 @@ are `### DW-<n>:` blocks whose `status:` line is `open`. If the ledger is
 missing or unreadable, escalate `CRITICAL` (`type: missing-ledger`) per
 automation-mode.md and end your turn.
 
+An entry carrying an `archived:` line keeps only a stub here — its full body
+lives in the sibling `deferred-work-archive.md`, keyed by the same DW- id; read
+it there before classifying that entry.
+
 If the invocation carries `--feedback <path>`, read that file FIRST — it lists
 the deterministic validation errors your previous attempt's result.json failed
 on. Fix exactly those defects in this attempt's output.

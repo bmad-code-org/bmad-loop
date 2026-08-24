@@ -2322,7 +2322,7 @@ def _sweep_archive(project: Path, paths: bmadconfig.ProjectPaths, args: argparse
     print(f"archived {len(archived)} {noun} to {archive_path}:")
     for dw_id in archived:
         print(f"  {dw_id}")
-    print("note: the ledger and archive are tracked files — commit them to make the move durable")
+    print("note: if the ledger is tracked, commit both files to make the move durable")
     return ExitCode.OK
 
 
@@ -4452,7 +4452,12 @@ def main(argv: list[str] | None = None) -> int:
         "--force", action="store_true", help="stop the run first if it is still live"
     )
 
-    archive_p = add("archive", cmd_archive, "compress a run into .bmad-loop/archive and remove it")
+    archive_p = add(
+        "archive",
+        cmd_archive,
+        "compress a run into .bmad-loop/archive and remove it; "
+        "for ledger archiving see `sweep --archive`",
+    )
     archive_p.add_argument("run_id")
     archive_p.add_argument(
         "--force", action="store_true", help="stop the run first if it is still live"

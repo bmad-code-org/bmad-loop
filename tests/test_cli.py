@@ -9176,7 +9176,7 @@ def test_sweep_archive_writes_ledger_and_archive(project, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "archived 1 entry" in out
-    assert "commit them to make the move durable" in out
+    assert "commit" in out  # durable-note printed; its wording is not a contract
     ledger_path = project.deferred_work
     archive_path = ledger_path.parent / "deferred-work-archive.md"
     text = ledger_path.read_text(encoding="utf-8")
