@@ -25,6 +25,7 @@ from .model import PAUSE_ESCALATION, Phase, RunState, StoryTask
 from .platform_util import (
     MAX_SEGMENT,
     UnconfinedWriteError,
+    _mkstemp_beside,
     atomic_replace,
     atomic_write_text_confined,
     has_parent_ref,
@@ -1614,10 +1615,6 @@ def archive_run(project: Path, run_dir: Path, *, force: bool = False) -> Path:
     archive_dir = project / ARCHIVE_DIR
     archive_dir.mkdir(parents=True, exist_ok=True)
     dest = archive_dir / f"{run_dir.name}.tar.gz"
-    # `with_name`, not `with_suffix`: the latter replaces only the LAST suffix, so
-    # on `<id>.tar.gz` (stem `<id>.tar`) it produced `<id>.tar.tar.gz.tmp` — not the
-    # name this docstring implies, and not one any cleanup could be written against.
-    tmp = dest.with_name(dest.name + ".tmp")
     # #363: the guard, not a helper — the path is handed to `tarfile.open`, so there
     # is no payload for `atomic_write_*` to take. Nothing gitignores this directory:
     # init writes `.bmad-loop/runs/`, `.bmad-loop/cache/`, `.bmad-loop/policy.toml`
@@ -1627,17 +1624,17 @@ def archive_run(project: Path, run_dir: Path, *, force: bool = False) -> Path:
     # `tui.settings.PolicyDoc.save` had. (Not the sweep's two `decisions.json`
     # writes, which look like the same fix but write under the ignored run dir.)
     #
-    # #591: because the name is fixed and predictable, the cleanup below may only
-    # remove a temp this process created — so the create is exclusive, and that is
-    # what licenses the unlink. `O_CREAT|O_EXCL` also fails EEXIST when the name is a
-    # symlink, whatever it points at (dangling included), so the create *is* the
-    # no-follow guard here; no `O_NOFOLLOW` is needed (the same property
-    # `_write_stop_request` leans on). It sits outside the `try` on purpose: a loser
-    # of the race raises `FileExistsError` from here and structurally cannot reach the
-    # cleanup, so the winner's in-flight temp survives. `O_BINARY` per the
-    # `read_trusted_config_digest` precedent — gzip bytes do not survive a win32
-    # text-mode fd.
-    fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0), 0o600)
+    # #591: staged through `_mkstemp_beside` — the atomic writers' own exclusive
+    # `0600` create (binary-mode on win32), under a fresh unpredictable name per
+    # attempt. A fixed name made a temp stranded by a kill, or planted at the
+    # guessable spelling, deny every later attempt as `FileExistsError`; the
+    # truncate-and-reuse it replaced followed a planted symlink instead. mkstemp's
+    # exclusivity still never opens a name something else holds, and the name being
+    # this process's own mint is what licenses the cleanup unlink below. It sits
+    # outside the `try` on purpose: a create that fails has staged nothing to
+    # clean up.
+    fd, tmp_name = _mkstemp_beside(dest)
+    tmp = Path(tmp_name)
     try:
         with os.fdopen(fd, "wb") as raw:
             with tarfile.open(fileobj=raw, mode="w:gz") as tar:
@@ -1652,7 +1649,7 @@ def archive_run(project: Path, run_dir: Path, *, force: bool = False) -> Path:
         atomic_replace(tmp, dest)
     except BaseException:
         with contextlib.suppress(OSError):
-            tmp.unlink(missing_ok=True)  # provably ours: the O_EXCL create above won
+            tmp.unlink(missing_ok=True)  # provably ours: mkstemp minted the name
         raise
     shutil.rmtree(run_dir)
     _discard_state_dir(project, run_dir.name)  # same tail as delete_run

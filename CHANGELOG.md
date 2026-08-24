@@ -37,11 +37,13 @@ breaking changes may land in a minor release.
 
 ### Security
 
-- **The run-archive staging temp is created exclusively (`O_EXCL`) at `0600`** (#591). The
-  fixed temp name was created and unlinked by name, so a symlink planted there was followed
-  and the cleanup could remove a concurrent archiver's in-flight temp; the exclusive create
-  refuses both. The staged tarball is also `fsync`ed before publish, since the run dir it
-  came from is removed immediately after.
+- **The run-archive staging temp is minted by `mkstemp` beside the destination — exclusive,
+  `0600`, freshly named per attempt** (#591). The fixed temp name was created and unlinked by
+  name, so a symlink planted there was followed and the cleanup could remove a concurrent
+  archiver's in-flight temp; the exclusive create closes both, and the unpredictable
+  per-attempt name keeps a temp stranded by a kill — or a file planted at a guessable name —
+  from denying every later archive. The staged tarball is also `fsync`ed before publish,
+  since the run dir it came from is removed immediately after.
 - **Confined atomic writers anchor a file's parent with a directory descriptor instead of
   resolving it by name** (#593). `follow_symlinks=False` refuses a link planted at the file
   itself, but every directory above it was still looked up by name, so a link planted at

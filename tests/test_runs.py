@@ -7,6 +7,7 @@ import re
 import subprocess
 import sys
 import tarfile
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -2641,22 +2642,25 @@ def test_archive_run(tmp_path):
 def test_archive_run_names_its_temp_after_the_destination(tmp_path, monkeypatch):
     """#363's filename half, and it needs its own test because NOTHING else grades
     it: on the happy path `atomic_replace` consumes the temp under either spelling,
-    and the new `except BaseException` guard unlinks it whatever it is named — so
-    reverting the fix reddens no other row in this file. Recording the name handed to
-    `os.replace` is the only place the spelling is observable.
+    and the `except BaseException` guard unlinks it whatever it is named — so a
+    wrongly named temp reddens no other row in this file. Recording the name handed
+    to `os.replace` is the only place the spelling is observable.
 
-    `dest.with_suffix(".tar.gz.tmp")` yielded `<id>.tar.tar.gz.tmp`, because
-    `with_suffix` replaces only the LAST suffix and `<id>.tar.gz` has stem
-    `<id>.tar` — not the name the docstring implied, and not one any cleanup could
-    have been written against.
+    The historical bug: `dest.with_suffix(".tar.gz.tmp")` yielded
+    `<id>.tar.tar.gz.tmp`, because `with_suffix` replaces only the LAST suffix and
+    `<id>.tar.gz` has stem `<id>.tar`. The name now flows from
+    `_mkstemp_beside(dest)`'s prefix, so the contract is prefix+suffix — the temp
+    is recognisably this destination's staging file and ends in `.tmp` — with
+    mkstemp's random token in between.
 
     `run_dir` is built BEFORE the patch on purpose: `save_state` writes through the
     same `os.replace`, and building it after would pollute `seen` with a call that
     has nothing to do with the archive.
 
-    Ablation A9: restore `dest.with_suffix(".tar.gz.tmp")` and this reddens alone —
-    `test_archive_run` and the guard test below stay GREEN, which is exactly why
-    this row exists rather than being folded into either."""
+    Ablation A9: stage beside a different name (`_mkstemp_beside(dest.parent /
+    "x")`) and this reddens alone — `test_archive_run` and the guard test below
+    stay GREEN, which is exactly why this row exists rather than being folded into
+    either."""
     run_dir = _make_state_run(tmp_path, "20260611-100000-aaaa")
     seen: list[str] = []
     real = os.replace
@@ -2668,9 +2672,10 @@ def test_archive_run_names_its_temp_after_the_destination(tmp_path, monkeypatch)
     monkeypatch.setattr(platform_util.os, "replace", record)
     dest = runs.archive_run(tmp_path, run_dir)
 
-    # an exact list, so it also pins "exactly one replace" — a retry loop or a second
-    # write creeping in here would redden rather than pass on a substring match
-    assert seen == [dest.name + ".tmp"]
+    # exactly one replace — a retry loop or a second write creeping in would redden
+    assert len(seen) == 1
+    assert seen[0].startswith(dest.name + ".")
+    assert seen[0].endswith(".tmp")
 
 
 def test_archive_run_failed_replace_strands_no_temp(tmp_path, monkeypatch):
@@ -2705,96 +2710,101 @@ def test_archive_run_failed_replace_strands_no_temp(tmp_path, monkeypatch):
 
 
 def test_archive_run_temp_is_created_exclusively_at_0600(tmp_path, monkeypatch):
-    """#591. The temp name is fixed and predictable, so the create must be exclusive:
-    that is the whole license for the `except BaseException` unlink below it, which
-    would otherwise remove a name this process never owned.
-
-    Grades the flags handed to `os.open` rather than only the outcome, because the
-    outcome is nearly unobservable on the happy path — `atomic_replace` consumes the
-    temp either way, so dropping `O_EXCL` reddens nothing else here. The recorded
-    call is the only place exclusivity is visible when no competitor exists.
-
-    The mode argument is asserted on both platforms (it is a recorded call argument,
-    not a filesystem fact); only the published file's on-disk bits are POSIX-only.
+    """#591. The staging create must be exclusive — that is the whole license for
+    the `except BaseException` unlink below it, which would otherwise remove a name
+    this process never owned. The site delegates to `_mkstemp_beside`, whose own
+    rows in test_platform_util grade the `O_EXCL` `0600` create and the NAME_MAX
+    ladder, so what THIS row grades is the delegation: the spy is the only place
+    the choice of writer is visible on the happy path, where `atomic_replace`
+    consumes the temp whichever writer staged it. The spy mirrors
+    `tempfile.mkstemp`'s exact keyword signature on purpose — it doubles as the
+    call-shape pin.
 
     `os.umask(0o022)` is the point of the bracket, not hygiene — the same trap
-    `test_file_lock_is_created_owner_only` documents. Under a 0o077 umask the
-    mode-less create produces 0o600 by accident and the on-disk assertion goes inert,
-    so the bracket is what makes this row's ablation bite on any box rather than only
-    where the ambient umask happens to cooperate."""
+    `test_file_lock_is_created_owner_only` documents. Under a 0o077 umask a
+    mode-less create produces 0o600 by accident and the on-disk assertion goes
+    inert, so the bracket is what makes this row's ablation bite on any box rather
+    than only where the ambient umask happens to cooperate.
+
+    Ablation: revert the staging to a fixed-name `os.open(tmp, O_CREAT | O_EXCL |
+    O_WRONLY, 0o600)` and this reddens alone on the spy staying empty — the
+    behavioural rows below redden on the denial, not the writer."""
     run_dir = _make_state_run(tmp_path, "20260611-100000-aaaa")
-    seen: list[tuple[int, int]] = []
-    real = os.open
+    seen: list[tuple[str, str, str]] = []
+    real_mkstemp = tempfile.mkstemp
 
-    def record(path, flags, mode=0o777, **kwargs):
-        if str(path).endswith(".tar.gz.tmp"):
-            seen.append((flags, mode))
-        return real(path, flags, mode, **kwargs)
+    def spy(*, dir, prefix, suffix):
+        seen.append((dir, prefix, suffix))
+        return real_mkstemp(dir=dir, prefix=prefix, suffix=suffix)
 
-    monkeypatch.setattr(runs.os, "open", record)
+    monkeypatch.setattr(platform_util.tempfile, "mkstemp", spy)
     previous = os.umask(0o022)
     try:
         dest = runs.archive_run(tmp_path, run_dir)
     finally:
         os.umask(previous)
 
-    assert len(seen) == 1  # also pins "exactly one create" — no retry loop crept in
-    flags, mode = seen[0]
-    assert flags & os.O_EXCL
-    assert flags & os.O_CREAT
-    assert flags & os.O_WRONLY
-    assert mode == 0o600
+    assert seen == [
+        (str(dest.parent), "20260611-100000-aaaa.tar.gz.", ".tmp")
+    ]  # exactly one staging create, minted beside the destination
     if sys.platform != "win32":
         published = dest.stat().st_mode & 0o777
         assert published == 0o600, oct(published)
 
 
-def test_archive_run_refuses_a_preexisting_temp_and_leaves_it(tmp_path):
-    """#591's ownership pin, and the row that grades the `os.open` PLACEMENT rather
-    than its flags: with the create inside the `try`, the loser of the race would
-    reach the `except BaseException` cleanup and unlink the winner's in-flight
-    tarball. Here the planted bytes stand in for that tarball, and surviving
-    byte-identical is the assertion.
+def test_archive_run_survives_a_stale_temp_and_leaves_it(tmp_path):
+    """#591's ownership pin, in the shape the fresh-name staging gives it. A FIXED
+    `O_EXCL` name turned any survivor at `<id>.tar.gz.tmp` — a temp stranded by a
+    kill between create and publish, or a file planted at the guessable spelling —
+    into a permanent `FileExistsError` denial of every later archive attempt,
+    where the pre-#591 truncate-and-reuse completed. Staging under a per-attempt
+    mkstemp name makes the survivor inert: the archive completes beside it, and
+    the cleanup can only ever unlink a name this process itself minted, so the
+    foreign bytes survive byte-identical.
 
-    Two failures are therefore graded together and must not be conflated — raising is
-    the flags half (`O_EXCL`), leaving the file alone is the placement half."""
+    Ablation: revert the staging to the fixed-name `os.open(tmp, O_CREAT | O_EXCL
+    | O_WRONLY, 0o600)` create and this reddens on the `FileExistsError`."""
     run_dir = _make_state_run(tmp_path, "20260611-100000-aaaa")
     archive_dir = tmp_path / ".bmad-loop" / "archive"
     archive_dir.mkdir(parents=True)
-    tmp = archive_dir / "20260611-100000-aaaa.tar.gz.tmp"
-    sentinel = b"another archiver's in-flight tarball"
-    tmp.write_bytes(sentinel)
+    stale = archive_dir / "20260611-100000-aaaa.tar.gz.tmp"
+    sentinel = b"a temp stranded by a killed archiver"
+    stale.write_bytes(sentinel)
 
-    with pytest.raises(FileExistsError):
-        runs.archive_run(tmp_path, run_dir)
+    dest = runs.archive_run(tmp_path, run_dir)
 
-    assert tmp.read_bytes() == sentinel  # never ours, never unlinked
-    assert (run_dir / "state.json").is_file()  # the run survives the refusal
-    assert not (archive_dir / "20260611-100000-aaaa.tar.gz").exists()
+    assert dest.is_file()  # the stale temp no longer denies the archive
+    assert stale.read_bytes() == sentinel  # never ours, never unlinked
+    assert not run_dir.exists()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
-def test_archive_run_refuses_a_symlink_at_the_temp_name(tmp_path):
-    """#591. `O_CREAT|O_EXCL` fails EEXIST when the name is a symlink whatever it
-    points at, so the exclusive create IS the no-follow guard and no `O_NOFOLLOW` is
-    needed — the same property `_write_stop_request` leans on. Before the fix
-    `tarfile.open(tmp, "w:gz")` followed the link and truncated the victim.
+def test_archive_run_never_writes_through_a_planted_symlink(tmp_path):
+    """#591. Before the fix `tarfile.open(tmp, "w:gz")` followed a link planted at
+    the predictable temp name and truncated the victim. Staging through mkstemp
+    closes that two ways at once: the per-attempt name is not guessable to plant
+    at, and the create is `O_EXCL` (plus `O_NOFOLLOW` where defined), which never
+    opens a name something else already holds — so a link at the old predictable
+    spelling is simply bypassed, untouched, while the archive completes.
 
     The victim is a plain file in the project root rather than anything bmad-loop
-    reads, so the test grades only the follow, not a second effect."""
+    reads, so the test grades only the follow, not a second effect.
+
+    Ablation: revert the staging to the pre-#591 `tarfile.open(tmp, "w:gz")` by
+    name and this reddens on the victim's bytes."""
     run_dir = _make_state_run(tmp_path, "20260611-100000-aaaa")
     victim = tmp_path / "victim.txt"
     victim.write_bytes(b"do not clobber me")
     archive_dir = tmp_path / ".bmad-loop" / "archive"
     archive_dir.mkdir(parents=True)
-    tmp = archive_dir / "20260611-100000-aaaa.tar.gz.tmp"
-    tmp.symlink_to(victim)
+    planted = archive_dir / "20260611-100000-aaaa.tar.gz.tmp"
+    planted.symlink_to(victim)
 
-    with pytest.raises(FileExistsError):
-        runs.archive_run(tmp_path, run_dir)
+    dest = runs.archive_run(tmp_path, run_dir)
 
     assert victim.read_bytes() == b"do not clobber me"  # not followed, not truncated
-    assert tmp.is_symlink()  # not ours, so not unlinked either
+    assert planted.is_symlink()  # not ours, so not unlinked either
+    assert dest.is_file()
 
 
 def test_archive_run_fsyncs_before_the_replace(tmp_path, monkeypatch):
