@@ -3536,9 +3536,11 @@ def test_path_tracked_still_matches_a_directory_prefix(project):
 
 
 def test_path_tracked_file_separates_a_file_from_a_directory_prefix(project):
-    """The whole reason this predicate exists next to its sibling: `path_tracked`
-    answers True for BOTH a tracked file and a tracked directory, and the worktree
-    shield needs opposite behaviour for the two (#392).
+    """Why this predicate is narrower than its sibling: `path_tracked` answers True for
+    BOTH a tracked file and a tracked directory, and its callers have to tell those
+    apart. Since #484 the shield asks `path_tracked_kind` for that — three answers, not
+    two — and this boolean is kept for `_pin_tracked_config_rewrite`, where only a
+    tracked FILE can carry the skip-worktree bit the pin depends on (#392, #484).
 
     Ablation: return `bool(entries)` instead of comparing the set — the mechanics now
     live in `path_tracked_kind`, which this delegates to — and the directory assertion
