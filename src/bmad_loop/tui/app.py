@@ -792,8 +792,8 @@ class BmadLoopApp(App[None]):
         if self._resolve_blocked_by_liveness(run_id, run_dir):
             return
         try:
-            reset = devcontract.reset_spec_status(spec_path, "draft")
-            devcontract.strip_auto_run_result(spec_path)
+            reset = devcontract.reset_spec_status(spec_path, "draft", confine_root=self.project)
+            devcontract.strip_auto_run_result(spec_path, confine_root=self.project)
         except (OSError, verify.FrontmatterWriteError) as e:
             # FrontmatterWriteError is not an OSError: a spec whose `status:` is a
             # block scalar or a flow mapping reads fine and fails the WRITE. It

@@ -266,7 +266,19 @@ def advance(path: Path, story_key: str, target: str, *, now: str | None = None) 
     Symlinks are FOLLOWED (the helper's default), which is what the old
     truncating write did too — the board is an operator-curated file at a
     project-relative path, and a repo that symlinks it somewhere must keep being
-    a symlink.
+    a symlink. That rules out the confined writers, which are no-follow by
+    construction: this site takes the #597 flag and nothing else.
+
+    ``require_writable_target=True`` is that flag, and it restores what going
+    atomic silently dropped: `os.replace` needs write permission on the parent
+    DIRECTORY, never on the entry it replaces, so a board an operator had marked
+    read-only was rewritten anyway — and because the mode is inherited it came
+    back reading ``0444``, leaving nothing in the permission bits to record that
+    it changed (#597). The truncating `write_bytes` this replaced raised
+    `PermissionError` there as a side effect of opening the file; that refusal is
+    a property worth keeping deliberately, because AGENTS.md makes this the
+    orchestrator's SOLE write path to the board — a read-only board is the only
+    way an operator can say "stop rewriting this", and it has to mean something.
     """
     if not path.is_file():
         return None
@@ -303,7 +315,7 @@ def advance(path: Path, story_key: str, target: str, *, now: str | None = None) 
         changed = _set_mapping_value(lines, "last_updated", now) or changed
 
     if changed:
-        atomic_write_bytes(path, "".join(lines).encode("utf-8"))
+        atomic_write_bytes(path, "".join(lines).encode("utf-8"), require_writable_target=True)
     return target
 
 

@@ -944,7 +944,7 @@ def test_register_hooks_write_failure_raises_and_leaves_the_config_entire(tmp_pa
     config.write_text(_OPERATOR_SETTINGS, encoding="utf-8")
     before = config.read_bytes()
 
-    def boom(path, text, *, follow_symlinks=True):
+    def boom(path, text, *, follow_symlinks=True, require_writable_target=False):
         raise OSError("no space left on device")
 
     monkeypatch.setattr(install_mod, "atomic_write_text", boom)
@@ -954,6 +954,43 @@ def test_register_hooks_write_failure_raises_and_leaves_the_config_entire(tmp_pa
     assert config.read_bytes() == before
     assert _operator_keys(config)["env"] == {"HOUSE_TOKEN": "keep-me"}
     assert "bmad_loop_hook" not in config.read_text(encoding="utf-8")  # the lost mutation
+
+
+def test_register_hooks_refuses_a_readonly_config(tmp_path):
+    """#597 at this site. `os.replace` needs write permission on the parent
+    DIRECTORY, never on the entry it replaces, so a settings.json the operator
+    marked read-only was rewritten anyway — and because this site inherits the
+    target's mode it came back reading `0444`, leaving nothing in the permission
+    bits to record that init had edited it. This file is the operator's own: the
+    merge above round-trips their allowlist, env, MCP entries and their own hooks.
+
+    `require_writable_target=True` is the WHOLE change here — `follow_symlinks`
+    stays at the default (the row below depends on that), so this site is
+    deliberately not a confined writer.
+
+    `0o444` sets the READONLY attribute on win32 too, so this runs unskipped on
+    both platforms; the chmod is on a file in this test's own tmp_path and is
+    restored in a `finally`, because Windows rmtree refuses a READONLY leftover.
+
+    Ablation: drop `require_writable_target=True` at the call and this fails
+    `DID NOT RAISE`, with `bmad_loop_hook` registered into a file still `0444`."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    claude = get_profile("claude")
+    config = project / claude.hooks.config_path
+    config.parent.mkdir(parents=True)
+    config.write_text(_OPERATOR_SETTINGS, encoding="utf-8")
+    before = config.read_bytes()
+    config.chmod(0o444)
+    try:
+        with pytest.raises(PermissionError):
+            _register_hooks(project, claude)
+    finally:
+        config.chmod(0o644)
+
+    assert config.read_bytes() == before
+    assert "bmad_loop_hook" not in config.read_text(encoding="utf-8")
+    assert list(config.parent.glob("*.tmp")) == []  # a refusal stages nothing
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
@@ -1106,7 +1143,7 @@ def test_provision_worktree_write_failure_raises_and_leaves_the_config_entire(
 
     import bmad_loop.worktree_flow as wtf
 
-    def boom(path, text, *, follow_symlinks=True):
+    def boom(path, text, *, follow_symlinks=True, require_writable_target=False):
         raise OSError("no space left on device")
 
     monkeypatch.setattr(wtf, "atomic_write_text", boom)
@@ -1118,6 +1155,43 @@ def test_provision_worktree_write_failure_raises_and_leaves_the_config_entire(
         "house": {"command": "node", "args": ["mcp.js"]}
     }
     assert "bmad_loop_hook" not in config.read_text(encoding="utf-8")  # the lost mutation
+
+
+def test_provision_worktree_refuses_a_readonly_hook_config(tmp_path):
+    """#597 at the second hook-config rewriter. Same mechanism as
+    `_register_hooks` — a temp-and-replace never opens the entry it replaces, so a
+    read-only settings file was rewritten and its `0444` restored — and the same
+    fix, `require_writable_target=True` and nothing else: the component-wise
+    refusal walk above the write is stricter than a confined writer's, so
+    converting this site would relax it.
+
+    This is the operator's own settings file, seeded into the worktree and
+    round-tripped through the parse above, which is why a read-only one is a
+    refusal rather than a silent overwrite.
+
+    `0o444` sets the win32 READONLY attribute, so this runs on both platforms; the
+    chmod is restored in a `finally` because Windows rmtree refuses a READONLY
+    leftover.
+
+    Ablation: drop `require_writable_target=True` at the call and this fails
+    `DID NOT RAISE`, with the hook registered into a file still `0444`."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    repo.mkdir()
+    claude = get_profile("claude")
+    config = wt / claude.hooks.config_path
+    config.parent.mkdir(parents=True)
+    config.write_text(_OPERATOR_SETTINGS, encoding="utf-8")
+    before = config.read_bytes()
+    config.chmod(0o444)
+    try:
+        with pytest.raises(PermissionError):
+            provision_worktree(wt, [claude], repo)
+    finally:
+        config.chmod(0o644)
+
+    assert config.read_bytes() == before
+    assert "bmad_loop_hook" not in config.read_text(encoding="utf-8")
+    assert list(config.parent.glob("*.tmp")) == []  # a refusal stages nothing
 
 
 def test_provision_worktree_refuses_an_unparseable_hook_config(tmp_path):

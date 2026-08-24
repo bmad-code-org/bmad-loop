@@ -26,7 +26,6 @@ from .platform_util import (
     MAX_SEGMENT,
     UnconfinedWriteError,
     atomic_replace,
-    atomic_write_text,
     atomic_write_text_confined,
     has_parent_ref,
     is_absolute_path,
@@ -499,11 +498,19 @@ def write_trusted_config_digest(project: Path, run_id: str, digest: str) -> None
     look like an orphan to a ``clean`` racing the launch."""
     path = config_digest_path_for(project, run_id)
     path.parent.mkdir(parents=True, exist_ok=True)
-    # follow_symlinks=False: a machine-minted record under a root whose path the
-    # driven session is handed (BMAD_LOOP_EVENTS_DIR names its sibling), so a
-    # planted link here must be replaced, never written through to whatever it
-    # aims at. The trailing newline is for the operator who cats the file.
-    atomic_write_text(path, digest + "\n", follow_symlinks=False)
+    # Confined to the state root (#593): a machine-minted record under a root
+    # whose path the driven session is handed (BMAD_LOOP_EVENTS_DIR names its
+    # sibling), so a planted link here must be replaced, never written through to
+    # whatever it aims at. Refusing a link at the FINAL component was not enough —
+    # `mkstemp(dir=...)` and `os.replace`'s destination still resolved every
+    # directory above by name, and the `mkdir` on the line above ACCEPTS a
+    # symlinked directory, so a link planted at either session-reachable component
+    # (`<project tag>/`, `<run id>/`) survived the setup step and redirected both
+    # the temp and the published stamp. `state_root()` is the one component the
+    # anchored walk starts from rather than checks, and it is a host fact this
+    # process derives — not a path any session names. The trailing newline is for
+    # the operator who cats the file.
+    atomic_write_text_confined(path, digest + "\n", confine_root=state_root())
 
 
 # ---------------------------------------------------- run resolution / liveness
@@ -2108,12 +2115,14 @@ def rearm_escalation(
                 # the restored diff); from-scratch -> ready-for-dev -> step-03
                 # (re-implement). Independent of the resolve agent having set it.
                 target_status = "in-review" if restore_patch else "ready-for-dev"
-                verify.set_frontmatter_status(spec_path, target_status)
+                verify.set_frontmatter_status(
+                    spec_path, target_status, confine_root=Path(state.project)
+                )
                 # drop the stale `## Auto Run Result` section along with the status flip
                 # (mirrors engine._reset_spec_for_repair): find_result_artifact keys on
                 # that heading, so leaving it would let the re-driven session's first
                 # save of the spec parse as the prior attempt's terminal outcome.
-                devcontract.strip_auto_run_result(spec_path)
+                devcontract.strip_auto_run_result(spec_path, confine_root=Path(state.project))
             except verify.FrontmatterWriteError as e:
                 # The spec reads fine but carries `status:` in a shape no line
                 # edit can move (a block scalar, a flow mapping, a value continued
@@ -2190,7 +2199,10 @@ def rearm_escalation(
     if restore_patch and task.spec_file and task.baseline_commit:
         try:
             verify.set_frontmatter_field(
-                Path(task.spec_file), "baseline_revision", task.baseline_commit
+                Path(task.spec_file),
+                "baseline_revision",
+                task.baseline_commit,
+                confine_root=Path(state.project),
             )
         except (OSError, UnicodeDecodeError, verify.FrontmatterWriteError) as e:
             # FrontmatterWriteError joins the tuple rather than getting its own

@@ -1167,8 +1167,21 @@ def provision_worktree(
             # diagnostic. follow_symlinks stays at the default, matching the
             # `write_text` it replaces — and the symlink question is already settled
             # above this line, by the component-wise refusal walk that skips the
-            # profile entirely when any component of the path is a link.
-            atomic_write_text(config_path, json.dumps(config, indent=2) + "\n")
+            # profile entirely when any component of the path is a link — a walk
+            # stricter than the confined writers' (it refuses a link anywhere on the
+            # path, in the worktree as well as out), so a confined write would
+            # relax this site rather than harden it. The #597 flag is the whole
+            # change here: `os.replace` needs write permission on the parent
+            # DIRECTORY, never on the entry it replaces, so a seeded config the
+            # operator had marked read-only was rewritten anyway and came back
+            # reading `0444`. This is the operator's own settings file, round-tripped
+            # through the parse above, so a read-only one earns the `PermissionError`
+            # the `write_text` this replaced raised.
+            atomic_write_text(
+                config_path,
+                json.dumps(config, indent=2) + "\n",
+                require_writable_target=True,
+            )
             pin_degrade = _pin_tracked_config_rewrite(worktree, profile.hooks.config_path)
             if pin_degrade is not None and on_degraded is not None:
                 on_degraded(pin_degrade)

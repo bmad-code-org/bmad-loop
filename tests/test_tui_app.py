@@ -3412,17 +3412,26 @@ async def test_plan_checkpoint_replan_resets_and_resumes(project, monkeypatch):
     monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
     monkeypatch.setattr(
-        devcontract, "reset_spec_status", lambda p, s: resets.append((p, s)) or True
+        devcontract,
+        "reset_spec_status",
+        lambda p, s, **kw: resets.append((p, s, kw["confine_root"])) or True,
     )
-    monkeypatch.setattr(devcontract, "strip_auto_run_result", lambda p: strips.append(p) or True)
+    monkeypatch.setattr(
+        devcontract,
+        "strip_auto_run_result",
+        lambda p, **kw: strips.append((p, kw["confine_root"])) or True,
+    )
     _run_dir, spec = _stories_paused_run(project.project, stage="plan-checkpoint")
     app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, SpecReviewModal)
         await pilot.click(await ready(pilot, "#act-replan"))
         await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
-        assert resets == [(spec, "draft")]
-        assert strips == [spec]
+        # the root is captured, not just the path: `_do_replan` has to pass the
+        # project it built `run_dir` from, and a `confine_root` naming the spec's
+        # own parent would be lexically confined and behaviourally inert (#593).
+        assert resets == [(spec, "draft", project.project)]
+        assert strips == [(spec, project.project)]
 
 
 async def test_story_checkpoint_continue_resumes(project, monkeypatch):

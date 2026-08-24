@@ -620,7 +620,9 @@ def _interrupt(project, key="1-1-a", *, board="awaiting-operator"):
     writes and its board write: the audit section appended, the spec at `done`,
     the board where the park left it, and the record still there."""
     spec = _park(project, key, status="done", board=board)
-    devcontract.append_operator_confirmation(spec, ACTIONS, date="2026-07-28")
+    devcontract.append_operator_confirmation(
+        spec, ACTIONS, date="2026-07-28", confine_root=project.project
+    )
     return spec
 
 
@@ -677,7 +679,9 @@ def test_resumable_requires_all_three_readings(project, spec_status, board, conf
     never happened."""
     spec = _park(project, status=spec_status, board=board)
     if confirmed:
-        devcontract.append_operator_confirmation(spec, ACTIONS, date="2026-07-28")
+        devcontract.append_operator_confirmation(
+            spec, ACTIONS, date="2026-07-28", confine_root=project.project
+        )
     (story,) = operatoractions.resolve(project.project, project)
     assert story.resumable is False, why
 

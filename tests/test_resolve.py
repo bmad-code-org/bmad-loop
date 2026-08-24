@@ -7,7 +7,7 @@ import pytest
 import yaml
 from conftest import escalated_run, git
 
-from bmad_loop import devcontract, resolve, runs, verify
+from bmad_loop import devcontract, platform_util, resolve, runs, verify
 from bmad_loop.journal import load_state, save_state
 from bmad_loop.model import (
     PAUSE_ESCALATION,
@@ -72,20 +72,29 @@ def _escalated_run(
 def test_set_frontmatter_field_replaces_inserts_idempotent(tmp_path):
     spec = tmp_path / "spec.md"
     spec.write_text(SPEC, encoding="utf-8")
-    assert verify.set_frontmatter_field(spec, "owner", "winston") is True
+    assert verify.set_frontmatter_field(spec, "owner", "winston", confine_root=tmp_path) is True
     assert verify.read_frontmatter(spec)["owner"] == "winston"
     # unlike set_frontmatter_status, a missing key is INSERTED (block's last line);
     # its refusal to invent one is pinned in tests/test_frontmatter.py
-    assert verify.set_frontmatter_field(spec, "baseline_revision", "abc123") is True
+    assert (
+        verify.set_frontmatter_field(spec, "baseline_revision", "abc123", confine_root=tmp_path)
+        is True
+    )
     fm = verify.read_frontmatter(spec)
     assert fm["baseline_revision"] == "abc123"
     assert fm["status"] == "in-review" and fm["title"] == "List command"  # untouched
     # idempotent: already at the target value
-    assert verify.set_frontmatter_field(spec, "baseline_revision", "abc123") is False
+    assert (
+        verify.set_frontmatter_field(spec, "baseline_revision", "abc123", confine_root=tmp_path)
+        is False
+    )
     # no frontmatter block -> no write
     bare = tmp_path / "bare.md"
     bare.write_text("# just a heading\n", encoding="utf-8")
-    assert verify.set_frontmatter_field(bare, "baseline_revision", "abc123") is False
+    assert (
+        verify.set_frontmatter_field(bare, "baseline_revision", "abc123", confine_root=tmp_path)
+        is False
+    )
 
 
 def test_set_frontmatter_field_preserves_a_trailing_inline_comment(tmp_path):
@@ -96,7 +105,10 @@ def test_set_frontmatter_field_preserves_a_trailing_inline_comment(tmp_path):
     made for the status writer reaches this caller silently."""
     spec = tmp_path / "spec.md"
     spec.write_bytes(b"---\nbaseline_revision: old  # stamped by step-03\n---\nbody\n")
-    assert verify.set_frontmatter_field(spec, "baseline_revision", "abc123") is True
+    assert (
+        verify.set_frontmatter_field(spec, "baseline_revision", "abc123", confine_root=tmp_path)
+        is True
+    )
     assert spec.read_bytes() == b"---\nbaseline_revision: abc123  # stamped by step-03\n---\nbody\n"
     assert verify.read_frontmatter(spec)["baseline_revision"] == "abc123"
 
@@ -108,7 +120,10 @@ def test_set_frontmatter_field_rewrites_a_quoted_key_instead_of_duplicating_it(t
     on a scan miss."""
     spec = tmp_path / "spec.md"
     spec.write_text('---\n"baseline_revision": old\n---\nbody\n', encoding="utf-8")
-    assert verify.set_frontmatter_field(spec, "baseline_revision", "abc123") is True
+    assert (
+        verify.set_frontmatter_field(spec, "baseline_revision", "abc123", confine_root=tmp_path)
+        is True
+    )
     text = spec.read_text(encoding="utf-8")
     assert text.count("baseline_revision") == 1  # rewritten, not duplicated
     assert verify.read_frontmatter(spec)["baseline_revision"] == "abc123"
@@ -123,7 +138,7 @@ def test_set_frontmatter_field_refuses_a_key_no_line_edit_can_move(tmp_path):
     original = "---\n{baseline_revision: old, keep: 1}\n---\nbody\n"
     spec.write_text(original, encoding="utf-8")
     with pytest.raises(verify.FrontmatterWriteError):
-        verify.set_frontmatter_field(spec, "baseline_revision", "abc123")
+        verify.set_frontmatter_field(spec, "baseline_revision", "abc123", confine_root=tmp_path)
     assert spec.read_text(encoding="utf-8") == original
 
 
@@ -135,7 +150,10 @@ def test_set_frontmatter_field_preserves_triple_dash_in_value(tmp_path):
         "---\ntitle: 'restore --- review'\nstatus: done\n---\nbody text\n",
         encoding="utf-8",
     )
-    assert verify.set_frontmatter_field(spec, "baseline_revision", "abc123") is True
+    assert (
+        verify.set_frontmatter_field(spec, "baseline_revision", "abc123", confine_root=tmp_path)
+        is True
+    )
     fm = verify.read_frontmatter(spec)
     assert fm["baseline_revision"] == "abc123"
     assert fm["title"] == "restore --- review"
@@ -151,7 +169,10 @@ def test_set_frontmatter_field_replaces_without_relaying_crlf(tmp_path):
     spec = tmp_path / "spec.md"
     original = "---\r\ntitle: t\r\nbaseline_revision: old\r\nstatus: done\r\n---\r\n\r\nbody\r\n"
     spec.write_bytes(original.encode("utf-8"))
-    assert verify.set_frontmatter_field(spec, "baseline_revision", "abc123") is True
+    assert (
+        verify.set_frontmatter_field(spec, "baseline_revision", "abc123", confine_root=tmp_path)
+        is True
+    )
     text = spec.read_bytes().decode("utf-8")
     assert text == original.replace("baseline_revision: old", "baseline_revision: abc123")
     assert "\n" not in text.replace("\r\n", "")  # no bare LF introduced
@@ -165,7 +186,10 @@ def test_set_frontmatter_field_inserts_with_the_blocks_own_line_ending(tmp_path)
     spec = tmp_path / "spec.md"
     original = "---\r\ntitle: t\r\nstatus: done\r\n---\r\n\r\nbody\r\n"
     spec.write_bytes(original.encode("utf-8"))
-    assert verify.set_frontmatter_field(spec, "baseline_revision", "abc123") is True
+    assert (
+        verify.set_frontmatter_field(spec, "baseline_revision", "abc123", confine_root=tmp_path)
+        is True
+    )
     text = spec.read_bytes().decode("utf-8")
     assert text == (
         "---\r\ntitle: t\r\nstatus: done\r\nbaseline_revision: abc123\r\n---\r\n\r\nbody\r\n"
@@ -182,7 +206,10 @@ def test_set_frontmatter_field_inserts_without_introducing_a_foreign_line_ending
     flat `\\n` fallback would append the sole LF line to an all-CR file."""
     spec = tmp_path / "spec.md"
     spec.write_bytes(b"---\rtitle: t\rstatus: done\r---\r\rbody\r")
-    assert verify.set_frontmatter_field(spec, "baseline_revision", "abc123") is True
+    assert (
+        verify.set_frontmatter_field(spec, "baseline_revision", "abc123", confine_root=tmp_path)
+        is True
+    )
     text = spec.read_bytes().decode("utf-8")
     assert text == "---\rtitle: t\rstatus: done\rbaseline_revision: abc123\r---\r\rbody\r"
     assert "\n" not in text
@@ -193,9 +220,13 @@ def test_set_frontmatter_field_inserts_without_introducing_a_foreign_line_ending
 #
 # Three rows for the three distinct choices at this call site — that it routes
 # through the helper at all, that it is the BYTES helper, and that it does not
-# follow a link. `verify` holds its own binding of `atomic_write_bytes`, separate
-# from `frontmatter`'s; tests/test_frontmatter.py grades the sibling status writer
-# through that other binding, and neither set reaches the other's site.
+# write through a redirected parent. `verify` holds its own bindings of the byte
+# writers, separate from `frontmatter`'s; tests/test_frontmatter.py grades the
+# sibling status writer through those other bindings, and neither set reaches the
+# other's site. Since #593 the in-tree arm is `atomic_write_bytes_confined`, which
+# is the binding these rows patch: the plain `atomic_write_bytes` survives for a
+# spec in an artifacts folder configured outside the checkout, so patching THAT
+# name would install cleanly and never fire.
 
 
 def test_set_frontmatter_field_write_failure_raises_and_keeps_the_spec(tmp_path, monkeypatch):
@@ -217,12 +248,12 @@ def test_set_frontmatter_field_write_failure_raises_and_keeps_the_spec(tmp_path,
     spec.write_text(SPEC, encoding="utf-8")
     before = spec.read_bytes()
 
-    def boom(path, data, *, follow_symlinks=True):
+    def boom(path, data, *, confine_root, require_writable_target=False):
         raise OSError("no space left on device")
 
-    monkeypatch.setattr(verify, "atomic_write_bytes", boom)
+    monkeypatch.setattr(verify, "atomic_write_bytes_confined", boom)
     with pytest.raises(OSError, match="no space left"):
-        verify.set_frontmatter_field(spec, "baseline_revision", "abc123")
+        verify.set_frontmatter_field(spec, "baseline_revision", "abc123", confine_root=tmp_path)
 
     assert spec.read_bytes() == before
     assert b"baseline_revision" not in spec.read_bytes()  # the insert that must not land
@@ -244,22 +275,31 @@ def test_set_frontmatter_field_hands_the_helper_bytes_not_text(tmp_path, monkeyp
     grade "the bytes helper was called", so the swap would redden on an empty `seen`
     and this row would be claiming more than it checked.
 
-    Ablation: swap `atomic_write_bytes` for `atomic_write_text` (dropping the
-    `.encode`) and this reddens on every platform, on the `isinstance` row."""
+    Ablation: swap `atomic_write_bytes_confined` for `atomic_write_text_confined`
+    (dropping the `.encode`) and this reddens on every platform, on the
+    `isinstance` row."""
     seen: list[bytes | str] = []
-    real = verify.atomic_write_bytes
+    real = verify.atomic_write_bytes_confined
 
-    def record(path, data, *, follow_symlinks=True):
+    def record(path, data, *, confine_root, require_writable_target=False):
         seen.append(data)
         blob = data if isinstance(data, bytes) else data.encode("utf-8")
-        real(path, blob, follow_symlinks=follow_symlinks)
+        real(
+            path,
+            blob,
+            confine_root=confine_root,
+            require_writable_target=require_writable_target,
+        )
 
-    monkeypatch.setattr(verify, "atomic_write_bytes", record)
-    monkeypatch.setattr(verify, "atomic_write_text", record, raising=False)
+    monkeypatch.setattr(verify, "atomic_write_bytes_confined", record)
+    monkeypatch.setattr(verify, "atomic_write_text_confined", record, raising=False)
     spec = tmp_path / "spec.md"
     spec.write_bytes(b"---\r\ntitle: t\r\nstatus: done\r\n---\r\n\r\nbody\r\n")
 
-    assert verify.set_frontmatter_field(spec, "baseline_revision", "abc123") is True
+    assert (
+        verify.set_frontmatter_field(spec, "baseline_revision", "abc123", confine_root=tmp_path)
+        is True
+    )
 
     assert len(seen) == 1  # exactly one write — no retry loop crept in
     assert isinstance(seen[0], bytes)
@@ -284,11 +324,148 @@ def test_set_frontmatter_field_replaces_a_planted_symlink(tmp_path):
     link = tmp_path / "spec.md"
     link.symlink_to(real)
 
-    assert verify.set_frontmatter_field(link, "baseline_revision", "abc123") is True
+    assert (
+        verify.set_frontmatter_field(link, "baseline_revision", "abc123", confine_root=tmp_path)
+        is True
+    )
 
     assert not link.is_symlink()  # the NAME was replaced
     assert verify.read_frontmatter(link)["baseline_revision"] == "abc123"
     assert real.read_text(encoding="utf-8") == SPEC  # not written through
+
+
+# ------------------------------------- confined parent (#593) + read-only (#597)
+#
+# The same three-row chokepoint grading as the sibling status writer
+# (tests/test_frontmatter.py), through verify's OWN bindings — patching one
+# module's names never reaches the other's site — plus the #597 refusal.
+#
+# `confine_root` is always a real ANCESTOR of the spec's directory: the anchored
+# walk covers the components strictly BELOW the root, so `confine_root` set to
+# the spec's own parent would walk nothing and leave the refusal row green with
+# the escape wide open.
+
+
+def _field_tree(tmp_path):
+    root = tmp_path / "checkout"
+    (root / "artifacts").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    return root, outside
+
+
+def _field_tap(label: str, seen: list[str], real):
+    def record(path, data, **kw):
+        seen.append(label)
+        return real(path, data, **kw)
+
+    return record
+
+
+def test_set_frontmatter_field_takes_the_confined_arm_for_an_in_tree_spec(tmp_path, monkeypatch):
+    """Positive control, grading WHICH writer an in-tree spec reaches. Both
+    bindings are wrapped and both keep the real write, so the insert below really
+    lands.
+
+    Ablation: swap the two arms of the `is_relative_to` branch and this fails on
+    `seen`, with the field still correctly stamped."""
+    root, _ = _field_tree(tmp_path)
+    spec = root / "artifacts" / "spec.md"
+    spec.write_text(SPEC, encoding="utf-8")
+    seen: list[str] = []
+    monkeypatch.setattr(
+        verify,
+        "atomic_write_bytes_confined",
+        _field_tap("confined", seen, verify.atomic_write_bytes_confined),
+    )
+    monkeypatch.setattr(
+        verify, "atomic_write_bytes", _field_tap("plain", seen, verify.atomic_write_bytes)
+    )
+
+    assert verify.set_frontmatter_field(spec, "baseline_revision", "abc", confine_root=root)
+
+    assert seen == ["confined"]
+    assert verify.read_frontmatter(spec)["baseline_revision"] == "abc"
+
+
+def test_set_frontmatter_field_keeps_the_plain_write_for_an_out_of_tree_spec(tmp_path, monkeypatch):
+    """The else-arm. An artifacts folder configured outside the checkout is
+    supported configuration, and this writer's one production caller
+    (`runs.rearm_escalation`) re-stamps `baseline_revision` on whatever spec the
+    task recorded — so refusing there would abort a re-drive rather than close a
+    hole.
+
+    Ablation: call the confined writer unconditionally and this fails with
+    `UnconfinedWriteError`, the re-stamp never landing."""
+    root, outside = _field_tree(tmp_path)
+    spec = outside / "spec.md"
+    spec.write_text(SPEC, encoding="utf-8")
+    seen: list[str] = []
+    monkeypatch.setattr(
+        verify,
+        "atomic_write_bytes_confined",
+        _field_tap("confined", seen, verify.atomic_write_bytes_confined),
+    )
+    monkeypatch.setattr(
+        verify, "atomic_write_bytes", _field_tap("plain", seen, verify.atomic_write_bytes)
+    )
+
+    assert verify.set_frontmatter_field(spec, "baseline_revision", "abc", confine_root=root)
+
+    assert seen == ["plain"]
+    assert verify.read_frontmatter(spec)["baseline_revision"] == "abc"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_set_frontmatter_field_refuses_a_symlinked_parent(tmp_path):
+    """#593 at this site. The stakes are the sibling's plus one: the key this
+    writer stamps is `baseline_revision`, the anchor every later restore diff is
+    computed against, so a redirected write hands a session the ability to plant
+    that anchor on a file of its choosing.
+
+    The read half still resolves through the planted link, so the edit is computed
+    and only the WRITE refuses — this reaches the writer rather than bailing at
+    `is_file`.
+
+    Ablation: revert the call to
+    `atomic_write_bytes(path, payload, follow_symlinks=False)` and this fails
+    `DID NOT RAISE`, with the victim spec carrying the stamped key."""
+    root, outside = _field_tree(tmp_path)
+    victim = outside / "victim.md"
+    victim.write_text(SPEC, encoding="utf-8")
+    (root / "artifacts").rmdir()
+    (root / "artifacts").symlink_to(outside, target_is_directory=True)
+    spec = root / "artifacts" / "victim.md"
+    assert spec.is_file()  # the read still resolves through the planted link
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        verify.set_frontmatter_field(spec, "baseline_revision", "abc", confine_root=root)
+
+    assert victim.read_text(encoding="utf-8") == SPEC  # not rewritten
+    assert sorted(p.name for p in outside.iterdir()) == ["victim.md"]  # nor staged
+
+
+def test_set_frontmatter_field_refuses_a_readonly_spec(tmp_path):
+    """#597 at this site: a spec the operator marked read-only is answered with the
+    kernel's `PermissionError`, not routed around by a replace that only needs the
+    directory writable. `0o444` sets the win32 READONLY attribute too, so this runs
+    on both platforms; the chmod is restored in a `finally` because Windows rmtree
+    refuses a READONLY leftover.
+
+    Ablation: drop `require_writable_target=True` from the confined call and this
+    fails `DID NOT RAISE`, the spec carrying the key and still reading `0444`."""
+    root, _ = _field_tree(tmp_path)
+    spec = root / "artifacts" / "spec.md"
+    spec.write_text(SPEC, encoding="utf-8")
+    spec.chmod(0o444)
+    try:
+        with pytest.raises(PermissionError):
+            verify.set_frontmatter_field(spec, "baseline_revision", "abc", confine_root=root)
+    finally:
+        spec.chmod(0o644)
+
+    assert spec.read_text(encoding="utf-8") == SPEC
+    assert list((root / "artifacts").glob("*.tmp")) == []  # a refusal stages nothing
 
 
 # ----------------------------------------------------------- build_context

@@ -1987,6 +1987,89 @@ def test_write_trusted_config_digest_replaces_a_planted_symlink(tmp_path):
     assert runs.read_trusted_config_digest(project, "r1") == "abc123"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_write_trusted_config_digest_refuses_a_symlinked_state_dir_component(tmp_path, monkeypatch):
+    """The escape #593 names, at this site. The row above grades
+    `follow_symlinks=False`, which stopped at the FINAL component only: the two
+    components BELOW the state root — `<project tag>/` and `<run id>/` — were still
+    resolved by name at both the `mkstemp` and the `os.replace`, and the
+    `mkdir(parents=True, exist_ok=True)` on the line before the write ACCEPTS a
+    symlinked directory, so a link planted at either survived the setup step and
+    aimed the stamp wherever it pointed.
+
+    The confinement root is the STATE ROOT, not the digest's parent: the walk
+    covers the components strictly below the root, so rooting this at
+    `path.parent` would check neither of the two components a session could reach
+    and this row would stay green with the escape open. It is also not the
+    project — this record deliberately lives OUT of the tree the baseline exists
+    to police (`test_config_digest_is_stamped_under_the_state_root_not_in_the_project`).
+
+    The mkdir runs first and walks THROUGH the planted link, so an empty `r1/`
+    legitimately appears outside; what must not appear is content. That is what the
+    last assertion says.
+
+    Ablation: revert the call to
+    `atomic_write_text(path, digest + chr(10), follow_symlinks=False)` and this
+    fails `DID NOT RAISE`, with the digest published out in `outside/`."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    root = tmp_path / "state"
+    root.mkdir()
+    monkeypatch.setenv(envvars.STATE_DIR, str(root))
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / runs.project_tag(project)).symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        runs.write_trusted_config_digest(project, "r1", "abc123")
+
+    # the mkdir walked through the link, so the run dir is out here; nothing else
+    # may be, and in particular no digest and no staging temp
+    assert [p.name for p in outside.iterdir()] == ["r1"]
+    assert list((outside / "r1").iterdir()) == []
+
+
+def test_write_trusted_config_digest_lands_under_a_clean_state_root(tmp_path, monkeypatch):
+    """The positive control for the refusal above: with no link planted, the
+    anchored walk opens both components and the stamp lands where the reader looks.
+
+    Wrapped rather than stubbed, so the real write still happens, and the CONFINED
+    binding is the one wrapped — `runs.atomic_write_text` no longer exists here, so
+    a stale patch of that name would fail loudly rather than record nothing.
+
+    `seen` records the ROOT, not merely that a write happened: `confine_root` is
+    the one component the anchored walk starts from rather than checks, so a root
+    naming the digest's own parent would be lexically confined and behaviourally
+    inert. Both this row and the refusal above redden under that ablation, from
+    opposite directions — this one on the recorded value, that one on the escape
+    it lets through.
+
+    Ablation: point `confine_root` at `path.parent` and this fails on `seen`."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    root = tmp_path / "state"
+    root.mkdir()
+    monkeypatch.setenv(envvars.STATE_DIR, str(root))
+    seen: list[Path] = []
+    real = runs.atomic_write_text_confined
+
+    def record(path, text, *, confine_root, require_writable_target=False):
+        seen.append(Path(confine_root))
+        real(
+            path,
+            text,
+            confine_root=confine_root,
+            require_writable_target=require_writable_target,
+        )
+
+    monkeypatch.setattr(runs, "atomic_write_text_confined", record)
+
+    runs.write_trusted_config_digest(project, "r1", "abc123")
+
+    assert seen == [root]  # the state root itself, not the run dir
+    assert runs.read_trusted_config_digest(project, "r1") == "abc123"
+
+
 def test_the_state_dir_gc_reclaims_the_config_digest(tmp_path):
     """#498's GC is #494's GC — the digest is a file inside the run's state dir, so
     the lifecycle that already reclaims that subtree reclaims this too. Asserted

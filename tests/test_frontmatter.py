@@ -19,7 +19,7 @@ import sys
 import pytest
 import yaml
 
-from bmad_loop import frontmatter, verify
+from bmad_loop import frontmatter, platform_util, verify
 
 _PLAIN = (
     "---\ntitle: List command\nstatus: in-review\nowner: amelia\n---\n\n# Spec\n\n"
@@ -50,7 +50,7 @@ def test_a_plain_flip_changes_the_status_line_and_nothing_else(tmp_path):
     never reach. One byte-exact comparison subsumes any list of per-field
     substring assertions: it also fails on what such a list forgot to name."""
     spec = _spec(tmp_path, _PLAIN)
-    assert frontmatter.set_frontmatter_status(spec, "done") is True
+    assert frontmatter.set_frontmatter_status(spec, "done", confine_root=tmp_path) is True
     assert spec.read_bytes().decode() == _PLAIN.replace("status: in-review", "status: done")
 
 
@@ -60,7 +60,7 @@ def test_flipping_to_the_status_already_there_returns_false_and_does_not_write(t
     scans that key on it."""
     spec = _spec(tmp_path, _PLAIN.replace("in-review", "done"))
     before = spec.stat().st_mtime_ns
-    assert frontmatter.set_frontmatter_status(spec, "done") is False
+    assert frontmatter.set_frontmatter_status(spec, "done", confine_root=tmp_path) is False
     assert spec.stat().st_mtime_ns == before
 
 
@@ -78,37 +78,40 @@ def test_a_quoted_value_is_written_back_unquoted(tmp_path):
     wording named only `done` — which is not the value the first of those three
     asserts at all."""
     spec = _spec(tmp_path, "---\nstatus: 'in-review'\n---\nbody\n")
-    assert frontmatter.set_frontmatter_status(spec, "done") is True
+    assert frontmatter.set_frontmatter_status(spec, "done", confine_root=tmp_path) is True
     assert spec.read_bytes().decode() == "---\nstatus: done\n---\nbody\n"
 
 
 def test_a_status_prefixed_key_is_never_targeted(tmp_path):
     spec = _spec(tmp_path, "---\nstatus_note: keep me\nstatus: in-review\n---\nbody\n")
-    assert frontmatter.set_frontmatter_status(spec, "done") is True
+    assert frontmatter.set_frontmatter_status(spec, "done", confine_root=tmp_path) is True
     assert spec.read_bytes().decode() == "---\nstatus_note: keep me\nstatus: done\n---\nbody\n"
 
 
 def test_a_commented_out_status_line_is_never_targeted(tmp_path):
     spec = _spec(tmp_path, "---\n# status: draft\nstatus: in-review\n---\nbody\n")
-    assert frontmatter.set_frontmatter_status(spec, "done") is True
+    assert frontmatter.set_frontmatter_status(spec, "done", confine_root=tmp_path) is True
     assert spec.read_bytes().decode() == "---\n# status: draft\nstatus: done\n---\nbody\n"
 
 
 def test_no_frontmatter_block_returns_false_with_the_bytes_unchanged(tmp_path):
     spec = _spec(tmp_path, "# just a heading\n")
-    assert frontmatter.set_frontmatter_status(spec, "done") is False
+    assert frontmatter.set_frontmatter_status(spec, "done", confine_root=tmp_path) is False
     assert spec.read_bytes() == b"# just a heading\n"
 
 
 def test_a_missing_file_returns_false(tmp_path):
-    assert frontmatter.set_frontmatter_status(tmp_path / "nope.md", "done") is False
+    assert (
+        frontmatter.set_frontmatter_status(tmp_path / "nope.md", "done", confine_root=tmp_path)
+        is False
+    )
 
 
 def test_a_block_with_no_status_key_returns_false(tmp_path):
     """Contrast with `verify.set_frontmatter_field`, which INSERTS a missing key.
     The status helper never invents a status."""
     spec = _spec(tmp_path, "---\ntitle: t\n---\nbody\n")
-    assert frontmatter.set_frontmatter_status(spec, "done") is False
+    assert frontmatter.set_frontmatter_status(spec, "done", confine_root=tmp_path) is False
     assert spec.read_bytes().decode() == "---\ntitle: t\n---\nbody\n"
 
 
@@ -116,13 +119,13 @@ def test_a_present_but_empty_status_is_filled(tmp_path):
     """A bmad-dev-auto template can leave the line blank. It reads as a status
     the writer must be able to move, not as a missing key."""
     spec = _spec(tmp_path, "---\nstatus:\ntitle: t\n---\nbody\n")
-    assert frontmatter.set_frontmatter_status(spec, "done") is True
+    assert frontmatter.set_frontmatter_status(spec, "done", confine_root=tmp_path) is True
     assert spec.read_bytes().decode() == "---\nstatus: done\ntitle: t\n---\nbody\n"
 
 
 def test_indentation_on_the_status_line_survives(tmp_path):
     spec = _spec(tmp_path, "---\n  status: in-review\n---\nbody\n")
-    assert frontmatter.set_frontmatter_status(spec, "done") is True
+    assert frontmatter.set_frontmatter_status(spec, "done", confine_root=tmp_path) is True
     assert spec.read_bytes().decode() == "---\n  status: done\n---\nbody\n"
 
 
@@ -131,7 +134,7 @@ def test_set_frontmatter_status_preserves_triple_dash_in_value(tmp_path):
     ---bearing title + body survive (a plain split("---", 2) corrupted this)."""
     text = "---\ntitle: 'restore --- review'\nstatus: in-review\n---\nbody text\n"
     spec = _spec(tmp_path, text)
-    assert frontmatter.set_frontmatter_status(spec, "done") is True
+    assert frontmatter.set_frontmatter_status(spec, "done", confine_root=tmp_path) is True
     fm = frontmatter.read_frontmatter(spec)
     assert fm["status"] == "done"
     assert fm["title"] == "restore --- review"  # scalar with --- intact
@@ -163,7 +166,7 @@ def test_set_frontmatter_status_preserves_triple_dash_in_value(tmp_path):
 def test_a_crlf_spec_keeps_every_crlf_and_only_the_status_line_changes(tmp_path):
     crlf = _PLAIN.replace("\n", "\r\n")
     spec = _spec(tmp_path, crlf)
-    assert frontmatter.set_frontmatter_status(spec, "done") is True
+    assert frontmatter.set_frontmatter_status(spec, "done", confine_root=tmp_path) is True
     text = spec.read_bytes().decode()
     assert text == crlf.replace("status: in-review", "status: done")
     assert "\n" not in text.replace("\r\n", "")  # not one bare LF, anywhere
@@ -178,7 +181,7 @@ def test_a_cr_only_spec_keeps_its_bare_carriage_returns(tmp_path):
     in tests/test_devcontract.py."""
     cr = _PLAIN.replace("\n", "\r")
     spec = _spec(tmp_path, cr)
-    assert frontmatter.set_frontmatter_status(spec, "done") is True
+    assert frontmatter.set_frontmatter_status(spec, "done", confine_root=tmp_path) is True
     text = spec.read_bytes().decode()
     assert text == cr.replace("status: in-review", "status: done")
     assert "\n" not in text
@@ -192,7 +195,7 @@ def test_a_mixed_ending_spec_keeps_each_line_its_own_ending(tmp_path):
     above and rewrites this LF status line to CRLF."""
     mixed = "---\r\ntitle: List command\r\nstatus: in-review\nowner: amelia\r\n---\r\nbody\r\n"
     spec = _spec(tmp_path, mixed)
-    assert frontmatter.set_frontmatter_status(spec, "done") is True
+    assert frontmatter.set_frontmatter_status(spec, "done", confine_root=tmp_path) is True
     assert spec.read_bytes().decode() == mixed.replace("status: in-review", "status: done")
     assert frontmatter.status_of(frontmatter.read_frontmatter(spec)) == "done"
 
@@ -218,7 +221,7 @@ def test_a_trailing_inline_comment_on_the_status_line_is_preserved(tmp_path):
     separating whitespace comes through as authored (two spaces here), so a
     hand-aligned comment column is not silently reflowed by a status flip."""
     spec = _spec(tmp_path, "---\nstatus: in-review  # set by step-03\n---\nbody\n")
-    assert frontmatter.set_frontmatter_status(spec, "done") is True
+    assert frontmatter.set_frontmatter_status(spec, "done", confine_root=tmp_path) is True
     assert spec.read_bytes().decode() == "---\nstatus: done  # set by step-03\n---\nbody\n"
     assert frontmatter.status_of(frontmatter.read_frontmatter(spec)) == "done"
 
@@ -231,7 +234,7 @@ def test_a_hash_inside_a_quoted_value_never_becomes_a_comment(tmp_path):
     which reads back as a clean `status: done` and therefore SURVIVES `_verified`
     with a fabricated comment attached."""
     spec = _spec(tmp_path, '---\nstatus: "a # b"\ntitle: t\n---\nbody\n')
-    assert frontmatter.set_frontmatter_status(spec, "done") is True
+    assert frontmatter.set_frontmatter_status(spec, "done", confine_root=tmp_path) is True
     assert spec.read_bytes().decode() == "---\nstatus: done\ntitle: t\n---\nbody\n"
 
 
@@ -242,7 +245,7 @@ def test_a_hash_abutting_the_scalar_is_part_of_the_value_not_a_comment(tmp_path)
     `#x` forward as a comment the spec never had."""
     spec = _spec(tmp_path, "---\nstatus: in-review#x\ntitle: t\n---\nbody\n")
     assert frontmatter.read_frontmatter(spec)["status"] == "in-review#x"  # one scalar
-    assert frontmatter.set_frontmatter_status(spec, "done") is True
+    assert frontmatter.set_frontmatter_status(spec, "done", confine_root=tmp_path) is True
     assert spec.read_bytes().decode() == "---\nstatus: done\ntitle: t\n---\nbody\n"
 
 
@@ -251,7 +254,7 @@ def test_a_quoted_value_keeps_its_comment_while_losing_its_quotes(tmp_path):
     both answers are deliberate: the comment is carried, the quotes are not (see
     test_a_quoted_value_is_written_back_unquoted for what depends on that)."""
     spec = _spec(tmp_path, "---\nstatus: 'in-review' # c\n---\nbody\n")
-    assert frontmatter.set_frontmatter_status(spec, "done") is True
+    assert frontmatter.set_frontmatter_status(spec, "done", confine_root=tmp_path) is True
     assert spec.read_bytes().decode() == "---\nstatus: done # c\n---\nbody\n"
 
 
@@ -261,7 +264,7 @@ def test_a_present_but_empty_status_keeps_its_comment(tmp_path):
     test_a_present_but_empty_status_is_filled), and its comment is as real as any
     other. The value slots in ahead of the comment instead of replacing it."""
     spec = _spec(tmp_path, "---\nstatus:  # set by step-03\ntitle: t\n---\nbody\n")
-    assert frontmatter.set_frontmatter_status(spec, "done") is True
+    assert frontmatter.set_frontmatter_status(spec, "done", confine_root=tmp_path) is True
     assert spec.read_bytes().decode() == "---\nstatus: done # set by step-03\ntitle: t\n---\nbody\n"
 
 
@@ -275,7 +278,7 @@ def test_a_comment_glued_to_the_colon_falls_back_to_the_full_drop(tmp_path):
     character that decides whether a `#` is a comment or scalar text."""
     spec = _spec(tmp_path, "---\nstatus:# c\n---\nbody\n")
     assert frontmatter.read_frontmatter(spec) == {}  # not a mapping — unreachable
-    assert frontmatter.set_frontmatter_status(spec, "done") is False
+    assert frontmatter.set_frontmatter_status(spec, "done", confine_root=tmp_path) is False
     line = "status:# c\n"
     m = frontmatter._STATUS_KEY_RE.match(line)
     assert m is not None  # the KEY pattern matches; only the value render declines
@@ -292,7 +295,7 @@ def test_a_comment_and_a_crlf_ending_both_survive_the_same_write(tmp_path):
         "---\r\ntitle: t\r\nstatus: in-review  # set by step-03\r\nowner: amelia\r\n---\r\nbody\r\n"
     )
     spec = _spec(tmp_path, crlf)
-    assert frontmatter.set_frontmatter_status(spec, "done") is True
+    assert frontmatter.set_frontmatter_status(spec, "done", confine_root=tmp_path) is True
     text = spec.read_bytes().decode()
     assert text == crlf.replace("status: in-review", "status: done")
     assert "\n" not in text.replace("\r\n", "")  # not one bare LF, anywhere
@@ -341,7 +344,7 @@ def test_a_status_no_line_edit_can_move_raises_and_leaves_the_file_alone(tmp_pat
     text, reads_as = _UNREWRITABLE[shape]
     spec = _spec(tmp_path, text)
     with pytest.raises(frontmatter.FrontmatterWriteError):
-        frontmatter.set_frontmatter_status(spec, "done")
+        frontmatter.set_frontmatter_status(spec, "done", confine_root=tmp_path)
     assert spec.read_bytes() == text.encode("utf-8")
     assert frontmatter.status_of(frontmatter.read_frontmatter(spec)) == reads_as
 
@@ -355,7 +358,9 @@ def test_an_unparseable_block_raises_where_the_reader_degrades(tmp_path):
     spec = _spec(tmp_path, text)
     assert frontmatter.read_frontmatter(spec) == {}  # the reader degrades...
     with pytest.raises(frontmatter.FrontmatterWriteError, match="does not parse as YAML"):
-        frontmatter.set_frontmatter_status(spec, "done")  # ...the writer does not
+        frontmatter.set_frontmatter_status(
+            spec, "done", confine_root=tmp_path
+        )  # ...the writer does not
     assert spec.read_bytes() == text.encode("utf-8")
 
 
@@ -366,7 +371,7 @@ def test_a_nested_status_is_not_the_status_and_is_never_written(tmp_path):
     change — and the decoy is left exactly as authored."""
     text = "---\nmeta:\n  status: in-review\n---\nbody\n"
     spec = _spec(tmp_path, text)
-    assert frontmatter.set_frontmatter_status(spec, "done") is False
+    assert frontmatter.set_frontmatter_status(spec, "done", confine_root=tmp_path) is False
     assert spec.read_bytes() == text.encode("utf-8")
 
 
@@ -384,7 +389,7 @@ def test_a_decoy_before_the_real_status_does_not_capture_the_write(tmp_path, dec
     line was never reached."""
     text = f"---\n{decoy}status: in-review\n---\nbody\n"
     spec = _spec(tmp_path, text)
-    assert frontmatter.set_frontmatter_status(spec, "done") is True
+    assert frontmatter.set_frontmatter_status(spec, "done", confine_root=tmp_path) is True
     assert spec.read_bytes().decode() == f"---\n{decoy}status: done\n---\nbody\n"
     assert frontmatter.status_of(frontmatter.read_frontmatter(spec)) == "done"
 
@@ -401,7 +406,7 @@ def test_a_key_spelling_yaml_accepts_is_rewritten_with_its_formatting_kept(tmp_p
     in this list on purpose: PyYAML rejects it outright, so it is not a shape the
     reader ever accepts — it lands on the unparseable-block raise above.)"""
     spec = _spec(tmp_path, f"---\n{key}: {value}\n---\nbody\n")
-    assert frontmatter.set_frontmatter_status(spec, "done") is True
+    assert frontmatter.set_frontmatter_status(spec, "done", confine_root=tmp_path) is True
     assert spec.read_bytes().decode() == f"---\n{key}: done\n---\nbody\n"
     assert frontmatter.status_of(frontmatter.read_frontmatter(spec)) == "done"
 
@@ -414,7 +419,7 @@ def test_a_key_that_merely_ends_where_status_does_is_not_a_status_line(tmp_path)
     text = '---\nstatus": in-review\ntitle: t\n---\nbody\n'
     spec = _spec(tmp_path, text)
     assert frontmatter.read_frontmatter(spec) == {'status"': "in-review", "title": "t"}
-    assert frontmatter.set_frontmatter_status(spec, "done") is False
+    assert frontmatter.set_frontmatter_status(spec, "done", confine_root=tmp_path) is False
     assert spec.read_bytes() == text.encode("utf-8")
 
 
@@ -425,7 +430,7 @@ def test_verify_re_exports_the_same_exception_object(tmp_path):
     assert verify.FrontmatterWriteError is frontmatter.FrontmatterWriteError
     spec = _spec(tmp_path, "---\n{status: in-review}\n---\nbody\n")
     with pytest.raises(verify.FrontmatterWriteError):
-        verify.set_frontmatter_status(spec, "done")
+        verify.set_frontmatter_status(spec, "done", confine_root=tmp_path)
 
 
 def test_the_verified_edit_is_never_a_yaml_round_trip(tmp_path):
@@ -441,7 +446,7 @@ def test_the_verified_edit_is_never_a_yaml_round_trip(tmp_path):
         "---\n\nbody\n"
     )
     spec = _spec(tmp_path, text)
-    assert frontmatter.set_frontmatter_status(spec, "done") is True
+    assert frontmatter.set_frontmatter_status(spec, "done", confine_root=tmp_path) is True
     assert spec.read_bytes().decode() == text.replace("status: in-review", "status: done")
     fm = frontmatter.read_frontmatter(spec)
     assert fm["status"] == "done" and fm["tags"] == ["a", "b"]
@@ -472,18 +477,24 @@ def test_set_frontmatter_status_write_failure_raises_and_keeps_the_spec(tmp_path
     same helper for `set_frontmatter_field` — patching one does not reach the other,
     which is why that site has a row of its own in tests/test_resolve.py.
 
+    Which binding is the CONFINED one (#593): `spec` sits under `tmp_path`, the
+    root passed below, so the chokepoint takes the confined arm.
+    `frontmatter.atomic_write_bytes` still exists for the out-of-tree arm, so
+    patching that name installs cleanly and never fires — `pytest.raises` catches
+    the difference.
+
     Ablation: restore `path.write_bytes(...)` at the call site and this reddens
     alone, on `pytest.raises` not raising (the import stays, so the stub still
     installs — it simply never gets called)."""
     spec = _spec(tmp_path, _PLAIN)
     before = spec.read_bytes()
 
-    def boom(path, data, *, follow_symlinks=True):
+    def boom(path, data, *, confine_root, require_writable_target=False):
         raise OSError("no space left on device")
 
-    monkeypatch.setattr(frontmatter, "atomic_write_bytes", boom)
+    monkeypatch.setattr(frontmatter, "atomic_write_bytes_confined", boom)
     with pytest.raises(OSError, match="no space left"):
-        frontmatter.set_frontmatter_status(spec, "done")
+        frontmatter.set_frontmatter_status(spec, "done", confine_root=tmp_path)
 
     assert spec.read_bytes() == before
     assert b"status: done" not in spec.read_bytes()  # the mutation that must not land
@@ -506,21 +517,32 @@ def test_set_frontmatter_status_hands_the_helper_bytes_not_text(tmp_path, monkey
     grade "the bytes helper was called", so the swap would redden on an empty `seen`
     and this row would be claiming more than it checked.
 
-    Ablation: swap `atomic_write_bytes` for `atomic_write_text` (dropping the
-    `.encode`) and this reddens on every platform, on the `isinstance` row."""
-    seen: list[bytes | str] = []
-    real = frontmatter.atomic_write_bytes
+    The CONFINED pair is what is wrapped (#593): `spec` is under `tmp_path`, so
+    that is the arm the chokepoint takes. The plain `atomic_write_bytes` binding
+    survives for out-of-tree specs, so wrapping it instead would record nothing and
+    `len(seen) == 1` — not the `isinstance` row — is what would fire.
 
-    def record(path, data, *, follow_symlinks=True):
+    Ablation: swap `atomic_write_bytes_confined` for `atomic_write_text_confined`
+    (dropping the `.encode`) and this reddens on every platform, on the
+    `isinstance` row."""
+    seen: list[bytes | str] = []
+    real = frontmatter.atomic_write_bytes_confined
+
+    def record(path, data, *, confine_root, require_writable_target=False):
         seen.append(data)
         blob = data if isinstance(data, bytes) else data.encode("utf-8")
-        real(path, blob, follow_symlinks=follow_symlinks)
+        real(
+            path,
+            blob,
+            confine_root=confine_root,
+            require_writable_target=require_writable_target,
+        )
 
-    monkeypatch.setattr(frontmatter, "atomic_write_bytes", record)
-    monkeypatch.setattr(frontmatter, "atomic_write_text", record, raising=False)
+    monkeypatch.setattr(frontmatter, "atomic_write_bytes_confined", record)
+    monkeypatch.setattr(frontmatter, "atomic_write_text_confined", record, raising=False)
     spec = _spec(tmp_path, "---\r\ntitle: t\r\nstatus: in-review\r\n---\r\n\r\nbody\r\n")
 
-    assert frontmatter.set_frontmatter_status(spec, "done") is True
+    assert frontmatter.set_frontmatter_status(spec, "done", confine_root=tmp_path) is True
 
     assert len(seen) == 1  # exactly one write — no retry loop crept in
     assert isinstance(seen[0], bytes)
@@ -545,8 +567,159 @@ def test_set_frontmatter_status_replaces_a_planted_symlink(tmp_path):
     link = tmp_path / "spec.md"
     link.symlink_to(real)
 
-    assert frontmatter.set_frontmatter_status(link, "done") is True
+    assert frontmatter.set_frontmatter_status(link, "done", confine_root=tmp_path) is True
 
     assert not link.is_symlink()  # the NAME was replaced
     assert frontmatter.read_frontmatter(link)["status"] == "done"
     assert real.read_bytes() == _PLAIN.encode("utf-8")  # not written through
+
+
+# --------------------------------------------- CONFINED PARENT (#593) + #597
+#
+# The chokepoint rule this writer states in its own docstring, graded as three
+# rows: an in-tree spec takes the confined arm, an out-of-tree one takes the
+# plain no-follow arm, and a redirected parent inside the tree is REFUSED. The
+# fourth row is #597 — an operator's read-only spec is answered, not routed
+# around.
+#
+# `confine_root` here is always a real ANCESTOR of the spec's directory, never
+# the directory itself: the anchored walk covers the components strictly BELOW
+# the root and opens the root without O_NOFOLLOW, so `confine_root=spec.parent`
+# would walk nothing, refuse nothing, and leave every row below green while the
+# escape stayed wide open.
+
+
+def _tree(tmp_path):
+    """A checkout root with one artifacts component below it, plus a sibling
+    directory genuinely outside that root to redirect into."""
+    root = tmp_path / "checkout"
+    (root / "artifacts").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    return root, outside
+
+
+def _tap(label: str, seen: list[str], real):
+    def record(path, data, **kw):
+        seen.append(label)
+        return real(path, data, **kw)
+
+    return record
+
+
+def test_set_frontmatter_status_takes_the_confined_arm_for_an_in_tree_spec(tmp_path, monkeypatch):
+    """The positive control, and the row that grades WHICH writer an in-tree spec
+    reaches rather than only that the edit landed.
+
+    Both bindings are wrapped and both keep the real write, so this is a control
+    and not a stub measurement — the flip below actually lands on disk. Wrapping
+    only one would grade "a write happened", which the twenty characterization
+    rows above already do.
+
+    Ablation: swap the two arms of the `is_relative_to` branch and this fails on
+    `seen`, with the file still correctly rewritten."""
+    root, _ = _tree(tmp_path)
+    spec = _spec(root / "artifacts", _PLAIN)
+    seen: list[str] = []
+    monkeypatch.setattr(
+        frontmatter,
+        "atomic_write_bytes_confined",
+        _tap("confined", seen, frontmatter.atomic_write_bytes_confined),
+    )
+    monkeypatch.setattr(
+        frontmatter, "atomic_write_bytes", _tap("plain", seen, frontmatter.atomic_write_bytes)
+    )
+
+    assert frontmatter.set_frontmatter_status(spec, "done", confine_root=root) is True
+
+    assert seen == ["confined"]
+    assert frontmatter.read_frontmatter(spec)["status"] == "done"
+
+
+def test_set_frontmatter_status_keeps_the_plain_write_for_an_out_of_tree_spec(
+    tmp_path, monkeypatch
+):
+    """The else-arm, and the reason the chokepoint is a branch rather than a
+    straight conversion: an artifacts folder configured OUTSIDE the checkout is
+    supported configuration, and the confined writer cannot vouch for a tree it
+    was not given. Refusing there would break working setups rather than close a
+    hole, so the plain no-follow write is kept — exactly what this site did before
+    #593.
+
+    Ablation: drop the `is_relative_to` branch and call the confined writer
+    unconditionally, and this fails with `UnconfinedWriteError` — the spec never
+    rewritten."""
+    root, outside = _tree(tmp_path)
+    spec = _spec(outside, _PLAIN)
+    seen: list[str] = []
+    monkeypatch.setattr(
+        frontmatter,
+        "atomic_write_bytes_confined",
+        _tap("confined", seen, frontmatter.atomic_write_bytes_confined),
+    )
+    monkeypatch.setattr(
+        frontmatter, "atomic_write_bytes", _tap("plain", seen, frontmatter.atomic_write_bytes)
+    )
+
+    assert frontmatter.set_frontmatter_status(spec, "done", confine_root=root) is True
+
+    assert seen == ["plain"]
+    assert frontmatter.read_frontmatter(spec)["status"] == "done"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_set_frontmatter_status_refuses_a_symlinked_parent(tmp_path):
+    """The escape #593 names, at this site. `follow_symlinks=False` stopped a link
+    planted at the SPEC; it did nothing about one planted at the directory holding
+    it, because `mkstemp(dir=...)` and `os.replace`'s destination were still
+    ordinary path lookups — so the temp and the published spec both landed
+    wherever the link pointed, outside the checkout entirely.
+
+    The read half still resolves through the link (the writer reads by name), so
+    the edit is computed and only the WRITE refuses: this reaches the writer
+    rather than bailing out at `is_file`.
+
+    The last assertions are the load-bearing ones — refusing loudly is worth
+    nothing if the bytes already escaped.
+
+    Ablation: revert the call to
+    `atomic_write_bytes(path, payload, follow_symlinks=False)` and this fails
+    `DID NOT RAISE`, with the victim spec rewritten out in `outside/`."""
+    root, outside = _tree(tmp_path)
+    victim = _spec(outside, _PLAIN, name="victim.md")
+    (root / "artifacts").rmdir()
+    (root / "artifacts").symlink_to(outside, target_is_directory=True)
+    spec = root / "artifacts" / "victim.md"
+    assert spec.is_file()  # the read still resolves through the planted link
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        frontmatter.set_frontmatter_status(spec, "done", confine_root=root)
+
+    assert victim.read_bytes() == _PLAIN.encode("utf-8")  # not rewritten
+    assert sorted(p.name for p in outside.iterdir()) == ["victim.md"]  # nor staged
+
+
+def test_set_frontmatter_status_refuses_a_readonly_spec(tmp_path):
+    """#597 at this site. `os.replace` needs write permission on the parent
+    DIRECTORY, never on the entry it replaces, so a spec an operator marked
+    read-only was rewritten anyway — and the mode came back `0444`, leaving
+    nothing in the permission bits to record it. The `PermissionError` here is the
+    one a bare `write_bytes` raised before this writer went atomic.
+
+    `0o444` sets the READONLY attribute on win32 too, so this runs unskipped on
+    both platforms; the chmod is on a file in this test's own tmp_path and is
+    restored in a `finally` (Windows rmtree refuses a READONLY leftover).
+
+    Ablation: drop `require_writable_target=True` from the confined call and this
+    fails `DID NOT RAISE`, with the spec reading `status: done` and still `0444`."""
+    root, _ = _tree(tmp_path)
+    spec = _spec(root / "artifacts", _PLAIN)
+    spec.chmod(0o444)
+    try:
+        with pytest.raises(PermissionError):
+            frontmatter.set_frontmatter_status(spec, "done", confine_root=root)
+    finally:
+        spec.chmod(0o644)
+
+    assert spec.read_bytes() == _PLAIN.encode("utf-8")
+    assert list((root / "artifacts").glob("*.tmp")) == []  # a refusal stages nothing

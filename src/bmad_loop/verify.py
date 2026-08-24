@@ -3047,7 +3047,7 @@ def capture_diff(repo: Path, baseline: str, *, max_file_bytes: int | None = None
     return "".join(parts)
 
 
-def set_frontmatter_field(path: Path, key: str, value: str) -> bool:
+def set_frontmatter_field(path: Path, key: str, value: str, *, confine_root: Path) -> bool:
     """Rewrite (or insert) a scalar ``<key>:`` line in a spec's `---`…`---`
     frontmatter block.
 
@@ -3075,9 +3075,16 @@ def set_frontmatter_field(path: Path, key: str, value: str) -> bool:
     Windows) by a write contracted to move one field. The INSERTED line takes the
     block's own ending, not a bare ``\\n``.
 
-    Atomic on the same terms too (#379) — `platform_util.atomic_write_bytes`,
-    ``follow_symlinks=False``, matching what `devcontract._atomic_write_spec`
-    already does to the same files. Use the BYTES helper and not the text one:
+    Atomic on the same terms too (#379), and CONFINED on the same terms (#593):
+    the spec-writer chokepoint rule — confined write in-tree, plain no-follow
+    write for an artifacts folder configured outside the checkout — is stated
+    once, in `frontmatter.set_frontmatter_status`, and this site implements it
+    identically. ``confine_root`` is required for the reason it is required
+    there. So is ``require_writable_target=True`` (#597): this rewrites an
+    operator-editable spec, and a read-only one is answered rather than routed
+    around by a replace that only needs the directory writable.
+
+    Use the BYTES helper and not the text one:
     `atomic_write_text` keeps ``Path.write_text``'s translating newline default,
     which would relay ``\\n``→``\\r\\n`` on Windows and undo the paragraph above.
     """
@@ -3091,7 +3098,13 @@ def set_frontmatter_field(path: Path, key: str, value: str) -> bool:
     edited = _edit_frontmatter_block(block, key, value, insert=True)
     if edited is None:
         return False
-    atomic_write_bytes(path, (before + edited + after).encode("utf-8"), follow_symlinks=False)
+    payload = (before + edited + after).encode("utf-8")
+    if path.is_relative_to(confine_root):
+        atomic_write_bytes_confined(
+            path, payload, confine_root=confine_root, require_writable_target=True
+        )
+    else:
+        atomic_write_bytes(path, payload, follow_symlinks=False, require_writable_target=True)
     return True
 
 

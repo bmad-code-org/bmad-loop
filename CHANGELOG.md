@@ -22,6 +22,14 @@ breaking changes may land in a minor release.
 - **A published run archive now lands at mode `0600`** instead of a umask-derived mode (#591).
   It is staged through a file the orchestrator creates itself rather than one `tarfile` opens
   by name, so it inherits the private mode the rest of the `.bmad-loop` write path uses.
+- **A read-only operator file is refused again instead of being rewritten** (#597). Marking
+  `sprint-status.yaml`, `policy.toml`, a hook `settings.json`, a story spec, a park record or the
+  decisions store read-only stopped meaning anything when those writes became atomic: `os.replace`
+  needs write permission on the parent _directory_, never on the entry it replaces, so the file was
+  overwritten and — where mode is inherited — came back reading `0444`, with nothing in the
+  permission bits to record the change. Those writers now ask for the `PermissionError` a plain
+  `write_text` used to raise. Machine-minted state (run archives, stop requests, the config-digest
+  stamp) is unaffected.
 
 ### Security
 
@@ -41,6 +49,14 @@ breaking changes may land in a minor release.
   components `O_NOFOLLOW` and write through the descriptor that walk produced, which a later swap
   of any name no longer reaches. Windows has no `*at()` family and degrades to the documented
   check-then-write. A refusal raises `UnconfinedWriteError`, an `OSError`.
+- **The orchestrator's own writers under session-writable roots adopted those confined helpers**
+  (#593): the decisions store, the three park-record writers, the stop-request channel, the two
+  per-run sweep decision writes, all three `policy.toml` writers, the three story-spec writers
+  (`devcontract`'s four repair writers plus both frontmatter field writers), and the run's
+  config-digest stamp. A story spec in an artifacts folder configured _outside_ the checkout keeps
+  the plain no-follow write — that is supported configuration, and a confined write cannot vouch
+  for a tree it was not given. `recovery_flow`'s snapshot put-back, `install`'s hook registration
+  and worktree provisioning keep their own stricter component walks unchanged.
 
 ## [0.11.1] — 2026-08-23
 

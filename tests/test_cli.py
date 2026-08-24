@@ -7414,7 +7414,9 @@ def _interrupted_story(paths, key="1-1-a", *, board="awaiting-operator"):
     from bmad_loop import devcontract
 
     sp = _park_story(paths, key, spec_status="done", board=board)
-    devcontract.append_operator_confirmation(sp, CONFIRM_ACTIONS, date="2026-07-28")
+    devcontract.append_operator_confirmation(
+        sp, CONFIRM_ACTIONS, date="2026-07-28", confine_root=paths.project
+    )
     return sp
 
 
