@@ -8602,9 +8602,9 @@ def test_auto_sweep_launches_the_profile_bytes_the_gate_validated(project, monke
     # the gate saw the honest bytes and passed
     factory("epic-boundary", started=lambda: signalled.append("started"))
 
-    assert profile_mod.get_profile("mycli", project.project).binary == "rogue-cli", (
-        "the swap must actually have landed on disk, or this test proves nothing"
-    )
+    assert (
+        profile_mod.get_profile("mycli", project.project).binary == "rogue-cli"
+    ), "the swap must actually have landed on disk, or this test proves nothing"
     assert captured["adapter"].profile.binary == "mycli"
     assert signalled == ["started"]  # #501: the child composed, so the parent may latch
     run_id = captured["state"].run_id
@@ -8681,9 +8681,9 @@ def test_run_pins_the_profile_bytes_it_launches(project, monkeypatch):
 
     assert cli.main(["run", "--project", str(project.project)]) == 0
 
-    assert profile_mod.get_profile("mycli", project.project).binary == "rogue-cli", (
-        "the swap must actually have landed on disk, or this test proves nothing"
-    )
+    assert (
+        profile_mod.get_profile("mycli", project.project).binary == "rogue-cli"
+    ), "the swap must actually have landed on disk, or this test proves nothing"
     assert captured["adapter"].profile.binary == "mycli"
     run_id = captured["state"].run_id
     assert runs.read_trusted_config_digest(project.project, run_id) == pin
@@ -8741,9 +8741,9 @@ def test_resume_pins_the_profile_bytes_it_launches(project, monkeypatch):
 
     assert cli._resume_paused_run(project.project, run_dir) == 0
 
-    assert profile_mod.get_profile("mycli", project.project).binary == "rogue-cli", (
-        "the swap must actually have landed on disk, or this test proves nothing"
-    )
+    assert (
+        profile_mod.get_profile("mycli", project.project).binary == "rogue-cli"
+    ), "the swap must actually have landed on disk, or this test proves nothing"
     assert captured["adapter"].profile.binary == "mycli"
     assert runs.read_trusted_config_digest(project.project, run_dir.name) == pin
 
@@ -9164,8 +9164,9 @@ def test_sweep_archive_dry_run(project, capsys):
 def test_sweep_archive_writes_ledger_and_archive(project, capsys):
     """The writing path is observed on disk: bodies move, stubs land, open
     entries stay (#706 pass 2 — a plumbing regression must not ship green)."""
-    from bmad_loop import deferredwork
     from conftest import write_ledger
+
+    from bmad_loop import deferredwork
 
     install_bmad_config(project)
     write_ledger(project, {"DW-1": "open", "DW-2": "done 2026-06-01"}, commit=False)
