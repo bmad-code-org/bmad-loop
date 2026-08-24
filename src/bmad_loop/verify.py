@@ -34,7 +34,7 @@ from .frontmatter import (
     status_of,
 )
 from .model import StoryTask, VerifyOutcome
-from .platform_util import atomic_write_bytes
+from .platform_util import atomic_write_bytes, atomic_write_bytes_confined
 from .policy import POLICY_FILE, Policy
 from .sprintstatus import STATUS_ORDER, story_status
 
@@ -2000,14 +2000,26 @@ def safe_rollback(
             # their orchestration config on top of it — and a truncated policy.toml
             # is not a smaller config but a parse error the next `bmad-loop run`
             # refuses on, which is the failure the whole restore exists to avoid.
-            # `follow_symlinks=False` is a real change here (a bare `write_bytes`
-            # opens the name and so writes THROUGH a link), and it is the right
-            # one twice over: `policy.write_mux_backend` already replaces this same
-            # file by name, so no link at this path survives the orchestrator
-            # anyway; and `runsetup` states a driven session can write
+            # Refusing to follow a link was a real change here (a bare
+            # `write_bytes` opens the name and so writes THROUGH one), and it is
+            # the right one twice over: `policy.write_mux_backend` already replaces
+            # this same file by name, so no link at this path survives the
+            # orchestrator anyway; and `runsetup` states a driven session can write
             # `.bmad-loop/policy.toml`, so honouring a link planted there would aim
-            # a host-side write at a path of that session's choosing.
-            atomic_write_bytes(policy_path, policy_content, follow_symlinks=False)
+            # a host-side write at a path of that session's choosing. Confined to
+            # `repo` (#593) because that refusal stopped at the final component:
+            # `policy_path` is built lexically from `repo` at the capture above, so
+            # the walk re-derives exactly the components that join was spelled
+            # from, and a link planted at `.bmad-loop/` no longer redirects the
+            # restore out of the repo. require_writable_target (#597) gives back
+            # the PermissionError a bare `write_bytes` raised on an operator's
+            # read-only policy.toml — this is their config, not machine state.
+            atomic_write_bytes_confined(
+                policy_path,
+                policy_content,
+                confine_root=repo,
+                require_writable_target=True,
+            )
     for target in cleanup.targets:
         try:
             target.path.unlink(missing_ok=True)

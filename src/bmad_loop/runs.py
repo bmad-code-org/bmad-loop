@@ -24,8 +24,10 @@ from .journal import STATE_FILE, VERIFY_DIR, Journal, load_state, save_state
 from .model import PAUSE_ESCALATION, Phase, RunState, StoryTask
 from .platform_util import (
     MAX_SEGMENT,
+    UnconfinedWriteError,
     atomic_replace,
     atomic_write_text,
+    atomic_write_text_confined,
     has_parent_ref,
     is_absolute_path,
     is_link_like,
@@ -1011,6 +1013,29 @@ def _stop_request_mode_of(path: Path) -> str | None:
     return "graceful"
 
 
+def _project_of_run_dir(run_dir: Path) -> Path:
+    """The project root a run directory hangs under, for confining writes into it.
+
+    Derived rather than passed because the stop-request channel is addressed by
+    run directory alone: `stop_run` resolves a run reference and never holds the
+    project separately. :func:`run_dir_for` is the only builder of these paths
+    and spells them ``project / RUNS_DIR / run_id``, so the root sits exactly
+    ``len(RUNS_DIR.parts)`` levels above the run's own directory — the arithmetic
+    tracks `RUNS_DIR` rather than hard-coding 2, so moving the runs tree moves
+    this with it.
+
+    A path too shallow to have that ancestor is not one this module built.
+    Refusing with :class:`UnconfinedWriteError` rather than letting `parents`
+    raise `IndexError` is the load-bearing part: `stop_run` degrades on `OSError`
+    so that a failed lodge still signals the run, and an `IndexError` there would
+    abort the stop before it ever signalled."""
+    depth = len(RUNS_DIR.parts)
+    parents = run_dir.parents
+    if len(parents) <= depth:
+        raise UnconfinedWriteError(f"{run_dir} is not shaped like a run directory")
+    return parents[depth]
+
+
 def _write_stop_request(run_dir: Path, mode: str) -> None:
     """Lodge a stop request of ``mode`` on the control-file channel, written
     atomically so a concurrent engine read never sees a partial body.
@@ -1038,13 +1063,24 @@ def _write_stop_request(run_dir: Path, mode: str) -> None:
     would abort ``stop_run`` *before* it ever signals. A ``mkstemp`` temp per writer
     removes the collision: the last replace wins and neither writer errors.
 
-    ``follow_symlinks=False`` preserves what the bare ``os.replace`` did — it never
-    dereferenced this destination — and matches what the file is: machine-minted
-    control state under a run dir a driven session can reach. It now lands at
-    ``mkstemp``'s ``0600`` instead of ``0644 & ~umask``; nothing reads it
-    cross-user."""
+    Refusing a link at the control file preserved what the bare ``os.replace``
+    did — it never dereferenced this destination — and matches what the file is:
+    machine-minted control state under a run dir a driven session can reach. The
+    write is now confined to the project root (#593), because that refusal
+    covered only the final component: every directory above it was still looked
+    up by name, so a link planted at ``.bmad-loop/`` — or at ``runs/``, or at the
+    run's own directory — aimed both the temp and the publish wherever it
+    pointed. The file still lands at ``mkstemp``'s ``0600`` instead of
+    ``0644 & ~umask``, since no-follow never inherited a mode either; nothing
+    reads it cross-user.
+
+    No ``require_writable_target``: this is not an operator-curated file but a
+    channel two ``stop`` invocations race on, and its whole contract above is
+    that the stronger request always lands."""
     body = json.dumps({"requested_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "mode": mode})
-    atomic_write_text(run_dir / STOP_REQUEST_FILE, body, follow_symlinks=False)
+    atomic_write_text_confined(
+        run_dir / STOP_REQUEST_FILE, body, confine_root=_project_of_run_dir(run_dir)
+    )
 
 
 def _create_stop_request(run_dir: Path) -> bool:

@@ -906,7 +906,7 @@ def _mux_set(project: Path, args: argparse.Namespace) -> int:
         if args.name:
             print("error: `mux set --clear` takes no backend name", file=sys.stderr)
             return 1
-        policy_mod.write_mux_backend(path, None)
+        policy_mod.write_mux_backend(path, None, confine_root=project)
         print(f"mux backend cleared (auto-select) in {path}")
         return 0
     if not args.name:
@@ -944,7 +944,8 @@ def _mux_set(project: Path, args: argparse.Namespace) -> int:
             "note: BMAD_LOOP_MUX_BACKEND is set in this shell and outranks the persisted choice",
             file=sys.stderr,
         )
-    policy_mod.write_mux_backend(path, args.name)  # a junk name raises PolicyError → main()
+    # a junk name raises PolicyError → main()
+    policy_mod.write_mux_backend(path, args.name, confine_root=project)
     print(f'mux backend set to "{args.name}" in {path}')
     return 0
 

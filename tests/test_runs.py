@@ -1038,23 +1038,28 @@ def test_write_stop_request_survives_an_interleaved_concurrent_writer(tmp_path, 
     `mkstemp` temp removes the collision: both calls return, the survivor is a
     complete body, and neither leaves a staging file behind.
 
-    Patched on both namespaces so reverting `_write_stop_request` to the hand-rolled
-    `tmp + atomic_replace` still routes through the interleave — that ablation must
-    redden this test."""
-    from bmad_loop import platform_util
+    Patched at `os.replace` rather than on the two `atomic_replace` namespaces:
+    the confined writer's anchored arm publishes with a bare dir_fd-relative
+    `os.replace` and never reaches `atomic_replace` (#593), so patching that name
+    would fire on nothing and the test would pass having interleaved nobody. One
+    seam still covers the ablation the old dual patch existed for, and covers it
+    better — `atomic_replace` is itself a wrapper around `os.replace`, so
+    reverting `_write_stop_request` to the hand-rolled `tmp + atomic_replace`
+    routes through this same patch and must still redden this test.
 
+    Filtered to the stop-request name so an unrelated replace during the test is
+    not collateral."""
     run_dir = _make_state_run(tmp_path, "r1")
-    real_replace = platform_util.atomic_replace
+    real_replace = os.replace
     nested: list[str] = []
 
-    def _interleave(tmp, target):
-        if not nested:  # inside writer A's replace, run writer B end to end
-            nested.append("b")
+    def _interleave(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
+        if not nested and str(dst).endswith(runs.STOP_REQUEST_FILE):
+            nested.append("b")  # inside writer A's replace, run writer B end to end
             runs._write_stop_request(run_dir, "graceful")
-        real_replace(tmp, target)
+        return real_replace(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
 
-    monkeypatch.setattr(platform_util, "atomic_replace", _interleave)
-    monkeypatch.setattr(runs, "atomic_replace", _interleave)
+    monkeypatch.setattr(os, "replace", _interleave)
 
     runs._write_stop_request(run_dir, "hard")  # writer A — must not raise
 
@@ -3241,3 +3246,105 @@ def test_classify_legacy_crash_stays_interrupted(tmp_path):
     (run_dir / "state.json").write_text(json.dumps(doc), encoding="utf-8")
     (run_dir / "engine.pid").write_text(str(_dead_pid()))
     assert runs.discover_runs(tmp_path)[0].status == runs.INTERRUPTED
+
+
+# ------------------------------- the stop-request channel's confined write (#593)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_the_stop_request_refuses_a_symlinked_bmad_loop(tmp_path):
+    """The escape #593 names, at this site. Refusing a link at
+    `stop-request.json` covered the final component only: `.bmad-loop/`, `runs/`
+    and the run's own directory were all still looked up by name, so a link
+    planted at any of them aimed both the temp and the published control file
+    wherever it pointed — and this is a directory a driven session can reach.
+
+    The run dir is arranged so the unconfined write would SUCCEED: `outside/`
+    already holds the `runs/r1` chain the link resolves to, so the second
+    assertion measures a write that had somewhere to land rather than one that
+    failed for want of a parent.
+
+    Ablation: revert `_write_stop_request` to
+    `atomic_write_text(..., follow_symlinks=False)` and this fails
+    `DID NOT RAISE`, with `stop-request.json` sitting in `outside/runs/r1/`."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    outside = tmp_path / "outside"
+    landing = outside / "runs" / "r1"
+    landing.mkdir(parents=True)
+    (proj / ".bmad-loop").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        runs._write_stop_request(proj / ".bmad-loop" / "runs" / "r1", "hard")
+
+    assert list(landing.iterdir()) == []  # nothing escaped the project
+
+
+def test_the_stop_request_lands_on_a_clean_tree(tmp_path):
+    """The positive control for the refusal above — without it that test passes
+    for a `_write_stop_request` wired to refuse everything, which is every reason
+    a file could be absent from `outside/`."""
+    run_dir = _make_state_run(tmp_path, "r1")
+
+    runs._write_stop_request(run_dir, "hard")
+
+    assert json.loads((run_dir / runs.STOP_REQUEST_FILE).read_text(encoding="utf-8"))["mode"] == (
+        "hard"
+    )
+
+
+def test_stop_run_still_signals_when_the_lodge_is_refused_as_unconfined(tmp_path, monkeypatch):
+    """`UnconfinedWriteError` subclasses `OSError` FOR THIS CALLER, and this is the
+    row that says so. `stop_run` lodges the hard request and then signals, and it
+    degrades rather than aborts when the lodge fails — the stop is delivered two
+    ways at once, so losing one redundant channel must not cost the other. A
+    refusal that escaped as a fresh exception type would abort `stop_run` BEFORE
+    it ever signalled, leaving a run alive that the signal path could have killed.
+
+    The sibling `_enospc` rows grade the degrade for a disk error; this one grades
+    it for the confinement refusal specifically, which is the failure the #593
+    adoption newly introduced at this call site.
+
+    Ablation: make `UnconfinedWriteError` inherit from `Exception` instead of
+    `OSError` and this fails — the refusal escapes `stop_run`'s `except OSError`
+    and no signal goes out."""
+    monkeypatch.setattr(runs, "kill_session", lambda _rid: None)
+    run_dir = _make_state_run(tmp_path, "r1")
+    (run_dir / "engine.pid").write_text("4242 100.0")
+
+    def _unconfined(_run_dir, _mode):
+        raise platform_util.UnconfinedWriteError("cannot reach the run dir without a redirect")
+
+    monkeypatch.setattr(runs, "_write_stop_request", _unconfined)
+    host = _FakeHost(alive=False, identity=100.0)
+    monkeypatch.setattr(runs, "get_process_host", lambda: host)
+
+    assert runs.stop_run(run_dir) is True
+    assert host.terminated == [4242]  # the signal went out despite the refused lodge
+    assert load_state(run_dir).stopped is True
+
+
+def test_project_of_a_run_dir_too_shallow_refuses_rather_than_indexing_off_the_end(tmp_path):
+    """The confinement root is derived by counting `RUNS_DIR` levels up from the
+    run directory, so a path too shallow to HAVE that ancestor would index off the
+    end of `Path.parents`. `IndexError` is not an `OSError`: it would escape
+    `stop_run`'s degrade and abort the stop before it signalled — the exact
+    failure the row above exists to prevent. So the guard refuses in the currency
+    every caller here already handles.
+
+    Ablation: drop the `len(parents) <= depth` check in `_project_of_run_dir` and
+    this fails with `IndexError` instead of `UnconfinedWriteError`."""
+    shallow = Path(tmp_path.anchor) / "one"
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        runs._project_of_run_dir(shallow)
+
+
+def test_project_of_a_real_run_dir_is_the_project_root(tmp_path):
+    """The positive control for the guard above: on a run dir this module actually
+    built, the derivation returns the project root rather than refusing. Without
+    it, `_project_of_run_dir` could refuse everything and the row above would
+    still pass."""
+    run_dir = _make_state_run(tmp_path, "r1")
+
+    assert runs._project_of_run_dir(run_dir) == tmp_path

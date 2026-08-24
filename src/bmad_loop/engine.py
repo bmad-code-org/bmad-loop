@@ -54,7 +54,13 @@ from .model import (
     StoryTask,
     VerifyOutcome,
 )
-from .platform_util import atomic_replace, atomic_write_text, retrying_unlink, safe_segment
+from .platform_util import (
+    atomic_replace,
+    atomic_write_text,
+    atomic_write_text_confined,
+    retrying_unlink,
+    safe_segment,
+)
 from .plugins import HookBus, HookContext, PluginRegistry
 from .policy import Policy
 from .recovery_flow import RecoveryFlow
@@ -3077,15 +3083,24 @@ class Engine:
         record as an entry owing nothing — a park silently discharged by a
         rollback of the commit it was written for.
 
-        `OSError` stays the guard, and stays wide enough BECAUSE of
-        `follow_symlinks=False`: no-follow skips `Path.resolve` entirely, so the
+        `OSError` stays the guard, and stays wide enough BECAUSE the put-back
+        never resolves: the confined writer walks the components below the
+        project root with `O_NOFOLLOW` and never calls `Path.resolve`, so the
         pre-3.13 `RuntimeError`-on-symlink-loop that forced
         `_restore_deferred_closes` (and `tui.launch`) to widen to `Exception`
         cannot arise on this path. That widening is a property of the resolve,
-        not of the helper — do not copy it back here. The no-follow itself is
-        right for the same reason it is right in `operatoractions.record_park`,
-        which writes this exact file: machine-minted, under a project root a
-        driven session writes all run long.
+        not of the helper — do not copy it back here. `UnconfinedWriteError` is
+        an `OSError` subclass precisely so a refusal arrives in this guard and
+        gets journaled rather than escaping as a type nothing catches.
+
+        Confined to `self.workspace.paths.project` — the WORKTREE root when one
+        is mounted, matching `_write_park_record`, since that is the tree this
+        record was written into — for the reason `operatoractions.record_park`
+        is (#593): refusing a link at the record itself left the directories
+        above it resolved by name, so a link planted at `.bmad-loop/` redirected
+        the put-back out of the project entirely. `require_writable_target=True`
+        (#597) keeps this writer's semantics identical to the other two writers
+        of this same file; a read-only record is answered, not routed around.
 
         A failure is journaled rather than dropped, matching the model above:
         `validate` reports a board parked with no record but never a record left
@@ -3102,7 +3117,12 @@ class Engine:
                 if parent.is_dir() and not any(parent.iterdir()):
                     parent.rmdir()
             else:
-                atomic_write_text(path, prior, follow_symlinks=False)
+                atomic_write_text_confined(
+                    path,
+                    prior,
+                    confine_root=self.workspace.paths.project,
+                    require_writable_target=True,
+                )
         except OSError as e:
             with contextlib.suppress(Exception):
                 self.journal.append(

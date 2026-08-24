@@ -21,7 +21,7 @@ from . import deferredwork, gates, verify
 from .engine import Engine, RunPaused
 from .escalation import critical_escalations, env_fault_pause_reason, session_failure_reason
 from .model import PAUSE_STORY_GATE, Phase, StoryTask
-from .platform_util import atomic_write_text, neutralize_surrogates
+from .platform_util import atomic_write_text, atomic_write_text_confined, neutralize_surrogates
 from .statemachine import advance
 from .workspace import discard_worktree
 
@@ -1166,9 +1166,17 @@ class SweepEngine(Engine):
             # project-level `.bmad-loop/decisions.json` is a different file with a
             # near-identical temp name — that is the exposed one. Taken anyway for
             # the fsync and the unique temp name, which two writers of one key
-            # would otherwise collide on. follow_symlinks=False replaces the NAME,
-            # which is what the bare replace did too.
-            atomic_write_text(decisions_path, json.dumps(answers, indent=2), follow_symlinks=False)
+            # would otherwise collide on. Confined to the project root (#593):
+            # replacing the NAME, as the bare replace did, left `.bmad-loop/` and
+            # `runs/` above it resolved by name, and a link planted at either
+            # aimed this write out of the project. The root has to be the PROJECT,
+            # not `self.run_dir` — a file confined against its own parent walks no
+            # components at all, which would refuse nothing.
+            atomic_write_text_confined(
+                decisions_path,
+                json.dumps(answers, indent=2),
+                confine_root=self.workspace.root,
+            )
         pending = [d for d in plan.decisions if d.id not in answers]
         answered_interactively = False
         if not self.prompting:
@@ -1204,8 +1212,10 @@ class SweepEngine(Engine):
                     "effect": option.effect,
                     "answered_at": self._today(),
                 }
-                atomic_write_text(  # same file, same reasoning as the seeded write above (#363)
-                    decisions_path, json.dumps(answers, indent=2), follow_symlinks=False
+                atomic_write_text_confined(  # same file, same reasoning as above (#363, #593)
+                    decisions_path,
+                    json.dumps(answers, indent=2),
+                    confine_root=self.workspace.root,
                 )
                 self.journal.append(
                     "decision-answered",

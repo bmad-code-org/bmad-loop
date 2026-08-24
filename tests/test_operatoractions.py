@@ -10,12 +10,13 @@ drifted.
 from __future__ import annotations
 
 import json
+import os
 import sys
 
 import pytest
 from conftest import git, install_bmad_config, spec_path, write_spec, write_sprint
 
-from bmad_loop import devcontract, operatoractions, verify
+from bmad_loop import devcontract, operatoractions, platform_util, verify
 
 ACTIONS = ["buy example.com at the registrar", "publish the _acme-challenge TXT record"]
 
@@ -167,20 +168,29 @@ def test_a_failed_record_write_leaves_no_tmp_residue(project, monkeypatch):
     a stranded temp would ride the story's own commit — one story's half-write
     polluting its own history forever.
 
-    The fault is injected at `platform_util.atomic_replace`, one layer BELOW the
-    helper `record_park` now delegates to (#379), and that placement is the whole
-    test: stubbing `atomic_write_text` itself would mean no temp was ever
-    created, so "no residue" would pass for that reason rather than for the
-    unlink. Faulting the publish instead runs the helper's real body — mkstemp,
-    write, fsync — so the assertion grades a temp that genuinely existed.
+    The fault is injected at the PUBLISH, one layer BELOW the helper `record_park`
+    delegates to (#379, #593), and that placement is the whole test: stubbing
+    `atomic_write_text_confined` itself would mean no temp was ever created, so
+    "no residue" would pass for that reason rather than for the unlink. Faulting
+    the publish instead runs the helper's real body — temp create, write, fsync —
+    so the assertion grades a temp that genuinely existed.
 
-    Ablation: drop the `tmp.unlink()` in `platform_util._atomic_write`'s except
-    arm and this fails."""
+    `os.replace`, not `platform_util.atomic_replace`: the confined writer's
+    anchored arm publishes with a bare dir_fd-relative `os.replace` and never
+    reaches `atomic_replace` at all, so the old injection point would no longer
+    fire and this test would pass having faulted nothing. Filtered to the record's
+    own name so an unrelated replace during the test is not collateral.
 
-    def boom(tmp, target):
-        raise OSError(28, "No space left on device")
+    Ablation: drop the `os.unlink(tmp, dir_fd=dir_fd)` in
+    `platform_util._atomic_write_at`'s except arm and this fails."""
+    real_replace = os.replace
 
-    monkeypatch.setattr("bmad_loop.platform_util.atomic_replace", boom)
+    def boom(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
+        if str(dst).endswith(".json"):
+            raise OSError(28, "No space left on device")
+        return real_replace(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+    monkeypatch.setattr(os, "replace", boom)
     with pytest.raises(OSError):
         operatoractions.record_park(
             project.project,
@@ -196,9 +206,13 @@ def test_a_failed_record_write_leaves_no_tmp_residue(project, monkeypatch):
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
 def test_the_record_replaces_a_planted_symlink_by_name(project, tmp_path):
-    """#379. The one row that grades this SITE's `follow_symlinks=False` argument
-    rather than the helper's implementation of it, which `test_platform_util.py`
-    pins by calling the helper directly.
+    """#379. The one row that grades this SITE's choice of a writer that replaces
+    the NAME, rather than the helper's implementation of it, which
+    `test_platform_util.py` pins by calling the helper directly. The site no
+    longer spells that choice as `follow_symlinks=False`: since #593 it calls
+    `atomic_write_text_confined`, which is no-follow by construction — the
+    anchored arm publishes with a dir_fd-relative `os.replace` that does not
+    dereference its destination, and the win32 arm passes the no-follow itself.
 
     Behaviour-preserving: the hand-rolled write this replaced ended in
     `os.replace`, which never dereferenced its destination either, so passing the
@@ -208,7 +222,8 @@ def test_the_record_replaces_a_planted_symlink_by_name(project, tmp_path):
     link planted at the record's own name would turn the park's bookkeeping into
     a host-side write at a path of that session's choosing.
 
-    Ablation: drop `follow_symlinks=False` in `record_park` and this reddens
+    Ablation: swap `record_park`'s writer for
+    `atomic_write_text(path, ...)` at its follow-the-link default and this reddens
     alone — the link survives and the planted target is what gets rewritten."""
     outside = tmp_path / "someone-elses-file"
     outside.write_text("not a park record\n", encoding="utf-8")
@@ -310,14 +325,19 @@ def test_a_failed_legacy_prune_leaves_no_tmp_residue(project, monkeypatch):
     `pytest.raises` is for — it fails LOUDLY on `DID NOT RAISE` rather than
     letting the residue assertion pass over a rewrite that never ran.
 
-    Faulted at `platform_util.atomic_replace` for its sibling row's reason (#379):
-    below the helper, so a temp is really created and really unlinked.
+    Faulted at the publish for its sibling row's reason (#379, #593): below the
+    helper, so a temp is really created and really unlinked — and at `os.replace`
+    rather than `platform_util.atomic_replace`, because the confined writer's
+    anchored arm publishes dir_fd-relative and never reaches `atomic_replace`.
 
-    Ablation: drop the `tmp.unlink()` in `platform_util._atomic_write`'s except
-    arm and this fails."""
+    Ablation: drop the `os.unlink(tmp, dir_fd=dir_fd)` in
+    `platform_util._atomic_write_at`'s except arm and this fails."""
+    real_replace = os.replace
 
-    def boom(tmp, target):
-        raise OSError(28, "No space left on device")
+    def boom(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
+        if str(dst).endswith(".json"):
+            raise OSError(28, "No space left on device")
+        return real_replace(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
 
     _legacy_entry(project, "1-1-a")
     _legacy_entry(project, "2-2-b")
@@ -325,7 +345,7 @@ def test_a_failed_legacy_prune_leaves_no_tmp_residue(project, monkeypatch):
     before = sorted(p.name for p in store.parent.iterdir())
     assert before == ["operator-actions.json"]  # a snapshot with something IN it
 
-    monkeypatch.setattr("bmad_loop.platform_util.atomic_replace", boom)
+    monkeypatch.setattr(os, "replace", boom)
     with pytest.raises(OSError):
         operatoractions.drop(project.project, "1-1-a")
 
@@ -339,7 +359,7 @@ def test_a_failed_legacy_prune_leaves_no_tmp_residue(project, monkeypatch):
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
 def test_the_legacy_prune_replaces_a_planted_symlink_by_name(project, tmp_path):
-    """The `_drop_legacy` half of the record row above (#379): same argument, a
+    """The `_drop_legacy` half of the record row above (#379): same property, a
     different write, and its own ablation. Reachable for a different reason too —
     `drop` is what `bmad-loop confirm` calls, out of band and on a machine whose
     repo a driven session has been writing all run long.
@@ -347,7 +367,8 @@ def test_the_legacy_prune_replaces_a_planted_symlink_by_name(project, tmp_path):
     TWO entries again, so the prune takes the rewrite arm; the one-entry `else`
     arm unlinks the store outright and never reaches the helper at all.
 
-    Ablation: drop `follow_symlinks=False` in `_drop_legacy` and this reddens
+    Ablation: swap `_drop_legacy`'s writer for
+    `atomic_write_text(path, ...)` at its follow-the-link default and this reddens
     alone — the link survives and the planted target is what gets rewritten."""
     _legacy_entry(project, "1-1-a")
     _legacy_entry(project, "2-2-b")
@@ -713,3 +734,192 @@ def test_drift_still_answers_exactly_as_it_did_for_a_readable_list(project, spec
     _park(project, status=spec_status, board=board)
     (story,) = operatoractions.resolve(project.project, project)
     assert story.drift() == story.committed_drift()
+
+
+# ------------------------------ the confined writes under `.bmad-loop/` (#593, #597)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_the_record_write_refuses_a_symlinked_bmad_loop(project, tmp_path):
+    """The escape #593 names, at this site. `follow_symlinks=False` refused a link
+    planted at the record's own name (the row above pins that); it never refused
+    one at `.bmad-loop/`, and `record_park`'s own
+    `mkdir(parents=True, exist_ok=True)` ACCEPTS a symlink-to-a-directory, so the
+    planted parent survives the setup step and both the temp and the published
+    record land wherever the link points.
+
+    The stakes are this store's, not a generic writer's: the record is written
+    inside the story's commit window by a driven session that has been writing
+    under `.bmad-loop/` all run long, so the escalation the no-follow was added to
+    close costs a directory swap instead of a file swap — and the write it
+    redirects is one `finalize_commit`'s `git add -A` is about to look for.
+
+    The assertions after the raise are the load-bearing half: refusing loudly is
+    worth nothing if the write already landed outside the project, and
+    `pytest.raises` alone passes just as happily on a raise that came AFTER the
+    escape. They are stated as "no record CONTENT escaped" rather than
+    "`outside/` is empty", because an empty `operator/` DOES land there — the
+    `mkdir` runs before the writer and is precisely the step #593 says a planted
+    parent survives. The confinement is what stops the bytes, and the bytes are
+    what a record is; an empty directory names no obligation and `load` reads it
+    as nothing.
+
+    Ablation: revert `record_park` to
+    `atomic_write_text(path, ..., follow_symlinks=False)` and this fails
+    `DID NOT RAISE`, with `1-1-a.json` sitting in `outside/operator/`."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (project.project / ".bmad-loop").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        _record_only(project)
+
+    assert [p.name for p in outside.iterdir()] == ["operator"]  # the mkdir, nothing more
+    assert list(outside.rglob("*.json")) == []  # no record escaped the project
+    assert not list(outside.rglob("*.tmp"))  # nor a temp it was staged through
+    assert operatoractions.load(project.project) == {}
+
+
+def test_the_record_write_lands_on_a_clean_tree(project):
+    """The positive control for the refusal above. Without it that test passes for
+    a `record_park` wired to refuse everything, which is every reason a record
+    could be absent from `outside/` — and a park that cannot record is a story a
+    human can never be told they owe."""
+    _record_only(project)
+
+    assert operatoractions.record_path(project.project, "1-1-a").is_file()
+    assert operatoractions.load(project.project)["1-1-a"]["actions"] == ACTIONS
+
+
+def test_the_record_write_refuses_a_readonly_record(project):
+    """#597 at this site: `record_park` is the THIRD writer of this same file —
+    `Engine._restore_park_record` and `confirm`'s prune are the others — so write
+    semantics belong to the file, not to whichever path reached it last. An
+    operator who marks a park record read-only gets back the `PermissionError` a
+    bare `Path.write_text` raised before #379, rather than having the mode routed
+    around by a replace that only needs the DIRECTORY writable.
+
+    Re-parking the SAME key, deliberately: that is the one path that overwrites an
+    existing record (`test_re_parking_replaces_rather_than_accumulates`), so it is
+    the only one where a target mode exists to be honoured.
+
+    The bytes assertion is the load-bearing one — `pytest.raises` alone would pass
+    for a writer that clobbered the record and then raised on something else.
+
+    No skipif: 0444 sets READONLY on win32 too, and the win32 degrade arm carries
+    the same probe. chmod is on the per-test copytree copy the `project` fixture
+    makes, never the session template, and it is restored in a `finally` because
+    Windows rmtree refuses a READONLY file at cleanup.
+
+    Ablation: drop `require_writable_target=True` from `record_park` and this
+    fails `DID NOT RAISE`, with the record rewritten to `run-2` and still 0444."""
+    _record_only(project)
+    rp = operatoractions.record_path(project.project, "1-1-a")
+    before = rp.read_bytes()
+    rp.chmod(0o444)
+    try:
+        with pytest.raises(PermissionError):
+            operatoractions.record_park(
+                project.project,
+                "1-1-a",
+                actions=["a second park nobody may land"],
+                spec_file="spec.md",
+                run_id="run-2",
+                parked_at="2026-07-29",
+            )
+    finally:
+        rp.chmod(0o644)
+
+    assert rp.read_bytes() == before  # the re-park never landed
+    # and it left no temp beside it: the probe refuses BEFORE the temp is created,
+    # so a residue here would mean the write body ran and was undone after the fact
+    assert not list(operatoractions.records_dir(project.project).glob("*.tmp"))
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_the_legacy_prune_refuses_a_symlinked_bmad_loop(project, tmp_path):
+    """The `_drop_legacy` half of the row above (#593): same escape, a different
+    write, and its own ablation. Reachable for a different reason too — `drop` is
+    what `bmad-loop confirm` calls, out of band and on a machine whose repo a
+    driven session has been writing all run long.
+
+    The arrangement is forced by the writer's own precondition. `_drop_legacy`
+    reaches the rewrite only when `_load_legacy` FOUND the key, so the store has
+    to stay readable THROUGH the planted link — seed it, move its bytes into
+    `outside/`, and let the link resolve back to them. Seeding into a real
+    `.bmad-loop/` and then replacing the directory would strand the store, the
+    read would come back empty, and the test would pass having never reached a
+    writer at all. Hence the explicit precondition assertion: two entries visible
+    through the link, so the prune takes the rewrite arm (with ONE entry it takes
+    the `else` and unlinks the store outright).
+
+    `outside/` is not asserted empty here — the store legitimately lives there —
+    so the load-bearing assertions are that its BYTES are untouched and that no
+    temp joined it: either would be the redirected write landing.
+
+    Ablation: revert `_drop_legacy` to
+    `atomic_write_text(path, ..., follow_symlinks=False)` and this fails
+    `DID NOT RAISE`, with `operator-actions.json` in `outside/` rewritten to one
+    entry through the link."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    _legacy_entry(project, "1-1-a")
+    _legacy_entry(project, "2-2-b")
+    store = operatoractions.legacy_store_path(project.project)
+    kept = store.read_bytes()
+    (outside / store.name).write_bytes(kept)
+    store.unlink()
+    store.parent.rmdir()
+    (project.project / ".bmad-loop").symlink_to(outside, target_is_directory=True)
+    # precondition: the store is READ through the link, so the prune gets past its
+    # `story_key not in data` early return and actually reaches the writer
+    assert sorted(operatoractions.load(project.project)) == ["1-1-a", "2-2-b"]
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        operatoractions.drop(project.project, "1-1-a")
+
+    assert [p.name for p in outside.iterdir()] == [store.name]  # no temp escaped either
+    assert (outside / store.name).read_bytes() == kept  # not written through
+    assert sorted(operatoractions.load(project.project)) == ["1-1-a", "2-2-b"]
+
+
+def test_the_legacy_prune_lands_on_a_clean_tree(project):
+    """The positive control for the refusal above, and it grades the same rewrite
+    arm: TWO entries, so the prune rewrites rather than unlinking, which is the
+    only arm that reaches the confined writer at all."""
+    _legacy_entry(project, "1-1-a")
+    _legacy_entry(project, "2-2-b")
+
+    assert operatoractions.drop(project.project, "1-1-a") is True
+
+    assert operatoractions.legacy_store_path(project.project).is_file()
+    assert sorted(operatoractions.load(project.project)) == ["2-2-b"]
+
+
+def test_the_legacy_prune_refuses_a_readonly_store(project):
+    """#597 at this site. The legacy store is the one file here a HUMAN may have
+    curated — it is machine-local, predates #356, and nothing writes it anymore —
+    so a mode set on it is a deliberate instruction, not stale state, and the
+    prune reports it instead of routing around it.
+
+    TWO entries again for the rewrite arm; with one, `_drop_legacy` takes the
+    `else` and unlinks the store, and `unlink` needs only the DIRECTORY writable,
+    so a read-only store would be removed and this test would grade nothing.
+
+    Ablation: drop `require_writable_target=True` from `_drop_legacy` and this
+    fails `DID NOT RAISE`, with the store rewritten to `2-2-b` alone and the
+    confirmed-nothing entry gone."""
+    _legacy_entry(project, "1-1-a")
+    _legacy_entry(project, "2-2-b")
+    store = operatoractions.legacy_store_path(project.project)
+    before = store.read_bytes()
+    store.chmod(0o444)
+    try:
+        with pytest.raises(PermissionError):
+            operatoractions.drop(project.project, "1-1-a")
+    finally:
+        store.chmod(0o644)
+
+    assert store.read_bytes() == before  # the prune never landed
+    assert sorted(operatoractions.load(project.project)) == ["1-1-a", "2-2-b"]
+    assert [p.name for p in store.parent.iterdir()] == [store.name]  # no temp residue
