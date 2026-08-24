@@ -713,8 +713,15 @@ class SweepEngine(Engine):
 
         ledger = self.workspace.paths.deferred_work
         text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
+        # The store lives under the project that owns `run_dir`, never
+        # `self.workspace.root`: under the `repo_root` override the two diverge
+        # and a workspace-rooted prune trimmed a store that does not exist,
+        # leaving consumed entries behind (the comment in `_decisions_phase`
+        # says why the run dir is the stable anchor). The ledger read above is
+        # unaffected — `deferred_work` hangs off `implementation_artifacts`,
+        # which stays project-rooted under the override.
         dropped = decisions_store.prune_pre_answers(
-            self.workspace.root, deferredwork.open_ids(text)
+            _project_of_run_dir(self.run_dir), deferredwork.open_ids(text)
         )
         if dropped:
             self.journal.append("decision-preanswers-pruned", dw_ids=dropped)

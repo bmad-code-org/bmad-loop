@@ -2868,6 +2868,46 @@ def test_decisions_phase_keys_on_the_run_dir_project_not_workspace_root(project,
     assert list(elsewhere.rglob("decisions*")) == []  # nothing leaked into the code repo
 
 
+def test_prune_pre_answers_keys_on_the_run_dir_project_not_workspace_root(project, tmp_path):
+    """`_prune_pre_answers` is the fourth workspace-rooted call in the family
+    the test above pins (read, seeded write, interactive write): under the
+    `repo_root` override it pruned against `workspace.root` — the separate CODE
+    repo, whose store does not exist — so the prune silently dropped nothing
+    and a consumed pre-answer survived in the PROJECT store, suppressing
+    `pending_missed_decisions` for its id and standing ready to re-apply if the
+    id ever returns to the open set. It now keys on `runs._project_of_run_dir`,
+    the same root the load reads. The ledger read is deliberately untouched:
+    `deferred_work` hangs off `implementation_artifacts`, which stays
+    project-rooted under the override.
+
+    Ablation: point the prune back at `self.workspace.root` → DW-1 survives in
+    the project store and the pruned journal line never lands."""
+    from bmad_loop import decisions
+    from bmad_loop.workspace import Workspace
+
+    write_ledger(project, {"DW-2": "open"})  # DW-1 consumed: absent from the open set
+    for dw in ("DW-1", "DW-2"):
+        decisions.record_pre_answer(
+            project.project,
+            dw,
+            DecisionOption(key="2", label="Keep", effect="keep-open"),
+            date="2026-06-12",
+        )
+    engine, _ = make_sweep(project, [])
+    elsewhere = tmp_path / "code-repo"
+    elsewhere.mkdir()
+    git(elsewhere, "init")
+    engine.workspace = Workspace(root=elsewhere, paths=engine.workspace.paths)
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+
+    engine._prune_pre_answers()
+
+    # DW-1 dropped from the PROJECT store; the still-open keep-open answer kept
+    assert set(decisions.load_pre_answers(project.project)) == {"DW-2"}
+    assert '"decision-preanswers-pruned"' in journal_text(engine)
+    assert list(elsewhere.rglob("decisions*")) == []  # the code repo was never the store
+
+
 def test_max_bundles_truncation(project):
     write_ledger(project, {"DW-1": "open", "DW-2": "open", "DW-3": "open"})
     plan = triage_result(
