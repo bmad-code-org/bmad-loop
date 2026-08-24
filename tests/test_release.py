@@ -314,7 +314,7 @@ def test_publish_dry_run_prints_notes(monkeypatch, capsys, tmp_path):
 # `tag_exists` reads the checkout's refs, so a run whose checkout predates another
 # runner's tag push reaches `gh release create` and loses. That is the only failure
 # the command may swallow; every other one still has to be loud.
-def _publish_with_gh(monkeypatch, tmp_path, *, returncode, stderr):
+def _publish_with_gh(monkeypatch, tmp_path, *, returncode, stderr, seen=None):
     cl = tmp_path / "CHANGELOG.md"
     cl.write_text(SAMPLE)
     monkeypatch.setattr(release, "CHANGELOG", cl)
@@ -322,11 +322,13 @@ def _publish_with_gh(monkeypatch, tmp_path, *, returncode, stderr):
     monkeypatch.setattr(release, "tag_exists", lambda tag: False)
     monkeypatch.setattr(release, "_git_out", lambda *a: "deadbeef" * 5)
     monkeypatch.setattr(release.shutil, "which", lambda name: f"/usr/bin/{name}")
-    monkeypatch.setattr(
-        release.subprocess,
-        "run",
-        lambda *a, **kw: SimpleNamespace(returncode=returncode, stdout="", stderr=stderr),
-    )
+
+    def fake_run(*a, **kw):
+        if seen is not None:
+            seen.update(kw)
+        return SimpleNamespace(returncode=returncode, stdout="", stderr=stderr)
+
+    monkeypatch.setattr(release.subprocess, "run", fake_run)
     return release.cmd_publish(SimpleNamespace(dry_run=False))
 
 
@@ -351,6 +353,12 @@ def test_publish_still_dies_on_a_genuine_gh_failure(monkeypatch, capsys, tmp_pat
         )
     assert "gh release create v0.5.0" in str(exc.value)
     assert "Bad credentials" in capsys.readouterr().err
+
+
+def test_publish_passes_check_false_so_the_swallow_inspects_the_rc(monkeypatch, tmp_path):
+    seen: dict[str, object] = {}
+    _publish_with_gh(monkeypatch, tmp_path, returncode=0, stderr="", seen=seen)
+    assert seen["check"] is False
 
 
 # --- prepare refuses an unpromoted changelog -------------------------------- #

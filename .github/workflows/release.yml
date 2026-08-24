@@ -18,6 +18,14 @@ concurrency:
   # leaves the tag unmade.
   group: release-publish
   cancel-in-progress: false
+  # `queue: max` because the default single-slot queue cancels an older *pending*
+  # publish when a newer run enters the group — an evicted publish is a silently
+  # unmade tag, the same failure the no-cancel rule above exists to prevent.
+  # The key shipped 2026-05-07; actionlint 1.7.12 (pinned, and upstream's latest,
+  # 2026-03-30) predates it and rejects it as unknown, so the check is suppressed
+  # here rather than repo-wide. Drop this once actionlint learns the key.
+  # trunk-ignore(actionlint/syntax-check)
+  queue: max
 
 permissions:
   contents: write # create tags + releases
@@ -31,6 +39,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # need all tags to detect whether vX.Y.Z already exists
+          persist-credentials: false # nothing here runs an authenticated git op
 
       - name: Install uv
         uses: astral-sh/setup-uv@v10.0.0
