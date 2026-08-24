@@ -9,13 +9,11 @@ breaking changes may land in a minor release.
 
 ### Added
 
-- **`bmad-loop sweep --archive`** moves closed (`status: done <ISO date>`) deferred-work entries to
-  a sibling `deferred-work-archive.md`, replacing each with a stub that preserves the DW- id for
-  grep and `closes_deferred` cross-references plus the load-bearing field lines (`gate:`,
-  `origin:`/`source_spec:`, reopenable-close undo markers). The live ledger stays proportional to
-  open work rather than to all history. Supports `--before DATE` to archive only entries closed
-  before a cutoff, and `--dry-run` to preview. Refuses while any engine run is live. Pure
-  deterministic Python — no LLM involvement.
+- **`bmad-loop sweep --archive`** moves closed (`status: done`) deferred-work entries to a sibling
+  `deferred-work-archive.md`, replacing each with a minimal stub that preserves the DW- id for
+  grep and `closes_deferred` cross-references. The live ledger stays proportional to open work
+  rather than to all history. Supports `--before DATE` to archive only entries closed before a
+  cutoff, and `--dry-run` to preview. Pure deterministic Python — no LLM involvement.
 
 ## [0.11.1] — 2026-08-23
 
