@@ -2414,6 +2414,44 @@ def test_default_readonly_denial_on_win32_comes_from_the_replace(tmp_path, monke
     assert list(tmp_path.glob("*.tmp")) == []  # and the staged temp was cleaned up
 
 
+def test_failed_publish_cleanup_clears_a_readonly_temp(tmp_path, monkeypatch):
+    """The win32 row above also asserts the staged temp is cleaned up, and that
+    claim needs the chmod-and-retry arm in `_atomic_write`'s cleanup: the follow
+    path's `copymode` stamps the READONLY target's bit onto the temp before the
+    publish is denied, and win32's `DeleteFile` refuses a READONLY file, so the
+    bare `unlink` was denied too and `suppress(OSError)` turned the denial into
+    a leaked temp. Driven from POSIX — where unlink consults the parent
+    directory and the arm never fires on its own — by faulting the publish and
+    teaching `os.unlink` DeleteFile's rule: refuse until a chmod grants
+    owner-write.
+
+    Ablation: drop the `except PermissionError` chmod-and-retry arm and this
+    fails on the temp surviving beside the target."""
+    target = tmp_path / "sprint-status.yaml"
+    target.write_text("before", encoding="utf-8")
+    target.chmod(0o444)
+    real_unlink = os.unlink
+
+    def deny_publish(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
+        raise PermissionError(errno.EACCES, "Access is denied", str(dst))
+
+    def win32_unlink(path):
+        if not os.stat(path).st_mode & stat.S_IWRITE:
+            raise PermissionError(errno.EACCES, "Access is denied", str(path))
+        real_unlink(path)
+
+    monkeypatch.setattr(platform_util.os, "replace", deny_publish)
+    monkeypatch.setattr(platform_util.os, "unlink", win32_unlink)
+    try:
+        with pytest.raises(PermissionError):
+            platform_util.atomic_write_text(target, "after")
+    finally:
+        target.chmod(0o644)
+
+    assert target.read_text(encoding="utf-8") == "before"
+    assert list(tmp_path.glob("*.tmp")) == []  # cleaned up, not leaked READONLY
+
+
 def test_require_writable_target_allows_a_missing_target(tmp_path):
     """A file that does not exist yet is not a refusal — there is nothing to
     refuse, and creating it is what every flagged caller does on first run.

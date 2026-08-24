@@ -33,6 +33,14 @@ breaking changes may land in a minor release.
   `write_text` used to raise. Machine-minted state (run archives, stop requests, the config-digest
   stamp) is unaffected.
 
+### Fixed
+
+- **A denied publish no longer leaks its staging temp on Windows** (#597). Where mode is
+  inherited, the temp had already taken a read-only target's READONLY bit when `MoveFileExW`
+  denied the replace — and `DeleteFile` refuses a READONLY file, so the cleanup's unlink was
+  denied too and the temp survived beside the target. The cleanup now clears the bit and
+  retries once; POSIX never takes that arm, since unlink consults the parent directory.
+
 ### Security
 
 - **The run-archive staging temp is created exclusively (`O_EXCL`) at `0600`, and unlinked only

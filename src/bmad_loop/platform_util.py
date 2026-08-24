@@ -700,7 +700,16 @@ def _atomic_write(
         atomic_replace(tmp, target)
     except BaseException:
         with suppress(OSError):
-            tmp.unlink()
+            try:
+                tmp.unlink()
+            except PermissionError:
+                # win32 DeleteFile refuses a READONLY file, and the copymode
+                # above stamps the target's READONLY bit onto the temp — so a
+                # publish denied over a read-only destination would leak it.
+                # POSIX never takes this arm: unlink consults the parent
+                # directory's permission, never the entry's own mode.
+                os.chmod(tmp, stat.S_IWRITE)
+                tmp.unlink()
         raise
 
 
