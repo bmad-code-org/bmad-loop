@@ -482,8 +482,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
         channel = (
             "the ATTENTION file in the run directory is the only alert channel left"
             if pol.notify.file
-            else "notify.file is also off, so no alert channel is configured — "
-            "enable notify.file"
+            else "notify.file is also off, so no alert channel is configured — enable notify.file"
         )
         report.warn(
             "notify.desktop-unavailable",
@@ -2211,6 +2210,26 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         return rc
     project = _project(args)
     paths = bmadconfig.load_paths(project)
+
+    if args.before and not args.archive:
+        print("--before requires --archive", file=sys.stderr)
+        return ExitCode.FAILURE
+
+    if args.archive:
+        if (
+            args.decisions_only
+            or args.repeat is not None
+            or args.max_bundles is not None
+            or args.max_cycles is not None
+        ):
+            print(
+                "--archive cannot combine with --decisions-only, --repeat, "
+                "--max-bundles, or --max-cycles",
+                file=sys.stderr,
+            )
+            return ExitCode.FAILURE
+        return _sweep_archive(paths, args)
+
     pol = policy_mod.load(_policy_path(project))
 
     if args.dry_run:
@@ -2243,6 +2262,33 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         trigger="cli",
         run_id=args.run_id,
     )
+
+
+def _sweep_archive(paths: bmadconfig.ProjectPaths, args: argparse.Namespace) -> int:
+    """`bmad-loop sweep --archive`: move closed deferred-work entries to a
+    sibling archive file. A self-contained sub-mode — no worktree, no
+    preflight, no LLM."""
+    try:
+        archived = deferredwork.archive_closed(
+            paths.deferred_work,
+            before=args.before,
+            dry_run=args.dry_run,
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return ExitCode.FAILURE
+    archive_path = paths.deferred_work.parent / deferredwork.ARCHIVE_REL
+    if not archived:
+        print("no closed entries to archive")
+    elif args.dry_run:
+        print(f"would archive {len(archived)} entries:")
+        for dw_id in archived:
+            print(f"  {dw_id}")
+    else:
+        print(f"archived {len(archived)} entries to {archive_path}:")
+        for dw_id in archived:
+            print(f"  {dw_id}")
+    return 0
 
 
 def _sweep_dry_run(paths: bmadconfig.ProjectPaths, pol) -> int:
@@ -4220,6 +4266,19 @@ def main(argv: list[str] | None = None) -> int:
     sweep_p.add_argument("--max-cycles", type=int, help="override [sweep] max_cycles")
     sweep_p.add_argument(
         "--dry-run", action="store_true", help="list open ledger entries, spawn nothing"
+    )
+    sweep_p.add_argument(
+        "--archive",
+        action="store_true",
+        help="move closed (status: done) deferred-work entries to a sibling "
+        "deferred-work-archive.md, leaving a minimal stub in the live ledger; "
+        "use --before DATE to archive only entries closed before that date, "
+        "and --dry-run to preview",
+    )
+    sweep_p.add_argument(
+        "--before",
+        metavar="DATE",
+        help="with --archive: archive only entries closed before this ISO date",
     )
     sweep_p.add_argument("--run-id", help=argparse.SUPPRESS)  # pre-assigned id (used by the TUI)
 

@@ -1044,6 +1044,140 @@ def append_entry(
     return dw_id
 
 
+ARCHIVE_REL = "deferred-work-archive.md"
+# A stub left by a prior archive_closed run carries this field. The next run
+# reads it to skip entries whose body has already been moved — without it,
+# every run would re-archive the stub (a heading + status line) and the
+# archive would accumulate duplicates.
+_ARCHIVED_FIELD_RE = re.compile(r"^archived:", re.MULTILINE)
+
+
+def _is_archived(entry: DWEntry) -> bool:
+    """Whether the entry carries a live ``archived:`` field line (not a quoted
+    example), marking it as a stub from a prior :func:`archive_closed` run.
+
+    Reads through :func:`_quoted` for the same reason every gate scan does:
+    an entry documenting the archive field in a fenced example carries the
+    line in column 0, right where the anchor looks, and without the fence
+    check a quoted ``archived:`` would be mistaken for the real thing.
+    """
+    return any(not _quoted(entry, m.start()) for m in _ARCHIVED_FIELD_RE.finditer(entry.body))
+
+
+def _close_date(entry: DWEntry) -> str | None:
+    """The ISO close date from a ``done <date>`` status, or None when the
+    entry is not done, is done without a date suffix, or carries a date
+    that does not match the ISO ``YYYY-MM-DD`` shape.
+
+    Entries closed with a bare ``status: done`` (no date) or a hand-edited
+    non-ISO date are skipped by :func:`archive_closed`: there is no close
+    date to compare against a ``--before`` cutoff, and the stub the function
+    leaves in the ledger needs one to stay readable as done.
+    """
+    if not entry.done:
+        return None
+    parts = entry.status.split()
+    if len(parts) < 2:
+        return None
+    date_str = parts[1]
+    return date_str if _ISO_DATE_RE.fullmatch(date_str) else None
+
+
+def archive_closed(
+    path: Path,
+    *,
+    before: str | None = None,
+    archive_date: str | None = None,
+    dry_run: bool = False,
+) -> list[str]:
+    """Move closed (``status: done <date>``) ledger entries to a sibling
+    archive file (:data:`ARCHIVE_REL`), replacing each with a minimal stub
+    that preserves the DW- id for grep and ``closes_deferred``
+    cross-references.
+
+    Returns the list of archived ids, in ledger order. ``dry_run=True``
+    returns the ids that *would* be archived without writing anything.
+
+    Each archived entry's body is preserved verbatim in the archive file,
+    with an ``archived: <date>`` field line appended after the entry's status
+    line. The stub left in the live ledger keeps the heading, a ``status:
+    done <date>`` line (so :func:`parse_ledger` reads it as done and
+    :func:`open_ids` drops it), and an ``archived: <date>`` line (so a
+    subsequent run skips it rather than re-archiving the stub).
+
+    ``before`` (ISO ``YYYY-MM-DD``) archives only entries closed strictly
+    *before* that date. Entries with ``status: done`` (no date) are always
+    skipped — there is no close date to compare against a cutoff or to stamp
+    the stub with. Open and legacy entries are never touched.
+
+    Dates are validated with :func:`_require_iso_date` (same validation as
+    the existing close-path writers), ahead of the ``is_file`` short-circuit
+    so a programmer bug fails the same way whether or not a ledger exists.
+    Both writes — the trimmed ledger and the appended archive — go through
+    :func:`atomic_write_text`, the same primitive every ledger writer uses.
+    The archive file accumulates on repeat runs: new entries are appended to
+    the existing file, never overwritten, and stubs from a prior run are
+    skipped by their ``archived:`` line.
+    """
+    if before is not None:
+        _require_iso_date(before)
+    if archive_date is not None:
+        _require_iso_date(archive_date)
+    if not path.is_file():
+        return []
+    text = path.read_text(encoding="utf-8")
+    to_archive: list[tuple[DWEntry, str]] = []
+    for entry in parse_ledger(text):
+        close_date = _close_date(entry)
+        if close_date is None:
+            continue  # not done, or done without a date
+        if before is not None and close_date >= before:
+            continue  # closed on or after the cutoff
+        if _is_archived(entry):
+            continue  # stub from a prior archive_closed run
+        to_archive.append((entry, close_date))
+    if not to_archive:
+        return []
+    archived_ids = [e.id for e, _ in to_archive]
+    if dry_run:
+        return archived_ids
+    stamp = archive_date or calendar_date.today().isoformat()
+    archive_path = path.parent / ARCHIVE_REL
+    existing = archive_path.read_text(encoding="utf-8") if archive_path.is_file() else ""
+    # Append an `archived:` line after each entry's status line. The status
+    # span is body-relative, so the insertion works within the body slice —
+    # same offset math as `_insert_after_status`, applied to the body.
+    archive_blocks: list[str] = []
+    for entry, _ in to_archive:
+        body = entry.body
+        assert entry.status_span is not None  # done with a date implies a status line
+        pos = entry.status_span[1]
+        body = body[:pos] + f"\narchived: {stamp}" + body[pos:]
+        archive_blocks.append(body)
+    if existing == "" or existing.endswith("\n\n"):
+        sep = ""
+    elif existing.endswith("\n"):
+        sep = "\n"
+    else:
+        sep = "\n\n"
+    archive_content = existing + sep + "".join(archive_blocks)
+    # Replace each archived entry's span with a stub, working backwards so
+    # earlier spans are unaffected by later replacements — the same
+    # text-surgery pattern as `_apply_done`, applied to multiple entries.
+    for entry, close_date in reversed(to_archive):
+        stub = f"### {entry.id}: {entry.title}\n\nstatus: done {close_date}\narchived: {stamp}\n\n"
+        start, end = entry.span
+        text = text[:start] + stub + text[end:]
+    # Write the archive BEFORE the ledger: a crash between writes leaves the
+    # archive with extra content (harmless — the archive is append-only) and
+    # the ledger unchanged (safe — the bodies are still in the live file).
+    # Writing the ledger first would leave stubs in the ledger with no bodies
+    # in the archive — content lost.
+    atomic_write_text(archive_path, archive_content)
+    atomic_write_text(path, text)
+    return archived_ids
+
+
 # ------------------------------------------------------------------- legacy
 #
 # Ledgers written before the DW format (older BMAD-method projects) are

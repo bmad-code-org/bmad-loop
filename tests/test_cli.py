@@ -1583,10 +1583,12 @@ def test_attach_records_return_pane_inside_tmux(project, monkeypatch):
     monkeypatch.setattr(
         launch,
         "attach_plan",
-        lambda proj, rid: planned.append((proj, rid))
-        or (
-            ["tmux", "switch-client", "-t", "=bmad-loop-ctl"],
-            "=bmad-loop-ctl:sweep-RID",
+        lambda proj, rid: (
+            planned.append((proj, rid))
+            or (
+                ["tmux", "switch-client", "-t", "=bmad-loop-ctl"],
+                "=bmad-loop-ctl:sweep-RID",
+            )
         ),
     )
     monkeypatch.setenv("TMUX", "/tmp/tmux-1000/default,1,0")
@@ -8600,9 +8602,9 @@ def test_auto_sweep_launches_the_profile_bytes_the_gate_validated(project, monke
     # the gate saw the honest bytes and passed
     factory("epic-boundary", started=lambda: signalled.append("started"))
 
-    assert (
-        profile_mod.get_profile("mycli", project.project).binary == "rogue-cli"
-    ), "the swap must actually have landed on disk, or this test proves nothing"
+    assert profile_mod.get_profile("mycli", project.project).binary == "rogue-cli", (
+        "the swap must actually have landed on disk, or this test proves nothing"
+    )
     assert captured["adapter"].profile.binary == "mycli"
     assert signalled == ["started"]  # #501: the child composed, so the parent may latch
     run_id = captured["state"].run_id
@@ -8679,9 +8681,9 @@ def test_run_pins_the_profile_bytes_it_launches(project, monkeypatch):
 
     assert cli.main(["run", "--project", str(project.project)]) == 0
 
-    assert (
-        profile_mod.get_profile("mycli", project.project).binary == "rogue-cli"
-    ), "the swap must actually have landed on disk, or this test proves nothing"
+    assert profile_mod.get_profile("mycli", project.project).binary == "rogue-cli", (
+        "the swap must actually have landed on disk, or this test proves nothing"
+    )
     assert captured["adapter"].profile.binary == "mycli"
     run_id = captured["state"].run_id
     assert runs.read_trusted_config_digest(project.project, run_id) == pin
@@ -8739,9 +8741,9 @@ def test_resume_pins_the_profile_bytes_it_launches(project, monkeypatch):
 
     assert cli._resume_paused_run(project.project, run_dir) == 0
 
-    assert (
-        profile_mod.get_profile("mycli", project.project).binary == "rogue-cli"
-    ), "the swap must actually have landed on disk, or this test proves nothing"
+    assert profile_mod.get_profile("mycli", project.project).binary == "rogue-cli", (
+        "the swap must actually have landed on disk, or this test proves nothing"
+    )
     assert captured["adapter"].profile.binary == "mycli"
     assert runs.read_trusted_config_digest(project.project, run_dir.name) == pin
 
@@ -9135,3 +9137,25 @@ def test_dry_run_banner_names_an_under_floor_git(project, capsys, monkeypatch):
     err = capsys.readouterr().err
     assert "NOT runnable" in err
     assert "2.25.1" in err and verify.git_floor_text() in err
+
+
+def test_sweep_archive_rejects_bad_before_date(project, capsys):
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open", "DW-2": "done 2026-06-01"}, commit=False)
+    rc = cli.main(["sweep", "--archive", "--before", "bad-date", "--project", str(project.project)])
+    assert rc == 1
+    assert "date must be YYYY-MM-DD" in capsys.readouterr().err
+
+
+def test_sweep_archive_dry_run(project, capsys):
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open", "DW-2": "done 2026-06-01"}, commit=False)
+    rc = cli.main(["sweep", "--archive", "--dry-run", "--project", str(project.project)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "would archive 1 entries" in out
+    assert "DW-2" in out

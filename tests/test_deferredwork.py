@@ -7,10 +7,12 @@ import pytest
 from bmad_loop import deferredwork, fences
 from bmad_loop.deferredwork import (
     _ISO_DATE_RE,
+    ARCHIVE_REL,
     LINE_BREAK_RE,
     SEVERITY_ALIASES,
     append_decision,
     append_entry,
+    archive_closed,
     classify,
     field_line_present,
     field_severity,
@@ -2350,3 +2352,259 @@ def test_an_unclosed_fence_swallows_no_prose_gate():
     """Parity with `gates()`: `unclosed_hides_rest=False`, so one stray ``` cannot
     silence every declaration below it."""
     assert _prose_gated("```", "an example nobody closed", "HARD GATE: for real") is True
+
+
+# ------------------------------------------------------- archive_closed (#706)
+#
+# Closed entries are moved verbatim to a sibling archive file; a minimal
+# stub (heading + status + archived line) replaces each in the live ledger
+# so parse_ledger reads it as done, open_ids drops it, and a subsequent run
+# skips it by the `archived:` line rather than re-archiving the stub.
+
+
+def test_archive_all_done(tmp_path):
+    """Done entries are moved verbatim to the archive file and replaced with
+    minimal stubs that parse as done; open entries are untouched."""
+    path = write_ledger(tmp_path)
+    archived = archive_closed(path, archive_date="2026-08-24")
+    assert archived == ["DW-2"]
+
+    text = path.read_text(encoding="utf-8")
+    entries = {e.id: e for e in parse_ledger(text)}
+    # The stub still parses as done, with the original close date
+    assert entries["DW-2"].done
+    assert entries["DW-2"].status == "done 2026-05-25"
+    assert "origin: code review" not in entries["DW-2"].body  # body was moved
+    assert entries["DW-2"].title == "Old closed item"  # heading preserved
+    assert "archived: 2026-08-24" in entries["DW-2"].body  # stub marker
+    # Open entries untouched
+    assert entries["DW-1"].open
+    assert "origin: quick-dev" in entries["DW-1"].body
+    assert entries["DW-3"].open
+    assert "seen-again" in entries["DW-3"].body
+
+    # The archive file has the full body with an `archived:` line
+    archive_path = path.parent / ARCHIVE_REL
+    assert archive_path.is_file()
+    archive_text = archive_path.read_text(encoding="utf-8")
+    assert "### DW-2: Old closed item" in archive_text
+    assert "origin: code review of spec-1-1.md" in archive_text
+    assert "status: done 2026-05-25" in archive_text
+    assert "archived: 2026-08-24" in archive_text
+
+
+def test_archive_before_cutoff(tmp_path):
+    """--before archives only entries closed strictly before that date."""
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: May item\n\norigin: a\nstatus: done 2026-05-15\n\n"
+        "### DW-2: july item\n\norigin: b\nstatus: done 2026-07-01\n\n"
+        "### DW-3: still open\n\norigin: c\nstatus: open\n"
+    )
+    path = write_ledger(tmp_path, text)
+    archived = archive_closed(path, before="2026-06-01", archive_date="2026-08-24")
+    assert archived == ["DW-1"]
+
+    entries = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}
+    assert entries["DW-1"].done  # stub
+    assert "origin: a" not in entries["DW-1"].body
+    # July entry untouched — not before the cutoff
+    assert entries["DW-2"].status == "done 2026-07-01"
+    assert "origin: b" in entries["DW-2"].body
+    assert entries["DW-3"].open
+
+
+def test_archive_dry_run(tmp_path):
+    """Dry run returns the ids that would be archived but writes nothing."""
+    path = write_ledger(tmp_path)
+    before = path.read_text(encoding="utf-8")
+    archived = archive_closed(path, dry_run=True)
+    assert archived == ["DW-2"]
+    assert path.read_text(encoding="utf-8") == before
+    assert not (path.parent / ARCHIVE_REL).exists()
+
+
+def test_archive_no_done_entries(tmp_path):
+    """A ledger with only open entries returns an empty list and writes nothing."""
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: open one\n\norigin: a\nstatus: open\n\n"
+        "### DW-2: open two\n\norigin: b\nstatus: open\n"
+    )
+    path = write_ledger(tmp_path, text)
+    before = path.read_text(encoding="utf-8")
+    assert archive_closed(path) == []
+    assert path.read_text(encoding="utf-8") == before
+    assert not (path.parent / ARCHIVE_REL).exists()
+
+
+def test_archive_no_ledger(tmp_path):
+    """A missing ledger file returns an empty list."""
+    path = tmp_path / "deferred-work.md"
+    assert archive_closed(path) == []
+    assert not (path.parent / ARCHIVE_REL).exists()
+
+
+def test_archive_done_without_date_skipped(tmp_path):
+    """An entry with `status: done` (no date) is skipped — there is no close
+    date to compare against a cutoff or to stamp the stub with."""
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: closed without date\n\norigin: a\nstatus: done\n\n"
+        "### DW-2: closed with date\n\norigin: b\nstatus: done 2026-05-25\n"
+    )
+    path = write_ledger(tmp_path, text)
+    archived = archive_closed(path, archive_date="2026-08-24")
+    assert archived == ["DW-2"]
+
+    entries = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}
+    assert entries["DW-1"].status == "done"  # untouched
+    assert "origin: a" in entries["DW-1"].body  # body still there
+    assert entries["DW-2"].done  # stub
+
+
+def test_archive_rerun_appends_to_existing(tmp_path):
+    """A second run appends new entries to the existing archive without
+    overwriting, and skips stubs left by the first run."""
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: first done\n\norigin: a\nstatus: done 2026-05-15\n\n"
+        "### DW-2: second done\n\norigin: b\nstatus: done 2026-06-01\n\n"
+        "### DW-3: open\n\norigin: c\nstatus: open\n"
+    )
+    path = write_ledger(tmp_path, text)
+    # First run: archive only the May entry
+    archive_closed(path, before="2026-06-01", archive_date="2026-08-24")
+    archive_path = path.parent / ARCHIVE_REL
+    first = archive_path.read_text(encoding="utf-8")
+    assert "DW-1" in first
+    assert "DW-2" not in first
+
+    # Close DW-3 and archive the rest — DW-1's stub is skipped
+    mark_done(path, "DW-3", "2026-07-01", "resolved")
+    archived = archive_closed(path, archive_date="2026-08-25")
+    assert set(archived) == {"DW-2", "DW-3"}
+
+    second = archive_path.read_text(encoding="utf-8")
+    # Both old and new entries are in the archive
+    assert "DW-1" in second and "DW-2" in second and "DW-3" in second
+    # The first run's stamp is preserved (not overwritten)
+    assert "archived: 2026-08-24" in second
+    assert "archived: 2026-08-25" in second
+
+
+def test_archive_stub_preserves_id_and_parses_as_done(tmp_path):
+    """The stub's heading and status line let parse_ledger read it as done
+    and open_ids exclude it, while the DW- id stays findable for grep."""
+    path = write_ledger(tmp_path)
+    archive_closed(path, archive_date="2026-08-24")
+
+    text = path.read_text(encoding="utf-8")
+    entries = {e.id: e for e in parse_ledger(text)}
+    assert entries["DW-2"].id == "DW-2"
+    assert entries["DW-2"].done
+    assert not entries["DW-2"].open
+    assert "DW-2" not in open_ids(text)
+
+
+def test_archive_open_entries_untouched(tmp_path):
+    """Open entries are never modified — their bodies stay byte-identical."""
+    path = write_ledger(tmp_path)
+    before_open = {e.id: e.body for e in parse_ledger(path.read_text(encoding="utf-8")) if e.open}
+    archive_closed(path, archive_date="2026-08-24")
+    after = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}
+    for dw_id, body in before_open.items():
+        assert after[dw_id].body == body
+
+
+def test_archive_validates_before_date(tmp_path):
+    """An invalid --before date raises ValueError without writing anything."""
+    path = write_ledger(tmp_path)
+    before = path.read_text(encoding="utf-8")
+    with pytest.raises(ValueError, match="date must be YYYY-MM-DD"):
+        archive_closed(path, before="not-a-date")
+    assert path.read_text(encoding="utf-8") == before
+    assert not (path.parent / ARCHIVE_REL).exists()
+
+
+def test_archive_validates_archive_date(tmp_path):
+    """An invalid archive_date raises ValueError without writing anything."""
+    path = write_ledger(tmp_path)
+    before = path.read_text(encoding="utf-8")
+    with pytest.raises(ValueError, match="date must be YYYY-MM-DD"):
+        archive_closed(path, archive_date="2026-13-01")
+    assert path.read_text(encoding="utf-8") == before
+
+
+def test_archive_bad_date_raises_even_with_no_ledger(tmp_path):
+    """Validated at function entry, ahead of the is_file short-circuit."""
+    path = tmp_path / "nope.md"
+    with pytest.raises(ValueError, match="date must be YYYY-MM-DD"):
+        archive_closed(path, before="nope")
+    with pytest.raises(ValueError, match="date must be YYYY-MM-DD"):
+        archive_closed(path, archive_date="nope")
+
+
+def test_archive_skips_already_archived_stubs(tmp_path):
+    """A second run with no new closures finds only stubs (which carry an
+    `archived:` line) and archives nothing."""
+    path = write_ledger(tmp_path)
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-2"]
+    assert archive_closed(path, archive_date="2026-08-25") == []
+    archive_path = path.parent / ARCHIVE_REL
+    assert "archived: 2026-08-25" not in archive_path.read_text(encoding="utf-8")
+
+
+def test_archive_default_archive_date_is_today(tmp_path):
+    """When archive_date is not supplied, the stub and archive carry today's date."""
+    from datetime import date as calendar_date
+
+    path = write_ledger(tmp_path)
+    archive_closed(path)
+    today = calendar_date.today().isoformat()
+
+    entries = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}
+    assert f"archived: {today}" in entries["DW-2"].body
+    archive_path = path.parent / ARCHIVE_REL
+    assert f"archived: {today}" in archive_path.read_text(encoding="utf-8")
+
+
+def test_archive_multi_entry_reparse(tmp_path):
+    """Archiving 2+ done entries in one call leaves stubs that re-parse with
+    correct id, title, status, and archived line; open entries are byte-identical."""
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: first done\n\norigin: a\nstatus: done 2026-05-15\n\n"
+        "### DW-2: open one\n\norigin: b\nstatus: open\n\n"
+        "### DW-3: second done\n\norigin: c\nstatus: done 2026-06-01\n\n"
+        "### DW-4: open two\n\norigin: d\nstatus: open\n"
+    )
+    path = write_ledger(tmp_path, text)
+    before_open = {e.id: e.body for e in parse_ledger(path.read_text(encoding="utf-8")) if e.open}
+    archived = archive_closed(path, archive_date="2026-08-24")
+    assert set(archived) == {"DW-1", "DW-3"}
+
+    entries = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}
+    for dw_id, title, close_date in [
+        ("DW-1", "first done", "2026-05-15"),
+        ("DW-3", "second done", "2026-06-01"),
+    ]:
+        assert entries[dw_id].id == dw_id
+        assert entries[dw_id].title == title
+        assert entries[dw_id].done
+        assert entries[dw_id].status == f"done {close_date}"
+        assert "archived: 2026-08-24" in entries[dw_id].body
+    for dw_id, body in before_open.items():
+        assert entries[dw_id].body == body
+
+
+def test_archive_before_boundary_excludes_cutoff_date(tmp_path):
+    """An entry closed exactly on the cutoff date is NOT archived (strict <)."""
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: on the boundary\n\norigin: a\nstatus: done 2026-06-01\n\n"
+        "### DW-2: before the boundary\n\norigin: b\nstatus: done 2026-05-31\n"
+    )
+    path = write_ledger(tmp_path, text)
+    archived = archive_closed(path, before="2026-06-01", archive_date="2026-08-24")
+    assert archived == ["DW-2"]  # DW-1 is ON the cutoff, excluded by strict <
