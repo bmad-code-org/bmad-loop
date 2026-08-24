@@ -19,7 +19,12 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .platform_util import atomic_write_bytes, has_parent_ref, is_absolute_path, names_tree_root
+from .platform_util import (
+    atomic_write_bytes_confined,
+    has_parent_ref,
+    is_absolute_path,
+    names_tree_root,
+)
 
 POLICY_FILE = Path(".bmad-loop") / "policy.toml"
 
@@ -1462,7 +1467,7 @@ enabled = true
 """
 
 
-def write_mux_backend(path: Path, name: str | None) -> None:
+def write_mux_backend(path: Path, name: str | None, *, confine_root: Path) -> None:
     """Persist (``name``) or clear (``None``) the ``[mux] backend`` key in the
     policy file at ``path``, preserving every other byte — devs hand-edit
     policy.toml, and the core install has no comment-preserving TOML writer
@@ -1474,7 +1479,12 @@ def write_mux_backend(path: Path, name: str | None) -> None:
     line replace: the first (possibly commented) ``backend =`` line inside
     ``[mux]`` is swapped for the new value, or re-commented on clear. A file
     predating the ``[mux]`` table gets the table appended at EOF (TOML tables
-    are order-free, so appending is always safe)."""
+    are order-free, so appending is always safe).
+
+    ``confine_root`` is a REQUIRED keyword (#593). This function is handed a
+    ``path`` and has no project of its own to derive a root from, so requiring
+    the tree the policy file belongs to makes a caller that has not decided one
+    a type error rather than a write that resolves ``.bmad-loop/`` by name."""
     if name is not None and not _MUX_NAME_RE.match(name):
         raise PolicyError(
             f"mux.backend must be a backend name (letters, digits, . _ -): got {name!r}"
@@ -1531,7 +1541,15 @@ def write_mux_backend(path: Path, name: str | None) -> None:
     # `tui.settings.PolicyDoc.save` built identically, so the two could collide.
     # The BYTES helper, not the text one: this function reads bytes and writes bytes
     # on purpose (see the decode above) so a CRLF policy.toml keeps its endings.
-    # follow_symlinks=False replaces the name, as the bare replace did; a driven
-    # session can write this exact path (runsetup), so a link planted here must be
-    # clobbered rather than written through.
-    atomic_write_bytes(path, result.encode("utf-8"), follow_symlinks=False)
+    # Confined, and the BYTES arm of it: replacing the name (as the bare replace
+    # did) clobbers a link planted at policy.toml, which `runsetup` says a driven
+    # session can write — but it left every directory above resolved by name, so a
+    # link at `.bmad-loop/` aimed this write out of the project entirely (#593).
+    # require_writable_target restores the PermissionError this raised on an
+    # operator's read-only policy.toml before the write went atomic (#597).
+    atomic_write_bytes_confined(
+        path,
+        result.encode("utf-8"),
+        confine_root=confine_root,
+        require_writable_target=True,
+    )

@@ -22,7 +22,7 @@ from conftest import (
     write_sprint,
 )
 
-from bmad_loop import verify
+from bmad_loop import platform_util, verify
 from bmad_loop.model import StoryTask
 from bmad_loop.policy import Policy, ReviewPolicy, VerifyPolicy
 
@@ -3148,13 +3148,16 @@ def test_safe_rollback_restores_the_policy_through_the_atomic_helper(project, mo
     git(repo, "add", "-f", str(pol))
     git(repo, "commit", "-q", "-m", "add policy after baseline")
     seen: list[tuple[Path, bytes]] = []
-    real = verify.atomic_write_bytes
+    real = verify.atomic_write_bytes_confined
 
-    def record(path, data, *, follow_symlinks=True):
+    def record(path, data, *, confine_root, require_writable_target=False):
         seen.append((Path(path), data))
-        real(path, data, follow_symlinks=follow_symlinks)
+        real(path, data, confine_root=confine_root, require_writable_target=require_writable_target)
 
-    monkeypatch.setattr(verify, "atomic_write_bytes", record)
+    # the CONFINED binding (#593). `verify.atomic_write_bytes` still exists — the
+    # frontmatter writer keeps it — so patching that name would not raise, it would
+    # simply record nothing; `len(seen) == 1` below is what catches that.
+    monkeypatch.setattr(verify, "atomic_write_bytes_confined", record)
 
     verify.safe_rollback(repo, baseline, baseline_untracked=None, keep=(".bmad-loop",))
 
@@ -3165,11 +3168,13 @@ def test_safe_rollback_restores_the_policy_through_the_atomic_helper(project, mo
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
 def test_safe_rollback_replaces_a_policy_symlink_by_name(project):
-    """#379. The one row that grades this SITE's `follow_symlinks=False` argument.
-    Unlike the other writers moved to the helper on this branch, the expression
-    replaced here was a direct `write_bytes` — which opens the name and so writes
-    THROUGH a planted link — so no-follow is a genuine change of behaviour, not a
-    preservation of what `os.replace` already did.
+    """#379. The one row that grades this SITE's choice of a writer that replaces
+    the NAME — since #593 the put-back calls `atomic_write_bytes_confined`, which
+    is no-follow by construction; the row below grades the confinement half of
+    that same call. Unlike the other writers moved to the helper on this branch,
+    the expression replaced here was a direct `write_bytes` — which opens the name
+    and so writes THROUGH a planted link — so replacing the name is a genuine
+    change of behaviour, not a preservation of what `os.replace` already did.
 
     It is still the right change. `policy.write_mux_backend` already replaces this
     same file by name, so a link at `.bmad-loop/policy.toml` does not survive the
@@ -3180,8 +3185,11 @@ def test_safe_rollback_replaces_a_policy_symlink_by_name(project):
     the redirect has to aim at a tracked in-repo file — which the reset then
     reverts and this write immediately clobbers with policy bytes.
 
-    Ablation: drop `follow_symlinks=False` and this reddens alone — the link
-    survives and `shared.toml` is the file that gets rewritten."""
+    Ablation: swap the put-back's writer for `atomic_write_bytes(policy_path, ...)`
+    at its follow-the-link default and this reddens on the link surviving and
+    `shared.toml` rewritten (the confined-refusal row below reddens with it, on
+    its `DID NOT RAISE`). It is still the one row here that plants a link at the
+    policy's own name."""
     repo = project.project
     shared = repo / "shared.toml"  # tracked, and NOT the operator's policy
     shared.write_bytes(b"[scm]\nrollback_on_failure = false\n")
@@ -3200,6 +3208,99 @@ def test_safe_rollback_replaces_a_policy_symlink_by_name(project):
     assert not pol.is_symlink()  # the NAME was replaced
     assert pol.read_bytes() == b"[scm]\nrollback_on_failure = true\n"
     assert shared.read_bytes() == b"[scm]\nrollback_on_failure = false\n"  # not through
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_safe_rollback_policy_putback_refuses_a_symlinked_bmad_loop_dir(project, tmp_path):
+    """The escape #593 names, at this site. The `follow_symlinks=False` the row
+    above grades stops at the FINAL component: `.bmad-loop/` itself was still
+    resolved by name, so a link planted there aimed both the temp and the
+    published policy.toml out of the repo entirely. The put-back's own
+    `mkdir(parents=True, exist_ok=True)` ACCEPTS a symlink-to-a-directory, so the
+    planted parent survives the setup step instead of being replaced by it.
+
+    Reaching the writer at all is the hard part, and it is asserted rather than
+    assumed: the put-back only fires when the capture read a real file
+    (`policy_content is not None`) AND the reset CHANGED what the name reads. So
+    the redirect is built the way a session would have to build it — `.bmad-loop/`
+    to a directory it owns, and `policy.toml` inside that directory back at a
+    TRACKED in-repo file the reset reverts. `UnconfinedWriteError` can only come
+    from that one confined call, so the raise itself is the proof the write was
+    reached; the pre-assert pins the capture half independently.
+
+    The last two assertions are the load-bearing ones: refusing loudly is worth
+    nothing if the operator's config already landed outside the project.
+
+    Ablation: revert the call to
+    `atomic_write_bytes(policy_path, policy_content, follow_symlinks=False)` and
+    this fails `DID NOT RAISE`, with the planted link in `outside/` replaced by a
+    real policy.toml holding the operator's config."""
+    repo = project.project
+    outside = tmp_path / "outside"  # sibling of the sandbox, genuinely outside it
+    outside.mkdir()
+    shared = repo / "shared.toml"  # tracked, and NOT the operator's policy
+    shared.write_bytes(b"[scm]\nrollback_on_failure = false\n")
+    git(repo, "add", str(shared))
+    git(repo, "commit", "-q", "-m", "a tracked file a session could aim at")
+    baseline = verify.rev_parse_head(repo)
+
+    (repo / ".bmad-loop").symlink_to(outside, target_is_directory=True)
+    (outside / "policy.toml").symlink_to(shared)
+    shared.write_bytes(b"[scm]\nrollback_on_failure = true\n")
+    pol = repo / ".bmad-loop" / "policy.toml"
+    # precondition: the capture reads a real file through both hops, so
+    # `policy_content` is non-None and the reset below makes `current` differ
+    assert pol.read_bytes() == b"[scm]\nrollback_on_failure = true\n"
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        verify.safe_rollback(repo, baseline, baseline_untracked=None, keep=(".bmad-loop",))
+
+    assert shared.read_bytes() == b"[scm]\nrollback_on_failure = false\n"  # reset, not rewritten
+    assert (outside / "policy.toml").is_symlink()  # no file was published out here
+    assert sorted(x.name for x in outside.iterdir()) == ["policy.toml"]  # nor staged
+
+
+def test_safe_rollback_policy_putback_is_confined_to_the_repo(project, monkeypatch):
+    """The positive control for the refusal above, and the row that grades the two
+    keywords this site passes rather than the behaviour they buy.
+
+    `confine_root` is the one component the anchored walk never checks — it is
+    where the walk STARTS — so rooting this call at `policy_path.parent` would be
+    lexically confined and still admit the whole #593 escape, silently. It has to
+    be the repo, which is exactly what `policy_path` was spelled from at the
+    capture. `require_writable_target` is #597: policy.toml is operator config, so
+    a read-only one is refused with the kernel's `PermissionError` instead of
+    being routed around by a replace that only needs the directory writable.
+
+    The wrap keeps the real write, so this is a control and not a stub
+    measurement: the restore below actually lands on disk.
+
+    Ablation: change `confine_root=repo` to `confine_root=policy_path.parent` and
+    this reddens alone (every behavioural row above stays green, which is the
+    point of grading the keyword); drop `require_writable_target=True` and it
+    reddens on the flag row."""
+    repo = project.project
+    baseline = verify.rev_parse_head(repo)  # baseline predates policy.toml
+    pol = repo / ".bmad-loop" / "policy.toml"
+    pol.parent.mkdir(parents=True, exist_ok=True)
+    pol.write_bytes(b"[scm]\nrollback_on_failure = true\n")
+    git(repo, "add", "-f", str(pol))
+    git(repo, "commit", "-q", "-m", "add policy after baseline")
+    seen: list[dict[str, object]] = []
+    real = verify.atomic_write_bytes_confined
+
+    def record(path, data, *, confine_root, require_writable_target=False):
+        seen.append({"root": Path(confine_root), "writable": require_writable_target})
+        real(path, data, confine_root=confine_root, require_writable_target=require_writable_target)
+
+    monkeypatch.setattr(verify, "atomic_write_bytes_confined", record)
+
+    verify.safe_rollback(repo, baseline, baseline_untracked=None, keep=(".bmad-loop",))
+
+    assert len(seen) == 1  # the writer was reached
+    assert seen[0]["root"] == repo  # the REPO, not `.bmad-loop/` — see above
+    assert seen[0]["writable"] is True
+    assert pol.read_bytes() == b"[scm]\nrollback_on_failure = true\n"  # and it landed
 
 
 def test_attempt_dirty_ignores_lone_policy_edit(project):

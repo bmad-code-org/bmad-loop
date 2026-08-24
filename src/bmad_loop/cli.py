@@ -905,7 +905,7 @@ def _mux_set(project: Path, args: argparse.Namespace) -> int:
         if args.name:
             print("error: `mux set --clear` takes no backend name", file=sys.stderr)
             return 1
-        policy_mod.write_mux_backend(path, None)
+        policy_mod.write_mux_backend(path, None, confine_root=project)
         print(f"mux backend cleared (auto-select) in {path}")
         return 0
     if not args.name:
@@ -943,7 +943,8 @@ def _mux_set(project: Path, args: argparse.Namespace) -> int:
             "note: BMAD_LOOP_MUX_BACKEND is set in this shell and outranks the persisted choice",
             file=sys.stderr,
         )
-    policy_mod.write_mux_backend(path, args.name)  # a junk name raises PolicyError → main()
+    # a junk name raises PolicyError → main()
+    policy_mod.write_mux_backend(path, args.name, confine_root=project)
     print(f'mux backend set to "{args.name}" in {path}')
     return 0
 
@@ -3063,7 +3064,9 @@ def _apply_confirmation(
     make it declare that falsely. The commit alone is best-effort — the files are
     the state, git history is the record of it."""
     today = time.strftime("%Y-%m-%d")
-    if not devcontract.append_operator_confirmation(spec, story.actions, date=today):
+    if not devcontract.append_operator_confirmation(
+        spec, story.actions, date=today, confine_root=project
+    ):
         # The one False the writer returns: the spec is gone since `resolve` read
         # it. Fatal here — the audit section is the ONLY record of the part of
         # this story that happened outside the repository, and there is nothing
@@ -3075,7 +3078,7 @@ def _apply_confirmation(
         )
         return 1
     try:
-        frontmatter.set_frontmatter_status(spec, "done")
+        frontmatter.set_frontmatter_status(spec, "done", confine_root=project)
     except frontmatter.FrontmatterWriteError as e:
         print(
             f"error: {spec} carries a status this cannot rewrite, so {story.story_key} "

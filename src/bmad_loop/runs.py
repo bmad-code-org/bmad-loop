@@ -24,8 +24,11 @@ from .journal import STATE_FILE, VERIFY_DIR, Journal, load_state, save_state
 from .model import PAUSE_ESCALATION, Phase, RunState, StoryTask
 from .platform_util import (
     MAX_SEGMENT,
+    UnconfinedWriteError,
+    _mkstemp_beside,
     atomic_replace,
-    atomic_write_text,
+    atomic_write_text_confined,
+    create_exclusive_confined,
     has_parent_ref,
     is_absolute_path,
     is_link_like,
@@ -497,11 +500,19 @@ def write_trusted_config_digest(project: Path, run_id: str, digest: str) -> None
     look like an orphan to a ``clean`` racing the launch."""
     path = config_digest_path_for(project, run_id)
     path.parent.mkdir(parents=True, exist_ok=True)
-    # follow_symlinks=False: a machine-minted record under a root whose path the
-    # driven session is handed (BMAD_LOOP_EVENTS_DIR names its sibling), so a
-    # planted link here must be replaced, never written through to whatever it
-    # aims at. The trailing newline is for the operator who cats the file.
-    atomic_write_text(path, digest + "\n", follow_symlinks=False)
+    # Confined to the state root (#593): a machine-minted record under a root
+    # whose path the driven session is handed (BMAD_LOOP_EVENTS_DIR names its
+    # sibling), so a planted link here must be replaced, never written through to
+    # whatever it aims at. Refusing a link at the FINAL component was not enough —
+    # `mkstemp(dir=...)` and `os.replace`'s destination still resolved every
+    # directory above by name, and the `mkdir` on the line above ACCEPTS a
+    # symlinked directory, so a link planted at either session-reachable component
+    # (`<project tag>/`, `<run id>/`) survived the setup step and redirected both
+    # the temp and the published stamp. `state_root()` is the one component the
+    # anchored walk starts from rather than checks, and it is a host fact this
+    # process derives — not a path any session names. The trailing newline is for
+    # the operator who cats the file.
+    atomic_write_text_confined(path, digest + "\n", confine_root=state_root())
 
 
 # ---------------------------------------------------- run resolution / liveness
@@ -1011,6 +1022,29 @@ def _stop_request_mode_of(path: Path) -> str | None:
     return "graceful"
 
 
+def _project_of_run_dir(run_dir: Path) -> Path:
+    """The project root a run directory hangs under, for confining writes into it.
+
+    Derived rather than passed because the stop-request channel is addressed by
+    run directory alone: `stop_run` resolves a run reference and never holds the
+    project separately. :func:`run_dir_for` is the only builder of these paths
+    and spells them ``project / RUNS_DIR / run_id``, so the root sits exactly
+    ``len(RUNS_DIR.parts)`` levels above the run's own directory — the arithmetic
+    tracks `RUNS_DIR` rather than hard-coding 2, so moving the runs tree moves
+    this with it.
+
+    A path too shallow to have that ancestor is not one this module built.
+    Refusing with :class:`UnconfinedWriteError` rather than letting `parents`
+    raise `IndexError` is the load-bearing part: `stop_run` degrades on `OSError`
+    so that a failed lodge still signals the run, and an `IndexError` there would
+    abort the stop before it ever signalled."""
+    depth = len(RUNS_DIR.parts)
+    parents = run_dir.parents
+    if len(parents) <= depth:
+        raise UnconfinedWriteError(f"{run_dir} is not shaped like a run directory")
+    return parents[depth]
+
+
 def _write_stop_request(run_dir: Path, mode: str) -> None:
     """Lodge a stop request of ``mode`` on the control-file channel, written
     atomically so a concurrent engine read never sees a partial body.
@@ -1038,13 +1072,24 @@ def _write_stop_request(run_dir: Path, mode: str) -> None:
     would abort ``stop_run`` *before* it ever signals. A ``mkstemp`` temp per writer
     removes the collision: the last replace wins and neither writer errors.
 
-    ``follow_symlinks=False`` preserves what the bare ``os.replace`` did — it never
-    dereferenced this destination — and matches what the file is: machine-minted
-    control state under a run dir a driven session can reach. It now lands at
-    ``mkstemp``'s ``0600`` instead of ``0644 & ~umask``; nothing reads it
-    cross-user."""
+    Refusing a link at the control file preserved what the bare ``os.replace``
+    did — it never dereferenced this destination — and matches what the file is:
+    machine-minted control state under a run dir a driven session can reach. The
+    write is now confined to the project root (#593), because that refusal
+    covered only the final component: every directory above it was still looked
+    up by name, so a link planted at ``.bmad-loop/`` — or at ``runs/``, or at the
+    run's own directory — aimed both the temp and the publish wherever it
+    pointed. The file still lands at ``mkstemp``'s ``0600`` instead of
+    ``0644 & ~umask``, since no-follow never inherited a mode either; nothing
+    reads it cross-user.
+
+    No ``require_writable_target``: this is not an operator-curated file but a
+    channel two ``stop`` invocations race on, and its whole contract above is
+    that the stronger request always lands."""
     body = json.dumps({"requested_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "mode": mode})
-    atomic_write_text(run_dir / STOP_REQUEST_FILE, body, follow_symlinks=False)
+    atomic_write_text_confined(
+        run_dir / STOP_REQUEST_FILE, body, confine_root=_project_of_run_dir(run_dir)
+    )
 
 
 def _create_stop_request(run_dir: Path) -> bool:
@@ -1067,7 +1112,13 @@ def _create_stop_request(run_dir: Path) -> bool:
 
     Refuses a planted symlink rather than following it — ``O_EXCL`` never
     dereferences — which is stricter than the ``follow_symlinks=False`` replace it
-    replaces.
+    replaces. That refusal covers only the FINAL component, though, so the create
+    goes through :func:`platform_util.create_exclusive_confined` (#593): a link
+    planted at ``.bmad-loop/``, ``runs/`` or the run's own directory was still
+    resolved by name and aimed the request outside the project, exactly the hole
+    the confined :func:`_write_stop_request` next door already closed. The
+    anchored create keeps the exclusive arbitration this function is built on;
+    an unreachable parent raises ``UnconfinedWriteError``.
 
     A failed write is deliberately NOT rolled back, and that is load-bearing rather
     than sloppy. ``unlink`` resolves a *name*, not the inode this call created, so a
@@ -1092,7 +1143,7 @@ def _create_stop_request(run_dir: Path) -> bool:
     body = json.dumps({"requested_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "mode": "graceful"})
     path = run_dir / STOP_REQUEST_FILE
     try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        fd = create_exclusive_confined(path, confine_root=_project_of_run_dir(run_dir))
     except FileExistsError:
         return False  # a request is already pending — a planted link included
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -1571,10 +1622,6 @@ def archive_run(project: Path, run_dir: Path, *, force: bool = False) -> Path:
     archive_dir = project / ARCHIVE_DIR
     archive_dir.mkdir(parents=True, exist_ok=True)
     dest = archive_dir / f"{run_dir.name}.tar.gz"
-    # `with_name`, not `with_suffix`: the latter replaces only the LAST suffix, so
-    # on `<id>.tar.gz` (stem `<id>.tar`) it produced `<id>.tar.tar.gz.tmp` — not the
-    # name this docstring implies, and not one any cleanup could be written against.
-    tmp = dest.with_name(dest.name + ".tmp")
     # #363: the guard, not a helper — the path is handed to `tarfile.open`, so there
     # is no payload for `atomic_write_*` to take. Nothing gitignores this directory:
     # init writes `.bmad-loop/runs/`, `.bmad-loop/cache/`, `.bmad-loop/policy.toml`
@@ -1583,13 +1630,33 @@ def archive_run(project: Path, run_dir: Path, *, force: bool = False) -> Path:
     # it — the same exposure `decisions._write_store`, `policy.write_mux_backend` and
     # `tui.settings.PolicyDoc.save` had. (Not the sweep's two `decisions.json`
     # writes, which look like the same fix but write under the ignored run dir.)
+    #
+    # #591: staged through `_mkstemp_beside` — the atomic writers' own exclusive
+    # `0600` create (binary-mode on win32), under a fresh unpredictable name per
+    # attempt. A fixed name made a temp stranded by a kill, or planted at the
+    # guessable spelling, deny every later attempt as `FileExistsError`; the
+    # truncate-and-reuse it replaced followed a planted symlink instead. mkstemp's
+    # exclusivity still never opens a name something else holds, and the name being
+    # this process's own mint is what licenses the cleanup unlink below. It sits
+    # outside the `try` on purpose: a create that fails has staged nothing to
+    # clean up.
+    fd, tmp_name = _mkstemp_beside(dest)
+    tmp = Path(tmp_name)
     try:
-        with tarfile.open(tmp, "w:gz") as tar:
-            tar.add(run_dir, arcname=run_dir.name)
+        with os.fdopen(fd, "wb") as raw:
+            with tarfile.open(fileobj=raw, mode="w:gz") as tar:
+                tar.add(run_dir, arcname=run_dir.name)
+            # Flushed and fsynced before the publish, and unlike the rest of this
+            # family that is not about staleness but about data loss: `shutil.rmtree`
+            # below removes the only other copy of the run, so a crash with the
+            # tarball still in page cache destroys it outright. Ordered inside the
+            # fdopen context so the gzip trailer `tar.close()` just wrote is included.
+            raw.flush()
+            os.fsync(raw.fileno())
         atomic_replace(tmp, dest)
     except BaseException:
         with contextlib.suppress(OSError):
-            tmp.unlink(missing_ok=True)
+            tmp.unlink(missing_ok=True)  # provably ours: mkstemp minted the name
         raise
     shutil.rmtree(run_dir)
     _discard_state_dir(project, run_dir.name)  # same tail as delete_run
@@ -2052,12 +2119,14 @@ def rearm_escalation(
                 # the restored diff); from-scratch -> ready-for-dev -> step-03
                 # (re-implement). Independent of the resolve agent having set it.
                 target_status = "in-review" if restore_patch else "ready-for-dev"
-                verify.set_frontmatter_status(spec_path, target_status)
+                verify.set_frontmatter_status(
+                    spec_path, target_status, confine_root=Path(state.project)
+                )
                 # drop the stale `## Auto Run Result` section along with the status flip
                 # (mirrors engine._reset_spec_for_repair): find_result_artifact keys on
                 # that heading, so leaving it would let the re-driven session's first
                 # save of the spec parse as the prior attempt's terminal outcome.
-                devcontract.strip_auto_run_result(spec_path)
+                devcontract.strip_auto_run_result(spec_path, confine_root=Path(state.project))
             except verify.FrontmatterWriteError as e:
                 # The spec reads fine but carries `status:` in a shape no line
                 # edit can move (a block scalar, a flow mapping, a value continued
@@ -2134,7 +2203,10 @@ def rearm_escalation(
     if restore_patch and task.spec_file and task.baseline_commit:
         try:
             verify.set_frontmatter_field(
-                Path(task.spec_file), "baseline_revision", task.baseline_commit
+                Path(task.spec_file),
+                "baseline_revision",
+                task.baseline_commit,
+                confine_root=Path(state.project),
             )
         except (OSError, UnicodeDecodeError, verify.FrontmatterWriteError) as e:
             # FrontmatterWriteError joins the tuple rather than getting its own

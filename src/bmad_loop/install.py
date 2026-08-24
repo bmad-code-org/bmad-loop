@@ -1266,8 +1266,20 @@ def _register_hooks(project: Path, profile: CLIProfile) -> int:
         # the `write_text` it replaces: `_confined_to` above resolves the path and
         # refuses anything landing outside the project, so the only links reaching
         # this write point back INSIDE it — an in-repo indirection the operator
-        # arranged, which a name-replacement would orphan on the first init.
-        atomic_write_text(config_path, json.dumps(config, indent=2) + "\n")
+        # arranged, which a name-replacement would orphan on the first init. That
+        # rules out the confined writers too: they are no-follow by construction,
+        # so this site takes the #597 flag and nothing else.
+        # `require_writable_target=True` is that flag. `os.replace` needs write
+        # permission on the parent DIRECTORY, never on the entry it replaces, so a
+        # settings.json the operator had marked read-only was rewritten anyway and,
+        # because the mode is inherited, came back reading `0444` with nothing in
+        # the permission bits to record it. This file is the operator's own — the
+        # parse above kept their allowlist, env and MCP entries — so a read-only one
+        # is a `PermissionError`, which is what the `write_text` this replaced
+        # raised (#597).
+        atomic_write_text(
+            config_path, json.dumps(config, indent=2) + "\n", require_writable_target=True
+        )
         print(f"  hooks registered ({profile.name}): {config_path}")
     else:
         print(f"  hooks already registered ({profile.name})")

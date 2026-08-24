@@ -2652,13 +2652,17 @@ def test_a_failed_park_record_rollback_is_journaled_not_raised(project, monkeypa
     left over for a park in no commit.
 
     `OSError` is the injected type deliberately. Unlike `_restore_deferred_closes`
-    this site passes `follow_symlinks=False`, so no `Path.resolve` runs and the
-    pre-3.13 `RuntimeError`-on-symlink-loop cannot arise — widening the guard here
-    would be copying a fix for a call this one does not make.
+    this site never resolves — the confined writer walks the components below the
+    project root with `O_NOFOLLOW` and calls no `Path.resolve` — so the pre-3.13
+    `RuntimeError`-on-symlink-loop cannot arise, and widening the guard here would
+    be copying a fix for a call this one does not make. `UnconfinedWriteError` is
+    an `OSError` subclass, so a confinement refusal lands in this same arm.
 
-    Patched as bound in `engine` and FILTERED BY FILENAME: the module has four
-    `atomic_write_text` sites on one binding, so a module-wide boom survives a
-    revert of this site and would go green by crashing from a different one.
+    Patched at the CONFINED binding as bound in `engine` (#593), and still
+    FILTERED BY FILENAME. The filter mattered when four sites shared one binding;
+    the confined name now has only this one, but `engine.atomic_write_text` still
+    exists for the other three — so a patch aimed at the old name would not raise,
+    it would simply never fire, which is why the journal row below is the oracle.
 
     Ablation: delete the `self.journal.append` and this fails on the journal row
     alone; delete the whole `except OSError` arm and it fails on `not
@@ -2666,14 +2670,16 @@ def test_a_failed_park_record_rollback_is_journaled_not_raised(project, monkeypa
     from bmad_loop import operatoractions
 
     engine, record = _park_over_an_earlier_record(project, ["the earlier park's action"])
-    real = platform_util.atomic_write_text
+    real = platform_util.atomic_write_text_confined
 
-    def boom(path, text, *, follow_symlinks=True):
+    def boom(path, text, *, confine_root, require_writable_target=False):
         if Path(path).name == record.name:
             raise OSError(30, "Read-only file system")
-        return real(path, text, follow_symlinks=follow_symlinks)
+        return real(
+            path, text, confine_root=confine_root, require_writable_target=require_writable_target
+        )
 
-    monkeypatch.setattr("bmad_loop.engine.atomic_write_text", boom)
+    monkeypatch.setattr("bmad_loop.engine.atomic_write_text_confined", boom)
 
     summary = engine.run()
 
@@ -14002,3 +14008,62 @@ def test_dev_prompt_resolves_in_the_reopened_worktree_not_the_main_checkout(proj
         (worktree.resolve(), ".claude/skills"): "bmad-dev-auto",
         (project.project, ".claude/skills"): "bmad-build-auto",
     }
+
+
+# --------------------- the park-record put-back, confined to the project (#593)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_a_park_record_rollback_refused_as_unconfined_is_journaled(project):
+    """The escape #593 names, at the site whose failure arm must never raise.
+
+    `follow_symlinks=False` refused a link planted at the record itself and
+    nothing above it, so a link at `.bmad-loop/operator/` sent the put-back — the
+    PRIOR park's text, read out of the repo — to a path of the planter's choosing.
+    A driven session writes under this root all run long, which is what makes the
+    directory swap a real move rather than a hypothetical one.
+
+    The redirect is planted BY THE PRE-COMMIT HOOK, which is the only honest place
+    for it: `_write_park_record` has already captured the prior and rewritten the
+    record by then, so planting earlier would refuse that write instead and this
+    row would grade a different site. The hook fires in exactly the window between
+    the record write and the rollback, and it moves the real directory out rather
+    than deleting it, so the unconfined write would have had somewhere to land.
+
+    The oracle is the DEGRADE, not a raise. This runs inside the commit window's
+    except arms, so anything escaping displaces the escalation those arms carry —
+    `UnconfinedWriteError` is an `OSError` precisely so the refusal lands in the
+    existing guard and is journaled. The last assertion is the one that pins the
+    fix: the escaped record still holds THIS run's actions, so the prior text
+    never followed the link out.
+
+    Ablation: revert `_restore_park_record` to
+    `atomic_write_text(path, prior, follow_symlinks=False)` and this fails — the
+    journal row disappears and the redirected record is rewritten with the prior
+    park's actions."""
+    import json as _json
+
+    from bmad_loop import operatoractions
+
+    prior_actions = ["the earlier park's action"]
+    engine, record = _park_over_an_earlier_record(project, prior_actions)
+    operator_dir = operatoractions.records_dir(project.project)
+    outside = project.project.parent / "outside-operator"
+    hook = project.project / ".git" / "hooks" / "pre-commit"
+    hook.write_text(
+        "#!/bin/sh\n"
+        f'mv "{operator_dir}" "{outside}"\n'
+        f'ln -s "{outside}" "{operator_dir}"\n'
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    hook.chmod(0o755)
+
+    summary = engine.run()
+
+    assert not summary.crashed  # the refusal did not displace the escalation
+    journal = (engine.run_dir / "journal.jsonl").read_text(encoding="utf-8")
+    assert '"park-record-rollback-failed"' in journal
+    assert "UnconfinedWriteError" in journal  # journaled by NAME, not a bare errno
+    escaped = _json.loads((outside / record.name).read_text(encoding="utf-8"))
+    assert escaped["actions"] == ACTIONS  # this run's record, NOT the prior put back

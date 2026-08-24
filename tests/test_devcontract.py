@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from bmad_loop import devcontract, verify
+from bmad_loop import devcontract, platform_util, verify
 
 
 def _spec(
@@ -569,7 +569,7 @@ def test_reset_status_preserves_quotes_and_inline_comment(tmp_path):
         "review_loop_iteration: 2\n---\n\n## Intent\n\nbody\n",
         encoding="utf-8",
     )
-    assert devcontract.reset_spec_status(sp, "in-progress") is True
+    assert devcontract.reset_spec_status(sp, "in-progress", confine_root=tmp_path) is True
     assert "status: 'in-progress' # draft | ready-for-dev | done\n" in sp.read_text()
     # nothing else moved
     assert "review_loop_iteration: 2\n" in sp.read_text()
@@ -578,7 +578,7 @@ def test_reset_status_preserves_quotes_and_inline_comment(tmp_path):
 def test_reset_status_unquoted(tmp_path):
     sp = tmp_path / "spec.md"
     sp.write_text("---\nstatus: done\n---\n\nbody\n", encoding="utf-8")
-    assert devcontract.reset_spec_status(sp, "in-progress") is True
+    assert devcontract.reset_spec_status(sp, "in-progress", confine_root=tmp_path) is True
     assert "status: in-progress\n" in sp.read_text()
 
 
@@ -586,7 +586,7 @@ def test_reset_status_leaves_prose_status_line_untouched(tmp_path):
     """Only the frontmatter status is rewritten — a `Status:` line in the
     ## Auto Run Result prose body must survive verbatim."""
     sp = _spec(tmp_path / "spec.md", status="done", auto_run="done")
-    devcontract.reset_spec_status(sp, "in-progress")
+    devcontract.reset_spec_status(sp, "in-progress", confine_root=tmp_path)
     text = sp.read_text()
     assert "status: 'in-progress'\n" in text  # frontmatter flipped
     assert "- Status: done\n" in text  # prose untouched
@@ -596,14 +596,14 @@ def test_reset_status_idempotent_no_write(tmp_path):
     sp = tmp_path / "spec.md"
     sp.write_text("---\nstatus: 'in-progress'\n---\n\nbody\n", encoding="utf-8")
     before = sp.stat().st_mtime_ns
-    assert devcontract.reset_spec_status(sp, "in-progress") is False
+    assert devcontract.reset_spec_status(sp, "in-progress", confine_root=tmp_path) is False
     assert sp.stat().st_mtime_ns == before  # no rewrite at all
 
 
 def test_reset_status_no_frontmatter(tmp_path):
     sp = tmp_path / "spec.md"
     sp.write_text("# just a heading\n\nstatus: done\n", encoding="utf-8")
-    assert devcontract.reset_spec_status(sp, "in-progress") is False
+    assert devcontract.reset_spec_status(sp, "in-progress", confine_root=tmp_path) is False
     assert "status: done\n" in sp.read_text()  # body status not touched
 
 
@@ -618,7 +618,7 @@ def test_reset_status_preserves_crlf_across_the_whole_spec(tmp_path):
         "---\r\ntitle: 'x'\r\nstatus: 'done' # keep me\r\n---\r\n\r\n## Intent\r\n\r\nbody\r\n"
     )
     sp.write_bytes(original.encode("utf-8"))
-    assert devcontract.reset_spec_status(sp, "in-progress") is True
+    assert devcontract.reset_spec_status(sp, "in-progress", confine_root=tmp_path) is True
     text = sp.read_bytes().decode("utf-8")
     assert text == original.replace("status: 'done'", "status: 'in-progress'")
     assert "\n" not in text.replace("\r\n", "")  # no bare LF introduced
@@ -629,7 +629,7 @@ def test_reset_status_inserts_a_missing_status_with_the_blocks_crlf(tmp_path):
     and the appended line takes the block's own ending rather than a flat `\\n`."""
     sp = tmp_path / "spec.md"
     sp.write_bytes(b"---\r\ntitle: 'x'\r\n---\r\n\r\nbody\r\n")
-    assert devcontract.reset_spec_status(sp, "in-progress") is True
+    assert devcontract.reset_spec_status(sp, "in-progress", confine_root=tmp_path) is True
     text = sp.read_bytes().decode("utf-8")
     assert text == "---\r\ntitle: 'x'\r\nstatus: in-progress\r\n---\r\n\r\nbody\r\n"
     assert "\n" not in text.replace("\r\n", "")
@@ -648,10 +648,10 @@ def test_reset_status_no_ops_on_a_cr_only_spec(tmp_path):
     sp = tmp_path / "spec.md"
     original = "---\rstatus: 'done'\r---\r\rbody\r"
     sp.write_bytes(original.encode("utf-8"))
-    assert devcontract.reset_spec_status(sp, "in-progress") is False
+    assert devcontract.reset_spec_status(sp, "in-progress", confine_root=tmp_path) is False
     assert sp.read_bytes() == original.encode("utf-8")  # untouched, not half-written
     # ...and the splitlines-based sibling rewrites the very same bytes
-    assert verify.set_frontmatter_status(sp, "in-progress") is True
+    assert verify.set_frontmatter_status(sp, "in-progress", confine_root=tmp_path) is True
     assert sp.read_bytes() == b"---\rstatus: in-progress\r---\r\rbody\r"
 
 
@@ -660,7 +660,7 @@ def test_reset_spec_status_noop_when_spec_absent(tmp_path):
     rather than raising (mirrors verify.set_frontmatter_status)."""
     sp = tmp_path / "missing.md"
     assert not sp.exists()
-    assert devcontract.reset_spec_status(sp, "in-progress") is False
+    assert devcontract.reset_spec_status(sp, "in-progress", confine_root=tmp_path) is False
 
 
 @pytest.mark.parametrize(
@@ -681,7 +681,7 @@ def test_reset_status_refuses_the_shapes_its_own_regex_misreads(tmp_path, shape,
     sp = tmp_path / "spec.md"
     sp.write_bytes(text.encode("utf-8"))
     with pytest.raises(verify.FrontmatterWriteError):
-        devcontract.reset_spec_status(sp, "done")
+        devcontract.reset_spec_status(sp, "done", confine_root=tmp_path)
     assert sp.read_bytes() == text.encode("utf-8")
 
 
@@ -693,7 +693,7 @@ def test_reset_status_inserts_rather_than_rewriting_a_nested_decoy(tmp_path):
     is added."""
     sp = tmp_path / "spec.md"
     sp.write_text("---\nmeta:\n  status: draft\n---\n\nbody\n", encoding="utf-8")
-    assert devcontract.reset_spec_status(sp, "done") is True
+    assert devcontract.reset_spec_status(sp, "done", confine_root=tmp_path) is True
     text = sp.read_text()
     assert "  status: draft\n" in text  # the decoy is not this story's status
     assert verify.status_of(verify.read_frontmatter(sp)) == "done"
@@ -720,7 +720,7 @@ def test_reset_status_from_each_reconcilable_value_to_done(tmp_path, frm):
     """reset_spec_status advances every line-valued reconcilable frontmatter status
     to done, rewriting only the frontmatter line."""
     sp = _spec(tmp_path / "spec.md", status=frm, auto_run="done")
-    assert devcontract.reset_spec_status(sp, "done") is True
+    assert devcontract.reset_spec_status(sp, "done", confine_root=tmp_path) is True
     text = sp.read_text()
     assert "status: 'done'\n" in text  # frontmatter advanced
     assert "- Status: done\n" in text  # prose untouched
@@ -730,7 +730,7 @@ def test_reset_status_fills_empty_value(tmp_path):
     """The "" allowlist member: a present-but-empty `status:` is filled in place,
     leaving the prose Status line untouched."""
     sp = _spec(tmp_path / "spec.md", status="", auto_run="done")
-    assert devcontract.reset_spec_status(sp, "done") is True
+    assert devcontract.reset_spec_status(sp, "done", confine_root=tmp_path) is True
     text = sp.read_text()
     assert "status: 'done'\n" in text  # empty value filled
     assert "- Status: done\n" in text  # prose untouched
@@ -747,7 +747,7 @@ def test_reset_status_fills_bare_yaml_null(tmp_path):
         "---\ntitle: 'x'\nstatus:\n---\n\n## Auto Run Result\n\n- Status: done\n",
         encoding="utf-8",
     )
-    assert devcontract.reset_spec_status(sp, "done") is True
+    assert devcontract.reset_spec_status(sp, "done", confine_root=tmp_path) is True
     text = sp.read_text()
     assert "status: done\n" in text  # space preserved -> valid YAML
     assert "status:done" not in text  # the corruption form is never written
@@ -766,7 +766,7 @@ def test_reset_status_blank_value_keeps_inline_comment(tmp_path):
         "---\ntitle: 'x'\nstatus: # intentionally blank\n---\n\nbody\n",
         encoding="utf-8",
     )
-    assert devcontract.reset_spec_status(sp, "done") is True
+    assert devcontract.reset_spec_status(sp, "done", confine_root=tmp_path) is True
     text = sp.read_text()
     assert "status: done # intentionally blank\n" in text  # space kept before `#`
     assert "done#" not in text  # never abut the value to the comment
@@ -781,7 +781,7 @@ def test_reset_status_inserts_missing_line(tmp_path):
         "---\ntitle: 'x'\nbaseline_revision: 'abc'\n---\n\n## Intent\n\nbody\n",
         encoding="utf-8",
     )
-    assert devcontract.reset_spec_status(sp, "done") is True
+    assert devcontract.reset_spec_status(sp, "done", confine_root=tmp_path) is True
     text = sp.read_text()
     assert "status: done\n" in text  # inserted
     assert "title: 'x'\n" in text and "baseline_revision: 'abc'\n" in text  # kept
@@ -801,7 +801,7 @@ def test_strip_auto_run_result_removes_trailing_section(tmp_path):
         "## Auto Run Result\n\nStatus: done\nAll done.\n",
         encoding="utf-8",
     )
-    assert devcontract.strip_auto_run_result(sp) is True
+    assert devcontract.strip_auto_run_result(sp, confine_root=tmp_path) is True
     text = sp.read_text()
     assert "Auto Run Result" not in text and "All done." not in text
     assert "status: in-progress\n" in text and "## Intent\n\nbody\n" in text
@@ -817,7 +817,7 @@ def test_strip_auto_run_result_stops_at_next_heading(tmp_path):
         "### Detail\n\nstale\n\n## Change Log\n\nkept\n",
         encoding="utf-8",
     )
-    assert devcontract.strip_auto_run_result(sp) is True
+    assert devcontract.strip_auto_run_result(sp, confine_root=tmp_path) is True
     text = sp.read_text()
     assert "Auto Run Result" not in text and "stale" not in text
     assert "## Change Log\n\nkept\n" in text
@@ -835,7 +835,7 @@ def test_strip_auto_run_result_stops_at_bare_empty_heading(tmp_path):
         "##\n\nkept after empty heading\n",
         encoding="utf-8",
     )
-    assert devcontract.strip_auto_run_result(sp) is True
+    assert devcontract.strip_auto_run_result(sp, confine_root=tmp_path) is True
     text = sp.read_text()
     assert "Auto Run Result" not in text
     assert "##\n\nkept after empty heading\n" in text
@@ -845,7 +845,7 @@ def test_strip_auto_run_result_noop_without_section(tmp_path):
     sp = tmp_path / "spec.md"
     original = "---\nstatus: draft\n---\n\n## Intent\n\nbody\n"
     sp.write_text(original, encoding="utf-8")
-    assert devcontract.strip_auto_run_result(sp) is False
+    assert devcontract.strip_auto_run_result(sp, confine_root=tmp_path) is False
     assert sp.read_text() == original
 
 
@@ -856,7 +856,7 @@ def test_strip_auto_run_result_noop_when_spec_absent(tmp_path):
     still raises so the stale section can't silently survive the re-open)."""
     sp = tmp_path / "missing.md"
     assert not sp.exists()
-    assert devcontract.strip_auto_run_result(sp) is False
+    assert devcontract.strip_auto_run_result(sp, confine_root=tmp_path) is False
 
 
 def test_strip_auto_run_result_raises_on_undecodable_spec(tmp_path):
@@ -868,7 +868,7 @@ def test_strip_auto_run_result_raises_on_undecodable_spec(tmp_path):
     sp = tmp_path / "spec.md"
     sp.write_bytes(b"---\nstatus: done\n---\n\n\xff\xfe## Auto Run Result\n\nStatus: done\n")
     with pytest.raises(UnicodeDecodeError):
-        devcontract.strip_auto_run_result(sp)
+        devcontract.strip_auto_run_result(sp, confine_root=tmp_path)
 
 
 def test_strip_auto_run_result_preserves_crlf_in_what_it_keeps(tmp_path):
@@ -879,7 +879,7 @@ def test_strip_auto_run_result_preserves_crlf_in_what_it_keeps(tmp_path):
     sp = tmp_path / "spec.md"
     kept = "---\r\nstatus: done\r\n---\r\n\r\n## Intent\r\n\r\nbody\r\n"
     sp.write_bytes((kept + "## Auto Run Result\r\n\r\nStatus: done\r\n").encode("utf-8"))
-    assert devcontract.strip_auto_run_result(sp) is True
+    assert devcontract.strip_auto_run_result(sp, confine_root=tmp_path) is True
     text = sp.read_bytes().decode("utf-8")
     assert text == kept
     assert "\n" not in text.replace("\r\n", "")  # no bare LF introduced
@@ -892,8 +892,13 @@ def test_append_then_strip_round_trips_a_crlf_spec_byte_for_byte(tmp_path):
     sp = tmp_path / "spec.md"
     original = "---\r\nstatus: done\r\n---\r\n\r\n## Intent\r\n\r\nbody\r\n"
     sp.write_bytes(original.encode("utf-8"))
-    assert devcontract.append_auto_run_result(sp, "done", detail="extra context") is True
-    assert devcontract.strip_auto_run_result(sp) is True
+    assert (
+        devcontract.append_auto_run_result(
+            sp, "done", detail="extra context", confine_root=tmp_path
+        )
+        is True
+    )
+    assert devcontract.strip_auto_run_result(sp, confine_root=tmp_path) is True
     assert sp.read_bytes() == original.encode("utf-8")
 
 
@@ -906,7 +911,7 @@ def test_strip_auto_run_result_no_ops_on_a_cr_only_spec(tmp_path):
     sp = tmp_path / "spec.md"
     original = "---\rstatus: done\r---\r\r## Auto Run Result\r\rStatus: done\r"
     sp.write_bytes(original.encode("utf-8"))
-    assert devcontract.strip_auto_run_result(sp) is False
+    assert devcontract.strip_auto_run_result(sp, confine_root=tmp_path) is False
     assert sp.read_bytes() == original.encode("utf-8")
 
 
@@ -920,7 +925,7 @@ def test_strip_auto_run_result_ignores_heading_quoted_in_code_fence(tmp_path):
         "```md\n## Auto Run Result\n\nStatus: done\n```\n\nmore body\n"
     )
     sp.write_text(original, encoding="utf-8")
-    assert devcontract.strip_auto_run_result(sp) is False
+    assert devcontract.strip_auto_run_result(sp, confine_root=tmp_path) is False
     assert sp.read_text() == original
 
 
@@ -933,7 +938,7 @@ def test_strip_auto_run_result_ignores_heading_in_indented_fence(tmp_path):
         "  ```md\n## Auto Run Result\n\nStatus: done\n  ```\n\nmore body\n"
     )
     sp.write_text(original, encoding="utf-8")
-    assert devcontract.strip_auto_run_result(sp) is False
+    assert devcontract.strip_auto_run_result(sp, confine_root=tmp_path) is False
     assert sp.read_text() == original
 
 
@@ -952,7 +957,7 @@ def test_strip_auto_run_result_ignores_list_indented_fence(tmp_path):
         "    ```md\n    ## Auto Run Result\n\n    Status: done\n    ```\n\nmore body\n"
     )
     sp.write_text(original, encoding="utf-8")
-    assert devcontract.strip_auto_run_result(sp) is False
+    assert devcontract.strip_auto_run_result(sp, confine_root=tmp_path) is False
     assert sp.read_text() == original
 
 
@@ -966,7 +971,7 @@ def test_strip_auto_run_result_skips_fenced_boundary_lines(tmp_path):
         "```sh\n## run tests\npytest -q\n```\n\ntrailing stale prose\n",
         encoding="utf-8",
     )
-    assert devcontract.strip_auto_run_result(sp) is True
+    assert devcontract.strip_auto_run_result(sp, confine_root=tmp_path) is True
     text = sp.read_text()
     assert "Auto Run Result" not in text and "trailing stale prose" not in text
     assert "## Intent\n\nbody\n" in text
@@ -982,7 +987,7 @@ def test_strip_auto_run_result_ignores_heading_in_longer_outer_fence(tmp_path):
         "````\n```\n## Auto Run Result\n\nStatus: done\n````\n\nmore body\n"
     )
     sp.write_text(original, encoding="utf-8")
-    assert devcontract.strip_auto_run_result(sp) is False
+    assert devcontract.strip_auto_run_result(sp, confine_root=tmp_path) is False
     assert sp.read_text() == original
 
 
@@ -995,7 +1000,7 @@ def test_strip_auto_run_result_ignores_heading_in_mismatched_fence_char(tmp_path
         "~~~\n```\n## Auto Run Result\n\nStatus: done\n~~~\n\nmore body\n"
     )
     sp.write_text(original, encoding="utf-8")
-    assert devcontract.strip_auto_run_result(sp) is False
+    assert devcontract.strip_auto_run_result(sp, confine_root=tmp_path) is False
     assert sp.read_text() == original
 
 
@@ -1088,7 +1093,7 @@ def test_append_auto_run_result_minimal_shape(tmp_path):
         "spec-a.md",
         "---\nstatus: done\nbaseline_revision: 'abc123'\n---\n\n## Intent\n\nbody\n",
     )
-    assert devcontract.append_auto_run_result(sp, "done") is True
+    assert devcontract.append_auto_run_result(sp, "done", confine_root=tmp_path) is True
     text = sp.read_text()
     arr = devcontract.parse_auto_run_result(text)
     assert arr.present and arr.status == "done"
@@ -1107,7 +1112,7 @@ def test_append_moves_spec_to_marker_scan_territory(tmp_path):
     assert devcontract.find_frontmatter_candidates(tmp_path, since_ns=0) == [sp]
     assert devcontract.find_result_artifact(tmp_path, since_ns=0) is None
 
-    assert devcontract.append_auto_run_result(sp, "done") is True
+    assert devcontract.append_auto_run_result(sp, "done", confine_root=tmp_path) is True
 
     assert devcontract.find_frontmatter_candidates(tmp_path, since_ns=0) == []
     assert devcontract.find_result_artifact(tmp_path, since_ns=0) == sp
@@ -1119,12 +1124,15 @@ def test_append_refuses_existing_real_heading(tmp_path):
     original = "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
     sp = _write(tmp_path, "spec-a.md", original)
     before = sp.read_bytes()
-    assert devcontract.append_auto_run_result(sp, "done") is False
+    assert devcontract.append_auto_run_result(sp, "done", confine_root=tmp_path) is False
     assert sp.read_bytes() == before
 
 
 def test_append_missing_file_false(tmp_path):
-    assert devcontract.append_auto_run_result(tmp_path / "ghost.md", "done") is False
+    assert (
+        devcontract.append_auto_run_result(tmp_path / "ghost.md", "done", confine_root=tmp_path)
+        is False
+    )
 
 
 def test_append_raises_on_undecodable_spec(tmp_path):
@@ -1133,7 +1141,7 @@ def test_append_raises_on_undecodable_spec(tmp_path):
     sp = tmp_path / "spec-a.md"
     sp.write_bytes(b"---\nstatus: done\n---\n\n\xff\xfebody\n")
     with pytest.raises(UnicodeDecodeError):
-        devcontract.append_auto_run_result(sp, "done")
+        devcontract.append_auto_run_result(sp, "done", confine_root=tmp_path)
 
 
 def test_append_over_fence_quoted_heading_appends(tmp_path):
@@ -1145,7 +1153,7 @@ def test_append_over_fence_quoted_heading_appends(tmp_path):
         "spec-a.md",
         "---\nstatus: done\n---\n\n## Intent\n\n```md\n## Auto Run Result\n\nStatus: done\n```\n",
     )
-    assert devcontract.append_auto_run_result(sp, "done") is True
+    assert devcontract.append_auto_run_result(sp, "done", confine_root=tmp_path) is True
     text = sp.read_text()
     assert len(devcontract._section_headings(text)) == 1
     arr = devcontract.parse_auto_run_result(text)
@@ -1158,7 +1166,7 @@ def test_append_handles_missing_trailing_newline_and_crlf(tmp_path):
     no bare LF is introduced into the appended block."""
     sp = tmp_path / "spec-a.md"
     sp.write_bytes(b"---\r\nstatus: done\r\n---\r\n\r\n## Intent\r\n\r\nbody")
-    assert devcontract.append_auto_run_result(sp, "done") is True
+    assert devcontract.append_auto_run_result(sp, "done", confine_root=tmp_path) is True
     text = sp.read_bytes().decode("utf-8")
     assert "body## Auto Run Result" not in text  # never glued
     assert "body\r\n## Auto Run Result\r\n" in text  # own line, trailing newline ensured
@@ -1172,9 +1180,14 @@ def test_append_then_strip_roundtrip(tmp_path):
     all."""
     original = "---\nstatus: done\n---\n\n## Intent\n\nbody\n"
     sp = _write(tmp_path, "spec-a.md", original)
-    assert devcontract.append_auto_run_result(sp, "done", detail="extra context") is True
+    assert (
+        devcontract.append_auto_run_result(
+            sp, "done", detail="extra context", confine_root=tmp_path
+        )
+        is True
+    )
     assert "## Auto Run Result" in sp.read_text() and "extra context" in sp.read_text()
-    assert devcontract.strip_auto_run_result(sp) is True
+    assert devcontract.strip_auto_run_result(sp, confine_root=tmp_path) is True
     assert sp.read_text() == original
 
 
@@ -1186,27 +1199,29 @@ def test_append_bare_cr_terminated_spec_makes_heading_visible(tmp_path):
     visible to the scan — under the old logic it was glued after ``\\r`` and unseen)."""
     sp = tmp_path / "spec-a.md"
     sp.write_bytes(b"---\nstatus: done\n---\n\nbody\r")
-    assert devcontract.append_auto_run_result(sp, "done") is True
+    assert devcontract.append_auto_run_result(sp, "done", confine_root=tmp_path) is True
     text = sp.read_bytes().decode("utf-8")
     assert len(devcontract._section_headings(text)) == 1
     arr = devcontract.parse_auto_run_result(text)
     assert arr.present and arr.status == "done"
-    assert devcontract.append_auto_run_result(sp, "done") is False  # idempotent → visible
+    assert (
+        devcontract.append_auto_run_result(sp, "done", confine_root=tmp_path) is False
+    )  # idempotent → visible
 
 
 @pytest.mark.parametrize(
     "writer, original",
     [
         (
-            lambda sp: devcontract.append_auto_run_result(sp, "done"),
+            lambda sp, root: devcontract.append_auto_run_result(sp, "done", confine_root=root),
             "---\nstatus: done\n---\n\n# Story\n\nbody\n",  # no marker → append writes
         ),
         (
-            lambda sp: devcontract.strip_auto_run_result(sp),
+            lambda sp, root: devcontract.strip_auto_run_result(sp, confine_root=root),
             "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n",  # marker → strip writes
         ),
         (
-            lambda sp: devcontract.reset_spec_status(sp, "in-progress"),
+            lambda sp, root: devcontract.reset_spec_status(sp, "in-progress", confine_root=root),
             "---\nstatus: done\n---\n\nbody\n",  # status differs → reset writes
         ),
     ],
@@ -1222,15 +1237,21 @@ def test_repair_write_failure_never_truncates_spec(tmp_path, monkeypatch, writer
     fault is injected at devcontract's OWN binding of that helper. The litter
     assertion still grades this module: it fires if a rewriter ever mints a temp of
     its own before delegating. The helper's internal unlink-on-raise is graded where
-    it lives, by test_platform_util's `os.replace` boom rows."""
+    it lives, by test_platform_util's `os.replace` boom rows.
+
+    #593 moved the in-tree arm again, to `atomic_write_bytes_confined`, and that is
+    the binding patched here: `sp` sits under `tmp_path`, so the chokepoint takes
+    the confined arm. `devcontract.atomic_write_bytes` still EXISTS — the
+    out-of-tree arm keeps it — so patching that name would install cleanly and
+    simply never fire, a silent false green. `pytest.raises` is what catches it."""
     sp = _write(tmp_path, "spec-a.md", original)
 
-    def boom(path, data, *, follow_symlinks=True):
+    def boom(path, data, *, confine_root, require_writable_target=False):
         raise OSError("no space left on device")
 
-    monkeypatch.setattr(devcontract, "atomic_write_bytes", boom)
+    monkeypatch.setattr(devcontract, "atomic_write_bytes_confined", boom)
     with pytest.raises(OSError, match="no space left"):
-        writer(sp)
+        writer(sp, tmp_path)
     assert sp.read_text(encoding="utf-8") == original  # original untouched
     assert list(tmp_path.glob("*.tmp")) == []  # no temp minted here, no litter
 
@@ -1256,19 +1277,27 @@ def test_atomic_write_spec_hands_the_helper_bytes_not_text(tmp_path, monkeypatch
     `_atomic_write_spec` (dropping the `.encode`) and this reddens on every
     platform, on the `isinstance` row."""
     seen: list[bytes | str] = []
-    real = devcontract.atomic_write_bytes
+    real = devcontract.atomic_write_bytes_confined
 
-    def record(path, data, *, follow_symlinks=True):
+    def record(path, data, *, confine_root, require_writable_target=False):
         seen.append(data)
         blob = data if isinstance(data, bytes) else data.encode("utf-8")
-        real(path, blob, follow_symlinks=follow_symlinks)
+        real(
+            path,
+            blob,
+            confine_root=confine_root,
+            require_writable_target=require_writable_target,
+        )
 
-    monkeypatch.setattr(devcontract, "atomic_write_bytes", record)
-    monkeypatch.setattr(devcontract, "atomic_write_text", record, raising=False)
+    # the CONFINED binding (#593) — the arm an in-tree spec takes. Patching
+    # `devcontract.atomic_write_bytes` would still install (the out-of-tree arm
+    # keeps that name) and record nothing; `len(seen) == 1` below is the backstop.
+    monkeypatch.setattr(devcontract, "atomic_write_bytes_confined", record)
+    monkeypatch.setattr(devcontract, "atomic_write_text_confined", record, raising=False)
     sp = tmp_path / "spec-a.md"
     sp.write_bytes(b"---\r\nstatus: done\r\n---\r\n\r\n# Story\r\n\r\nbody\r\n")
 
-    devcontract.append_auto_run_result(sp, "done")
+    devcontract.append_auto_run_result(sp, "done", confine_root=tmp_path)
 
     assert len(seen) == 1  # exactly one write — no retry loop crept in
     assert isinstance(seen[0], bytes)
@@ -1277,28 +1306,34 @@ def test_atomic_write_spec_hands_the_helper_bytes_not_text(tmp_path, monkeypatch
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
 def test_atomic_write_spec_replaces_a_planted_symlink(tmp_path):
-    """The row that grades this SITE's `follow_symlinks=False` argument rather than
-    the helper's implementation of it (pinned in test_platform_util.py, where the
-    helper is called directly).
+    """The row that grades this SITE's choice of a writer that replaces the NAME,
+    rather than the helper's implementation of it (pinned in test_platform_util.py,
+    where the helper is called directly). An in-tree spec no longer spells that
+    choice as `follow_symlinks=False`: since #593 `_atomic_write_spec` routes it to
+    `atomic_write_bytes_confined`, which is no-follow by construction. The
+    out-of-tree arm keeps the plain no-follow write — the chokepoint rows below
+    grade that routing.
 
     Behaviour-preserving, not a tightening: the `atomic_replace` this replaced never
-    dereferenced its destination either, so passing the default True would have
+    dereferenced its destination either, so a follow-the-link writer would have
     CHANGED what these four rewriters do. It is also the security choice — the spec
     path reaches them from a scan of a directory a driven session owns, so writing
     THROUGH a link planted at that name would hand the session a host-side write to
     any operator-writable path.
 
-    Ablation: drop `follow_symlinks=False` in `_atomic_write_spec` and this reddens
-    alone — alone in both directions, since it does not reach the two
-    `frontmatter`-side writers of these same specs. Each of those passes its own
-    literal and carries its own row (tests/test_frontmatter.py,
+    Ablation: swap the in-tree arm of `_atomic_write_spec` for
+    `atomic_write_bytes(spec_path, payload)` at its follow-the-link default and
+    this reddens on the link surviving and the planted target rewritten — and only
+    among `devcontract`'s rows, since the mutation does not reach the two
+    `frontmatter`-side writers of these same specs. Each of those makes its own
+    routing choice and carries its own row (tests/test_frontmatter.py,
     tests/test_resolve.py)."""
     original = "---\nstatus: done\n---\n\nbody\n"
     real = _write(tmp_path, "someone-elses-file", original)
     link = tmp_path / "spec-a.md"
     link.symlink_to(real)
 
-    assert devcontract.reset_spec_status(link, "in-progress") is True
+    assert devcontract.reset_spec_status(link, "in-progress", confine_root=tmp_path) is True
 
     assert not link.is_symlink()  # the NAME was replaced
     assert verify.read_frontmatter(link)["status"] == "in-progress"
@@ -1325,7 +1360,12 @@ def test_operator_confirmation_records_the_actions_and_its_provenance(tmp_path):
     and this is the acknowledgment, so a later reader comparing the two can see
     whether the spec was edited in between."""
     sp = _write(tmp_path, "spec-a.md", _PARKED)
-    assert devcontract.append_operator_confirmation(sp, _ACTIONS, date="2026-07-28") is True
+    assert (
+        devcontract.append_operator_confirmation(
+            sp, _ACTIONS, date="2026-07-28", confine_root=tmp_path
+        )
+        is True
+    )
     text = sp.read_text()
     assert "## Operator Confirmation" in text
     assert "Confirmed 2026-07-28:" in text
@@ -1337,7 +1377,7 @@ def test_operator_confirmation_records_the_actions_and_its_provenance(tmp_path):
 
 def test_operator_confirmation_appends_after_the_existing_body(tmp_path):
     sp = _write(tmp_path, "spec-a.md", _PARKED)
-    devcontract.append_operator_confirmation(sp, _ACTIONS, date="2026-07-28")
+    devcontract.append_operator_confirmation(sp, _ACTIONS, date="2026-07-28", confine_root=tmp_path)
     text = sp.read_text()
     assert text.index("## Intent") < text.index("## Operator Confirmation")
     assert text.startswith("---\n")  # frontmatter block untouched at the top
@@ -1348,9 +1388,12 @@ def test_operator_confirmation_accumulates_rather_than_no_opping(tmp_path):
     spec reverted to the park status and confirmed again). Dropping it would make
     the audit trail claim there was only ever one sign-off."""
     sp = _write(tmp_path, "spec-a.md", _PARKED)
-    devcontract.append_operator_confirmation(sp, _ACTIONS, date="2026-07-28")
+    devcontract.append_operator_confirmation(sp, _ACTIONS, date="2026-07-28", confine_root=tmp_path)
     assert (
-        devcontract.append_operator_confirmation(sp, ["the redone one"], date="2026-07-30") is True
+        devcontract.append_operator_confirmation(
+            sp, ["the redone one"], date="2026-07-30", confine_root=tmp_path
+        )
+        is True
     )
     text = sp.read_text()
     assert text.count("## Operator Confirmation") == 2
@@ -1362,13 +1405,15 @@ def test_operator_confirmation_is_not_a_marker_the_result_scan_harvests(tmp_path
     `## Auto Run Result` — that marker is the dev session's completion contract,
     and a human sign-off is not one."""
     sp = _write(tmp_path, "spec-a.md", _PARKED)
-    devcontract.append_operator_confirmation(sp, _ACTIONS, date="2026-07-28")
+    devcontract.append_operator_confirmation(sp, _ACTIONS, date="2026-07-28", confine_root=tmp_path)
     assert devcontract.parse_auto_run_result(sp.read_text()).present is False
 
 
 def test_operator_confirmation_on_an_absent_spec_returns_false(tmp_path):
     assert (
-        devcontract.append_operator_confirmation(tmp_path / "nope.md", _ACTIONS, date="2026-07-28")
+        devcontract.append_operator_confirmation(
+            tmp_path / "nope.md", _ACTIONS, date="2026-07-28", confine_root=tmp_path
+        )
         is False
     )
 
@@ -1377,7 +1422,7 @@ def test_operator_confirmation_preserves_crlf(tmp_path):
     """An in-place write must not rewrite line endings it did not author."""
     sp = tmp_path / "spec-a.md"
     sp.write_bytes(_PARKED.replace("\n", "\r\n").encode("utf-8"))
-    devcontract.append_operator_confirmation(sp, _ACTIONS, date="2026-07-28")
+    devcontract.append_operator_confirmation(sp, _ACTIONS, date="2026-07-28", confine_root=tmp_path)
     raw = sp.read_bytes().decode("utf-8")
     assert "## Operator Confirmation\r\n" in raw
     assert "\n" not in raw.replace("\r\n", "")  # every break is CRLF, none bare
@@ -1385,7 +1430,7 @@ def test_operator_confirmation_preserves_crlf(tmp_path):
 
 def test_operator_confirmation_never_glues_onto_an_unterminated_body(tmp_path):
     sp = _write(tmp_path, "spec-a.md", "---\nstatus: awaiting-operator\n---\n\nno trailing nl")
-    devcontract.append_operator_confirmation(sp, _ACTIONS, date="2026-07-28")
+    devcontract.append_operator_confirmation(sp, _ACTIONS, date="2026-07-28", confine_root=tmp_path)
     assert "no trailing nl## Operator" not in sp.read_text()
     assert "\n## Operator Confirmation" in sp.read_text()
 
@@ -1401,7 +1446,7 @@ def test_operator_confirmation_leaves_a_blank_line_before_the_heading(tmp_path, 
     sp = _write(
         tmp_path, "spec-a.md", f"---\nstatus: awaiting-operator\n---\n\n## Intent\n\n{tail}"
     )
-    devcontract.append_operator_confirmation(sp, _ACTIONS, date="2026-07-28")
+    devcontract.append_operator_confirmation(sp, _ACTIONS, date="2026-07-28", confine_root=tmp_path)
     text = sp.read_text()
     assert "\n\n## Operator Confirmation" in text
     assert "body\n\n\n" not in text  # exactly one blank line, never a growing gap
@@ -1413,14 +1458,164 @@ def test_operator_confirmation_write_failure_raises_and_keeps_the_spec(tmp_path,
     never made."""
     sp = _write(tmp_path, "spec-a.md", _PARKED)
 
-    def boom(path, data, *, follow_symlinks=True):
+    def boom(path, data, *, confine_root, require_writable_target=False):
         raise OSError("no space left on device")
 
-    monkeypatch.setattr(devcontract, "atomic_write_bytes", boom)
+    # the CONFINED binding: `sp` is under `tmp_path`, so the chokepoint takes that
+    # arm (#593). `devcontract.atomic_write_bytes` survives for the out-of-tree arm,
+    # so patching it here would never fire.
+    monkeypatch.setattr(devcontract, "atomic_write_bytes_confined", boom)
     with pytest.raises(OSError, match="no space left"):
-        devcontract.append_operator_confirmation(sp, _ACTIONS, date="2026-07-28")
+        devcontract.append_operator_confirmation(
+            sp, _ACTIONS, date="2026-07-28", confine_root=tmp_path
+        )
     assert sp.read_text(encoding="utf-8") == _PARKED
     assert list(tmp_path.glob("*.tmp")) == []
+
+
+# ------------------------------------- confined parent (#593) + read-only (#597)
+#
+# `_atomic_write_spec` is the chokepoint for all four public writers, so these
+# rows drive it through `reset_spec_status` and grade the branch itself: an
+# in-tree spec takes the confined arm, an out-of-tree one keeps the plain
+# no-follow write, a redirected parent inside the tree is refused, and a
+# read-only spec earns a PermissionError.
+#
+# `confine_root` is always a real ANCESTOR of the spec's directory. The anchored
+# walk covers the components strictly BELOW the root and opens the root itself
+# without O_NOFOLLOW, so a `confine_root` naming the spec's own parent walks
+# nothing, refuses nothing, and would leave the refusal row green with the escape
+# still open.
+
+
+def _spec_tree(tmp_path):
+    root = tmp_path / "checkout"
+    (root / "artifacts").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    return root, outside
+
+
+def _spec_tap(label: str, seen: list[str], real):
+    def record(path, data, **kw):
+        seen.append(label)
+        return real(path, data, **kw)
+
+    return record
+
+
+_RESET_SPEC = "---\nstatus: done\n---\n\nbody\n"
+
+
+def test_atomic_write_spec_takes_the_confined_arm_for_an_in_tree_spec(tmp_path, monkeypatch):
+    """Positive control, grading WHICH writer an in-tree spec reaches rather than
+    only that the rewrite landed. Both bindings are wrapped and both keep the real
+    write, so the reset below really lands on disk.
+
+    Ablation: swap the two arms of the `is_relative_to` branch and this fails on
+    `seen`, with the spec still correctly reset."""
+    root, _ = _spec_tree(tmp_path)
+    sp = _write(root / "artifacts", "spec-a.md", _RESET_SPEC)
+    seen: list[str] = []
+    monkeypatch.setattr(
+        devcontract,
+        "atomic_write_bytes_confined",
+        _spec_tap("confined", seen, devcontract.atomic_write_bytes_confined),
+    )
+    monkeypatch.setattr(
+        devcontract,
+        "atomic_write_bytes",
+        _spec_tap("plain", seen, devcontract.atomic_write_bytes),
+    )
+
+    assert devcontract.reset_spec_status(sp, "in-progress", confine_root=root) is True
+
+    assert seen == ["confined"]
+    assert "status: in-progress" in sp.read_text(encoding="utf-8")
+
+
+def test_atomic_write_spec_keeps_the_plain_write_for_an_out_of_tree_spec(tmp_path, monkeypatch):
+    """The else-arm, and the reason the chokepoint is a branch. These four writers
+    are driven over `paths.implementation_artifacts`, which `bmadconfig` lets an
+    operator configure OUTSIDE the checkout — `verify.spec_within_roots` trusts
+    such a root, and a confined writer cannot vouch for a tree it was not given, so
+    refusing there would break the repair path rather than close a hole.
+
+    Ablation: call the confined writer unconditionally and this fails with
+    `UnconfinedWriteError`, the spec never reset."""
+    root, outside = _spec_tree(tmp_path)
+    sp = _write(outside, "spec-a.md", _RESET_SPEC)
+    seen: list[str] = []
+    monkeypatch.setattr(
+        devcontract,
+        "atomic_write_bytes_confined",
+        _spec_tap("confined", seen, devcontract.atomic_write_bytes_confined),
+    )
+    monkeypatch.setattr(
+        devcontract,
+        "atomic_write_bytes",
+        _spec_tap("plain", seen, devcontract.atomic_write_bytes),
+    )
+
+    assert devcontract.reset_spec_status(sp, "in-progress", confine_root=root) is True
+
+    assert seen == ["plain"]
+    assert "status: in-progress" in sp.read_text(encoding="utf-8")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_atomic_write_spec_refuses_a_symlinked_parent(tmp_path):
+    """#593 at the chokepoint every one of the four writers funnels through. The
+    `follow_symlinks=False` the row above grades stops at the FINAL component: the
+    artifacts DIRECTORY was still resolved by name at both the `mkstemp` and the
+    `os.replace`, so a link planted there landed the temp and the published spec
+    outside the checkout entirely.
+
+    The read half still resolves through the link, so the rewrite is computed and
+    only the WRITE refuses — this reaches `_atomic_write_spec` rather than bailing
+    out in the reader.
+
+    Ablation: revert the call to
+    `atomic_write_bytes(spec_path, payload, follow_symlinks=False)` and this fails
+    `DID NOT RAISE`, with the victim spec reset out in `outside/`."""
+    root, outside = _spec_tree(tmp_path)
+    victim = _write(outside, "victim.md", _RESET_SPEC)
+    (root / "artifacts").rmdir()
+    (root / "artifacts").symlink_to(outside, target_is_directory=True)
+    sp = root / "artifacts" / "victim.md"
+    assert sp.is_file()  # the read still resolves through the planted link
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        devcontract.reset_spec_status(sp, "in-progress", confine_root=root)
+
+    assert victim.read_text(encoding="utf-8") == _RESET_SPEC  # not rewritten
+    assert sorted(p.name for p in outside.iterdir()) == ["victim.md"]  # nor staged
+
+
+def test_atomic_write_spec_refuses_a_readonly_spec(tmp_path):
+    """#597 at this site. `os.replace` needs write permission on the parent
+    DIRECTORY, never on the entry it replaces, so a spec an operator marked
+    read-only was rewritten anyway and — because the mode is inherited — came back
+    reading `0444`, with nothing in the permission bits to record it.
+
+    `0o444` sets the READONLY attribute on win32 too, so this runs unskipped on
+    both platforms; the chmod is on a file in this test's own tmp_path and is
+    restored in a `finally` (Windows rmtree refuses a READONLY leftover).
+
+    Ablation: drop `require_writable_target=True` from the confined call and this
+    fails `DID NOT RAISE`, the spec reading `status: in-progress` and still
+    `0444`."""
+    root, _ = _spec_tree(tmp_path)
+    sp = _write(root / "artifacts", "spec-a.md", _RESET_SPEC)
+    sp.chmod(0o444)
+    try:
+        with pytest.raises(PermissionError):
+            devcontract.reset_spec_status(sp, "in-progress", confine_root=root)
+    finally:
+        sp.chmod(0o644)
+
+    assert sp.read_text(encoding="utf-8") == _RESET_SPEC
+    assert list((root / "artifacts").glob("*.tmp")) == []  # a refusal stages nothing
 
 
 # --------------------------------- has_operator_confirmation (#335 part 3)
@@ -1438,7 +1633,7 @@ def test_operator_confirm_heading_round_trips_through_its_own_reader(tmp_path):
     assert devcontract.OPERATOR_CONFIRM_HEADING_RE.match(devcontract.OPERATOR_CONFIRM_HEADING)
     sp = _write(tmp_path, "spec-a.md", _PARKED)
     assert devcontract.has_operator_confirmation(sp) is False
-    devcontract.append_operator_confirmation(sp, _ACTIONS, date="2026-07-28")
+    devcontract.append_operator_confirmation(sp, _ACTIONS, date="2026-07-28", confine_root=tmp_path)
     assert devcontract.has_operator_confirmation(sp) is True
 
 
@@ -1469,7 +1664,7 @@ def test_auto_run_marker_is_not_read_as_an_operator_confirmation(tmp_path):
     """The two section readers share `_section_headings`; the pattern parameter is
     what keeps them distinct. Neither heading may answer for the other."""
     sp = _write(tmp_path, "spec-a.md", _PARKED)
-    devcontract.append_auto_run_result(sp, "done")
+    devcontract.append_auto_run_result(sp, "done", confine_root=tmp_path)
     assert devcontract.has_operator_confirmation(sp) is False
 
 
