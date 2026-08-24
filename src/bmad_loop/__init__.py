@@ -8,4 +8,4 @@ runs still generate and edit it outside one), spec files, and the per-run
 directory under .bmad-loop/runs/.
 """
 
-__version__ = "0.11.0"
+__version__ = "0.11.1"
