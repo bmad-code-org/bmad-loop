@@ -372,10 +372,21 @@ def test_advance_sends_bytes_to_the_atomic_writer(tmp_path, monkeypatch):
     p.write_bytes(board)
     writes: list[bytes | str] = []
 
-    def record(path: Path, payload: bytes | str, *, follow_symlinks: bool = True) -> None:
+    def record(
+        path: Path,
+        payload: bytes | str,
+        *,
+        follow_symlinks: bool = True,
+        require_writable_target: bool = False,
+    ) -> None:
         writes.append(payload)
         raw = payload if isinstance(payload, bytes) else payload.encode("utf-8")
-        real_atomic_write_bytes(path, raw, follow_symlinks=follow_symlinks)
+        real_atomic_write_bytes(
+            path,
+            raw,
+            follow_symlinks=follow_symlinks,
+            require_writable_target=require_writable_target,
+        )
 
     # Wrap both names so the writer-choice ablation still reaches the payload
     # assertion instead of escaping through whichever module binding it restores.
@@ -433,7 +444,7 @@ def test_advance_write_failure_raises_and_leaves_the_board_entire(tmp_path, monk
     p = _write(tmp_path)
     before = p.read_bytes()
 
-    def boom(path, data: bytes, *, follow_symlinks=True):
+    def boom(path, data: bytes, *, follow_symlinks=True, require_writable_target=False):
         raise OSError("no space left on device")
 
     monkeypatch.setattr(sprintstatus, "atomic_write_bytes", boom)
@@ -466,6 +477,59 @@ def test_advance_writes_through_a_symlinked_board(tmp_path):
 
     assert link.is_symlink()  # still a link, not turned into a regular file
     assert sprintstatus.story_status(real, "3-2-digest-delivery") == "in-progress"
+
+
+def test_advance_refuses_a_readonly_board(tmp_path):
+    """#597's headline regression, restored. AGENTS.md makes `advance` the
+    orchestrator's SOLE write path to sprint-status.yaml, so a read-only board is
+    the only way an operator can say "stop rewriting this" — and it has to mean
+    something. Before #590 it did, as a side effect of `write_bytes` opening the
+    file. Going atomic silently took that away: `os.replace` needs write permission
+    on the parent DIRECTORY, never on the entry it replaces, so the board was
+    rewritten anyway and — because the mode is inherited — came back reading
+    `0444`, leaving nothing in the permission bits to record the change.
+
+    This site keeps `follow_symlinks` at the default (the row above), so it is NOT
+    a confined writer; `require_writable_target=True` is the entire change, and
+    this row is what grades it.
+
+    `0o444` sets the READONLY attribute on win32 too, where `O_WRONLY` then fails
+    with ERROR_ACCESS_DENIED, so this runs unskipped on both platforms. The chmod
+    is on a file in this test's own tmp_path and is restored in a `finally` —
+    never the session `project` template, and Windows rmtree refuses a READONLY
+    leftover.
+
+    Ablation: drop `require_writable_target=True` at the call and this fails
+    `DID NOT RAISE`, with the board advanced and still reading `0444`."""
+    p = _write(tmp_path)
+    before = p.read_bytes()
+    p.chmod(0o444)
+    try:
+        with pytest.raises(PermissionError):
+            sprintstatus.advance(p, "3-2-digest-delivery", "in-progress")
+    finally:
+        p.chmod(0o644)
+
+    assert p.read_bytes() == before  # the board is entire, and unadvanced
+    assert list(tmp_path.glob("*.tmp")) == []  # a refusal stages nothing
+
+
+def test_advance_still_advances_a_writable_board(tmp_path):
+    """The positive control for the refusal above, stated as its own row because
+    the flag is a REFUSAL and a refusal that fires too eagerly is the failure #597
+    itself argued against: the owner of a `0444` file can legitimately replace it
+    today, and an `os.access`-style check would have refused this ordinary write.
+    The probe is a real `os.open(target, O_WRONLY)`, so the kernel answers and the
+    normal path is untouched.
+
+    Ablation: make `_refuse_unwritable_target` refuse unconditionally and this
+    reddens while the row above stays green — the pair is what pins the boundary,
+    not either alone."""
+    p = _write(tmp_path)
+
+    assert sprintstatus.advance(p, "3-2-digest-delivery", "in-progress") == "in-progress"
+
+    assert sprintstatus.story_status(p, "3-2-digest-delivery") == "in-progress"
 
 
 def test_advanced_bytes_matches_what_advance_writes_to_a_file(tmp_path):

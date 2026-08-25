@@ -3407,22 +3407,31 @@ async def test_plan_checkpoint_replan_resets_and_resumes(project, monkeypatch):
 
     calls: list[str] = []
     resets: list[tuple] = []
-    strips: list[Path] = []
+    strips: list[tuple[Path, Path]] = []
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
     monkeypatch.setattr(
-        devcontract, "reset_spec_status", lambda p, s: resets.append((p, s)) or True
+        devcontract,
+        "reset_spec_status",
+        lambda p, s, **kw: resets.append((p, s, kw["confine_root"])) or True,
     )
-    monkeypatch.setattr(devcontract, "strip_auto_run_result", lambda p: strips.append(p) or True)
+    monkeypatch.setattr(
+        devcontract,
+        "strip_auto_run_result",
+        lambda p, **kw: strips.append((p, kw["confine_root"])) or True,
+    )
     _run_dir, spec = _stories_paused_run(project.project, stage="plan-checkpoint")
     app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, SpecReviewModal)
         await pilot.click(await ready(pilot, "#act-replan"))
         await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
-        assert resets == [(spec, "draft")]
-        assert strips == [spec]
+        # the root is captured, not just the path: `_do_replan` has to pass the
+        # project it built `run_dir` from, and a `confine_root` naming the spec's
+        # own parent would be lexically confined and behaviourally inert (#593).
+        assert resets == [(spec, "draft", project.project)]
+        assert strips == [(spec, project.project)]
 
 
 async def test_story_checkpoint_continue_resumes(project, monkeypatch):
@@ -3668,6 +3677,33 @@ async def test_graceful_stop_token_messages(project, monkeypatch, token, needle)
         await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
         await pilot.click(await ready(pilot, "#ok"))
         await until(pilot, lambda: any(needle in m for m in notifications(app)))
+
+
+async def test_graceful_stop_write_failure_notifies_instead_of_crashing(project, monkeypatch):
+    """The worker catches `OSError` the way the CLI's `stop --graceful` does. The
+    confined lodge (#593) raises `UnconfinedWriteError` — an `OSError` — on a
+    planted parent, and Textual workers default to `exit_on_error=True`, so
+    without the catch pressing `S` in that scenario tore the whole dashboard
+    down instead of reporting the refusal.
+
+    Ablation: drop the worker's `except OSError` arm and this reddens — the
+    worker error kills the app under run_test and the toast never arrives."""
+    from bmad_loop import runs
+
+    def boom(rd):
+        raise runs.UnconfinedWriteError("cannot reach .bmad-loop/runs without a redirect")
+
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "alive")
+    monkeypatch.setattr(runs, "request_graceful_stop", boom)
+    make_run(project.project, "20260611-100000-aaaa", alive=True)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: dashboard(app).selected_run_id == "20260611-100000-aaaa")
+        await pilot.press("S")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        await until(pilot, lambda: any("could not be written" in m for m in notifications(app)))
+        assert app.is_running  # the dashboard survived the refusal
 
 
 async def test_graceful_stop_not_live_warns_without_calling(project, monkeypatch):

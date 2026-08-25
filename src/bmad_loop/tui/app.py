@@ -792,8 +792,8 @@ class BmadLoopApp(App[None]):
         if self._resolve_blocked_by_liveness(run_id, run_dir):
             return
         try:
-            reset = devcontract.reset_spec_status(spec_path, "draft")
-            devcontract.strip_auto_run_result(spec_path)
+            reset = devcontract.reset_spec_status(spec_path, "draft", confine_root=self.project)
+            devcontract.strip_auto_run_result(spec_path, confine_root=self.project)
         except (OSError, verify.FrontmatterWriteError) as e:
             # FrontmatterWriteError is not an OSError: a spec whose `status:` is a
             # block scalar or a flow mapping reads fine and fails the WRITE. It
@@ -1002,6 +1002,22 @@ class BmadLoopApp(App[None]):
             outcome = runs.request_graceful_stop(run_dir)
         except runs.GracefulStopError as e:
             self.call_from_thread(self.notify, str(e), severity="error")
+            return
+        except OSError as e:
+            # Mirrors the CLI's `stop --graceful` arm: the lodge does not roll
+            # back a failed write (see _create_stop_request), so a part-way
+            # failure can leave a graceful request standing — and a confined
+            # refusal (`UnconfinedWriteError`, #593) wrote nothing at all. Either
+            # way the worker must not raise: Textual workers default to
+            # exit_on_error=True, so an uncaught OSError here would take the
+            # whole dashboard down instead of reporting the refusal.
+            self.call_from_thread(
+                self.notify,
+                f"run {run_id}: stop request could not be written ({e}) — a graceful "
+                f"request may still be pending; check `bmad-loop status {run_id}` and "
+                f"use `bmad-loop stop {run_id} --cancel-graceful` to withdraw it",
+                severity="error",
+            )
             return
         if outcome == "already-pending":
             # Mode-neutral: the pending request may be a hard one, and this token

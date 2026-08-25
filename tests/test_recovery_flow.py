@@ -19,6 +19,7 @@ from bmad_loop import verify
 from bmad_loop.bmadconfig import ProjectPaths
 from bmad_loop.gates import ATTENTION_FILE
 from bmad_loop.model import Phase, StoryTask
+from bmad_loop.platform_util import UnconfinedWriteError
 from bmad_loop.policy import GatesPolicy, LimitsPolicy, NotifyPolicy, Policy, ScmPolicy
 from bmad_loop.recovery_flow import PRESERVE_REF_PROBE_LIMIT, RecoveryFlow
 from bmad_loop.verify import GitError, rev_parse_head
@@ -326,7 +327,7 @@ def test_bound_lifecycle_only_spec_is_normalized_and_reads_git_clean(project):
     spec = _tracked_spec(project)
     task = _task(repo)
     task.dispatched_spec_file = str(spec)
-    verify.set_frontmatter_status(spec, "in-progress")
+    verify.set_frontmatter_status(spec, "in-progress", confine_root=repo)
     flow = _make_flow(
         workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
     )
@@ -386,7 +387,7 @@ def test_plain_bound_lifecycle_change_restores_baseline_status(
     spec = _tracked_spec(project, status=baseline_status)
     task = _task(repo)
     task.dispatched_spec_file = str(spec)
-    verify.set_frontmatter_status(spec, attempt_status)
+    verify.set_frontmatter_status(spec, attempt_status, confine_root=repo)
     flow = _make_flow(
         workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
     )
@@ -411,7 +412,7 @@ def test_plain_bound_lifecycle_commit_is_parked_and_reset_before_retry(project):
     task = _task(repo)
     baseline = task.baseline_commit
     task.dispatched_spec_file = str(spec)
-    verify.set_frontmatter_status(spec, "in-progress")
+    verify.set_frontmatter_status(spec, "in-progress", confine_root=repo)
     git(repo, "add", "-A")
     git(repo, "commit", "-q", "-m", "attempt lifecycle flip")
     attempt_head = rev_parse_head(repo)
@@ -469,7 +470,7 @@ def test_bound_spec_exclusion_does_not_hide_sibling_source_residue(project):
     spec = _tracked_spec(project)
     task = _task(repo)
     task.dispatched_spec_file = str(spec)
-    verify.set_frontmatter_status(spec, "in-progress")
+    verify.set_frontmatter_status(spec, "in-progress", confine_root=repo)
     (repo / "src.txt").write_text("attempt source residue\n")
     flow = _make_flow(
         workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
@@ -493,7 +494,7 @@ def test_bound_spec_exclusion_does_not_hide_sibling_artifact_residue(project):
     spec = _tracked_spec(project)
     task = _task(repo)
     task.dispatched_spec_file = str(spec)
-    verify.set_frontmatter_status(spec, "in-progress")
+    verify.set_frontmatter_status(spec, "in-progress", confine_root=repo)
     (project.implementation_artifacts / "sibling-result.md").write_text("attempt residue\n")
     flow = _make_flow(
         workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
@@ -516,7 +517,7 @@ def test_bound_spec_exclusion_does_not_hide_run_created_untracked_residue(projec
     spec = _tracked_spec(project)
     task = _task(repo)
     task.dispatched_spec_file = str(spec)
-    verify.set_frontmatter_status(spec, "in-progress")
+    verify.set_frontmatter_status(spec, "in-progress", confine_root=repo)
     (repo / "run-created.tmp").write_text("attempt residue\n")
     flow = _make_flow(
         workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
@@ -541,7 +542,7 @@ def test_unbound_spec_flip_retains_existing_dirty_policy(project):
     spec = _tracked_spec(project)
     task = _task(repo)
     task.spec_file = str(spec)  # deliberately late/accepted ownership only
-    verify.set_frontmatter_status(spec, "in-progress")
+    verify.set_frontmatter_status(spec, "in-progress", confine_root=repo)
     flow = _make_flow(
         workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
     )
@@ -944,8 +945,8 @@ def test_plain_normalization_restore_revalidates_parent_authority(project, tmp_p
         workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
     )
 
-    def retarget_after_normalize(path, target_status):
-        RecoveryFlow._normalize_attempt_owned_spec(path, target_status)
+    def retarget_after_normalize(path, target_status, *, confine_root):
+        RecoveryFlow._normalize_attempt_owned_spec(path, target_status, confine_root=confine_root)
         path.unlink()
         parent.rmdir()
         parent.symlink_to(victim_parent, target_is_directory=True)
@@ -1006,6 +1007,78 @@ def test_post_reset_authority_failure_reports_completed_rollback(project, tmp_pa
     assert "rollback-auto" in flow.journal.events()
     assert "any rollback already completed" in str(raised.value)
     assert "left untouched" not in str(raised.value)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="directory symlinks may need elevation")
+def test_resolved_redrive_normalization_confines_to_the_project_not_workspace_root(
+    project, tmp_path, monkeypatch
+):
+    """The supported `repo_root` override (isolation = "none") makes
+    `workspace.root` the separate CODE repo while the attempt binding resolves
+    under `workspace.paths.project`. Threading `workspace.root` as
+    `confine_root` made an in-project spec fail the chokepoint's
+    `is_relative_to` test and silently take the plain arm, whose parent
+    directories are resolved by NAME — so a parent swapped after
+    `_attempt_owned_spec` validated the binding sent the post-reset route
+    repair outside the project. The recovery sites now thread
+    `workspace.paths.project` (equal to `workspace.root` under worktree
+    isolation via `ProjectPaths.rebased`, so only the override shape moves).
+    This drives the bare-normalize site of the `resolved` unwind — the one arm
+    where the confined walk is the ONLY parent authority: no byte restore runs
+    there to re-validate the path.
+
+    Ablation: thread `workspace.root` back at that site and this fails on
+    `DID NOT RAISE UnconfinedWriteError` — measured with the gate ablated, the
+    decoy behind the swapped parent is rewritten to `ready-for-dev` (content
+    escaping the project through the parent link)."""
+    code_repo = tmp_path / "code-repo"
+    code_repo.mkdir()
+    git(code_repo, "init")
+    git(code_repo, "config", "user.email", "t@t")
+    git(code_repo, "config", "user.name", "t")
+    (code_repo / "src.txt").write_text("baseline\n")
+    git(code_repo, "add", "-A")
+    git(code_repo, "commit", "-q", "-m", "code baseline")
+
+    parent = project.implementation_artifacts / "override-retarget"
+    parent.mkdir(parents=True, exist_ok=True)
+    spec = parent / "owned.md"
+    spec.write_bytes(b"---\nstatus: done\n---\n\nescalated attempt\n")
+
+    override = ProjectPaths(
+        project=project.project,
+        implementation_artifacts=project.implementation_artifacts,
+        planning_artifacts=project.planning_artifacts,
+        output_folder=project.output_folder,
+        repo_root=code_repo,
+    )
+    workspace = Workspace.default(override)
+    assert workspace.root == code_repo  # the override shape this row exists for
+    flow = _make_flow(workspace=workspace, policy=_policy(rollback_on_failure=False))
+
+    task = _task(code_repo)
+    task.dispatched_spec_file = str(spec.resolve())
+    (code_repo / "src.txt").write_text("failed attempt residue\n")  # real dirt to undo
+
+    victim_parent = tmp_path / "external-victim"
+    victim_parent.mkdir()
+    decoy = b"---\nstatus: done\n---\n\nexternal victim\n"
+    (victim_parent / "owned.md").write_bytes(decoy)
+    real_safe_reset = flow.safe_reset
+
+    def retarget_after_reset(reset_task, *, preserve=()):
+        real_safe_reset(reset_task, preserve=preserve)
+        spec.unlink()
+        parent.rmdir()
+        parent.symlink_to(victim_parent, target_is_directory=True)
+
+    monkeypatch.setattr(flow, "safe_reset", retarget_after_reset)
+
+    with pytest.raises(UnconfinedWriteError):
+        flow.rollback_or_pause(task, cause="resolved")
+
+    assert parent.is_symlink()
+    assert (victim_parent / "owned.md").read_bytes() == decoy  # nothing escaped
 
 
 @pytest.mark.parametrize("git_invisible", ["baseline-untracked", "ignored"])
@@ -1535,7 +1608,7 @@ def test_pre_repair_owned_spec_read_fault_pauses_without_mutation(project, monke
     spec = _tracked_spec(project)
     task = _task(repo)
     task.dispatched_spec_file = str(spec)
-    verify.set_frontmatter_status(spec, "in-progress")
+    verify.set_frontmatter_status(spec, "in-progress", confine_root=repo)
     real_read_bytes = Path.read_bytes
     before = real_read_bytes(spec)
     canonical = spec.resolve()
@@ -1585,7 +1658,7 @@ def test_owned_spec_outside_trusted_roots_is_not_excluded_or_mutated(project):
     git(repo, "commit", "-q", "-m", "outside binding baseline")
     task = _task(repo)
     task.dispatched_spec_file = str(outside)
-    verify.set_frontmatter_status(outside, "in-progress")
+    verify.set_frontmatter_status(outside, "in-progress", confine_root=repo)
     flow = _make_flow(
         workspace=Workspace(root=repo, paths=paths),
         paths=paths,
@@ -1611,7 +1684,7 @@ def test_missing_attempt_binding_does_not_fall_back_to_late_spec(project):
     task = _task(repo)
     task.spec_file = str(spec)
     task.dispatched_spec_file = str(project.implementation_artifacts / "missing.md")
-    verify.set_frontmatter_status(spec, "in-progress")
+    verify.set_frontmatter_status(spec, "in-progress", confine_root=repo)
     flow = _make_flow(
         workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
     )
@@ -1634,7 +1707,7 @@ def test_non_file_attempt_binding_is_refused(project):
     spec = _tracked_spec(project)
     task = _task(repo)
     task.dispatched_spec_file = str(project.implementation_artifacts)
-    verify.set_frontmatter_status(spec, "in-progress")
+    verify.set_frontmatter_status(spec, "in-progress", confine_root=repo)
     flow = _make_flow(
         workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
     )
@@ -1662,7 +1735,7 @@ def test_ambiguous_relative_attempt_binding_is_refused(project):
     git(repo, "commit", "-q", "-m", "ambiguous spec baseline")
     task = _task(repo)
     task.dispatched_spec_file = "spec.md"
-    verify.set_frontmatter_status(project_candidate, "in-progress")
+    verify.set_frontmatter_status(project_candidate, "in-progress", confine_root=repo)
     flow = _make_flow(
         workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)
     )
@@ -1686,7 +1759,7 @@ def test_binding_resolution_fault_is_fail_safe_dirty(project, monkeypatch):
     spec = _tracked_spec(project)
     task = _task(repo)
     task.dispatched_spec_file = str(spec)
-    verify.set_frontmatter_status(spec, "in-progress")
+    verify.set_frontmatter_status(spec, "in-progress", confine_root=repo)
     refuse_to_resolve(monkeypatch, spec)
     flow = _make_flow(
         workspace=Workspace.default(project), policy=_policy(rollback_on_failure=False)

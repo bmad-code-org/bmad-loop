@@ -20,7 +20,53 @@ splits are a legacy/attended source only — the current unattended primitive do
 not split a multi-goal spec, it records a `multiple-goals` warning in the spec's
 `warnings:` and proceeds.
 
-The file is append-only — never rewrite or delete existing entries.
+The file is append-only — never rewrite or delete existing entries. The one
+sanctioned rewrite is operator-run archiving (below): closed entries move to
+`deferred-work-archive.md` — body preserved, with an `archived: <date>` marker
+appended after the status line — leaving a stub behind.
+
+## Archiving (`bmad-loop sweep --archive`)
+
+The operator may periodically move closed entries
+(`status: done <ISO date>`) to the sibling `deferred-work-archive.md`, leaving
+a stub in this file:
+
+```markdown
+### DW-7: Old closed item
+
+status: done 2026-05-25
+archived: 2026-08-24
+```
+
+Rules for sessions reading the ledger:
+
+- The stub's `status: done` line means what it always meant — the entry is
+  closed and not open work.
+- An `archived:` line marks content that lives in `deferred-work-archive.md`.
+  The full body (evidence, resolution, dates) is there, keyed by the same
+  DW- id — read the archive file for anything beyond the stub. An id may own
+  more than one block there once a reopened entry has been archived twice.
+  Narrow by the date on this line; when several blocks share it — one entry
+  closed, archived, reopened and archived again inside a single day — take the
+  **last** of them. The archive file is append-only, so for one id a later
+  block is a later closure.
+- An `archived-body:` line is that same pointer carried by an entry that was
+  archived and then **reopened** — the orchestrator writes it in place of the
+  `archived:` stamp, which would otherwise claim a live entry's body is
+  elsewhere. The entry is open work again and its `status:` says so, but the
+  body it carried before that close is still in the archive file — resolve
+  this line exactly as an `archived:` stamp above: narrow by its date, and take
+  the last of the blocks that share it. Reopening does not bring the body back, and a stub keeps neither `location:` nor `reason:`, so read that block
+  before triaging the entry. Never edit or drop the line.
+- The archive may be absent even when a stub or an `archived-body:` line
+  references it: only the ledger is seeded into an isolated unit worktree. That
+  is not an error — the fields the stub preserves are sufficient for dedupe.
+- Stubs keep load-bearing field lines (`gate:`, `origin:`/`source_spec:`,
+  resolution undo markers) — treat them exactly as if the entry were still
+  whole. Never edit or drop them when touching a stub.
+- When deduping against existing entries, a stub still counts: match on the
+  id and preserved `origin:`/`source_spec:` lines, and check the archive for
+  the full substance before appending.
 
 ## Before appending: dedupe check
 
