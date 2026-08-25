@@ -314,6 +314,32 @@ def test_resolve_run_dir_exact_wins_over_ambiguity(tmp_path):
     assert runs.resolve_run_dir(tmp_path, "20260620-143025-a1b2") == exact
 
 
+@pytest.mark.parametrize("ref", ["", ".", "...", ".. ", " .."], ids=repr)
+def test_resolve_run_dir_refuses_the_root_naming_refs(tmp_path, ref):
+    """#480: `_is_path_escape` was the one member of the guard family omitting
+    `names_tree_root`, so a ref naming the runs *root* still reached the exact
+    branch. `""` and `"."` both join to that root exactly — measured here, both
+    `runs / ""` and `runs / "."` *are* the runs dir — so a state.json lying there
+    made `bmad-loop delete ""` hand the whole runs tree to `shutil.rmtree`. The
+    trailing dot/space spellings are the Win32 half of the same rule, cited rather
+    than measurable on POSIX: the trim of trailing periods and spaces leaves `..`
+    or nothing, so they name `.bmad-loop/` or the runs dir there.
+
+    The planted state.json is the load-bearing part of the fixture. Without it the
+    exact branch is inert for every row and the test would pass for the wrong
+    reason. Ablation: drop `names_tree_root` from `_is_path_escape` and the `""`
+    and `"."` rows redden alone — the other three have no POSIX reach to lose."""
+    project = tmp_path / "proj"
+    _make_run(project, "20260620-143025-a1b2")
+    _make_run(project, "20260619-101010-a1c9")
+    runs_root = project / ".bmad-loop" / "runs"
+    (runs_root / "state.json").write_text("{}")  # exactly where "" and "." land
+
+    with pytest.raises(runs.RunRefError):
+        runs.resolve_run_dir(project, ref)
+    assert (runs_root / "state.json").is_file()  # never consumed as a run
+
+
 def test_read_pid_missing_and_garbage(tmp_path):
     run_dir = _make_run(tmp_path, "r1")
     assert runs.read_pid(run_dir) is None
@@ -2452,6 +2478,42 @@ def test_delete_run_proceeds_when_the_multiplexer_cannot_answer(tmp_path, monkey
     assert not run_dir.exists()
 
 
+@pytest.mark.parametrize(
+    "kind", ["outside-the-project", "the-runs-root-itself", "a-nested-grandchild"]
+)
+def test_delete_run_refuses_a_run_dir_outside_the_runs_dir(tmp_path, kind):
+    """#480's containment half, and the reason it is a second guard rather than a
+    tighter ref check: `delete_run` is module-public and takes a `run_dir` outright,
+    so a path composed by any route other than `resolve_run_dir` never meets
+    `_is_path_escape` at all.
+
+    The canary — not the raise — is what grades the guard's PLACEMENT: a guard that
+    raised *after* `shutil.rmtree` would satisfy `pytest.raises` and still have
+    destroyed the directory. Ablation: delete the guard and the raise assertion
+    reddens; move it below the `rmtree` and the canary assertion reddens alone."""
+    project = tmp_path / "proj"
+    _make_run(project, "20260620-143025-a1b2")
+    runs_root = project / ".bmad-loop" / "runs"
+    target = {
+        "outside-the-project": tmp_path / "outside",
+        "the-runs-root-itself": runs_root,
+        "a-nested-grandchild": runs_root / "20260620-143025-a1b2" / "nested",
+    }[kind]
+    target.mkdir(parents=True, exist_ok=True)
+    canary = target / "canary.txt"
+    canary.write_text("survives")
+
+    with pytest.raises(platform_util.UnconfinedWriteError, match="not a run directory under"):
+        runs.delete_run(project, target)
+    assert canary.is_file()
+
+    # `force` is the operator accepting a leaked session, never a licence to
+    # rmtree outside the runs dir — so containment sits above it, not under it.
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        runs.delete_run(project, target, force=True)
+    assert canary.is_file()
+
+
 def _escalated_run(tmp_path, spec_text, *, restore_patch_stale=None, git_project=False):
     """conftest's builder with this module's shape: the spec is written first (so
     `git_project=True` commits it), and only `(run_dir, spec)` comes back."""
@@ -2897,6 +2959,34 @@ def test_archive_run_refuses_while_the_agent_session_is_live(tmp_path, monkeypat
         runs.archive_run(tmp_path, run_dir)
     assert run_dir.exists()
     assert not (tmp_path / ".bmad-loop" / "archive").exists()
+
+
+@pytest.mark.parametrize(
+    "kind", ["outside-the-project", "the-runs-root-itself", "a-nested-grandchild"]
+)
+def test_archive_run_refuses_a_run_dir_outside_the_runs_dir(tmp_path, kind):
+    """Archive carries the same `shutil.rmtree` as delete and needs the same
+    containment (#480). It is checked ahead of the tarball for the reason the
+    session guard is: a refusal must leave no archive directory behind.
+
+    Graded like the delete twin — the canary, not the raise, pins the guard above
+    the `rmtree`."""
+    project = tmp_path / "proj"
+    _make_run(project, "20260611-100000-aaaa")
+    runs_root = project / ".bmad-loop" / "runs"
+    target = {
+        "outside-the-project": tmp_path / "outside",
+        "the-runs-root-itself": runs_root,
+        "a-nested-grandchild": runs_root / "20260611-100000-aaaa" / "nested",
+    }[kind]
+    target.mkdir(parents=True, exist_ok=True)
+    canary = target / "canary.txt"
+    canary.write_text("survives")
+
+    with pytest.raises(platform_util.UnconfinedWriteError, match="not a run directory under"):
+        runs.archive_run(project, target)
+    assert canary.is_file()
+    assert not (project / ".bmad-loop" / "archive").exists()  # nothing staged
 
 
 def test_archive_run_removes_the_out_of_tree_state_counterpart(tmp_path):

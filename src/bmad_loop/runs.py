@@ -32,6 +32,7 @@ from .platform_util import (
     has_parent_ref,
     is_absolute_path,
     is_link_like,
+    names_tree_root,
     retrying_unlink,
     safe_segment,
 )
@@ -560,11 +561,40 @@ def short_ref(run_id: str) -> str:
 
 def _is_path_escape(ref: str) -> bool:
     """True when ``ref`` would steer ``run_dir_for``'s recomposition outside the
-    runs dir — it is absolute/drive-qualified, climbs with ``..``, or carries a
-    path separator of either flavour. Sub-check of the run-id charset rather than
-    `is_valid_run_id` itself: a run dir created by an older version (or by hand)
-    may bear a name we would no longer mint, and must stay addressable."""
-    return is_absolute_path(ref) or has_parent_ref(ref) or "/" in ref or "\\" in ref
+    runs dir — it is absolute/drive-qualified, climbs with ``..``, names the runs
+    dir itself rather than anything inside it, or carries a path separator of
+    either flavour. Sub-check of the run-id charset rather than `is_valid_run_id`
+    itself: a run dir created by an older version (or by hand) may bear a name we
+    would no longer mint, and must stay addressable.
+
+    `names_tree_root` restores this site to the three-guard pairing every sibling
+    already spells (`policy.py`, `adapters/profile.py`, `plugins/manifest.py`); it
+    was the only member of the family omitting it (#480). It closes the spellings
+    that recompose to the runs *root* instead of a run in it. ``""`` and ``"."``
+    join to it exactly — measured here, both `runs / ""` and `runs / "."` *are*
+    the runs dir — so a `state.json` lying at that root made the exact branch
+    below hand `delete_run` the whole runs tree to `rmtree`. ``"..."``, ``".. "``
+    and ``"   "`` are the Win32 half of the same rule (cited, not measurable on
+    POSIX): the trim of trailing periods and spaces leaves ``..`` or nothing, so
+    they name `.bmad-loop/` or the runs dir there while both pure pathlib flavours
+    keep them as ordinary one-segment names.
+
+    Addressability is unharmed: skipping the exact branch only defers to partial
+    matching, and a legacy dir named ``"..."`` is still enumerated by
+    `list_run_dirs` and still matched by its own spelling.
+
+    `names_win32_alias`, the family's fourth member, is deliberately NOT applied
+    here — it would make a legacy run dir named ``NUL`` or ``run. `` permanently
+    unaddressable, which is the one thing this guard exists to prevent. Refusing
+    to *mint* such a name is `is_valid_run_id`'s job, and it already does it with
+    a `safe_segment` identity check."""
+    return (
+        is_absolute_path(ref)
+        or has_parent_ref(ref)
+        or names_tree_root(ref)
+        or "/" in ref
+        or "\\" in ref
+    )
 
 
 def resolve_run_dir(project: Path, ref: str) -> Path:
@@ -1608,6 +1638,36 @@ def _discard_state_dir(project: Path, run_id: str) -> None:
     shutil.rmtree(target, ignore_errors=True)
 
 
+def _refuse_uncontained_run_dir(project: Path, run_dir: Path, action: str) -> None:
+    """Refuse to remove anything but a direct child of ``project``'s runs dir.
+
+    The containment half of #480, and deliberately independent of how the ref was
+    spelled: :func:`_is_path_escape` gates the *string* an operator typed, this
+    gates the *path* the two destructive writes are about to hand `shutil.rmtree`.
+    Both are wanted. `delete_run` and `archive_run` are module-public and take a
+    `run_dir` outright, so a caller that composed one by some route other than
+    :func:`resolve_run_dir` — the TUI's selection, a record read back from disk, a
+    call site not yet written — never passes the ref guard at all.
+
+    ``run_dir_for`` is the sole builder of these paths, so recomposing one from
+    the basename and comparing is exactly the "is a direct child" question: the
+    runs root itself, a nested grandchild, and anything outside the project all
+    differ from what it returns. Comparing against the rebuild rather than
+    walking `parents` keeps this tracking `RUNS_DIR` the way
+    :func:`_project_of_run_dir` does.
+
+    Raises rather than degrading — observation may degrade, a repair write must
+    not: there is no partial `rmtree` to fall back to, and declining quietly would
+    report a removal that never happened. :class:`UnconfinedWriteError` is the
+    shape-refusal this module already raises for the same class of mistake (see
+    :func:`_project_of_run_dir`), and being an ``OSError`` it lands in the
+    handling callers already have for a removal that failed."""
+    if run_dir_for(project, run_dir.name) != run_dir:
+        raise UnconfinedWriteError(
+            f"refusing to {action} {run_dir}: not a run directory under {project / RUNS_DIR}"
+        )
+
+
 def delete_run(project: Path, run_dir: Path, *, force: bool = False) -> None:
     """Permanently remove a run directory. Callers enforce the engine-liveness
     guard; the session guard is enforced here (see :func:`_refuse_live_session`),
@@ -1617,7 +1677,12 @@ def delete_run(project: Path, run_dir: Path, *, force: bool = False) -> None:
     the leak on their own say-so. It deliberately does not kill the session
     instead — that would be unscoped, and this project cannot prove the session is
     its own (which is the whole defect). Trading a possible leak of our own session
-    for a possible kill of someone else's is the wrong direction for an override."""
+    for a possible kill of someone else's is the wrong direction for an override.
+
+    The containment guard runs first and is NOT under ``force``: an override is
+    the operator accepting a leaked session, never a licence to rmtree a path
+    outside the runs dir."""
+    _refuse_uncontained_run_dir(project, run_dir, "delete")
     if not force:
         _refuse_live_session(project, run_dir.name, "delete")
     shutil.rmtree(run_dir)
@@ -1638,7 +1703,12 @@ def archive_run(project: Path, run_dir: Path, *, force: bool = False) -> Path:
     the run's ``events/``: the channel moved out of the tree, and its files are
     transient completion signals the watcher has already consumed — the recorded
     decision accepts losing them from the archive. Everything an archive is read
-    for later (state, journal, tasks, logs) is in the run dir and unaffected."""
+    for later (state, journal, tasks, logs) is in the run dir and unaffected.
+
+    Containment (see :func:`_refuse_uncontained_run_dir`) is checked ahead of both,
+    for the reason the session guard runs early: a refusal must leave no archive
+    directory and no tarball behind."""
+    _refuse_uncontained_run_dir(project, run_dir, "archive")
     if not force:
         _refuse_live_session(project, run_dir.name, "archive")
     archive_dir = project / ARCHIVE_DIR
