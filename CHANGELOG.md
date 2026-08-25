@@ -21,7 +21,9 @@ breaking changes may land in a minor release.
   `origin:`/`source_spec:`, reopenable-close undo markers). The live ledger then carries open
   entries in full and archived ones as compact stubs, rather than every closed body forever.
   Supports `--before DATE` to archive only entries closed before a cutoff, and `--dry-run` to
-  preview. Refuses while any engine run is live. Pure deterministic Python — no LLM involvement.
+  preview. Reopening an archived stub leaves an `archived-body:` line pointing at the archive
+  block that holds its body. Refuses while any engine run is live. Pure deterministic Python —
+  no LLM involvement.
 
 ### Changed
 

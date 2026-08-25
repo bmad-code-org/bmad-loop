@@ -37,7 +37,10 @@ automation-mode.md and end your turn.
 
 An entry carrying an `archived:` line keeps only a stub here — its full body
 lives in the sibling `deferred-work-archive.md`, keyed by the same DW- id; read
-it there before classifying that entry.
+it there before classifying that entry. An `archived-body:` line says the same
+of an entry that was archived and later reopened: it is live work again, but the
+body it carried before that close is still in the archive file, in the block
+stamped with the date the line carries.
 
 If the invocation carries `--feedback <path>`, read that file FIRST — it lists
 the deterministic validation errors your previous attempt's result.json failed

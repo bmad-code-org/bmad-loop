@@ -869,6 +869,11 @@ def mark_open(path: Path, dw_id: str, note: str, operation_id: str) -> bool:
     The entry must still carry the operation's adjacent resolution and undo-marker
     lines. A standard or earlier close has no matching marker and cannot be
     reopened merely because it reused the same human-readable note.
+
+    A live ``archived:`` stamp is demoted to :data:`_ARCHIVED_BODY_FIELD` rather
+    than dropped: the reopened entry is no longer archived, but the body its
+    close moved out still is, and that line is the only thing a later triage has
+    to find it with.
     """
     undo_owner = _operation_digest(operation_id)
     if not path.is_file():
@@ -908,20 +913,42 @@ def mark_open(path: Path, dw_id: str, note: str, operation_id: str) -> bool:
         return False
     start = entry.span[0] + entry.status_span[0]
     end = entry.span[0] + res_m.end()
-    # Drop the entry's live `archived:` stamps along with the close they
-    # describe. A stub's stamp says "this body lives in the archive file"; once
-    # the close is undone the body is here and the line is a lie, and leaving it
-    # is not merely untidy — status + undo tail + stamp is the exact
-    # `_STUB_BODY_RE` shape, so the next reopenable close reconstitutes a stub
-    # `archive_closed` skips forever, stranding the entry outside every future
-    # archive (#711). Cuts are disjoint (an `^archived:` line cannot start
-    # inside the status line or its adjacent tail) and applied back-to-front so
-    # earlier offsets stay valid.
+    # Demote the entry's live `archived:` stamps along with the close they
+    # describe, rather than deleting them. A stub's stamp says "this body lives
+    # in the archive file"; once the close is undone the body is here and the
+    # line is a lie, and leaving it standing is not merely untidy — status +
+    # undo tail + stamp is the exact `_STUB_BODY_RE` shape, so the next
+    # reopenable close reconstitutes a stub `archive_closed` skips forever,
+    # stranding the entry outside every future archive (#711).
+    #
+    # Cutting the line outright strands the entry a second way: a stub keeps
+    # neither `location:` nor `reason:` (`_PRESERVED_FIELD_RE`), so the stamp is
+    # the reopened entry's ONLY route back to the body, and triage arrives with
+    # a heading and nothing to triage (#711 review). Renaming the field keeps
+    # both properties — the value still names the archive block, since an id may
+    # own several and each carries its own `archived:` date, while the renamed
+    # line matches neither `_ARCHIVED_FIELD_RE` nor `_STUB_BODY_RE`, so the
+    # entry reads as live and re-archives normally. Rehydrating the body here
+    # instead was the alternative and is worse: several blocks per id is by
+    # design, so a rollback's reopen would have to guess which one, and a wrong
+    # guess overwrites live content with a stale body.
+    #
+    # Cuts are disjoint (an `^archived:` line cannot start inside the status
+    # line or its adjacent tail) and applied back-to-front so earlier offsets
+    # stay valid.
     cuts = [(start, end, previous_status_line)]
-    cuts += [
-        (entry.span[0] + cut_start, entry.span[0] + cut_end, "")
-        for cut_start, cut_end in _archived_line_spans(entry)
-    ]
+    for cut_start, cut_end in _archived_line_spans(entry):
+        # Everything after the field name — value, spacing and the terminating
+        # newline — carries over verbatim; the span starts at the anchor, so
+        # the first colon is the field's own.
+        stamp = entry.body[cut_start:cut_end].split(":", 1)[1]
+        cuts.append(
+            (
+                entry.span[0] + cut_start,
+                entry.span[0] + cut_end,
+                f"{_ARCHIVED_BODY_FIELD}{stamp}",
+            )
+        )
     for cut_start, cut_end, replacement in sorted(cuts, reverse=True):
         text = text[:cut_start] + replacement + text[cut_end:]
     atomic_write_text(path, text)
@@ -1079,6 +1106,15 @@ ARCHIVE_REL = "deferred-work-archive.md"
 # archive would accumulate duplicates.
 _ARCHIVED_FIELD_RE = re.compile(r"^archived:", re.MULTILINE)
 
+# What :func:`mark_open` leaves where that stamp was. A reopened entry is not
+# archived — its body is back in the ledger — but the body the undone close
+# moved out still is, and this line is what a triage session follows to it.
+# Deliberately a different field name: `archived:` means "the body is
+# elsewhere", which a reopened entry must not claim, and a line matching
+# `_ARCHIVED_FIELD_RE` here would rebuild the exact `_STUB_BODY_RE` shape on
+# the next reopenable close.
+_ARCHIVED_BODY_FIELD = "archived-body:"
+
 
 def _archived_line_spans(entry: DWEntry) -> list[tuple[int, int]]:
     """Body-relative spans of the entry's live ``archived:`` field lines, each
@@ -1090,7 +1126,7 @@ def _archived_line_spans(entry: DWEntry) -> list[tuple[int, int]]:
     check a quoted ``archived:`` would be mistaken for the real thing. The one
     place that rule is written, so the three questions asked about the field —
     is this entry archived, what does its body say apart from the stamp, and
-    which bytes must a reopen drop — cannot answer it differently.
+    which bytes must a reopen rename — cannot answer it differently.
 
     Whole lines rather than match starts because both cutting callers remove
     the line, and a span ending at the anchor would leave the stamp's value

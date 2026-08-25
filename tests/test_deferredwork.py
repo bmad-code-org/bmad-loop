@@ -2896,7 +2896,8 @@ def test_archive_fenced_heading_in_archive_does_not_suppress_reclose(tmp_path):
 # `append_decision` writes to a closed entry without reading its status. The
 # crash-recovery skip therefore cannot key on id + close date alone, the stub
 # shape must survive the spacing `_MARK_DONE_TAIL_RE` tolerates, and a reopen
-# must drop the `archived:` stamp that no longer describes the entry.
+# must demote the `archived:` stamp that no longer describes the entry without
+# severing the reopened entry from the body that stamp was pointing at.
 
 
 def test_archive_same_date_reclose_preserves_new_body(tmp_path):
@@ -2940,8 +2941,8 @@ def test_archive_decision_on_stub_preserved(tmp_path):
 
 def test_mark_open_strips_archived_line(tmp_path):
     """Reopening drops the entry's live `archived:` stamp — the body is back in
-    the ledger, so the line is a lie — while a fenced example of the field is
-    left alone (#711 review)."""
+    the ledger, so the line is a lie — demoting it to `archived-body:`, while a
+    fenced example of the field is left alone (#711 review)."""
     text = (
         "# Deferred Work\n\n"
         "### DW-1: documents the field it also carries\n\n"
@@ -2961,8 +2962,46 @@ def test_mark_open_strips_archived_line(tmp_path):
     entry = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}["DW-1"]
     assert entry.open
     assert "archived: 2026-08-24" not in entry.body  # the live stamp is gone
+    assert "archived-body: 2026-08-24" in entry.body  # demoted, not deleted
     assert "archived: 2026-01-01" in entry.body  # the fenced example is not a stamp
+    assert "archived-body: 2026-01-01" not in entry.body  # ...so it was not demoted
     assert "origin: a" in entry.body  # nothing else was cut
+
+
+def test_mark_open_leaves_a_pointer_to_the_archived_body(tmp_path):
+    """A reopened stub stays triage-resolvable. Its `location:`/`reason:` are in
+    the archive file — the stub preserves neither — so the demoted
+    `archived-body:` line has to name the block holding them. Deleting the
+    stamp outright left triage a heading and nothing to triage (#711 review)."""
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: reopened after archiving\n\n"
+        "origin: a\n"
+        "location: src/x.py:1\n"
+        "reason: waiting on the codec seam\n"
+        "status: open\n"
+    )
+    path = write_ledger(tmp_path, text)
+    close_reopenable(path, "DW-1", "bundle close")
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-1"]
+    assert mark_open(path, "DW-1", "bundle close", OPERATION_ID) is True
+
+    entry = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}["DW-1"]
+    assert entry.open
+    assert "reason: waiting on the codec seam" not in entry.body  # the body did move out
+    pointers = [ln for ln in entry.body.splitlines() if ln.startswith("archived-body:")]
+    assert pointers == ["archived-body: 2026-08-24"]  # and this is what says where to
+
+    # Walk the pointer the way a triage session must: its date picks the block,
+    # since one id owns several once a divergent re-closure is archived too.
+    stamp = pointers[0].split(":", 1)[1].strip()
+    archive_text = (path.parent / ARCHIVE_REL).read_text(encoding="utf-8")
+    blocks = [
+        e for e in parse_ledger(archive_text) if e.id == "DW-1" and f"archived: {stamp}" in e.body
+    ]
+    assert len(blocks) == 1
+    assert "location: src/x.py:1" in blocks[0].body
+    assert "reason: waiting on the codec seam" in blocks[0].body
 
 
 def test_archive_reopened_stub_recloses_and_archives(tmp_path):
