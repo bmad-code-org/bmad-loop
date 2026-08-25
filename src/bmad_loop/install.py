@@ -1790,7 +1790,12 @@ def _shield_enable_worktree_config(worktree: Path, common_dir: Path) -> tuple[st
     the installer will not make behind an operator's back, so the shield degrades
     instead.
 
-    The version gate and both refusal probes STAY HERE, first. The gate is the
+    It is refused a THIRD way, which is this project's rather than git's: an
+    `extensions.worktreeConfig` already PRESENT but not `true` is an operator's
+    explicit disable, and enabling over it would rewrite that declaration
+    permanently — the same discipline as above, applied to the flag itself (#396).
+
+    The version gate and the refusal probes STAY HERE, first. The gate is the
     PROJECT support floor (`verify.GIT_FLOOR`), not a capability threshold of this
     shield's own: `extensions.worktreeConfig` and `git config --worktree` arrived in
     git 2.20 and `--type=` in 2.18, all well below the floor, so on any supported git
@@ -1857,6 +1862,25 @@ def _shield_enable_worktree_config(worktree: Path, common_dir: Path) -> tuple[st
     carried = _shield_shared_config(worktree, shared, "extensions.worktreeConfig", "--type=bool")
     if carried is not None and os.fsdecode(carried).strip() == "true":
         return None, False  # already carried: nothing for the caller to write
+    if carried is not None:
+        # Present but NOT true: enabling over an operator's explicit disable is a stronger
+        # intervention than enabling from ABSENT, and it is the SUCCESS path that does the
+        # lasting damage — rewriting that declaration to `true` forever, unjournaled. The
+        # shield degrades instead, which also puts #396's rollback deletion out of reach.
+        #
+        # `--type=bool` normalized the spelling away (`off`/`no`/`0`/`FALSE` all read back
+        # `false`, measured at 2.34.1 and 2.55.0), so re-read it RAW for the reason and
+        # neutralize it as the sharedRepository arm above does. A GitError from that read
+        # propagates — the caller's tail degrades, and still nothing is enabled. `carried`
+        # stands in only if the key stops existing between the two reads.
+        raw = _shield_shared_config(worktree, shared, "extensions.worktreeConfig")
+        value = os.fsdecode(carried if raw is None else raw).removesuffix("\n")
+        return (
+            f"skipped the git-add shield ({worktree}): the repository's shared config sets "
+            f"extensions.worktreeConfig = {value!r}, explicitly disabling it, and the shield "
+            "will not override an operator's declaration — the provisioned tool files are "
+            "not shielded from the unit's `git add -A`"
+        ), False
     bare = _shield_shared_config(worktree, shared, "core.bare", "--type=bool")
     if bare is not None and os.fsdecode(bare).strip() == "true":
         refused = "core.bare = true"

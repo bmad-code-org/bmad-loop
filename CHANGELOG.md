@@ -44,6 +44,12 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **The git-add shield refuses to enable `extensions.worktreeConfig` over an operator's
+  explicit disable** (#396), instead of enabling it and deleting the line on rollback. The
+  probe read the flag `--type=bool`, so a `false`/`off`/`no`/`0` in the shared config read
+  as "needs enabling": the success path rewrote that declaration to `true` permanently, and
+  a failed activation's `--unset-all` removed the operator's line and reported a clean
+  rollback. Such a repo now gets no shield there, with a reason naming the spelling found.
 - **TUI: a graceful-stop request that cannot be written is reported, not fatal.** The `S`
   worker caught only the helper's own refusals; an `OSError` from the write itself escaped,
   and Textual's default `exit_on_error` took the dashboard down with it. It now surfaces

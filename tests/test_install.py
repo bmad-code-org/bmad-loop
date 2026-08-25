@@ -5088,6 +5088,138 @@ def test_shield_refuses_to_enable_extension_over_core_bare(project, tmp_path):
     assert shared_exclude.read_bytes() == before
 
 
+def _trap_worktree_config_writes(monkeypatch):
+    """Booby-trap every WRITE of `extensions.worktreeConfig`, leaving every read real.
+
+    The refusal arm's whole claim is that nothing is written, and "the key still says
+    `off` afterwards" cannot carry that alone: `git config` rewriting a value the file
+    already holds leaves it byte-identical, so an enable that fired and was rolled back
+    reads exactly like one that never fired.
+
+    Patches BOTH bindings for the reason `_shield_on_git` gives, and guards the argv by
+    PREFIX rather than exact token: `"--get" not in args` is an exact-token test, so a
+    `--get-all` or `--get-regexp` READ misses it and would be raised on as a write — the
+    `_is_unset` trap above, run in the other direction. `--unset` spellings are writes
+    here too, which is deliberate: the rollback deleting an operator's line is the very
+    thing #396 is about."""
+    real = verify.git_bytes
+
+    def no_format_change(worktree, *args, timeout_s=None):
+        reads = any(a.startswith("--get") for a in args)
+        if args[:1] == ("config",) and "extensions.worktreeConfig" in args and not reads:
+            raise AssertionError(f"wrote the flag over an operator's own line: {args}")
+        return real(worktree, *args)
+
+    monkeypatch.setattr(verify, "git_bytes", no_format_change)
+    monkeypatch.setattr(install_mod, "git_bytes", no_format_change)
+
+
+def test_shield_refuses_to_enable_over_an_operator_explicit_false(project, tmp_path, monkeypatch):
+    """An `extensions.worktreeConfig` the operator explicitly turned OFF is a declaration,
+    and the shield stands down rather than overruling it (#396).
+
+    Before this the `--type=bool` probe read `off` as "not `true`" and reported
+    `needs_enable=True`: the SUCCESS path then rewrote the operator's line to `true`
+    permanently with nothing journaling what it replaced, and a failed activation's
+    `--unset-all` deleted the line outright and reported a clean rollback.
+
+    The fixture spells it `off` rather than `false` on purpose. The reason has to quote
+    what is really in the file, and `--type=bool` normalizes `off`/`no`/`0`/`FALSE` all to
+    `false` (measured rc 0 at 2.34.1 and 2.55.0), so a reason built from the probe's own
+    answer would tell the operator about a line they never wrote.
+
+    Ablation: delete the `carried is not None` refusal arm in
+    `_shield_enable_worktree_config` and this fails — the enable fires and the trap
+    raises."""
+    repo = project.project
+    shared = repo / ".git" / "config"
+    # `--file` rather than a scope, and BEFORE the worktree is mounted: this is the state
+    # an operator's repo is already in when provisioning arrives, not one this run made.
+    git(repo, "config", "--file", str(shared), "extensions.worktreeConfig", "off")
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    shared_exclude = repo / ".git" / "info" / "exclude"
+    before = shared_exclude.read_bytes()
+    _trap_worktree_config_writes(monkeypatch)
+
+    reason = _worktree_local_exclude(wt, ["/probe-396"])
+
+    assert reason is not None and "explicitly disabling it" in reason
+    assert "'off'" in reason  # the RAW spelling, re-read for the reason
+    assert "'false'" not in reason  # non-vacuity: the bool probe's normalization did not win
+    assert "worktreeConfig = off" in shared.read_text(encoding="utf-8")
+    assert not _wt_private_exclude(wt).exists()
+    assert shared_exclude.read_bytes() == before
+
+
+def test_shield_refusal_preserves_a_doubled_disabled_flag(project, tmp_path, monkeypatch):
+    """The doubled-key shape, which is where the rollback did its most visible damage:
+    `--unset-all` removes EVERY line, so a repo declaring the flag twice lost both.
+
+    Written by hand rather than through `git config`, which de-duplicates. The two lines
+    are both disabled but spelled differently, which pins the measured reading the arm
+    rests on: `--type=bool --get` validates the whole file and answers the LAST line, so a
+    doubled disabled flag reaches the refusal at rc 0 rather than degrading, and the raw
+    read quotes that last spelling — `off`, not the leading `false` (2.34.1 and 2.55.0).
+
+    Ablation: delete the `carried is not None` refusal arm and this fails — the enable
+    fires and the trap raises."""
+    repo = project.project
+    shared = repo / ".git" / "config"
+    shared.write_text(
+        shared.read_text(encoding="utf-8")
+        + "[extensions]\n\tworktreeConfig = false\n\tworktreeConfig = off\n",
+        encoding="utf-8",
+    )
+    assert shared.read_text(encoding="utf-8").count("worktreeConfig") == 2  # non-vacuity
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    before = shared.read_bytes()
+    _trap_worktree_config_writes(monkeypatch)
+
+    reason = _worktree_local_exclude(wt, ["/probe-396"])
+
+    assert reason is not None and "explicitly disabling it" in reason
+    assert "'off'" in reason  # the LAST line's spelling, which is the one git answers
+    assert shared.read_bytes() == before  # byte-identical: neither line was touched
+    assert not _wt_private_exclude(wt).exists()
+
+
+def test_shield_valueless_flag_counts_as_carried_not_refused(project, tmp_path, monkeypatch):
+    """A VALUELESS `worktreeConfig` line is not an explicit disable, and the refusal above
+    must not swallow it: git reads a key written with no `=` as boolean TRUE (measured rc
+    0, `true`, at 2.34.1 and 2.55.0), so the repo already carries the flag and the shield
+    proceeds with nothing to write.
+
+    This is the claim the refusal arm rests on, which is why it is pinned rather than
+    argued. The arm tests the `--type=bool` probe's NORMALIZED answer instead of the
+    stored text precisely because the stored text here is the empty string, which any
+    truthiness reading calls false.
+
+    Ablation: make the already-carried test read raw truthiness (drop `--type=bool` and
+    test the value) and this fails — the empty stored value reads falsy, the valueless
+    line is refused as a disable, and the shield stands down over a repo that carried the
+    flag all along."""
+    repo = project.project
+    shared = repo / ".git" / "config"
+    shared.write_text(
+        shared.read_text(encoding="utf-8") + "[extensions]\n\tworktreeConfig\n",
+        encoding="utf-8",
+    )
+    # non-vacuity, and this test's own precondition: git must read the hand-written line
+    # as boolean true while the RAW read answers rc 0 with nothing at all.
+    assert git(repo, "config", "--type=bool", "--get", "extensions.worktreeConfig") == "true"
+    assert git(repo, "config", "--get", "extensions.worktreeConfig") == ""
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    _trap_worktree_config_writes(monkeypatch)
+
+    reason = _worktree_local_exclude(wt, ["/probe-396"])
+
+    assert reason is None  # already carried: the shield applied, with nothing to enable
+    assert _wt_private_exclude(wt).exists()
+
+
 def test_shield_refuses_a_repository_shared_between_os_users(project, tmp_path):
     """A repository configured as shared between OS users is not supported (#384), and
     is refused UP FRONT rather than shielded — loudly, and identically for every user.
