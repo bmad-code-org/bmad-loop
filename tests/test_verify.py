@@ -5656,6 +5656,10 @@ def test_engine_written_is_keyword_only_on_all_dev_verifiers():
         ("git version 2.33.8\n", False),  # one minor below it
         ("git version 2.9.5\n", False),  # numeric, not lexicographic: "9" > "34" as text
         ("git version 2.44.0.windows.1\n", True),
+        # The four-component fork spelling `_shield_home_git_ignore` gates its
+        # `%APPDATA%/Git/ignore` preference on (#403). The lookahead has to accept the
+        # `.` that continues into `0.windows.1` for that gate to read 2.46 at all.
+        ("git version 2.46.0.windows.1\n", True),
         ("git version 2.39.5 (Apple Git-154)\n", True),
         ("git version 3.0\n", True),
         ("git version 2.34\n", True),  # bare major.minor: the end-of-string arm

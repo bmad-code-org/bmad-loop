@@ -5088,6 +5088,138 @@ def test_shield_refuses_to_enable_extension_over_core_bare(project, tmp_path):
     assert shared_exclude.read_bytes() == before
 
 
+def _trap_worktree_config_writes(monkeypatch):
+    """Booby-trap every WRITE of `extensions.worktreeConfig`, leaving every read real.
+
+    The refusal arm's whole claim is that nothing is written, and "the key still says
+    `off` afterwards" cannot carry that alone: `git config` rewriting a value the file
+    already holds leaves it byte-identical, so an enable that fired and was rolled back
+    reads exactly like one that never fired.
+
+    Patches BOTH bindings for the reason `_shield_on_git` gives, and guards the argv by
+    PREFIX rather than exact token: `"--get" not in args` is an exact-token test, so a
+    `--get-all` or `--get-regexp` READ misses it and would be raised on as a write — the
+    `_is_unset` trap above, run in the other direction. `--unset` spellings are writes
+    here too, which is deliberate: the rollback deleting an operator's line is the very
+    thing #396 is about."""
+    real = verify.git_bytes
+
+    def no_format_change(worktree, *args, timeout_s=None):
+        reads = any(a.startswith("--get") for a in args)
+        if args[:1] == ("config",) and "extensions.worktreeConfig" in args and not reads:
+            raise AssertionError(f"wrote the flag over an operator's own line: {args}")
+        return real(worktree, *args)
+
+    monkeypatch.setattr(verify, "git_bytes", no_format_change)
+    monkeypatch.setattr(install_mod, "git_bytes", no_format_change)
+
+
+def test_shield_refuses_to_enable_over_an_operator_explicit_false(project, tmp_path, monkeypatch):
+    """An `extensions.worktreeConfig` the operator explicitly turned OFF is a declaration,
+    and the shield stands down rather than overruling it (#396).
+
+    Before this the `--type=bool` probe read `off` as "not `true`" and reported
+    `needs_enable=True`: the SUCCESS path then rewrote the operator's line to `true`
+    permanently with nothing journaling what it replaced, and a failed activation's
+    `--unset-all` deleted the line outright and reported a clean rollback.
+
+    The fixture spells it `off` rather than `false` on purpose. The reason has to quote
+    what is really in the file, and `--type=bool` normalizes `off`/`no`/`0`/`FALSE` all to
+    `false` (measured rc 0 at 2.34.1 and 2.55.0), so a reason built from the probe's own
+    answer would tell the operator about a line they never wrote.
+
+    Ablation: delete the `carried is not None` refusal arm in
+    `_shield_enable_worktree_config` and this fails — the enable fires and the trap
+    raises."""
+    repo = project.project
+    shared = repo / ".git" / "config"
+    # `--file` rather than a scope, and BEFORE the worktree is mounted: this is the state
+    # an operator's repo is already in when provisioning arrives, not one this run made.
+    git(repo, "config", "--file", str(shared), "extensions.worktreeConfig", "off")
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    shared_exclude = repo / ".git" / "info" / "exclude"
+    before = shared_exclude.read_bytes()
+    _trap_worktree_config_writes(monkeypatch)
+
+    reason = _worktree_local_exclude(wt, ["/probe-396"])
+
+    assert reason is not None and "explicitly disabling it" in reason
+    assert "'off'" in reason  # the RAW spelling, re-read for the reason
+    assert "'false'" not in reason  # non-vacuity: the bool probe's normalization did not win
+    assert "worktreeConfig = off" in shared.read_text(encoding="utf-8")
+    assert not _wt_private_exclude(wt).exists()
+    assert shared_exclude.read_bytes() == before
+
+
+def test_shield_refusal_preserves_a_doubled_disabled_flag(project, tmp_path, monkeypatch):
+    """The doubled-key shape, which is where the rollback did its most visible damage:
+    `--unset-all` removes EVERY line, so a repo declaring the flag twice lost both.
+
+    Written by hand rather than through `git config`, which de-duplicates. The two lines
+    are both disabled but spelled differently, which pins the measured reading the arm
+    rests on: `--type=bool --get` validates the whole file and answers the LAST line, so a
+    doubled disabled flag reaches the refusal at rc 0 rather than degrading, and the raw
+    read quotes that last spelling — `off`, not the leading `false` (2.34.1 and 2.55.0).
+
+    Ablation: delete the `carried is not None` refusal arm and this fails — the enable
+    fires and the trap raises."""
+    repo = project.project
+    shared = repo / ".git" / "config"
+    shared.write_text(
+        shared.read_text(encoding="utf-8")
+        + "[extensions]\n\tworktreeConfig = false\n\tworktreeConfig = off\n",
+        encoding="utf-8",
+    )
+    assert shared.read_text(encoding="utf-8").count("worktreeConfig") == 2  # non-vacuity
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    before = shared.read_bytes()
+    _trap_worktree_config_writes(monkeypatch)
+
+    reason = _worktree_local_exclude(wt, ["/probe-396"])
+
+    assert reason is not None and "explicitly disabling it" in reason
+    assert "'off'" in reason  # the LAST line's spelling, which is the one git answers
+    assert shared.read_bytes() == before  # byte-identical: neither line was touched
+    assert not _wt_private_exclude(wt).exists()
+
+
+def test_shield_valueless_flag_counts_as_carried_not_refused(project, tmp_path, monkeypatch):
+    """A VALUELESS `worktreeConfig` line is not an explicit disable, and the refusal above
+    must not swallow it: git reads a key written with no `=` as boolean TRUE (measured rc
+    0, `true`, at 2.34.1 and 2.55.0), so the repo already carries the flag and the shield
+    proceeds with nothing to write.
+
+    This is the claim the refusal arm rests on, which is why it is pinned rather than
+    argued. The arm tests the `--type=bool` probe's NORMALIZED answer instead of the
+    stored text precisely because the stored text here is the empty string, which any
+    truthiness reading calls false.
+
+    Ablation: make the already-carried test read raw truthiness (drop `--type=bool` and
+    test the value) and this fails — the empty stored value reads falsy, the valueless
+    line is refused as a disable, and the shield stands down over a repo that carried the
+    flag all along."""
+    repo = project.project
+    shared = repo / ".git" / "config"
+    shared.write_text(
+        shared.read_text(encoding="utf-8") + "[extensions]\n\tworktreeConfig\n",
+        encoding="utf-8",
+    )
+    # non-vacuity, and this test's own precondition: git must read the hand-written line
+    # as boolean true while the RAW read answers rc 0 with nothing at all.
+    assert git(repo, "config", "--type=bool", "--get", "extensions.worktreeConfig") == "true"
+    assert git(repo, "config", "--get", "extensions.worktreeConfig") == ""
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    _trap_worktree_config_writes(monkeypatch)
+
+    reason = _worktree_local_exclude(wt, ["/probe-396"])
+
+    assert reason is None  # already carried: the shield applied, with nothing to enable
+    assert _wt_private_exclude(wt).exists()
+
+
 def test_shield_refuses_a_repository_shared_between_os_users(project, tmp_path):
     """A repository configured as shared between OS users is not supported (#384), and
     is refused UP FRONT rather than shielded — loudly, and identically for every user.
@@ -6290,6 +6422,72 @@ def test_shield_rollback_scan_fault_is_reported_not_raised(project, tmp_path, mo
     assert "worktreeConfig" in (repo / ".git" / "config").read_text(encoding="utf-8")
 
 
+def test_shield_rollback_stderr_decode_fault_is_reported_not_raised(project, tmp_path, monkeypatch):
+    """The OTHER block of the same never-raises promise, and the same fault shape (#394).
+
+    Where the sibling test above covers the dependents scan, this covers the `--unset-all`
+    block one down: it decodes git's stderr with `os.fsdecode` to name why the rollback
+    failed, and that decode was guarded for `GitError` alone — so a codec fault escaped a
+    function contracted never to raise, replacing BOTH the activation fault and the
+    retained-flag disclosure with the caller's generic tail reason.
+
+    The fault is INJECTED rather than produced from real bytes, for the reason the issue's
+    testability note gives: POSIX `os.fsdecode` decodes with `surrogateescape` and cannot
+    raise, so the real-world trigger is Windows-only (utf-8/surrogatepass rejects a lone
+    invalid byte). Same justification as the sibling's injected `resolve()` fault.
+
+    Driven at the helper rather than through `_worktree_local_exclude`, and for the same
+    reason: an end-to-end injection would fire on an earlier same-shaped `fsdecode` — the
+    caller decodes `rev-parse`'s stderr before the rollback is ever reached — and prove
+    something else. The `os.fsdecode` fake is predicate-scoped to the marker bytes so
+    every other decode in the process keeps working.
+
+    Ablation: restore the bare `except GitError` at the `--unset-all` block and this test
+    errors — the injected UnicodeDecodeError escapes a function contracted never to
+    raise."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    git(repo, "config", "extensions.worktreeConfig", "true")
+    git_dir = Path(git(wt, "rev-parse", "--absolute-git-dir")).resolve()
+    common = Path(git(wt, "rev-parse", "--git-common-dir")).resolve()
+    # the scan must find no dependent, or the helper returns before the decode under test
+    assert not (common / "config.worktree").exists()
+    marker = b"fatal: could not lock config file \xff"
+    real_git_bytes, real_fsdecode = install_mod.git_bytes, os.fsdecode
+
+    def unset_fails(worktree, *args, timeout_s=None):
+        # An exact-argv match, and the `_is_unset` tripwire lesson does not bite here:
+        # a spelling drift makes this fake stop matching, the REAL unset then answers
+        # rc 5 for an absent key, and the helper returns "" — which reddens the clause
+        # assertions below rather than going quiet.
+        if args == ("config", "--unset-all", "extensions.worktreeConfig"):
+            return subprocess.CompletedProcess(
+                args=["git", *args], returncode=2, stdout=b"", stderr=marker
+            )
+        return real_git_bytes(worktree, *args, timeout_s=timeout_s)
+
+    def undecodable(value):
+        if value == marker:
+            raise UnicodeDecodeError("utf-8", b"\x62", 0, 1, "injected")
+        return real_fsdecode(value)
+
+    monkeypatch.setattr(install_mod, "git_bytes", unset_fails)
+    monkeypatch.setattr(os, "fsdecode", undecodable)
+
+    clause = _shield_undo_extension(wt, git_dir, common)
+
+    # before ANY assertion: a globally patched `os.fsdecode` must not outlive the call
+    monkeypatch.undo()
+    assert isinstance(clause, str) and clause  # reported, not raised...
+    assert "could NOT be" in clause  # ...with the hedge the caller's tail cannot give
+    # names the injected decode as the cause, separating it from "git exited 2": the
+    # rc-2 branch is what the escape used to skip past
+    assert "injected" in clause
+    # the flag survives — the fake is why, and the clause is the only thing that says so
+    assert "worktreeConfig" in (repo / ".git" / "config").read_text(encoding="utf-8")
+
+
 def test_shield_rolls_back_inside_the_lock(project, tmp_path, monkeypatch):
     """The ROLLBACK has to happen while the lock is still held, and that placement is
     load-bearing rather than incidental: released first, a second run probes in the
@@ -7135,6 +7333,275 @@ def test_shield_degrades_when_git_will_not_resolve_its_home_directory(
     assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
     (wt / "probe-384").write_text("noise\n", encoding="utf-8")
     assert "probe-384" in git(wt, "status", "--porcelain", "-uall")
+
+
+def _shield_on_reported_git_version(monkeypatch, reported):
+    """Answer `git version` with `reported`; every other call reaches the real git.
+
+    The APPDATA arm of `_shield_home_git_ignore` asks git what it IS rather than
+    asking the OS what it is running on (#403), so the only thing a test has to fake
+    is that one answer — no `sys.platform` patch, and the rest of the shield runs
+    against the real repo and the real linked worktree.
+
+    Patches BOTH bindings, like `_shield_on_git` above and for the same reason:
+    `install.py` does `from .verify import git_bytes`, which is a name distinct from
+    `verify.git_bytes`. The new arm resolves the `install` one while
+    `verify.git_below_floor`'s own floor probe resolves the `verify` one, and patching
+    either alone leaves the other live — silently, in the direction that fakes
+    nothing. Unlike `_shield_on_git` the config write is NOT booby-trapped: these
+    tests drive the shield to completion and then read the file it seeded.
+
+    Returns the argv log, so a test can refuse to pass on a fake that was never
+    consulted."""
+    real = verify.git_bytes
+    seen: list[tuple[str, ...]] = []
+
+    def reporting(worktree, *args, timeout_s=None):
+        if args == ("version",):
+            seen.append(args)
+            return subprocess.CompletedProcess(
+                args=["git", "version"], returncode=0, stdout=reported.encode(), stderr=b""
+            )
+        return real(worktree, *args, timeout_s=timeout_s)
+
+    monkeypatch.setattr(verify, "git_bytes", reporting)
+    monkeypatch.setattr(install_mod, "git_bytes", reporting)
+    return seen
+
+
+def _appdata_and_home_ignores(tmp_path, *, appdata_shape="file"):
+    """A `$HOME` global ignore and (optionally) an `%APPDATA%` one, distinguishable.
+
+    Both carry a pattern of their own so that "seeded the wrong file" and "seeded
+    nothing" are different observations — the second is exactly the silent failure
+    #403 describes, so a test that cannot tell them apart proves nothing."""
+    home = tmp_path / "githome"
+    (home / ".config" / "git").mkdir(parents=True)
+    (home / ".config" / "git" / "ignore").write_text("home-junk.tmp\n", encoding="utf-8")
+    appdata = tmp_path / "appdata"
+    # The four shapes git's `lstat` predicate can meet at `%APPDATA%/Git/ignore`. They
+    # are NOT interchangeable: git reads a file, silently skips a broken symlink, and
+    # dies on a directory, so the shield owes each a different answer.
+    if appdata_shape == "directory":
+        (appdata / "Git" / "ignore").mkdir(parents=True)
+    elif appdata_shape == "broken-symlink":
+        (appdata / "Git").mkdir(parents=True)
+        (appdata / "Git" / "ignore").symlink_to(tmp_path / "nowhere")
+    elif appdata_shape == "file":
+        (appdata / "Git").mkdir(parents=True)
+        (appdata / "Git" / "ignore").write_text("appdata-junk.tmp\n", encoding="utf-8")
+    else:
+        assert appdata_shape == "absent", appdata_shape
+        appdata.mkdir(parents=True)
+    return home, appdata
+
+
+def _drive_shield(project, tmp_path, monkeypatch, *, reported, appdata_shape="file"):
+    """Run the shield over a real worktree against a faked `git version`; return its
+    degrade reason (None when it applied) and the private exclude's lines.
+
+    The env is pinned inside a `monkeypatch.context()` because conftest's
+    session-scoped `_isolate_ambient_git_ignores` pins `XDG_CONFIG_HOME` for every
+    test, and the caller only reaches `_shield_home_git_ignore` when that variable is
+    unset AND `core.excludesFile` is unset (which conftest already arranges by
+    pointing `GIT_CONFIG_GLOBAL` at a file that does not exist). `GIT_CONFIG_NOSYSTEM`
+    is deliberately NOT pinned, for the reason conftest records: it would suppress Git
+    for Windows' system `core.autocrlf`. A system-level `core.excludesFile` would send
+    the shield down the branch above instead, and every caller here asserts on BOTH a
+    pattern that must be seeded and one that must not, so that case fails loudly
+    rather than passing vacuously."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    home, appdata = _appdata_and_home_ignores(tmp_path, appdata_shape=appdata_shape)
+    seen = _shield_on_reported_git_version(monkeypatch, reported)
+
+    with monkeypatch.context() as pinned:
+        pinned.delenv("XDG_CONFIG_HOME", raising=False)
+        pinned.setenv("HOME", str(home))
+        pinned.setenv("APPDATA", str(appdata))
+        reason = _worktree_local_exclude(wt, ["/probe-403"])
+
+    assert seen, "the fake never answered `git version` — the shield read a real one"
+    private = _wt_private_exclude(wt)
+    lines = private.read_text(encoding="utf-8").splitlines() if private.is_file() else []
+    return reason, lines
+
+
+def _seed_with(project, tmp_path, monkeypatch, *, reported, appdata_shape="file"):
+    """`_drive_shield` for the APPLIED case: refuses a degrade, returns the lines."""
+    reason, lines = _drive_shield(
+        project, tmp_path, monkeypatch, reported=reported, appdata_shape=appdata_shape
+    )
+    assert reason is None, f"the shield degraded instead of applying: {reason}"
+    return lines
+
+
+def test_shield_prefers_appdata_ignore_on_the_windows_fork(project, tmp_path, monkeypatch):
+    """On Git for Windows >= 2.46 the operator's global ignores live at
+    `%APPDATA%\\Git\\ignore`, and that is the file the shield must copy (#403).
+
+    The fork patches `xdg_config_home_for` (`git-for-windows/git`, `path.c`) to prefer
+    `%APPDATA%/Git/<file>` over the `$HOME/.config/git/<file>` upstream computes,
+    whenever the APPDATA one exists — and when BOTH exist it warns that the `$HOME`
+    one "was ignored because" the APPDATA one is there. They are alternative
+    locations, not a search path.
+
+    PROVENANCE: that is a SOURCE READ of the fork (counted per tag through #403:
+    present at 2.46 and 2.55, absent at 2.45 and 2.20, absent upstream), **not a
+    measurement**. No Windows machine was available to observe it, and Windows CI
+    could not have supplied one either — its runners carry no `%APPDATA%\\Git\\ignore`.
+    So this test pins OUR selection logic against a version string we state; it cannot
+    and does not claim Git for Windows agrees.
+
+    Both files exist here, which folds the mirror direction in: preferring APPDATA is
+    the same assertion as not seeding the `$HOME` file git itself is ignoring. Seeding
+    that one would copy patterns git is not applying, and the worktree would
+    OVER-ignore — session-created files going silently missing from `git add -A`,
+    #384's harm inverted.
+
+    Ablation: delete the whole APPDATA arm and this fails — `home-junk.tmp` is seeded
+    and `appdata-junk.tmp` is not, which is the pre-fix behavior exactly."""
+    seeded = _seed_with(project, tmp_path, monkeypatch, reported="git version 2.46.0.windows.1\n")
+
+    assert "appdata-junk.tmp" in seeded
+    assert "home-junk.tmp" not in seeded
+
+
+def test_shield_appdata_ignore_needs_the_246_fork(project, tmp_path, monkeypatch):
+    """2.45.0.windows.1 is the same FORK without the patch, and it reads `$HOME`.
+
+    The preference arrived at 2.46 (`APPDATA` is absent from `path.c` at
+    2.45.0.windows.1 and 2.20.0.windows.1, counted per tag through #403), far above
+    this project's own `GIT_FLOOR`. So "APPDATA exists, prefer it" is not enough on
+    its own: on an older Git for Windows it would seed a file git is not reading and
+    the worktree would over-ignore — the same silent loss the fix exists to stop,
+    aimed the other way.
+
+    Ablation: delete the `git_version_at_least` conjunct and this fails —
+    `appdata-junk.tmp` is seeded off a fork that never had the patch."""
+    seeded = _seed_with(project, tmp_path, monkeypatch, reported="git version 2.45.0.windows.1\n")
+
+    assert "home-junk.tmp" in seeded
+    assert "appdata-junk.tmp" not in seeded
+
+
+def test_shield_appdata_ignore_is_the_forks_not_the_platforms(project, tmp_path, monkeypatch):
+    """A current UPSTREAM git ignores `%APPDATA%` however new it is, so the gate reads
+    the fork string rather than the platform (#403).
+
+    `APPDATA` appears nowhere in `git/git`'s `path.c` at any version, so 2.55.0
+    upstream is above the 2.46 floor and still has no such preference. That is why
+    this gate is not `sys.platform == "win32"`: Cygwin, MSYS2 and WSL gits all run on
+    Windows hardware and are all upstream builds, and a platform test would hand every
+    one of them the wrong file. Asking git what it IS also keeps this test honest —
+    it fakes a version string, never a platform, and so it exercises the real code
+    path on the box it runs on.
+
+    Ablation: delete the `".windows." in reported` conjunct and this fails —
+    `appdata-junk.tmp` is seeded off an upstream git that would never read it."""
+    seeded = _seed_with(project, tmp_path, monkeypatch, reported="git version 2.55.0\n")
+
+    assert "home-junk.tmp" in seeded
+    assert "appdata-junk.tmp" not in seeded
+
+
+def test_shield_appdata_ignore_directory_degrades_instead_of_seeding_empty(
+    project, tmp_path, monkeypatch
+):
+    """A DIRECTORY at `%APPDATA%\\Git\\ignore` is selected by git and then UNUSABLE by it,
+    so the shield stands down rather than modelling that fatal as an empty seed.
+
+    Git's predicate is `lstat` (`file_exists`, `dir.c`), so `xdg_config_home_for`
+    selects a directory exactly as it selects a file. Reading it is where the two part:
+    `access(R_OK)` succeeds on a readable directory, so git reaches
+    `add_patterns_from_file_1` and dies — "cannot use %s as an exclude file".
+
+    Seeding nothing here would be the WRONG mirror. The shield's activation writes a
+    worktree-scoped `core.excludesFile`, which SHADOWS the broken path, so the unit's
+    `git add -A` would run happily inside the worktree where the operator's own git
+    refuses to run at all — a misconfiguration silently masked, and files staged where
+    the unshielded command would have halted. An unusable answer is UNKNOWN, not empty,
+    which is the same reading this module already gives an unresolvable `$HOME`.
+
+    PROVENANCE: source read of the fork, as the sibling tests record — the version
+    string is faked and nothing here was measured on Windows.
+
+    Ablation: drop the `is_dir()` refusal and this fails — the shield applies, `reason`
+    comes back None, and the private exclude carries `/probe-403` with no inherited
+    patterns, which is the masked-fatal shape exactly."""
+    reason, _lines = _drive_shield(
+        project,
+        tmp_path,
+        monkeypatch,
+        reported="git version 2.46.0.windows.1\n",
+        appdata_shape="directory",
+    )
+
+    assert reason is not None
+    assert "is a directory" in reason
+    # ...and it named the path, so the operator can find the thing to repair.
+    assert str(tmp_path / "appdata") in reason
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_shield_appdata_ignore_broken_symlink_seeds_empty_not_a_refusal(
+    project, tmp_path, monkeypatch
+):
+    """A BROKEN SYMLINK there is selected too, and unlike a directory it must NOT refuse.
+
+    This is the discriminator for the refusal above: git's `lstat` predicate accepts
+    both shapes, but its READ path treats them differently. `access(R_OK)` follows the
+    link to a missing target, giving `ENOENT`, which `access_error_is_ok` classifies as
+    an ignorable missing file — so git prints nothing, loads no patterns, and runs on.
+
+    An empty inherited seed mirrors that precisely, and refusing here instead would
+    stand the shield down over a configuration git itself is perfectly happy with. The
+    `$HOME` file must not be seeded either: git selected the APPDATA path and is not
+    reading `$HOME` at all.
+
+    Ablation: widen the `is_dir()` refusal to any non-regular candidate and this fails —
+    the shield degrades over a repo whose git runs fine."""
+    reason, lines = _drive_shield(
+        project,
+        tmp_path,
+        monkeypatch,
+        reported="git version 2.46.0.windows.1\n",
+        appdata_shape="broken-symlink",
+    )
+
+    assert reason is None, reason
+    assert "home-junk.tmp" not in lines
+    assert "appdata-junk.tmp" not in lines
+    # ...and the shield still RAN: the inherited seed is empty, not the whole file.
+    assert "/probe-403" in lines
+
+
+def test_shield_appdata_absent_file_keeps_the_home_fallback(project, tmp_path, monkeypatch):
+    """`%APPDATA%` set with no `Git/ignore` under it is the ORDINARY case on the fork,
+    and it must reach `$HOME` — the preference is conditional on the file existing.
+
+    The `_shield_file_exists` precondition mirrors the fork's own `file_exists` guard:
+    git does not prefer a path that is not there, it computes the `$HOME` one instead.
+    Dropping it
+    would not merely seed the wrong file, it would seed NOTHING — a non-existent
+    source reads as an empty seed with `reason is None`, after which the caller
+    activates a worktree-scoped `core.excludesFile` that SHADOWS the operator's real
+    global ignores. That is #403's own harm, and it is silent.
+
+    Ablation: drop the `_shield_file_exists` precondition and this fails — the arm
+    returns the absent candidate, the seed comes back empty, and `home-junk.tmp` is
+    missing."""
+    seeded = _seed_with(
+        project,
+        tmp_path,
+        monkeypatch,
+        reported="git version 2.46.0.windows.1\n",
+        appdata_shape="absent",
+    )
+
+    assert "home-junk.tmp" in seeded
+    assert "/probe-403" in seeded  # ...and the seed is not empty for some other reason
 
 
 def test_shield_seeds_a_relative_xdg_config_home_resolved_like_git(project, tmp_path, monkeypatch):

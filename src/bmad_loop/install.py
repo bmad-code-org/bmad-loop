@@ -34,7 +34,7 @@ from .checks import Finding
 from .platform_util import atomic_write_bytes, atomic_write_text, file_lock
 from .policy import POLICY_TEMPLATE
 from .process_host import get_process_host
-from .verify import GitError, git_below_floor, git_bytes, git_floor_text
+from .verify import GitError, git_below_floor, git_bytes, git_floor_text, git_version_at_least
 
 HOOK_SCRIPT_REL = ".bmad-loop/bmad_loop_hook.py"
 # Markers for bmad-loop-managed hook commands. RELAY_MARKER is shared by
@@ -1790,7 +1790,12 @@ def _shield_enable_worktree_config(worktree: Path, common_dir: Path) -> tuple[st
     the installer will not make behind an operator's back, so the shield degrades
     instead.
 
-    The version gate and both refusal probes STAY HERE, first. The gate is the
+    It is refused a THIRD way, which is this project's rather than git's: an
+    `extensions.worktreeConfig` already PRESENT but not `true` is an operator's
+    explicit disable, and enabling over it would rewrite that declaration
+    permanently — the same discipline as above, applied to the flag itself (#396).
+
+    The version gate and the refusal probes STAY HERE, first. The gate is the
     PROJECT support floor (`verify.GIT_FLOOR`), not a capability threshold of this
     shield's own: `extensions.worktreeConfig` and `git config --worktree` arrived in
     git 2.20 and `--type=` in 2.18, all well below the floor, so on any supported git
@@ -1857,6 +1862,25 @@ def _shield_enable_worktree_config(worktree: Path, common_dir: Path) -> tuple[st
     carried = _shield_shared_config(worktree, shared, "extensions.worktreeConfig", "--type=bool")
     if carried is not None and os.fsdecode(carried).strip() == "true":
         return None, False  # already carried: nothing for the caller to write
+    if carried is not None:
+        # Present but NOT true: enabling over an operator's explicit disable is a stronger
+        # intervention than enabling from ABSENT, and it is the SUCCESS path that does the
+        # lasting damage — rewriting that declaration to `true` forever, unjournaled. The
+        # shield degrades instead, which also puts #396's rollback deletion out of reach.
+        #
+        # `--type=bool` normalized the spelling away (`off`/`no`/`0`/`FALSE` all read back
+        # `false`, measured at 2.34.1 and 2.55.0), so re-read it RAW for the reason and
+        # neutralize it as the sharedRepository arm above does. A GitError from that read
+        # propagates — the caller's tail degrades, and still nothing is enabled. `carried`
+        # stands in only if the key stops existing between the two reads.
+        raw = _shield_shared_config(worktree, shared, "extensions.worktreeConfig")
+        value = os.fsdecode(carried if raw is None else raw).removesuffix("\n")
+        return (
+            f"skipped the git-add shield ({worktree}): the repository's shared config sets "
+            f"extensions.worktreeConfig = {value!r}, explicitly disabling it, and the shield "
+            "will not override an operator's declaration — the provisioned tool files are "
+            "not shielded from the unit's `git add -A`"
+        ), False
     bare = _shield_shared_config(worktree, shared, "core.bare", "--type=bool")
     if bare is not None and os.fsdecode(bare).strip() == "true":
         refused = "core.bare = true"
@@ -1957,9 +1981,16 @@ def _shield_undo_extension(worktree: Path, git_dir: Path, common_dir: Path) -> s
         if undone.returncode in (0, 5):
             return ""
         detail = os.fsdecode(undone.stderr).strip() or f"git exited {undone.returncode}"
-    except GitError as e:
+    except (GitError, UnicodeError) as e:
         # the rollback's OWN git can time out or fail to spawn: a read-only `.git` or
         # a dead git fails this unset for the same reason it failed the activation.
+        #
+        # `UnicodeError` is the `fsdecode` of git's stderr one line up (#394): Windows
+        # decodes utf-8/surrogatepass, which REJECTS a lone invalid byte, so without it
+        # a codec fault escapes a function contracted never to raise (POSIX decodes
+        # with surrogateescape and never raises). `OSError`/`RuntimeError` are
+        # deliberately absent, so this is NOT a copy of the sibling scan's tuple above:
+        # nothing in this block resolves a path, which is what those two are there for.
         detail = str(e)
     # Both clauses HEDGE whether this shield set the flag, and must: reached from the
     # enable's own raise, a spawn failure can kill the enable and this unset alike,
@@ -1970,6 +2001,43 @@ def _shield_undo_extension(worktree: Path, git_dir: Path, common_dir: Path) -> s
         f"rolled back ({detail}) — if this shield set the flag, the repository keeps "
         "a permanent format change that shields nothing"
     )
+
+
+# The Git for Windows FORK patches `xdg_config_home_for` (`path.c`) to prefer
+# `%APPDATA%/Git/<file>` over the `$HOME/.config/git/<file>` upstream computes,
+# from this version onward (absent at 2.45, absent upstream at every version).
+# `_shield_home_git_ignore` gates on it (#403).
+_APPDATA_IGNORE_GIT = (2, 46)
+
+
+def _shield_file_exists(candidate: Path) -> bool:
+    """git's OWN existence predicate, which is `lstat(f, &sb) == 0` (`dir.c`).
+
+    Deliberately NOT `Path.is_file()`. `lstat` succeeds on a DIRECTORY and on a BROKEN
+    SYMLINK, so `xdg_config_home_for` selects those exactly as it selects a regular
+    file, and a narrower test here would reject what the fork accepts — sending this
+    module down the `$HOME` arm git is NOT reading, which is #403's over-ignore
+    direction rather than a safe fall-through.
+
+    Selecting is not the same as being able to MIRROR, and the two non-regular shapes
+    part company right there — the caller distinguishes them:
+
+    - a BROKEN SYMLINK is dropped by git's own `access_or_warn(..., R_OK)` gate, whose
+      `ENOENT` counts as an ignorable missing file, so git loads no patterns and runs
+      on. The caller's `is_file()` seeds nothing, which mirrors that exactly.
+    - a DIRECTORY passes that same `access(R_OK)` gate, so git goes on to
+      `add_patterns_from_file_1` and `die("cannot use %s as an exclude file")`. Git
+      does not run at all, and an empty seed would model a FATAL as a permissive
+      success — see `_shield_home_git_ignore`, which refuses that shape.
+
+    Swallows `OSError` alone — a candidate this process cannot stat is one the shield
+    must treat as absent, exactly as `file_exists` reports a failed `lstat`.
+    """
+    try:
+        os.lstat(candidate)
+    except OSError:
+        return False
+    return True
 
 
 def _shield_home_git_ignore(worktree: Path) -> Path:
@@ -1996,12 +2064,25 @@ def _shield_home_git_ignore(worktree: Path) -> Path:
     operator's config. The answer comes back NUL-terminated at rc 0; with `HOME`
     unset git exits 128 and applies no fallback at all.
 
-    KNOWN GAP: this answers "where is git's `$HOME`", which is the whole of the
-    fallback UPSTREAM but not on **Git for Windows >= 2.46**, whose fork patches
-    `xdg_config_home_for` to prefer `%APPDATA%/Git/<file>` whenever that file EXISTS.
-    An operator there keeping global ignores at `%APPDATA%\\Git\\ignore` still gets
-    the wrong file seeded. Not fixed here: a downstream fork's behavior, and one
-    gated well above `GIT_FLOOR` at that.
+    That `$HOME` answer is the whole of the fallback UPSTREAM, and is not on **Git
+    for Windows >= 2.46** (#403). The fork patches `xdg_config_home_for`
+    (`git-for-windows/git`, `path.c`) to prefer `%APPDATA%/Git/<file>` whenever that
+    file EXISTS, warning that it ignored the `$HOME` one when both are there. Counted
+    per tag: present at 2.46.0.windows.1 and 2.55.0.windows.3, absent at
+    2.45.0.windows.1 and 2.20.0.windows.1, absent from upstream `git/git` entirely.
+    PROVENANCE: source-read through #403, **NOT measured on a Windows machine** — no
+    runtime observation of Git for Windows was available, and Windows CI cannot supply
+    one either (the runners carry no `%APPDATA%\\Git\\ignore`, so they can show only
+    that nothing broke).
+
+    The APPDATA arm below closes a harm that ran in BOTH directions, each silent.
+    APPDATA file only: this returned a `$HOME` path that is typically not a file, the
+    seed came back empty with `reason is None`, and the caller then activated a
+    worktree-scoped `core.excludesFile` SHADOWING the file git really reads — so
+    everything the operator globally ignores became visible to `git add -A` and swept
+    into the story commit. BOTH files present: git uses the APPDATA one and says so,
+    while this seeded the `$HOME` one — copying patterns git is not applying, so the
+    worktree OVER-ignored and session-created files went silently missing instead.
 
     Raises `GitError` on any non-zero rc, INCLUDING the `HOME`-unset one. Proceeding
     would be a guess, and a guess here is silent: the caller seeds nothing and
@@ -2010,6 +2091,52 @@ def _shield_home_git_ignore(worktree: Path) -> Path:
     version-dependent. A `HOME`-less environment therefore skips the shield with a
     reported reason; only a definite absent may be silent in this caller.
     """
+    # Cheap-first, and every arm that does not MATCH falls through to the `$HOME`
+    # probe below — no APPDATA, no such file, an unanswerable `git version`, upstream
+    # git, a fork below 2.46. That fall-through is the conservative direction: it is
+    # exactly the pre-fix behavior, and a git too dead to report its version is not
+    # absolved by it, because the probe below raises its own `GitError` on the same
+    # git and the caller degrades with a reason.
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        candidate = Path(appdata) / "Git" / "ignore"
+        # LOAD-BEARING, and it mirrors the fork's own `file_exists` precondition
+        # EXACTLY rather than approximately — see `_shield_file_exists` for why an
+        # `is_file()` here would reject a directory and a broken symlink that git
+        # itself selects. It is also what keeps the cost at one `lstat` on every other
+        # platform: only a candidate that exists is worth the extra spawn below.
+        if _shield_file_exists(candidate):
+            # Gated on the FORK STRING, deliberately NOT `sys.platform` (#403). The
+            # preference is a patch carried by one FORK, not a property of the OS:
+            # Cygwin, MSYS2 and WSL gits run on Windows hardware without it, and a
+            # `win32` test would hand them the wrong file. This module has no
+            # `sys.platform` branch anywhere else, and asking git what it is keeps the
+            # tests honest — they fake a version string, never a platform.
+            version = git_bytes(worktree, "version")
+            if version.returncode == 0:
+                reported = os.fsdecode(version.stdout)
+                if ".windows." in reported and git_version_at_least(reported, _APPDATA_IGNORE_GIT):
+                    if candidate.is_dir():
+                        # SELECTED by git and then UNUSABLE by it: `access(R_OK)`
+                        # succeeds on a readable directory, so git reaches
+                        # `add_patterns_from_file_1` and dies ("cannot use %s as an
+                        # exclude file"). Returning it would seed nothing — and an
+                        # empty seed here is not the faithful mirror it is for a broken
+                        # symlink, it is a FATAL rendered as a permissive success:
+                        # activating a worktree-scoped `core.excludesFile` SHADOWS the
+                        # broken path, so the unit's `git add -A` would run happily
+                        # where the operator's own git refuses to run at all, and the
+                        # misconfiguration would never surface.
+                        #
+                        # `is_dir()` FOLLOWS the link deliberately: a symlink to a
+                        # directory is the same fatal. A broken one is not a directory
+                        # and falls through to be seeded as empty, which is what git
+                        # does with it.
+                        raise GitError(
+                            f"git's global ignore path is a directory ({candidate}) — "
+                            "git for Windows selects it and then cannot read it"
+                        )
+                    return candidate
     key = "bmadloop.xdghomeprobe"
     probe = git_bytes(
         worktree, "-c", f"{key}=~/.config/git/ignore", "config", "-z", "--type=path", "--get", key
@@ -2310,7 +2437,8 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
         # `except` of its own: a non-zero rc returns the reason below, a raise lands in
         # this try's tail — which also catches the `UnicodeError` the `fsdecode` of
         # git's stderr can raise on Windows, hence that read sits inside the guard.
-        # #394 records that same decode escaping at a sibling block that lacks it.
+        # The sibling decode in `_shield_undo_extension`'s rollback carries that same
+        # guard, for the same reason (#394).
         shared_answer = git_bytes(worktree, "rev-parse", "--git-common-dir")
         if shared_answer.returncode != 0:
             detail = (

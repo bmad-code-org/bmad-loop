@@ -44,6 +44,17 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **The git-add shield refuses to enable `extensions.worktreeConfig` over an operator's
+  explicit disable** (#396), instead of enabling it and deleting the line on rollback. The
+  probe read the flag `--type=bool`, so a `false`/`off`/`no`/`0` in the shared config read
+  as "needs enabling": the success path rewrote that declaration to `true` permanently, and
+  a failed activation's `--unset-all` removed the operator's line and reported a clean
+  rollback. Such a repo now gets no shield there, with a reason naming the spelling found.
+- **The git-add shield seeds `%APPDATA%/Git/ignore` on Git for Windows >= 2.46** (#403), the
+  file that fork prefers over `$HOME/.config/git/ignore` whenever it exists. Seeding the
+  `$HOME` one there was wrong in both directions — an empty seed that let global ignores leak
+  into `git add -A`, or patterns git is not applying that made session files go missing. Gated
+  on the reported version's own `.windows.` fork string, not on the platform.
 - **TUI: a graceful-stop request that cannot be written is reported, not fatal.** The `S`
   worker caught only the helper's own refusals; an `OSError` from the write itself escaped,
   and Textual's default `exit_on_error` took the dashboard down with it. It now surfaces
@@ -58,6 +69,9 @@ breaking changes may land in a minor release.
   sitting there. Also refuse an empty or `:`-bearing session name before the probe spawns. A
   same-named session on a foreign server, and one differing only by whitespace the seam
   normalizes away, stay #531's subject (#671)
+- The git-add shield's rollback report no longer raises through its own stderr decode on
+  Windows (#394). `_shield_undo_extension` is contracted never to raise, but the `fsdecode` of a
+  failing `--unset-all`'s stderr was guarded for `GitError` alone.
 
 ### Security
 
