@@ -2010,6 +2010,32 @@ def _shield_undo_extension(worktree: Path, git_dir: Path, common_dir: Path) -> s
 _APPDATA_IGNORE_GIT = (2, 46)
 
 
+def _shield_file_exists(candidate: Path) -> bool:
+    """git's OWN existence predicate, which is `lstat(f, &sb) == 0` (`dir.c`).
+
+    Deliberately NOT `Path.is_file()`. `lstat` succeeds on a DIRECTORY and on a BROKEN
+    SYMLINK, so `xdg_config_home_for` selects those exactly as it selects a regular
+    file, and a narrower test here would reject what the fork accepts — sending this
+    module down the `$HOME` arm git is NOT reading, which is #403's over-ignore
+    direction rather than a safe fall-through.
+
+    A non-regular candidate still seeds NOTHING, because the caller applies its own
+    `is_file()` before reading it, and that empty seed is the faithful answer: git
+    applies no patterns from either shape. A broken symlink is dropped by git's own
+    `access_or_warn(..., R_OK)` gate, whose `ENOENT` counts as an ignorable missing
+    file; a directory makes git `die("cannot use %s as an exclude file")` instead, so
+    there are no patterns to mirror in either case.
+
+    Swallows `OSError` alone — a candidate this process cannot stat is one the shield
+    must treat as absent, exactly as `file_exists` reports a failed `lstat`.
+    """
+    try:
+        os.lstat(candidate)
+    except OSError:
+        return False
+    return True
+
+
 def _shield_home_git_ignore(worktree: Path) -> Path:
     """`$HOME/.config/git/ignore` — git's XDG fallback — asked of GIT, not of Python.
 
@@ -2070,11 +2096,12 @@ def _shield_home_git_ignore(worktree: Path) -> Path:
     appdata = os.environ.get("APPDATA")
     if appdata:
         candidate = Path(appdata) / "Git" / "ignore"
-        # LOAD-BEARING, and it mirrors the fork's own `file_exists` precondition: the
-        # preference applies only when that file is really there. It is also what
-        # keeps the cost at one stat on every other platform — only a candidate that
-        # exists is worth the extra spawn below.
-        if candidate.is_file():
+        # LOAD-BEARING, and it mirrors the fork's own `file_exists` precondition
+        # EXACTLY rather than approximately — see `_shield_file_exists` for why an
+        # `is_file()` here would reject a directory and a broken symlink that git
+        # itself selects. It is also what keeps the cost at one `lstat` on every other
+        # platform: only a candidate that exists is worth the extra spawn below.
+        if _shield_file_exists(candidate):
             # Gated on the FORK STRING, deliberately NOT `sys.platform` (#403). The
             # preference is a patch carried by one FORK, not a property of the OS:
             # Cygwin, MSYS2 and WSL gits run on Windows hardware without it, and a

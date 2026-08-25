@@ -7369,7 +7369,7 @@ def _shield_on_reported_git_version(monkeypatch, reported):
     return seen
 
 
-def _appdata_and_home_ignores(tmp_path, *, appdata_file=True):
+def _appdata_and_home_ignores(tmp_path, *, appdata_file=True, appdata_dir=False):
     """A `$HOME` global ignore and (optionally) an `%APPDATA%` one, distinguishable.
 
     Both carry a pattern of their own so that "seeded the wrong file" and "seeded
@@ -7379,7 +7379,11 @@ def _appdata_and_home_ignores(tmp_path, *, appdata_file=True):
     (home / ".config" / "git").mkdir(parents=True)
     (home / ".config" / "git" / "ignore").write_text("home-junk.tmp\n", encoding="utf-8")
     appdata = tmp_path / "appdata"
-    if appdata_file:
+    if appdata_dir:
+        # A DIRECTORY where the fork expects a file: git's `lstat` predicate selects it
+        # anyway, so the shield must too (see `_shield_file_exists`).
+        (appdata / "Git" / "ignore").mkdir(parents=True)
+    elif appdata_file:
         (appdata / "Git").mkdir(parents=True)
         (appdata / "Git" / "ignore").write_text("appdata-junk.tmp\n", encoding="utf-8")
     else:
@@ -7387,7 +7391,7 @@ def _appdata_and_home_ignores(tmp_path, *, appdata_file=True):
     return home, appdata
 
 
-def _seed_with(project, tmp_path, monkeypatch, *, reported, appdata_file=True):
+def _seed_with(project, tmp_path, monkeypatch, *, reported, appdata_file=True, appdata_dir=False):
     """Run the shield over a real worktree against a faked `git version`; return the
     private exclude's lines.
 
@@ -7404,7 +7408,9 @@ def _seed_with(project, tmp_path, monkeypatch, *, reported, appdata_file=True):
     repo = project.project
     wt = tmp_path / "wt"
     verify.worktree_add(repo, wt, "feat", "main")
-    home, appdata = _appdata_and_home_ignores(tmp_path, appdata_file=appdata_file)
+    home, appdata = _appdata_and_home_ignores(
+        tmp_path, appdata_file=appdata_file, appdata_dir=appdata_dir
+    )
     seen = _shield_on_reported_git_version(monkeypatch, reported)
 
     with monkeypatch.context() as pinned:
@@ -7486,19 +7492,59 @@ def test_shield_appdata_ignore_is_the_forks_not_the_platforms(project, tmp_path,
     assert "appdata-junk.tmp" not in seeded
 
 
+def test_shield_appdata_ignore_directory_is_selected_like_gits_lstat(
+    project, tmp_path, monkeypatch
+):
+    """A DIRECTORY at `%APPDATA%\\Git\\ignore` is SELECTED, because git's predicate is `lstat`.
+
+    `xdg_config_home_for` gates the preference on `file_exists` (`path.c`), and
+    `file_exists` is `lstat(f, &sb) == 0` (`dir.c`) — so a directory satisfies it and
+    the fork returns that path as its `excludes_file`. A `Path.is_file()` here would
+    reject what git accepts and fall through to `$HOME`, seeding patterns git is not
+    applying: the OVER-IGNORE direction, since git never reads the `$HOME` file once it
+    has selected the APPDATA one.
+
+    What the shield seeds for that shape is NOTHING, and that is the faithful answer
+    rather than an accident of the caller: the caller's own `is_file()` refuses to read
+    a directory, and git gets no usable patterns from one either — it dies on it
+    (`add_patterns_from_file_1`, `dir.c`). An empty inherited seed is what both ends
+    agree on.
+
+    PROVENANCE: a source read of the fork, as the sibling tests record — the version
+    string is faked, and nothing here was measured on Windows.
+
+    Ablation: narrow `_shield_file_exists` back to `candidate.is_file()` and this fails
+    — the arm rejects the directory, falls through to the `$HOME` probe, and
+    `home-junk.tmp` is seeded."""
+    seeded = _seed_with(
+        project,
+        tmp_path,
+        monkeypatch,
+        reported="git version 2.46.0.windows.1\n",
+        appdata_dir=True,
+    )
+
+    assert "home-junk.tmp" not in seeded
+    assert "appdata-junk.tmp" not in seeded
+    # ...and the shield still RAN: the inherited seed is empty, not the whole file.
+    assert "/probe-403" in seeded
+
+
 def test_shield_appdata_absent_file_keeps_the_home_fallback(project, tmp_path, monkeypatch):
     """`%APPDATA%` set with no `Git/ignore` under it is the ORDINARY case on the fork,
     and it must reach `$HOME` — the preference is conditional on the file existing.
 
-    The `is_file()` precondition mirrors the fork's own `file_exists` guard: git does
-    not prefer a path it cannot read, it computes the `$HOME` one instead. Dropping it
+    The `_shield_file_exists` precondition mirrors the fork's own `file_exists` guard:
+    git does not prefer a path that is not there, it computes the `$HOME` one instead.
+    Dropping it
     would not merely seed the wrong file, it would seed NOTHING — a non-existent
     source reads as an empty seed with `reason is None`, after which the caller
     activates a worktree-scoped `core.excludesFile` that SHADOWS the operator's real
     global ignores. That is #403's own harm, and it is silent.
 
-    Ablation: drop the `is_file()` precondition and this fails — the arm returns the
-    absent candidate, the seed comes back empty, and `home-junk.tmp` is missing."""
+    Ablation: drop the `_shield_file_exists` precondition and this fails — the arm
+    returns the absent candidate, the seed comes back empty, and `home-junk.tmp` is
+    missing."""
     seeded = _seed_with(
         project,
         tmp_path,
