@@ -45,15 +45,18 @@ Rules for sessions reading the ledger:
 - An `archived:` line marks content that lives in `deferred-work-archive.md`.
   The full body (evidence, resolution, dates) is there, keyed by the same
   DW- id — read the archive file for anything beyond the stub. An id may own
-  more than one block there once a reopened entry has been archived twice; the
-  date on this line is what picks the block this stub's body is in.
+  more than one block there once a reopened entry has been archived twice.
+  Narrow by the date on this line; when several blocks share it — one entry
+  closed, archived, reopened and archived again inside a single day — take the
+  **last** of them. The archive file is append-only, so for one id a later
+  block is a later closure.
 - An `archived-body:` line is that same pointer carried by an entry that was
   archived and then **reopened** — the orchestrator writes it in place of the
   `archived:` stamp, which would otherwise claim a live entry's body is
   elsewhere. The entry is open work again and its `status:` says so, but the
-  body it carried before that close is still in the archive file, in the block
-  stamped with the date this line carries. Reopening does not bring the body
-  back, and a stub keeps neither `location:` nor `reason:`, so read that block
+  body it carried before that close is still in the archive file — resolve
+  this line exactly as an `archived:` stamp above: narrow by its date, and take
+  the last of the blocks that share it. Reopening does not bring the body back, and a stub keeps neither `location:` nor `reason:`, so read that block
   before triaging the entry. Never edit or drop the line.
 - The archive may be absent even when a stub or an `archived-body:` line
   references it: only the ledger is seeded into an isolated unit worktree. That

@@ -925,10 +925,10 @@ def mark_open(path: Path, dw_id: str, note: str, operation_id: str) -> bool:
     # neither `location:` nor `reason:` (`_PRESERVED_FIELD_RE`), so the stamp is
     # the reopened entry's ONLY route back to the body, and triage arrives with
     # a heading and nothing to triage (#711 review). Renaming the field keeps
-    # both properties — the value still names the archive block, since an id may
-    # own several and each carries its own `archived:` date, while the renamed
-    # line matches neither `_ARCHIVED_FIELD_RE` nor `_STUB_BODY_RE`, so the
-    # entry reads as live and re-archives normally. Rehydrating the body here
+    # both properties — the value still narrows to the archive block, an id
+    # owning several once a re-closure is archived too, while the renamed line
+    # matches neither `_ARCHIVED_FIELD_RE` nor `_STUB_BODY_RE`, so the entry
+    # reads as live and re-archives normally. Rehydrating the body here
     # instead was the alternative and is worse: several blocks per id is by
     # design, so a rollback's reopen would have to guess which one, and a wrong
     # guess overwrites live content with a stale body.
@@ -1171,10 +1171,12 @@ def _archived_stamp(entry: DWEntry) -> str | None:
     """The value of the entry's first live ``archived:`` field line, or None
     when it carries none.
 
-    Read from an *archive* twin, this is that block's identity: the archive
-    holds several blocks per id by design, and their stamps are what tells them
-    apart — for a stub pointing at one, and for the `archived-body:` pointer
-    :func:`mark_open` demotes that stub's stamp into.
+    Read from an *archive* twin, this is what a stub pointing at that block
+    must carry — and what :func:`mark_open` demotes into an `archived-body:`
+    pointer. The archive holds several blocks per id by design, so the stamp
+    narrows rather than identifies: two closures archived on one day share it,
+    and the append-only file's order is the tie-break (later block, later
+    closure).
     """
     spans = _archived_line_spans(entry)
     if not spans:
@@ -1374,6 +1376,9 @@ def archive_closed(
         pos = entry.status_span[1]
         body = body[:pos] + f"\narchived: {stamp}" + body[pos:]
         archive_blocks.append(body)
+    # Appended, never prepended: for one id the file's order is closure order,
+    # which is the documented tie-break when two closures were archived on the
+    # same day and so carry the same stamp (#711 review).
     if archive_blocks:
         if existing == "" or existing.endswith("\n\n"):
             sep = ""

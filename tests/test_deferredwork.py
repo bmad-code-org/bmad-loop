@@ -3072,6 +3072,39 @@ def test_archive_reopened_stub_recloses_and_archives(tmp_path):
     assert "resolution: second close" in archive_text
 
 
+def test_archive_same_day_reclosures_resolve_by_append_order(tmp_path):
+    """Two closures of one id archived on the SAME day share a stamp, so the
+    stamp narrows rather than identifies. The tie-break the format documents is
+    the archive's append order — later block, later closure — and that is a
+    property of how `archive_closed` writes, not a convention a reader can only
+    hope for (#711 review)."""
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: closed twice in one day\n\n"
+        "origin: a\nlocation: src/x.py:1\nreason: first pass\nstatus: open\n"
+    )
+    path = write_ledger(tmp_path, text)
+    close_reopenable(path, "DW-1", "first close", date="2026-06-11")
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-1"]
+    assert mark_open(path, "DW-1", "first close", OPERATION_ID) is True
+    close_reopenable(path, "DW-1", "second close", date="2026-06-12")
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-1"]
+
+    stub = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}["DW-1"]
+    stamp = deferredwork._archived_stamp(stub)
+    archive_text = (path.parent / ARCHIVE_REL).read_text(encoding="utf-8")
+    blocks = [
+        e for e in parse_ledger(archive_text) if e.id == "DW-1" and f"archived: {stamp}" in e.body
+    ]
+    # Both closures carry the same stamp — the ambiguity the tie-break exists for
+    assert len(blocks) == 2
+    # ...and file order is closure order, so the LAST one is what the stub points at
+    assert "resolution: first close" in blocks[0].body
+    assert "resolution: second close" in blocks[-1].body
+    assert "status: done 2026-06-11" in blocks[0].body
+    assert "status: done 2026-06-12" in blocks[-1].body
+
+
 def test_archive_tab_resolution_stub_converges(tmp_path):
     """A tab-separated undo tail is copied into the stub verbatim, so the stub
     shape must tolerate the spacing `_MARK_DONE_TAIL_RE` accepts. Otherwise the
