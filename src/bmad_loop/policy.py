@@ -24,6 +24,7 @@ from .platform_util import (
     has_parent_ref,
     is_absolute_path,
     names_tree_root,
+    names_win32_alias,
 )
 
 POLICY_FILE = Path(".bmad-loop") / "policy.toml"
@@ -1148,10 +1149,23 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
     # skipped); they are rejected here for consistency with the sibling sources, and
     # because a silently-inert seed entry reads as applied configuration when it is
     # not.
+    #
+    # The second refusal is a SEPARATE arm, not a fourth term in the first, because
+    # the first one's message is false for what it catches: `NUL` and `cfg. ` are
+    # project-relative by every measure those three predicates apply. What they are
+    # not is deterministic — each names a different path on Windows than it does
+    # here, so the same seed entry copies a different file (or a device) depending
+    # on where the run happens. `names_win32_alias`'s docstring carries the two
+    # rules, their sources, and which half of each is measurable on this platform.
     for seed in scm.worktree_seed:
         if names_tree_root(seed) or is_absolute_path(seed) or has_parent_ref(seed):
             raise PolicyError(
                 f"scm.worktree_seed entries must be project-relative paths: got {seed!r}"
+            )
+        if names_win32_alias(seed):
+            raise PolicyError(
+                "scm.worktree_seed entries must not name a Windows device or end a component "
+                f"in a period or space: got {seed!r}"
             )
     cleanup = CleanupPolicy(
         run_retention=_typed_int(

@@ -501,6 +501,65 @@ def test_invalid_profiles_rejected(tmp_path, mutation, match):
         load_profiles(tmp_path)
 
 
+@pytest.mark.parametrize(
+    ("mutation", "match"),
+    [
+        # skill_tree — a reserved device name, then the trailing-trim alias. Each of
+        # the three fields carries the same grammar with its own name in front.
+        (
+            MINIMAL_PROFILE.replace("[hooks]", 'skill_tree = "NUL"\n[hooks]'),
+            "skill_tree must not name a Windows device",
+        ),
+        (
+            MINIMAL_PROFILE.replace("[hooks]", 'skill_tree = ".claude/skills."\n[hooks]'),
+            "skill_tree must not name a Windows device",
+        ),
+        # hooks.config_path — the field a real dialect is required to set anyway
+        (
+            MINIMAL_PROFILE.replace(
+                'config_path = ".mycli/settings.json"', 'config_path = "aux.json"'
+            ),
+            "hooks.config_path must not name a Windows device",
+        ),
+        (
+            MINIMAL_PROFILE.replace(
+                'config_path = ".mycli/settings.json"',
+                'config_path = ".mycli/settings.json "',
+            ),
+            "hooks.config_path must not name a Windows device",
+        ),
+        # seed_files is checked per entry, so both aliases sit beside a good one and a
+        # non-final component carries the reserved name `_is_reserved_basename` misses
+        (
+            MINIMAL_PROFILE.replace("[hooks]", 'seed_files = [".mcp.json", "sub/NUL"]\n[hooks]'),
+            "seed_files entries must not name a Windows device",
+        ),
+        (
+            MINIMAL_PROFILE.replace("[hooks]", 'seed_files = [".mcp.json", "cfg "]\n[hooks]'),
+            "seed_files entries must not name a Windows device",
+        ),
+    ],
+)
+def test_profile_rejects_win32_alias_paths(tmp_path, mutation, match):
+    """Every row here is project-relative, so the refusal beside this one passes it —
+    a profile that names `NUL` or `.claude/skills.` is contained, and still does not
+    name the same path on Windows as it does here. The harm is a profile that quietly
+    means something else per platform: a reserved component resolves to a device, and
+    a component ending in a period or space is created trimmed, so the path the
+    shield renders from the configured spelling is not the path on disk. Cited to
+    Microsoft, Wine and Project Zero, not measured — this suite runs on POSIX.
+
+    Ablation: delete any one of the three `names_win32_alias` arms in
+    `_validate_profile` and exactly that field's two rows fail; the other four stay
+    green, which is what proves the three sites are independently guarded rather than
+    sharing one upstream check."""
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "bad.toml").write_text(mutation)
+    with pytest.raises(ProfileError, match=match):
+        load_profiles(tmp_path)
+
+
 # every type `tomllib` can yield, plus the numeric spellings that are legal TOML
 # and hostile to a raw coercion
 TOML_VALUE_DOMAIN = [
