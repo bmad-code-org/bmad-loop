@@ -21,7 +21,12 @@ from . import deferredwork, gates, verify
 from .engine import Engine, RunPaused
 from .escalation import critical_escalations, env_fault_pause_reason, session_failure_reason
 from .model import PAUSE_STORY_GATE, Phase, StoryTask
-from .platform_util import atomic_write_text, atomic_write_text_confined, neutralize_surrogates
+from .platform_util import (
+    atomic_write_text,
+    atomic_write_text_confined,
+    neutralize_surrogates,
+    safe_segment,
+)
 from .runs import _project_of_run_dir
 from .statemachine import advance
 from .workspace import discard_worktree
@@ -196,6 +201,17 @@ def validate_triage(
         name = str(item.get("name", ""))
         if not BUNDLE_NAME_RE.match(name):
             errors.append(f"bundle name {name!r} invalid (want {BUNDLE_NAME_RE.pattern})")
+        # The one rule BUNDLE_NAME_RE cannot express. A cycle-1 bundle's name IS its
+        # directory (`_write_intent`), and the reserved Windows device basenames --
+        # CON, NUL, AUX, PRN, COM<N>, LPT<N> -- are `[a-z0-9-]`-legal names that no
+        # Windows filesystem will accept as one (matched case-insensitively, so
+        # lowercase is no reprieve). Testing `safe_segment` identity rather than a
+        # hand-written device list keeps this gate in lockstep with the sanitizer
+        # that defines the set: the identical idiom, for the identical reason, as
+        # `runs.is_valid_run_id`. Guarded on the match above so one bad name yields
+        # one error and not two.
+        if BUNDLE_NAME_RE.match(name) and safe_segment(name) != name:
+            errors.append(f"bundle name {name!r} is not a legal path segment")
         if name in names:
             errors.append(f"duplicate bundle name {name!r}")
         names.add(name)

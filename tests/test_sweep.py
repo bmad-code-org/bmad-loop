@@ -287,6 +287,75 @@ def test_bundle_key_re_refuses_a_trailing_newline():
     assert BUNDLE_KEY_RE.match("dw-c2-foo").group(2) == "c2-foo"
 
 
+# ------------------------------ reserved Windows device basenames (#637)
+#
+# The third axis on the same "a bundle name IS a path segment" surface. A
+# reserved device basename is `[a-z0-9-]`-legal and at least 2 characters, so
+# BUNDLE_NAME_RE accepts every one of them, and a cycle-1 bundle turns the name
+# into run_dir/bundles/<name>/ verbatim -- a directory native Windows will not
+# create. The gate is `safe_segment` identity, so the accepted set stays in
+# lockstep with the sanitizer instead of a second hand-written device list.
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["con", "nul", "aux", "prn", "com1", "com9", "lpt1", "lpt9"],
+    ids=["con", "nul", "aux", "prn", "com1", "com9", "lpt1", "lpt9"],
+)
+def test_validate_triage_rejects_reserved_device_bundle_names(name):
+    """ABLATION: delete the safe_segment identity gate and every row here accepts."""
+    rj = triage_result(["DW-1"], bundles=[{"name": name, "dw_ids": ["DW-1"], "intent": "do x"}])
+
+    plan, errors = validate_triage(rj, {"DW-1"})
+
+    assert plan is None
+    # Exactly one error, not merely one that matches: these names pass
+    # BUNDLE_NAME_RE, so a bare `plan is None` (or an `any(...)` over errors)
+    # would pass for reasons unrelated to the device name. The count is what
+    # says the two name gates report a given defect once between them.
+    assert len(errors) == 1
+    assert repr(name) in errors[0]
+    assert "not a legal path segment" in errors[0]
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["CON", "nul.", "aux.txt", "lpt9 "],
+    ids=["uppercase", "trailing-dot", "extension", "trailing-space"],
+)
+def test_validate_triage_reports_one_error_when_a_name_fails_both_gates(name):
+    """ABLATION: drop the `BUNDLE_NAME_RE.match(name) and` guard and each row
+    double-reports -- two errors for one name. Unlike the reserved-name rows
+    above, these fail BUNDLE_NAME_RE *and* safe_segment identity, so they are
+    the only inputs on which that guard can be observed at all."""
+    rj = triage_result(["DW-1"], bundles=[{"name": name, "dw_ids": ["DW-1"], "intent": "do x"}])
+
+    plan, errors = validate_triage(rj, {"DW-1"})
+
+    assert plan is None
+    assert len(errors) == 1
+    assert repr(name) in errors[0]
+    assert "invalid" in errors[0]
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["com10", "console", "com", "lpt", "aux2", "nul-fix", "a" * 40],
+    ids=["com10", "console", "com", "lpt", "aux2", "nul-fix", "max-length"],
+)
+def test_validate_triage_accepts_ordinary_bundle_names(name):
+    """The over-refusal guard: `com10` and `console` merely start with a device
+    name, and a 40-character name is BUNDLE_NAME_RE's maximum -- well under
+    platform_util.MAX_SEGMENT (120), so length never reaches the new gate."""
+    rj = triage_result(["DW-1"], bundles=[{"name": name, "dw_ids": ["DW-1"], "intent": "do x"}])
+
+    plan, errors = validate_triage(rj, {"DW-1"})
+
+    assert errors == []
+    assert plan is not None
+    assert plan.bundles[0].name == name
+
+
 def test_validate_triage_truncates_overlong_bundle_name():
     """ABLATION A1: delete direct-bundle normalization and this fails on validation."""
     rj = triage_result(
