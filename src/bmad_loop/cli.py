@@ -482,8 +482,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
         channel = (
             "the ATTENTION file in the run directory is the only alert channel left"
             if pol.notify.file
-            else "notify.file is also off, so no alert channel is configured — "
-            "enable notify.file"
+            else "notify.file is also off, so no alert channel is configured — enable notify.file"
         )
         report.warn(
             "notify.desktop-unavailable",
@@ -2212,6 +2211,28 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         return rc
     project = _project(args)
     paths = bmadconfig.load_paths(project)
+
+    if args.before is not None and not args.archive:
+        print("--before requires --archive", file=sys.stderr)
+        return ExitCode.FAILURE
+
+    if args.archive:
+        if (
+            args.decisions_only
+            or args.repeat is not None
+            or args.max_bundles is not None
+            or args.max_cycles is not None
+            or args.no_prompt
+            or args.run_id is not None
+        ):
+            print(
+                "--archive cannot combine with --decisions-only, --repeat, "
+                "--max-bundles, --max-cycles, --no-prompt, or --run-id",
+                file=sys.stderr,
+            )
+            return ExitCode.FAILURE
+        return _sweep_archive(project, paths, args)
+
     pol = policy_mod.load(_policy_path(project))
 
     if args.dry_run:
@@ -2244,6 +2265,74 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         trigger="cli",
         run_id=args.run_id,
     )
+
+
+def _sweep_archive(project: Path, paths: bmadconfig.ProjectPaths, args: argparse.Namespace) -> int:
+    """`bmad-loop sweep --archive`: move closed deferred-work entries to a
+    sibling archive file. A self-contained sub-mode — no worktree, no
+    preflight, no LLM. Refuses while any engine run is live or unverifiably
+    so: this is the one out-of-band ledger writer, and a concurrent close or
+    harvest landing between its read and its writes would be silently
+    clobbered. An unverifiable pid is treated as live — a write op takes the
+    conservative side, unlike the cleanup guards which only warn.
+
+    Run dirs are enumerated raw (:func:`runs.all_run_dirs`) rather than through
+    the ``state.json``-gated :func:`runs.list_run_dirs`: a run whose state file
+    was removed still owns its ``engine.pid`` and still writes this ledger, and
+    the gated view would report it as no run at all. An unreadable runs root
+    answers nothing, so it refuses too — same conservative side."""
+    run_dirs = runs.all_run_dirs(project)
+    if run_dirs is None:
+        print(
+            f"cannot list runs under {project / runs.RUNS_DIR} — "
+            "refusing to archive ledger entries",
+            file=sys.stderr,
+        )
+        return ExitCode.FAILURE
+    for run_dir in run_dirs:
+        if runs.engine_liveness(run_dir) != "dead":
+            print(
+                f"run {run_dir.name} may still be live — stop it before archiving ledger entries",
+                file=sys.stderr,
+            )
+            return ExitCode.FAILURE
+    ledger = paths.deferred_work
+    # Call the primitive BEFORE reporting a missing ledger, and report the
+    # missing ledger from its empty result. `archive_closed` validates `before`
+    # ahead of its own `is_file` short-circuit precisely so a malformed date
+    # fails the same way whether or not a ledger exists; short-circuiting here
+    # first put that back, and `--before not-a-date` then exited 0 on a project
+    # that happens to have no ledger today and 1 on one that does — the same
+    # invocation graded by optional project data rather than by its own shape
+    # (#711 review). The call is safe on a missing file: it short-circuits to
+    # an empty list without writing.
+    try:
+        archived = deferredwork.archive_closed(
+            ledger,
+            before=args.before,
+            dry_run=args.dry_run,
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return ExitCode.FAILURE
+    if not ledger.is_file():
+        print(f"no deferred-work ledger at {ledger}")
+        return ExitCode.OK
+    archive_path = ledger.parent / deferredwork.ARCHIVE_REL
+    if not archived:
+        print("no closed entries to archive")
+        return ExitCode.OK
+    noun = "entry" if len(archived) == 1 else "entries"
+    if args.dry_run:
+        print(f"would archive {len(archived)} {noun}:")
+        for dw_id in archived:
+            print(f"  {dw_id}")
+        return ExitCode.OK
+    print(f"archived {len(archived)} {noun} to {archive_path}:")
+    for dw_id in archived:
+        print(f"  {dw_id}")
+    print("note: if the ledger is tracked, commit both files to make the move durable")
+    return ExitCode.OK
 
 
 def _sweep_dry_run(paths: bmadconfig.ProjectPaths, pol) -> int:
@@ -4222,7 +4311,23 @@ def main(argv: list[str] | None = None) -> int:
     )
     sweep_p.add_argument("--max-cycles", type=int, help="override [sweep] max_cycles")
     sweep_p.add_argument(
-        "--dry-run", action="store_true", help="list open ledger entries, spawn nothing"
+        "--dry-run",
+        action="store_true",
+        help="list open ledger entries, spawn nothing; with --archive: list the "
+        "entries that would move, write nothing",
+    )
+    sweep_p.add_argument(
+        "--archive",
+        action="store_true",
+        help="move closed (status: done <ISO date>) deferred-work entries to a "
+        "sibling deferred-work-archive.md, leaving a minimal stub in the live "
+        "ledger; use --before DATE to archive only entries closed before that "
+        "date, and --dry-run to preview",
+    )
+    sweep_p.add_argument(
+        "--before",
+        metavar="DATE",
+        help="with --archive: archive only entries closed before this ISO date",
     )
     sweep_p.add_argument("--run-id", help=argparse.SUPPRESS)  # pre-assigned id (used by the TUI)
 
@@ -4356,7 +4461,12 @@ def main(argv: list[str] | None = None) -> int:
         "--force", action="store_true", help="stop the run first if it is still live"
     )
 
-    archive_p = add("archive", cmd_archive, "compress a run into .bmad-loop/archive and remove it")
+    archive_p = add(
+        "archive",
+        cmd_archive,
+        "compress a run into .bmad-loop/archive and remove it; "
+        "for ledger archiving see `sweep --archive`",
+    )
     archive_p.add_argument("run_id")
     archive_p.add_argument(
         "--force", action="store_true", help="stop the run first if it is still live"

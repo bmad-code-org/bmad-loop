@@ -104,6 +104,33 @@ def test_list_run_dirs_missing(tmp_path):
     assert runs.latest_run_dir(tmp_path) is None
 
 
+def test_all_run_dirs_includes_state_json_less_dirs(tmp_path):
+    """The ungated counterpart sees the run `list_run_dirs` filters out — a run
+    whose state.json is gone still owns its engine.pid, and a liveness guard
+    built on the gated view would archive out from under it (#711 review)."""
+    _make_run(tmp_path, "20260611-120000-bbbb")
+    _make_run(tmp_path, "20260610-090000-aaaa")
+    _make_run(tmp_path, "20260612-080000-cccc", with_state=False)
+    listed = runs.all_run_dirs(tmp_path)
+    assert listed is not None
+    assert [d.name for d in listed] == [
+        "20260610-090000-aaaa",
+        "20260611-120000-bbbb",
+        "20260612-080000-cccc",
+    ]
+    assert all(d.parent == tmp_path / runs.RUNS_DIR for d in listed)
+
+
+def test_all_run_dirs_distinguishes_missing_from_unreadable(tmp_path):
+    """A missing runs root is a real answer (no runs); an unreadable one is no
+    answer at all. Callers that refuse on "cannot tell" need them apart, so the
+    empty list and `None` must not collapse into each other."""
+    assert runs.all_run_dirs(tmp_path) == []
+    (tmp_path / runs.RUNS_DIR).parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / runs.RUNS_DIR).write_text("not a directory", encoding="utf-8")
+    assert runs.all_run_dirs(tmp_path) is None
+
+
 def test_latest_run_dir(tmp_path):
     _make_run(tmp_path, "20260610-090000-aaaa")
     newest = _make_run(tmp_path, "20260611-120000-bbbb")

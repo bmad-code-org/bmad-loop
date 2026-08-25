@@ -15,6 +15,16 @@ breaking changes may land in a minor release.
   compatibility contract. The probe opens non-blocking, so a planted reader-less FIFO cannot
   park the orchestrator.
 
+- **`bmad-loop sweep --archive`** moves closed (`status: done <ISO date>`) deferred-work entries to
+  a sibling `deferred-work-archive.md`, replacing each with a stub that preserves the DW- id for
+  grep and `closes_deferred` cross-references plus the load-bearing field lines (`gate:`,
+  `origin:`/`source_spec:`, reopenable-close undo markers). The live ledger then carries open
+  entries in full and archived ones as compact stubs, rather than every closed body forever.
+  Supports `--before DATE` to archive only entries closed before a cutoff, and `--dry-run` to
+  preview. Reopening an archived stub leaves an `archived-body:` line pointing at the archive
+  block that holds its body. Refuses while any engine run is live. Pure deterministic Python —
+  no LLM involvement.
+
 ### Changed
 
 - **A published run archive now lands at mode `0600`** instead of a umask-derived mode (#591).
