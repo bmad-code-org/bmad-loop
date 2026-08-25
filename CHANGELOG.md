@@ -37,6 +37,10 @@ breaking changes may land in a minor release.
   writes became atomic. Their writers now refuse with the `PermissionError` a plain
   `write_text` used to raise. Machine-minted state (run archives, stop requests, the
   config-digest stamp) is unaffected.
+- **Document the qualified-id obligation once for adapter authors (#311).** The authoring guide
+  states the rule a native-id backend must follow rather than leaving it to be inferred from
+  psmux's per-seam specifics, and `TerminalMultiplexer.new_parked_window` now says its id is
+  opaque and MAY be qualified, matching `new_window`. Documentation only; no behavior change.
 
 ### Fixed
 
