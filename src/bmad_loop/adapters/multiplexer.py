@@ -171,8 +171,13 @@ class TerminalMultiplexer(ABC):
         """Create a window that runs ``argv`` then *parks* — waiting on a key so
         the exit status stays inspectable instead of the window closing the moment
         the process exits — and finally returns an attached client to its origin
-        (keyed by the per-window ``return_opt``). Returns the native window id;
-        for its required form see :meth:`list_window_ids`'s note on #482."""
+        (keyed by the per-window ``return_opt``). Returns the native window id.
+
+        That id is **opaque to core** exactly as :meth:`new_window`'s is, so a
+        backend MAY return an already-qualified target rather than a bare id
+        (psmux returns ``session:@N``) — and an obligation follows from that
+        choice here too, a different pairing than :meth:`new_window`'s: for the
+        form it binds the id to, see :meth:`list_window_ids`'s note on #482."""
 
     @abstractmethod
     def list_window_ids(self, session: str) -> list[str]:

@@ -38,7 +38,7 @@ from typing import Any
 
 import yaml
 
-from .platform_util import atomic_write_bytes
+from .platform_util import atomic_write_bytes, atomic_write_bytes_confined
 
 
 def _split_frontmatter(text: str) -> tuple[str, str, str] | None:
@@ -360,7 +360,7 @@ def _verified(candidate: str, key: str, value: str, rest: dict[str, Any]) -> str
     return candidate
 
 
-def set_frontmatter_status(path: Path, status: str) -> bool:
+def set_frontmatter_status(path: Path, status: str, *, confine_root: Path) -> bool:
     """Rewrite the `status:` field in a spec's `---`…`---` frontmatter block.
 
     A minimal in-place line replacement (not a YAML round-trip) so the spec's
@@ -385,10 +385,42 @@ def set_frontmatter_status(path: Path, status: str) -> bool:
     reached the same conclusion on the same files, with fault injection: it cut a
     46-byte spec to 12.
 
-    ``follow_symlinks=False``, matching that sibling's name-replacing
-    `atomic_replace`. A spec path is handed to this writer from a session-driven
-    scan, so honouring a link planted there would aim a host-side write wherever
-    that session chose.
+    The write is CONFINED, and this is the canonical statement of the rule the
+    three spec writers share (`verify.set_frontmatter_field` and
+    `devcontract._atomic_write_spec` restate it by reference):
+
+    * A spec path under ``confine_root`` goes through
+      `platform_util.atomic_write_bytes_confined`, which walks the components
+      below that root ``O_NOFOLLOW`` and writes through the descriptor the walk
+      produced. Refusing a link at the FINAL component was never enough (#593):
+      `mkstemp(dir=...)` and `os.replace`'s destination still looked every
+      DIRECTORY above the spec up by name, so a link planted at the artifacts
+      folder landed both the temp and the published spec wherever it pointed —
+      and the callers' own ``mkdir(parents=True, exist_ok=True)`` accepts a
+      symlinked directory, so a planted parent survives the setup step.
+    * A spec path OUTSIDE ``confine_root`` keeps the plain no-follow write. An
+      artifacts folder configured outside the checkout is real, supported
+      configuration (`bmadconfig` resolves one; `verify.spec_within_roots` trusts
+      it), and a confined writer cannot vouch for a tree it was not given — so
+      refusing there would break working setups rather than close a hole.
+
+    ``follow_symlinks=False`` on that second arm matches the name-replacing
+    `atomic_replace` this writer's `devcontract` sibling always had. A spec path
+    is handed to this writer from a session-driven scan, so honouring a link
+    planted there would aim a host-side write wherever that session chose. The
+    confined arm needs no such flag — it never follows anything.
+
+    ``confine_root`` is a REQUIRED keyword: a caller that has not decided which
+    checkout the spec belongs to is a pyright error rather than an unconfined
+    write, which is how every call site of this and its two siblings was found.
+
+    ``require_writable_target=True`` on both arms (#597): a spec is
+    operator-editable, and a temp-and-replace write needs write permission on the
+    PARENT DIRECTORY, never on the entry it replaces — so before this a spec an
+    operator had marked ``0444`` was rewritten anyway and, where the mode was
+    inherited, came back reading ``0444`` with nothing in the permission bits to
+    record it. The kernel's `PermissionError` is what a bare ``write_bytes``
+    raised, and it is what this raises again.
 
     Returns True when the file was rewritten. Returns False for **nothing to
     change** only: no file, no frontmatter block, no top-level `status` for
@@ -415,5 +447,11 @@ def set_frontmatter_status(path: Path, status: str) -> bool:
     edited = _edit_frontmatter_block(block, "status", status, pattern=_STATUS_KEY_RE)
     if edited is None:
         return False
-    atomic_write_bytes(path, (before + edited + after).encode("utf-8"), follow_symlinks=False)
+    payload = (before + edited + after).encode("utf-8")
+    if path.is_relative_to(confine_root):
+        atomic_write_bytes_confined(
+            path, payload, confine_root=confine_root, require_writable_target=True
+        )
+    else:
+        atomic_write_bytes(path, payload, follow_symlinks=False, require_writable_target=True)
     return True

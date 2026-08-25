@@ -682,7 +682,9 @@ override and is not the same as unset).
 `ctrl+s` validates the whole document through the engine's own parser
 (`policy.loads()`) before writing; errors land in a red strip above the
 buttons and block the save. The write itself is atomic (temp file +
-`os.replace`).
+`os.replace`), confined to the project so a symlink planted at `.bmad-loop/`
+is refused rather than followed, and refused outright with a `PermissionError`
+if the operator has marked `policy.toml` read-only (#593, #597).
 
 ## Troubleshooting
 

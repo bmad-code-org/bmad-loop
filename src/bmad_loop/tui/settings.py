@@ -15,7 +15,7 @@ from typing import Any
 import tomlkit
 
 from .. import policy as policy_mod
-from ..platform_util import atomic_write_text
+from ..platform_util import atomic_write_text_confined
 
 # STAGES now lives in policy.py (#679) so the settings schema can reach it
 # without importing this tomlkit-backed module. Re-exported here because
@@ -107,12 +107,29 @@ class PolicyDoc:
     def dumps(self) -> str:
         return tomlkit.dumps(self._doc)
 
-    def save(self, path: Path) -> None:
+    def save(self, path: Path, *, confine_root: Path) -> None:
         """#363: via the helper, which removes its temp on any raise. The
         hand-rolled temp was the fixed name `.bmad-loop/policy.toml.tmp` —
         gitignored by nothing, and byte-identical to the one
         `policy.write_mux_backend` built, so the settings editor and the mux
         writer raced on one name. Raises rather than degrades: the screen catches
-        OSError to show "save failed", which requires the raise to reach it."""
+        OSError to show "save failed", which requires the raise to reach it —
+        and `UnconfinedWriteError` is an OSError, so a refusal arrives there too.
+
+        `confine_root` is a REQUIRED keyword rather than a defaulted one, and
+        this document does not remember one: a `PolicyDoc` is parsed text with no
+        path of its own — `load` and `save` are each handed one per call — so
+        there is nothing here to derive a root from. Requiring it makes a caller
+        that has not decided what tree this policy file belongs to a type error
+        rather than an unconfined write (#593). `runsetup` documents
+        `.bmad-loop/policy.toml` as a path a driven session may write, so the
+        directories above it are exactly the ones worth anchoring.
+
+        `require_writable_target=True` (#597): policy.toml is hand-edited config,
+        and an operator who marks it read-only gets the `PermissionError` a bare
+        `Path.write_text` raised before this write went atomic — surfaced by the
+        same "save failed" the screen already shows."""
         path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_text(path, self.dumps(), follow_symlinks=False)
+        atomic_write_text_confined(
+            path, self.dumps(), confine_root=confine_root, require_writable_target=True
+        )

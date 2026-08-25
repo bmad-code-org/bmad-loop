@@ -3,7 +3,9 @@
 The ledger (`{implementation_artifacts}/deferred-work.md`) is append-only
 markdown in the canonical form documented at
 bmad-loop-sweep/deferred-work-format.md: `### DW-<seq>: <title>` headings with
-`origin:`/`location:`/`reason:`/`status:` field lines. Pre-#2651 dev primitives
+`origin:`/`location:`/`reason:`/`status:` field lines. The one sanctioned
+rewrite is :func:`archive_closed`, which moves closed entries verbatim to a
+sibling archive file and leaves id-preserving stubs. Pre-#2651 dev primitives
 and the attended `bmad-build` append flatter entries here directly, which the
 orchestrator normalizes on sweep; the current unattended primitive records its
 findings in the spec's frontmatter instead and the engine harvests them into
@@ -675,6 +677,26 @@ def _one_line(value: str) -> str:
     return LINE_BREAK_RE.sub(" ", value).strip()
 
 
+def _iso_date_or_none(value: str) -> str | None:
+    """`value` when it is a strict ISO ``YYYY-MM-DD`` calendar date, else None.
+
+    The shared shape of the ledger's two date checks, so a skip-not-raise caller
+    (:func:`_close_date`) and a raise caller (:func:`_require_iso_date`) cannot
+    drift apart on what counts as a close date. The regex is not redundant with
+    ``date.fromisoformat``: since 3.11 that also accepts ``20260611`` and ISO
+    week dates, neither of which the ledger's own readers recognize, and it is
+    the regex — via ``[0-9]`` — that pins the digits to ASCII. ``fromisoformat``
+    in turn rejects the well-shaped impossible day (``2026-02-30``) that no
+    pattern can catch."""
+    if not _ISO_DATE_RE.fullmatch(value):
+        return None
+    try:
+        calendar_date.fromisoformat(value)
+    except ValueError:
+        return None
+    return value
+
+
 def _require_iso_date(value: str) -> None:
     """Raise unless `value` is a strict ISO `YYYY-MM-DD` calendar date.
 
@@ -682,19 +704,9 @@ def _require_iso_date(value: str) -> None:
     (`Engine._today()`), never model-authored, so a bad value is a programmer
     bug. Letting it through writes a `status:` line that reads as neither open
     nor done, which `classify` reports as malformed and `open_ids` drops — the
-    entry silently leaves the sweep's world.
-
-    The regex is not redundant with `date.fromisoformat`: since 3.11 that also
-    accepts `20260611` and ISO week dates, neither of which the ledger's own
-    readers recognize, and it is the regex — via `[0-9]` — that pins the digits
-    to ASCII. `fromisoformat` in turn rejects the well-shaped impossible day
-    (`2026-02-30`) that no pattern can catch."""
-    if not _ISO_DATE_RE.fullmatch(value):
+    entry silently leaves the sweep's world."""
+    if _iso_date_or_none(value) is None:
         raise ValueError(f"date must be YYYY-MM-DD: {value!r}")
-    try:
-        calendar_date.fromisoformat(value)
-    except ValueError as exc:
-        raise ValueError(f"date must be YYYY-MM-DD: {value!r}") from exc
 
 
 def _require_canonical_status(status: str) -> None:
@@ -857,6 +869,11 @@ def mark_open(path: Path, dw_id: str, note: str, operation_id: str) -> bool:
     The entry must still carry the operation's adjacent resolution and undo-marker
     lines. A standard or earlier close has no matching marker and cannot be
     reopened merely because it reused the same human-readable note.
+
+    A live ``archived:`` stamp is demoted to :data:`_ARCHIVED_BODY_FIELD` rather
+    than dropped: the reopened entry is no longer archived, but the body its
+    close moved out still is, and that line is the only thing a later triage has
+    to find it with.
     """
     undo_owner = _operation_digest(operation_id)
     if not path.is_file():
@@ -896,7 +913,45 @@ def mark_open(path: Path, dw_id: str, note: str, operation_id: str) -> bool:
         return False
     start = entry.span[0] + entry.status_span[0]
     end = entry.span[0] + res_m.end()
-    atomic_write_text(path, text[:start] + previous_status_line + text[end:])
+    # Demote the entry's live `archived:` stamps along with the close they
+    # describe, rather than deleting them. A stub's stamp says "this body lives
+    # in the archive file"; once the close is undone the body is here and the
+    # line is a lie, and leaving it standing is not merely untidy — status +
+    # undo tail + stamp is the exact `_STUB_BODY_RE` shape, so the next
+    # reopenable close reconstitutes a stub `archive_closed` skips forever,
+    # stranding the entry outside every future archive (#711).
+    #
+    # Cutting the line outright strands the entry a second way: a stub keeps
+    # neither `location:` nor `reason:` (`_PRESERVED_FIELD_RE`), so the stamp is
+    # the reopened entry's ONLY route back to the body, and triage arrives with
+    # a heading and nothing to triage (#711 review). Renaming the field keeps
+    # both properties — the value still narrows to the archive block, an id
+    # owning several once a re-closure is archived too, while the renamed line
+    # matches neither `_ARCHIVED_FIELD_RE` nor `_STUB_BODY_RE`, so the entry
+    # reads as live and re-archives normally. Rehydrating the body here
+    # instead was the alternative and is worse: several blocks per id is by
+    # design, so a rollback's reopen would have to guess which one, and a wrong
+    # guess overwrites live content with a stale body.
+    #
+    # Cuts are disjoint (an `^archived:` line cannot start inside the status
+    # line or its adjacent tail) and applied back-to-front so earlier offsets
+    # stay valid.
+    cuts = [(start, end, previous_status_line)]
+    for cut_start, cut_end in _archived_line_spans(entry):
+        # Everything after the field name — value, spacing and the terminating
+        # newline — carries over verbatim; the span starts at the anchor, so
+        # the first colon is the field's own.
+        stamp = entry.body[cut_start:cut_end].split(":", 1)[1]
+        cuts.append(
+            (
+                entry.span[0] + cut_start,
+                entry.span[0] + cut_end,
+                f"{_ARCHIVED_BODY_FIELD}{stamp}",
+            )
+        )
+    for cut_start, cut_end, replacement in sorted(cuts, reverse=True):
+        text = text[:cut_start] + replacement + text[cut_end:]
+    atomic_write_text(path, text)
     return True
 
 
@@ -1042,6 +1097,319 @@ def append_entry(
     path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(path, text + sep + block)
     return dw_id
+
+
+ARCHIVE_REL = "deferred-work-archive.md"
+# A stub left by a prior archive_closed run carries this field. The next run
+# reads it to skip entries whose body has already been moved — without it,
+# every run would re-archive the stub (a heading + status line) and the
+# archive would accumulate duplicates.
+_ARCHIVED_FIELD_RE = re.compile(r"^archived:", re.MULTILINE)
+
+# What :func:`mark_open` leaves where that stamp was. A reopened entry is not
+# archived — its body is back in the ledger — but the body the undone close
+# moved out still is, and this line is what a triage session follows to it.
+# Deliberately a different field name: `archived:` means "the body is
+# elsewhere", which a reopened entry must not claim, and a line matching
+# `_ARCHIVED_FIELD_RE` here would rebuild the exact `_STUB_BODY_RE` shape on
+# the next reopenable close.
+_ARCHIVED_BODY_FIELD = "archived-body:"
+
+
+def _archived_line_spans(entry: DWEntry) -> list[tuple[int, int]]:
+    """Body-relative spans of the entry's live ``archived:`` field lines, each
+    covering the whole line including its terminating newline.
+
+    Reads through :func:`_quoted` for the same reason every gate scan does:
+    an entry documenting the archive field in a fenced example carries the
+    line in column 0, right where the anchor looks, and without the fence
+    check a quoted ``archived:`` would be mistaken for the real thing. The one
+    place that rule is written, so the three questions asked about the field —
+    is this entry archived, what does its body say apart from the stamp, and
+    which bytes must a reopen rename — cannot answer it differently.
+
+    Whole lines rather than match starts because both cutting callers remove
+    the line, and a span ending at the anchor would leave the stamp's value
+    behind as orphaned text.
+    """
+    spans: list[tuple[int, int]] = []
+    for m in _ARCHIVED_FIELD_RE.finditer(entry.body):
+        if _quoted(entry, m.start()):
+            continue
+        line_end = entry.body.find("\n", m.end())
+        spans.append((m.start(), len(entry.body) if line_end == -1 else line_end + 1))
+    return spans
+
+
+def _is_archived(entry: DWEntry) -> bool:
+    """Whether the entry carries a live ``archived:`` field line (not a quoted
+    example), marking it as touched by :func:`archive_closed` — a stub in the
+    live ledger, or an archived body in the archive file.
+    """
+    return bool(_archived_line_spans(entry))
+
+
+def _body_without_archived(entry: DWEntry) -> str:
+    """The entry's body with its live ``archived:`` stamps and trailing blank
+    lines removed — the comparison key for :func:`archive_closed`'s
+    crash-recovery skip.
+
+    An archived twin is its ledger entry plus exactly one ``archived:`` line,
+    so the two are the same content only once that line is discounted; trailing
+    newlines go with it because they record where the entry sat in its file,
+    not what it says. Everything else is compared verbatim, deliberately: the
+    cheap wrong answer is archiving a body twice, and the expensive one is
+    deciding a divergent re-closure was already saved and dropping it (#711).
+    """
+    body = entry.body
+    for start, end in reversed(_archived_line_spans(entry)):
+        body = body[:start] + body[end:]
+    return body.rstrip("\n")
+
+
+def _archived_stamp(entry: DWEntry) -> str | None:
+    """The value of the entry's first live ``archived:`` field line, or None
+    when it carries none.
+
+    Read from an *archive* twin, this is what a stub pointing at that block
+    must carry — and what :func:`mark_open` demotes into an `archived-body:`
+    pointer. The archive holds several blocks per id by design, so the stamp
+    narrows rather than identifies: two closures archived on one day share it,
+    and the append-only file's order is the tie-break (later block, later
+    closure).
+    """
+    spans = _archived_line_spans(entry)
+    if not spans:
+        return None
+    start, end = spans[0]
+    return entry.body[start:end].split(":", 1)[1].strip()
+
+
+# Field lines a stub must carry when the archived body had them, because
+# downstream readers key on them regardless of status: `gate:` (validate's
+# closed-entry gate report deliberately keeps speaking), `origin:` +
+# `source_spec:` (the engine's status-agnostic harvest-replay dedupe), and the
+# reopenable-close undo tail (`mark_open`'s adjacency requirement).
+_PRESERVED_FIELD_RE = re.compile(r"^(gate:.*|origin:.*|source_spec:.*)$", re.MULTILINE)
+
+# The exact stub shape :func:`archive_closed` leaves in the live ledger.
+# A done entry that merely carries a hand-written `archived:` line does NOT
+# match — it is a real entry, not a stub, and must still be archived.
+_STUB_BODY_RE = re.compile(
+    r"### .*: .*\n\n"
+    r"status: done [0-9]{4}-[0-9]{2}-[0-9]{2}\n"
+    # Separators mirror `_MARK_DONE_TAIL_RE`, which tolerates tabs: that regex
+    # decides what `_preserved_stub_lines` copies into the stub verbatim, so a
+    # stricter shape here reads a stub this module just wrote as a live entry
+    # and re-archives it on every run, forever, appending nothing (#711).
+    r"(?:resolution:[ \t]*[^\n]*\nresolution-undo:[ \t]*[0-9a-f]{64}[ \t]+[^\n]*\n)?"
+    r"(?:(?:gate:|origin:|source_spec:)[^\n]*\n)*"
+    r"archived: [^\n]*\n"
+    r"\n?"
+)
+
+
+def _is_stub(entry: DWEntry) -> bool:
+    """Whether the entry is a stub left by a prior :func:`archive_closed` run.
+
+    Shape-based rather than `archived:`-line-based: a done entry a human
+    annotated with a stray unfenced ``archived:`` line is a real entry whose
+    body still belongs in the live ledger — skipping it forever on the strength
+    of one line would silently exclude it from every future archive.
+    """
+    return entry.done and _STUB_BODY_RE.fullmatch(entry.body.rstrip("\n") + "\n") is not None
+
+
+def _preserved_stub_lines(entry: DWEntry) -> list[str]:
+    """The load-bearing field lines a stub must keep from the archived body.
+
+    Scanned fence-aware like every field read in this module: a fenced example
+    documenting `origin:` is not a declaration. The undo tail is read with the
+    same adjacency regex :func:`mark_open` will later use against the stub, so
+    what qualifies here is exactly what remains undoable there.
+    """
+    lines = [
+        entry.body[m.start() : m.end()]
+        for m in _PRESERVED_FIELD_RE.finditer(entry.body)
+        if not _quoted(entry, m.start())
+    ]
+    if entry.status_span is not None:
+        tail = _MARK_DONE_TAIL_RE.match(entry.body, entry.status_span[1])
+        if tail is not None:
+            lines = [tail.group(0).lstrip("\n")] + lines
+    return lines
+
+
+def _close_date(entry: DWEntry) -> str | None:
+    """The ISO close date from a ``done <date>`` status, or None when the
+    entry is not done, is done without a date suffix, or carries a date
+    that does not match the ISO ``YYYY-MM-DD`` shape.
+
+    Entries closed with a bare ``status: done`` (no date) or a hand-edited
+    non-ISO date are skipped by :func:`archive_closed`: there is no close
+    date to compare against a ``--before`` cutoff, and the stub the function
+    leaves in the ledger needs one to stay readable as done.
+    """
+    if not entry.done:
+        return None
+    parts = entry.status.split()
+    if len(parts) != 2:  # exactly `done YYYY-MM-DD` — extra tokens are not a close date
+        return None
+    # Same shape check as `_require_iso_date` (well-formed regex AND a real
+    # calendar day), skip-not-raise: a hand-edited close is data, not a bug.
+    return _iso_date_or_none(parts[1])
+
+
+def archive_closed(
+    path: Path,
+    *,
+    before: str | None = None,
+    archive_date: str | None = None,
+    dry_run: bool = False,
+) -> list[str]:
+    """Move closed (``status: done <date>``) ledger entries to a sibling
+    archive file (:data:`ARCHIVE_REL`), replacing each with a minimal stub
+    that preserves the DW- id for grep and ``closes_deferred``
+    cross-references.
+
+    Returns the list of archived ids, in ledger order. ``dry_run=True``
+    returns the ids that *would* be archived without writing anything.
+
+    Each archived entry's body is preserved verbatim in the archive file,
+    with an ``archived: <date>`` field line appended after the entry's status
+    line. The stub left in the live ledger keeps the heading, a ``status:
+    done <date>`` line (so :func:`parse_ledger` reads it as done and
+    :func:`open_ids` drops it), an ``archived: <date>`` line (so a subsequent
+    run skips it rather than re-archiving the stub), and the entry's
+    load-bearing field lines — ``gate:``, ``origin:``/``source_spec:``, and
+    the reopenable-close undo tail — because downstream readers key on those
+    regardless of status (validate's closed-gate report, the engine's
+    harvest-replay dedupe, and sweep bundle rollback respectively).
+
+    ``before`` (ISO ``YYYY-MM-DD``) archives only entries closed strictly
+    *before* that date. Entries with ``status: done`` (no date) are always
+    skipped — there is no close date to compare against a cutoff or to stamp
+    the stub with. Open and legacy entries are never touched.
+
+    Dates are validated with :func:`_require_iso_date` (same validation as
+    the existing close-path writers), ahead of the ``is_file`` short-circuit
+    so a programmer bug fails the same way whether or not a ledger exists.
+    Both writes — the trimmed ledger and the appended archive — go through
+    :func:`atomic_write_text`, the same primitive every ledger writer uses.
+    The archive file accumulates on repeat runs: new entries are appended to
+    the existing file, never overwritten, and stubs from a prior run are
+    skipped by their exact stub shape. A stub's ``archived:`` date names the
+    archive block holding its body, so an entry recovered from a crashed run
+    is stamped with the date already on that block rather than with this run's.
+    """
+    if before is not None:
+        _require_iso_date(before)
+    if archive_date is not None:
+        _require_iso_date(archive_date)
+    if not path.is_file():
+        return []
+    text = path.read_text(encoding="utf-8")
+    to_archive: list[tuple[DWEntry, str]] = []
+    for entry in parse_ledger(text):
+        close_date = _close_date(entry)
+        if close_date is None:
+            continue  # not done, or done without a date
+        if before is not None and close_date >= before:
+            continue  # closed on or after the cutoff
+        if _is_stub(entry):
+            continue  # stub from a prior archive_closed run
+        to_archive.append((entry, close_date))
+    if not to_archive:
+        return []
+    archived_ids = [e.id for e, _ in to_archive]
+    if dry_run:
+        return archived_ids
+    stamp = archive_date or calendar_date.today().isoformat()
+    archive_path = path.parent / ARCHIVE_REL
+    existing = archive_path.read_text(encoding="utf-8") if archive_path.is_file() else ""
+    # Append an `archived:` line after each entry's status line. The status
+    # span is body-relative, so the insertion works within the body slice —
+    # same offset math as `_insert_after_status`, applied to the body.
+    #
+    # Crash recovery: the archive is written BEFORE the ledger (see below), so
+    # a crash between the two writes leaves the ledger with full entries whose
+    # bodies are already in the archive. A retry must still stub those ledger
+    # entries (completing the interrupted operation) but must NOT append their
+    # bodies again — an append-only archive accumulating duplicates. Entries
+    # whose parsed archive twin carries a live (non-fenced) ``archived:``
+    # field are therefore skipped here and only replaced with stubs below.
+    #
+    # The twin must match in BODY, not merely in id and close date. A DW id is
+    # reusable across closures (`mark_open` reopens, a re-close follows) and a
+    # closed entry still accepts writes (`append_decision` does not read
+    # status), so id + date names a *closure slot*, not its content: reopened
+    # and re-closed the same day with a new resolution, or annotated with a
+    # decision after its body was archived, the ledger entry and its twin
+    # differ. Skipping on the slot alone stubbed that entry over its own
+    # content while reporting the id as archived — the body reached neither
+    # file (#711). A body that differs is appended instead; the archive holds
+    # several blocks per id by design, and over-archiving is recoverable where
+    # a silent drop is not.
+    archive_blocks: list[str] = []
+    already_archived = {
+        e.id: ((_close_date(e), _body_without_archived(e)), _archived_stamp(e))
+        for e in parse_ledger(existing)
+        if _is_archived(e)
+    }  # fence-aware: a quoted example in the archive is not a real body
+    # A recovered entry's stub is stamped with the date already on its archived
+    # body, not with this run's. The two diverge whenever the retry lands on a
+    # later day than the crashed run, and the stamp is not decoration: it is
+    # what picks one of an id's several archive blocks — for a reader following
+    # the stub, and for the `archived-body:` pointer `mark_open` demotes that
+    # stamp into, which is a reopened entry's only route back to its body
+    # (#711 review). A stub naming a date no block carries resolves to nothing.
+    recovered_stamps: dict[str, str] = {}
+    for entry, close_date in to_archive:
+        twin = already_archived.get(entry.id)
+        if twin is not None and twin[0] == (close_date, _body_without_archived(entry)):
+            # this closure's body is already archived (crashed prior run)
+            if twin[1] is not None:
+                recovered_stamps[entry.id] = twin[1]
+            continue
+        body = entry.body
+        assert entry.status_span is not None  # done with a date implies a status line
+        pos = entry.status_span[1]
+        body = body[:pos] + f"\narchived: {stamp}" + body[pos:]
+        archive_blocks.append(body)
+    # Appended, never prepended: for one id the file's order is closure order,
+    # which is the documented tie-break when two closures were archived on the
+    # same day and so carry the same stamp (#711 review).
+    if archive_blocks:
+        if existing == "" or existing.endswith("\n\n"):
+            sep = ""
+        elif existing.endswith("\n"):
+            sep = "\n"
+        else:
+            sep = "\n\n"
+        archive_content = existing + sep + "".join(archive_blocks)
+    else:
+        archive_content = existing  # pure crash-recovery pass: only stub the ledger
+    # Replace each archived entry's span with a stub, working backwards so
+    # earlier spans are unaffected by later replacements — the same
+    # text-surgery pattern as `_apply_done`, applied to multiple entries.
+    for entry, close_date in reversed(to_archive):
+        preserved = "".join(f"{line}\n" for line in _preserved_stub_lines(entry))
+        stub = (
+            f"### {entry.id}: {entry.title}\n\n"
+            f"status: done {close_date}\n"
+            f"{preserved}"
+            f"archived: {recovered_stamps.get(entry.id, stamp)}\n\n"
+        )
+        start, end = entry.span
+        text = text[:start] + stub + text[end:]
+    # Write the archive BEFORE the ledger: a crash between writes leaves the
+    # archive with extra content (harmless — the archive is append-only) and
+    # the ledger unchanged (safe — the bodies are still in the live file).
+    # Writing the ledger first would leave stubs in the ledger with no bodies
+    # in the archive — content lost.
+    atomic_write_text(archive_path, archive_content)
+    atomic_write_text(path, text)
+    return archived_ids
 
 
 # ------------------------------------------------------------------- legacy

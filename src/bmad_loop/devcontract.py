@@ -30,7 +30,7 @@ from typing import Any
 from . import deferredwork
 from .fences import fenced as _fenced
 from .frontmatter import _edit_frontmatter_block, status_of
-from .platform_util import atomic_write_bytes
+from .platform_util import atomic_write_bytes, atomic_write_bytes_confined
 from .verify import DEV_WORKFLOW, operator_actions_of, read_frontmatter
 
 # The section the skill appends on EVERY terminal path (success and blocked),
@@ -551,7 +551,7 @@ def is_frontmatter_candidate(path: Path, *, since_ns: int) -> bool:
     return status_of(fm) in (DONE, BLOCKED, AWAITING_OPERATOR)
 
 
-def _atomic_write_spec(spec_path: Path, text: str) -> None:
+def _atomic_write_spec(spec_path: Path, text: str, *, confine_root: Path) -> None:
     """Rewrite ``spec_path`` with ``text`` via a same-directory temp file + atomic
     rename, so an interrupted / short / disk-full write can never truncate the
     canonical spec — a failed repair must lose no work (fault injection on the old
@@ -563,16 +563,36 @@ def _atomic_write_spec(spec_path: Path, text: str) -> None:
     it. On any failure the temp file is removed and the error re-raised — the
     callers impose best-effort, the writer never swallows.
 
-    Now a thin name over `platform_util.atomic_write_bytes` (#379) rather than a
-    hand-rolled temp: same shape, plus an fsync before the replace and a temp name
-    unique per write instead of a fixed ``<spec>.md.tmp`` two concurrent writers
-    would collide on. ``follow_symlinks=False`` keeps the name-replacing semantics
-    the `atomic_replace` here always had — the spec path comes from a
-    session-driven scan, so writing THROUGH a planted link would hand that session
-    a host-side write wherever it chose. The two `frontmatter`-side writers of
-    these same files land on the identical call (#379); this wrapper stays for its
-    callers' ``str``-in signature and this docstring."""
-    atomic_write_bytes(spec_path, text.encode("utf-8"), follow_symlinks=False)
+    Now a thin name over `platform_util`'s atomic byte writers (#379) rather than
+    a hand-rolled temp: same shape, plus an fsync before the replace and a temp
+    name unique per write instead of a fixed ``<spec>.md.tmp`` two concurrent
+    writers would collide on.
+
+    Which writer is the spec-writer chokepoint rule (#593), stated once in
+    `frontmatter.set_frontmatter_status` and implemented identically here and in
+    `verify.set_frontmatter_field`: a spec under ``confine_root`` is written
+    through the anchored, component-walked helper; a spec in an artifacts folder
+    configured outside the checkout keeps the plain ``follow_symlinks=False``
+    write. That no-follow keeps the name-replacing semantics the `atomic_replace`
+    here always had — the spec path comes from a session-driven scan, so writing
+    THROUGH a planted link would hand that session a host-side write wherever it
+    chose — and the confined arm needs no flag, because it never follows
+    anything. ``require_writable_target=True`` on both arms restores the
+    `PermissionError` an operator's read-only spec used to earn (#597).
+
+    ``confine_root`` is a REQUIRED keyword here and on all four public writers
+    that reach this one, so a caller that has not decided which checkout the spec
+    belongs to is a pyright error rather than an unconfined write. The two
+    `frontmatter`-side writers of these same files land on the identical pair of
+    calls (#379); this wrapper stays for its callers' ``str``-in signature and
+    this docstring."""
+    payload = text.encode("utf-8")
+    if spec_path.is_relative_to(confine_root):
+        atomic_write_bytes_confined(
+            spec_path, payload, confine_root=confine_root, require_writable_target=True
+        )
+    else:
+        atomic_write_bytes(spec_path, payload, follow_symlinks=False, require_writable_target=True)
 
 
 def _render_status_line(line: str, m: re.Match[str], value: str) -> str:
@@ -599,7 +619,7 @@ def _render_status_line(line: str, m: re.Match[str], value: str) -> str:
     return f"{pre}{q}{value}{q}{rest}" + ("\n" if line.endswith("\n") else "")
 
 
-def reset_spec_status(spec_path: Path, new_status: str) -> bool:
+def reset_spec_status(spec_path: Path, new_status: str, *, confine_root: Path) -> bool:
     """Rewrite the frontmatter ``status:`` value of a spec in place.
 
     Used by the generic-skill repair path: bmad-build-auto self-finalizes a spec to
@@ -655,11 +675,13 @@ def reset_spec_status(spec_path: Path, new_status: str) -> bool:
     )
     if new_body is None:
         return False
-    _atomic_write_spec(spec_path, head + new_body + tail + text[fm.end() :])
+    _atomic_write_spec(
+        spec_path, head + new_body + tail + text[fm.end() :], confine_root=confine_root
+    )
     return True
 
 
-def strip_auto_run_result(spec_path: Path) -> bool:
+def strip_auto_run_result(spec_path: Path, *, confine_root: Path) -> bool:
     """Remove every ``## Auto Run Result`` section from a spec, in place.
 
     Companion to `reset_spec_status` on the re-drive path: re-opening a spec by
@@ -698,7 +720,7 @@ def strip_auto_run_result(spec_path: Path) -> bool:
         kept.append(text[pos : m.start()])
         pos = _next_heading_start(text, m.end())
     kept.append(text[pos:])
-    _atomic_write_spec(spec_path, "".join(kept))
+    _atomic_write_spec(spec_path, "".join(kept), confine_root=confine_root)
     return True
 
 
@@ -734,7 +756,9 @@ OPERATOR_CONFIRM_NOTE = (
 )
 
 
-def append_auto_run_result(spec_path: Path, status: str, *, detail: str = "") -> bool:
+def append_auto_run_result(
+    spec_path: Path, status: str, *, confine_root: Path, detail: str = ""
+) -> bool:
     """Append a synthesized ``## Auto Run Result`` marker section — the inverse of
     `strip_auto_run_result`.
 
@@ -792,11 +816,13 @@ def append_auto_run_result(spec_path: Path, status: str, *, detail: str = "") ->
     section = f"## Auto Run Result{nl}{nl}Status: {status}{nl}{nl}{ORCHESTRATOR_SYNTH_NOTE}{nl}"
     if detail:
         section += f"{nl}{detail.strip()}{nl}"
-    _atomic_write_spec(spec_path, text + section)
+    _atomic_write_spec(spec_path, text + section, confine_root=confine_root)
     return True
 
 
-def append_operator_confirmation(spec_path: Path, actions: Sequence[str], *, date: str) -> bool:
+def append_operator_confirmation(
+    spec_path: Path, actions: Sequence[str], *, date: str, confine_root: Path
+) -> bool:
     """Append the ``## Operator Confirmation`` audit section `bmad-loop confirm`
     writes when a human signs off a parked story (#335).
 
@@ -842,7 +868,7 @@ def append_operator_confirmation(spec_path: Path, actions: Sequence[str], *, dat
         f"Confirmed {date}: the external actions this story owed were carried out.{nl}{nl}"
         f"{items}{nl}{OPERATOR_CONFIRM_NOTE}{nl}"
     )
-    _atomic_write_spec(spec_path, text + section)
+    _atomic_write_spec(spec_path, text + section, confine_root=confine_root)
     return True
 
 

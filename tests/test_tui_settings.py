@@ -8,12 +8,14 @@ make substring checks lie."""
 
 from __future__ import annotations
 
+import sys
 import tomllib
 
 import pytest
 from test_tui_app import until
 from textual.widgets import Collapsible, Input, Select, Switch
 
+from bmad_loop import platform_util
 from bmad_loop import policy as policy_mod
 from bmad_loop.plugins import load_plugins
 from bmad_loop.plugins.loader import PLUGIN_FILE, USER_PLUGINS_REL
@@ -41,7 +43,7 @@ def test_set_preserves_comments_with_minimal_diff(tmp_path):
     path.write_text(POLICY_TEMPLATE, encoding="utf-8")
     doc = PolicyDoc.load(path)
     doc.set("limits", "max_review_cycles", 5)
-    doc.save(path)
+    doc.save(path, confine_root=tmp_path)
     new = path.read_text(encoding="utf-8")
     assert "# cache reads bill at ~0.1x" in new
     changed = set(POLICY_TEMPLATE.splitlines()) ^ set(new.splitlines())
@@ -128,7 +130,7 @@ def test_save_creates_parent_and_leaves_no_tmp(tmp_path):
     path = tmp_path / ".bmad-loop" / "policy.toml"
     doc = PolicyDoc.load(path)
     doc.set("limits", "max_dev_attempts", 3)
-    doc.save(path)
+    doc.save(path, confine_root=tmp_path)
     assert policy_mod.load(path).limits.max_dev_attempts == 3
     # name-agnostic on purpose: it grades "nothing left behind", not which name the
     # temp had, so it survived the #363 move from a fixed `.toml.tmp` to the helper's
@@ -162,12 +164,12 @@ def test_save_failure_raises_and_keeps_the_file(tmp_path, monkeypatch):
     doc = PolicyDoc.load(path)
     doc.set("limits", "max_dev_attempts", 9)
 
-    def boom(path, text, *, follow_symlinks=True):
+    def boom(path, text, *, confine_root, require_writable_target=False):
         raise OSError("disk full")
 
-    monkeypatch.setattr(settings_mod, "atomic_write_text", boom)
+    monkeypatch.setattr(settings_mod, "atomic_write_text_confined", boom)
     with pytest.raises(OSError, match="disk full"):
-        doc.save(path)
+        doc.save(path, confine_root=tmp_path)
 
     assert path.read_bytes() == before
     assert b"max_dev_attempts = 9" not in path.read_bytes()  # the mutation, not landed
@@ -676,3 +678,108 @@ async def test_escape_in_nav_mode_pops_screen(project):
         await open_settings(app, pilot)
         await pilot.press("escape")
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+
+
+# ------------------------------------- the policy write's confinement (#593, #597)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_save_refuses_a_symlinked_bmad_loop(tmp_path):
+    """The escape #593 names, at the settings editor's write. `follow_symlinks=False`
+    refused a link planted at `policy.toml` itself and nothing above it, while
+    `save`'s own `mkdir(parents=True, exist_ok=True)` ACCEPTS a
+    symlink-to-a-directory — so a link planted at `.bmad-loop/` survives the setup
+    step, and both the mkstemp temp and the published document land wherever it
+    points.
+
+    Not a hypothetical writer: `runsetup` documents `.bmad-loop/policy.toml` as a
+    path a driven session may write, so an unattended session already holds a handle
+    on this tree, and the escalation the no-follow was added to close costs a
+    directory swap instead of a file swap.
+
+    The second assertion is the load-bearing one — refusing loudly buys nothing if
+    the document already landed outside the confine root.
+
+    Ablation: revert `save` to `atomic_write_text(path, self.dumps(),
+    follow_symlinks=False)` and this fails `DID NOT RAISE`, with `policy.toml`
+    sitting in `outside/`."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (tmp_path / ".bmad-loop").symlink_to(outside, target_is_directory=True)
+    doc = fresh_doc(tmp_path)
+    doc.set("limits", "max_review_cycles", 7)
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        doc.save(tmp_path / ".bmad-loop" / "policy.toml", confine_root=tmp_path)
+
+    assert list(outside.iterdir()) == []  # nothing escaped the confine root
+
+
+def test_save_lands_on_a_clean_tree_at_the_same_target(tmp_path):
+    """The positive control for the refusal above: the same target path, the same
+    confine root, the same `outside/` — differing only in whether `.bmad-loop/` is a
+    real directory. Without it that test passes for a `save` wired to refuse
+    everything, which is every reason a file could be absent from `outside/`.
+
+    Deliberately not `test_save_creates_parent_and_leaves_no_tmp` over again: that
+    one grades "the parent gets created and no temp is left behind" on a bare tree
+    with nowhere to escape TO. What this adds is the geometry — `outside/` exists
+    here as well and stays empty — so the pair isolates the planted link as the only
+    difference between landing and refusing, rather than leaving "the refusal test's
+    `outside/` was empty" open to an unrelated cause.
+
+    The value is read back through `policy_mod.load`, not off the document, because
+    what is being graded is the file the confined write published."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    path = tmp_path / ".bmad-loop" / "policy.toml"
+    path.parent.mkdir()  # a real directory where the refusal test plants a link
+    doc = fresh_doc(tmp_path)
+    doc.set("limits", "max_review_cycles", 7)  # distinctive: the template ships 3
+
+    doc.save(path, confine_root=tmp_path)
+
+    assert policy_mod.load(path).limits.max_review_cycles == 7
+    assert list(outside.iterdir()) == []  # the write stayed where it was aimed
+
+
+def test_save_refuses_a_readonly_policy_toml(tmp_path):
+    """#597 at this site: policy.toml is hand-edited configuration — the settings
+    screen is one editor of it, an operator with a text editor is another — so a file
+    marked read-only is a stated intent, not an accident. A temp-and-replace write
+    never opens the file it replaces and `os.replace` needs write permission on the
+    DIRECTORY only, so 0444 was rewritten anyway; the bare `Path.write_text` this
+    write replaced refused it as a side effect of opening the target, and going
+    atomic dropped that refusal silently.
+
+    No skipif, unlike the symlink test above: 0444 sets the READONLY attribute on
+    win32 too, where `O_WRONLY` is then denied with `ERROR_ACCESS_DENIED` and
+    arrives as this same `PermissionError` — so the dir_fd-anchored probe and the
+    win32 by-path one are both graded here.
+
+    `PermissionError` and not `UnconfinedWriteError` on purpose: the read-only
+    refusal re-raises the kernel's own error rather than the confinement class, and
+    both reach the settings screen's existing `except OSError` -> "save failed".
+
+    The second assertion is the load-bearing one — a raise after the replace had
+    already published would be a refusal in name only. The `finally` restore is not
+    tidiness: Windows rmtree refuses a READONLY file at cleanup.
+
+    Ablation: drop `require_writable_target=True` from `save` and this fails
+    `DID NOT RAISE`, with the edited document written over a file still reading
+    0444."""
+    path = tmp_path / ".bmad-loop" / "policy.toml"
+    path.parent.mkdir(parents=True)
+    path.write_text("[limits]\nmax_review_cycles = 3\n", encoding="utf-8")
+    before = path.read_bytes()
+
+    doc = PolicyDoc.load(path)
+    doc.set("limits", "max_review_cycles", 9)
+    path.chmod(0o444)
+    try:
+        with pytest.raises(PermissionError):
+            doc.save(path, confine_root=tmp_path)
+    finally:
+        path.chmod(0o644)
+
+    assert path.read_bytes() == before  # the edit never landed
