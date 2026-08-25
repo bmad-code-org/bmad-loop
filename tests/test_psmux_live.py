@@ -604,3 +604,57 @@ def test_adopted_display_message_pane_target_resolves_globally(probe):
         "TMUX_PANE pin in psmux_backend._display_message answers for the "
         f"active window again: expected {expected!r}, got {answered.stdout.strip()!r}"
     )
+
+
+def test_premise_a_port_and_key_pair_is_answered_by_whichever_server_it_names(
+    probe, psmux_data_root
+):
+    """A `-t <session>` read resolves through that name's port and key files,
+    and psmux does not check that the server behind them is the session asked
+    for. Copying BOTH files under a second name is the reachable shape of that
+    — a duplicated registry entry. Both are required: the server rejects a key
+    mismatch before running anything, so a recycled port alone fails instead of
+    answering. The read then lands at rc 0 with a real count belonging to the
+    WRONG session, which is why _attached_clients compares the name it got back.
+
+    The two assertions below carry OPPOSITE meanings, which is why neither says
+    simply "droppable". A red on the rc means psmux started refusing the
+    misroute, and the identity compare is then redundant. A red on the answered
+    NAME means psmux started echoing the name that was asked for instead of the
+    answering server's own — the compare would then be inert rather than
+    redundant, and the guard needs replacing, not removing.
+
+    Note what this probe cannot reach: a foreign server whose session genuinely
+    carries the same name, or one whose name merely collides after the seam's
+    own `.strip()`, is indistinguishable by name and stays #531's subject.
+    """
+    mux, session, _ = probe
+    root = Path(psmux_data_root)
+    forged = f"{session}-forged"
+    for suffix in ("port", "key"):
+        source = root / f"{session}.{suffix}"
+        assert source.exists(), f"probe setup: no {source.name} to forge from"
+        shutil.copyfile(source, root / f"{forged}.{suffix}")
+    try:
+        read = mux._run(
+            ["display-message", "-p", "-t", forged, "#{session_attached}|#{session_name}"],
+            check=False,
+        )
+        assert read.returncode == 0, (
+            "psmux now REFUSES a port and key pair whose server does not own the name — the "
+            f"identity compare in _attached_clients is redundant: {read.stderr.strip()!r}"
+        )
+        count, _, answered = read.stdout.strip().partition("|")
+        assert answered == session, (
+            "psmux now answers with the name that was ASKED for rather than the "
+            "answering server's own — the identity compare in _attached_clients is "
+            f"INERT, not redundant, and needs replacing rather than removing "
+            f"(asked {forged!r}, got {answered!r})"
+        )
+        assert count.isdigit(), (
+            "probe setup: the forged read gave no attached count "
+            f"({read.stdout.strip()!r}) — it cannot show what a misroute hands back"
+        )
+    finally:
+        for suffix in ("port", "key"):
+            (root / f"{forged}.{suffix}").unlink(missing_ok=True)

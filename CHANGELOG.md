@@ -52,6 +52,12 @@ breaking changes may land in a minor release.
   already taken a read-only target's READONLY bit when the replace was denied, and Windows
   refuses to delete a READONLY file, so the cleanup was denied too and the temp survived.
   It now clears the bit and retries.
+- Refuse a psmux attached-client count whose answer names a different session, so a duplicated
+  registry entry can no longer vouch for a `switch-client` that moved nobody — which
+  `return_attached_client` reported as `RETURNED`, clearing the return option for a human still
+  sitting there. Also refuse an empty or `:`-bearing session name before the probe spawns. A
+  same-named session on a foreign server, and one differing only by whitespace the seam
+  normalizes away, stay #531's subject (#671)
 
 ### Security
 
