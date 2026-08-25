@@ -1167,6 +1167,22 @@ def _body_without_archived(entry: DWEntry) -> str:
     return body.rstrip("\n")
 
 
+def _archived_stamp(entry: DWEntry) -> str | None:
+    """The value of the entry's first live ``archived:`` field line, or None
+    when it carries none.
+
+    Read from an *archive* twin, this is that block's identity: the archive
+    holds several blocks per id by design, and their stamps are what tells them
+    apart — for a stub pointing at one, and for the `archived-body:` pointer
+    :func:`mark_open` demotes that stub's stamp into.
+    """
+    spans = _archived_line_spans(entry)
+    if not spans:
+        return None
+    start, end = spans[0]
+    return entry.body[start:end].split(":", 1)[1].strip()
+
+
 # Field lines a stub must carry when the archived body had them, because
 # downstream readers key on them regardless of status: `gate:` (validate's
 # closed-entry gate report deliberately keeps speaking), `origin:` +
@@ -1280,7 +1296,9 @@ def archive_closed(
     :func:`atomic_write_text`, the same primitive every ledger writer uses.
     The archive file accumulates on repeat runs: new entries are appended to
     the existing file, never overwritten, and stubs from a prior run are
-    skipped by their exact stub shape.
+    skipped by their exact stub shape. A stub's ``archived:`` date names the
+    archive block holding its body, so an entry recovered from a crashed run
+    is stamped with the date already on that block rather than with this run's.
     """
     if before is not None:
         _require_iso_date(before)
@@ -1332,13 +1350,25 @@ def archive_closed(
     # a silent drop is not.
     archive_blocks: list[str] = []
     already_archived = {
-        e.id: (_close_date(e), _body_without_archived(e))
+        e.id: ((_close_date(e), _body_without_archived(e)), _archived_stamp(e))
         for e in parse_ledger(existing)
         if _is_archived(e)
     }  # fence-aware: a quoted example in the archive is not a real body
+    # A recovered entry's stub is stamped with the date already on its archived
+    # body, not with this run's. The two diverge whenever the retry lands on a
+    # later day than the crashed run, and the stamp is not decoration: it is
+    # what picks one of an id's several archive blocks — for a reader following
+    # the stub, and for the `archived-body:` pointer `mark_open` demotes that
+    # stamp into, which is a reopened entry's only route back to its body
+    # (#711 review). A stub naming a date no block carries resolves to nothing.
+    recovered_stamps: dict[str, str] = {}
     for entry, close_date in to_archive:
-        if already_archived.get(entry.id) == (close_date, _body_without_archived(entry)):
-            continue  # this closure's body is already archived (crashed prior run)
+        twin = already_archived.get(entry.id)
+        if twin is not None and twin[0] == (close_date, _body_without_archived(entry)):
+            # this closure's body is already archived (crashed prior run)
+            if twin[1] is not None:
+                recovered_stamps[entry.id] = twin[1]
+            continue
         body = entry.body
         assert entry.status_span is not None  # done with a date implies a status line
         pos = entry.status_span[1]
@@ -1363,7 +1393,7 @@ def archive_closed(
             f"### {entry.id}: {entry.title}\n\n"
             f"status: done {close_date}\n"
             f"{preserved}"
-            f"archived: {stamp}\n\n"
+            f"archived: {recovered_stamps.get(entry.id, stamp)}\n\n"
         )
         start, end = entry.span
         text = text[:start] + stub + text[end:]

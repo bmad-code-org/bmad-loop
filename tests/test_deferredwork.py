@@ -2678,6 +2678,50 @@ def test_archive_crash_recovery_no_duplicate_bodies(tmp_path):
     assert "archived: 2026-08-25" not in archive_text
 
 
+def test_archive_crash_recovery_stub_keeps_the_archived_body_stamp(tmp_path):
+    """A stub recovered from a crashed run is stamped with the date already on
+    its archived body, not with the retry's date. The stamp is what picks one
+    of an id's several archive blocks — including once `mark_open` demotes it
+    into the `archived-body:` pointer — so a stub naming a date no block
+    carries resolves to nothing (#711 review)."""
+    path = write_ledger(tmp_path)
+    archive_path = path.parent / ARCHIVE_REL
+    archive_path.write_text(
+        "### DW-2: Old closed item\n\n"
+        "origin: code review of spec-1-1.md, 2026-05-20\n"
+        "location: src/foo.py:10\n"
+        "reason: pre-existing.\n"
+        "status: done 2026-05-25\n"
+        "archived: 2026-08-24\n",
+        encoding="utf-8",
+    )
+    assert archive_closed(path, archive_date="2026-08-25") == ["DW-2"]
+
+    stub = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}["DW-2"]
+    assert "archived: 2026-08-24" in stub.body  # the body's own stamp
+    assert "archived: 2026-08-25" not in stub.body  # not the retry's
+
+    # Resolve the stub the way a reader must: its stamp names exactly one block.
+    stamp = deferredwork._archived_stamp(stub)
+    archive_text = archive_path.read_text(encoding="utf-8")
+    blocks = [
+        e for e in parse_ledger(archive_text) if e.id == "DW-2" and f"archived: {stamp}" in e.body
+    ]
+    assert len(blocks) == 1
+    assert "reason: pre-existing." in blocks[0].body
+
+
+def test_archive_fresh_stub_keeps_this_runs_stamp(tmp_path):
+    """The recovered-stamp carry-over is scoped to entries the crash-recovery
+    skip fired for: an entry archived normally is stamped with this run's date
+    on both sides (#711 review)."""
+    path = write_ledger(tmp_path)
+    assert archive_closed(path, archive_date="2026-08-25") == ["DW-2"]
+    stub = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}["DW-2"]
+    assert "archived: 2026-08-25" in stub.body
+    assert "archived: 2026-08-25" in (path.parent / ARCHIVE_REL).read_text(encoding="utf-8")
+
+
 def test_archive_crash_recovery_fenced_example_does_not_suppress(tmp_path):
     """A fenced worked example in the archive quoting `### DW-2:` is not a
     real archived body — the crash-recovery skip must be fence-aware, so the

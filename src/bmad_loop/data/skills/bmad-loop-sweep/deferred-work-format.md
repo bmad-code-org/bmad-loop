@@ -44,7 +44,9 @@ Rules for sessions reading the ledger:
   closed and not open work.
 - An `archived:` line marks content that lives in `deferred-work-archive.md`.
   The full body (evidence, resolution, dates) is there, keyed by the same
-  DW- id — read the archive file for anything beyond the stub.
+  DW- id — read the archive file for anything beyond the stub. An id may own
+  more than one block there once a reopened entry has been archived twice; the
+  date on this line is what picks the block this stub's body is in.
 - An `archived-body:` line is that same pointer carried by an entry that was
   archived and then **reopened** — the orchestrator writes it in place of the
   `archived:` stamp, which would otherwise claim a live entry's body is
