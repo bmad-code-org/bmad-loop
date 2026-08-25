@@ -34,7 +34,7 @@ from .checks import Finding
 from .platform_util import atomic_write_bytes, atomic_write_text, file_lock
 from .policy import POLICY_TEMPLATE
 from .process_host import get_process_host
-from .verify import GitError, git_below_floor, git_bytes, git_floor_text
+from .verify import GitError, git_below_floor, git_bytes, git_floor_text, git_version_at_least
 
 HOOK_SCRIPT_REL = ".bmad-loop/bmad_loop_hook.py"
 # Markers for bmad-loop-managed hook commands. RELAY_MARKER is shared by
@@ -2003,6 +2003,13 @@ def _shield_undo_extension(worktree: Path, git_dir: Path, common_dir: Path) -> s
     )
 
 
+# The Git for Windows FORK patches `xdg_config_home_for` (`path.c`) to prefer
+# `%APPDATA%/Git/<file>` over the `$HOME/.config/git/<file>` upstream computes,
+# from this version onward (absent at 2.45, absent upstream at every version).
+# `_shield_home_git_ignore` gates on it (#403).
+_APPDATA_IGNORE_GIT = (2, 46)
+
+
 def _shield_home_git_ignore(worktree: Path) -> Path:
     """`$HOME/.config/git/ignore` — git's XDG fallback — asked of GIT, not of Python.
 
@@ -2027,12 +2034,25 @@ def _shield_home_git_ignore(worktree: Path) -> Path:
     operator's config. The answer comes back NUL-terminated at rc 0; with `HOME`
     unset git exits 128 and applies no fallback at all.
 
-    KNOWN GAP: this answers "where is git's `$HOME`", which is the whole of the
-    fallback UPSTREAM but not on **Git for Windows >= 2.46**, whose fork patches
-    `xdg_config_home_for` to prefer `%APPDATA%/Git/<file>` whenever that file EXISTS.
-    An operator there keeping global ignores at `%APPDATA%\\Git\\ignore` still gets
-    the wrong file seeded. Not fixed here: a downstream fork's behavior, and one
-    gated well above `GIT_FLOOR` at that.
+    That `$HOME` answer is the whole of the fallback UPSTREAM, and is not on **Git
+    for Windows >= 2.46** (#403). The fork patches `xdg_config_home_for`
+    (`git-for-windows/git`, `path.c`) to prefer `%APPDATA%/Git/<file>` whenever that
+    file EXISTS, warning that it ignored the `$HOME` one when both are there. Counted
+    per tag: present at 2.46.0.windows.1 and 2.55.0.windows.3, absent at
+    2.45.0.windows.1 and 2.20.0.windows.1, absent from upstream `git/git` entirely.
+    PROVENANCE: source-read through #403, **NOT measured on a Windows machine** — no
+    runtime observation of Git for Windows was available, and Windows CI cannot supply
+    one either (the runners carry no `%APPDATA%\\Git\\ignore`, so they can show only
+    that nothing broke).
+
+    The APPDATA arm below closes a harm that ran in BOTH directions, each silent.
+    APPDATA file only: this returned a `$HOME` path that is typically not a file, the
+    seed came back empty with `reason is None`, and the caller then activated a
+    worktree-scoped `core.excludesFile` SHADOWING the file git really reads — so
+    everything the operator globally ignores became visible to `git add -A` and swept
+    into the story commit. BOTH files present: git uses the APPDATA one and says so,
+    while this seeded the `$HOME` one — copying patterns git is not applying, so the
+    worktree OVER-ignored and session-created files went silently missing instead.
 
     Raises `GitError` on any non-zero rc, INCLUDING the `HOME`-unset one. Proceeding
     would be a guess, and a guess here is silent: the caller seeds nothing and
@@ -2041,6 +2061,31 @@ def _shield_home_git_ignore(worktree: Path) -> Path:
     version-dependent. A `HOME`-less environment therefore skips the shield with a
     reported reason; only a definite absent may be silent in this caller.
     """
+    # Cheap-first, and every arm that does not MATCH falls through to the `$HOME`
+    # probe below — no APPDATA, no such file, an unanswerable `git version`, upstream
+    # git, a fork below 2.46. That fall-through is the conservative direction: it is
+    # exactly the pre-fix behavior, and a git too dead to report its version is not
+    # absolved by it, because the probe below raises its own `GitError` on the same
+    # git and the caller degrades with a reason.
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        candidate = Path(appdata) / "Git" / "ignore"
+        # LOAD-BEARING, and it mirrors the fork's own `file_exists` precondition: the
+        # preference applies only when that file is really there. It is also what
+        # keeps the cost at one stat on every other platform — only a candidate that
+        # exists is worth the extra spawn below.
+        if candidate.is_file():
+            # Gated on the FORK STRING, deliberately NOT `sys.platform` (#403). The
+            # preference is a patch carried by one FORK, not a property of the OS:
+            # Cygwin, MSYS2 and WSL gits run on Windows hardware without it, and a
+            # `win32` test would hand them the wrong file. This module has no
+            # `sys.platform` branch anywhere else, and asking git what it is keeps the
+            # tests honest — they fake a version string, never a platform.
+            version = git_bytes(worktree, "version")
+            if version.returncode == 0:
+                reported = os.fsdecode(version.stdout)
+                if ".windows." in reported and git_version_at_least(reported, _APPDATA_IGNORE_GIT):
+                    return candidate
     key = "bmadloop.xdghomeprobe"
     probe = git_bytes(
         worktree, "-c", f"{key}=~/.config/git/ignore", "config", "-z", "--type=path", "--get", key

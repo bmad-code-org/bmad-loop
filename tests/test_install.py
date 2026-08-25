@@ -7335,6 +7335,182 @@ def test_shield_degrades_when_git_will_not_resolve_its_home_directory(
     assert "probe-384" in git(wt, "status", "--porcelain", "-uall")
 
 
+def _shield_on_reported_git_version(monkeypatch, reported):
+    """Answer `git version` with `reported`; every other call reaches the real git.
+
+    The APPDATA arm of `_shield_home_git_ignore` asks git what it IS rather than
+    asking the OS what it is running on (#403), so the only thing a test has to fake
+    is that one answer — no `sys.platform` patch, and the rest of the shield runs
+    against the real repo and the real linked worktree.
+
+    Patches BOTH bindings, like `_shield_on_git` above and for the same reason:
+    `install.py` does `from .verify import git_bytes`, which is a name distinct from
+    `verify.git_bytes`. The new arm resolves the `install` one while
+    `verify.git_below_floor`'s own floor probe resolves the `verify` one, and patching
+    either alone leaves the other live — silently, in the direction that fakes
+    nothing. Unlike `_shield_on_git` the config write is NOT booby-trapped: these
+    tests drive the shield to completion and then read the file it seeded.
+
+    Returns the argv log, so a test can refuse to pass on a fake that was never
+    consulted."""
+    real = verify.git_bytes
+    seen: list[tuple[str, ...]] = []
+
+    def reporting(worktree, *args, timeout_s=None):
+        if args == ("version",):
+            seen.append(args)
+            return subprocess.CompletedProcess(
+                args=["git", "version"], returncode=0, stdout=reported.encode(), stderr=b""
+            )
+        return real(worktree, *args, timeout_s=timeout_s)
+
+    monkeypatch.setattr(verify, "git_bytes", reporting)
+    monkeypatch.setattr(install_mod, "git_bytes", reporting)
+    return seen
+
+
+def _appdata_and_home_ignores(tmp_path, *, appdata_file=True):
+    """A `$HOME` global ignore and (optionally) an `%APPDATA%` one, distinguishable.
+
+    Both carry a pattern of their own so that "seeded the wrong file" and "seeded
+    nothing" are different observations — the second is exactly the silent failure
+    #403 describes, so a test that cannot tell them apart proves nothing."""
+    home = tmp_path / "githome"
+    (home / ".config" / "git").mkdir(parents=True)
+    (home / ".config" / "git" / "ignore").write_text("home-junk.tmp\n", encoding="utf-8")
+    appdata = tmp_path / "appdata"
+    if appdata_file:
+        (appdata / "Git").mkdir(parents=True)
+        (appdata / "Git" / "ignore").write_text("appdata-junk.tmp\n", encoding="utf-8")
+    else:
+        appdata.mkdir(parents=True)
+    return home, appdata
+
+
+def _seed_with(project, tmp_path, monkeypatch, *, reported, appdata_file=True):
+    """Run the shield over a real worktree against a faked `git version`; return the
+    private exclude's lines.
+
+    The env is pinned inside a `monkeypatch.context()` because conftest's
+    session-scoped `_isolate_ambient_git_ignores` pins `XDG_CONFIG_HOME` for every
+    test, and the caller only reaches `_shield_home_git_ignore` when that variable is
+    unset AND `core.excludesFile` is unset (which conftest already arranges by
+    pointing `GIT_CONFIG_GLOBAL` at a file that does not exist). `GIT_CONFIG_NOSYSTEM`
+    is deliberately NOT pinned, for the reason conftest records: it would suppress Git
+    for Windows' system `core.autocrlf`. A system-level `core.excludesFile` would send
+    the shield down the branch above instead, and every caller here asserts on BOTH a
+    pattern that must be seeded and one that must not, so that case fails loudly
+    rather than passing vacuously."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    home, appdata = _appdata_and_home_ignores(tmp_path, appdata_file=appdata_file)
+    seen = _shield_on_reported_git_version(monkeypatch, reported)
+
+    with monkeypatch.context() as pinned:
+        pinned.delenv("XDG_CONFIG_HOME", raising=False)
+        pinned.setenv("HOME", str(home))
+        pinned.setenv("APPDATA", str(appdata))
+        assert _worktree_local_exclude(wt, ["/probe-403"]) is None
+
+    assert seen, "the fake never answered `git version` — the shield read a real one"
+    return _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
+
+
+def test_shield_prefers_appdata_ignore_on_the_windows_fork(project, tmp_path, monkeypatch):
+    """On Git for Windows >= 2.46 the operator's global ignores live at
+    `%APPDATA%\\Git\\ignore`, and that is the file the shield must copy (#403).
+
+    The fork patches `xdg_config_home_for` (`git-for-windows/git`, `path.c`) to prefer
+    `%APPDATA%/Git/<file>` over the `$HOME/.config/git/<file>` upstream computes,
+    whenever the APPDATA one exists — and when BOTH exist it warns that the `$HOME`
+    one "was ignored because" the APPDATA one is there. They are alternative
+    locations, not a search path.
+
+    PROVENANCE: that is a SOURCE READ of the fork (counted per tag through #403:
+    present at 2.46 and 2.55, absent at 2.45 and 2.20, absent upstream), **not a
+    measurement**. No Windows machine was available to observe it, and Windows CI
+    could not have supplied one either — its runners carry no `%APPDATA%\\Git\\ignore`.
+    So this test pins OUR selection logic against a version string we state; it cannot
+    and does not claim Git for Windows agrees.
+
+    Both files exist here, which folds the mirror direction in: preferring APPDATA is
+    the same assertion as not seeding the `$HOME` file git itself is ignoring. Seeding
+    that one would copy patterns git is not applying, and the worktree would
+    OVER-ignore — session-created files going silently missing from `git add -A`,
+    #384's harm inverted.
+
+    Ablation: delete the whole APPDATA arm and this fails — `home-junk.tmp` is seeded
+    and `appdata-junk.tmp` is not, which is the pre-fix behavior exactly."""
+    seeded = _seed_with(project, tmp_path, monkeypatch, reported="git version 2.46.0.windows.1\n")
+
+    assert "appdata-junk.tmp" in seeded
+    assert "home-junk.tmp" not in seeded
+
+
+def test_shield_appdata_ignore_needs_the_246_fork(project, tmp_path, monkeypatch):
+    """2.45.0.windows.1 is the same FORK without the patch, and it reads `$HOME`.
+
+    The preference arrived at 2.46 (`APPDATA` is absent from `path.c` at
+    2.45.0.windows.1 and 2.20.0.windows.1, counted per tag through #403), far above
+    this project's own `GIT_FLOOR`. So "APPDATA exists, prefer it" is not enough on
+    its own: on an older Git for Windows it would seed a file git is not reading and
+    the worktree would over-ignore — the same silent loss the fix exists to stop,
+    aimed the other way.
+
+    Ablation: delete the `git_version_at_least` conjunct and this fails —
+    `appdata-junk.tmp` is seeded off a fork that never had the patch."""
+    seeded = _seed_with(project, tmp_path, monkeypatch, reported="git version 2.45.0.windows.1\n")
+
+    assert "home-junk.tmp" in seeded
+    assert "appdata-junk.tmp" not in seeded
+
+
+def test_shield_appdata_ignore_is_the_forks_not_the_platforms(project, tmp_path, monkeypatch):
+    """A current UPSTREAM git ignores `%APPDATA%` however new it is, so the gate reads
+    the fork string rather than the platform (#403).
+
+    `APPDATA` appears nowhere in `git/git`'s `path.c` at any version, so 2.55.0
+    upstream is above the 2.46 floor and still has no such preference. That is why
+    this gate is not `sys.platform == "win32"`: Cygwin, MSYS2 and WSL gits all run on
+    Windows hardware and are all upstream builds, and a platform test would hand every
+    one of them the wrong file. Asking git what it IS also keeps this test honest —
+    it fakes a version string, never a platform, and so it exercises the real code
+    path on the box it runs on.
+
+    Ablation: delete the `".windows." in reported` conjunct and this fails —
+    `appdata-junk.tmp` is seeded off an upstream git that would never read it."""
+    seeded = _seed_with(project, tmp_path, monkeypatch, reported="git version 2.55.0\n")
+
+    assert "home-junk.tmp" in seeded
+    assert "appdata-junk.tmp" not in seeded
+
+
+def test_shield_appdata_absent_file_keeps_the_home_fallback(project, tmp_path, monkeypatch):
+    """`%APPDATA%` set with no `Git/ignore` under it is the ORDINARY case on the fork,
+    and it must reach `$HOME` — the preference is conditional on the file existing.
+
+    The `is_file()` precondition mirrors the fork's own `file_exists` guard: git does
+    not prefer a path it cannot read, it computes the `$HOME` one instead. Dropping it
+    would not merely seed the wrong file, it would seed NOTHING — a non-existent
+    source reads as an empty seed with `reason is None`, after which the caller
+    activates a worktree-scoped `core.excludesFile` that SHADOWS the operator's real
+    global ignores. That is #403's own harm, and it is silent.
+
+    Ablation: drop the `is_file()` precondition and this fails — the arm returns the
+    absent candidate, the seed comes back empty, and `home-junk.tmp` is missing."""
+    seeded = _seed_with(
+        project,
+        tmp_path,
+        monkeypatch,
+        reported="git version 2.46.0.windows.1\n",
+        appdata_file=False,
+    )
+
+    assert "home-junk.tmp" in seeded
+    assert "/probe-403" in seeded  # ...and the seed is not empty for some other reason
+
+
 def test_shield_seeds_a_relative_xdg_config_home_resolved_like_git(project, tmp_path, monkeypatch):
     """The relative-path defect of the `core.excludesFile` branch, at the XDG fallback
     branch (#384). This branch exists to REPRODUCE git's fallback, so
