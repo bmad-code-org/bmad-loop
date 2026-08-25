@@ -58,6 +58,9 @@ breaking changes may land in a minor release.
   sitting there. Also refuse an empty or `:`-bearing session name before the probe spawns. A
   same-named session on a foreign server, and one differing only by whitespace the seam
   normalizes away, stay #531's subject (#671)
+- The git-add shield's rollback report no longer raises through its own stderr decode on
+  Windows (#394). `_shield_undo_extension` is contracted never to raise, but the `fsdecode` of a
+  failing `--unset-all`'s stderr was guarded for `GitError` alone.
 
 ### Security
 

@@ -6290,6 +6290,72 @@ def test_shield_rollback_scan_fault_is_reported_not_raised(project, tmp_path, mo
     assert "worktreeConfig" in (repo / ".git" / "config").read_text(encoding="utf-8")
 
 
+def test_shield_rollback_stderr_decode_fault_is_reported_not_raised(project, tmp_path, monkeypatch):
+    """The OTHER block of the same never-raises promise, and the same fault shape (#394).
+
+    Where the sibling test above covers the dependents scan, this covers the `--unset-all`
+    block one down: it decodes git's stderr with `os.fsdecode` to name why the rollback
+    failed, and that decode was guarded for `GitError` alone — so a codec fault escaped a
+    function contracted never to raise, replacing BOTH the activation fault and the
+    retained-flag disclosure with the caller's generic tail reason.
+
+    The fault is INJECTED rather than produced from real bytes, for the reason the issue's
+    testability note gives: POSIX `os.fsdecode` decodes with `surrogateescape` and cannot
+    raise, so the real-world trigger is Windows-only (utf-8/surrogatepass rejects a lone
+    invalid byte). Same justification as the sibling's injected `resolve()` fault.
+
+    Driven at the helper rather than through `_worktree_local_exclude`, and for the same
+    reason: an end-to-end injection would fire on an earlier same-shaped `fsdecode` — the
+    caller decodes `rev-parse`'s stderr before the rollback is ever reached — and prove
+    something else. The `os.fsdecode` fake is predicate-scoped to the marker bytes so
+    every other decode in the process keeps working.
+
+    Ablation: restore the bare `except GitError` at the `--unset-all` block and this test
+    errors — the injected UnicodeDecodeError escapes a function contracted never to
+    raise."""
+    repo = project.project
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    git(repo, "config", "extensions.worktreeConfig", "true")
+    git_dir = Path(git(wt, "rev-parse", "--absolute-git-dir")).resolve()
+    common = Path(git(wt, "rev-parse", "--git-common-dir")).resolve()
+    # the scan must find no dependent, or the helper returns before the decode under test
+    assert not (common / "config.worktree").exists()
+    marker = b"fatal: could not lock config file \xff"
+    real_git_bytes, real_fsdecode = install_mod.git_bytes, os.fsdecode
+
+    def unset_fails(worktree, *args, timeout_s=None):
+        # An exact-argv match, and the `_is_unset` tripwire lesson does not bite here:
+        # a spelling drift makes this fake stop matching, the REAL unset then answers
+        # rc 5 for an absent key, and the helper returns "" — which reddens the clause
+        # assertions below rather than going quiet.
+        if args == ("config", "--unset-all", "extensions.worktreeConfig"):
+            return subprocess.CompletedProcess(
+                args=["git", *args], returncode=2, stdout=b"", stderr=marker
+            )
+        return real_git_bytes(worktree, *args, timeout_s=timeout_s)
+
+    def undecodable(value):
+        if value == marker:
+            raise UnicodeDecodeError("utf-8", b"\x62", 0, 1, "injected")
+        return real_fsdecode(value)
+
+    monkeypatch.setattr(install_mod, "git_bytes", unset_fails)
+    monkeypatch.setattr(os, "fsdecode", undecodable)
+
+    clause = _shield_undo_extension(wt, git_dir, common)
+
+    # before ANY assertion: a globally patched `os.fsdecode` must not outlive the call
+    monkeypatch.undo()
+    assert isinstance(clause, str) and clause  # reported, not raised...
+    assert "could NOT be" in clause  # ...with the hedge the caller's tail cannot give
+    # names the injected decode as the cause, separating it from "git exited 2": the
+    # rc-2 branch is what the escape used to skip past
+    assert "injected" in clause
+    # the flag survives — the fake is why, and the clause is the only thing that says so
+    assert "worktreeConfig" in (repo / ".git" / "config").read_text(encoding="utf-8")
+
+
 def test_shield_rolls_back_inside_the_lock(project, tmp_path, monkeypatch):
     """The ROLLBACK has to happen while the lock is still held, and that placement is
     load-bearing rather than incidental: released first, a second run probes in the

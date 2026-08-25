@@ -1957,9 +1957,16 @@ def _shield_undo_extension(worktree: Path, git_dir: Path, common_dir: Path) -> s
         if undone.returncode in (0, 5):
             return ""
         detail = os.fsdecode(undone.stderr).strip() or f"git exited {undone.returncode}"
-    except GitError as e:
+    except (GitError, UnicodeError) as e:
         # the rollback's OWN git can time out or fail to spawn: a read-only `.git` or
         # a dead git fails this unset for the same reason it failed the activation.
+        #
+        # `UnicodeError` is the `fsdecode` of git's stderr one line up (#394): Windows
+        # decodes utf-8/surrogatepass, which REJECTS a lone invalid byte, so without it
+        # a codec fault escapes a function contracted never to raise (POSIX decodes
+        # with surrogateescape and never raises). `OSError`/`RuntimeError` are
+        # deliberately absent, so this is NOT a copy of the sibling scan's tuple above:
+        # nothing in this block resolves a path, which is what those two are there for.
         detail = str(e)
     # Both clauses HEDGE whether this shield set the flag, and must: reached from the
     # enable's own raise, a spawn failure can kill the enable and this unset alike,
@@ -2310,7 +2317,8 @@ def _worktree_local_exclude(worktree: Path, patterns: Sequence[str]) -> str | No
         # `except` of its own: a non-zero rc returns the reason below, a raise lands in
         # this try's tail — which also catches the `UnicodeError` the `fsdecode` of
         # git's stderr can raise on Windows, hence that read sits inside the guard.
-        # #394 records that same decode escaping at a sibling block that lacks it.
+        # The sibling decode in `_shield_undo_extension`'s rollback carries that same
+        # guard, for the same reason (#394).
         shared_answer = git_bytes(worktree, "rev-parse", "--git-common-dir")
         if shared_answer.returncode != 0:
             detail = (
