@@ -17,6 +17,9 @@ import importlib.util
 import os
 from pathlib import Path
 
+import pytest
+
+from bmad_loop import platform_util
 from bmad_loop.plugins import get_plugin
 
 _GUARD_DIR = "Assets/BmadLoop/Editor"
@@ -223,6 +226,83 @@ def test_seed_rejects_windows_flavored_escapes_on_any_platform(tmp_path, monkeyp
         _set_env(monkeypatch, tmp_path, guard_dir=evil)
         assert mod.main() == 2, evil
     assert not (tmp_path / "Assets" / "BmadLoop").exists()  # nothing seeded
+
+
+def test_seed_rejects_a_win32_alias_guard_dir_on_any_platform(tmp_path, monkeypatch):
+    """The fourth family member, wired into the same guard chain: a guard dir that
+    names a Windows device, or whose trailing periods/spaces Win32 trims, installs
+    somewhere other than the path it spells. Refused on every platform for the same
+    reason the drive-qualified rows above are — a value must not mean one thing here
+    and another on Windows. `Editor.` is the shape that matters in practice: nothing
+    upstream catches it, since the caller `.strip()`s only the whole env var."""
+    mod = _load_seeder()
+    (tmp_path / "Assets").mkdir()
+    for evil in ("Assets/NUL", "Assets/BmadLoop/Editor.", "Assets/BmadLoop /Editor", "NUL"):
+        _set_env(monkeypatch, tmp_path, guard_dir=evil)
+        assert mod.main() == 2, evil
+    assert not (tmp_path / "Assets" / "BmadLoop").exists()  # nothing seeded
+
+
+# --------------------------------------------- the hand-mirrored win32 predicate
+
+# The phase-1 truth table from `tests/test_platform_util.py`, carried over verbatim:
+# rule 1 (reserved device basenames, per component, both separators), rule 2 (the
+# trailing period/space trim), the over-refusal tripwires (`com10`, `nulls`,
+# `auxiliary`), and the root/parent spellings the predicate must leave to its three
+# siblings. Any divergence between core and the clone shows up on one of these rows.
+_WIN32_ALIAS_ROWS = (
+    "NUL",
+    "nul",
+    "NUL.txt",
+    "PRN  ",
+    "sub/NUL",
+    "sub/NUL.txt",
+    "CONIN$",
+    "COM1",
+    "COM0",
+    "LPT9",
+    "AUX",
+    "aux.json",
+    "CON.",
+    "sub\\NUL",
+    ".claude/skills.",
+    ".claude/skills ",
+    "skills. ",
+    "sub./x",
+    "a/b ",
+    ".claude/skills",
+    "normal/path",
+    "com10",
+    "nulls",
+    "auxiliary",
+    "a.b/c.d",
+    "..",
+    ".",
+    "",
+    "...",
+    "   ",
+    ".. ",
+)
+
+
+@pytest.mark.parametrize("value", _WIN32_ALIAS_ROWS)
+def test_seeder_win32_alias_clone_agrees_with_the_core_predicate(value):
+    """This script is stdlib-only (it is deployed into a consumer project and cannot
+    import bmad_loop), so `_names_win32_alias` is a hand-written mirror of
+    `platform_util.names_win32_alias`. The file is also excluded from pyright and has
+    no other guard against drift (#546) — so the mirror is pinned behaviorally, on
+    the core predicate's own truth table, rather than trusted to stay in sync."""
+    mod = _load_seeder()
+    assert mod._names_win32_alias(value) is platform_util.names_win32_alias(value)
+
+
+def test_seeder_reserved_basename_set_mirrors_core_member_for_member():
+    """The truth table above cannot reach every member of the set, and a device name
+    dropped from the clone would simply be seeded. Pin the set itself — including the
+    deliberate over-refusals (`COM0`/`LPT0`, the `CONIN$`/`CONOUT$` pair) that neither
+    Microsoft's published list nor Wine's `RtlIsDosDeviceName_U` backs on its own."""
+    mod = _load_seeder()
+    assert mod._RESERVED_BASENAMES == platform_util._RESERVED_BASENAMES
 
 
 # ------------------------------------------------------------ version parsing

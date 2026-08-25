@@ -88,6 +88,51 @@ def _names_tree_root(value: str) -> bool:
     return bool(parts) and all(part.strip(" .") == "" and part != ".." for part in parts)
 
 
+# Reserved on Windows regardless of extension: CON.txt is as illegal as CON. Mirrors
+# ``bmad_loop.platform_util._RESERVED_BASENAMES`` member for member, including its
+# deliberate over-refusals: Microsoft's published list names only COM1-COM9 /
+# LPT1-LPT9 and omits the console pair, while Wine's ``RtlIsDosDeviceName_U`` matches
+# CONIN$/CONOUT$ but rejects the 0 forms, so COM0/LPT0 are backed by neither. Mirror
+# the set, not any claim about it.
+_RESERVED_BASENAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
+    | {f"COM{i}" for i in range(10)}
+    | {f"LPT{i}" for i in range(10)}
+    | {f"COM{s}" for s in "¹²³"}
+    | {f"LPT{s}" for s in "¹²³"}
+)
+
+
+def _is_reserved_basename(seg: str) -> bool:
+    """True if ``seg``'s basename (before the first dot, trailing spaces trimmed —
+    ``CON .txt`` counts) is a Windows reserved device name (mirrors
+    ``bmad_loop.platform_util._is_reserved_basename``)."""
+    stem = seg.split(".", 1)[0].rstrip(" ")
+    return stem.upper() in _RESERVED_BASENAMES
+
+
+def _names_win32_alias(value: str) -> bool:
+    """True if any component of ``value`` names something other than itself on Win32 —
+    a reserved device name, or a name whose trailing periods and spaces Win32 trims
+    away before the path ever reaches the filesystem (mirrors
+    ``bmad_loop.platform_util.names_win32_alias`` — this deployed script is stdlib-only
+    and cannot import core).
+
+    The fourth member of the family, and the only one about *determinism* rather than
+    containment: ``"Assets/NUL"`` and ``"Assets/BmadLoop/Editor."`` are both inside the
+    worktree by every measure the other three apply, and both name a different thing on
+    Windows than they spell here. The ``part.strip(" .") != ""`` carve-out hands a
+    component made solely of periods and spaces back to :func:`_names_tree_root` and
+    plain ``".."`` back to :func:`_has_parent_ref`, so all four refuse disjoint sets.
+    Core's docstring carries the two rules, their sources, and the Windows 11 narrowing
+    this deliberately does not track."""
+    parts = [part for part in value.replace("\\", "/").split("/") if part]
+    return any(
+        _is_reserved_basename(part) or (part.strip(" .") != "" and part != part.rstrip(" ."))
+        for part in parts
+    )
+
+
 def _truthy(value: str | None, default: bool) -> bool:
     if value is None or value.strip() == "":
         return default
@@ -187,14 +232,26 @@ def main() -> int:
     # The install dir must stay inside the worktree AND name something in it: an
     # absolute/drive-qualified path would make _install's relative_to() raise, a
     # ".." segment would let the copy escape the project tree, and a root-naming
-    # spelling would scatter the payload across the worktree root itself.
+    # spelling would scatter the payload across the worktree root itself. The fourth
+    # term is about determinism rather than containment: Win32 trims a component's
+    # trailing periods and spaces, so "Assets/BmadLoop/Editor." installs into "Editor"
+    # while the configured string still spells "Editor.", and a component naming a
+    # reserved device writes to the device instead of the tree. The caller's .strip()
+    # above removes only a trailing run on the WHOLE value, so neither an interior
+    # component nor a trailing dot is already handled.
     if (
         not rel.parts
         or _names_tree_root(guard_dir)
         or _is_absolute(guard_dir)
         or _has_parent_ref(guard_dir)
+        or _names_win32_alias(guard_dir)
     ):
-        print(f"unity_seed_assets: invalid scene guard dir {guard_dir!r}", file=sys.stderr)
+        print(
+            f"unity_seed_assets: invalid scene guard dir {guard_dir!r}: it must name a "
+            "path inside the worktree and must not name a Windows device or end a "
+            "component in a period or space",
+            file=sys.stderr,
+        )
         return 2
     target_dir = worktree / guard_dir
 
