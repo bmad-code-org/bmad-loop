@@ -7369,7 +7369,7 @@ def _shield_on_reported_git_version(monkeypatch, reported):
     return seen
 
 
-def _appdata_and_home_ignores(tmp_path, *, appdata_file=True, appdata_dir=False):
+def _appdata_and_home_ignores(tmp_path, *, appdata_shape="file"):
     """A `$HOME` global ignore and (optionally) an `%APPDATA%` one, distinguishable.
 
     Both carry a pattern of their own so that "seeded the wrong file" and "seeded
@@ -7379,21 +7379,26 @@ def _appdata_and_home_ignores(tmp_path, *, appdata_file=True, appdata_dir=False)
     (home / ".config" / "git").mkdir(parents=True)
     (home / ".config" / "git" / "ignore").write_text("home-junk.tmp\n", encoding="utf-8")
     appdata = tmp_path / "appdata"
-    if appdata_dir:
-        # A DIRECTORY where the fork expects a file: git's `lstat` predicate selects it
-        # anyway, so the shield must too (see `_shield_file_exists`).
+    # The four shapes git's `lstat` predicate can meet at `%APPDATA%/Git/ignore`. They
+    # are NOT interchangeable: git reads a file, silently skips a broken symlink, and
+    # dies on a directory, so the shield owes each a different answer.
+    if appdata_shape == "directory":
         (appdata / "Git" / "ignore").mkdir(parents=True)
-    elif appdata_file:
+    elif appdata_shape == "broken-symlink":
+        (appdata / "Git").mkdir(parents=True)
+        (appdata / "Git" / "ignore").symlink_to(tmp_path / "nowhere")
+    elif appdata_shape == "file":
         (appdata / "Git").mkdir(parents=True)
         (appdata / "Git" / "ignore").write_text("appdata-junk.tmp\n", encoding="utf-8")
     else:
+        assert appdata_shape == "absent", appdata_shape
         appdata.mkdir(parents=True)
     return home, appdata
 
 
-def _seed_with(project, tmp_path, monkeypatch, *, reported, appdata_file=True, appdata_dir=False):
-    """Run the shield over a real worktree against a faked `git version`; return the
-    private exclude's lines.
+def _drive_shield(project, tmp_path, monkeypatch, *, reported, appdata_shape="file"):
+    """Run the shield over a real worktree against a faked `git version`; return its
+    degrade reason (None when it applied) and the private exclude's lines.
 
     The env is pinned inside a `monkeypatch.context()` because conftest's
     session-scoped `_isolate_ambient_git_ignores` pins `XDG_CONFIG_HOME` for every
@@ -7408,19 +7413,28 @@ def _seed_with(project, tmp_path, monkeypatch, *, reported, appdata_file=True, a
     repo = project.project
     wt = tmp_path / "wt"
     verify.worktree_add(repo, wt, "feat", "main")
-    home, appdata = _appdata_and_home_ignores(
-        tmp_path, appdata_file=appdata_file, appdata_dir=appdata_dir
-    )
+    home, appdata = _appdata_and_home_ignores(tmp_path, appdata_shape=appdata_shape)
     seen = _shield_on_reported_git_version(monkeypatch, reported)
 
     with monkeypatch.context() as pinned:
         pinned.delenv("XDG_CONFIG_HOME", raising=False)
         pinned.setenv("HOME", str(home))
         pinned.setenv("APPDATA", str(appdata))
-        assert _worktree_local_exclude(wt, ["/probe-403"]) is None
+        reason = _worktree_local_exclude(wt, ["/probe-403"])
 
     assert seen, "the fake never answered `git version` — the shield read a real one"
-    return _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
+    private = _wt_private_exclude(wt)
+    lines = private.read_text(encoding="utf-8").splitlines() if private.is_file() else []
+    return reason, lines
+
+
+def _seed_with(project, tmp_path, monkeypatch, *, reported, appdata_shape="file"):
+    """`_drive_shield` for the APPLIED case: refuses a degrade, returns the lines."""
+    reason, lines = _drive_shield(
+        project, tmp_path, monkeypatch, reported=reported, appdata_shape=appdata_shape
+    )
+    assert reason is None, f"the shield degraded instead of applying: {reason}"
+    return lines
 
 
 def test_shield_prefers_appdata_ignore_on_the_windows_fork(project, tmp_path, monkeypatch):
@@ -7492,42 +7506,75 @@ def test_shield_appdata_ignore_is_the_forks_not_the_platforms(project, tmp_path,
     assert "appdata-junk.tmp" not in seeded
 
 
-def test_shield_appdata_ignore_directory_is_selected_like_gits_lstat(
+def test_shield_appdata_ignore_directory_degrades_instead_of_seeding_empty(
     project, tmp_path, monkeypatch
 ):
-    """A DIRECTORY at `%APPDATA%\\Git\\ignore` is SELECTED, because git's predicate is `lstat`.
+    """A DIRECTORY at `%APPDATA%\\Git\\ignore` is selected by git and then UNUSABLE by it,
+    so the shield stands down rather than modelling that fatal as an empty seed.
 
-    `xdg_config_home_for` gates the preference on `file_exists` (`path.c`), and
-    `file_exists` is `lstat(f, &sb) == 0` (`dir.c`) — so a directory satisfies it and
-    the fork returns that path as its `excludes_file`. A `Path.is_file()` here would
-    reject what git accepts and fall through to `$HOME`, seeding patterns git is not
-    applying: the OVER-IGNORE direction, since git never reads the `$HOME` file once it
-    has selected the APPDATA one.
+    Git's predicate is `lstat` (`file_exists`, `dir.c`), so `xdg_config_home_for`
+    selects a directory exactly as it selects a file. Reading it is where the two part:
+    `access(R_OK)` succeeds on a readable directory, so git reaches
+    `add_patterns_from_file_1` and dies — "cannot use %s as an exclude file".
 
-    What the shield seeds for that shape is NOTHING, and that is the faithful answer
-    rather than an accident of the caller: the caller's own `is_file()` refuses to read
-    a directory, and git gets no usable patterns from one either — it dies on it
-    (`add_patterns_from_file_1`, `dir.c`). An empty inherited seed is what both ends
-    agree on.
+    Seeding nothing here would be the WRONG mirror. The shield's activation writes a
+    worktree-scoped `core.excludesFile`, which SHADOWS the broken path, so the unit's
+    `git add -A` would run happily inside the worktree where the operator's own git
+    refuses to run at all — a misconfiguration silently masked, and files staged where
+    the unshielded command would have halted. An unusable answer is UNKNOWN, not empty,
+    which is the same reading this module already gives an unresolvable `$HOME`.
 
-    PROVENANCE: a source read of the fork, as the sibling tests record — the version
-    string is faked, and nothing here was measured on Windows.
+    PROVENANCE: source read of the fork, as the sibling tests record — the version
+    string is faked and nothing here was measured on Windows.
 
-    Ablation: narrow `_shield_file_exists` back to `candidate.is_file()` and this fails
-    — the arm rejects the directory, falls through to the `$HOME` probe, and
-    `home-junk.tmp` is seeded."""
-    seeded = _seed_with(
+    Ablation: drop the `is_dir()` refusal and this fails — the shield applies, `reason`
+    comes back None, and the private exclude carries `/probe-403` with no inherited
+    patterns, which is the masked-fatal shape exactly."""
+    reason, _lines = _drive_shield(
         project,
         tmp_path,
         monkeypatch,
         reported="git version 2.46.0.windows.1\n",
-        appdata_dir=True,
+        appdata_shape="directory",
     )
 
-    assert "home-junk.tmp" not in seeded
-    assert "appdata-junk.tmp" not in seeded
+    assert reason is not None
+    assert "is a directory" in reason
+    # ...and it named the path, so the operator can find the thing to repair.
+    assert str(tmp_path / "appdata") in reason
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_shield_appdata_ignore_broken_symlink_seeds_empty_not_a_refusal(
+    project, tmp_path, monkeypatch
+):
+    """A BROKEN SYMLINK there is selected too, and unlike a directory it must NOT refuse.
+
+    This is the discriminator for the refusal above: git's `lstat` predicate accepts
+    both shapes, but its READ path treats them differently. `access(R_OK)` follows the
+    link to a missing target, giving `ENOENT`, which `access_error_is_ok` classifies as
+    an ignorable missing file — so git prints nothing, loads no patterns, and runs on.
+
+    An empty inherited seed mirrors that precisely, and refusing here instead would
+    stand the shield down over a configuration git itself is perfectly happy with. The
+    `$HOME` file must not be seeded either: git selected the APPDATA path and is not
+    reading `$HOME` at all.
+
+    Ablation: widen the `is_dir()` refusal to any non-regular candidate and this fails —
+    the shield degrades over a repo whose git runs fine."""
+    reason, lines = _drive_shield(
+        project,
+        tmp_path,
+        monkeypatch,
+        reported="git version 2.46.0.windows.1\n",
+        appdata_shape="broken-symlink",
+    )
+
+    assert reason is None, reason
+    assert "home-junk.tmp" not in lines
+    assert "appdata-junk.tmp" not in lines
     # ...and the shield still RAN: the inherited seed is empty, not the whole file.
-    assert "/probe-403" in seeded
+    assert "/probe-403" in lines
 
 
 def test_shield_appdata_absent_file_keeps_the_home_fallback(project, tmp_path, monkeypatch):
@@ -7550,7 +7597,7 @@ def test_shield_appdata_absent_file_keeps_the_home_fallback(project, tmp_path, m
         tmp_path,
         monkeypatch,
         reported="git version 2.46.0.windows.1\n",
-        appdata_file=False,
+        appdata_shape="absent",
     )
 
     assert "home-junk.tmp" in seeded

@@ -2019,12 +2019,16 @@ def _shield_file_exists(candidate: Path) -> bool:
     module down the `$HOME` arm git is NOT reading, which is #403's over-ignore
     direction rather than a safe fall-through.
 
-    A non-regular candidate still seeds NOTHING, because the caller applies its own
-    `is_file()` before reading it, and that empty seed is the faithful answer: git
-    applies no patterns from either shape. A broken symlink is dropped by git's own
-    `access_or_warn(..., R_OK)` gate, whose `ENOENT` counts as an ignorable missing
-    file; a directory makes git `die("cannot use %s as an exclude file")` instead, so
-    there are no patterns to mirror in either case.
+    Selecting is not the same as being able to MIRROR, and the two non-regular shapes
+    part company right there — the caller distinguishes them:
+
+    - a BROKEN SYMLINK is dropped by git's own `access_or_warn(..., R_OK)` gate, whose
+      `ENOENT` counts as an ignorable missing file, so git loads no patterns and runs
+      on. The caller's `is_file()` seeds nothing, which mirrors that exactly.
+    - a DIRECTORY passes that same `access(R_OK)` gate, so git goes on to
+      `add_patterns_from_file_1` and `die("cannot use %s as an exclude file")`. Git
+      does not run at all, and an empty seed would model a FATAL as a permissive
+      success — see `_shield_home_git_ignore`, which refuses that shape.
 
     Swallows `OSError` alone — a candidate this process cannot stat is one the shield
     must treat as absent, exactly as `file_exists` reports a failed `lstat`.
@@ -2112,6 +2116,26 @@ def _shield_home_git_ignore(worktree: Path) -> Path:
             if version.returncode == 0:
                 reported = os.fsdecode(version.stdout)
                 if ".windows." in reported and git_version_at_least(reported, _APPDATA_IGNORE_GIT):
+                    if candidate.is_dir():
+                        # SELECTED by git and then UNUSABLE by it: `access(R_OK)`
+                        # succeeds on a readable directory, so git reaches
+                        # `add_patterns_from_file_1` and dies ("cannot use %s as an
+                        # exclude file"). Returning it would seed nothing — and an
+                        # empty seed here is not the faithful mirror it is for a broken
+                        # symlink, it is a FATAL rendered as a permissive success:
+                        # activating a worktree-scoped `core.excludesFile` SHADOWS the
+                        # broken path, so the unit's `git add -A` would run happily
+                        # where the operator's own git refuses to run at all, and the
+                        # misconfiguration would never surface.
+                        #
+                        # `is_dir()` FOLLOWS the link deliberately: a symlink to a
+                        # directory is the same fatal. A broken one is not a directory
+                        # and falls through to be seeded as empty, which is what git
+                        # does with it.
+                        raise GitError(
+                            f"git's global ignore path is a directory ({candidate}) — "
+                            "git for Windows selects it and then cannot read it"
+                        )
                     return candidate
     key = "bmadloop.xdghomeprobe"
     probe = git_bytes(
