@@ -2297,9 +2297,15 @@ def _sweep_archive(project: Path, paths: bmadconfig.ProjectPaths, args: argparse
             )
             return ExitCode.FAILURE
     ledger = paths.deferred_work
-    if not ledger.is_file():
-        print(f"no deferred-work ledger at {ledger}")
-        return ExitCode.OK
+    # Call the primitive BEFORE reporting a missing ledger, and report the
+    # missing ledger from its empty result. `archive_closed` validates `before`
+    # ahead of its own `is_file` short-circuit precisely so a malformed date
+    # fails the same way whether or not a ledger exists; short-circuiting here
+    # first put that back, and `--before not-a-date` then exited 0 on a project
+    # that happens to have no ledger today and 1 on one that does — the same
+    # invocation graded by optional project data rather than by its own shape
+    # (#711 review). The call is safe on a missing file: it short-circuits to
+    # an empty list without writing.
     try:
         archived = deferredwork.archive_closed(
             ledger,
@@ -2309,6 +2315,9 @@ def _sweep_archive(project: Path, paths: bmadconfig.ProjectPaths, args: argparse
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return ExitCode.FAILURE
+    if not ledger.is_file():
+        print(f"no deferred-work ledger at {ledger}")
+        return ExitCode.OK
     archive_path = ledger.parent / deferredwork.ARCHIVE_REL
     if not archived:
         print("no closed entries to archive")

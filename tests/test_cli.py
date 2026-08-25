@@ -9151,6 +9151,19 @@ def test_sweep_archive_rejects_bad_before_date(project, capsys):
     assert "date must be YYYY-MM-DD" in capsys.readouterr().err
 
 
+def test_sweep_archive_rejects_bad_before_date_without_a_ledger(project, capsys):
+    """The same malformed `--before` is refused whether or not the project has
+    a ledger. `archive_closed` validates dates ahead of its own `is_file`
+    short-circuit for that reason; a missing-ledger early return in the CLI
+    graded the invocation by optional project data instead (#711 review)."""
+    install_bmad_config(project)  # no ledger written
+    rc = cli.main(["sweep", "--archive", "--before", "bad-date", "--project", str(project.project)])
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "date must be YYYY-MM-DD" in captured.err
+    assert "no deferred-work ledger at" not in captured.out  # not reported as a clean run
+
+
 def test_sweep_archive_dry_run(project, capsys):
     """--dry-run previews and writes nothing.
 
