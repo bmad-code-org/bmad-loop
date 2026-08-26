@@ -4635,11 +4635,12 @@ class Engine:
         """The ledger text ``reset --hard`` republishes, taken from git itself (#735).
 
         Answers ``(True, text)`` when the baseline commit carries the ledger,
-        ``(True, None)`` when it determinately does not — the reset leaves no
-        tracked file behind, whether because the commit lacks the path or
-        because the ledger is proven external and no revision of this repo can
-        name it — and ``(False, None)`` when no anchor could be derived at all:
-        no baseline commit, or a probe that failed.
+        ``(True, None)`` when it determinately does not — the reset republishes
+        no ledger text, whether because the commit lacks the path, because the
+        ledger is proven external and no revision of this repo can name it, or
+        because the baseline holds a non-regular entry (a symlink, whose blob is
+        a pathname rather than ledger text) — and ``(False, None)`` when no
+        anchor could be derived at all: no baseline commit, or a probe failed.
 
         Newlines are normalized to LF because the only thing this text is ever
         compared against is :meth:`_ledger_text`, which reads in Python's
@@ -4684,6 +4685,22 @@ class Engine:
             # the evidence does not support.
             return True, None
         try:
+            if verify.path_is_non_regular_at_revision(
+                self.workspace.root, task.baseline_commit, rel
+            ):
+                # A symlink, gitlink or tree at the baseline is a path whose
+                # CONTENTS the reset never republished: `reset --hard` restores
+                # the link itself and cannot reach through it to revert what it
+                # points at. Behind mode 120000 the blob is the TARGET PATHNAME,
+                # so trusting it here would compare a pathname against ledger
+                # text and leave the anchor silently never-true — the same
+                # failure mode the newline normalization above exists to prevent,
+                # and one that would escalate every failed migration over a
+                # ledger symlinked into the repo. That shape is supported on
+                # purpose: `atomic_write_text` follows symlinks by DEFAULT so
+                # such a ledger keeps being a symlink. Determinate absence of
+                # republished text, exactly like a proven-external ledger.
+                return True, None
             blob = verify.worktree_file_bytes_at_revision(
                 self.workspace.root, task.baseline_commit, rel
             )

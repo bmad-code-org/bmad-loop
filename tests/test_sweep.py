@@ -5420,3 +5420,39 @@ def test_migration_restore_writes_back_an_external_ledger(project, tmp_path):
     assert summary.paused
     assert external.deferred_work.read_text(encoding="utf-8") == LEGACY_LEDGER
     assert "sweep-migration-restore-diverged" not in journal_kinds(engine)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_migration_restore_writes_back_a_symlinked_ledger(project, tmp_path):
+    """#735 follow-up. A ledger symlinked into the repo is a supported shape —
+    `atomic_write_text` follows symlinks BY DEFAULT precisely so such a ledger
+    "keeps being a symlink and the real file is what gets rewritten".
+
+    Git stores that tracked symlink as a blob holding the TARGET PATHNAME, so a
+    baseline anchor taken from the blob would compare a pathname against ledger
+    text and never be true — escalating every failed migration over a shape that
+    is not ambiguous at all. `reset --hard` restores the link, never what it
+    points at, so the reset republished no ledger text and the anchor is the
+    rejected rewrite this attempt graded, as for an untracked or external ledger.
+
+    Ablation: drop the `path_is_non_regular_at_revision` arm from
+    `_ledger_baseline_text` and this reddens on the restored-text assertion, with
+    `sweep-migration-restore-diverged` journaled and the half-migrated rewrite
+    left standing.
+    """
+    target = tmp_path / "shared" / "deferred-work.md"
+    target.parent.mkdir(parents=True)
+    target.write_text(LEGACY_LEDGER, encoding="utf-8")
+    if project.deferred_work.is_symlink() or project.deferred_work.exists():
+        project.deferred_work.unlink()
+    project.deferred_work.symlink_to(target)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "symlinked ledger")
+    engine, _ = make_sweep(project, [_half_migrated_effect(project)] * 2)
+    summary = engine.run()
+
+    assert summary.paused
+    # the link survived the round trip, and the real file holds the restored text
+    assert project.deferred_work.is_symlink()
+    assert target.read_text(encoding="utf-8") == LEGACY_LEDGER
+    assert "sweep-migration-restore-diverged" not in journal_kinds(engine)
