@@ -132,7 +132,13 @@ breaking changes may land in a minor release.
   is keyed on the resolved path, so every spelling of one file contends on one lock. Nested
   acquisition raises instead of self-deadlocking, and a lock that cannot be taken fails the
   write rather than proceeding unlocked. The dev/review session's own ledger writes are
-  unchanged and still take no lock.
+  unchanged and still take no lock. Batched primitives collapse the remaining multi-write
+  sequences into one locked read-modify-write each: `append_entries` files several entries in
+  one pass (validating every spec before the lock, minting sequential ids, and deduplicating
+  in-call twins exactly as the loop it replaces did), `mark_open_many` reopens a set of closes,
+  `record_decision` merges a decision record with its optional closure, and `mark_done_many`
+  accepts a per-id resolution note. Each is byte-identical to the serial sequence it replaces,
+  so a caller adopting one changes how many windows it leaves open and nothing else.
 
 ### Security
 
