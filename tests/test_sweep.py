@@ -31,6 +31,7 @@ from bmad_loop import sweep as sweep_mod
 from bmad_loop import verify
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
+from bmad_loop.bmadconfig import ProjectPaths
 from bmad_loop.journal import Journal, load_state, save_state
 from bmad_loop.model import PAUSE_STORY_GATE, Phase, RunState, StoryTask, TokenUsage
 from bmad_loop.policy import (
@@ -3935,8 +3936,9 @@ def test_migration_restore_escalates_on_divergence(project, monkeypatch):
     and a migration input that changed underneath the attempt it was graded
     against is a human problem — the same call `migrate-duplicate-ids` makes.
 
-    Ablation: drop the `current == observed` arm so the restore always writes,
-    and the rival's line is clobbered while no escalation is raised.
+    Ablation: drop the `anchored and current == expected` arm so the restore
+    always writes, and the rival's line is clobbered while no escalation is
+    raised.
     """
     write_legacy_ledger(project, LEGACY_LEDGER)
     engine, adapter = make_sweep(project, [_half_migrated_effect(project)] * 2)
@@ -3952,6 +3954,134 @@ def test_migration_restore_escalates_on_divergence(project, monkeypatch):
     text = project.deferred_work.read_text(encoding="utf-8")
     assert "Filed by another process" in text and text != LEGACY_LEDGER
     # the refusal is terminal for this run: the second attempt never dispatches
+    assert len(adapter.sessions) == 1
+
+
+@contextlib.contextmanager
+def _rival_appending_safe_reset(monkeypatch, engine, ledger, addition):
+    """A `_safe_reset` spy that lands one foreign append the instant the real
+    reset returns, and still really resets.
+
+    That instant is where the migration restore's window opens: `_safe_reset`
+    returning is the last event before the restore decides what the ledger is
+    supposed to contain. A rival there is precisely what #735 describes, and it
+    is the half the old `current == observed` anchor could not see — the rival
+    became the observation. One-shot, because this wrapper is re-entered on every
+    migration attempt and the retry must not file it twice.
+    """
+    real_reset = engine._safe_reset
+    landed: list[bool] = []
+
+    def reset_then_rival(task, **kwargs):
+        real_reset(task, **kwargs)
+        if not landed:
+            landed.append(True)
+            with ledger.open("a", encoding="utf-8") as f:
+                f.write(addition)
+
+    monkeypatch.setattr(engine, "_safe_reset", reset_then_rival)
+    yield landed
+
+
+def test_migration_restore_escalates_when_a_rival_writes_inside_the_reset_window(
+    project, monkeypatch
+):
+    """#735, tracked. The twin above lands its rival at the lock, where the old
+    anchor already refused. This one lands it in the window the old anchor was
+    blind to: between `_safe_reset` returning and the read that graded it.
+
+    A rival writing a TRACKED ledger there BECOMES `observed`, so the compare
+    holds under the lock and the pre-migration text is written straight over it —
+    and the run then RETRIES over a ledger no human has looked at. The anchor is
+    the committed blob at `task.baseline_commit` instead, which is what the reset
+    republished and which no rival can author.
+
+    Ablation: restore the `observed` read after `_safe_reset` and compare
+    `current == observed` — the rival's line is clobbered, the escalation never
+    raises, and the second attempt dispatches. Every row below reds.
+    """
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    engine, adapter = make_sweep(project, [_half_migrated_effect(project)] * 2)
+    rival = "- **Filed by another process** — `other.txt` needs a look\n"
+    with _rival_appending_safe_reset(monkeypatch, engine, project.deferred_work, rival) as landed:
+        summary = engine.run()
+
+    assert summary.paused and landed == [True]
+    assert engine.state.tasks["sweep-migrate"].phase == Phase.ESCALATED
+    assert "changed underneath the failed migration attempt" in engine.state.paused_reason
+    assert "sweep-migration-restore-diverged" in journal_kinds(engine)
+    # the rival's line stands, and the refusal did not paper the rewrite over
+    text = project.deferred_work.read_text(encoding="utf-8")
+    assert "Filed by another process" in text and text != LEGACY_LEDGER
+    # the refusal is terminal for this run: the second attempt never dispatches
+    assert len(adapter.sessions) == 1
+
+
+def test_migration_restore_escalates_for_an_untracked_rival_inside_the_reset_window(
+    project, monkeypatch
+):
+    """#735, untracked. An untracked ledger has no blob to anchor on, and
+    `reset --hard` cannot have put anything back into it either — so the anchor
+    is the rejected rewrite this attempt actually graded, which is the one text
+    here that predates the window.
+
+    Same rival, same window, same refusal: the point is that losing the blob does
+    NOT send this site back to trusting the observation. `_ledger_baseline_text`
+    answers determinate absence (`(True, None)`) rather than "no anchor", and the
+    rewrite fills the slot.
+
+    Ablation: restore the `observed` read after `_safe_reset` and compare
+    `current == observed` — the rival is clobbered and the run retries.
+    """
+    write_legacy_ledger(project, LEGACY_LEDGER, commit=False)
+    engine, adapter = make_sweep(project, [_half_migrated_effect(project)] * 2)
+    rival = "- **Filed by another process** — `other.txt` needs a look\n"
+    with _rival_appending_safe_reset(monkeypatch, engine, project.deferred_work, rival) as landed:
+        summary = engine.run()
+
+    assert summary.paused and landed == [True]
+    assert engine.state.tasks["sweep-migrate"].phase == Phase.ESCALATED
+    assert "changed underneath the failed migration attempt" in engine.state.paused_reason
+    assert "sweep-migration-restore-diverged" in journal_kinds(engine)
+    text = project.deferred_work.read_text(encoding="utf-8")
+    assert "Filed by another process" in text and text != LEGACY_LEDGER
+    assert len(adapter.sessions) == 1
+
+
+def test_migration_restore_escalates_when_the_baseline_probe_fails(project, monkeypatch):
+    """DIRECTION PIN, #735: an unprovable baseline escalates, it never falls back
+    to the observation.
+
+    No rival anywhere — the quiet fixture of the positive control below, with
+    only the probe faulted. Two failed probes' worth of uncertainty is the most
+    this site can have, and the answer to it is the same one a rival gets: refuse
+    the write and put it in front of a human. Unlike the defer restore there is
+    no append-only merge to degrade into — republishing the pre-migration text is
+    an overwrite or it is nothing — so the escalation IS the degrade, and the
+    resume it routes to resets the attempt budget and re-reads the ledger.
+
+    Ablation: invert the fault direction — have `_ledger_baseline_text`'s except
+    arm return `(True, self._ledger_text())` — and the restore writes, the run
+    retries, and every row below reds.
+    """
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    engine, adapter = make_sweep(project, [_half_migrated_effect(project)] * 2)
+
+    def fail_probe(*args, **kwargs):
+        raise verify.GitError("injected baseline probe failure")
+
+    monkeypatch.setattr(verify, "worktree_file_bytes_at_revision", fail_probe)
+
+    summary = engine.run()
+
+    assert summary.paused
+    assert engine.state.tasks["sweep-migrate"].phase == Phase.ESCALATED
+    assert "changed underneath the failed migration attempt" in engine.state.paused_reason
+    kinds = journal_kinds(engine)
+    assert "ledger-baseline-probe-failed" in kinds
+    assert "sweep-migration-restore-diverged" in kinds
+    # escalated on the FIRST failed attempt: an unprovable restore does not get
+    # to spend the retry budget over a ledger nobody has graded
     assert len(adapter.sessions) == 1
 
 
@@ -5262,3 +5392,130 @@ def test_reopen_after_defer_uses_one_lock(project, monkeypatch):
     assert len(reopened) == 1
     assert reopened[0]["dw_ids"] == ["DW-1", "DW-2", "DW-3"]
     assert reopened[0]["story_key"] == "dw-fix"
+
+
+def test_migration_restore_writes_back_an_external_ledger(project, tmp_path):
+    """#735 follow-up. An `implementation_artifacts` dir configured OUTSIDE the
+    repo tree is a supported shape — `ProjectPaths.rebased` deliberately leaves
+    such dirs put, because they are shared rather than per-checkout — so the
+    ledger can resolve outside `workspace.root`.
+
+    `git reset --hard` provably cannot have touched a path no revision of this
+    repo can even name, which is the same proof the untracked-inside-the-tree
+    case relies on. So the anchor is the rejected rewrite this attempt graded,
+    the restore puts the pre-migration text back, and no divergence is journaled.
+    Escalating here would strand the half-migrated rewrite on disk for a
+    configuration that is not ambiguous at all.
+    """
+    external = ProjectPaths(
+        project=project.project,
+        implementation_artifacts=tmp_path / "shared-artifacts" / "implementation-artifacts",
+        planning_artifacts=project.planning_artifacts,
+    )
+    external.implementation_artifacts.mkdir(parents=True)
+    write_legacy_ledger(external, LEGACY_LEDGER, commit=False)
+    engine, _ = make_sweep(external, [_half_migrated_effect(external)] * 2)
+    summary = engine.run()
+
+    assert summary.paused
+    assert external.deferred_work.read_text(encoding="utf-8") == LEGACY_LEDGER
+    assert "sweep-migration-restore-diverged" not in journal_kinds(engine)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_migration_restore_writes_back_a_symlinked_ledger(project, tmp_path):
+    """#735 follow-up. A ledger symlinked into the repo is a supported shape —
+    `atomic_write_text` follows symlinks BY DEFAULT precisely so such a ledger
+    "keeps being a symlink and the real file is what gets rewritten".
+
+    Git stores that tracked symlink as a blob holding the TARGET PATHNAME, so a
+    baseline anchor taken from the blob would compare a pathname against ledger
+    text and never be true — escalating every failed migration over a shape that
+    is not ambiguous at all. `reset --hard` restores the link, never what it
+    points at, so the reset republished no ledger text and the anchor is the
+    rejected rewrite this attempt graded, as for an untracked or external ledger.
+
+    Ablation: drop the `path_is_non_regular_at_revision` arm from
+    `_ledger_baseline_text` and this reddens on the restored-text assertion, with
+    `sweep-migration-restore-diverged` journaled and the half-migrated rewrite
+    left standing.
+    """
+    target = tmp_path / "shared" / "deferred-work.md"
+    target.parent.mkdir(parents=True)
+    target.write_text(LEGACY_LEDGER, encoding="utf-8")
+    if project.deferred_work.is_symlink() or project.deferred_work.exists():
+        project.deferred_work.unlink()
+    project.deferred_work.symlink_to(target)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "symlinked ledger")
+    engine, _ = make_sweep(project, [_half_migrated_effect(project)] * 2)
+    summary = engine.run()
+
+    assert summary.paused
+    # the link survived the round trip, and the real file holds the restored text
+    assert project.deferred_work.is_symlink()
+    assert target.read_text(encoding="utf-8") == LEGACY_LEDGER
+    assert "sweep-migration-restore-diverged" not in journal_kinds(engine)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_migration_restore_accepts_an_already_restored_symlink_ledger(project, tmp_path):
+    """#735/#736. A restore that finds the ledger already holding the text it
+    would write is DONE, not divergent.
+
+    Reachable with no rival at all. A migration session that atomic-saves —
+    write-temp-then-rename, which is how most editors and many CLIs write —
+    replaces the tracked symlink with a regular file. `reset --hard` puts the
+    link back, and the external target it can never reach was therefore never
+    rewritten, so the ledger is already correct. But `rewrite`, read off that
+    regular file, is the rejected migration text, so demanding the anchor here
+    reports a divergence that did not happen, escalates, and spends the attempt
+    budget: the second attempt never dispatches.
+
+    This is the #736 principle at the restore: an operation with nothing to write
+    must not fail.
+
+    Ablation: drop the `current == text` arm and this reddens on all three —
+    `sweep-migration-restore-diverged` is journaled, the paused reason becomes
+    the "changed underneath" accusation, and only one session runs.
+    """
+    target = tmp_path / "shared" / "deferred-work.md"
+    target.parent.mkdir(parents=True)
+    target.write_text(LEGACY_LEDGER, encoding="utf-8")
+    if project.deferred_work.is_symlink() or project.deferred_work.exists():
+        project.deferred_work.unlink()
+    project.deferred_work.symlink_to(target)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "symlinked ledger")
+
+    manifest = legacy_manifest()
+    half = (
+        "# Deferred Work\n\n"
+        "### DW-1: Old fixed thing\n\norigin: migrated, 2026-06-12\nlocation: n/a\n"
+        "reason: repaired.\nstatus: done 2026-04-06\n\n"
+        "## Deferred from: epic 1 review (2026-04-06)\n\n"
+        "- **Open legacy thing here** — `src.txt` mishandles em-dashes\n"
+    )
+
+    def atomic_save_effect(spec):
+        # the rename an atomic save performs: the symlink is REPLACED, so the
+        # external target keeps the pre-migration text throughout.
+        project.deferred_work.unlink()
+        project.deferred_work.write_text(half, encoding="utf-8")
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "deferred-sweep-migrate",
+                "mapping": [{"key": manifest[0]["key"], "dw_id": "DW-1"}],
+                "escalations": [],
+            },
+        )
+
+    engine, adapter = make_sweep(project, [atomic_save_effect] * 2)
+    summary = engine.run()
+
+    assert summary.paused  # on the attempt cap, having actually retried
+    assert "sweep-migration-restore-diverged" not in journal_kinds(engine)
+    assert "changed underneath the failed migration attempt" not in engine.state.paused_reason
+    assert target.read_text(encoding="utf-8") == LEGACY_LEDGER
+    assert len(adapter.sessions) == 2

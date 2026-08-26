@@ -670,8 +670,16 @@ def test_status_in_bytes_raises_rather_than_calling_an_unreadable_board_absent(t
 # makes two of them serialize rather than trade last-write-wins.
 
 
-def test_advance_holds_the_lock_across_every_read_and_the_write(tmp_path, monkeypatch):
-    """The hold spans the whole read-modify-write, not just the write.
+def test_the_reads_that_decide_the_published_bytes_are_inside_the_lock(tmp_path, monkeypatch):
+    """The hold spans every read that decides the bytes — and only those (#736).
+
+    Formerly `test_advance_holds_the_lock_across_every_read_and_the_write`, which
+    pinned the stricter claim that ALL THREE reads sit inside the hold. #736
+    relaxed it deliberately: `advance` now runs ONE advisory pre-lock read to
+    answer the calls that would write nothing, so an idempotent replay no longer
+    fails on contention for work it was never going to do. What survives — and is
+    the whole protection — is that the reads feeding the published bytes still
+    happen after the acquisition.
 
     A lock taken around the atomic write alone excludes nobody that matters: the
     bytes being published were computed from a read that happened OUTSIDE it, so
@@ -679,14 +687,22 @@ def test_advance_holds_the_lock_across_every_read_and_the_write(tmp_path, monkey
     ordering is recorded from the calls themselves rather than inferred from the
     result, because a lost update leaves a board that looks perfectly well-formed.
 
-    `load` is the probe for two of the three reads — the `story_status`
-    never-regress read and the epic-lift read both go through it — and the
-    writer spy is the third event. Advancing a `backlog` story of a `backlog`
-    epic is what makes the epic lift fire, so all three are present.
+    `load` is the probe for three of the four reads — the advisory probe, the
+    inside-the-lock `story_status` never-regress read, and the epic-lift read all
+    go through it — and the writer spy is the fourth event. Advancing a `backlog`
+    story of a `backlog` epic is what makes the epic lift fire, and a `backlog`
+    row is exactly what the advisory probe declines to answer, so the fall-through
+    and all three inside events are present.
 
-    Ablation: move `with _board_lock(path):` down to wrap only the
-    `atomic_write_bytes` call and this reddens — the two `load` events sort ahead
-    of `lock-enter`."""
+    Ablation A: make `_advance_locked` reuse the probe's answer instead of its own
+    read (hoist the `current = story_status(...)` out and pass it in) and this
+    reddens — the inside segment loses a `load`, and with it the guarantee that
+    the never-regress decision saw the board the write is applied to.
+
+    Ablation B: move `with _board_lock(path):` down to wrap only the
+    `atomic_write_bytes` call and this reddens — the two deciding `load` events
+    sort ahead of `lock-enter`, so the prefix is no longer the single advisory
+    read."""
     p = _write(tmp_path)
     events: list[str] = []
     real_lock, real_load = sprintstatus._board_lock, sprintstatus.load
@@ -713,8 +729,10 @@ def test_advance_holds_the_lock_across_every_read_and_the_write(tmp_path, monkey
     assert sprintstatus.advance(p, "3-2-digest-delivery", "in-progress") == "in-progress"
 
     assert events.count("lock-enter") == 1 and events.count("lock-exit") == 1
-    assert events[0] == "lock-enter" and events[-1] == "lock-exit"
-    assert events[1:-1] == ["load", "load", "write"]  # both reads AND the write, inside
+    enter = events.index("lock-enter")
+    assert events[-1] == "lock-exit"
+    assert events[:enter] == ["load"]  # exactly one advisory read, and nothing else
+    assert events[enter + 1 : -1] == ["load", "load", "write"]  # the deciding reads, inside
 
 
 def test_a_racing_writers_flip_survives_a_concurrent_advance(tmp_path):
@@ -741,7 +759,15 @@ def test_a_racing_writers_flip_survives_a_concurrent_advance(tmp_path):
     `atomic_write_bytes` call alone — and this reddens, `4-1-thing` coming back
     `review`. Hoisting read#1 (`story_status`) alone does NOT redden this row:
     that read decides never-regress, it does not produce the bytes published over
-    the rival, and its position is graded by the ordering row above instead."""
+    the rival, and its position is graded by the ordering row above instead.
+
+    Read#1 above the lock is no longer hypothetical — it is what `advance` does
+    (#736): the advisory probe reads exactly that, and this row is why doing so
+    is safe. The probe declines to answer a row that must move (`3-2-digest-
+    delivery` is `backlog`, below its target), so this call falls through to the
+    hold and recomputes read#1 there, which is the read the rival's flip has to
+    be visible to. Only a would-write-nothing answer is ever taken from the
+    probe, and such a call publishes no bytes for a rival to lose."""
     p = _write(tmp_path)
     real_lock = sprintstatus._board_lock
     raced: list[str | None] = []
@@ -903,3 +929,186 @@ def test_advance_takes_no_lock_for_a_missing_board(tmp_path, monkeypatch):
     assert sprintstatus.advance(tmp_path / "nope.yaml", "3-1-login", "done") is None
 
     assert entered == []
+
+
+def test_advance_takes_no_lock_when_the_row_is_already_at_or_past_target(tmp_path, monkeypatch):
+    """A never-regress no-op answers from an advisory read, without acquiring (#736).
+
+    The defect this closes: `advance` acquired before `_advance_locked` could
+    discover there was nothing to write, so an idempotent replay — `bmad-loop
+    confirm` against a story the board already records as done is a DESIGNED
+    path, not an error — could fail on lock contention for work it never had.
+    Both shapes of the comparison are exercised: a row strictly PAST target
+    (`4-1-thing` sits at `review`, asked for `in-progress`) and a row exactly AT
+    it (`3-1-login` is `done`, asked for `done`).
+
+    The board bytes are the second oracle. A probe that answered the no-op but
+    still went on to rewrite the file would satisfy the acquisition count alone,
+    and "no lock" would then be describing an unserialized write rather than a
+    no-op.
+
+    Ablation: delete the probe from `advance` and this reddens on the count —
+    both calls acquire, since discovering the no-op is the locked body's job
+    again."""
+    p = _write(tmp_path)
+    before = p.read_bytes()  # as they landed, not `SPRINT.encode()` — CRLF on Windows
+    entered: list[Path] = []
+
+    @contextlib.contextmanager
+    def spy_file_lock(path, **kwargs):
+        entered.append(path)  # pragma: no cover — must not be reached
+        with real_file_lock(path, **kwargs):
+            yield
+
+    monkeypatch.setattr(sprintstatus, "file_lock", spy_file_lock)
+
+    assert sprintstatus.advance(p, "4-1-thing", "in-progress") == "review"  # past target
+    assert sprintstatus.advance(p, "3-1-login", "done") == "done"  # exactly at target
+
+    assert entered == []
+    assert p.read_bytes() == before  # a no-op, not an unserialized write
+
+
+def test_advance_takes_no_lock_for_an_absent_row(tmp_path, monkeypatch):
+    """A story the board does not carry is answered before the lock too (#736).
+
+    Sibling of the missing-board row above, one level in: the board exists, so
+    the `is_file` guard passes, but the story is not on it. `advance`'s contract
+    is `None` there, and a `None` return writes nothing, so there is no reason to
+    mint a sidecar — or to fail on one — for a row that does not exist. The
+    engine asks about stories it has not confirmed are on the board.
+
+    Ablation: delete the probe's `if current is None: return None` early-out and
+    this reddens on the count — the absent-row answer moves back under the
+    hold."""
+    p = _write(tmp_path)
+    entered: list[Path] = []
+
+    @contextlib.contextmanager
+    def spy_file_lock(path, **kwargs):
+        entered.append(path)  # pragma: no cover — must not be reached
+        with real_file_lock(path, **kwargs):
+            yield
+
+    monkeypatch.setattr(sprintstatus, "file_lock", spy_file_lock)
+
+    assert sprintstatus.advance(p, "9-9-ghost", "done") is None
+
+    assert entered == []
+
+
+def test_a_probe_satisfied_noop_succeeds_when_no_state_root_is_derivable(tmp_path, monkeypatch):
+    """The no-op stops risking a failure mode it had no work to earn (#736).
+
+    `_board_lock` names its sidecar through `runs.lock_path_for`, which raises
+    `StateRootError` when no state root can be derived — and `StateRootError` is
+    NOT an `OSError`, so it escapes on its own taxonomy. Before the probe, that
+    made an already-done board's replay fail outright. Now it cannot: the answer
+    is reached without ever asking for a lock path.
+
+    The second half is the load-bearing half. A probe that made the lock
+    optional, rather than unnecessary, would be a far worse bug than the one
+    being fixed — so the same fault on a call that really does write must still
+    surface. `3-2-digest-delivery` is `backlog`, so advancing it to `in-progress`
+    is a genuine write and has to raise.
+
+    Patching the module attribute reaches the real call site because
+    `_board_lock`'s `from . import runs` is deliberately lazy (the import cycle
+    runs → verify → sprintstatus forbids a top-level one), so the lookup happens
+    per call against the patched module.
+
+    Ablation: delete the probe and the FIRST call raises `StateRootError` — the
+    behavior #736 filed."""
+    p = _write(tmp_path)
+
+    def no_state_root(data_path):
+        raise runs.StateRootError("no state root")
+
+    monkeypatch.setattr(runs, "lock_path_for", no_state_root)
+
+    assert sprintstatus.advance(p, "3-1-login", "done") == "done"  # probe-satisfied, no lock
+
+    with pytest.raises(runs.StateRootError):
+        sprintstatus.advance(p, "3-2-digest-delivery", "in-progress")  # a real write still needs it
+
+
+def test_a_malformed_board_probe_falls_through_and_raises_from_under_the_lock(
+    tmp_path, monkeypatch
+):
+    """The probe is advisory: a fault in it decides nothing (#736).
+
+    An unreadable board makes `story_status` raise inside the probe, and the
+    probe swallows it — deliberately broadly, because narrowing the catch would
+    let the probe invent a failure the locked path does not have. The call then
+    falls through and the locked body raises `SprintStatusError` on exactly the
+    channel `cli.py`'s error routing already expects.
+
+    The ACQUISITION COUNT is the oracle, not the raise. `pytest.raises` alone
+    survives removing the try/except entirely — the probe's own uncaught
+    `SprintStatusError` is the same class, from the same reader, and would pass
+    this row while never having reached the lock at all. Only `len(entered) == 1`
+    tells the two apart.
+
+    Ablation: remove the probe's `try`/`except Exception` and this reddens on the
+    count — `entered == []`, because the probe raised before the acquisition."""
+    p = tmp_path / "sprint-status.yaml"
+    p.write_text("development_status: []\n", encoding="utf-8")
+    entered: list[Path] = []
+
+    @contextlib.contextmanager
+    def spy_file_lock(path, **kwargs):
+        entered.append(path)
+        with real_file_lock(path, **kwargs):
+            yield
+
+    monkeypatch.setattr(sprintstatus, "file_lock", spy_file_lock)
+
+    with pytest.raises(sprintstatus.SprintStatusError):
+        sprintstatus.advance(p, "3-2-digest-delivery", "in-progress")
+
+    assert len(entered) == 1  # it raised from UNDER the hold, not instead of taking it
+
+
+def test_the_authoritative_never_regress_decision_is_made_under_the_lock(tmp_path):
+    """The probe's row may be stale by acquisition time, and is then discarded (#736).
+
+    The probe reads outside all exclusion, so between it and the hold a rival can
+    move the row anywhere — including PAST the target this call is carrying. If
+    that stale answer were carried into `_advance_locked` instead of being
+    re-read, the never-regress test would be applied to a status the board no
+    longer has and the rival's forward progress would be rewritten backwards. The
+    published bytes are decided under the hold precisely so this cannot happen.
+
+    The rival runs from inside the `_board_lock` spy, BEFORE it enters the real
+    lock, which is what a second process actually gets to do; running it after
+    would nest a blocking acquisition on a second fd and self-deadlock. The
+    one-shot latch stops the rival's own `advance` from recursing into another
+    rival. Both calls target the SAME row — that is the point, unlike the
+    lost-update row above, which needs two different rows.
+
+    Ablation: thread the probe's answer into `_advance_locked` (hoist its
+    `current = story_status(...)` read and pass the probe's value in) and this
+    reddens — the call decides against the stale `backlog`, writes, and the board
+    comes back `in-progress` with the rival's `done` gone."""
+    p = _write(tmp_path)
+    real_lock = sprintstatus._board_lock
+    raced: list[str | None] = []
+
+    @contextlib.contextmanager
+    def racing_lock(path):
+        if not raced:
+            # Latch FIRST: the rival's own `advance` re-enters this spy, and a
+            # latch set only on the way out would stage a rival per rival.
+            raced.append(None)
+            # a rival takes the row all the way to `done` while we are still queued
+            raced[0] = sprintstatus.advance(path, "3-2-digest-delivery", "done")
+        with real_lock(path):
+            yield
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(sprintstatus, "_board_lock", racing_lock)
+        # our probe saw `backlog`; by the time we hold the lock the row is `done`
+        assert sprintstatus.advance(p, "3-2-digest-delivery", "in-progress") == "done"
+
+    assert raced == ["done"]  # the rival really wrote, so there was progress to lose
+    assert sprintstatus.story_status(p, "3-2-digest-delivery") == "done"  # NOT regressed

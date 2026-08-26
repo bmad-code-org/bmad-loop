@@ -11,9 +11,13 @@ exclusion — a second orchestrator process (another `bmad-loop run`, a sweep, t
 TUI) runs the same sole writer, and :func:`advance` is a read-modify-write of the
 whole board, so two of them would both read, both edit, and let the last atomic
 write win. :func:`advance` therefore serializes itself cross-process on the
-board's state-root sidecar lock, holding it across every read AND the write.
-Readers stay lock-free: the publish is an atomic replace, so a reader sees either
-the old board entire or the new one.
+board's state-root sidecar lock, and holds it across every read that decides the
+PUBLISHED BYTES as well as the write itself. That invariant is deliberately
+narrower than "every read": one advisory pre-lock probe may answer a
+read-dependent no-op — an absent row, or a row already at or past target —
+without acquiring at all (#736), because such a call publishes nothing and so has
+no bytes for the hold to protect. Readers stay lock-free: the publish is an
+atomic replace, so a reader sees either the old board entire or the new one.
 """
 
 from __future__ import annotations
@@ -270,6 +274,30 @@ def _board_lock(path: Path) -> Iterator[None]:
         yield
 
 
+def _row_at_or_past(current: str, target: str) -> bool:
+    """Is a row at ``current`` already at or past ``target`` in :data:`STATUS_ORDER`?
+
+    The never-regress comparison :func:`_advance_locked` makes, factored out so
+    that :func:`advance`'s advisory pre-lock probe and the authoritative locked
+    decision run one body and cannot drift apart (#736). A probe that answered
+    this question even slightly differently from the writer would either skip a
+    write the board needed or take a lock it did not.
+
+    Deliberately NOT :func:`~bmad_loop.engine._at_or_past`, the reader-side twin:
+    that one counts an exact match OUTSIDE ``STATUS_ORDER`` as reached, which is
+    right for reading what :func:`advance` RETURNED and wrong as input to its
+    WRITE decision. An off-order status equal to ``target`` is a no-op owned by
+    :func:`_set_mapping_value` under the lock — it refuses a value it already
+    holds — and routing it through this predicate instead would hand the answer
+    to a pre-lock probe on a comparison the writer does not make.
+    """
+    return (
+        current in STATUS_ORDER
+        and target in STATUS_ORDER
+        and STATUS_ORDER.index(current) >= STATUS_ORDER.index(target)
+    )
+
+
 def advance(path: Path, story_key: str, target: str, *, now: str | None = None) -> str | None:
     """Advance a story's sprint-status to `target` for the generic-skill path.
 
@@ -321,9 +349,31 @@ def advance(path: Path, story_key: str, target: str, *, now: str | None = None) 
     intra-call TOCTOU, since the never-regress decision and the bytes it is
     applied to now come from one hold rather than from two independent reads.
 
-    The missing-board check runs BEFORE the lock, so asking about a board that
-    does not exist leaves no sidecar behind; the locked half rechecks, deletion
-    being able to race the pre-lock answer. Acquisition failure surfaces as
+    Two answers are reached BEFORE the lock. The missing-board check runs first,
+    so asking about a board that does not exist leaves no sidecar behind. Then an
+    ADVISORY probe (#736) reads the row once and answers the two cases in which
+    this call would write nothing at all: an absent row (``None``) and a row
+    already at or past ``target`` (the current status, via :func:`_row_at_or_past`
+    — the same predicate the locked body applies). Acquiring for those was the
+    defect: an idempotent replay — ``bmad-loop confirm`` against a story the board
+    already records as done is a designed path, not an error
+    (:meth:`~bmad_loop.model.ParkedStory.resumable` accepts it), as is
+    ``_carry_board_advance``'s routine no-op on a tracked board — could fail on
+    lock contention, or on a :class:`~bmad_loop.runs.StateRootError` from
+    :func:`~bmad_loop.runs.lock_path_for`, for work it was never going to do.
+
+    The probe is advisory in the strict sense: only a "would write nothing"
+    answer is acted on, and such a call simply linearizes at the probe's read
+    rather than at an acquisition. Every other outcome — including ANY exception
+    raised while probing — falls through to the locked path, which re-reads,
+    re-decides authoritatively and raises on the channel it always did. So the
+    probe can neither authorize a write nor add a failure mode the hold lacks: a
+    malformed board still raises :class:`SprintStatusError` from under the lock.
+    ``now`` needs no handling here, because both no-op arms of
+    :func:`_advance_locked` return before the ``last_updated`` write; a
+    probe-satisfied early-out is write-equivalent to the locked answer.
+
+    Acquisition failure — for the calls that do reach the lock — surfaces as
     ``OSError`` (or :class:`~bmad_loop.runs.StateRootError` when no state root can
     be derived) on the channel callers already route this function's raises
     through — the engine's crash/escalation handling, the CLI's failure exit — so
@@ -334,6 +384,19 @@ def advance(path: Path, story_key: str, target: str, *, now: str | None = None) 
     """
     if not path.is_file():
         return None  # no board, nothing to serialize against — take no lock
+    try:
+        current = story_status(path, story_key)
+        if current is None:
+            return None  # absent row — nothing this call would write
+        if _row_at_or_past(current, target):
+            return current  # already at or past target — never regress, no write
+    except Exception:  # nosec B110 - ADVISORY probe: a fault here must decide nothing
+        # Broad by design, and the swallow is the point: narrowing the catch would
+        # let the probe invent a failure mode the locked path does not have. An
+        # unreadable board decides nothing here — the path below re-reads,
+        # re-decides, and raises on the channel callers already route this
+        # function's raises through.
+        pass
     with _board_lock(path):
         return _advance_locked(path, story_key, target, now=now)
 
@@ -344,19 +407,17 @@ def _advance_locked(
     """:func:`advance`'s read-modify-write, run with the board's lock already held.
 
     Split out so the hold is exactly the file I/O and so every read inside it sees
-    one board. The leading ``is_file`` check repeats the caller's: the pre-lock
-    answer is taken without exclusion, and a delete can land between it and the
-    acquisition."""
+    one board. The reads below repeat work the caller's pre-lock answers may
+    already have done, and deliberately: those answers are taken without
+    exclusion, so a delete can land between the ``is_file`` check and the
+    acquisition, and the advisory probe's row (#736) can be stale by the time the
+    lock is held. Only what this function reads decides the published bytes."""
     if not path.is_file():
         return None
     current = story_status(path, story_key)
     if current is None:
         return None
-    if (
-        current in STATUS_ORDER
-        and target in STATUS_ORDER
-        and STATUS_ORDER.index(current) >= STATUS_ORDER.index(target)
-    ):
+    if _row_at_or_past(current, target):
         return current  # already at or past target — never regress
 
     text = path.read_bytes().decode("utf-8")

@@ -3459,17 +3459,24 @@ def test_mark_open_many_matches_serial_mark_open_bytes(tmp_path, monkeypatch):
 
 
 def test_mark_open_many_writes_nothing_when_no_id_is_eligible(tmp_path, monkeypatch):
-    """A replayed rollback over already-open entries leaves the file untouched.
+    """A replayed rollback over already-open entries leaves the file untouched —
+    and, since #736, takes no lock to establish that.
 
-    Ablation: drop the `if not reopened: return []` guard — the write spy fires
-    and the row reds."""
+    Ablation: delete `mark_open_many`'s pre-lock probe block — the acquisition
+    assertion reds. NOT the `if not reopened: return []` guard, whose documented
+    ablation used to live here and now goes GREEN: the probe answers these exact
+    inputs above the lock, so the write spy never reaches that guard. Its
+    ablation moved to `test_a_failing_probe_read_falls_through_to_the_locked_path`,
+    which faults the probe read so the same inputs reach the hold."""
     path = write_ledger(tmp_path)
-    writes = []
+    writes, acquisitions = [], []
     _counting_write(monkeypatch, writes)
 
-    assert mark_open_many(path, ["DW-1", "DW-99"], "by dw-a", OPERATION_ID) == []
+    with _counting_lock(monkeypatch, acquisitions):
+        assert mark_open_many(path, ["DW-1", "DW-99"], "by dw-a", OPERATION_ID) == []
 
     assert writes == []
+    assert acquisitions == []
 
 
 def test_record_decision_close_matches_the_serial_pair_bytes(tmp_path, monkeypatch):
@@ -3565,17 +3572,25 @@ def test_record_decision_records_a_decision_on_an_already_done_entry(tmp_path):
 
 
 def test_record_decision_returns_false_for_a_missing_entry(tmp_path, monkeypatch):
-    """A missing id records nothing and writes nothing.
+    """A missing id records nothing, writes nothing, and takes no lock (#736).
 
-    Ablation: write unconditionally after the appliers — the write spy fires."""
+    Ablation: delete `record_decision`'s pre-lock probe block — the acquisition
+    assertion reds. The ablation this docstring used to carry ("write
+    unconditionally after the appliers") now goes GREEN: the probe answers a
+    missing id above the lock, so the write spy never reaches the under-lock
+    `if updated is None` guard. That guard's ablation moved to
+    `test_a_failing_probe_read_falls_through_to_the_locked_path`, which faults
+    the probe read so this same call reaches the hold."""
     path = write_ledger(tmp_path)
     before = path.read_text(encoding="utf-8")
-    writes = []
+    writes, acquisitions = [], []
     _counting_write(monkeypatch, writes)
 
-    assert record_decision(path, "DW-99", "2026-06-11", "keep", "x", close_note="y") is False
+    with _counting_lock(monkeypatch, acquisitions):
+        assert record_decision(path, "DW-99", "2026-06-11", "keep", "x", close_note="y") is False
 
     assert writes == []
+    assert acquisitions == []
     assert path.read_text(encoding="utf-8") == before
 
 
@@ -3667,6 +3682,11 @@ def _unavailable_lock(path, **kwargs):
     yield  # pragma: no cover — unreachable
 
 
+# Every row here must be seeded to WRITE. A no-op row would grade nothing: the
+# advisory pre-lock probe (#736) answers a read-dependent no-op before the
+# acquisition these tests spy on, so the hold, the nesting and the
+# raise-on-failure claims would all pass vacuously. `NOOP_MUTATORS` below is the
+# deliberate inverse, and grades the absence of that same acquisition.
 LOCKED_MUTATORS = {
     "append_decision": lambda p: append_decision(p, "DW-1", "2026-06-11", "keep", "later"),
     "append_entries": lambda p: append_entries(
@@ -3853,8 +3873,12 @@ def test_scripted_interleave_loses_no_update(tmp_path, monkeypatch):
     reverts B's append.
 
     Ablation: hoist `_mark_done_many`'s `path.read_text` above its
-    `with ledger_lock(path):` — A's read then happens before the spy fires, A
-    writes its stale snapshot, and DW-4 is gone from the final ledger."""
+    `with ledger_lock(path):` AND WRITE FROM IT — A's read then happens before
+    the spy fires, A writes its stale snapshot, and DW-4 is gone from the final
+    ledger. The hoist alone is no longer the ablation: the advisory probe (#736)
+    already reads above the lock. It decides nothing here — DW-1 is open, so the
+    probe declines to answer and the under-lock read stays authoritative — which
+    is exactly the property this row keeps grading."""
     path = write_ledger(tmp_path)
     real_lock = deferredwork.ledger_lock
     rival_ran = []
@@ -3948,6 +3972,237 @@ def test_lock_acquisition_failure_raises_and_writes_nothing(tmp_path, monkeypatc
 
     assert path.read_text(encoding="utf-8") == before
     assert (archive.read_text(encoding="utf-8") if archive.is_file() else None) == archive_before
+
+
+# --------------------------- read-dependent no-ops take no lock (#736)
+#
+# A lock taken for an operation that will not write turns a previously
+# successful no-op into a failure: the acquisition itself can raise `OSError`,
+# and deriving the sidecar path raises `runs.StateRootError` wherever no state
+# root is nameable. #726 closed two instances of that class here — the missing
+# ledger and the empty batch, both answerable without reading. This section
+# grades the third, where only a READ can tell that the call would write
+# nothing: every id already done, an id no entry carries, every spec deduping,
+# nothing eligible to archive. Each is answered from ONE advisory pre-lock read
+# that runs the same pure decision helper the locked pass runs; every other
+# answer, and any fault during the probe, falls through to the hold.
+
+_DEDUPE_SPEC = {
+    "title": "already appended by the seeder",
+    "origin": "probe-noop",
+    "source_spec": "spec-probe-noop.md",
+    "reason": "so the row dedupes and writes nothing",
+}
+
+# The deliberate inverse of `LOCKED_MUTATORS`: every row is seeded to write
+# NOTHING. Pairs are (call, expected result). The return value is graded
+# alongside the acquisition count because the count alone is satisfiable by a
+# probe that skipped the lock while answering the WRONG no-op value — and each
+# mutator's no-op answer is part of its frozen contract.
+NOOP_MUTATORS = {
+    # No entry carries DW-99, so the decision line has nowhere to go.
+    "append_decision": (
+        lambda p: append_decision(p, "DW-99", "2026-06-11", "keep", "later"),
+        False,
+    ),
+    # The seeder already appended this spec's open twin, so it dedupes.
+    "append_entries": (lambda p: append_entries(p, [EntrySpec(**_DEDUPE_SPEC)]), [None]),
+    "append_entry": (lambda p: append_entry(p, **_DEDUPE_SPEC), None),
+    # DW-2 closed 2026-05-25, on or after the cutoff; DW-1 and DW-3 are open.
+    "archive_closed": (lambda p: archive_closed(p, before="2026-05-01"), []),
+    "mark_done": (lambda p: mark_done(p, "DW-99", "2026-06-11", "fixed"), False),
+    # DW-2 is already done, and DW-99 does not exist.
+    "mark_done_many": (
+        lambda p: mark_done_many(p, ["DW-2", "DW-99"], "2026-06-11", "fixed"),
+        [],
+    ),
+    "mark_done_many_reopenable": (
+        lambda p: mark_done_many_reopenable(p, ["DW-2"], "2026-06-11", "fixed", OPERATION_ID),
+        [],
+    ),
+    "mark_open": (lambda p: mark_open(p, "DW-99", "by dw-a", OPERATION_ID), False),
+    # DW-1 is open and carries no undo marker; DW-99 does not exist.
+    "mark_open_many": (
+        lambda p: mark_open_many(p, ["DW-1", "DW-99"], "by dw-a", OPERATION_ID),
+        [],
+    ),
+    "record_decision": (
+        lambda p: record_decision(p, "DW-99", "2026-06-11", "keep", "x", close_note="y"),
+        False,
+    ),
+}
+
+# The append rows dedupe against an entry that has to be on disk first; every
+# other row is already a no-op against the plain fixture.
+_NEEDS_A_DEDUPE_TWIN = {"append_entries", "append_entry"}
+
+# One row per PROBED LEAF, keyed into `NOOP_MUTATORS` above. The wrapper rows
+# there reach these same five bodies, so faulting the probe once per leaf covers
+# every probe in the module without re-grading a delegation.
+PROBED_LEAVES = [
+    "append_entries",
+    "archive_closed",
+    "mark_done_many",
+    "mark_open_many",
+    "record_decision",
+]
+
+
+def _noop_seed_for(tmp_path: Path, name: str) -> Path:
+    """The ledger `name`'s no-op call needs, written before any spy is installed."""
+    path = write_ledger(tmp_path)
+    if name in _NEEDS_A_DEDUPE_TWIN:
+        assert append_entry(path, **_DEDUPE_SPEC) == "DW-4"
+    return path
+
+
+@pytest.mark.parametrize("name", sorted(NOOP_MUTATORS))
+def test_a_read_dependent_noop_takes_no_lock(tmp_path, monkeypatch, name):
+    """A call a read proves would write nothing acquires nothing.
+
+    The exact inverse of `test_every_mutator_holds_the_ledger_lock`, over the
+    same public surface: there the input is seeded to write and the acquisition
+    is mandatory; here it is seeded to no-op and the acquisition is a defect.
+    Both readings of "the lock is load-bearing" have to hold, or the fix has
+    traded one failure for another.
+
+    Nothing landing on disk is asserted as well as nothing acquiring, and it is
+    not redundant: the probe reaches its answer through the same pure helper the
+    locked pass folds, so a helper that reported "no write" while the authority
+    would have written would show up here as changed bytes rather than as a
+    count.
+
+    Ablation: delete this mutator's pre-lock `try:` probe block — the spy counts
+    one and the row reds on `acquisitions == []`."""
+    path = _noop_seed_for(tmp_path, name)
+    before = path.read_text(encoding="utf-8")
+    call, expected = NOOP_MUTATORS[name]
+    acquisitions = []
+
+    with _counting_lock(monkeypatch, acquisitions):
+        assert call(path) == expected
+
+    assert acquisitions == []
+    assert path.read_text(encoding="utf-8") == before
+    assert not (path.parent / ARCHIVE_REL).exists()
+
+
+@pytest.mark.parametrize("name", PROBED_LEAVES)
+def test_a_failing_probe_read_falls_through_to_the_locked_path(tmp_path, monkeypatch, name):
+    """A probe that cannot read decides nothing: the call takes the lock and the
+    under-lock guards refuse the write, exactly as before the probe existed.
+
+    This is what keeps those under-lock guards ablation-provable. Their own
+    tests used to reach them with these very inputs; the probe now answers first,
+    so the write-spy oracle fires above the lock and those ablations go green.
+    Faulting the probe read — and only the probe read, the under-lock one
+    succeeds — routes the same call back through the hold, where the guard is
+    the only thing standing between it and a pointless rewrite.
+
+    The acquisition count is the load-bearing assertion, not the return value.
+    A probe whose fault escaped instead of falling through would raise; a probe
+    that answered anyway would leave the count at zero. Only `== [path]` says
+    "fell through to the hold" rather than "never needed it" (S1 found the
+    matching trap one module over, where `pytest.raises` stayed green with the
+    `except` deleted).
+
+    Ablations, singly: (A) delete this leaf's `except Exception:` — the injected
+    `PermissionError` escapes and the row reds; (B) delete this leaf's
+    under-lock no-write guard (`if not marked:` / `if not reopened:` /
+    `if updated is None:` / `if all(dw_id is None ...)` / `if not to_archive:`)
+    — the write spy fires and the row reds."""
+    path = _noop_seed_for(tmp_path, name)
+    before = path.read_text(encoding="utf-8")
+    call, expected = NOOP_MUTATORS[name]
+    real, fired = Path.read_text, []
+
+    def raise_once_then_delegate(self, *a, **kw):
+        # Keyed on the ledger: the probe read is the FIRST read of this path, so
+        # the fault lands there and the under-lock read gets the real file.
+        if self == path and not fired:
+            fired.append(self)
+            raise PermissionError(13, "Permission denied")
+        return real(self, *a, **kw)
+
+    acquisitions, writes = [], []
+    _counting_write(monkeypatch, writes)
+    monkeypatch.setattr(Path, "read_text", raise_once_then_delegate)
+
+    with _counting_lock(monkeypatch, acquisitions):
+        assert call(path) == expected
+
+    assert fired  # the fault really fired (a green row proves nothing otherwise)
+    assert acquisitions == [path]
+    assert writes == []
+    assert path.read_text(encoding="utf-8") == before
+
+
+@pytest.mark.parametrize(
+    ("call", "expected"),
+    [
+        pytest.param(
+            lambda p: mark_done_many(p, ["DW-1"], "2026-06-11", "fixed"), [], id="mark_done_many"
+        ),
+        pytest.param(
+            lambda p: mark_open_many(p, ["DW-1"], "by dw-a", OPERATION_ID), [], id="mark_open_many"
+        ),
+        pytest.param(
+            lambda p: record_decision(p, "DW-1", "2026-06-11", "keep", "x"),
+            False,
+            id="record_decision",
+        ),
+    ],
+)
+def test_mutators_take_no_lock_for_a_missing_ledger(tmp_path, monkeypatch, call, expected):
+    """No ledger means no write, and so no lock — `archive_closed`'s rule, now
+    kept by its three siblings too.
+
+    These ids are real and these arguments are valid, so nothing but the absent
+    file can be answering: it is the `is_file` guard under test, not the probe
+    beneath it (which would fault on the same missing file and fall through).
+    The recheck under the hold stays in each body, creation being able to race
+    this answer.
+
+    Ablation: move that mutator's `is_file` guard back below its
+    `with ledger_lock(path):` — the spy fires and the row reds."""
+    path = tmp_path / "deferred-work.md"  # deliberately never created
+    acquisitions = []
+
+    with _counting_lock(monkeypatch, acquisitions):
+        assert call(path) == expected
+
+    assert acquisitions == []
+    assert not path.exists()  # and nothing was created on the way past
+
+
+@pytest.mark.parametrize("name", sorted(NOOP_MUTATORS))
+def test_a_noop_mutation_succeeds_when_no_state_root_is_derivable(tmp_path, monkeypatch, name):
+    """With nowhere to put a lock file, a no-op still succeeds; a write still fails.
+
+    `runs.StateRootError` is raised while DERIVING the sidecar path, before any
+    OS lock is attempted, so it reaches every caller of `ledger_lock` in an
+    environment that names no state root — and it is not an `OSError`, so no
+    caller's net catches it. Answering the no-op above the acquisition is what
+    stops that environment from failing calls that were never going to write.
+
+    The write-shaped control is not decoration: it is what says the patch is
+    live. Without it a `lock_path_for` stub that silently never fired would make
+    every row above vacuously green.
+
+    Ablation: delete any probe — that row raises `StateRootError` instead of
+    returning, and reds."""
+    path = _noop_seed_for(tmp_path, name)
+    call, expected = NOOP_MUTATORS[name]
+
+    def no_state_root(_path):
+        raise runs.StateRootError("no state root in this environment")
+
+    monkeypatch.setattr(runs, "lock_path_for", no_state_root)
+
+    assert call(path) == expected
+
+    with pytest.raises(runs.StateRootError):
+        mark_done(path, "DW-1", "2026-06-11", "a call that would really write")
 
 
 # The child of the two-process acceptance test. Appends 8 entries with distinct

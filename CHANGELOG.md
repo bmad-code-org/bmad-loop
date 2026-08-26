@@ -233,6 +233,30 @@ decisions` and the TUI decision modal now also catch the state-root failure that
   created inside the window went with it. A tracked ledger absent at snapshot time is
   still never deleted, and is now answered before any lock is taken. A write or lock fault
   is journaled as `ledger-restore-failed` and preserves an in-flight pause, as before.
+- **A read-dependent no-op is answered before its lock is taken** (#736). Taking a lock for
+  work that turns out to write nothing could fail a call that used to succeed — a replayed
+  `bmad-loop confirm` against a story the board already records as `done`, a replayed
+  rollback, `sweep --archive` over a ledger holding nothing closed — either on contention or
+  on deriving a sidecar path where no state root exists. `sprintstatus.advance` and the five
+  read-dependent `deferred-work.md` mutators now take one advisory read first, running the
+  same pure decision helper the locked pass runs; only a writes-nothing answer skips the lock,
+  and every other answer, plus any probe fault, falls through to the hold and decides there.
+  `sweep --archive` with nothing eligible now exits 0 rather than 1; an eligible archive under
+  a dead lock still fails as before. `append_entries_published` deliberately still locks on a
+  missing ledger, where absence means create.
+- **A ledger restore that spans `git reset --hard` anchors on the committed baseline blob**
+  (#735). The three restores no lock may cover — the rejected attempt's retraction, a rolled
+  back defer's, and the sweep's failed-migration rewrite — compared the ledger against an
+  observation read after the reset returned. A rival writing a tracked ledger inside that
+  window became the observation, so the compare held and the restore overwrote its entries.
+  Each write arm now takes its expected text from the ledger's blob at the baseline commit,
+  probed before the lock, since a lock may never span a subprocess. Where the reset
+  republishes no text at all — an untracked ledger, one configured outside the repo tree, or
+  one symlinked into it, whose blob is a target pathname rather than ledger text — the anchor
+  is the rewrite the attempt actually graded. Where no anchor can be derived, the retraction
+  skips, the defer restore merges what disk has lost, and the sweep escalates; those
+  doubly-uncertain cases previously still wrote. A rival whose text is byte-equal to the
+  anchor stays indistinguishable from the reset's own work.
 
 ### Security
 

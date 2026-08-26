@@ -25,6 +25,21 @@ adding a way to deadlock. Out of scope by #286's own non-goals: the dev/review
 LLM session writes this file directly and does NOT take the lock — orchestrator
 writes are sequenced against sessions today, so the exposure this closes is
 orchestrator-vs-orchestrator.
+
+What the hold covers is every read that decides the PUBLISHED BYTES, which is
+not quite every read (#736). A mutator handed work that turns out to be a no-op
+— ids that are all already done, a decision on an entry that is not there,
+specs that all dedupe, nothing eligible to archive — may answer from ONE
+advisory read taken before the lock, running the same pure decision helper the
+locked pass runs so the two cannot drift. Only a "would write nothing" answer
+is acted on, and such a call linearizes at the probe read: it publishes no
+bytes, so there is nothing for a rival to interleave with. Every other answer,
+and any fault during the probe, falls through to the hold, which re-reads and
+decides authoritatively. This is what keeps a no-op from failing on a lock it
+never needed — an `OSError` from acquisition, or a
+:class:`~bmad_loop.runs.StateRootError` from deriving the sidecar path where no
+state root exists — which a replayed rollback, a re-run sweep and
+``sweep --archive`` all reach routinely.
 """
 
 from __future__ import annotations
@@ -845,6 +860,35 @@ def _apply_done(
     return _insert_after_status(text, entry, tail)
 
 
+def _apply_done_many(
+    text: str,
+    dw_ids: Sequence[str],
+    date: str,
+    note: str,
+    notes: Sequence[str] | None,
+    undo_owner: str | None,
+) -> tuple[str, list[str]]:
+    """Fold every id in `dw_ids` through :func:`_apply_done` *within* `text`,
+    returning the new text and the ids actually flipped, in the order given.
+
+    Pure — text in, text out, no `Path` and no I/O — and it is ONE body for the
+    advisory pre-lock probe and the locked pass, so the two cannot drift: the
+    argument :func:`_apply_append`'s extraction already makes for the batched
+    appender. The whole decision lives here, `undo_owner` included, because the
+    reopenable arm's LINE_BREAK refusal (:func:`_apply_done`) can be the only
+    reason a batch flips nothing — a probe that scanned for open entries by hand
+    would answer "would write" where this answers "would not"."""
+    marked: list[str] = []
+    for index, dw_id in enumerate(dw_ids):
+        entry_note = note if notes is None else notes[index]
+        updated = _apply_done(text, dw_id, date, entry_note, undo_owner=undo_owner)
+        if updated is None:
+            continue
+        text = updated
+        marked.append(dw_id)
+    return text, marked
+
+
 def _mark_done_many(
     path: Path,
     dw_ids: Sequence[str],
@@ -861,6 +905,12 @@ def _mark_done_many(
     TUI decision modal, ``sweep --archive`` — serialize here rather than trading
     last-write-wins. Validation stays ABOVE the lock, so a programmer bug reports
     itself without first waiting on another process.
+
+    A batch that would flip nothing — every id missing, already done, or refused
+    by the reopenable arm's line-break guard — is answered from the advisory
+    pre-lock probe instead, with no acquisition at all (#736). The probe folds
+    the ids through :func:`_apply_done_many`, the same helper the locked pass
+    uses, so it cannot answer "no write" where the authority would write.
 
     ``notes`` supplies a per-id resolution note, positionally paired with
     ``dw_ids``; ``note`` is the fallback for every id when it is None. A length
@@ -881,18 +931,26 @@ def _mark_done_many(
         # primitive replaced took no lock at all when handed nothing, and that
         # identity is part of what "byte-identical to the serial sequence" buys.
         return []
+    if not path.is_file():
+        # No ledger, no entry to flip, so no write and no lock — the order
+        # `archive_closed` already keeps for its own missing-ledger case. The
+        # recheck under the hold below stays: creation can race this answer.
+        return []
+    try:
+        # ADVISORY pre-lock probe (#736): one read, and the same pure decision
+        # the locked pass makes. Only a "would write nothing" answer is acted on
+        # — the call then serializes at this read. Anything else, including any
+        # fault here, falls through to the hold, which re-reads and decides.
+        probe = path.read_text(encoding="utf-8")
+        if not _apply_done_many(probe, dw_ids, date, note, notes, undo_owner)[1]:
+            return []
+    except Exception:  # nosec B110 - ADVISORY probe: a fault here must decide nothing
+        pass
     with ledger_lock(path):
         if not path.is_file():
             return []
         text = path.read_text(encoding="utf-8")
-        marked: list[str] = []
-        for index, dw_id in enumerate(dw_ids):
-            entry_note = note if notes is None else notes[index]
-            updated = _apply_done(text, dw_id, date, entry_note, undo_owner=undo_owner)
-            if updated is None:
-                continue
-            text = updated
-            marked.append(dw_id)
+        text, marked = _apply_done_many(text, dw_ids, date, note, notes, undo_owner)
         if not marked:
             return []
         atomic_write_text(path, text)
@@ -1061,6 +1119,27 @@ def _apply_open(text: str, dw_id: str, note: str, undo_owner: str) -> str | None
     return text
 
 
+def _apply_open_many(
+    text: str, dw_ids: Sequence[str], note: str, undo_owner: str
+) -> tuple[str, list[str]]:
+    """Fold every id in `dw_ids` through :func:`_apply_open` *within* `text`,
+    returning the new text and the ids actually reopened, in the order given.
+
+    Pure — text in, text out, no `Path` and no I/O — and ONE body for the
+    advisory pre-lock probe and the locked pass, so the two cannot drift. The
+    `undo_owner` match is part of the decision: an entry closed by a different
+    operation is skipped here, which is what makes "no id was eligible" a
+    question only this fold can answer."""
+    reopened: list[str] = []
+    for dw_id in dw_ids:
+        updated = _apply_open(text, dw_id, note, undo_owner)
+        if updated is None:
+            continue
+        text = updated
+        reopened.append(dw_id)
+    return text, reopened
+
+
 def mark_open_many(path: Path, dw_ids: Sequence[str], note: str, operation_id: str) -> list[str]:
     """Undo every close in `dw_ids` written by :func:`mark_done_many_reopenable`
     under `operation_id`, in ONE read and ONE atomic write. Returns the ids
@@ -1075,25 +1154,34 @@ def mark_open_many(path: Path, dw_ids: Sequence[str], note: str, operation_id: s
     lock once per id, leaving a rival writer a window between every pair of
     undos in what a rollback needs to be one step.
 
-    Nothing is written when no id was eligible, so a replayed rollback over
-    already-reopened entries leaves the file untouched rather than rewriting it
-    byte-for-byte."""
+    Nothing is written when no id was eligible, and no lock is taken either
+    (#736): a replayed rollback over already-reopened entries is answered from
+    one advisory read, so it leaves the file untouched rather than rewriting it
+    byte-for-byte, and cannot fail on a lock it had no write to serialize."""
     undo_owner = _operation_digest(operation_id)
     if not dw_ids:
         # No ids, no lock — see `_mark_done_many`. The `operation_id` above is
         # still validated, so an empty reopen cannot smuggle a bad one through.
         return []
+    if not path.is_file():
+        # No ledger, no close to undo — see `_mark_done_many`. Rechecked under
+        # the hold below.
+        return []
+    try:
+        # ADVISORY pre-lock probe (#736): one read, and the same pure decision
+        # the locked pass makes. Only a "would write nothing" answer is acted on
+        # — the call then serializes at this read. Anything else, including any
+        # fault here, falls through to the hold, which re-reads and decides.
+        probe = path.read_text(encoding="utf-8")
+        if not _apply_open_many(probe, dw_ids, note, undo_owner)[1]:
+            return []
+    except Exception:  # nosec B110 - ADVISORY probe: a fault here must decide nothing
+        pass
     with ledger_lock(path):
         if not path.is_file():
             return []
         text = path.read_text(encoding="utf-8")
-        reopened: list[str] = []
-        for dw_id in dw_ids:
-            updated = _apply_open(text, dw_id, note, undo_owner)
-            if updated is None:
-                continue
-            text = updated
-            reopened.append(dw_id)
+        text, reopened = _apply_open_many(text, dw_ids, note, undo_owner)
         if not reopened:
             return []
         atomic_write_text(path, text)
@@ -1178,6 +1266,12 @@ def record_decision(
     checked before the ``is_file`` short-circuit so an absent ledger cannot hide
     the bug.
 
+    A missing ledger, and a `dw_id` no entry carries, are both answered False
+    without taking the lock (#736) — there is no write to serialize, and the
+    TUI decision modal reaching a stale id should not fail on an acquisition.
+    The probe runs :func:`_apply_decision`, the same helper the locked pass
+    runs, which is None exactly when the entry is missing.
+
     The write goes through :func:`~bmad_loop.platform_util.atomic_write_text` for
     the reasons documented on :func:`mark_done_many`, plus one this sibling shares
     with it: a bare ``Path.write_text`` truncates *before* it encodes, so any
@@ -1185,6 +1279,20 @@ def record_decision(
     zero-byte ledger where every entry used to be (#328).
     """
     _require_iso_date(date)
+    if not path.is_file():
+        # No ledger, no entry to record against — see `_mark_done_many`.
+        # Rechecked under the hold below.
+        return False
+    try:
+        # ADVISORY pre-lock probe (#736): one read, and the same pure decision
+        # the locked pass makes. Only a "would write nothing" answer is acted on
+        # — the call then serializes at this read. Anything else, including any
+        # fault here, falls through to the hold, which re-reads and decides.
+        probe = path.read_text(encoding="utf-8")
+        if _apply_decision(probe, dw_id, date, label, detail) is None:
+            return False
+    except Exception:  # nosec B110 - ADVISORY probe: a fault here must decide nothing
+        pass
     with ledger_lock(path):
         if not path.is_file():
             return False
@@ -1318,6 +1426,23 @@ def _apply_append(text: str, spec: EntrySpec) -> tuple[str, str | None]:
     return text + sep + block, dw_id
 
 
+def _apply_appends(text: str, specs: Sequence[EntrySpec]) -> tuple[str, list[str | None]]:
+    """Fold every spec through :func:`_apply_append` *within* `text`, returning
+    the new text and one minted id per spec — None where the spec deduped
+    against an open entry that already carries its marker.
+
+    Pure — text in, text out, no `Path` and no I/O — and ONE body for the
+    advisory pre-lock probe and the locked pass, so the two cannot drift. Each
+    spec sees the text the previous one produced, which is what makes ids
+    sequential and lets two identical specs in one call dedupe against each
+    other; see :func:`_apply_append` for why that evolution is load-bearing."""
+    minted: list[str | None] = []
+    for spec in specs:
+        text, dw_id = _apply_append(text, spec)
+        minted.append(dw_id)
+    return text, minted
+
+
 def append_entries(path: Path, specs: Sequence[EntrySpec]) -> list[str | None]:
     """Append every entry in `specs` in ONE read and ONE atomic write, returning
     each spec's minted id — or None in its position when that spec deduped
@@ -1372,8 +1497,12 @@ def append_entries_published(
     prefix that happened to precede it. Validating above the lock also means a
     programmer bug reports itself without first waiting on another process.
 
-    Nothing is written when every spec dedupes, so a replayed defer leaves the
-    file untouched rather than rewriting it byte-for-byte.
+    Nothing is written when every spec dedupes, and no lock is taken either
+    (#736): a replayed defer is answered from one advisory read that runs
+    :func:`_apply_appends`, the same helper the locked pass runs, so it leaves
+    the file untouched rather than rewriting it byte-for-byte. Deliberately NO
+    missing-ledger guard, unlike its sibling mutators: an absent ledger here
+    means CREATE, which is a write, and a write must take the lock.
 
     The write goes through :func:`~bmad_loop.platform_util.atomic_write_text` for
     the reasons documented on :func:`mark_done_many`, plus one this sibling shares
@@ -1393,12 +1522,22 @@ def append_entries_published(
     if not specs:
         # Nothing to serialize against, so nothing to take a lock for.
         return [], None
+    try:
+        # ADVISORY pre-lock probe (#736): one read — shaped exactly like the
+        # locked one, absence included — and the same pure decision the locked
+        # pass makes. Only a "would write nothing" answer is acted on, and here
+        # that is every spec deduping, which is also the only case where the
+        # published text is the text already on disk. Anything else, including
+        # any fault here, falls through to the hold, which re-reads and decides.
+        probe = path.read_text(encoding="utf-8") if path.is_file() else ""
+        minted = _apply_appends(probe, specs)[1]
+        if all(dw_id is None for dw_id in minted):
+            return minted, None
+    except Exception:  # nosec B110 - ADVISORY probe: a fault here must decide nothing
+        pass
     with ledger_lock(path):
         text = path.read_text(encoding="utf-8") if path.is_file() else ""
-        minted: list[str | None] = []
-        for spec in specs:
-            text, dw_id = _apply_append(text, spec)
-            minted.append(dw_id)
+        text, minted = _apply_appends(text, specs)
         if all(dw_id is None for dw_id in minted):
             return minted, None
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1610,6 +1749,29 @@ def _close_date(entry: DWEntry) -> str | None:
     return _iso_date_or_none(parts[1])
 
 
+def _eligible_for_archive(text: str, before: str | None) -> list[tuple[DWEntry, str]]:
+    """Every entry in `text` :func:`archive_closed` would move, paired with its
+    close date, in ledger order.
+
+    Pure — text in, entries out, no `Path` and no I/O — and ONE body for the
+    advisory pre-lock probe and the locked pass, so the two cannot drift. Three
+    skips make up the decision: an entry that is not done, or done without a
+    date, has nothing to compare or to stamp a stub with; `before` excludes
+    entries closed on or after the cutoff; and a stub from a prior run is
+    already archived."""
+    to_archive: list[tuple[DWEntry, str]] = []
+    for entry in parse_ledger(text):
+        close_date = _close_date(entry)
+        if close_date is None:
+            continue  # not done, or done without a date
+        if before is not None and close_date >= before:
+            continue  # closed on or after the cutoff
+        if _is_stub(entry):
+            continue  # stub from a prior archive_closed run
+        to_archive.append((entry, close_date))
+    return to_archive
+
+
 def archive_closed(
     path: Path,
     *,
@@ -1657,8 +1819,13 @@ def archive_closed(
     modal, ``sweep --archive`` — serialize here rather than trading
     last-write-wins. ONE acquisition spans BOTH writes — the
     archive sibling has no lock of its own precisely because it is only ever
-    written under its ledger's lock — and ``dry_run`` runs inside the hold too,
-    so there is one code path rather than a locked and an unlocked one.
+    written under its ledger's lock — and an ELIGIBLE ``dry_run`` runs inside
+    the hold too, so there is one code path rather than a locked and an unlocked
+    one. A run with nothing eligible is the exception, and only because it is
+    not a code path at all: the advisory pre-lock probe (#736) answers it with
+    the empty list before either branch is reached, so ``sweep --archive`` over
+    a ledger holding nothing closed keeps reporting success where the state root
+    cannot be derived or the lock cannot be taken.
     """
     if before is not None:
         _require_iso_date(before)
@@ -1673,20 +1840,23 @@ def archive_closed(
         # taken for a file that is not there. Rechecked under the hold below,
         # deletion being able to race this answer.
         return []
+    try:
+        # ADVISORY pre-lock probe (#736): one read, and the same pure decision
+        # the locked pass makes. Only a "would write nothing" answer is acted on
+        # — the call then serializes at this read. Above the `dry_run` branch on
+        # purpose, so a nothing-eligible dry run skips the lock too; an ELIGIBLE
+        # dry run still runs under the hold, where the one code path is. Anything
+        # else, including any fault here, falls through to that hold.
+        probe = path.read_text(encoding="utf-8")
+        if not _eligible_for_archive(probe, before):
+            return []
+    except Exception:  # nosec B110 - ADVISORY probe: a fault here must decide nothing
+        pass
     with ledger_lock(path):
         if not path.is_file():
             return []
         text = path.read_text(encoding="utf-8")
-        to_archive: list[tuple[DWEntry, str]] = []
-        for entry in parse_ledger(text):
-            close_date = _close_date(entry)
-            if close_date is None:
-                continue  # not done, or done without a date
-            if before is not None and close_date >= before:
-                continue  # closed on or after the cutoff
-            if _is_stub(entry):
-                continue  # stub from a prior archive_closed run
-            to_archive.append((entry, close_date))
+        to_archive = _eligible_for_archive(text, before)
         if not to_archive:
             return []
         archived_ids = [e.id for e, _ in to_archive]
