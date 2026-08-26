@@ -3884,6 +3884,101 @@ def test_migration_restore_write_failure_propagates_and_keeps_the_ledger(project
     assert project.deferred_work.read_bytes()  # and emphatically not zero bytes
 
 
+@contextlib.contextmanager
+def _rival_appending_ledger_lock(monkeypatch, ledger, addition):
+    """A `ledger_lock` spy that lands one foreign append BEFORE acquiring, and
+    still really locks.
+
+    Ahead of the acquisition on purpose: that is the window the migration
+    restore's compare-and-set covers — between the post-reset observation and the
+    hold. Still really locking for `_counting_ledger_lock`'s reason: a spy that
+    only staged the rival would let a nested acquisition through. One-shot, so a
+    later acquisition cannot file the rival twice.
+    """
+    real_lock = deferredwork.ledger_lock
+    landed: list[bool] = []
+
+    @contextlib.contextmanager
+    def spy_lock(path):
+        if path == ledger and not landed:
+            landed.append(True)
+            with ledger.open("a", encoding="utf-8") as f:
+                f.write(addition)
+        with real_lock(path):
+            yield
+
+    monkeypatch.setattr(deferredwork, "ledger_lock", spy_lock)
+    yield landed
+
+
+def _half_migrated_effect(project):
+    """A migration rewrite that converts only the done item, so the open one
+    stays legacy and `validate_migration` rejects it — the restore's trigger."""
+    manifest = legacy_manifest()
+    half = (
+        "# Deferred Work\n\n"
+        "### DW-1: Old fixed thing\n\norigin: migrated, 2026-06-12\nlocation: n/a\n"
+        "reason: repaired.\nstatus: done 2026-04-06\n\n"
+        "## Deferred from: epic 1 review (2026-04-06)\n\n"
+        "- **Open legacy thing here** — `src.txt` mishandles em-dashes\n"
+    )
+    return migrate_effect(project, half, [{"key": manifest[0]["key"], "dw_id": "DW-1"}])
+
+
+def test_migration_restore_escalates_on_divergence(project, monkeypatch):
+    """#286. The failed migration's restore is compare-and-set: when the ledger
+    moved between the reset and the lock, the pre-migration text is NOT written
+    back over it and a human is asked to re-run the sweep.
+
+    No merge and no silent skip, and the site's own rule is why. Leaving the
+    rejected rewrite standing would be re-prompting over a half-broken ledger,
+    and a migration input that changed underneath the attempt it was graded
+    against is a human problem — the same call `migrate-duplicate-ids` makes.
+
+    Ablation: drop the `current == observed` arm so the restore always writes,
+    and the rival's line is clobbered while no escalation is raised.
+    """
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    engine, adapter = make_sweep(project, [_half_migrated_effect(project)] * 2)
+    rival = "- **Filed by another process** — `other.txt` needs a look\n"
+    with _rival_appending_ledger_lock(monkeypatch, project.deferred_work, rival) as landed:
+        summary = engine.run()
+
+    assert summary.paused and landed == [True]
+    assert engine.state.tasks["sweep-migrate"].phase == Phase.ESCALATED
+    assert "changed underneath the failed migration attempt" in engine.state.paused_reason
+    assert "sweep-migration-restore-diverged" in journal_kinds(engine)
+    # the rival's line stands, and the refusal did not paper the rewrite over
+    text = project.deferred_work.read_text(encoding="utf-8")
+    assert "Filed by another process" in text and text != LEGACY_LEDGER
+    # the refusal is terminal for this run: the second attempt never dispatches
+    assert len(adapter.sessions) == 1
+
+
+def test_migration_restore_quiet_path_unchanged(project):
+    """#286. With no interleaving writer the restore still puts the
+    pre-migration text back byte for byte, and journals no divergence — the CAS
+    is invisible on the path every migration failure actually takes.
+
+    The ledger is deliberately left UNTRACKED. `git reset --hard` puts a tracked
+    one back on its own, so the explicit write is the only thing standing between
+    a rejected rewrite and disk here — over a committed ledger this assertion
+    passes with the write deleted, which is what the site's own comment predicts
+    ("the baseline reset covers tracked files, the explicit write covers an
+    untracked ledger that `git reset` cannot restore").
+
+    Ablation: delete the restore write and the rejected rewrite stays on disk;
+    force the diverged arm and the journal row appears.
+    """
+    write_legacy_ledger(project, LEGACY_LEDGER, commit=False)
+    engine, _ = make_sweep(project, [_half_migrated_effect(project)] * 2)
+    summary = engine.run()
+
+    assert summary.paused
+    assert project.deferred_work.read_text(encoding="utf-8") == LEGACY_LEDGER
+    assert "sweep-migration-restore-diverged" not in journal_kinds(engine)
+
+
 def test_migration_escalation_resume_retries(project):
     write_legacy_ledger(project, LEGACY_LEDGER)
     manifest = legacy_manifest()

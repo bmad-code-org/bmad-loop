@@ -1028,8 +1028,37 @@ class SweepEngine(Engine):
             # covers tracked files, the explicit write covers an untracked
             # ledger that `git reset` cannot restore
             self._safe_reset(task)
-            ledger.parent.mkdir(parents=True, exist_ok=True)
-            atomic_write_text(ledger, text)
+            # Read IMMEDIATELY after the reset returned: only pure Python runs
+            # between them, so the compare below is file-I/O-only rather than
+            # spanning the reset's git spawns, which no lock may cover (#286).
+            observed = ledger.read_text(encoding="utf-8") if ledger.is_file() else None
+            diverged = False
+            with deferredwork.ledger_lock(ledger):
+                # PURE TEXT ONLY under the hold — `ledger_lock` is not reentrant
+                # and every mutator takes it.
+                current = ledger.read_text(encoding="utf-8") if ledger.is_file() else None
+                if current == observed:
+                    ledger.parent.mkdir(parents=True, exist_ok=True)
+                    atomic_write_text(ledger, text)
+                else:
+                    diverged = True
+            if diverged:
+                # No merge and no silent skip. The comment above is the reason:
+                # leaving the rejected rewrite standing IS re-prompting over a
+                # half-broken ledger, and the migration input a human must fix is
+                # no longer the one this attempt was graded against — the same
+                # call `migrate-duplicate-ids` makes about a corrupt ledger.
+                # Journaled outside the hold; `_escalate` raises.
+                self.journal.append(
+                    "sweep-migration-restore-diverged",
+                    story_key=MIGRATE_KEY,
+                    ledger=str(ledger),
+                )
+                self._escalate(
+                    task,
+                    "the ledger changed underneath the failed migration attempt — "
+                    "re-run the sweep",
+                )
             if task.attempt >= self.policy.sweep.max_migration_attempts:
                 self._escalate(
                     task, "migration failed deterministic validation: " + "; ".join(errors)

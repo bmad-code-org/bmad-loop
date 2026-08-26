@@ -6114,21 +6114,131 @@ class Engine:
                     "attempt's work is)",
                 )
                 raise
-            # reset reverts tracked deferred-work.md edits; restore review-found
-            # defer entries — they are real knowledge worth keeping
+            # The reset reverts a *tracked* ledger's uncommitted edits, so the
+            # review-found entries it erased are real knowledge worth putting
+            # back. The restore is compare-and-set against the post-reset
+            # observation and gated on git owning the file, and it merges rather
+            # than overwrites when another writer interleaved. A foreign write
+            # that landed BEFORE the reset is the reset's casualty, not the
+            # restore's: the snapshot predates both, so nothing here can tell
+            # that write apart from the session's own erased edits.
             if snapshot is not None:
-                current = (
-                    deferred_work.read_text(encoding="utf-8") if deferred_work.is_file() else None
-                )
-                if current != snapshot:
-                    deferred_work.parent.mkdir(parents=True, exist_ok=True)
-                    atomic_write_text(deferred_work, snapshot)
+                self._restore_defer_ledger(task, snapshot)
             # The restore deliberately keeps review-found ledger knowledge, but
             # it also replays this bundle's accepted close after the code was
             # discarded. Let the mode undo only the close it can identify as its
             # own; the base path has no bundle close and is a no-op.
             self._reopen_ledger_after_defer(task)
         self._record_defer(task, reason)
+
+    def _restore_defer_ledger(self, task: StoryTask, snapshot: str) -> None:
+        """Put back the ledger knowledge a defer's reset erased, without taking a
+        concurrent writer's work with it (#286).
+
+        The window being repaired spans ``_rollback_or_pause``'s git spawns, so a
+        lock cannot cover it — :func:`deferredwork.ledger_lock` is contracted
+        never to span a subprocess. Compare-and-set stands in: the post-reset
+        observation is the expected state, and anything else found under the lock
+        belongs to somebody else.
+
+        Three refusals, in order of how much they know:
+
+        * ``observed == snapshot`` — the reset changed nothing, so there is
+          nothing to put back. Today's quiet path, byte-identical.
+        * the ledger is not git's — ``reset --hard`` cannot have touched an
+          untracked or external file, so the whole delta arrived from a live
+          foreign writer and the correct restore is no write at all. The guard
+          this replaces compared ``current != snapshot`` and overwrote on exactly
+          that difference: it ARMED the lost update it reads like it prevents.
+        * the text moved between the observation and the lock — another writer
+          landed inside the window, so the snapshot is republished by APPENDING
+          the entries disk has since lost, never by overwriting what arrived.
+
+        Write and lock faults propagate, as the unguarded write here always did:
+        a repair write that could not be serialized must fail loudly.
+        """
+        ledger = self.workspace.paths.deferred_work
+        # Read IMMEDIATELY after `_rollback_or_pause` returned: only pure Python
+        # runs between the reset and this line, so the compare window below is
+        # file-I/O-only rather than spanning the rollback's git spawns.
+        observed = self._ledger_text()
+        if observed == snapshot:
+            return
+        if not self._ledger_is_gits_to_restore(task):
+            # The reset never reached an untracked or external ledger, so every
+            # byte of the delta above is a live foreign write and there is
+            # nothing of ours to restore over it.
+            return
+        merged: list[str] = []
+        flat_remainder = False
+        with deferredwork.ledger_lock(ledger):
+            # PURE TEXT ONLY under the hold. Every `deferredwork` mutator takes
+            # this same lock, and `ledger_lock` raises on the nesting rather than
+            # deadlocking — that raise would abandon the repair half-done.
+            current = self._ledger_text()
+            if current == snapshot:
+                return
+            if current == observed:
+                ledger.parent.mkdir(parents=True, exist_ok=True)
+                atomic_write_text(ledger, snapshot)
+                return
+            restored, merged, flat_remainder = self._merge_snapshot_entries(current or "", snapshot)
+            if restored is not None:
+                ledger.parent.mkdir(parents=True, exist_ok=True)
+                atomic_write_text(ledger, restored)
+        # Only the divergent arm falls through to here. Journaled outside the
+        # hold: the lock covers this ledger's read-modify-write and nothing else.
+        self.journal.append(
+            "defer-ledger-restore-diverged",
+            story_key=task.story_key,
+            ledger=str(ledger),
+            dw_ids=merged,
+            flat_remainder=flat_remainder,
+        )
+
+    def _merge_snapshot_entries(
+        self, current: str, snapshot: str
+    ) -> tuple[str | None, list[str], bool]:
+        """Republish the snapshot's lost entries onto `current` by APPENDING them.
+
+        Returns the merged text — None when there was nothing to append — the ids
+        appended, and whether the snapshot carried flat-appender content this
+        merge could not account for.
+
+        Append-only and keyed by id, deliberately: the divergent text is another
+        writer's published state, so the only edit that cannot destroy it is
+        adding back what it no longer carries. Bodies cross over verbatim, since
+        re-rendering one would drop every field `parse_ledger` does not model,
+        and they are joined by the same one-blank-line rule
+        `deferredwork._apply_append` uses so a merged ledger is shaped like an
+        appended one.
+
+        Flat appender blocks belong to no canonical entry — `parse_ledger`
+        truncates a span at :data:`deferredwork.FLAT_ENTRY_RE` rather than
+        absorbing one — so no body can carry one across and guessing at their
+        boundaries is exactly what PR #274 forbids. Each opener line in the
+        snapshot is instead probed against the text about to be published, and a
+        missing one is REPORTED for a human rather than merged.
+        """
+        present = {entry.id for entry in deferredwork.parse_ledger(current)}
+        missing = [e for e in deferredwork.parse_ledger(snapshot) if e.id not in present]
+        text = current
+        for entry in missing:
+            if text == "" or text.endswith("\n\n"):
+                sep = ""
+            elif text.endswith("\n"):
+                sep = "\n"
+            else:
+                sep = "\n\n"
+            text += sep + entry.body
+        flat_remainder = False
+        for m in deferredwork.FLAT_ENTRY_RE.finditer(snapshot):
+            line_end = snapshot.find("\n", m.start())
+            opener = snapshot[m.start() : line_end if line_end != -1 else len(snapshot)]
+            if opener not in text:
+                flat_remainder = True
+                break
+        return (text if missing else None, [e.id for e in missing], flat_remainder)
 
     def _reopen_ledger_after_defer(self, task: StoryTask) -> None:
         """Undo mode-owned ledger closes after a defer discarded their code.

@@ -190,6 +190,30 @@ breaking changes may land in a minor release.
   committed ledger — the format `sweep` bundle closes already publish, now used by one more
   writer. Readers that ignore unknown fields are unaffected; `bmad-loop sweep --archive`
   already preserves the line.
+- **A rolled-back defer no longer restores its ledger over a writer that arrived during
+  the rollback** (#286). The window between the pre-rollback snapshot and the restore spans
+  `git reset --hard` and its preflight spawns, so a lock must not cover it; the restore is
+  now compare-and-set against the ledger as observed the instant the rollback returned.
+  It is also gated on git owning the file, which inverts the old guard's worst case: on an
+  untracked or external ledger — the one kind `reset --hard` cannot have touched — every
+  difference from the snapshot was by definition somebody else's write, and rewriting the
+  file on exactly that difference is what destroyed it. Such a ledger is now left alone.
+  When the text does move between the observation and the lock, the snapshot is republished
+  by APPENDING the entries disk has since lost, keyed by DW- id and carrying their bodies
+  verbatim, so a concurrent append survives the restore instead of being rolled back with
+  it; `defer-ledger-restore-diverged` names the ids moved. Flat appender blocks, which
+  belong to no canonical entry, are reported rather than guessed at (`flat_remainder`) —
+  the merge never invents a boundary the parser does not model. A write or lock fault still
+  propagates, as the unguarded write always did.
+- **A failed legacy-ledger migration refuses to restore over a ledger that changed
+  underneath it** (#286). The sweep's post-reset rewrite of the pre-migration text had the
+  same unguarded window; it now compares against the ledger as observed the instant the
+  reset returned, and on a difference journals `sweep-migration-restore-diverged` and
+  escalates for a human to re-run the sweep rather than writing. Deliberately no merge and
+  no silent skip: leaving the rejected rewrite standing is the "never re-prompt over a
+  half-broken rewrite" failure the restore exists to prevent, and a migration input that
+  moved after the attempt was graded against it is a human problem — the same call the
+  duplicate-id refusal already makes.
 
 ### Security
 

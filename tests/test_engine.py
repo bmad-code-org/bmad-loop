@@ -6433,6 +6433,146 @@ def test_defer_preserves_deferred_work_additions(project):
     assert "DW-1: pre-existing flaky retry" in project.deferred_work.read_text()
 
 
+@contextlib.contextmanager
+def _rival_appending_ledger_lock(monkeypatch, ledger, addition):
+    """A `ledger_lock` spy that lands one foreign append BEFORE acquiring, and
+    still really locks.
+
+    Ahead of the acquisition on purpose: that is the window the restore's
+    compare-and-set covers — between the post-reset observation and the hold —
+    and a deterministic write there is what a rival process would have done.
+    Still really locking, because a spy that only staged the rival would let a
+    nested acquisition through, and `ledger_lock` raising on nesting is the guard
+    keeping the restore's under-the-lock work pure. Latched one-shot so a second
+    acquisition cannot file the rival twice.
+    """
+    real_lock = deferredwork.ledger_lock
+    landed: list[bool] = []
+
+    @contextlib.contextmanager
+    def spy_lock(path):
+        if path == ledger and not landed:
+            landed.append(True)
+            with ledger.open("a", encoding="utf-8") as f:
+                f.write(addition)
+        with real_lock(path):
+            yield
+
+    monkeypatch.setattr(deferredwork, "ledger_lock", spy_lock)
+    yield landed
+
+
+def test_defer_restore_merges_a_concurrent_append(project, monkeypatch):
+    """#286. Another process files an entry while the defer's rollback is in
+    flight; the restore must republish its own review-found knowledge WITHOUT
+    taking the rival's entry back out.
+
+    The rival lands inside the compare-and-set window — after the post-reset
+    observation, before the lock — which is exactly the interleaving the old
+    `current != snapshot` guard overwrote wholesale.
+
+    Ablation: delete the `current == observed` arm so the restore always writes
+    the snapshot, and the rival entry vanishes.
+    """
+    from conftest import git
+    from conftest import review_effect as make_review
+
+    project.deferred_work.write_text("# Deferred Work\n")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "seed deferred-work")
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+
+    filed: list[bool] = []
+
+    def reviewing_with_defer(spec):
+        # latched: the review budget spends three sessions, but a finding is
+        # filed once — three copies of one heading would make a duplicate-id
+        # ledger, and the merge below reports the ids it moved.
+        if not filed:
+            filed.append(True)
+            with project.deferred_work.open("a") as f:
+                f.write("\n### DW-1: review-found flaky retry\n\nstatus: open\n")
+        return make_review(project, "1-1-a", clean=False, patched=1, finalized=False)(spec)
+
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a")] + [reviewing_with_defer for _ in range(3)],
+    )
+    rival = "\n### DW-2: filed by another process\n\nstatus: open\n"
+    with _rival_appending_ledger_lock(monkeypatch, project.deferred_work, rival) as landed:
+        summary = engine.run()
+
+    assert summary.deferred == 1 and landed == [True]
+    entries = _ledger_entries(project)
+    assert entries["DW-1"].title == "review-found flaky retry"
+    assert entries["DW-2"].title == "filed by another process"
+    (event,) = [e for e in engine.journal.entries() if e["kind"] == "defer-ledger-restore-diverged"]
+    assert event["story_key"] == "1-1-a"
+    assert event["dw_ids"] == ["DW-1"] and event["flat_remainder"] is False
+
+
+def test_defer_skips_restore_for_a_ledger_the_reset_never_touched(project, monkeypatch):
+    """#286. An untracked ledger sits outside `reset --hard`'s reach, so a delta
+    observed after the rollback can only be a live foreign write — and the right
+    restore is no write at all.
+
+    The guard this replaces compared disk against the snapshot and overwrote on
+    exactly that difference: it ARMED the lost update it reads like it prevents.
+
+    Ablation: delete the `_ledger_is_gits_to_restore` gate and the rival entry is
+    clobbered by the snapshot.
+    """
+    from conftest import review_effect as make_review
+
+    # Untracked, and present before the attempt's baseline is stamped, so the
+    # reset's cleanup (created-since-baseline files only) leaves it alone. Git
+    # never owned this file, so git never put anything back into it either.
+    project.deferred_work.write_text("# Deferred Work\n")
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+
+    filed: list[bool] = []
+
+    def reviewing_with_defer(spec):
+        if not filed:  # one finding, three review sessions — see the twin above
+            filed.append(True)
+            with project.deferred_work.open("a") as f:
+                f.write("\n### DW-1: review-found flaky retry\n\nstatus: open\n")
+        return make_review(project, "1-1-a", clean=False, patched=1, finalized=False)(spec)
+
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a")] + [reviewing_with_defer for _ in range(3)],
+    )
+
+    real_rollback = engine._rollback_or_pause
+
+    def rollback_then_rival(task, **kwargs):
+        real_rollback(task, **kwargs)
+        # after the reset returned, before the restore reads its observation
+        with project.deferred_work.open("a") as f:
+            f.write("\n### DW-2: filed by another process\n\nstatus: open\n")
+
+    monkeypatch.setattr(engine, "_rollback_or_pause", rollback_then_rival)
+
+    writes: list[Path] = []
+    real_write = platform_util.atomic_write_text
+
+    def recording_write(path, text, **kwargs):
+        writes.append(Path(path))
+        real_write(path, text, **kwargs)
+
+    monkeypatch.setattr("bmad_loop.engine.atomic_write_text", recording_write)
+
+    summary = engine.run()
+
+    assert summary.deferred == 1
+    # the restore returned before writing: nothing of ours was owed here
+    assert project.deferred_work not in writes
+    entries = _ledger_entries(project)
+    assert entries["DW-1"].title == "review-found flaky retry"
+    assert entries["DW-2"].title == "filed by another process"
+
+
 def test_rollback_off_pauses_with_manual_notice(project):
     """Production default (rollback_on_failure=False): a would-be defer reset
     never touches the tree — it pauses with bold manual-recovery instructions."""
