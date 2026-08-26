@@ -267,6 +267,18 @@ def validate_triage(
             bundle_name = str(raw.get("bundle_name", ""))
             if bundle_name and not BUNDLE_NAME_RE.match(bundle_name):
                 errors.append(f"decision {dw_id} option {key}: bad bundle_name {bundle_name!r}")
+            # The second site that mints a bundle directory, gated for the reason
+            # stated at the `bundles` loop above. A build-effect option's
+            # `bundle_name` becomes `Bundle.name` in `_materialize_bundles`, so it
+            # reaches `_write_intent`'s cycle-1 directory by the identical path --
+            # `BUNDLE_NAME_RE` is no more able to express the rule here than there.
+            # Guarded on the match above so one bad name yields one error, and on
+            # nothing else: an absent `bundle_name` fails that match already.
+            if BUNDLE_NAME_RE.match(bundle_name) and safe_segment(bundle_name) != bundle_name:
+                errors.append(
+                    f"decision {dw_id} option {key}: bundle_name {bundle_name!r} "
+                    "is not a legal path segment"
+                )
             if effect == "build" and bundle_name:
                 if bundle_name in names:
                     errors.append(f"duplicate bundle name {bundle_name!r}")
