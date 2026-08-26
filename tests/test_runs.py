@@ -4475,15 +4475,23 @@ class _RegistryMux:
 
     `root` is what `registry_root()` answers: `None` is psmux's own default
     registry (the seam deliberately never respells its home cascade), which the
-    remainder labels `runs.DEFAULT_REGISTRY_LABEL`."""
+    remainder labels `runs.DEFAULT_REGISTRY_LABEL`.
 
-    def __init__(self, sessions, tags, root=None):
+    `fold` is the transport's name comparison: the seam's identity default
+    (tmux, exact) unless set, `name.lower()` when set (psmux, whose registry is
+    a directory of per-session files NTFS opens case-insensitively)."""
+
+    def __init__(self, sessions, tags, root=None, fold=False):
         self._sessions, self._tags = sessions, tags
         self._root = root
+        self._fold = fold
         self.killed: list[str] = []
 
     def registry_root(self):
         return self._root
+
+    def session_name_key(self, name):
+        return name.lower() if self._fold else name
 
     def list_sessions(self):
         return list(self._sessions)
@@ -4858,6 +4866,38 @@ def test_legacy_registry_leftovers_names_a_surviving_control_session(tmp_path, m
     }
 
 
+def test_legacy_leftovers_names_a_case_variant_ctl_where_the_transport_folds(tmp_path, monkeypatch):
+    """psmux resolves a session by opening `<data dir>\\<name>.port`, and NTFS
+    opens names case-insensitively, so in ITS registry `bmad-loop-CTL-<hex>` is
+    the control session. Asking `is_ctl_session_name` about the name as spelled
+    misses it, and it then falls through `_agent_run_id` — which refuses every
+    ctl-aliasing id, case-folded — so the leftover goes unreported by both arms.
+
+    Ablate `legacy.session_name_key(name)` back to `name` and this fails with
+    `{}`: the survivor is standing in a registry nothing else addresses, unnamed."""
+    upper = runs.CTL_SESSION.upper() + "-0123456789ABCDEF"
+    legacy = _RegistryMux([upper], {}, fold=True)
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
+    assert runs.legacy_registry_leftovers(tmp_path) == {runs.DEFAULT_REGISTRY_LABEL: [upper]}
+
+
+def test_legacy_leftovers_leaves_a_case_variant_alone_where_the_transport_is_exact(
+    tmp_path, monkeypatch
+):
+    """The other direction, and the reason the fold cannot be a constant here.
+    On an exact transport (tmux: `bmad-loop-ctl` and `bmad-loop-CTL` coexist as
+    distinct sessions, measured on 3.4) that name is NOT the control session, and
+    it is not a session of ours either — the mint refuses every ctl-aliasing id
+    case-folded, so bmad-loop cannot have created it. Naming it would send the
+    operator after somebody else's session.
+
+    Ablate to the blanket `.lower()` the review proposed and this fails."""
+    upper = runs.CTL_SESSION.upper() + "-0123456789ABCDEF"
+    legacy = _RegistryMux([upper], {})  # identity key: the seam default
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
+    assert runs.legacy_registry_leftovers(tmp_path) == {}
+
+
 def test_legacy_registry_leftovers_degrades_on_a_transport_fault(tmp_path, monkeypatch):
     """Observation degrades: the sweep's own report still stands, and a migration
     remainder nobody could read is not a reason to fail a cleanup that already
@@ -5059,3 +5099,34 @@ def test_legacy_leftovers_dry_run_never_drops_what_the_preview_did_not_announce(
     assert runs.legacy_registry_leftovers(tmp_path, announced=plan[0]) == {
         runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-race-live"]
     }
+
+
+def test_legacy_leftovers_dry_run_keeps_what_the_legacy_pass_cannot_claim(tmp_path, monkeypatch):
+    """`prune_sessions` unions the ids of every pass, so the flat plan says only
+    "some registry would kill this id" — and applying it here as a global name set
+    let a would-kill in the PRIMARY registry silence a same-named session in a
+    legacy one that the legacy pass, running with `require_tag=True`, deliberately
+    cannot claim. The preview then disagreed with the cleanup it previews.
+
+    Both halves are asserted against the same two registries: the real sweep leaves
+    and reports the untagged session, and the dry run must say the same thing.
+
+    Ablate by hoisting the exclusion back above the tag arms and the dry-run half
+    fails with `{}` while the real half still reports it — the disagreement itself."""
+    (_make_state_run(tmp_path, "dup") / "engine.pid").write_text(str(_dead_pid()))
+    ours = _RootedMux(["bmad-loop-dup"], {}, str(runs.mux_registry_root(tmp_path)))
+    monkeypatch.setattr(runs, "get_multiplexer", lambda: ours)
+    monkeypatch.setattr(runs, "mux_sessions", ours.list_sessions)
+    monkeypatch.setattr(runs, "session_project_tags", lambda: {})
+    # untagged over there: the run dir proves nothing in a shared registry
+    legacy = _RegistryMux(["bmad-loop-dup"], {})
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
+
+    plan = runs.prune_sessions(tmp_path, dry_run=True)
+    assert plan == (["dup"], [], set())  # announced by the primary pass alone
+    preview = runs.legacy_registry_leftovers(tmp_path, announced=plan[0])
+
+    assert runs.prune_sessions(tmp_path) == (["dup"], [], set())
+    assert legacy.killed == []  # the legacy pass declined it, as it must
+    assert preview == runs.legacy_registry_leftovers(tmp_path)
+    assert preview == {runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-dup"]}

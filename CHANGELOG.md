@@ -288,7 +288,9 @@ resolve` manufactures exactly that dual-key spec, inserting `baseline_revision` 
   run under any other `ctl-*` id keeps its genuine agent session
   reachable in the registry the process addresses: `stop` kills it there by its exact name, and
   `cleanup` sweeps it like any other run's — including, for a tagged pre-upgrade session left in
-  psmux's old default registry, through the legacy pass (`stop` does not reach that registry).
+  a legacy registry, through the legacy pass (`stop` reaches no registry but the one this
+  process exported; the stop itself is registry-independent, only its backstop session kill is
+  scoped).
 - **TUI: a graceful-stop request that cannot be written is reported, not fatal.** The `S`
   worker caught only the helper's own refusals; an `OSError` from the write itself escaped,
   and Textual's default `exit_on_error` took the dashboard down with it. It now surfaces

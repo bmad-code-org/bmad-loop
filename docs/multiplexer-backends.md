@@ -197,6 +197,19 @@ Two further consequences:
   `bmad-loop list --project <that project>` and stop it through bmad-loop (`bmad-loop stop
 <run-id>`, or the TUI) rather than through psmux.
 
+  **`stop` works there, but it does not sweep the old registry.** The stop reaches the engine
+  _process_, not a session: it lodges a request in the run directory and signals the recorded pid,
+  and a run directory belongs to a project and a run id, not to a registry. So a pre-upgrade run
+  stops, and a still-live engine tears its own window down under the registry it was launched with.
+  What `stop` does not reach is its own backstop kill — that one addresses the registry bmad-loop
+  exported for this project, so an agent session an already-dead engine left behind in an older
+  registry stays standing and the run is still marked stopped. It is `bmad-loop cleanup` that
+  reaches those, through the legacy pass described above: a session carrying this project's tag is
+  killed there, and anything the tag rule declines is named on the leftovers line with the registry
+  it is in. `stop` is deliberately not widened to match — a by-name kill in a registry shared with
+  other projects, without that tag proof, could take a neighbour's same-named session, since run
+  ids are unique only within one project.
+
   Finished windows can simply be left parked — a parked window costs one idle shell. To close one,
   `psmux kill-window -t bmad-loop-ctl:<index>` kills only that window's own children, so it is
   safe once `capture-pane` has shown you the banner. Closing the last window ends the session too,

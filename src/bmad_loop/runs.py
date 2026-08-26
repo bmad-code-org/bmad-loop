@@ -1646,7 +1646,12 @@ def legacy_registry_leftovers(
     - **A surviving control session.** The prune never touches a ctl-named
       session (:func:`is_ctl_session_name`), and its parked windows are not swept
       in a legacy registry either — the ctl-window scan runs against the primary
-      backend only.
+      backend only. The shape question is asked through *that registry's*
+      :meth:`~.adapters.multiplexer.TerminalMultiplexer.session_name_key`, never a
+      constant fold: on a case-folding store ``bmad-loop-CTL-<hex>`` IS the
+      control session and goes unnamed without it, while on an exact one it is a
+      distinct session bmad-loop cannot have minted — naming it there would send
+      the operator after somebody else's.
 
     Another project's tagged sessions never appear: the sweep skipping them is the
     correct outcome, not a remainder.
@@ -1656,6 +1661,23 @@ def legacy_registry_leftovers(
     is still standing and would be named here as if the sweep had declined it. The
     caller passes the run ids it printed — :func:`prune_sessions`' own return — and
     they are excluded.
+
+    **Excluded only where THIS registry's own pass could have announced it**, which
+    is the tagged-ours arm and only it. :func:`prune_sessions` unions the ids of
+    every pass, the *primary* registry's included, so the flat set says no more
+    than "some registry would kill this id" — while a legacy pass runs with
+    ``require_tag=True`` and therefore cannot claim an untagged session at all.
+    Applied to the untagged arm the set hid exactly the remainder this listing
+    exists for: a dead ``bmad-loop-X`` the primary pass plans to kill, an untagged
+    ``bmad-loop-X`` over here that the real cleanup leaves and reports, and a
+    preview of that same cleanup that does not mention it.
+
+    Inside the tagged arm the flat set is exact, so no per-registry plan has to be
+    threaded down here. Liveness is read from ``run_dir_for(project, run_id)`` —
+    one directory per (project, id), whatever registry the session sits in — so an
+    id the primary pass judged dead the legacy pass judges dead too: if the same
+    id is standing here under a tag proving ours, this pass announced it as well
+    and the union merely collapsed the two.
 
     Passed in rather than re-derived, and that is the whole point of the parameter.
     An earlier revision re-ran the partition here to rediscover the plan, which is
@@ -1693,18 +1715,22 @@ def legacy_registry_leftovers(
             continue  # observation degrades; the sweep's own report still stands
         here: list[str] = []
         for name in names:
-            if name in excluded:
-                continue
-            if is_ctl_session_name(name):
+            if is_ctl_session_name(legacy.session_name_key(name)):
                 # A legacy registry holds the pre-#537 fixed name; the shape
-                # predicate also names any per-registry-named stray.
+                # predicate also names any per-registry-named stray. Asked
+                # through THIS registry's own comparison key, never a constant
+                # fold: whether `bmad-loop-CTL-<hex>` denotes the control
+                # session is the transport's answer to give.
                 here.append(name)
                 continue
             if _agent_run_id(name) is None:
                 continue  # not a bmad-loop agent session at all
             tag = tags.get(name, "")
-            if not tag or tag in mine:
-                here.append(name)
+            if tag and tag not in mine:
+                continue  # another project's session
+            if tag and name in excluded:
+                continue  # a would-kill of this registry's own pass (dry run)
+            here.append(name)
         if here:
             # `registry_root()` is a diagnostic and never raises (seam contract).
             # Two admitted registries could in principle answer the same label —
@@ -2090,6 +2116,30 @@ def stop_run(run_dir: Path) -> bool:
     only channel that can still stop it: the StopRunError refusal below (we decline
     to force-kill an unverifiable pid), and the ``engine_may_live`` paths where the
     signal or the kill was refused outright rather than racing us to exit.
+
+    **Registry scope, stated because it is easy to read past.** The stop
+    itself is registry-independent: both channels address the engine *process* —
+    the request file lands in the run directory, the signal on the pid recorded
+    there — and a run directory is per (project, run id), not per registry. So a
+    pre-upgrade run living in a legacy psmux registry stops, and a still-live
+    engine tears down its own window under the registry it was launched with.
+    What is scoped is the backstop below: :func:`kill_session` addresses the
+    registry THIS process exported, so an agent session an already-dead engine
+    leaked in a legacy registry is not reached from here and the run is marked
+    stopped with that session standing.
+
+    Deliberately not widened, and for the reason ``kill_session``'s own docstring
+    gives: a by-name kill in a registry shared with other projects, without tag
+    proof, could take a neighbour's same-named session — run ids are unique per
+    project only. Both legacy registries are shared in exactly that sense. The
+    displaced one is no exception: it is the *ambient* ``PSMUX_DATA_DIR`` this
+    process found (:func:`~.adapters.psmux_backend.note_displaced_registry`), so
+    a profile that exports one exports it into every project's shell and every
+    one of them kept its pre-upgrade sessions there. That is why the legacy pass
+    of :func:`prune_sessions` demands the tag in both, and it is the path that
+    reaches such a session — ``bmad-loop cleanup``, with
+    :func:`legacy_registry_leftovers` naming whatever the tag rule leaves and the
+    registry it is in.
     """
     state = load_state(run_dir)
     if state.finished:
@@ -2201,6 +2251,9 @@ def stop_run(run_dir: Path) -> bool:
     # in case it died before tearing it down. Ahead of everything below, because both
     # exits from here need it — an engine that honored the stop and died before
     # tearing its window down leaks the session just as surely as one we killed.
+    # This is the one registry-scoped step of the stop (see the docstring): it
+    # addresses the registry this process exported, and `cleanup`'s legacy pass is
+    # what reaches a session left in an older one.
     kill_session(run_dir.name)
     state = load_state(run_dir)
     if state.stopped:
