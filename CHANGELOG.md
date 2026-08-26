@@ -50,9 +50,13 @@ breaking changes may land in a minor release.
   spells — a device rather than a file, or a sibling once Win32 strips the trailing run — so the
   file that gets seeded and the exclude pattern rendered from the authored spelling disagree
   about which path they mean. The refusal is cross-platform on purpose, matching how the family
-  already rejects `C:\secrets` on POSIX: a config value must not mean one thing per host. No
-  shipped profile, bundled `plugin.toml` or default trips it, but this is a compatibility break
-  on previously-loading config.
+  already rejects `C:\secrets` on POSIX: a config value must not mean one thing per host. A
+  component of only periods and spaces embedded beside a real one (`sub/...`) is refused by the
+  same rule — Win32 empties it and the value addresses `sub` — and the Unity seeder validates
+  the authored env value rather than a `.strip()`-normalized copy, so an authored trailing
+  space is refused like at every other site instead of silently trimmed. No shipped profile,
+  bundled `plugin.toml` or default trips it, but this is a compatibility break on
+  previously-loading config.
 
 ### Fixed
 
@@ -92,7 +96,13 @@ breaking changes may land in a minor release.
   and can only name a child — and the ref is the operator's own argv, so this was a footgun
   rather than an escalation. `delete_run` and `archive_run` now also refuse a `run_dir` that is
   not a direct child of the runs directory, raising `UnconfinedWriteError` ahead of the
-  live-session guard and not waived by `--force`.
+  live-session guard and not waived by `--force`. That refusal also covers a `run_dir` spelled
+  `runs/..` — the one shape the direct-child rebuild reproduces verbatim while `rmtree` would
+  resolve it to `.bmad-loop` itself — and a run-dir level redirected through a symlink or, on
+  Windows, an unelevated directory junction, which kept the lexical spelling while sending the
+  removal outside the project. An empty run ref is refused outright as well: it is a prefix and
+  a suffix of every id, so partial matching read it as a wildcard and resolved the sole run of
+  a one-run project.
 - **A sweep bundle name that is not a legal path segment is refused at triage** (#637), at both
   of `validate_triage`'s bundle-name sites — the `bundles` list and a decision option's
   `bundle_name`, which becomes `Bundle.name` by way of `_materialize_bundles`. A cycle-1

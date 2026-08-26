@@ -348,8 +348,10 @@ happens.
 - `names_win32_alias(value)` — the determinism member. The other three refuse a value
   that _escapes_ the tree; this one refuses a value that stays inside it and still
   names a **different** path on Windows: a reserved device basename (`NUL`,
-  `aux.json`, `CON .txt`), or a component whose trailing periods and spaces Win32
-  strips (`.claude/skills.`).
+  `aux.json`, `CON .txt`), a component whose trailing periods and spaces Win32
+  strips (`.claude/skills.`), or a component of _nothing but_ periods and spaces
+  sitting beside a real one (`sub/...` — Win32 empties it and the value addresses
+  `sub`).
 
 What a porter needs to know:
 
@@ -358,11 +360,13 @@ What a porter needs to know:
   reason `C:\secrets` is. The alternative turns a `seed_files` entry into a
   build-number question, since Windows 11 narrowed the device rule and Windows 10 did
   not.
-- **They refuse disjoint sets, and that is load-bearing.** `names_tree_root` carves
-  out `..` for `has_parent_ref`; `names_win32_alias` carves out components that are
-  nothing but periods and spaces for `names_tree_root`. Those carve-outs are what let
-  each predicate be ablated on its own — a "simplification" that merges them costs the
-  suite its ability to say which rule fired.
+- **They refuse disjoint spelling classes, and that is load-bearing.**
+  `names_tree_root` carves out `..` for `has_parent_ref`; `names_win32_alias` carves
+  out a _value_ made entirely of period/space components for `names_tree_root` (a
+  single such component beside a real one stays its own — it aliases its parent, not
+  the root) and the `.`/`..` components for their owners. Those carve-outs are what
+  let each predicate be ablated on its own — a "simplification" that merges them
+  costs the suite its ability to say which rule fired.
 - **`_is_reserved_basename` is a _segment_ predicate**, blind to `sub/NUL`: it splits
   on the first dot of the whole string. Apply it per component, after splitting on
   both separators, or it silently answers False.

@@ -607,7 +607,17 @@ def resolve_run_dir(project: Path, ref: str) -> Path:
     ref that could escape the runs dir (`bmad-loop delete ../../x` would otherwise
     rmtree an outside directory that happens to hold a state.json). Such a ref
     falls through to partial matching, which can only ever yield a name
-    `list_run_dirs` enumerated — and so cannot escape."""
+    `list_run_dirs` enumerated — and so cannot escape.
+
+    An EMPTY ref is refused outright rather than deferred: `""` is a prefix and a
+    suffix of every name, so partial matching reads it as a wildcard — harmlessly
+    ambiguous with two runs, but silently resolving the sole run of a one-run
+    project, which handed `bmad-loop delete ""` that run. No addressability is
+    lost (no directory can be named `""`); every other escape spelling keeps the
+    partial fallback so a legacy dir named `"..."` stays matchable by its own
+    spelling."""
+    if not ref:
+        raise RunRefError("empty run ref: it would match every run, never name one")
     if not _is_path_escape(ref):
         exact = run_dir_for(project, ref)
         if is_run(exact):
@@ -1654,7 +1664,27 @@ def _refuse_uncontained_run_dir(project: Path, run_dir: Path, action: str) -> No
     runs root itself, a nested grandchild, and anything outside the project all
     differ from what it returns. Comparing against the rebuild rather than
     walking `parents` keeps this tracking `RUNS_DIR` the way
-    :func:`_project_of_run_dir` does.
+    :func:`_project_of_run_dir` does. The rebuild has one blind spot the name
+    check closes: ``.name`` of ``runs / ".."`` is ``".."`` and the rebuild
+    reproduces it verbatim, so the lexical equality holds while `rmtree` would
+    resolve it to ``.bmad-loop`` itself. pathlib drops ``"."`` at parse so only
+    the ``".."`` spelling survives to here; ``"."`` is refused anyway rather than
+    reasoned about.
+
+    The link walk below the equality check refuses a REDIRECTED spelling of a
+    contained path: with ``.bmad-loop``, ``runs`` or the run dir itself replaced
+    by a symlink (or, on Windows, an unelevated ``mklink /J`` junction — why this
+    is :func:`is_link_like` and not ``is_symlink``), the rebuild is lexically
+    identical while `rmtree` follows the redirect and removes a tree outside the
+    project. A planted redirect is this module's live threat class (see the #591
+    notes in :func:`archive_run`). The walk stops short of ``project`` — the
+    operator's own argument, and a project addressed through a symlinked home is
+    legitimate — and covers only the orchestrator-owned levels under it. It is
+    check-then-act, not fd-anchored like `journal.py`'s writes: `resolve()` is
+    banned here (it can raise on a WSL-UNC host — `tests/conftest.py`'s
+    ``refuse_to_resolve``), `tarfile` cannot take a dir fd at all, and the racer
+    that could re-plant between check and rmtree is a live session, which the
+    guard below this one refuses anyway.
 
     Raises rather than degrading — observation may degrade, a repair write must
     not: there is no partial `rmtree` to fall back to, and declining quietly would
@@ -1662,10 +1692,20 @@ def _refuse_uncontained_run_dir(project: Path, run_dir: Path, action: str) -> No
     shape-refusal this module already raises for the same class of mistake (see
     :func:`_project_of_run_dir`), and being an ``OSError`` it lands in the
     handling callers already have for a removal that failed."""
-    if run_dir_for(project, run_dir.name) != run_dir:
+    if run_dir.name in (".", "..") or run_dir_for(project, run_dir.name) != run_dir:
         raise UnconfinedWriteError(
             f"refusing to {action} {run_dir}: not a run directory under {project / RUNS_DIR}"
         )
+    node = run_dir
+    while node != project:
+        if is_link_like(node):
+            raise UnconfinedWriteError(
+                f"refusing to {action} {run_dir}: {node} is a symlink or junction"
+            )
+        parent = node.parent
+        if parent == node:  # anchored: never walk past the filesystem root
+            break
+        node = parent
 
 
 def delete_run(project: Path, run_dir: Path, *, force: bool = False) -> None:

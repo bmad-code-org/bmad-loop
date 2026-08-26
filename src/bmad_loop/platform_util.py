@@ -233,14 +233,21 @@ def names_win32_alias(value: str | Path) -> bool:
     reads the authored spelling, so a shield pattern rendered from the config
     matches ``skills.`` and misses the directory Win32 actually made.
 
-    Rule 2 reads the same trim :func:`names_tree_root` does, split by what the trim
-    leaves behind. That predicate owns a component made *solely* of periods and
-    spaces, where the trim leaves nothing and the component names the tree root.
-    This one owns a component where the trim leaves something, where it names a
-    *sibling* of what was written. The ``part.strip(" .") != ""`` carve-out is what
-    draws that line, and it hands plain ``".."`` back to :func:`has_parent_ref` at
-    the same time. All four members therefore refuse disjoint sets — which is what
-    lets each be ablated on its own, and mirrors :func:`names_tree_root`'s own
+    Rule 2 reads the same trim :func:`names_tree_root` does, split by what the
+    whole *value* amounts to rather than by component. That predicate owns a value
+    made *entirely* of period/space components, where the trim leaves nothing at
+    any level and the value names the tree root. This one owns everything else the
+    trim touches: a component the trim shortens (``"skills. "`` names a sibling of
+    what was written) and equally a component the trim *empties* when it sits
+    beside a real one — ``"sub/..."`` is nobody's root and nobody's parent, so it
+    is an alias and belongs here (it addresses ``sub`` on Windows and a literal
+    ``...`` directory on POSIX; the first review round caught it slipping all four
+    members). The ``not root_naming`` term draws that line, and the
+    ``part not in (".", "..")`` carve-out beside it hands the two spellings that
+    mean the *same* path on every platform back to their owners — ``"."`` is a
+    no-op component everywhere, ``".."`` is :func:`has_parent_ref`'s climb. All
+    four members therefore refuse disjoint spelling classes — which is what lets
+    each be ablated on its own, and mirrors :func:`names_tree_root`'s own
     ``part != ".."`` carve-out one function up.
 
     The git half of rule 2 is measured, on this repo's own suite. **The Win32
@@ -258,12 +265,22 @@ def names_win32_alias(value: str | Path) -> bool:
     # Same both-separator split as `names_tree_root`, and for the same reason: a
     # value is judged by the components Win32 would see.
     parts = [part for part in text.replace("\\", "/").split("/") if part]
+    # A value made ENTIRELY of period/space components names the tree root and is
+    # `names_tree_root`'s to refuse; scoping rule 2 by the WHOLE value rather than
+    # per component is what keeps the two disjoint while still catching an
+    # all-period/space component embedded beside a real one (`sub/...`), which is
+    # nobody's root and nobody's parent.
+    root_naming = names_tree_root(text)
     return any(
-        # `part.strip(" .") != ""` hands a component that is nothing but periods
-        # and spaces back to `names_tree_root` (and plain `..` to `has_parent_ref`),
-        # so the four predicates refuse disjoint sets and stay separately ablatable
-        # — the same carve-out, for the same reason, as `names_tree_root`'s `..`.
-        _is_reserved_basename(part) or (part.strip(" .") != "" and part != part.rstrip(" ."))
+        _is_reserved_basename(part)
+        or (
+            part != part.rstrip(" .")
+            # `.` and `..` spell the same path on every platform — the no-op
+            # component, and the climb `has_parent_ref` owns — the same
+            # carve-out, for the same reason, as `names_tree_root`'s `..`.
+            and part not in (".", "..")
+            and not root_naming
+        )
         for part in parts
     )
 

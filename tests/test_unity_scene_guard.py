@@ -207,12 +207,12 @@ def test_seed_rejects_root_naming_guard_dir(tmp_path, monkeypatch):
     mod = _load_seeder()
     worktree = tmp_path / "wt"
     (worktree / "Assets").mkdir(parents=True)
-    # `main()` `.strip()`s the env var, so the trailing-SPACE spellings collapse to
-    # "." and the pre-existing `not rel.parts` arm already caught them. These are
-    # the ones that survive that strip: on Windows each names the worktree itself,
-    # and the asset-root probe below the guard would then find the worktree (a real
-    # directory) and pass, scattering the payload across the worktree root.
-    for evil in ("...", "....", ". .", ".\\"):
+    # On Windows each of these names the worktree itself, and the asset-root probe
+    # below the guard would then find the worktree (a real directory) and pass,
+    # scattering the payload across the worktree root. `main()` once `.strip()`-ed
+    # the env var, which collapsed the space spellings into "."; validation now
+    # sees the authored value, so `. ` reaches `_names_tree_root` intact.
+    for evil in ("...", "....", ". .", ".\\", ". "):
         _set_env(monkeypatch, worktree, guard_dir=evil)
         assert mod.main() == 2, evil
     assert not (worktree / mod._GUARD_CS).exists()  # payload never hit the root
@@ -233,14 +233,32 @@ def test_seed_rejects_a_win32_alias_guard_dir_on_any_platform(tmp_path, monkeypa
     names a Windows device, or whose trailing periods/spaces Win32 trims, installs
     somewhere other than the path it spells. Refused on every platform for the same
     reason the drive-qualified rows above are — a value must not mean one thing here
-    and another on Windows. `Editor.` is the shape that matters in practice: nothing
-    upstream catches it, since the caller `.strip()`s only the whole env var."""
+    and another on Windows. The `Editor ` row is the round-1 review catch: `main()`
+    once `.strip()`-ed the env var before validating, so the authored trailing
+    space was silently trimmed and installed into `Editor` instead of being
+    refused; validation now sees the raw value and only uses the strip to detect
+    an unset/blank setting. `Assets/...` is the same round's embedded
+    all-dot-component catch, refused by the widened predicate itself.
+
+    Ablation: remove `_names_win32_alias(guard_dir)` from `main()`'s validation
+    chain and every row here reddens while the clone-parity rows below stay green
+    — parity grades the MIRROR, this test grades the WIRING, and they must fail
+    alone. The `Editor ` row also reddens alone if the caller's `.strip()` is
+    restored into the value that gets validated."""
     mod = _load_seeder()
     (tmp_path / "Assets").mkdir()
-    for evil in ("Assets/NUL", "Assets/BmadLoop/Editor.", "Assets/BmadLoop /Editor", "NUL"):
+    for evil in (
+        "Assets/NUL",
+        "Assets/BmadLoop/Editor.",
+        "Assets/BmadLoop /Editor",
+        "NUL",
+        "Assets/BmadLoop/Editor ",
+        "Assets/...",
+    ):
         _set_env(monkeypatch, tmp_path, guard_dir=evil)
         assert mod.main() == 2, evil
     assert not (tmp_path / "Assets" / "BmadLoop").exists()  # nothing seeded
+    assert not (tmp_path / "Assets" / "...").exists()
 
 
 # --------------------------------------------- the hand-mirrored win32 predicate
@@ -282,6 +300,14 @@ _WIN32_ALIAS_ROWS = (
     "...",
     "   ",
     ".. ",
+    # the round-1 widening: an all-dot/space component beside a real one is an
+    # alias; a value made entirely of such components stays `_names_tree_root`'s
+    "sub/...",
+    "sub/.. ",
+    "sub/   ",
+    "a/. ",
+    "a/..",
+    "a/./b",
 )
 
 

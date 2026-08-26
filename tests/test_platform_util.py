@@ -153,9 +153,30 @@ def test_names_win32_alias_catches_reserved_device_names(value):
 def test_names_win32_alias_catches_the_trailing_trim(value):
     # Rule 2, deliberately holding no row rule 1 also catches, so the two rules
     # redden separately: every component here strips to something non-empty and is
-    # not a reserved name. Ablation A2 (dropping the `part.strip(" .") != ""`
-    # carve-out) leaves this test entirely green — it only widens rule 2 onto the
-    # sibling predicates' territory, which is what the disjointness test below pins.
+    # not a reserved name. Dropping either of rule 2's carve-outs leaves this test
+    # entirely green — they only subtract, widening rule 2 onto the sibling
+    # predicates' territory, which is what the disjointness test below pins.
+    assert platform_util.names_win32_alias(value) is True
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["sub/...", "sub/.. ", "sub/   ", "a/. ", " /a", "sub\\..."],
+)
+def test_names_win32_alias_catches_an_all_dot_or_space_component_beside_a_real_one(value):
+    """The round-1 review gap in rule 2's original carve-out: `names_tree_root`
+    demands EVERY component be root-naming, `has_parent_ref` wants a literal `..`,
+    and the old `part.strip(" .") != ""` carve-out excluded an all-period/space
+    component unconditionally — so `sub/...` passed all four family members while
+    Win32's trim empties the component and the value addresses `sub` (or, for
+    `.. `, climbs under the other reading of the trim-vs-`..` ordering — divergent
+    from the literal POSIX directory either way, so the refusal rests on neither
+    reading). Scoping the carve-out by the WHOLE value (`not root_naming`) is what
+    closes this without taking the single-component spellings off
+    `names_tree_root`'s hands. Ablation: restore the old carve-out — replace
+    `part not in (".", "..") and not root_naming` with `part.strip(" .") != ""` —
+    and every row here reddens while the three alias tests above and the sibling
+    delegation test below stay green."""
     assert platform_util.names_win32_alias(value) is True
 
 
@@ -177,16 +198,18 @@ def test_names_win32_alias_accepts_ordinary_paths(value):
     assert platform_util.names_win32_alias(value) is False
 
 
-@pytest.mark.parametrize("value", ["..", ".", "", "...", "   ", ".. "])
+@pytest.mark.parametrize("value", ["..", ".", "", "...", "   ", ".. ", "a/..", "a/./b"])
 def test_names_win32_alias_leaves_the_root_and_parent_spellings_to_its_siblings(value):
-    # The disjointness pin. Every row here is refused by `has_parent_ref` (`..`) or
-    # by `names_tree_root` (the rest), and this predicate must leave them alone so
-    # the four family members reject disjoint sets and each stays separately
-    # ablatable. Ablation A2: drop the `part.strip(" .") != ""` carve-out from
-    # `names_win32_alias` — a bare `part != part.rstrip(" .")` test — and this test
-    # reddens alone, on every row but `""` (which has no components at all), while
-    # the three tests above stay green. It is also what reddens if someone
-    # "simplifies" the predicate to that bare rstrip.
+    # The disjointness pin. Every row here is refused by `has_parent_ref` (the
+    # `..` spellings), refused by `names_tree_root` (the value-wide dot/space
+    # ones), or contains a no-op `.` component that names the SAME path on every
+    # platform — and this predicate must leave them all alone so the four family
+    # members reject disjoint spelling classes and each stays separately
+    # ablatable. Two arms, disjoint red sets: A2 — drop the `not root_naming`
+    # term and the value-wide rows (`...`, `   `, `.. `) redden alone; A3 — drop
+    # the `part not in (".", "..")` carve-out and the `..`/`.`-component rows
+    # (`..`, `a/..`, `a/./b`) redden alone. `""` and bare `.` can redden under
+    # neither: one has no components at all, the other is root-naming whole.
     assert platform_util.names_win32_alias(value) is False
 
 
