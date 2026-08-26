@@ -10383,6 +10383,28 @@ def test_main_exports_the_registry_root_before_dispatch(force_psmux_backend, tmp
     assert seen["root"] == str(runs.mux_registry_root(tmp_path))
 
 
+def test_main_derives_registry_before_automatic_availability_probe(tmp_path, monkeypatch):
+    """An automatic psmux availability probe must see the derived root.
+
+    Its result is cached by ``get_multiplexer``; probing an ambient relative
+    root first would therefore leave later launches unavailable in this process.
+    """
+    monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "state"))
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, "relative-registry")
+    seen = []
+
+    class _Namespaced:
+        def has_registry_namespace(self):
+            seen.append(os.environ[runs.PSMUX_DATA_DIR])
+            return True
+
+    monkeypatch.setattr(mux_mod, "get_multiplexer", lambda: _Namespaced())
+    monkeypatch.setattr(cli, "cmd_list", lambda _args: 0)
+
+    assert cli.main(["list", "--project", str(tmp_path)]) == 0
+    assert seen == [str(runs.mux_registry_root(tmp_path))]
+
+
 def test_main_says_once_when_it_overrode_an_operators_registry(
     force_psmux_backend, tmp_path, capsys, monkeypatch
 ):

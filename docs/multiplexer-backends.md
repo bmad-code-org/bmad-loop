@@ -194,8 +194,9 @@ Two further consequences:
 
   A window whose last line reads `[bmad-loop exited <code> — press enter]` has finished. One that
   does not is still running — take its `run-<run-id>` / `sweep-<run-id>` name to
-  `bmad-loop list --project <that project>` and stop it through bmad-loop (`bmad-loop stop
-<run-id>`, or the TUI) rather than through psmux.
+  `bmad-loop list --project <that project>` and stop it through bmad-loop
+  (`bmad-loop stop --project <that project> <run-id>`, or run it from that project)
+  rather than through psmux.
 
   **`stop` works there, but it does not sweep the old registry.** The stop reaches the engine
   _process_, not a session: it lodges a request in the run directory and signals the recorded pid,

@@ -181,27 +181,41 @@ def _configure_mux(project: Path) -> None:
     except (policy_mod.PolicyError, OSError):
         name = None
     configure_multiplexer(name, origin=path)
-    # Selection first, because the export is a *psmux* fact and not every host
-    # runs psmux. On tmux there is no registry for a root to point at, and
-    # `PSMUX_DATA_DIR` is not bmad-loop's variable to spend: replacing it there
-    # would announce a registry the transport never consults, and the operator's
-    # own psmux sessions would then be unreachable from every window this
-    # process spawns — a tmux server cold-started here passes the replacement
-    # down to each of its coding-CLI panes. Ceiling, named: the gate is the
-    # seam's own "does this transport namespace by registry at all", so an
-    # out-of-tree backend that namespaces through some *other* variable still
-    # sees the export. The seam has no finer question, and adding one for a
-    # backend that does not exist yet is the wrong trade — `bmad-loop mux`
-    # discloses the root either way.
-    try:
-        if not get_multiplexer().has_registry_namespace():
-            return
-    except MultiplexerError:
-        # A backend that cannot even be selected runs no verb, so there is
-        # nothing to point anywhere; the commands that need it fail loudly on
-        # their own and diagnostics keep working.
-        return
+    # Automatic selection probes availability before returning its cached
+    # instance. Give that probe the derived root first: psmux's version probe
+    # reaches `_run`, which must reject an empty/relative ambient value, and a
+    # failed probe stays cached for this process. Restore the ambient value
+    # before the real export when the selected transport has no registry.
+    # The gate asks only the seam's `has_registry_namespace()` question. Ceiling,
+    # named: an out-of-tree backend that namespaces through some other variable
+    # still sees this export, because the seam has no finer question. Adding one
+    # for a backend that does not exist yet is not worth expanding the seam;
+    # `bmad-loop mux` discloses the root either way.
     ambient = os.environ.get(runs.PSMUX_DATA_DIR)
+    try:
+        probe_root = str(runs.mux_registry_root(project))
+    except (runs.StateRootError, OSError, RuntimeError):
+        probe_root = None
+    if probe_root is not None:
+        os.environ[runs.PSMUX_DATA_DIR] = probe_root
+    try:
+        namespaced = get_multiplexer().has_registry_namespace()
+    except MultiplexerError:
+        if probe_root is not None:
+            if ambient is None:
+                os.environ.pop(runs.PSMUX_DATA_DIR, None)
+            else:
+                os.environ[runs.PSMUX_DATA_DIR] = ambient
+        # A backend that cannot even be selected runs no verb, so there is
+        # nothing to point anywhere; diagnostics keep working.
+        return
+    if not namespaced:
+        if probe_root is not None:
+            if ambient is None:
+                os.environ.pop(runs.PSMUX_DATA_DIR, None)
+            else:
+                os.environ[runs.PSMUX_DATA_DIR] = ambient
+        return
     root = runs.export_psmux_registry_root(project)
     if root is not None:
         if ambient is not None and ambient != root:

@@ -5112,7 +5112,12 @@ def test_legacy_leftovers_dry_run_keeps_what_the_legacy_pass_cannot_claim(tmp_pa
     and reports the untagged session, and the dry run must say the same thing.
 
     Ablate by hoisting the exclusion back above the tag arms and the dry-run half
-    fails with `{}` while the real half still reports it — the disagreement itself."""
+    fails with `{}` while the real half still reports it — the disagreement itself.
+
+    Legacy refusal-gate ablation: temporarily changed the legacy call's
+    ``require_tag=True`` to ``False`` and ran this test; it failed as intended,
+    with ``legacy.killed == ['bmad-loop-dup']`` (the untagged session was killed).
+    The gate was restored."""
     (_make_state_run(tmp_path, "dup") / "engine.pid").write_text(str(_dead_pid()))
     ours = _RootedMux(["bmad-loop-dup"], {}, str(runs.mux_registry_root(tmp_path)))
     monkeypatch.setattr(runs, "get_multiplexer", lambda: ours)
