@@ -25,6 +25,7 @@ from conftest import (
     fault_read_text,
     generic_dev_effect,
     git,
+    refuse_to_resolve,
     review_effect,
     set_sprint,
     spec_path,
@@ -12887,6 +12888,39 @@ def test_ledger_scope_probe_failure_keeps_file_and_journals(project, monkeypatch
     assert project.deferred_work.read_text(encoding="utf-8") == "uncertain scope\n"
     (event,) = [e for e in engine.journal.entries() if e["kind"] == "ledger-scope-probe-failed"]
     assert event["story_key"] == task.story_key
+
+
+def test_ledger_rel_derives_lexically_before_resolving(project, monkeypatch):
+    """DIRECTION PIN (#552). `_ledger_rel` tries the LEXICAL `relative_to` first and
+    only falls back to `resolve()`. That ordering is load-bearing, not stylistic.
+
+    A registered-but-not-serving WSL UNC provider makes `resolve()` raise WinError
+    64 on a path that is perfectly nameable lexically. Resolving FIRST would turn
+    that into `(None, fault)` — and the fault degrades cost real behavior: the
+    baseline anchor drops to `NONE`, so the retraction skips, the defer restore
+    falls to its merge, and the sweep escalates, all for a ledger sitting in an
+    ordinary place inside the repo.
+
+    Ablation: reorder `_ledger_rel` to `return ledger.resolve().relative_to(
+    root.resolve()).as_posix(), None` first (the shape a reviewer proposed on PR
+    #737 to make symlinked artifact dirs classify as external). Both assertions
+    red — and NOTHING else in the suite does, which is why this row exists.
+    """
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    committed = "# Deferred Work\n\n## DW-1 committed at baseline\n"
+    project.deferred_work.write_text(committed, encoding="utf-8")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "track deferred-work")
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.baseline_commit = rev_parse_head(project.project)
+    task.baseline_untracked = []
+    refuse_to_resolve(monkeypatch, project.deferred_work, project.project)
+
+    # named lexically, with no fault raised
+    assert engine._ledger_rel() == ("_bmad-output/implementation-artifacts/deferred-work.md", None)
+    # and the anchor stays authoritative rather than degrading to no-anchor
+    assert engine._ledger_baseline_text(task) == (_LedgerAnchor.BASELINE, committed)
 
 
 def test_ledger_baseline_text_reads_the_committed_blob(project, monkeypatch):
