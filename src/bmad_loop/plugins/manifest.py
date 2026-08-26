@@ -16,7 +16,12 @@ from __future__ import annotations
 import tomllib
 from typing import Any
 
-from ..platform_util import has_parent_ref, is_absolute_path, names_tree_root
+from ..platform_util import (
+    has_parent_ref,
+    is_absolute_path,
+    names_tree_root,
+    names_win32_alias,
+)
 from .model import (
     SETTING_TYPES,
     WORKFLOW_ROLES,
@@ -56,9 +61,22 @@ def _check_relative_paths(values: tuple[str, ...], label: str, fail) -> None:
     # `names_tree_root` subsumes the emptiness check it replaced: "", ".", "./" and
     # ".\" all name the tree rather than anything in it, and a seed entry that names
     # the tree root makes provision_worktree copy the whole repo into the worktree.
+    #
+    # The second refusal is a SEPARATE arm rather than a fourth term in the first,
+    # because the first one's message is false for what it catches: `NUL` and
+    # `skills.` ARE project-relative. What they are not is deterministic — each names
+    # a different path on Windows than the string spells, so the same manifest seeds a
+    # different file (or a device) depending on where the run happens. One call site
+    # guards BOTH `seed_files` and `seed_globs`; see `names_win32_alias`'s docstring
+    # for the two rules and their sources.
     for value in values:
         if names_tree_root(value) or is_absolute_path(value) or has_parent_ref(value):
             raise fail(f"{label} entries must be project-relative paths: got {value!r}")
+        if names_win32_alias(value):
+            raise fail(
+                f"{label} entries must not name a Windows device or end a component "
+                f"in a period or space: got {value!r}"
+            )
 
 
 def _parse_hooks(hooks_d: Any, fail) -> tuple[HookSpec, ...]:
@@ -169,11 +187,24 @@ def _parse_python(python_d: Any, fail) -> PythonSpec | None:
         return None
     if not isinstance(python_d, dict):
         raise fail("[python] must be a table")
-    module = str(python_d.get("module", "")).strip()
-    if not module:
+    # `.strip()` decides only whether a module was given — the authored value is
+    # what gets validated and stored. Stripping first silently normalized the
+    # trailing-space spelling the alias arm below promises to refuse
+    # (`module = "hooks.py "` was trimmed and accepted), making this the one
+    # site of seven whose value the family never saw raw.
+    module = str(python_d.get("module", ""))
+    if not module.strip():
         raise fail("[python] requires a 'module'")
     if names_tree_root(module) or is_absolute_path(module) or has_parent_ref(module):
         raise fail(f"[python] module must be a plugin-relative path: got {module!r}")
+    # Separate arm, same reason as `_check_relative_paths`, and it bites harder here:
+    # this value is not copied but *imported*, so a module spelled `NUL` or `hooks.`
+    # resolves on Windows to something other than the file the manifest names.
+    if names_win32_alias(module):
+        raise fail(
+            "[python] module must not name a Windows device or end a component "
+            f"in a period or space: got {module!r}"
+        )
     return PythonSpec(module=module, cls=str(python_d.get("class", "Plugin")) or "Plugin")
 
 

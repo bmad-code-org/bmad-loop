@@ -21,7 +21,12 @@ from . import deferredwork, gates, verify
 from .engine import Engine, RunPaused
 from .escalation import critical_escalations, env_fault_pause_reason, session_failure_reason
 from .model import PAUSE_STORY_GATE, Phase, StoryTask
-from .platform_util import atomic_write_text, atomic_write_text_confined, neutralize_surrogates
+from .platform_util import (
+    atomic_write_text,
+    atomic_write_text_confined,
+    neutralize_surrogates,
+    safe_segment,
+)
 from .runs import _project_of_run_dir
 from .statemachine import advance
 from .workspace import discard_worktree
@@ -196,6 +201,17 @@ def validate_triage(
         name = str(item.get("name", ""))
         if not BUNDLE_NAME_RE.match(name):
             errors.append(f"bundle name {name!r} invalid (want {BUNDLE_NAME_RE.pattern})")
+        # The one rule BUNDLE_NAME_RE cannot express. A cycle-1 bundle's name IS its
+        # directory (`_write_intent`), and the reserved Windows device basenames --
+        # CON, NUL, AUX, PRN, COM<N>, LPT<N> -- are `[a-z0-9-]`-legal names that no
+        # Windows filesystem will accept as one (matched case-insensitively, so
+        # lowercase is no reprieve). Testing `safe_segment` identity rather than a
+        # hand-written device list keeps this gate in lockstep with the sanitizer
+        # that defines the set: the identical idiom, for the identical reason, as
+        # `runs.is_valid_run_id`. Guarded on the match above so one bad name yields
+        # one error and not two.
+        if BUNDLE_NAME_RE.match(name) and safe_segment(name) != name:
+            errors.append(f"bundle name {name!r} is not a legal path segment")
         if name in names:
             errors.append(f"duplicate bundle name {name!r}")
         names.add(name)
@@ -251,6 +267,18 @@ def validate_triage(
             bundle_name = str(raw.get("bundle_name", ""))
             if bundle_name and not BUNDLE_NAME_RE.match(bundle_name):
                 errors.append(f"decision {dw_id} option {key}: bad bundle_name {bundle_name!r}")
+            # The second site that mints a bundle directory, gated for the reason
+            # stated at the `bundles` loop above. A build-effect option's
+            # `bundle_name` becomes `Bundle.name` in `_materialize_bundles`, so it
+            # reaches `_write_intent`'s cycle-1 directory by the identical path --
+            # `BUNDLE_NAME_RE` is no more able to express the rule here than there.
+            # Guarded on the match above so one bad name yields one error, and on
+            # nothing else: an absent `bundle_name` fails that match already.
+            if BUNDLE_NAME_RE.match(bundle_name) and safe_segment(bundle_name) != bundle_name:
+                errors.append(
+                    f"decision {dw_id} option {key}: bundle_name {bundle_name!r} "
+                    "is not a legal path segment"
+                )
             if effect == "build" and bundle_name:
                 if bundle_name in names:
                     errors.append(f"duplicate bundle name {bundle_name!r}")
@@ -1331,6 +1359,24 @@ class SweepEngine(Engine):
             bundle_name = (option.bundle_name if option else "") or str(
                 answer.get("bundle_name", "")
             )
+            # A pre-answer's bundle_name never passed `validate_triage` — it was
+            # answered out of band against an earlier triage, and a fresh one can
+            # renumber or drop the option it named — so this fallback lane was the
+            # one route by which a name failing the two option-site gates (#637)
+            # still reached `_write_intent` as a directory. Gate it with the same
+            # two rules, but by DISCARD rather than by error: the human's build
+            # decision is the payload and `decision-<id>` below is the always-legal
+            # name it falls back to anyway, so the discard is journaled the way
+            # `_normalize_bundle_names`'s repairs are and the sweep proceeds.
+            if bundle_name and (
+                not BUNDLE_NAME_RE.match(bundle_name) or safe_segment(bundle_name) != bundle_name
+            ):
+                self.journal.append(
+                    "sweep-bundle-name-discarded",
+                    decision=decision.id,
+                    original=bundle_name,
+                )
+                bundle_name = ""
             key = (option.key if option else "") or str(answer.get("key", "")) or "?"
             name = bundle_name or "decision-" + decision.id.lower()
             bundles.append(

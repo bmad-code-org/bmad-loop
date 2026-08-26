@@ -41,7 +41,12 @@ from pathlib import Path
 
 import regex
 
-from ..platform_util import has_parent_ref, is_absolute_path, names_tree_root
+from ..platform_util import (
+    has_parent_ref,
+    is_absolute_path,
+    names_tree_root,
+    names_win32_alias,
+)
 from .entrypoints import record_load_error
 
 USAGE_PARSERS = {"claude-jsonl", "codex-rollout", "gemini-chat", "copilot-events", "none"}
@@ -248,6 +253,11 @@ def _validate_profile(profile: CLIProfile, source: str) -> None:
             # `names_tree_root("")` is True, so this arm also carries the
             # "a real dialect must name a config_path at all" case.
             raise fail("hooks.config_path must be a project-relative path")
+        if names_win32_alias(hooks.config_path):
+            raise fail(
+                "hooks.config_path must not name a Windows device or end a component "
+                "in a period or space"
+            )
         if not hooks.events:
             raise fail("hooks.events must map native event names to canonical ones")
         bad = sorted(set(hooks.events.values()) - CANONICAL_EVENTS)
@@ -339,6 +349,11 @@ def _validate_profile(profile: CLIProfile, source: str) -> None:
     ):
         raise fail("skill_tree must be a project-relative path")
 
+    if names_win32_alias(profile.skill_tree):
+        raise fail(
+            "skill_tree must not name a Windows device or end a component in a period or space"
+        )
+
     # `names_tree_root` subsumes the emptiness check it replaced. These entries feed
     # provision_worktree's seed loop, where any spelling of the root ("", ".", "./",
     # ".\") resolves src to the repo root and dst to the worktree — both pass the
@@ -346,6 +361,11 @@ def _validate_profile(profile: CLIProfile, source: str) -> None:
     for seed in profile.seed_files:
         if names_tree_root(seed) or is_absolute_path(seed) or has_parent_ref(seed):
             raise fail(f"seed_files entries must be project-relative paths: got {seed!r}")
+        if names_win32_alias(seed):
+            raise fail(
+                "seed_files entries must not name a Windows device or end a component "
+                f"in a period or space: got {seed!r}"
+            )
 
     for pattern in profile.env_fault_patterns:
         try:

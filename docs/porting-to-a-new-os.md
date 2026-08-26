@@ -331,6 +331,59 @@ byte-identical; the new-OS branch can be best-effort until exercised.
 
 ---
 
+## Path predicates — the guard family a port must not relax
+
+`src/bmad_loop/platform_util.py` carries four predicates that every "this config
+value must be a path inside the project" guard is built from. They are
+**platform-independent by construction**: each answers the same way on every host,
+because a config file must not mean different things depending on where the run
+happens.
+
+- `is_absolute_path(value)` — rooted or drive-qualified in _either_ flavour:
+  `/etc/passwd`, `C:\x`, `\\server\share`, and the drive-_relative_ `C:foo`.
+- `has_parent_ref(value)` — a `..` segment in either flavour.
+- `names_tree_root(value)` — names the tree itself rather than anything inside it:
+  `""`, `"."`, and the all-periods-and-spaces spellings Win32 trims to nothing
+  (`". "`, `"..."`, `"   "`).
+- `names_win32_alias(value)` — the determinism member. The other three refuse a value
+  that _escapes_ the tree; this one refuses a value that stays inside it and still
+  names a **different** path on Windows: a reserved device basename (`NUL`,
+  `aux.json`, `CON .txt`), a component whose trailing periods and spaces Win32
+  strips (`.claude/skills.`), or a component of _nothing but_ periods and spaces
+  sitting beside a real one (`sub/...` — Win32 empties it and the value addresses
+  `sub`).
+
+What a porter needs to know:
+
+- **Do not make any of them consult `sys.platform`.** A value refused here is refused
+  everywhere, deliberately — `skill_tree = "NUL"` is rejected on Linux for the same
+  reason `C:\secrets` is. The alternative turns a `seed_files` entry into a
+  build-number question, since Windows 11 narrowed the device rule and Windows 10 did
+  not.
+- **They refuse disjoint spelling classes, and that is load-bearing.**
+  `names_tree_root` carves out `..` for `has_parent_ref`; `names_win32_alias` carves
+  out a _value_ made entirely of period/space components for `names_tree_root` (a
+  single such component beside a real one stays its own — it aliases its parent, not
+  the root) and the `.`/`..` components for their owners. Those carve-outs are what
+  let each predicate be ablated on its own — a "simplification" that merges them
+  costs the suite its ability to say which rule fired.
+- **`_is_reserved_basename` is a _segment_ predicate**, blind to `sub/NUL`: it splits
+  on the first dot of the whole string. Apply it per component, after splitting on
+  both separators, or it silently answers False.
+- **`safe_segment` is not one of them.** It maps `/` to `_`, so it sanitizes a single
+  name (a run id, a sweep bundle name) and must never be applied to a multi-segment
+  config path.
+- **Their Win32 half is cited, not measured** — CI's legs are Linux and nothing here
+  calls a Win32 API. A native-Windows port is the first chance to measure it; the
+  docstrings carry their sources (Microsoft, Wine's ntdll path conformance tests,
+  Project Zero) so a disagreement can be settled rather than argued.
+- `src/bmad_loop/data/plugins/unity/unity_seed_assets.py` re-implements all four by
+  hand: it is deployed into a consumer project, is stdlib-only, and is excluded from
+  pyright. Its only drift guard is the parity suite in
+  `tests/test_unity_scene_guard.py`. Mirror any change there too.
+
+---
+
 ## Testing a port
 
 Both `get_multiplexer()` and `get_process_host()` are `lru_cache`d, and selection

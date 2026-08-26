@@ -17,6 +17,9 @@ import importlib.util
 import os
 from pathlib import Path
 
+import pytest
+
+from bmad_loop import platform_util
 from bmad_loop.plugins import get_plugin
 
 _GUARD_DIR = "Assets/BmadLoop/Editor"
@@ -204,12 +207,12 @@ def test_seed_rejects_root_naming_guard_dir(tmp_path, monkeypatch):
     mod = _load_seeder()
     worktree = tmp_path / "wt"
     (worktree / "Assets").mkdir(parents=True)
-    # `main()` `.strip()`s the env var, so the trailing-SPACE spellings collapse to
-    # "." and the pre-existing `not rel.parts` arm already caught them. These are
-    # the ones that survive that strip: on Windows each names the worktree itself,
-    # and the asset-root probe below the guard would then find the worktree (a real
-    # directory) and pass, scattering the payload across the worktree root.
-    for evil in ("...", "....", ". .", ".\\"):
+    # On Windows each of these names the worktree itself, and the asset-root probe
+    # below the guard would then find the worktree (a real directory) and pass,
+    # scattering the payload across the worktree root. `main()` once `.strip()`-ed
+    # the env var, which collapsed the space spellings into "."; validation now
+    # sees the authored value, so `. ` reaches `_names_tree_root` intact.
+    for evil in ("...", "....", ". .", ".\\", ". "):
         _set_env(monkeypatch, worktree, guard_dir=evil)
         assert mod.main() == 2, evil
     assert not (worktree / mod._GUARD_CS).exists()  # payload never hit the root
@@ -223,6 +226,116 @@ def test_seed_rejects_windows_flavored_escapes_on_any_platform(tmp_path, monkeyp
         _set_env(monkeypatch, tmp_path, guard_dir=evil)
         assert mod.main() == 2, evil
     assert not (tmp_path / "Assets" / "BmadLoop").exists()  # nothing seeded
+
+
+def test_seed_rejects_a_win32_alias_guard_dir_on_any_platform(tmp_path, monkeypatch):
+    """The fourth family member, wired into the same guard chain: a guard dir that
+    names a Windows device, or whose trailing periods/spaces Win32 trims, installs
+    somewhere other than the path it spells. Refused on every platform for the same
+    reason the drive-qualified rows above are — a value must not mean one thing here
+    and another on Windows. The `Editor ` row is the round-1 review catch: `main()`
+    once `.strip()`-ed the env var before validating, so the authored trailing
+    space was silently trimmed and installed into `Editor` instead of being
+    refused; validation now sees the raw value and only uses the strip to detect
+    an unset/blank setting. `Assets/...` is the same round's embedded
+    all-dot-component catch, refused by the widened predicate itself.
+
+    Ablation: remove `_names_win32_alias(guard_dir)` from `main()`'s validation
+    chain and every row here reddens while the clone-parity rows below stay green
+    — parity grades the MIRROR, this test grades the WIRING, and they must fail
+    alone. The `Editor ` row also reddens alone if the caller's `.strip()` is
+    restored into the value that gets validated."""
+    mod = _load_seeder()
+    (tmp_path / "Assets").mkdir()
+    for evil in (
+        "Assets/NUL",
+        "Assets/BmadLoop/Editor.",
+        "Assets/BmadLoop /Editor",
+        "NUL",
+        "Assets/BmadLoop/Editor ",
+        "Assets/...",
+    ):
+        _set_env(monkeypatch, tmp_path, guard_dir=evil)
+        assert mod.main() == 2, evil
+    assert not (tmp_path / "Assets" / "BmadLoop").exists()  # nothing seeded
+    # The `Assets/...` canary is checked through the payload file, not the
+    # directory: `(tmp_path / "Assets" / "...").exists()` is True ON WINDOWS with
+    # nothing seeded at all — the trim resolves `...` to `Assets` itself. That
+    # spelling failed the Windows CI legs, a measured live demonstration of the
+    # rule under test. This one grades on both platforms: had seeding happened,
+    # POSIX holds a literal `.../SceneAutoSaveGuard.cs` and Windows lands the
+    # payload in `Assets/` — and this path resolves to whichever one exists.
+    assert not (tmp_path / "Assets" / "..." / mod._GUARD_CS).exists()
+
+
+# --------------------------------------------- the hand-mirrored win32 predicate
+
+# The phase-1 truth table from `tests/test_platform_util.py`, carried over verbatim:
+# rule 1 (reserved device basenames, per component, both separators), rule 2 (the
+# trailing period/space trim), the over-refusal tripwires (`com10`, `nulls`,
+# `auxiliary`), and the root/parent spellings the predicate must leave to its three
+# siblings. Any divergence between core and the clone shows up on one of these rows.
+_WIN32_ALIAS_ROWS = (
+    "NUL",
+    "nul",
+    "NUL.txt",
+    "PRN  ",
+    "sub/NUL",
+    "sub/NUL.txt",
+    "CONIN$",
+    "COM1",
+    "COM0",
+    "LPT9",
+    "AUX",
+    "aux.json",
+    "CON.",
+    "sub\\NUL",
+    ".claude/skills.",
+    ".claude/skills ",
+    "skills. ",
+    "sub./x",
+    "a/b ",
+    ".claude/skills",
+    "normal/path",
+    "com10",
+    "nulls",
+    "auxiliary",
+    "a.b/c.d",
+    "..",
+    ".",
+    "",
+    "...",
+    "   ",
+    ".. ",
+    # the round-1 widening: an all-dot/space component beside a real one is an
+    # alias; a value made entirely of such components stays `_names_tree_root`'s
+    "sub/...",
+    "sub/.. ",
+    "sub/   ",
+    "a/. ",
+    "a/..",
+    "a/./b",
+)
+
+
+@pytest.mark.parametrize("value", _WIN32_ALIAS_ROWS)
+def test_seeder_win32_alias_clone_agrees_with_the_core_predicate(value):
+    """This script is stdlib-only (it is deployed into a consumer project and cannot
+    import bmad_loop), so `_names_win32_alias` is a hand-written mirror of
+    `platform_util.names_win32_alias`. The file is also excluded from pyright and has
+    no other guard against drift (#546) — so the mirror is pinned behaviorally, on
+    the core predicate's own truth table, rather than trusted to stay in sync."""
+    mod = _load_seeder()
+    assert mod._names_win32_alias(value) is platform_util.names_win32_alias(value)
+
+
+def test_seeder_reserved_basename_set_mirrors_core_member_for_member():
+    """The truth table above cannot reach every member of the set, and a device name
+    dropped from the clone would simply be seeded. Pin the set itself — including the
+    deliberate over-refusals (`COM0`/`LPT0`, the `CONIN$`/`CONOUT$` pair) that neither
+    Microsoft's published list nor Wine's `RtlIsDosDeviceName_U` backs on its own."""
+    mod = _load_seeder()
+    assert mod._RESERVED_BASENAMES == platform_util._RESERVED_BASENAMES
 
 
 # ------------------------------------------------------------ version parsing

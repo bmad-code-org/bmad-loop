@@ -206,6 +206,21 @@ class RecoveryFlow:
                 if existing_parent == existing_parent.parent:
                     break
                 existing_parent = existing_parent.parent
+            # `Path.is_absolute()` on purpose, NOT `platform_util.is_absolute_path`
+            # (#480 item 4). That family predicate is built for "must stay INSIDE
+            # the project" config guards, where the answer must not vary by host.
+            # This is the opposite question: a live path this process is about to
+            # `resolve(strict=True)` and write through on the host it is running on,
+            # so the platform's own notion of absolute is the operative one. They
+            # diverge in the direction that matters -- on Windows a POSIX-absolute
+            # `/spec.md` reads as NOT absolute, so this REFUSES it and fails CLOSED,
+            # while `is_absolute_path` answers True and would let it through. The
+            # swap #480 proposes would loosen the only genuine refusal guard it
+            # named. Measured on POSIX: the `resolve(strict=True)` fixed-point term
+            # below already refuses every relative spelling on its own (a relative
+            # path never equals its own resolve), so on this platform the term
+            # states the intent rather than carrying it alone -- which is exactly
+            # why it needs saying here.
             if (
                 not spec_path.is_absolute()
                 or not existing_parent.is_dir()

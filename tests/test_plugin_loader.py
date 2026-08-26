@@ -186,13 +186,15 @@ def test_full_manifest_parses(tmp_path):
         ('[plugin]\nname = "e"\napi_version = 1\nseed_globs = ["."]\n', "seed_globs"),
         # absolute python module path
         ('[plugin]\nname = "e"\napi_version = 1\n[python]\nmodule = "/x.py"\n', "plugin-relative"),
-        # root-naming python module path. The value is `.strip()`ed before the guard,
-        # so the trailing-space spellings arrive as "." — but the trailing-DOT ones
-        # arrive intact, and Win32 trims those to the plugin dir just the same. What
-        # gets exec'd matters more than what gets copied, hence the whole family.
+        # root-naming python module path. The guard sees the AUTHORED value (the
+        # `.strip()` decides only whether a module was given), so the space
+        # spellings arrive intact alongside the dot ones — Win32 trims each to
+        # the plugin dir just the same. What gets exec'd matters more than what
+        # gets copied, hence the whole family.
         ('[plugin]\nname = "e"\napi_version = 1\n[python]\nmodule = "."\n', "plugin-relative"),
         ('[plugin]\nname = "e"\napi_version = 1\n[python]\nmodule = "..."\n', "plugin-relative"),
         ('[plugin]\nname = "e"\napi_version = 1\n[python]\nmodule = ". ."\n', "plugin-relative"),
+        ('[plugin]\nname = "e"\napi_version = 1\n[python]\nmodule = ". "\n', "plugin-relative"),
         # hook with no cmd
         (
             '[plugin]\nname = "e"\napi_version = 1\n[hooks.pre_run]\nblocking = true\n',
@@ -229,6 +231,65 @@ def test_invalid_toml_rejected(tmp_path):
     write_plugin(tmp_path, "broken", "[plugin]\nname = \n")
     with pytest.raises(PluginError, match="invalid TOML"):
         load_plugins(tmp_path)
+
+
+# The one substring every #480 refusal shares, across all seven guarded config
+# sites — a single matcher for the whole family.
+_WIN32_ALIAS_MATCH = "must not name a Windows device or end a component in a period or space"
+
+
+@pytest.mark.parametrize("key", ["seed_files", "seed_globs"])
+@pytest.mark.parametrize(
+    "value",
+    [
+        "NUL",  # the bare device — project-relative by every measure the arm above applies
+        "sub/CON",  # a non-final component: `_is_reserved_basename` alone reads this False
+        "aux.json",  # lowercase and extensioned, the shape a seed entry actually takes
+        ".claude/skills.",  # rule 2: Win32 creates `skills`, the manifest still spells `skills.`
+        "a/b ",  # the trailing space, identical in shape to the dot since PR #708
+    ],
+)
+def test_manifest_rejects_win32_alias_seed_paths(key, value):
+    """Both seed fields refuse a value that names a Windows device or ends a
+    component in a period or space.
+
+    The `key` axis is the assertion, not scenery: `seed_files` and `seed_globs` are
+    each guarded by one `_check_relative_paths` call, so this proves the single
+    shared helper covers both rather than assuming it. Ablation: delete that
+    helper's `names_win32_alias` arm and every row of BOTH parametrizations reddens
+    together — one helper, two fields — while the `[python] module` test below stays
+    green.
+    """
+    body = f'[plugin]\nname = "e"\napi_version = 1\n{key} = ["{value}"]\n'
+    with pytest.raises(PluginError, match=_WIN32_ALIAS_MATCH) as excinfo:
+        load_manifest(body, "e/plugin.toml", "e")
+    assert key in str(excinfo.value)  # the message names the field it refused
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "NUL",
+        "hooks.",  # Win32 trims to `hooks`, so the import resolves past the file named
+        "sub/CON.py",
+        "pkg /hooks.py",  # an interior component, out of any whole-string strip's reach
+        # the round-2 review catch: `_parse_python` once `.strip()`-ed the value
+        # BEFORE this guard ran, so the authored trailing space was silently
+        # trimmed and accepted instead of refused — the one site of seven whose
+        # value the family never saw raw. Ablation: restore that
+        # strip-before-validate composition and this row reddens alone.
+        "hooks.py ",
+    ],
+)
+def test_manifest_rejects_win32_alias_python_module(value):
+    """`[python] module` refuses the same family, and it bites harder here than at
+    the seed fields: this value is imported rather than copied, so a spelling Win32
+    resolves elsewhere is what gets exec'd. Its own arm — ablate it and only these
+    rows redden, while both seed-field parametrizations above stay green."""
+    body = f'[plugin]\nname = "e"\napi_version = 1\n[python]\nmodule = "{value}"\n'
+    with pytest.raises(PluginError, match=_WIN32_ALIAS_MATCH) as excinfo:
+        load_manifest(body, "e/plugin.toml", "e")
+    assert "[python] module" in str(excinfo.value)
 
 
 # ------------------------------------------------------------ manifest reads

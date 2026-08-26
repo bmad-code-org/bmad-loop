@@ -1010,6 +1010,45 @@ def test_scm_worktree_seed_rejects_non_project_relative_entries(tmp_path, entry)
 
 
 @pytest.mark.parametrize(
+    "entry",
+    [
+        "NUL",  # a device rather than a directory, and project-relative by every other measure
+        "sub/NUL",  # non-final component — `_is_reserved_basename` alone answers False here
+        "aux.json",  # lowercase with an extension: the shape a seed entry actually takes
+        "PRN  ",  # trailing spaces are trimmed away before the device name is compared
+        ".claude/skills.",  # the trim rule one component up from the leaf
+        "cfg ",  # …and at the leaf, on a name that is otherwise entirely ordinary
+    ],
+)
+def test_scm_worktree_seed_rejects_win32_alias_entries(tmp_path, entry):
+    """The second refusal at this site, and the one the first cannot make: every row
+    here IS project-relative, so `names_tree_root`, `is_absolute_path` and
+    `has_parent_ref` all pass it. What it is not is the same path on both platforms,
+    which is why it carries its own message instead of a fourth spelling of "must be
+    project-relative".
+
+    The harm is a seed entry that quietly means something else on Windows. A reserved
+    name resolves to a device rather than to the file it spells, and a component
+    ending in a period or space is created trimmed — so the entry the shield later
+    renders as an exclude pattern names a path that does not exist, the line is inert,
+    and the surplus it fails to shield is staged by the unit's `git add -A`. Both
+    halves of that are cited (Microsoft, Wine, Project Zero) rather than measured:
+    this suite runs on POSIX, where every row here is an ordinary name.
+
+    Ablation: delete the `names_win32_alias(seed)` arm and all six rows fail while
+    `test_scm_worktree_seed_rejects_non_project_relative_entries` stays green — the
+    two arms reject disjoint sets, which is what keeps each separately ablatable."""
+    p = tmp_path / "policy.toml"
+    p.write_text(f"[scm]\nworktree_seed = [{entry!r}]\n".replace("'", '"'))
+
+    with pytest.raises(
+        policy.PolicyError,
+        match="must not name a Windows device or end a component in a period or space",
+    ):
+        policy.load(p)
+
+
+@pytest.mark.parametrize(
     ("value", "match"),
     [
         ('""', "must be a list of paths"),  # iterates to an EMPTY tuple: silently inert
@@ -1038,13 +1077,21 @@ def test_scm_worktree_seed_rejects_value_shapes_that_are_not_a_list_of_paths(
         policy.load(p)
 
 
-def test_scm_worktree_seed_rejects_a_bad_entry_beside_good_ones(tmp_path):
+@pytest.mark.parametrize(
+    ("entry", "match"),
+    [
+        ("", "got ''"),  # root-naming: caught by the project-relative arm
+        ("NUL", "got 'NUL'"),  # …and by the win32-alias arm that follows it in the same loop
+    ],
+)
+def test_scm_worktree_seed_rejects_a_bad_entry_beside_good_ones(tmp_path, entry, match):
     """Every entry is checked, not just the first: a valid leading entry must not
-    let a later empty one through."""
+    let a later empty one through. The win32-alias arm sits inside that same loop, so
+    the row for it pins that it inherits the property rather than re-earning it."""
     p = tmp_path / "policy.toml"
-    p.write_text('[scm]\nworktree_seed = [".mcp.json", "", ".envrc"]\n')
+    p.write_text(f'[scm]\nworktree_seed = [".mcp.json", "{entry}", ".envrc"]\n')
 
-    with pytest.raises(policy.PolicyError, match="got ''"):
+    with pytest.raises(policy.PolicyError, match=match):
         policy.load(p)
 
 

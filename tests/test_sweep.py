@@ -287,6 +287,171 @@ def test_bundle_key_re_refuses_a_trailing_newline():
     assert BUNDLE_KEY_RE.match("dw-c2-foo").group(2) == "c2-foo"
 
 
+# ------------------------------ reserved Windows device basenames (#637)
+#
+# The third axis on the same "a bundle name IS a path segment" surface. A
+# reserved device basename is `[a-z0-9-]`-legal and at least 2 characters, so
+# BUNDLE_NAME_RE accepts every one of them, and a cycle-1 bundle turns the name
+# into run_dir/bundles/<name>/ verbatim -- a directory native Windows will not
+# create. The gate is `safe_segment` identity, so the accepted set stays in
+# lockstep with the sanitizer instead of a second hand-written device list.
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["con", "nul", "aux", "prn", "com1", "com9", "lpt1", "lpt9"],
+    ids=["con", "nul", "aux", "prn", "com1", "com9", "lpt1", "lpt9"],
+)
+def test_validate_triage_rejects_reserved_device_bundle_names(name):
+    """ABLATION: delete the safe_segment identity gate and every row here accepts."""
+    rj = triage_result(["DW-1"], bundles=[{"name": name, "dw_ids": ["DW-1"], "intent": "do x"}])
+
+    plan, errors = validate_triage(rj, {"DW-1"})
+
+    assert plan is None
+    # Exactly one error, not merely one that matches: these names pass
+    # BUNDLE_NAME_RE, so a bare `plan is None` (or an `any(...)` over errors)
+    # would pass for reasons unrelated to the device name. The count is what
+    # says the two name gates report a given defect once between them.
+    assert len(errors) == 1
+    assert repr(name) in errors[0]
+    assert "not a legal path segment" in errors[0]
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["CON", "nul.", "aux.txt", "lpt9 "],
+    ids=["uppercase", "trailing-dot", "extension", "trailing-space"],
+)
+def test_validate_triage_reports_one_error_when_a_name_fails_both_gates(name):
+    """ABLATION: drop the `BUNDLE_NAME_RE.match(name) and` guard and each row
+    double-reports -- two errors for one name. Unlike the reserved-name rows
+    above, these fail BUNDLE_NAME_RE *and* safe_segment identity, so they are
+    the only inputs on which that guard can be observed at all."""
+    rj = triage_result(["DW-1"], bundles=[{"name": name, "dw_ids": ["DW-1"], "intent": "do x"}])
+
+    plan, errors = validate_triage(rj, {"DW-1"})
+
+    assert plan is None
+    assert len(errors) == 1
+    assert repr(name) in errors[0]
+    assert "invalid" in errors[0]
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["com10", "console", "com", "lpt", "aux2", "nul-fix", "a" * 40],
+    ids=["com10", "console", "com", "lpt", "aux2", "nul-fix", "max-length"],
+)
+def test_validate_triage_accepts_ordinary_bundle_names(name):
+    """The over-refusal guard: `com10` and `console` merely start with a device
+    name, and a 40-character name is BUNDLE_NAME_RE's maximum -- well under
+    platform_util.MAX_SEGMENT (120), so length never reaches the new gate."""
+    rj = triage_result(["DW-1"], bundles=[{"name": name, "dw_ids": ["DW-1"], "intent": "do x"}])
+
+    plan, errors = validate_triage(rj, {"DW-1"})
+
+    assert errors == []
+    assert plan is not None
+    assert plan.bundles[0].name == name
+
+
+# ------------------------- the same rule at the decision-option site (#637)
+#
+# `validate_triage` gates bundle names TWICE. A build-effect option's
+# `bundle_name` becomes `Bundle.name` in `_materialize_bundles`, so it reaches
+# `_write_intent`'s cycle-1 directory by the same path the `bundles` loop above
+# does -- and it was validated against BUNDLE_NAME_RE alone.
+
+
+def _option_bundle_decision(bundle_name):
+    """One otherwise-clean build decision whose only possible defect is its
+    option's `bundle_name`. That cleanliness is what lets the tests below assert
+    an error COUNT: a decision also carries question / >=2 options /
+    recommendation rules, any of which would add errors of their own."""
+    return triage_result(
+        ["DW-1"],
+        decisions=[
+            {
+                "id": "DW-1",
+                "question": "build it?",
+                "options": [
+                    {
+                        "key": "1",
+                        "label": "build",
+                        "effect": "build",
+                        "intent": "fix it",
+                        "bundle_name": bundle_name,
+                    },
+                    {"key": "2", "label": "keep", "effect": "keep-open"},
+                ],
+                "recommendation": "1",
+            }
+        ],
+    )
+
+
+@pytest.mark.parametrize(
+    "bundle_name",
+    ["con", "nul", "aux", "prn", "com1", "com9", "lpt1", "lpt9"],
+    ids=["con", "nul", "aux", "prn", "com1", "com9", "lpt1", "lpt9"],
+)
+def test_validate_triage_rejects_reserved_device_option_bundle_names(bundle_name):
+    """ABLATION: delete the safe_segment identity gate at the decision-option
+    site and every row here accepts. The `bundles` loop's gate does not reach
+    this value -- it is a different loop over a different key."""
+    rj = _option_bundle_decision(bundle_name)
+
+    plan, errors = validate_triage(rj, {"DW-1"})
+
+    assert plan is None
+    # Exactly one error, not merely one that matches: these names pass
+    # BUNDLE_NAME_RE, so a bare `plan is None` would pass for reasons unrelated
+    # to the device name.
+    assert len(errors) == 1
+    assert repr(bundle_name) in errors[0]
+    assert "not a legal path segment" in errors[0]
+    assert "option 1" in errors[0]
+
+
+@pytest.mark.parametrize(
+    "bundle_name",
+    ["CON", "nul.", "aux.txt", "lpt9 "],
+    ids=["uppercase", "trailing-dot", "extension", "trailing-space"],
+)
+def test_validate_triage_reports_one_option_error_when_a_name_fails_both_gates(bundle_name):
+    """ABLATION: drop the `BUNDLE_NAME_RE.match(bundle_name) and` guard and each
+    row double-reports -- two errors for one name. The rows above cannot show
+    this: a lowercase device name PASSES BUNDLE_NAME_RE, so it raises exactly one
+    error with or without the guard. Only an input failing both gates can
+    observe it at all."""
+    rj = _option_bundle_decision(bundle_name)
+
+    plan, errors = validate_triage(rj, {"DW-1"})
+
+    assert plan is None
+    assert len(errors) == 1
+    assert repr(bundle_name) in errors[0]
+    assert "bad bundle_name" in errors[0]
+
+
+@pytest.mark.parametrize(
+    "bundle_name",
+    ["com10", "console", "nul-fix"],
+    ids=["com10", "console", "nul-fix"],
+)
+def test_validate_triage_accepts_ordinary_option_bundle_names(bundle_name):
+    """The over-refusal guard at this site: `com10` and `console` merely start
+    with a device name, and the gate must not reach them."""
+    rj = _option_bundle_decision(bundle_name)
+
+    plan, errors = validate_triage(rj, {"DW-1"})
+
+    assert errors == []
+    assert plan is not None
+    assert plan.decisions[0].option("1").bundle_name == bundle_name
+
+
 def test_validate_triage_truncates_overlong_bundle_name():
     """ABLATION A1: delete direct-bundle normalization and this fails on validation."""
     rj = triage_result(
@@ -2639,6 +2804,63 @@ def test_preanswered_build_materializes_bundle_unattended(project):
     # consumed: the entry left the open set, so its pre-answer is pruned
     assert decisions.load_pre_answers(project.project) == {}
     assert '"decision-preanswers-pruned"' in journal
+
+
+def test_preanswered_bundle_name_failing_the_segment_gate_is_discarded(project):
+    """Round-2 review: a pre-answer's `bundle_name` never passes `validate_triage`
+    — it was answered out of band against an earlier triage, and a fresh one can
+    renumber or drop the option it named — so it was the one route by which a name
+    failing the two option-site gates (#637) still reached `_write_intent` as a
+    directory (`nul` passes BUNDLE_NAME_RE and fails `safe_segment` identity).
+    `_materialize_bundles` now applies the same two rules to that lane, by
+    journaled DISCARD rather than by error: the build decision is the payload and
+    the always-legal `decision-<id>` fallback is what an unnamed answer gets
+    anyway. Ablation: drop that gate and this reddens — the bundle materializes
+    as `nul`, so the `decision-dw-1` effects below never match and the discard
+    event never appears."""
+    from bmad_loop import decisions
+    from bmad_loop.sweep import DecisionOption
+
+    write_ledger(project, {"DW-1": "open"})
+    # stored key "9" is NOT one of this triage's option keys, so every field —
+    # bundle_name included — comes from the stored answer, not a validated option
+    decisions.record_pre_answer(
+        project.project,
+        "DW-1",
+        DecisionOption(
+            key="9", label="Widen", effect="build", intent="widen the field", bundle_name="nul"
+        ),
+        date="2026-06-12",
+    )
+    plan = triage_result(
+        ["DW-1"],
+        decisions=[
+            _decision(
+                "DW-1",
+                [
+                    {"key": "1", "label": "Widen", "effect": "build", "intent": "fresh intent"},
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+            )
+        ],
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "decision-dw-1", ["DW-1"]),
+            bundle_review_effect(project, "decision-dw-1"),
+        ],
+        prompting=False,
+    )
+    summary = engine.run()
+    assert not summary.paused
+
+    journal = journal_text(engine)
+    assert '"sweep-bundle-name-discarded"' in journal
+    assert '"nul"' in journal  # the discard names the spelling it dropped
+    assert engine.state.tasks["dw-decision-dw-1"].phase == Phase.DONE
+    assert "dw-nul" not in engine.state.tasks  # the raw name minted nothing
 
 
 def test_preanswered_keep_open_suppresses_prompt_and_persists(project):

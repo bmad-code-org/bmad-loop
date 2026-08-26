@@ -109,6 +109,110 @@ def test_names_tree_root_catches_the_win32_trim_aliases(value):
     assert platform_util.names_tree_root(value) is True
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "NUL",  # the bare device, the one form every Windows build still special-cases
+        "nul",  # the match is case-insensitive
+        "NUL.txt",  # an extension does not defuse it (Win10 and earlier)
+        "PRN  ",  # trailing spaces are trimmed before the name is compared
+        "sub/NUL",  # non-final component — `_is_reserved_basename` alone answers False here
+        "sub/NUL.txt",  # both narrowings at once
+        "CONIN$",  # the console pair, easy to omit from a hand-written set
+        "COM1",
+        "COM0",  # COM0/LPT0 are reserved by the same rule as COM1..COM9
+        "LPT9",  # the last member — the set stops here, `com10` is the tripwire below
+        "AUX",
+        "aux.json",  # lowercase *and* extension, the shape a config field actually takes
+        "CON.",  # a bare trailing dot on a device name
+        "sub\\NUL",  # backslash separator — judged by the components Win32 would see
+    ],
+)
+def test_names_win32_alias_catches_reserved_device_names(value):
+    # Rule 1, proven per-component and in both separator flavours. The `sub/...`
+    # rows are the ones `_is_reserved_basename` cannot answer on its own: it splits
+    # on the first dot of the *whole* string, so it reads `"sub/NUL"` as stem
+    # `"sub/NUL"` and returns False. Splitting into components first is the whole
+    # difference. Ablation A1: drop the `_is_reserved_basename(part)` term from
+    # `names_win32_alias` and this test reddens while
+    # `test_names_win32_alias_catches_the_trailing_trim` stays green — except the
+    # `"PRN  "` and `"CON."` rows, which rule 2 catches on its own.
+    assert platform_util.names_win32_alias(value) is True
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        ".claude/skills.",  # the #480 item-2 spelling: git matches `skills.`, Win32 creates `skills`
+        ".claude/skills ",  # PR #708 made the space case identical to the dot case
+        "skills. ",  # both at once
+        "sub./x",  # a non-final component — the trim is not a basename-only rule
+        "a/b ",
+    ],
+)
+def test_names_win32_alias_catches_the_trailing_trim(value):
+    # Rule 2, deliberately holding no row rule 1 also catches, so the two rules
+    # redden separately: every component here strips to something non-empty and is
+    # not a reserved name. Dropping either of rule 2's carve-outs leaves this test
+    # entirely green — they only subtract, widening rule 2 onto the sibling
+    # predicates' territory, which is what the disjointness test below pins.
+    assert platform_util.names_win32_alias(value) is True
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["sub/...", "sub/.. ", "sub/   ", "a/. ", " /a", "sub\\..."],
+)
+def test_names_win32_alias_catches_an_all_dot_or_space_component_beside_a_real_one(value):
+    """The round-1 review gap in rule 2's original carve-out: `names_tree_root`
+    demands EVERY component be root-naming, `has_parent_ref` wants a literal `..`,
+    and the old `part.strip(" .") != ""` carve-out excluded an all-period/space
+    component unconditionally — so `sub/...` passed all four family members while
+    Win32's trim empties the component and the value addresses `sub` (or, for
+    `.. `, climbs under the other reading of the trim-vs-`..` ordering — divergent
+    from the literal POSIX directory either way, so the refusal rests on neither
+    reading). Scoping the carve-out by the WHOLE value (`not root_naming`) is what
+    closes this without taking the single-component spellings off
+    `names_tree_root`'s hands. Ablation: restore the old carve-out — replace
+    `part not in (".", "..") and not root_naming` with `part.strip(" .") != ""` —
+    and every row here reddens while the three alias tests above and the sibling
+    delegation test below stay green."""
+    assert platform_util.names_win32_alias(value) is True
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        ".claude/skills",  # the shipped default — this predicate must never touch it
+        "normal/path",
+        "com10",  # NOT reserved: the set stops at COM9
+        "nulls",  # a device name as a *prefix* is an ordinary name
+        "auxiliary",
+        "a.b/c.d",  # interior dots are ordinary; only *trailing* ones alias
+    ],
+)
+def test_names_win32_alias_accepts_ordinary_paths(value):
+    # The over-refusal guard. `com10`/`nulls`/`auxiliary` are the false-positive
+    # tripwires: each would redden if the reserved-name test were loosened from an
+    # exact stem match to a prefix or substring one.
+    assert platform_util.names_win32_alias(value) is False
+
+
+@pytest.mark.parametrize("value", ["..", ".", "", "...", "   ", ".. ", "a/..", "a/./b"])
+def test_names_win32_alias_leaves_the_root_and_parent_spellings_to_its_siblings(value):
+    # The disjointness pin. Every row here is refused by `has_parent_ref` (the
+    # `..` spellings), refused by `names_tree_root` (the value-wide dot/space
+    # ones), or contains a no-op `.` component that names the SAME path on every
+    # platform — and this predicate must leave them all alone so the four family
+    # members reject disjoint spelling classes and each stays separately
+    # ablatable. Two arms, disjoint red sets: A2 — drop the `not root_naming`
+    # term and the value-wide rows (`...`, `   `, `.. `) redden alone; A3 — drop
+    # the `part not in (".", "..")` carve-out and the `..`/`.`-component rows
+    # (`..`, `a/..`, `a/./b`) redden alone. `""` and bare `.` can redden under
+    # neither: one has no components at all, the other is root-naming whole.
+    assert platform_util.names_win32_alias(value) is False
+
+
 # --------------------------------------------------------------- is_wsl_unc_path
 
 

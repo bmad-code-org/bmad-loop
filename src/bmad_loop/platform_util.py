@@ -150,8 +150,12 @@ def names_tree_root(value: str | Path) -> bool:
     containing directory there, while both pure flavours keep them as ordinary
     one-segment names (pathlib never applies that trim — only ``resolve()``, by
     asking the OS, does). A component made solely of periods and spaces is
-    therefore root-naming, and that is the whole rule: ``"foo. "`` strips to
-    ``"foo"``, names a child, and is accepted.
+    therefore root-naming, and that is where *this* predicate's rule stops:
+    ``"foo. "`` strips to ``"foo"``, names a child, and is accepted here. It is
+    still refused, by :func:`names_win32_alias`, on the ground this predicate does
+    not speak to: the trim leaves ``"foo. "`` inside the tree, so containment has
+    nothing to object to, but it does not name the same path on Windows as it does
+    on POSIX, and that determinism rule is the fourth member's.
 
     ``".. "`` lands here rather than in :func:`has_parent_ref` because the trailing
     space stops it matching the ``..`` relative component, so Win32 trims it to
@@ -168,6 +172,117 @@ def names_tree_root(value: str | Path) -> bool:
     # value is judged by the same components Win32 would see.
     parts = [part for part in text.replace("\\", "/").split("/") if part]
     return bool(parts) and all(part.strip(" .") == "" and part != ".." for part in parts)
+
+
+def names_win32_alias(value: str | Path) -> bool:
+    """True if any component of ``value`` names something other than itself on
+    Win32 — a reserved device name, or a name whose trailing periods and spaces
+    Win32 trims away before the path ever reaches the filesystem.
+
+    The fourth member of the "must be a path inside the project" family, and the
+    only one about *determinism* rather than containment. The other three refuse a
+    value that leaves the tree; this one refuses a value that stays inside it and
+    still names a *different* path on Windows than it does on POSIX.
+    ``skill_tree = "NUL"`` is project-relative by every measure the other three
+    apply, and on Windows it is a device rather than a directory. Two rules, both
+    applied per component — both separators are split for the same reason
+    :func:`names_tree_root` splits both.
+
+    **Rule 1 — reserved device basenames.** ``_RESERVED_BASENAMES`` holds ``CON``,
+    ``PRN``, ``AUX``, ``NUL``, the console pair ``CONIN$``/``CONOUT$``, ``COM0``
+    through ``COM9``, ``LPT0`` through ``LPT9``, and the ISO-8859-1 superscript
+    ``COM¹``/``COM²``/``COM³`` and ``LPT¹``/``LPT²``/``LPT³`` forms.
+    :func:`_is_reserved_basename` compares case-insensitively, with or without an
+    extension, and trims trailing spaces before comparing — ``nul``, ``NUL.txt``
+    and ``CON .txt`` all count, and the trim-first ordering is right because Win32
+    strips the trailing run *before* it tests for a device (``aux.. ..`` resolves
+    to AUX). It is a *segment* predicate: it splits on the first dot of the whole
+    string, so ``_is_reserved_basename("sub/NUL")`` is False. Applying it per
+    component is what puts ``"sub/NUL"`` in reach at all.
+
+    That set is deliberately a superset of Microsoft's published list, which names
+    only ``COM1``-``COM9`` and ``LPT1``-``LPT9`` and omits the console pair
+    entirely — Wine's ``RtlIsDosDeviceName_U`` matches ``CONIN$``/``CONOUT$`` and
+    rejects the ``0`` forms, so ``COM0``/``LPT0`` are refused here by neither
+    authority. Over-refusing six spellings nobody wants as a directory name is the
+    safe direction for a guard; do not read the set as a claim about Win32.
+
+    Windows 11 narrowed the rule the set encodes. Microsoft states the change (in
+    the .NET path-format documentation, not in the file-naming page, which still
+    asserts the old model): before Windows 11 a path *beginning* with a legacy
+    device name was always interpreted as that device, so ``CON.TXT`` meant
+    ``\\\\.\\CON``; that no longer applies. Wine's conformance data encodes the
+    same narrowing case by case — ``C:\\con\\con`` carries a Windows 11 alternate
+    expectation of a literal path, and the extension forms are marked as failing
+    there — while bare ``NUL`` is left unmarked at every position. Bare ``NUL`` at
+    a leaf therefore stays a device on Windows 11, as though every existing
+    directory holds a virtual ``NUL``; ``sub/CON`` and ``NUL.txt`` do not. The
+    unnarrowed rule — hijack from any position, extension or not — holds on
+    Windows 10 and earlier.
+
+    We refuse the Windows 10 superset on every platform anyway, deliberately: a
+    config value must not mean one thing on one OS build and something else on the
+    next, and a guard that tracked the narrowing would turn a ``seed_files`` entry
+    into a build-number question. It is the same reasoning that already has the
+    family refusing ``C:\\secrets`` on POSIX.
+
+    **Rule 2 — the trailing period/space trim.** Win32 removes every trailing
+    period and space from a path component, so ``".claude/skills."`` creates and
+    addresses ``.claude/skills`` while the configured string still spells
+    ``skills.``. The divergence reaches past the filesystem: git's gitignore parser
+    reads the authored spelling, so a shield pattern rendered from the config
+    matches ``skills.`` and misses the directory Win32 actually made.
+
+    Rule 2 reads the same trim :func:`names_tree_root` does, split by what the
+    whole *value* amounts to rather than by component. That predicate owns a value
+    made *entirely* of period/space components, where the trim leaves nothing at
+    any level and the value names the tree root. This one owns everything else the
+    trim touches: a component the trim shortens (``"skills. "`` names a sibling of
+    what was written) and equally a component the trim *empties* when it sits
+    beside a real one — ``"sub/..."`` is nobody's root and nobody's parent, so it
+    is an alias and belongs here (it addresses ``sub`` on Windows and a literal
+    ``...`` directory on POSIX; the first review round caught it slipping all four
+    members). The ``not root_naming`` term draws that line, and the
+    ``part not in (".", "..")`` carve-out beside it hands the two spellings that
+    mean the *same* path on every platform back to their owners — ``"."`` is a
+    no-op component everywhere, ``".."`` is :func:`has_parent_ref`'s climb. All
+    four members therefore refuse disjoint spelling classes — which is what lets
+    each be ablated on its own, and mirrors :func:`names_tree_root`'s own
+    ``part != ".."`` carve-out one function up.
+
+    The git half of rule 2 is measured, on this repo's own suite. **The Win32
+    filesystem half is cited, not measured** — this is a Linux box and nothing here
+    calls a Win32 API. The sources are Microsoft's "Naming Files, Paths, and
+    Namespaces" for the reserved list and the ``NUL.txt`` equivalence; Microsoft's
+    ".NET File path formats on Windows systems" for the trim rule and the Windows
+    11 statement; Wine's ntdll path conformance tests (``test_RtlGetFullPathName_U``
+    and ``test_RtlIsDosDeviceName_U``, against ``collapse_path`` and
+    ``RtlIsDosDeviceName_U``) for the per-case narrowing and the ``NUL`` carve-out;
+    and Project Zero's "The Definitive Guide on Win32 to NT Path Conversion" (2016,
+    so pre-narrowing) for the mechanism. The ``NUL`` carve-out is stated by none of
+    Microsoft's pages."""
+    text = str(value)
+    # Same both-separator split as `names_tree_root`, and for the same reason: a
+    # value is judged by the components Win32 would see.
+    parts = [part for part in text.replace("\\", "/").split("/") if part]
+    # A value made ENTIRELY of period/space components names the tree root and is
+    # `names_tree_root`'s to refuse; scoping rule 2 by the WHOLE value rather than
+    # per component is what keeps the two disjoint while still catching an
+    # all-period/space component embedded beside a real one (`sub/...`), which is
+    # nobody's root and nobody's parent.
+    root_naming = names_tree_root(text)
+    return any(
+        _is_reserved_basename(part)
+        or (
+            part != part.rstrip(" .")
+            # `.` and `..` spell the same path on every platform — the no-op
+            # component, and the climb `has_parent_ref` owns — the same
+            # carve-out, for the same reason, as `names_tree_root`'s `..`.
+            and part not in (".", "..")
+            and not root_naming
+        )
+        for part in parts
+    )
 
 
 def is_wsl_unc_path(value: str | Path) -> bool:
