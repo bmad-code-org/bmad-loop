@@ -1594,11 +1594,31 @@ def prune_sessions(
     return prunable, live, unknown
 
 
-def legacy_registry_leftovers(project: Path, *, announced: Iterable[str] = ()) -> list[str]:
+#: How a frontend names psmux's OWN default registry, the one root
+#: :meth:`~.adapters.multiplexer.TerminalMultiplexer.registry_root` deliberately
+#: answers ``None`` for (respelling its home cascade in Python is a second thing
+#: to keep in sync). Lives here so both frontends say it the same way.
+DEFAULT_REGISTRY_LABEL = "the multiplexer's own default registry"
+
+
+def legacy_registry_leftovers(
+    project: Path, *, announced: Iterable[str] = ()
+) -> dict[str, list[str]]:
     """Session names a legacy registry **still holds** after :func:`prune_sessions`
     ran — the migration's honest remainder, for the cleanup frontends to print.
-    ``[]`` when there is no legacy registry, when it holds nothing, or when the
-    listing fails.
+    ``{}`` when there is no legacy registry, when they hold nothing, or when
+    every listing fails.
+
+    **Grouped by registry, and that is load-bearing.** There is more than one
+    legacy registry now (:meth:`~.adapters.psmux_backend.PsmuxMultiplexer.legacy_registries`
+    — psmux's default, and the root this process displaced), so a flat list
+    cannot say where to go look: a message built from one would either name a
+    registry the leftovers are not in, or name every registry the sweep
+    addressed including the ones that contributed nothing. The operator's next
+    action is to open that registry, so the answer has to be per registry. Keys
+    are :meth:`registry_root`'s answer, or :data:`DEFAULT_REGISTRY_LABEL` where
+    that is ``None``; a registry holding nothing is absent rather than empty, so
+    a caller can print the keys without checking.
 
     **Presence, not a second opinion.** Called after the sweep, this lists what is
     actually there; a session the sweep killed is simply gone from the listing.
@@ -1656,9 +1676,10 @@ def legacy_registry_leftovers(project: Path, *, announced: Iterable[str] = ()) -
     pre-registry build.
 
     Names, not run ids: the ctl session has no run id, and the operator is going to
-    paste these into a ``psmux`` target.
+    paste these into a ``psmux`` target — under the registry this maps them to,
+    which is the other half of what makes them pasteable.
     """
-    leftovers: list[str] = []
+    grouped: dict[str, list[str]] = {}
     mine = accepted_tags(project)
     # Run ids, so names. `prune_sessions` unions its passes, so an id it reports
     # names at most one session anywhere — the same collapse that makes its own
@@ -1670,20 +1691,28 @@ def legacy_registry_leftovers(project: Path, *, announced: Iterable[str] = ()) -
             tags = legacy.session_options(PROJECT_OPTION) if names else {}
         except MultiplexerError:
             continue  # observation degrades; the sweep's own report still stands
+        here: list[str] = []
         for name in names:
             if name in excluded:
                 continue
             if is_ctl_session_name(name):
                 # A legacy registry holds the pre-#537 fixed name; the shape
                 # predicate also names any per-registry-named stray.
-                leftovers.append(name)
+                here.append(name)
                 continue
             if _agent_run_id(name) is None:
                 continue  # not a bmad-loop agent session at all
             tag = tags.get(name, "")
             if not tag or tag in mine:
-                leftovers.append(name)
-    return sorted(set(leftovers))
+                here.append(name)
+        if here:
+            # `registry_root()` is a diagnostic and never raises (seam contract).
+            # Two admitted registries could in principle answer the same label —
+            # a displaced root that spells the default is swept twice — so the
+            # rows are merged rather than overwritten.
+            label = legacy.registry_root() or DEFAULT_REGISTRY_LABEL
+            grouped[label] = sorted(set(grouped.get(label, []) + here))
+    return grouped
 
 
 def _legacy_registries() -> list[TerminalMultiplexer]:

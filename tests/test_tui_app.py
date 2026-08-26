@@ -2824,7 +2824,12 @@ async def test_cleanup_warns_about_sessions_left_in_the_legacy_registry(project,
     monkeypatch.setattr(runs, "prune_sessions", lambda _p: ([], [], set()))
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
     monkeypatch.setattr(
-        runs, "legacy_registry_leftovers", lambda _p: ["bmad-loop-ctl", "bmad-loop-old-1"]
+        runs,
+        "legacy_registry_leftovers",
+        lambda _p: {
+            runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-ctl"],
+            r"D:	heir-own-registry": ["bmad-loop-old-1"],
+        },
     )
     make_run(project.project, "20260611-100000-aaaa")
     app = BmadLoopApp(project.project)
@@ -2833,11 +2838,22 @@ async def test_cleanup_warns_about_sessions_left_in_the_legacy_registry(project,
         await pilot.press("c")
         await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
         await pilot.click(await ready(pilot, "#ok"))
+        # One toast per registry, each naming its own — the CLI arm's twin.
+        # A single toast calling both "the default registry" sent an operator
+        # whose sessions are in their own displaced root to the wrong place.
         await until(
             pilot,
             lambda: any(
-                "2 session(s) left in the multiplexer's default registry" in m
-                and "bmad-loop-old-1" in m
+                f"1 session(s) left in {runs.DEFAULT_REGISTRY_LABEL}" in m
+                and "bmad-loop-ctl" in m
+                and "bmad-loop-old-1" not in m
+                for m in notifications(app)
+            ),
+        )
+        await until(
+            pilot,
+            lambda: any(
+                r"1 session(s) left in D:	heir-own-registry" in m and "bmad-loop-old-1" in m
                 for m in notifications(app)
             ),
         )

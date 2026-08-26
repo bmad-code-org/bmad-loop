@@ -10681,7 +10681,9 @@ def test_cleanup_names_what_the_migration_left_behind(project, capsys, monkeypat
     monkeypatch.setattr(
         runs,
         "legacy_registry_leftovers",
-        lambda _p, announced=(): ["bmad-loop-ctl", "bmad-loop-old-1"],
+        lambda _p, announced=(): {
+            runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-ctl", "bmad-loop-old-1"]
+        },
     )
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
 
@@ -10699,7 +10701,9 @@ def test_cleanup_dry_run_previews_what_the_migration_would_leave_behind(
 
     monkeypatch.setattr(runs, "prune_sessions", lambda _p, dry_run=False: ([], [], set()))
     monkeypatch.setattr(
-        runs, "legacy_registry_leftovers", lambda _p, announced=(): ["bmad-loop-old-1"]
+        runs,
+        "legacy_registry_leftovers",
+        lambda _p, announced=(): {runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-old-1"]},
     )
     monkeypatch.setattr(launch, "prunable_ctl_windows", lambda _p: [])
 
@@ -10728,7 +10732,7 @@ def test_cleanup_dry_run_hands_the_remainder_the_plan_it_printed(project, capsys
 
     def _leftovers(_p, announced=()):
         seen.append(sorted(announced))
-        return []
+        return {}
 
     monkeypatch.setattr(runs, "legacy_registry_leftovers", _leftovers)
     monkeypatch.setattr(launch, "prunable_ctl_windows", lambda _p: [])
@@ -10749,7 +10753,9 @@ def test_cleanup_json_carries_the_remainder_and_leaves_stderr_empty(project, cap
 
     monkeypatch.setattr(runs, "prune_sessions", lambda _p, dry_run=False: ([], [], set()))
     monkeypatch.setattr(
-        runs, "legacy_registry_leftovers", lambda _p, announced=(): ["bmad-loop-old-1"]
+        runs,
+        "legacy_registry_leftovers",
+        lambda _p, announced=(): {runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-old-1"]},
     )
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
 
@@ -10760,13 +10766,78 @@ def test_cleanup_json_carries_the_remainder_and_leaves_stderr_empty(project, cap
     assert captured.err == ""
 
 
+def test_cleanup_names_the_registry_each_leftover_is_actually_in(project, capsys, monkeypatch):
+    """The reader's next action is to open the registry and look, so the message
+    has to name the right one.
+
+    There are two legacy registries now — psmux's default, and any absolute
+    `PSMUX_DATA_DIR` this process displaced — and the sweep reads both. A message
+    that called them all "the multiplexer's default registry" sent an operator
+    whose sessions are in their own exported root to a registry those sessions
+    are not in, and at documentation describing a registry that is not theirs.
+
+    One line per registry, and only for registries that hold something: a line
+    naming an empty one is the same wrong errand in miniature.
+
+    Ablate the per-registry loop in `_warn_legacy_leftovers` back to a single
+    line naming the default and the displaced root goes unnamed."""
+    from bmad_loop.tui import launch
+
+    theirs = r"D:\their-own-registry"
+    monkeypatch.setattr(runs, "prune_sessions", lambda _p, dry_run=False: ([], [], set()))
+    monkeypatch.setattr(
+        runs,
+        "legacy_registry_leftovers",
+        lambda _p, announced=(): {
+            runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-ctl"],
+            theirs: ["bmad-loop-old-1"],
+        },
+    )
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
+
+    assert cli.main(["cleanup", "--project", str(project.project)]) == 0
+    err = capsys.readouterr().err
+    lines = [ln for ln in err.splitlines() if "not migrated" in ln]
+    assert len(lines) == 2
+    # each registry names its OWN sessions, and nobody else's
+    default_line = next(ln for ln in lines if runs.DEFAULT_REGISTRY_LABEL in ln)
+    theirs_line = next(ln for ln in lines if theirs in ln)
+    assert "bmad-loop-ctl" in default_line and "bmad-loop-old-1" not in default_line
+    assert "bmad-loop-old-1" in theirs_line and "bmad-loop-ctl" not in theirs_line
+
+
+def test_cleanup_json_flattens_the_remainder_to_the_documented_list(project, capsys, monkeypatch):
+    """`sessions.legacy_leftovers` is a documented list of NAMES in a
+    schema-versioned document, so the grouping serves the text mode only —
+    widening the field would be a contract change and a schema bump.
+
+    Ablate the flatten at the `cleanup_document` call and the field carries the
+    grouping instead, which no consumer of this schema version can read."""
+    from bmad_loop.tui import launch
+
+    monkeypatch.setattr(runs, "prune_sessions", lambda _p, dry_run=False: ([], [], set()))
+    monkeypatch.setattr(
+        runs,
+        "legacy_registry_leftovers",
+        lambda _p, announced=(): {
+            runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-ctl"],
+            r"D:\theirs": ["bmad-loop-old-1"],
+        },
+    )
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
+
+    assert cli.main(["cleanup", "--json", "--project", str(project.project)]) == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["sessions"]["legacy_leftovers"] == ["bmad-loop-ctl", "bmad-loop-old-1"]
+
+
 def test_cleanup_says_nothing_about_a_registry_with_no_remainder(project, capsys, monkeypatch):
     """Silence on the normal path — every platform without a registry namespace,
     and every already-migrated machine."""
     from bmad_loop.tui import launch
 
     monkeypatch.setattr(runs, "prune_sessions", lambda _p, dry_run=False: ([], [], set()))
-    monkeypatch.setattr(runs, "legacy_registry_leftovers", lambda _p, announced=(): [])
+    monkeypatch.setattr(runs, "legacy_registry_leftovers", lambda _p, announced=(): {})
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
 
     assert cli.main(["cleanup", "--project", str(project.project)]) == 0

@@ -3916,8 +3916,8 @@ def cmd_archive(args: argparse.Namespace) -> int:
     return 0
 
 
-def _warn_legacy_leftovers(leftovers: list[str]) -> None:
-    """Name what a legacy multiplexer registry still holds after the sweep.
+def _warn_legacy_leftovers(leftovers: dict[str, list[str]]) -> None:
+    """Name what each legacy multiplexer registry still holds after the sweep.
 
     Silent on the normal path — the list is empty on every platform without a
     registry namespace and on every machine that never ran the pre-registry
@@ -3926,6 +3926,15 @@ def _warn_legacy_leftovers(leftovers: list[str]) -> None:
     not to migrate reads as "everything is clean". stderr rather than stdout, the
     `unverifiable_pid` precedent, so `cleanup > log` keeps the receipt; in
     `--json` mode this lives in the document instead and stderr stays empty.
+
+    **One line per registry, naming it.** There is more than one legacy registry
+    now — psmux's default, and any root this process displaced — and the
+    operator's next action is to open the one holding these sessions. A message
+    that named the default for all of them sent the reader to a registry the
+    sessions are not in, and at documentation about a registry that is not
+    theirs. `runs.legacy_registry_leftovers` maps names to registries so this
+    does not have to guess, and omits a registry that holds nothing so no line
+    here points somewhere empty.
 
     Points at the docs rather than printing a command. One of the things named
     here is the machine-wide control session, and `psmux kill-session` on it kills
@@ -3937,15 +3946,14 @@ def _warn_legacy_leftovers(leftovers: list[str]) -> None:
 
     Deliberately unconditional on dry-run: a preview that omits the remainder
     would disagree with the run it is previewing."""
-    if not leftovers:
-        return
-    print(
-        "left in the multiplexer's default registry (not migrated): "
-        + ", ".join(leftovers)
-        + " — still running, ownership unprovable there, or the shared control "
-        "session; see docs/multiplexer-backends.md before removing any of them",
-        file=sys.stderr,
-    )
+    for registry, names in leftovers.items():
+        print(
+            f"left in {registry} (not migrated): "
+            + ", ".join(names)
+            + " — still running, ownership unprovable there, or the shared control "
+            "session; see docs/multiplexer-backends.md before removing any of them",
+            file=sys.stderr,
+        )
 
 
 def cmd_cleanup(args: argparse.Namespace) -> int:
@@ -4009,7 +4017,10 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
                 windows_survived=survived,
                 windows_unverifiable=unverifiable,
                 scan_error=scan_error,
-                legacy_leftovers=leftovers,
+                # Flattened: `sessions.legacy_leftovers` is a documented
+                # list of names and widening it would bump the schema. The
+                # grouping serves the text mode, which has room to say where.
+                legacy_leftovers=sorted({n for names in leftovers.values() for n in names}),
             )
         )
         return 0

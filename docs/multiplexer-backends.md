@@ -138,11 +138,17 @@ Two further consequences:
   duplicate. On psmux the session is therefore `bmad-loop-ctl-<16-hex registry digest>`; the
   TUI's toasts name the exact session. On tmux (no registries) the shared `bmad-loop-ctl` is
   unchanged.
-- **Sessions created before this change are in the default registry**, and `bmad-loop cleanup`
-  sweeps that registry too — but only for sessions that carry this project's ownership tag and
-  are not still running. Whatever it leaves standing is **named on stderr** (and in
-  `cleanup --json`, at `sessions.legacy_leftovers`) so a removal count never quietly stands for a
-  partial migration. Three kinds stay behind by design:
+- **Sessions created before this change are in whichever registry the old build inherited**,
+  and `bmad-loop cleanup` sweeps those too — but only for sessions that carry this project's
+  ownership tag and are not still running. There are two such registries, because the old build
+  simply used whatever `PSMUX_DATA_DIR` it found: psmux's **default** registry on a machine that
+  never set the variable, and **your own exported root** on one that did — the same root
+  bmad-loop now overrides (it remembers what it displaced, for exactly this sweep). The leftovers
+  line names the registry each session is in, so the one to open is the one it names.
+
+  Whatever the sweep leaves standing is **named on stderr** (and in `cleanup --json`, at
+  `sessions.legacy_leftovers`) so a removal count never quietly stands for a partial migration.
+  Three kinds stay behind by design:
 
   - An **untagged** `bmad-loop-<run-id>` session. In a shared registry a matching run directory
     here is not proof of ownership — run ids are only unique within one project, and `--run-id`
@@ -157,10 +163,15 @@ Two further consequences:
   own `removed` count is still the pre-kill plan, the ceiling `cleanup --json`'s
   `sessions.removed` has always documented; the leftovers line is what catches the difference.)
 
-  These are one-time artifacts of the upgrade. To see them, open a shell with **no**
-  `PSMUX_DATA_DIR` set — that is psmux's default registry:
+  These are one-time artifacts of the upgrade. To see them, put the shell on the registry the
+  leftovers line named. For psmux's default registry that means a shell with **no**
+  `PSMUX_DATA_DIR` set; for a root of your own, export that root:
 
   ```powershell
+  Remove-Item Env:PSMUX_DATA_DIR      # psmux's default registry
+  # ...or, for the root bmad-loop displaced, the one the message named:
+  $env:PSMUX_DATA_DIR = 'D:\your-own-registry'
+
   psmux ls
   psmux list-windows -t bmad-loop-ctl -F '#{window_index}: #{window_name}'
   ```

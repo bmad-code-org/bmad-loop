@@ -1322,13 +1322,15 @@ class BmadLoopApp(App[None]):
         # registry, and a count that quietly excludes them reads as "all clean".
         # Read after the prune, so it describes what is left standing. Silent on
         # every platform without a registry namespace.
-        leftovers = runs.legacy_registry_leftovers(self.project)
-        if leftovers:
+        # One toast per registry, naming it: there is more than one legacy
+        # registry (psmux's default, and any root this process displaced), and
+        # the operator's next action is to open the one holding these.
+        for registry, names in runs.legacy_registry_leftovers(self.project).items():
             self.call_from_thread(
                 self.notify,
-                f"{len(leftovers)} session(s) left in the multiplexer's default "
-                f"registry (not migrated): {', '.join(leftovers)} — see "
-                "docs/multiplexer-backends.md before removing any of them",
+                f"{len(names)} session(s) left in {registry} (not migrated): "
+                f"{', '.join(names)} — see docs/multiplexer-backends.md before "
+                "removing any of them",
                 severity="warning",
             )
         # A kill that did not verifiably land gets its own toast rather than a

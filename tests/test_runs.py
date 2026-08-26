@@ -4471,11 +4471,19 @@ def test_orphan_state_sweep_still_reaps_a_real_orphan_beside_the_registry(tmp_pa
 
 class _RegistryMux:
     """A backend bound to one registry, standing in for the cleanup sweep's
-    second pass. Only the three verbs the partition and the kill use."""
+    second pass. Only the verbs the partition, the kill and the remainder use.
 
-    def __init__(self, sessions, tags):
+    `root` is what `registry_root()` answers: `None` is psmux's own default
+    registry (the seam deliberately never respells its home cascade), which the
+    remainder labels `runs.DEFAULT_REGISTRY_LABEL`."""
+
+    def __init__(self, sessions, tags, root=None):
         self._sessions, self._tags = sessions, tags
+        self._root = root
         self.killed: list[str] = []
+
+    def registry_root(self):
+        return self._root
 
     def list_sessions(self):
         return list(self._sessions)
@@ -4581,6 +4589,14 @@ def test_export_records_the_root_it_displaced_for_the_migration_sweep(tmp_path, 
     and the sweep is back to psmux's default alone."""
     from bmad_loop.adapters import psmux_backend
 
+    # Before the export, never after: `monkeypatch.setattr` records whatever it
+    # finds as the value to restore, so a reset placed *below* a real write would
+    # record that write and hand it back at teardown. The autouse
+    # `_isolate_mux_registry` fixture registers the same reset first and so
+    # restores last (undo is LIFO), which is what keeps that mistake from
+    # actually leaking — but a test whose own hygiene depends on the ordering of
+    # a fixture in another file is one edit away from being wrong.
+    monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", None)
     theirs = str(tmp_path / "their-own-registry")
     monkeypatch.setenv(runs.PSMUX_DATA_DIR, theirs)
 
@@ -4588,9 +4604,20 @@ def test_export_records_the_root_it_displaced_for_the_migration_sweep(tmp_path, 
     assert root == str(runs.mux_registry_root(tmp_path)) != theirs
     assert psmux_backend._DISPLACED_ROOT == theirs
 
-    # ...and it is not recorded when nothing was displaced (a pane child of this
-    # project's own session, the ordinary way the variable is already set).
+
+def test_export_records_nothing_when_it_displaced_nothing(tmp_path, monkeypatch):
+    """The other half, split into its own test rather than reset mid-body: a pane
+    child of this project's own session already carries the derived root, which is
+    the ordinary way the variable is set, and recording it would hand the sweep
+    this project's *current* registry as a legacy one.
+
+    Ablate the `displaced != root` guard in `export_psmux_registry_root` and this
+    fails."""
+    from bmad_loop.adapters import psmux_backend
+
     monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", None)
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, str(runs.mux_registry_root(tmp_path)))
+
     runs.export_psmux_registry_root(tmp_path)
     assert psmux_backend._DISPLACED_ROOT is None
 
@@ -4776,7 +4803,48 @@ def test_legacy_registry_leftovers_names_an_untagged_session(tmp_path, monkeypat
     excludes what it chose not to claim reads as "everything is clean"."""
     legacy = _RegistryMux(["bmad-loop-old-1"], {})
     monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
-    assert runs.legacy_registry_leftovers(tmp_path) == ["bmad-loop-old-1"]
+    assert runs.legacy_registry_leftovers(tmp_path) == {
+        runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-old-1"]
+    }
+
+
+def test_legacy_registry_leftovers_keys_each_session_to_its_own_registry(tmp_path, monkeypatch):
+    """The grouping is the whole point of the shape: the operator's next action is
+    to open the registry and look, and there are two of them now — psmux's own
+    default, and any absolute `PSMUX_DATA_DIR` this process displaced.
+
+    A flat list, or a grouping that keyed everything on the default, told an
+    operator whose sessions are in their own exported root to go look in a
+    registry those sessions are not in.
+
+    `registry_root()` answers `None` for psmux's default — the seam deliberately
+    never respells its home cascade — so that arm is labelled instead.
+
+    Ablate `legacy.registry_root() or DEFAULT_REGISTRY_LABEL` down to the
+    constant and both keys collapse into one."""
+    theirs = r"D:	heir-own-registry"
+    default_reg = _RegistryMux(["bmad-loop-ctl"], {})
+    displaced = _RegistryMux(["bmad-loop-old-1"], {}, root=theirs)
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [default_reg, displaced])
+
+    assert runs.legacy_registry_leftovers(tmp_path) == {
+        runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-ctl"],
+        theirs: ["bmad-loop-old-1"],
+    }
+
+
+def test_legacy_registry_leftovers_merges_two_registries_that_name_one_root(tmp_path, monkeypatch):
+    """A displaced root that happens to spell psmux's own default is admitted
+    twice, and the rows merge rather than the second overwriting the first.
+
+    Ablate the `grouped.get(label, [])` merge and the first registry's sessions
+    vanish from a message that claims to name what is standing."""
+    both = _RegistryMux(["bmad-loop-a"], {}), _RegistryMux(["bmad-loop-b"], {})
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: list(both))
+
+    assert runs.legacy_registry_leftovers(tmp_path) == {
+        runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-a", "bmad-loop-b"]
+    }
 
 
 def test_legacy_registry_leftovers_names_a_surviving_control_session(tmp_path, monkeypatch):
@@ -4785,7 +4853,9 @@ def test_legacy_registry_leftovers_names_a_surviving_control_session(tmp_path, m
     the migration. Naming it is the whole remedy."""
     legacy = _RegistryMux([runs.CTL_SESSION], {})
     monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
-    assert runs.legacy_registry_leftovers(tmp_path) == [runs.CTL_SESSION]
+    assert runs.legacy_registry_leftovers(tmp_path) == {
+        runs.DEFAULT_REGISTRY_LABEL: [runs.CTL_SESSION]
+    }
 
 
 def test_legacy_registry_leftovers_degrades_on_a_transport_fault(tmp_path, monkeypatch):
@@ -4798,12 +4868,12 @@ def test_legacy_registry_leftovers_degrades_on_a_transport_fault(tmp_path, monke
             raise MultiplexerError("no server")
 
     monkeypatch.setattr(runs, "_legacy_registries", lambda: [_Broken([], {})])
-    assert runs.legacy_registry_leftovers(tmp_path) == []
+    assert runs.legacy_registry_leftovers(tmp_path) == {}
 
 
 def test_legacy_registry_leftovers_is_empty_with_no_legacy_registry(tmp_path, monkeypatch):
     monkeypatch.setattr(runs, "_legacy_registries", lambda: [])
-    assert runs.legacy_registry_leftovers(tmp_path) == []
+    assert runs.legacy_registry_leftovers(tmp_path) == {}
 
 
 # ------------------ legacy remainder: our own stranded sessions (#537)
@@ -4822,7 +4892,9 @@ def test_legacy_registry_leftovers_names_our_own_live_session(tmp_path, monkeypa
     assert runs.prune_sessions(tmp_path) == ([], ["live-1"], set())
     assert legacy.killed == []
     # ...and the remainder says so
-    assert runs.legacy_registry_leftovers(tmp_path) == ["bmad-loop-live-1"]
+    assert runs.legacy_registry_leftovers(tmp_path) == {
+        runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-live-1"]
+    }
 
 
 def test_legacy_registry_leftovers_stays_quiet_about_a_dead_session_the_sweep_takes(
@@ -4838,7 +4910,7 @@ def test_legacy_registry_leftovers_stays_quiet_about_a_dead_session_the_sweep_ta
 
     plan = runs.prune_sessions(tmp_path, dry_run=True)
     assert plan == (["fin-1"], [], set())
-    assert runs.legacy_registry_leftovers(tmp_path, announced=plan[0]) == []
+    assert runs.legacy_registry_leftovers(tmp_path, announced=plan[0]) == {}
 
 
 def test_legacy_registry_leftovers_still_stays_quiet_about_another_projects_session(
@@ -4852,7 +4924,7 @@ def test_legacy_registry_leftovers_still_stays_quiet_about_another_projects_sess
         {"bmad-loop-theirs-1": "0123456789abcdef"},
     )
     monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
-    assert runs.legacy_registry_leftovers(tmp_path) == []
+    assert runs.legacy_registry_leftovers(tmp_path) == {}
 
 
 # ---------------- legacy remainder: presence, not a resampled partition (#537)
@@ -4894,7 +4966,9 @@ def test_legacy_leftovers_names_a_session_whose_engine_exited_mid_sweep(tmp_path
     assert runs.prune_sessions(tmp_path) == ([], ["race-live"], set())
     assert legacy.killed == []
     # ...and the reader names it even though it now looks prunable
-    assert runs.legacy_registry_leftovers(tmp_path) == ["bmad-loop-race-live"]
+    assert runs.legacy_registry_leftovers(tmp_path) == {
+        runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-race-live"]
+    }
 
 
 def test_legacy_leftovers_names_a_session_whose_kill_did_not_land(tmp_path, monkeypatch):
@@ -4912,7 +4986,9 @@ def test_legacy_leftovers_names_a_session_whose_kill_did_not_land(tmp_path, monk
 
     assert runs.prune_sessions(tmp_path) == (["fin-1"], [], set())
     assert legacy.killed == ["bmad-loop-fin-1"]
-    assert runs.legacy_registry_leftovers(tmp_path) == ["bmad-loop-fin-1"]
+    assert runs.legacy_registry_leftovers(tmp_path) == {
+        runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-fin-1"]
+    }
 
 
 def test_legacy_leftovers_is_quiet_once_the_sweep_actually_removed_the_session(
@@ -4932,7 +5008,7 @@ def test_legacy_leftovers_is_quiet_once_the_sweep_actually_removed_the_session(
     monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
 
     assert runs.prune_sessions(tmp_path) == (["fin-1"], [], set())
-    assert runs.legacy_registry_leftovers(tmp_path) == []
+    assert runs.legacy_registry_leftovers(tmp_path) == {}
 
 
 def test_legacy_leftovers_dry_run_excludes_what_the_preview_announced(tmp_path, monkeypatch):
@@ -4950,7 +5026,9 @@ def test_legacy_leftovers_dry_run_excludes_what_the_preview_announced(tmp_path, 
 
     plan = runs.prune_sessions(tmp_path, dry_run=True)
     assert plan == (["fin-1"], ["live-1"], set())
-    assert runs.legacy_registry_leftovers(tmp_path, announced=plan[0]) == ["bmad-loop-live-1"]
+    assert runs.legacy_registry_leftovers(tmp_path, announced=plan[0]) == {
+        runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-live-1"]
+    }
 
 
 def test_legacy_leftovers_dry_run_never_drops_what_the_preview_did_not_announce(
@@ -4978,4 +5056,6 @@ def test_legacy_leftovers_dry_run_never_drops_what_the_preview_did_not_announce(
     plan = runs.prune_sessions(tmp_path, dry_run=True)
     assert plan == ([], ["race-live"], set())  # nothing announced as a would-kill
     assert legacy.killed == []
-    assert runs.legacy_registry_leftovers(tmp_path, announced=plan[0]) == ["bmad-loop-race-live"]
+    assert runs.legacy_registry_leftovers(tmp_path, announced=plan[0]) == {
+        runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-race-live"]
+    }
