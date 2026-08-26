@@ -885,3 +885,60 @@ def test_binary_runs_pins_devnull_stdin_and_the_caller_timeout():
     # `errors="replace"` onto `_run_capture` (#383) never happens here and cannot
     # raise the UnicodeDecodeError the guard above does not name.
     assert kwargs.get("text") is None
+
+
+def test_probe_launcher_pins_the_window_to_this_state_root(tmp_path, monkeypatch):
+    """The probe window's env carries this process's resolved state root, and
+    the pin WINS over the caller's env: `start`'s env is the profile's own
+    `[env]` table plus the probe protocol keys, and a profile declaring
+    `BMAD_LOOP_STATE_DIR` would otherwise aim a bmad-loop wrapper in that
+    window at a different state root — a different registry, where this very
+    session reads as gone. Same precedence as the engine path, where the
+    session env dict (pin included) wins over `profile.env`.
+
+    Ablate the `runs.pinned_state_env()` spread — or move it back ahead of
+    `env` — and one of the two assertions fails."""
+    from bmad_loop import envvars, runs
+
+    class _Mux:
+        def __init__(self):
+            self.window_env = None
+
+        def new_session(self, name, cwd, cols=None, lines=None):
+            pass
+
+        def new_window(self, session, name, cwd, env, command):
+            self.window_env = env
+            return "@1"
+
+        def pipe_pane(self, window_id, log_file):
+            pass
+
+    monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "S"))
+    mux = _Mux()
+    monkeypatch.setattr(probe, "get_multiplexer", lambda: mux)
+    launcher = probe._ProbeLauncher(session_name="bmad-loop-probe-x")
+
+    win = launcher.start(
+        ["prog"],
+        {"CALLER": "1", envvars.STATE_DIR: str(tmp_path / "elsewhere")},
+        tmp_path,
+        tmp_path / "log.txt",
+    )
+
+    assert win == "@1"
+    assert mux.window_env == {"CALLER": "1", envvars.STATE_DIR: str(runs.state_root())}
+
+    # The underivable arm — the round-11 gap: with no pin key to spread, an
+    # ordering rule protects nothing, so the key is STRIPPED instead and the
+    # window inherits the parent's own (broken) value, failing as the parent
+    # fails. Ablate `runs.pin_state_root` back to the round-11 spread merge
+    # and the profile's C:\elsewhere lands in the window.
+    monkeypatch.setenv(envvars.STATE_DIR, "relative-root")
+    launcher.start(
+        ["prog"],
+        {"CALLER": "1", envvars.STATE_DIR: str(tmp_path / "elsewhere")},
+        tmp_path,
+        tmp_path / "log.txt",
+    )
+    assert mux.window_env == {"CALLER": "1"}

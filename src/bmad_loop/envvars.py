@@ -16,6 +16,12 @@ session-protocol vars the engine *injects* into a child session
 (`BMAD_LOOP_RUN_DIR`, `BMAD_LOOP_TASK_ID`, …): those have a producing side inside
 the orchestrator, and the stdlib-only relays that read them back cannot import
 this module at all.
+
+Note what the carve-out is and is not: "has a producing side" does not qualify a
+name, "is read only by a stdlib-only relay that cannot import this module" does.
+Anything core orchestration reads back belongs here, and
+`test_portability_guard.test_bmad_loop_env_reads_only_in_the_registry` is the
+enforced form of that rule.
 """
 
 from __future__ import annotations

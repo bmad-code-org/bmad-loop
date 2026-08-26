@@ -80,15 +80,30 @@ fragments) — or implement
 seams of a full OS port are in
 [Porting bmad-loop to a new OS](porting-to-a-new-os.md). The contract groups into:
 
-- **Sessions** — `has_session`, `new_session` (geometry is optional: agent
-  sessions pin a fixed pane size because they are observed while detached; the
-  control session omits it), `kill_session`, `list_sessions`, `session_options`
-  (read a user option across all sessions), `set_session_option`.
+- **Sessions** — `has_session`, `new_session` (geometry is
+  optional: agent sessions pin a fixed pane size because they are observed
+  while detached; the control session omits it),
+  `kill_session`, `list_sessions`, `session_options` (read a user option
+  across all sessions), `set_session_option`.
+
+  One session method carries a default the seam cannot verify for your
+  transport: `session_name_key(name)`, the canonical comparison key — two
+  names denote the same live session exactly when their keys are equal. The
+  default is identity (exact comparison — correct for tmux, whose session
+  names are case-sensitive). **If your transport resolves session names
+  case-insensitively — or folds them any other way — you MUST override**
+  (psmux does: its NTFS port-file store opens names case-insensitively).
+  With the inherited identity key, a case-variant of the control session's
+  name is not discounted by the removal guard, so the documented recovery
+  `bmad-loop delete ctl` wedges behind a false live-session refusal on a
+  persisted `CTL` run.
+
 - **Windows** — `new_window` (run a command in a fresh window), `new_parked_window`
-  (run a command, then _park_ on a keypress so the exit status stays inspectable,
-  then return any attached client to its origin — the POSIX `sh -c` recipe is
-  composed from the base's overridable shell-dialect hooks, so a non-POSIX
-  backend swaps the dialect fragments, not the method body), `list_window_ids`
+  (run a command, then _park_ on a keypress so the exit
+  status stays inspectable, then return any attached client to its origin — the
+  POSIX `sh -c` recipe is composed from the base's overridable shell-dialect
+  hooks, so a non-POSIX backend swaps the dialect fragments, not the method
+  body), `list_window_ids`
   (which MUST emit the same id form your `new_window` returns — `window_alive` is
   a membership test over it, so qualifying one side and not the other reads every
   live window as dead), `list_windows` (selected fields per window),
@@ -106,6 +121,24 @@ seams of a full OS port are in
   `available` (is this backend usable on the current host), `version` (the
   binary's version string or `None` — **one bounded line**, folded with
   `fold_version()`; see [the porting guide](porting-to-a-new-os.md)).
+- **Registry namespace** (optional; all three default to "no namespace", so a
+  transport without one writes nothing) — `has_registry_namespace` (a property
+  of the transport: does it namespace sessions by registry at all? Answer
+  `True` on every instance if it does, even when no root is currently in
+  force: cleanup uses it to tell "no namespace exists" from "running on the
+  transport's shared default registry", and only the first lets an untagged
+  session be claimed on run-directory evidence — a namespaced backend that
+  leaves this at the inherited `False` keeps the pre-namespace historical
+  reach, which on a shared registry can kill another project's session),
+  `registry_root` (the root your verbs
+  currently resolve targets through, for `bmad-loop mux` to disclose; `None`
+  from a namespaced backend means "no root in force" — the shared default —
+  not "no namespace") and
+  `legacy_registries` (instances bound to roots your sessions may predate, for
+  the cleanup sweep). Only for a transport that addresses sessions through a
+  directory of per-session files, as psmux does through `PSMUX_DATA_DIR`; the
+  rules are in [the porting
+  guide](porting-to-a-new-os.md#registry-namespaces-only-if-your-transport-has-one).
 
   **Both client verbs report effect, not dispatch.** They answer what the
   parked-window return path trusts — a bool from `detach_client`, a tri-state

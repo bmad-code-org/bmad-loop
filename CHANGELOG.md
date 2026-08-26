@@ -45,6 +45,25 @@ breaking changes may land in a minor release.
 
 ### Changed
 
+- **psmux sessions now live in a per-project registry** (#537). bmad-loop points
+  `PSMUX_DATA_DIR` at `<state root>/<project>/_mux`, so a prune in one project cannot address
+  another's servers at all. A bare `psmux ls` no longer shows them — `bmad-loop mux` prints the
+  root and the export that does. The `bmad-loop-ctl` control session becomes one per project —
+  named `bmad-loop-ctl-<registry digest>` on psmux, whose duplicate-server mutex is keyed on the
+  session name across every registry in a login session (a fixed name would fail every project's
+  launch but the first);
+  unchanged on tmux —
+  and `cleanup` also sweeps the old default registry for tagged pre-upgrade sessions, naming
+  whatever it still holds afterwards. The root is always derived: an ambient `PSMUX_DATA_DIR` is
+  overridden — reported once on stderr, and left alone for your own psmux sessions — because
+  honouring it would make the registry a function of the shell a command started in. Coding-CLI
+  windows are told the state root through their env; other windows inherit it as before, and
+  psmux's `PSMUX_BARE_ENV=1` — which breaks that inheritance — is declared unsupported and warned
+  about once per process. Cleanup demands the project tag
+  whenever the registry it addresses is not one bmad-loop derived, a shared default registry
+  included. The multiplexer seam signatures are unchanged; a backend built against them keeps
+  working.
+
 - **`bmad-loop diagnose` routes the re-arm records by field name** (#640, #716). `spec_file` and
   `overwritten` are aliased, and `repo` is dropped — an absolute host path that correlates nothing.
   Routing is by field name across every entry rather than by kind, so no existing run's dump changes
@@ -255,6 +274,19 @@ resolve` manufactures exactly that dual-key spec, inserting `baseline_revision` 
   `$HOME` one there was wrong in both directions — an empty seed that let global ignores leak
   into `git add -A`, or patterns git is not applying that made session files go missing. Gated
   on the reported version's own `.windows.` fork string, not on the platform.
+- **`--run-id` refuses the reserved control-session shape (`ctl`, `ctl-…`, any letter case)**.
+  Such an id mints the control session's own name as the run's agent session (`bmad-loop-ctl`,
+  or a per-registry `bmad-loop-ctl-<digest>` on psmux), so the adapter adopts the live control
+  session and the run's teardown kills it — every parked window with it; on Windows the
+  multiplexer resolves session names case-insensitively, so the case variants alias it too. The
+  two session namespaces are now disjoint at the mint — and guarded at the read paths for runs
+  an older release already persisted under such an id: `resume` and `resolve` refuse (at entry,
+  before any side effect) with the recovery steps, while `stop`, `delete`, `archive` and `clean`
+  work on the run without ever addressing a session that can be a control session's name (`ctl`,
+  `ctl-<16 hex>`). A historical run under any other `ctl-*` id keeps its genuine agent session
+  reachable in the registry the process addresses: `stop` kills it there by its exact name, and
+  `cleanup` sweeps it like any other run's — including, for a tagged pre-upgrade session left in
+  psmux's old default registry, through the legacy pass (`stop` does not reach that registry).
 - **TUI: a graceful-stop request that cannot be written is reported, not fatal.** The `S`
   worker caught only the helper's own refusals; an `OSError` from the write itself escaped,
   and Textual's default `exit_on_error` took the dashboard down with it. It now surfaces

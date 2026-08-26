@@ -386,6 +386,7 @@ def cleanup_document(
     windows_survived: list[str],
     windows_unverifiable: list[str],
     scan_error: str | None = None,
+    legacy_leftovers: list[str] | None = None,
 ) -> dict[str, object]:
     """The `cleanup --json` document: the multiplexer artifacts this invocation
     removed, or — under ``--dry-run`` — would remove.
@@ -425,6 +426,14 @@ def cleanup_document(
     ceiling as prune_ctl_windows' post-kill probe; narrowing it is seam work,
     not a document field.
 
+    `sessions.legacy_leftovers` is the migration's remainder: session NAMES (not
+    run ids — the control session has no run id) that a legacy multiplexer
+    registry still holds and that cleanup deliberately did not remove. Additive,
+    so no schema bump: a consumer that does not know the key reads exactly what it
+    read before. Empty on every platform and every already-migrated machine. See
+    `runs.legacy_registry_leftovers` for what qualifies and why; the text mode
+    prints the same list on stderr, the `unverifiable_pid` precedent.
+
     `sessions.removed` did NOT get the same treatment and is still the pre-kill
     prunable partition — an *attempted* kill, since `kill_session` is best-effort
     and silent in exactly the way `kill_window` is. #435 narrowed the windows
@@ -437,6 +446,7 @@ def cleanup_document(
             "removed": list(killed),
             "live": list(live),
             "unverifiable_pid": sorted(unknown),
+            "legacy_leftovers": list(legacy_leftovers or []),
         },
         "ctl_windows": {
             "removed": list(windows),

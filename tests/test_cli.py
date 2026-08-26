@@ -34,10 +34,10 @@ from conftest import (
     write_sprint,
 )
 
-from bmad_loop import cli, platform_util
+from bmad_loop import cli, envvars, platform_util
 from bmad_loop import policy as policy_mod
 from bmad_loop import probe as probe_mod
-from bmad_loop import runsetup, verify
+from bmad_loop import runs, runsetup, verify
 from bmad_loop.adapters import multiplexer as mux_mod
 
 STORIES_SPEC_FOLDER = "_bmad-output/epic-1"
@@ -1906,6 +1906,9 @@ _BAD_RUN_IDS = [
     "a b",  # whitespace
     "",  # empty
     "CON",  # reserved windows device basename
+    "ctl",  # session_name("ctl") IS the control session
+    "ctl-0123456789abcdef",  # can equal a per-registry control-session name exactly
+    "CTL-0123456789ABCDEF",  # Windows resolves session names case-insensitively
 ]
 
 
@@ -2341,9 +2344,11 @@ def test_delete_refuses_an_orphaned_session_without_force(tmp_path, monkeypatch,
     """Engine dead, agent session still live — the one state the pid-keyed guard
     passes, and the one where the run dir is the only ownership proof an untagged
     session has left (#419)."""
+    from test_runs import _LivenessMux
+
     from bmad_loop import runs
 
-    monkeypatch.setattr(runs, "mux_sessions", lambda: ["bmad-loop-r1"])
+    monkeypatch.setattr(runs, "get_multiplexer", lambda: _LivenessMux(["bmad-loop-r1"]))
     run_dir = _make_run_with_state(tmp_path, "r1")  # no pid -> engine reads dead
     assert cli.main(["delete", "--project", str(tmp_path), "r1"]) == 1
     err = capsys.readouterr().err
@@ -2369,7 +2374,9 @@ def test_delete_force_overrides_the_session_guard_without_killing_it(tmp_path, m
     from bmad_loop import runs
 
     killed = []
-    monkeypatch.setattr(runs, "mux_sessions", lambda: ["bmad-loop-r1"])
+    from test_runs import _LivenessMux
+
+    monkeypatch.setattr(runs, "get_multiplexer", lambda: _LivenessMux(["bmad-loop-r1"]))
     monkeypatch.setattr(runs, "kill_session", lambda rid: killed.append(rid))
     run_dir = _make_run_with_state(tmp_path, "r1")
     assert cli.main(["delete", "--project", str(tmp_path), "r1", "--force"]) == 0
@@ -2386,7 +2393,9 @@ def test_archive_force_overrides_the_session_guard_without_killing_it(
     from bmad_loop import runs
 
     killed = []
-    monkeypatch.setattr(runs, "mux_sessions", lambda: ["bmad-loop-r1"])
+    from test_runs import _LivenessMux
+
+    monkeypatch.setattr(runs, "get_multiplexer", lambda: _LivenessMux(["bmad-loop-r1"]))
     monkeypatch.setattr(runs, "kill_session", lambda rid: killed.append(rid))
     run_dir = _make_run_with_state(tmp_path, "r1")
     assert cli.main(["archive", "--project", str(tmp_path), "r1", "--force"]) == 0
@@ -2396,9 +2405,11 @@ def test_archive_force_overrides_the_session_guard_without_killing_it(
 
 
 def test_archive_refuses_an_orphaned_session_without_force(tmp_path, monkeypatch, capsys):
+    from test_runs import _LivenessMux
+
     from bmad_loop import runs
 
-    monkeypatch.setattr(runs, "mux_sessions", lambda: ["bmad-loop-r1"])
+    monkeypatch.setattr(runs, "get_multiplexer", lambda: _LivenessMux(["bmad-loop-r1"]))
     run_dir = _make_run_with_state(tmp_path, "r1")
     assert cli.main(["archive", "--project", str(tmp_path), "r1"]) == 1
     err = capsys.readouterr().err
@@ -3767,7 +3778,12 @@ def test_cleanup_json_dry_run_plans_without_pruning(tmp_path, monkeypatch, capsy
 
     assert doc["schema_version"] == cli.CLEANUP_SCHEMA_VERSION
     assert doc["dry_run"] is True
-    assert doc["sessions"] == {"removed": ["fin-1"], "live": ["live-1"], "unverifiable_pid": []}
+    assert doc["sessions"] == {
+        "removed": ["fin-1"],
+        "live": ["live-1"],
+        "unverifiable_pid": [],
+        "legacy_leftovers": [],
+    }
     assert doc["ctl_windows"] == {
         "removed": ["sweep-fin-1"],
         "survived": [],
@@ -3818,7 +3834,12 @@ def test_cleanup_json_nothing_to_clean_up_is_a_valid_empty_document(tmp_path, mo
     doc = machine_json(["cleanup", "--project", str(tmp_path), "--json"], capsys)
 
     assert doc["schema_version"] == cli.CLEANUP_SCHEMA_VERSION
-    assert doc["sessions"] == {"removed": [], "live": [], "unverifiable_pid": []}
+    assert doc["sessions"] == {
+        "removed": [],
+        "live": [],
+        "unverifiable_pid": [],
+        "legacy_leftovers": [],
+    }
     assert doc["ctl_windows"] == {
         "removed": [],
         "survived": [],
@@ -3999,6 +4020,196 @@ def test_cleanup_text_counts_only_verified_removals_and_names_the_rest(
     # happily when the code reports one under the other's wording.
     assert "still open after the kill: stuck-1" in captured.err
     assert "kill attempted, outcome unverifiable: dunno-1" in captured.err
+
+
+def test_resolve_refuses_a_persisted_ctl_run_before_any_side_effect(project, monkeypatch, capsys):
+    """Through the ENTRY POINT, deliberately — the round-15 test called the
+    shared helper directly and could not see that resolve's flow launches the
+    interactive session and re-arms the escalation before reaching it. The
+    gate is at cmd_resolve entry: no adapters are built (the interactive
+    session is downstream of that), nothing is re-armed.
+
+    Ablate the entry gate and this fails two ways: the stderr message becomes
+    the not-at-an-escalation one, and the adapter build runs."""
+    from bmad_loop import runs
+
+    install_bmad_config(project)
+    run_dir = _make_run_with_state(
+        project.project,
+        "ctl",
+        paused_reason="spec approval",
+        paused_stage="spec-approval",
+    )
+    built = []
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: built.append(1) or {})
+    killed: list[str] = []
+    monkeypatch.setattr(runs, "kill_session", lambda rid: killed.append(rid))
+
+    assert cli.main(["resolve", "ctl", "--project", str(project.project)]) == 1
+    err = capsys.readouterr().err
+    assert "cannot resolve" in err and "bmad-loop-ctl" in err and "delete ctl" in err
+    assert built == [] and killed == []
+    # the run is untouched: still paused exactly as persisted, nothing re-armed
+    from bmad_loop.journal import load_state
+
+    assert load_state(run_dir).paused_reason == "spec approval"
+
+
+def test_resume_entrypoint_refuses_a_persisted_ctl_run(project, monkeypatch, capsys):
+    """The same gate through `bmad-loop resume ctl` itself — the helper-level
+    test cannot see the command wiring."""
+    from bmad_loop import runs
+
+    install_bmad_config(project)
+    _make_run_with_state(
+        project.project,
+        "ctl",
+        paused_reason="spec approval",
+        paused_stage="spec-approval",
+    )
+    killed: list[str] = []
+    monkeypatch.setattr(runs, "kill_session", lambda rid: killed.append(rid))
+
+    assert cli.main(["resume", "ctl", "--project", str(project.project)]) == 1
+    err = capsys.readouterr().err
+    assert "cannot resume" in err and "delete ctl" in err
+    assert killed == []
+
+
+def test_delete_removes_a_persisted_ctl_run_despite_the_live_control_session(
+    project, monkeypatch, capsys
+):
+    """The recovery the refusal advertises has to WORK: with the normal live
+    `bmad-loop-ctl` control session up, `bmad-loop delete ctl` used to reach
+    the live-session backstop (that session name IS `session_name("ctl")`),
+    raise, and leave the run directory intact — a refusal naming a recovery
+    that fails. The control session is never claimed through a run dir, so
+    its liveness is not evidence about the run and the delete proceeds.
+
+    Ablate the alias early-return in `live_session_may_be_ours` and this
+    fails with the LiveSessionError message."""
+    from bmad_loop import runs
+
+    install_bmad_config(project)
+    run_dir = _make_run_with_state(
+        project.project,
+        "ctl",
+        paused_reason="spec approval",
+        paused_stage="spec-approval",
+    )
+    # the machine's normal, live control session — untagged, as ctl sessions are
+    from test_runs import _LivenessMux
+
+    monkeypatch.setattr(runs, "get_multiplexer", lambda: _LivenessMux(["bmad-loop-ctl"]))
+
+    assert cli.main(["delete", "ctl", "--project", str(project.project)]) == 0
+    assert "deleted" in capsys.readouterr().out
+    assert not run_dir.exists()
+
+
+def test_delete_refuses_a_historical_digest_run_with_a_live_agent(project, monkeypatch, capsys):
+    """The data-loss inverse of the recovery test below, through the ENTRY
+    POINT: on tmux a `main`-created run `ctl-<16 hex>` owns a genuine agent
+    session (there are no digest-named control sessions there), and the
+    round-16 shape discount let `delete` destroy its run dir while that
+    agent was live — removing the untagged session's only ownership proof.
+    The instance test queries the mux and the live-session backstop refuses.
+
+    Ablate the discount back to the shape predicate and this fails: rc 0
+    and the run dir gone."""
+    from bmad_loop import runs
+
+    install_bmad_config(project)
+    run_dir = _make_run_with_state(
+        project.project,
+        "ctl-0123456789abcdef",
+        paused_reason="spec approval",
+        paused_stage="spec-approval",
+    )
+    # tmux shape: the fixed name is the only control session; the digest name
+    # is this run's own live agent session
+    from test_runs import _LivenessMux
+
+    monkeypatch.setattr(runs, "ctl_session_for", lambda p, mux=None: runs.CTL_SESSION)
+    monkeypatch.setattr(
+        runs,
+        "get_multiplexer",
+        lambda: _LivenessMux(["bmad-loop-ctl", "bmad-loop-ctl-0123456789abcdef"]),
+    )
+
+    assert cli.main(["delete", "ctl-0123456789abcdef", "--project", str(project.project)]) == 1
+    assert "still live" in capsys.readouterr().err
+    assert run_dir.exists()  # the run dir survived its live agent
+
+
+def test_delete_refuses_a_case_variant_run_where_the_transport_is_case_sensitive(
+    project, monkeypatch, capsys
+):
+    """Finding-1's reproduction, through the ENTRY POINT: on tmux
+    `bmad-loop-CTL` coexists with `bmad-loop-ctl` (measured on 3.4), so a
+    persisted `CTL` run's uppercase agent is a genuinely live session — the
+    round-17 constant fold discounted it as "the control session" and delete
+    removed the run dir under it. The comparison now belongs to the
+    transport (`session_name_key`, identity on tmux) and the refusal stands.
+
+    Ablate the seam key back to a constant `.lower()` and this fails: rc 0
+    and the run dir gone."""
+    from test_runs import _LivenessMux
+
+    from bmad_loop import runs
+
+    install_bmad_config(project)
+    run_dir = _make_run_with_state(
+        project.project,
+        "CTL",
+        paused_reason="spec approval",
+        paused_stage="spec-approval",
+    )
+    monkeypatch.setattr(runs, "ctl_session_for", lambda p, mux=None: runs.CTL_SESSION)
+    monkeypatch.setattr(
+        runs,
+        "get_multiplexer",
+        lambda: _LivenessMux(["bmad-loop-ctl", "bmad-loop-CTL"], fold=False),
+    )
+
+    assert cli.main(["delete", "CTL", "--project", str(project.project)]) == 1
+    assert "still live" in capsys.readouterr().err
+    assert run_dir.exists()
+
+
+def test_resume_refuses_a_persisted_ctl_shaped_run(project, monkeypatch, capsys):
+    """Mint-time validation never sees what an older release already wrote to
+    disk: a run dir named `ctl`, resolved through resume, would relaunch under
+    the control session's own name (and its stale-session sweep would kill
+    that session first). Refused in the shared helper — so resolve's re-arm
+    gets the same gate — before any side effect, and the message names the
+    way out (`bmad-loop delete`, which no longer touches any session under
+    the name).
+
+    Ablate the gate and this proceeds to the stub engine: rc 0, and the
+    stale-session sweep fires with the reserved name."""
+    from conftest import install_base_skills
+
+    from bmad_loop import runs
+
+    install_bmad_config(project)
+    install_base_skills(project)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    run_dir = _make_run_with_state(
+        project.project,
+        "ctl",
+        paused_reason="spec approval",
+        paused_stage="spec-approval",
+    )
+    killed: list[str] = []
+    monkeypatch.setattr(runs, "kill_session", lambda rid: killed.append(rid))
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {r: None for r in cli.ROLES})
+
+    assert cli._resume_paused_run(project.project, run_dir) == 1
+    err = capsys.readouterr().err
+    assert "cannot resume" in err and "bmad-loop-ctl" in err and "delete ctl" in err
+    assert killed == []  # the stale-session sweep never ran with the reserved name
 
 
 def test_resume_kills_stale_session_before_running(project, monkeypatch):
@@ -6833,11 +7044,24 @@ def test_dry_run_stories_unresolvable_absolute_folder_refused(project, monkeypat
 
 
 class _MuxStub:
-    """Selection-surface double (available/version only — `mux` needs no more)."""
+    """Selection-surface double (available/version/registry — all `mux` reads)."""
 
-    def __init__(self, avail=True, version=None, version_error=None):
+    def __init__(
+        self, avail=True, version=None, version_error=None, registry=None, namespaced=None
+    ):
         self._avail, self._version = avail, version
         self._version_error = version_error
+        self._registry = registry
+        # Same coupling as the bundled backends unless the test says otherwise:
+        # a root in force implies a namespace, no root implies none (tmux).
+        self._namespaced = (registry is not None) if namespaced is None else namespaced
+
+    def registry_root(self):
+        # Default None = "no registry namespace", the seam's tmux-shaped answer.
+        return self._registry
+
+    def has_registry_namespace(self):
+        return self._namespaced
 
     def available(self):
         return self._avail
@@ -10137,3 +10361,349 @@ def test_sweep_archive_pid_gate_refuses_before_any_lock(project, monkeypatch, ca
     assert rc == 1
     assert "may still be live" in capsys.readouterr().err
     assert acquired == []  # refused BEFORE any acquisition, not merely before the write
+
+
+# ------------------------------------------------- registry disclosure (#537)
+
+
+def test_main_exports_the_registry_root_before_dispatch(tmp_path, monkeypatch):
+    """The one chokepoint that both knows the project and precedes every psmux
+    spawn. Ablate the `runs.export_psmux_registry_root` call in `_configure_mux`
+    and the handler runs against whatever registry the launching shell had — the
+    cross-process failure the derivation exists to kill."""
+    monkeypatch.delenv(runs.PSMUX_DATA_DIR, raising=False)
+    seen = {}
+
+    def handler(args):
+        seen["root"] = os.environ.get(runs.PSMUX_DATA_DIR)
+        return 0
+
+    monkeypatch.setattr(cli, "cmd_list", handler)
+    assert cli.main(["list", "--project", str(tmp_path)]) == 0
+    assert seen["root"] == str(runs.mux_registry_root(tmp_path))
+
+
+def test_main_says_once_when_it_overrode_an_operators_registry(tmp_path, capsys, monkeypatch):
+    """Overriding a variable the operator set, silently, is how someone spends an
+    hour on a `psmux ls` that shows nothing. bmad-loop derives its registry root
+    unconditionally — an ambient value cannot be told apart from an inherited one,
+    nor a shell-local pin from a profile-wide one — so the override is real and
+    has to be said.
+
+    stderr, not stdout: the `--json` contract is one object on stdout and nothing
+    else (the `unverifiable_pid` precedent). Ablate the report in `_configure_mux`
+    and this fails while the override goes on happening."""
+    theirs = str(tmp_path / "their-own-registry")
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, theirs)
+    monkeypatch.setattr(cli, "cmd_list", lambda _args: 0)
+
+    assert cli.main(["list", "--project", str(tmp_path)]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert str(runs.mux_registry_root(tmp_path)) in captured.err
+    assert theirs in captured.err
+
+
+@pytest.mark.parametrize("ambient", ["derived", None])
+def test_main_stays_quiet_when_it_overrode_nothing(tmp_path, capsys, monkeypatch, ambient):
+    """The other half, and the one that keeps the note from becoming noise every
+    operator learns to ignore: nothing was displaced, so nothing is said. The
+    `derived` case is a pane child of this project's own session, which is the
+    ordinary way the variable is already set."""
+    if ambient is None:
+        monkeypatch.delenv(runs.PSMUX_DATA_DIR, raising=False)
+    else:
+        monkeypatch.setenv(runs.PSMUX_DATA_DIR, str(runs.mux_registry_root(tmp_path)))
+    monkeypatch.setattr(cli, "cmd_list", lambda _args: 0)
+
+    assert cli.main(["list", "--project", str(tmp_path)]) == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_main_warns_when_it_has_no_registry_of_its_own(tmp_path, capsys, monkeypatch):
+    """The arm an operator most needs told about, and the one the first version of
+    this report missed: no state root could be derived, so the export left their
+    `PSMUX_DATA_DIR` in force and every psmux verb this command runs addresses
+    THEIR registry. Silence there reads as "bmad-loop is using its own".
+
+    Ablate the `root is None` arm of the report in `_configure_mux` and this
+    fails."""
+    theirs = str(tmp_path / "their-own-registry")
+    monkeypatch.setenv(envvars.STATE_DIR, "relative-state-root")  # derivation fails
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, theirs)
+    monkeypatch.setattr(cli, "cmd_list", lambda _args: 0)
+
+    assert cli.main(["list", "--project", str(tmp_path)]) == 0
+    err = capsys.readouterr().err
+    assert theirs in err
+    assert envvars.STATE_DIR in err
+
+
+def test_main_warns_when_the_backend_is_left_on_its_default_registry(tmp_path, capsys, monkeypatch):
+    """The other degrade arm, which the first version of this report ALSO
+    missed: no state root, no ambient value — so nothing was exported and a
+    namespacing backend (psmux) runs on its own shared default registry. Silence
+    there reads as "bmad-loop is using its own registry" while every verb,
+    the kill path included, addresses the shared one.
+
+    Ablate the `namespaced` warning arm in `_configure_mux` and this fails."""
+    from bmad_loop.adapters import multiplexer as multiplexer_mod
+
+    class _Namespaced:
+        def has_registry_namespace(self):
+            return True
+
+    monkeypatch.setenv(envvars.STATE_DIR, "relative-state-root")  # derivation fails
+    monkeypatch.delenv(runs.PSMUX_DATA_DIR, raising=False)
+    monkeypatch.setattr(multiplexer_mod, "get_multiplexer", lambda: _Namespaced())
+    monkeypatch.setattr(cli, "cmd_list", lambda _args: 0)
+
+    assert cli.main(["list", "--project", str(tmp_path)]) == 0
+    err = capsys.readouterr().err
+    assert "default registry" in err
+    assert envvars.STATE_DIR in err
+
+
+def test_main_stays_quiet_on_a_namespace_less_backend_with_no_root(tmp_path, capsys, monkeypatch):
+    """The half that keeps the new warning from firing on every tmux host with a
+    broken state root: with no registry namespace there is no registry for the
+    degrade to have cost, and the failure surfaces where it actually bites."""
+    from bmad_loop.adapters import multiplexer as multiplexer_mod
+
+    class _NamespaceLess:
+        def has_registry_namespace(self):
+            return False
+
+    monkeypatch.setenv(envvars.STATE_DIR, "relative-state-root")  # derivation fails
+    monkeypatch.delenv(runs.PSMUX_DATA_DIR, raising=False)
+    monkeypatch.setattr(multiplexer_mod, "get_multiplexer", lambda: _NamespaceLess())
+    monkeypatch.setattr(cli, "cmd_list", lambda _args: 0)
+
+    assert cli.main(["list", "--project", str(tmp_path)]) == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_relay_is_not_given_a_registry_root(tmp_path, monkeypatch):
+    """`relay` dispatches ahead of `_configure_mux` by contract — it touches
+    neither mux nor policy, and a hook that exits non-zero is surfaced as a
+    failed tool call inside the session it is reporting for."""
+    monkeypatch.delenv(runs.PSMUX_DATA_DIR, raising=False)
+    monkeypatch.setattr(cli, "cmd_relay", lambda _args: 0)
+    assert cli.main(["relay", "Stop"]) == 0
+    assert runs.PSMUX_DATA_DIR not in os.environ
+
+
+def test_mux_discloses_the_registry_root(mux_registry, tmp_path, capsys, monkeypatch):
+    """An operator's bare `psmux ls` reads psmux's default registry and answers
+    "no sessions" for this project — not an error, just a lie by omission. The
+    root and a paste-ready export are what make that actionable."""
+    import sys as _sys
+
+    root = str(tmp_path / "reg")
+    mux_registry.register_multiplexer(
+        "alpha", lambda p: p == _sys.platform, lambda: _MuxStub(registry=root)
+    )
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, root)
+
+    assert cli.main(["mux", "--project", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    assert f"registry: {root}" in out
+    assert f"$env:{runs.PSMUX_DATA_DIR} = '{root}'" in out
+
+
+def test_mux_says_when_the_registry_is_not_the_derived_one(
+    mux_registry, tmp_path, capsys, monkeypatch
+):
+    """bmad-loop always derives, so a root that is NOT the derived one means the
+    export degraded — an underivable state root, where it leaves what it found
+    rather than inventing one. Reporting that as "derived" would mislead about
+    the single case an operator most needs told."""
+    import sys as _sys
+
+    theirs = str(tmp_path / "theirs")
+    mux_registry.register_multiplexer(
+        "alpha", lambda p: p == _sys.platform, lambda: _MuxStub(registry=theirs)
+    )
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, theirs)
+
+    assert cli.main(["mux", "--project", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    assert f"registry: {theirs} (NOT bmad-loop's" in out
+    assert "no state root could be derived" in out
+
+
+def test_mux_says_when_the_registry_was_derived(mux_registry, tmp_path, capsys, monkeypatch):
+    """The other half: a root matching the derivation is reported as derived, so
+    an operator can tell "bmad-loop put it here" from "your shell did"."""
+    import sys as _sys
+
+    derived = str(runs.mux_registry_root(tmp_path))
+    mux_registry.register_multiplexer(
+        "alpha", lambda p: p == _sys.platform, lambda: _MuxStub(registry=derived)
+    )
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, derived)
+
+    assert cli.main(["mux", "--project", str(tmp_path)]) == 0
+    assert f"registry: {derived} (derived from the project)" in capsys.readouterr().out
+
+
+def test_mux_says_nothing_about_a_registry_a_backend_does_not_have(mux_registry, tmp_path, capsys):
+    """tmux has no registry namespace; disclosing one would be an invention."""
+    import sys as _sys
+
+    mux_registry.register_multiplexer("alpha", lambda p: p == _sys.platform, _MuxStub)
+    assert cli.main(["mux", "--project", str(tmp_path)]) == 0
+    assert "registry:" not in capsys.readouterr().out
+
+
+def test_mux_names_the_shared_default_registry_when_no_root_is_in_force(
+    mux_registry, tmp_path, capsys, monkeypatch
+):
+    """A namespacing backend with no root in force is on its transport's shared
+    default registry — the one case `registry:` staying silent about would read
+    as "per-project as usual". Reachable when the export degrades on an
+    underivable state root with no ambient value set.
+
+    Ablate the `has_registry_namespace()` arm in `_print_registry` and this
+    fails."""
+    import sys as _sys
+
+    mux_registry.register_multiplexer(
+        "alpha", lambda p: p == _sys.platform, lambda: _MuxStub(namespaced=True)
+    )
+    monkeypatch.setenv(envvars.STATE_DIR, "relative-state-root")  # derivation fails
+    monkeypatch.delenv(runs.PSMUX_DATA_DIR, raising=False)
+
+    assert cli.main(["mux", "--project", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    assert "registry: the multiplexer's shared default" in out
+    assert envvars.STATE_DIR in out
+
+
+# --------------------------- registry disclosure, round 2 (#537)
+
+
+def test_mux_export_line_escapes_a_single_quote(mux_registry, tmp_path, capsys, monkeypatch):
+    """The line is printed as paste-ready, so it has to paste: a root under
+    `C:\\Users\\O'Brien\\...` ends its own single-quoted PowerShell literal unless
+    the quote is doubled. Ablate the `.replace` and this fails."""
+    import sys as _sys
+
+    root = str(tmp_path / "O'Brien" / "reg")
+    mux_registry.register_multiplexer(
+        "alpha", lambda p: p == _sys.platform, lambda: _MuxStub(registry=root)
+    )
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, root)
+
+    assert cli.main(["mux", "--project", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    export = next(line for line in out.splitlines() if "$env:" in line)
+    literal = export.split(" = ", 1)[1]
+    assert literal.startswith("'") and literal.endswith("'")
+    # The body of a single-quoted PowerShell literal holds only DOUBLED quotes;
+    # a lone one would terminate the string early.
+    assert "''" in literal and "'" not in literal[1:-1].replace("''", "")
+    # And it still round-trips to the real path.
+    assert literal[1:-1].replace("''", "'") == root
+
+
+def test_cleanup_names_what_the_migration_left_behind(project, capsys, monkeypatch):
+    """cleanup prints a removal count; a count that quietly excludes sessions the
+    migration pass declined to claim reads as "everything is clean". Ablate the
+    `_warn_legacy_leftovers` call and this fails."""
+    from bmad_loop.tui import launch
+
+    monkeypatch.setattr(runs, "prune_sessions", lambda _p, dry_run=False: ([], [], set()))
+    monkeypatch.setattr(
+        runs,
+        "legacy_registry_leftovers",
+        lambda _p, announced=(): ["bmad-loop-ctl", "bmad-loop-old-1"],
+    )
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
+
+    assert cli.main(["cleanup", "--project", str(project)]) == 0
+    err = capsys.readouterr().err
+    assert "not migrated" in err
+    assert "bmad-loop-ctl" in err and "bmad-loop-old-1" in err
+
+
+def test_cleanup_dry_run_previews_what_the_migration_would_leave_behind(
+    project, capsys, monkeypatch
+):
+    """A preview that omits the remainder would disagree with the run it previews."""
+    from bmad_loop.tui import launch
+
+    monkeypatch.setattr(runs, "prune_sessions", lambda _p, dry_run=False: ([], [], set()))
+    monkeypatch.setattr(
+        runs, "legacy_registry_leftovers", lambda _p, announced=(): ["bmad-loop-old-1"]
+    )
+    monkeypatch.setattr(launch, "prunable_ctl_windows", lambda _p: [])
+
+    assert cli.main(["cleanup", "--dry-run", "--project", str(project)]) == 0
+    assert "bmad-loop-old-1" in capsys.readouterr().err
+
+
+def test_cleanup_dry_run_hands_the_remainder_the_plan_it_printed(project, capsys, monkeypatch):
+    """The wiring, graded on its own, because the doubles above cannot grade it: a
+    parameter with a default absorbs a call site that stopped passing it, and both
+    the ablated and the wired build then return the same list.
+
+    `legacy_registry_leftovers` judges by presence, so on a dry run — where nothing
+    was killed — it has to be told which standing sessions this very command
+    already announced as would-kills, or the preview names them twice and reads as
+    "the migration declined these". It must be told by being *handed* the plan, not
+    by re-deriving it. Ablate `announced=killed if args.dry_run else ()` at the
+    call site and this fails.
+
+    A real cleanup hands over nothing: there, a killed session is gone from the
+    listing by presence, and one whose kill did not land must still be named."""
+    from bmad_loop.tui import launch
+
+    seen: list[object] = []
+    monkeypatch.setattr(runs, "prune_sessions", lambda _p, dry_run=False: (["old-1"], [], set()))
+
+    def _leftovers(_p, announced=()):
+        seen.append(sorted(announced))
+        return []
+
+    monkeypatch.setattr(runs, "legacy_registry_leftovers", _leftovers)
+    monkeypatch.setattr(launch, "prunable_ctl_windows", lambda _p: [])
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
+
+    assert cli.main(["cleanup", "--dry-run", "--project", str(project)]) == 0
+    assert seen == [["old-1"]]
+
+    seen.clear()
+    assert cli.main(["cleanup", "--project", str(project)]) == 0
+    assert seen == [[]]
+
+
+def test_cleanup_json_carries_the_remainder_and_leaves_stderr_empty(project, capsys, monkeypatch):
+    """The `unverifiable_pid` precedent: in --json mode the degradation travels in
+    the document, and stderr stays empty for a consumer reading both streams."""
+    from bmad_loop.tui import launch
+
+    monkeypatch.setattr(runs, "prune_sessions", lambda _p, dry_run=False: ([], [], set()))
+    monkeypatch.setattr(
+        runs, "legacy_registry_leftovers", lambda _p, announced=(): ["bmad-loop-old-1"]
+    )
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
+
+    assert cli.main(["cleanup", "--json", "--project", str(project)]) == 0
+    captured = capsys.readouterr()
+    doc = json.loads(captured.out)
+    assert doc["sessions"]["legacy_leftovers"] == ["bmad-loop-old-1"]
+    assert captured.err == ""
+
+
+def test_cleanup_says_nothing_about_a_registry_with_no_remainder(project, capsys, monkeypatch):
+    """Silence on the normal path — every platform without a registry namespace,
+    and every already-migrated machine."""
+    from bmad_loop.tui import launch
+
+    monkeypatch.setattr(runs, "prune_sessions", lambda _p, dry_run=False: ([], [], set()))
+    monkeypatch.setattr(runs, "legacy_registry_leftovers", lambda _p, announced=(): [])
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
+
+    assert cli.main(["cleanup", "--project", str(project)]) == 0
+    assert "not migrated" not in capsys.readouterr().err

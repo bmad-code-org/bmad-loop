@@ -1,8 +1,9 @@
 """`bmad-loop tui` application shell.
 
 Observer/launcher only: the TUI never runs engines in-process. Run control
-(r/s/e) launches detached bmad-loop processes in the bmad-loop-ctl tmux
-session via tui.launch. Dry runs are captured into a text modal; validate
+(r/s/e) launches detached bmad-loop processes in the control session via
+tui.launch (bmad-loop-ctl on tmux; a per-registry name on psmux, which the
+launch toasts print). Dry runs are captured into a text modal; validate
 renders its `--json` document into a findings modal (falling back to the text
 one), so the verdict is the document's `ok` rather than an exit code.
 The g binding opens the policy.toml settings editor.
@@ -313,7 +314,9 @@ class BmadLoopApp(App[None]):
             except launch.LaunchError as e:
                 self.notify(str(e), severity="error")
                 return
-            self.notify(f"run {run_id} launched (control session {launch.CTL_SESSION})")
+            self.notify(
+                f"run {run_id} launched (control session {launch.ctl_session(self.project)})"
+            )
             self._dashboard.expect_run(run_id)
 
         self._guarded(go)
@@ -346,7 +349,9 @@ class BmadLoopApp(App[None]):
             except launch.LaunchError as e:
                 self.notify(str(e), severity="error")
                 return
-            self.notify(f"sweep {run_id} launched (control session {launch.CTL_SESSION})")
+            self.notify(
+                f"sweep {run_id} launched (control session {launch.ctl_session(self.project)})"
+            )
             self._dashboard.expect_run(run_id)
 
         self._guarded(go)
@@ -454,14 +459,14 @@ class BmadLoopApp(App[None]):
         # live agent session, falling back to the ctl window between sessions.
         if win_id is not None and (self._dashboard.decision_pending is not None or not agent_live):
             launch.select_ctl_window_id(win_id)
-            self._attach_to_target(launch.ctl_target(), return_window=win_id)
+            self._attach_to_target(launch.ctl_target(self.project), return_window=win_id)
             return
         elif agent_live:
             target = runs.session_target(run_id)
         else:
             self.notify(
                 f"nothing to attach: no live agent session ({session}) and no "
-                f"{launch.CTL_SESSION} window for this run (runs started outside "
+                f"{launch.ctl_session(self.project)} window for this run (runs started outside "
                 "the TUI have none)",
                 severity="warning",
                 timeout=10,
@@ -563,7 +568,7 @@ class BmadLoopApp(App[None]):
                 severity="warning",
             )
         launch.select_ctl_window_id(win_id)
-        self._attach_to_target(launch.ctl_target(), return_window=win_id)
+        self._attach_to_target(launch.ctl_target(self.project), return_window=win_id)
 
     # -------------------------------------------------------- HITL pause review
 
@@ -759,7 +764,10 @@ class BmadLoopApp(App[None]):
     def _do_resume(self, run_id: str) -> None:
         """Resume a paused run — the `bmad-loop resume` / `e` path, minus the
         confirm modal (the viewer was the confirmation). Guards tmux + a
-        possibly-live engine so an approve/continue can't double-drive."""
+        possibly-live engine so an approve/continue can't double-drive. No
+        control-alias gate here: this path mutates nothing before the launch,
+        and the launcher itself refuses at the mutation's chokepoint
+        (`launch.start_detached`) — the LaunchError lands in the except below."""
         if self._mux_missing():
             return
         run_dir = self.project / RUNS_DIR / run_id
@@ -783,7 +791,9 @@ class BmadLoopApp(App[None]):
                 "attach/stop may target an older window for this run",
                 severity="warning",
             )
-        self.notify(f"resume of {run_id} launched (control session {launch.CTL_SESSION})")
+        self.notify(
+            f"resume of {run_id} launched (control session {launch.ctl_session(self.project)})"
+        )
 
     def _do_replan(self, run_id: str, spec_path: Path) -> None:
         """Request-replan: reset the planned spec to draft + strip its Auto Run
@@ -793,6 +803,11 @@ class BmadLoopApp(App[None]):
         # strip under a still-running session would race its writes (the rearm path
         # already checks liveness first; match it so replan can't corrupt a live
         # drive, and only then does _do_resume re-check before relaunching).
+        # The control-alias gate sits equally early: the child `bmad-loop resume`
+        # would refuse such a run anyway, and a spec rewritten ahead of that
+        # refusal is the mutate-then-refuse shape the CLI entry gates closed.
+        if self._blocked_by_control_alias(run_id):
+            return
         run_dir = self.project / RUNS_DIR / run_id
         if self._resolve_blocked_by_liveness(run_id, run_dir):
             return
@@ -857,6 +872,10 @@ class BmadLoopApp(App[None]):
     ) -> None:
         """Re-arm a resolved escalation + resume — the `resolve --no-interactive`
         path (rearm_escalation handles sentinel auto-delete-with-preservation)."""
+        # Ahead of rearm_escalation for the same reason cmd_resolve gates at
+        # entry: a run left re-armed-but-not-running by the child's refusal.
+        if self._blocked_by_control_alias(run_id):
+            return
         if self._resolve_blocked_by_liveness(run_id, run_dir):
             return
         # Same seam as `cli.cmd_resolve`, for the same reason and at the same moment:
@@ -939,6 +958,26 @@ class BmadLoopApp(App[None]):
     def _resolve_blocked_by_liveness(self, run_id: str, run_dir: Path) -> bool:
         if _engine_possibly_live(run_dir):
             self.notify(f"run {run_id} may still be live — stop it first", severity="warning")
+            return True
+        return False
+
+    def _blocked_by_control_alias(self, run_id: str) -> bool:
+        """Refuse to mutate persisted state for a run whose id aliases a
+        control session (`ctl`, `ctl-<16 hex>` — the CLI's resume/resolve
+        gates, mirrored): the launch it would end in is refused at the
+        mutation chokepoint (`launch.start_detached`), so a spec reset or an
+        escalation re-arm performed FIRST would strand the run in the mutated
+        state. Only the paths that mutate before launching need this —
+        `_do_replan` (spec draft-reset/strip) and `_do_rearm`
+        (rearm_escalation); plain resume/resolve mutate nothing early and are
+        covered by the launcher's own gate."""
+        if runs.run_id_aliases_control_session(run_id):
+            self.notify(
+                f"run {run_id}: its agent session name is the control session's own — "
+                "cannot be driven. Recover its work by hand, then `bmad-loop delete "
+                f"{run_id}`",
+                severity="error",
+            )
             return True
         return False
 
@@ -1238,8 +1277,23 @@ class BmadLoopApp(App[None]):
     @work(thread=True, group="lifecycle")
     def _cleanup_sessions_worker(self) -> None:
         # killed and unknown come from prune_sessions' single partition sample,
-        # so the warning below only ever names sessions that were actually pruned
-        killed, _live, unknown = runs.prune_sessions(self.project)
+        # so the warning below only ever names sessions that were actually pruned.
+        #
+        # Guarded for the same reason as the ctl-window arm below, with the
+        # opposite conclusion. This half is raiser-side too — the psmux backend
+        # refuses a registry root that would fail its pre-spawn absoluteness gate,
+        # and that raise is thrown before the tolerant listing wrapper can degrade
+        # it — and an escape from a worker thread takes the whole dashboard down
+        # (Textual's exit_on_error). Every CLI surface turns that same raise into
+        # one named error through main()'s backstop; a worker thread has none.
+        # But nothing has been killed yet, so there is no completed work to
+        # protect: toast and stop, rather than carry on reporting a sweep that
+        # never ran.
+        try:
+            killed, _live, unknown = runs.prune_sessions(self.project)
+        except (MultiplexerError, UnicodeError) as e:
+            self.call_from_thread(self.notify, f"session prune failed: {e}", severity="error")
+            return
         # prune_ctl_windows probes has_session on the shared ctl session, a
         # raiser-side call; on a worker thread the toast must be marshalled, and
         # notify() must not be called directly (see _mux_guarded — foreground only).
@@ -1261,6 +1315,20 @@ class BmadLoopApp(App[None]):
                 self.notify,
                 f"{len(unknown)} pruned session(s) had an unverifiable engine pid "
                 f"(may still be live): {', '.join(sorted(unknown))}",
+                severity="warning",
+            )
+        # The cli cleanup arm's stderr line, as a toast: the removal count below
+        # excludes sessions the migration pass declined to claim in a legacy
+        # registry, and a count that quietly excludes them reads as "all clean".
+        # Read after the prune, so it describes what is left standing. Silent on
+        # every platform without a registry namespace.
+        leftovers = runs.legacy_registry_leftovers(self.project)
+        if leftovers:
+            self.call_from_thread(
+                self.notify,
+                f"{len(leftovers)} session(s) left in the multiplexer's default "
+                f"registry (not migrated): {', '.join(leftovers)} — see "
+                "docs/multiplexer-backends.md before removing any of them",
                 severity="warning",
             )
         # A kill that did not verifiably land gets its own toast rather than a

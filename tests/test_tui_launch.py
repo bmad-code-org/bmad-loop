@@ -109,6 +109,9 @@ def test_start_run_detached_argv(fake_run, tmp_path: Path):
         "bmad-loop-ctl",
         "-c",
         str(tmp_path),
+        # no `-e` pairs: session env is not part of the released verb, and on
+        # tmux this ONE ctl session is shared by every project on the machine,
+        # so no single project's value could be right for its window 0 anyway.
     ]
 
     nw = fake_run.by_verb("new-window")[0]
@@ -650,6 +653,71 @@ def test_current_return_target_none_on_empty_pane(monkeypatch):
         lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, stdout="\n", stderr=""),
     )
     assert launch.current_return_target() is None
+
+
+def test_start_detached_uses_the_per_registry_ctl_name(tmp_path: Path, monkeypatch):
+    """On a namespacing transport the launcher creates and parks into the
+    per-registry control session (runs.ctl_session_for), never the fixed name:
+    psmux's duplicate-server mutex is keyed on the session name machine-wide,
+    so a second project minting the fixed `bmad-loop-ctl` is rejected as a
+    duplicate and its launch fails. The tmux half — the fixed name,
+    byte-identical argv — is pinned by test_start_run_detached_argv.
+
+    Ablate `runs.ctl_session_for` at `_ensure_ctl_session` / the parked-window
+    call (hardcode CTL_SESSION) and this fails."""
+
+    class _NamespacedStub:
+        def __init__(self):
+            self.created = []
+            self.parked = []
+
+        def has_registry_namespace(self):
+            return True
+
+        def has_session(self, name):
+            return False
+
+        def new_session(self, name, cwd, cols=None, lines=None):
+            self.created.append(name)
+
+        def new_parked_window(self, session, name, cwd, argv, return_opt):
+            self.parked.append((session, name))
+            return "@7"
+
+        def set_window_option(self, window, option, value):
+            pass
+
+    stub = _NamespacedStub()
+    monkeypatch.setattr(launch, "get_multiplexer", lambda: stub)
+    monkeypatch.setattr(launch, "mux_usable", lambda _m: True)
+
+    assert launch.start_detached(tmp_path, ["run"], "RID", "run") == "@7"
+    expected = runs.ctl_session_for(tmp_path, stub)
+    assert expected.startswith(runs.CTL_SESSION + "-")
+    assert stub.created == [expected]
+    assert stub.parked == [(expected, "run-RID")]
+
+
+@pytest.mark.parametrize(
+    "drive",
+    [
+        lambda p: launch.resume_detached(p, "ctl"),
+        lambda p: launch.start_resolve_detached(p, "ctl-0123456789abcdef"),
+        lambda p: launch.start_detached(p, ["resume"], "CTL", "resume"),
+    ],
+)
+def test_start_detached_refuses_a_control_alias_run(tmp_path: Path, drive):
+    """The convergence gate: every drive path — resume, resolve, and any
+    future button — mints its window and overwrites the ctl-window record
+    through `start_detached`, so the control-alias refusal lives there, not
+    per button (gating buttons kept finding the ungated fourth: resolve).
+    First, ahead of every mux probe, so no window is minted, no record
+    overwritten, and no child is launched only to bounce off the CLI gate.
+
+    Ablate the gate in `start_detached` and all three fail (with no mux
+    stubbed, the next probe raises a different LaunchError text)."""
+    with pytest.raises(launch.LaunchError, match="control session's own"):
+        drive(tmp_path)
 
 
 def test_start_detached_returns_window_id(fake_run, tmp_path: Path):
@@ -1524,6 +1592,137 @@ def test_prune_ctl_windows_skips_invalid_run_ids(monkeypatch, tmp_path: Path):
     assert killed == [["tmux", "kill-window", "-t", "@2"]]
 
 
+def test_prune_ctl_windows_reads_a_pre_upgrade_ctl_shaped_run_id(monkeypatch, tmp_path: Path):
+    """The sweep asks the PARSE question about a window that already exists,
+    never the mint's.
+
+    `--run-id ctl-foo` was accepted before the control-session shape was
+    reserved, so `run-ctl-foo` windows are parked in real control sessions
+    right now. `is_valid_run_id` — the mint-side predicate — refuses that id,
+    so borrowing it here leaked every such window out of `cleanup` and its
+    `--dry-run` forever: never listed, never closed, and no error anywhere.
+    `runs.is_parsable_run_id` asks what the name IS instead.
+
+    What stays excluded is the narrow alias shape (`ctl`, `ctl-<16 hex>`):
+    those ids are the ones a control session's own name can be, and the read
+    paths keep them out of run-shaped handling everywhere.
+
+    Ablate to `runs.is_valid_run_id` and the `run-ctl-foo` assertions fail;
+    drop the alias half of `is_parsable_run_id` and the `run-ctl` /
+    digest-shaped rows are pruned, failing the killed-argv assertion."""
+    from bmad_loop import runs
+
+    mine = runs.project_tag(tmp_path)
+    windows = (
+        f"@2\trun-ctl-foo\t{mine}\n"  # pre-upgrade run: a genuine parked window
+        f"@3\trun-ctl\t{mine}\n"  # aliases the fixed control session — skipped
+        f"@4\tsweep-ctl-0123456789abcdef\t{mine}\n"  # aliases a per-registry name
+        f"@5\trun-ctl-0123456789abcde\t{mine}\n"  # 15 hex: not a mintable ctl name
+    )
+    killed: list[list[str]] = []
+
+    def fake(argv, **kwargs):
+        verb = argv[1]
+        if verb == "has-session":
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        if verb == "display-message":  # current window is none of the rows
+            return subprocess.CompletedProcess(argv, 0, stdout="@1\n", stderr="")
+        if verb == "list-windows":
+            if argv[-1] == "#{window_id}":  # post-kill liveness: the kills landed
+                gone = {a[-1] for a in killed}
+                ids = [line.split("\t")[0] for line in windows.splitlines()]
+                return subprocess.CompletedProcess(
+                    argv, 0, stdout="\n".join(i for i in ids if i not in gone), stderr=""
+                )
+            return subprocess.CompletedProcess(argv, 0, stdout=windows, stderr="")
+        if verb == "kill-window":
+            killed.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setenv("TMUX", "/tmp/tmux-1000/default,123,0")
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    expected = ["run-ctl-foo", "run-ctl-0123456789abcde"]
+    assert launch.prunable_ctl_windows(tmp_path) == expected
+    assert launch.prune_ctl_windows(tmp_path) == (expected, [], [])
+    assert killed == [
+        ["tmux", "kill-window", "-t", "@2"],
+        ["tmux", "kill-window", "-t", "@5"],
+    ]
+
+
+class _NamespacedMux:
+    """Duck-typed namespacing backend recording every session name the launch
+    layer addresses. Only what the three ctl-name sites and their pre-gates
+    consult — a psmux-shaped transport with no psmux."""
+
+    def __init__(self, rows):
+        self._rows = rows
+        self.sessions: list[str] = []
+        self.killed: list[str] = []
+
+    def available(self):
+        return True
+
+    def has_registry_namespace(self):
+        return True
+
+    def has_session(self, session):
+        self.sessions.append(session)
+        return True
+
+    def target(self, session):
+        self.sessions.append(session)
+        return f"={session}"
+
+    def current_window_id(self):
+        return "@1"
+
+    def list_windows(self, session, fields):
+        self.sessions.append(session)
+        return list(self._rows)
+
+    def list_window_ids(self, session):
+        self.sessions.append(session)
+        return [w for w, _n, _t in self._rows if w not in self.killed]
+
+    def kill_window(self, win_id):
+        self.killed.append(win_id)
+
+
+def test_launch_addresses_the_per_registry_control_session(monkeypatch, tmp_path: Path):
+    """Every launch-layer read of the control session resolves its name through
+    `runs.ctl_session_for`, never the `CTL_SESSION` constant.
+
+    On a namespacing transport the name carries the registry digest, so a site
+    still spelling the constant addresses a session that does not exist there:
+    `list_windows` answers empty and attach reports "nothing to attach", while
+    the post-kill listing reads every candidate as removed — cleanup claims
+    windows it never closed. All three fail silently, which is why the constant
+    survived at these sites at all.
+
+    Ablate any one of `ctl_window_id`'s listing, `ctl_target`'s token, or
+    `prune_ctl_windows`' post-kill listing back to `runs.CTL_SESSION` and the
+    final assertion fails naming that call."""
+    from bmad_loop import runs
+
+    mine = runs.project_tag(tmp_path)
+    mux = _NamespacedMux([("@2", "run-20260101-000000-dead", mine)])
+    monkeypatch.setattr(launch, "get_multiplexer", lambda: mux)
+
+    expected = runs.ctl_session_for(tmp_path, mux)
+    # premise: the digest name is what this project's control session is called,
+    # and it is NOT the constant — without this the assertion below is vacuous
+    assert expected.startswith(runs.CTL_SESSION + "-") and expected != runs.CTL_SESSION
+
+    assert launch.ctl_window_id(tmp_path, "20260101-000000-dead") == "@2"
+    assert launch.ctl_target(tmp_path) == f"={expected}"
+    assert launch.prune_ctl_windows(tmp_path) == (["run-20260101-000000-dead"], [], [])
+
+    assert mux.sessions and set(mux.sessions) == {expected}
+
+
 def test_prune_ctl_windows_no_session(monkeypatch, tmp_path: Path):
     def fake(argv, **kwargs):  # has-session reports the ctl session is gone
         return subprocess.CompletedProcess(argv, 1, stdout="", stderr="")
@@ -1544,6 +1743,10 @@ def test_in_ctl_session(monkeypatch):
     # old direct TMUX sniff lives in the tmux backend's _display_message now —
     # see test_in_ctl_session_outside_tmux).
     monkeypatch.setattr(launch, "current_session", lambda: "bmad-loop-ctl")
+    assert launch.in_ctl_session() is True
+    # ...and a per-registry name (runs.ctl_session_for on a namespacing
+    # transport): the question is "am I in A control session".
+    monkeypatch.setattr(launch, "current_session", lambda: "bmad-loop-ctl-0123456789abcdef")
     assert launch.in_ctl_session() is True
     monkeypatch.setattr(launch, "current_session", lambda: "some-other-session")
     assert launch.in_ctl_session() is False

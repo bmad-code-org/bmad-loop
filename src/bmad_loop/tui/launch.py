@@ -1,9 +1,10 @@
 """Detached launching of bmad-loop commands for the TUI.
 
 The TUI never runs engines in-process: run/sweep/resume are launched in new
-windows of a dedicated tmux control session (bmad-loop-ctl) so they survive
-TUI exit, and the dashboard observes them through run-dir artifacts exactly
-like runs started from a plain shell. Fast read-only commands (validate,
+windows of a dedicated control session (bmad-loop-ctl on tmux, a per-registry
+name on psmux — see the CTL_SESSION comment below) so they survive TUI exit,
+and the dashboard observes them through run-dir artifacts exactly like runs
+started from a plain shell. Fast read-only commands (validate,
 --dry-run) are captured instead, for display in a modal.
 
 No textual imports here — everything drives the multiplexer seam (or a plain
@@ -21,7 +22,11 @@ from enum import StrEnum
 from pathlib import Path
 
 from .. import runs
-from ..adapters.multiplexer import MultiplexerError, get_multiplexer, mux_usable
+from ..adapters.multiplexer import (
+    MultiplexerError,
+    get_multiplexer,
+    mux_usable,
+)
 from ..journal import Journal
 from ..platform_util import (
     DIR_FD_ANCHORED_WRITES,
@@ -30,7 +35,17 @@ from ..platform_util import (
     open_dir_confined,
 )
 
-CTL_SESSION = "bmad-loop-ctl"
+CTL_SESSION = runs.CTL_SESSION
+# The control-session NAME is the transport's business, resolved per call
+# through `runs.ctl_session_for(project)`: the fixed name on tmux, where one
+# server serves the machine and the session really is machine-wide (scoped by
+# the per-window PROJECT_OPTION tag below), and a per-registry name on psmux,
+# whose duplicate-server mutex is keyed on the session name alone, across
+# every registry in the login session (`Local\` is a per-login-session object
+# namespace) — so a fixed name would let only ONE registry there hold a control
+# session and every other project's launch would fail as a duplicate.
+# The constant survives as the fixed base name (display fallbacks, tmux argv
+# pins); anything that addresses a live session resolves the name instead.
 
 # control-session windows are named <kind>-<run_id> (see start_detached)
 _CTL_WINDOW_RE = re.compile(r"^(?:run|sweep|resume|resolve)-(.+)$")
@@ -384,7 +399,7 @@ def ctl_window_id(project: Path, run_id: str) -> str | None:
     tagged: list[str] = []
     untagged: list[str] = []
     rows = get_multiplexer().list_windows(
-        CTL_SESSION, ["window_id", "window_name", runs.PROJECT_OPTION]
+        ctl_session(project), ["window_id", "window_name", runs.PROJECT_OPTION]
     )
     for win_id, name, tag in rows:
         # win_id can be "": psmux's qualifier passes a falsy id through. An
@@ -458,11 +473,11 @@ def ctl_window_recorded(project: Path, run_id: str, win_id: str) -> bool:
         return False
 
 
-def ctl_target() -> str:
-    """Seam-canonical target token for the control session; see
+def ctl_target(project: Path) -> str:
+    """Seam-canonical target token for this project's control session; see
     :meth:`TerminalMultiplexer.target`. Windows are targeted by stable id
     (ctl_window_id), never by name through this token."""
-    return get_multiplexer().target(CTL_SESSION)
+    return get_multiplexer().target(ctl_session(project))
 
 
 def select_ctl_window_id(window_id: str) -> None:
@@ -517,8 +532,12 @@ def in_ctl_session() -> bool:
     """True when we are running inside a control-session window (i.e. launched
     detached by the TUI), as opposed to a user's own shell. Backend-honest:
     current_session() is None whenever this process is not inside the selected
-    multiplexer, so no direct TMUX/HERDR_* env sniffing happens here."""
-    return current_session() == CTL_SESSION
+    multiplexer, so no direct TMUX/HERDR_* env sniffing happens here. The
+    shape predicate rather than one project's resolved name: the question its
+    callers ask is "am I in A control session", and on a namespacing transport
+    the name carries a registry suffix (runs.ctl_session_for)."""
+    session = current_session()
+    return session is not None and runs.is_ctl_session_name(session)
 
 
 def detach_client() -> bool:
@@ -641,7 +660,7 @@ def attach_plan(project: Path, run_id: str) -> tuple[list[str], str | None] | No
         decision_pending(runs.run_dir_for(project, run_id)) or not agent_live
     ):
         select_ctl_window_id(win_id)
-        return runs.attach_target_argv(ctl_target()), win_id
+        return runs.attach_target_argv(ctl_target(project)), win_id
     if agent_live:
         return runs.attach_target_argv(runs.session_target(run_id)), None
     return None
@@ -670,10 +689,11 @@ def _ctl_window_candidates(project: Path) -> list[tuple[str, str]]:
     directory under this project (mirrors runs.prunable_sessions).
     """
     mux = get_multiplexer()
-    if not mux_usable(mux) or not session_exists(CTL_SESSION):
+    ctl = runs.ctl_session_for(project, mux)
+    if not mux_usable(mux) or not session_exists(ctl):
         return []
     current = mux.current_window_id()
-    rows = mux.list_windows(CTL_SESSION, ["window_id", "window_name", runs.PROJECT_OPTION])
+    rows = mux.list_windows(ctl, ["window_id", "window_name", runs.PROJECT_OPTION])
     mine = runs.accepted_tags(project)
     candidates: list[tuple[str, str]] = []
     for win_id, name, tag in rows:
@@ -682,8 +702,12 @@ def _ctl_window_candidates(project: Path) -> list[tuple[str, str]]:
         m = _CTL_WINDOW_RE.match(name)
         if m is None:
             continue  # not a run window (e.g. the session's initial shell)
-        if not runs.is_valid_run_id(m.group(1)):
-            continue  # a foreign/mangled window name must not steer a run-dir path
+        if not runs.is_parsable_run_id(m.group(1)):
+            # A foreign/mangled window name must not steer a run-dir path. The
+            # PARSE-side predicate: this window already exists, so the mint's
+            # broad ctl reservation would leak every pre-upgrade `run-ctl-*`
+            # window out of the sweep instead of closing it.
+            continue
         run_dir = runs.run_dir_for(project, m.group(1))
         if tag:
             if tag not in mine:
@@ -756,7 +780,7 @@ def prune_ctl_windows(project: Path) -> tuple[list[str], list[str], list[str]]:
         except UnicodeError:
             pass
     try:
-        live = set(mux.list_window_ids(CTL_SESSION))
+        live = set(mux.list_window_ids(runs.ctl_session_for(project, mux)))
     except MultiplexerError:
         # The kills may well have landed; nothing here can say so. Claiming the
         # optimistic half is exactly the bug — the next cleanup pass retries.
@@ -766,18 +790,26 @@ def prune_ctl_windows(project: Path) -> tuple[list[str], list[str], list[str]]:
     return removed, survived, []
 
 
-def _ensure_ctl_session(project: Path) -> None:
+def ctl_session(project: Path) -> str:
+    """The control-session name for this project on the selected transport
+    (see `runs.ctl_session_for`). The TUI-facing spelling, so `tui/app.py`
+    and the screens name the session an operator would actually attach to."""
+    return runs.ctl_session_for(project, get_multiplexer())
+
+
+def _ensure_ctl_session(project: Path) -> str:
     mux = get_multiplexer()
+    name = runs.ctl_session_for(project, mux)
     # has_session is raiser-side (a server-backed backend can fail the probe after
     # the availability pre-gate). Keep it inside the try so a transport failure
     # converts to LaunchError, which the TUI launch/resume/resolve handlers already
     # catch — otherwise the raw MultiplexerError slips past them and crashes the app.
     try:
-        if mux.has_session(CTL_SESSION):
-            return
-        mux.new_session(CTL_SESSION, project)
+        if not mux.has_session(name):
+            mux.new_session(name, project)
     except MultiplexerError as e:
         raise LaunchError(f"multiplexer ctl-session setup failed: {e}") from e
+    return name
 
 
 def cli_argv(*tail: str) -> list[str]:
@@ -799,18 +831,31 @@ def start_detached(project: Path, argv_tail: list[str], run_id: str, kind: str) 
     names collide when several kinds share a run_id). The same id is recorded in
     the run dir so ctl_window_id answers this window rather than an older one
     under the same run id — see _record_ctl_window.
+
+    Refuses a run id that aliases a control session, FIRST — this is the one
+    place every drive path converges on the mutation (the window mint and the
+    ctl-window record overwrite): run/sweep launches with freshly validated
+    ids, and resume/resolve replaying ids an older release persisted. Gating
+    each button separately kept finding the path nobody gated (resolve was
+    the fourth); gating the mutation cannot. Ahead of the mux probes so the
+    refusal needs no transport to be phrased.
     """
+    if runs.run_id_aliases_control_session(run_id):
+        raise LaunchError(
+            f"run {run_id}: its agent session name is the control session's own — "
+            f"cannot be driven. Recover its work by hand, then `bmad-loop delete {run_id}`"
+        )
     mux = get_multiplexer()
     if not mux_usable(mux):
         raise LaunchError(
             "multiplexer backend unavailable (binary missing, version unsupported, "
             "or a required helper absent)"
         )
-    _ensure_ctl_session(project)
+    ctl = _ensure_ctl_session(project)
     try:
         win_id = (
             mux.new_parked_window(
-                CTL_SESSION,
+                ctl,
                 f"{kind}-{run_id}",
                 project,
                 cli_argv(*argv_tail),

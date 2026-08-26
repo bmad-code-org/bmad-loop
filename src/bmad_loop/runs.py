@@ -15,12 +15,18 @@ import stat
 import sys
 import tarfile
 import time
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
 from . import devcontract, envvars, verify
-from .adapters.multiplexer import MultiplexerError, get_multiplexer, mux_usable
+from .adapters.multiplexer import (
+    MultiplexerError,
+    TerminalMultiplexer,
+    get_multiplexer,
+    mux_usable,
+)
 from .frontmatter import auto_dev_baseline_of, parse_frontmatter, status_of
 from .journal import STATE_FILE, VERIFY_DIR, Journal, load_state, save_state
 from .model import PAUSE_ESCALATION, Phase, RunState, StoryTask
@@ -41,6 +47,18 @@ from .platform_util import (
 )
 from .process_host import ProcessHostError, get_process_host
 
+# The multiplexer registry's directory name inside a project's state subtree (see
+# `mux_registry_root`). It sits beside the run entries and must never BE one: the
+# leading underscore is what makes that structural, since `RUN_ID_RE` requires an
+# alphanumeric first character, so no `--run-id` can key its state dir onto the
+# registry. That is also what lets the orphan-state sweep tell the two apart by
+# name alone (see `reconcile_orphan_state_dirs`).
+MUX_REGISTRY_DIR = "_mux"
+# psmux's own registry-root variable. Named here, in transport-agnostic code, for
+# the same reason `PROJECT_OPTION` is: the export has to happen ahead of backend
+# selection, which probes a subprocess, so it cannot be routed through a backend
+# instance. See `export_psmux_registry_root`.
+PSMUX_DATA_DIR = "PSMUX_DATA_DIR"
 RUNS_DIR = Path(".bmad-loop") / "runs"
 ARCHIVE_DIR = Path(".bmad-loop") / "archive"
 PID_FILE = "engine.pid"
@@ -130,12 +148,104 @@ def is_valid_run_id(value: str) -> bool:
     The length cap is ``platform_util.MAX_SEGMENT``: a run id is a directory name.
     The ``safe_segment`` identity check adds the one rule ``RUN_ID_RE`` cannot
     express — the reserved Windows device basenames (``CON``, ``NUL``, ``COM1``…),
-    which are legal-looking ids that no filesystem will accept as a directory."""
+    which are legal-looking ids that no filesystem will accept as a directory.
+
+    The control-session shape (``ctl``, ``ctl-…``, any letter case) is reserved
+    on the same principle, against the multiplexer namespace instead of the
+    filesystem's — see :func:`is_reserved_run_id` for the shape and why case is
+    folded. Refusing the id here is what makes the two session namespaces
+    disjoint: every agent session is ``bmad-loop-<valid id>``, so none can
+    reach the control session's name."""
+    return _wellformed_run_id(value) and not is_reserved_run_id(value)
+
+
+def _wellformed_run_id(value: str) -> bool:
+    """The shape half of :func:`is_valid_run_id`: charset, length, and the
+    reserved-device-basename identity check — everything except the
+    control-session reservation. Split out because the *parse* side
+    (:func:`_agent_run_id`) must accept ids the *mint* refuses: a run
+    persisted by an older release under e.g. ``ctl-foo`` owns a genuine
+    ``bmad-loop-ctl-foo`` agent session that the sweep has to be able to
+    reach."""
     return (
         bool(RUN_ID_RE.fullmatch(value))
         and len(value) <= MAX_SEGMENT
         and safe_segment(value) == value
     )
+
+
+def is_reserved_run_id(value: str) -> bool:
+    """The MINT-side reservation: any id of the control-session shape (``ctl``
+    or ``ctl-…``, any letter case) is refused at :func:`is_valid_run_id`.
+    Deliberately broader than :func:`run_id_aliases_control_session` — a new id
+    anywhere near the control namespace buys nothing but confusion, so none is
+    admitted — while the read paths, which must handle ids an older release
+    already persisted, use the narrow test. ``RUN_ID_RE`` is ASCII-only, so
+    ``str.lower`` is the exact fold (see the narrow test for why case folds at
+    all)."""
+    v = value.lower()
+    return v == "ctl" or v.startswith("ctl-")
+
+
+def run_id_aliases_control_session(value: str) -> bool:
+    """True when ``session_name(value)`` names a session that can BE a live
+    control session: the fixed name (id ``ctl``) or a per-registry digest name
+    (id ``ctl-<16 hex>`` — the only suffix :func:`ctl_session_for` can mint).
+    The adapter's ensure-session would *adopt* that live session as the run's
+    own, and the run's teardown would kill the whole control session, every
+    parked window of every run in it — so the project-free READ paths key on
+    this: :func:`kill_session` skips such an id, :func:`_agent_run_id`
+    refuses to read such a session as a run, and ``cli``/the TUI refuse to
+    resume/re-arm/replan such a run. This is the SHAPE question — "could
+    this name be a control session's on some registry" — and it must stay
+    out of any site asking the *instance* question ("is it the control
+    session this process addresses"): :func:`live_session_may_be_ours`
+    compares against the actual names (the fixed one plus this project's
+    :func:`ctl_session_for`), because discounting the whole shape there
+    destroyed run dirs under live `ctl-<other digest>` agents on tmux.
+
+    Compared **case-insensitively**: psmux resolves a session by opening
+    ``<data dir>\\<name>.port`` by name (``src/paths.rs:113``, source-read at
+    v3.3.8), and NTFS opens names case-insensitively — measured: with
+    ``bmad-loop-ctl-x`` live, target ``bmad-loop-CTL-x`` answers
+    ``has-session``, is refused as a duplicate by ``new-session``, and a kill
+    through it takes the lowercase session down.
+
+    Deliberately narrower than :func:`is_reserved_run_id`: a historical
+    ``ctl-foo`` run's session is a GENUINE agent session, distinct from every
+    control session and addressable exactly and safely (tmux: measured, the
+    exact full target removes only it; our seam sends ``=``-exact targets —
+    ``tmux_base.py:141,166``, source-read. psmux: exact port files, case
+    aside). Skipping those too made such runs unreachable by ``stop`` and
+    ``cleanup`` both. Ceiling, named: an id of exactly the digest shape whose
+    hex is NOT the current registry's digest is also skipped — undecidable
+    without the project in hand, and the leak direction (one stale session
+    left standing) is the safe one."""
+    return is_ctl_session_name(session_name(value).lower())
+
+
+def is_parsable_run_id(value: str) -> bool:
+    """The PARSE-side counterpart of :func:`is_valid_run_id`: may an id
+    recovered from an existing multiplexer name be acted on as a run?
+
+    The two questions are different and must never share a predicate.
+    :func:`is_valid_run_id` answers "may a NEW id be this", so it carries the
+    mint's broad ctl reservation (:func:`is_reserved_run_id`) — and a reader
+    that borrows it stops recognising every id an older release already
+    persisted. A ``ctl-foo`` run minted before that reservation owns a real
+    run dir and a real ``run-ctl-foo`` control-session window; asking the
+    mint's question about them leaks both, unreachable by the sweep forever.
+
+    So: the shape half (:func:`_wellformed_run_id` — charset, length, and the
+    reserved-device-basename check, because the id still steers a run-dir
+    path) minus only the narrow alias test
+    (:func:`run_id_aliases_control_session`), which the read paths key on
+    because reading one of THOSE as a run points a kill path at the control
+    plane. Exactly :func:`_agent_run_id`'s guard, public so the other parse
+    sites ask it instead of re-deriving it — the ctl-window sweep in
+    ``tui.launch`` did borrow the mint's, and parked pre-upgrade windows
+    leaked from ``cleanup`` because of it."""
+    return _wellformed_run_id(value) and not run_id_aliases_control_session(value)
 
 
 def list_run_dirs(project: Path) -> list[Path]:
@@ -364,6 +474,183 @@ def project_state_root(project: Path) -> Path:
     path — see :func:`reconcile_orphan_state_dirs`, whose whole job is the entries
     under here that no longer have a run dir."""
     return state_root() / project_tag(project)
+
+
+def mux_registry_root(project: Path) -> Path:
+    """This project's terminal-multiplexer registry root:
+    ``<state root>/<project key>/_mux`` (see :data:`MUX_REGISTRY_DIR`).
+
+    A *registry* is the directory a multiplexer keeps its per-session addressing
+    state in — psmux writes one ``.port``/``.key``/``.sid``/``.pid`` quartet per
+    session under ``PSMUX_DATA_DIR`` (default ``%USERPROFILE%\\.psmux``), and
+    every verb resolves a session by reading that quartet back. Two processes
+    that disagree about the root therefore disagree about which sessions exist,
+    which is why the root is *derived* — from the project, through the same
+    :func:`project_tag` every ownership tag already uses — rather than minted per
+    run, read from a file, or taken from whatever the launching shell exported.
+    See :func:`export_psmux_registry_root` for the export and its rules.
+
+    Keyed on the project rather than on bmad-loop as a whole so a prune bug in
+    one project cannot address another project's servers at all: the partition
+    becomes structural instead of a filter (the ``@bmad_project`` tag stays, as
+    the tmux-side answer and the belt). The price is that one ``psmux ls`` no
+    longer shows every bmad-loop session on the machine — stated for the operator
+    in ``docs/multiplexer-backends.md`` and printed by ``bmad-loop mux``.
+
+    Under :func:`state_root` and not in the project tree, deliberately: a branch
+    switch or a rollback that deleted a ``.port`` file would leave the server
+    alive, unreachable, and invisible to ``psmux ls`` in *any* registry — a
+    manufactured orphan. Same doctrine :func:`state_root` itself exists for.
+    """
+    return project_state_root(project) / MUX_REGISTRY_DIR
+
+
+def export_psmux_registry_root(project: Path) -> str | None:
+    """Point this process — and everything it spawns — at ``project``'s registry
+    by exporting ``PSMUX_DATA_DIR``. Returns the value in force afterwards, or
+    ``None`` when no root could be derived.
+
+    **The process environment, not a per-call argument.** The seam spawns every
+    psmux verb through ``BaseTmuxBackend._run``, whose ``env=None`` default means
+    *inherit this process's environment*, and a create-call-only injection is
+    worse than none: the session's server would come up under a root every later
+    ``has_session`` / ``list_window_ids`` cannot see, and those verbs report an
+    unreadable registry as ``False`` / ``[]`` — a live run reading itself as gone.
+    One export ahead of dispatch covers every verb in-process.
+
+    **The root is always derived, and an ambient value never changes it.** That
+    is the whole rule, and the absence of an exception is the point:
+    :func:`mux_registry_root` is a pure function of (project, state root), so any
+    two bmad-loop processes given the same project and the same state root agree
+    — which is the entire property #537 exists to establish. A value already in
+    the environment is *overridden*, and the caller says so
+    (:func:`cli._configure_mux` reports it once on stderr; ``bmad-loop mux``
+    discloses it).
+
+    **Why an operator's own ``PSMUX_DATA_DIR`` is not honoured**, since honouring
+    it is the obvious kindness and it was tried:
+
+    - It would make the registry a function of the launch *shell*. A TUI started
+      from the Start menu carries no profile environment and derives; a run
+      started from a dev shell whose profile exports a root honours that root.
+      Two registries on one machine, and a live session reading as gone in one of
+      them — which is the failure this module exists to prevent, not a corner of
+      it.
+    - Whether honouring is even the right answer is unknowable from here. A
+      process that finds a root in its environment cannot tell one the operator
+      typed once in *this* shell — where a clean sibling process would derive —
+      from one their profile exports into *every* shell, where a clean sibling
+      honours it. The two produce byte-identical environments and want opposite
+      answers, so no comparison settles it: the missing fact is the operator's
+      intent, and it is not in the environment.
+    - It contradicts the promise made beside it. ``BMAD_LOOP_STATE_DIR``'s
+      documentation says there is deliberately no second variable naming the
+      registry, because "two knobs that can disagree would put two processes on
+      different registries, each blind to the other's live sessions". An ambient
+      ``PSMUX_DATA_DIR`` is exactly that second knob.
+
+    Overridden rather than *refused*, deliberately: ``PSMUX_DATA_DIR`` is psmux's
+    variable, and an operator may have it set for their own sessions with no
+    thought of bmad-loop at all. Erroring out of every command on such a machine
+    would be bmad-loop claiming a name it does not own. The remedy runs the other
+    way and ``bmad-loop mux`` prints it ready to paste: point *your* shell at
+    bmad-loop's root, which is a function of the project rather than of whichever
+    shell happened to launch something.
+
+    Wanting one registry to serve both is a real request and is deliberately not
+    answered here. It needs a stated operator preference rather than a guess at
+    one — and it must be a policy *whether*, never a *where*: ``policy.toml`` is
+    written by the sessions this orchestrator drives, so a policy-sourced root
+    would let a driven session choose which registry the cleanup path kills in.
+
+    **No ``BMAD_LOOP_*`` knob for the root either.** It is derived state, not
+    configuration; ``BMAD_LOOP_STATE_DIR`` already relocates it transitively —
+    one knob, one cascade, instead of two that can disagree. And ``envvars.py``
+    gains no entry for ``PSMUX_DATA_DIR`` itself: that module is scoped to
+    ``BMAD_LOOP_*`` names and this is psmux's own, unregistered on the same
+    precedent as ``PSMUX_ALLOW_NESTING``.
+
+    **No root travels between processes.** Because every bmad-loop process
+    derives its own root, nothing about a registry has to be transported at
+    all. What does have to travel is the *state root*: coding-CLI windows are
+    told it explicitly through their env dict (:func:`pinned_state_env`), and
+    everything else — a session's window-0 shell, the TUI's parked engine
+    windows — inherits it, as it always has. psmux's ``PSMUX_BARE_ENV=1`` mode
+    breaks that inheritance and is **not supported**: the psmux backend warns
+    once per process when it is on (see ``PsmuxMultiplexer._warn_if_bare_env``).
+
+    Never raises. This runs ahead of *every* command, ``diagnose`` and
+    ``validate`` included, and an underivable state root must not take the
+    diagnostics down with it. ``None`` means "no root established": psmux keeps
+    whatever it had, which is also the root cleanup sweeps as the legacy one.
+    """
+    try:
+        root = str(mux_registry_root(project))
+    except (StateRootError, OSError, RuntimeError):
+        # OSError/RuntimeError: project_tag resolves the project, which raises on
+        # a path the OS cannot canonicalize and, below 3.13, on a symlink loop.
+        # The ambient value is left exactly as found — there is nothing better to
+        # put there, and PsmuxMultiplexer._run still refuses to spawn under a
+        # value psmux would panic on.
+        return None
+    os.environ[PSMUX_DATA_DIR] = root
+    return root
+
+
+def pinned_state_env() -> dict[str, str]:
+    """``{BMAD_LOOP_STATE_DIR: <this process's state root>}``, for a child that
+    must land on the same one — or ``{}`` when no root can be derived.
+
+    A convenience spelling of :func:`pin_state_root` over an empty dict, for
+    composing env dicts (the engine's session env spreads it in). The final
+    merge before a window launch goes through :func:`pin_state_root` itself —
+    a spread of this dict is only an ordering guarantee, and ordering
+    guarantees nothing when the dict is ``{}``.
+
+    **Resolved, never forwarded.** Passing this only when the operator set it
+    would leave exactly the default case broken, which is the common one. What
+    travels is the answer this process reached, however it reached it.
+
+    What follows the state root, and what does not, since the two are easy to
+    swap: the run's control plane (:func:`state_dir_for`), its event channel
+    (:func:`events_dir_for`) and the multiplexer registry
+    (:func:`mux_registry_root`) all live under it, so a child computing a
+    different root writes and reads where nothing else looks. The run *directory*
+    does not — :func:`run_dir_for` is in-tree at ``<project>/.bmad-loop/runs``
+    and moves with the project, not with this.
+
+    ``{}`` rather than a raise: a child told nothing derives its own answer and
+    fails on the same broken environment with its own message, which is better
+    than a launcher that cannot report anything at all.
+    """
+    return pin_state_root({})
+
+
+def pin_state_root(env: Mapping[str, str]) -> dict[str, str]:
+    """``env`` with its ``BMAD_LOOP_STATE_DIR`` entry forced to this process's
+    own answer: **set** to the resolved state root when one derives, **removed**
+    when none does. Other keys pass through untouched.
+
+    The chokepoint for every merge where a caller-supplied env (a profile's
+    ``[env]`` table rides those dicts) meets the state-root pin — the engine's
+    coding-CLI window, the probe window, and the attached resolve session. A
+    "pin spreads last" ordering rule is not enough, because with an underivable
+    state root there is no pin key to order: :func:`pinned_state_env` is ``{}``
+    and a profile-declared absolute root would sail through, aiming the window
+    at a state root — and so a per-project registry — its own parent cannot
+    see. Removing the key instead makes the child inherit the parent's own
+    (broken) value and fail exactly as the parent fails: whatever a child
+    concludes is what a clean process under the same conditions concludes, in
+    the error arm too. The strip governs only what bmad-loop *adds* to a
+    child; a value already in the environment a child inherits is not
+    scrubbed here.
+    """
+    pinned = dict(env)
+    try:
+        pinned[envvars.STATE_DIR] = str(state_root())
+    except StateRootError:
+        pinned.pop(envvars.STATE_DIR, None)
+    return pinned
 
 
 def state_dir_for(project: Path, run_id: str) -> Path:
@@ -866,14 +1153,133 @@ def discover_runs(project: Path) -> list[RunInfo]:
 # ----------------------------------------------------------- stop / delete / archive
 
 
-def kill_session(run_id: str) -> None:
+def kill_session(run_id: str, mux: TerminalMultiplexer | None = None) -> None:
     """Kill a run's agent session (bmad-loop-<id>); a no-op when it is already
-    gone or the multiplexer is unavailable."""
-    get_multiplexer().kill_session(session_name(run_id))
+    gone or the multiplexer is unavailable.
+
+    Also a no-op for an id that **aliases a control session**
+    (:func:`run_id_aliases_control_session` — ``ctl`` or ``ctl-<16 hex>``,
+    case-folded): the only session such a name can address is the control
+    plane, every parked window of every run in it. Unreachable through
+    minting (validation refuses the shape) but reachable through what an
+    **older release persisted**: a run dir named ``ctl`` that `stop`,
+    `delete` or a resume's stale-session sweep replays as a kill target.
+    This chokepoint keeps those read paths safe — and usable as the
+    operator's way out of such a run — without each caller re-deriving the
+    rule.
+
+    The narrow test, not the mint's broad reservation, deliberately: a
+    historical ``ctl-foo`` run DOES own an agent session of its own
+    (``bmad-loop-ctl-foo``, distinct from every control session and killed
+    exactly — the seam sends ``=``-exact tmux targets, and psmux resolves
+    exact port files), and skipping its kill stranded it: the prune already
+    could not reach it, so nothing could. Scope, stated: the kill addresses
+    the registry THIS process addresses — a pre-upgrade session left in
+    psmux's old default registry is not reachable from here (measured), and
+    deliberately so: a by-name kill in a shared registry without tag proof
+    could take another project's same-named session (run ids are unique per
+    project only). The legacy sweep in :func:`prune_sessions`, which does
+    demand the tag, is the path that reaches it."""
+    if run_id_aliases_control_session(run_id):
+        return
+    (mux or get_multiplexer()).kill_session(session_name(run_id))
 
 
 CTL_SESSION = "bmad-loop-ctl"
 _SESSION_PREFIX = "bmad-loop-"
+
+
+def ctl_session_for(project: Path, mux: TerminalMultiplexer | None = None) -> str:
+    """The control-session name this project's launches and lookups share.
+
+    On a transport with no registry namespace (tmux) it is the fixed
+    :data:`CTL_SESSION`, machine-shared as it has always been. On a namespacing
+    transport (psmux) the name carries the registry's identity — a 16-hex
+    digest of the derived registry root — because the two scopes genuinely
+    differ: the session lives *per registry*, but psmux's duplicate-server
+    guard is a mutex keyed on the session name alone, across every registry
+    in the **login session** (``Local\\psmux-session-{name}`` over
+    ``port_file_base()`` — the ``Local\\`` kernel-object namespace is
+    per-login-session, not machine-global; ``server/mod.rs:853`` /
+    ``platform.rs:346`` / ``types.rs:1345``, source-read at v3.3.8 —
+    ``PSMUX_DATA_DIR`` never enters it). A fixed name therefore admits ONE
+    control session across every registry a desktop session can reach,
+    and the second project's create is rejected as a duplicate server — its
+    TUI launch fails instead of minting its own session (measured: a second
+    registry answers ``new-session`` rc 1 for the fixed name while the first
+    registry's server lives, and rc 0 for a per-registry name).
+
+    The digest is over ``mux_registry_root(project)`` **resolved**: the name
+    must be unique per *physical* registry, and the resolved path is that
+    registry's identity — (project, state root), both axes; ``project_tag``
+    alone would recreate the collision for one project under two state roots.
+    Resolved rather than as spelled because two spellings of one state root
+    (``C:\\work\\state`` vs ``C:\\work\\alias\\..\\state``) reach **one**
+    registry — Windows resolves both to the same files, and psmux keeps the
+    spelling only while constructing those paths (``src/paths.rs:79``,
+    source-read at v3.3.8; convergence measured) — so an as-spelled digest
+    minted two control sessions inside one registry, each blind to the other's
+    parked windows: the split-control-plane failure again, one level up. Same
+    rule ``project_tag`` already states: resolve *before* digesting.
+
+    …and then ``os.path.normcase``, because ``resolve()`` can only return the
+    filesystem's stored case for a path that **exists**, and the registry
+    root usually does not yet exist at the moment the name is needed (psmux
+    ``create_dir_all``\\s it at first spawn). Two case spellings of a
+    not-yet-created state root resolve to two strings, digest to two names —
+    and then land in ONE physical registry, because NTFS folds case when
+    psmux opens the ``.port`` files (measured). ``normcase`` folds exactly
+    where the filesystem does: it lowercases on Windows and is the identity
+    on POSIX, where case is significant and two case spellings ARE two
+    registries — folding there would merge genuinely distinct roots.
+    Ceiling, named: ``normcase`` lowercases with ``str.lower``, which can
+    disagree with NTFS's own fold table for a few non-ASCII case pairs; a
+    state root spelled in two such casings of the same non-ASCII name stays
+    split, as it is for every other digest of an operator-supplied path.
+
+    The degrade arm (namespaced transport, underivable state root) answers
+    the fixed name: that arm runs on the transport's shared default registry,
+    where a shared session scoped by per-window project tags is the correct,
+    tmux-shaped semantic — and where a pre-#537 legacy ctl session under the
+    fixed name may exist to be reused rather than collided with.
+    """
+    mux = mux or get_multiplexer()
+    if not mux.has_registry_namespace():
+        return CTL_SESSION
+    try:
+        scope = os.path.normcase(str(mux_registry_root(project).resolve()))
+    except (StateRootError, OSError, RuntimeError):
+        return CTL_SESSION
+    return f"{CTL_SESSION}-{hashlib.sha256(os.fsencode(scope)).hexdigest()[:16]}"
+
+
+def is_ctl_session_name(name: str) -> bool:
+    """Whether ``name`` is a control session's name — the fixed
+    :data:`CTL_SESSION`, or ``bmad-loop-ctl-<16 hex>``, the ONE suffix shape
+    :func:`ctl_session_for` can mint.
+
+    The shape predicate exists because several readers ask "is this A control
+    session" without a project in hand: the agent-session parser must exclude
+    ctl sessions (``bmad-loop-ctl-<16hex>`` would otherwise parse as run id
+    ``ctl-<16hex>``, which ``RUN_ID_RE`` admits), the legacy-leftovers reader
+    names a surviving ctl session in a registry this process did not derive,
+    and ``in_ctl_session`` classifies whatever session this process woke up
+    inside.
+
+    Exactly the mintable shapes, no wider: an arbitrary suffix
+    (``bmad-loop-ctl-foo``) is NOT a control session — it is the agent
+    session of a run an older release accepted as ``--run-id ctl-foo``, and
+    reading it as a control session made it unreachable by ``stop`` and the
+    prune both. No agent session of OURS can match this predicate:
+    :func:`is_valid_run_id` refuses every ctl-shaped id at the mint (broad —
+    :func:`is_reserved_run_id`), so a matching name is either genuinely a
+    control session or hand-made to look like one — and the hand-made
+    16-hex-suffixed case stays unprunable, the leak direction."""
+    if name == CTL_SESSION:
+        return True
+    suffix = name.removeprefix(CTL_SESSION + "-")
+    return suffix != name and len(suffix) == 16 and all(c in "0123456789abcdef" for c in suffix)
+
 
 # tmux user option stamping a session/window with the project it belongs to, so
 # a prune in one project never touches another project's live runs. See
@@ -975,13 +1381,33 @@ def session_project_tags() -> dict[str, str]:
     return get_multiplexer().session_options(PROJECT_OPTION)
 
 
-def prunable_sessions(project: Path) -> tuple[list[str], list[str], set[str]]:
+def _agent_run_id(session: str) -> str | None:
+    """The run id behind a ``bmad-loop-<id>`` agent session name, or ``None`` when
+    the name is not one: the control session, a foreign session, or a mangled name
+    whose id could not be replayed as a path segment — never let one steer a
+    run-dir path. Shared so the prune partition and
+    :func:`legacy_registry_leftovers` cannot drift on what counts as ours.
+
+    The id question is :func:`is_parsable_run_id`, deliberately NOT
+    :func:`is_valid_run_id` — the parse side must accept ids the mint refuses.
+    That predicate owns the reasoning, and the ctl-window sweep in
+    ``tui.launch`` asks the same one."""
+    if not session.startswith(_SESSION_PREFIX):
+        return None
+    run_id = session[len(_SESSION_PREFIX) :]
+    return run_id if is_parsable_run_id(run_id) else None
+
+
+def prunable_sessions(
+    project: Path, mux: TerminalMultiplexer | None = None, *, require_tag: bool = False
+) -> tuple[list[str], list[str], set[str]]:
     """Partition the bmad-loop-<id> agent sessions into (prunable, live) run ids,
     plus the subset of prunable ids whose engine liveness read 'unknown'
     (unverifiable pid). Unknown never blocks cleanup — those sessions stay
     prunable — but frontends surface a warning for them.
 
-    The control session (bmad-loop-ctl) is never a candidate. Pruning is scoped
+    A control session (:func:`is_ctl_session_name` — the fixed name or a
+    per-registry one) is never a candidate. Pruning is scoped
     to `project` via the PROJECT_OPTION tag set at session creation:
 
     - tag proves this project (see accepted_tags): ours — prunable unless a
@@ -995,25 +1421,40 @@ def prunable_sessions(project: Path) -> tuple[list[str], list[str], set[str]]:
       the option read degrades (session_options reads unset as "no answer", never
       as proof nothing was written), or on a session predating a working tag
       write — e.g. psmux path tags refused before the digest.
+
+    ``require_tag`` drops that last arm: an untagged session is skipped outright
+    rather than falling back to the run dir. Set for a **shared** registry — the
+    legacy psmux root every project's pre-upgrade sessions sit in together (see
+    :func:`prune_sessions`). The fallback proves ownership from
+    ``run_dir_for(project, run_id)``, and a run id is only unique *within* one
+    project (``--run-id`` is caller-supplied), so in a shared registry a dead run
+    dir here is not evidence about a session over there: project A holding a dead
+    `shared-id` would claim project B's live, untagged `bmad-loop-shared-id` and
+    kill it. In a per-project registry the same fallback is sound because the
+    registry itself proves ownership, which is why the flag is off by default and
+    the primary pass keeps the reach it always had. What the flag leaves behind is
+    reported by :func:`legacy_registry_leftovers`.
     """
-    tags = session_project_tags()
+    # `mux` bypasses the module-level readers rather than widening them: those
+    # two are the seam every other caller (and every test) reaches the process-wide
+    # backend through, and a bound instance is this function's business alone.
+    tags = mux.session_options(PROJECT_OPTION) if mux is not None else session_project_tags()
     mine = accepted_tags(project)
     prunable: list[str] = []
     live: list[str] = []
     unknown: set[str] = set()
-    for name in mux_sessions():
-        if name == CTL_SESSION or not name.startswith(_SESSION_PREFIX):
+    names = mux.list_sessions() if mux is not None else mux_sessions()
+    for name in names:
+        run_id = _agent_run_id(name)
+        if run_id is None:
             continue
-        run_id = name[len(_SESSION_PREFIX) :]
-        if not is_valid_run_id(run_id):
-            continue  # a foreign/mangled session name must not steer a run-dir path
         run_dir = run_dir_for(project, run_id)
         tag = tags.get(name, "")
         if tag:
             if tag not in mine:
                 continue  # another project's session
-        elif not is_run(run_dir):
-            continue  # untagged and no run dir here — ownership unprovable
+        elif require_tag or not is_run(run_dir):
+            continue  # ownership unprovable: no tag, and no run dir here to stand in
         liveness = engine_liveness(run_dir)
         if liveness == "alive":
             live.append(run_id)
@@ -1024,6 +1465,62 @@ def prunable_sessions(project: Path) -> tuple[list[str], list[str], set[str]]:
     return prunable, live, unknown
 
 
+def _registry_proves_ownership(project: Path) -> bool:
+    """True when the registry the *primary* prune pass addresses is one bmad-loop
+    derived for this project — which is what makes
+    :func:`prunable_sessions`' untagged run-dir fallback evidence rather than a
+    guess.
+
+    That fallback claims an untagged ``bmad-loop-<id>`` session when this project
+    holds a dead run dir of the same id. Run ids are only unique *within* a
+    project (``--run-id`` is caller-supplied), so the claim is sound exactly when
+    the registry itself already restricts what can be listed to this project's
+    sessions. In a registry shared with other projects — or with the operator —
+    it is not, and the same reasoning that put ``require_tag=True`` on the legacy
+    pass applies here.
+
+    The primary registry is not always ours. :func:`export_psmux_registry_root`
+    degrades to ``None`` on an underivable state root and leaves whatever ambient
+    ``PSMUX_DATA_DIR`` it found in force, and psmux honours any absolute value
+    (``src/paths.rs``, source-read at v3.3.8) — so on that arm every verb,
+    including the kill, addresses the operator's own registry while this project's
+    run dirs go on looking like ownership.
+
+    ``registry_root()`` answering ``None`` covers two cases, and they get
+    **opposite** answers — conflating them was a defect, not caution. A backend
+    with no registry namespace at all (tmux: one server for the machine,
+    ``has_registry_namespace()`` False) keeps the reach it had before
+    per-project registries existed: the listing there is exactly what it always
+    was, and narrowing it would be a regression dressed as caution. A backend
+    that DOES namespace and has no root in force (psmux with ``PSMUX_DATA_DIR``
+    unset — the export degraded on an underivable state root and there was no
+    ambient value either) is running on its transport's own **default**
+    registry — shared with every other project and with the operator
+    (``<home>\\.psmux``, the home being ``USERPROFILE`` when set, else the
+    profile API, else ``HOMEDRIVE``+``HOMEPATH``, else ``HOME`` —
+    ``src/paths.rs`` ``home_dir``, source-read at v3.3.8) — which proves nothing about
+    ownership, exactly as an absolute ambient value naming a foreign registry
+    proves nothing. Both shared cases make the tag mandatory.
+
+    A backend that cannot be asked answers ``False``: the safe direction is to
+    demand the tag, which leaves a session standing rather than killing one on
+    evidence that may not hold.
+    """
+    try:
+        mux = get_multiplexer()
+        root = mux.registry_root()
+        if root is None:
+            # No namespace (tmux): historical reach. A namespace with no root
+            # in force is the transport's shared default registry: demand the tag.
+            return not mux.has_registry_namespace()
+    except MultiplexerError:
+        return False
+    try:
+        return root == str(mux_registry_root(project))
+    except (StateRootError, OSError, RuntimeError):
+        return False
+
+
 def prune_sessions(
     project: Path, *, dry_run: bool = False
 ) -> tuple[list[str], list[str], set[str]]:
@@ -1031,12 +1528,154 @@ def prune_sessions(
     returns (killed, live, unknown): the run ids that were (or, with dry_run,
     would be) killed, the live ids skipped, and the killed subset whose engine
     liveness read 'unknown'. All three come from the same partition sample, so
-    frontend messaging built from them always describes the performed actions."""
-    prunable, live, unknown = prunable_sessions(project)
+    frontend messaging built from them always describes the performed actions.
+
+    Runs once per registry: the one this process is pointed at, then each legacy
+    registry the backend still admits (:func:`_legacy_registries`). Sessions
+    bmad-loop created before it took a per-project psmux root are addressable
+    only from the second pass, and without it cleanup would report a clean sweep
+    while their servers ran on. The passes are unioned rather than concatenated —
+    a run id can only be in one registry, but a backend answering the same
+    registry twice must not make one kill look like two.
+
+    Ownership is judged per pass by the same :func:`prunable_sessions` partition,
+    so a legacy registry buys no extra reach: another project's sessions and the
+    operator's own psmux sessions are skipped there exactly as they are here.
+
+    The legacy pass always runs with ``require_tag=True``, and the primary pass
+    runs with it whenever the registry it addresses is not one bmad-loop derived
+    for this project (:func:`_registry_proves_ownership`). Both are the same rule:
+    :func:`prunable_sessions`' untagged run-dir fallback is evidence only where
+    the registry has already restricted the listing to this project. A legacy
+    registry is shared by every project by definition; the primary one is shared
+    whenever the derivation failed — an ambient ``PSMUX_DATA_DIR`` left in
+    force, or nothing in force at all, where a namespacing backend runs on its
+    own shared default registry. What that strictness leaves standing in a
+    legacy registry is reported
+    by :func:`legacy_registry_leftovers`, which the cleanup frontends print: a
+    sweep that silently declines to migrate something is the same silence this
+    whole change exists to remove."""
+    prunable, live, unknown = prunable_sessions(
+        project, require_tag=not _registry_proves_ownership(project)
+    )
     if not dry_run:
         for run_id in prunable:
             kill_session(run_id)
+    for legacy in _legacy_registries():
+        extra, extra_live, extra_unknown = prunable_sessions(project, legacy, require_tag=True)
+        if not dry_run:
+            for run_id in extra:
+                kill_session(run_id, legacy)
+        prunable += [i for i in extra if i not in prunable]
+        live += [i for i in extra_live if i not in live]
+        unknown |= extra_unknown
     return prunable, live, unknown
+
+
+def legacy_registry_leftovers(project: Path, *, announced: Iterable[str] = ()) -> list[str]:
+    """Session names a legacy registry **still holds** after :func:`prune_sessions`
+    ran — the migration's honest remainder, for the cleanup frontends to print.
+    ``[]`` when there is no legacy registry, when it holds nothing, or when the
+    listing fails.
+
+    **Presence, not a second opinion.** Called after the sweep, this lists what is
+    actually there; a session the sweep killed is simply gone from the listing.
+    That is the whole judgement for anything tagged as ours, and it is deliberately
+    *not* a re-run of the partition: re-judging liveness would open a race the
+    reader cannot see the far side of. A run alive during the prune (correctly
+    left, and reported ``live``) can exit before the reader looks; a resampled
+    partition would then call it ``prunable``, and it would fall out of both the
+    live arm and the untagged fallback — stranded and unreported, with no kill ever
+    attempted. Presence has no such gap: the session is standing, so it is named.
+
+    What that covers, in one rule:
+
+    - **Untagged** ``bmad-loop-<id>`` sessions. The legacy pass runs with
+      ``require_tag=True`` (:func:`prunable_sessions`), so an untagged session there
+      is skipped rather than claimed by a run dir that proves nothing in a shared
+      registry.
+    - **Ours, still standing.** Tagged this project's, and the sweep did not remove
+      it — because it was live, because it exited mid-sweep, or because
+      ``kill_session`` (best-effort and silent by contract) did not land. All three
+      leave the same fact behind: a session of ours in a registry ordinary attach
+      and cleanup no longer address. Naming it needs no cause, which is why this
+      also closes the failed-kill case ``cleanup --json``'s ``sessions.removed``
+      documents as an *attempted* kill.
+    - **A surviving control session.** The prune never touches a ctl-named
+      session (:func:`is_ctl_session_name`), and its parked windows are not swept
+      in a legacy registry either — the ctl-window scan runs against the primary
+      backend only.
+
+    Another project's tagged sessions never appear: the sweep skipping them is the
+    correct outcome, not a remainder.
+
+    ``announced`` is the one thing presence alone cannot judge: on a **dry run**
+    nothing was killed, so every session the preview just announced as a would-kill
+    is still standing and would be named here as if the sweep had declined it. The
+    caller passes the run ids it printed — :func:`prune_sessions`' own return — and
+    they are excluded.
+
+    Passed in rather than re-derived, and that is the whole point of the parameter.
+    An earlier revision re-ran the partition here to rediscover the plan, which is
+    a *second sample*: a tagged legacy run seen alive by the first (so printed as
+    live, never announced) can exit before this call, land in the second sample's
+    prunable arm, and be excluded from a listing it should have headed — a session
+    dropped from the preview outright, not merely mentioned twice. Consuming what
+    the preview actually printed cannot disagree with it.
+
+    On a real cleanup the caller passes nothing: there, a killed session is gone
+    from the listing by presence, and one whose kill did not land must be named.
+
+    Deliberately its own listing rather than a fourth arm on
+    :func:`prune_sessions`. That tuple is read by two frontends and projected into
+    the schema-versioned ``cleanup --json`` document; widening it is a contract
+    change and ~30 call sites, against one extra pair of psmux calls against a
+    registry that answers "no server" instantly on any machine that never ran the
+    pre-registry build.
+
+    Names, not run ids: the ctl session has no run id, and the operator is going to
+    paste these into a ``psmux`` target.
+    """
+    leftovers: list[str] = []
+    mine = accepted_tags(project)
+    # Run ids, so names. `prune_sessions` unions its passes, so an id it reports
+    # names at most one session anywhere — the same collapse that makes its own
+    # "killed" count one per id.
+    excluded = {session_name(run_id) for run_id in announced}
+    for legacy in _legacy_registries():
+        try:
+            names = legacy.list_sessions()
+            tags = legacy.session_options(PROJECT_OPTION) if names else {}
+        except MultiplexerError:
+            continue  # observation degrades; the sweep's own report still stands
+        for name in names:
+            if name in excluded:
+                continue
+            if is_ctl_session_name(name):
+                # A legacy registry holds the pre-#537 fixed name; the shape
+                # predicate also names any per-registry-named stray.
+                leftovers.append(name)
+                continue
+            if _agent_run_id(name) is None:
+                continue  # not a bmad-loop agent session at all
+            tag = tags.get(name, "")
+            if not tag or tag in mine:
+                leftovers.append(name)
+    return sorted(set(leftovers))
+
+
+def _legacy_registries() -> list[TerminalMultiplexer]:
+    """Backends bound to registries this project's sessions may predate, or []
+    (see :meth:`~.multiplexer.TerminalMultiplexer.legacy_registries`, which owns
+    the concept and every backend's answer).
+
+    Degrades to [] rather than raising: a backend that cannot even be selected
+    has no legacy registry to offer, and a cleanup that already swept the primary
+    registry must report that work rather than die on the migration pass."""
+    try:
+        return list(get_multiplexer().legacy_registries())
+    except MultiplexerError:
+        return []
 
 
 # The run dir of the OUTERMOST engine in this call stack (#319). A nested auto-sweep
@@ -1598,17 +2237,73 @@ def live_session_may_be_ours(project: Path, run_id: str) -> bool:
     `pipe_pane` and `kill_session` are contractually best-effort, so an
     out-of-tree backend raises :class:`MultiplexerError` here where the bundled
     one returns empty (docs/adapter-authoring-guide.md). The listing is checked
-    first, so the tag query only runs on a name collision."""
-    name = session_name(run_id)
+    first, so the tag query only runs on a name collision.
+
+    A stronger shape was built and withdrawn: a proof discipline (block unless
+    the transport *proves* the session absent) fell to four consecutive reviews,
+    each refuting its newest proof source — the transports genuinely offer none.
+    psmux's registry is advisory and self-healing (its server re-creates a
+    reaped port file on a 5 s tick, source-read at v3.3.8), a binary's PATH
+    presence is per-process while the server is not, and the listing is
+    load-sensitive; so a "proof of absence" either wedges every removal behind
+    `--force` or quietly accepts a refutable proof. The degrade above is the
+    guard's owner's documented trade, kept deliberately; the measured cost of
+    the unobservable-multiplexer window is filed for that owner to revisit
+    rather than overturned here.
+
+    Two registry-root-era additions on that unchanged contract:
+
+    **The control-alias discount.** An id whose session name is one of THE
+    control session's own names — the fixed :data:`CTL_SESSION`, or this
+    project's :func:`ctl_session_for` — answers False before any transport
+    read: that session is the control plane's, never claimed through a run
+    dir, so its liveness is not evidence about the run, and blocking removal
+    on it wedged exactly the recovery (`bmad-loop delete ctl`) the resume
+    refusal points an operator at, for as long as the machine had a control
+    session at all. This is the *instance* question, deliberately not
+    :func:`run_id_aliases_control_session`'s shape question: on tmux a
+    `main`-created run `ctl-<16 hex>` owns a genuine agent session distinct
+    from the fixed name (measured: killing it exactly leaves `bmad-loop-ctl`
+    alive), and the shape discount destroyed its run dir without ever querying
+    the mux. A namespace probe that cannot answer degrades to the fixed name
+    alone — the *smaller* discount, which blocks more, the safe direction. A
+    discount, not a proof source: it removes non-evidence, and never clears a
+    removal on transport testimony.
+
+    **Transport-owned name comparison.** Every comparison goes through
+    :meth:`session_name_key`, never a constant fold: psmux resolves names
+    through a case-folding store, tmux is case-sensitive (both measured), and
+    a constant ``.lower()`` discounted a persisted `CTL` run's genuinely live
+    uppercase agent on tmux as "the control session" and deleted its run dir.
+    On tmux the key is identity, so the listing and tag reads keep their
+    historical exact comparison. Selecting that backend is itself part of the
+    listing read — :func:`mux_sessions` selects inside the caught call — so it
+    degrades the listing's way: a transport that cannot even be chosen (a
+    persisted `[mux] backend` naming a backend no longer registered) reports
+    no live session rather than aborting every removal path."""
     try:
-        if name not in mux_sessions():
+        mux = get_multiplexer()
+    except MultiplexerError:
+        return False
+    key = mux.session_name_key
+    name = session_name(run_id)
+    control = {CTL_SESSION}
+    try:
+        control.add(ctl_session_for(project, mux))
+    except MultiplexerError:
+        pass  # namespace unanswerable: only the fixed name is knowable
+    if key(name) in {key(c) for c in control}:
+        return False
+    try:
+        if key(name) not in {key(s) for s in mux_sessions()}:
             return False
     except MultiplexerError:
         return False
     try:
-        tag = session_project_tags().get(name, "")
+        tags = session_project_tags()
     except MultiplexerError:
-        tag = ""  # unread is not proof of foreign
+        tags = {}  # unread is not proof of foreign
+    tag = next((v for s, v in tags.items() if key(s) == key(name)), "")
     return not tag or tag in accepted_tags(project)
 
 
@@ -2026,6 +2721,20 @@ def reconcile_orphan_state_dirs(project: Path, *, dry_run: bool = False) -> list
     handled: list[Path] = []
     for entry in entries:
         if entry.name in live or entry.is_symlink() or not entry.is_dir():
+            continue
+        if entry.name == MUX_REGISTRY_DIR:
+            # Not a run entry at all (`mux_registry_root`), and the one entry here
+            # whose deletion costs more than the disk it reclaims: it holds the
+            # `.port`/`.key` files every psmux verb resolves a session through, so
+            # sweeping it while a server is up leaves that server alive,
+            # unreachable, and invisible to `psmux ls` in any registry — the
+            # manufactured orphan the root was moved out of the project tree to
+            # avoid. Never reaped rather than reaped-when-empty: proving it empty
+            # means asking every server in it whether it is alive, and this sweep
+            # has no seam to the multiplexer (nor may it acquire one — it must
+            # degrade to a no-op, and a transport probe cannot promise that).
+            # psmux removes its own quartet on session shutdown, so what is left
+            # behind is a directory of small files, not growth.
             continue
         try:
             entry.resolve().relative_to(root_res)

@@ -3555,6 +3555,36 @@ def test_session_env_names_the_out_of_tree_events_dir(project):
     assert not Path(expected).is_relative_to(project.project)
 
 
+def test_every_session_is_told_this_runs_state_root(project):
+    """A coding-session window is *told* the state root, exactly as it is told the
+    events dir above, and for the same reason: inheritance is not a transport a
+    multiplexer has to provide. psmux's `PSMUX_BARE_ENV=1` clears a pane child's
+    environment and rebuilds it from a 14-name allowlist that keeps `TMUX` and
+    drops both `BMAD_LOOP_STATE_DIR` and the `LOCALAPPDATA` its default falls back
+    to — so a `bmad-loop` run inside such a session would answer with a different
+    state root, hence a different psmux registry, and read its own live session as
+    gone.
+
+    The value is `runs.state_root()` resolved, not the override forwarded: the
+    allowlist takes the default's sources too, so passing only what the operator
+    set would leave the common case broken.
+
+    Ablation guard: delete the `pinned_state_env()` spread from the engine's
+    session env and this fails."""
+    from bmad_loop import envvars, runs
+
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+    )
+    engine.run()
+
+    expected = str(runs.state_root())
+    assert [s.role for s in adapter.sessions] == ["dev", "review"]
+    assert {s.env[envvars.STATE_DIR] for s in adapter.sessions} == {expected}
+
+
 def test_post_kill_rescued_result_flows_and_journals(project):
     """A result rescued by the adapter's post-kill reconcile (#61) reaches the
     engine as an ordinary completed result — it must flow the completed path

@@ -55,7 +55,7 @@ from datetime import datetime, timezone
 from importlib import resources
 from pathlib import Path
 
-from . import sanitize
+from . import runs, sanitize
 from .adapters.multiplexer import MultiplexerError, get_multiplexer
 from .adapters.profile import CLIProfile
 from .install import merge_hooks, relay_registered
@@ -549,7 +549,17 @@ class _ProbeLauncher:
         try:
             self.mux.new_session(self.session_name, cwd, 220, 50)
             command = " ".join(shlex.quote(a) for a in argv)
-            window_id = self.mux.new_window(self.session_name, PROBE_TASK_ID, cwd, env, command)
+            # `env` carries the profile's own `[env]` table verbatim, and a
+            # profile declaring BMAD_LOOP_STATE_DIR would aim a bmad-loop
+            # wrapper in that window at a different state root — and so a
+            # different registry, where this very session reads as gone. The
+            # pin chokepoint forces the entry to this process's own answer in
+            # both arms, the underivable one included (runs.pin_state_root);
+            # the engine's window merge applies the same rule.
+            window_env = runs.pin_state_root(env)
+            window_id = self.mux.new_window(
+                self.session_name, PROBE_TASK_ID, cwd, window_env, command
+            )
         except MultiplexerError:
             return None
         # pipe-pane may race a window that dies instantly; tolerate failure.
