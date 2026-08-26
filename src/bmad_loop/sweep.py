@@ -1359,6 +1359,24 @@ class SweepEngine(Engine):
             bundle_name = (option.bundle_name if option else "") or str(
                 answer.get("bundle_name", "")
             )
+            # A pre-answer's bundle_name never passed `validate_triage` — it was
+            # answered out of band against an earlier triage, and a fresh one can
+            # renumber or drop the option it named — so this fallback lane was the
+            # one route by which a name failing the two option-site gates (#637)
+            # still reached `_write_intent` as a directory. Gate it with the same
+            # two rules, but by DISCARD rather than by error: the human's build
+            # decision is the payload and `decision-<id>` below is the always-legal
+            # name it falls back to anyway, so the discard is journaled the way
+            # `_normalize_bundle_names`'s repairs are and the sweep proceeds.
+            if bundle_name and (
+                not BUNDLE_NAME_RE.match(bundle_name) or safe_segment(bundle_name) != bundle_name
+            ):
+                self.journal.append(
+                    "sweep-bundle-name-discarded",
+                    decision=decision.id,
+                    original=bundle_name,
+                )
+                bundle_name = ""
             key = (option.key if option else "") or str(answer.get("key", "")) or "?"
             name = bundle_name or "decision-" + decision.id.lower()
             bundles.append(

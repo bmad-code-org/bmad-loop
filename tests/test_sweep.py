@@ -2806,6 +2806,63 @@ def test_preanswered_build_materializes_bundle_unattended(project):
     assert '"decision-preanswers-pruned"' in journal
 
 
+def test_preanswered_bundle_name_failing_the_segment_gate_is_discarded(project):
+    """Round-2 review: a pre-answer's `bundle_name` never passes `validate_triage`
+    — it was answered out of band against an earlier triage, and a fresh one can
+    renumber or drop the option it named — so it was the one route by which a name
+    failing the two option-site gates (#637) still reached `_write_intent` as a
+    directory (`nul` passes BUNDLE_NAME_RE and fails `safe_segment` identity).
+    `_materialize_bundles` now applies the same two rules to that lane, by
+    journaled DISCARD rather than by error: the build decision is the payload and
+    the always-legal `decision-<id>` fallback is what an unnamed answer gets
+    anyway. Ablation: drop that gate and this reddens — the bundle materializes
+    as `nul`, so the `decision-dw-1` effects below never match and the discard
+    event never appears."""
+    from bmad_loop import decisions
+    from bmad_loop.sweep import DecisionOption
+
+    write_ledger(project, {"DW-1": "open"})
+    # stored key "9" is NOT one of this triage's option keys, so every field —
+    # bundle_name included — comes from the stored answer, not a validated option
+    decisions.record_pre_answer(
+        project.project,
+        "DW-1",
+        DecisionOption(
+            key="9", label="Widen", effect="build", intent="widen the field", bundle_name="nul"
+        ),
+        date="2026-06-12",
+    )
+    plan = triage_result(
+        ["DW-1"],
+        decisions=[
+            _decision(
+                "DW-1",
+                [
+                    {"key": "1", "label": "Widen", "effect": "build", "intent": "fresh intent"},
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+            )
+        ],
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "decision-dw-1", ["DW-1"]),
+            bundle_review_effect(project, "decision-dw-1"),
+        ],
+        prompting=False,
+    )
+    summary = engine.run()
+    assert not summary.paused
+
+    journal = journal_text(engine)
+    assert '"sweep-bundle-name-discarded"' in journal
+    assert '"nul"' in journal  # the discard names the spelling it dropped
+    assert engine.state.tasks["dw-decision-dw-1"].phase == Phase.DONE
+    assert "dw-nul" not in engine.state.tasks  # the raw name minted nothing
+
+
 def test_preanswered_keep_open_suppresses_prompt_and_persists(project):
     """A keep-open pre-answer is adopted (no skip, no re-prompt) and, since the
     entry stays open, the store keeps it for the next sweep too."""

@@ -186,13 +186,15 @@ def test_full_manifest_parses(tmp_path):
         ('[plugin]\nname = "e"\napi_version = 1\nseed_globs = ["."]\n', "seed_globs"),
         # absolute python module path
         ('[plugin]\nname = "e"\napi_version = 1\n[python]\nmodule = "/x.py"\n', "plugin-relative"),
-        # root-naming python module path. The value is `.strip()`ed before the guard,
-        # so the trailing-space spellings arrive as "." — but the trailing-DOT ones
-        # arrive intact, and Win32 trims those to the plugin dir just the same. What
-        # gets exec'd matters more than what gets copied, hence the whole family.
+        # root-naming python module path. The guard sees the AUTHORED value (the
+        # `.strip()` decides only whether a module was given), so the space
+        # spellings arrive intact alongside the dot ones — Win32 trims each to
+        # the plugin dir just the same. What gets exec'd matters more than what
+        # gets copied, hence the whole family.
         ('[plugin]\nname = "e"\napi_version = 1\n[python]\nmodule = "."\n', "plugin-relative"),
         ('[plugin]\nname = "e"\napi_version = 1\n[python]\nmodule = "..."\n', "plugin-relative"),
         ('[plugin]\nname = "e"\napi_version = 1\n[python]\nmodule = ". ."\n', "plugin-relative"),
+        ('[plugin]\nname = "e"\napi_version = 1\n[python]\nmodule = ". "\n', "plugin-relative"),
         # hook with no cmd
         (
             '[plugin]\nname = "e"\napi_version = 1\n[hooks.pre_run]\nblocking = true\n',
@@ -270,7 +272,13 @@ def test_manifest_rejects_win32_alias_seed_paths(key, value):
         "NUL",
         "hooks.",  # Win32 trims to `hooks`, so the import resolves past the file named
         "sub/CON.py",
-        "pkg /hooks.py",  # an interior component, which the caller's .strip() cannot reach
+        "pkg /hooks.py",  # an interior component, out of any whole-string strip's reach
+        # the round-2 review catch: `_parse_python` once `.strip()`-ed the value
+        # BEFORE this guard ran, so the authored trailing space was silently
+        # trimmed and accepted instead of refused — the one site of seven whose
+        # value the family never saw raw. Ablation: restore that
+        # strip-before-validate composition and this row reddens alone.
+        "hooks.py ",
     ],
 )
 def test_manifest_rejects_win32_alias_python_module(value):

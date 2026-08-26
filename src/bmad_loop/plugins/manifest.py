@@ -187,8 +187,13 @@ def _parse_python(python_d: Any, fail) -> PythonSpec | None:
         return None
     if not isinstance(python_d, dict):
         raise fail("[python] must be a table")
-    module = str(python_d.get("module", "")).strip()
-    if not module:
+    # `.strip()` decides only whether a module was given — the authored value is
+    # what gets validated and stored. Stripping first silently normalized the
+    # trailing-space spelling the alias arm below promises to refuse
+    # (`module = "hooks.py "` was trimmed and accepted), making this the one
+    # site of seven whose value the family never saw raw.
+    module = str(python_d.get("module", ""))
+    if not module.strip():
         raise fail("[python] requires a 'module'")
     if names_tree_root(module) or is_absolute_path(module) or has_parent_ref(module):
         raise fail(f"[python] module must be a plugin-relative path: got {module!r}")

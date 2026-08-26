@@ -52,9 +52,10 @@ breaking changes may land in a minor release.
   about which path they mean. The refusal is cross-platform on purpose, matching how the family
   already rejects `C:\secrets` on POSIX: a config value must not mean one thing per host. A
   component of only periods and spaces embedded beside a real one (`sub/...`) is refused by the
-  same rule — Win32 empties it and the value addresses `sub` — and the Unity seeder validates
-  the authored env value rather than a `.strip()`-normalized copy, so an authored trailing
-  space is refused like at every other site instead of silently trimmed. No shipped profile,
+  same rule — Win32 empties it and the value addresses `sub` — and the Unity seeder and a
+  plugin's `[python] module` validate the authored value rather than a `.strip()`-normalized
+  copy, so an authored trailing space is refused like at every other site instead of silently
+  trimmed. No shipped profile,
   bundled `plugin.toml` or default trips it, but this is a compatibility break on
   previously-loading config.
 
@@ -111,7 +112,11 @@ breaking changes may land in a minor release.
   filesystem would create the directory — matched case-insensitively, so lowercase was no
   reprieve. The test is `safe_segment` identity rather than a second hand-written device list,
   which keeps the accepted set in lockstep with the sanitizer that defines it: the same idiom,
-  for the same reason, as `runs.is_valid_run_id`.
+  for the same reason, as `runs.is_valid_run_id`. The persisted pre-answer lane takes the same
+  two rules at `_materialize_bundles` — a `bundle_name` answered out of band against an earlier
+  triage never passes `validate_triage`, and a fresh triage can renumber the option it named —
+  applied by journaled discard rather than by error: the build decision is honored under the
+  always-legal `decision-<id>` fallback name.
 
 ### Security
 
