@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from . import deferredwork, gates, verify
-from .engine import Engine, RunPaused
+from .engine import Engine, RunPaused, _ArmedClose
 from .escalation import critical_escalations, env_fault_pause_reason, session_failure_reason
 from .model import PAUSE_STORY_GATE, Phase, StoryTask
 from .platform_util import (
@@ -1609,7 +1609,7 @@ class SweepEngine(Engine):
         return f"resolved by sweep bundle {task.story_key}"
 
     def _close_declared_deferred(
-        self, task: StoryTask, snapshot: list[tuple[Path, str]] | None = None
+        self, task: StoryTask, snapshot: list[_ArmedClose] | None = None
     ) -> None:
         """No-op: a bundle's ledger closure is owned by
         ``_close_bundle_ledger_when_spec_status``, which runs after accepted dev

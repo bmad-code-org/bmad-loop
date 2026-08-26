@@ -4325,14 +4325,17 @@ def test_closes_deferred_rolls_back_when_a_signal_stops_the_close_itself(project
     monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: None)
     engine = _closes_deferred_run(project, ["DW-1"])
     before = project.deferred_work.read_bytes()
-    real_mark = deferredwork.mark_done_many
+    # the forward close is `mark_done_many_reopenable` since #286 made the story
+    # close entry-scoped; patching the plain `mark_done_many` it used to call would
+    # inject nothing and this test would fail on its assertions instead of its fault
+    real_mark = deferredwork.mark_done_many_reopenable
 
     def sigterm_after_publication(*a, **kw):
         marked = real_mark(*a, **kw)  # the flip is on disk now
         signal.raise_signal(signal.SIGTERM)
         return marked  # unreachable: the handler raises first
 
-    monkeypatch.setattr(deferredwork, "mark_done_many", sigterm_after_publication)
+    monkeypatch.setattr(deferredwork, "mark_done_many_reopenable", sigterm_after_publication)
 
     summary = engine.run()
 
@@ -4353,10 +4356,12 @@ def test_failed_rollback_does_not_displace_the_commit_failure(project, monkeypat
     and the `BaseException` arm would skip its bare `raise` and swap a graceful
     `RunStopped` for a write complaint.
 
-    `OSError` was too narrow to hold that. `atomic_write_text` resolves the path
-    before its own try, and below 3.13 `Path.resolve` reports a symlink loop as
-    `RuntimeError` — for a ledger the helper explicitly supports being a symlink,
-    and whose OTHER resolve (`_ledger_in_repo`) already catches that type.
+    `OSError` was too narrow to hold that. The `atomic_write_text` under the undo
+    resolves the path before its own try, and below 3.13 `Path.resolve` reports a
+    symlink loop as `RuntimeError` — for a ledger the helper explicitly supports
+    being a symlink, and whose OTHER resolve (`_ledger_in_repo`) already catches
+    that type. Deriving the ledger lock's sidecar path can raise
+    `runs.StateRootError`, which is no `OSError` either.
 
     The fault is injected rather than built from a real symlink loop on purpose:
     3.13+ resolves loops without raising, so a loop-based version would pass on
@@ -4368,10 +4373,14 @@ def test_failed_rollback_does_not_displace_the_commit_failure(project, monkeypat
     def unresolvable(*a, **kw):
         raise RuntimeError("Symlink loop from '/w/deferred-work.md'")
 
-    # patched as bound in `engine` (its sole call site is the restore), NOT in
-    # `deferredwork` — the forward close must still publish, or there would be
-    # nothing for the rollback to fail at.
-    monkeypatch.setattr("bmad_loop.engine.atomic_write_text", unresolvable)
+    # patched on the restore's own primitive, not on the forward close's: since
+    # #286 the rollback goes through `mark_open_many` and the close through
+    # `mark_done_many_reopenable`, so breaking the first leaves the second free to
+    # publish — and there has to be a published close for the rollback to fail at.
+    # (This read `bmad_loop.engine.atomic_write_text` while the restore rewrote the
+    # whole document itself; the restore no longer calls it, so that patch would
+    # inject nothing.)
+    monkeypatch.setattr(deferredwork, "mark_open_many", unresolvable)
 
     summary = engine.run()
 
@@ -4388,6 +4397,126 @@ def test_failed_rollback_does_not_displace_the_commit_failure(project, monkeypat
     # still reads `done` for a commit that does not exist. Advisory, journaled,
     # human-attended — not silently papered over.
     assert not _ledger_entries(project)["DW-1"].open
+
+
+def test_deferred_close_rollback_preserves_a_concurrent_append(project, monkeypatch):
+    """The rollback undoes THIS story's closes and nothing else (#286).
+
+    The close-to-commit window spans `finalize_commit`'s git spawns and, on this
+    very leg, an operator-blocking pause, so it is long enough for a second
+    orchestrator process — another run, a sweep, the TUI decision modal — to file
+    an entry into the same ledger. The old restore rewrote the whole document from
+    the pre-close text and called that an accepted advisory trade-off; the rival's
+    entry disappeared, and `next_seq` would hand its id out again.
+
+    Ablation: restore `atomic_write_text(ledger, before)` over the pre-close text in
+    `_restore_deferred_closes` and the foreign entry vanishes — this reds."""
+    engine = _closes_deferred_run(project, ["DW-1"])
+    ledger = project.deferred_work
+
+    def rival_appends_then_the_commit_fails(*a, **kw):
+        # a second writer, mid-window, through the ordinary public appender
+        deferredwork.append_entry(
+            ledger,
+            title="filed by another process",
+            origin="sweep, 2026-06-11",
+            source_spec="other.md",
+            reason="a rival writer got here first.",
+        )
+        raise verify.GitError("commit refused")
+
+    monkeypatch.setattr(verify, "finalize_commit", rival_appends_then_the_commit_fails)
+
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1
+    entries = _ledger_entries(project)
+    assert entries["DW-1"].open  # ours is undone
+    # ...and theirs is untouched, body and all — not merely present under a
+    # re-minted id, which a whole-document restore followed by a replay would give
+    assert "DW-2" in entries and "a rival writer got here first." in entries["DW-2"].body
+    rolled = [e for e in engine.journal.entries() if e["kind"] == "deferred-close-rolled-back"]
+    assert len(rolled) == 1 and rolled[0]["dw_ids"] == ["DW-1"]
+
+
+def test_deferred_close_rollback_preserves_a_concurrent_close(project, monkeypatch):
+    """The other half of entry scoping: a rival's CLOSE inside the window survives
+    the rollback (#286).
+
+    Harder than the append and the reason the undo is marker-owned rather than
+    id-owned: reopening "the ids we are rolling back" would already leave DW-2
+    alone, but restoring the pre-close document reverts it — silently undoing work
+    somebody else verified as resolved, which is the lost-closure half of #286.
+
+    Ablation: restore the whole-document write and DW-2 reads `open` again — reds."""
+    engine = _closes_deferred_run(project, ["DW-1"], ledger={"DW-1": "open", "DW-2": "open"})
+    ledger = project.deferred_work
+
+    def rival_closes_then_the_commit_fails(*a, **kw):
+        deferredwork.mark_done(ledger, "DW-2", "2026-06-11", "resolved by a human")
+        raise verify.GitError("commit refused")
+
+    monkeypatch.setattr(verify, "finalize_commit", rival_closes_then_the_commit_fails)
+
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1
+    entries = _ledger_entries(project)
+    assert entries["DW-1"].open  # ours is undone
+    assert not entries["DW-2"].open  # theirs still stands
+    assert "resolution: resolved by a human" in entries["DW-2"].body
+    rolled = [e for e in engine.journal.entries() if e["kind"] == "deferred-close-rolled-back"]
+    assert len(rolled) == 1 and rolled[0]["dw_ids"] == ["DW-1"]
+
+
+def test_deferred_close_reopen_degrade_is_journaled(project, monkeypatch):
+    """An armed close whose undo marker no longer matches is REPORTED, never worked
+    around (#286).
+
+    The undo matches on the `resolution:`/`resolution-undo:` pair sitting
+    immediately after the status line, so a foreign writer that inserts anything
+    between them — a `decision:` line is exactly the shape `record_decision` is
+    careful to write BEFORE the close for this reason — leaves the entry
+    permanently un-reopenable. The arm here is `exact`: the marker was on disk
+    moments ago, so its absence is somebody else's edit and not our own miss. The
+    entry stays `done`, the foreign line is preserved, and the ids are journaled;
+    overwriting around it would destroy the human decision that broke the tail.
+
+    The failure must also stay invisible to the exception in flight: the commit's
+    own escalation is the disposition, not the rollback's.
+
+    Ablation: drop the `failed` derivation (hardcode `failed = []`) — reds."""
+    engine = _closes_deferred_run(project, ["DW-1"])
+    ledger = project.deferred_work
+
+    def rival_breaks_the_tail_then_the_commit_fails(*a, **kw):
+        text = ledger.read_text(encoding="utf-8")
+        # inserted between `status:` and `resolution:`, which is what breaks the
+        # adjacency `_MARK_DONE_TAIL_RE` matches on
+        broken = text.replace("\nresolution:", "\ndecision: 2026-06-11 keep-open\nresolution:", 1)
+        assert broken != text  # the close really published a tail to break
+        ledger.write_text(broken, encoding="utf-8")
+        raise verify.GitError("commit refused")
+
+    monkeypatch.setattr(verify, "finalize_commit", rival_breaks_the_tail_then_the_commit_fails)
+
+    summary = engine.run()
+
+    # the commit's disposition survives the degraded rollback intact
+    assert summary.paused and summary.escalated == 1 and not summary.crashed
+    reasons = [e["reason"] for e in engine.journal.entries() if e["kind"] == "story-escalated"]
+    assert len(reasons) == 1 and reasons[0].startswith("commit failed:")
+    entry = _ledger_entries(project)["DW-1"]
+    assert not entry.open  # left done, honestly, rather than rewritten around
+    assert "decision: 2026-06-11 keep-open" in entry.body  # the foreign line stands
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    unmatched = [
+        e for e in engine.journal.entries() if e["kind"] == "deferred-close-reopen-unmatched"
+    ]
+    assert len(unmatched) == 1 and unmatched[0]["dw_ids"] == ["DW-1"]
+    # nothing reopened, so there is no rollback to claim
+    assert "deferred-close-rolled-back" not in kinds
+    assert "deferred-close-rollback-failed" not in kinds  # a degrade, not a raise
 
 
 def test_transient_spec_read_fault_does_not_crash_run(project, monkeypatch):

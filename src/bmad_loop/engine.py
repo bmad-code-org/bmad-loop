@@ -21,7 +21,7 @@ import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, NoReturn, Protocol, Sequence
+from typing import TYPE_CHECKING, Callable, NamedTuple, NoReturn, Protocol, Sequence
 
 from . import deferredwork, devcontract, envvars, gates, operatoractions, verify
 from .adapters.base import CodingCLIAdapter, SessionResult, SessionSpec, SpecSnapshot
@@ -448,6 +448,32 @@ def _story_label_stripped(value: object, story_key: str = "") -> str:
 # the parent's depth into the child. Tracked independently of signal ownership so an
 # off-main-thread top-level run (which cannot own signals) is still seen as depth-0.
 _run_depth: contextvars.ContextVar[int] = contextvars.ContextVar("bmad_loop_run_depth", default=0)
+
+
+class _ArmedClose(NamedTuple):
+    """One armed story-close rollback: what ``Engine._restore_deferred_closes``
+    undoes if the commit the close was written for never lands (#234, #286).
+
+    ``ids`` is entry-scoped, never a whole-document snapshot: the restore reopens
+    exactly these ledger entries through their operation-specific undo markers, so
+    anything a concurrent writer appended, closed or decided inside the commit
+    window survives the rollback untouched.
+
+    ``exact`` says which set ``ids`` is. Armed BEFORE the write it is the INTENDED
+    set (``exact=False``) — a raise inside the close itself must still be undoable,
+    and reopening an id that never flipped is a safe no-op. Replaced after a normal
+    return by the set actually marked (``exact=True``), which is the only form
+    where an id that fails to reopen means something: its undo marker was there
+    moments ago and is not now, so a foreign edit displaced it, and that is worth
+    journaling rather than repairing around.
+
+    Lives at module scope, not beside its method, because ``SweepEngine`` annotates
+    the same parameter — a class body cannot host a module-level type.
+    """
+
+    ledger: Path
+    ids: tuple[str, ...]
+    exact: bool
 
 
 class Engine:
@@ -2936,9 +2962,9 @@ class Engine:
         # verify gate, checkpoint, review cycle and pre-commit workflow is behind
         # us, and finalize_commit's `git add -A` is still ahead, so an in-repo
         # annotation rides this story's own commit. `snapshot` is armed inside
-        # the close, before its write, so both failure arms below hold the
-        # pre-close text no matter where in the window a raise lands.
-        snapshot: list[tuple[Path, str]] = []
+        # the close, before its write, so both failure arms below hold the ids to
+        # reopen no matter where in the window a raise lands.
+        snapshot: list[_ArmedClose] = []
         park_record: tuple[Path, str | None] | None = None
         try:
             self._close_declared_deferred(task, snapshot)
@@ -3941,7 +3967,7 @@ class Engine:
         return tuple(dict.fromkeys(ids))
 
     def _close_declared_deferred(
-        self, task: StoryTask, snapshot: list[tuple[Path, str]] | None = None
+        self, task: StoryTask, snapshot: list[_ArmedClose] | None = None
     ) -> None:
         """At the commit boundary, flip every ledger entry the story declares
         via ``closes_deferred:`` to ``status: done <date>`` + a ``resolution:``
@@ -4028,8 +4054,20 @@ class Engine:
             # "no such entries".
             self._journal_ledger_unavailable(task, ids, ledger, f"{e.__class__.__name__}: {e}")
             return
+        # Classified ONCE, here, and handed down: the arm below and the write in
+        # `_apply_deferred_closes` have to name the same set, and a second
+        # `classify` over the same text would only make that a coincidence rather
+        # than a fact. The "one document" contract the write already kept now
+        # covers the rollback too.
+        declared = deferredwork.classify(text, ids)
         if snapshot is not None:
-            snapshot.append((ledger, text))
+            # Armed BEFORE the write, with the INTENDED set (#284): a raise inside
+            # the close itself must still be undoable, and `mark_open_many` skips an
+            # id that never flipped, so an over-broad arm costs nothing. `exact` is
+            # False precisely because these ids are a plan, not an outcome — the
+            # unmatched journal below must not fire for an id the write never
+            # reached.
+            snapshot.append(_ArmedClose(ledger, declared.open_ids, False))
         # The DECLARED set, never `marked` — the transposed lesson of `e88776a`. A
         # host loss in this window resumes into `_finalize_commit_phase` again, and
         # by then the worktree ledger already reads `done`, so `classify` returns
@@ -4044,11 +4082,17 @@ class Engine:
         # crash, which is the stale snapshot `_declared_deferred_ids` reads live to
         # avoid.
         task.story_closes_intended = list(ids)
-        marked = self._apply_deferred_closes(task, ids, ledger, text)
-        if snapshot is not None and not marked:
-            # `mark_done_many` writes only when it marks: the ledger is
-            # byte-identical, so a restore would record a rollback of nothing.
-            snapshot.clear()
+        marked = self._apply_deferred_closes(task, declared, ledger)
+        if snapshot is not None:
+            if marked:
+                # Narrow the plan to the outcome. `exact` from here on: every id
+                # carries an undo marker this method wrote moments ago, so one that
+                # will not reopen has had it displaced by somebody else.
+                snapshot[-1] = _ArmedClose(ledger, tuple(marked), True)
+            else:
+                # The close writes only when it marks: the ledger is byte-identical,
+                # so a restore would record a rollback of nothing.
+                snapshot.clear()
         if marked and not self._ledger_in_repo(ledger):
             self.journal.append(
                 "deferred-close-external-ledger",
@@ -4080,19 +4124,39 @@ class Engine:
         except (OSError, RuntimeError):
             return False
 
-    def _restore_deferred_closes(self, task: StoryTask, snapshot: list[tuple[Path, str]]) -> None:
-        """Put the ledger back the way ``_close_declared_deferred`` found it,
-        after the commit its closures were written for failed (#234): left
-        alone the entries read ``done`` for work that is in no commit, and the
-        likeliest recovery makes that permanent — a human-resolved re-drive
-        sets ``resolved_redrive``, which has ``safe_reset`` preserve the
-        artifact folders' tracked content through the rollback.
+    def _restore_deferred_closes(self, task: StoryTask, snapshot: list[_ArmedClose]) -> None:
+        """Undo the closes ``_close_declared_deferred`` wrote, after the commit
+        they were written for failed (#234): left alone the entries read ``done``
+        for work that is in no commit, and the likeliest recovery makes that
+        permanent — a human-resolved re-drive sets ``resolved_redrive``, which has
+        ``safe_reset`` preserve the artifact folders' tracked content through the
+        rollback.
 
-        Whole-document, from the pre-close text. Within the commit window the
-        engine is the only writer this restore can know about; anything else
-        that edited the ledger inside it (a native pre-commit hook, say) is
-        restored away with the close — an accepted advisory trade-off, and the
-        escalation hands the tree to a human either way.
+        **Entry-scoped, through the closes' own undo markers (#286).** This used to
+        rewrite the whole document from the pre-close text and call the collateral
+        an accepted advisory trade-off: within the commit window the engine was
+        held to be the only writer worth knowing about, so whatever anyone else had
+        added was restored away with the close. That contract is overturned. The
+        window spans `finalize_commit`'s git spawns and, on the escalation leg, an
+        operator-blocking pause, so a second orchestrator process, a sweep, the TUI
+        decision modal or `sweep --archive` can and does write inside it — and a
+        lock cannot be held across a window shaped like that (#286's own acceptance
+        criterion). So the rollback reopens exactly the armed ids through the
+        operation-specific markers ``mark_done_many_reopenable`` wrote, in ONE
+        locked read-edit-write: a concurrent append, an unrelated close, a recorded
+        human decision are each left standing, and a row this run never closed is
+        never touched.
+
+        An armed id that will not reopen is reported, never worked around. It only
+        means anything for an ``exact`` arm — one narrowed to the ids actually
+        marked — where the marker was on disk moments ago: something has since
+        broken the ``resolution:``/``resolution-undo:`` adjacency the undo matches
+        on (a foreign ``decision:`` line inserted after the status line does
+        exactly this), so the entry stays ``done`` and the foreign content is
+        preserved, with ``deferred-close-reopen-unmatched`` naming the ids. A
+        pre-write arm carries the INTENDED set instead, where an id that never
+        flipped is an ordinary silence rather than a signal, and nothing is
+        reported.
 
         Advisory itself, twice over: a failed restore is journaled, never
         raised, and the journaling is suppressed rather than allowed to become
@@ -4102,18 +4166,24 @@ class Engine:
         strand the story in COMMITTING with no diagnosis on the record.
 
         The guard is type-agnostic on purpose, and `OSError` is not wide enough
-        to hold it: `atomic_write_text` resolves the path before its own try,
-        and below 3.13 `Path.resolve` reports a symlink loop as `RuntimeError`
-        — the same non-OSError `_ledger_in_repo` already catches for this very
-        path. Catching `Exception` and not `BaseException` is the other half:
-        `RunStopped` is an `Exception`, so a second stop signal landing inside
-        the restore is absorbed while the first still travels, and a genuine
-        KeyboardInterrupt still gets out."""
+        to hold it: the write under `mark_open_many` resolves the path before its
+        own try, and below 3.13 `Path.resolve` reports a symlink loop as
+        `RuntimeError` — the same non-OSError `_ledger_in_repo` already catches for
+        this very path. Deriving the lock's own sidecar path can raise
+        `runs.StateRootError`, which is likewise no `OSError`. Catching `Exception`
+        and not `BaseException` is the other half: `RunStopped` is an `Exception`,
+        so a second stop signal landing inside the restore is absorbed while the
+        first still travels, and a genuine KeyboardInterrupt still gets out."""
         if not snapshot:
             return
-        ledger, before = snapshot[-1]
+        ledger, ids, exact = snapshot[-1]
         try:
-            atomic_write_text(ledger, before)
+            reopened = deferredwork.mark_open_many(
+                ledger,
+                list(ids),
+                self._story_close_note(task),
+                self._story_close_operation_id(task),
+            )
         except Exception as e:
             with contextlib.suppress(Exception):
                 self.journal.append(
@@ -4126,29 +4196,70 @@ class Engine:
                     error=f"{e.__class__.__name__}: {e}",
                 )
             return
-        with contextlib.suppress(Exception):
-            self.journal.append(
-                "deferred-close-rolled-back", story_key=task.story_key, ledger=str(ledger)
-            )
+        if reopened:
+            with contextlib.suppress(Exception):
+                self.journal.append(
+                    "deferred-close-rolled-back",
+                    story_key=task.story_key,
+                    ledger=str(ledger),
+                    dw_ids=reopened,
+                )
+        failed = [i for i in ids if i not in reopened] if exact else []
+        if failed:
+            with contextlib.suppress(Exception):
+                self.journal.append(
+                    "deferred-close-reopen-unmatched",
+                    story_key=task.story_key,
+                    ledger=str(ledger),
+                    dw_ids=failed,
+                    error="the close's undo marker is gone; the entry is left done",
+                )
 
     def _story_close_note(self, task: StoryTask) -> str:
         """Resolution note shared by the commit-boundary close and its isolation
         carry, so a carried row cannot drift from one the merge delivered."""
         return f"resolved by story {task.story_key}"
 
-    def _apply_deferred_closes(
-        self, task: StoryTask, ids: Sequence[str], ledger: Path, text: str
-    ) -> list[str]:
-        """Write the closure for `ids`, journal exactly what landed, and return
-        the ids actually flipped.
+    def _story_close_operation_id(self, task: StoryTask) -> str:
+        """Owner of the undo markers a story's declared closes write, shared by the
+        close, its rollback and its isolation carry.
 
-        ``text`` is the ledger snapshot the caller already read, never re-read
-        here: classification and the write have to describe the same document, and
-        a second read is a second chance for the location to have gone away
-        underneath them."""
-        declared = deferredwork.classify(text, ids)
-        marked = deferredwork.mark_done_many(
-            ledger, declared.open_ids, self._today(), self._story_close_note(task)
+        Recomputed from already-persisted identity — never minted — so the rollback
+        arm reaches the same owner the write used even across a crash and replay,
+        which is `mark_done_many_reopenable`'s stated requirement of its callers.
+
+        The ``/closes-deferred`` suffix is what keeps it disjoint from
+        ``SweepEngine._bundle_close_operation_id``, which is this string's prefix
+        exactly. The two never coexist on one task — a bundle has no
+        ``closes_deferred:`` declaration and ``SweepEngine`` no-ops this whole hook
+        — but a shared ledger holds rows from both, and an undo must not reach
+        across."""
+        return f"{self.state.run_id}/{task.story_key}/closes-deferred"
+
+    def _apply_deferred_closes(
+        self, task: StoryTask, declared: deferredwork.Declared, ledger: Path
+    ) -> list[str]:
+        """Write the closure `declared` describes, journal exactly what landed, and
+        return the ids actually flipped.
+
+        ``declared`` is classified by the caller from the ledger snapshot it already
+        read, never re-read here: classification, the rollback arm and the write all
+        have to describe the same document, and a second read is a second chance for
+        the location to have gone away underneath them.
+
+        The REOPENABLE close (#286): each flipped row gains a ``resolution-undo:``
+        line owned by this story's close operation, which is what lets
+        ``_restore_deferred_closes`` undo these entries and only these — rather than
+        restoring the whole document over a concurrent writer's work. The marker is
+        permanent and rides the story's own commit; the sweep bundle close has
+        published the same format since #284, so this is an extension of the ledger
+        format, not an invention (user decision, 2026-08-25)."""
+        marked = deferredwork.mark_done_many_reopenable(
+            ledger,
+            declared.open_ids,
+            self._today(),
+            self._story_close_note(task),
+            self._story_close_operation_id(task),
         )
         if marked:
             self.journal.append("story-deferred-closed", story_key=task.story_key, dw_ids=marked)
@@ -6230,12 +6341,15 @@ class Engine:
         re-bundles resolved work on every later sweep: unbounded re-triage, not a
         one-time drop.
 
-        ``mark_done_many``, NOT the reopenable variant ``SweepEngine`` uses: a story
-        close carries no operation id and no ``resolution-undo:`` line, so this is
-        what keeps a carried row byte-identical to one the merge delivered. The note
-        goes through ``_story_close_note`` for the same reason. Only the date can
-        differ, and only across a midnight boundary — the same accepted drift the
-        park record carries.
+        ``mark_done_many_reopenable``, the same variant the commit-boundary close
+        now uses, under the same ``_story_close_operation_id`` and the same
+        ``_story_close_note``: byte-identity between a carried row and one the merge
+        delivered is the point, and both halves of that comparison carry the
+        ``resolution-undo:`` line since #286 made the story close entry-scoped. This
+        paragraph used to say the opposite — no operation id, no undo marker — which
+        was the byte-identity argument against the old close, and inverts with it.
+        Only the date can differ, and only across a midnight boundary — the same
+        accepted drift the park record carries.
 
         Unconditional and idempotent, with no tracked/ignored predicate. Idempotence
         here is stronger than the appends': ``_apply_done`` returns None for a row
@@ -6267,11 +6381,12 @@ class Engine:
         if not task.story_closes_intended:
             return
         ledger = self.paths.deferred_work
-        carried = deferredwork.mark_done_many(
+        carried = deferredwork.mark_done_many_reopenable(
             ledger,
             task.story_closes_intended,
             self._today(),
             self._story_close_note(task),
+            self._story_close_operation_id(task),
         )
         if carried:
             try:

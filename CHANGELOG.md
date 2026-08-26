@@ -170,6 +170,26 @@ breaking changes may land in a minor release.
   all; and a lock that cannot be taken fails the advance on the channel that already carries
   its errors rather than rewriting the board unserialized. The atomic, symlink-following,
   read-only-refusing write itself is unchanged.
+- **A failed commit now rolls back only the ledger entries the story itself closed** (#286).
+  The window between a story's declared `closes_deferred:` closure and its commit spans git
+  spawns and, on the escalation leg, a pause for a human, so it is long enough for another
+  writer to reach the same ledger — and the rollback used to rewrite the whole document from
+  the pre-close text, taking whatever had arrived with it: an entry another process filed
+  vanished (and its `DW-<n>` was handed out again), and a closure someone else had verified
+  silently reverted to `open`. A story close is therefore written the way a sweep bundle's
+  has been since #284, with a durable undo marker owned by that close, and the rollback
+  reopens exactly those entries in one locked read-modify-write. Concurrent appends, closes
+  and recorded decisions are left standing. An armed entry whose marker has since been
+  displaced — a foreign line inserted between the status and its marker breaks the pairing —
+  is left `done` with the foreign content intact and journaled as
+  `deferred-close-reopen-unmatched`, rather than overwritten around; `deferred-close-rolled-back`
+  now names the ids it reopened. The rollback stays advisory: it still never raises out of
+  the failure arm it runs inside, so the commit's own escalation remains the disposition.
+  **Ledger format:** a story close now leaves a permanent
+  `resolution-undo: <digest> <date> <hex>` line beside its `resolution:` line, in the same
+  committed ledger — the format `sweep` bundle closes already publish, now used by one more
+  writer. Readers that ignore unknown fields are unaffected; `bmad-loop sweep --archive`
+  already preserves the line.
 
 ### Security
 

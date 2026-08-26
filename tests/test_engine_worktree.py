@@ -4420,7 +4420,7 @@ def test_worktree_in_repo_ledger_closure_reaches_the_target_branch(project):
     assert "resolution: resolved by story 1-1-a" in entry.body
     assert worktree_clean(project.project)
     # #458's carry runs here too, and finds nothing to do: `_apply_done` returns
-    # None for a row that is already `done`, so `mark_done_many` writes nothing at
+    # None for a row that is already `done`, so `_mark_done_many` writes nothing at
     # all and no commit is attempted. That is what lets the carry be unconditional
     # rather than needing a tracked/ignored predicate.
     carried = [e for e in engine.journal.entries() if e["kind"] == "story-deferred-close-carried"]
@@ -4428,7 +4428,14 @@ def test_worktree_in_repo_ledger_closure_reaches_the_target_branch(project):
     assert "story-deferred-close-carry-uncommitted" not in journal_kinds(engine)
     # exactly one annotation — a second close would append a second resolution line
     assert entry.body.count("resolution:") == 1
-    assert "resolution-undo:" not in entry.body
+    # ...and exactly one undo marker beside it. This line read `not in` until #286
+    # made the story close REOPENABLE: the commit-boundary rollback now undoes these
+    # entries through their own markers instead of restoring the whole document over
+    # a concurrent writer, so the marker is permanent and rides the unit's commit to
+    # the target branch like the resolution line does. A second marker here would
+    # mean the carry re-closed a row the merge had already delivered — the very
+    # byte-identity the carry shares `_story_close_operation_id` to preserve.
+    assert entry.body.count("resolution-undo:") == 1
 
 
 def test_gitignored_declared_closure_reaches_the_main_ledger(project):
