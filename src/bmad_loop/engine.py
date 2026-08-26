@@ -4636,9 +4636,10 @@ class Engine:
 
         Answers ``(True, text)`` when the baseline commit carries the ledger,
         ``(True, None)`` when it determinately does not — the reset leaves no
-        tracked file behind — and ``(False, None)`` when no anchor could be
-        derived at all: no baseline commit, no repo-relative name, or a probe
-        that failed.
+        tracked file behind, whether because the commit lacks the path or
+        because the ledger is proven external and no revision of this repo can
+        name it — and ``(False, None)`` when no anchor could be derived at all:
+        no baseline commit, or a probe that failed.
 
         Newlines are normalized to LF because the only thing this text is ever
         compared against is :meth:`_ledger_text`, which reads in Python's
@@ -4669,7 +4670,19 @@ class Engine:
                     story_key=task.story_key,
                     error=str(fault),
                 )
-            return False, None
+                return False, None
+            # PROVEN external — it resolved cleanly and still fell outside the
+            # root — which is determinate absence, not uncertainty: no revision
+            # of this repo can name the path, so `reset --hard` cannot have
+            # republished it. Same answer as a baseline commit that does not
+            # carry the ledger, and for the same reason; the caller supplies the
+            # anchor for a file git never had. Collapsing this into the fault
+            # answer withholds the anchor from a SUPPORTED shape — an
+            # `implementation_artifacts` dir configured outside the repo tree,
+            # which `ProjectPaths.rebased` deliberately leaves put — and strands
+            # the sweep's migration restore on an unprovable-anchor refusal that
+            # the evidence does not support.
+            return True, None
         try:
             blob = verify.worktree_file_bytes_at_revision(
                 self.workspace.root, task.baseline_commit, rel

@@ -31,6 +31,7 @@ from bmad_loop import sweep as sweep_mod
 from bmad_loop import verify
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
+from bmad_loop.bmadconfig import ProjectPaths
 from bmad_loop.journal import Journal, load_state, save_state
 from bmad_loop.model import PAUSE_STORY_GATE, Phase, RunState, StoryTask, TokenUsage
 from bmad_loop.policy import (
@@ -5391,3 +5392,31 @@ def test_reopen_after_defer_uses_one_lock(project, monkeypatch):
     assert len(reopened) == 1
     assert reopened[0]["dw_ids"] == ["DW-1", "DW-2", "DW-3"]
     assert reopened[0]["story_key"] == "dw-fix"
+
+
+def test_migration_restore_writes_back_an_external_ledger(project, tmp_path):
+    """#735 follow-up. An `implementation_artifacts` dir configured OUTSIDE the
+    repo tree is a supported shape — `ProjectPaths.rebased` deliberately leaves
+    such dirs put, because they are shared rather than per-checkout — so the
+    ledger can resolve outside `workspace.root`.
+
+    `git reset --hard` provably cannot have touched a path no revision of this
+    repo can even name, which is the same proof the untracked-inside-the-tree
+    case relies on. So the anchor is the rejected rewrite this attempt graded,
+    the restore puts the pre-migration text back, and no divergence is journaled.
+    Escalating here would strand the half-migrated rewrite on disk for a
+    configuration that is not ambiguous at all.
+    """
+    external = ProjectPaths(
+        project=project.project,
+        implementation_artifacts=tmp_path / "shared-artifacts" / "implementation-artifacts",
+        planning_artifacts=project.planning_artifacts,
+    )
+    external.implementation_artifacts.mkdir(parents=True)
+    write_legacy_ledger(external, LEGACY_LEDGER, commit=False)
+    engine, _ = make_sweep(external, [_half_migrated_effect(external)] * 2)
+    summary = engine.run()
+
+    assert summary.paused
+    assert external.deferred_work.read_text(encoding="utf-8") == LEGACY_LEDGER
+    assert "sweep-migration-restore-diverged" not in journal_kinds(engine)

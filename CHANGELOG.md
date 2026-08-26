@@ -263,17 +263,20 @@ decisions` and the TUI decision modal now also catch the state-root failure that
   overwrites the rival's entries. Each write arm now takes its expected text from the
   ledger's committed blob at the run's baseline commit — what `reset --hard` actually
   republished, which is nobody's concurrent write — probed out of git before the lock, since
-  a lock may never span a subprocess. The post-reset observation is kept only where it was
-  always safe: authorizing a skip, never a write. Where no anchor can be derived — no
-  baseline commit, an external ledger, or a probe fault, journaled
-  `ledger-baseline-probe-failed` — each site degrades in its own direction rather than
-  writing: the retraction skips (`ledger-restore-skipped-diverged`), the defer restore merges
+  a lock may never span a subprocess. A ledger git never had — untracked, or configured
+  outside the repo tree, which is a supported shape — has no blob to anchor on, but is
+  equally beyond `reset --hard`'s reach; that is determinate absence rather than
+  uncertainty, so the sweep's restore anchors it on the rewrite the attempt actually graded.
+  The post-reset observation is kept only where it was always safe: authorizing a skip,
+  never a write. Where no anchor can be derived — no baseline commit, or a probe fault,
+  journaled `ledger-baseline-probe-failed` — each site degrades in its own direction rather
+  than writing: the retraction skips (`ledger-restore-skipped-diverged`), the defer restore merges
   by appending the entries disk has since lost (`defer-ledger-restore-diverged`), and the
   sweep escalates for a human (`sweep-migration-restore-diverged`). Those doubly-uncertain
   cases previously still wrote. What stays unfixable in principle, and is documented rather
   than claimed: a rival whose text is byte-equal to the committed blob — or, on the sweep's
-  untracked ledger, to the rewrite the attempt just rejected — is indistinguishable from the
-  reset's own work.
+  untracked or external ledger, to the rewrite the attempt just rejected — is
+  indistinguishable from the reset's own work.
 
 ### Security
 
