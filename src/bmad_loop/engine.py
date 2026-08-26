@@ -65,6 +65,7 @@ from .plugins import HookBus, HookContext, PluginRegistry
 from .policy import Policy
 from .recovery_flow import RecoveryFlow
 from .runs import (
+    StateRootError,
     clear_graceful_stop,
     consume_stop_request,
     events_dir_for,
@@ -2179,6 +2180,12 @@ class Engine:
                 if (not replayed and feedback is None) or not task.pre_harvest_ledger_captured:
                     task.pre_harvest_ledger = self._ledger_text()
                     task.pre_harvest_ledger_captured = True
+                    # The snapshot's own text is the first thing this engine can
+                    # claim to have left on disk: nothing of ours has been
+                    # written over it yet. The harvest below refreshes this to
+                    # the bytes it appends, so the CAS anchor always names the
+                    # engine's latest write rather than the chain's first.
+                    task.post_engine_ledger_digest = _digest_of(task.pre_harvest_ledger)
                     self._save()
                 # bmad-build-auto sometimes finalizes the spec in prose (## Auto Run
                 # Result: Status done) but leaves the frontmatter status at the
@@ -2279,7 +2286,7 @@ class Engine:
                         # rollback. Detect the active unwind without limiting it to
                         # RunPaused: reset/preserve failures are the #420 gap.
                         unwinding = sys.exc_info()[0] is not None
-                        restore_error: OSError | None = None
+                        restore_error: OSError | StateRootError | None = None
                         # Recovery resets code/spec state but protects artifact
                         # directories through `_safe_reset`'s
                         # keep=(".bmad-loop", *self._protected_relpaths()) shield.
@@ -2290,11 +2297,18 @@ class Engine:
                         # reset would not remove an untracked or ignored file either.
                         try:
                             self._restore_persisted_ledger(task, replayed=replayed)
-                        except OSError as e:
+                        except (OSError, StateRootError) as e:
                             # Preserve an exception already in flight; replacing a
                             # RunPaused/reset fault would misclassify the run and
                             # skip the stale-arm cleanup below. The journal keeps
                             # this secondary repair failure visible.
+                            # `StateRootError` joins `OSError` because the restore
+                            # now serializes on `ledger_lock`, which raises it when
+                            # the environment names no state root to put the lock
+                            # sidecar under. A lock that could not be taken is the
+                            # same class of secondary repair failure as a write
+                            # that could not land, and must not be the exception a
+                            # paused run reports either.
                             restore_error = e
                             self.journal.append(
                                 "ledger-restore-failed",
@@ -3892,6 +3906,27 @@ class Engine:
         # durability ordering the comment there describes is unchanged.
         minted = deferredwork.append_entries(ledger, specs)
         filed = [dw_id for dw_id in minted if dw_id is not None]
+        if filed:
+            # Re-anchor the pre-harvest restore's compare-and-set on what this
+            # append actually published. `append_entries` writes only when some
+            # spec minted an id (it returns the text untouched when every one
+            # dedupes), so `filed` IS the "did we write" answer and no extra
+            # probe is needed to derive it.
+            #
+            # Read back rather than reconstructed: the writer owns the applied
+            # text and does not hand it out. The read is unlocked, so a rival
+            # landing between the writer's release and this line would be
+            # counted as ours — a window of pure Python, against the restore's
+            # own window that spans `git reset --hard` and its preflight spawns.
+            # It is also never worse than the unguarded write this anchor
+            # replaces, which retracted whatever it found unconditionally.
+            #
+            # Durable before the decision that consumes it: a crash replay
+            # re-runs the harvest, which either writes again (refreshing this)
+            # or dedupes to no write at all, leaving the dead attempt's bytes
+            # exactly as this digest recorded them.
+            task.post_engine_ledger_digest = self._ledger_digest()
+            self._save()
         # The writer's open-entry guard can catch two frontmatter items with
         # the same clamped fingerprint inside this one pre-scan snapshot.
         deduped += sum(1 for dw_id in minted if dw_id is None)
@@ -4578,22 +4613,110 @@ class Engine:
             return True
 
     def _restore_ledger(self, task: StoryTask, snapshot: str | None) -> None:
-        """Restore the active ledger to a pre-harvest filesystem snapshot."""
+        """Retract this attempt's engine ledger writes, without taking a concurrent
+        writer's work with them (#286).
+
+        The window being repaired spans ``_rollback_or_pause``'s git spawns, so a
+        lock cannot cover it — :func:`deferredwork.ledger_lock` is contracted
+        never to span a subprocess. Compare-and-set stands in, against two
+        anchors, because this restore serves two different owners:
+
+        * ``post_engine_ledger_digest`` — the bytes THIS engine last published.
+          Matching it means the file on disk is the harvest append this restore
+          exists to retract.
+        * the post-rollback observation, on a ledger git owns. ``reset --hard``
+          republishes a tracked ledger's committed bytes, which are nobody's
+          concurrent write; restoring the snapshot over them is what puts back
+          the session's own ledger edits the reset erased.
+
+        Neither anchor holding means the text belongs to somebody else, and the
+        restore degrades to a journaled skip rather than a write. **A retraction
+        cannot be expressed as an append**, so there is no merge to fall back on
+        the way :meth:`_restore_defer_ledger` has one. Skipping is safe by
+        design: the harvest entries left standing are real findings rather than
+        noise, ``append_entry``'s idempotence stops the next attempt filing them
+        twice, and the attribution rebase at the call site reads a non-restored
+        disk as "the ledger changed", which stands the harvest exclusion down and
+        exposes MORE of the tree to the proof-of-work gate — the conservative
+        direction (see :meth:`_harvest_gate_exclude`).
+
+        The ``snapshot is None`` unlink is gated on the digest for the same
+        reason, and that is a latent data loss being closed rather than a new
+        guard: the code this replaces deleted whatever it found there, so a
+        ledger a concurrent writer had created inside the window was removed
+        along with the harvest that was supposed to be the only thing in it.
+
+        Signature-stable on purpose — the direct-call unit tests drive this with
+        an explicit snapshot. Write and lock faults propagate to the call site's
+        net, which preserves an in-flight ``RunPaused`` rather than being
+        replaced by a secondary repair failure.
+        """
         ledger = self.workspace.paths.deferred_work
-        if self._ledger_text() == snapshot:
+        # Read IMMEDIATELY after `_rollback_or_pause` returned: only pure Python
+        # runs between the reset and this line, so the compare window below is
+        # file-I/O-only rather than spanning the rollback's git spawns.
+        observed = self._ledger_text()
+        if observed == snapshot:
             return
-        if snapshot is None:
-            # The harvest created an untracked/ignored ledger. A tracked ledger
-            # absent at snapshot time is different: reset restored its committed
-            # bytes, which must never be deleted here.
-            if not self._ledger_is_gits_to_restore(task):
-                ledger.unlink(missing_ok=True)
+        # Probed BEFORE the lock: it spawns git, and `ledger_lock` may cover file
+        # I/O only. It also journals its own degrades, which belong outside the
+        # hold for the same reason.
+        gits = self._ledger_is_gits_to_restore(task)
+        if snapshot is None and gits:
+            # A tracked ledger absent at snapshot time is not ours to delete —
+            # reset restored its committed bytes. Deleting is the only thing a
+            # None snapshot could do, so return before taking a lock no write
+            # would ever use.
             return
-        ledger.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_text(ledger, snapshot)
+        diverged = False
+        with deferredwork.ledger_lock(ledger):
+            # PURE TEXT ONLY under the hold. Every `deferredwork` mutator takes
+            # this same lock, and `ledger_lock` raises on the nesting rather than
+            # deadlocking — that raise would abandon the repair half-done.
+            current = self._ledger_text()
+            if current == snapshot:
+                return
+            ours = _digest_of(current) == task.post_engine_ledger_digest
+            reset_owned = current == observed and gits
+            if snapshot is None:
+                # `gits` is False on this arm — the guard above returned
+                # otherwise — so the file is untracked, ignored or external and
+                # `reset --hard` cannot have put it there. Deleting it is
+                # therefore only defensible when the digest says these are the
+                # bytes this engine itself published; the unguarded unlink this
+                # replaces took a concurrent writer's ledger with the harvest.
+                if ours:
+                    ledger.unlink(missing_ok=True)
+                else:
+                    diverged = True
+            elif ours or reset_owned:
+                ledger.parent.mkdir(parents=True, exist_ok=True)
+                atomic_write_text(ledger, snapshot)
+            else:
+                diverged = True
+        # Journaled outside the hold: the lock covers this ledger's
+        # read-modify-write and nothing else.
+        if diverged:
+            self.journal.append(
+                "ledger-restore-skipped-diverged",
+                story_key=task.story_key,
+                ledger=str(ledger),
+            )
 
     def _restore_persisted_ledger(self, task: StoryTask, *, replayed: bool) -> None:
-        """Restore the snapshot durably armed before this attempt's engine writes."""
+        """Restore the snapshot durably armed before this attempt's engine writes.
+
+        The arm is the captured flag, never the text: ``None`` is a real snapshot
+        value meaning "no ledger existed", so an unarmed task and one armed over
+        an absent ledger are different states that must not collapse.
+
+        Delegates the compare-and-set to :meth:`_restore_ledger`, whose anchors
+        both live on the task — which is what makes this safe across a crash
+        replay, where the restore runs in a process that did not take the
+        snapshot. A divergent ledger is skipped and journaled rather than
+        overwritten, and the harvest-created file is unlinked only when the
+        digest says the engine wrote it.
+        """
         if not task.pre_harvest_ledger_captured:
             if replayed:
                 self.journal.append("ledger-snapshot-missing", story_key=task.story_key)
@@ -4601,9 +4724,13 @@ class Engine:
         self._restore_ledger(task, task.pre_harvest_ledger)
 
     def _disarm_ledger_snapshot(self, task: StoryTask) -> None:
-        """Drop the chain-scoped pre-harvest ledger snapshot."""
+        """Drop the chain-scoped pre-harvest ledger snapshot and its CAS anchor."""
         task.pre_harvest_ledger = None
         task.pre_harvest_ledger_captured = False
+        # The anchor is meaningless without the snapshot it guards, and a stale
+        # digest is worse than none: it could vouch for bytes a later attempt's
+        # restore has no claim to retract.
+        task.post_engine_ledger_digest = None
 
     def _harvest_gate_exclude(self, task: StoryTask) -> tuple[str, ...]:
         """Exclude only this attempt's engine-authored ledger append from proof of work.

@@ -214,6 +214,24 @@ breaking changes may land in a minor release.
   half-broken rewrite" failure the restore exists to prevent, and a migration input that
   moved after the attempt was graded against it is a human problem — the same call the
   duplicate-id refusal already makes.
+- **A rejected attempt's ledger retraction no longer overwrites, or deletes, a concurrent
+  writer's work** (#286). The pre-harvest snapshot is restored across `git reset --hard`
+  and its preflight spawns, so a lock cannot cover that window either; the restore is now
+  compare-and-set against two anchors — a persisted digest of the bytes the engine itself
+  last published, and the ledger as observed the instant the rollback returned when git
+  owns the file and its `reset --hard` republished it. Matching neither means the text is
+  somebody else's, and the restore degrades to a journaled
+  `ledger-restore-skipped-diverged` skip rather than a write. Deliberately no merge: a
+  retraction cannot be expressed as an append. The skip is the safe direction — the
+  harvest entries left standing are real findings, `append_entry`'s idempotence stops the
+  next attempt filing them twice, and a non-restored ledger already reads as "changed" to
+  the attribution rebase, which stands the harvest exclusion down and exposes more of the
+  tree to the proof-of-work gate. The `snapshot is None` arm, which retracts a ledger the
+  harvest itself created, is gated on the same digest, closing a latent data loss: it
+  previously deleted whatever it found at that path, so a ledger a concurrent writer had
+  created inside the window went with it. A tracked ledger absent at snapshot time is
+  still never deleted, and is now answered before any lock is taken. A write or lock fault
+  is journaled as `ledger-restore-failed` and preserves an in-flight pause, as before.
 
 ### Security
 

@@ -12453,22 +12453,58 @@ def test_ledger_digest_collapses_absent_and_empty_only():
 
 
 def test_persisted_ledger_restore_is_gated_by_capture_flag(project):
-    """None text is active only with the independent captured flag."""
+    """None text is active only with the independent captured flag.
+
+    Both halves are armed to unlink — the digest vouches for exactly the bytes on
+    disk — so the flag is the only thing left that can decide the first call, and
+    the assertion cannot pass because some other guard happened to refuse.
+
+    The armed half retracts a ledger the engine itself wrote, which is all the
+    unlink was ever for. That it must NOT retract one the engine did not write is
+    a separate claim, in
+    ``test_persisted_ledger_restore_skips_the_unlink_over_operator_content`` —
+    this test asserted the opposite of it until #286, deleting operator bytes the
+    engine never authored.
+    """
     engine, _ = make_engine(project, [], policy=_harvest_policy())
     task = StoryTask(story_key="1-1-a", epic=1)
     project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
-    project.deferred_work.write_text("operator-owned\n", encoding="utf-8")
+    harvested = "# Deferred Work\n\n## DW-1 our harvest row\n"
+    project.deferred_work.write_text(harvested, encoding="utf-8")
+    task.post_engine_ledger_digest = _digest_of(harvested)
 
     task.pre_harvest_ledger = None
     task.pre_harvest_ledger_captured = False
     engine._restore_persisted_ledger(task, replayed=False)
-    assert project.deferred_work.read_text(encoding="utf-8") == "operator-owned\n"
+    assert project.deferred_work.read_text(encoding="utf-8") == harvested
 
     task.pre_harvest_ledger_captured = True
     engine._restore_persisted_ledger(task, replayed=False)
     assert not project.deferred_work.exists()
     # Restore never prunes the harmless orchestrator-owned parent.
     assert project.deferred_work.parent.is_dir()
+
+
+def test_persisted_ledger_restore_skips_the_unlink_over_operator_content(project):
+    """An armed None snapshot never deletes a ledger the engine did not write."""
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    ledger = project.deferred_work
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_text("operator-owned\n", encoding="utf-8")
+
+    # Armed exactly as the harvest-created case is, but no engine write ever
+    # happened, so there is no digest to vouch for what is on disk.
+    task.pre_harvest_ledger = None
+    task.pre_harvest_ledger_captured = True
+    engine._restore_persisted_ledger(task, replayed=False)
+
+    assert ledger.read_text(encoding="utf-8") == "operator-owned\n"
+    (event,) = [
+        e for e in engine.journal.entries() if e["kind"] == "ledger-restore-skipped-diverged"
+    ]
+    assert event["story_key"] == "1-1-a"
+    assert event["ledger"] == str(ledger)
 
 
 def test_unarmed_replay_journals_missing_snapshot_without_touching_ledger(project):
@@ -12581,12 +12617,149 @@ def test_pre_harvest_ledger_restore_is_atomic_on_publication_failure(project, mo
         raise OSError("atomic replace blocked")
 
     monkeypatch.setattr(platform_util, "atomic_replace", publication_fails)
+    # Reaching the write at all now needs the compare-and-set to hold: the bytes
+    # being retracted have to be the ones this engine published (#286).
+    task.post_engine_ledger_digest = _digest_of(current)
 
     with pytest.raises(OSError, match="atomic replace blocked"):
         engine._restore_ledger(task, "# Deferred Work\n\npre-harvest snapshot\n")
 
     assert project.deferred_work.read_text(encoding="utf-8") == current
     assert list(project.deferred_work.parent.glob("deferred-work.md.*.tmp")) == []
+
+
+def test_rejected_attempt_restore_skips_over_a_concurrent_append(project, monkeypatch):
+    """A writer that lands inside the restore window keeps its entry.
+
+    The rival is staged between the post-rollback observation and the lock —
+    the only window compare-and-set can still be surprised in — so the restore
+    finds text it can attribute to nobody and must refuse rather than retract.
+    """
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    ledger = project.deferred_work
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    snapshot = "# Deferred Work\n\n## DW-1 pre-existing\n"
+    harvested = snapshot + "\n## DW-2 our harvest row\n"
+    ledger.write_text(harvested, encoding="utf-8")
+    task.post_engine_ledger_digest = _digest_of(harvested)
+
+    rival = harvested + "\n## DW-3 a concurrent run's row\n"
+    real_lock = deferredwork.ledger_lock
+    staged = False
+
+    @contextlib.contextmanager
+    def staging_lock(path):
+        nonlocal staged
+        # Latch BEFORE writing: the real lock is re-entered by nothing here, but
+        # a spy that latches after its nested call recurses forever.
+        if not staged:
+            staged = True
+            path.write_text(rival, encoding="utf-8")
+        with real_lock(path):
+            yield
+
+    monkeypatch.setattr(deferredwork, "ledger_lock", staging_lock)
+    engine._restore_ledger(task, snapshot)
+
+    assert staged
+    assert ledger.read_text(encoding="utf-8") == rival
+    (event,) = [
+        e for e in engine.journal.entries() if e["kind"] == "ledger-restore-skipped-diverged"
+    ]
+    assert event["story_key"] == "1-1-a"
+    assert event["ledger"] == str(ledger)
+
+
+def test_harvest_created_ledger_is_never_unlinked_over_foreign_content(project):
+    """A rival's entry in a harvest-created ledger survives the retraction.
+
+    The engine created the file, so the snapshot is None and today's code
+    deleted it outright. The digest names only the harvest, and the file now
+    holds more than that, so the whole file is somebody else's problem too.
+    """
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    ledger = project.deferred_work
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    harvested = "# Deferred Work\n\n## DW-1 our harvest row\n"
+    task.post_engine_ledger_digest = _digest_of(harvested)
+    both = harvested + "\n## DW-2 a concurrent run's row\n"
+    ledger.write_text(both, encoding="utf-8")
+
+    engine._restore_ledger(task, None)
+
+    assert ledger.read_text(encoding="utf-8") == both
+    (event,) = [
+        e for e in engine.journal.entries() if e["kind"] == "ledger-restore-skipped-diverged"
+    ]
+    assert event["story_key"] == "1-1-a"
+    assert event["ledger"] == str(ledger)
+
+
+def test_restore_still_retracts_the_engines_own_harvest(project):
+    """The uncontended path is unchanged: our own append is put back and removed.
+
+    Both directions on an UNTRACKED ledger deliberately: a tracked one is put
+    back by ``reset --hard`` on its own, so it would grade the write vacuously.
+    """
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    ledger = project.deferred_work
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+
+    # The harvest appended to a ledger that already existed: the snapshot text
+    # is republished over our row.
+    snapshot = "# Deferred Work\n\n## DW-1 pre-existing\n"
+    harvested = snapshot + "\n## DW-2 our harvest row\n"
+    ledger.write_text(harvested, encoding="utf-8")
+    task.post_engine_ledger_digest = _digest_of(harvested)
+    engine._restore_ledger(task, snapshot)
+    assert ledger.read_text(encoding="utf-8") == snapshot
+
+    # The harvest created the ledger: the file goes away again.
+    created = "# Deferred Work\n\n## DW-1 our harvest row\n"
+    ledger.write_text(created, encoding="utf-8")
+    task.post_engine_ledger_digest = _digest_of(created)
+    engine._restore_ledger(task, None)
+    assert not ledger.exists()
+
+    assert [
+        e for e in engine.journal.entries() if e["kind"] == "ledger-restore-skipped-diverged"
+    ] == []
+
+
+def test_harvest_digest_is_on_disk_before_the_attempt_decision(project, monkeypatch):
+    """Probe the refresh's own save before any later ambient save can mask it.
+
+    The anchor is only useful to a process that did not take it: a host loss
+    between the append and the dev decision leaves the harvest on disk, and the
+    replay that finds it there must be able to recognize it as this engine's.
+    Sampled at the harvest journal line, which is the first statement after the
+    refresh, so a later save cannot supply the durability being asserted.
+    """
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", followup_review=False, deferred=[HARVEST_A])],
+        policy=_harvest_policy(),
+    )
+    seen: list[tuple[str | None, str | None]] = []
+    real_append = engine.journal.append
+
+    def probing_append(kind, **fields):
+        if kind == "spec-deferrals-harvested" and not seen:
+            saved = load_state(engine.run_dir).tasks["1-1-a"]
+            seen.append((saved.post_engine_ledger_digest, engine._ledger_text()))
+        real_append(kind, **fields)
+
+    monkeypatch.setattr(engine.journal, "append", probing_append)
+
+    assert engine.run().done == 1
+
+    ((persisted, on_disk),) = seen
+    assert on_disk is not None and HARVEST_A["summary"] in on_disk
+    assert persisted == _digest_of(on_disk)
 
 
 def test_nonfixable_retry_leaves_tracked_ledger_at_its_baseline_bytes(project):
