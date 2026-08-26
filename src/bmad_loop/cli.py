@@ -2326,17 +2326,22 @@ def _sweep_archive(project: Path, paths: bmadconfig.ProjectPaths, args: argparse
         return ExitCode.FAILURE
     except (OSError, runs.StateRootError) as exc:
         # `archive_closed` serializes on the ledger's sidecar lock (#286/#469).
-        # Two ways that fails, and the operator's next move is the same for both:
-        # the acquisition itself raises `OSError` (a rival holder outlasting the
-        # blocking retry, or an unwritable locks dir), and deriving the sidecar's
-        # path raises `runs.StateRootError` — NOT an OSError — when the
-        # environment names no usable state root. Naming the lock is what makes
-        # the message actionable; a bare `error: [Errno 11] ...` from a command
-        # with no other lock in sight reads as a bug in the archive. Existing
+        # THREE ways this arm is reached, not two: the acquisition raises
+        # `OSError` (a rival holder outlasting the blocking retry, or an
+        # unwritable locks dir); deriving the sidecar's path raises
+        # `runs.StateRootError` — NOT an OSError — when the environment names no
+        # usable state root; and the archive's own I/O raises `OSError` too, for
+        # the ledger read and for either atomic write. Naming the lock is what
+        # makes the message actionable — a bare `error: [Errno 11] ...` from a
+        # command with no other lock in sight reads as a bug in the archive — but
+        # the message must not ASSERT contention, or a full disk sends the
+        # operator hunting a rival process that was never there. So it names both
+        # possibilities and lets the carried cause decide between them. Existing
         # FAILURE path, no new exit code, and `--archive` has no --json arm.
         print(
-            f"error: cannot take the deferred-work ledger lock ({exc}) — "
-            "another bmad-loop process may hold it",
+            f"error: cannot archive the deferred-work ledger ({exc}) — another "
+            "bmad-loop process may hold its ledger lock, or the ledger or its "
+            "archive could not be read or written",
             file=sys.stderr,
         )
         return ExitCode.FAILURE

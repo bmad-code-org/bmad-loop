@@ -9403,6 +9403,10 @@ def test_sweep_archive_names_the_lock_on_failure(project, monkeypatch, capsys):
     already returns FAILURE, and the exit code is the same either way. The
     stderr assert is what decides this test.
 
+    The lock is named as a POSSIBILITY rather than asserted, because the same arm
+    catches the archive's own read and write failures — see
+    `test_sweep_archive_write_failure_is_not_blamed_on_a_rival_process`.
+
     Ablation: drop the `except (OSError, runs.StateRootError)` arm from
     `_sweep_archive` — the rc assert still passes and the message assert reddens.
     """
@@ -9429,11 +9433,45 @@ def test_sweep_archive_names_the_lock_on_failure(project, monkeypatch, capsys):
 
     assert rc == 1
     err = capsys.readouterr().err
-    assert "cannot take the deferred-work ledger lock" in err
+    assert "ledger lock" in err  # named, rather than left as a bare errno
     assert "Resource deadlock avoided" in err  # the cause is carried, not swallowed
     # A write that could not be serialized did not proceed unlocked.
     assert not (project.deferred_work.parent / deferredwork.ARCHIVE_REL).exists()
     assert project.deferred_work.read_text(encoding="utf-8") == before
+
+
+def test_sweep_archive_write_failure_is_not_blamed_on_a_rival_process(project, monkeypatch, capsys):
+    """A disk failure during the archive is not reported as lock contention.
+
+    One `except (OSError, runs.StateRootError)` arm covers three causes: the
+    acquisition, deriving the sidecar path, and the archive's OWN I/O — the
+    ledger read and both atomic writes. A message that asserts "another
+    bmad-loop process may hold it" is therefore wrong for a full disk or a
+    permission error, and sends the operator hunting a rival that never existed.
+    The message names both possibilities and lets the carried cause decide.
+
+    Ablation: restore the message that asserts contention outright — the
+    "could not be read or written" assert reddens while `rc` stays 1, which is
+    again why the exit code is not the oracle here."""
+    from conftest import write_ledger
+
+    from bmad_loop import deferredwork
+
+    def full_disk(*args, **kwargs):
+        raise OSError(28, "No space left on device")
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open", "DW-2": "done 2026-06-01"}, commit=False)
+    # The archive's own write, not the lock: the acquisition succeeds normally.
+    monkeypatch.setattr(deferredwork, "atomic_write_text", full_disk)
+
+    rc = cli.main(["sweep", "--archive", "--project", str(project.project)])
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "No space left on device" in err  # the real cause is carried
+    assert "could not be read or written" in err  # ...and offered as an explanation
+    assert "may hold" in err  # the lock stays a possibility, not a verdict
 
 
 def test_sweep_archive_pid_gate_refuses_before_any_lock(project, monkeypatch, capsys):

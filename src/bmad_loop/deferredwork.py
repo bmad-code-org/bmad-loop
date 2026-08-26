@@ -872,6 +872,15 @@ def _mark_done_many(
     if notes is not None and len(notes) != len(dw_ids):
         raise ValueError(f"notes must be one per dw_id: {len(notes)} for {len(dw_ids)} ids")
     undo_owner = _operation_digest(operation_id) if operation_id is not None else None
+    if not dw_ids:
+        # Nothing to serialize against, so nothing to take a lock for — the same
+        # early return `append_entries` makes, for the same reason. Below the
+        # validation above, so an empty batch still reports a bad date or a bad
+        # operation id; above the lock, so a caller that batches an empty set
+        # cannot start failing on a lock it never needed. The per-id loop this
+        # primitive replaced took no lock at all when handed nothing, and that
+        # identity is part of what "byte-identical to the serial sequence" buys.
+        return []
     with ledger_lock(path):
         if not path.is_file():
             return []
@@ -1070,6 +1079,10 @@ def mark_open_many(path: Path, dw_ids: Sequence[str], note: str, operation_id: s
     already-reopened entries leaves the file untouched rather than rewriting it
     byte-for-byte."""
     undo_owner = _operation_digest(operation_id)
+    if not dw_ids:
+        # No ids, no lock — see `_mark_done_many`. The `operation_id` above is
+        # still validated, so an empty reopen cannot smuggle a bad one through.
+        return []
     with ledger_lock(path):
         if not path.is_file():
             return []

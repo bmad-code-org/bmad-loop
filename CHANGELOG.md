@@ -34,7 +34,9 @@ breaking changes may land in a minor release.
   changes how many windows it leaves open and nothing else. `append_entries_published`
   additionally hands back the text it wrote, so a caller that has to record what it published —
   rather than what the file happens to hold afterwards — takes its anchor from inside the hold
-  instead of reading the ledger back once the lock is gone.
+  instead of reading the ledger back once the lock is gone. An empty batch takes no lock at
+  all, matching the per-id loop it replaces, so a caller that batches nothing cannot begin
+  failing on a lock it never needed.
 
 ### Changed
 
@@ -143,7 +145,10 @@ breaking changes may land in a minor release.
   sees one whole version or another. Nested acquisition raises instead of self-deadlocking, and a
   lock that cannot be taken fails the write rather than proceeding unlocked. The dev/review
   session's own ledger writes are unchanged and still take no lock. `bmad-loop sweep --archive`
-  reports a lock it could not take by name rather than as a bare `errno`, and `bmad-loop
+  names the ledger lock in its failure message rather than printing a bare `errno` — as a
+  possibility rather than a verdict, since the same arm also catches the archive's own read
+  and write failures and a full disk must not send an operator hunting a rival process. And
+  `bmad-loop
 decisions` and the TUI decision modal now also catch the state-root failure that deriving a
   lock path can raise — in the TUI an uncaught one escaped into the Textual event loop and took
   the dashboard down mid-walk. `--archive`'s refusal while a run is live is unchanged and

@@ -3363,6 +3363,42 @@ def test_append_entries_validates_all_specs_before_writing(tmp_path, monkeypatch
     assert path.read_text(encoding="utf-8") == before
 
 
+@pytest.mark.parametrize(
+    "call",
+    [
+        pytest.param(lambda p: append_entries(p, []), id="append_entries"),
+        pytest.param(lambda p: mark_done_many(p, [], "2026-06-11", "fixed"), id="mark_done_many"),
+        pytest.param(lambda p: mark_open_many(p, [], "by dw-a", OPERATION_ID), id="mark_open_many"),
+    ],
+)
+def test_an_empty_batch_takes_no_lock(tmp_path, monkeypatch, call):
+    """Handed nothing to do, a batch primitive acquires nothing.
+
+    The per-id loops these replaced took no lock when the set was empty, because
+    there was no call to make; a batch that acquires anyway turns a no-op into
+    something that can fail on a lock it never needed — an `OSError` from the
+    acquisition, or a `runs.StateRootError` from deriving the sidecar path in an
+    environment that names no state root. The sweep reaches all three of these
+    with an empty set routinely: a triage plan with nothing already-resolved, a
+    discarded bundle with no closes to undo.
+
+    Validation still runs above the early return, which is why the date and the
+    operation id are real here rather than junk — an empty batch must still
+    report a caller's bad argument.
+
+    Ablation: delete the `if not dw_ids:` / `if not specs:` early return from the
+    primitive under test and its row reds, the spy having counted one."""
+    path = write_ledger(tmp_path)
+    before = path.read_text(encoding="utf-8")
+    acquisitions = []
+
+    with _counting_lock(monkeypatch, acquisitions):
+        assert call(path) == []
+
+    assert acquisitions == []
+    assert path.read_text(encoding="utf-8") == before
+
+
 def test_mark_open_many_matches_serial_mark_open_bytes(tmp_path, monkeypatch):
     """A batched reopen writes what a serial `mark_open` loop writes, in one
     acquisition and one write, skipping the ids it cannot reopen.
