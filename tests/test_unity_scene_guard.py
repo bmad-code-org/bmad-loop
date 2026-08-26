@@ -258,7 +258,14 @@ def test_seed_rejects_a_win32_alias_guard_dir_on_any_platform(tmp_path, monkeypa
         _set_env(monkeypatch, tmp_path, guard_dir=evil)
         assert mod.main() == 2, evil
     assert not (tmp_path / "Assets" / "BmadLoop").exists()  # nothing seeded
-    assert not (tmp_path / "Assets" / "...").exists()
+    # The `Assets/...` canary is checked through the payload file, not the
+    # directory: `(tmp_path / "Assets" / "...").exists()` is True ON WINDOWS with
+    # nothing seeded at all — the trim resolves `...` to `Assets` itself. That
+    # spelling failed the Windows CI legs, a measured live demonstration of the
+    # rule under test. This one grades on both platforms: had seeding happened,
+    # POSIX holds a literal `.../SceneAutoSaveGuard.cs` and Windows lands the
+    # payload in `Assets/` — and this path resolves to whichever one exists.
+    assert not (tmp_path / "Assets" / "..." / mod._GUARD_CS).exists()
 
 
 # --------------------------------------------- the hand-mirrored win32 predicate
