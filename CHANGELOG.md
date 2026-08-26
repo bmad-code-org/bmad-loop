@@ -25,6 +25,19 @@ breaking changes may land in a minor release.
   block that holds its body. Refuses while any engine run is live. Pure deterministic Python —
   no LLM involvement.
 
+- **Batched deferred-work ledger primitives** (#286, #469). `append_entries`,
+  `mark_open_many`, `record_decision` and `mark_done_many`'s per-id `notes=` each collapse a
+  sequence that used to be one write per row — or one write per half of an append-then-close
+  pair — into a single read-modify-write. Each is byte-identical to the serial sequence it
+  replaces, validating the whole batch before it takes the lock, minting sequential ids and
+  deduplicating in-call twins exactly as the loop it stands in for did, so a caller adopting one
+  changes how many windows it leaves open and nothing else. `append_entries_published`
+  additionally hands back the text it wrote, so a caller that has to record what it published —
+  rather than what the file happens to hold afterwards — takes its anchor from inside the hold
+  instead of reading the ledger back once the lock is gone. An empty batch takes no lock at
+  all, matching the per-id loop it replaces, so a caller that batches nothing cannot begin
+  failing on a lock it never needed.
+
 ### Changed
 
 - **A published run archive now lands at mode `0600`** instead of a umask-derived mode (#591).
@@ -117,6 +130,109 @@ breaking changes may land in a minor release.
   triage never passes `validate_triage`, and a fresh triage can renumber the option it named —
   applied by journaled discard rather than by error: the build decision is honored under the
   always-legal `decision-<id>` fallback name.
+- **Deferred-work ledger mutators serialize on a cross-process lock** (#286, #469). Every
+  mutator was an unlocked read-modify-write of the whole file, so two orchestrator processes —
+  a second `bmad-loop run`, a run plus a sweep, a run plus the TUI decision modal, a run plus
+  `sweep --archive` — both read, both edited, and the last atomic write won: entries lost,
+  closures silently reverted, and two appenders minting the same `DW-<n>` because each read
+  `next_seq` from the text it had just read. Every mutator now holds an advisory lock across its
+  whole read-modify-write, and the orchestrator's remaining multi-write sequences adopt the
+  batched primitives above, so each is one locked pass rather than one open window per row. The
+  lock lives at `<state root>/locks/<digest>-<basename>.lock`, out of the repository rather than
+  beside the ledger, because the ledger is tracked by design and the engine stages with
+  `git add -A`; it is keyed on the resolved path, so every spelling of one file contends on one
+  lock. Readers stay lock-free — every writer already replaced the file atomically, so a reader
+  sees one whole version or another. Nested acquisition raises instead of self-deadlocking, and a
+  lock that cannot be taken fails the write rather than proceeding unlocked. The dev/review
+  session's own ledger writes are unchanged and still take no lock. `bmad-loop sweep --archive`
+  names the ledger lock in its failure message rather than printing a bare `errno` — as a
+  possibility rather than a verdict, since the same arm also catches the archive's own read
+  and write failures and a full disk must not send an operator hunting a rival process. And
+  `bmad-loop
+decisions` and the TUI decision modal now also catch the state-root failure that deriving a
+  lock path can raise — in the TUI an uncaught one escaped into the Textual event loop and took
+  the dashboard down mid-walk. A project with no ledger at all is still answered without taking a
+  lock, so `--archive` keeps reporting it as the success it always was rather than failing
+  wherever no state root can be derived. `--archive`'s refusal while a run is live is
+  unchanged and deliberately kept: it is coarser than the lock, refusing the archive rewrite outright rather
+  than merely serializing it.
+- **`sprint-status.yaml` advances serialize on a cross-process lock** (#286, #469). Being the
+  board's sole writer was never mutual exclusion — a second orchestrator process runs that same
+  sole writer — and an advance is a read-modify-write of the whole board, so two of them both
+  read, both edited, and the last atomic write won: a story flipped by one run silently reverted
+  to its earlier status, and the run simply walked past it. `advance` now holds the board's own
+  sidecar lock across all three of its reads and its write, which also closes the gap inside a
+  single call between the never-regress decision and the bytes that decision was applied to. A
+  board that does not exist is still reported missing without creating a lock file at all, and a
+  lock that cannot be taken fails the advance on the channel that already carries its errors
+  rather than rewriting the board unserialized. Recomputing an advance for the isolated-run
+  ownership check runs the locked body directly against its private throwaway copy: it needs no
+  exclusion, nobody else being able to name that copy, and taking a lock anyway would strand one
+  more sidecar keyed on a path that exists only for that call, since lock files are never
+  reaped. The atomic, symlink-following,
+  read-only-refusing write itself is unchanged.
+- **A failed commit now rolls back only the ledger entries the story itself closed** (#286).
+  The window between a story's declared `closes_deferred:` closure and its commit spans git
+  spawns and, on the escalation leg, a pause for a human, so it is long enough for another
+  writer to reach the same ledger — and the rollback used to rewrite the whole document from
+  the pre-close text, taking whatever had arrived with it: an entry another process filed
+  vanished (and its `DW-<n>` was handed out again), and a closure someone else had verified
+  silently reverted to `open`. A story close is therefore written the way a sweep bundle's
+  has been since #284, with a durable undo marker owned by that close, and the rollback
+  reopens exactly those entries in one locked read-modify-write. Concurrent appends, closes
+  and recorded decisions are left standing. An armed entry whose marker has since been
+  displaced — a foreign line inserted between the status and its marker breaks the pairing —
+  is left `done` with the foreign content intact and journaled as
+  `deferred-close-reopen-unmatched`, rather than overwritten around; `deferred-close-rolled-back`
+  now names the ids it reopened. The rollback stays advisory: it still never raises out of
+  the failure arm it runs inside, so the commit's own escalation remains the disposition.
+  **Ledger format:** a story close now leaves a permanent
+  `resolution-undo: <digest> <date> <hex>` line beside its `resolution:` line, in the same
+  committed ledger — the format `sweep` bundle closes already publish, now used by one more
+  writer. Readers that ignore unknown fields are unaffected; `bmad-loop sweep --archive`
+  already preserves the line.
+- **A rolled-back defer no longer restores its ledger over a writer that arrived during
+  the rollback** (#286). The three ledger-restore windows that remain all span `git reset --hard`
+  and its preflight spawns, so a lock must not cover them; each is instead compare-and-set
+  against the ledger as observed the instant the rollback returned. The defer restore is also
+  gated on git owning the file, which inverts the old guard's worst case: on an untracked or
+  external ledger — the one kind `reset --hard` cannot have touched — every difference from the
+  snapshot was by definition somebody else's write, and rewriting the file on exactly that
+  difference is what destroyed it. Such a ledger is now left alone. When the text does move
+  between the observation and the lock, the snapshot is republished by APPENDING the entries disk
+  has since lost, keyed by DW- id and carrying their bodies verbatim, so a concurrent append
+  survives the restore instead of being rolled back with it; `defer-ledger-restore-diverged`
+  names the ids moved. Flat appender blocks, which belong to no canonical entry, are reported
+  rather than guessed at (`flat_remainder`) — the merge never invents a boundary the parser does
+  not model. Entries are matched by id AND body, so an id the reset removed and a rival then
+  re-minted for an entry of its own is reported as an `id_collisions` conflict rather than
+  silently accepted as already-there: matching on the id alone dropped the very entry the
+  merge exists to carry, and re-appending it would publish a duplicate `DW-<n>` instead. A
+  write or lock fault still propagates, as the unguarded write always did.
+- **A failed legacy-ledger migration refuses to restore over a ledger that changed
+  underneath it** (#286). The sweep's post-reset rewrite of the pre-migration text had the
+  same unguarded window; on a difference it now journals `sweep-migration-restore-diverged` and
+  escalates for a human to re-run the sweep rather than writing. Deliberately no merge and
+  no silent skip: leaving the rejected rewrite standing is the "never re-prompt over a
+  half-broken rewrite" failure the restore exists to prevent, and a migration input that
+  moved after the attempt was graded against it is a human problem — the same call the
+  duplicate-id refusal already makes.
+- **A rejected attempt's ledger retraction no longer overwrites, or deletes, a concurrent
+  writer's work** (#286). This restore compares against two anchors — a persisted digest of the
+  bytes the engine itself last published, and the ledger as observed the instant the rollback
+  returned when git owns the file and its `reset --hard` republished it. Matching neither means
+  the text is somebody else's, and the restore degrades to a journaled
+  `ledger-restore-skipped-diverged` skip rather than a write. Deliberately no merge: a
+  retraction cannot be expressed as an append. The skip is the safe direction — the
+  harvest entries left standing are real findings, `append_entry`'s idempotence stops the
+  next attempt filing them twice, and a non-restored ledger already reads as "changed" to
+  the attribution rebase, which stands the harvest exclusion down and exposes more of the
+  tree to the proof-of-work gate. The `snapshot is None` arm, which retracts a ledger the
+  harvest itself created, is gated on the same digest, closing a latent data loss: it
+  previously deleted whatever it found at that path, so a ledger a concurrent writer had
+  created inside the window went with it. A tracked ledger absent at snapshot time is
+  still never deleted, and is now answered before any lock is taken. A write or lock fault
+  is journaled as `ledger-restore-failed` and preserves an in-flight pause, as before.
 
 ### Security
 

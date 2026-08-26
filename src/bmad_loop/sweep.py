@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from . import deferredwork, gates, verify
-from .engine import Engine, RunPaused
+from .engine import Engine, RunPaused, _ArmedClose
 from .escalation import critical_escalations, env_fault_pause_reason, session_failure_reason
 from .model import PAUSE_STORY_GATE, Phase, StoryTask
 from .platform_util import (
@@ -1028,8 +1028,37 @@ class SweepEngine(Engine):
             # covers tracked files, the explicit write covers an untracked
             # ledger that `git reset` cannot restore
             self._safe_reset(task)
-            ledger.parent.mkdir(parents=True, exist_ok=True)
-            atomic_write_text(ledger, text)
+            # Read IMMEDIATELY after the reset returned: only pure Python runs
+            # between them, so the compare below is file-I/O-only rather than
+            # spanning the reset's git spawns, which no lock may cover (#286).
+            observed = ledger.read_text(encoding="utf-8") if ledger.is_file() else None
+            diverged = False
+            with deferredwork.ledger_lock(ledger):
+                # PURE TEXT ONLY under the hold — `ledger_lock` is not reentrant
+                # and every mutator takes it.
+                current = ledger.read_text(encoding="utf-8") if ledger.is_file() else None
+                if current == observed:
+                    ledger.parent.mkdir(parents=True, exist_ok=True)
+                    atomic_write_text(ledger, text)
+                else:
+                    diverged = True
+            if diverged:
+                # No merge and no silent skip. The comment above is the reason:
+                # leaving the rejected rewrite standing IS re-prompting over a
+                # half-broken ledger, and the migration input a human must fix is
+                # no longer the one this attempt was graded against — the same
+                # call `migrate-duplicate-ids` makes about a corrupt ledger.
+                # Journaled outside the hold; `_escalate` raises.
+                self.journal.append(
+                    "sweep-migration-restore-diverged",
+                    story_key=MIGRATE_KEY,
+                    ledger=str(ledger),
+                )
+                self._escalate(
+                    task,
+                    "the ledger changed underneath the failed migration attempt — "
+                    "re-run the sweep",
+                )
             if task.attempt >= self.policy.sweep.max_migration_attempts:
                 self._escalate(
                     task, "migration failed deterministic validation: " + "; ".join(errors)
@@ -1158,12 +1187,21 @@ class SweepEngine(Engine):
     def _close_resolved(self, plan: TriagePlan) -> int:
         self._emit("pre_close_resolved")
         ledger = self.workspace.paths.deferred_work
-        closed = []
-        for entry in plan.already_resolved:
-            if deferredwork.mark_done(
-                ledger, entry.id, self._today(), f"already resolved: {entry.evidence}"
-            ):
-                closed.append(entry.id)
+        # ONE locked read->edit->write for the whole batch (#286/#469). The
+        # per-entry `mark_done` loop this replaces took the cross-process ledger
+        # lock once per id, leaving a rival writer — a live run's harvest, the TUI
+        # decision modal, `sweep --archive` — a window between every pair of
+        # closures, so half this phase's closures could be lost while the other
+        # half landed and the journal claimed all of them. `notes=` carries the
+        # per-entry evidence the loop passed positionally, so the resulting ledger
+        # text and the returned ids (order preserved, skips dropped) are unchanged.
+        closed = deferredwork.mark_done_many(
+            ledger,
+            [entry.id for entry in plan.already_resolved],
+            self._today(),
+            "already resolved",
+            notes=[f"already resolved: {entry.evidence}" for entry in plan.already_resolved],
+        )
         if closed:
             self.journal.append("sweep-resolved-closed", dw_ids=closed)
         self._commit_ledger("chore(sweep): close resolved deferred-work entries")
@@ -1321,12 +1359,20 @@ class SweepEngine(Engine):
     def _apply_decision_effect(self, decision: Decision, option: DecisionOption) -> None:
         ledger = self.workspace.paths.deferred_work
         detail = option.resolution or option.intent
-        deferredwork.append_decision(ledger, decision.id, self._today(), option.label, detail)
+        close_note = None
         if option.effect == "close":
-            note = "closed by human decision" + (
+            close_note = "closed by human decision" + (
                 f": {option.resolution}" if option.resolution else ""
             )
-            deferredwork.mark_done(ledger, decision.id, self._today(), note)
+        # ONE locked read->edit->write (#286/#469). As the `append_decision` +
+        # `mark_done` pair it was two acquisitions with a window between them, and
+        # a rival writer landing there saw an entry whose decision line says "close
+        # it" and whose status still says open — a human answer half-recorded. The
+        # bytes are identical to the pair's: `record_decision` inserts the decision
+        # line before it applies the close, which is the order the pair produced.
+        deferredwork.record_decision(
+            ledger, decision.id, self._today(), option.label, detail, close_note=close_note
+        )
 
     def _commit_ledger(self, message: str) -> None:
         """Commit pending orchestrator ledger edits; bundles need a clean
@@ -1592,7 +1638,7 @@ class SweepEngine(Engine):
         return f"resolved by sweep bundle {task.story_key}"
 
     def _close_declared_deferred(
-        self, task: StoryTask, snapshot: list[tuple[Path, str]] | None = None
+        self, task: StoryTask, snapshot: list[_ArmedClose] | None = None
     ) -> None:
         """No-op: a bundle's ledger closure is owned by
         ``_close_bundle_ledger_when_spec_status``, which runs after accepted dev
@@ -1645,7 +1691,12 @@ class SweepEngine(Engine):
         ledger = self.workspace.paths.deferred_work
         note = self._bundle_close_note(task)
         operation_id = self._bundle_close_operation_id(task)
-        reopened = [i for i in task.dw_ids if deferredwork.mark_open(ledger, i, note, operation_id)]
+        # ONE locked read->edit->write (#286/#469): the per-id `mark_open`
+        # comprehension this replaces took the lock once per id, and a rollback
+        # that leaves some closes undone and others standing is the one shape this
+        # method exists to prevent. Order and skip semantics are `mark_open_many`'s
+        # own, which are the comprehension's.
+        reopened = deferredwork.mark_open_many(ledger, list(task.dw_ids), note, operation_id)
         if reopened:
             self.journal.append("sweep-bundle-reopened", story_key=task.story_key, dw_ids=reopened)
 

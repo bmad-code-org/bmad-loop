@@ -1845,6 +1845,79 @@ def test_state_dir_for_raises_when_the_project_cannot_be_canonicalized(tmp_path,
         runs.state_dir_for(project, "r1")
 
 
+# ------------------------------------------------- lock_path_for (#286, #469)
+#
+# The advisory-lock sidecar for a mutable data file. Two claims are load-bearing
+# and graded below: WHERE it lives (under the state root, never beside the data
+# file, because the ledger is tracked and the engine stages with `git add -A`)
+# and WHAT it is keyed on (the resolved path, so every spelling of one file
+# contends on one lock).
+
+
+def test_lock_path_for_keys_on_the_resolved_path(tmp_path):
+    """Two spellings of one ledger get one lock; two ledgers get two.
+
+    A lock keyed on the spelling excludes nobody: the run reaching the ledger by
+    its `.bmad-loop` relative path and the sweep reaching it through an absolute
+    or dot-dot spelling would take different sidecars and interleave exactly as
+    they do today, with the fix installed and inert.
+
+    Also grades the placement, which is the deliberate deviation from #286's own
+    proposal of a `deferred-work.md.lock` sibling: the ledger is tracked by
+    design and `verify.commit_story`/`finalize_commit` stage with `git add -A`,
+    so a sibling would ride into the engine's own commits.
+
+    Ablation: digest `data_path` instead of `data_path.resolve()` and the
+    dot-dot row fails — one file, two locks."""
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    ledger = artifacts / "deferred-work.md"
+    ledger.write_text("# Deferred Work\n", encoding="utf-8")
+
+    direct = runs.lock_path_for(ledger)
+    # A dot-dot spelling: `str()` keeps it verbatim, so only resolution folds it
+    dotted = runs.lock_path_for(artifacts / ".." / "artifacts" / "deferred-work.md")
+
+    assert direct == dotted  # one file, one lock
+    assert direct.parent == runs.state_root() / "locks"  # never beside the ledger
+    assert tmp_path not in direct.parents  # ...and never inside the project
+    assert direct.name.endswith("-deferred-work.md.lock")  # basename, for humans
+
+    sibling = artifacts / "deferred-work-archive.md"
+    sibling.write_text("", encoding="utf-8")
+    assert runs.lock_path_for(sibling) != direct  # distinct files, distinct locks
+
+
+def test_lock_path_for_is_pure_and_creates_nothing(tmp_path):
+    """No mkdir here: `file_lock` mkdirs the lock's parent when it opens it.
+
+    Worth pinning rather than assuming — a helper that provisions the state root
+    as a side effect of being *asked a question* turns every read-only caller
+    into a writer, and `lock_path_for` is called from `--json` read models."""
+    ledger = tmp_path / "deferred-work.md"
+
+    lock = runs.lock_path_for(ledger)
+
+    assert not lock.exists()
+    assert not lock.parent.exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_lock_path_for_follows_a_symlinked_ledger_to_one_lock(tmp_path):
+    """The symlink half of the spelling problem — the one no lexical comparison
+    catches, since the two paths share no component. A project pointed at a
+    shared external artifact dir through a link contends with the direct
+    spelling, which is where the real contention is."""
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    ledger = artifacts / "deferred-work.md"
+    ledger.write_text("# Deferred Work\n", encoding="utf-8")
+    link = tmp_path / "link"
+    link.symlink_to(artifacts, target_is_directory=True)
+
+    assert runs.lock_path_for(link / "deferred-work.md") == runs.lock_path_for(ledger)
+
+
 def test_config_digest_is_stamped_under_the_state_root_not_in_the_project(tmp_path):
     """#498's whole point: the baseline `resume` TRUSTS leaves the tree the driven
     sessions can write to.

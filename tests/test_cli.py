@@ -9389,3 +9389,133 @@ def test_sweep_archive_refuses_when_runs_dir_unreadable(project, capsys):
     assert "cannot list runs under" in capsys.readouterr().err
     assert not (project.deferred_work.parent / deferredwork.ARCHIVE_REL).exists()
     assert project.deferred_work.read_text(encoding="utf-8") == before
+
+
+def test_sweep_archive_names_the_lock_on_failure(project, monkeypatch, capsys):
+    """A ledger lock `--archive` cannot take is reported as a lock, by name.
+
+    `archive_closed` serializes on the ledger's cross-process sidecar lock
+    (#286/#469). Without the dedicated arm the acquisition's `OSError` fell
+    through to `main`'s bare backstop, which prints `error: [Errno 11] Resource
+    deadlock avoided` from a command with no other lock in sight — a message
+    that reads as a bug in the archive rather than as "another bmad-loop process
+    holds this". `rc == 1` is therefore a vacuous oracle here: the backstop
+    already returns FAILURE, and the exit code is the same either way. The
+    stderr assert is what decides this test.
+
+    The lock is named as a POSSIBILITY rather than asserted, because the same arm
+    catches the archive's own read and write failures — see
+    `test_sweep_archive_write_failure_is_not_blamed_on_a_rival_process`.
+
+    Ablation: drop the `except (OSError, runs.StateRootError)` arm from
+    `_sweep_archive` — the rc assert still passes and the message assert reddens.
+    """
+    import contextlib
+
+    from conftest import write_ledger
+
+    from bmad_loop import deferredwork
+
+    @contextlib.contextmanager
+    def unavailable(lock_path, **kwargs):
+        # The shape `msvcrt.locking` raises when its ~10s blocking retry runs
+        # out — a routine outcome on the Windows legs, not a contrived one. The
+        # dead `yield` keeps this a generator, which `contextmanager` requires.
+        raise OSError(11, "Resource deadlock avoided")
+        yield  # pragma: no cover — unreachable
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open", "DW-2": "done 2026-06-01"}, commit=False)
+    before = project.deferred_work.read_text(encoding="utf-8")
+    monkeypatch.setattr(deferredwork, "file_lock", unavailable)
+
+    rc = cli.main(["sweep", "--archive", "--project", str(project.project)])
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "ledger lock" in err  # named, rather than left as a bare errno
+    assert "Resource deadlock avoided" in err  # the cause is carried, not swallowed
+    # A write that could not be serialized did not proceed unlocked.
+    assert not (project.deferred_work.parent / deferredwork.ARCHIVE_REL).exists()
+    assert project.deferred_work.read_text(encoding="utf-8") == before
+
+
+def test_sweep_archive_write_failure_is_not_blamed_on_a_rival_process(project, monkeypatch, capsys):
+    """A disk failure during the archive is not reported as lock contention.
+
+    One `except (OSError, runs.StateRootError)` arm covers three causes: the
+    acquisition, deriving the sidecar path, and the archive's OWN I/O — the
+    ledger read and both atomic writes. A message that asserts "another
+    bmad-loop process may hold it" is therefore wrong for a full disk or a
+    permission error, and sends the operator hunting a rival that never existed.
+    The message names both possibilities and lets the carried cause decide.
+
+    Ablation: restore the message that asserts contention outright — the
+    "could not be read or written" assert reddens while `rc` stays 1, which is
+    again why the exit code is not the oracle here."""
+    from conftest import write_ledger
+
+    from bmad_loop import deferredwork
+
+    def full_disk(*args, **kwargs):
+        raise OSError(28, "No space left on device")
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open", "DW-2": "done 2026-06-01"}, commit=False)
+    # The archive's own write, not the lock: the acquisition succeeds normally.
+    monkeypatch.setattr(deferredwork, "atomic_write_text", full_disk)
+
+    rc = cli.main(["sweep", "--archive", "--project", str(project.project)])
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "No space left on device" in err  # the real cause is carried
+    assert "could not be read or written" in err  # ...and offered as an explanation
+    assert "may hold" in err  # the lock stays a possibility, not a verdict
+
+
+def test_sweep_archive_pid_gate_refuses_before_any_lock(project, monkeypatch, capsys):
+    """The pid-liveness gate still refuses ahead of the ledger lock beneath it.
+
+    The lock (#286/#469) makes this refusal belt-and-braces, and the temptation
+    once a lock exists is to drop the gate as redundant. It is not: the gate is
+    deliberately coarser — no archive rewrite AT ALL while a run is live, where
+    the lock would merely serialize the two writers' read-modify-writes and
+    happily move a live run's entries out from under a plan it has already read.
+
+    The zero-acquisition spy is what makes this a gate test rather than a
+    refusal test. "Nothing was written" cannot tell the two apart: a refused
+    acquisition and a refused archive both leave the ledger byte-identical, so
+    the count is the only thing that says the gate fired FIRST.
+
+    Ablation: move the `archive_closed` call above the liveness loop — the
+    refusal message still prints, and `acquired` goes to 1.
+    """
+    import contextlib
+
+    from conftest import write_ledger
+
+    from bmad_loop import deferredwork
+
+    acquired = []
+    real_file_lock = deferredwork.file_lock
+
+    @contextlib.contextmanager
+    def counting(lock_path, **kwargs):
+        acquired.append(lock_path)
+        with real_file_lock(lock_path, **kwargs):
+            yield
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open", "DW-2": "done 2026-06-01"}, commit=False)
+    run_dir = project.project / ".bmad-loop" / "runs" / "20260824-100000-aaaa"
+    run_dir.mkdir(parents=True)
+    (run_dir / "state.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(cli.runs, "engine_liveness", lambda _dir: "alive")
+    monkeypatch.setattr(deferredwork, "file_lock", counting)
+
+    rc = cli.main(["sweep", "--archive", "--project", str(project.project)])
+
+    assert rc == 1
+    assert "may still be live" in capsys.readouterr().err
+    assert acquired == []  # refused BEFORE any acquisition, not merely before the write

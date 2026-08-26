@@ -24,7 +24,7 @@ Things that break silently. Never violate; when in doubt, read the named module'
 
 - No LLM calls in the orchestrator control loop.
 - Sessions complete only on hook Stop events or window death — never on LLM prose. Never add another completion path. Post-session state is re-verified deterministically (`verify.py`).
-- `sprintstatus.advance()` is the orchestrator's sole write path to sprint-status.yaml (the dev skill flips only spec frontmatter; the engine mirrors it onto the board pre-verify). Legal phase transitions live only in `statemachine.py`.
+- `sprintstatus.advance()` is the orchestrator's sole write path to sprint-status.yaml (internally serialized cross-process since #469; the dev skill flips only spec frontmatter; the engine mirrors it onto the board pre-verify). Legal phase transitions live only in `statemachine.py`.
 - All git subprocess calls in `src/bmad_loop` go through the `_run_git` chokepoint in `verify.py` (timeouts, `LC_ALL=C`) — no bare subprocess git; `tests/test_portability_guard.py` enforces it. Tests, `scripts/`, and CI workflows deliberately spawn their own git: a harness must not depend on the artifact it validates.
 - Every new policy field needs an entry in `src/bmad_loop/data/settings/core.toml` (a sync test enforces defaults/options match `policy.py`). New core env vars register in `envvars.py`; plugin-owned env-var families stay with their plugin.
 - Version strings are stamped only by `scripts/sync_version.py` from `src/bmad_loop/__init__.py` — never hand-edit pyproject.toml, module.yaml, marketplace.json, or uv.lock versions.

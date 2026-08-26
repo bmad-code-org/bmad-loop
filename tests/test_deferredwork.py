@@ -1,16 +1,22 @@
 """Ledger parsing and editing: deferredwork.py."""
 
+import contextlib
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
 
-from bmad_loop import deferredwork, fences
+from bmad_loop import deferredwork, fences, platform_util, runs
 from bmad_loop.deferredwork import (
     _ISO_DATE_RE,
     ARCHIVE_REL,
     LINE_BREAK_RE,
     SEVERITY_ALIASES,
+    EntrySpec,
     append_decision,
+    append_entries,
     append_entry,
     archive_closed,
     classify,
@@ -22,11 +28,13 @@ from bmad_loop.deferredwork import (
     mark_done_many,
     mark_done_many_reopenable,
     mark_open,
+    mark_open_many,
     next_seq,
     open_ids,
     parse_declaration,
     parse_ledger,
     parse_legacy,
+    record_decision,
 )
 
 OPERATION_ID = "run-20260803T120000/dw-fix"
@@ -3167,3 +3175,868 @@ def test_archive_fenced_archived_line_in_twin_does_not_suppress(tmp_path):
     # ...and the body left the ledger for the archive rather than being dropped.
     stub = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}["DW-2"]
     assert "reason: pre-existing." not in stub.body
+
+
+# ----------------------------------- batched locked mutation primitives (#286)
+#
+# Each batch primitive collapses what used to be N read->edit->write cycles into
+# ONE, so the section grades two separable claims per primitive: that the batch
+# really is one acquisition and one write, and that what it writes is what the
+# serial loop it replaces would have written. The second is not a formality —
+# batching is where the interesting bugs live. Every applier re-parses the text
+# it is handed, so a batch that fed each step the text the CALL read rather than
+# the text the previous step produced would mint the same `DW-<n>` for every
+# spec, miss an in-call duplicate, and apply the second reopen's cuts at offsets
+# the first reopen had already shifted.
+
+
+BATCH_SEED = """\
+# Deferred Work
+
+### DW-1: Already closed twin
+origin: code review of spec-batch.md
+location: n/a
+source_spec: `spec-batch.md`
+reason: fixed already.
+status: done 2026-06-01
+"""
+
+# One new entry, its exact in-call duplicate, and a spec whose marker matches the
+# CLOSED DW-1 above. Expected result: [DW-2, None, DW-3] — the duplicate dedupes
+# against the entry the first spec just appended, and the closed twin does not
+# suppress anything because the idempotence scan is open-only (the work is back).
+BATCH_SPECS = (
+    dict(title="first", origin="code review of spec-x.md", source_spec="spec-x.md", reason="r1"),
+    dict(
+        title="twin of first",
+        origin="code review of spec-x.md",
+        source_spec="spec-x.md",
+        reason="r1 again",
+    ),
+    dict(
+        title="closed twin returns",
+        origin="code review of spec-batch.md",
+        source_spec="spec-batch.md",
+        reason="came back",
+    ),
+)
+
+
+def _twin_ledger(tmp_path: Path, text: str) -> Path:
+    """A second ledger, in its own directory so it contends on its own lock."""
+    twin = tmp_path / "twin" / "deferred-work.md"
+    twin.parent.mkdir(parents=True, exist_ok=True)
+    twin.write_text(text, encoding="utf-8")
+    return twin
+
+
+@contextlib.contextmanager
+def _counting_lock(monkeypatch, acquisitions):
+    """Install a `ledger_lock` spy that records every acquisition and still locks."""
+    real_lock = deferredwork.ledger_lock
+
+    @contextlib.contextmanager
+    def spy_lock(p):
+        acquisitions.append(p)
+        with real_lock(p):
+            yield
+
+    monkeypatch.setattr(deferredwork, "ledger_lock", spy_lock)
+    yield
+
+
+def _counting_write(monkeypatch, writes):
+    """Install an `atomic_write_text` spy that records every write and still writes."""
+    real_write = deferredwork.atomic_write_text
+
+    def spy_write(p, text):
+        writes.append(p)
+        return real_write(p, text)
+
+    monkeypatch.setattr(deferredwork, "atomic_write_text", spy_write)
+
+
+def test_append_entries_is_one_lock_one_write(tmp_path, monkeypatch):
+    """Three specs cost one acquisition and one write, and mint sequential ids.
+
+    The three claims are one mechanism. Ids are sequential only because each
+    spec's `next_seq` runs against the text the previous spec produced, and that
+    text can only exist inside one hold — which is the same reason there is one
+    write. A loop of `append_entry` gets all three wrong at once.
+
+    Ablation: reimplement the body as `[append_entry(path, **spec) for spec in
+    specs]` — three acquisitions and three writes, and the row reds on the first
+    assertion it reaches."""
+    path = write_ledger(tmp_path)
+    specs = [
+        EntrySpec(
+            title=f"batched {n}", origin=f"probe-{n}", source_spec=f"spec-{n}.md", reason="raced"
+        )
+        for n in (1, 2, 3)
+    ]
+    acquisitions, writes = [], []
+    _counting_write(monkeypatch, writes)
+
+    with _counting_lock(monkeypatch, acquisitions):
+        assert append_entries(path, specs) == ["DW-4", "DW-5", "DW-6"]
+
+    assert acquisitions == [path]
+    assert writes == [path]
+
+
+def test_append_entries_matches_serial_append_entry_bytes(tmp_path):
+    """One batched call writes exactly what the serial loop it replaces writes.
+
+    Graded twice, against two different kinds of oracle, because they fail to
+    different bugs. The serial-loop twin catches every way batching can diverge
+    from looping — a shared `next_seq` read, an idempotence scan against stale
+    text, a separator computed from the text the call read. The literal catches
+    what the twin cannot: both sides now route through `_apply_append`, so a
+    drift in the extracted applier itself would move both files together and
+    leave them equal.
+
+    Compared as TEXT rather than bytes: the fixtures write via `write_text`, so a
+    byte comparison would red on Windows for the newline translation alone.
+
+    Ablation: mint every id from the text the call read (hoist `next_seq` out of
+    `_apply_append`) — the batch writes DW-2 twice, and both assertions red."""
+    path = write_ledger(tmp_path, BATCH_SEED)
+    twin = _twin_ledger(tmp_path, BATCH_SEED)
+
+    minted = append_entries(path, [EntrySpec(**spec) for spec in BATCH_SPECS])
+    serial = [append_entry(twin, **spec) for spec in BATCH_SPECS]
+
+    assert minted == ["DW-2", None, "DW-3"]
+    assert serial == minted
+    assert path.read_text(encoding="utf-8") == twin.read_text(encoding="utf-8")
+
+    assert path.read_text(encoding="utf-8") == BATCH_SEED + (
+        "\n### DW-2: first\n"
+        "origin: code review of spec-x.md\n"
+        "location: n/a\n"
+        "source_spec: `spec-x.md`\n"
+        "reason: r1\n"
+        "status: open\n"
+        "\n### DW-3: closed twin returns\n"
+        "origin: code review of spec-batch.md\n"
+        "location: n/a\n"
+        "source_spec: `spec-batch.md`\n"
+        "reason: came back\n"
+        "status: open\n"
+    )
+
+
+def test_append_entries_validates_all_specs_before_writing(tmp_path, monkeypatch):
+    """A bad spec anywhere in the sequence writes nothing — and is caught before
+    the lock is even taken.
+
+    All-or-nothing is the point: validating per spec inside the loop would commit
+    whatever prefix happened to precede the bad one, and the caller that raised
+    has no record of which entries landed. Asserting the lock was never acquired
+    grades the placement rather than merely the outcome — validation moved inside
+    the hold would still leave the ledger untouched here (there is one write, at
+    the end), so an untouched-bytes assertion alone passes for the wrong reason,
+    and a programmer bug would queue behind another process before reporting.
+
+    Ablation: move the two enum checks inside `with ledger_lock(path):` — the
+    acquisition assertion reds while the bytes assertion still passes, which is
+    exactly the pair's division of labor."""
+    path = write_ledger(tmp_path)
+    before = path.read_text(encoding="utf-8")
+    specs = [
+        EntrySpec(title="fine", origin="probe-1", source_spec="spec-1.md", reason="ok"),
+        EntrySpec(
+            title="bad",
+            origin="probe-2",
+            source_spec="spec-2.md",
+            reason="ok",
+            severity="catastrophic",
+        ),
+    ]
+    acquisitions = []
+
+    with _counting_lock(monkeypatch, acquisitions):
+        with pytest.raises(ValueError, match="severity must be one of"):
+            append_entries(path, specs)
+
+    assert acquisitions == []
+    assert path.read_text(encoding="utf-8") == before
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        pytest.param(lambda p: append_entries(p, []), id="append_entries"),
+        pytest.param(lambda p: mark_done_many(p, [], "2026-06-11", "fixed"), id="mark_done_many"),
+        pytest.param(lambda p: mark_open_many(p, [], "by dw-a", OPERATION_ID), id="mark_open_many"),
+    ],
+)
+def test_an_empty_batch_takes_no_lock(tmp_path, monkeypatch, call):
+    """Handed nothing to do, a batch primitive acquires nothing.
+
+    The per-id loops these replaced took no lock when the set was empty, because
+    there was no call to make; a batch that acquires anyway turns a no-op into
+    something that can fail on a lock it never needed — an `OSError` from the
+    acquisition, or a `runs.StateRootError` from deriving the sidecar path in an
+    environment that names no state root. The sweep reaches all three of these
+    with an empty set routinely: a triage plan with nothing already-resolved, a
+    discarded bundle with no closes to undo.
+
+    Validation still runs above the early return, which is why the date and the
+    operation id are real here rather than junk — an empty batch must still
+    report a caller's bad argument.
+
+    Ablation: delete the `if not dw_ids:` / `if not specs:` early return from the
+    primitive under test and its row reds, the spy having counted one."""
+    path = write_ledger(tmp_path)
+    before = path.read_text(encoding="utf-8")
+    acquisitions = []
+
+    with _counting_lock(monkeypatch, acquisitions):
+        assert call(path) == []
+
+    assert acquisitions == []
+    assert path.read_text(encoding="utf-8") == before
+
+
+def test_archive_closed_takes_no_lock_for_a_missing_ledger(tmp_path, monkeypatch):
+    """No ledger means no write, and so no lock — `advance`'s rule, one module over.
+
+    `bmad-loop sweep --archive` reports a project that has no ledger as SUCCESS
+    ("no deferred-work ledger at ..."). With the acquisition first, that answer
+    became a FAILURE wherever the state root cannot be derived: a released
+    behavior changed by a lock taken for a file that is not there. The guard under
+    the hold stays, deletion being able to race this one.
+
+    Ablation: move the `is_file` guard back below `with ledger_lock(path):` — the
+    spy fires and this reds."""
+    path = tmp_path / "deferred-work.md"  # deliberately never created
+    acquisitions = []
+
+    with _counting_lock(monkeypatch, acquisitions):
+        assert archive_closed(path, archive_date="2026-08-24") == []
+
+    assert acquisitions == []
+    assert not path.exists()  # and nothing was created on the way past
+
+
+def test_mark_open_many_matches_serial_mark_open_bytes(tmp_path, monkeypatch):
+    """A batched reopen writes what a serial `mark_open` loop writes, in one
+    acquisition and one write, skipping the ids it cannot reopen.
+
+    The skipped ids are load-bearing, not padding. `DW-2` was closed by the
+    ordinary `mark_done_many`, which writes no undo marker, and `DW-99` does not
+    exist — a batch that treated either as reopened would return an id its caller
+    would then journal as rolled back.
+
+    The equality is not vacuous now that `mark_open` delegates to this function:
+    `_apply_open` cuts a span computed from the entry's parsed offsets, and the
+    first reopen shifts every offset after it. Feeding the second id the text the
+    call READ rather than the text the first reopen produced corrupts the file.
+
+    Ablation: apply every id's cuts against the text read at the top of the hold
+    — the second entry's cut lands at a stale offset and the equality reds."""
+    seed = write_ledger(tmp_path)
+    mark_done_many_reopenable(seed, ["DW-1", "DW-3"], "2026-06-11", "by dw-a", OPERATION_ID)
+    assert mark_done(seed, "DW-2", "2026-06-11", "plain close") is False  # already done
+    closed = seed.read_text(encoding="utf-8")
+    twin = _twin_ledger(tmp_path, closed)
+
+    ids = ["DW-1", "DW-2", "DW-99", "DW-3"]
+    acquisitions, writes = [], []
+    _counting_write(monkeypatch, writes)
+
+    with _counting_lock(monkeypatch, acquisitions):
+        reopened = mark_open_many(seed, ids, "by dw-a", OPERATION_ID)
+
+    assert reopened == ["DW-1", "DW-3"]
+    assert acquisitions == [seed]
+    assert writes == [seed]
+
+    serial = [dw_id for dw_id in ids if mark_open(twin, dw_id, "by dw-a", OPERATION_ID)]
+    assert serial == reopened
+    assert seed.read_text(encoding="utf-8") == twin.read_text(encoding="utf-8")
+
+
+def test_mark_open_many_writes_nothing_when_no_id_is_eligible(tmp_path, monkeypatch):
+    """A replayed rollback over already-open entries leaves the file untouched.
+
+    Ablation: drop the `if not reopened: return []` guard — the write spy fires
+    and the row reds."""
+    path = write_ledger(tmp_path)
+    writes = []
+    _counting_write(monkeypatch, writes)
+
+    assert mark_open_many(path, ["DW-1", "DW-99"], "by dw-a", OPERATION_ID) == []
+
+    assert writes == []
+
+
+def test_record_decision_close_matches_the_serial_pair_bytes(tmp_path, monkeypatch):
+    """One `record_decision(close_note=...)` writes exactly what the
+    `append_decision` + `mark_done` pair writes, in one write rather than two.
+
+    The byte equality is where the ordering trap is graded. `_apply_done` inserts
+    its `resolution:` line immediately after the status line, and
+    `_MARK_DONE_TAIL_RE` — the pattern a reopenable close's undo marker is
+    matched with — anchors on exactly that adjacency. Applying the close first
+    and the decision second produces the same two lines in the other order, which
+    parses, reads correctly to a human, and quietly makes the close unreopenable.
+
+    Ablation: swap the two applier calls so `_apply_done` runs first — the
+    decision line lands between `status:` and `resolution:`, and both the
+    equality and the adjacency assertion red."""
+    path = write_ledger(tmp_path)
+    twin = _twin_ledger(tmp_path, path.read_text(encoding="utf-8"))
+    writes = []
+    _counting_write(monkeypatch, writes)
+
+    assert (
+        record_decision(
+            path,
+            "DW-1",
+            "2026-06-11",
+            "fix now",
+            "worth the churn",
+            close_note="closed by decision",
+        )
+        is True
+    )
+    assert writes == [path]
+
+    writes.clear()
+    assert append_decision(twin, "DW-1", "2026-06-11", "fix now", "worth the churn") is True
+    assert mark_done(twin, "DW-1", "2026-06-11", "closed by decision") is True
+    assert writes == [twin, twin]  # the pair this primitive replaces: two writes
+
+    assert path.read_text(encoding="utf-8") == twin.read_text(encoding="utf-8")
+
+    entry = deferredwork._find_entry(path.read_text(encoding="utf-8"), "DW-1")
+    assert entry is not None
+    body = entry.body.splitlines()
+    assert body[body.index("status: done 2026-06-11") + 1] == "resolution: closed by decision"
+    assert body[body.index("status: done 2026-06-11") + 2] == (
+        "decision: 2026-06-11 fix now — worth the churn"
+    )
+
+
+def test_record_decision_without_close_note_only_records_the_decision(tmp_path):
+    """The no-close case leaves the status alone and writes one decision line.
+
+    Asserted against a literal rather than against `append_decision`, which now
+    delegates here — a comparison between them could not fail.
+
+    Ablation: apply `_apply_done` unconditionally — `status: open` becomes
+    `status: done` and the literal reds."""
+    path = write_ledger(tmp_path)
+
+    assert record_decision(path, "DW-1", "2026-06-11", "defer", "next sprint") is True
+
+    assert path.read_text(encoding="utf-8") == LEDGER.replace(
+        "reason: out of scope for the digest story.\nstatus: open\n",
+        "reason: out of scope for the digest story.\n"
+        "status: open\n"
+        "decision: 2026-06-11 defer — next sprint\n",
+    )
+
+
+def test_record_decision_records_a_decision_on_an_already_done_entry(tmp_path):
+    """A done entry still gets its decision line; only the close half is skipped.
+
+    `append_decision`'s long-standing behavior, preserved through the merge: a
+    decision is a record of what a human chose, and an entry someone else already
+    closed is still an entry they chose something about. Returning False here
+    would tell the caller nothing was recorded while a line had been written.
+
+    Ablation: return False when `_apply_done` returns None — the return
+    assertion reds."""
+    path = write_ledger(tmp_path)
+
+    assert (
+        record_decision(path, "DW-2", "2026-06-11", "keep", "already fixed", close_note="n/a")
+        is True
+    )
+
+    entry = deferredwork._find_entry(path.read_text(encoding="utf-8"), "DW-2")
+    assert entry is not None
+    assert entry.status == "done 2026-05-25"  # untouched: the close half no-ops
+    assert "decision: 2026-06-11 keep — already fixed" in entry.body
+    assert "resolution:" not in entry.body
+
+
+def test_record_decision_returns_false_for_a_missing_entry(tmp_path, monkeypatch):
+    """A missing id records nothing and writes nothing.
+
+    Ablation: write unconditionally after the appliers — the write spy fires."""
+    path = write_ledger(tmp_path)
+    before = path.read_text(encoding="utf-8")
+    writes = []
+    _counting_write(monkeypatch, writes)
+
+    assert record_decision(path, "DW-99", "2026-06-11", "keep", "x", close_note="y") is False
+
+    assert writes == []
+    assert path.read_text(encoding="utf-8") == before
+
+
+def test_mark_done_many_per_id_notes(tmp_path, monkeypatch):
+    """`notes[i]` supplies `dw_ids[i]`'s resolution note, still in one write.
+
+    The shape sweep's per-entry evidence needs: without it, closing N entries
+    under N different notes costs N read-modify-write cycles, which is the very
+    window this program is closing.
+
+    Ablation: ignore `notes` and pass `note` for every id — the fallback string
+    appears and the per-id notes do not."""
+    path = write_ledger(tmp_path)
+    writes = []
+    _counting_write(monkeypatch, writes)
+
+    assert mark_done_many(
+        path,
+        ["DW-1", "DW-3"],
+        "2026-06-11",
+        "fallback note",
+        notes=["evidence for one", "evidence for three"],
+    ) == ["DW-1", "DW-3"]
+
+    text = path.read_text(encoding="utf-8")
+    assert writes == [path]
+    assert "resolution: evidence for one" in text
+    assert "resolution: evidence for three" in text
+    assert "fallback note" not in text
+
+
+def test_mark_done_many_notes_length_mismatch_raises_before_any_io(tmp_path, monkeypatch):
+    """A short `notes` list raises before the lock, not partway through the ids.
+
+    The pairing is positional, so a mismatch is a caller bug that would otherwise
+    attribute the wrong evidence to a real closure — silently, since every note
+    is free text nothing validates. Raising above the lock keeps it from queueing
+    behind another process first.
+
+    Ablation: check the lengths inside the `with ledger_lock(path):` block — the
+    acquisition assertion reds."""
+    path = write_ledger(tmp_path)
+    before = path.read_text(encoding="utf-8")
+    acquisitions = []
+
+    with _counting_lock(monkeypatch, acquisitions):
+        with pytest.raises(ValueError, match="notes must be one per dw_id"):
+            mark_done_many(path, ["DW-1", "DW-3"], "2026-06-11", "n", notes=["only one"])
+
+    assert acquisitions == []
+    assert path.read_text(encoding="utf-8") == before
+
+
+# ----------------------------------- cross-process ledger lock (#286, #469)
+#
+# Every mutator here is a read->edit->write of the whole ledger, so two
+# orchestrator processes — a second run, a sweep, the TUI decision modal,
+# `sweep --archive` — would otherwise both read, both edit, and let the last
+# atomic write win. The section grades four separable claims: that each leaf
+# mutator holds `ledger_lock` across its whole critical section, that the hold
+# really excludes, that a nested acquisition raises rather than self-deadlocking,
+# and that a failed acquisition raises without writing.
+#
+# Exclusion is probed with `blocking=False` only. That is not an optimization:
+# `file_lock` is per open fd, so a blocking probe from this process would wait
+# forever on POSIX `flock` against a lock this very thread holds, and ~10s on
+# Windows before raising. The suite runs under xdist, so neither is acceptable.
+
+
+def _lock_is_held(path: Path) -> bool:
+    """True when the ledger's sidecar lock cannot be taken right now."""
+    try:
+        with platform_util.file_lock(runs.lock_path_for(path), blocking=False):
+            return False
+    except OSError:
+        return True
+
+
+@contextlib.contextmanager
+def _unavailable_lock(path, **kwargs):
+    """A `file_lock` that cannot be acquired.
+
+    `OSError(11, "Resource deadlock avoided")` is the shape `msvcrt.locking`
+    raises when its ~10 s blocking retry runs out — a routine outcome on the
+    Windows legs rather than a contrived one. The dead `yield` after the raise
+    keeps this a generator function, which `contextlib.contextmanager` requires.
+    """
+    raise OSError(11, "Resource deadlock avoided")
+    yield  # pragma: no cover — unreachable
+
+
+LOCKED_MUTATORS = {
+    "append_decision": lambda p: append_decision(p, "DW-1", "2026-06-11", "keep", "later"),
+    "append_entries": lambda p: append_entries(
+        p,
+        [
+            EntrySpec(
+                title="new", origin="probe-batch", source_spec="spec-probe-batch.md", reason="raced"
+            )
+        ],
+    ),
+    "append_entry": lambda p: append_entry(
+        p, title="new", origin="probe", source_spec="spec-probe.md", reason="raced"
+    ),
+    "archive_closed": lambda p: archive_closed(p, archive_date="2026-08-24"),
+    "mark_done": lambda p: mark_done(p, "DW-1", "2026-06-11", "fixed"),
+    "mark_done_many": lambda p: mark_done_many(p, ["DW-1"], "2026-06-11", "fixed"),
+    "mark_done_many_reopenable": lambda p: mark_done_many_reopenable(
+        p, ["DW-1"], "2026-06-11", "fixed", OPERATION_ID
+    ),
+    "mark_open": lambda p: mark_open(p, "DW-1", "by dw-a", OPERATION_ID),
+    "mark_open_many": lambda p: mark_open_many(p, ["DW-1"], "by dw-a", OPERATION_ID),
+    "record_decision": lambda p: record_decision(
+        p, "DW-1", "2026-06-11", "keep", "later", close_note="closed by decision"
+    ),
+}
+
+# The primitives that reopen a close need one on disk to undo; every other row
+# runs against the plain fixture.
+_NEEDS_A_REOPENABLE_CLOSE = {"mark_open", "mark_open_many"}
+
+
+def _seed_for(tmp_path: Path, name: str) -> Path:
+    """The ledger `name`'s call needs, written before any lock spy is installed."""
+    path = write_ledger(tmp_path)
+    if name in _NEEDS_A_REOPENABLE_CLOSE:
+        close_reopenable(path, "DW-1", "by dw-a")
+    return path
+
+
+@pytest.mark.parametrize("name", sorted(LOCKED_MUTATORS))
+def test_every_mutator_holds_the_ledger_lock(tmp_path, monkeypatch, name):
+    """Each leaf mutator takes the lock exactly once, and the hold really excludes.
+
+    Two claims in one assertion, and both are needed. That the spy fired says the
+    mutator routes through `ledger_lock` at all; that it fired ONCE says the whole
+    read->edit->write sits inside a single acquisition rather than a per-step
+    hold that another writer can slip between. The probe inside the critical
+    section says the acquisition is a real OS lock and not a no-op — a
+    `ledger_lock` that yielded without taking anything would satisfy the call
+    count and exclude nobody.
+
+    Ablation: delete this mutator's `with ledger_lock(path):` and dedent its
+    body — the spy never fires, `probed` stays empty, and the row reds."""
+    path = _seed_for(tmp_path, name)
+    real_lock = deferredwork.ledger_lock
+    probed = []
+
+    @contextlib.contextmanager
+    def spy_lock(p):
+        with real_lock(p):
+            probed.append(_lock_is_held(p))
+            yield
+
+    monkeypatch.setattr(deferredwork, "ledger_lock", spy_lock)
+
+    LOCKED_MUTATORS[name](path)
+
+    assert probed == [True]
+
+
+@pytest.mark.parametrize("name", sorted(LOCKED_MUTATORS))
+def test_mutators_acquire_exactly_once_and_never_nest(tmp_path, monkeypatch, name):
+    """One public call is one acquisition, at depth zero, for every entry point
+    including the thin wrappers.
+
+    What this adds over the row above is the *shape* of the failure it can name.
+    That test grades the leaf's hold from inside; this one grades the whole call
+    graph a public name reaches, and distinguishes the two ways the count can
+    exceed one. A wrapper that re-pairs two locked primitives instead of
+    delegating to a single leaf acquires twice in sequence — count 2, depth 0. A
+    wrapper that takes the lock and then calls a mutator under it acquires while
+    already held — `ledger_lock`'s own guard turns that into a `RuntimeError`
+    rather than the POSIX self-deadlock it would otherwise be, but the spy names
+    the offending mutator before the guard is even reached.
+
+    Ablation: re-pair `record_decision` as `append_decision(...)` +
+    `mark_done(...)` at the wrapper — that row's count becomes 2 and it reds."""
+    path = _seed_for(tmp_path, name)
+    real_lock = deferredwork.ledger_lock
+    depth = 0
+    acquisitions = 0
+
+    @contextlib.contextmanager
+    def spy_lock(p):
+        nonlocal depth, acquisitions
+        assert depth == 0, f"{name} nested a ledger_lock acquisition"
+        acquisitions += 1
+        depth += 1
+        try:
+            with real_lock(p):
+                yield
+        finally:
+            depth -= 1
+
+    monkeypatch.setattr(deferredwork, "ledger_lock", spy_lock)
+
+    LOCKED_MUTATORS[name](path)
+
+    assert acquisitions == 1
+
+
+def test_ledger_lock_is_not_reentrant(tmp_path, monkeypatch):
+    """A nested acquisition raises rather than deadlocking, and raises BEFORE it
+    reaches the OS lock.
+
+    `file_lock` is per open fd: on POSIX a second `flock(LOCK_EX)` from this same
+    thread blocks against the lock the thread already holds, with no timeout and
+    no traceback — the run simply stops. The guard converts that silent wedge
+    into a loud error at the call site that introduced the nesting.
+
+    The `file_lock` counter is what makes the test deterministic. Asserting only
+    the `RuntimeError` would leave a version of the guard that raises *after*
+    attempting the acquire indistinguishable from one that raises before it, and
+    the former hangs. Counting proves the nested entry never reached the kernel,
+    so this test never risks the deadlock it is about.
+
+    Ablation is deliberately NOT run here: dropping the depth guard makes the
+    nested entry block forever rather than fail, which hangs the suite instead
+    of reddening one row. The guard's absence is graded by inspection.
+
+    The tail grades the release: the guard is per-thread state, so a hold that
+    is not cleared on exit would refuse every later mutation in this thread."""
+    path = write_ledger(tmp_path)
+    real_file_lock = deferredwork.file_lock
+    acquired = []
+
+    @contextlib.contextmanager
+    def counting(lock_path, **kwargs):
+        acquired.append(lock_path)
+        with real_file_lock(lock_path, **kwargs):
+            yield
+
+    monkeypatch.setattr(deferredwork, "file_lock", counting)
+
+    with deferredwork.ledger_lock(path):
+        with pytest.raises(RuntimeError, match="not reentrant"):
+            with deferredwork.ledger_lock(path):
+                pass  # pragma: no cover — the guard raises on entry
+    assert len(acquired) == 1  # the nested entry never reached the OS lock
+
+    with deferredwork.ledger_lock(path):  # released cleanly, so this is fine
+        pass
+    assert len(acquired) == 2
+
+
+def test_a_failed_acquisition_does_not_leak_the_reentrancy_guard(tmp_path, monkeypatch):
+    """An acquisition that raises must still leave this thread unmarked.
+
+    The guard is set before the acquire (it has to be — the acquire is what would
+    deadlock), so clearing it anywhere but a `finally` strands the thread: every
+    later mutation in this process raises `RuntimeError` and the run dies of a
+    transient lock failure it should merely have reported.
+
+    Ablation: move `_LOCK_STATE.held = False` out of `ledger_lock`'s `finally`
+    onto the success path — the second `mark_done` raises `RuntimeError` instead
+    of closing DW-1."""
+    path = write_ledger(tmp_path)
+    with monkeypatch.context() as m:
+        m.setattr(deferredwork, "file_lock", _unavailable_lock)
+        with pytest.raises(OSError, match="Resource deadlock avoided"):
+            mark_done(path, "DW-1", "2026-06-11", "fixed")
+
+    assert mark_done(path, "DW-1", "2026-06-11", "fixed")
+
+
+def test_scripted_interleave_loses_no_update(tmp_path, monkeypatch):
+    """The #286 lost-update scenario, made deterministic: a rival writer commits
+    in full between writer A's call and A's acquisition, and A must still see it.
+
+    Writer A closes DW-1; writer B appends a new entry. B is run to completion —
+    acquire, read, write, release — immediately BEFORE A delegates to the real
+    lock, which is the worst legal interleaving the lock permits. A therefore has
+    to read the ledger B just wrote, not one it snapshotted earlier, or A's write
+    reverts B's append.
+
+    Ablation: hoist `_mark_done_many`'s `path.read_text` above its
+    `with ledger_lock(path):` — A's read then happens before the spy fires, A
+    writes its stale snapshot, and DW-4 is gone from the final ledger."""
+    path = write_ledger(tmp_path)
+    real_lock = deferredwork.ledger_lock
+    rival_ran = []
+
+    @contextlib.contextmanager
+    def rival_first(p):
+        if not rival_ran:
+            rival_ran.append(True)  # once: B's own append re-enters this spy
+            assert (
+                append_entry(
+                    p,
+                    title="rival append",
+                    origin="rival-origin",
+                    source_spec="spec-rival.md",
+                    reason="raced with a close",
+                )
+                == "DW-4"
+            )
+        with real_lock(p):
+            yield
+
+    monkeypatch.setattr(deferredwork, "ledger_lock", rival_first)
+
+    assert mark_done(path, "DW-1", "2026-06-11", "closed by A")
+
+    entries = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}
+    assert entries["DW-4"].open  # B's append survived A's write
+    assert "origin: rival-origin" in entries["DW-4"].body
+    assert entries["DW-1"].status == "done 2026-06-11"  # ...and A's close landed
+    assert "resolution: closed by A" in entries["DW-1"].body
+    assert len(entries) == 4  # DW-1..DW-3 plus B's, every id distinct
+
+
+def test_archive_closed_writes_both_files_inside_one_acquisition(tmp_path, monkeypatch):
+    """The archive and the trimmed ledger are written under ONE hold.
+
+    The pair is a transaction: the archive is written first so a crash between
+    the writes leaves bodies duplicated (harmless, the archive is append-only)
+    rather than lost. Release the lock between them and a rival mutator lands in
+    the gap and writes the untrimmed ledger back, resurrecting entries whose
+    bodies have already moved to the archive — a duplicate no later run cleans
+    up. It is also why the archive sibling has no lock of its own: it is only
+    ever written under its ledger's.
+
+    Ablation: hoist either `atomic_write_text` out of the `with` — the event
+    order changes and the assertion reds."""
+    path = write_ledger(tmp_path)
+    archive = path.parent / ARCHIVE_REL
+    real_lock, real_write = deferredwork.ledger_lock, deferredwork.atomic_write_text
+    events = []
+
+    @contextlib.contextmanager
+    def spy_lock(p):
+        events.append("lock-enter")
+        with real_lock(p):
+            yield
+        events.append("lock-exit")
+
+    def spy_write(p, text):
+        events.append("write-archive" if p == archive else "write-ledger")
+        return real_write(p, text)
+
+    monkeypatch.setattr(deferredwork, "ledger_lock", spy_lock)
+    monkeypatch.setattr(deferredwork, "atomic_write_text", spy_write)
+
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-2"]
+
+    assert events == ["lock-enter", "write-archive", "write-ledger", "lock-exit"]
+
+
+@pytest.mark.parametrize("name", sorted(LOCKED_MUTATORS))
+def test_lock_acquisition_failure_raises_and_writes_nothing(tmp_path, monkeypatch, name):
+    """A lock that cannot be taken fails the write; it never proceeds unlocked.
+
+    This pins the repo's "repair writes must raise" doctrine at the new seam.
+    Degrading to an unlocked write would be the worst of both worlds: the caller
+    is told the mutation succeeded while the exact interleaving the lock exists
+    to prevent is back, and only under contention — the case no test would catch.
+
+    Ablation: swallow the acquisition `OSError` inside `ledger_lock` and let the
+    body run anyway — `pytest.raises` fails on every row."""
+    path = _seed_for(tmp_path, name)
+    archive = path.parent / ARCHIVE_REL
+    before = path.read_text(encoding="utf-8")
+    archive_before = archive.read_text(encoding="utf-8") if archive.is_file() else None
+
+    monkeypatch.setattr(deferredwork, "file_lock", _unavailable_lock)
+
+    with pytest.raises(OSError, match="Resource deadlock avoided"):
+        LOCKED_MUTATORS[name](path)
+
+    assert path.read_text(encoding="utf-8") == before
+    assert (archive.read_text(encoding="utf-8") if archive.is_file() else None) == archive_before
+
+
+# The child of the two-process acceptance test. Appends 8 entries with distinct
+# origins (so the idempotence scan never dedupes one away) through the real
+# `append_entry`, after a file rendezvous with the parent. It reports the ids it
+# minted so the parent can grade the mint, not merely the entry count.
+CONCURRENT_APPENDER = (
+    "import pathlib, sys, time\n"
+    "from bmad_loop.deferredwork import append_entry\n"
+    "ledger, ready, go, done = (pathlib.Path(a) for a in sys.argv[1:5])\n"
+    "tag = sys.argv[5]\n"
+    "ready.write_text('ready')\n"
+    "deadline = time.monotonic() + 60\n"
+    "while time.monotonic() < deadline and not go.exists():\n"
+    "    time.sleep(0.01)\n"
+    "if not go.exists():\n"
+    "    sys.exit(3)\n"  # never released — what a broken rendezvous looks like
+    "ids = []\n"
+    "for n in range(8):\n"
+    "    ids.append(append_entry(ledger, title=tag + '-' + str(n),\n"
+    "                            origin=tag + '-origin-' + str(n),\n"
+    "                            source_spec='spec-' + tag + '-' + str(n) + '.md',\n"
+    "                            reason='raced'))\n"
+    "done.write_text('\\n'.join(str(i) for i in ids))\n"
+)
+
+
+def test_two_processes_append_concurrently_produce_distinct_ids(tmp_path):
+    """#286's first acceptance criterion, end to end: two PROCESSES appending at
+    once produce every entry, each with its own id, and lose none.
+
+    This is the integration proof that the lock crosses a process boundary — the
+    one thing no in-process spy can show, and the only test here that exercises
+    the `msvcrt` branch on the Windows CI legs rather than `flock`. The children
+    inherit the environment, so the autouse `_isolate_state_root` fixture's
+    `BMAD_LOOP_STATE_DIR` reaches them and all three processes resolve the same
+    sidecar.
+
+    Deliberately NOT this test's job to grade the lock's absence: without it the
+    outcome is stochastic — a lost update or a duplicated `next_seq` mint needs
+    the two read->write windows to actually overlap — so an ablation here reds
+    only sometimes. The deterministic coverage is
+    `test_every_mutator_holds_the_ledger_lock` and
+    `test_scripted_interleave_loses_no_update` above.
+
+    No parent-held lock: the parent must not be a third contender, or the
+    children's blocking acquires would sit on the Windows ~10 s ceiling. Waits
+    are bounded polls on a monotonic deadline, never a bare sleep."""
+    path = write_ledger(tmp_path, "# Deferred Work\n")
+    go = tmp_path / "go"
+    procs, readies, dones = [], [], []
+    for n in (1, 2):
+        ready, done = tmp_path / f"ready-{n}", tmp_path / f"done-{n}"
+        procs.append(
+            subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    CONCURRENT_APPENDER,
+                    str(path),
+                    str(ready),
+                    str(go),
+                    str(done),
+                    f"w{n}",
+                ]
+            )
+        )
+        readies.append(ready)
+        dones.append(done)
+    try:
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and not all(r.exists() for r in readies):
+            time.sleep(0.02)
+        assert all(r.exists() for r in readies), "a child never reached the rendezvous"
+
+        go.write_text("go")  # release both at once
+        for proc in procs:
+            proc.communicate(timeout=120)
+            assert proc.returncode == 0
+    finally:
+        for proc in procs:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=10)
+
+    entries = parse_ledger(path.read_text(encoding="utf-8"))
+    assert len(entries) == 16  # nothing lost to a last-write-wins overwrite
+    assert len({e.id for e in entries}) == 16  # ...and no id minted twice
+
+    reported = [line for d in dones for line in d.read_text(encoding="utf-8").splitlines()]
+    assert "None" not in reported  # no append was silently deduped away
+    assert sorted(reported) == sorted(e.id for e in entries)

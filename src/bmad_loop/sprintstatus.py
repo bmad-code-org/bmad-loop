@@ -4,19 +4,30 @@ The dev primitive `bmad-build-auto` deliberately does not touch sprint-status
 ("the orchestrator's business"), so the orchestrator is the single writer via
 :func:`advance` — idempotent, never-regress, epic-lift. The orchestrator
 otherwise only re-reads this file to pick the next story and verify what a
-session claims, so the no-races invariant holds.
+session claims.
+
+Concurrency (#286/#469): being the sole writer is not on its own mutual
+exclusion — a second orchestrator process (another `bmad-loop run`, a sweep, the
+TUI) runs the same sole writer, and :func:`advance` is a read-modify-write of the
+whole board, so two of them would both read, both edit, and let the last atomic
+write win. :func:`advance` therefore serializes itself cross-process on the
+board's state-root sidecar lock, holding it across every read AND the write.
+Readers stay lock-free: the publish is an atomic replace, so a reader sees either
+the old board entire or the new one.
 """
 
 from __future__ import annotations
 
 import re
 import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
 
-from .platform_util import atomic_write_bytes
+from .platform_util import atomic_write_bytes, file_lock
 
 EPIC_RE = re.compile(r"^epic-(\d+)$")
 RETRO_RE = re.compile(r"^epic-(\d+)-retrospective$")
@@ -239,6 +250,26 @@ def _set_mapping_value(lines: list[str], key: str, new_value: str) -> bool:
     return False
 
 
+@contextmanager
+def _board_lock(path: Path) -> Iterator[None]:
+    """Cross-process mutual exclusion for one sprint-status board (#286/#469).
+
+    The board's counterpart to :func:`~bmad_loop.deferredwork.ledger_lock`, and
+    private for the same reason it is narrow: :func:`advance` is the only writer,
+    so the only thing that ever needs to hold this is the read-modify-write below.
+    Held around file I/O only — never across a subprocess, a coding-CLI session,
+    or an operator pause (#286).
+
+    The import of :mod:`~bmad_loop.runs` is lazy and has to stay lazy: ``runs``
+    imports ``verify``, which imports this module, so a top-level import would
+    close the cycle.
+    """
+    from . import runs
+
+    with file_lock(runs.lock_path_for(path)):
+        yield
+
+
 def advance(path: Path, story_key: str, target: str, *, now: str | None = None) -> str | None:
     """Advance a story's sprint-status to `target` for the generic-skill path.
 
@@ -279,7 +310,43 @@ def advance(path: Path, story_key: str, target: str, *, now: str | None = None) 
     a property worth keeping deliberately, because AGENTS.md makes this the
     orchestrator's SOLE write path to the board — a read-only board is the only
     way an operator can say "stop rewriting this", and it has to mean something.
+
+    Serialized cross-process (#286/#469) on the board's advisory lock — the
+    state-root sidecar :func:`~bmad_loop.runs.lock_path_for` names for it, not a
+    sibling of the board itself, because the board is a tracked file and the
+    engine's own ``git add -A`` would commit a sidecar beside it. The hold spans
+    the whole read-modify-write and nothing else: three reads (the status probe,
+    the raw bytes, the epic-lift ``load``) and the one atomic write, with no
+    subprocess, session, or operator pause inside it (#286). That also closes the
+    intra-call TOCTOU, since the never-regress decision and the bytes it is
+    applied to now come from one hold rather than from two independent reads.
+
+    The missing-board check runs BEFORE the lock, so asking about a board that
+    does not exist leaves no sidecar behind; the locked half rechecks, deletion
+    being able to race the pre-lock answer. Acquisition failure surfaces as
+    ``OSError`` (or :class:`~bmad_loop.runs.StateRootError` when no state root can
+    be derived) on the channel callers already route this function's raises
+    through — the engine's crash/escalation handling, the CLI's failure exit — so
+    a board that could not be serialized fails loudly rather than being rewritten
+    unlocked. :func:`advanced_bytes` deliberately does NOT come through
+    here: it calls :func:`_advance_locked` against a private throwaway copy, so it
+    neither contends on the real board's sidecar nor mints one of its own.
     """
+    if not path.is_file():
+        return None  # no board, nothing to serialize against — take no lock
+    with _board_lock(path):
+        return _advance_locked(path, story_key, target, now=now)
+
+
+def _advance_locked(
+    path: Path, story_key: str, target: str, *, now: str | None = None
+) -> str | None:
+    """:func:`advance`'s read-modify-write, run with the board's lock already held.
+
+    Split out so the hold is exactly the file I/O and so every read inside it sees
+    one board. The leading ``is_file`` check repeats the caller's: the pre-lock
+    answer is taken without exclusion, and a delete can land between it and the
+    acquisition."""
     if not path.is_file():
         return None
     current = story_status(path, story_key)
@@ -326,8 +393,8 @@ def advanced_bytes(source: bytes, story_key: str, target: str) -> bytes | None:
     and nothing else, and so needs the intended content recomputed from a baseline it
     trusts rather than read back out of the file it is about to commit.
 
-    Goes through ``advance`` itself, against a throwaway copy, rather than
-    reimplementing the edit. Never-regress, the epic lift, and
+    Goes through the real writer's own body (``_advance_locked``), against a
+    throwaway copy, rather than reimplementing the edit. Never-regress, the epic lift, and
     ``_set_mapping_value``'s quoted-scalar, inline-comment and per-line-terminator
     handling ARE what makes two boards "the same advance" — a second implementation of
     them would drift from the writer silently, and for this caller a silent drift means
@@ -336,8 +403,8 @@ def advanced_bytes(source: bytes, story_key: str, target: str) -> bytes | None:
     No ``now=``: the caller's own carry passes none either, and a ``last_updated`` line
     rewritten here and not there would make every comparison fail.
 
-    Returns None only when the board's row is absent. ``advance``'s other None — a
-    missing file — cannot be reached from here, the shadow being this function's own
+    Returns None only when the board's row is absent. The other None — a missing
+    file — cannot be reached from here, the shadow being this function's own
     copy. There is then no intended content to compare against, and a caller must not
     read "I could not compute it" as "the tree is mine".
 
@@ -349,7 +416,15 @@ def advanced_bytes(source: bytes, story_key: str, target: str) -> bytes | None:
     with tempfile.TemporaryDirectory() as tmp:
         shadow = Path(tmp) / "sprint-status.yaml"
         shadow.write_bytes(source)
-        if advance(shadow, story_key, target) is None:
+        # Straight to the locked body, deliberately skipping `advance`'s own
+        # acquisition. The shadow is this function's private copy inside a
+        # TemporaryDirectory that no other process can name, so there is no
+        # second writer to exclude — and taking the lock anyway would mint a
+        # state-root sidecar keyed on a path that exists only for this call.
+        # `file_lock` never removes a sidecar and the TemporaryDirectory removes
+        # only the shadow, so every ownership computation would strand another
+        # dead lock file under `<state root>/locks` (#286).
+        if _advance_locked(shadow, story_key, target) is None:
             return None
         return shadow.read_bytes()
 

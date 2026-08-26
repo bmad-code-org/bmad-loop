@@ -206,6 +206,13 @@ class StoryTask:
     baseline_ledger_digest: str | None = None
     pre_harvest_ledger: str | None = None
     pre_harvest_ledger_captured: bool = False
+    # Digest of the last ledger state THIS engine left on disk: the snapshot's
+    # own text at capture, refreshed to the post-append bytes once the harvest
+    # writes. It is the compare-and-set anchor `_restore_ledger` uses to tell
+    # its own retractable write from a concurrent writer's (#286), which is why
+    # it is persisted rather than kept in memory: a crash replay must be able to
+    # recognize the dead attempt's append still sitting on disk.
+    post_engine_ledger_digest: str | None = None
     harvest_wrote_ledger: bool = False
     ledger_changed_before_harvest: bool = False
     # JSON-native containers only; callers persist these through state.json.
@@ -389,6 +396,7 @@ class StoryTask:
             "baseline_ledger_digest": self.baseline_ledger_digest,
             "pre_harvest_ledger": self.pre_harvest_ledger,
             "pre_harvest_ledger_captured": self.pre_harvest_ledger_captured,
+            "post_engine_ledger_digest": self.post_engine_ledger_digest,
             "harvest_wrote_ledger": self.harvest_wrote_ledger,
             "ledger_changed_before_harvest": self.ledger_changed_before_harvest,
             "harvested_deferrals": self.harvested_deferrals,
@@ -480,6 +488,11 @@ class StoryTask:
                 else None
             ),
             pre_harvest_ledger_captured=bool(d.get("pre_harvest_ledger_captured", False)),
+            post_engine_ledger_digest=(
+                str(d.get("post_engine_ledger_digest"))
+                if d.get("post_engine_ledger_digest") is not None
+                else None
+            ),
             harvest_wrote_ledger=bool(d.get("harvest_wrote_ledger", False)),
             ledger_changed_before_harvest=bool(d.get("ledger_changed_before_harvest", False)),
             harvested_deferrals=[deepcopy(dict(item)) for item in d.get("harvested_deferrals", [])],
