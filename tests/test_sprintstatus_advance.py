@@ -822,6 +822,11 @@ def test_advanced_bytes_never_touches_the_real_boards_lock(tmp_path, monkeypatch
     Ablation: make `runs.lock_path_for` ignore its argument (return one constant
     sidecar) and this reddens — every path collapses onto the board's own lock."""
     board = _write(tmp_path)
+    # Snapshot the bytes as they actually landed, rather than re-encoding SPRINT:
+    # `_write` writes in text mode, so on Windows the newlines on disk are CRLF
+    # while `SPRINT.encode` is LF, and the comparison would fail there for a
+    # reason that has nothing to do with the lock.
+    before = board.read_bytes()
     sidecars: list[Path] = []
 
     @contextlib.contextmanager
@@ -837,7 +842,7 @@ def test_advanced_bytes_never_touches_the_real_boards_lock(tmp_path, monkeypatch
     assert out is not None and b"3-2-digest-delivery: in-progress" in out
     assert sidecars  # it really did lock something — the shadow's own sidecar
     assert runs.lock_path_for(board) not in sidecars
-    assert board.read_bytes() == SPRINT.encode("utf-8")  # and the real board is untouched
+    assert board.read_bytes() == before  # and the real board is untouched
 
 
 def test_advance_lock_failure_raises_oserror(tmp_path, monkeypatch):
