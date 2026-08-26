@@ -5456,3 +5456,66 @@ def test_migration_restore_writes_back_a_symlinked_ledger(project, tmp_path):
     assert project.deferred_work.is_symlink()
     assert target.read_text(encoding="utf-8") == LEGACY_LEDGER
     assert "sweep-migration-restore-diverged" not in journal_kinds(engine)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_migration_restore_accepts_an_already_restored_symlink_ledger(project, tmp_path):
+    """#735/#736. A restore that finds the ledger already holding the text it
+    would write is DONE, not divergent.
+
+    Reachable with no rival at all. A migration session that atomic-saves —
+    write-temp-then-rename, which is how most editors and many CLIs write —
+    replaces the tracked symlink with a regular file. `reset --hard` puts the
+    link back, and the external target it can never reach was therefore never
+    rewritten, so the ledger is already correct. But `rewrite`, read off that
+    regular file, is the rejected migration text, so demanding the anchor here
+    reports a divergence that did not happen, escalates, and spends the attempt
+    budget: the second attempt never dispatches.
+
+    This is the #736 principle at the restore: an operation with nothing to write
+    must not fail.
+
+    Ablation: drop the `current == text` arm and this reddens on all three —
+    `sweep-migration-restore-diverged` is journaled, the paused reason becomes
+    the "changed underneath" accusation, and only one session runs.
+    """
+    target = tmp_path / "shared" / "deferred-work.md"
+    target.parent.mkdir(parents=True)
+    target.write_text(LEGACY_LEDGER, encoding="utf-8")
+    if project.deferred_work.is_symlink() or project.deferred_work.exists():
+        project.deferred_work.unlink()
+    project.deferred_work.symlink_to(target)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "symlinked ledger")
+
+    manifest = legacy_manifest()
+    half = (
+        "# Deferred Work\n\n"
+        "### DW-1: Old fixed thing\n\norigin: migrated, 2026-06-12\nlocation: n/a\n"
+        "reason: repaired.\nstatus: done 2026-04-06\n\n"
+        "## Deferred from: epic 1 review (2026-04-06)\n\n"
+        "- **Open legacy thing here** — `src.txt` mishandles em-dashes\n"
+    )
+
+    def atomic_save_effect(spec):
+        # the rename an atomic save performs: the symlink is REPLACED, so the
+        # external target keeps the pre-migration text throughout.
+        project.deferred_work.unlink()
+        project.deferred_work.write_text(half, encoding="utf-8")
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "deferred-sweep-migrate",
+                "mapping": [{"key": manifest[0]["key"], "dw_id": "DW-1"}],
+                "escalations": [],
+            },
+        )
+
+    engine, adapter = make_sweep(project, [atomic_save_effect] * 2)
+    summary = engine.run()
+
+    assert summary.paused  # on the attempt cap, having actually retried
+    assert "sweep-migration-restore-diverged" not in journal_kinds(engine)
+    assert "changed underneath the failed migration attempt" not in engine.state.paused_reason
+    assert target.read_text(encoding="utf-8") == LEGACY_LEDGER
+    assert len(adapter.sessions) == 2

@@ -1053,11 +1053,30 @@ class SweepEngine(Engine):
                 # PURE TEXT ONLY under the hold — `ledger_lock` is not reentrant
                 # and every mutator takes it.
                 current = ledger.read_text(encoding="utf-8") if ledger.is_file() else None
-                # Either anchor will do HERE, unlike the engine's two restores:
+                if anchor is _LedgerAnchor.NO_RESET_CONTENT and current == text:
+                    # ALREADY the text this restore exists to write, so it is
+                    # done and there is nothing to escalate. Reachable without
+                    # any rival: a session that atomic-SAVES the ledger replaces
+                    # a tracked symlink with a regular file, `reset --hard` puts
+                    # the link back, and the external target it cannot reach was
+                    # never rewritten — so the ledger is correct while `rewrite`,
+                    # read off the regular file, is not what is on disk. Demanding
+                    # the anchor here would escalate a finished restore and spend
+                    # the attempt budget on it.
+                    #
+                    # Scoped to NO_RESET_CONTENT deliberately. On a BASELINE
+                    # anchor the reset republishes the committed text, so
+                    # `current == text` is the ORDINARY post-reset state and
+                    # accepting it there would retire the divergence check and
+                    # the probe-fault escalation along with it. Only where the
+                    # reset restored no text of its own is "already correct"
+                    # information the anchor cannot supply.
+                    pass
+                # Either anchor will do below, unlike the engine's two restores:
                 # this site supplies its own text for the no-reset-content case
                 # (`rewrite`, which it graded), so `expected` is never the bare
                 # `None` that would read a rival's deletion as the reset's work.
-                if anchor is not _LedgerAnchor.NONE and current == expected:
+                elif anchor is not _LedgerAnchor.NONE and current == expected:
                     ledger.parent.mkdir(parents=True, exist_ok=True)
                     atomic_write_text(ledger, text)
                 else:
