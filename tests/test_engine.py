@@ -12718,6 +12718,228 @@ def test_ledger_scope_probe_failure_keeps_file_and_journals(project, monkeypatch
     assert event["story_key"] == task.story_key
 
 
+def test_ledger_baseline_text_reads_the_committed_blob(project, monkeypatch):
+    """The reset-owned write anchor is the committed blob, read before the lock.
+
+    ``reset --hard <baseline>`` republishes exactly this blob, so the blob — and
+    not an observation of the working tree taken after that reset — is what a
+    reset-owned restore is entitled to overwrite (#735).
+
+    The probe spawns git and `ledger_lock` is contracted to cover file I/O only
+    (#286), so the spy grades WHERE the call happens as well as what it answers.
+
+    Ablation: move the `_ledger_baseline_text(task)` call in `_restore_ledger`
+    inside the `with deferredwork.ledger_lock(ledger):` block and the `held` row
+    reds.
+    """
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    committed = "# Deferred Work\n\n## DW-1 committed at baseline\n"
+    project.deferred_work.write_text(committed, encoding="utf-8")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "track deferred-work")
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.baseline_commit = rev_parse_head(project.project)
+    task.baseline_untracked = []
+
+    assert engine._ledger_baseline_text(task) == (True, committed)
+
+    held: list[bool] = []
+    real_blob = verify.worktree_file_bytes_at_revision
+
+    def spying_blob(*args, **kwargs):
+        held.append(bool(getattr(deferredwork._LOCK_STATE, "held", False)))
+        return real_blob(*args, **kwargs)
+
+    monkeypatch.setattr(verify, "worktree_file_bytes_at_revision", spying_blob)
+    engine._restore_ledger(task, committed + "\n## DW-2 this session's edit\n")
+
+    assert held == [False]
+
+
+def test_ledger_baseline_text_normalizes_committed_crlf(project):
+    """A CRLF blob is normalized to LF, because `_ledger_text` reads universal.
+
+    `worktree_file_bytes_at_revision` applies the path's working-tree filters, so
+    under `core.autocrlf=true` the baseline blob comes back CRLF while
+    `_ledger_text`'s `read_text` has already turned the same file on disk into
+    LF. Comparing them raw makes `reset_owned` silently NEVER-true on Windows:
+    every tracked restore would degrade to a skip, and no Linux run would ever
+    say so. This row is that Windows guard, made Linux-visible by committing the
+    CRLF bytes directly.
+
+    Ablation: drop the `.replace("\\r\\n", "\\n").replace("\\r", "\\n")` tail and
+    both rows red here, on Linux.
+    """
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_bytes(b"# Deferred Work\r\n\r\n## DW-1 crlf at baseline\r\n")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "track a crlf deferred-work")
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.baseline_commit = rev_parse_head(project.project)
+    task.baseline_untracked = []
+
+    anchored, expected = engine._ledger_baseline_text(task)
+    assert (anchored, expected) == (True, "# Deferred Work\n\n## DW-1 crlf at baseline\n")
+    # The point of the normalization: the anchor must equal what the ONLY thing
+    # it is ever compared against reads back off those same bytes.
+    assert expected == engine._ledger_text()
+
+
+def test_ledger_baseline_text_reports_absence_at_baseline(project):
+    """A baseline that does not carry the ledger is determinate, not a fault.
+
+    `reset --hard` leaves no tracked file there, so `None` IS the expected
+    post-reset state and the anchor still holds — which is what lets a restore
+    put the session's ledger back over an absence rather than calling it
+    divergence.
+    """
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.baseline_commit = rev_parse_head(project.project)
+    task.baseline_untracked = []
+    # Committed AFTER the baseline was stamped: tracked now, absent at baseline.
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "track deferred-work after the baseline")
+
+    assert engine._ledger_baseline_text(task) == (True, None)
+    assert [
+        e for e in engine.journal.entries() if e["kind"] == "ledger-baseline-probe-failed"
+    ] == []
+
+
+def test_ledger_baseline_text_degrades_without_a_baseline(project):
+    """No baseline commit is a determinate no-anchor, and NOT a probe fault.
+
+    Nothing failed — there is simply no revision to derive an expected state
+    from — so the write arm stands down silently rather than filing a fault row
+    an operator would have to triage.
+    """
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+
+    assert task.baseline_commit is None
+    assert engine._ledger_baseline_text(task) == (False, None)
+    assert [
+        e for e in engine.journal.entries() if e["kind"] == "ledger-baseline-probe-failed"
+    ] == []
+
+
+def test_ledger_baseline_probe_failure_degrades_and_journals(project, monkeypatch):
+    """A probe that cannot answer withholds the anchor — the INVERSE degrade.
+
+    `_ledger_is_gits_to_restore` degrades to True because its consumer is an
+    unlink and uncertainty must never delete. This probe's only consumer is a
+    write arm, so uncertainty must never write; copying the other direction here
+    would reopen #735 through the error path itself.
+
+    The catch also has to live INSIDE the helper: `verify.GitError` is a plain
+    `Exception` and the attempt's net is `(OSError, StateRootError)`, so an
+    escape would replace an in-flight `RunPaused` in that `finally`.
+
+    Ablation: delete the `except (verify.GitError, OSError, RuntimeError,
+    UnicodeDecodeError)` arm and the GitError escapes — this row reds on the
+    raise rather than on the tuple.
+    """
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "track deferred-work")
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.baseline_commit = rev_parse_head(project.project)
+    task.baseline_untracked = []
+
+    def fail_probe(*args, **kwargs):
+        raise GitError("injected baseline probe failure")
+
+    monkeypatch.setattr(verify, "worktree_file_bytes_at_revision", fail_probe)
+
+    assert engine._ledger_baseline_text(task) == (False, None)
+    (event,) = [e for e in engine.journal.entries() if e["kind"] == "ledger-baseline-probe-failed"]
+    assert event["story_key"] == "1-1-a"
+    assert "injected baseline probe failure" in event["error"]
+
+
+def test_restore_ledger_reset_owned_write_uses_the_blob_anchor(project):
+    """POSITIVE CONTROL: the reset-owned write arm still fires on the new anchor.
+
+    Without this row a normalization slip or a mis-derived rel would make
+    `expected` never equal `current`, every tracked restore would quietly degrade
+    to a skip, and every negative test around it would stay green — the anchor
+    would be dead and nothing would say so.
+
+    The digest anchor is deliberately NOT ours here, so the write is attributable
+    to `reset_owned` alone.
+
+    Ablation: hardcode `reset_owned = False` in `_restore_ledger` and both the
+    written bytes and the empty-journal row red.
+    """
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    committed = "# Deferred Work\n\n## DW-1 committed at baseline\n"
+    project.deferred_work.write_text(committed, encoding="utf-8")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "track deferred-work")
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.baseline_commit = rev_parse_head(project.project)
+    task.baseline_untracked = []
+    # What `reset --hard` erased: this session's own ledger edits, which the
+    # snapshot exists to put back over the republished committed bytes.
+    snapshot = committed + "\n## DW-2 this session's own edit\n"
+    task.post_engine_ledger_digest = _digest_of("bytes this engine never published")
+
+    engine._restore_ledger(task, snapshot)
+
+    assert project.deferred_work.read_text(encoding="utf-8") == snapshot
+    assert [
+        e for e in engine.journal.entries() if e["kind"] == "ledger-restore-skipped-diverged"
+    ] == []
+
+
+def test_restore_ledger_probe_failure_never_writes(project, monkeypatch):
+    """DIRECTION PIN: an unprovable baseline skips, it never falls back to the
+    observation.
+
+    The same inputs as the positive control above, with only the probe faulted.
+    The tempting degrade — trust `current == observed` when the blob could not be
+    read — is exactly the #735 defect, reintroduced through the error path. The
+    restore also has to come back normally: a fault that raised here would
+    replace an in-flight `RunPaused`.
+
+    Ablation: make `_ledger_baseline_text`'s except arm return
+    `(True, self._ledger_text())` and the write fires — the bytes row reds.
+    """
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    committed = "# Deferred Work\n\n## DW-1 committed at baseline\n"
+    project.deferred_work.write_text(committed, encoding="utf-8")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "track deferred-work")
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.baseline_commit = rev_parse_head(project.project)
+    task.baseline_untracked = []
+    snapshot = committed + "\n## DW-2 this session's own edit\n"
+    task.post_engine_ledger_digest = _digest_of("bytes this engine never published")
+
+    def fail_probe(*args, **kwargs):
+        raise GitError("injected baseline probe failure")
+
+    monkeypatch.setattr(verify, "worktree_file_bytes_at_revision", fail_probe)
+
+    engine._restore_ledger(task, snapshot)
+
+    assert project.deferred_work.read_text(encoding="utf-8") == committed
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "ledger-baseline-probe-failed" in kinds
+    assert "ledger-restore-skipped-diverged" in kinds
+
+
 def test_pre_harvest_ledger_restore_is_atomic_on_publication_failure(project, monkeypatch):
     """A failed rollback publish leaves the current ledger byte-intact."""
     engine, _ = make_engine(project, [], policy=_harvest_policy())
@@ -12898,6 +13120,67 @@ def test_nonfixable_retry_leaves_tracked_ledger_at_its_baseline_bytes(project):
     persisted = load_state(engine.run_dir).tasks["1-1-a"]
     assert persisted.pre_harvest_ledger_captured is False
     assert persisted.pre_harvest_ledger is None
+
+
+def test_rejected_attempt_restore_leaves_a_rival_that_wrote_inside_the_reset_window(
+    project, monkeypatch
+):
+    """THE #735 DEFECT PROOF. A rival that writes a TRACKED ledger between
+    `reset --hard` returning and the restore's observation read is not
+    reset-owned, and the snapshot must not be republished over it.
+
+    The anchor this replaces was `current == observed and gits`, with `observed`
+    read once the rollback returned. A rival landing inside that window BECOMES
+    `observed`, so the comparison holds later and labels the rival's bytes "what
+    reset put back". The blob anchor is taken from `task.baseline_commit`
+    instead, which no rival can author.
+
+    The oracle is the rival's SURVIVAL and the journal kind, never the restored
+    bytes: this ledger is tracked, so `reset --hard` republishes its committed
+    text whether or not this code runs at all, and a byte assertion would pass
+    for the wrong reason (proven by control in #726 session 6).
+
+    Ablation: restore `reset_owned = current == observed and gits` and the
+    snapshot overwrites the rival — the survival row AND the diverged row red.
+    """
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    before = "# Deferred Work\n\ntracked baseline\n"
+    project.deferred_work.write_text(before, encoding="utf-8")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "track deferred-work")
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            _baseline_liar_effect(project, deferred=[HARVEST_A]),
+            dev_effect(project, "1-1-a", followup_review=False),
+        ],
+        policy=_harvest_policy(attempts=2),
+    )
+
+    real_rollback = engine._rollback_or_pause
+    landed: list[bool] = []
+
+    def rollback_then_rival(task, **kwargs):
+        real_rollback(task, **kwargs)
+        # After the reset returned, before `_restore_ledger` reads `observed`:
+        # exactly the window #735 describes. One-shot, so a later attempt's
+        # rollback cannot file it twice.
+        if not landed:
+            landed.append(True)
+            with project.deferred_work.open("a", encoding="utf-8") as f:
+                f.write("\n### DW-9: filed by another process\n\nstatus: open\n")
+
+    monkeypatch.setattr(engine, "_rollback_or_pause", rollback_then_rival)
+
+    assert engine.run().done == 1
+
+    assert landed == [True]
+    assert "DW-9: filed by another process" in project.deferred_work.read_text(encoding="utf-8")
+    (event,) = [
+        e for e in engine.journal.entries() if e["kind"] == "ledger-restore-skipped-diverged"
+    ]
+    assert event["story_key"] == "1-1-a"
 
 
 @pytest.mark.parametrize(
