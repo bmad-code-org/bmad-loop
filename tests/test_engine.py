@@ -13111,6 +13111,53 @@ def test_restore_ledger_reset_owned_write_uses_the_blob_anchor(project):
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_defer_restore_never_resurrects_a_deleted_symlink_target(project, tmp_path):
+    """DIRECTION PIN (#735), the merge arm's twin of
+    `test_restore_ledger_never_reads_a_symlink_deletion_as_reset_owned`.
+
+    Gating the DIRECT overwrite on a `BASELINE` anchor is not enough here,
+    because this site degrades to an append-only merge rather than to a skip.
+    That merge is immune to a rival's WRITE — it only ever adds — but it read
+    `current or ""`, so a ledger that is GONE looked like a ledger where every
+    snapshot entry is merely missing, and it wrote them all back. Recreating a
+    file a rival deleted is the same overwrite wearing different clothes.
+
+    A tracked symlink is the shape that reaches it: it is git-owned, so the
+    `_ledger_is_gits_to_restore` gate above lets it through, while `reset --hard`
+    restores only the link and can never reach the target a rival unlinked.
+
+    Ablation: restore `current or ""` as the merge input and drop the
+    `current is not None` guard — the target comes back and this reddens.
+    """
+    target = tmp_path / "shared" / "deferred-work.md"
+    target.parent.mkdir(parents=True)
+    target.write_text("# Deferred Work\n", encoding="utf-8")
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    if project.deferred_work.is_symlink() or project.deferred_work.exists():
+        project.deferred_work.unlink()
+    project.deferred_work.symlink_to(target)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "track a symlinked deferred-work")
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.baseline_commit = rev_parse_head(project.project)
+    task.baseline_untracked = []
+    snapshot = (
+        "# Deferred Work\n\n### DW-1: review found this\n\n"
+        "origin: review, 2026-08-26\nlocation: src.txt\nreason: needs a look.\nstatus: open\n"
+    )
+    # The rival's deletion, landing inside the window the reset opened.
+    target.unlink()
+
+    engine._restore_defer_ledger(task, snapshot)
+
+    assert not target.exists()
+    assert project.deferred_work.is_symlink()
+    (event,) = [e for e in engine.journal.entries() if e["kind"] == "defer-ledger-restore-diverged"]
+    assert event["dw_ids"] == []
+
+
 def test_restore_ledger_never_reads_a_symlink_deletion_as_reset_owned(project, tmp_path):
     """DIRECTION PIN (#735). A tracked ledger symlink whose TARGET a rival deleted
     inside the reset window must not be written back over.

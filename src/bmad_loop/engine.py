@@ -6476,9 +6476,11 @@ class Engine:
         # `reset --hard` could actually have republished. No anchor degrades to
         # the merge below, which is append-only and therefore cannot destroy a
         # rival's write — the reason this site can absorb a probe fault the way
-        # `_restore_ledger`'s degrade-to-skip has to.
+        # `_restore_ledger`'s degrade-to-skip has to. That immunity covers a
+        # rival's WRITE only; a rival's DELETION is refused at the merge itself.
         anchor, expected = self._ledger_baseline_text(task)
         merged: list[str] = []
+        collided: list[str] = []
         flat_remainder = False
         with deferredwork.ledger_lock(ledger):
             # PURE TEXT ONLY under the hold. Every `deferredwork` mutator takes
@@ -6495,12 +6497,23 @@ class Engine:
                 ledger.parent.mkdir(parents=True, exist_ok=True)
                 atomic_write_text(ledger, snapshot)
                 return
-            restored, merged, flat_remainder, collided = self._merge_snapshot_entries(
-                current or "", snapshot
-            )
-            if restored is not None:
-                ledger.parent.mkdir(parents=True, exist_ok=True)
-                atomic_write_text(ledger, restored)
+            if current is not None:
+                restored, merged, flat_remainder, collided = self._merge_snapshot_entries(
+                    current, snapshot
+                )
+                if restored is not None:
+                    ledger.parent.mkdir(parents=True, exist_ok=True)
+                    atomic_write_text(ledger, restored)
+            # A MISSING ledger falls straight through to the divergence journal.
+            # The arm above already claimed the only absence that IS the reset's
+            # own work (a baseline determinately lacking the ledger, where
+            # `None == None` holds), so reaching here with no file means somebody
+            # removed it after the reset — or through a symlink the reset cannot
+            # reach at all. Merging `current or ""` would read that deletion as
+            # "every entry is merely missing" and write them all back, recreating
+            # the file: the append-only merge cannot destroy a rival's WRITE, but
+            # it can resurrect what a rival DELETED, which is the same overwrite
+            # wearing different clothes.
         # Only the divergent arm falls through to here. Journaled outside the
         # hold: the lock covers this ledger's read-modify-write and nothing else.
         self.journal.append(
