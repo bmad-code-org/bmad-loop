@@ -759,7 +759,15 @@ def test_a_racing_writers_flip_survives_a_concurrent_advance(tmp_path):
     `atomic_write_bytes` call alone — and this reddens, `4-1-thing` coming back
     `review`. Hoisting read#1 (`story_status`) alone does NOT redden this row:
     that read decides never-regress, it does not produce the bytes published over
-    the rival, and its position is graded by the ordering row above instead."""
+    the rival, and its position is graded by the ordering row above instead.
+
+    Read#1 above the lock is no longer hypothetical — it is what `advance` does
+    (#736): the advisory probe reads exactly that, and this row is why doing so
+    is safe. The probe declines to answer a row that must move (`3-2-digest-
+    delivery` is `backlog`, below its target), so this call falls through to the
+    hold and recomputes read#1 there, which is the read the rival's flip has to
+    be visible to. Only a would-write-nothing answer is ever taken from the
+    probe, and such a call publishes no bytes for a rival to lose."""
     p = _write(tmp_path)
     real_lock = sprintstatus._board_lock
     raced: list[str | None] = []

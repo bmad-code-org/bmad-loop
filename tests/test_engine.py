@@ -6709,8 +6709,20 @@ def test_defer_skips_restore_for_a_ledger_the_reset_never_touched(project, monke
     The guard this replaces compared disk against the snapshot and overwrote on
     exactly that difference: it ARMED the lost update it reads like it prevents.
 
-    Ablation: delete the `_ledger_is_gits_to_restore` gate and the rival entry is
-    clobbered by the snapshot.
+    Ablation: delete the `_ledger_is_gits_to_restore` gate and `probed` stops
+    being empty — an untracked ledger reaches the baseline probe, spawning git
+    and then taking the ledger lock for a restore with nothing to restore.
+
+    That probe count is the oracle, and deliberately, because the DATA oracles
+    below no longer grade this gate at all. Since #735 the write arm is
+    `anchored and current == expected`, and an untracked ledger has no blob at
+    the baseline, so `expected` is None and the arm cannot fire whether the gate
+    runs or not: control falls through to the append-only merge, which finds
+    nothing the snapshot has and disk has lost, and writes nothing. Deleting the
+    gate used to clobber DW-2 — the consequence this docstring claimed — and now
+    costs only a spawn and an acquisition. The rival's survival is still asserted
+    because it is the behavior that matters; it is simply no longer this
+    ablation's discriminator.
     """
     from conftest import review_effect as make_review
 
@@ -6744,6 +6756,18 @@ def test_defer_skips_restore_for_a_ledger_the_reset_never_touched(project, monke
 
     monkeypatch.setattr(engine, "_rollback_or_pause", rollback_then_rival)
 
+    probed: list[str] = []
+    real_baseline = engine._ledger_baseline_text
+
+    def recording_baseline(task):
+        # The gate's first observable: reaching this at all means the restore is
+        # about to spawn git and take the ledger lock for a file `reset --hard`
+        # never touched.
+        probed.append(task.story_key)
+        return real_baseline(task)
+
+    monkeypatch.setattr(engine, "_ledger_baseline_text", recording_baseline)
+
     writes: list[Path] = []
     real_write = platform_util.atomic_write_text
 
@@ -6756,6 +6780,8 @@ def test_defer_skips_restore_for_a_ledger_the_reset_never_touched(project, monke
     summary = engine.run()
 
     assert summary.deferred == 1
+    # short-circuited above the probe, so above the lock too
+    assert probed == []
     # the restore returned before writing: nothing of ours was owed here
     assert project.deferred_work not in writes
     entries = _ledger_entries(project)

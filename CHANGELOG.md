@@ -233,6 +233,47 @@ decisions` and the TUI decision modal now also catch the state-root failure that
   created inside the window went with it. A tracked ledger absent at snapshot time is
   still never deleted, and is now answered before any lock is taken. A write or lock fault
   is journaled as `ledger-restore-failed` and preserves an in-flight pause, as before.
+- **A read-dependent no-op is answered before its lock is taken** (#736). A lock acquired for
+  work that turns out to write nothing turns a previously successful no-op into a failure:
+  `bmad-loop confirm` replayed against a story the board already records as `done`, a rollback
+  replayed over entries already reopened, `sweep --archive` over a ledger holding nothing
+  closed. Acquisition can fail, and so can deriving the sidecar path where no state root
+  exists — on work that was never going to happen. #726 fixed two instances of the shape (a
+  missing ledger, an empty batch); the rest of the class is swept here. `sprintstatus.advance`
+  and the five read-dependent `deferred-work.md` mutators each take ONE advisory read before
+  acquiring, running the same pure decision helper the locked pass runs so the probe cannot
+  answer "no write" where the authority would write. Only a would-write-nothing answer is
+  acted on, and such a call linearizes at that read: it publishes no bytes, so there is
+  nothing for a rival to interleave with. Every other answer — and any fault while probing —
+  falls through to the hold, which re-reads and decides authoritatively, so a malformed board
+  still raises from under the lock and the probe adds no failure mode the locked path lacks.
+  `mark_done_many`, `mark_open_many` and `record_decision` also answer a missing ledger
+  without acquiring, as `archive_closed` already did; `append_entries_published` deliberately
+  does not, because an absent ledger there means CREATE, which is a write.
+  With nothing eligible to archive, `bmad-loop sweep --archive` therefore now exits 0 ("no
+  closed entries to archive") where a dead lock or an underivable state root made it exit 1.
+  An ELIGIBLE archive under a dead lock still fails exactly as before, as does every write
+  arm.
+- **A ledger restore that spans `git reset --hard` anchors on the committed baseline blob,
+  not on an observation of the tree** (#735). The three restores no lock may cover — the
+  rejected attempt's retraction, a rolled-back defer's, and the sweep's failed-migration
+  rewrite — each compared against the ledger as observed the instant the rollback returned.
+  That read is taken after the very reset it attests to, so a rival writing a tracked ledger
+  inside the window BECOMES the observation, the compare then holds, and the restore
+  overwrites the rival's entries. Each write arm now takes its expected text from the
+  ledger's committed blob at the run's baseline commit — what `reset --hard` actually
+  republished, which is nobody's concurrent write — probed out of git before the lock, since
+  a lock may never span a subprocess. The post-reset observation is kept only where it was
+  always safe: authorizing a skip, never a write. Where no anchor can be derived — no
+  baseline commit, an external ledger, or a probe fault, journaled
+  `ledger-baseline-probe-failed` — each site degrades in its own direction rather than
+  writing: the retraction skips (`ledger-restore-skipped-diverged`), the defer restore merges
+  by appending the entries disk has since lost (`defer-ledger-restore-diverged`), and the
+  sweep escalates for a human (`sweep-migration-restore-diverged`). Those doubly-uncertain
+  cases previously still wrote. What stays unfixable in principle, and is documented rather
+  than claimed: a rival whose text is byte-equal to the committed blob — or, on the sweep's
+  untracked ledger, to the rewrite the attempt just rejected — is indistinguishable from the
+  reset's own work.
 
 ### Security
 
