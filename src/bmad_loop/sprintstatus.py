@@ -328,9 +328,9 @@ def advance(path: Path, story_key: str, target: str, *, now: str | None = None) 
     be derived) on the channel callers already route this function's raises
     through — the engine's crash/escalation handling, the CLI's failure exit — so
     a board that could not be serialized fails loudly rather than being rewritten
-    unlocked. :func:`advanced_bytes` goes through here against a throwaway copy,
-    whose lock key derives from the shadow's own path and so never contends on
-    the real board's sidecar.
+    unlocked. :func:`advanced_bytes` deliberately does NOT come through
+    here: it calls :func:`_advance_locked` against a private throwaway copy, so it
+    neither contends on the real board's sidecar nor mints one of its own.
     """
     if not path.is_file():
         return None  # no board, nothing to serialize against — take no lock
@@ -393,8 +393,8 @@ def advanced_bytes(source: bytes, story_key: str, target: str) -> bytes | None:
     and nothing else, and so needs the intended content recomputed from a baseline it
     trusts rather than read back out of the file it is about to commit.
 
-    Goes through ``advance`` itself, against a throwaway copy, rather than
-    reimplementing the edit. Never-regress, the epic lift, and
+    Goes through the real writer's own body (``_advance_locked``), against a
+    throwaway copy, rather than reimplementing the edit. Never-regress, the epic lift, and
     ``_set_mapping_value``'s quoted-scalar, inline-comment and per-line-terminator
     handling ARE what makes two boards "the same advance" — a second implementation of
     them would drift from the writer silently, and for this caller a silent drift means
@@ -403,8 +403,8 @@ def advanced_bytes(source: bytes, story_key: str, target: str) -> bytes | None:
     No ``now=``: the caller's own carry passes none either, and a ``last_updated`` line
     rewritten here and not there would make every comparison fail.
 
-    Returns None only when the board's row is absent. ``advance``'s other None — a
-    missing file — cannot be reached from here, the shadow being this function's own
+    Returns None only when the board's row is absent. The other None — a missing
+    file — cannot be reached from here, the shadow being this function's own
     copy. There is then no intended content to compare against, and a caller must not
     read "I could not compute it" as "the tree is mine".
 
@@ -416,7 +416,15 @@ def advanced_bytes(source: bytes, story_key: str, target: str) -> bytes | None:
     with tempfile.TemporaryDirectory() as tmp:
         shadow = Path(tmp) / "sprint-status.yaml"
         shadow.write_bytes(source)
-        if advance(shadow, story_key, target) is None:
+        # Straight to the locked body, deliberately skipping `advance`'s own
+        # acquisition. The shadow is this function's private copy inside a
+        # TemporaryDirectory that no other process can name, so there is no
+        # second writer to exclude — and taking the lock anyway would mint a
+        # state-root sidecar keyed on a path that exists only for this call.
+        # `file_lock` never removes a sidecar and the TemporaryDirectory removes
+        # only the shadow, so every ownership computation would strand another
+        # dead lock file under `<state root>/locks` (#286).
+        if _advance_locked(shadow, story_key, target) is None:
             return None
         return shadow.read_bytes()
 

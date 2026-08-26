@@ -31,7 +31,10 @@ breaking changes may land in a minor release.
   pair — into a single read-modify-write. Each is byte-identical to the serial sequence it
   replaces, validating the whole batch before it takes the lock, minting sequential ids and
   deduplicating in-call twins exactly as the loop it stands in for did, so a caller adopting one
-  changes how many windows it leaves open and nothing else.
+  changes how many windows it leaves open and nothing else. `append_entries_published`
+  additionally hands back the text it wrote, so a caller that has to record what it published —
+  rather than what the file happens to hold afterwards — takes its anchor from inside the hold
+  instead of reading the ledger back once the lock is gone.
 
 ### Changed
 
@@ -155,7 +158,11 @@ decisions` and the TUI decision modal now also catch the state-root failure that
   single call between the never-regress decision and the bytes that decision was applied to. A
   board that does not exist is still reported missing without creating a lock file at all, and a
   lock that cannot be taken fails the advance on the channel that already carries its errors
-  rather than rewriting the board unserialized. The atomic, symlink-following,
+  rather than rewriting the board unserialized. Recomputing an advance for the isolated-run
+  ownership check runs the locked body directly against its private throwaway copy: it needs no
+  exclusion, nobody else being able to name that copy, and taking a lock anyway would strand one
+  more sidecar keyed on a path that exists only for that call, since lock files are never
+  reaped. The atomic, symlink-following,
   read-only-refusing write itself is unchanged.
 - **A failed commit now rolls back only the ledger entries the story itself closed** (#286).
   The window between a story's declared `closes_deferred:` closure and its commit spans git

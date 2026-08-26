@@ -3904,28 +3904,28 @@ class Engine:
         # because each spec is applied to the text the previous one produced.
         # The scan above already ran, and the latch above already fired, so the
         # durability ordering the comment there describes is unchanged.
-        minted = deferredwork.append_entries(ledger, specs)
+        minted, published = deferredwork.append_entries_published(ledger, specs)
         filed = [dw_id for dw_id in minted if dw_id is not None]
         if filed:
             # Re-anchor the pre-harvest restore's compare-and-set on what this
-            # append actually published. `append_entries` writes only when some
-            # spec minted an id (it returns the text untouched when every one
+            # append actually published. `append_entries_published` writes only
+            # when some spec minted an id (it hands back None when every one
             # dedupes), so `filed` IS the "did we write" answer and no extra
             # probe is needed to derive it.
             #
-            # Read back rather than reconstructed: the writer owns the applied
-            # text and does not hand it out. The read is unlocked, so a rival
-            # landing between the writer's release and this line would be
-            # counted as ours — a window of pure Python, against the restore's
-            # own window that spans `git reset --hard` and its preflight spawns.
-            # It is also never worse than the unguarded write this anchor
-            # replaces, which retracted whatever it found unconditionally.
+            # Taken from the writer, not read back off disk. The lock is released
+            # when the call returns, so a rival landing between that release and
+            # a read here would be folded into an anchor whose entire job is to
+            # say "these bytes are ours" — and on a rejected attempt the restore
+            # would then retract the rival's entry as if it were our own harvest.
+            # That is the loss this change exists to prevent, so the anchor comes
+            # from inside the hold instead.
             #
             # Durable before the decision that consumes it: a crash replay
             # re-runs the harvest, which either writes again (refreshing this)
             # or dedupes to no write at all, leaving the dead attempt's bytes
             # exactly as this digest recorded them.
-            task.post_engine_ledger_digest = self._ledger_digest()
+            task.post_engine_ledger_digest = _digest_of(published)
             self._save()
         # The writer's open-entry guard can catch two frontmatter items with
         # the same clamped fingerprint inside this one pre-scan snapshot.

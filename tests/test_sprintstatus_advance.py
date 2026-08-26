@@ -811,16 +811,19 @@ def test_the_board_lock_excludes_a_second_acquirer(tmp_path, monkeypatch):
 
 
 def test_advanced_bytes_never_touches_the_real_boards_lock(tmp_path, monkeypatch):
-    """The shadow advance must not contend on the board it is reasoning about.
+    """The shadow advance neither contends on the board nor strands a lock file.
 
-    `advanced_bytes` recomputes an advance by running the real writer against a
-    throwaway copy, so it inherits the lock — and a shadow keyed off the board's
-    own identity would have the caller queue behind, or worse deadlock with, the
-    very run whose write it is trying to describe. The key is the shadow's own
-    path, so the sidecars are disjoint.
+    `advanced_bytes` recomputes an advance by running the real writer's body
+    against a throwaway copy. Routing that through `advance` would take a lock
+    keyed on the shadow's own path — harmless for exclusion, since nobody else
+    can name a private TemporaryDirectory, but `file_lock` never removes a
+    sidecar while the TemporaryDirectory removes only the shadow. Every
+    ownership computation would then strand one more dead file under
+    `<state root>/locks`, without bound. So it calls `_advance_locked` directly
+    and takes no lock at all.
 
-    Ablation: make `runs.lock_path_for` ignore its argument (return one constant
-    sidecar) and this reddens — every path collapses onto the board's own lock."""
+    Ablation: put `advance(shadow, ...)` back in place of `_advance_locked` —
+    the spy fires and a sidecar is left behind, so both rows red."""
     board = _write(tmp_path)
     # Snapshot the bytes as they actually landed, rather than re-encoding SPRINT:
     # `_write` writes in text mode, so on Windows the newlines on disk are CRLF
@@ -836,12 +839,15 @@ def test_advanced_bytes_never_touches_the_real_boards_lock(tmp_path, monkeypatch
             yield
 
     monkeypatch.setattr(sprintstatus, "file_lock", spy_file_lock)
+    locks_dir = runs.state_root() / "locks"
+    before_locks = set(locks_dir.glob("*")) if locks_dir.is_dir() else set()
 
     out = sprintstatus.advanced_bytes(board.read_bytes(), "3-2-digest-delivery", "in-progress")
 
     assert out is not None and b"3-2-digest-delivery: in-progress" in out
-    assert sidecars  # it really did lock something — the shadow's own sidecar
-    assert runs.lock_path_for(board) not in sidecars
+    assert sidecars == []  # no acquisition at all — the shadow is private
+    after_locks = set(locks_dir.glob("*")) if locks_dir.is_dir() else set()
+    assert after_locks == before_locks  # and nothing was stranded under the state root
     assert board.read_bytes() == before  # and the real board is untouched
 
 

@@ -1311,6 +1311,35 @@ def append_entries(path: Path, specs: Sequence[EntrySpec]) -> list[str | None]:
     against an already-open entry. Creates the ledger (and parent dir) if it does
     not yet exist.
 
+    A thin wrapper over :func:`append_entries_published`, for the callers that
+    only need the ids. One acquisition, in the leaf.
+    """
+    return append_entries_published(path, specs)[0]
+
+
+def append_entries_published(
+    path: Path, specs: Sequence[EntrySpec]
+) -> tuple[list[str | None], str | None]:
+    """:func:`append_entries`, additionally handing back the text it published —
+    or None when it wrote nothing, because every spec deduped or `specs` was
+    empty.
+
+    For a caller that has to record WHAT IT WROTE rather than what the file holds
+    afterwards. Reading the ledger back after this returns is a different
+    question with the same answer only when nobody else wrote in between: the
+    lock is released before the read, so a concurrent mutator's bytes would be
+    folded into the caller's own anchor. That matters for
+    ``post_engine_ledger_digest``, whose whole job is to say "these bytes are
+    ours" — counting a rival's write as ours would have the pre-harvest restore
+    retract it, which is the loss this module exists to prevent (#286). Taking
+    the text from inside the hold removes the window rather than narrowing it.
+
+    The returned text is what was handed to
+    :func:`~bmad_loop.platform_util.atomic_write_text`, so a digest of it equals
+    a digest of a later ``read_text`` of the file: the writer's text mode
+    translates the newlines on the way out and ``read_text`` normalizes them back
+    on the way in.
+
     ONE locked read->edit->write: the whole cycle runs under the cross-process
     ledger lock (#286/#469), so concurrent mutators — a second run, a sweep, the
     TUI decision modal, ``sweep --archive`` — serialize here rather than trading
@@ -1350,7 +1379,7 @@ def append_entries(path: Path, specs: Sequence[EntrySpec]) -> list[str | None]:
             )
     if not specs:
         # Nothing to serialize against, so nothing to take a lock for.
-        return []
+        return [], None
     with ledger_lock(path):
         text = path.read_text(encoding="utf-8") if path.is_file() else ""
         minted: list[str | None] = []
@@ -1358,10 +1387,12 @@ def append_entries(path: Path, specs: Sequence[EntrySpec]) -> list[str | None]:
             text, dw_id = _apply_append(text, spec)
             minted.append(dw_id)
         if all(dw_id is None for dw_id in minted):
-            return minted
+            return minted, None
         path.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_text(path, text)
-        return minted
+        # Returned from INSIDE the hold: this is the published text by
+        # construction, not a read-back that a rival could have moved.
+        return minted, text
 
 
 def append_entry(

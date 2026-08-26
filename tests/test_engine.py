@@ -12253,10 +12253,12 @@ def test_spec_deferral_provenance_is_durable_before_append_for_crash_replay(proj
     sp.parent.mkdir(parents=True, exist_ok=True)
     write_spec(sp, "done", "abc123", deferred=[HARVEST_A])
     result_json = {"spec_file": str(sp)}
-    # The harvest files its whole batch in ONE `append_entries` call (#286/#469),
-    # so that is where a host loss lands; `append_entry` is no longer on this path
-    # and patching it would inject nothing.
-    real_append = deferredwork.append_entries
+    # The harvest files its whole batch in ONE `append_entries_published` call
+    # (#286/#469), so that is where a host loss lands. Neither `append_entry` nor
+    # the `append_entries` wrapper is on this path any more, and patching either
+    # would inject nothing — the test would then fail on its assertions rather
+    # than on the crash it meant to stage.
+    real_append = deferredwork.append_entries_published
 
     class PowerLoss(BaseException):
         pass
@@ -12265,7 +12267,7 @@ def test_spec_deferral_provenance_is_durable_before_append_for_crash_replay(proj
         real_append(*args, **kwargs)
         raise PowerLoss
 
-    monkeypatch.setattr(deferredwork, "append_entries", append_then_die)
+    monkeypatch.setattr(deferredwork, "append_entries_published", append_then_die)
     with pytest.raises(PowerLoss):
         engine._harvest_spec_deferrals(task, result_json)
 
@@ -12274,7 +12276,7 @@ def test_spec_deferral_provenance_is_durable_before_append_for_crash_replay(proj
     saved_task = saved.tasks[task.story_key]
     assert saved_task.harvest_wrote_ledger is True
 
-    monkeypatch.setattr(deferredwork, "append_entries", real_append)
+    monkeypatch.setattr(deferredwork, "append_entries_published", real_append)
     resumed = Engine(
         paths=project,
         policy=engine.policy,
@@ -12303,10 +12305,12 @@ def test_expanded_harvest_records_are_durable_before_a_later_append(project, mon
     assert task.harvest_wrote_ledger is True
 
     write_spec(sp, "done", "abc123", deferred=[HARVEST_A, HARVEST_B])
-    # The harvest files its whole batch in ONE `append_entries` call (#286/#469),
-    # so that is where a host loss lands; `append_entry` is no longer on this path
-    # and patching it would inject nothing.
-    real_append = deferredwork.append_entries
+    # The harvest files its whole batch in ONE `append_entries_published` call
+    # (#286/#469), so that is where a host loss lands. Neither `append_entry` nor
+    # the `append_entries` wrapper is on this path any more, and patching either
+    # would inject nothing — the test would then fail on its assertions rather
+    # than on the crash it meant to stage.
+    real_append = deferredwork.append_entries_published
 
     class PowerLoss(BaseException):
         pass
@@ -12315,7 +12319,7 @@ def test_expanded_harvest_records_are_durable_before_a_later_append(project, mon
         real_append(*args, **kwargs)
         raise PowerLoss
 
-    monkeypatch.setattr(deferredwork, "append_entries", append_then_die)
+    monkeypatch.setattr(deferredwork, "append_entries_published", append_then_die)
     with pytest.raises(PowerLoss):
         engine._harvest_spec_deferrals(task, result_json)
 
@@ -12328,6 +12332,63 @@ def test_expanded_harvest_records_are_durable_before_a_later_append(project, mon
         HARVEST_A["summary"],
         HARVEST_B["summary"],
     ]
+
+
+def test_harvest_anchor_names_what_was_published_not_a_later_rival(project, monkeypatch):
+    """`post_engine_ledger_digest` records what the engine wrote, not what the
+    file holds once somebody else has added to it (#286).
+
+    `append_entries_published` releases the ledger lock when it returns, so a
+    read-back taken after that can already carry a concurrent mutator's bytes.
+    Folding them into this anchor would make `_restore_ledger` classify them as
+    engine-owned and retract them on a rejected attempt — reintroducing, through
+    the anchor itself, the concurrent-writer loss this change exists to prevent.
+    Taking the text from inside the hold removes the window rather than narrowing
+    it.
+
+    Ablation: set the anchor from `self._ledger_digest()` (a read-back) instead of
+    the text the writer returned, and the rival's entry is inside the digest —
+    the `!=` row reds."""
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1, phase=Phase.DEV_VERIFY)
+    engine.state.tasks[task.story_key] = task
+    sp = spec_path(project, task.story_key)
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    write_spec(sp, "done", "abc123", deferred=[HARVEST_A])
+    result_json = {"spec_file": str(sp)}
+
+    ledger = project.deferred_work
+    real_append = deferredwork.append_entries_published
+    published: list[str] = []
+    rival_filed: list[bool] = []
+
+    def append_then_a_rival_writes(*args, **kwargs):
+        minted, text = real_append(*args, **kwargs)
+        if not rival_filed:
+            # Latched BEFORE the nested call, not after: the rival goes through
+            # the ordinary public appender, which delegates down to this very
+            # symbol, so an unlatched spy would re-enter itself forever.
+            rival_filed.append(True)
+            published.append(text or "")
+            # Lands the instant the writer's lock is released — the worst legal
+            # interleaving, and the one an unlocked read-back would absorb.
+            deferredwork.append_entry(
+                ledger,
+                title="filed by another process",
+                origin="sweep, 2026-06-11",
+                source_spec="other.md",
+                reason="a rival writer got here first.",
+            )
+        return minted, text
+
+    monkeypatch.setattr(deferredwork, "append_entries_published", append_then_a_rival_writes)
+
+    engine._harvest_spec_deferrals(task, result_json)
+
+    on_disk = ledger.read_text(encoding="utf-8")
+    assert "filed by another process" in on_disk  # the rival really did land
+    assert published and task.post_engine_ledger_digest == _digest_of(published[0])
+    assert task.post_engine_ledger_digest != _digest_of(on_disk)
 
 
 def test_spec_deferrals_dedup_sees_already_done_entries(project):
