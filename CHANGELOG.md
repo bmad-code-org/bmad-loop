@@ -41,6 +41,18 @@ breaking changes may land in a minor release.
   states the rule a native-id backend must follow rather than leaving it to be inferred from
   psmux's per-seam specifics, and `TerminalMultiplexer.new_parked_window` now says its id is
   opaque and MAY be qualified, matching `new_window`. Documentation only; no behavior change.
+- **A config path component that names a Windows device, or ends in a period or space, is
+  refused at load** (#480). Values that were accepted before — `skill_tree = "NUL"`, a
+  `seed_files` entry of `aux.json`, a `worktree_seed` of `.claude/skills.` — now raise at all
+  seven validation sites: `scm.worktree_seed`, an adapter's `hooks.config_path` / `skill_tree` /
+  `seed_files`, a plugin's `seed_files` / `seed_globs` and `[python] module`, and the Unity
+  seeder's guard dir. Such a component names a _different_ path on Windows than the one it
+  spells — a device rather than a file, or a sibling once Win32 strips the trailing run — so the
+  file that gets seeded and the exclude pattern rendered from the authored spelling disagree
+  about which path they mean. The refusal is cross-platform on purpose, matching how the family
+  already rejects `C:\secrets` on POSIX: a config value must not mean one thing per host. No
+  shipped profile, bundled `plugin.toml` or default trips it, but this is a compatibility break
+  on previously-loading config.
 
 ### Fixed
 
@@ -72,6 +84,24 @@ breaking changes may land in a minor release.
 - The git-add shield's rollback report no longer raises through its own stderr decode on
   Windows (#394). `_shield_undo_extension` is contracted never to raise, but the `fsdecode` of a
   failing `--unset-all`'s stderr was guarded for `GitError` alone.
+- **A run ref that names the runs directory itself is refused, and the two destructive run-dir
+  writes are contained** (#480). `runs._is_path_escape` was the only member of the seven-site
+  guard family omitting `names_tree_root`, so `""` and `"."` joined to the runs root exactly,
+  and `delete_run` removed whatever it was handed with a bare `rmtree`. That reach needed a
+  `state.json` lying at the runs root — without one those refs fall through to partial matching
+  and can only name a child — and the ref is the operator's own argv, so this was a footgun
+  rather than an escalation. `delete_run` and `archive_run` now also refuse a `run_dir` that is
+  not a direct child of the runs directory, raising `UnconfinedWriteError` ahead of the
+  live-session guard and not waived by `--force`.
+- **A sweep bundle name that is not a legal path segment is refused at triage** (#637), at both
+  of `validate_triage`'s bundle-name sites — the `bundles` list and a decision option's
+  `bundle_name`, which becomes `Bundle.name` by way of `_materialize_bundles`. A cycle-1
+  bundle's name becomes its directory verbatim, and the reserved device basenames are all
+  `[a-z0-9-]`-legal, so `BUNDLE_NAME_RE` accepted `con`, `nul` and `com1` while no Windows
+  filesystem would create the directory — matched case-insensitively, so lowercase was no
+  reprieve. The test is `safe_segment` identity rather than a second hand-written device list,
+  which keeps the accepted set in lockstep with the sanitizer that defines it: the same idiom,
+  for the same reason, as `runs.is_valid_run_id`.
 
 ### Security
 

@@ -9,7 +9,7 @@ under a real Engine stays covered by test_engine.py.
 from __future__ import annotations
 
 import sys
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from types import SimpleNamespace
 
 import pytest
@@ -19,7 +19,7 @@ from bmad_loop import verify
 from bmad_loop.bmadconfig import ProjectPaths
 from bmad_loop.gates import ATTENTION_FILE
 from bmad_loop.model import Phase, StoryTask
-from bmad_loop.platform_util import UnconfinedWriteError
+from bmad_loop.platform_util import UnconfinedWriteError, is_absolute_path
 from bmad_loop.policy import GatesPolicy, LimitsPolicy, NotifyPolicy, Policy, ScmPolicy
 from bmad_loop.recovery_flow import PRESERVE_REF_PROBE_LIMIT, RecoveryFlow
 from bmad_loop.verify import GitError, rev_parse_head
@@ -87,6 +87,41 @@ def test_owned_spec_restore_recreates_missing_canonical_parents(tmp_path):
     RecoveryFlow._restore_attempt_owned_spec_bytes(spec, snapshot)
 
     assert spec.read_bytes() == snapshot
+
+
+def test_attempt_owned_spec_refuses_a_posix_absolute_spec_path(tmp_path, monkeypatch):
+    """#480 item 4: the one genuine REFUSAL guard in the tree built on stdlib
+    `is_absolute()`, pinned so a later path-guard sweep does not "fix" it.
+
+    It fails CLOSED on Windows, and `platform_util.is_absolute_path` would open
+    it: the Windows flavour reads a POSIX-absolute spec path as NOT absolute, so
+    the guard raises, while the family predicate answers True and would let it
+    through. That divergence is asserted on the pure flavour, so a POSIX host
+    measures the claim rather than skipping it.
+
+    Ablation: deleting the whole refusal reddens the raise and the canary
+    together. Deleting the `not spec_path.is_absolute()` term ALONE leaves this
+    GREEN on POSIX -- measured, not assumed -- because the `resolve(strict=True)`
+    fixed-point term below subsumes it here: a relative path never equals its own
+    resolve. That is the finding rather than a hole in the test. The term is
+    load-bearing on Windows only, so no POSIX test can protect it from deletion
+    and the comment at the guard is what has to."""
+    # The divergence the proposed swap would introduce, on the flavour that
+    # decides it -- this is the whole of #480 item 4's mechanism, inverted.
+    assert PureWindowsPath("/attempt/owned.md").is_absolute() is False
+    assert is_absolute_path("/attempt/owned.md") is True
+
+    monkeypatch.chdir(tmp_path)
+    snapshot = b"---\nstatus: ready-for-dev\n---\n\noperator input\n"
+    spec = Path("attempt") / "owned.md"
+
+    with pytest.raises(RuntimeError, match="became unsafe"):
+        RecoveryFlow._restore_attempt_owned_spec_bytes(spec, snapshot)
+
+    # Canary: the guard sits ABOVE the mkdir and the write, so neither ran. A
+    # refusal raised after the restore would pass the assertion above alone.
+    assert not spec.exists()
+    assert not spec.parent.exists()
 
 
 def _make_flow(

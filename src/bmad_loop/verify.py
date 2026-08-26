@@ -3202,6 +3202,32 @@ def spec_within_roots(spec_path: Path, paths: ProjectPaths) -> bool:
 
 
 def resolve_spec_path(spec_file: str, paths: ProjectPaths) -> Path:
+    """A session-reported ``spec_file`` as a concrete path: an absolute value passes
+    through untouched, a relative one is probed against ``paths.project`` and falls
+    back to ``paths.implementation_artifacts``.
+
+    Neither branch promises the result exists — the fallback is returned unprobed
+    when the project candidate is not a file — so every caller re-tests
+    ``.is_file()`` itself. Deliberately does NOT ``.resolve()``: callers needing
+    symlink and ``..`` normalization get it from :func:`spec_within_roots`, which
+    resolves both sides itself.
+
+    The rule its call sites follow: a caller that goes on to REWRITE the spec must
+    pair this with :func:`spec_within_roots` first. The value is session-reported
+    and this function hands back whatever it spells, so the containment check is
+    what stands between an untrusted string and a write to it. The frontmatter
+    reconcile, the marker repair and the repair/review spec resets all pair it; so
+    do the two attempt-binding observations, which write nothing themselves but
+    establish the binding ``recovery_flow`` later restores bytes through — the
+    check belongs at the site conferring the authority, not only at the write.
+
+    The rule is about writes to the SPEC, not writes in general, and two callers sit
+    outside it deliberately: the post-dev board sync and the sweep bundle's ledger
+    close each read a ``status:`` from an unchecked path and then write to a
+    deterministic orchestrator-owned target of their own (the sprint board, the
+    deferred-work ledger). An out-of-tree spec can influence what those write, never
+    where. A caller that only reads — the ``--json`` read-model, the dev-verify
+    gates — pairs it with nothing."""
     p = Path(spec_file)
     if p.is_absolute():
         return p

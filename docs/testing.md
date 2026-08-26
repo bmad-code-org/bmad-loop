@@ -72,7 +72,7 @@ Placement rules:
 ## Fixtures and helpers
 
 `tests/conftest.py` holds **fixtures for lifecycle and isolation only — currently exactly
-four** — and everything else is a plain function or constant a test imports by name:
+five** — and everything else is a plain function or constant a test imports by name:
 
 - `project` — the workhorse: a disposable copy of a session-scoped template repo
   (`_project_template`), BMAD-shaped artifact dirs plus an initial commit. Never hand-roll a
@@ -87,6 +87,11 @@ four** — and everything else is a plain function or constant a test imports by
   just sandbox ones, shadowing the developer's global gitignore sources (`GIT_CONFIG_GLOBAL`,
   `XDG_CONFIG_HOME`). Without it, a dev box that globally ignores `.claude/` makes shield
   tests measure the wrong thing while passing.
+- `_isolate_state_root` — **autouse** and function-scoped: points `BMAD_LOOP_STATE_DIR` at a
+  per-test temp dir. `runs.state_root()` does not merely read the user-scoped state location,
+  it mkdirs into it, so without this every test that builds an adapter would litter the
+  developer's (or the runner's) real state directory with one tree per run id, on a path no
+  fixture cleans up.
 
 Everything else is a **plain helper — a function or constant** (`from conftest import
 write_spec, dev_effect, machine_json, ...`). The rule is deliberate: a fixture is ambient — its consumers are invisible
