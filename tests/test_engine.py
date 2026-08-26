@@ -1,5 +1,6 @@
 """Engine scenario tests against the mock adapter — no tmux, no LLM."""
 
+import contextlib
 import dataclasses
 import hashlib
 import json
@@ -11776,6 +11777,50 @@ def test_review_prompt_does_not_ask_the_session_to_double_file_deferrals(project
     assert "the orchestrator owns their status and resolution" in prompt
 
 
+def test_harvest_files_findings_in_one_write(project, monkeypatch):
+    """One harvest is ONE locked write, however many findings it carries.
+
+    A per-finding `append_entry` loop takes and drops the ledger lock once per
+    row, leaving a window between two of THIS spec's own findings for any other
+    mutator — a second run, a sweep, `sweep --archive`, the TUI decision modal —
+    to interleave (#286/#469). The count IS the claim: a batch that quietly fell
+    back to the loop would file both rows just the same, so the ledger contents
+    cannot tell the two apart and only the acquisition tally can.
+
+    The journal payload is asserted unchanged alongside it, because batching must
+    not be visible to anything downstream — `dw_ids` stays the filed ids in
+    frontmatter order, `deduped` still counts what the pre-scan and the writer's
+    own idempotence scan each suppressed.
+
+    Ablation: restore the per-finding `append_entry` loop and this reddens on the
+    acquisition list while every content assertion below stays green."""
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    sp = spec_path(project, task.story_key)
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    write_spec(sp, "done", "abc123", deferred=[HARVEST_A, HARVEST_B])
+    acquisitions: list[Path] = []
+    real_lock = deferredwork.ledger_lock
+
+    @contextlib.contextmanager
+    def spy_lock(p):
+        acquisitions.append(p)
+        with real_lock(p):
+            yield
+
+    monkeypatch.setattr(deferredwork, "ledger_lock", spy_lock)
+
+    engine._harvest_spec_deferrals(task, {"spec_file": str(sp)})
+
+    assert acquisitions == [project.deferred_work]  # two findings, ONE hold on the ledger
+    entries = _harvest_entries(project)
+    assert [entry.title for entry in entries] == [HARVEST_A["summary"], HARVEST_B["summary"]]
+    (event,) = [e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert event["dw_ids"] == [entry.id for entry in entries]
+    assert event["deduped"] == 0 and event["malformed"] == 0
+    assert task.harvest_wrote_ledger is True
+
+
 def test_spec_frontmatter_deferrals_harvested_into_ledger(project):
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     engine, _ = make_engine(
@@ -11939,7 +11984,10 @@ def test_spec_deferral_provenance_is_durable_before_append_for_crash_replay(proj
     sp.parent.mkdir(parents=True, exist_ok=True)
     write_spec(sp, "done", "abc123", deferred=[HARVEST_A])
     result_json = {"spec_file": str(sp)}
-    real_append = deferredwork.append_entry
+    # The harvest files its whole batch in ONE `append_entries` call (#286/#469),
+    # so that is where a host loss lands; `append_entry` is no longer on this path
+    # and patching it would inject nothing.
+    real_append = deferredwork.append_entries
 
     class PowerLoss(BaseException):
         pass
@@ -11948,7 +11996,7 @@ def test_spec_deferral_provenance_is_durable_before_append_for_crash_replay(proj
         real_append(*args, **kwargs)
         raise PowerLoss
 
-    monkeypatch.setattr(deferredwork, "append_entry", append_then_die)
+    monkeypatch.setattr(deferredwork, "append_entries", append_then_die)
     with pytest.raises(PowerLoss):
         engine._harvest_spec_deferrals(task, result_json)
 
@@ -11957,7 +12005,7 @@ def test_spec_deferral_provenance_is_durable_before_append_for_crash_replay(proj
     saved_task = saved.tasks[task.story_key]
     assert saved_task.harvest_wrote_ledger is True
 
-    monkeypatch.setattr(deferredwork, "append_entry", real_append)
+    monkeypatch.setattr(deferredwork, "append_entries", real_append)
     resumed = Engine(
         paths=project,
         policy=engine.policy,
@@ -11986,7 +12034,10 @@ def test_expanded_harvest_records_are_durable_before_a_later_append(project, mon
     assert task.harvest_wrote_ledger is True
 
     write_spec(sp, "done", "abc123", deferred=[HARVEST_A, HARVEST_B])
-    real_append = deferredwork.append_entry
+    # The harvest files its whole batch in ONE `append_entries` call (#286/#469),
+    # so that is where a host loss lands; `append_entry` is no longer on this path
+    # and patching it would inject nothing.
+    real_append = deferredwork.append_entries
 
     class PowerLoss(BaseException):
         pass
@@ -11995,7 +12046,7 @@ def test_expanded_harvest_records_are_durable_before_a_later_append(project, mon
         real_append(*args, **kwargs)
         raise PowerLoss
 
-    monkeypatch.setattr(deferredwork, "append_entry", append_then_die)
+    monkeypatch.setattr(deferredwork, "append_entries", append_then_die)
     with pytest.raises(PowerLoss):
         engine._harvest_spec_deferrals(task, result_json)
 

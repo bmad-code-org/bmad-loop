@@ -1,13 +1,15 @@
 """Tests for the orchestrator-owned sprint-status writer (generic-skill path)."""
 
+import contextlib
 import sys
 from pathlib import Path
 
 import pytest
 import yaml
 
-from bmad_loop import sprintstatus
+from bmad_loop import runs, sprintstatus
 from bmad_loop.platform_util import atomic_write_bytes as real_atomic_write_bytes
+from bmad_loop.platform_util import file_lock as real_file_lock
 
 SPRINT = """\
 # Sprint status — do not hand-edit casually
@@ -658,3 +660,235 @@ def test_status_in_bytes_raises_rather_than_calling_an_unreadable_board_absent(t
     for source in (b"development_status: []\n", b"{ this is not: [valid yaml\n"):
         with pytest.raises(sprintstatus.SprintStatusError):
             sprintstatus.status_in_bytes(source, "3-2-digest-delivery")
+
+
+# --- the board lock (#286/#469) ------------------------------------------------
+#
+# `advance` is the board's SOLE writer, but sole-writer is not mutual exclusion:
+# a second orchestrator process runs the same sole writer, and `advance` is a
+# read-modify-write of the whole file. These rows grade the sidecar lock that
+# makes two of them serialize rather than trade last-write-wins.
+
+
+def test_advance_holds_the_lock_across_every_read_and_the_write(tmp_path, monkeypatch):
+    """The hold spans the whole read-modify-write, not just the write.
+
+    A lock taken around the atomic write alone excludes nobody that matters: the
+    bytes being published were computed from a read that happened OUTSIDE it, so
+    a rival's advance can land in between and be overwritten wholesale. The
+    ordering is recorded from the calls themselves rather than inferred from the
+    result, because a lost update leaves a board that looks perfectly well-formed.
+
+    `load` is the probe for two of the three reads — the `story_status`
+    never-regress read and the epic-lift read both go through it — and the
+    writer spy is the third event. Advancing a `backlog` story of a `backlog`
+    epic is what makes the epic lift fire, so all three are present.
+
+    Ablation: move `with _board_lock(path):` down to wrap only the
+    `atomic_write_bytes` call and this reddens — the two `load` events sort ahead
+    of `lock-enter`."""
+    p = _write(tmp_path)
+    events: list[str] = []
+    real_lock, real_load = sprintstatus._board_lock, sprintstatus.load
+
+    @contextlib.contextmanager
+    def spy_lock(path):
+        events.append("lock-enter")
+        with real_lock(path):
+            yield
+        events.append("lock-exit")
+
+    def spy_load(path):
+        events.append("load")
+        return real_load(path)
+
+    def spy_write(path, data, **kwargs):
+        events.append("write")
+        return real_atomic_write_bytes(path, data, **kwargs)
+
+    monkeypatch.setattr(sprintstatus, "_board_lock", spy_lock)
+    monkeypatch.setattr(sprintstatus, "load", spy_load)
+    monkeypatch.setattr(sprintstatus, "atomic_write_bytes", spy_write)
+
+    assert sprintstatus.advance(p, "3-2-digest-delivery", "in-progress") == "in-progress"
+
+    assert events.count("lock-enter") == 1 and events.count("lock-exit") == 1
+    assert events[0] == "lock-enter" and events[-1] == "lock-exit"
+    assert events[1:-1] == ["load", "load", "write"]  # both reads AND the write, inside
+
+
+def test_a_racing_writers_flip_survives_a_concurrent_advance(tmp_path):
+    """The lost update #469 names, reproduced deterministically and refused.
+
+    A rival process completes its whole advance while this one is still queued
+    for the lock. Because every read happens after the acquisition, this call
+    computes its bytes from the board the rival left behind, and both flips
+    survive. Read the board before the lock instead and the rival's row is
+    absent from the bytes published over it — gone, with no error anywhere.
+
+    The rival runs from inside the spy, BEFORE it enters the real lock, which is
+    what a second process actually gets to do; running it after would nest a
+    blocking acquisition on a second fd and self-deadlock. The one-shot latch
+    stops the rival's own `advance` from recursing into another rival.
+
+    The rival's row must be one its advance really REWRITES — `4-1-thing` moves
+    `review` -> `done`. A rival whose advance never-regresses writes nothing, and
+    there is then no update available to lose: the test would pass against every
+    ablation, including no lock at all.
+
+    Ablation: hoist `text = path.read_bytes()...` (read#2) above the lock — e.g.
+    drop the `with _board_lock(path):` in `advance` and re-wrap the
+    `atomic_write_bytes` call alone — and this reddens, `4-1-thing` coming back
+    `review`. Hoisting read#1 (`story_status`) alone does NOT redden this row:
+    that read decides never-regress, it does not produce the bytes published over
+    the rival, and its position is graded by the ordering row above instead."""
+    p = _write(tmp_path)
+    real_lock = sprintstatus._board_lock
+    raced: list[str | None] = []
+
+    @contextlib.contextmanager
+    def racing_lock(path):
+        if not raced:
+            # Latch FIRST: the rival's own `advance` re-enters this spy, and a
+            # latch set only on the way out would stage a rival per rival.
+            raced.append(None)
+            # a rival orchestrator gets the lock first and finishes its advance
+            raced[0] = sprintstatus.advance(path, "4-1-thing", "done")
+        with real_lock(path):
+            yield
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(sprintstatus, "_board_lock", racing_lock)
+        assert sprintstatus.advance(p, "3-2-digest-delivery", "in-progress") == "in-progress"
+
+    assert raced == ["done"]  # the rival really wrote, so there was an update to lose
+    assert sprintstatus.story_status(p, "3-2-digest-delivery") == "in-progress"  # ours
+    assert sprintstatus.story_status(p, "4-1-thing") == "done"  # ...and the rival's, NOT lost
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_the_board_lock_excludes_a_second_acquirer(tmp_path, monkeypatch):
+    """The sidecar is a real OS lock, and its identity is the board's identity.
+
+    Two claims, because either alone is satisfiable by a lock that excludes
+    nobody. The `blocking=False` probe says the acquisition is genuine — a
+    `_board_lock` that yielded without taking anything would pass every ordering
+    assertion above and serialize nothing. The symlink half says two spellings of
+    one board rendezvous on ONE sidecar, without which a repo that keeps its
+    board outside the tree and symlinks it in would have its two callers exclude
+    each other not at all.
+
+    Probed with `blocking=False` rather than a sleep: `file_lock` is per-open-fd,
+    so a second acquirer in this same process contends exactly as another process
+    would, and the refusal is immediate and deterministic under `-n logical`.
+
+    Ablation: drop the `.resolve()` in `runs.lock_path_for` and this reddens on
+    the one-sidecar assertion — the two spellings hash to different digests."""
+    real = tmp_path / "elsewhere" / "sprint-status.yaml"
+    real.parent.mkdir()
+    real.write_text(SPRINT, encoding="utf-8")
+    link = tmp_path / "sprint-status.yaml"
+    link.symlink_to(real)
+    sidecars: list[Path] = []
+
+    @contextlib.contextmanager
+    def spy_file_lock(path, **kwargs):
+        sidecars.append(path)
+        with real_file_lock(path, **kwargs):
+            yield
+
+    monkeypatch.setattr(sprintstatus, "file_lock", spy_file_lock)
+
+    assert sprintstatus.advance(link, "3-2-digest-delivery", "in-progress") == "in-progress"
+    assert sprintstatus.advance(real, "3-2-digest-delivery", "review") == "review"
+
+    assert len(sidecars) == 2 and sidecars[0] == sidecars[1]  # one board, one sidecar
+    assert sidecars[0] == runs.lock_path_for(link) == runs.lock_path_for(real)
+    with real_file_lock(sidecars[0]):
+        with pytest.raises(OSError):
+            with real_file_lock(sidecars[0], blocking=False):
+                pass  # pragma: no cover — the acquisition above must refuse
+
+
+def test_advanced_bytes_never_touches_the_real_boards_lock(tmp_path, monkeypatch):
+    """The shadow advance must not contend on the board it is reasoning about.
+
+    `advanced_bytes` recomputes an advance by running the real writer against a
+    throwaway copy, so it inherits the lock — and a shadow keyed off the board's
+    own identity would have the caller queue behind, or worse deadlock with, the
+    very run whose write it is trying to describe. The key is the shadow's own
+    path, so the sidecars are disjoint.
+
+    Ablation: make `runs.lock_path_for` ignore its argument (return one constant
+    sidecar) and this reddens — every path collapses onto the board's own lock."""
+    board = _write(tmp_path)
+    sidecars: list[Path] = []
+
+    @contextlib.contextmanager
+    def spy_file_lock(path, **kwargs):
+        sidecars.append(path)
+        with real_file_lock(path, **kwargs):
+            yield
+
+    monkeypatch.setattr(sprintstatus, "file_lock", spy_file_lock)
+
+    out = sprintstatus.advanced_bytes(board.read_bytes(), "3-2-digest-delivery", "in-progress")
+
+    assert out is not None and b"3-2-digest-delivery: in-progress" in out
+    assert sidecars  # it really did lock something — the shadow's own sidecar
+    assert runs.lock_path_for(board) not in sidecars
+    assert board.read_bytes() == SPRINT.encode("utf-8")  # and the real board is untouched
+
+
+def test_advance_lock_failure_raises_oserror(tmp_path, monkeypatch):
+    """A board that could not be serialized is not rewritten unlocked.
+
+    Parity with the write-failure row above: acquisition faults propagate on the
+    channel every caller already routes `advance`'s raises through — the engine's
+    crash/escalation handling, the CLI's failure exit — rather than degrading to
+    an unserialized write. `file_lock`'s Windows branch gives up after ~10 s and
+    raises `OSError`, so this is a reachable production shape, not a hypothetical.
+
+    Ablation: swallow the acquisition error and proceed without the lock and this
+    fails `DID NOT RAISE`, with the row advanced."""
+    p = _write(tmp_path)
+    before = p.read_bytes()
+
+    @contextlib.contextmanager
+    def unavailable(path):
+        # the shape `msvcrt.locking` raises when the ~10 s blocking retry runs out
+        raise OSError(11, "Resource deadlock avoided")
+        yield  # pragma: no cover — unreachable; keeps this a generator function
+
+    monkeypatch.setattr(sprintstatus, "_board_lock", unavailable)
+
+    with pytest.raises(OSError, match="Resource deadlock avoided"):
+        sprintstatus.advance(p, "3-2-digest-delivery", "in-progress")
+
+    assert p.read_bytes() == before  # entire, and unadvanced
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_advance_takes_no_lock_for_a_missing_board(tmp_path, monkeypatch):
+    """Asking about a board that does not exist leaves no sidecar behind.
+
+    The missing-board answer is `None` and it predates the lock, so a probe for a
+    story on a project that has no board never mkdirs a locks dir nor creates a
+    lockfile for a path nothing will ever write. The locked half rechecks anyway
+    — a delete can land between the two.
+
+    Ablation: move the pre-lock `is_file` check inside `_board_lock` and this
+    reddens on the acquisition count."""
+    entered: list[Path] = []
+
+    @contextlib.contextmanager
+    def spy_file_lock(path, **kwargs):
+        entered.append(path)  # pragma: no cover — must not be reached
+        with real_file_lock(path, **kwargs):
+            yield
+
+    monkeypatch.setattr(sprintstatus, "file_lock", spy_file_lock)
+
+    assert sprintstatus.advance(tmp_path / "nope.yaml", "3-1-login", "done") is None
+
+    assert entered == []

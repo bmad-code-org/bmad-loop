@@ -3830,7 +3830,7 @@ class Engine:
         ledger = self.workspace.paths.deferred_work
         text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
         seen = deferredwork.parse_ledger(text)
-        filed: list[str] = []
+        specs: list[deferredwork.EntrySpec] = []
         deduped = 0
         for origin, title, reason, location, severity in pending:
             if any(
@@ -3848,21 +3848,27 @@ class Engine:
             if not task.harvest_wrote_ledger:
                 task.harvest_wrote_ledger = True
                 self._save()
-            dw_id = deferredwork.append_entry(
-                ledger,
-                title=title,
-                origin=origin,
-                location=location or "n/a",
-                source_spec=spec_name,
-                reason=reason,
-                severity=severity,
+            specs.append(
+                deferredwork.EntrySpec(
+                    title=title,
+                    origin=origin,
+                    location=location or "n/a",
+                    source_spec=spec_name,
+                    reason=reason,
+                    severity=severity,
+                )
             )
-            # The writer's open-entry guard can catch two frontmatter items with
-            # the same clamped fingerprint inside this one pre-scan snapshot.
-            if dw_id is None:
-                deduped += 1
-            else:
-                filed.append(dw_id)
+        # One locked read->edit->write for the whole harvest (#286/#469) rather
+        # than one per finding: a concurrent mutator can no longer interleave
+        # between two of this spec's own rows, and the ids stay sequential
+        # because each spec is applied to the text the previous one produced.
+        # The scan above already ran, and the latch above already fired, so the
+        # durability ordering the comment there describes is unchanged.
+        minted = deferredwork.append_entries(ledger, specs)
+        filed = [dw_id for dw_id in minted if dw_id is not None]
+        # The writer's open-entry guard can catch two frontmatter items with
+        # the same clamped fingerprint inside this one pre-scan snapshot.
+        deduped += sum(1 for dw_id in minted if dw_id is None)
         # The flag is set-only within an attempt and was latched durably before
         # the first append. A crash replay dedupes to an empty `filed` list while
         # the dead attempt's engine-authored ledger diff is still on disk, so it
@@ -6076,10 +6082,17 @@ class Engine:
         ledger = self.paths.deferred_work
         text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
         seen = deferredwork.parse_ledger(text)
-        carried: list[str] = []
+        specs: list[deferredwork.EntrySpec] = []
         for item in task.harvested_deferrals:
             origin = str(item["origin"])
             source_spec = str(item["source_spec"])
+            # Status-agnostic, and it has to be: a row this unit's finding already
+            # earned and that the sweep has since CLOSED must not be re-filed,
+            # and the batch writer's own idempotence scan is open-only by design
+            # (a closed entry means the work came back). This one fresh
+            # `parse_ledger` read is therefore the whole on-disk guard; the
+            # batch's evolving scan covers only twins minted inside this call,
+            # which it does see, every row it appends being open.
             if any(
                 deferredwork.field_line_present(entry.body, "origin", origin)
                 and deferredwork.field_line_present(entry.body, "source_spec", source_spec)
@@ -6087,7 +6100,7 @@ class Engine:
             ):
                 continue
             # Persist the commit obligation before the filesystem write. A host
-            # loss after append_entry writes the row but before it returns must
+            # loss after the append writes the rows but before it returns must
             # still make replay commit the now-deduplicated tracked/untracked row.
             # Latch only once a novel provenance is known: when every row already
             # arrived through the merge, committing here could sweep unrelated
@@ -6097,19 +6110,17 @@ class Engine:
                 self._save()
             location = item.get("location")
             severity = item.get("severity")
-            dw_id = deferredwork.append_entry(
-                ledger,
-                title=str(item["title"]),
-                origin=origin,
-                location=str(location) if location else "n/a",
-                source_spec=source_spec,
-                reason=str(item["reason"]),
-                severity=str(severity) if severity else None,
+            specs.append(
+                deferredwork.EntrySpec(
+                    title=str(item["title"]),
+                    origin=origin,
+                    location=str(location) if location else "n/a",
+                    source_spec=source_spec,
+                    reason=str(item["reason"]),
+                    severity=str(severity) if severity else None,
+                )
             )
-            if dw_id:
-                carried.append(dw_id)
-                # Keep the same-call dedupe status-agnostic too.
-                seen = deferredwork.parse_ledger(ledger.read_text(encoding="utf-8"))
+        carried = [dw_id for dw_id in deferredwork.append_entries(ledger, specs) if dw_id]
         commit_needed = bool(carried) or task.harvest_carry_commit_pending
         if commit_needed:
             # The pre-append latch also covers every git observation/write below.
@@ -6180,19 +6191,17 @@ class Engine:
         if not task.refiled_followups:
             return
         ledger = self.paths.deferred_work
-        carried: list[str] = []
-        for item in task.refiled_followups:
-            severity = item.get("severity")
-            dw_id = deferredwork.append_entry(
-                ledger,
+        specs = [
+            deferredwork.EntrySpec(
                 title=str(item["title"]),
                 origin=str(item["origin"]),
                 source_spec=str(item["source_spec"]),
                 reason=str(item["reason"]),
-                severity=str(severity) if severity else None,
+                severity=str(item["severity"]) if item.get("severity") else None,
             )
-            if dw_id:
-                carried.append(dw_id)
+            for item in task.refiled_followups
+        ]
+        carried = [dw_id for dw_id in deferredwork.append_entries(ledger, specs) if dw_id]
         if carried:
             try:
                 verify.commit_paths(

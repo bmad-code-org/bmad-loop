@@ -142,13 +142,34 @@ breaking changes may land in a minor release.
   The sweep and the out-of-band decision writers now use them: closing a triage plan's
   already-resolved entries, reopening a discarded bundle's closes, and recording a human
   decision together with the closure it asks for are each one locked read-modify-write
-  instead of one per id or one per half. `bmad-loop sweep --archive` reports a lock it could
+  instead of one per id or one per half. The engine's three ledger-append producers follow:
+  harvesting a spec's `deferred:` findings, carrying an isolated unit's harvest into the main
+  ledger, and carrying its review-budget follow-up now each file their whole set in one locked
+  write instead of one per row, closing the window another writer could slip between two rows
+  of the same harvest. The carry's own duplicate scan keeps reading every entry regardless of
+  status, so a finding the sweep has since closed is still not re-filed — the batch writer's
+  scan is deliberately open-only, a closed entry there meaning the work came back.
+  `bmad-loop sweep --archive` reports a lock it could
   not take by name rather than as a bare `errno`, and `bmad-loop decisions` and the TUI
   decision modal now also catch the state-root failure that deriving a lock path can raise —
   in the TUI an uncaught one escaped into the Textual event loop and took the dashboard down
   mid-walk. `--archive`'s refusal while a run is live is unchanged and deliberately kept: it
   is coarser than the lock, refusing the archive rewrite outright rather than merely
   serializing it.
+- **`sprint-status.yaml` advances serialize on a cross-process lock** (#286, #469). Being the
+  board's sole writer was never mutual exclusion — a second orchestrator process runs that same
+  sole writer — and an advance is a read-modify-write of the whole board, so two of them both
+  read, both edited, and the last atomic write won: a story flipped by one run silently
+  reverted to its earlier status, and the run simply walked past it. `advance` now holds the
+  board's advisory lock across all three of its reads and its write, which also closes the
+  gap inside a single call between the never-regress decision and the bytes that decision was
+  applied to. The lock is the same state-root sidecar the ledger uses, out of the repository
+  because the board is tracked and the engine stages with `git add -A`, and keyed on the
+  resolved path so a symlinked board and its target contend on one lock. Readers stay
+  lock-free; a board that does not exist is reported missing without creating a lock file at
+  all; and a lock that cannot be taken fails the advance on the channel that already carries
+  its errors rather than rewriting the board unserialized. The atomic, symlink-following,
+  read-only-refusing write itself is unchanged.
 
 ### Security
 

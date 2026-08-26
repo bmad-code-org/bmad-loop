@@ -991,6 +991,54 @@ def test_done_isolated_unit_carries_gitignored_harvests_from_every_successful_pa
     assert [event["dw_ids"] for event in _harvest_carry_events(engine)] == [["DW-1", "DW-2"]]
 
 
+def test_carry_harvest_dedupe_stays_status_agnostic(project):
+    """A finding the sweep has since CLOSED must not be re-filed by the carry.
+
+    The carry's own pre-scan is the whole on-disk guard, and it has to stay
+    status-agnostic, because the batch writer's idempotence scan deliberately is
+    NOT: a closed entry with the same marker does not suppress an append there,
+    the work having come back. That is right for a fresh defer and wrong for this
+    caller, which is re-filing rows an isolated unit already filed once — a row
+    the sweep resolved between the unit's write and the merge would come back
+    from the dead as a second open entry, and nothing downstream would ever
+    reconcile the twins.
+
+    The mid-loop `parse_ledger` re-read this replaced kept the SAME-call dedupe
+    status-agnostic too; that half needs no guard here, since every row the batch
+    appends is open and its evolving scan therefore sees it.
+
+    Ablation: delete the `if any(... field_line_present ...): continue` pre-filter
+    and lean on the batch's open-only scan — a second row appears and this reddens
+    on the id list."""
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    record = _harvest_record()
+    dw_id = deferredwork.append_entry(
+        project.deferred_work,
+        title=record["title"],
+        origin=record["origin"],
+        location=record["location"],
+        source_spec=record["source_spec"],
+        reason=record["reason"],
+        severity=record["severity"],
+    )
+    assert dw_id is not None
+    assert deferredwork.mark_done(project.deferred_work, dw_id, "2026-06-01", "fixed upstream")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1, harvested_deferrals=[record])
+    engine.state.tasks[task.story_key] = task
+
+    engine._carry_harvested_deferrals(task)
+
+    entries = _main_harvest_entries(project)
+    assert [entry.id for entry in entries] == [dw_id]  # the done twin, and nothing beside it
+    assert not entries[0].open
+    (carried,) = _harvest_carry_events(engine)
+    assert carried["dw_ids"] == []
+    assert task.harvest_carry_commit_pending is False  # nothing novel, so no latch
+
+
 def test_tracked_harvest_carry_commit_failure_propagates(project, monkeypatch):
     """A tracked ledger persistence fault cannot be reported as a completed carry."""
     project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
@@ -1111,7 +1159,11 @@ def test_external_harvest_carry_commit_failure_degrades(project, tmp_path, monke
 
 
 def test_host_loss_after_harvest_append_replays_the_pending_commit(project, monkeypatch):
-    """The commit intent is durable before append_entry can mutate the ledger."""
+    """The commit intent is durable before the append can mutate the ledger.
+
+    The carry files its whole batch in ONE `append_entries` call (#286/#469), so
+    that is where a host loss lands; `append_entry` is no longer on this path and
+    patching it would inject nothing."""
     from bmad_loop import deferredwork
 
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
@@ -1134,13 +1186,13 @@ def test_host_loss_after_harvest_append_replays_the_pending_commit(project, monk
         branch=task.branch,
         target="main",
     )
-    real_append = deferredwork.append_entry
+    real_append = deferredwork.append_entries
 
     def append_then_host_dies(*args, **kwargs):
         real_append(*args, **kwargs)
         raise SystemExit("host died after ledger append")
 
-    monkeypatch.setattr(deferredwork, "append_entry", append_then_host_dies)
+    monkeypatch.setattr(deferredwork, "append_entries", append_then_host_dies)
     with pytest.raises(SystemExit, match="host died"):
         engine._carry_harvested_deferrals(task)
 
@@ -1148,7 +1200,7 @@ def test_host_loss_after_harvest_append_replays_the_pending_commit(project, monk
     assert failed.harvest_carry_commit_pending is True
     assert [entry.title for entry in _main_harvest_entries(project)] == [_HARVEST_CARRY["summary"]]
 
-    monkeypatch.setattr(deferredwork, "append_entry", real_append)
+    monkeypatch.setattr(deferredwork, "append_entries", real_append)
     failed_state = load_state(engine.run_dir)
     resumed = Engine(
         paths=project,
