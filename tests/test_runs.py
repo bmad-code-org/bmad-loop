@@ -4493,7 +4493,7 @@ def test_prune_sessions_sweeps_a_legacy_registry(tmp_path, monkeypatch):
     reports a clean sweep while their servers run on."""
     monkeypatch.setattr(runs, "mux_sessions", lambda: [])
     monkeypatch.setattr(runs, "session_project_tags", lambda: {})
-    monkeypatch.setattr(runs, "engine_liveness", lambda _d: ("dead", None))
+    monkeypatch.setattr(runs, "engine_liveness", lambda _d: "dead")
     legacy = _RegistryMux(["bmad-loop-old-1"], {"bmad-loop-old-1": runs.project_tag(tmp_path)})
     monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
 
@@ -4519,12 +4519,80 @@ def test_prune_sessions_leaves_another_projects_session_in_the_legacy_registry(
 def test_prune_sessions_dry_run_kills_nothing_in_a_legacy_registry(tmp_path, monkeypatch):
     monkeypatch.setattr(runs, "mux_sessions", lambda: [])
     monkeypatch.setattr(runs, "session_project_tags", lambda: {})
-    monkeypatch.setattr(runs, "engine_liveness", lambda _d: ("dead", None))
+    monkeypatch.setattr(runs, "engine_liveness", lambda _d: "dead")
     legacy = _RegistryMux(["bmad-loop-old-1"], {"bmad-loop-old-1": runs.project_tag(tmp_path)})
     monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
 
     assert runs.prune_sessions(tmp_path, dry_run=True) == (["old-1"], [], set())
     assert legacy.killed == []
+
+
+def test_prune_sessions_carries_an_unknown_pid_out_of_the_legacy_registry(tmp_path, monkeypatch):
+    """The legacy pass reports an unverifiable engine pid like the primary one.
+
+    `unknown` is the killed subset whose liveness could not be read (win32
+    ERROR_ACCESS_DENIED), and every cleanup frontend turns it into the "may
+    still be live" warning. A session swept out of a legacy registry is exactly
+    as unverifiable as one swept here, and the union in `prune_sessions` is what
+    carries it — an arm that stayed green for years because the sibling tests
+    stubbed `engine_liveness` with a tuple, which compares equal to neither
+    "alive" nor "unknown".
+
+    Ablate `unknown |= extra_unknown` in `prune_sessions` and this fails."""
+    monkeypatch.setattr(runs, "mux_sessions", lambda: [])
+    monkeypatch.setattr(runs, "session_project_tags", lambda: {})
+    monkeypatch.setattr(runs, "engine_liveness", lambda _d: "unknown")
+    legacy = _RegistryMux(["bmad-loop-old-1"], {"bmad-loop-old-1": runs.project_tag(tmp_path)})
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
+
+    # still killed — unknown never blocks cleanup — but named as unverifiable
+    assert runs.prune_sessions(tmp_path) == (["old-1"], [], {"old-1"})
+    assert legacy.killed == ["bmad-loop-old-1"]
+
+
+def test_prune_sessions_leaves_a_live_legacy_session_standing(tmp_path, monkeypatch):
+    """The live arm of the same union: a legacy session whose engine is provably
+    running is reported live and never killed.
+
+    Ablate `live += [...]` in `prune_sessions` and the tuple goes empty; ablate
+    the `liveness == "alive"` continue and the session is killed."""
+    monkeypatch.setattr(runs, "mux_sessions", lambda: [])
+    monkeypatch.setattr(runs, "session_project_tags", lambda: {})
+    monkeypatch.setattr(runs, "engine_liveness", lambda _d: "alive")
+    legacy = _RegistryMux(["bmad-loop-old-1"], {"bmad-loop-old-1": runs.project_tag(tmp_path)})
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
+
+    assert runs.prune_sessions(tmp_path) == ([], ["old-1"], set())
+    assert legacy.killed == []
+
+
+def test_export_records_the_root_it_displaced_for_the_migration_sweep(tmp_path, monkeypatch):
+    """The wiring, end to end: the value the export overwrites is the only record
+    of where a pre-upgrade machine's sessions live, and it is handed to the
+    backend at the one moment it is still readable.
+
+    Before #537 the backend inherited `PSMUX_DATA_DIR` as found, so an operator
+    who exported an absolute root of their own has THEIR bmad-loop sessions in
+    THAT registry — not in psmux's default. Without this hand-off the override
+    strands exactly the sessions it displaced, with `cleanup` reporting a clean
+    machine while the coding processes run on.
+
+    Ablate the `note_displaced_registry` call in `export_psmux_registry_root`
+    and the sweep is back to psmux's default alone."""
+    from bmad_loop.adapters import psmux_backend
+
+    theirs = str(tmp_path / "their-own-registry")
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, theirs)
+
+    root = runs.export_psmux_registry_root(tmp_path)
+    assert root == str(runs.mux_registry_root(tmp_path)) != theirs
+    assert psmux_backend._DISPLACED_ROOT == theirs
+
+    # ...and it is not recorded when nothing was displaced (a pane child of this
+    # project's own session, the ordinary way the variable is already set).
+    monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", None)
+    runs.export_psmux_registry_root(tmp_path)
+    assert psmux_backend._DISPLACED_ROOT is None
 
 
 def test_legacy_registries_degrades_when_no_backend_can_be_selected(monkeypatch):

@@ -557,6 +557,16 @@ def export_psmux_registry_root(project: Path) -> str | None:
     bmad-loop's root, which is a function of the project rather than of whichever
     shell happened to launch something.
 
+    **Overridden, but not abandoned.** A machine that had an absolute value
+    exported before the upgrade kept its bmad-loop sessions in THAT registry,
+    because the old backend simply inherited it — so the displaced root is
+    handed to :func:`~.adapters.psmux_backend.note_displaced_registry` here,
+    the last moment anything can still read it, and the migration sweep runs a
+    tag-scoped pass over it alongside psmux's default
+    (:meth:`~.adapters.psmux_backend.PsmuxMultiplexer.legacy_registries`).
+    Without that the override would strand exactly the sessions it displaced,
+    with cleanup reporting a clean machine.
+
     Wanting one registry to serve both is a real request and is deliberately not
     answered here. It needs a stated operator preference rather than a guess at
     one — and it must be a policy *whether*, never a *where*: ``policy.toml`` is
@@ -593,7 +603,19 @@ def export_psmux_registry_root(project: Path) -> str | None:
         # put there, and PsmuxMultiplexer._run still refuses to spawn under a
         # value psmux would panic on.
         return None
+    displaced = os.environ.get(PSMUX_DATA_DIR)
     os.environ[PSMUX_DATA_DIR] = root
+    if displaced is not None and displaced != root:
+        # The variable is now gone, and it was the only record of where a
+        # pre-upgrade machine's sessions live: before #537 the backend simply
+        # inherited it. Hand it to the backend that has to sweep there, at the
+        # one moment it is still knowable. Imported here rather than at module
+        # scope because this is the psmux leaf, and this module talks to the
+        # seam — the coupling is confined to the function already named for
+        # psmux's own variable.
+        from .adapters.psmux_backend import note_displaced_registry
+
+        note_displaced_registry(displaced)
     return root
 
 

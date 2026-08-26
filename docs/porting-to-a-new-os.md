@@ -217,7 +217,7 @@ therefore disagree about which sessions exist — and the verbs that carry that
 disagreement (`has_session`, `list_window_ids`) are exactly the ones whose seam
 contract says to degrade quietly.
 
-If your transport namespaces, three rules:
+If your transport namespaces, four rules:
 
 - **Derive the root from the project**, never from the run, never from the
   launching shell, and never from anything a driven session can write

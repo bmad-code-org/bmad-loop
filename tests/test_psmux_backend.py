@@ -2344,6 +2344,86 @@ def test_legacy_registries_is_empty_when_this_process_is_already_on_the_default(
     assert PsmuxMultiplexer().legacy_registries() == []
 
 
+def test_legacy_registries_also_sweeps_the_displaced_ambient_root(monkeypatch, tmp_path):
+    """A machine whose operator exported an absolute `PSMUX_DATA_DIR` before the
+    upgrade kept its bmad-loop sessions in THAT registry — the old backend simply
+    inherited the variable. This branch overrides it, so returning only psmux's
+    default assumes a pre-upgrade world that machine never had: `stop`, `attach`
+    and `cleanup` would each see nothing while the coding processes ran on, and
+    cleanup would report a clean sweep.
+
+    Ablate the displaced arm of `legacy_registries` and only the default-registry
+    instance comes back."""
+    monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", str(tmp_path / "theirs"))
+    monkeypatch.setenv("PSMUX_DATA_DIR", str(tmp_path / "ours"))
+
+    legacy = PsmuxMultiplexer().legacy_registries()
+    assert [x.registry_root() for x in legacy] == [None, str(tmp_path / "theirs")]
+    assert legacy[0]._default_registry is True
+
+
+def test_a_bound_instance_spawns_under_its_own_root(monkeypatch, tmp_path):
+    """The binding is per instance and lands in the CHILD's env, never in this
+    process's: the sweep runs on a TUI worker thread beside other threads issuing
+    ordinary verbs, and a global swap would aim one of those at the wrong
+    registry for as long as it was in place.
+
+    Ablate the `registry_root` arm of `_run` and the child inherits this
+    process's root instead — the sweep would then re-scan its own registry and
+    report the displaced one as empty."""
+    run = _RecordRun()
+    monkeypatch.setattr(tmux_base.subprocess, "run", run)
+    monkeypatch.setenv("PSMUX_DATA_DIR", str(tmp_path / "ours"))
+
+    PsmuxMultiplexer(registry_root=str(tmp_path / "theirs"))._run(["list-sessions"], check=False)
+    assert run.kwargs["env"]["PSMUX_DATA_DIR"] == str(tmp_path / "theirs")
+    assert os.environ["PSMUX_DATA_DIR"] == str(tmp_path / "ours")  # untouched
+
+
+def test_a_bound_instance_still_refuses_a_root_psmux_would_panic_on(monkeypatch, tmp_path):
+    """The absoluteness gate covers the bound arm too — a relative bound root
+    would panic psmux exactly as an inherited one does, and the nonzero exit
+    reads to every observer as an ordinary "no sessions"."""
+    run = _RecordRun()
+    monkeypatch.setattr(tmux_base.subprocess, "run", run)
+    monkeypatch.setenv("PSMUX_DATA_DIR", str(tmp_path))
+
+    with pytest.raises(TmuxError) as exc:
+        PsmuxMultiplexer(registry_root="relative\\root")._run(["list-sessions"], check=False)
+    assert "PSMUX_DATA_DIR" in str(exc.value)
+    assert run.calls == []
+
+
+def test_legacy_registries_skips_a_displaced_root_that_is_the_one_in_force(monkeypatch, tmp_path):
+    """Nothing moved, so there is nothing extra to sweep — the primary pass is
+    already addressing it. psmux's default is still offered, as always: this
+    process is pointed away from it either way."""
+    monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", str(tmp_path))
+    monkeypatch.setenv("PSMUX_DATA_DIR", str(tmp_path))
+    assert [x._default_registry for x in PsmuxMultiplexer().legacy_registries()] == [True]
+
+
+@pytest.mark.parametrize("bad", ["", "relative\\root"])
+def test_legacy_registries_skips_a_displaced_root_psmux_would_panic_on(monkeypatch, tmp_path, bad):
+    """Same rule as the primary root: a sweep that appeared to work while the
+    registry was unreachable would read as "nothing to clean"."""
+    monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", bad)
+    monkeypatch.setenv("PSMUX_DATA_DIR", str(tmp_path))
+    assert [x._default_registry for x in PsmuxMultiplexer().legacy_registries()] == [True]
+
+
+def test_note_displaced_registry_keeps_the_first_value(monkeypatch):
+    """The operator's own root is what the FIRST call carries — `_configure_mux`
+    runs once per process, ahead of dispatch. A later call would be handing back
+    a root this process itself exported, which is not a pre-upgrade world."""
+    monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", None)
+    psmux_backend.note_displaced_registry("")  # empty is nothing displaced
+    assert psmux_backend._DISPLACED_ROOT is None
+    psmux_backend.note_displaced_registry("C:\\theirs")
+    psmux_backend.note_displaced_registry("C:\\ours")
+    assert psmux_backend._DISPLACED_ROOT == "C:\\theirs"
+
+
 @pytest.mark.parametrize("bad", ["", "relative\\root"])
 def test_legacy_registries_is_empty_under_a_root_psmux_would_panic_on(monkeypatch, bad):
     """The primary pass is not running either, and a sweep that appeared to work

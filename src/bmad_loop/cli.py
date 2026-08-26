@@ -173,7 +173,7 @@ def _configure_mux(project: Path) -> None:
     point that runs ahead of every command. stderr, not stdout: the ``--json``
     contract is one object on stdout and nothing else, and this is the
     ``unverifiable_pid`` precedent."""
-    from .adapters.multiplexer import configure_multiplexer
+    from .adapters.multiplexer import MultiplexerError, configure_multiplexer, get_multiplexer
 
     path = _policy_path(project)
     try:
@@ -181,6 +181,26 @@ def _configure_mux(project: Path) -> None:
     except (policy_mod.PolicyError, OSError):
         name = None
     configure_multiplexer(name, origin=path)
+    # Selection first, because the export is a *psmux* fact and not every host
+    # runs psmux. On tmux there is no registry for a root to point at, and
+    # `PSMUX_DATA_DIR` is not bmad-loop's variable to spend: replacing it there
+    # would announce a registry the transport never consults, and the operator's
+    # own psmux sessions would then be unreachable from every window this
+    # process spawns — a tmux server cold-started here passes the replacement
+    # down to each of its coding-CLI panes. Ceiling, named: the gate is the
+    # seam's own "does this transport namespace by registry at all", so an
+    # out-of-tree backend that namespaces through some *other* variable still
+    # sees the export. The seam has no finer question, and adding one for a
+    # backend that does not exist yet is the wrong trade — `bmad-loop mux`
+    # discloses the root either way.
+    try:
+        if not get_multiplexer().has_registry_namespace():
+            return
+    except MultiplexerError:
+        # A backend that cannot even be selected runs no verb, so there is
+        # nothing to point anywhere; the commands that need it fail loudly on
+        # their own and diagnostics keep working.
+        return
     ambient = os.environ.get(runs.PSMUX_DATA_DIR)
     root = runs.export_psmux_registry_root(project)
     if root is not None:
@@ -207,21 +227,15 @@ def _configure_mux(project: Path) -> None:
             file=sys.stderr,
         )
         return
-    # No ambient value either: only worth a line on a backend that namespaces at
-    # all — on tmux there is no registry for the degrade to have cost.
-    from .adapters.multiplexer import MultiplexerError, get_multiplexer
-
-    try:
-        namespaced = get_multiplexer().has_registry_namespace()
-    except MultiplexerError:
-        return
-    if namespaced:
-        print(
-            f"warning: no state root could be derived, so bmad-loop has no registry of "
-            f"its own here and is using the multiplexer's shared default registry — set "
-            f"{envvars.STATE_DIR} to an absolute path, or unset it, to get one",
-            file=sys.stderr,
-        )
+    # No ambient value either: psmux's shared default is what every verb here
+    # will address. Unconditional now — the namespacing gate above already
+    # returned on a transport with no registry for the degrade to have cost.
+    print(
+        f"warning: no state root could be derived, so bmad-loop has no registry of "
+        f"its own here and is using the multiplexer's shared default registry — set "
+        f"{envvars.STATE_DIR} to an absolute path, or unset it, to get one",
+        file=sys.stderr,
+    )
 
 
 def _reject_bad_run_id(run_id: str | None) -> int | None:

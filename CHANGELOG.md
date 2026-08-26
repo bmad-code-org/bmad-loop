@@ -274,7 +274,8 @@ resolve` manufactures exactly that dual-key spec, inserting `baseline_revision` 
   `$HOME` one there was wrong in both directions — an empty seed that let global ignores leak
   into `git add -A`, or patterns git is not applying that made session files go missing. Gated
   on the reported version's own `.windows.` fork string, not on the platform.
-- **`--run-id` refuses the reserved control-session shape (`ctl`, `ctl-…`, any letter case)**.
+- **`--run-id` refuses the reserved control-session shape — `ctl` and every `ctl-<anything>`, in
+  any letter case**.
   Such an id mints the control session's own name as the run's agent session (`bmad-loop-ctl`,
   or a per-registry `bmad-loop-ctl-<digest>` on psmux), so the adapter adopts the live control
   session and the run's teardown kills it — every parked window with it; on Windows the
@@ -283,7 +284,8 @@ resolve` manufactures exactly that dual-key spec, inserting `baseline_revision` 
   an older release already persisted under such an id: `resume` and `resolve` refuse (at entry,
   before any side effect) with the recovery steps, while `stop`, `delete`, `archive` and `clean`
   work on the run without ever addressing a session that can be a control session's name (`ctl`,
-  `ctl-<16 hex>`). A historical run under any other `ctl-*` id keeps its genuine agent session
+  `ctl-<16 hex>` — the narrower shape a control session's name can actually take). A historical
+  run under any other `ctl-*` id keeps its genuine agent session
   reachable in the registry the process addresses: `stop` kills it there by its exact name, and
   `cleanup` sweeps it like any other run's — including, for a tagged pre-upgrade session left in
   psmux's old default registry, through the legacy pass (`stop` does not reach that registry).

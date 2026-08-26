@@ -10366,7 +10366,7 @@ def test_sweep_archive_pid_gate_refuses_before_any_lock(project, monkeypatch, ca
 # ------------------------------------------------- registry disclosure (#537)
 
 
-def test_main_exports_the_registry_root_before_dispatch(tmp_path, monkeypatch):
+def test_main_exports_the_registry_root_before_dispatch(force_psmux_backend, tmp_path, monkeypatch):
     """The one chokepoint that both knows the project and precedes every psmux
     spawn. Ablate the `runs.export_psmux_registry_root` call in `_configure_mux`
     and the handler runs against whatever registry the launching shell had — the
@@ -10383,7 +10383,9 @@ def test_main_exports_the_registry_root_before_dispatch(tmp_path, monkeypatch):
     assert seen["root"] == str(runs.mux_registry_root(tmp_path))
 
 
-def test_main_says_once_when_it_overrode_an_operators_registry(tmp_path, capsys, monkeypatch):
+def test_main_says_once_when_it_overrode_an_operators_registry(
+    force_psmux_backend, tmp_path, capsys, monkeypatch
+):
     """Overriding a variable the operator set, silently, is how someone spends an
     hour on a `psmux ls` that shows nothing. bmad-loop derives its registry root
     unconditionally — an ambient value cannot be told apart from an inherited one,
@@ -10405,7 +10407,9 @@ def test_main_says_once_when_it_overrode_an_operators_registry(tmp_path, capsys,
 
 
 @pytest.mark.parametrize("ambient", ["derived", None])
-def test_main_stays_quiet_when_it_overrode_nothing(tmp_path, capsys, monkeypatch, ambient):
+def test_main_stays_quiet_when_it_overrode_nothing(
+    force_psmux_backend, tmp_path, capsys, monkeypatch, ambient
+):
     """The other half, and the one that keeps the note from becoming noise every
     operator learns to ignore: nothing was displaced, so nothing is said. The
     `derived` case is a pane child of this project's own session, which is the
@@ -10420,7 +10424,9 @@ def test_main_stays_quiet_when_it_overrode_nothing(tmp_path, capsys, monkeypatch
     assert capsys.readouterr().err == ""
 
 
-def test_main_warns_when_it_has_no_registry_of_its_own(tmp_path, capsys, monkeypatch):
+def test_main_warns_when_it_has_no_registry_of_its_own(
+    force_psmux_backend, tmp_path, capsys, monkeypatch
+):
     """The arm an operator most needs told about, and the one the first version of
     this report missed: no state root could be derived, so the export left their
     `PSMUX_DATA_DIR` in force and every psmux verb this command runs addresses
@@ -10480,6 +10486,64 @@ def test_main_stays_quiet_on_a_namespace_less_backend_with_no_root(tmp_path, cap
     monkeypatch.setattr(cli, "cmd_list", lambda _args: 0)
 
     assert cli.main(["list", "--project", str(tmp_path)]) == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_main_leaves_psmux_data_dir_alone_on_a_namespace_less_transport(
+    force_tmux_backend, tmp_path, capsys, monkeypatch
+):
+    """`PSMUX_DATA_DIR` is psmux's variable, and on tmux psmux is not the
+    transport — so bmad-loop neither spends it nor announces a registry the
+    selected backend never consults.
+
+    Replacing it there is not merely untidy: a tmux server cold-started by this
+    process hands its environment to every pane child, so `psmux ls` typed in a
+    coding-CLI window would look at bmad-loop's registry instead of the
+    operator's own live sessions, on a host where bmad-loop is not using psmux
+    at all.
+
+    Ablate the `has_registry_namespace()` gate in `_configure_mux` and both
+    assertions fail: the value is replaced and the note is printed."""
+    theirs = str(tmp_path / "their-own-registry")
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, theirs)
+    seen = {}
+
+    def handler(_args):
+        seen["root"] = os.environ.get(runs.PSMUX_DATA_DIR)
+        return 0
+
+    monkeypatch.setattr(cli, "cmd_list", handler)
+
+    assert cli.main(["list", "--project", str(tmp_path)]) == 0
+    assert seen["root"] == theirs  # untouched, all the way into the handler
+    assert capsys.readouterr().err == ""
+
+
+def test_main_leaves_psmux_data_dir_alone_when_no_backend_can_be_selected(
+    tmp_path, capsys, monkeypatch
+):
+    """The same gate's unanswerable arm. A persisted `[mux] backend` naming a
+    backend that is no longer registered cannot say whether the transport
+    namespaces, and a backend that cannot be selected runs no verb — so there is
+    nothing to point anywhere. Diagnostics keep working and the operator's
+    variable survives.
+
+    Ablate the `except MultiplexerError` arm and `bmad-loop list` dies in
+    `_configure_mux` on a misconfigured host instead of in the command that
+    needs the transport."""
+    from bmad_loop.adapters import multiplexer as multiplexer_mod
+
+    theirs = str(tmp_path / "their-own-registry")
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, theirs)
+
+    def boom():
+        raise multiplexer_mod.MultiplexerError("[mux] backend = 'ghost' matches nothing")
+
+    monkeypatch.setattr(multiplexer_mod, "get_multiplexer", boom)
+    monkeypatch.setattr(cli, "cmd_list", lambda _args: 0)
+
+    assert cli.main(["list", "--project", str(tmp_path)]) == 0
+    assert os.environ.get(runs.PSMUX_DATA_DIR) == theirs
     assert capsys.readouterr().err == ""
 
 
@@ -10621,7 +10685,7 @@ def test_cleanup_names_what_the_migration_left_behind(project, capsys, monkeypat
     )
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
 
-    assert cli.main(["cleanup", "--project", str(project)]) == 0
+    assert cli.main(["cleanup", "--project", str(project.project)]) == 0
     err = capsys.readouterr().err
     assert "not migrated" in err
     assert "bmad-loop-ctl" in err and "bmad-loop-old-1" in err
@@ -10639,7 +10703,7 @@ def test_cleanup_dry_run_previews_what_the_migration_would_leave_behind(
     )
     monkeypatch.setattr(launch, "prunable_ctl_windows", lambda _p: [])
 
-    assert cli.main(["cleanup", "--dry-run", "--project", str(project)]) == 0
+    assert cli.main(["cleanup", "--dry-run", "--project", str(project.project)]) == 0
     assert "bmad-loop-old-1" in capsys.readouterr().err
 
 
@@ -10670,11 +10734,11 @@ def test_cleanup_dry_run_hands_the_remainder_the_plan_it_printed(project, capsys
     monkeypatch.setattr(launch, "prunable_ctl_windows", lambda _p: [])
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
 
-    assert cli.main(["cleanup", "--dry-run", "--project", str(project)]) == 0
+    assert cli.main(["cleanup", "--dry-run", "--project", str(project.project)]) == 0
     assert seen == [["old-1"]]
 
     seen.clear()
-    assert cli.main(["cleanup", "--project", str(project)]) == 0
+    assert cli.main(["cleanup", "--project", str(project.project)]) == 0
     assert seen == [[]]
 
 
@@ -10689,7 +10753,7 @@ def test_cleanup_json_carries_the_remainder_and_leaves_stderr_empty(project, cap
     )
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
 
-    assert cli.main(["cleanup", "--json", "--project", str(project)]) == 0
+    assert cli.main(["cleanup", "--json", "--project", str(project.project)]) == 0
     captured = capsys.readouterr()
     doc = json.loads(captured.out)
     assert doc["sessions"]["legacy_leftovers"] == ["bmad-loop-old-1"]
@@ -10705,5 +10769,5 @@ def test_cleanup_says_nothing_about_a_registry_with_no_remainder(project, capsys
     monkeypatch.setattr(runs, "legacy_registry_leftovers", lambda _p, announced=(): [])
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
 
-    assert cli.main(["cleanup", "--project", str(project)]) == 0
+    assert cli.main(["cleanup", "--project", str(project.project)]) == 0
     assert "not migrated" not in capsys.readouterr().err

@@ -896,8 +896,10 @@ def test_probe_launcher_pins_the_window_to_this_state_root(tmp_path, monkeypatch
     session reads as gone. Same precedence as the engine path, where the
     session env dict (pin included) wins over `profile.env`.
 
-    Ablate the `runs.pinned_state_env()` spread — or move it back ahead of
-    `env` — and one of the two assertions fails."""
+    Ablate `runs.pin_state_root` in `_ProbeLauncher.start` — return `env`
+    unchanged, or restore the round-11 `{**runs.pinned_state_env(), **env}`
+    merge, where the caller's own key wins — and one of the two assertions
+    fails."""
     from bmad_loop import envvars, runs
 
     class _Mux:
