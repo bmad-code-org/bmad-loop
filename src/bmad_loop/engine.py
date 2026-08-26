@@ -6309,7 +6309,9 @@ class Engine:
                 ledger.parent.mkdir(parents=True, exist_ok=True)
                 atomic_write_text(ledger, snapshot)
                 return
-            restored, merged, flat_remainder = self._merge_snapshot_entries(current or "", snapshot)
+            restored, merged, flat_remainder, collided = self._merge_snapshot_entries(
+                current or "", snapshot
+            )
             if restored is not None:
                 ledger.parent.mkdir(parents=True, exist_ok=True)
                 atomic_write_text(ledger, restored)
@@ -6321,11 +6323,12 @@ class Engine:
             ledger=str(ledger),
             dw_ids=merged,
             flat_remainder=flat_remainder,
+            id_collisions=collided,
         )
 
     def _merge_snapshot_entries(
         self, current: str, snapshot: str
-    ) -> tuple[str | None, list[str], bool]:
+    ) -> tuple[str | None, list[str], bool, list[str]]:
         """Republish the snapshot's lost entries onto `current` by APPENDING them.
 
         Returns the merged text — None when there was nothing to append — the ids
@@ -6347,8 +6350,26 @@ class Engine:
         snapshot is instead probed against the text about to be published, and a
         missing one is REPORTED for a human rather than merged.
         """
-        present = {entry.id for entry in deferredwork.parse_ledger(current)}
-        missing = [e for e in deferredwork.parse_ledger(snapshot) if e.id not in present]
+        # Keyed by id AND body, not by id alone. `git reset --hard` can remove our
+        # uncommitted `DW-n` and leave the text ending at `DW-(n-1)`, so a rival
+        # appending into that window mints `DW-n` for an entry of its own. An
+        # id-only membership test then reads our lost entry as "already present"
+        # and drops it silently — the exact preservation this repair exists for,
+        # failing quietly and reporting nothing moved. Re-appending is not the
+        # answer either: it would publish a duplicate id, which the writer's own
+        # `next_seq` and the sweep's duplicate refusal both treat as corruption.
+        # So a same-id-different-body pair is REPORTED and left alone, the same
+        # call the flat remainder below makes — a human is told, rather than a
+        # boundary being guessed at.
+        present = {entry.id: entry.body for entry in deferredwork.parse_ledger(current)}
+        missing = []
+        collided: list[str] = []
+        for entry in deferredwork.parse_ledger(snapshot):
+            held = present.get(entry.id)
+            if held is None:
+                missing.append(entry)
+            elif held != entry.body:
+                collided.append(entry.id)
         text = current
         for entry in missing:
             if text == "" or text.endswith("\n\n"):
@@ -6365,7 +6386,7 @@ class Engine:
             if opener not in text:
                 flat_remainder = True
                 break
-        return (text if missing else None, [e.id for e in missing], flat_remainder)
+        return (text if missing else None, [e.id for e in missing], flat_remainder, collided)
 
     def _reopen_ledger_after_defer(self, task: StoryTask) -> None:
         """Undo mode-owned ledger closes after a defer discarded their code.

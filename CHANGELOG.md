@@ -151,8 +151,10 @@ breaking changes may land in a minor release.
   `bmad-loop
 decisions` and the TUI decision modal now also catch the state-root failure that deriving a
   lock path can raise — in the TUI an uncaught one escaped into the Textual event loop and took
-  the dashboard down mid-walk. `--archive`'s refusal while a run is live is unchanged and
-  deliberately kept: it is coarser than the lock, refusing the archive rewrite outright rather
+  the dashboard down mid-walk. A project with no ledger at all is still answered without taking a
+  lock, so `--archive` keeps reporting it as the success it always was rather than failing
+  wherever no state root can be derived. `--archive`'s refusal while a run is live is
+  unchanged and deliberately kept: it is coarser than the lock, refusing the archive rewrite outright rather
   than merely serializing it.
 - **`sprint-status.yaml` advances serialize on a cross-process lock** (#286, #469). Being the
   board's sole writer was never mutual exclusion — a second orchestrator process runs that same
@@ -202,7 +204,11 @@ decisions` and the TUI decision modal now also catch the state-root failure that
   survives the restore instead of being rolled back with it; `defer-ledger-restore-diverged`
   names the ids moved. Flat appender blocks, which belong to no canonical entry, are reported
   rather than guessed at (`flat_remainder`) — the merge never invents a boundary the parser does
-  not model. A write or lock fault still propagates, as the unguarded write always did.
+  not model. Entries are matched by id AND body, so an id the reset removed and a rival then
+  re-minted for an entry of its own is reported as an `id_collisions` conflict rather than
+  silently accepted as already-there: matching on the id alone dropped the very entry the
+  merge exists to carry, and re-appending it would publish a duplicate `DW-<n>` instead. A
+  write or lock fault still propagates, as the unguarded write always did.
 - **A failed legacy-ledger migration refuses to restore over a ledger that changed
   underneath it** (#286). The sweep's post-reset rewrite of the pre-migration text had the
   same unguarded window; on a difference it now journals `sweep-migration-restore-diverged` and

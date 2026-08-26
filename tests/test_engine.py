@@ -6511,6 +6511,58 @@ def test_defer_restore_merges_a_concurrent_append(project, monkeypatch):
     assert event["dw_ids"] == ["DW-1"] and event["flat_remainder"] is False
 
 
+def test_merge_reports_an_id_collision_instead_of_dropping_the_entry(project):
+    """A rival that mints OUR id is reported, never silently accepted (#286).
+
+    `git reset --hard` can remove an uncommitted `DW-5` and leave the ledger
+    ending at `DW-4`, so a rival appending into the restore's window mints `DW-5`
+    for an entry of its own — `next_seq` reads the shortened text. Keyed by id
+    alone, the merge then reads OUR lost entry as already present, drops it, and
+    reports nothing moved: a silent loss of exactly what this repair exists to
+    preserve, with a journal line saying it did nothing wrong.
+
+    Re-appending is not the answer either — that publishes a duplicate id, which
+    the writer's own `next_seq` and the sweep's duplicate-id refusal both treat as
+    corruption. So the pair is reported and left alone, the same call the flat
+    remainder makes: tell a human rather than guess.
+
+    Ablation: key `present` on the id alone (drop the body comparison) — `collided`
+    empties and the entry vanishes from both outputs, reddening the first two rows."""
+    engine, _ = make_engine(project, [])
+    ours = "### DW-5: ours\n\norigin: engine\nreason: ours.\nstatus: open\n"
+    theirs = "### DW-5: theirs\n\norigin: sweep\nreason: theirs.\nstatus: open\n"
+    snapshot = "# Deferred Work\n\n" + ours
+    current = "# Deferred Work\n\n" + theirs
+
+    restored, merged, flat_remainder, collided = engine._merge_snapshot_entries(current, snapshot)
+
+    assert collided == ["DW-5"]  # named, so the operator can reconcile the two
+    assert merged == []  # nothing was moved...
+    assert restored is None  # ...so the rival's entry is not written over
+    assert not flat_remainder  # the snapshot is fully canonical; no guessing needed
+
+
+def test_merge_still_carries_an_entry_whose_id_is_simply_absent(project):
+    """The collision check does not cost the ordinary merge (#286).
+
+    Same-id-different-body is reported; a snapshot entry the current text lacks
+    entirely is still appended verbatim, which is the case the merge exists for.
+    Without this beside the row above, keying `present` on `(id, body)` pairs
+    could report every re-append as a collision and still pass."""
+    engine, _ = make_engine(project, [])
+    kept = "### DW-4: theirs\n\norigin: sweep\nreason: theirs.\nstatus: open\n"
+    lost = "### DW-5: ours\n\norigin: engine\nreason: ours.\nstatus: open\n"
+
+    restored, merged, flat_remainder, collided = engine._merge_snapshot_entries(
+        "# Deferred Work\n\n" + kept, "# Deferred Work\n\n" + lost
+    )
+
+    assert merged == ["DW-5"]
+    assert collided == []
+    assert restored is not None and lost in restored
+    assert kept in restored  # the rival's entry survives the restore
+
+
 def test_defer_skips_restore_for_a_ledger_the_reset_never_touched(project, monkeypatch):
     """#286. An untracked ledger sits outside `reset --hard`'s reach, so a delta
     observed after the rollback can only be a live foreign write — and the right

@@ -1664,6 +1664,15 @@ def archive_closed(
         _require_iso_date(before)
     if archive_date is not None:
         _require_iso_date(archive_date)
+    if not path.is_file():
+        # No ledger means no write, and so no lock — the order
+        # `sprintstatus.advance` already keeps for its own missing-board case.
+        # Acquiring first would turn "there is nothing to archive", which
+        # `bmad-loop sweep --archive` reports as SUCCESS, into a failure wherever
+        # the state root cannot be derived: a released behavior, changed by a lock
+        # taken for a file that is not there. Rechecked under the hold below,
+        # deletion being able to race this answer.
+        return []
     with ledger_lock(path):
         if not path.is_file():
             return []

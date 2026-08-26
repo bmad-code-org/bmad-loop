@@ -3399,6 +3399,27 @@ def test_an_empty_batch_takes_no_lock(tmp_path, monkeypatch, call):
     assert path.read_text(encoding="utf-8") == before
 
 
+def test_archive_closed_takes_no_lock_for_a_missing_ledger(tmp_path, monkeypatch):
+    """No ledger means no write, and so no lock — `advance`'s rule, one module over.
+
+    `bmad-loop sweep --archive` reports a project that has no ledger as SUCCESS
+    ("no deferred-work ledger at ..."). With the acquisition first, that answer
+    became a FAILURE wherever the state root cannot be derived: a released
+    behavior changed by a lock taken for a file that is not there. The guard under
+    the hold stays, deletion being able to race this one.
+
+    Ablation: move the `is_file` guard back below `with ledger_lock(path):` — the
+    spy fires and this reds."""
+    path = tmp_path / "deferred-work.md"  # deliberately never created
+    acquisitions = []
+
+    with _counting_lock(monkeypatch, acquisitions):
+        assert archive_closed(path, archive_date="2026-08-24") == []
+
+    assert acquisitions == []
+    assert not path.exists()  # and nothing was created on the way past
+
+
 def test_mark_open_many_matches_serial_mark_open_bytes(tmp_path, monkeypatch):
     """A batched reopen writes what a serial `mark_open` loop writes, in one
     acquisition and one write, skipping the ids it cannot reopen.
