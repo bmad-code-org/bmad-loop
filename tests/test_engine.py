@@ -37,7 +37,14 @@ from conftest import (
 from bmad_loop import deferredwork, platform_util, runs, verify
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
-from bmad_loop.engine import Engine, RunPaused, RunStopped, _digest_of, _run_depth
+from bmad_loop.engine import (
+    Engine,
+    RunPaused,
+    RunStopped,
+    _digest_of,
+    _LedgerAnchor,
+    _run_depth,
+)
 from bmad_loop.journal import LOGS_DIR, VERIFY_DIR, Journal, load_state
 from bmad_loop.model import (
     PAUSE_EPIC_BOUNDARY,
@@ -12906,7 +12913,7 @@ def test_ledger_baseline_text_reads_the_committed_blob(project, monkeypatch):
     task.baseline_commit = rev_parse_head(project.project)
     task.baseline_untracked = []
 
-    assert engine._ledger_baseline_text(task) == (True, committed)
+    assert engine._ledger_baseline_text(task) == (_LedgerAnchor.BASELINE, committed)
 
     held: list[bool] = []
     real_blob = verify.worktree_file_bytes_at_revision
@@ -12945,7 +12952,10 @@ def test_ledger_baseline_text_normalizes_committed_crlf(project):
     task.baseline_untracked = []
 
     anchored, expected = engine._ledger_baseline_text(task)
-    assert (anchored, expected) == (True, "# Deferred Work\n\n## DW-1 crlf at baseline\n")
+    assert (anchored, expected) == (
+        _LedgerAnchor.BASELINE,
+        "# Deferred Work\n\n## DW-1 crlf at baseline\n",
+    )
     # The point of the normalization: the anchor must equal what the ONLY thing
     # it is ever compared against reads back off those same bytes.
     assert expected == engine._ledger_text()
@@ -12969,7 +12979,7 @@ def test_ledger_baseline_text_reports_absence_at_baseline(project):
     git(project.project, "add", "-A")
     git(project.project, "commit", "-q", "-m", "track deferred-work after the baseline")
 
-    assert engine._ledger_baseline_text(task) == (True, None)
+    assert engine._ledger_baseline_text(task) == (_LedgerAnchor.BASELINE, None)
     assert [
         e for e in engine.journal.entries() if e["kind"] == "ledger-baseline-probe-failed"
     ] == []
@@ -12988,7 +12998,7 @@ def test_ledger_baseline_text_degrades_without_a_baseline(project):
     task = StoryTask(story_key="1-1-a", epic=1)
 
     assert task.baseline_commit is None
-    assert engine._ledger_baseline_text(task) == (False, None)
+    assert engine._ledger_baseline_text(task) == (_LedgerAnchor.NONE, None)
     assert [
         e for e in engine.journal.entries() if e["kind"] == "ledger-baseline-probe-failed"
     ] == []
@@ -13024,7 +13034,7 @@ def test_ledger_baseline_probe_failure_degrades_and_journals(project, monkeypatc
 
     monkeypatch.setattr(verify, "worktree_file_bytes_at_revision", fail_probe)
 
-    assert engine._ledger_baseline_text(task) == (False, None)
+    assert engine._ledger_baseline_text(task) == (_LedgerAnchor.NONE, None)
     (event,) = [e for e in engine.journal.entries() if e["kind"] == "ledger-baseline-probe-failed"]
     assert event["story_key"] == "1-1-a"
     assert "injected baseline probe failure" in event["error"]
@@ -13064,6 +13074,52 @@ def test_restore_ledger_reset_owned_write_uses_the_blob_anchor(project):
     assert [
         e for e in engine.journal.entries() if e["kind"] == "ledger-restore-skipped-diverged"
     ] == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_restore_ledger_never_reads_a_symlink_deletion_as_reset_owned(project, tmp_path):
+    """DIRECTION PIN (#735). A tracked ledger symlink whose TARGET a rival deleted
+    inside the reset window must not be written back over.
+
+    `reset --hard` restores the link and cannot reach through it, so it never
+    republished any ledger text here — the anchor is `NO_RESET_CONTENT`, whose
+    `None` means "no text to offer", not "the reset removed it". Pairing that
+    `None` with the `None` a dangling link reads back would make the two compare
+    equal and undo the deletion. Only a `BASELINE` anchor may spend a missing
+    file as proof, because only there did the reset actually delete it — which is
+    exactly what `test_ledger_baseline_text_answers_determinate_absence` pins.
+
+    The digest anchor is deliberately NOT ours, so any write would be
+    attributable to `reset_owned` alone.
+
+    Ablation: widen the arm to `anchor is not _LedgerAnchor.NONE` and this reddens
+    on the restored-file assertion — the rival's deletion is undone.
+    """
+    target = tmp_path / "shared" / "deferred-work.md"
+    target.parent.mkdir(parents=True)
+    target.write_text("# Deferred Work\n\n## DW-1 at baseline\n", encoding="utf-8")
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    if project.deferred_work.is_symlink() or project.deferred_work.exists():
+        project.deferred_work.unlink()
+    project.deferred_work.symlink_to(target)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "track a symlinked deferred-work")
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.baseline_commit = rev_parse_head(project.project)
+    task.baseline_untracked = []
+    task.post_engine_ledger_digest = _digest_of("bytes this engine never published")
+    # The rival's deletion, landing inside the window the reset opened.
+    target.unlink()
+
+    engine._restore_ledger(task, "# Deferred Work\n\n## DW-2 this session's edit\n")
+
+    # the deletion stands; the link was not spent as a channel to undo it
+    assert not target.exists()
+    assert project.deferred_work.is_symlink()
+    assert [
+        e for e in engine.journal.entries() if e["kind"] == "ledger-restore-skipped-diverged"
+    ] != []
 
 
 def test_restore_ledger_probe_failure_never_writes(project, monkeypatch):

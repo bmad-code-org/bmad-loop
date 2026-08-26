@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from . import deferredwork, gates, verify
-from .engine import Engine, RunPaused, _ArmedClose
+from .engine import Engine, RunPaused, _ArmedClose, _LedgerAnchor
 from .escalation import critical_escalations, env_fault_pause_reason, session_failure_reason
 from .model import PAUSE_STORY_GATE, Phase, StoryTask
 from .platform_util import (
@@ -1046,14 +1046,18 @@ class SweepEngine(Engine):
             # touched it either, so there the anchor is the rejected rewrite this
             # attempt actually graded — down to `None == None` when the session
             # deleted the ledger outright. No anchor at all withholds the write.
-            anchored, committed = self._ledger_baseline_text(task)
+            anchor, committed = self._ledger_baseline_text(task)
             expected = committed if committed is not None else rewrite
             diverged = False
             with deferredwork.ledger_lock(ledger):
                 # PURE TEXT ONLY under the hold — `ledger_lock` is not reentrant
                 # and every mutator takes it.
                 current = ledger.read_text(encoding="utf-8") if ledger.is_file() else None
-                if anchored and current == expected:
+                # Either anchor will do HERE, unlike the engine's two restores:
+                # this site supplies its own text for the no-reset-content case
+                # (`rewrite`, which it graded), so `expected` is never the bare
+                # `None` that would read a rival's deletion as the reset's work.
+                if anchor is not _LedgerAnchor.NONE and current == expected:
                     ledger.parent.mkdir(parents=True, exist_ok=True)
                     atomic_write_text(ledger, text)
                 else:

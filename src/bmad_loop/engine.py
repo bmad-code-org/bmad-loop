@@ -20,6 +20,7 @@ import sys
 import time
 import traceback
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, NamedTuple, NoReturn, Protocol, Sequence
 
@@ -475,6 +476,35 @@ class _ArmedClose(NamedTuple):
     ledger: Path
     ids: tuple[str, ...]
     exact: bool
+
+
+class _LedgerAnchor(StrEnum):
+    """How much authority a baseline probe established for a ledger restore (#735).
+
+    Three states, because the domain has three and a boolean silently merged two
+    of them into a write:
+
+    ``BASELINE`` — ``reset --hard`` republished the baseline's own content at
+    this path, so the accompanying text (or its determinate absence, ``None``)
+    is what the reset itself put there. Only this state may authorize a
+    reset-owned WRITE.
+
+    ``NO_RESET_CONTENT`` — the path is real but the reset republished no ledger
+    TEXT for it: a ledger proven external, or one the baseline holds as a
+    non-regular entry (a symlink, whose blob is a target pathname and whose
+    target the reset cannot reach through). There is nothing of the reset's to
+    compare against, so a caller with an anchor of its own — the sweep's
+    rejected rewrite — may use it, and a caller without one must not treat a
+    missing file as the reset's work. ``None`` here means "no text to offer",
+    NEVER "the reset deleted it".
+
+    ``NONE`` — nothing could be derived: no baseline commit, or a probe that
+    faulted. Authorizes nothing.
+    """
+
+    NONE = "none"
+    BASELINE = "baseline"
+    NO_RESET_CONTENT = "no-reset-content"
 
 
 class Engine:
@@ -4631,16 +4661,17 @@ class Engine:
             )
             return True
 
-    def _ledger_baseline_text(self, task: StoryTask) -> tuple[bool, str | None]:
+    def _ledger_baseline_text(self, task: StoryTask) -> tuple[_LedgerAnchor, str | None]:
         """The ledger text ``reset --hard`` republishes, taken from git itself (#735).
 
-        Answers ``(True, text)`` when the baseline commit carries the ledger,
-        ``(True, None)`` when it determinately does not — the reset republishes
-        no ledger text, whether because the commit lacks the path, because the
-        ledger is proven external and no revision of this repo can name it, or
-        because the baseline holds a non-regular entry (a symlink, whose blob is
-        a pathname rather than ledger text) — and ``(False, None)`` when no
-        anchor could be derived at all: no baseline commit, or a probe failed.
+        Answers ``(BASELINE, text)`` when the baseline commit carries the
+        ledger, and ``(BASELINE, None)`` when it determinately does not — the
+        reset removed it, so a missing file IS the reset's own work.
+        ``(NO_RESET_CONTENT, None)`` when the path is real but the reset
+        republished no text for it: proven external, or a non-regular baseline
+        entry such as a symlink. ``(NONE, None)`` when nothing could be derived
+        at all: no baseline commit, or a probe that failed. :class:`_LedgerAnchor`
+        carries why only the first of those may authorize a write.
 
         Newlines are normalized to LF because the only thing this text is ever
         compared against is :meth:`_ledger_text`, which reads in Python's
@@ -4662,7 +4693,7 @@ class Engine:
         with a secondary repair failure.
         """
         if not task.baseline_commit:
-            return False, None
+            return _LedgerAnchor.NONE, None
         rel, fault = self._ledger_rel()
         if rel is None:
             if fault is not None:
@@ -4671,7 +4702,7 @@ class Engine:
                     story_key=task.story_key,
                     error=str(fault),
                 )
-                return False, None
+                return _LedgerAnchor.NONE, None
             # PROVEN external — it resolved cleanly and still fell outside the
             # root — which is determinate absence, not uncertainty: no revision
             # of this repo can name the path, so `reset --hard` cannot have
@@ -4683,7 +4714,7 @@ class Engine:
             # which `ProjectPaths.rebased` deliberately leaves put — and strands
             # the sweep's migration restore on an unprovable-anchor refusal that
             # the evidence does not support.
-            return True, None
+            return _LedgerAnchor.NO_RESET_CONTENT, None
         try:
             if verify.path_is_non_regular_at_revision(
                 self.workspace.root, task.baseline_commit, rel
@@ -4700,12 +4731,12 @@ class Engine:
                 # purpose: `atomic_write_text` follows symlinks by DEFAULT so
                 # such a ledger keeps being a symlink. Determinate absence of
                 # republished text, exactly like a proven-external ledger.
-                return True, None
+                return _LedgerAnchor.NO_RESET_CONTENT, None
             blob = verify.worktree_file_bytes_at_revision(
                 self.workspace.root, task.baseline_commit, rel
             )
             if blob is None:
-                return True, None
+                return _LedgerAnchor.BASELINE, None
             text = blob.decode("utf-8")
         except (verify.GitError, OSError, RuntimeError, UnicodeDecodeError) as e:
             self.journal.append(
@@ -4713,8 +4744,8 @@ class Engine:
                 story_key=task.story_key,
                 error=str(e),
             )
-            return False, None
-        return True, text.replace("\r\n", "\n").replace("\r", "\n")
+            return _LedgerAnchor.NONE, None
+        return _LedgerAnchor.BASELINE, text.replace("\r\n", "\n").replace("\r", "\n")
 
     def _restore_ledger(self, task: StoryTask, snapshot: str | None) -> None:
         """Retract this attempt's engine ledger writes, without taking a concurrent
@@ -4789,7 +4820,7 @@ class Engine:
         # reset-owned at all, so an untracked, ignored or external one skips the
         # spawn. A fault degrades to NO anchor — the inverse of the gits probe
         # above, whose consumer is an unlink; this one's is a write.
-        anchored, expected = self._ledger_baseline_text(task) if gits else (False, None)
+        anchor, expected = self._ledger_baseline_text(task) if gits else (_LedgerAnchor.NONE, None)
         diverged = False
         with deferredwork.ledger_lock(ledger):
             # PURE TEXT ONLY under the hold. Every `deferredwork` mutator takes
@@ -4799,7 +4830,11 @@ class Engine:
             if current == snapshot:
                 return
             ours = _digest_of(current) == task.post_engine_ledger_digest
-            reset_owned = anchored and current == expected
+            # BASELINE only: `NO_RESET_CONTENT` carries `None` meaning "no text
+            # to offer", so pairing it with a missing file would read a rival's
+            # deletion as the reset's own work and write the snapshot back over
+            # it. Observation may justify a skip, never a write.
+            reset_owned = anchor is _LedgerAnchor.BASELINE and current == expected
             if snapshot is None:
                 # `gits` is False on this arm — the guard above returned
                 # otherwise — so the file is untracked, ignored or external and
@@ -6442,7 +6477,7 @@ class Engine:
         # the merge below, which is append-only and therefore cannot destroy a
         # rival's write — the reason this site can absorb a probe fault the way
         # `_restore_ledger`'s degrade-to-skip has to.
-        anchored, expected = self._ledger_baseline_text(task)
+        anchor, expected = self._ledger_baseline_text(task)
         merged: list[str] = []
         flat_remainder = False
         with deferredwork.ledger_lock(ledger):
@@ -6452,7 +6487,11 @@ class Engine:
             current = self._ledger_text()
             if current == snapshot:
                 return
-            if anchored and current == expected:
+            # BASELINE only, for the reason `_restore_ledger` states: a
+            # `NO_RESET_CONTENT` anchor plus a missing file is a rival's
+            # deletion, not the reset's. The append-only merge below is the
+            # right degrade — it cannot destroy a rival's write.
+            if anchor is _LedgerAnchor.BASELINE and current == expected:
                 ledger.parent.mkdir(parents=True, exist_ok=True)
                 atomic_write_text(ledger, snapshot)
                 return
