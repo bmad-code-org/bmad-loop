@@ -983,7 +983,15 @@ class SweepEngine(Engine):
             if crits:
                 details = "; ".join(str(e.get("detail", e.get("type", "?"))) for e in crits)
                 self._escalate(task, f"CRITICAL escalation from migration session: {details}")
-            new_text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
+            # Split so ABSENCE survives: `new_text` stays `str` for
+            # `validate_migration`, while `rewrite` keeps the difference between
+            # "the session emptied the ledger" and "the session deleted it". On
+            # an untracked ledger the restore below has no blob to anchor on and
+            # this rejected rewrite — the exact text this attempt graded — is the
+            # anchor instead, so flattening `None` to `""` here would make the
+            # deleted-ledger case indistinguishable from a rival's empty write.
+            rewrite = ledger.read_text(encoding="utf-8") if ledger.is_file() else None
+            new_text = rewrite if rewrite is not None else ""
             if result.status != "completed":
                 errors = [session_failure_reason("migration", result)]
             else:
@@ -1028,16 +1036,24 @@ class SweepEngine(Engine):
             # covers tracked files, the explicit write covers an untracked
             # ledger that `git reset` cannot restore
             self._safe_reset(task)
-            # Read IMMEDIATELY after the reset returned: only pure Python runs
-            # between them, so the compare below is file-I/O-only rather than
-            # spanning the reset's git spawns, which no lock may cover (#286).
-            observed = ledger.read_text(encoding="utf-8") if ledger.is_file() else None
+            # The WRITE anchor derives from the committed blob, never from an
+            # observation of the tree taken after the very reset it would attest
+            # to: a rival writing a tracked ledger inside that window would BE
+            # the observation, and this restore would overwrite it (#735). Probed
+            # BEFORE the lock — it spawns git, and `ledger_lock` may cover file
+            # I/O only, which no reset window can (#286). A ledger git does not
+            # own has no blob to anchor on, and `reset --hard` cannot have
+            # touched it either, so there the anchor is the rejected rewrite this
+            # attempt actually graded — down to `None == None` when the session
+            # deleted the ledger outright. No anchor at all withholds the write.
+            anchored, committed = self._ledger_baseline_text(task)
+            expected = committed if committed is not None else rewrite
             diverged = False
             with deferredwork.ledger_lock(ledger):
                 # PURE TEXT ONLY under the hold — `ledger_lock` is not reentrant
                 # and every mutator takes it.
                 current = ledger.read_text(encoding="utf-8") if ledger.is_file() else None
-                if current == observed:
+                if anchored and current == expected:
                     ledger.parent.mkdir(parents=True, exist_ok=True)
                     atomic_write_text(ledger, text)
                 else:
@@ -1048,6 +1064,13 @@ class SweepEngine(Engine):
                 # half-broken ledger, and the migration input a human must fix is
                 # no longer the one this attempt was graded against — the same
                 # call `migrate-duplicate-ids` makes about a corrupt ledger.
+                # A baseline probe that could not answer lands here too, and
+                # deliberately: without an anchor there is no proof the text on
+                # disk is the reset's own work rather than somebody's live write,
+                # and an unprovable restore is exactly the overwrite this arm
+                # exists to refuse. The escalation is the right recovery for both
+                # — the resume above resets the attempt budget and re-reads the
+                # ledger, which is what a rival-corrupted migration input needs.
                 # Journaled outside the hold; `_escalate` raises.
                 self.journal.append(
                     "sweep-migration-restore-diverged",

@@ -6335,9 +6335,11 @@ class Engine:
                 raise
             # The reset reverts a *tracked* ledger's uncommitted edits, so the
             # review-found entries it erased are real knowledge worth putting
-            # back. The restore is compare-and-set against the post-reset
-            # observation and gated on git owning the file, and it merges rather
-            # than overwrites when another writer interleaved. A foreign write
+            # back. The restore is compare-and-set against the ledger's committed
+            # blob at the baseline — the text the reset republished, never an
+            # observation of the tree a rival could have authored (#735) — and
+            # gated on git owning the file; it merges rather than overwrites when
+            # another writer interleaved. A foreign write
             # that landed BEFORE the reset is the reset's casualty, not the
             # restore's: the snapshot predates both, so nothing here can tell
             # that write apart from the session's own erased edits.
@@ -6356,9 +6358,10 @@ class Engine:
 
         The window being repaired spans ``_rollback_or_pause``'s git spawns, so a
         lock cannot cover it — :func:`deferredwork.ledger_lock` is contracted
-        never to span a subprocess. Compare-and-set stands in: the post-reset
-        observation is the expected state, and anything else found under the lock
-        belongs to somebody else.
+        never to span a subprocess. Compare-and-set stands in, anchored on the
+        ledger's committed blob at ``task.baseline_commit`` — the text the reset
+        republished — and anything else found under the lock belongs to somebody
+        else.
 
         Three refusals, in order of how much they know:
 
@@ -6369,9 +6372,17 @@ class Engine:
           foreign writer and the correct restore is no write at all. The guard
           this replaces compared ``current != snapshot`` and overwrote on exactly
           that difference: it ARMED the lost update it reads like it prevents.
-        * the text moved between the observation and the lock — another writer
-          landed inside the window, so the snapshot is republished by APPENDING
-          the entries disk has since lost, never by overwriting what arrived.
+        * the text under the lock is not the one the reset republished. The
+          anchor is read out of git rather than off the working tree because **a
+          post-reset observation may justify a SKIP, never a WRITE**: a rival
+          writing a tracked ledger inside the reset window would otherwise BE the
+          observation this arm trusts, and the overwrite would take that rival's
+          entries with it (#735). Every other case — a writer who landed inside
+          the window, or a baseline no probe could read — republishes the
+          snapshot by APPENDING the entries disk has since lost, never by
+          overwriting what arrived. Unlike :meth:`_restore_ledger`, this site can
+          degrade all the way to that merge instead of to a skip: appending
+          cannot destroy anybody's write.
 
         Write and lock faults propagate, as the unguarded write here always did:
         a repair write that could not be serialized must fail loudly.
@@ -6379,7 +6390,12 @@ class Engine:
         ledger = self.workspace.paths.deferred_work
         # Read IMMEDIATELY after `_rollback_or_pause` returned: only pure Python
         # runs between the reset and this line, so the compare window below is
-        # file-I/O-only rather than spanning the rollback's git spawns.
+        # file-I/O-only rather than spanning the rollback's git spawns. This
+        # observation authorizes ONLY the skip that follows — declining to act is
+        # safe whoever wrote those bytes. It is never the write anchor: taken
+        # after the very reset it would attest to, a rival that landed inside
+        # that window becomes the observation itself (#735), which is what the
+        # blob probe below exists to replace.
         observed = self._ledger_text()
         if observed == snapshot:
             return
@@ -6388,6 +6404,15 @@ class Engine:
             # byte of the delta above is a live foreign write and there is
             # nothing of ours to restore over it.
             return
+        # The WRITE anchor derives from the committed blob, never from an
+        # observation a rival could have authored (#735). Probed here, before the
+        # lock, because it spawns git and `ledger_lock` may cover file I/O only.
+        # `gits` is already established above, so this only ever runs on a ledger
+        # `reset --hard` could actually have republished. No anchor degrades to
+        # the merge below, which is append-only and therefore cannot destroy a
+        # rival's write — the reason this site can absorb a probe fault the way
+        # `_restore_ledger`'s degrade-to-skip has to.
+        anchored, expected = self._ledger_baseline_text(task)
         merged: list[str] = []
         flat_remainder = False
         with deferredwork.ledger_lock(ledger):
@@ -6397,7 +6422,7 @@ class Engine:
             current = self._ledger_text()
             if current == snapshot:
                 return
-            if current == observed:
+            if anchored and current == expected:
                 ledger.parent.mkdir(parents=True, exist_ok=True)
                 atomic_write_text(ledger, snapshot)
                 return

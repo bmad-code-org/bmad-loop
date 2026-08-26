@@ -6410,7 +6410,18 @@ def test_review_leg_reconciles_finalize_tail_death_followup_true(project):
 
 def test_defer_preserves_deferred_work_additions(project):
     """Review sessions append real knowledge to deferred-work.md; a plateau
-    defer's git reset must not erase it."""
+    defer's git reset must not erase it.
+
+    Doubles as the POSITIVE CONTROL for the blob anchor (#735): with no rival
+    anywhere, the reset-owned write arm still has to fire. The last row is what
+    earns it that job — the merge this site degrades to ALSO republishes DW-1, so
+    a normalization slip or a mis-derived rel that made `expected` never equal
+    `current` would leave the entry assertion green over an anchor that is dead,
+    and every negative test around it green with it.
+
+    Ablation: hardcode `anchored = False` in `_restore_defer_ledger` and the
+    diverged row appears.
+    """
     from conftest import git
     from conftest import review_effect as make_review
 
@@ -6419,9 +6430,16 @@ def test_defer_preserves_deferred_work_additions(project):
     git(project.project, "commit", "-q", "-m", "seed deferred-work")
     write_sprint(project, {"1-1-a": "ready-for-dev"})
 
+    filed: list[bool] = []
+
     def reviewing_with_defer(spec):
-        with project.deferred_work.open("a") as f:
-            f.write("\n### DW-1: pre-existing flaky retry\n\nstatus: open\n")
+        # latched: the review budget spends three sessions, but the finding is
+        # filed once — three copies of one heading are a duplicate-id ledger, and
+        # the merge the ablation above forces reports the ids it moved.
+        if not filed:
+            filed.append(True)
+            with project.deferred_work.open("a") as f:
+                f.write("\n### DW-1: pre-existing flaky retry\n\nstatus: open\n")
         return make_review(project, "1-1-a", clean=False, patched=1, finalized=False)(spec)
 
     engine, _ = make_engine(
@@ -6431,6 +6449,8 @@ def test_defer_preserves_deferred_work_additions(project):
     summary = engine.run()
     assert summary.deferred == 1
     assert "DW-1: pre-existing flaky retry" in project.deferred_work.read_text()
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "defer-ledger-restore-diverged" not in kinds
 
 
 @contextlib.contextmanager
@@ -6471,8 +6491,8 @@ def test_defer_restore_merges_a_concurrent_append(project, monkeypatch):
     observation, before the lock — which is exactly the interleaving the old
     `current != snapshot` guard overwrote wholesale.
 
-    Ablation: delete the `current == observed` arm so the restore always writes
-    the snapshot, and the rival entry vanishes.
+    Ablation: delete the `anchored and current == expected` arm so the restore
+    always writes the snapshot, and the rival entry vanishes.
     """
     from conftest import git
     from conftest import review_effect as make_review
@@ -6509,6 +6529,124 @@ def test_defer_restore_merges_a_concurrent_append(project, monkeypatch):
     (event,) = [e for e in engine.journal.entries() if e["kind"] == "defer-ledger-restore-diverged"]
     assert event["story_key"] == "1-1-a"
     assert event["dw_ids"] == ["DW-1"] and event["flat_remainder"] is False
+
+
+def test_defer_restore_merges_a_rival_that_wrote_inside_the_reset_window(project, monkeypatch):
+    """#735. The rival lands one window EARLIER than the twin above: between
+    `reset --hard` returning and the restore's observation read.
+
+    That window is the one the old anchor was blind to. A rival writing a TRACKED
+    ledger there BECOMES `observed`, so `current == observed` holds under the
+    lock, labels the rival's bytes "what the reset put back", and overwrites them
+    with the snapshot. The anchor is the ledger's committed blob at
+    `task.baseline_commit` instead — the text the reset actually republished, and
+    the one thing in this comparison no rival can author.
+
+    The oracle is the rival's SURVIVAL and the journal row, never the restored
+    bytes: this ledger is tracked, so `reset --hard` puts its committed text back
+    whether or not this code runs at all, and a byte assertion would pass for the
+    wrong reason (proven by control in #726 session 6).
+
+    Ablation: revert the write arm to `current == observed` and DW-2 vanishes
+    under the snapshot — the entry row reds, and the merge's `dw_ids` row with it.
+    """
+    from conftest import git
+    from conftest import review_effect as make_review
+
+    project.deferred_work.write_text("# Deferred Work\n")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "seed deferred-work")
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+
+    filed: list[bool] = []
+
+    def reviewing_with_defer(spec):
+        if not filed:  # one finding, three review sessions — see the twin above
+            filed.append(True)
+            with project.deferred_work.open("a") as f:
+                f.write("\n### DW-1: review-found flaky retry\n\nstatus: open\n")
+        return make_review(project, "1-1-a", clean=False, patched=1, finalized=False)(spec)
+
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a")] + [reviewing_with_defer for _ in range(3)],
+    )
+
+    real_rollback = engine._rollback_or_pause
+    landed: list[bool] = []
+
+    def rollback_then_rival(task, **kwargs):
+        real_rollback(task, **kwargs)
+        # After the reset returned, before `_restore_defer_ledger` reads
+        # `observed`: exactly the window #735 describes. One-shot, so a rollback
+        # on any other path cannot file it twice.
+        if not landed:
+            landed.append(True)
+            with project.deferred_work.open("a", encoding="utf-8") as f:
+                f.write("\n### DW-2: filed by another process\n\nstatus: open\n")
+
+    monkeypatch.setattr(engine, "_rollback_or_pause", rollback_then_rival)
+
+    summary = engine.run()
+
+    assert summary.deferred == 1 and landed == [True]
+    entries = _ledger_entries(project)
+    assert entries["DW-1"].title == "review-found flaky retry"
+    assert entries["DW-2"].title == "filed by another process"
+    (event,) = [e for e in engine.journal.entries() if e["kind"] == "defer-ledger-restore-diverged"]
+    assert event["story_key"] == "1-1-a" and event["dw_ids"] == ["DW-1"]
+
+
+def test_defer_restore_probe_failure_degrades_to_the_merge(project, monkeypatch):
+    """DIRECTION PIN, #735: an unprovable baseline merges, it never falls back to
+    the observation.
+
+    No rival at all here — the only difference from the positive control is a
+    faulted probe. The tempting degrade (trust `current == observed` when the
+    blob could not be read) is the defect itself, reintroduced through the error
+    path. This site can afford the strict direction where `_restore_ledger`
+    cannot afford anything softer: the merge is append-only, so refusing to
+    overwrite still republishes every entry the reset erased.
+
+    Ablation: have `_ledger_baseline_text`'s except arm return `(True,
+    self._ledger_text())` and the write arm fires — both journal rows red.
+    """
+    from conftest import git
+    from conftest import review_effect as make_review
+
+    project.deferred_work.write_text("# Deferred Work\n")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "seed deferred-work")
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+
+    filed: list[bool] = []
+
+    def reviewing_with_defer(spec):
+        if not filed:  # one finding, three review sessions — see the twin above
+            filed.append(True)
+            with project.deferred_work.open("a") as f:
+                f.write("\n### DW-1: review-found flaky retry\n\nstatus: open\n")
+        return make_review(project, "1-1-a", clean=False, patched=1, finalized=False)(spec)
+
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a")] + [reviewing_with_defer for _ in range(3)],
+    )
+
+    def fail_probe(*args, **kwargs):
+        raise GitError("injected baseline probe failure")
+
+    monkeypatch.setattr(verify, "worktree_file_bytes_at_revision", fail_probe)
+
+    summary = engine.run()
+
+    # the knowledge still comes back — via the merge, not via a write it could
+    # not prove it was entitled to make
+    assert summary.deferred == 1
+    assert _ledger_entries(project)["DW-1"].title == "review-found flaky retry"
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "ledger-baseline-probe-failed" in kinds
+    assert "defer-ledger-restore-diverged" in kinds
 
 
 def test_merge_reports_an_id_collision_instead_of_dropping_the_entry(project):
