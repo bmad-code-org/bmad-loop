@@ -845,6 +845,35 @@ def _apply_done(
     return _insert_after_status(text, entry, tail)
 
 
+def _apply_done_many(
+    text: str,
+    dw_ids: Sequence[str],
+    date: str,
+    note: str,
+    notes: Sequence[str] | None,
+    undo_owner: str | None,
+) -> tuple[str, list[str]]:
+    """Fold every id in `dw_ids` through :func:`_apply_done` *within* `text`,
+    returning the new text and the ids actually flipped, in the order given.
+
+    Pure — text in, text out, no `Path` and no I/O — and it is ONE body for the
+    advisory pre-lock probe and the locked pass, so the two cannot drift: the
+    argument :func:`_apply_append`'s extraction already makes for the batched
+    appender. The whole decision lives here, `undo_owner` included, because the
+    reopenable arm's LINE_BREAK refusal (:func:`_apply_done`) can be the only
+    reason a batch flips nothing — a probe that scanned for open entries by hand
+    would answer "would write" where this answers "would not"."""
+    marked: list[str] = []
+    for index, dw_id in enumerate(dw_ids):
+        entry_note = note if notes is None else notes[index]
+        updated = _apply_done(text, dw_id, date, entry_note, undo_owner=undo_owner)
+        if updated is None:
+            continue
+        text = updated
+        marked.append(dw_id)
+    return text, marked
+
+
 def _mark_done_many(
     path: Path,
     dw_ids: Sequence[str],
@@ -885,14 +914,7 @@ def _mark_done_many(
         if not path.is_file():
             return []
         text = path.read_text(encoding="utf-8")
-        marked: list[str] = []
-        for index, dw_id in enumerate(dw_ids):
-            entry_note = note if notes is None else notes[index]
-            updated = _apply_done(text, dw_id, date, entry_note, undo_owner=undo_owner)
-            if updated is None:
-                continue
-            text = updated
-            marked.append(dw_id)
+        text, marked = _apply_done_many(text, dw_ids, date, note, notes, undo_owner)
         if not marked:
             return []
         atomic_write_text(path, text)
@@ -1061,6 +1083,27 @@ def _apply_open(text: str, dw_id: str, note: str, undo_owner: str) -> str | None
     return text
 
 
+def _apply_open_many(
+    text: str, dw_ids: Sequence[str], note: str, undo_owner: str
+) -> tuple[str, list[str]]:
+    """Fold every id in `dw_ids` through :func:`_apply_open` *within* `text`,
+    returning the new text and the ids actually reopened, in the order given.
+
+    Pure — text in, text out, no `Path` and no I/O — and ONE body for the
+    advisory pre-lock probe and the locked pass, so the two cannot drift. The
+    `undo_owner` match is part of the decision: an entry closed by a different
+    operation is skipped here, which is what makes "no id was eligible" a
+    question only this fold can answer."""
+    reopened: list[str] = []
+    for dw_id in dw_ids:
+        updated = _apply_open(text, dw_id, note, undo_owner)
+        if updated is None:
+            continue
+        text = updated
+        reopened.append(dw_id)
+    return text, reopened
+
+
 def mark_open_many(path: Path, dw_ids: Sequence[str], note: str, operation_id: str) -> list[str]:
     """Undo every close in `dw_ids` written by :func:`mark_done_many_reopenable`
     under `operation_id`, in ONE read and ONE atomic write. Returns the ids
@@ -1087,13 +1130,7 @@ def mark_open_many(path: Path, dw_ids: Sequence[str], note: str, operation_id: s
         if not path.is_file():
             return []
         text = path.read_text(encoding="utf-8")
-        reopened: list[str] = []
-        for dw_id in dw_ids:
-            updated = _apply_open(text, dw_id, note, undo_owner)
-            if updated is None:
-                continue
-            text = updated
-            reopened.append(dw_id)
+        text, reopened = _apply_open_many(text, dw_ids, note, undo_owner)
         if not reopened:
             return []
         atomic_write_text(path, text)
@@ -1318,6 +1355,23 @@ def _apply_append(text: str, spec: EntrySpec) -> tuple[str, str | None]:
     return text + sep + block, dw_id
 
 
+def _apply_appends(text: str, specs: Sequence[EntrySpec]) -> tuple[str, list[str | None]]:
+    """Fold every spec through :func:`_apply_append` *within* `text`, returning
+    the new text and one minted id per spec — None where the spec deduped
+    against an open entry that already carries its marker.
+
+    Pure — text in, text out, no `Path` and no I/O — and ONE body for the
+    advisory pre-lock probe and the locked pass, so the two cannot drift. Each
+    spec sees the text the previous one produced, which is what makes ids
+    sequential and lets two identical specs in one call dedupe against each
+    other; see :func:`_apply_append` for why that evolution is load-bearing."""
+    minted: list[str | None] = []
+    for spec in specs:
+        text, dw_id = _apply_append(text, spec)
+        minted.append(dw_id)
+    return text, minted
+
+
 def append_entries(path: Path, specs: Sequence[EntrySpec]) -> list[str | None]:
     """Append every entry in `specs` in ONE read and ONE atomic write, returning
     each spec's minted id — or None in its position when that spec deduped
@@ -1395,10 +1449,7 @@ def append_entries_published(
         return [], None
     with ledger_lock(path):
         text = path.read_text(encoding="utf-8") if path.is_file() else ""
-        minted: list[str | None] = []
-        for spec in specs:
-            text, dw_id = _apply_append(text, spec)
-            minted.append(dw_id)
+        text, minted = _apply_appends(text, specs)
         if all(dw_id is None for dw_id in minted):
             return minted, None
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1610,6 +1661,29 @@ def _close_date(entry: DWEntry) -> str | None:
     return _iso_date_or_none(parts[1])
 
 
+def _eligible_for_archive(text: str, before: str | None) -> list[tuple[DWEntry, str]]:
+    """Every entry in `text` :func:`archive_closed` would move, paired with its
+    close date, in ledger order.
+
+    Pure — text in, entries out, no `Path` and no I/O — and ONE body for the
+    advisory pre-lock probe and the locked pass, so the two cannot drift. Three
+    skips make up the decision: an entry that is not done, or done without a
+    date, has nothing to compare or to stamp a stub with; `before` excludes
+    entries closed on or after the cutoff; and a stub from a prior run is
+    already archived."""
+    to_archive: list[tuple[DWEntry, str]] = []
+    for entry in parse_ledger(text):
+        close_date = _close_date(entry)
+        if close_date is None:
+            continue  # not done, or done without a date
+        if before is not None and close_date >= before:
+            continue  # closed on or after the cutoff
+        if _is_stub(entry):
+            continue  # stub from a prior archive_closed run
+        to_archive.append((entry, close_date))
+    return to_archive
+
+
 def archive_closed(
     path: Path,
     *,
@@ -1677,16 +1751,7 @@ def archive_closed(
         if not path.is_file():
             return []
         text = path.read_text(encoding="utf-8")
-        to_archive: list[tuple[DWEntry, str]] = []
-        for entry in parse_ledger(text):
-            close_date = _close_date(entry)
-            if close_date is None:
-                continue  # not done, or done without a date
-            if before is not None and close_date >= before:
-                continue  # closed on or after the cutoff
-            if _is_stub(entry):
-                continue  # stub from a prior archive_closed run
-            to_archive.append((entry, close_date))
+        to_archive = _eligible_for_archive(text, before)
         if not to_archive:
             return []
         archived_ids = [e.id for e, _ in to_archive]
