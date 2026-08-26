@@ -4723,3 +4723,116 @@ def test_run_tui_survives_junk_forced_backend(monkeypatch, tmp_path):
     finally:
         mux_mod.get_multiplexer.cache_clear()
     assert ran == [True]
+
+
+def _write_two_triage_decisions(run_dir: Path) -> None:
+    """A sweep triage carrying TWO decisions, so a walk has somewhere to continue to."""
+    import json
+
+    (run_dir / "triage.json").write_text(
+        json.dumps(
+            {
+                "workflow": "deferred-sweep-triage",
+                "open_ids": ["DW-1", "DW-2"],
+                "already_resolved": [],
+                "bundles": [],
+                "blocked": [],
+                "skip": [],
+                "decisions": [
+                    {
+                        "id": dw_id,
+                        "question": f"what about {dw_id}?",
+                        "context": "ctx",
+                        "options": [
+                            {"key": "1", "label": "Widen", "effect": "build", "intent": "widen it"},
+                            {"key": "2", "label": "Keep", "effect": "keep-open"},
+                        ],
+                        "recommendation": "1",
+                    }
+                    for dw_id in ("DW-1", "DW-2")
+                ],
+                "escalations": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+async def test_decision_modal_survives_lock_and_state_root_failures(project, monkeypatch):
+    """Both ledger-lock failures degrade to a per-decision toast, and the walk
+    carries on to the next decision (#286/#469).
+
+    `apply_pre_answer` now takes a cross-process lock whose sidecar path is
+    derived from the state root, which gives it two new ways to fail: `OSError`
+    from the acquisition itself, and `runs.StateRootError` from deriving the
+    path. The second is NOT an `OSError`, and here that distinction is not
+    cosmetic — an uncaught exception in this callback does not print a traceback
+    and exit, it escapes into the Textual event loop and takes the dashboard
+    down mid-walk, with the human's remaining answers unrecorded and no window
+    left to type them into.
+
+    Both are raised, in that order, across two pending decisions: the first
+    grades the arm that already existed, the second grades the widened tuple.
+    The second modal appearing at all is what says the walk continued rather
+    than stopping at the first failure, and it is keyed on the modal's own
+    decision id so a first modal that simply never dismissed cannot satisfy it.
+
+    Ablation: drop `runs.StateRootError` from `_record_decision`'s catch tuple.
+    The DW-1 toast still lands; the DW-2 assertions red, with the exception
+    coming out of `run_test` instead of arriving as a notification.
+    """
+    from bmad_loop import decisions as decisions_mod
+    from bmad_loop import runs
+
+    install_bmad_config(project)
+    project.deferred_work.write_text(
+        "# Deferred Work\n\n"
+        "### DW-1: first thing\n\norigin: t\nlocation: a.py:1\nreason: t.\nstatus: open\n\n"
+        "### DW-2: second thing\n\norigin: t\nlocation: b.py:1\nreason: t.\nstatus: open\n",
+        encoding="utf-8",
+    )
+    _write_two_triage_decisions(make_run(project.project, "20260101-000000-aaaa", run_type="sweep"))
+
+    failures = iter(
+        [
+            OSError(11, "Resource deadlock avoided"),
+            runs.StateRootError("no usable state root"),
+        ]
+    )
+
+    def boom(*_args, **_kwargs):
+        raise next(failures)
+
+    # `bmad_loop.tui.app` holds the module, not the function, so patching the
+    # attribute here is what the TUI call site resolves.
+    monkeypatch.setattr(decisions_mod, "apply_pre_answer", boom)
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("d")
+        await until(pilot, lambda: isinstance(app.screen, DecisionModal))
+        await pilot.click(await ready(pilot, "#opt-1"))
+
+        # OSError: toast, no crash.
+        await until(pilot, lambda: any("failed to record DW-1" in m for m in notifications(app)))
+        # ...and the walk moved on, rather than ending on the first failure.
+        await until(
+            pilot,
+            lambda: isinstance(app.screen, DecisionModal) and app.screen._decision.id == "DW-2",
+        )
+        await pilot.click(await ready(pilot, "#opt-1"))
+
+        # StateRootError: same degradation, and it is not an OSError.
+        await until(pilot, lambda: any("failed to record DW-2" in m for m in notifications(app)))
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+
+        toasts = [n for n in app._notifications if "failed to record" in n.message]
+        assert len(toasts) == 2
+        assert {n.severity for n in toasts} == {"error"}
+        assert "Resource deadlock avoided" in toasts[0].message
+        assert "no usable state root" in toasts[1].message
+        # Survived both: still running, still on the dashboard, with the whole
+        # walk behind it. The `run_test` context exiting without raising is the
+        # other half — an escape into the event loop surfaces there, not here.
+        assert app.is_running

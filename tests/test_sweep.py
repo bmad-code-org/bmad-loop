@@ -1,5 +1,6 @@
 """Sweep engine scenario tests against the mock adapter — no tmux, no LLM."""
 
+import contextlib
 import json
 import re
 import sys
@@ -5059,3 +5060,110 @@ def test_the_decisions_writes_land_on_a_clean_tree(project):
     assert not summary.crashed
     landed = json.loads((engine.run_dir / "decisions.json").read_text(encoding="utf-8"))
     assert landed["DW-1"]["effect"] == "close"
+
+
+# ------------------------------------------ batched locked ledger adoption (#286/#469)
+
+
+@contextlib.contextmanager
+def _counting_ledger_lock(monkeypatch, acquisitions):
+    """A `ledger_lock` spy that records every acquisition and still really locks.
+
+    Still locking matters: a spy that only counted would let a nesting bug
+    through, and `ledger_lock` raising on nested entry is the guard that keeps
+    these callers honest.
+    """
+    real_lock = deferredwork.ledger_lock
+
+    @contextlib.contextmanager
+    def spy_lock(p):
+        acquisitions.append(p)
+        with real_lock(p):
+            yield
+
+    monkeypatch.setattr(deferredwork, "ledger_lock", spy_lock)
+    yield
+
+
+def test_close_resolved_batches_with_per_entry_evidence(project, monkeypatch):
+    """The whole already-resolved set closes in ONE locked read->edit->write, and
+    each entry keeps its own evidence (#286/#469).
+
+    Two claims, and both are needed. The per-entry evidence says the collapse to
+    `mark_done_many` did not flatten three distinct notes into one shared string
+    — `notes=` pairs positionally with the ids, and a batch that dropped it would
+    still close all three entries and still journal all three ids. The
+    acquisition count is what says this is one transaction: as a per-entry
+    `mark_done` loop it took the cross-process ledger lock once per id, leaving a
+    rival writer — a live run's harvest, the TUI decision modal, `sweep
+    --archive` — a window between every pair of closures, so the sweep could
+    journal three closures with only some of them on disk.
+
+    Ablation: restore the per-entry `mark_done` loop. The evidence asserts still
+    pass, which is exactly why the count is asserted too; `acquisitions` goes to
+    3 and this reddens.
+    """
+    write_ledger(project, {"DW-1": "open", "DW-2": "open", "DW-3": "open"})
+    engine, _adapter = make_sweep(project, [])
+    plan = TriagePlan(
+        open_ids=frozenset({"DW-1", "DW-2", "DW-3"}),
+        already_resolved=(
+            ResolvedEntry("DW-1", "fixed by a1b2c3d"),
+            ResolvedEntry("DW-2", "superseded by DW-9"),
+            ResolvedEntry("DW-3", "never reproduced"),
+        ),
+    )
+
+    acquisitions = []
+    with _counting_ledger_lock(monkeypatch, acquisitions):
+        assert engine._close_resolved(plan) == 3
+
+    assert acquisitions == [project.deferred_work]  # ONE, and on this ledger
+    text = project.deferred_work.read_text(encoding="utf-8")
+    assert "already resolved: fixed by a1b2c3d" in text
+    assert "already resolved: superseded by DW-9" in text
+    assert "already resolved: never reproduced" in text
+    entries = ledger_entries(project)
+    assert all(entries[i].status.startswith("done ") for i in ("DW-1", "DW-2", "DW-3"))
+    closed = [e for e in engine.journal.entries() if e["kind"] == "sweep-resolved-closed"]
+    assert len(closed) == 1 and closed[0]["dw_ids"] == ["DW-1", "DW-2", "DW-3"]
+
+
+def test_reopen_after_defer_uses_one_lock(project, monkeypatch):
+    """A deferred bundle's closes are all undone in ONE locked read->edit->write
+    (#286/#469), and the journal reports the same ids in the same order.
+
+    A rollback that leaves some of this run's closes undone and others standing
+    is the one outcome this method exists to prevent, and the per-id `mark_open`
+    comprehension it replaces took the lock once per id — three separate windows
+    for a rival writer, in a step that has to be atomic to mean anything. The
+    journal assert is what says the collapse preserved the contract the caller
+    reads: `mark_open_many` returns the ids actually reopened, in the order
+    given, exactly as the comprehension did.
+
+    Ablation: restore the per-id comprehension — `acquisitions` goes to 3.
+    """
+    write_ledger(project, {"DW-1": "open", "DW-2": "open", "DW-3": "open"})
+    engine, _adapter = make_sweep(project, [])
+    task = StoryTask(story_key="dw-fix", epic=0, dw_ids=["DW-1", "DW-2", "DW-3"])
+    # Seed the reopenable closes BEFORE the spy: this write is the setup, not
+    # the behavior under test, and counting it would hide the real number.
+    deferredwork.mark_done_many_reopenable(
+        project.deferred_work,
+        task.dw_ids,
+        engine._today(),
+        engine._bundle_close_note(task),
+        engine._bundle_close_operation_id(task),
+    )
+
+    acquisitions = []
+    with _counting_ledger_lock(monkeypatch, acquisitions):
+        engine._reopen_ledger_after_defer(task)
+
+    assert acquisitions == [project.deferred_work]  # ONE, and on this ledger
+    entries = ledger_entries(project)
+    assert all(entries[i].open for i in ("DW-1", "DW-2", "DW-3"))
+    reopened = [e for e in engine.journal.entries() if e["kind"] == "sweep-bundle-reopened"]
+    assert len(reopened) == 1
+    assert reopened[0]["dw_ids"] == ["DW-1", "DW-2", "DW-3"]
+    assert reopened[0]["story_key"] == "dw-fix"

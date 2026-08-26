@@ -391,12 +391,17 @@ class BmadLoopApp(App[None]):
                 option,  # pyright: ignore[reportArgumentType]
                 date=time.strftime("%Y-%m-%d"),
             )
-        except (OSError, bmadconfig.BmadConfigError, ValueError) as e:
-            # ValueError is the ledger writers' date precondition. It cannot fire
-            # from the strftime above, but an uncaught one here escapes into the
-            # Textual event loop and takes the dashboard down mid-walk — the
-            # per-decision notification is the right degradation for a modal the
-            # human is still stepping through.
+        except (OSError, bmadconfig.BmadConfigError, ValueError, runs.StateRootError) as e:
+            # ValueError is the ledger writers' date precondition; it cannot fire
+            # from the strftime above. StateRootError is reachable: the ledger
+            # write now takes a cross-process lock whose sidecar lives under the
+            # state root (#286/#469), and an environment that names no usable root
+            # raises it — it is NOT an OSError, so the tuple has to say so.
+            # OSError covers the acquisition itself failing against a live holder.
+            # Every one of them uncaught here escapes into the Textual event loop
+            # and takes the dashboard down mid-walk — the per-decision
+            # notification is the right degradation for a modal the human is still
+            # stepping through, and the walk continues to the next decision.
             self.notify(
                 f"failed to record {decision.id}: {e}",  # pyright: ignore[reportAttributeAccessIssue]
                 severity="error",

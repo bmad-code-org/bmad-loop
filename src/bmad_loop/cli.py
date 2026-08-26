@@ -2281,6 +2281,15 @@ def _sweep_archive(project: Path, paths: bmadconfig.ProjectPaths, args: argparse
     was removed still owns its ``engine.pid`` and still writes this ledger, and
     the gated view would report it as no run at all. An unreadable runs root
     answers nothing, so it refuses too — same conservative side."""
+    # The pid-liveness gate below is now belt-and-braces: `archive_closed` takes
+    # the cross-process ledger lock beneath it (#286/#469), so a run that started
+    # after this check still cannot interleave its writes with the archive's. The
+    # gate STAYS, because its semantics are deliberately coarser than the lock's:
+    # the lock only serializes the two writers' read->edit->write cycles, while
+    # the gate refuses to rewrite the archive AT ALL while any run is live —
+    # including a run that would merely be surprised to find its open entries
+    # moved out from under a plan it has already read. Removing it would trade a
+    # refusal a human can act on for a race the lock does not cover.
     run_dirs = runs.all_run_dirs(project)
     if run_dirs is None:
         print(
@@ -2314,6 +2323,22 @@ def _sweep_archive(project: Path, paths: bmadconfig.ProjectPaths, args: argparse
         )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
+        return ExitCode.FAILURE
+    except (OSError, runs.StateRootError) as exc:
+        # `archive_closed` serializes on the ledger's sidecar lock (#286/#469).
+        # Two ways that fails, and the operator's next move is the same for both:
+        # the acquisition itself raises `OSError` (a rival holder outlasting the
+        # blocking retry, or an unwritable locks dir), and deriving the sidecar's
+        # path raises `runs.StateRootError` — NOT an OSError — when the
+        # environment names no usable state root. Naming the lock is what makes
+        # the message actionable; a bare `error: [Errno 11] ...` from a command
+        # with no other lock in sight reads as a bug in the archive. Existing
+        # FAILURE path, no new exit code, and `--archive` has no --json arm.
+        print(
+            f"error: cannot take the deferred-work ledger lock ({exc}) — "
+            "another bmad-loop process may hold it",
+            file=sys.stderr,
+        )
         return ExitCode.FAILURE
     if not ledger.is_file():
         print(f"no deferred-work ledger at {ledger}")
@@ -3228,7 +3253,7 @@ def cmd_decisions(args: argparse.Namespace) -> int:
         option = prompter.ask(decision)
         try:
             decisions.apply_pre_answer(project, decision, option, date=today)
-        except (OSError, bmadconfig.BmadConfigError, ValueError) as e:
+        except (OSError, bmadconfig.BmadConfigError, ValueError, runs.StateRootError) as e:
             # What this buys is the `{decision.id}` in the message, and only
             # that: `main`'s tail catches BmadConfigError by name and everything
             # else through a bare `except Exception`, so none of these ever
@@ -3237,9 +3262,15 @@ def cmd_decisions(args: argparse.Namespace) -> int:
             # printed an outcome line per answered decision, and a bare
             # `error: <msg>` after them does not say which one did not land.
             #
-            # ValueError is the ledger writers' `date` precondition, unreachable
-            # from the strftime above and here for the same reason as the TUI's
-            # copy of this call. BmadConfigError is the reachable one:
+            # The inventory: OSError covers the ledger and store writes and the
+            # ledger lock's own acquisition (#286/#469). StateRootError is that
+            # lock's other failure — deriving its state-root sidecar from an
+            # environment that names no usable root — and it is NOT an OSError, so
+            # leaving it out would let it fall through to `main`'s bare tail and
+            # lose the attribution this handler exists for. ValueError is the
+            # ledger writers' `date` precondition, unreachable from the strftime
+            # above and here for the same reason as the TUI's copy of this call.
+            # BmadConfigError is the reachable one:
             # `apply_pre_answer` re-reads the BMAD config on every call and
             # `prompter.ask` blocks on the human in between, so a config removed
             # or broken mid-prompt raises here even though the read at the top of

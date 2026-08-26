@@ -139,6 +139,16 @@ breaking changes may land in a minor release.
   `record_decision` merges a decision record with its optional closure, and `mark_done_many`
   accepts a per-id resolution note. Each is byte-identical to the serial sequence it replaces,
   so a caller adopting one changes how many windows it leaves open and nothing else.
+  The sweep and the out-of-band decision writers now use them: closing a triage plan's
+  already-resolved entries, reopening a discarded bundle's closes, and recording a human
+  decision together with the closure it asks for are each one locked read-modify-write
+  instead of one per id or one per half. `bmad-loop sweep --archive` reports a lock it could
+  not take by name rather than as a bare `errno`, and `bmad-loop decisions` and the TUI
+  decision modal now also catch the state-root failure that deriving a lock path can raise —
+  in the TUI an uncaught one escaped into the Textual event loop and took the dashboard down
+  mid-walk. `--archive`'s refusal while a run is live is unchanged and deliberately kept: it
+  is coarser than the lock, refusing the archive rewrite outright rather than merely
+  serializing it.
 
 ### Security
 

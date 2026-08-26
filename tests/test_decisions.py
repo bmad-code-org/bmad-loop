@@ -353,3 +353,71 @@ def test_the_store_write_refuses_a_readonly_store(project):
         store.chmod(0o644)
 
     assert store.read_bytes() == before  # the second answer never landed
+
+
+@pytest.mark.parametrize(
+    ("effect", "label", "extra", "close_note"),
+    [
+        ("build", "Build", {"intent": "widen field"}, None),
+        ("close", "Close", {"resolution": "superseded"}, "closed by human decision: superseded"),
+    ],
+)
+def test_apply_pre_answer_is_one_ledger_transaction(
+    project, tmp_path, monkeypatch, effect, label, extra, close_note
+):
+    """The decision record and the closure it asks for land in ONE locked
+    read->edit->write, byte-identical to the released `append_decision` +
+    `mark_done` pair (#286/#469).
+
+    Two claims, and both are needed. The golden text says the collapse moved no
+    bytes — these ledgers are committed and read by humans, so `record_decision`
+    inserting the decision line before it applies the close is a contract, not a
+    detail (`_MARK_DONE_TAIL_RE` anchors an undo marker on the status/resolution
+    adjacency the other order would break). The acquisition count is what says
+    the pair actually collapsed: as two calls it was two acquisitions with a
+    window between them, and a rival writer landing there left the entry
+    carrying a decision that says "close it" over a status that still says open.
+    Byte equality alone passes just as well for the released pair.
+
+    Ablation: restore the pair in `decisions.apply_pre_answer`. The golden assert
+    still passes — that is the point — and `acquisitions` goes to 2 on the CLOSE
+    variant, which is the one that grades the collapse. The build variant stays
+    green under that ablation and is known to: with `close_note=None` there is no
+    second call to make, and `append_decision` is itself a one-acquisition
+    delegate to `record_decision`, so the two spellings are the same transaction.
+    It is kept for the claim it does decide — that the no-close path still writes
+    the pair's bytes and leaves the entry open — not as a second count oracle.
+    """
+    import contextlib
+
+    from bmad_loop.sweep import Decision
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    pristine = project.deferred_work.read_text(encoding="utf-8")
+    opt = DecisionOption(key="1", label=label, effect=effect, **extra)
+    d = Decision(id="DW-1", question="?", context="", options=(opt,), recommendation="1")
+
+    # The released serial pair, run against a twin of the same pristine ledger in
+    # its own directory so it contends on its own lock and is never counted.
+    golden = tmp_path / f"golden-{effect}" / "deferred-work.md"
+    golden.parent.mkdir(parents=True)
+    golden.write_text(pristine, encoding="utf-8")
+    deferredwork.append_decision(golden, "DW-1", "2026-06-13", label, opt.resolution or opt.intent)
+    if close_note is not None:
+        deferredwork.mark_done(golden, "DW-1", "2026-06-13", close_note)
+
+    acquisitions = []
+    real_lock = deferredwork.ledger_lock
+
+    @contextlib.contextmanager
+    def spy_lock(p):
+        acquisitions.append(p)
+        with real_lock(p):
+            yield
+
+    monkeypatch.setattr(deferredwork, "ledger_lock", spy_lock)
+    decisions.apply_pre_answer(project.project, d, opt, date="2026-06-13", commit=False)
+
+    assert project.deferred_work.read_text(encoding="utf-8") == golden.read_text(encoding="utf-8")
+    assert acquisitions == [project.deferred_work]  # ONE, and on the project's ledger

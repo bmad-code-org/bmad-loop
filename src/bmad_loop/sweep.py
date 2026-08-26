@@ -1158,12 +1158,21 @@ class SweepEngine(Engine):
     def _close_resolved(self, plan: TriagePlan) -> int:
         self._emit("pre_close_resolved")
         ledger = self.workspace.paths.deferred_work
-        closed = []
-        for entry in plan.already_resolved:
-            if deferredwork.mark_done(
-                ledger, entry.id, self._today(), f"already resolved: {entry.evidence}"
-            ):
-                closed.append(entry.id)
+        # ONE locked read->edit->write for the whole batch (#286/#469). The
+        # per-entry `mark_done` loop this replaces took the cross-process ledger
+        # lock once per id, leaving a rival writer — a live run's harvest, the TUI
+        # decision modal, `sweep --archive` — a window between every pair of
+        # closures, so half this phase's closures could be lost while the other
+        # half landed and the journal claimed all of them. `notes=` carries the
+        # per-entry evidence the loop passed positionally, so the resulting ledger
+        # text and the returned ids (order preserved, skips dropped) are unchanged.
+        closed = deferredwork.mark_done_many(
+            ledger,
+            [entry.id for entry in plan.already_resolved],
+            self._today(),
+            "already resolved",
+            notes=[f"already resolved: {entry.evidence}" for entry in plan.already_resolved],
+        )
         if closed:
             self.journal.append("sweep-resolved-closed", dw_ids=closed)
         self._commit_ledger("chore(sweep): close resolved deferred-work entries")
@@ -1321,12 +1330,20 @@ class SweepEngine(Engine):
     def _apply_decision_effect(self, decision: Decision, option: DecisionOption) -> None:
         ledger = self.workspace.paths.deferred_work
         detail = option.resolution or option.intent
-        deferredwork.append_decision(ledger, decision.id, self._today(), option.label, detail)
+        close_note = None
         if option.effect == "close":
-            note = "closed by human decision" + (
+            close_note = "closed by human decision" + (
                 f": {option.resolution}" if option.resolution else ""
             )
-            deferredwork.mark_done(ledger, decision.id, self._today(), note)
+        # ONE locked read->edit->write (#286/#469). As the `append_decision` +
+        # `mark_done` pair it was two acquisitions with a window between them, and
+        # a rival writer landing there saw an entry whose decision line says "close
+        # it" and whose status still says open — a human answer half-recorded. The
+        # bytes are identical to the pair's: `record_decision` inserts the decision
+        # line before it applies the close, which is the order the pair produced.
+        deferredwork.record_decision(
+            ledger, decision.id, self._today(), option.label, detail, close_note=close_note
+        )
 
     def _commit_ledger(self, message: str) -> None:
         """Commit pending orchestrator ledger edits; bundles need a clean
@@ -1645,7 +1662,12 @@ class SweepEngine(Engine):
         ledger = self.workspace.paths.deferred_work
         note = self._bundle_close_note(task)
         operation_id = self._bundle_close_operation_id(task)
-        reopened = [i for i in task.dw_ids if deferredwork.mark_open(ledger, i, note, operation_id)]
+        # ONE locked read->edit->write (#286/#469): the per-id `mark_open`
+        # comprehension this replaces took the lock once per id, and a rollback
+        # that leaves some closes undone and others standing is the one shape this
+        # method exists to prevent. Order and skip semantics are `mark_open_many`'s
+        # own, which are the comprehension's.
+        reopened = deferredwork.mark_open_many(ledger, list(task.dw_ids), note, operation_id)
         if reopened:
             self.journal.append("sweep-bundle-reopened", story_key=task.story_key, dw_ids=reopened)
 

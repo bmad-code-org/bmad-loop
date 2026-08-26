@@ -175,11 +175,21 @@ def apply_pre_answer(
     paths = bmadconfig.load_paths(project)
     ledger = paths.deferred_work
     detail = option.resolution or option.intent
-    deferredwork.append_decision(ledger, decision.id, date, option.label, detail)
+    close_note = None
     if option.effect == "close":
-        note = "closed by human decision" + (f": {option.resolution}" if option.resolution else "")
-        deferredwork.mark_done(ledger, decision.id, date, note)
-    else:
+        close_note = "closed by human decision" + (
+            f": {option.resolution}" if option.resolution else ""
+        )
+    # ONE locked read->edit->write (#286/#469). As the `append_decision` +
+    # `mark_done` pair it was two acquisitions with a window between them, and a
+    # rival writer landing there left the entry carrying a decision that says
+    # "close it" over a status that still says open. The bytes are identical to
+    # the pair's. The commit below stays OUTSIDE any lock — locks are held only
+    # around file I/O, never across a subprocess (#286).
+    deferredwork.record_decision(
+        ledger, decision.id, date, option.label, detail, close_note=close_note
+    )
+    if option.effect != "close":
         record_pre_answer(project, decision.id, option, date=date)
     if commit:
         try:
