@@ -117,6 +117,22 @@ breaking changes may land in a minor release.
   triage never passes `validate_triage`, and a fresh triage can renumber the option it named —
   applied by journaled discard rather than by error: the build decision is honored under the
   always-legal `decision-<id>` fallback name.
+- **Deferred-work ledger mutators serialize on a cross-process lock** (#286, #469). Every
+  mutator was an unlocked read-modify-write of the whole file, so two orchestrator processes —
+  a second `bmad-loop run`, a run plus a sweep, a run plus the TUI decision modal, a run plus
+  `sweep --archive` — both read, both edited, and the last atomic write won: entries lost,
+  closures silently reverted, and two appenders minting the same `DW-<n>` because each read
+  `next_seq` from the text it had just read. `_mark_done_many`, `mark_open`, `append_decision`,
+  `append_entry` and `archive_closed` now hold an advisory lock across their whole
+  read-modify-write, with `archive_closed` covering both of its writes in one acquisition.
+  Readers stay lock-free — every writer already replaced the file atomically, so a reader sees
+  one whole version or another. The lock lives at
+  `<state root>/locks/<digest>-<basename>.lock`, out of the repository rather than beside the
+  ledger, because the ledger is tracked by design and the engine stages with `git add -A`; it
+  is keyed on the resolved path, so every spelling of one file contends on one lock. Nested
+  acquisition raises instead of self-deadlocking, and a lock that cannot be taken fails the
+  write rather than proceeding unlocked. The dev/review session's own ledger writes are
+  unchanged and still take no lock.
 
 ### Security
 

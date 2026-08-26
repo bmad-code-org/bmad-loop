@@ -1,10 +1,14 @@
 """Ledger parsing and editing: deferredwork.py."""
 
+import contextlib
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
 
-from bmad_loop import deferredwork, fences
+from bmad_loop import deferredwork, fences, platform_util, runs
 from bmad_loop.deferredwork import (
     _ISO_DATE_RE,
     ARCHIVE_REL,
@@ -3167,3 +3171,359 @@ def test_archive_fenced_archived_line_in_twin_does_not_suppress(tmp_path):
     # ...and the body left the ledger for the archive rather than being dropped.
     stub = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}["DW-2"]
     assert "reason: pre-existing." not in stub.body
+
+
+# ----------------------------------- cross-process ledger lock (#286, #469)
+#
+# Every mutator here is a read->edit->write of the whole ledger, so two
+# orchestrator processes — a second run, a sweep, the TUI decision modal,
+# `sweep --archive` — would otherwise both read, both edit, and let the last
+# atomic write win. The section grades four separable claims: that each leaf
+# mutator holds `ledger_lock` across its whole critical section, that the hold
+# really excludes, that a nested acquisition raises rather than self-deadlocking,
+# and that a failed acquisition raises without writing.
+#
+# Exclusion is probed with `blocking=False` only. That is not an optimization:
+# `file_lock` is per open fd, so a blocking probe from this process would wait
+# forever on POSIX `flock` against a lock this very thread holds, and ~10s on
+# Windows before raising. The suite runs under xdist, so neither is acceptable.
+
+
+def _lock_is_held(path: Path) -> bool:
+    """True when the ledger's sidecar lock cannot be taken right now."""
+    try:
+        with platform_util.file_lock(runs.lock_path_for(path), blocking=False):
+            return False
+    except OSError:
+        return True
+
+
+@contextlib.contextmanager
+def _unavailable_lock(path, **kwargs):
+    """A `file_lock` that cannot be acquired.
+
+    `OSError(11, "Resource deadlock avoided")` is the shape `msvcrt.locking`
+    raises when its ~10 s blocking retry runs out — a routine outcome on the
+    Windows legs rather than a contrived one. The dead `yield` after the raise
+    keeps this a generator function, which `contextlib.contextmanager` requires.
+    """
+    raise OSError(11, "Resource deadlock avoided")
+    yield  # pragma: no cover — unreachable
+
+
+LOCKED_MUTATORS = {
+    "append_decision": lambda p: append_decision(p, "DW-1", "2026-06-11", "keep", "later"),
+    "append_entry": lambda p: append_entry(
+        p, title="new", origin="probe", source_spec="spec-probe.md", reason="raced"
+    ),
+    "archive_closed": lambda p: archive_closed(p, archive_date="2026-08-24"),
+    "mark_done": lambda p: mark_done(p, "DW-1", "2026-06-11", "fixed"),
+    "mark_done_many": lambda p: mark_done_many(p, ["DW-1"], "2026-06-11", "fixed"),
+    "mark_done_many_reopenable": lambda p: mark_done_many_reopenable(
+        p, ["DW-1"], "2026-06-11", "fixed", OPERATION_ID
+    ),
+    "mark_open": lambda p: mark_open(p, "DW-1", "by dw-a", OPERATION_ID),
+}
+
+
+def _seed_for(tmp_path: Path, name: str) -> Path:
+    """The ledger `name`'s call needs, written before any lock spy is installed."""
+    path = write_ledger(tmp_path)
+    if name == "mark_open":
+        close_reopenable(path, "DW-1", "by dw-a")
+    return path
+
+
+@pytest.mark.parametrize("name", sorted(LOCKED_MUTATORS))
+def test_every_mutator_holds_the_ledger_lock(tmp_path, monkeypatch, name):
+    """Each leaf mutator takes the lock exactly once, and the hold really excludes.
+
+    Two claims in one assertion, and both are needed. That the spy fired says the
+    mutator routes through `ledger_lock` at all; that it fired ONCE says the whole
+    read->edit->write sits inside a single acquisition rather than a per-step
+    hold that another writer can slip between. The probe inside the critical
+    section says the acquisition is a real OS lock and not a no-op — a
+    `ledger_lock` that yielded without taking anything would satisfy the call
+    count and exclude nobody.
+
+    Ablation: delete this mutator's `with ledger_lock(path):` and dedent its
+    body — the spy never fires, `probed` stays empty, and the row reds."""
+    path = _seed_for(tmp_path, name)
+    real_lock = deferredwork.ledger_lock
+    probed = []
+
+    @contextlib.contextmanager
+    def spy_lock(p):
+        with real_lock(p):
+            probed.append(_lock_is_held(p))
+            yield
+
+    monkeypatch.setattr(deferredwork, "ledger_lock", spy_lock)
+
+    LOCKED_MUTATORS[name](path)
+
+    assert probed == [True]
+
+
+def test_ledger_lock_is_not_reentrant(tmp_path, monkeypatch):
+    """A nested acquisition raises rather than deadlocking, and raises BEFORE it
+    reaches the OS lock.
+
+    `file_lock` is per open fd: on POSIX a second `flock(LOCK_EX)` from this same
+    thread blocks against the lock the thread already holds, with no timeout and
+    no traceback — the run simply stops. The guard converts that silent wedge
+    into a loud error at the call site that introduced the nesting.
+
+    The `file_lock` counter is what makes the test deterministic. Asserting only
+    the `RuntimeError` would leave a version of the guard that raises *after*
+    attempting the acquire indistinguishable from one that raises before it, and
+    the former hangs. Counting proves the nested entry never reached the kernel,
+    so this test never risks the deadlock it is about.
+
+    Ablation is deliberately NOT run here: dropping the depth guard makes the
+    nested entry block forever rather than fail, which hangs the suite instead
+    of reddening one row. The guard's absence is graded by inspection.
+
+    The tail grades the release: the guard is per-thread state, so a hold that
+    is not cleared on exit would refuse every later mutation in this thread."""
+    path = write_ledger(tmp_path)
+    real_file_lock = deferredwork.file_lock
+    acquired = []
+
+    @contextlib.contextmanager
+    def counting(lock_path, **kwargs):
+        acquired.append(lock_path)
+        with real_file_lock(lock_path, **kwargs):
+            yield
+
+    monkeypatch.setattr(deferredwork, "file_lock", counting)
+
+    with deferredwork.ledger_lock(path):
+        with pytest.raises(RuntimeError, match="not reentrant"):
+            with deferredwork.ledger_lock(path):
+                pass  # pragma: no cover — the guard raises on entry
+    assert len(acquired) == 1  # the nested entry never reached the OS lock
+
+    with deferredwork.ledger_lock(path):  # released cleanly, so this is fine
+        pass
+    assert len(acquired) == 2
+
+
+def test_a_failed_acquisition_does_not_leak_the_reentrancy_guard(tmp_path, monkeypatch):
+    """An acquisition that raises must still leave this thread unmarked.
+
+    The guard is set before the acquire (it has to be — the acquire is what would
+    deadlock), so clearing it anywhere but a `finally` strands the thread: every
+    later mutation in this process raises `RuntimeError` and the run dies of a
+    transient lock failure it should merely have reported.
+
+    Ablation: move `_LOCK_STATE.held = False` out of `ledger_lock`'s `finally`
+    onto the success path — the second `mark_done` raises `RuntimeError` instead
+    of closing DW-1."""
+    path = write_ledger(tmp_path)
+    with monkeypatch.context() as m:
+        m.setattr(deferredwork, "file_lock", _unavailable_lock)
+        with pytest.raises(OSError, match="Resource deadlock avoided"):
+            mark_done(path, "DW-1", "2026-06-11", "fixed")
+
+    assert mark_done(path, "DW-1", "2026-06-11", "fixed")
+
+
+def test_scripted_interleave_loses_no_update(tmp_path, monkeypatch):
+    """The #286 lost-update scenario, made deterministic: a rival writer commits
+    in full between writer A's call and A's acquisition, and A must still see it.
+
+    Writer A closes DW-1; writer B appends a new entry. B is run to completion —
+    acquire, read, write, release — immediately BEFORE A delegates to the real
+    lock, which is the worst legal interleaving the lock permits. A therefore has
+    to read the ledger B just wrote, not one it snapshotted earlier, or A's write
+    reverts B's append.
+
+    Ablation: hoist `_mark_done_many`'s `path.read_text` above its
+    `with ledger_lock(path):` — A's read then happens before the spy fires, A
+    writes its stale snapshot, and DW-4 is gone from the final ledger."""
+    path = write_ledger(tmp_path)
+    real_lock = deferredwork.ledger_lock
+    rival_ran = []
+
+    @contextlib.contextmanager
+    def rival_first(p):
+        if not rival_ran:
+            rival_ran.append(True)  # once: B's own append re-enters this spy
+            assert (
+                append_entry(
+                    p,
+                    title="rival append",
+                    origin="rival-origin",
+                    source_spec="spec-rival.md",
+                    reason="raced with a close",
+                )
+                == "DW-4"
+            )
+        with real_lock(p):
+            yield
+
+    monkeypatch.setattr(deferredwork, "ledger_lock", rival_first)
+
+    assert mark_done(path, "DW-1", "2026-06-11", "closed by A")
+
+    entries = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}
+    assert entries["DW-4"].open  # B's append survived A's write
+    assert "origin: rival-origin" in entries["DW-4"].body
+    assert entries["DW-1"].status == "done 2026-06-11"  # ...and A's close landed
+    assert "resolution: closed by A" in entries["DW-1"].body
+    assert len(entries) == 4  # DW-1..DW-3 plus B's, every id distinct
+
+
+def test_archive_closed_writes_both_files_inside_one_acquisition(tmp_path, monkeypatch):
+    """The archive and the trimmed ledger are written under ONE hold.
+
+    The pair is a transaction: the archive is written first so a crash between
+    the writes leaves bodies duplicated (harmless, the archive is append-only)
+    rather than lost. Release the lock between them and a rival mutator lands in
+    the gap and writes the untrimmed ledger back, resurrecting entries whose
+    bodies have already moved to the archive — a duplicate no later run cleans
+    up. It is also why the archive sibling has no lock of its own: it is only
+    ever written under its ledger's.
+
+    Ablation: hoist either `atomic_write_text` out of the `with` — the event
+    order changes and the assertion reds."""
+    path = write_ledger(tmp_path)
+    archive = path.parent / ARCHIVE_REL
+    real_lock, real_write = deferredwork.ledger_lock, deferredwork.atomic_write_text
+    events = []
+
+    @contextlib.contextmanager
+    def spy_lock(p):
+        events.append("lock-enter")
+        with real_lock(p):
+            yield
+        events.append("lock-exit")
+
+    def spy_write(p, text):
+        events.append("write-archive" if p == archive else "write-ledger")
+        return real_write(p, text)
+
+    monkeypatch.setattr(deferredwork, "ledger_lock", spy_lock)
+    monkeypatch.setattr(deferredwork, "atomic_write_text", spy_write)
+
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-2"]
+
+    assert events == ["lock-enter", "write-archive", "write-ledger", "lock-exit"]
+
+
+@pytest.mark.parametrize("name", sorted(LOCKED_MUTATORS))
+def test_lock_acquisition_failure_raises_and_writes_nothing(tmp_path, monkeypatch, name):
+    """A lock that cannot be taken fails the write; it never proceeds unlocked.
+
+    This pins the repo's "repair writes must raise" doctrine at the new seam.
+    Degrading to an unlocked write would be the worst of both worlds: the caller
+    is told the mutation succeeded while the exact interleaving the lock exists
+    to prevent is back, and only under contention — the case no test would catch.
+
+    Ablation: swallow the acquisition `OSError` inside `ledger_lock` and let the
+    body run anyway — `pytest.raises` fails on every row."""
+    path = _seed_for(tmp_path, name)
+    archive = path.parent / ARCHIVE_REL
+    before = path.read_text(encoding="utf-8")
+    archive_before = archive.read_text(encoding="utf-8") if archive.is_file() else None
+
+    monkeypatch.setattr(deferredwork, "file_lock", _unavailable_lock)
+
+    with pytest.raises(OSError, match="Resource deadlock avoided"):
+        LOCKED_MUTATORS[name](path)
+
+    assert path.read_text(encoding="utf-8") == before
+    assert (archive.read_text(encoding="utf-8") if archive.is_file() else None) == archive_before
+
+
+# The child of the two-process acceptance test. Appends 8 entries with distinct
+# origins (so the idempotence scan never dedupes one away) through the real
+# `append_entry`, after a file rendezvous with the parent. It reports the ids it
+# minted so the parent can grade the mint, not merely the entry count.
+CONCURRENT_APPENDER = (
+    "import pathlib, sys, time\n"
+    "from bmad_loop.deferredwork import append_entry\n"
+    "ledger, ready, go, done = (pathlib.Path(a) for a in sys.argv[1:5])\n"
+    "tag = sys.argv[5]\n"
+    "ready.write_text('ready')\n"
+    "deadline = time.monotonic() + 60\n"
+    "while time.monotonic() < deadline and not go.exists():\n"
+    "    time.sleep(0.01)\n"
+    "if not go.exists():\n"
+    "    sys.exit(3)\n"  # never released — what a broken rendezvous looks like
+    "ids = []\n"
+    "for n in range(8):\n"
+    "    ids.append(append_entry(ledger, title=tag + '-' + str(n),\n"
+    "                            origin=tag + '-origin-' + str(n),\n"
+    "                            source_spec='spec-' + tag + '-' + str(n) + '.md',\n"
+    "                            reason='raced'))\n"
+    "done.write_text('\\n'.join(str(i) for i in ids))\n"
+)
+
+
+def test_two_processes_append_concurrently_produce_distinct_ids(tmp_path):
+    """#286's first acceptance criterion, end to end: two PROCESSES appending at
+    once produce every entry, each with its own id, and lose none.
+
+    This is the integration proof that the lock crosses a process boundary — the
+    one thing no in-process spy can show, and the only test here that exercises
+    the `msvcrt` branch on the Windows CI legs rather than `flock`. The children
+    inherit the environment, so the autouse `_isolate_state_root` fixture's
+    `BMAD_LOOP_STATE_DIR` reaches them and all three processes resolve the same
+    sidecar.
+
+    Deliberately NOT this test's job to grade the lock's absence: without it the
+    outcome is stochastic — a lost update or a duplicated `next_seq` mint needs
+    the two read->write windows to actually overlap — so an ablation here reds
+    only sometimes. The deterministic coverage is
+    `test_every_mutator_holds_the_ledger_lock` and
+    `test_scripted_interleave_loses_no_update` above.
+
+    No parent-held lock: the parent must not be a third contender, or the
+    children's blocking acquires would sit on the Windows ~10 s ceiling. Waits
+    are bounded polls on a monotonic deadline, never a bare sleep."""
+    path = write_ledger(tmp_path, "# Deferred Work\n")
+    go = tmp_path / "go"
+    procs, readies, dones = [], [], []
+    for n in (1, 2):
+        ready, done = tmp_path / f"ready-{n}", tmp_path / f"done-{n}"
+        procs.append(
+            subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    CONCURRENT_APPENDER,
+                    str(path),
+                    str(ready),
+                    str(go),
+                    str(done),
+                    f"w{n}",
+                ]
+            )
+        )
+        readies.append(ready)
+        dones.append(done)
+    try:
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and not all(r.exists() for r in readies):
+            time.sleep(0.02)
+        assert all(r.exists() for r in readies), "a child never reached the rendezvous"
+
+        go.write_text("go")  # release both at once
+        for proc in procs:
+            proc.communicate(timeout=120)
+            assert proc.returncode == 0
+    finally:
+        for proc in procs:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=10)
+
+    entries = parse_ledger(path.read_text(encoding="utf-8"))
+    assert len(entries) == 16  # nothing lost to a last-write-wins overwrite
+    assert len({e.id for e in entries}) == 16  # ...and no id minted twice
+
+    reported = [line for d in dones for line in d.read_text(encoding="utf-8").splitlines()]
+    assert "None" not in reported  # no append was silently deduped away
+    assert sorted(reported) == sorted(e.id for e in entries)

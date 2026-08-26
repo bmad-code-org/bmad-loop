@@ -926,6 +926,40 @@ def accepted_tags(project: Path) -> frozenset[str]:
     return frozenset({project_tag(project), str(project.resolve())})
 
 
+def lock_path_for(data_path: Path) -> Path:
+    """The advisory-lock sidecar for a mutable data file:
+    ``<state root>/locks/<sha256(resolved path)[:16]>-<basename>.lock``.
+
+    Out of the repository, deliberately, and NOT the ``<file>.lock`` sibling the
+    obvious reading of #286 asks for. The deferred-work ledger is a *tracked*
+    file by design, and both :func:`verify.commit_story` and
+    :func:`verify.finalize_commit` stage with ``git add -A``: a lock beside it
+    would be swept into the engine's own commits, and the git-add shield that
+    would otherwise hide it covers linked worktrees only. Under the state root
+    the sidecar is never git-visible at all, so no exclusion machinery has to be
+    kept correct for it.
+
+    Keyed on the **resolved** path so the identity of the lock is the identity of
+    the file rather than of the spelling used to reach it: a symlinked and a
+    direct path to one ledger rendezvous on one lock (without which the two
+    spellings would exclude nobody), two worktrees' in-tree ledgers are different
+    files and correctly get independent locks, and several projects pointed at a
+    shared external artifact dir land on one lock, which is where the real
+    contention is. The basename is appended for debuggability only — a human
+    reading ``ls`` of the locks dir should see which file a sidecar guards — and
+    carries no meaning for exclusion, which rides the digest.
+
+    Pure: no directory is created here, because
+    :func:`~bmad_loop.platform_util.file_lock` mkdirs the parent when it opens
+    the lock. May raise :class:`StateRootError` when the environment names no
+    usable state root (see :func:`state_root`); the caller fails rather than
+    silently locking somewhere else.
+    """
+    resolved = data_path.resolve()
+    digest = hashlib.sha256(os.fsencode(str(resolved))).hexdigest()[:16]
+    return state_root() / "locks" / f"{digest}-{resolved.name}.lock"
+
+
 def mux_sessions() -> list[str]:
     """All live session names, or [] when the multiplexer is missing, no server
     is running, or the query fails."""

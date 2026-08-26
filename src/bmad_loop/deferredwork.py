@@ -12,21 +12,36 @@ findings in the spec's frontmatter instead and the engine harvests them into
 canonical entries. The
 orchestrator never trusts an LLM to have edited it — status flips and decision
 records happen here, and gates re-read the file from disk.
+
+Concurrency (#286/#469): every mutator below is a read->edit->write of the whole
+file, so two orchestrator processes — a second `bmad-loop run`, a run plus a
+sweep, a run plus the TUI decision modal, a run plus `sweep --archive` — would
+otherwise both read, both edit, and let the last atomic write win. Each leaf
+mutator therefore runs its whole read->edit->write under :func:`ledger_lock`, a
+cross-process mutex on an out-of-repo sidecar. Readers stay lock-free on
+purpose: every writer replaces the file atomically, so a reader already sees one
+whole version or another, and taking the lock to read would buy nothing while
+adding a way to deadlock. Out of scope by #286's own non-goals: the dev/review
+LLM session writes this file directly and does NOT take the lock — orchestrator
+writes are sequenced against sessions today, so the exposure this closes is
+orchestrator-vs-orchestrator.
 """
 
 from __future__ import annotations
 
 import hashlib
 import re
+import threading
 from bisect import bisect_right
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date as calendar_date
 from pathlib import Path
 
 from . import sprintstatus
 from .fences import fenced_spans
-from .platform_util import atomic_write_text, neutralize_surrogates
+from .platform_util import atomic_write_text, file_lock, neutralize_surrogates
 
 HEADING_RE = re.compile(r"^### (DW-\d+): (.+?)\s*$", re.MULTILINE)
 # Where a canonical entry ENDS, in every shape CommonMark spells an ATX heading:
@@ -734,6 +749,57 @@ def _operation_digest(operation_id: str) -> str:
     return hashlib.sha256(operation_id.encode("utf-8")).hexdigest()
 
 
+# Per-thread reentrancy guard for :func:`ledger_lock`. `file_lock` is per open
+# fd, so a second acquisition from the same process does not merely queue — on
+# POSIX `flock` it blocks forever against a lock this very thread holds, with no
+# timeout and no traceback. Thread-local rather than a plain module global
+# because the state being tracked is "does THIS thread already hold it", and two
+# threads legitimately contend through the OS lock.
+_LOCK_STATE = threading.local()
+
+
+@contextmanager
+def ledger_lock(path: Path) -> Iterator[None]:
+    """Cross-process mutual exclusion for one ledger (#286/#469).
+
+    Held only around a single read->edit->write of `path` — never across a
+    subprocess, a coding-CLI session, or an operator pause. That is an acceptance
+    criterion of #286 rather than a style preference: `file_lock`'s Windows
+    branch gives up after ~10 s and raises, so a holder that waits on anything
+    slower converts a contended run into a failed one. It is also why the
+    engine's rollback/restore windows, which span git spawns, get compare-and-set
+    semantics instead of a lock around the window.
+
+    Acquired in exactly two strata: the leaf mutators in this module, and the
+    engine's CAS restores, which do pure in-memory text work under the hold.
+    Never call a mutator while holding it — every mutator takes this lock itself,
+    and the nested acquisition would deadlock.
+
+    Nesting raises :class:`RuntimeError` rather than deadlocking. The guard is
+    deliberately path-agnostic: two *different* ledgers would not self-deadlock
+    on the OS lock, but nesting is still a lock-ordering hazard, and no caller
+    has a reason to hold two ledgers at once. The lock file itself lives out of
+    the repository — see :func:`~bmad_loop.runs.lock_path_for` for why a sidecar
+    beside the tracked ledger would be committed by the engine's own `git add
+    -A`. Propagates `OSError` from acquisition and
+    :class:`~bmad_loop.runs.StateRootError` when no state root can be derived: a
+    write that could not be serialized must fail loudly, not proceed unlocked.
+    """
+    # Lazy, and it has to stay lazy: `runs` imports `verify`, which imports this
+    # module, so a top-level import here closes the cycle.
+    from . import runs
+
+    if getattr(_LOCK_STATE, "held", False):
+        raise RuntimeError("ledger lock is not reentrant")
+    lock_path = runs.lock_path_for(path)
+    _LOCK_STATE.held = True
+    try:
+        with file_lock(lock_path):
+            yield
+    finally:
+        _LOCK_STATE.held = False
+
+
 def _apply_done(
     text: str,
     dw_id: str,
@@ -787,23 +853,31 @@ def _mark_done_many(
     *,
     operation_id: str | None = None,
 ) -> list[str]:
-    """Shared atomic implementation for the public close operations."""
+    """Shared atomic implementation for the public close operations.
+
+    The whole read->edit->write runs under the cross-process ledger lock
+    (#286/#469): concurrent mutators — a second run, a sweep, the TUI decision
+    modal, ``sweep --archive`` — serialize here rather than trading
+    last-write-wins. Validation stays ABOVE the lock, so a programmer bug reports
+    itself without first waiting on another process.
+    """
     _require_iso_date(date)
     undo_owner = _operation_digest(operation_id) if operation_id is not None else None
-    if not path.is_file():
-        return []
-    text = path.read_text(encoding="utf-8")
-    marked: list[str] = []
-    for dw_id in dw_ids:
-        updated = _apply_done(text, dw_id, date, note, undo_owner=undo_owner)
-        if updated is None:
-            continue
-        text = updated
-        marked.append(dw_id)
-    if not marked:
-        return []
-    atomic_write_text(path, text)
-    return marked
+    with ledger_lock(path):
+        if not path.is_file():
+            return []
+        text = path.read_text(encoding="utf-8")
+        marked: list[str] = []
+        for dw_id in dw_ids:
+            updated = _apply_done(text, dw_id, date, note, undo_owner=undo_owner)
+            if updated is None:
+                continue
+            text = updated
+            marked.append(dw_id)
+        if not marked:
+            return []
+        atomic_write_text(path, text)
+        return marked
 
 
 def mark_done_many(path: Path, dw_ids: Sequence[str], date: str, note: str) -> list[str]:
@@ -874,85 +948,91 @@ def mark_open(path: Path, dw_id: str, note: str, operation_id: str) -> bool:
     than dropped: the reopened entry is no longer archived, but the body its
     close moved out still is, and that line is the only thing a later triage has
     to find it with.
+
+    The whole read->edit->write runs under the cross-process ledger lock
+    (#286/#469): concurrent mutators — a second run, a sweep, the TUI decision
+    modal, ``sweep --archive`` — serialize here rather than trading
+    last-write-wins.
     """
     undo_owner = _operation_digest(operation_id)
-    if not path.is_file():
-        return False
-    text = path.read_text(encoding="utf-8")
-    entry = _find_entry(text, dw_id)
-    if entry is None or entry.open:
-        return False
-    if entry.status_span is None:
-        # parse_ledger deliberately tolerates status-less entries. This primitive
-        # is later called from _defer, where an AttributeError would crash the run
-        # instead of completing the deferral.
-        return False
-    status_line = entry.body[entry.status_span[0] : entry.status_span[1]]
-    try:
-        _require_canonical_status(entry.status)
-    except ValueError:
-        # Only a canonical status written by mark_done is eligible for undo.
-        # Preserve malformed or human-authored statuses for validation/reporting.
-        return False
-    res_m = _MARK_DONE_TAIL_RE.match(entry.body, entry.status_span[1])
-    if res_m is None:
-        return False
-    if res_m.group(1).strip() != _one_line(note).strip() or res_m.group(2) != undo_owner:
-        return False
-    if status_line != f"status: done {res_m.group(3)}":
-        return False
-    try:
-        previous_status_line = bytes.fromhex(res_m.group(4)).decode("utf-8")
-    except (UnicodeDecodeError, ValueError):
-        return False
-    if LINE_BREAK_RE.search(previous_status_line):
-        return False
-    previous_status_m = STATUS_RE.fullmatch(previous_status_line)
-    previous_status = previous_status_m.group(1).strip() if previous_status_m else ""
-    if not previous_status or previous_status.split()[0] != "open":
-        return False
-    start = entry.span[0] + entry.status_span[0]
-    end = entry.span[0] + res_m.end()
-    # Demote the entry's live `archived:` stamps along with the close they
-    # describe, rather than deleting them. A stub's stamp says "this body lives
-    # in the archive file"; once the close is undone the body is here and the
-    # line is a lie, and leaving it standing is not merely untidy — status +
-    # undo tail + stamp is the exact `_STUB_BODY_RE` shape, so the next
-    # reopenable close reconstitutes a stub `archive_closed` skips forever,
-    # stranding the entry outside every future archive (#711).
-    #
-    # Cutting the line outright strands the entry a second way: a stub keeps
-    # neither `location:` nor `reason:` (`_PRESERVED_FIELD_RE`), so the stamp is
-    # the reopened entry's ONLY route back to the body, and triage arrives with
-    # a heading and nothing to triage (#711 review). Renaming the field keeps
-    # both properties — the value still narrows to the archive block, an id
-    # owning several once a re-closure is archived too, while the renamed line
-    # matches neither `_ARCHIVED_FIELD_RE` nor `_STUB_BODY_RE`, so the entry
-    # reads as live and re-archives normally. Rehydrating the body here
-    # instead was the alternative and is worse: several blocks per id is by
-    # design, so a rollback's reopen would have to guess which one, and a wrong
-    # guess overwrites live content with a stale body.
-    #
-    # Cuts are disjoint (an `^archived:` line cannot start inside the status
-    # line or its adjacent tail) and applied back-to-front so earlier offsets
-    # stay valid.
-    cuts = [(start, end, previous_status_line)]
-    for cut_start, cut_end in _archived_line_spans(entry):
-        # Everything after the field name — value, spacing and the terminating
-        # newline — carries over verbatim; the span starts at the anchor, so
-        # the first colon is the field's own.
-        stamp = entry.body[cut_start:cut_end].split(":", 1)[1]
-        cuts.append(
-            (
-                entry.span[0] + cut_start,
-                entry.span[0] + cut_end,
-                f"{_ARCHIVED_BODY_FIELD}{stamp}",
+    with ledger_lock(path):
+        if not path.is_file():
+            return False
+        text = path.read_text(encoding="utf-8")
+        entry = _find_entry(text, dw_id)
+        if entry is None or entry.open:
+            return False
+        if entry.status_span is None:
+            # parse_ledger deliberately tolerates status-less entries. This primitive
+            # is later called from _defer, where an AttributeError would crash the run
+            # instead of completing the deferral.
+            return False
+        status_line = entry.body[entry.status_span[0] : entry.status_span[1]]
+        try:
+            _require_canonical_status(entry.status)
+        except ValueError:
+            # Only a canonical status written by mark_done is eligible for undo.
+            # Preserve malformed or human-authored statuses for validation/reporting.
+            return False
+        res_m = _MARK_DONE_TAIL_RE.match(entry.body, entry.status_span[1])
+        if res_m is None:
+            return False
+        if res_m.group(1).strip() != _one_line(note).strip() or res_m.group(2) != undo_owner:
+            return False
+        if status_line != f"status: done {res_m.group(3)}":
+            return False
+        try:
+            previous_status_line = bytes.fromhex(res_m.group(4)).decode("utf-8")
+        except (UnicodeDecodeError, ValueError):
+            return False
+        if LINE_BREAK_RE.search(previous_status_line):
+            return False
+        previous_status_m = STATUS_RE.fullmatch(previous_status_line)
+        previous_status = previous_status_m.group(1).strip() if previous_status_m else ""
+        if not previous_status or previous_status.split()[0] != "open":
+            return False
+        start = entry.span[0] + entry.status_span[0]
+        end = entry.span[0] + res_m.end()
+        # Demote the entry's live `archived:` stamps along with the close they
+        # describe, rather than deleting them. A stub's stamp says "this body lives
+        # in the archive file"; once the close is undone the body is here and the
+        # line is a lie, and leaving it standing is not merely untidy — status +
+        # undo tail + stamp is the exact `_STUB_BODY_RE` shape, so the next
+        # reopenable close reconstitutes a stub `archive_closed` skips forever,
+        # stranding the entry outside every future archive (#711).
+        #
+        # Cutting the line outright strands the entry a second way: a stub keeps
+        # neither `location:` nor `reason:` (`_PRESERVED_FIELD_RE`), so the stamp is
+        # the reopened entry's ONLY route back to the body, and triage arrives with
+        # a heading and nothing to triage (#711 review). Renaming the field keeps
+        # both properties — the value still narrows to the archive block, an id
+        # owning several once a re-closure is archived too, while the renamed line
+        # matches neither `_ARCHIVED_FIELD_RE` nor `_STUB_BODY_RE`, so the entry
+        # reads as live and re-archives normally. Rehydrating the body here
+        # instead was the alternative and is worse: several blocks per id is by
+        # design, so a rollback's reopen would have to guess which one, and a wrong
+        # guess overwrites live content with a stale body.
+        #
+        # Cuts are disjoint (an `^archived:` line cannot start inside the status
+        # line or its adjacent tail) and applied back-to-front so earlier offsets
+        # stay valid.
+        cuts = [(start, end, previous_status_line)]
+        for cut_start, cut_end in _archived_line_spans(entry):
+            # Everything after the field name — value, spacing and the terminating
+            # newline — carries over verbatim; the span starts at the anchor, so
+            # the first colon is the field's own.
+            stamp = entry.body[cut_start:cut_end].split(":", 1)[1]
+            cuts.append(
+                (
+                    entry.span[0] + cut_start,
+                    entry.span[0] + cut_end,
+                    f"{_ARCHIVED_BODY_FIELD}{stamp}",
+                )
             )
-        )
-    for cut_start, cut_end, replacement in sorted(cuts, reverse=True):
-        text = text[:cut_start] + replacement + text[cut_end:]
-    atomic_write_text(path, text)
-    return True
+        for cut_start, cut_end, replacement in sorted(cuts, reverse=True):
+            text = text[:cut_start] + replacement + text[cut_end:]
+        atomic_write_text(path, text)
+        return True
 
 
 def append_decision(path: Path, dw_id: str, date: str, label: str, detail: str) -> bool:
@@ -971,23 +1051,30 @@ def append_decision(path: Path, dw_id: str, date: str, label: str, detail: str) 
     the reasons documented on :func:`mark_done_many`, plus one this sibling shares
     with it: a bare ``Path.write_text`` truncates *before* it encodes, so any
     failure between the two — an unencodable value, ``ENOSPC``, ``EIO`` — leaves a
-    zero-byte ledger where every entry used to be (#328)."""
+    zero-byte ledger where every entry used to be (#328).
+
+    The whole read->edit->write runs under the cross-process ledger lock
+    (#286/#469): concurrent mutators — a second run, a sweep, the TUI decision
+    modal, ``sweep --archive`` — serialize here rather than trading
+    last-write-wins.
+    """
     _require_iso_date(date)
-    if not path.is_file():
-        return False
-    text = path.read_text(encoding="utf-8")
-    entry = _find_entry(text, dw_id)
-    if entry is None:
-        return False
-    label = _one_line(label)
-    # Sanitize before the emptiness test, never after: a break-only detail
-    # collapses to "" and must then drop the separator with it, or the entry
-    # carries a dangling `— ` promising a detail that is not there.
-    detail = _one_line(detail)
-    detail_part = f" — {detail}" if detail else ""
-    text = _insert_after_status(text, entry, f"decision: {date} {label}{detail_part}")
-    atomic_write_text(path, text)
-    return True
+    with ledger_lock(path):
+        if not path.is_file():
+            return False
+        text = path.read_text(encoding="utf-8")
+        entry = _find_entry(text, dw_id)
+        if entry is None:
+            return False
+        label = _one_line(label)
+        # Sanitize before the emptiness test, never after: a break-only detail
+        # collapses to "" and must then drop the separator with it, or the entry
+        # carries a dangling `— ` promising a detail that is not there.
+        detail = _one_line(detail)
+        detail_part = f" — {detail}" if detail else ""
+        text = _insert_after_status(text, entry, f"decision: {date} {label}{detail_part}")
+        atomic_write_text(path, text)
+        return True
 
 
 DW_ID_RE = re.compile(r"\bDW-(\d+)\b")
@@ -1040,7 +1127,15 @@ def append_entry(
     the reasons documented on :func:`mark_done_many`, plus one this sibling shares
     with it: a bare ``Path.write_text`` truncates *before* it encodes, so any
     failure between the two — an unencodable value, ``ENOSPC``, ``EIO`` — leaves a
-    zero-byte ledger where every entry used to be (#328)."""
+    zero-byte ledger where every entry used to be (#328).
+
+    The whole read->edit->write runs under the cross-process ledger lock
+    (#286/#469): concurrent mutators — a second run, a sweep, the TUI decision
+    modal, ``sweep --archive`` — serialize here rather than trading
+    last-write-wins. That hold spans the ``next_seq`` mint as
+    well as the idempotence scan, which is what stops two concurrent appenders
+    reading the same highest id and both minting it (#469).
+    """
     _require_canonical_status(status)
     # The whitelist is derived from the legacy parser's alias table (defined
     # below; resolved at call time) so what this writer emits and what
@@ -1053,53 +1148,57 @@ def append_entry(
     source_spec = _one_line(source_spec)
     reason = _one_line(reason)
     location = _one_line(location)
-    text = path.read_text(encoding="utf-8") if path.is_file() else ""
-    for entry in parse_ledger(text):
-        if (
-            entry.open
-            and field_line_present(entry.body, "origin", origin)
-            and field_line_present(entry.body, "source_spec", source_spec)
-        ):
-            return None
-    dw_id = f"DW-{next_seq(text)}"
-    if given_title and not title.strip():
-        # A break-only title sanitizes to nothing, and `### DW-<n>: ` is a
-        # heading `HEADING_RE`'s `(.+?)` does not match: the caller is handed an
-        # id no reader can find while `next_seq` has already burned it.
-        #
-        # Tested with `.strip()`, not `not title`: a title of `"  "` carries no
-        # break at all, so `_one_line` returns it unchanged by the byte-identity
-        # fast path and it stays truthy. It parses, but renders blank in
-        # `status`, `--json` and the TUI — the unidentifiable half of the same
-        # problem, reached without ever touching the sanitizer.
-        #
-        # Scoped to a title that *had* content: an already-empty one keeps its
-        # long-standing behavior, and the invariant is about non-empty values.
-        title = f"(untitled {dw_id})"
-    lines = [
-        f"### {dw_id}: {title}",
-        f"origin: {origin}",
-        f"location: {location}",
-        f"source_spec: `{source_spec}`",
-    ]
-    if severity:
-        lines.append(f"severity: {severity}")
-    lines.append(f"reason: {reason}")
-    lines.append(f"status: {status}")
-    block = "\n".join(lines) + "\n"
-    # exactly one blank line between the previous content and the new entry
-    if text == "" or text.endswith("\n\n"):
-        sep = ""
-    elif text.endswith("\n"):
-        sep = "\n"
-    else:
-        sep = "\n\n"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_text(path, text + sep + block)
-    return dw_id
+    with ledger_lock(path):
+        text = path.read_text(encoding="utf-8") if path.is_file() else ""
+        for entry in parse_ledger(text):
+            if (
+                entry.open
+                and field_line_present(entry.body, "origin", origin)
+                and field_line_present(entry.body, "source_spec", source_spec)
+            ):
+                return None
+        dw_id = f"DW-{next_seq(text)}"
+        if given_title and not title.strip():
+            # A break-only title sanitizes to nothing, and `### DW-<n>: ` is a
+            # heading `HEADING_RE`'s `(.+?)` does not match: the caller is handed an
+            # id no reader can find while `next_seq` has already burned it.
+            #
+            # Tested with `.strip()`, not `not title`: a title of `"  "` carries no
+            # break at all, so `_one_line` returns it unchanged by the byte-identity
+            # fast path and it stays truthy. It parses, but renders blank in
+            # `status`, `--json` and the TUI — the unidentifiable half of the same
+            # problem, reached without ever touching the sanitizer.
+            #
+            # Scoped to a title that *had* content: an already-empty one keeps its
+            # long-standing behavior, and the invariant is about non-empty values.
+            title = f"(untitled {dw_id})"
+        lines = [
+            f"### {dw_id}: {title}",
+            f"origin: {origin}",
+            f"location: {location}",
+            f"source_spec: `{source_spec}`",
+        ]
+        if severity:
+            lines.append(f"severity: {severity}")
+        lines.append(f"reason: {reason}")
+        lines.append(f"status: {status}")
+        block = "\n".join(lines) + "\n"
+        # exactly one blank line between the previous content and the new entry
+        if text == "" or text.endswith("\n\n"):
+            sep = ""
+        elif text.endswith("\n"):
+            sep = "\n"
+        else:
+            sep = "\n\n"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(path, text + sep + block)
+        return dw_id
 
 
 ARCHIVE_REL = "deferred-work-archive.md"
+# The archive sibling is never locked in its own right: :func:`archive_closed`
+# is the only writer, and it holds the LEDGER's :func:`ledger_lock` across both
+# writes (#286/#469). Any future writer of this file must take that same lock.
 # A stub left by a prior archive_closed run carries this field. The next run
 # reads it to skip entries whose body has already been moved — without it,
 # every run would re-archive the stub (a heading + status line) and the
@@ -1301,115 +1400,124 @@ def archive_closed(
     skipped by their exact stub shape. A stub's ``archived:`` date names the
     archive block holding its body, so an entry recovered from a crashed run
     is stamped with the date already on that block rather than with this run's.
+
+    The whole read->edit->write runs under the cross-process ledger lock
+    (#286/#469): concurrent mutators — a second run, a sweep, the TUI decision
+    modal, ``sweep --archive`` — serialize here rather than trading
+    last-write-wins. ONE acquisition spans BOTH writes — the
+    archive sibling has no lock of its own precisely because it is only ever
+    written under its ledger's lock — and ``dry_run`` runs inside the hold too,
+    so there is one code path rather than a locked and an unlocked one.
     """
     if before is not None:
         _require_iso_date(before)
     if archive_date is not None:
         _require_iso_date(archive_date)
-    if not path.is_file():
-        return []
-    text = path.read_text(encoding="utf-8")
-    to_archive: list[tuple[DWEntry, str]] = []
-    for entry in parse_ledger(text):
-        close_date = _close_date(entry)
-        if close_date is None:
-            continue  # not done, or done without a date
-        if before is not None and close_date >= before:
-            continue  # closed on or after the cutoff
-        if _is_stub(entry):
-            continue  # stub from a prior archive_closed run
-        to_archive.append((entry, close_date))
-    if not to_archive:
-        return []
-    archived_ids = [e.id for e, _ in to_archive]
-    if dry_run:
-        return archived_ids
-    stamp = archive_date or calendar_date.today().isoformat()
-    archive_path = path.parent / ARCHIVE_REL
-    existing = archive_path.read_text(encoding="utf-8") if archive_path.is_file() else ""
-    # Append an `archived:` line after each entry's status line. The status
-    # span is body-relative, so the insertion works within the body slice —
-    # same offset math as `_insert_after_status`, applied to the body.
-    #
-    # Crash recovery: the archive is written BEFORE the ledger (see below), so
-    # a crash between the two writes leaves the ledger with full entries whose
-    # bodies are already in the archive. A retry must still stub those ledger
-    # entries (completing the interrupted operation) but must NOT append their
-    # bodies again — an append-only archive accumulating duplicates. Entries
-    # whose parsed archive twin carries a live (non-fenced) ``archived:``
-    # field are therefore skipped here and only replaced with stubs below.
-    #
-    # The twin must match in BODY, not merely in id and close date. A DW id is
-    # reusable across closures (`mark_open` reopens, a re-close follows) and a
-    # closed entry still accepts writes (`append_decision` does not read
-    # status), so id + date names a *closure slot*, not its content: reopened
-    # and re-closed the same day with a new resolution, or annotated with a
-    # decision after its body was archived, the ledger entry and its twin
-    # differ. Skipping on the slot alone stubbed that entry over its own
-    # content while reporting the id as archived — the body reached neither
-    # file (#711). A body that differs is appended instead; the archive holds
-    # several blocks per id by design, and over-archiving is recoverable where
-    # a silent drop is not.
-    archive_blocks: list[str] = []
-    already_archived = {
-        e.id: ((_close_date(e), _body_without_archived(e)), _archived_stamp(e))
-        for e in parse_ledger(existing)
-        if _is_archived(e)
-    }  # fence-aware: a quoted example in the archive is not a real body
-    # A recovered entry's stub is stamped with the date already on its archived
-    # body, not with this run's. The two diverge whenever the retry lands on a
-    # later day than the crashed run, and the stamp is not decoration: it is
-    # what picks one of an id's several archive blocks — for a reader following
-    # the stub, and for the `archived-body:` pointer `mark_open` demotes that
-    # stamp into, which is a reopened entry's only route back to its body
-    # (#711 review). A stub naming a date no block carries resolves to nothing.
-    recovered_stamps: dict[str, str] = {}
-    for entry, close_date in to_archive:
-        twin = already_archived.get(entry.id)
-        if twin is not None and twin[0] == (close_date, _body_without_archived(entry)):
-            # this closure's body is already archived (crashed prior run)
-            if twin[1] is not None:
-                recovered_stamps[entry.id] = twin[1]
-            continue
-        body = entry.body
-        assert entry.status_span is not None  # done with a date implies a status line
-        pos = entry.status_span[1]
-        body = body[:pos] + f"\narchived: {stamp}" + body[pos:]
-        archive_blocks.append(body)
-    # Appended, never prepended: for one id the file's order is closure order,
-    # which is the documented tie-break when two closures were archived on the
-    # same day and so carry the same stamp (#711 review).
-    if archive_blocks:
-        if existing == "" or existing.endswith("\n\n"):
-            sep = ""
-        elif existing.endswith("\n"):
-            sep = "\n"
+    with ledger_lock(path):
+        if not path.is_file():
+            return []
+        text = path.read_text(encoding="utf-8")
+        to_archive: list[tuple[DWEntry, str]] = []
+        for entry in parse_ledger(text):
+            close_date = _close_date(entry)
+            if close_date is None:
+                continue  # not done, or done without a date
+            if before is not None and close_date >= before:
+                continue  # closed on or after the cutoff
+            if _is_stub(entry):
+                continue  # stub from a prior archive_closed run
+            to_archive.append((entry, close_date))
+        if not to_archive:
+            return []
+        archived_ids = [e.id for e, _ in to_archive]
+        if dry_run:
+            return archived_ids
+        stamp = archive_date or calendar_date.today().isoformat()
+        archive_path = path.parent / ARCHIVE_REL
+        existing = archive_path.read_text(encoding="utf-8") if archive_path.is_file() else ""
+        # Append an `archived:` line after each entry's status line. The status
+        # span is body-relative, so the insertion works within the body slice —
+        # same offset math as `_insert_after_status`, applied to the body.
+        #
+        # Crash recovery: the archive is written BEFORE the ledger (see below), so
+        # a crash between the two writes leaves the ledger with full entries whose
+        # bodies are already in the archive. A retry must still stub those ledger
+        # entries (completing the interrupted operation) but must NOT append their
+        # bodies again — an append-only archive accumulating duplicates. Entries
+        # whose parsed archive twin carries a live (non-fenced) ``archived:``
+        # field are therefore skipped here and only replaced with stubs below.
+        #
+        # The twin must match in BODY, not merely in id and close date. A DW id is
+        # reusable across closures (`mark_open` reopens, a re-close follows) and a
+        # closed entry still accepts writes (`append_decision` does not read
+        # status), so id + date names a *closure slot*, not its content: reopened
+        # and re-closed the same day with a new resolution, or annotated with a
+        # decision after its body was archived, the ledger entry and its twin
+        # differ. Skipping on the slot alone stubbed that entry over its own
+        # content while reporting the id as archived — the body reached neither
+        # file (#711). A body that differs is appended instead; the archive holds
+        # several blocks per id by design, and over-archiving is recoverable where
+        # a silent drop is not.
+        archive_blocks: list[str] = []
+        already_archived = {
+            e.id: ((_close_date(e), _body_without_archived(e)), _archived_stamp(e))
+            for e in parse_ledger(existing)
+            if _is_archived(e)
+        }  # fence-aware: a quoted example in the archive is not a real body
+        # A recovered entry's stub is stamped with the date already on its archived
+        # body, not with this run's. The two diverge whenever the retry lands on a
+        # later day than the crashed run, and the stamp is not decoration: it is
+        # what picks one of an id's several archive blocks — for a reader following
+        # the stub, and for the `archived-body:` pointer `mark_open` demotes that
+        # stamp into, which is a reopened entry's only route back to its body
+        # (#711 review). A stub naming a date no block carries resolves to nothing.
+        recovered_stamps: dict[str, str] = {}
+        for entry, close_date in to_archive:
+            twin = already_archived.get(entry.id)
+            if twin is not None and twin[0] == (close_date, _body_without_archived(entry)):
+                # this closure's body is already archived (crashed prior run)
+                if twin[1] is not None:
+                    recovered_stamps[entry.id] = twin[1]
+                continue
+            body = entry.body
+            assert entry.status_span is not None  # done with a date implies a status line
+            pos = entry.status_span[1]
+            body = body[:pos] + f"\narchived: {stamp}" + body[pos:]
+            archive_blocks.append(body)
+        # Appended, never prepended: for one id the file's order is closure order,
+        # which is the documented tie-break when two closures were archived on the
+        # same day and so carry the same stamp (#711 review).
+        if archive_blocks:
+            if existing == "" or existing.endswith("\n\n"):
+                sep = ""
+            elif existing.endswith("\n"):
+                sep = "\n"
+            else:
+                sep = "\n\n"
+            archive_content = existing + sep + "".join(archive_blocks)
         else:
-            sep = "\n\n"
-        archive_content = existing + sep + "".join(archive_blocks)
-    else:
-        archive_content = existing  # pure crash-recovery pass: only stub the ledger
-    # Replace each archived entry's span with a stub, working backwards so
-    # earlier spans are unaffected by later replacements — the same
-    # text-surgery pattern as `_apply_done`, applied to multiple entries.
-    for entry, close_date in reversed(to_archive):
-        preserved = "".join(f"{line}\n" for line in _preserved_stub_lines(entry))
-        stub = (
-            f"### {entry.id}: {entry.title}\n\n"
-            f"status: done {close_date}\n"
-            f"{preserved}"
-            f"archived: {recovered_stamps.get(entry.id, stamp)}\n\n"
-        )
-        start, end = entry.span
-        text = text[:start] + stub + text[end:]
-    # Write the archive BEFORE the ledger: a crash between writes leaves the
-    # archive with extra content (harmless — the archive is append-only) and
-    # the ledger unchanged (safe — the bodies are still in the live file).
-    # Writing the ledger first would leave stubs in the ledger with no bodies
-    # in the archive — content lost.
-    atomic_write_text(archive_path, archive_content)
-    atomic_write_text(path, text)
-    return archived_ids
+            archive_content = existing  # pure crash-recovery pass: only stub the ledger
+        # Replace each archived entry's span with a stub, working backwards so
+        # earlier spans are unaffected by later replacements — the same
+        # text-surgery pattern as `_apply_done`, applied to multiple entries.
+        for entry, close_date in reversed(to_archive):
+            preserved = "".join(f"{line}\n" for line in _preserved_stub_lines(entry))
+            stub = (
+                f"### {entry.id}: {entry.title}\n\n"
+                f"status: done {close_date}\n"
+                f"{preserved}"
+                f"archived: {recovered_stamps.get(entry.id, stamp)}\n\n"
+            )
+            start, end = entry.span
+            text = text[:start] + stub + text[end:]
+        # Write the archive BEFORE the ledger: a crash between writes leaves the
+        # archive with extra content (harmless — the archive is append-only) and
+        # the ledger unchanged (safe — the bodies are still in the live file).
+        # Writing the ledger first would leave stubs in the ledger with no bodies
+        # in the archive — content lost.
+        atomic_write_text(archive_path, archive_content)
+        atomic_write_text(path, text)
+        return archived_ids
 
 
 # ------------------------------------------------------------------- legacy
