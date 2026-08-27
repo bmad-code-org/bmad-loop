@@ -591,6 +591,18 @@ _STALE = "a" * 40
         ({"baseline_commit": None}, ""),
         ({"baseline_revision": None, "baseline_commit": _STALE}, _STALE),
         ({"baseline_revision": None, "baseline_commit": None}, ""),
+        # A YAML boolean is the same trap class: PyYAML resolves `no`/`off`/`false`
+        # to False, `str(False)` is the token "False", and the truthiness test runs on
+        # that STRING — so an unguarded bool reads back as a claimed sha.
+        ({"baseline_revision": False}, ""),
+        ({"baseline_revision": True}, ""),
+        ({"baseline_commit": False}, ""),
+        # the sharp case: a bool on the WINNING key must defer to a valid legacy sha
+        # rather than shadow it. Unguarded this returns "False", which the gate's
+        # non-empty filter admits and `_canonical_commit_oid` then rejects — refusing
+        # an attempt whose correct baseline was sitting on the very next line.
+        ({"baseline_revision": False, "baseline_commit": _STALE}, _STALE),
+        ({"baseline_revision": True, "baseline_commit": _STALE}, _STALE),
         ({"baseline_revision": f"  {_FRESH}  "}, _FRESH),  # stripped
         ({}, ""),  # claims nothing
         ({"baseline_revision": 123}, "123"),  # a non-string scalar still reads back
@@ -599,9 +611,11 @@ _STALE = "a" * 40
 def test_auto_dev_baseline_of_precedence(fm, expected):
     """The one reader both consumers of a claimed baseline go through (#716).
 
-    Ablation for the two negative rows: delete the ``if raw is None: continue``
-    guard and the YAML-null rows read back the token ``"None"``; delete the
-    ``if value:`` guard and the empty-legacy-key row reads back ``""``.
+    Ablation for the negative rows: delete the ``raw is None`` guard and the
+    YAML-null rows read back the token ``"None"``; delete the ``isinstance(raw, bool)``
+    guard and the boolean rows read back ``"True"``/``"False"``, including in place of
+    the legacy sha they must defer to; delete the ``if value:`` guard and the
+    empty-legacy-key row reads back ``""``.
     """
     assert verify.auto_dev_baseline_of(fm) == expected
 
@@ -5350,7 +5364,10 @@ def test_verify_dev_stories_roots_its_exclude_on_the_code_tree(project, tmp_path
 
     assert out.ok
     assert seen == [paths.repo_root]
-    assert seen != [paths.project]  # the two are genuinely different directories
+    # the premise the assertion above rests on: under this override the two roots are
+    # genuinely different directories. Should the fixture ever collapse them, the
+    # recorded-root assertion stops separating the two spellings and this reddens.
+    assert paths.project != paths.repo_root
 
 
 def test_stories_relpaths_follows_the_root_it_is_given(project, tmp_path):

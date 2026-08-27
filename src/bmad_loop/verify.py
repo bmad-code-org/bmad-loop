@@ -3199,14 +3199,13 @@ def verify_dev_exclude_relpaths(
     status flip starts counting as real work. The latched `restore_patch` is
     anchored on the SAME root for the same reason (a relative latch names a path
     in the tree it will be applied to)."""
-    base = root
     candidates: list[Path] = [paths.sprint_status, spec_path]
     if restore_patch:
-        candidates.append(resolve_restore_path(restore_patch, base))
+        candidates.append(resolve_restore_path(restore_patch, root))
     out: list[str] = []
     for path in candidates:
         try:
-            rel = path.resolve().relative_to(base).as_posix()
+            rel = path.resolve().relative_to(root).as_posix()
         except (OSError, RuntimeError, ValueError):
             continue  # outside or uncertain; nothing safe to exclude here
         if rel and rel != ".":
@@ -3364,8 +3363,15 @@ def _verify_shared_gates(
     # configuration. Under the `repo_root` override (`isolation = "none"` plus a
     # `repo_root:` config key, the only shape where the two differ —
     # `bmadconfig.worktree_isolation_conflict` refuses the other) the session's cwd
-    # IS the code tree, so a `project`-anchored `has_changes_since` reported "no
-    # changes" forever and burned every attempt.
+    # IS the code tree, so a `project`-anchored probe judged a tree the session never
+    # touched. WHICH probe burned the attempt depends on the layout, and the burn is
+    # not `has_changes_since` in both: it fails OPEN (`rc != 0` -> True), so wherever
+    # `project` is not a checkout the failing git call PASSES that gate. Nested
+    # (`project` a subdirectory of the code tree) the call succeeds but is scoped to
+    # that subdirectory, and the "no changes" forever-burn is real. Disjoint
+    # (`project` beside the checkout) git fails and the burn moves to the probes that
+    # fail CLOSED: `_canonical_commit_oid` returns None -> "does not match", and
+    # `is_ancestor` / `commit_reachable_above_baseline` read the failure as False.
     if task.baseline_commit and claimed_baseline not in ("", "NO_VCS"):
         try:
             canonical_claimed = _canonical_commit_oid(paths.repo_root, claimed_baseline)

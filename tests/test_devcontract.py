@@ -14,6 +14,7 @@ import pytest
 # `baseline_commit:` line), a distinct case the reader must treat as absent WITHOUT
 # turning it into the token "None" (#358).
 from conftest import OMIT as _OMIT
+from conftest import _Omit
 
 from bmad_loop import devcontract, platform_util, verify
 
@@ -24,7 +25,7 @@ def _spec(
     status: str = "done",
     baseline_field: str = "baseline_revision",
     baseline: str = "abc123def456abc123def456abc123def456abcd",
-    legacy_baseline: object = _OMIT,
+    legacy_baseline: str | None | _Omit = _OMIT,
     auto_run: str | None = "done",
     body_extra: str = "",
     followup: bool | None = None,

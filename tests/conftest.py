@@ -1310,9 +1310,16 @@ def escalated_run(
     ``with_session`` appends the completed review SessionRecord the resolve-context
     builder reads. ``git_project`` makes ``state.project`` a REAL repo (spec files
     already written are committed, run state is gitignored) so `rearm_escalation`'s
-    baseline snapshot refresh actually runs and `baseline_commit` defaults to HEAD —
-    in a bare tmp_path its best-effort `except` swallows every git call and the
-    refresh silently no-ops.
+    baseline snapshot refresh actually runs and `baseline_commit` defaults to HEAD.
+    That refresh reads `state.code_root`, not `state.project`; the two name the same
+    directory for this fixture only because the RunState below records no
+    `repo_root`, and `code_root` is defined as `repo_root or project` — a caller that
+    ever adds an override must git-init THAT tree, not this one. In a bare tmp_path
+    the refresh's git calls raise `verify.GitError`, which re-arm swallows (a
+    non-repo project must not fail re-arm) but journals as
+    `rearm-baseline-advance-failed` while the old baseline stands — degraded and
+    visible, not silent, so a test asserting the advance must pass ``git_project``
+    rather than read a no-op as success.
     """
     project = Path(project)
     if git_project:

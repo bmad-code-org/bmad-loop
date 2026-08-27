@@ -201,7 +201,9 @@ _JOURNAL_DROP_FIELDS = frozenset(
         # collapses to `<redacted:str>`), but it fails closed only by accident of
         # shape — a root that did parse as a bare identifier would pass verbatim, and
         # nothing here should depend on a path never looking like one. The `error=`
-        # field on the very same record is dropped for the same reason.
+        # field on the very same record is dropped too, but under this set's
+        # free-text rule above (it is a `GitError` string quoting git's own stderr),
+        # not this identifier-shape argument — same set, different rationale.
         "repo",
     }
 )

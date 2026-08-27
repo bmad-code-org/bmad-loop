@@ -176,11 +176,17 @@ def auto_dev_baseline_of(fm: dict[str, Any]) -> str:
     A YAML-null value (a bare ``baseline_commit:`` line, or ``: null``) is treated
     as absent for the same reason ``status_of`` guards it: ``str(None)`` is the
     token ``"None"``, which is not a sha but IS non-empty, so it would flow into
-    the gate as a claim and fail an attempt that never made one (#358).
+    the gate as a claim and fail an attempt that never made one (#358). A YAML
+    BOOLEAN is the same trap class and is skipped with it: PyYAML resolves ``no``,
+    ``off`` and ``false`` to ``False`` (``yes``/``on``/``true`` to ``True``), and
+    ``str(False)`` is the token ``"False"`` — again not a sha, again non-empty.
+    Worse than null: because the truthiness test is on the STRINGIFIED value, a
+    bool on ``baseline_revision`` outranks and SHADOWS a correct ``baseline_commit``
+    sitting right beside it, refusing an attempt whose legacy claim was good.
     """
     for key in _BASELINE_KEYS:
         raw = fm.get(key)
-        if raw is None:
+        if raw is None or isinstance(raw, bool):
             continue
         value = str(raw).strip()
         if value:
