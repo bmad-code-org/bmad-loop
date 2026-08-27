@@ -2,6 +2,7 @@
 
 import binascii
 import json
+from pathlib import Path
 
 import pytest
 
@@ -36,6 +37,27 @@ def test_run_state_stories_fields_default_and_round_trip():
     back = RunState.from_dict(stories.to_dict())
     assert back.source == "stories"
     assert back.spec_folder == "_bmad-output/epic-1"
+
+
+def test_run_state_repo_root_round_trips_and_backs_code_root():
+    """The git root a run's code work happens in, persisted because
+    `runs.rearm_escalation` runs OUT OF PROCESS from the engine and had only
+    `project` to reach for."""
+    state = _state(repo_root="/code")
+    back = RunState.from_dict(state.to_dict())
+    assert back.repo_root == "/code"
+    assert back.code_root == Path("/code")
+
+
+def test_run_state_code_root_falls_back_to_project_for_legacy_state():
+    """A state.json written before the field existed reads back empty, and
+    `code_root` then answers `project` — exactly the pre-upgrade behavior, and the
+    correct answer for every run without a `repo_root:` override."""
+    d = _state().to_dict()
+    del d["repo_root"]  # state.json from before the field existed
+    back = RunState.from_dict(d)
+    assert back.repo_root == ""
+    assert back.code_root == Path("/p")
 
 
 def test_run_state_stories_fields_default_when_absent_from_dict():
@@ -174,6 +196,20 @@ def test_followup_reviews_spent_defaults_zero_for_legacy_state():
     doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
     del doc["followup_reviews_spent"]  # state.json from before the field existed
     assert StoryTask.from_dict(doc).followup_reviews_spent == 0
+
+
+def test_generation_round_trips():
+    task = StoryTask(story_key="1-1-a", epic=1, generation=2)
+    assert StoryTask.from_dict(task.to_dict()).generation == 2
+
+
+def test_generation_defaults_zero_for_legacy_state():
+    """A run in flight across the upgrade must resume at generation 0, which is the
+    value `engine._session_task_id` renders as no suffix at all — so every task id
+    already on disk still matches and its `tasks/` directory is still found (#705)."""
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    del doc["generation"]  # state.json from before the field existed
+    assert StoryTask.from_dict(doc).generation == 0
 
 
 def test_resolved_redrive_round_trips():

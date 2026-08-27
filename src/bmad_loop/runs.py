@@ -20,6 +20,7 @@ from pathlib import Path
 
 from . import devcontract, envvars, verify
 from .adapters.multiplexer import MultiplexerError, get_multiplexer, mux_usable
+from .frontmatter import auto_dev_baseline_of
 from .journal import STATE_FILE, VERIFY_DIR, Journal, load_state, save_state
 from .model import PAUSE_ESCALATION, Phase, RunState, StoryTask
 from .platform_util import (
@@ -2180,13 +2181,27 @@ def rearm_escalation(
     Flips the escalated task out of its terminal ESCALATED phase back to
     PENDING — which makes `_finish_inflight` reset the tree to the story's
     baseline and re-run it (clean rebuild) against the now-corrected frozen
-    spec. The baseline itself is advanced to the project's current HEAD (and
-    the untracked snapshot refreshed) so commits and files the resolve session
+    spec. The baseline itself is advanced to the CODE TREE's current HEAD
+    (`state.code_root`, which is `paths.repo_root` — the tree the dev writer
+    stamps from and the proof-of-work gate measures, and the same directory as
+    `state.project` in every configuration without a `repo_root:` override) and
+    the untracked snapshot refreshed, so commits and files the resolve session
     produced count as the rebuild's starting point, not as attempt debris to
     roll back. Strips the escalated attempt's stale `## Auto Run Result`
     section so the re-drive cannot read as terminal from its first save, and
     sets the spec's frontmatter status so step-01 routes to the right stage.
     Does NOT clear the pause; the caller resumes the run separately.
+
+    Two consequences of the reset are load-bearing and easy to undo by accident:
+
+    - `task.generation` is bumped, because `attempt` returning to 0 would
+      otherwise let the re-drive re-mint a session id byte-equal to one the
+      abandoned attempt already recorded (#705). `task.sessions` is deliberately
+      NOT cleared — a second resolve cycle reads that run-dir audit trail — so
+      the id is what has to change.
+    - The spec's `baseline_revision` is re-stamped on BOTH legs, and only when the
+      advance above actually moved (see the block that does it for why each half
+      of that is the way it is).
 
     Two re-drive modes, selected by `restore_patch`:
 
@@ -2250,6 +2265,14 @@ def rearm_escalation(
     # engine._finish_inflight): a clean re-attempt against the corrected spec.
     task.phase = Phase.PENDING
     task.attempt = 0
+    # A new generation of this task. `attempt` going back to 0 (and the next
+    # dispatch bumping it to 1) would otherwise re-mint a session task_id
+    # byte-equal to one the abandoned attempt already recorded, and
+    # `Engine._resumable_session` — matching that id over the append-only
+    # `task.sessions`, which this function deliberately does NOT clear — would
+    # replay the abandoned verdict for the fresh attempt (#705). Bumped BEFORE any
+    # dispatch, so the id is unique from the re-drive's first session onward.
+    task.generation += 1
     task.review_cycle = 0
     task.followup_reviews_spent = 0  # human-resolved re-drive gets a fresh damping budget
     task.defer_reason = None
@@ -2330,12 +2353,17 @@ def rearm_escalation(
     # sentinel must not be snapshotted), and before it because it feeds it.
     # Nothing is deleted here: the re-drive's reset (verify.safe_rollback) removes
     # whatever the refreshed snapshot no longer blesses, at the right moment.
-    stale_residue = _stale_restore_residue(
-        Path(state.project), journal, key, old_latch, old_baseline
-    )
+    # The CODE tree, not `state.project`: every git read below (and every baseline
+    # the proof-of-work gate later measures against) must name the repository the
+    # dev writer stamps, which is `paths.repo_root` == `workspace.root`. They are
+    # the same directory unless the BMAD config sets a `repo_root:` override, and a
+    # pre-upgrade state.json with no recorded root degrades to `project` exactly as
+    # before.
+    repo = state.code_root
+    stale_residue = _stale_restore_residue(repo, journal, key, old_latch, old_baseline)
 
-    # Advance the attempt baseline to the project's current HEAD and refresh the
-    # untracked snapshot: whatever the human-driven resolve session left on the
+    # Advance the attempt baseline to the CODE TREE's current HEAD (`repo`, above)
+    # and refresh the untracked snapshot: whatever the human-driven resolve session left on the
     # branch (a committed fixture, a corrected ledger, ...) is authorized input
     # for the re-drive, not failed-attempt debris. Without this, the re-drive's
     # reset-to-baseline in engine._rollback_or_pause parks the resolution
@@ -2349,27 +2377,81 @@ def rearm_escalation(
     # pre-existing untracked file. The two locals are computed before either task
     # field is assigned, so a failure on either git call can't advance
     # baseline_commit while baseline_untracked stays stale, or vice versa.
+    advanced = False
     try:
-        repo = Path(state.project)
         head = verify.rev_parse_head(repo)
         untracked = sorted(verify.untracked_files(repo) - stale_residue)
+    except verify.GitError as e:
+        # `verify.GitError` is a TOTAL replacement for the `except Exception` that
+        # stood here, not a narrowing that leaks: both calls go through `_run_git`,
+        # which translates spawn (`GitSpawnError`), timeout (`GitTimeoutError`) and
+        # decode faults into this one taxonomy, and a non-zero rc into a plain
+        # `GitError`. Still swallowed rather than raised — a project that is not a
+        # git repo must not fail re-arm — but no longer SILENT: the degrade is the
+        # difference between "the re-drive starts from the resolution" and "it
+        # rebuilds against the tree the human just corrected away", and the
+        # re-stamp below now refuses to paper over it.
+        journal.append(
+            "rearm-baseline-advance-failed",
+            story_key=key,
+            repo=str(repo),
+            baseline=old_baseline or "",
+            error=f"{e.__class__.__name__}: {e}",
+        )
+    else:
         task.baseline_commit = head
         task.baseline_untracked = untracked
-    except Exception:  # nosec B110 - best-effort git read, must not fail re-arm
-        pass
+        advanced = True
 
-    # Patch-restore only: re-stamp the spec's own baseline to the advanced one.
-    # The in-review route skips step-03 — the only step that stamps
-    # `baseline_revision` — so without this the re-driven step-04 would build its
-    # review diff (and, on an intent-gap/bad-spec re-triage, revert) "since" the
-    # ORIGINAL pre-attempt sha, clawing back the very resolve-session commits the
-    # advance above just blessed as the re-drive's starting point. Loud on
-    # failure: a silently stale spec baseline is exactly the hazard being closed
-    # (the spec block above already proved the file readable, so this is remote).
-    if restore_patch and task.spec_file and task.baseline_commit:
+    # Re-stamp the spec's own baseline to the advanced one, on BOTH re-drive legs.
+    #
+    # The patch-restore leg needs it because the in-review route skips step-03 —
+    # the only step that stamps `baseline_revision` — so without it the re-driven
+    # step-04 would build its review diff (and, on an intent-gap/bad-spec
+    # re-triage, revert) "since" the ORIGINAL pre-attempt sha, clawing back the
+    # very resolve-session commits the advance above just blessed as the re-drive's
+    # starting point.
+    #
+    # The from-scratch leg gets it too (#640a). Its step-03 re-stamps the key
+    # itself, so the write is redundant on the happy path — but only ON that path:
+    # until step-03 runs, the spec carries the escalated attempt's sha, and every
+    # gate that reads a claimed baseline before then reads a stale one. The cost is
+    # recorded rather than hidden: re-stamping removes the gate's INDEPENDENT
+    # signal on this leg (it then compares a value the orchestrator itself wrote),
+    # so a claim that genuinely diverged is journalled on the way out instead of
+    # being silently normalized.
+    #
+    # Gated on `advanced`, not on truthiness of `task.baseline_commit`: a failed
+    # advance leaves the OLD sha in that field, which passes a truthiness test
+    # identically to a freshly advanced one. Writing it would make spec and task
+    # agree on a stale value — the one state in which nothing downstream can tell
+    # that the advance never happened, and the re-drive rebuilds from the wrong
+    # point with no error anywhere. Skipping keeps the failure legible (the degrade
+    # is journalled above) and keeps re-arm non-fatal outside a repo.
+    #
+    # Loud on WRITE failure: a silently stale spec baseline is exactly the hazard
+    # being closed (the spec block above already proved the file readable, so this
+    # is remote).
+    if advanced and task.spec_file and task.baseline_commit:
+        spec_path = Path(task.spec_file)
         try:
+            # Read through the same reader both consumers of a claimed baseline use,
+            # so what gets journalled as "overwritten" is the value the gate would
+            # have judged — not whichever key happened to be inspected here (#716).
+            #
+            # INSIDE the try, with the write it describes. `read_frontmatter` opens
+            # the file itself, so an OSError here would otherwise escape as a
+            # traceback from the one block whose whole contract is to turn a spec
+            # this re-arm cannot move into an actionable `RearmError`. What it does
+            # NOT rescue: `read_frontmatter` DEGRADES an unparseable YAML block to
+            # `{}` rather than raising, so on such a spec `overwritten` is `""`, the
+            # guard below is falsy, and no divergence record is written even though
+            # the insert lands. That is the reader's deliberate observe-degrade
+            # contract, not something to defeat here — the value is unknowable, and
+            # inventing one would be worse than the silence.
+            overwritten = auto_dev_baseline_of(verify.read_frontmatter(spec_path))
             verify.set_frontmatter_field(
-                Path(task.spec_file),
+                spec_path,
                 "baseline_revision",
                 task.baseline_commit,
                 confine_root=Path(state.project),
@@ -2384,6 +2466,20 @@ def rearm_escalation(
                 f"cannot re-stamp baseline_revision on {task.spec_file} "
                 f"({e.__class__.__name__}: {e}) — fix the file, then re-run resolve"
             ) from e
+        if overwritten and overwritten != task.baseline_commit:
+            # A claim that did not already name the advanced baseline. On the
+            # patch-restore leg that is the ordinary case (the spec still names the
+            # pre-attempt sha); on the from-scratch leg it is the only trace left
+            # of a divergence the gate can no longer report, which is precisely why
+            # it is recorded.
+            journal.append(
+                "rearm-baseline-restamped",
+                story_key=key,
+                spec_file=str(spec_path),
+                overwritten=overwritten,
+                baseline=task.baseline_commit,
+                restore=bool(restore_patch),
+            )
 
     save_state(run_dir, state)
     journal.append(

@@ -111,6 +111,11 @@ _JOURNAL_ALIAS_FIELDS = {
     "target_branch": "branch",
     "commit": "commit",
     "baseline": "commit",
+    # The baseline a re-arm's re-stamp replaced (`rearm-baseline-restamped`). Its
+    # OWN entry rather than the `baseline` one beside it, because both shas ride a
+    # single record: alias one and leave the other and a dump pseudonymizes half a
+    # comparison, which is worse than either doing both or doing neither.
+    "overwritten": "commit",
     # A spec name IS the customer's feature name — `Pseudonymizer`'s own docstring
     # has always listed "spec filenames" among what it exists to alias, so the
     # omission here was a routing gap, not a policy. A producer that journals a
@@ -124,6 +129,12 @@ _JOURNAL_ALIAS_FIELDS = {
     # whose epic could not be resolved. See `_JOURNAL_BASENAME_NAMESPACES` for why
     # the value is normalized first: the producers do NOT agree on a bare basename.
     "spec": "spec",
+    # The producers do not agree on a field NAME either: `runs.rearm_escalation`
+    # and `engine._park_awaiting_operator` journal `spec_file`, and one of them
+    # writes an absolute path. Same value, same hazard, same namespace — and
+    # `_JOURNAL_BASENAME_NAMESPACES` keys on the namespace, not the field, so the
+    # absolute and worktree-relative spellings still reduce to one alias.
+    "spec_file": "spec",
 }
 # Namespaces whose journalled value arrives in more than one shape and must be
 # reduced to its basename before it is aliased. `spec` is one: engine.py's
@@ -176,6 +187,14 @@ _JOURNAL_DROP_FIELDS = frozenset(
         "capture_error",
         "stdout_path",
         "stderr_path",
+        # An absolute host path naming the run's code tree
+        # (`rearm-baseline-advance-failed`). Dropped rather than aliased: unlike a
+        # spec filename it correlates nothing across events — one run has one code
+        # root — while carrying the customer's directory layout, and
+        # `looks_like_identifier` would wave a one-segment root (`/srv`, `C:\code`)
+        # through verbatim on the `scrub_json` fallback. The `error=` field on the
+        # very same record is dropped for the same reason.
+        "repo",
     }
 )
 # Journal fields whose value is a LIST of story keys (sprint unknown-keys).

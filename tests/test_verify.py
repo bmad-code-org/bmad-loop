@@ -12,6 +12,7 @@ from conftest import (
     _FAIL,
     _OK,
     MISSING_TOOL_CMD,
+    OMIT,
     UNRESOLVABLE,
     _file_exists_cmd,
     fault_read_text,
@@ -562,6 +563,47 @@ def test_git_bytes_spawn_oserror_still_becomes_git_spawn_error(project, monkeypa
 )
 def test_status_of_normalizes(fm, expected):
     assert verify.status_of(fm) == expected
+
+
+_FRESH = "b" * 40
+_STALE = "a" * 40
+
+
+@pytest.mark.parametrize(
+    "fm,expected",
+    [
+        # the key the skill actually stamps, alone
+        ({"baseline_revision": _FRESH}, _FRESH),
+        # legacy-only spec: the orchestrator's own name, kept readable
+        ({"baseline_commit": _STALE}, _STALE),
+        # THE #716 CASE. `rearm_escalation` inserts `baseline_revision` and never
+        # removes a pre-existing `baseline_commit`, so a re-armed spec carries both.
+        # The replaced expression was `fm.get("baseline_commit", fm.get(...))`, which
+        # ranked the leftover FIRST and failed an attempt that did everything right.
+        ({"baseline_revision": _FRESH, "baseline_commit": _STALE}, _FRESH),
+        # `dict.get`'s default fires only on a MISSING key, so an empty legacy value
+        # was SELECTED and yielded "" — which every consumer reads as "no claim",
+        # disabling the baseline-match gate outright.
+        ({"baseline_revision": _FRESH, "baseline_commit": ""}, _FRESH),
+        # the fallback is on the VALUE, not the key: an empty fresh key defers
+        ({"baseline_revision": "", "baseline_commit": _STALE}, _STALE),
+        # YAML-null on either key is absent, never the token "None" (#358)
+        ({"baseline_commit": None}, ""),
+        ({"baseline_revision": None, "baseline_commit": _STALE}, _STALE),
+        ({"baseline_revision": None, "baseline_commit": None}, ""),
+        ({"baseline_revision": f"  {_FRESH}  "}, _FRESH),  # stripped
+        ({}, ""),  # claims nothing
+        ({"baseline_revision": 123}, "123"),  # a non-string scalar still reads back
+    ],
+)
+def test_auto_dev_baseline_of_precedence(fm, expected):
+    """The one reader both consumers of a claimed baseline go through (#716).
+
+    Ablation for the two negative rows: delete the ``if raw is None: continue``
+    guard and the YAML-null rows read back the token ``"None"``; delete the
+    ``if value:`` guard and the empty-legacy-key row reads back ``""``.
+    """
+    assert verify.auto_dev_baseline_of(fm) == expected
 
 
 def test_verify_dev_happy(project):
@@ -5059,6 +5101,171 @@ def test_read_frontmatter_ignores_triple_dash_in_value(project):
     assert fm["title"] == "restore --- review"
 
 
+# ------------------------------------------- repo_root override (divergent roots)
+#
+# `isolation = "none"` plus a `repo_root:` key in _bmad/bmm/config.yaml is the ONE
+# supported shape where `paths.project` and `paths.repo_root` name different
+# directories (`bmadconfig.worktree_isolation_conflict` refuses the other). The
+# `project` fixture sets no override, so `repo_root == project` and no pre-existing
+# row here can tell the two apart — which is why the wrong-root bug survived.
+
+
+def _repo_root_override(project, tmp_path):
+    """ProjectPaths for the override: BMAD artifacts under a `project` directory
+    that is not a checkout, code + git under a separate `repo_root`.
+
+    The session's cwd under this config IS `repo_root` (`Workspace.default` sets
+    `root = paths.repo_root`), so the dev writer already stamps its baseline there.
+    Only the readers were anchored on `project`."""
+    art = tmp_path / "artifacts-root"
+    impl = art / "_bmad-output" / "implementation-artifacts"
+    plan = art / "_bmad-output" / "planning-artifacts"
+    impl.mkdir(parents=True)
+    plan.mkdir(parents=True)
+    return dataclasses.replace(
+        project,
+        project=art,
+        implementation_artifacts=impl,
+        planning_artifacts=plan,
+        output_folder=art / "_bmad-output",
+        repo_root=project.project,
+    )
+
+
+def test_verify_dev_measures_proof_of_work_in_the_code_tree(project, tmp_path):
+    """The baseline is written in `repo_root` (by `Engine._dev_phase`, off
+    `workspace.root`) and must be READ there too. Anchored on `paths.project` the
+    gate asked a directory that is not the code checkout about a commit only the
+    code checkout has.
+
+    Ablation: put the canonical-oid probe back on `paths.project` and this reddens
+    with "does not match" — `artifacts-root` is not a repo, so the claimed commit
+    cannot be resolved there.
+
+    The proof-of-work probe deliberately is NOT graded by this row, and cannot be:
+    `has_changes_since` fails OPEN (`rc != 0 -> return True`), so pointing it at a
+    non-repo returns "there are changes" and a passing row stays green for the
+    wrong reason. The refusal row below is what grades it, which is why that one
+    asserts the exact reason rather than `not out.ok`.
+    """
+    paths = _repo_root_override(project, tmp_path)
+    write_sprint(paths, {"1-1-a": "review"})
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.baseline_commit = verify.rev_parse_head(paths.repo_root)
+    sp = spec_path(paths, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+    # the session's work lands where the session's cwd is: the CODE tree
+    (paths.repo_root / "src.txt").write_text("real work\n")
+
+    out = verify.verify_dev(task, paths, dev_result(sp))
+    assert out.ok
+    assert task.spec_file == str(sp)
+
+
+def test_verify_dev_refuses_proof_of_work_only_the_project_tree_holds(project, tmp_path):
+    """The other half of the same anchor: residue under `project` is not evidence
+    that anything was implemented, because no session writes code there.
+
+    The assertion is on the exact refusal REASON, not merely on `not out.ok` — but
+    NOT for the reason a reader might assume. Re-anchoring `has_changes_since` on
+    `paths.project` does not make the gate fault: `has_changes_since` fails OPEN
+    (`rc != 0 -> return True`, verify.py), so pointing it at a directory that is not
+    a git repository reports "there are changes" and the gate PASSES. The exact-reason
+    assertion is still the right call, for the neighbouring row's sake — that one
+    cannot grade this probe at all, precisely because the fail-open answer is also
+    the answer a correct run gives.
+
+    Ablation: re-anchor `has_changes_since` on `paths.project` and this row reddens
+    on `not out.ok` with `ok=True`.
+    """
+    paths = _repo_root_override(project, tmp_path)
+    write_sprint(paths, {"1-1-a": "review"})
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.baseline_commit = verify.rev_parse_head(paths.repo_root)
+    sp = spec_path(paths, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+    # a marker ONLY the project tree holds; the code tree is untouched
+    (paths.project / "marker.txt").write_text("not implementation work\n")
+
+    out = verify.verify_dev(task, paths, dev_result(sp))
+    assert not out.ok
+    assert out.reason == "no changes in worktree since baseline commit"
+
+
+def test_verify_dev_exclude_relpaths_follows_the_root_it_is_given(project, tmp_path):
+    """The pathspecs handed to git must be relative to the root git is invoked
+    against. A relpath computed against the other root does not raise — git simply
+    matches nothing — so the exclusion vanishes silently, which is why this is
+    pinned rather than left to the gate's behavior.
+
+    Ablation: make the helper ignore `root` (pin `base = paths.project`) and the
+    second half reddens — the board and spec come back as `project`-relative entries
+    that name nothing inside the code tree, which is the silent-no-op shape.
+    """
+    paths = _repo_root_override(project, tmp_path)
+    sp = spec_path(paths, "1-1-a")
+    sp.write_text("---\nstatus: in-review\n---\n", encoding="utf-8")
+
+    # project-rooted (the default): the board and the spec are both inside it
+    default = verify.verify_dev_exclude_relpaths(paths, sp)
+    assert any(r.endswith("sprint-status.yaml") for r in default)
+    assert any(r.endswith("spec-1-1-a.md") for r in default)
+    # code-tree-rooted: neither artifact lives there, so there is nothing to exclude
+    assert verify.verify_dev_exclude_relpaths(paths, sp, root=paths.repo_root) == ()
+
+
+def test_verify_dev_stories_roots_its_exclude_on_the_code_tree(project, tmp_path, monkeypatch):
+    """`_stories_relpaths` is one of the four exclude sources that had to move with
+    the gate's git root, and it is pinned at the SEAM rather than by outcome — on
+    purpose.
+
+    Under the supported override the story record and manifest sit outside the code
+    tree whichever root is used, so both spellings end in "nothing was excluded" and
+    no outcome assertion can separate them. What the wrong root actually costs is
+    invisible in a passing gate: a `project`-relative pathspec is resolved by git
+    against the CODE tree, silently excluding whatever happens to live at that
+    relative path there. So the contract is the root itself.
+
+    Ablation: pass `paths.project` at the call site and the recorded root reddens.
+    """
+    paths = _repo_root_override(project, tmp_path)
+    spec_folder = paths.planning_artifacts / "epic-a"
+    # built by hand rather than via `make_stories_task`, which reads HEAD of
+    # `paths.project` — under this override that directory is not a checkout
+    task = StoryTask(story_key="1", epic=1)
+    task.baseline_commit = verify.rev_parse_head(paths.repo_root)
+    sp = write_story(spec_folder, "1", "x", "done", task.baseline_commit)
+    (paths.repo_root / "src.txt").write_text("real work\n")
+
+    seen = []
+    real = verify._stories_relpaths
+    monkeypatch.setattr(
+        verify,
+        "_stories_relpaths",
+        lambda root, folder: (seen.append(root), real(root, folder))[1],
+    )
+    out = verify.verify_dev_stories(
+        task, paths, dev_result(sp), spec_folder=spec_folder, review_enabled=False
+    )
+
+    assert out.ok
+    assert seen == [paths.repo_root]
+    assert seen != [paths.project]  # the two are genuinely different directories
+
+
+def test_stories_relpaths_follows_the_root_it_is_given(project, tmp_path):
+    """Same rule for the stories-mode exclude: rooted where git runs."""
+    paths = _repo_root_override(project, tmp_path)
+    spec_folder = paths.implementation_artifacts / "spec-x"
+    spec_folder.mkdir(parents=True)
+    assert verify._stories_relpaths(paths.project, spec_folder) == (
+        "_bmad-output/implementation-artifacts/spec-x/stories",
+        "_bmad-output/implementation-artifacts/spec-x/stories.yaml",
+    )
+    # outside the code tree: nothing to exclude there, and no exception
+    assert verify._stories_relpaths(paths.repo_root, spec_folder) == ()
+
+
 def test_artifact_relpaths_returns_in_repo_folders(project):
     """The orchestrator-owned artifact folders, repo-relative posix."""
     rels = verify.artifact_relpaths(project)
@@ -5297,6 +5504,86 @@ def test_verify_dev_baseline_gate_reads_the_skills_baseline_revision_key(project
     # matching baseline + real work → the gate passes
     write_spec(sp, "in-review", task.baseline_commit)
     (project.project / "src.txt").write_text("real work\n")
+    assert verify.verify_dev(task, project, dev_result(sp)).ok
+
+
+def test_verify_dev_baseline_gate_prefers_the_fresh_revision_over_a_stale_legacy_key(project):
+    """#716: a spec carrying BOTH keys is what `runs.rearm_escalation` produces —
+    it inserts `baseline_revision` and never removes a pre-existing
+    `baseline_commit`. The gate must judge the value the skill just wrote, not the
+    leftover.
+
+    Ablation: swap `_BASELINE_KEYS` back to ("baseline_commit", "baseline_revision")
+    and this row reddens with "does not match", which is precisely the attempt this
+    bug burned — everything the session did was correct.
+    """
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit, legacy_baseline="0" * 40)
+    body = sp.read_text()
+    assert "baseline_revision:" in body and "baseline_commit:" in body  # the dual-key shape
+    (project.project / "src.txt").write_text("real work\n")
+
+    assert verify.verify_dev(task, project, dev_result(sp)).ok
+
+
+@pytest.mark.parametrize("legacy", ["", None])
+def test_verify_dev_baseline_gate_skips_an_unusable_legacy_key(project, legacy):
+    """An EMPTY (`baseline_commit: ''`) or YAML-null (bare `baseline_commit:`) legacy
+    key must not shadow the fresh claim. `dict.get`'s default fires only on a MISSING
+    key, so the empty value used to be selected and read back as "no claim" — which
+    skips the baseline-match check entirely, on the very spec shape the re-arm writes.
+
+    Ablation: drop the `if value:` / `if raw is None` guards in `auto_dev_baseline_of`
+    and the gate stops checking (the empty case) or fails on the token "None" (the
+    null case); either way the pairing below no longer holds.
+    """
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+    sp = spec_path(project, "1-1-a")
+    (project.project / "src.txt").write_text("real work\n")
+
+    # the fresh key still decides: matching passes ...
+    write_spec(sp, "in-review", task.baseline_commit, legacy_baseline=legacy)
+    assert verify.verify_dev(task, project, dev_result(sp)).ok
+    # ... and a foreign fresh key is still REFUSED (the gate is live, not skipped)
+    write_spec(sp, "in-review", "0" * 40, legacy_baseline=legacy)
+    out = verify.verify_dev(task, project, dev_result(sp))
+    assert not out.ok and "does not match" in out.reason
+
+
+def test_verify_dev_baseline_gate_refuses_a_stale_revision_beside_a_matching_legacy_key(project):
+    """The reverse-mismatch row, and a DELIBERATE tightening: `baseline_revision`
+    wins whenever it is non-empty, so a stale fresh key is refused even though the
+    legacy key names the right commit. That is the point of a precedence rule —
+    the stale field cannot override in EITHER direction, and a spec whose two keys
+    disagree is not silently rescued by whichever one happens to match.
+
+    Ablation: make the reader prefer whichever key matches and this row passes,
+    which is the "reads as green for the wrong reason" outcome it exists to refuse.
+    """
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", "0" * 40, legacy_baseline=task.baseline_commit)
+    (project.project / "src.txt").write_text("real work\n")
+
+    out = verify.verify_dev(task, project, dev_result(sp))
+    assert not out.ok and "does not match" in out.reason
+
+
+def test_verify_dev_baseline_gate_reads_a_legacy_only_spec(project):
+    """Back-compat: a spec predating the `baseline_revision` rename claims only
+    `baseline_commit`, and the gate must still read it."""
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", OMIT, legacy_baseline=task.baseline_commit)
+    body = sp.read_text()
+    assert "baseline_revision:" not in body and "baseline_commit:" in body
+    (project.project / "src.txt").write_text("real work\n")
+
     assert verify.verify_dev(task, project, dev_result(sp)).ok
 
 

@@ -138,6 +138,56 @@ def operator_actions_of(fm: dict[str, Any]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(a for a in items if a))
 
 
+# The two frontmatter keys a bmad-build-auto spec can carry a dev baseline under,
+# in precedence order. `baseline_revision` is what the skill's step-03 actually
+# stamps; `baseline_commit` is the legacy spelling (the name the orchestrator's
+# synthesized result.json uses) kept readable for specs written before the rename.
+_BASELINE_KEYS = ("baseline_revision", "baseline_commit")
+
+
+def auto_dev_baseline_of(fm: dict[str, Any]) -> str:
+    """The dev baseline a bmad-build-auto spec CLAIMS: the first non-empty value
+    among ``baseline_revision`` then ``baseline_commit``, stripped; ``""`` when the
+    spec claims neither.
+
+    Deliberately not the bare ``baseline_of`` the siblings' naming would suggest.
+    ``status_of`` and ``operator_actions_of`` are field-generic — they read one key
+    and normalize it — whereas this precedence belongs to the bmad-build-auto
+    contract specifically: the skill stamps ``baseline_revision``, the orchestrator's
+    own result.json says ``baseline_commit``, and a spec re-armed by
+    ``runs.rearm_escalation`` can carry both. A bare ``baseline_of`` would read as
+    universal when it is not (#716).
+
+    ``baseline_revision`` WINS whenever it is non-empty, even against a
+    ``baseline_commit`` that would have matched. Both consumers — the dev
+    devcontract's synthesized result and verify's baseline-match gate — read
+    through here so the two cannot drift, and the two byte-identical
+    ``fm.get("baseline_commit", fm.get("baseline_revision", ""))`` expressions
+    this replaces had the precedence the other way round. That flip is deliberate
+    and tightening: the legacy key is a leftover the re-arm never removes, so
+    ranking it first let a stale sha silently outrank the fresh value the skill
+    had just written, killing the gate on an attempt that did everything right.
+
+    An EMPTY legacy key is skipped rather than returned. ``dict.get``'s default
+    only fires on a MISSING key, so ``baseline_commit: ''`` used to be selected and
+    yield ``""`` — which every consumer reads as "no claim" and which therefore
+    disabled the baseline-match gate outright.
+
+    A YAML-null value (a bare ``baseline_commit:`` line, or ``: null``) is treated
+    as absent for the same reason ``status_of`` guards it: ``str(None)`` is the
+    token ``"None"``, which is not a sha but IS non-empty, so it would flow into
+    the gate as a claim and fail an attempt that never made one (#358).
+    """
+    for key in _BASELINE_KEYS:
+        raw = fm.get(key)
+        if raw is None:
+            continue
+        value = str(raw).strip()
+        if value:
+            return value
+    return ""
+
+
 class FrontmatterWriteError(Exception):
     """A frontmatter block carries a key the reader can see but no minimal line
     edit can safely rewrite.

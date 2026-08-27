@@ -504,6 +504,77 @@ def test_verify_command_free_text_drops_to_presence_booleans():
         assert canary not in rendered, f"LEAK: {canary!r}"
 
 
+def test_rearm_records_leak_neither_the_code_root_nor_a_spec_name():
+    """The two records `runs.rearm_escalation` added must be routed by FIELD NAME,
+    not left to the `scrub_json` fallback (#640, #716).
+
+    `repo` is an absolute host path naming the run's code tree, and the fallback
+    fails closed only by accident of shape — `looks_like_identifier` forbids `/`,
+    so a POSIX root collapses, but a one-segment root would ship verbatim. It is
+    DROPPED rather than aliased: one run has one code root, so it correlates
+    nothing, and the `error` field on the same record is already dropped.
+
+    `spec_file` is the customer's feature name (the very hazard
+    `_JOURNAL_ALIAS_FIELDS`' `spec` entry exists for) and is ALIASED, so a
+    maintainer can still follow one spec across events.
+
+    `overwritten` and `baseline` are both shas on one record, so aliasing one and
+    leaving the other would pseudonymize half a comparison — the assertion below
+    is that BOTH come back aliased and DIFFERENT from each other.
+
+    Ablation: drop `repo` from `_JOURNAL_DROP_FIELDS` and the canary sweep reddens;
+    drop `spec_file` or `overwritten` from `_JOURNAL_ALIAS_FIELDS` and the alias
+    assertions redden (`spec_file` on the canary sweep too).
+    """
+    other_sha = "f" * 40
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    advance_failed = diagnostics._scrub_entry(
+        {
+            "ts": 1.0,
+            "kind": "rearm-baseline-advance-failed",
+            "story_key": STORY_KEY,
+            "repo": HOME_PATH,
+            "baseline": SHA,
+            "error": f"GitError: git rev-parse HEAD failed in {HOME_PATH}",
+        },
+        pseudo,
+        {},
+        1.0,
+    )
+    restamped = diagnostics._scrub_entry(
+        {
+            "ts": 2.0,
+            "kind": "rearm-baseline-restamped",
+            "story_key": STORY_KEY,
+            "spec_file": SPEC_ABS,
+            "overwritten": other_sha,
+            "baseline": SHA,
+            "restore": False,
+        },
+        pseudo,
+        {},
+        1.0,
+    )
+
+    assert "repo" not in advance_failed and advance_failed["repo_present"] is True
+    assert "error" not in advance_failed  # the sibling that was already routed
+    # aliased, not dropped: the key stays and the VALUE is replaced, which is what
+    # keeps the record correlatable across events
+    alias = next(a for ns, orig, a in pseudo.entries() if ns == "spec" and orig == SPEC_NAME)
+    assert restamped["spec_file"] == alias
+    # the absolute spelling reduced to the basename first, so this spec has ONE
+    # alias and the home path never entered the legend
+    assert [orig for ns, orig, _a in pseudo.entries() if ns == "spec"] == [SPEC_NAME]
+    # both shas aliased, and distinguishable from each other
+    assert restamped["overwritten"] != other_sha and restamped["baseline"] != SHA
+    assert restamped["overwritten"] != restamped["baseline"]
+    assert restamped["restore"] is False  # a plain flag still ships
+
+    rendered = json.dumps([advance_failed, restamped])
+    for canary in (SHA, other_sha, SPEC_NAME, PROPRIETARY, HOME_PATH, *CANARIES):
+        assert canary not in rendered, f"LEAK: {canary!r}"
+
+
 def test_structure_is_preserved(project):
     run_dir = _seed_run(project.project)
     diag, _pseudo, _combined = _render_all([run_dir])

@@ -718,21 +718,43 @@ def render_deferred(items) -> str:
     return "\n".join(lines) + "\n"
 
 
+# `write_spec`'s "this key is not present at all" marker. A plain `None` cannot
+# serve: for `legacy_baseline` it means the YAML-null shape (a bare
+# `baseline_commit:` line), which is a distinct case the reader must treat as
+# absent WITHOUT turning it into the token "None" (#358).
+OMIT = object()
+
+
 def write_spec(
     path: Path,
     status: str,
-    baseline: str,
+    baseline: object,
     *,
     prose_status: str | None = None,
     closes_deferred: object = None,
     operator_actions: object = None,
     deferred=None,
+    legacy_baseline: object = OMIT,
 ) -> None:
     """Write a spec the way the real bmad-dev-auto skill does. The skill's step-03
     stamps `baseline_revision` and NEVER `baseline_commit` (that name exists only
     in the orchestrator's synthesized result.json), so this fixture stamps the
     same key — a reader that only knows `baseline_commit` must fail a test here,
     not sail through production (issue #89).
+
+    ``legacy_baseline`` adds the OTHER key, and exists because until #716 this
+    fixture *could not express the bug*: a spec that carries both is exactly what
+    `runs.rearm_escalation` manufactures (it inserts `baseline_revision` and never
+    removes a pre-existing `baseline_commit`), and no fixture could produce one, so
+    the precedence between them was untestable. ``OMIT`` writes no key at all
+    (the default, and what every pre-existing caller gets — `tests/test_verify.py`
+    asserts on that absence). ``None`` writes a bare ``baseline_commit:`` line, the
+    YAML-null shape. Any other value is written as a quoted scalar, including ``""``
+    for the empty-value shape that a ``dict.get(k, default)`` chain selects but a
+    non-empty test cannot see.
+
+    ``baseline`` accepts ``OMIT`` too, for the legacy-only spec: `baseline_revision`
+    is then absent and `baseline_commit` is the only claim on the file.
 
     ``closes_deferred`` writes the story-declared ledger-closure field (#234): a
     list renders as a YAML flow sequence, and a bare string renders as a scalar —
@@ -763,9 +785,16 @@ def write_spec(
         declare += f"operator_actions: {operator_actions}\n"
     if deferred is not None:
         declare += render_deferred(deferred)
+    claims = "" if baseline is OMIT else f"baseline_revision: '{baseline}'\n"
+    if legacy_baseline is not OMIT:
+        claims += (
+            "baseline_commit:\n"
+            if legacy_baseline is None
+            else f"baseline_commit: '{legacy_baseline}'\n"
+        )
     body = (
         f"---\ntitle: 'test'\ntype: 'feature'\nstatus: '{status}'\n"
-        f"baseline_revision: '{baseline}'\n{declare}---\n\n## Intent\n\ntest spec\n"
+        f"{claims}{declare}---\n\n## Intent\n\ntest spec\n"
     )
     if prose_status is not None:
         # mirror bmad-dev-auto's terminal finalize: it appends a `## Auto Run

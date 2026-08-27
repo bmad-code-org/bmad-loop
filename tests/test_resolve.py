@@ -40,16 +40,23 @@ def _escalated_run(
     source="sprint-status",
     sentinel_kind="",
     worktree_path="",
+    baseline_commit="abc123",
+    restore_patch=None,
 ):
     """conftest's builder with this module's shape: a review-cycle-1 task carrying a
-    completed review session (what `build_context` reads), returning the full triple."""
+    completed review session (what `build_context` reads), returning the full triple.
+
+    ``baseline_commit`` / ``restore_patch`` are forwarded for the rows that need a
+    task ALREADY carrying a latch and a real sha before re-arm runs — the state
+    `_stale_restore_residue` reads (`old_latch`, `old_baseline`) and returns early
+    without touching git when the latch is absent."""
     run = escalated_run(
         project,
         run_id,
         story_key="6-4-cli-list-command",
         epic=6,
         review_cycle=1,
-        baseline_commit="abc123",
+        baseline_commit=baseline_commit,
         started_at="2026-06-13T11:14:29",
         paused_reason="CRITICAL escalation from review session: names not unique",
         spec_file=spec_file,
@@ -57,6 +64,7 @@ def _escalated_run(
         source=source,
         sentinel_kind=sentinel_kind,
         worktree_path=worktree_path,
+        restore_patch=restore_patch,
     )
     return run.run_dir, run.state, run.task
 
@@ -655,6 +663,227 @@ def test_rearm_keeps_stale_baseline_outside_a_repo(tmp_path):
     assert task.baseline_commit == "abc123"
 
 
+def test_rearm_journals_a_failed_baseline_advance(tmp_path):
+    """#640(b): the advance was `except Exception: pass  # nosec B110`, so a
+    re-drive that silently rebuilt against the pre-resolution tree looked exactly
+    like one that adopted the human's fix. Still non-fatal — a project that is not
+    a repo must not fail re-arm — but no longer silent.
+
+    A non-repo project reaches the arm through `git rev-parse HEAD` returning 128,
+    which `_run_git` turns into a plain `GitError`; the spawn and timeout faults
+    arrive as its `GitSpawnError` / `GitTimeoutError` subclasses, so the narrowed
+    `except verify.GitError` is a total replacement for the bare `Exception`.
+
+    Ablation: delete the `journal.append` and this row reddens alone.
+    """
+    run_dir, _, _ = _escalated_run(tmp_path)  # tmp_path is not a git repo
+
+    runs.rearm_escalation(run_dir)
+
+    (entry,) = [e for e in _kinds(run_dir) if e["kind"] == "rearm-baseline-advance-failed"]
+    assert entry["story_key"] == "6-4-cli-list-command"
+    assert entry["baseline"] == "abc123"  # the sha that consequently still stands
+    assert "GitError" in entry["error"]
+    assert load_state(run_dir).tasks["6-4-cli-list-command"].baseline_commit == "abc123"
+
+
+def test_rearm_does_not_swallow_a_non_git_fault_from_the_advance(monkeypatch, tmp_path):
+    """The `except` arm is NARROWED, not merely observed. `_run_git` translates
+    every reachable git fault — non-zero rc, spawn failure, timeout, undecodable
+    output — into the `verify.GitError` taxonomy, so nothing legitimate is lost;
+    what the old bare `except Exception` also swallowed was every fault that is NOT
+    a git answer, and those are real bugs that must not be filed away as "the
+    project probably isn't a repo".
+
+    Ablation: widen the arm back to `except Exception` and this reddens with
+    DID NOT RAISE, which is exactly how the class of fault it names used to end.
+    """
+    _resolve_repo(tmp_path)
+    run_dir, _, _ = _escalated_run(tmp_path)
+
+    def boom(repo):
+        raise MemoryError("not a git answer")
+
+    monkeypatch.setattr(runs.verify, "untracked_files", boom)
+    with pytest.raises(MemoryError):
+        runs.rearm_escalation(run_dir)
+
+
+@pytest.mark.parametrize("restore", [None, "artifacts/attempt.patch"])
+def test_rearm_does_not_restamp_a_baseline_the_advance_did_not_move(monkeypatch, tmp_path, restore):
+    """#640(a)+(b) couple in ONE expression. The re-stamp guard tested
+    `task.baseline_commit` for truthiness only, and a failed advance leaves the OLD
+    sha in that field — which passes a truthiness test identically to a freshly
+    advanced one. Writing it would make spec and task agree on a stale value, the
+    one state in which nothing downstream can tell the advance never happened.
+
+    Both legs, because dropping the `restore_patch` guard is what makes the
+    from-scratch leg reach this write at all.
+
+    Ablation: gate the re-stamp on `task.baseline_commit` instead of `advanced` and
+    both rows redden — the spec comes back carrying the stale sha.
+    """
+    old_head = _resolve_repo(tmp_path)
+    run_dir, spec, new_head = _escalated_spec_run(tmp_path, old_head)
+
+    def boom(repo):
+        raise verify.GitError("simulated failure")
+
+    monkeypatch.setattr(runs.verify, "untracked_files", boom)
+    runs.rearm_escalation(run_dir, restore_patch=restore)
+
+    fm = verify.read_frontmatter(spec)
+    assert fm["baseline_revision"] == old_head  # NOT re-stamped with the stale sha
+    assert fm["baseline_revision"] != new_head
+    assert load_state(run_dir).tasks["6-4-cli-list-command"].baseline_commit == "abc123"
+    assert [e["kind"] for e in _kinds(run_dir) if e["kind"] == "rearm-baseline-restamped"] == []
+    assert [e["kind"] for e in _kinds(run_dir) if e["kind"] == "rearm-baseline-advance-failed"]
+
+
+def test_rearm_bumps_the_task_generation(tmp_path):
+    """#705: re-arm resets `attempt` to 0 and never clears `task.sessions`, so the
+    next dispatch re-mints a session task_id byte-equal to a record the abandoned
+    attempt already appended. The generation counter is what makes the new id
+    unique; `engine._session_task_id` emits it only above zero so every id already
+    on disk stays byte-identical.
+
+    Clearing `task.sessions` was the rejected alternative — it costs the run-dir
+    audit trail that a second resolve cycle reads — so the records below must still
+    be there after the re-arm.
+    """
+    run_dir, _, _ = _escalated_run(tmp_path)
+    before = load_state(run_dir).tasks["6-4-cli-list-command"]
+    assert before.generation == 0 and len(before.sessions) == 1
+
+    runs.rearm_escalation(run_dir)
+
+    task = load_state(run_dir).tasks["6-4-cli-list-command"]
+    assert task.generation == 1
+    assert task.attempt == 0
+    assert len(task.sessions) == 1  # the audit trail survives the re-arm
+
+    save_state(run_dir, _rearmable(run_dir))
+    runs.rearm_escalation(run_dir)
+    assert load_state(run_dir).tasks["6-4-cli-list-command"].generation == 2
+
+
+def test_rearm_advances_the_baseline_in_the_code_tree(tmp_path):
+    """Under a `repo_root` override the run's code + git live somewhere other than
+    `state.project`, and re-arm's advance used to read HEAD of `Path(state.project)`
+    — a directory the proof-of-work gate never measures.
+
+    Ablation: put the advance back on `Path(state.project)` and this reddens on the
+    journalled degrade (`artifacts-root` is not a repo), which is the *visible*
+    version of what the swallowed `except Exception` used to do silently.
+    """
+    code = tmp_path / "code"
+    code.mkdir()
+    head = _resolve_repo(code)
+    art = tmp_path / "artifacts-root"
+    art.mkdir()
+    run_dir, _, _ = _escalated_run(art)
+    state = load_state(run_dir)
+    state.repo_root = str(code)
+    save_state(run_dir, state)
+
+    (code / "fixture.txt").write_text("resolution fixture\n")
+    git(code, "add", "-A")
+    git(code, "commit", "-q", "-m", "resolution fixture")
+    (code / "leftover.txt").write_text("keep me\n")
+
+    runs.rearm_escalation(run_dir)
+
+    task = load_state(run_dir).tasks["6-4-cli-list-command"]
+    assert task.baseline_commit == git(code, "rev-parse", "HEAD") != head
+    assert "leftover.txt" in task.baseline_untracked
+    assert [e for e in _kinds(run_dir) if e["kind"] == "rearm-baseline-advance-failed"] == []
+
+
+def test_rearm_reads_stale_restore_residue_from_the_code_tree(tmp_path):
+    """`_stale_restore_residue`'s repo argument moved to the code tree with the
+    advance, and the cost of getting it wrong here is not a lost notice — it is
+    CONTAMINATED baseline state.
+
+    The helper does two things with that root: it anchors a RELATIVE `restore_patch`
+    latch on it, and it runs `commits_above` in it. Anchored on the wrong root the
+    patch is not found, the abandoned restore's new files are never subtracted, and
+    they enter `baseline_untracked` as "pre-existing" — after which every rollback
+    preserves them and `finalize_commit`'s `add -A` sweeps the abandoned attempt into
+    the corrected story's commit (#90). The committed-variant notice is lost in the
+    same breath, because `commits_above` faults in a directory that is not a repo and
+    the warn-only arm degrades to no record at all.
+
+    Ablation: revert the argument to `Path(state.project)` and this reddens three
+    ways — `newfile.txt` re-enters `baseline_untracked`, `stale-restore-excluded`
+    becomes `stale-restore-unparseable`, and `stale-restore-commits` disappears.
+    """
+    code = tmp_path / "code"
+    code.mkdir()
+    old_head = _resolve_repo(code)
+    art = tmp_path / "artifacts-root"
+    art.mkdir()
+
+    # the abandoned restore attempt: a patch under the CODE tree, latched RELATIVE
+    # (which is what makes the anchoring root load-bearing), plus the untracked file
+    # it created
+    (code / "artifacts").mkdir()
+    (code / "artifacts" / "attempt.patch").write_text(
+        "diff --git a/newfile.txt b/newfile.txt\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/newfile.txt\n"
+        "@@ -0,0 +1 @@\n"
+        "+from the abandoned attempt\n",
+        encoding="utf-8",
+    )
+    (code / "newfile.txt").write_text("from the abandoned attempt\n")
+    (code / "leftover.txt").write_text("genuinely pre-existing\n")
+
+    run_dir, _, _ = _escalated_run(
+        art, baseline_commit=old_head, restore_patch="artifacts/attempt.patch"
+    )
+    state = load_state(run_dir)
+    state.repo_root = str(code)
+    save_state(run_dir, state)
+
+    # the resolve session's own commit, above the old baseline
+    (code / "fixture.txt").write_text("resolution fixture\n")
+    git(code, "add", "fixture.txt")
+    git(code, "commit", "-q", "-m", "resolution fixture")
+    new_head = git(code, "rev-parse", "HEAD")
+
+    runs.rearm_escalation(run_dir)  # from scratch: the latch is dropped
+
+    task = load_state(run_dir).tasks["6-4-cli-list-command"]
+    assert task.baseline_commit == new_head
+    # the patch's new file is SUBTRACTED; the genuine leftover is kept
+    assert "newfile.txt" not in task.baseline_untracked
+    assert "leftover.txt" in task.baseline_untracked
+
+    kinds = _kinds(run_dir)
+    (excluded,) = [e for e in kinds if e["kind"] == "stale-restore-excluded"]
+    assert excluded["files"] == ["newfile.txt"]
+    assert [e for e in kinds if e["kind"] == "stale-restore-unparseable"] == []
+    # the committed variant the human has to classify by hand
+    (commits,) = [e for e in kinds if e["kind"] == "stale-restore-commits"]
+    assert commits["old_baseline"] == old_head and commits["commits"] == [new_head]
+
+
+def test_rearm_falls_back_to_project_when_no_code_root_was_recorded(tmp_path):
+    """A state.json written before `RunState.repo_root` existed carries no root, and
+    must degrade to exactly the pre-upgrade behavior rather than to a path that does
+    not exist. `d.get(key, default)` on the load side is what makes that true."""
+    head = _resolve_repo(tmp_path)
+    run_dir, _, _ = _escalated_run(tmp_path)
+    raw = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+    del raw["repo_root"]  # state.json from before the field existed
+    (run_dir / "state.json").write_text(json.dumps(raw), encoding="utf-8")
+
+    assert load_state(run_dir).repo_root == ""
+    runs.rearm_escalation(run_dir)
+    assert load_state(run_dir).tasks["6-4-cli-list-command"].baseline_commit == head
+
+
 def test_rearm_clears_sentinel_preserving_a_copy(tmp_path):
     """Stories mode: a fixed-slug sentinel (`<id>-unresolved.md`) is cleared by
     deletion, not a status flip — re-arm preserves a copy, journals the blocking
@@ -901,25 +1130,99 @@ def test_rearm_restore_patch_restamps_spec_baseline(tmp_path):
     assert load_state(run_dir).tasks[key].baseline_commit == new_head
 
 
-def test_rearm_from_scratch_leaves_spec_baseline_alone(tmp_path):
-    """A from-scratch re-arm routes ready-for-dev -> step-03, which re-stamps
-    `baseline_revision` itself — the re-arm must not touch it."""
-    old_head = _resolve_repo(tmp_path)
+def _escalated_spec_run(tmp_path, baseline: str, *, extra: str = ""):
+    """A real repo + an escalated run whose spec claims `baseline`, plus one
+    resolution commit on top. Returns (run_dir, spec, new_head)."""
     spec = tmp_path / "spec.md"
     spec.write_text(
-        f"---\nstatus: blocked\nbaseline_revision: {old_head}\n---\n\n## Intent\n\nx\n",
+        f"---\nstatus: blocked\nbaseline_revision: {baseline}\n{extra}---\n\n## Intent\n\nx\n",
         encoding="utf-8",
     )
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec))
     (tmp_path / "fixture.txt").write_text("resolution fixture\n")
     git(tmp_path, "add", "-A")
     git(tmp_path, "commit", "-q", "-m", "resolution fixture")
+    return run_dir, spec, git(tmp_path, "rev-parse", "HEAD")
+
+
+def _kinds(run_dir):
+    return [
+        json.loads(line)
+        for line in (run_dir / "journal.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+
+
+def test_rearm_restamps_spec_baseline_on_the_from_scratch_leg_too(tmp_path):
+    """#640(a): the re-stamp used to be gated on `restore_patch`, so a from-scratch
+    re-drive left the escalated attempt's sha on the spec until step-03 ran — and
+    every gate reading a claimed baseline before then read a stale one.
+
+    The design call is recorded rather than hidden: extending the re-stamp to this
+    leg also removes the gate's INDEPENDENT signal here (it then compares a value
+    the orchestrator itself wrote), which is why the overwrite is journalled — see
+    the row below.
+    """
+    old_head = _resolve_repo(tmp_path)
+    run_dir, spec, new_head = _escalated_spec_run(tmp_path, old_head)
 
     runs.rearm_escalation(run_dir)  # no restore
 
     fm = verify.read_frontmatter(spec)
-    assert fm["baseline_revision"] == old_head  # untouched; step-03 owns the stamp
+    assert fm["baseline_revision"] == new_head
     assert fm["status"] == "ready-for-dev"
+    assert load_state(run_dir).tasks["6-4-cli-list-command"].baseline_commit == new_head
+
+
+def test_rearm_journals_the_spec_baseline_it_overwrote(tmp_path):
+    """A claim the re-stamp normalizes away is the only trace of a divergence the
+    gate can no longer report, so it lands in the journal on the way out — read
+    back through the SAME reader the gate uses, so what is recorded is the value
+    the gate would have judged (#716).
+
+    Ablation: drop the `rearm-baseline-restamped` append and the row reddens; drop
+    the `overwritten != task.baseline_commit` guard and the second half reddens
+    (a re-arm that changed nothing would report an overwrite).
+    """
+    old_head = _resolve_repo(tmp_path)
+    run_dir, spec, new_head = _escalated_spec_run(tmp_path, old_head)
+
+    runs.rearm_escalation(run_dir)
+
+    (entry,) = [e for e in _kinds(run_dir) if e["kind"] == "rearm-baseline-restamped"]
+    assert entry["overwritten"] == old_head
+    assert entry["baseline"] == new_head
+    assert entry["restore"] is False
+
+    # a second re-arm has nothing left to overwrite: no duplicate record
+    save_state(run_dir, _rearmable(run_dir))
+    runs.rearm_escalation(run_dir)
+    assert len([e for e in _kinds(run_dir) if e["kind"] == "rearm-baseline-restamped"]) == 1
+
+
+def test_rearm_prefers_the_fresh_revision_when_the_spec_carries_both_keys(tmp_path):
+    """A re-armed spec carries BOTH keys — this function is what puts them there.
+    What it journals as overwritten must therefore be the value the gate reads,
+    which is `baseline_revision`, not the stale legacy leftover (#716)."""
+    old_head = _resolve_repo(tmp_path)
+    run_dir, spec, new_head = _escalated_spec_run(
+        tmp_path, old_head, extra=f"baseline_commit: {'a' * 40}\n"
+    )
+
+    runs.rearm_escalation(run_dir)
+
+    (entry,) = [e for e in _kinds(run_dir) if e["kind"] == "rearm-baseline-restamped"]
+    assert entry["overwritten"] == old_head  # NOT the stale baseline_commit
+    fm = verify.read_frontmatter(spec)
+    assert fm["baseline_revision"] == new_head
+    assert fm["baseline_commit"] == "a" * 40  # the legacy key is never removed
+
+
+def _rearmable(run_dir):
+    """Re-escalate the task so a second `rearm_escalation` is legal."""
+    state = load_state(run_dir)
+    task = state.tasks["6-4-cli-list-command"]
+    task.phase = Phase.ESCALATED
+    return state
 
 
 # -------------------------------------------------- non-UTF-8 robustness (bug class)

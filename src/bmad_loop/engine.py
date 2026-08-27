@@ -360,13 +360,63 @@ produces. If you end your turn without it, the session is eventually declared
 stalled and its work may be discarded."""
 
 
-def _session_task_id(story_key: str, part: str, seq: int) -> str:
+def _session_task_id(story_key: str, part: str, seq: int, generation: int = 0) -> str:
     """Single composition point for session task ids. Sanitize the whole
     composition, not the parts: two individually capped parts can still compose
     past a Windows filename segment limit, and ``safe_segment``'s digest suffix
     differs between the two orders. ``_resumable_session``'s resume match must
-    be byte-identical to what ``_run_session`` stored, so both MUST call this."""
-    return safe_segment(f"{story_key}-{part}-{seq}")
+    be byte-identical to what ``_run_session`` stored, so both MUST call this.
+
+    ``generation`` is ``StoryTask.generation``, bumped once per human re-arm
+    (``runs.rearm_escalation``). Re-arm resets ``attempt`` to 0 and the next
+    dispatch bumps it back to 1, so without this the re-minted id was BYTE-EQUAL
+    to a record the abandoned attempt already appended to ``task.sessions`` — and
+    ``_resumable_session``, which scans that append-only list, replayed the
+    abandoned attempt's verdict for the fresh one (#705).
+
+    The suffix is composed INSIDE the f-string, before ``safe_segment``, because
+    the whole-composition cap and digest contract above is what makes the id a
+    legal single segment; appending after sanitization could push it back over
+    ``MAX_SEGMENT``. It is emitted ONLY when ``generation > 0``, so every id an
+    existing run already wrote to disk stays byte-identical and a run resumed
+    across this upgrade still finds its ``tasks/`` directories."""
+    gen = f"-g{generation}" if generation > 0 else ""
+    return safe_segment(f"{story_key}-{part}-{seq}{gen}")
+
+
+# Longest single-line `reason` a notification channel carries. Not a display
+# preference: `gates.notify` writes exactly one `[stamp] title: message` line into
+# ATTENTION and hands the same string to a desktop toast, while a `Decision.reason`
+# is routinely MULTI-line — `verify.verify_command_results_outcome` appends the
+# captured output tail below the command line on purpose, because a repair session
+# reads that tail as its feedback. Pasted through verbatim, one failing verify
+# command spills a whole build log into ATTENTION as many un-prefixed lines (the
+# file's own `[stamp] title:` grammar breaks with it) and into a notification bubble.
+NOTICE_REASON_MAX = 200
+
+
+def _notice_reason(reason: str) -> str:
+    """``reason`` as ONE bounded line, for a notification channel.
+
+    Keeps the first non-empty line and caps it. Every producer front-loads the
+    classification there — ``verify command failed (rc=1): pytest -q``, ``spec
+    baseline … does not match orchestrator-recorded baseline …`` — and puts the
+    evidence underneath, so the first line is exactly the part a human deciding
+    whether to intervene needs. Nothing is lost: the untruncated reason is already
+    in the ``dev-decision`` journal entry every caller writes before notifying,
+    which is where a maintainer reads it.
+
+    A trim is MARKED (``[…]``) rather than silent, so a reader can tell a reason
+    that ended there from one that was cut — a bare truncation reads as the whole
+    story and is how a "no changes since baseline" gets mistaken for the complete
+    diagnosis.
+    """
+    first = next((line.strip() for line in reason.splitlines() if line.strip()), "")
+    trimmed = first != reason.strip()
+    if len(first) > NOTICE_REASON_MAX:
+        first = first[:NOTICE_REASON_MAX].rstrip()
+        trimmed = True
+    return f"{first} […]" if trimmed else first
 
 
 def _at_or_past(landed: str | None, target: str) -> bool:
@@ -1585,7 +1635,7 @@ class Engine:
             role, seq = "review", task.review_cycle
         else:
             return None
-        task_id = _session_task_id(task.story_key, role, seq)
+        task_id = _session_task_id(task.story_key, role, seq, task.generation)
         for record in reversed(task.sessions):
             if record.task_id != task_id:
                 continue
@@ -1601,7 +1651,7 @@ class Engine:
 
     def _current_dev_session_index(self, task: StoryTask) -> int | None:
         """Index of the newest primary dev record for the current attempt."""
-        task_id = _session_task_id(task.story_key, "dev", task.attempt)
+        task_id = _session_task_id(task.story_key, "dev", task.attempt, task.generation)
         for index in range(len(task.sessions) - 1, -1, -1):
             if task.sessions[index].task_id == task_id:
                 return index
@@ -2297,6 +2347,27 @@ class Engine:
                     return False
                 return True
             if decision.action == Action.RETRY:
+                # Tell the operator WHY the attempt is being redone (#640d). Every
+                # other dev outcome already notifies; RETRY was the one silent arm,
+                # and it is the arm that DISCARDS a completed implementation — the
+                # non-fixable leg below rolls the tree back to baseline. Without
+                # this the only record was the `dev-decision` journal line, so a
+                # run could burn its whole attempt budget throwing away finished
+                # work with nothing on the operator's phone but the eventual
+                # exhaustion notice.
+                #
+                # Placed at the TOP of the branch, ahead of the fixable/non-fixable
+                # split: it is the only point where both `decision.reason` and
+                # `task.attempt` are known-good for this decision, and it is before
+                # `_rollback_or_pause` can raise `RunPaused` and skip the notice for
+                # exactly the attempt whose loss most needs announcing.
+                gates.notify(
+                    self.policy,
+                    self.run_dir,
+                    f"dev retry: {task.story_key} (attempt {task.attempt})",
+                    _notice_reason(decision.reason)
+                    or "dev attempt rejected with no reason recorded",
+                )
                 if outcome is not None and outcome.fixable:
                     # work exists and the failure is concrete: keep the tree,
                     # hand the failing output to a repair session
@@ -4905,22 +4976,30 @@ class Engine:
         a session-authored ledger-only change as valid work even when the same
         attempt also records a frontmatter deferral. Standing down exposes more
         of the tree to the gate, which is the conservative direction.
+
+        The relpath is derived against ``paths.repo_root``, the tree the gate
+        invokes git in, NOT ``paths.project`` (#716). The two are the same object
+        in every configuration but the `repo_root` override, and under that
+        override the ledger sits outside the code tree — where it cannot satisfy
+        proof-of-work, so ``()`` is the right answer rather than a pathspec git
+        would silently match nothing against.
         """
         if not task.harvest_wrote_ledger or task.ledger_changed_before_harvest:
             return ()
         paths = self.workspace.paths
+        root = paths.repo_root
         try:
-            rel = paths.deferred_work.resolve().relative_to(paths.project.resolve())
+            rel = paths.deferred_work.resolve().relative_to(root.resolve())
         except ValueError:
-            # The proof-of-work gate only sees the project tree, so an external
-            # ledger cannot satisfy it and needs no exclusion.
+            # The proof-of-work gate only sees the code tree, so a ledger outside it
+            # cannot satisfy the gate and needs no exclusion.
             return ()
         except (OSError, RuntimeError):
             # ProjectPaths are normalized when loaded. If filesystem resolution
-            # nevertheless faults, keep a lexically in-project ledger excluded:
+            # nevertheless faults, keep a lexically in-tree ledger excluded:
             # uncertainty must not turn the engine's append into session proof.
             try:
-                rel = paths.deferred_work.relative_to(paths.project)
+                rel = paths.deferred_work.relative_to(root)
             except ValueError:
                 return ()
         return (rel.as_posix(),)
@@ -5178,7 +5257,7 @@ class Engine:
     ) -> SessionResult:
         # ``label`` names a non-standard session (a plugin-provided workflow) so
         # its task_id stays distinct from the role's own dev/review attempts.
-        task_id = _session_task_id(task.story_key, label if label else role, seq)
+        task_id = _session_task_id(task.story_key, label if label else role, seq, task.generation)
         adapter = self.adapters[role]
         cfg = self.policy.adapter.resolved(role)
         env = {

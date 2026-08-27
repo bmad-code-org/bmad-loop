@@ -29,6 +29,7 @@ from .frontmatter import set_frontmatter_status  # noqa: F401 — re-export
 from .frontmatter import (
     _edit_frontmatter_block,
     _split_frontmatter,
+    auto_dev_baseline_of,
     operator_actions_of,
     read_frontmatter,
     status_of,
@@ -3133,7 +3134,11 @@ def artifact_relpaths(paths: ProjectPaths) -> tuple[str, ...]:
 
 
 def verify_dev_exclude_relpaths(
-    paths: ProjectPaths, spec_path: Path, restore_patch: str | None = None
+    paths: ProjectPaths,
+    spec_path: Path,
+    restore_patch: str | None = None,
+    *,
+    root: Path | None = None,
 ) -> tuple[str, ...]:
     """Repo-relative posix paths the dev/bundle proof-of-work gate excludes from
     `has_changes_since` — file-granularity, unlike `artifact_relpaths`' whole-folder
@@ -3165,15 +3170,26 @@ def verify_dev_exclude_relpaths(
     an un-normalized `..`/`.` segment would still resolve to the real on-disk
     file (the OS resolves it), but as a raw string it wouldn't match git's own
     normalized path output, silently defeating this exclude and letting a bare
-    status flip on the session's own spec count as real work."""
+    status flip on the session's own spec count as real work.
+
+    ``root`` is the tree the resulting pathspecs are relative to, and MUST be the
+    same root the caller invokes git against — `paths.repo_root` for the
+    proof-of-work gate, which is where `has_changes_since` runs. It defaults to
+    `paths.project`, which is what every pre-#716 caller passed implicitly and
+    what the two roots collapse to in every configuration but the `repo_root`
+    override. A relpath computed against the wrong root does not raise: it simply
+    matches nothing on git's side, so the exclusion silently disappears and a bare
+    status flip starts counting as real work. The latched `restore_patch` is
+    anchored on the SAME root for the same reason (a relative latch names a path
+    in the tree it will be applied to)."""
+    base = paths.project if root is None else root
     candidates: list[Path] = [paths.sprint_status, spec_path]
     if restore_patch:
-        candidates.append(resolve_restore_path(restore_patch, paths.project))
+        candidates.append(resolve_restore_path(restore_patch, base))
     out: list[str] = []
-    project = paths.project
     for path in candidates:
         try:
-            rel = path.resolve().relative_to(project).as_posix()
+            rel = path.resolve().relative_to(base).as_posix()
         except (OSError, RuntimeError, ValueError):
             continue  # outside or uncertain; nothing safe to exclude here
         if rel and rel != ".":
@@ -3315,14 +3331,27 @@ def _verify_shared_gates(
     # `baseline_commit` — that name exists only in the result.json devcontract
     # synthesizes, which this gate does not consult (it re-reads frontmatter).
     # An absent key skips the check below, so reading `baseline_commit` alone
-    # made this gate dead code for every generic-skill session. Read both, the
-    # same idiom as `devcontract.synthesize_result`.
-    claimed_baseline = str(fm.get("baseline_commit", fm.get("baseline_revision", ""))).strip()
+    # made this gate dead code for every generic-skill session. Both keys are read
+    # through the one shared reader `devcontract.synthesize_result` also calls, so
+    # the value this gate judges and the value the result.json reports are the same
+    # value by construction rather than by two expressions agreeing (#716).
+    claimed_baseline = auto_dev_baseline_of(fm)
     proof_baseline: str = task.baseline_commit or ""
     include_untracked_proof = True
+    # Every probe below runs against `paths.repo_root`, the CODE tree, never
+    # `paths.project`. Both baseline writers stamp `workspace.root`
+    # (`Engine._dev_phase`, `SweepEngine`'s migration task) and re-arm now does the
+    # same, and `Workspace.default` sets `root = paths.repo_root` while
+    # `ProjectPaths.rebased` sets both roots to the worktree — so `repo_root` is
+    # the one root that names the same repository as the recorded baseline in every
+    # configuration. Under the `repo_root` override (`isolation = "none"` plus a
+    # `repo_root:` config key, the only shape where the two differ —
+    # `bmadconfig.worktree_isolation_conflict` refuses the other) the session's cwd
+    # IS the code tree, so a `project`-anchored `has_changes_since` reported "no
+    # changes" forever and burned every attempt.
     if task.baseline_commit and claimed_baseline not in ("", "NO_VCS"):
         try:
-            canonical_claimed = _canonical_commit_oid(paths.project, claimed_baseline)
+            canonical_claimed = _canonical_commit_oid(paths.repo_root, claimed_baseline)
         except GitError as e:
             return VerifyOutcome.escalate(str(e))
         if canonical_claimed is None:
@@ -3340,7 +3369,7 @@ def _verify_shared_gates(
             # history (a superset of the unit's changes), which is sound; a
             # diverged or unknown baseline still fails.
             older_ok = allow_ancestor_baseline and is_ancestor(
-                paths.project, canonical_claimed, task.baseline_commit
+                paths.repo_root, canonical_claimed, task.baseline_commit
             )
             # The other direction needs no opt-in flag: an intervening commit
             # before step-03 stamps `baseline_revision` makes the claim newer
@@ -3348,7 +3377,7 @@ def _verify_shared_gates(
             # HEAD reaches that canonical descendant; stale, diverged, unknown,
             # and off-HEAD commits still fail.
             newer_ok = commit_reachable_above_baseline(
-                paths.project, canonical_claimed, task.baseline_commit
+                paths.repo_root, canonical_claimed, task.baseline_commit
             )
             # Accepting a newer claim moves the proof-of-work reference onto it:
             # under `isolation = "none"` the claimed commit may have arrived in
@@ -3366,10 +3395,18 @@ def _verify_shared_gates(
                 )
 
     if extra_exclude is not None and task.baseline_commit:
-        exclude = verify_dev_exclude_relpaths(paths, spec_path, task.restore_patch) + extra_exclude
+        # The exclude pathspecs are rooted where git is invoked: `repo_root` here
+        # and `repo_root` in every producer that composes into `extra_exclude`
+        # (`Engine._harvest_gate_exclude`, `_stories_relpaths`). A pathspec relative
+        # to a different root is not merely wrong, it is SILENTLY wrong — git
+        # matches nothing and the exclusion evaporates.
+        exclude = (
+            verify_dev_exclude_relpaths(paths, spec_path, task.restore_patch, root=paths.repo_root)
+            + extra_exclude
+        )
         try:
             if not has_changes_since(
-                paths.project,
+                paths.repo_root,
                 proof_baseline,
                 exclude=exclude,
                 baseline_untracked=task.baseline_untracked,
@@ -3477,12 +3514,15 @@ def verify_dev(
     covers EVERY park, including one that wrote nothing and listed plausible
     actions, because the actions gate tests list non-emptiness and never content.
 
-    ``engine_written`` names project-relative paths the orchestrator itself
-    wrote above this gate during the attempt. They compose with the mode's normal
-    proof-of-work exclusions so engine bookkeeping cannot masquerade as session
-    work; see :meth:`Engine._harvest_gate_exclude`. On the parked leg they are not
-    passed at all — proof-of-work is skipped there, so there is no exclusion set
-    left for them to compose with.
+    ``engine_written`` names paths the orchestrator itself wrote above this gate
+    during the attempt, relative to ``paths.repo_root`` — the tree the gate invokes
+    git in, and therefore the root every pathspec composed into this exclusion set
+    must share (#716). They compose with the mode's normal proof-of-work exclusions
+    so engine bookkeeping cannot masquerade as session work; see
+    :meth:`Engine._harvest_gate_exclude`, which is their producer and states what a
+    ledger outside the code tree resolves to. On the parked leg they are not passed
+    at all — proof-of-work is skipped there, so there is no exclusion set left for
+    them to compose with.
     """
     rj = result_json or {}
     spec_file = rj.get("spec_file")
@@ -3681,7 +3721,12 @@ def verify_dev_stories(
         paths,
         expected_status=expected,
         extra_exclude=(
-            None if plan_halt else _stories_relpaths(paths.project, spec_folder) + engine_written
+            None
+            if plan_halt
+            # Rooted where the proof-of-work gate invokes git (`paths.repo_root`),
+            # not on `paths.project`: a pathspec relative to the other root matches
+            # nothing and the exclusion evaporates without an error (#716).
+            else _stories_relpaths(paths.repo_root, spec_folder) + engine_written
         ),
     )
     if gate is not None:
@@ -3691,14 +3736,19 @@ def verify_dev_stories(
     return VerifyOutcome.passed()
 
 
-def _stories_relpaths(project: Path, spec_folder: Path) -> tuple[str, ...]:
+def _stories_relpaths(root: Path, spec_folder: Path) -> tuple[str, ...]:
     """Proof-of-work exclude prefixes for the story record + manifest: the spec
-    folder's ``stories/`` subdir and its ``stories.yaml``, project-relative. Empty
-    when the spec folder is outside the project tree (nothing to exclude there)."""
+    folder's ``stories/`` subdir and its ``stories.yaml``, relative to ``root``.
+    Empty when the spec folder is outside that tree (nothing to exclude there).
+
+    ``root`` is the tree git is invoked against — `paths.repo_root` at the one
+    production call site, which under the `repo_root` override is NOT
+    `paths.project` (the spec folder then sits outside the code tree and this
+    correctly returns ``()``)."""
     from .stories import STORIES_FILENAME, STORIES_SUBDIR
 
     try:
-        rel = spec_folder.resolve().relative_to(project.resolve()).as_posix()
+        rel = spec_folder.resolve().relative_to(root.resolve()).as_posix()
     except (OSError, RuntimeError, ValueError):
         return ()
     base = "" if rel == "." else f"{rel}/"
@@ -4288,8 +4338,10 @@ def resolve_restore_path(raw: str, root: Path) -> Path:
     `model.StoryTask.restore_patch` documents the field as repo-relative-or-absolute,
     and every consumer must resolve it against the base it actually reads the tree
     from — the engine's live workspace root (the unit worktree under isolation),
-    `paths.project` for the proof-of-work exclude, the CLI's `--project`. Hence the
-    caller-supplied `root` rather than one baked-in base.
+    `paths.repo_root` for the proof-of-work exclude (which is where
+    `has_changes_since` runs, so the latch has to name a path in that tree; #716),
+    the CLI's `--project`. Hence the caller-supplied `root` rather than one
+    baked-in base.
 
     In practice `cli._resolve_restore_patch` always latches an already-`.resolve()`d
     absolute path, so the relative branch is exercised only by a hand-written state

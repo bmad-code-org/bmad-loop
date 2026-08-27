@@ -25,6 +25,12 @@ breaking changes may land in a minor release.
   block that holds its body. Refuses while any engine run is live. Pure deterministic Python —
   no LLM involvement.
 
+- **A dev RETRY now notifies the operator, with the reason** (#640). RETRY was the only dev
+  outcome that raised no notice, and it is the one that discards a completed implementation —
+  the non-fixable leg resets the tree to baseline. The reason lived only in the `dev-decision`
+  journal line, so a run could spend its whole attempt budget throwing finished work away with
+  nothing but the eventual exhaustion notice reaching a human.
+
 - **Batched deferred-work ledger primitives** (#286, #469). `append_entries`,
   `mark_open_many`, `record_decision` and `mark_done_many`'s per-id `notes=` each collapse a
   sequence that used to be one write per row — or one write per half of an append-then-close
@@ -39,6 +45,15 @@ breaking changes may land in a minor release.
   failing on a lock it never needed.
 
 ### Changed
+
+- **`bmad-loop resolve` re-stamps the spec's `baseline_revision` on both re-drive legs**
+  (#640), not only on a patch-restore. A from-scratch re-drive used to carry the escalated
+  attempt's sha until step-03 re-stamped it, so every gate reading a claimed baseline before
+  then read a stale one. The trade is recorded rather than hidden: on that leg the gate now
+  compares a value the orchestrator itself wrote, so a claim that genuinely diverged is
+  journalled (`rearm-baseline-restamped`) instead of being silently normalized. A re-stamp is
+  refused outright when the baseline advance failed, so spec and task can never agree on a
+  stale sha.
 
 - **A published run archive now lands at mode `0600`** instead of a umask-derived mode (#591).
   It is staged through a file the orchestrator creates itself rather than one `tarfile` opens
@@ -73,6 +88,44 @@ breaking changes may land in a minor release.
   previously-loading config.
 
 ### Fixed
+
+- **A stale `baseline_commit` no longer outranks the fresh `baseline_revision` a spec
+  claims** (#716). The two consumers of a claimed dev baseline carried byte-identical
+  expressions that ranked the legacy key first — and `bmad-loop resolve` manufactures exactly
+  that dual-key spec, inserting `baseline_revision` while never removing a pre-existing
+  `baseline_commit`. The gate then judged the leftover and failed an attempt that had done
+  everything right. One shared reader (`frontmatter.auto_dev_baseline_of`) now backs both:
+  `baseline_revision` wins whenever it is non-empty, `baseline_commit` remains the
+  backward-compatible fallback, and an empty or YAML-null value on either key reads as absent
+  rather than as a claim of `""` or the token `"None"`.
+
+- **The dev proof-of-work gate measures the tree the baseline was written in** (#716). Under an
+  explicit `repo_root:` with `isolation = "none"`, the baseline is stamped in the git root
+  (where the session's cwd is) but every gate probe — the commit-identity lookup, both
+  ancestry checks and `has_changes_since` — asked the BMAD project directory about it. The
+  four probes now share the git root, and so do the three proof-of-work exclude sources that
+  feed them — the gate's own file-granular excludes, the stories record/manifest excludes, and
+  the engine's own ledger append. A marker only the project tree holds therefore no longer
+  satisfies proof of work, and a correct attempt is no longer refused forever. The fourth
+  exclude helper, `artifact_relpaths`, stays project-rooted on purpose: its consumer is
+  rollback protection (`Engine._protected_relpaths`), not this gate. No effect where the two
+  roots coincide, which is every other configuration.
+
+- **`bmad-loop resolve` advances the re-arm baseline in the code tree, and says so when it
+  cannot** (#640). The advance read HEAD of the BMAD project directory rather than the git
+  root, and swallowed every failure with a bare `except Exception`, so a re-drive that
+  silently rebuilt against the pre-resolution tree looked exactly like one that adopted the
+  human's fix. It is still non-fatal outside a repository, but now narrowed to the typed git
+  errors and journalled (`rearm-baseline-advance-failed`); anything that is not a git answer
+  propagates.
+
+- **A re-armed story can no longer replay the abandoned attempt's verdict** (#705). Re-arm
+  resets `attempt` to 0 and deliberately keeps `task.sessions`, so the next dispatch re-minted
+  a session id byte-equal to a record the abandoned attempt had already written — and a host
+  death before the new record landed resumed straight into that stale result. A per-task
+  generation counter now discriminates the id. It is emitted only above zero, so every id
+  already on disk stays byte-identical and a run resumed across the upgrade still finds its
+  `tasks/` directories.
 
 - **The three review gates run `[verify] commands` in the git root, not the BMAD project
   root** (#695). Under an explicit `repo_root:` with `isolation = "none"` they shelled out in
