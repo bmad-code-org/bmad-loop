@@ -15,7 +15,7 @@ import subprocess
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import TypeVar
+from typing import Any, TypeVar
 
 from rich.text import Text
 from textual import work
@@ -821,6 +821,24 @@ class BmadLoopApp(App[None]):
         self.notify("plan reset to draft — the next dispatch re-plans")
         self._do_resume(run_id)
 
+    @staticmethod
+    def _journal_entries_guarded(run_dir: Path) -> list[dict[str, Any]]:
+        """Journal entries, or `[]` when the journal cannot be read.
+
+        `_do_rearm` reads the journal twice to diff what a re-arm appended, and before
+        that echo existed it read it not at all. `Journal.entries()` decodes strict
+        UTF-8 and `Journal.__init__` mkdirs the run dir, so an undecodable byte or an
+        unreadable directory would turn a corrupt journal into a re-arm the operator
+        can no longer perform — a strictly worse failure than the missing echo, and a
+        regression against the gesture's own history. Degrading to `[]` costs the echo
+        and keeps the action; the dashboard already decodes this same file with
+        `errors="replace"` everywhere else it reads it.
+        """
+        try:
+            return Journal(run_dir).entries()
+        except (OSError, UnicodeDecodeError):
+            return []
+
     def _do_rearm(
         self, run_id: str, run_dir: Path, story_key: str, *, restore_recorded: bool = False
     ) -> None:
@@ -828,38 +846,29 @@ class BmadLoopApp(App[None]):
         path (rearm_escalation handles sentinel auto-delete-with-preservation)."""
         if self._resolve_blocked_by_liveness(run_id, run_dir):
             return
-        seen_entries = len(Journal(run_dir).entries())
+        seen_entries = len(self._journal_entries_guarded(run_dir))
         try:
             runs.rearm_escalation(run_dir, story_key)
         except RearmError as e:
             self.notify(f"re-arm failed: {e}", severity="error")
             return
-        # Surface the same baseline degrades `cli._echo_rearm_events` prints. Both
-        # are warn-only by contract (a project that is not a repo must not fail
-        # re-arm), so without this the whole degrade is journal-only on the path
-        # that RESUMES in the same gesture — the invisibility #640(b) exists to
-        # end, not to relocate to the other caller.
-        for entry in Journal(run_dir).entries()[seen_entries:]:
-            kind = entry.get("kind", "")
-            if kind == "rearm-baseline-advance-failed":
-                self.notify(
-                    "could not advance the re-drive baseline "
-                    f"({entry.get('error', '?')}) — the re-drive rebuilds against the "
-                    "tree as it stood before your resolve; the spec was NOT re-stamped",
-                    severity="warning",
-                )
-            elif kind == "rearm-baseline-restamp-skipped":
-                self.notify(
-                    f"the recorded spec ({entry.get('spec_file', '?')}) is not readable "
-                    "from here — its status flip and baseline re-stamp were skipped",
-                    severity="warning",
-                )
-            elif kind == "rearm-baseline-restamped" and not entry.get("restore"):
-                self.notify(
-                    "the spec claimed a different baseline than the run recorded; "
-                    "this re-stamp is the only trace of that divergence",
-                    severity="warning",
-                )
+        # The same records `cli._echo_rearm_events` prints, routed through the same
+        # table (`runs.rearm_event_notice`) so the two surfaces cannot drift apart
+        # again. This loop used to carry its own copy of the routing and handled three
+        # kinds where the CLI handled six — silently dropping the `stale-restore-*`
+        # family, including the `commits` warning the CLI's own docstring calls the one
+        # a human must act on. All of it is warn-only by contract, so without an echo
+        # the degrade is journal-only on the path that RESUMES in the same gesture —
+        # the invisibility #640(b) exists to end, not to relocate to the other caller.
+        #
+        # The table's `next_step` is deliberately dropped here: it reads "... before
+        # resuming", and this path resumes immediately below.
+        for entry in self._journal_entries_guarded(run_dir)[seen_entries:]:
+            notice = runs.rearm_event_notice(entry)
+            if notice is None:
+                continue
+            severity, message, _next_step = notice
+            self.notify(message, severity="warning" if severity == "warning" else "information")
         if restore_recorded:
             self.notify(
                 "recorded restore patch NOT honored — this re-arm re-drives from "

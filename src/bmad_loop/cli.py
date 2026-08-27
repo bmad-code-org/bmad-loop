@@ -2742,83 +2742,33 @@ def _resolve_restore_patch(
 
 def _echo_rearm_events(run_dir: Path, seen_entries: int) -> None:
     """Surface the events a just-completed re-arm journaled: the `stale-restore-*`
-    residue of the restore attempt it abandoned (runs._stale_restore_residue), and
-    the three `rearm-baseline-*` records the advance and the re-stamp write. The
-    commits variant is the one the human must act on — nothing else will.
+    residue of the restore attempt it abandoned (runs._stale_restore_residue), and the
+    `rearm-*` records the status flip, the advance and the re-stamp write. The commits
+    variant is the one the human must act on — nothing else will.
 
     Named for the re-arm, not for the stale restore: it began as a `stale-restore-*`
     echo and now carries the baseline family too, so a name from the narrower era
     would send the next re-arm record somewhere else.
 
-    The baseline records are echoed for the same reason: a failed advance means the
-    re-drive rebuilds against the tree as it stood BEFORE the resolve, and the
-    re-stamp then deliberately refuses to write a sha it did not earn. Both are
-    warn-only by contract (a project that is not a repo must not fail re-arm), so
-    without an echo the whole degrade is journal-only — which is the invisibility
-    #640(b) exists to end, not to relocate."""
+    Routing lives in `runs.rearm_event_notice`, not here, because the TUI re-arms
+    through the same journal and used to carry its own divergent copy of this chain —
+    it surfaced three of the kinds and silently dropped the rest. One table, two
+    renderings: this one appends the `next_step` imperative, the TUI omits it because
+    it resumes in the same gesture.
+
+    The baseline records are echoed because a failed advance means the re-drive
+    rebuilds against the tree as it stood BEFORE the resolve, and the re-stamp then
+    deliberately refuses to write a sha it did not earn. All of it is warn-only by
+    contract (a project that is not a repo must not fail re-arm), so without an echo
+    the whole degrade is journal-only — the invisibility #640(b) exists to end, not to
+    relocate."""
     for entry in Journal(run_dir).entries()[seen_entries:]:
-        kind = entry.get("kind", "")
-        if kind == "stale-restore-excluded":
-            files = ", ".join(entry.get("files", []))
-            print(
-                f"note: excluded the abandoned restore's new files from the "
-                f"re-drive baseline: {files}",
-                file=sys.stderr,
-            )
-        elif kind == "stale-restore-unparseable":
-            print(
-                f"warning: could not read the abandoned restore patch "
-                f"({entry.get('patch', '?')}) — its new files may be swept into the "
-                "next commit; check `git status` before resuming",
-                file=sys.stderr,
-            )
-        elif kind == "rearm-baseline-advance-failed":
-            print(
-                f"warning: could not advance the re-drive baseline "
-                f"({entry.get('error', '?')}) — it still names "
-                f"{str(entry.get('baseline', '') or '(none)')[:12]}, so the re-drive "
-                "rebuilds against the tree as it stood before your resolve; the spec "
-                "was deliberately NOT re-stamped. Check the baseline before resuming",
-                file=sys.stderr,
-            )
-        elif kind == "rearm-baseline-restamped":
-            # Differentiated on the `restore` flag the record already carries, which
-            # exists precisely because the two legs mean different things. On the
-            # patch-restore leg an overwrite is the ORDINARY case (the spec still
-            # names the pre-attempt sha); on the from-scratch leg it is the only
-            # trace left of a divergence the gate can no longer report. Printing one
-            # warning for both trains the operator to scroll past the meaningful one.
-            head = (
-                f"note: re-stamped the spec baseline "
-                f"{str(entry.get('overwritten', '?'))[:12]}.. -> "
-                f"{str(entry.get('baseline', '?'))[:12]}.."
-            )
-            if entry.get("restore"):
-                print(f"{head} — routine on a restore re-drive", file=sys.stderr)
-            else:
-                print(
-                    f"{head} — the spec claimed a DIFFERENT baseline than the run "
-                    "recorded, and this re-stamp is the only trace of it; the gate "
-                    "can no longer report that divergence",
-                    file=sys.stderr,
-                )
-        elif kind == "rearm-baseline-restamp-skipped":
-            print(
-                f"warning: the recorded spec for this story "
-                f"({entry.get('spec_file', '?')}) is not a readable file from here, "
-                "so its status flip and baseline re-stamp were both skipped — the "
-                "spec still names the escalated attempt's baseline. Check the "
-                "recorded spec path before resuming",
-                file=sys.stderr,
-            )
-        elif kind == "stale-restore-commits":
-            n = len(entry.get("commits", []))
-            print(
-                f"warning: {n} commit(s) sit below the re-drive's new baseline "
-                f"({entry.get('old_baseline', '?')[:12]}..) — if any came from the "
-                "abandoned attempt rather than your resolve, revert them now",
-                file=sys.stderr,
-            )
+        notice = runs.rearm_event_notice(entry)
+        if notice is None:
+            continue
+        severity, message, next_step = notice
+        tail = f"; {next_step}" if next_step else ""
+        print(f"{severity}: {message}{tail}", file=sys.stderr)
 
 
 def cmd_resolve(args: argparse.Namespace) -> int:
@@ -2927,7 +2877,14 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     except runs.RearmError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
-    _echo_rearm_events(run_dir, seen_entries)
+    finally:
+        # In the `finally`, not after the `try`: `_stale_restore_residue` journals
+        # BEFORE the re-stamp block that raises `RearmError`, so on that path the
+        # records were already written and returning early threw them away — including
+        # `stale-restore-commits`, the one record whose whole point is that nothing
+        # else will tell the human. An abort is when that residue matters most: the
+        # re-arm half-ran and the operator has to decide what to do with the tree.
+        _echo_rearm_events(run_dir, seen_entries)
     print(
         f"re-armed {story_key}"
         + (" (restoring the attempted change for review)" if restore_patch else "")

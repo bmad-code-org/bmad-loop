@@ -617,6 +617,48 @@ def test_rearm_strips_stale_terminal_section(tmp_path):
     assert devcontract.find_result_artifact(tmp_path, since_ns=0) is None
 
 
+@pytest.mark.parametrize("frontmatter", [True, False])
+def test_rearm_journals_a_status_flip_that_silently_did_nothing(tmp_path, frontmatter):
+    """`verify.set_frontmatter_status` answers "nothing to change" with `False`, never
+    an exception — no file, no frontmatter block, no top-level `status:`. Its return
+    was DISCARDED, so on such a spec the flip no-opped invisibly: the re-drive was
+    dispatched anyway, step-01 read the unchanged terminal status, routed the session
+    to "ingest as context, do not resume", and the story re-wedged with nothing on the
+    record explaining why. The `FrontmatterWriteError` arm below it covers only the
+    shapes that RAISE; this covers the ones that lie quietly.
+
+    Graded on a spec that EXISTS and is readable but carries no `---` block: the writer
+    returns False and leaves the file byte-identical, so the record is the ONLY thing
+    that distinguishes this from a flip that landed. The `frontmatter=True` leg is the
+    control — an ordinary spec must not produce the record, or the row would pass for a
+    guard that fires on everything.
+
+    Ablation: delete the `if not flipped:` append and the `False` leg reddens with
+    `ValueError: not enough values to unpack (expected 1, got 0)` while the control
+    still passes.
+    """
+    _resolve_repo(tmp_path)
+    spec = tmp_path / "spec.md"
+    spec.write_text(SPEC if frontmatter else "# Spec\n\nno frontmatter block\n", encoding="utf-8")
+    before = spec.read_bytes()
+    run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec))
+
+    runs.rearm_escalation(run_dir)
+
+    records = [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-flip-skipped"]
+    if frontmatter:
+        assert records == []
+        assert verify.read_frontmatter(spec)["status"] == "ready-for-dev"
+    else:
+        (skipped,) = records
+        assert skipped["story_key"] == "6-4-cli-list-command"
+        assert skipped["spec_file"] == str(spec)
+        assert skipped["status"] == "ready-for-dev"
+        # the no-op left NOTHING behind but the record — including the re-stamp, which
+        # `set_frontmatter_field` declines on the same missing block
+        assert spec.read_bytes() == before
+
+
 def test_rearm_journals_event(tmp_path):
     run_dir, _, _ = _escalated_run(tmp_path)
     runs.rearm_escalation(run_dir)
@@ -900,6 +942,57 @@ def test_rearm_falls_back_to_project_when_no_code_root_was_recorded(tmp_path):
     assert load_state(run_dir).tasks["6-4-cli-list-command"].baseline_commit == head
 
 
+def test_rearm_writes_the_worktree_spec_not_the_main_checkouts_copy(monkeypatch, tmp_path):
+    """The recorded spec path is re-anchored on the tree it was persisted RELATIVE to.
+
+    `StoryTask._serialized_worktree_path` (`model.py`) persists a worktree-local spec
+    relative to the mounted worktree root — no worktree prefix — and `from_dict` reads
+    it back raw, so a bare `Path(task.spec_file)` resolves against the process cwd.
+    That is not merely unreachable, it is actively WRONG: `bmad-loop resolve` runs from
+    the project root, and the main checkout carries the very same
+    `_bmad-output/specs/...` layout. `is_file()` answered True on the wrong file,
+    `confine_root` accepted it (it genuinely is under `project`), and both the status
+    flip AND the baseline re-stamp landed on a spec the run never used, while the
+    worktree's real spec kept the escalated attempt's sha and the re-drive re-wedged.
+
+    `_task_spec_path` now anchors a relative path on `task.worktree_path` (falling back
+    to `state.project`) and passes an absolute one through.
+
+    The cwd is set EXPLICITLY: pytest's own cwd is not this sandbox, so without the
+    `chdir` the old code would simply fail to resolve the relative path and the row
+    would pass for the wrong reason instead of reproducing the hazard. The two copies
+    carry distinguishable `baseline_revision` claims for the same reason — "the right
+    file was written" has to be checkable against "the other one was not".
+
+    Ablation: revert `_task_spec_path`'s body to `return Path(task.spec_file or "")`
+    and this reddens on the worktree copy with
+    `AssertionError: assert 'blocked' == 'ready-for-dev'` — the flip went to the main
+    checkout — and the byte-identity assertion on the main copy reddens behind it.
+    """
+    head = _resolve_repo(tmp_path)
+    rel = "_bmad-output/specs/6-4-cli-list-command.md"
+    wt = tmp_path / "wt"
+    for root, claim in ((wt, "sha-of-the-escalated-attempt"), (tmp_path, "sha-in-main-checkout")):
+        spec = root / rel
+        spec.parent.mkdir(parents=True, exist_ok=True)
+        spec.write_text(
+            f"---\nstatus: blocked\nbaseline_revision: {claim}\n---\n\n## Intent\n\nx\n",
+            encoding="utf-8",
+        )
+    main_spec = tmp_path / rel
+    untouched = main_spec.read_bytes()
+
+    run_dir, _, _ = _escalated_run(tmp_path, spec_file=rel, worktree_path=str(wt))
+    monkeypatch.chdir(tmp_path)  # what `bmad-loop resolve` actually runs from
+
+    runs.rearm_escalation(run_dir)
+
+    fm = verify.read_frontmatter(wt / rel)
+    assert fm["status"] == "ready-for-dev"  # the flip landed in the WORKTREE
+    assert fm["baseline_revision"] == head  # and so did the re-stamp
+    assert main_spec.read_bytes() == untouched  # the main checkout's copy is unread
+
+
 def test_rearm_journals_a_skip_when_the_recorded_spec_is_not_readable(tmp_path):
     """A spec path that does not resolve must not be a SILENT no-op.
 
@@ -928,6 +1021,46 @@ def test_rearm_journals_a_skip_when_the_recorded_spec_is_not_readable(tmp_path):
     assert skipped["baseline"] == load_state(run_dir).tasks["6-4-cli-list-command"].baseline_commit
     # and the re-stamp record is NOT written, since nothing was stamped
     assert [e for e in kinds if e["kind"] == "rearm-baseline-restamped"] == []
+
+
+@pytest.mark.parametrize("repo", [True, False])
+def test_rearm_records_an_unreachable_spec_even_when_the_advance_failed(tmp_path, repo):
+    """The two #640 degrades COMPOSE; they do not substitute for each other.
+
+    The restamp-skip record used to sit INSIDE the `advanced and ...` gate, so on a
+    project that is not a git repo — where the advance raises `verify.GitError` and
+    `advanced` stays False — an unreachable spec produced NO record at all. The journal
+    blamed git, while the status flip had silently no-opped for an entirely different
+    reason and the spec still carried the escalated attempt's sha. One warning was
+    standing in for two independent failures.
+
+    The `repo=True` leg is the sibling row's case (advance succeeds, spec still
+    unreachable) carried here so the parametrization states the composition rather than
+    asserting only the half that used to be shadowed.
+
+    Ablation: nest the `rearm-baseline-restamp-skipped` append back under
+    `elif advanced and task.baseline_commit:` and the `repo=False` row reddens with
+    `ValueError: not enough values to unpack (expected 1, got 0)` while `repo=True`
+    keeps passing — which is precisely the shadowing that hid it.
+    """
+    if repo:
+        _resolve_repo(tmp_path)
+    run_dir, _, _ = _escalated_run(tmp_path, spec_file="wt/_bmad-output/specs/gone.md")
+
+    runs.rearm_escalation(run_dir)
+
+    kinds = _kinds(run_dir)
+    (skipped,) = [e for e in kinds if e["kind"] == "rearm-baseline-restamp-skipped"]
+    assert skipped["story_key"] == "6-4-cli-list-command"
+    assert skipped["spec_file"].endswith("gone.md")
+    # the advance's own degrade is reported alongside it, not instead of it
+    failed = [e for e in kinds if e["kind"] == "rearm-baseline-advance-failed"]
+    if repo:
+        assert failed == []
+    else:
+        (advance_failed,) = failed
+        assert "GitError" in advance_failed["error"]
+        assert advance_failed["baseline"] == "abc123"  # the stale sha that still stands
 
 
 def test_rearm_restamps_normally_when_the_spec_resolves(tmp_path):
@@ -1198,15 +1331,22 @@ def test_rearm_restore_patch_restamps_spec_baseline(tmp_path):
     assert load_state(run_dir).tasks[key].baseline_commit == new_head
 
 
-def _escalated_spec_run(tmp_path, baseline: str, *, extra: str = ""):
+def _escalated_spec_run(tmp_path, baseline: str, *, extra: str = "", recorded: str = "abc123"):
     """A real repo + an escalated run whose spec claims `baseline`, plus one
-    resolution commit on top. Returns (run_dir, spec, new_head)."""
+    resolution commit on top. Returns (run_dir, spec, new_head).
+
+    ``recorded`` sets what the RUN recorded for the escalated attempt
+    (`task.baseline_commit`), which defaults to the fixture's `"abc123"` and therefore
+    differs from every spec claim a caller can write. The divergence-reference rows
+    need it equal to the claim: that is the only shape in which the two candidate
+    references (`old_baseline` vs the advanced `task.baseline_commit`) disagree.
+    """
     spec = tmp_path / "spec.md"
     spec.write_text(
         f"---\nstatus: blocked\nbaseline_revision: {baseline}\n{extra}---\n\n## Intent\n\nx\n",
         encoding="utf-8",
     )
-    run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec))
+    run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec), baseline_commit=recorded)
     (tmp_path / "fixture.txt").write_text("resolution fixture\n")
     git(tmp_path, "add", "-A")
     git(tmp_path, "commit", "-q", "-m", "resolution fixture")
@@ -1248,7 +1388,7 @@ def test_rearm_journals_the_spec_baseline_it_overwrote(tmp_path):
     the gate would have judged (#716).
 
     Ablation: drop the `rearm-baseline-restamped` append and the row reddens; drop
-    the `overwritten != task.baseline_commit` guard and the second half reddens
+    the `overwritten != old_baseline` guard and the second half reddens
     (a re-arm that changed nothing would report an overwrite).
     """
     old_head = _resolve_repo(tmp_path)
@@ -1265,6 +1405,72 @@ def test_rearm_journals_the_spec_baseline_it_overwrote(tmp_path):
     save_state(run_dir, _rearmable(run_dir))
     runs.rearm_escalation(run_dir)
     assert len([e for e in _kinds(run_dir) if e["kind"] == "rearm-baseline-restamped"]) == 1
+
+
+def test_rearm_does_not_report_a_divergence_the_run_never_had(tmp_path):
+    """`rearm-baseline-restamped` measures the spec's claim against what the RUN
+    RECORDED — `old_baseline`, captured before the advance — and NOT against
+    `task.baseline_commit`, which the advance has already moved to the new HEAD.
+
+    Against the advanced value the record fired on every ordinary from-scratch re-arm
+    whose resolve session committed anything: the spec and the run agreed exactly, HEAD
+    had simply moved on, and the operator was still told they diverged. A warning that
+    fires on the routine case is the "trains the operator to scroll past the meaningful
+    one" failure the `restore` split exists to prevent.
+
+    This is the regression direction: it is the row that must redden if someone puts
+    `task.baseline_commit` back. The re-stamp is asserted to have LANDED first, so the
+    row cannot pass because the whole block was skipped.
+
+    Ablation: restore `overwritten != task.baseline_commit` and this reddens with
+    `AssertionError: assert [{...'kind': 'rearm-baseline-restamped'...}] == []` — the
+    record fires on a re-arm with nothing to report.
+    """
+    old_head = _resolve_repo(tmp_path)
+    run_dir, spec, new_head = _escalated_spec_run(tmp_path, old_head, recorded=old_head)
+
+    runs.rearm_escalation(run_dir)
+
+    # the re-stamp itself ran: this row is about what was REPORTED, not what was skipped
+    assert verify.read_frontmatter(spec)["baseline_revision"] == new_head
+    assert load_state(run_dir).tasks["6-4-cli-list-command"].baseline_commit == new_head
+    assert [e for e in _kinds(run_dir) if e["kind"] == "rearm-baseline-restamped"] == []
+
+
+def test_rearm_reports_a_claim_the_advanced_head_would_have_masked(tmp_path):
+    """The other direction of the same reference choice — and the one the old guard got
+    backwards. The spec claims the tree's CURRENT head while the run recorded a
+    different baseline: a real divergence (the spec names a sha this run never used),
+    yet compared against `task.baseline_commit` — already advanced to that same head —
+    the two came out equal and the record was dropped.
+
+    Paired with the row above, the two bracket the guard: one reddens if the reference
+    moves forward to the advanced sha, the other if it does. Neither can be satisfied
+    by deleting the comparison, because `test_rearm_journals_the_spec_baseline_it_
+    overwrote` pins the no-duplicate case.
+
+    Ablation: restore `overwritten != task.baseline_commit` and this reddens with
+    `ValueError: not enough values to unpack (expected 1, got 0)` — no record at all.
+    """
+    old_head = _resolve_repo(tmp_path)
+    spec = tmp_path / "spec.md"
+    run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec), baseline_commit=old_head)
+    (tmp_path / "fixture.txt").write_text("resolution fixture\n")
+    git(tmp_path, "add", "-A")
+    git(tmp_path, "commit", "-q", "-m", "resolution fixture")
+    new_head = git(tmp_path, "rev-parse", "HEAD")
+    # written AFTER the commit: the claim has to name the sha the advance will adopt
+    spec.write_text(
+        f"---\nstatus: blocked\nbaseline_revision: {new_head}\n---\n\n## Intent\n\nx\n",
+        encoding="utf-8",
+    )
+
+    runs.rearm_escalation(run_dir)
+
+    (entry,) = [e for e in _kinds(run_dir) if e["kind"] == "rearm-baseline-restamped"]
+    assert entry["overwritten"] == new_head  # the claim, carried verbatim
+    assert entry["baseline"] == new_head  # which the advance happens to agree with
+    assert entry["restore"] is False
 
 
 def test_rearm_prefers_the_fresh_revision_when_the_spec_carries_both_keys(tmp_path):

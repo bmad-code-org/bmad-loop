@@ -17,6 +17,7 @@ import tarfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from . import devcontract, envvars, verify
 from .adapters.multiplexer import MultiplexerError, get_multiplexer, mux_usable
@@ -2173,6 +2174,27 @@ def validate_restore_latch(
     return None
 
 
+def _task_spec_path(task: StoryTask, state: RunState) -> Path:
+    """The recorded spec path, re-anchored on the tree it was persisted relative to.
+
+    `StoryTask._serialized_worktree_path` (`model.py`) persists a worktree-local spec
+    RELATIVE to the mounted worktree root, and `from_dict` reads it back raw. Resolving
+    that against the process cwd is not merely unreachable — it is actively wrong:
+    `bmad-loop resolve` runs from the project root, where the MAIN CHECKOUT carries the
+    same `_bmad-output/specs/...` layout, so a bare `Path(task.spec_file)` names the main
+    checkout's copy of the story spec. `is_file()` then answers True, `confine_root`
+    accepts it (it genuinely is under `project`), and the status flip and the baseline
+    re-stamp both land on a file the run never used while the worktree's real spec is
+    left on the escalated attempt's sha.
+
+    Absolute paths pass through: a spec outside the worktree is persisted verbatim.
+    """
+    raw = Path(task.spec_file or "")
+    if raw.is_absolute():
+        return raw
+    return Path(task.worktree_path or state.project) / raw
+
+
 def rearm_escalation(
     run_dir: Path, story_key: str | None = None, *, restore_patch: str | None = None
 ) -> str:
@@ -2200,8 +2222,11 @@ def rearm_escalation(
       NOT cleared — a second resolve cycle reads that run-dir audit trail — so
       the id is what has to change.
     - The spec's `baseline_revision` is re-stamped on BOTH legs, and only when the
-      advance above actually moved (see the block that does it for why each half
-      of that is the way it is).
+      advance above actually RAN — `advanced` records that both git reads succeeded,
+      not that HEAD changed, so a resolve session that committed nothing still
+      re-stamps (with the same sha, harmlessly). What it will not do is re-stamp
+      after a FAILED advance (see the block that does it for why each half of that
+      is the way it is).
 
     Two re-drive modes, selected by `restore_patch`:
 
@@ -2283,7 +2308,7 @@ def rearm_escalation(
     task.restore_patch = restore_patch
 
     if task.spec_file:
-        spec_path = Path(task.spec_file)
+        spec_path = _task_spec_path(task, state)
         # Stories mode only: a fixed-slug pre-planning-halt sentinel
         # (`<id>-unresolved.md` / `<id>-ambiguous.md`) is cleared by deletion, not a
         # status flip. Clear it ONLY when the run recorded this task AS a sentinel at
@@ -2308,7 +2333,7 @@ def rearm_escalation(
                 # the restored diff); from-scratch -> ready-for-dev -> step-03
                 # (re-implement). Independent of the resolve agent having set it.
                 target_status = "in-review" if restore_patch else "ready-for-dev"
-                verify.set_frontmatter_status(
+                flipped = verify.set_frontmatter_status(
                     spec_path, target_status, confine_root=Path(state.project)
                 )
                 # drop the stale `## Auto Run Result` section along with the status flip
@@ -2316,6 +2341,21 @@ def rearm_escalation(
                 # that heading, so leaving it would let the re-driven session's first
                 # save of the spec parse as the prior attempt's terminal outcome.
                 devcontract.strip_auto_run_result(spec_path, confine_root=Path(state.project))
+                if not flipped:
+                    # `set_frontmatter_status` answers "nothing to change" with
+                    # `False`, never an exception — no file, no frontmatter block, no
+                    # top-level `status:`. Discarding that return is how the flip
+                    # became a SILENT no-op: the re-drive is dispatched anyway, step-01
+                    # reads the unchanged terminal status, routes the session to "ingest
+                    # as context, do not resume", and the story re-wedges with nothing on
+                    # the record. The `FrontmatterWriteError` arm below covers only the
+                    # shapes that RAISE; this covers the ones that lie quietly.
+                    journal.append(
+                        "rearm-spec-flip-skipped",
+                        story_key=key,
+                        spec_file=str(spec_path),
+                        status=target_status,
+                    )
             except verify.FrontmatterWriteError as e:
                 # The spec reads fine but carries `status:` in a shape no line
                 # edit can move (a block scalar, a flow mapping, a value continued
@@ -2355,9 +2395,20 @@ def rearm_escalation(
     # whatever the refreshed snapshot no longer blesses, at the right moment.
     # The CODE tree, not `state.project`: every git read below (and every baseline
     # the proof-of-work gate later measures against) must name the repository the
-    # dev writer stamps, which is `paths.repo_root` == `workspace.root`. They are
-    # the same directory unless the BMAD config sets a `repo_root:` override, and a
-    # pre-upgrade state.json with no recorded root degrades to `project` exactly as
+    # dev writer stamps.
+    #
+    # That is `paths.repo_root` for every run this function can be reached from, but
+    # NOT because `paths.repo_root == workspace.root` universally — it does not.
+    # `Workspace.default` sets `root=paths.repo_root`, while the isolation constructor
+    # mounts `root=<run_dir>/worktrees/<unit>` and rebases a fresh `ProjectPaths` onto
+    # it, so under `isolation = "worktree"` the run-level `repo_root` is the main
+    # checkout and the baseline is stamped in the worktree. The two configurations are
+    # mutually exclusive: `bmadconfig.worktree_isolation_conflict` refuses worktree
+    # isolation beside a `repo_root:` override, so wherever the roots could diverge,
+    # isolation is off and `repo_root` IS the tree the dev writer used. Do not carry
+    # the identity itself into new code; carry this argument.
+    #
+    # A pre-upgrade state.json with no recorded root degrades to `project` exactly as
     # before.
     repo = state.code_root
     stale_residue = _stale_restore_residue(repo, journal, key, old_latch, old_baseline)
@@ -2432,28 +2483,39 @@ def rearm_escalation(
     # Loud on WRITE failure: a silently stale spec baseline is exactly the hazard
     # being closed.
     #
-    # Guarded on `is_file` FIRST, because a missing spec is not a write failure here
-    # — it is a SILENT one. `StoryTask` persists `spec_file` worktree-relative
-    # (`model._serialized_worktree_path`) and `from_dict` reads it back raw, so a
-    # re-arm of a task that ran under worktree isolation can hold a path that
-    # resolves against nothing from this process's cwd. Both frontmatter writers
-    # answer that with `False` rather than an exception
-    # (`frontmatter.set_frontmatter_status`, `verify.set_frontmatter_field`), and
-    # both return values are dropped — so the status flip above and this re-stamp
-    # would BOTH no-op with no exception and no record, leaving the spec on the
-    # escalated attempt's sha. The restore leg cannot reach this (its precondition
-    # rejects a truthy `task.worktree_path`); the from-scratch leg has no such
-    # guard, which is exactly why that precondition has to exist.
-    if advanced and task.spec_file and task.baseline_commit:
-        spec_path = Path(task.spec_file)
+    # Guarded on `is_file` FIRST, because a spec this process cannot reach is not a
+    # write failure here — it is a SILENT one. Both frontmatter writers answer such a
+    # path with `False` rather than an exception (`verify.set_frontmatter_status`,
+    # `verify.set_frontmatter_field`), so without a check the re-stamp no-ops with
+    # nothing on the record and the spec keeps the escalated attempt's sha.
+    #
+    # `_task_spec_path` re-anchors the recorded path before we get here, which is what
+    # makes `is_file` mean what it says. Resolved raw it meant something else and worse:
+    # `spec_file` is persisted RELATIVE to the worktree for an isolated task, and the
+    # main checkout carries the same layout, so the check passed on the wrong file and
+    # the write landed there. The restore leg cannot reach any of this (its precondition
+    # rejects a truthy `task.worktree_path`); the from-scratch leg has no such guard,
+    # which is exactly why that precondition has to exist.
+    #
+    # `is_file` is necessary but not sufficient: a spec that EXISTS with no frontmatter
+    # block also returns `False` from both writers. That shape is caught by the flip's
+    # `flipped` check above and, here, by `overwritten` staying empty.
+    if task.spec_file:
+        spec_path = _task_spec_path(task, state)
         if not spec_path.is_file():
+            # OUTSIDE the `advanced` gate on purpose. Nesting this record inside it
+            # made the two #640 legs shadow each other: on a project that is not a
+            # repo the advance fails, `advanced` is False, and an unreadable spec
+            # then produced NO record at all — the journal blamed git while the
+            # status flip above had silently no-opped for an entirely different
+            # reason. The two degrades compose; they do not substitute.
             journal.append(
                 "rearm-baseline-restamp-skipped",
                 story_key=key,
                 spec_file=str(spec_path),
-                baseline=task.baseline_commit,
+                baseline=task.baseline_commit or "",
             )
-        else:
+        elif advanced and task.baseline_commit:
             try:
                 # Read through the same reader both consumers of a claimed baseline use,
                 # so what gets journalled as "overwritten" is the value the gate would
@@ -2486,12 +2548,20 @@ def rearm_escalation(
                     f"cannot re-stamp baseline_revision on {task.spec_file} "
                     f"({e.__class__.__name__}: {e}) — fix the file, then re-run resolve"
                 ) from e
-            if overwritten and overwritten != task.baseline_commit:
-                # A claim that did not already name the advanced baseline. On the
-                # patch-restore leg that is the ordinary case (the spec still names the
-                # pre-attempt sha); on the from-scratch leg it is the only trace left
-                # of a divergence the gate can no longer report, which is precisely why
-                # it is recorded.
+            if overwritten and overwritten != old_baseline:
+                # Compared against `old_baseline` — what the RUN recorded for the
+                # escalated attempt — NOT against `task.baseline_commit`, which the
+                # advance above has already moved to the new HEAD. Measuring against the
+                # advanced value made this fire on every ordinary from-scratch re-arm
+                # whose resolve session committed anything: the spec and the run agreed
+                # exactly, and the operator was still told they diverged. A record that
+                # fires on the routine case is the "trains the operator to scroll past
+                # the meaningful one" failure the `restore` split exists to prevent.
+                #
+                # What survives is the real signal: the spec claimed a baseline the run
+                # never recorded. On the from-scratch leg that is the only trace left of
+                # a divergence the gate can no longer report, because the re-stamp is
+                # about to normalize it away.
                 journal.append(
                     "rearm-baseline-restamped",
                     story_key=key,
@@ -2509,6 +2579,94 @@ def rearm_escalation(
         restore=bool(restore_patch),
     )
     return key
+
+
+def rearm_event_notice(entry: dict[str, Any]) -> tuple[str, str, str] | None:
+    """`(severity, message, next_step)` for a re-arm record an operator must see.
+
+    ONE table, two surfaces. `cli._echo_rearm_events` prints `message` followed by
+    `next_step`; `TuiApp._do_rearm` shows `message` alone. That split is the whole
+    reason this returns three fields instead of a formatted line: the TUI re-arms and
+    RESUMES in a single gesture, so an instruction to check something "before
+    resuming" is already unactionable by the time it renders — but the finding it
+    reports is not, and dropping the record to avoid the dead imperative is what left
+    the TUI silent on three kinds `resolve` echoed.
+
+    Returns None for journal kinds no operator has to act on, so a caller can walk
+    every new entry and let the table decide.
+
+    Severity is `"note"` or `"warning"`; each surface maps those onto its own channel.
+    """
+    kind = entry.get("kind", "")
+    if kind == "stale-restore-excluded":
+        files = ", ".join(entry.get("files", []))
+        return (
+            "note",
+            f"excluded the abandoned restore's new files from the re-drive " f"baseline: {files}",
+            "",
+        )
+    if kind == "stale-restore-unparseable":
+        return (
+            "warning",
+            f"could not read the abandoned restore patch ({entry.get('patch', '?')}) "
+            "— its new files may be swept into the next commit",
+            "check `git status` before resuming",
+        )
+    if kind == "stale-restore-commits":
+        n = len(entry.get("commits", []))
+        return (
+            "warning",
+            f"{n} commit(s) sit below the re-drive's new baseline "
+            f"({str(entry.get('old_baseline', '?'))[:12]}..) — if any came from the "
+            "abandoned attempt rather than your resolve, revert them now",
+            "",
+        )
+    if kind == "rearm-baseline-advance-failed":
+        return (
+            "warning",
+            f"could not advance the re-drive baseline ({entry.get('error', '?')}) — it "
+            f"still names {str(entry.get('baseline', '') or '(none)')[:12]}, so the "
+            "re-drive rebuilds against the tree as it stood before your resolve; the "
+            "spec was deliberately NOT re-stamped",
+            "Check the baseline before resuming",
+        )
+    if kind == "rearm-spec-flip-skipped":
+        return (
+            "warning",
+            f"the recorded spec for this story ({entry.get('spec_file', '?')}) could "
+            f"not be re-opened to `{entry.get('status', '?')}` — the re-drive will read "
+            "the escalated attempt's terminal status and may re-wedge on it",
+            "Check the recorded spec path before resuming",
+        )
+    if kind == "rearm-baseline-restamp-skipped":
+        return (
+            "warning",
+            f"the recorded spec for this story ({entry.get('spec_file', '?')}) is not a "
+            "readable file from here, so the baseline re-stamp was skipped — the spec "
+            "still names the escalated attempt's baseline",
+            "Check the recorded spec path before resuming",
+        )
+    if kind == "rearm-baseline-restamped":
+        head = (
+            f"re-stamped the spec baseline "
+            f"{str(entry.get('overwritten', '?'))[:12]}.. -> "
+            f"{str(entry.get('baseline', '?'))[:12]}.."
+        )
+        # Differentiated on the `restore` flag the record already carries, because the
+        # two legs mean different things. On the patch-restore leg an overwrite is
+        # ordinary; on the from-scratch leg the record is only written when the spec
+        # claimed a baseline the RUN never recorded, which is the last trace of a
+        # divergence the re-stamp is about to normalize away.
+        if entry.get("restore"):
+            return ("note", f"{head} — routine on a restore re-drive", "")
+        return (
+            "warning",
+            f"{head} — the spec claimed a DIFFERENT baseline than the run recorded, "
+            "and this re-stamp is the only trace of it; the gate can no longer report "
+            "that divergence",
+            "",
+        )
+    return None
 
 
 def _stale_restore_residue(

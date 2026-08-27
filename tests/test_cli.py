@@ -2601,8 +2601,9 @@ def test_resolve_echoes_the_rearm_baseline_records(tmp_path, monkeypatch, capsys
     agreeing on a stale value. Journal-only, that is invisible to the human running
     `bmad-loop resolve` — the invisibility #640(b) exists to end.
 
-    Ablation: drop either `elif` arm from `_echo_rearm_events` and the matching
-    assertion reddens.
+    Ablation: drop either `rearm-baseline-*` arm from `runs.rearm_event_notice`
+    (the shared table both surfaces route through) and the matching assertion
+    reddens.
     """
     from bmad_loop import runs
     from bmad_loop.journal import Journal
@@ -2650,9 +2651,9 @@ def test_resolve_restamp_echo_distinguishes_the_two_legs(tmp_path, monkeypatch, 
     of a divergence the gate can no longer report. One warning for both trains the
     operator to scroll past the meaningful one.
 
-    Ablation: collapse the `if entry.get("restore")` branch back to a single print
-    and the `restore=True` assertion reddens on the divergence wording appearing
-    where nothing diverged.
+    Ablation: collapse the `if entry.get("restore")` branch in
+    `runs.rearm_event_notice` back to one return and the `restore=True` assertion
+    reddens on the divergence wording appearing where nothing diverged.
     """
     from bmad_loop import runs
     from bmad_loop.journal import Journal
@@ -2697,7 +2698,8 @@ def test_resolve_echoes_a_skipped_restamp(tmp_path, monkeypatch, capsys):
     only place it ever surfaces. Without the echo the operator resumes a re-drive
     whose spec still names the escalated attempt's baseline.
 
-    Ablation: drop the `rearm-baseline-restamp-skipped` arm and this reddens.
+    Ablation: drop the `rearm-baseline-restamp-skipped` arm from
+    `runs.rearm_event_notice` and this reddens.
     """
     from bmad_loop import runs
     from bmad_loop.journal import Journal
@@ -2722,6 +2724,94 @@ def test_resolve_echoes_a_skipped_restamp(tmp_path, monkeypatch, capsys):
     err = capsys.readouterr().err
     assert "wt/specs/s1.md" in err
     assert "not a readable file from here" in err
+
+
+def test_resolve_echoes_the_residue_even_when_the_rearm_aborts(tmp_path, monkeypatch, capsys):
+    """An abort is when the residue matters MOST, so the echo lives in a `finally`.
+
+    `runs._stale_restore_residue` journals BEFORE the re-stamp block that raises
+    `RearmError`, so on that path the records are already on disk when the abort
+    happens — and an echo placed after an early `return 1` threw away records the
+    re-arm had genuinely written. The one it threw away is the one that cannot be
+    recovered from anywhere else: `stale-restore-commits` names commits now sitting
+    below a baseline the operator is looking at in a half-run re-arm, and nothing
+    but this line will tell them. The failure and the residue are both true, and the
+    operator needs both to decide what to do with the tree.
+
+    Ablation: move `_echo_rearm_events` out of the `finally` back under the `try` and
+    the commits assertion reddens while the `error:` line still prints.
+    """
+    from bmad_loop import runs
+    from bmad_loop.journal import Journal
+
+    _escalated_run(tmp_path, "r1")
+
+    def fake_rearm(rd, key, *, restore_patch=None):
+        # journalled first, exactly as the real residue pass is ordered
+        Journal(rd).append(
+            "stale-restore-commits", story_key=key, old_baseline="f" * 40, commits=["c1", "c2"]
+        )
+        raise runs.RearmError("could not re-stamp the spec baseline")
+
+    monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+    assert (
+        cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-interactive", "--resume"]) == 1
+    )
+
+    out, err = capsys.readouterr()
+    assert "error: could not re-stamp the spec baseline" in err  # the abort still reports
+    assert "2 commit(s) sit below the re-drive's new baseline (ffffffffffff..)" in err
+    assert "re-armed" not in out  # ...and the failure is not dressed up as a success
+
+
+def test_resolve_appends_the_next_step_imperative(tmp_path, monkeypatch, capsys):
+    """This surface renders `severity: message; next_step`; the TUI renders `message`.
+
+    That split is the entire reason `runs.rearm_event_notice` returns three fields
+    instead of one formatted line — the TUI re-arms and RESUMES in a single gesture,
+    so "before resuming" is already moot there, while `resolve` leaves the run parked
+    and the imperative is the actionable half. Dropping it here would leave the field
+    with no observable purpose on either surface and nothing red to say so.
+
+    Graded both ways in one run, because the empty string is a real table value: a
+    row that carries a next_step prints it after `; `, and a row that carries "" must
+    print no dangling separator.
+
+    Ablation: drop `tail` from `_echo_rearm_events`' f-string and the first assertion
+    reddens; hard-code it to `f"; {next_step}"` and the second does.
+    """
+    from bmad_loop import runs
+    from bmad_loop.journal import Journal
+
+    _escalated_run(tmp_path, "r1")
+
+    def fake_rearm(rd, key, *, restore_patch=None):
+        journal = Journal(rd)
+        journal.append(  # table row with a next_step
+            "rearm-baseline-advance-failed",
+            story_key=key,
+            repo=str(tmp_path),
+            baseline="a" * 40,
+            error="GitError: not a git repository",
+        )
+        journal.append(  # table row whose next_step is ""
+            "stale-restore-commits", story_key=key, old_baseline="f" * 40, commits=["c1"]
+        )
+        return key
+
+    monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+    assert (
+        cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-interactive", "--resume"]) == 0
+    )
+
+    lines = capsys.readouterr().err.splitlines()
+    advance = next(ln for ln in lines if "could not advance the re-drive baseline" in ln)
+    assert advance.startswith("warning: ")
+    assert advance.endswith("; Check the baseline before resuming")
+    commits = next(ln for ln in lines if "commit(s) sit below" in ln)
+    assert commits.endswith("revert them now")
 
 
 def test_resolve_interactive_runs_session_then_rearms(tmp_path, monkeypatch):
