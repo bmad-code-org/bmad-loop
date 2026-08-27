@@ -783,7 +783,7 @@ def test_verify_dev_park_unknown_when_the_policy_is_off(project):
     assert "'awaiting-operator'" in out.reason and "expected 'done'" in out.reason
 
 
-def _residue_free(project, *, status, sprint):
+def _residue_free(project, *, status, sprint, baseline=None):
     """A dev attempt whose ONLY residue is the spec and the sprint board — the two
     paths proof-of-work already excludes.
 
@@ -796,15 +796,28 @@ def _residue_free(project, *, status, sprint):
     by the two status tokens `status`/`sprint` select. The set is what
     proof-of-work keys on, so it is the property that makes the control a control:
     both trees are residue-free by the gate's own measure, and only the terminal
-    differs."""
+    differs.
+
+    `operator_actions:` is written on the park terminal ONLY, because that is the
+    only status the product ever emits it on: `devcontract.synthesize_result`
+    folds the field from `status == AWAITING_OPERATOR`, and its comment gives the
+    reason — carrying it on another terminal would let a story register
+    obligations the verify gates never held it to. The park call sites pass
+    `verify.AWAITING_OPERATOR` rather than the bare literal so they move with the
+    branch above on a rename: were the two to drift, this helper would quietly stop
+    writing the field and every park row would fail on "declares no usable
+    operator_actions" instead of on the thing it tests. `baseline` overrides what
+    the spec claims, for the row that probes the baseline-match gate."""
     write_sprint(project, {"1-1-a": sprint})
     task = make_task(project)
     sp = spec_path(project, "1-1-a")
     write_spec(
         sp,
         status,
-        task.baseline_commit,
-        operator_actions=["publish the TXT record"],
+        baseline or task.baseline_commit,
+        operator_actions=(
+            ["publish the TXT record"] if status == verify.AWAITING_OPERATOR else None
+        ),
     )
     return task, sp
 
@@ -822,7 +835,9 @@ def test_verify_dev_park_with_no_code_residue_passes(project, review_enabled):
     this gate. A park short-circuits both terminals — the pair demanded is
     (awaiting-operator, awaiting-operator) either way — so the flag must not reach
     the outcome, and the `True` leg is what would catch a future edit that let it."""
-    task, sp = _residue_free(project, status="awaiting-operator", sprint="awaiting-operator")
+    task, sp = _residue_free(
+        project, status=verify.AWAITING_OPERATOR, sprint=verify.AWAITING_OPERATOR
+    )
 
     out = verify.verify_dev(
         task, project, dev_result(sp), review_enabled=review_enabled, operator_park=True
@@ -832,18 +847,82 @@ def test_verify_dev_park_with_no_code_residue_passes(project, review_enabled):
     assert task.spec_file == str(sp)
 
 
-def test_verify_dev_residue_free_in_review_still_fails_proof_of_work(project):
+@pytest.mark.parametrize("operator_park", [False, True])
+@pytest.mark.parametrize(
+    "status, sprint, review_enabled",
+    [("in-review", "review", True), ("done", "done", False)],
+)
+def test_verify_dev_residue_free_non_park_still_fails_proof_of_work(
+    project, status, sprint, review_enabled, operator_park
+):
     """The control for the row above, and the reason that row proves anything: the
-    SAME residue-free tree at the ordinary in-review terminal must still be
-    refused. Without this, the park row would pass for any tree that merely
-    happened not to be empty, and the skip could have widened past `parked`
-    unnoticed."""
-    task, sp = _residue_free(project, status="in-review", sprint="review")
+    SAME residue-free tree at an ordinary terminal must still be refused. Without
+    this, the park row would pass for any tree that merely happened not to be
+    empty, and the skip could have widened past `parked` unnoticed.
 
-    out = verify.verify_dev(task, project, dev_result(sp))
+    Both non-park terminals are covered, not just `in-review`: the skip is spelled
+    `None if parked else engine_written`, and a widening that reached the
+    review-disabled `done` leg instead would redden nothing if this row only ever
+    ran the handoff terminal.
+
+    `operator_park` is parametrized because it is the ONE input that separates the
+    two halves of `parked = operator_park and status_of(fm) == AWAITING_OPERATOR`,
+    and the `True` leg is the only thing in this file pinning the skip's SCOPE. Its
+    absence was a real hole: rewriting the skip as `None if operator_park` — the
+    policy flag alone, ignoring the observed status — left every row in this file
+    green, and reddened only incidental `write_src=False` rows over in
+    `test_engine.py` that are about harvest, not about park. A run with parking
+    enabled but a session that finished ordinarily must still owe a diff."""
+    task, sp = _residue_free(project, status=status, sprint=sprint)
+
+    out = verify.verify_dev(
+        task,
+        project,
+        dev_result(sp),
+        review_enabled=review_enabled,
+        operator_park=operator_park,
+    )
 
     assert not out.ok and out.retryable
     assert out.reason == "no changes in worktree since baseline commit"
+
+
+def test_verify_dev_park_still_faces_the_workflow_tag_gate(project):
+    """Proof-of-work is the ONLY gate the park leg skips. The tree is residue-free,
+    so nothing else can account for a refusal here — with the skip in place, a
+    foreign `workflow` is the only thing left to refuse on, and it must.
+
+    This is the gate the park-leg docstrings promise "still runs" and that no row
+    asserted: every other park row hands in a well-formed `dev_result(sp)`, so
+    deleting the whole shared-gate block on the parked leg left the suite green."""
+    task, sp = _residue_free(
+        project, status=verify.AWAITING_OPERATOR, sprint=verify.AWAITING_OPERATOR
+    )
+    rj = {"workflow": "quick-dev", "spec_file": str(sp)}
+
+    out = verify.verify_dev(task, project, rj, review_enabled=False, operator_park=True)
+
+    assert not out.ok and out.retryable
+    assert "auto-dev" in out.reason
+
+
+def test_verify_dev_park_still_faces_the_baseline_match_gate(project):
+    """The sibling of the row above, and the more load-bearing half: proof-of-work
+    was the park's last diff-based tie to the attempt, so baseline-match is now
+    what remains binding a park to the attempt the orchestrator actually launched.
+    A residue-free park claiming a baseline the orchestrator never recorded must
+    still be refused."""
+    task, sp = _residue_free(
+        project,
+        status=verify.AWAITING_OPERATOR,
+        sprint=verify.AWAITING_OPERATOR,
+        baseline="deadbeef" * 5,
+    )
+
+    out = verify.verify_dev(task, project, dev_result(sp), review_enabled=False, operator_park=True)
+
+    assert not out.ok and out.retryable
+    assert "does not match" in out.reason
 
 
 def test_verify_review_accepts_the_park_pair(project):
@@ -2633,6 +2712,111 @@ def test_verify_review_gates_run_commands_in_repo_root(project, tmp_path, mode):
     in_project = Policy(verify=VerifyPolicy(commands=(_file_exists_cmd("only-in-project.txt"),)))
     out = gate(task, paths, in_project)
     assert not out.ok and "verify command failed" in out.reason
+
+
+@pytest.mark.parametrize("mode", ["review", "review_stories", "review_bundle"])
+def test_verify_review_gates_classify_against_the_root_they_run_in(
+    project, tmp_path, monkeypatch, mode
+):
+    """The cwd is forwarded TWICE, and the row above pins only the first hop.
+
+    `verify_commands_outcome` hands its `cwd` to `run_verify_commands` (execution)
+    and again to `verify_command_results_outcome` -> `env_fault_reason` ->
+    `_win32_env_fault_reason`, which resolves a command's leading token as
+    `cwd / token` to tell "tool missing" from "command failed". The two outcomes
+    are not interchangeable: an env fault ESCALATES and pauses the run, while an
+    ordinary failure is `fixable` and routes a repair session.
+
+    The sibling row cannot see the second hop. Both its assertions are rc-based —
+    `.ok`, then `"verify command failed"`, which `verify_command_results_outcome`
+    reaches only AFTER `env_fault_reason` returned None for every result — so
+    re-rooting the classifier alone leaves it green. Confirmed by ablation: rewriting
+    the helper as `verify_command_results_outcome(run_verify_commands(policy,
+    paths.repo_root), paths.project)` passed all of `test_verify.py` +
+    `test_engine.py` at 818 passed / 23 skipped. On Windows that split would probe a
+    relative token such as `check.cmd`, living in the code root, against the project
+    dir instead, miss it, fall through to the PATH branch and escalate — pausing the
+    run over a command that had merely failed.
+
+    Spying both hops rather than asserting on `env_fault` keeps this cross-platform:
+    the classifier's own behavior is already pinned by the rows beside
+    `_win32_env_fault_reason`, and what was unpinned is only WHICH ROOT reaches it
+    from these three gates."""
+    repo_root = tmp_path / "code-root"
+    repo_root.mkdir()
+    paths = dataclasses.replace(project, repo_root=repo_root)
+    task, gate = _review_gate_at_done(project, mode)
+
+    seen: dict[str, Path] = {}
+    real_run = verify.run_verify_commands
+    real_classify = verify.verify_command_results_outcome
+
+    def spy_run(policy, cwd):
+        seen["run"] = cwd
+        return real_run(policy, cwd)
+
+    def spy_classify(results, cwd):
+        seen["classify"] = cwd
+        return real_classify(results, cwd)
+
+    monkeypatch.setattr(verify, "run_verify_commands", spy_run)
+    monkeypatch.setattr(verify, "verify_command_results_outcome", spy_classify)
+
+    assert gate(task, paths, Policy(verify=VerifyPolicy(commands=(_OK,)))).ok
+
+    # both hops, not just execution: the classifier decides escalate-vs-retry
+    assert seen["run"] == repo_root
+    assert seen["classify"] == repo_root
+
+
+@pytest.mark.parametrize("mode", ["review", "review_bundle"])
+def test_verify_review_gates_read_artifacts_from_the_project_root(project, tmp_path, mode):
+    """The other half of the split `_verify_review_commands` states, and the half
+    the row above deliberately cannot reach: only the command `cwd` moved to
+    `repo_root` — the artifacts these gates read stay project-rooted.
+
+    It has to be a decoy rather than an ablation. `dataclasses.replace(...,
+    repo_root=...)` moves nothing else, and both `paths.sprint_status` and
+    `paths.deferred_work` derive from `implementation_artifacts`, so no ablation
+    of the root can redden on them. Instead plant a complete artifact tree at the
+    same RELATIVE path under `repo_root`, carrying statuses that would fail the
+    gate, and require the gate to pass anyway: a regression that re-derived either
+    artifact from `repo_root` reads the decoy and reddens here.
+
+    `review_stories` is absent on purpose — it reads neither artifact, so there is
+    nothing for a decoy to shadow.
+
+    The decoy is followed by a positive control, because on its own it asserts only
+    that a gate PASSED, which is what it would also do if the gate had stopped
+    reading these artifacts altogether. Planting the same statuses in the project's
+    own tree and requiring a refusal is what establishes they are load-bearing —
+    the discrimination is then built here rather than borrowed from the rows that
+    happen to cover each failure separately."""
+    repo_root = tmp_path / "code-root"
+    rel = project.implementation_artifacts.relative_to(project.project)
+    decoy_paths = dataclasses.replace(project, implementation_artifacts=repo_root / rel)
+    decoy_paths.implementation_artifacts.mkdir(parents=True)
+
+    task, gate = _review_gate_at_done(project, mode)
+
+    # both decoys carry the status that WOULD fail this gate, so either artifact
+    # resolving off repo_root is a red test rather than a silent pass
+    write_sprint(decoy_paths, {"1-1-a": "in-progress"})
+    bundle_ledger(decoy_paths, {"DW-1": "open", "DW-2": "open"})
+
+    paths = dataclasses.replace(project, repo_root=repo_root)
+
+    assert gate(task, paths, Policy()).ok
+
+    # positive control: the SAME statuses in the project's own artifacts must
+    # refuse. Without this the row above passes for a gate that reads neither file.
+    write_sprint(project, {"1-1-a": "in-progress"})
+    bundle_ledger(project, {"DW-1": "open", "DW-2": "open"})
+
+    refused = gate(task, paths, Policy())
+
+    assert not refused.ok and refused.retryable
+    assert ("in-progress" if mode == "review" else "DW-1") in refused.reason
 
 
 def test_verify_review_bundle_ledger_oserror_degrades_to_retry(project, monkeypatch):

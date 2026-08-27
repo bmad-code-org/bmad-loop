@@ -3282,8 +3282,10 @@ def _verify_shared_gates(
 
     The proof-of-work exclude is derived here from the `task` this gate already
     receives (`verify_dev_exclude_relpaths`, which needs the latched restore patch);
-    ``extra_exclude`` carries only what a mode adds on top — ``()`` for sprint and
-    bundle, the story record + manifest for stories. Threading the restore patch in
+    ``extra_exclude`` carries only what a mode adds on top — the engine-written
+    paths for sprint and bundle, those plus the story record + manifest for
+    stories, and ``None`` on the two legs that skip the gate outright (sprint's
+    park, stories' plan halt). Threading the restore patch in
     from three call sites instead left a default-None foot-gun for a future fourth
     mode, which would silently let a restore re-drive pass proof-of-work on the
     patch file's mere presence. ``extra_exclude=None`` still skips the gate
@@ -3445,17 +3447,42 @@ def verify_dev(
     spelling: a park's whole output can legitimately be its own spec's park
     declaration plus the board sync, both of which proof-of-work already excludes,
     so demanding a diff read a correct park as "no changes since baseline commit"
-    and retried it into rollback and defer (#676). Nothing else relaxes — the
+    and refused it (#676) — costing the attempt, and with it the park declaration:
+    reverted outright under ``isolation = "worktree"`` or
+    ``scm.rollback_on_failure = true``, and a paused run with manual-recovery steps
+    on the default in-place config. What is still pending here is the
+    ORCHESTRATOR's commit — the squash plus the park record land only after this
+    gate passes — not the session's own work: ``bmad-build-auto`` commits each
+    iteration, so a skill commit chain usually already sits above baseline
+    (``Engine._finalize_commit_phase``), and a reset discards that too, onto an
+    ``attempt-preserve/*`` ref. Nothing else relaxes — the
     ``operator_actions`` gate above still refuses a park that enumerates nothing,
     and the workflow-tag, status, baseline-match and sprint-pair gates all still
-    run. The trade is recorded rather than hidden: the skip covers EVERY park,
-    including one that wrote nothing and listed plausible actions, because the
-    actions gate tests list non-emptiness and never content.
+    run. Two of those four are not independent evidence on this leg, and saying so
+    is the point: the status check is tautological here (the same ``fm`` that
+    selected ``parked`` is threaded in as ``fm=fm``, so the shared gate compares it
+    against an ``expected_status`` derived from itself), and the sprint pair was
+    written from that same frontmatter by ``Engine._post_dev_state_sync`` a dozen
+    lines before this gate runs, so it confirms the orchestrator's own write landed
+    rather than anything the session did. What still binds a park to the attempt
+    the orchestrator actually launched is the workflow tag, the baseline match, and
+    a non-empty actions list — and the middle one is weaker on this leg than its
+    name suggests. Baseline-match also accepts a claim NEWER than the recorded
+    baseline whenever it is a HEAD-reachable descendant, and the comment guarding
+    that branch names the compensating control: such a commit "may have arrived in
+    the shared checkout from outside the session", so the check re-anchors
+    proof-of-work onto the claimed commit rather than trusting the match alone.
+    Proof-of-work is precisely what this leg skips, so on a park that re-anchoring
+    is inert and the newer-claim branch tightens nothing. The trade is recorded rather than hidden: the skip
+    covers EVERY park, including one that wrote nothing and listed plausible
+    actions, because the actions gate tests list non-emptiness and never content.
 
     ``engine_written`` names project-relative paths the orchestrator itself
     wrote above this gate during the attempt. They compose with the mode's normal
     proof-of-work exclusions so engine bookkeeping cannot masquerade as session
-    work; see :meth:`Engine._harvest_gate_exclude`.
+    work; see :meth:`Engine._harvest_gate_exclude`. On the parked leg they are not
+    passed at all — proof-of-work is skipped there, so there is no exclusion set
+    left for them to compose with.
     """
     rj = result_json or {}
     spec_file = rj.get("spec_file")
@@ -3485,16 +3512,11 @@ def verify_dev(
         expected_status=(
             AWAITING_OPERATOR if parked else ("in-review" if review_enabled else "done")
         ),
-        # A park declares the agent-doable work finished, and finished
-        # legitimately includes having written no code: the residue can be
-        # nothing but the spec's own frontmatter and the sprint board, both of
-        # which proof-of-work already excludes, so the gate read a correct park
-        # as "no changes since baseline" and retried it into rollback and defer
-        # (#676). Skip that one gate on the parked leg (``extra_exclude=None``,
-        # the callee-blessed spelling). Nothing else relaxes: the actions gate
-        # just above still refuses a park that enumerates nothing, and the
-        # workflow-tag, status and baseline-match gates inside the shared block
-        # all still run.
+        # Proof-of-work is the one gate the parked leg skips (``extra_exclude=None``,
+        # the callee-blessed spelling): a park's whole residue can legitimately be
+        # the spec and the board, both already excluded (#676). The park paragraph
+        # in this function's docstring carries the reasoning and, more importantly,
+        # what the skip does NOT relax.
         extra_exclude=None if parked else engine_written,
         fm=fm,
     )
@@ -4024,6 +4046,16 @@ def _verify_review_commands(policy: Policy, paths: ProjectPaths) -> VerifyOutcom
     isolation (``ProjectPaths.rebased`` sets both); they diverge only under an
     explicit ``repo_root:`` with ``isolation = "none"``. One helper rather than
     three edited lines so the three gates cannot drift apart on the split.
+
+    On win32 the cwd carries one more thing with it, so the split is not purely a
+    subprocess concern: ``verify_commands_outcome`` forwards ``cwd`` a second time
+    into ``env_fault_reason`` -> ``_win32_env_fault_reason``, which resolves a
+    command's leading token as ``cwd / token`` to tell "tool missing" from "command
+    failed" — and an env fault escalates where a plain failure retries. So a
+    RELATIVE verify command is now classified against ``repo_root`` on these legs
+    too. That is the correct direction (classification should follow execution, and
+    the dev side already classifies against the same root), but it is a second
+    consequence of the move rather than a restatement of the first.
 
     ``paths.repo_root`` is the ONLY member of ``paths`` this reads — it takes the
     whole dataclass to keep the three call sites uniform, not because it consults

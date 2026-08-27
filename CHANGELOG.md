@@ -76,15 +76,23 @@ breaking changes may land in a minor release.
 
 - **The three review gates run `[verify] commands` in the git root, not the BMAD project
   root** (#695). Under an explicit `repo_root:` with `isolation = "none"` they shelled out in
-  the wrong tree, so an operator's build/test verbs ran somewhere their project was not.
+  the wrong tree — an operator's build/test verbs ran in the BMAD project dir rather than in
+  the git root their code lives in.
   Artifact reads — the spec, the sprint board, the deferred-work ledger — stay project-rooted;
   only the command `cwd` moves. Every other caller already used the repo root.
-- **A park that produced no code passes the dev gate instead of being rolled back** (#676). A
-  session parking at `awaiting-operator` may legitimately leave nothing but the spec's own
-  park declaration and the board sync, both of which proof-of-work excludes — so the gate read
-  a correct park as "no changes since baseline commit", retried it, and reverted the park
-  commit. Proof-of-work is now skipped on the parked leg only; the gate that refuses a park
-  enumerating no `operator_actions` still runs.
+- **A park that produced no code passes the dev gate** (#676). A session parking at
+  `awaiting-operator` may legitimately leave nothing but the spec's own park declaration and
+  the board sync, both of which proof-of-work excludes — so the gate read a correct park as
+  "no changes since baseline commit" and refused it, costing the attempt and the park
+  declaration with it. What was still pending at that point was the ORCHESTRATOR's commit —
+  the squash and the park record land only once this gate passes; the session's own work is
+  usually already committed above baseline, and a reset discards that too (onto an
+  `attempt-preserve/*` ref). What the loss looked like depended on configuration — a reverted tree
+  under `isolation = "worktree"` or `scm.rollback_on_failure = true`, a paused run with manual
+  recovery steps on the default in-place config. Proof-of-work is now skipped on the parked
+  leg only; the gate that refuses a park enumerating no `operator_actions` still runs. That skip
+  covers every park, including one that produced nothing and listed plausible actions — the
+  action gate tests that the list is non-empty, never what is in it.
 - **The git-add shield refuses to enable `extensions.worktreeConfig` over an operator's
   explicit disable** (#396), instead of enabling it and deleting the line on rollback. The
   probe read the flag `--type=bool`, so a `false`/`off`/`no`/`0` in the shared config read
