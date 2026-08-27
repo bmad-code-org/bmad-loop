@@ -74,6 +74,17 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **The three review gates run `[verify] commands` in the git root, not the BMAD project
+  root** (#695). Under an explicit `repo_root:` with `isolation = "none"` they shelled out in
+  the wrong tree, so an operator's build/test verbs ran somewhere their project was not.
+  Artifact reads — the spec, the sprint board, the deferred-work ledger — stay project-rooted;
+  only the command `cwd` moves. Every other caller already used the repo root.
+- **A park that produced no code passes the dev gate instead of being rolled back** (#676). A
+  session parking at `awaiting-operator` may legitimately leave nothing but the spec's own
+  park declaration and the board sync, both of which proof-of-work excludes — so the gate read
+  a correct park as "no changes since baseline commit", retried it, and reverted the park
+  commit. Proof-of-work is now skipped on the parked leg only; the gate that refuses a park
+  enumerating no `operator_actions` still runs.
 - **The git-add shield refuses to enable `extensions.worktreeConfig` over an operator's
   explicit disable** (#396), instead of enabling it and deleting the line on rollback. The
   probe read the flag `--type=bool`, so a `false`/`off`/`no`/`0` in the shared config read

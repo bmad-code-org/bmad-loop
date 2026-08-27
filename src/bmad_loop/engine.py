@@ -2876,7 +2876,10 @@ class Engine:
         this delegates to the same skip-review commit path, whose `_verify_review`
         now holds the park to its (awaiting-operator, awaiting-operator) pair, a
         non-empty action list, and the project's verify commands. Parked work
-        clears every check `done` work clears — no commit path skips verification.
+        clears every check that still applies to it — no commit path skips
+        verification. Scope that claim to this gate: the dev gate's proof-of-work
+        is the one check a park does NOT face, skipped there because a park may
+        legitimately have produced no code at all (#676, `verify.verify_dev`).
 
         No `_defer` machinery: a park is a SUCCESS that commits, so there is no
         stash or rollback, and the ordinary path has no ledger snapshot to

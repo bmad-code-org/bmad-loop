@@ -3286,8 +3286,12 @@ def _verify_shared_gates(
     bundle, the story record + manifest for stories. Threading the restore patch in
     from three call sites instead left a default-None foot-gun for a future fourth
     mode, which would silently let a restore re-drive pass proof-of-work on the
-    patch file's mere presence. ``extra_exclude=None`` still skips the gate outright
-    (a plan-halt leg produced only its own spec)."""
+    patch file's mere presence. ``extra_exclude=None`` still skips the gate
+    outright, and two callers now spell it for two different reasons: a plan-halt
+    leg produced only its own spec (structurally spec-only), and a park may
+    legitimately have produced no code at all because its remaining work is a
+    human's (#676). Both mean "there is no diff to demand here"; neither
+    generalizes to the other's leg, so keep them named separately."""
     workflow = rj.get("workflow")
     if workflow != DEV_WORKFLOW:
         return VerifyOutcome.retry(
@@ -3422,9 +3426,10 @@ def verify_dev(
     Checks the claimed spec exists, carries the fixed ``auto-dev`` workflow tag,
     sits at the expected status (``in-review`` when a separate review session
     follows, ``done`` when review is disabled), records a baseline matching the
-    orchestrator's, has produced changes since that baseline, and that the
-    story's sprint-status was advanced to the matching stage. Returns a retryable
-    VerifyOutcome on any mismatch, escalates on git failure, passes otherwise.
+    orchestrator's, has produced changes since that baseline (every leg but the
+    park — see ``operator_park`` below), and that the story's sprint-status was
+    advanced to the matching stage. Returns a retryable VerifyOutcome on any
+    mismatch, escalates on git failure, passes otherwise.
 
     ``operator_park`` (``[operator] enabled``, engine-supplied) adds one more
     accepted spec/sprint pair: ``(awaiting-operator, awaiting-operator)``, the
@@ -3434,6 +3439,18 @@ def verify_dev(
     state and to a non-empty action list. Off by policy, the token is simply not
     a terminal the gate knows, so it fails the ordinary status check and the
     session is retried with that mismatch as feedback.
+
+    On the park leg the proof-of-work gate is skipped, the same way the plan-halt
+    leg of :func:`verify_dev_stories` skips it and by the same ``extra_exclude=None``
+    spelling: a park's whole output can legitimately be its own spec's park
+    declaration plus the board sync, both of which proof-of-work already excludes,
+    so demanding a diff read a correct park as "no changes since baseline commit"
+    and retried it into rollback and defer (#676). Nothing else relaxes — the
+    ``operator_actions`` gate above still refuses a park that enumerates nothing,
+    and the workflow-tag, status, baseline-match and sprint-pair gates all still
+    run. The trade is recorded rather than hidden: the skip covers EVERY park,
+    including one that wrote nothing and listed plausible actions, because the
+    actions gate tests list non-emptiness and never content.
 
     ``engine_written`` names project-relative paths the orchestrator itself
     wrote above this gate during the attempt. They compose with the mode's normal
@@ -3468,7 +3485,17 @@ def verify_dev(
         expected_status=(
             AWAITING_OPERATOR if parked else ("in-review" if review_enabled else "done")
         ),
-        extra_exclude=engine_written,
+        # A park declares the agent-doable work finished, and finished
+        # legitimately includes having written no code: the residue can be
+        # nothing but the spec's own frontmatter and the sprint board, both of
+        # which proof-of-work already excludes, so the gate read a correct park
+        # as "no changes since baseline" and retried it into rollback and defer
+        # (#676). Skip that one gate on the parked leg (``extra_exclude=None``,
+        # the callee-blessed spelling). Nothing else relaxes: the actions gate
+        # just above still refuses a park that enumerates nothing, and the
+        # workflow-tag, status and baseline-match gates inside the shared block
+        # all still run.
+        extra_exclude=None if parked else engine_written,
         fm=fm,
     )
     if gate is not None:
@@ -3979,6 +4006,32 @@ def verify_commands_outcome(policy: Policy, cwd: Path) -> VerifyOutcome:
     return verify_command_results_outcome(run_verify_commands(policy, cwd), cwd)
 
 
+def _verify_review_commands(policy: Policy, paths: ProjectPaths) -> VerifyOutcome:
+    """Run a review gate's ``[verify] commands`` in ``paths.repo_root``.
+
+    The two roots split by what is being addressed, and the split is deliberate:
+    the artifacts these gates read — the claimed spec, ``paths.sprint_status``,
+    ``paths.deferred_work`` — are BMAD output and stay project-rooted, while
+    ``[verify] commands`` are the operator's build/test verbs and belong in the
+    git root the code lives in. Every other caller of these commands already
+    resolves them that way: the dev side runs them in ``Workspace.root``
+    (``Engine._verify_commands_with_results``), which ``Workspace.default`` sets
+    from ``paths.repo_root``, and ``cli._reverify`` is handed ``paths.repo_root``
+    at both of its call sites. The three review gates were the sole outlier
+    (#695).
+
+    The two roots are the same path in the default layout and under worktree
+    isolation (``ProjectPaths.rebased`` sets both); they diverge only under an
+    explicit ``repo_root:`` with ``isolation = "none"``. One helper rather than
+    three edited lines so the three gates cannot drift apart on the split.
+
+    ``paths.repo_root`` is the ONLY member of ``paths`` this reads — it takes the
+    whole dataclass to keep the three call sites uniform, not because it consults
+    anything else. A future caller must not infer that artifact paths reach here.
+    """
+    return verify_commands_outcome(policy, paths.repo_root)
+
+
 def verify_review(
     task: StoryTask,
     paths: ProjectPaths,
@@ -4005,7 +4058,10 @@ def verify_review(
     the same observed-spec-status selection ``verify_dev`` uses: this is the gate
     the park path runs before committing (``Engine._park_awaiting_operator``), so
     parked work clears exactly the deterministic checks every other commit path
-    clears — the pair, a non-empty action list, and the verify commands. The
+    clears *at this gate* — the pair, a non-empty action list, and the verify
+    commands. The scope is load-bearing: a ``done`` story additionally clears
+    proof-of-work at the dev gate, which a park no longer does (#676), so this
+    gate is not evidence that a park faced every check a ``done`` story faced. The
     sign-off-regression arm stays scoped to the ``done`` pair: a board short of
     ``awaiting-operator`` is a stage never reached, not a revoked sign-off.
 
@@ -4051,7 +4107,7 @@ def verify_review(
             f"sprint-status for {task.story_key} is {sprint!r}, expected {expected!r}"
         )
 
-    return verify_commands_outcome(policy, paths.project)
+    return _verify_review_commands(policy, paths)
 
 
 def _is_signoff_regression(sprint: str | None, sprint_reached_done: bool, policy: Policy) -> bool:
@@ -4083,7 +4139,7 @@ def verify_review_stories(task: StoryTask, paths: ProjectPaths, policy: Policy) 
     status = status_of(fm)
     if status != "done":
         return VerifyOutcome.retry(f"spec status is {status!r}, expected 'done'")
-    return verify_commands_outcome(policy, paths.project)
+    return _verify_review_commands(policy, paths)
 
 
 def verify_review_bundle(task: StoryTask, paths: ProjectPaths, policy: Policy) -> VerifyOutcome:
@@ -4123,7 +4179,7 @@ def verify_review_bundle(task: StoryTask, paths: ProjectPaths, policy: Policy) -
             fixable=True,
         )
 
-    return verify_commands_outcome(policy, paths.project)
+    return _verify_review_commands(policy, paths)
 
 
 def commit_story(repo: Path, message: str) -> str:

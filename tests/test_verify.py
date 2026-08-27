@@ -13,6 +13,7 @@ from conftest import (
     _OK,
     MISSING_TOOL_CMD,
     UNRESOLVABLE,
+    _file_exists_cmd,
     fault_read_text,
     git,
     make_git_noisy,
@@ -782,9 +783,74 @@ def test_verify_dev_park_unknown_when_the_policy_is_off(project):
     assert "'awaiting-operator'" in out.reason and "expected 'done'" in out.reason
 
 
+def _residue_free(project, *, status, sprint):
+    """A dev attempt whose ONLY residue is the spec and the sprint board — the two
+    paths proof-of-work already excludes.
+
+    Deliberately does NOT write `src.txt` the way `_park` does: that one line is
+    what gives every other park row a non-empty proof diff, which is why none of
+    them can see #676.
+
+    What the park row and its control share is the SET OF PATHS touched — exactly
+    the spec and the board, and nothing else — not the bytes in them, which differ
+    by the two status tokens `status`/`sprint` select. The set is what
+    proof-of-work keys on, so it is the property that makes the control a control:
+    both trees are residue-free by the gate's own measure, and only the terminal
+    differs."""
+    write_sprint(project, {"1-1-a": sprint})
+    task = make_task(project)
+    sp = spec_path(project, "1-1-a")
+    write_spec(
+        sp,
+        status,
+        task.baseline_commit,
+        operator_actions=["publish the TXT record"],
+    )
+    return task, sp
+
+
+@pytest.mark.parametrize("review_enabled", [False, True])
+def test_verify_dev_park_with_no_code_residue_passes(project, review_enabled):
+    """A park may legitimately have produced no code — the story's remaining work
+    is a human's, and the session's whole output can be the spec's own park
+    declaration plus the board sync. Both are excluded from proof-of-work, so the
+    gate used to read a correct park as "no changes", retry it, and roll the park
+    commit back (#676). The parked leg now skips proof-of-work outright.
+
+    Parametrized over `review_enabled` because every other park row in this file
+    passes `False`, and the skip is now the only thing standing between a park and
+    this gate. A park short-circuits both terminals — the pair demanded is
+    (awaiting-operator, awaiting-operator) either way — so the flag must not reach
+    the outcome, and the `True` leg is what would catch a future edit that let it."""
+    task, sp = _residue_free(project, status="awaiting-operator", sprint="awaiting-operator")
+
+    out = verify.verify_dev(
+        task, project, dev_result(sp), review_enabled=review_enabled, operator_park=True
+    )
+
+    assert out.ok
+    assert task.spec_file == str(sp)
+
+
+def test_verify_dev_residue_free_in_review_still_fails_proof_of_work(project):
+    """The control for the row above, and the reason that row proves anything: the
+    SAME residue-free tree at the ordinary in-review terminal must still be
+    refused. Without this, the park row would pass for any tree that merely
+    happened not to be empty, and the skip could have widened past `parked`
+    unnoticed."""
+    task, sp = _residue_free(project, status="in-review", sprint="review")
+
+    out = verify.verify_dev(task, project, dev_result(sp))
+
+    assert not out.ok and out.retryable
+    assert out.reason == "no changes in worktree since baseline commit"
+
+
 def test_verify_review_accepts_the_park_pair(project):
-    """The gate the park path runs before committing: parked work clears the same
-    deterministic checks `done` work clears."""
+    """The gate the park path runs before committing: at THIS gate parked work
+    clears the same deterministic checks `done` work clears. Scoped on purpose —
+    a `done` story additionally clears proof-of-work at the dev gate, which a park
+    no longer does (#676)."""
     task, sp = _park(project)
     task.spec_file = str(sp)
 
@@ -2498,6 +2564,75 @@ def test_verify_review_gates_oserror_degrades_to_retry(project, monkeypatch, mod
     assert not out.ok and out.retryable
     assert "spec unreadable" in out.reason and "PermissionError" in out.reason
     assert "expected 'done'" not in out.reason
+
+
+def _review_gate_at_done(project, mode):
+    """A task+spec each review gate accepts, so the only thing left to decide the
+    outcome is the verify commands. Mirrors the mode fan-out beside it."""
+    if mode == "review":
+        write_sprint(project, {"1-1-a": "done"})
+        task = make_task(project)
+        sp = spec_path(project, "1-1-a")
+        write_spec(sp, "done", task.baseline_commit)
+        gate = verify.verify_review
+    elif mode == "review_stories":
+        task = make_stories_task(project, "1")
+        sp = write_story(
+            project.planning_artifacts / "epic-a", "1", "x", "done", task.baseline_commit
+        )
+        gate = verify.verify_review_stories
+    else:
+        task = make_bundle_task(project)
+        sp = project.implementation_artifacts / "spec-dw-test-bundle.md"
+        write_spec(sp, "done", task.baseline_commit)
+        bundle_ledger(project, {"DW-1": "done 2026-06-11", "DW-2": "done 2026-06-11"})
+        gate = verify.verify_review_bundle
+    task.spec_file = str(sp)
+    return task, gate
+
+
+@pytest.mark.parametrize("mode", ["review", "review_stories", "review_bundle"])
+def test_verify_review_gates_run_commands_in_repo_root(project, tmp_path, mode):
+    """`[verify] commands` run in the git root, not the BMAD project root (#695).
+
+    The two are the same path everywhere except under an explicit `repo_root:`
+    with `isolation = "none"` — `ProjectPaths.rebased` sets both, so worktree
+    isolation never diverges — and the `project` fixture sets no `repo_root`, so
+    no pre-existing row can tell the two apart. These three gates were the sole
+    callers running the commands in `paths.project`; the dev side and
+    `cli._reverify` both already used `repo_root`.
+
+    Pinned from BOTH directions on purpose: a marker only the repo root holds
+    must pass AND a marker only the project holds must fail. Either assertion
+    alone is satisfied by a cwd that is neither of them.
+
+    It does NOT pin the other half of the split. The artifact reads resolve
+    through `paths.sprint_status` / `paths.deferred_work` (derived from
+    `implementation_artifacts`) and an absolute `task.spec_file`, none of which
+    `dataclasses.replace(..., repo_root=...)` moves — so no ablation here can
+    redden on them, and this row must not be read as evidence they stayed
+    project-rooted.
+
+    `repo_root` is a bare directory, not a git repo, deliberately: these three
+    gates run no git in that root at all — only `subprocess.run(cwd=...)` — so a
+    plain dir is the honest fixture. Turning it into a real repo would let a
+    regression that started shelling out to git there pass unnoticed."""
+    repo_root = tmp_path / "code-root"
+    repo_root.mkdir()
+    (repo_root / "only-in-repo-root.txt").write_text("x\n", encoding="utf-8")
+    (project.project / "only-in-project.txt").write_text("x\n", encoding="utf-8")
+    paths = dataclasses.replace(project, repo_root=repo_root)
+    task, gate = _review_gate_at_done(project, mode)
+
+    # relative paths, so the probe is cwd-sensitive on both OSes
+    in_repo_root = Policy(
+        verify=VerifyPolicy(commands=(_file_exists_cmd("only-in-repo-root.txt"),))
+    )
+    assert gate(task, paths, in_repo_root).ok
+
+    in_project = Policy(verify=VerifyPolicy(commands=(_file_exists_cmd("only-in-project.txt"),)))
+    out = gate(task, paths, in_project)
+    assert not out.ok and "verify command failed" in out.reason
 
 
 def test_verify_review_bundle_ledger_oserror_degrades_to_retry(project, monkeypatch):
