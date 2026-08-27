@@ -2601,7 +2601,7 @@ def test_resolve_echoes_the_rearm_baseline_records(tmp_path, monkeypatch, capsys
     agreeing on a stale value. Journal-only, that is invisible to the human running
     `bmad-loop resolve` — the invisibility #640(b) exists to end.
 
-    Ablation: drop either `elif` arm from `_echo_stale_restore` and the matching
+    Ablation: drop either `elif` arm from `_echo_rearm_events` and the matching
     assertion reddens.
     """
     from bmad_loop import runs
@@ -2639,6 +2639,89 @@ def test_resolve_echoes_the_rearm_baseline_records(tmp_path, monkeypatch, capsys
     assert "aaaaaaaaaaaa" in err
     assert "deliberately NOT re-stamped" in err
     assert "re-stamped the spec baseline bbbbbbbbbbbb.. -> cccccccccccc.." in err
+
+
+def test_resolve_restamp_echo_distinguishes_the_two_legs(tmp_path, monkeypatch, capsys):
+    """The `restore` flag the record already carries decides which sentence prints.
+
+    It is journalled precisely because the two legs mean opposite things: on a
+    patch-restore re-drive an overwrite is the ORDINARY case (the spec still names
+    the pre-attempt sha), while on a from-scratch one it is the only surviving trace
+    of a divergence the gate can no longer report. One warning for both trains the
+    operator to scroll past the meaningful one.
+
+    Ablation: collapse the `if entry.get("restore")` branch back to a single print
+    and the `restore=True` assertion reddens on the divergence wording appearing
+    where nothing diverged.
+    """
+    from bmad_loop import runs
+    from bmad_loop.journal import Journal
+
+    def rearm_with(restore: bool):
+        def fake_rearm(rd, key, *, restore_patch=None):
+            Journal(rd).append(
+                "rearm-baseline-restamped",
+                story_key=key,
+                spec_file="spec.md",
+                overwritten="b" * 40,
+                baseline="c" * 40,
+                restore=restore,
+            )
+            return key
+
+        return fake_rearm
+
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+
+    _escalated_run(tmp_path, "r1")
+    monkeypatch.setattr(runs, "rearm_escalation", rearm_with(True))
+    assert (
+        cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-interactive", "--resume"]) == 0
+    )
+    err = capsys.readouterr().err
+    assert "routine on a restore re-drive" in err
+    assert "DIFFERENT baseline" not in err
+
+    _escalated_run(tmp_path, "r2")
+    monkeypatch.setattr(runs, "rearm_escalation", rearm_with(False))
+    assert (
+        cli.main(["resolve", "--project", str(tmp_path), "r2", "--no-interactive", "--resume"]) == 0
+    )
+    err = capsys.readouterr().err
+    assert "DIFFERENT baseline" in err
+    assert "routine on a restore re-drive" not in err
+
+
+def test_resolve_echoes_a_skipped_restamp(tmp_path, monkeypatch, capsys):
+    """The unreadable-spec skip is warn-only like its two siblings, so stderr is the
+    only place it ever surfaces. Without the echo the operator resumes a re-drive
+    whose spec still names the escalated attempt's baseline.
+
+    Ablation: drop the `rearm-baseline-restamp-skipped` arm and this reddens.
+    """
+    from bmad_loop import runs
+    from bmad_loop.journal import Journal
+
+    _escalated_run(tmp_path, "r1")
+
+    def fake_rearm(rd, key, *, restore_patch=None):
+        Journal(rd).append(
+            "rearm-baseline-restamp-skipped",
+            story_key=key,
+            spec_file="wt/specs/s1.md",
+            baseline="c" * 40,
+        )
+        return key
+
+    monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+    assert (
+        cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-interactive", "--resume"]) == 0
+    )
+
+    err = capsys.readouterr().err
+    assert "wt/specs/s1.md" in err
+    assert "not a readable file from here" in err
 
 
 def test_resolve_interactive_runs_session_then_rearms(tmp_path, monkeypatch):

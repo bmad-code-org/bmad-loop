@@ -3149,8 +3149,11 @@ def verify_dev_exclude_relpaths(
 ) -> tuple[str, ...]:
     """Repo-relative posix paths the dev/bundle proof-of-work gate excludes from
     `has_changes_since` — file-granularity, unlike `artifact_relpaths`' whole-folder
-    exclusion (still used as-is by `Engine._protected_relpaths` for rollback
-    protection, a different job). Deliberately does NOT exclude `output_folder`:
+    exclusion. `artifact_relpaths` has NO production caller left: rollback
+    protection builds its own list in `recovery_flow.protected_relpaths` against
+    `workspace.root`, and `Engine._protected_relpaths` merely delegates there. Do
+    not adopt it as a shortcut — it is still anchored on `paths.project`, which is
+    #716's root cause. Deliberately does NOT exclude `output_folder`:
     in the standard layout it is the parent directory of `implementation_artifacts`/
     `planning_artifacts`, so excluding it as a directory prefix would swallow those
     two folders' content right back out of view via the same git-pathspec prefix
@@ -3185,8 +3188,11 @@ def verify_dev_exclude_relpaths(
     default: an implicit `paths.project` anchor is #716's own root cause, and the
     two roots collapse in every configuration but the `repo_root` override, so a
     defaulted caller would look correct everywhere it was tested and be wrong only
-    on the one config that matters. Passing it explicitly turns a future wrong-root
-    caller into a type error instead of the silent no-op below.
+    on the one config that matters. Requiring it turns OMITTING the root into a
+    type error; it does not police a WRONG one — ``root=paths.project`` type-checks
+    cleanly and silently excludes nothing, which is the failure the next paragraph
+    describes. The requirement buys a caller who must think about the root, not a
+    checker that knows the right answer.
 
     A relpath computed against the wrong root does not raise: it simply
     matches nothing on git's side, so the exclusion silently disappears and a bare

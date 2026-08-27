@@ -42,6 +42,7 @@ def _escalated_run(
     worktree_path="",
     baseline_commit="abc123",
     restore_patch=None,
+    repo_root=None,
 ):
     """conftest's builder with this module's shape: a review-cycle-1 task carrying a
     completed review session (what `build_context` reads), returning the full triple.
@@ -49,7 +50,12 @@ def _escalated_run(
     ``baseline_commit`` / ``restore_patch`` are forwarded for the rows that need a
     task ALREADY carrying a latch and a real sha before re-arm runs — the state
     `_stale_restore_residue` reads (`old_latch`, `old_baseline`) and returns early
-    without touching git when the latch is absent."""
+    without touching git when the latch is absent.
+
+    ``repo_root`` records the divergent CODE tree on the saved state, so the
+    divergent-root rows do not each re-open, mutate and re-save the file they just
+    built. A row that forgot that save would silently degrade into the same-root
+    case it exists to distinguish, which is the failure this kwarg removes."""
     run = escalated_run(
         project,
         run_id,
@@ -66,6 +72,9 @@ def _escalated_run(
         worktree_path=worktree_path,
         restore_patch=restore_patch,
     )
+    if repo_root is not None:
+        run.state.repo_root = str(repo_root)
+        save_state(run.run_dir, run.state)
     return run.run_dir, run.state, run.task
 
 
@@ -781,10 +790,7 @@ def test_rearm_advances_the_baseline_in_the_code_tree(tmp_path):
     head = _resolve_repo(code)
     art = tmp_path / "artifacts-root"
     art.mkdir()
-    run_dir, _, _ = _escalated_run(art)
-    state = load_state(run_dir)
-    state.repo_root = str(code)
-    save_state(run_dir, state)
+    run_dir, _, _ = _escalated_run(art, repo_root=code)
 
     (code / "fixture.txt").write_text("resolution fixture\n")
     git(code, "add", "-A")
@@ -840,11 +846,8 @@ def test_rearm_reads_stale_restore_residue_from_the_code_tree(tmp_path):
     (code / "leftover.txt").write_text("genuinely pre-existing\n")
 
     run_dir, _, _ = _escalated_run(
-        art, baseline_commit=old_head, restore_patch="artifacts/attempt.patch"
+        art, baseline_commit=old_head, restore_patch="artifacts/attempt.patch", repo_root=code
     )
-    state = load_state(run_dir)
-    state.repo_root = str(code)
-    save_state(run_dir, state)
 
     # the resolve session's own commit, above the old baseline
     (code / "fixture.txt").write_text("resolution fixture\n")
@@ -895,6 +898,58 @@ def test_rearm_falls_back_to_project_when_no_code_root_was_recorded(tmp_path):
     assert load_state(run_dir).repo_root == ""
     runs.rearm_escalation(run_dir)
     assert load_state(run_dir).tasks["6-4-cli-list-command"].baseline_commit == head
+
+
+def test_rearm_journals_a_skip_when_the_recorded_spec_is_not_readable(tmp_path):
+    """A spec path that does not resolve must not be a SILENT no-op.
+
+    `StoryTask` persists `spec_file` relative to a worktree
+    (`model._serialized_worktree_path`) and `from_dict` reads it back raw, so a
+    re-arm of a task that ran under isolation can hold a path that resolves against
+    nothing from this process's cwd. Every writer in the spec block answers that
+    with `False` rather than an exception — `set_frontmatter_status`,
+    `strip_auto_run_result` and `set_frontmatter_field` all guard on `is_file` — and
+    all three return values are dropped, so without this guard the status flip AND
+    the baseline re-stamp both do nothing and the spec keeps the escalated attempt's
+    sha with no record anywhere.
+
+    Ablation: delete the `if not spec_path.is_file():` arm in `rearm_escalation` and
+    this reddens on the missing record — re-arm still "succeeds", which is the whole
+    problem.
+    """
+    _resolve_repo(tmp_path)
+    run_dir, _, _ = _escalated_run(tmp_path, spec_file="wt/_bmad-output/specs/gone.md")
+
+    runs.rearm_escalation(run_dir)
+
+    kinds = _kinds(run_dir)
+    (skipped,) = [e for e in kinds if e["kind"] == "rearm-baseline-restamp-skipped"]
+    assert skipped["spec_file"].endswith("gone.md")
+    assert skipped["baseline"] == load_state(run_dir).tasks["6-4-cli-list-command"].baseline_commit
+    # and the re-stamp record is NOT written, since nothing was stamped
+    assert [e for e in kinds if e["kind"] == "rearm-baseline-restamped"] == []
+
+
+def test_rearm_restamps_normally_when_the_spec_resolves(tmp_path):
+    """The control for the row above: same code path, readable spec, no skip record.
+
+    Without this the guard could refuse every spec and the negative row would still
+    pass — a skip record is present for the right reason only if the ordinary case
+    still stamps.
+    """
+    _resolve_repo(tmp_path)
+    spec = tmp_path / "spec.md"
+    spec.write_text("---\nstatus: 'escalated'\nbaseline_revision: 'old'\n---\n\nbody\n")
+    run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec))
+
+    runs.rearm_escalation(run_dir)
+
+    kinds = _kinds(run_dir)
+    assert [e for e in kinds if e["kind"] == "rearm-baseline-restamp-skipped"] == []
+    head = load_state(run_dir).tasks["6-4-cli-list-command"].baseline_commit
+    # unquoted: `_replace_value` drops the quotes it found, which is its own
+    # documented behavior and not what this row is about
+    assert f"baseline_revision: {head}" in spec.read_text()
 
 
 def test_rearm_clears_sentinel_preserving_a_copy(tmp_path):

@@ -2430,56 +2430,76 @@ def rearm_escalation(
     # is journalled above) and keeps re-arm non-fatal outside a repo.
     #
     # Loud on WRITE failure: a silently stale spec baseline is exactly the hazard
-    # being closed (the spec block above already proved the file readable, so this
-    # is remote).
+    # being closed.
+    #
+    # Guarded on `is_file` FIRST, because a missing spec is not a write failure here
+    # — it is a SILENT one. `StoryTask` persists `spec_file` worktree-relative
+    # (`model._serialized_worktree_path`) and `from_dict` reads it back raw, so a
+    # re-arm of a task that ran under worktree isolation can hold a path that
+    # resolves against nothing from this process's cwd. Both frontmatter writers
+    # answer that with `False` rather than an exception
+    # (`frontmatter.set_frontmatter_status`, `verify.set_frontmatter_field`), and
+    # both return values are dropped — so the status flip above and this re-stamp
+    # would BOTH no-op with no exception and no record, leaving the spec on the
+    # escalated attempt's sha. The restore leg cannot reach this (its precondition
+    # rejects a truthy `task.worktree_path`); the from-scratch leg has no such
+    # guard, which is exactly why that precondition has to exist.
     if advanced and task.spec_file and task.baseline_commit:
         spec_path = Path(task.spec_file)
-        try:
-            # Read through the same reader both consumers of a claimed baseline use,
-            # so what gets journalled as "overwritten" is the value the gate would
-            # have judged — not whichever key happened to be inspected here (#716).
-            #
-            # INSIDE the try, with the write it describes. `read_frontmatter` opens
-            # the file itself, so an OSError here would otherwise escape as a
-            # traceback from the one block whose whole contract is to turn a spec
-            # this re-arm cannot move into an actionable `RearmError`. What it does
-            # NOT rescue: `read_frontmatter` DEGRADES an unparseable YAML block to
-            # `{}` rather than raising, so on such a spec `overwritten` is `""`, the
-            # guard below is falsy, and no divergence record is written even though
-            # the insert lands. That is the reader's deliberate observe-degrade
-            # contract, not something to defeat here — the value is unknowable, and
-            # inventing one would be worse than the silence.
-            overwritten = auto_dev_baseline_of(verify.read_frontmatter(spec_path))
-            verify.set_frontmatter_field(
-                spec_path,
-                "baseline_revision",
-                task.baseline_commit,
-                confine_root=Path(state.project),
-            )
-        except (OSError, UnicodeDecodeError, verify.FrontmatterWriteError) as e:
-            # FrontmatterWriteError joins the tuple rather than getting its own
-            # arm: the remedy is the same sentence ("fix the file"), and the
-            # exception already says which shape it could not move. What matters
-            # is that it aborts here — the stale-baseline hazard this block exists
-            # to close is exactly what a swallowed write would leave behind.
-            raise RearmError(
-                f"cannot re-stamp baseline_revision on {task.spec_file} "
-                f"({e.__class__.__name__}: {e}) — fix the file, then re-run resolve"
-            ) from e
-        if overwritten and overwritten != task.baseline_commit:
-            # A claim that did not already name the advanced baseline. On the
-            # patch-restore leg that is the ordinary case (the spec still names the
-            # pre-attempt sha); on the from-scratch leg it is the only trace left
-            # of a divergence the gate can no longer report, which is precisely why
-            # it is recorded.
+        if not spec_path.is_file():
             journal.append(
-                "rearm-baseline-restamped",
+                "rearm-baseline-restamp-skipped",
                 story_key=key,
                 spec_file=str(spec_path),
-                overwritten=overwritten,
                 baseline=task.baseline_commit,
-                restore=bool(restore_patch),
             )
+        else:
+            try:
+                # Read through the same reader both consumers of a claimed baseline use,
+                # so what gets journalled as "overwritten" is the value the gate would
+                # have judged — not whichever key happened to be inspected here (#716).
+                #
+                # INSIDE the try, with the write it describes. `read_frontmatter` opens
+                # the file itself, so an OSError here would otherwise escape as a
+                # traceback from the one block whose whole contract is to turn a spec
+                # this re-arm cannot move into an actionable `RearmError`. What it does
+                # NOT rescue: `read_frontmatter` DEGRADES an unparseable YAML block to
+                # `{}` rather than raising, so on such a spec `overwritten` is `""`, the
+                # guard below is falsy, and no divergence record is written even though
+                # the insert lands. That is the reader's deliberate observe-degrade
+                # contract, not something to defeat here — the value is unknowable, and
+                # inventing one would be worse than the silence.
+                overwritten = auto_dev_baseline_of(verify.read_frontmatter(spec_path))
+                verify.set_frontmatter_field(
+                    spec_path,
+                    "baseline_revision",
+                    task.baseline_commit,
+                    confine_root=Path(state.project),
+                )
+            except (OSError, UnicodeDecodeError, verify.FrontmatterWriteError) as e:
+                # FrontmatterWriteError joins the tuple rather than getting its own
+                # arm: the remedy is the same sentence ("fix the file"), and the
+                # exception already says which shape it could not move. What matters
+                # is that it aborts here — the stale-baseline hazard this block exists
+                # to close is exactly what a swallowed write would leave behind.
+                raise RearmError(
+                    f"cannot re-stamp baseline_revision on {task.spec_file} "
+                    f"({e.__class__.__name__}: {e}) — fix the file, then re-run resolve"
+                ) from e
+            if overwritten and overwritten != task.baseline_commit:
+                # A claim that did not already name the advanced baseline. On the
+                # patch-restore leg that is the ordinary case (the spec still names the
+                # pre-attempt sha); on the from-scratch leg it is the only trace left
+                # of a divergence the gate can no longer report, which is precisely why
+                # it is recorded.
+                journal.append(
+                    "rearm-baseline-restamped",
+                    story_key=key,
+                    spec_file=str(spec_path),
+                    overwritten=overwritten,
+                    baseline=task.baseline_commit,
+                    restore=bool(restore_patch),
+                )
 
     save_state(run_dir, state)
     journal.append(

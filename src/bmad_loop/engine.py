@@ -384,14 +384,21 @@ def _session_task_id(story_key: str, part: str, seq: int, generation: int = 0) -
     return safe_segment(f"{story_key}-{part}-{seq}{gen}")
 
 
-# Longest single-line `reason` a notification channel carries. Not a display
-# preference: `gates.notify` writes exactly one `[stamp] title: message` line into
+# Longest single-line `reason` a notification channel carries — the returned string
+# runs to NOTICE_REASON_MAX + len(" […]") when a trim is marked, which is the bound
+# `test_notice_reason_caps_a_long_single_line_and_marks_the_trim` pins. Not a display
+# preference: `gates.notify` normally writes one `[stamp] title: message` line into
 # ATTENTION and hands the same string to a desktop toast, while a `Decision.reason`
 # is routinely MULTI-line — `verify.verify_command_results_outcome` appends the
 # captured output tail below the command line on purpose, because a repair session
 # reads that tail as its feedback. Pasted through verbatim, one failing verify
 # command spills a whole build log into ATTENTION as many un-prefixed lines (the
 # file's own `[stamp] title:` grammar breaks with it) and into a notification bubble.
+#
+# "Normally" is exact, not hedging: `_notify_park` deliberately writes a newline-joined
+# numbered action list through the same call, so one-line-per-notice is a property of
+# the reason-carrying notices, NOT of the ATTENTION file. Any test asserting the shape
+# over the whole file is really asserting that no park fired in that run.
 NOTICE_REASON_MAX = 200
 
 
@@ -2347,9 +2354,11 @@ class Engine:
                     return False
                 return True
             if decision.action == Action.RETRY:
-                # Tell the operator WHY the attempt is being redone (#640d). Every
-                # other dev outcome already notifies; RETRY was the one silent arm,
-                # and it is the arm that DISCARDS a completed implementation — the
+                # Tell the operator WHY the attempt is being redone (#640d). RETRY
+                # was the only dev outcome that REJECTS an attempt without raising a
+                # notice (PROCEED raises none either, but it accepts the work rather
+                # than discarding it), and it is the arm that DISCARDS a completed
+                # implementation — the
                 # non-fixable leg below rolls the tree back to baseline. Without
                 # this the only record was the `dev-decision` journal line, so a
                 # run could burn its whole attempt budget throwing away finished

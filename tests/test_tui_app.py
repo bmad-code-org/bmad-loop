@@ -4025,6 +4025,65 @@ async def test_escalation_rearm_warns_when_restore_recorded(project, monkeypatch
     assert any("NOT honored" in n for n in notes)  # the drop was surfaced, not silent
 
 
+async def test_escalation_rearm_surfaces_a_failed_baseline_advance(project, monkeypatch):
+    """The TUI re-arm RESUMES in the same gesture, so a degrade it does not surface
+    is a degrade the operator acts on without seeing.
+
+    `cli._echo_rearm_events` prints these to stderr on the other re-arm path; both
+    records are warn-only by contract (a project that is not a git repo must not
+    fail re-arm), so a journal line in a scrolling panel was the only trace here. A
+    failed advance means the re-drive rebuilds against the tree as it stood BEFORE
+    the resolve — the invisibility #640(b) exists to end, not to relocate to the
+    other caller.
+
+    Ablation: delete the journal read-back loop in `_do_rearm` and this reddens,
+    while the plain `re-armed 1` notice still fires.
+    """
+    from bmad_loop import resolve, runs
+    from bmad_loop.journal import Journal
+
+    calls: list[str] = []
+    notes: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+
+    def fake_rearm(rd, sk):
+        Journal(rd).append(
+            "rearm-baseline-advance-failed",
+            story_key=sk,
+            repo=str(rd),
+            baseline="a" * 40,
+            error="GitError: not a git repository",
+        )
+        return "ready-for-dev"
+
+    monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
+    orig_notify = BmadLoopApp.notify
+    monkeypatch.setattr(
+        BmadLoopApp,
+        "notify",
+        lambda self, msg, **kw: notes.append(str(msg)) or orig_notify(self, msg, **kw),
+    )
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: needs a human decision on the auth scheme.",
+    )
+    marker = resolve.resolution_path(run_dir, "1")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{}", encoding="utf-8")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, EscalationModal)
+        await pilot.click(await ready(pilot, "#act-rearm"))
+        await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
+    assert any("could not advance the re-drive baseline" in n for n in notes)
+    assert any("re-armed 1" in n for n in notes)  # the ordinary notice still fires
+
+
 async def test_escalation_rearm_disabled_without_resolution(project, monkeypatch):
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
     _stories_paused_run(

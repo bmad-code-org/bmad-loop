@@ -129,11 +129,16 @@ _JOURNAL_ALIAS_FIELDS = {
     # whose epic could not be resolved. See `_JOURNAL_BASENAME_NAMESPACES` for why
     # the value is normalized first: the producers do NOT agree on a bare basename.
     "spec": "spec",
-    # The producers do not agree on a field NAME either: `runs.rearm_escalation`
-    # and `engine._park_awaiting_operator` journal `spec_file`, and one of them
-    # writes an absolute path. Same value, same hazard, same namespace — and
-    # `_JOURNAL_BASENAME_NAMESPACES` keys on the namespace, not the field, so the
-    # absolute and worktree-relative spellings still reduce to one alias.
+    # The same value also arrives under a second field NAME. `runs.rearm_escalation`
+    # is the only journal producer of `spec_file` (its `rearm-baseline-restamped` and
+    # `rearm-baseline-restamp-skipped` kinds); `engine._park_awaiting_operator` passes
+    # `spec_file=` to `operatoractions.record_park`, which is a record file, not the
+    # journal. So the divergence is BETWEEN FIELDS, not between two producers of this
+    # one: `spec` carries absolute paths from engine's reconcile and marker-repair
+    # kinds, while `spec_file` carries whatever `StoryTask` persisted — worktree-relative
+    # for a task that ran under isolation. Same value, same hazard, same namespace, and
+    # `_JOURNAL_BASENAME_NAMESPACES` keys on the namespace rather than the field, so
+    # both spellings still reduce to one alias.
     "spec_file": "spec",
 }
 # Namespaces whose journalled value arrives in more than one shape and must be

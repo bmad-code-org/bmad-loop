@@ -722,19 +722,30 @@ def render_deferred(items) -> str:
 # serve: for `legacy_baseline` it means the YAML-null shape (a bare
 # `baseline_commit:` line), which is a distinct case the reader must treat as
 # absent WITHOUT turning it into the token "None" (#358).
-OMIT = object()
+class _Omit:
+    """Type of :data:`OMIT`, so a parameter accepting the sentinel can still be
+    annotated. A bare ``object()`` forced ``baseline: object``, which silently
+    disabled checking for every ordinary caller passing a sha."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "OMIT"
+
+
+OMIT = _Omit()
 
 
 def write_spec(
     path: Path,
     status: str,
-    baseline: object,
+    baseline: str | _Omit,
     *,
     prose_status: str | None = None,
     closes_deferred: object = None,
     operator_actions: object = None,
     deferred=None,
-    legacy_baseline: object = OMIT,
+    legacy_baseline: str | None | _Omit = OMIT,
 ) -> None:
     """Write a spec the way the real bmad-dev-auto skill does. The skill's step-03
     stamps `baseline_revision` and NEVER `baseline_commit` (that name exists only

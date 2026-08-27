@@ -605,8 +605,14 @@ class ActiveAgent:
 def _story_key_from_task_id(task_id: str, role: str) -> str:
     """Recover the story key from a session task_id when the journal entry
     predates story-key stamping (#153 phase 1). The id is
-    ``safe_segment(f"{story_key}-{part}-{seq}")`` where ``part`` is the role, or
-    a workflow label for labeled plugin sessions — so peel the trailing
+    ``safe_segment(f"{story_key}-{part}-{seq}{gen}")`` where ``part`` is the role, or
+    a workflow label for labeled plugin sessions, and ``gen`` is a ``-g<N>`` re-arm
+    generation suffix emitted only above zero (#705). This parser handles the
+    unsuffixed shape ONLY: a ``-g1`` tail fails the ``seq.isdigit()`` test below and
+    returns the whole id. That is unreachable rather than latent-correct — every
+    session-start has carried ``story_key`` since #153 phase 1, so the entries this
+    fallback sees are exactly the ones that predate generations — but widen the
+    fallback and this is the assumption that breaks. So peel the trailing
     ``-{part}-{seq}``: drop the numeric seq, then the recorded role when it
     matches (the common case), else one more ``-`` group (best-effort, since a
     label is not recoverable from the entry)."""

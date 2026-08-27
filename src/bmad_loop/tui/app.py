@@ -25,7 +25,7 @@ from tomlkit.exceptions import ParseError
 
 from .. import bmadconfig, decisions, devcontract, policy, resolve, runs, stories, verify
 from ..adapters.multiplexer import MultiplexerError, mux_usable
-from ..journal import load_state
+from ..journal import Journal, load_state
 from ..model import (
     PAUSE_EPIC_BOUNDARY,
     PAUSE_ESCALATION,
@@ -828,11 +828,38 @@ class BmadLoopApp(App[None]):
         path (rearm_escalation handles sentinel auto-delete-with-preservation)."""
         if self._resolve_blocked_by_liveness(run_id, run_dir):
             return
+        seen_entries = len(Journal(run_dir).entries())
         try:
             runs.rearm_escalation(run_dir, story_key)
         except RearmError as e:
             self.notify(f"re-arm failed: {e}", severity="error")
             return
+        # Surface the same baseline degrades `cli._echo_rearm_events` prints. Both
+        # are warn-only by contract (a project that is not a repo must not fail
+        # re-arm), so without this the whole degrade is journal-only on the path
+        # that RESUMES in the same gesture — the invisibility #640(b) exists to
+        # end, not to relocate to the other caller.
+        for entry in Journal(run_dir).entries()[seen_entries:]:
+            kind = entry.get("kind", "")
+            if kind == "rearm-baseline-advance-failed":
+                self.notify(
+                    "could not advance the re-drive baseline "
+                    f"({entry.get('error', '?')}) — the re-drive rebuilds against the "
+                    "tree as it stood before your resolve; the spec was NOT re-stamped",
+                    severity="warning",
+                )
+            elif kind == "rearm-baseline-restamp-skipped":
+                self.notify(
+                    f"the recorded spec ({entry.get('spec_file', '?')}) is not readable "
+                    "from here — its status flip and baseline re-stamp were skipped",
+                    severity="warning",
+                )
+            elif kind == "rearm-baseline-restamped" and not entry.get("restore"):
+                self.notify(
+                    "the spec claimed a different baseline than the run recorded; "
+                    "this re-stamp is the only trace of that divergence",
+                    severity="warning",
+                )
         if restore_recorded:
             self.notify(
                 "recorded restore patch NOT honored — this re-arm re-drives from "

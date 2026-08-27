@@ -7,13 +7,15 @@ from pathlib import Path
 
 import pytest
 
-from bmad_loop import devcontract, platform_util, verify
+# The shared "this key is absent entirely" marker, for `legacy_baseline`. Imported
+# rather than redefined: `conftest.write_spec` states the same rule for the same
+# reason, and two sentinels for one contract is one place for them to disagree. A
+# plain `None` cannot serve: there it means the YAML-null shape (a bare
+# `baseline_commit:` line), a distinct case the reader must treat as absent WITHOUT
+# turning it into the token "None" (#358).
+from conftest import OMIT as _OMIT
 
-# `_spec`'s "this key is absent entirely" marker, for `legacy_baseline`. A plain
-# `None` cannot serve: there it means the YAML-null shape (a bare
-# `baseline_commit:` line), a distinct case the reader must treat as absent
-# WITHOUT turning it into the token "None" (#358).
-_OMIT = object()
+from bmad_loop import devcontract, platform_util, verify
 
 
 def _spec(

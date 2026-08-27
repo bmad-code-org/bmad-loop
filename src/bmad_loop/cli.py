@@ -2740,11 +2740,15 @@ def _resolve_restore_patch(
     return str(patch), None
 
 
-def _echo_stale_restore(run_dir: Path, seen_entries: int) -> None:
+def _echo_rearm_events(run_dir: Path, seen_entries: int) -> None:
     """Surface the events a just-completed re-arm journaled: the `stale-restore-*`
     residue of the restore attempt it abandoned (runs._stale_restore_residue), and
-    the two `rearm-baseline-*` records the advance and the re-stamp write. The
+    the three `rearm-baseline-*` records the advance and the re-stamp write. The
     commits variant is the one the human must act on — nothing else will.
+
+    Named for the re-arm, not for the stale restore: it began as a `stale-restore-*`
+    echo and now carries the baseline family too, so a name from the narrower era
+    would send the next re-arm record somewhere else.
 
     The baseline records are echoed for the same reason: a failed advance means the
     re-drive rebuilds against the tree as it stood BEFORE the resolve, and the
@@ -2778,11 +2782,33 @@ def _echo_stale_restore(run_dir: Path, seen_entries: int) -> None:
                 file=sys.stderr,
             )
         elif kind == "rearm-baseline-restamped":
-            print(
+            # Differentiated on the `restore` flag the record already carries, which
+            # exists precisely because the two legs mean different things. On the
+            # patch-restore leg an overwrite is the ORDINARY case (the spec still
+            # names the pre-attempt sha); on the from-scratch leg it is the only
+            # trace left of a divergence the gate can no longer report. Printing one
+            # warning for both trains the operator to scroll past the meaningful one.
+            head = (
                 f"note: re-stamped the spec baseline "
                 f"{str(entry.get('overwritten', '?'))[:12]}.. -> "
-                f"{str(entry.get('baseline', '?'))[:12]}.. — if the old value was not "
-                "a stale leftover, the gate can no longer report the divergence",
+                f"{str(entry.get('baseline', '?'))[:12]}.."
+            )
+            if entry.get("restore"):
+                print(f"{head} — routine on a restore re-drive", file=sys.stderr)
+            else:
+                print(
+                    f"{head} — the spec claimed a DIFFERENT baseline than the run "
+                    "recorded, and this re-stamp is the only trace of it; the gate "
+                    "can no longer report that divergence",
+                    file=sys.stderr,
+                )
+        elif kind == "rearm-baseline-restamp-skipped":
+            print(
+                f"warning: the recorded spec for this story "
+                f"({entry.get('spec_file', '?')}) is not a readable file from here, "
+                "so its status flip and baseline re-stamp were both skipped — the "
+                "spec still names the escalated attempt's baseline. Check the "
+                "recorded spec path before resuming",
                 file=sys.stderr,
             )
         elif kind == "stale-restore-commits":
@@ -2901,7 +2927,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     except runs.RearmError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
-    _echo_stale_restore(run_dir, seen_entries)
+    _echo_rearm_events(run_dir, seen_entries)
     print(
         f"re-armed {story_key}"
         + (" (restoring the attempted change for review)" if restore_patch else "")

@@ -54,9 +54,24 @@ breaking changes may land in a minor release.
 ### Changed
 
 - **`bmad-loop diagnose` routes the re-arm records by field name** (#640, #716). `spec_file` is
-  aliased (it is a customer feature name) and `repo` is dropped (an absolute host path that
-  correlates nothing — one run has one code root). Applies to matching records already on disk,
-  so an existing run's dump changes shape too.
+  aliased (it is a customer feature name), `overwritten` is aliased (it is half a baseline
+  comparison, meaningless without its partner), and `repo` is dropped (an absolute host path
+  that correlates nothing — one run has one code root). Scoped to the journal kinds this
+  release introduces: no first-party producer emitted these fields before, so no existing run's
+  dump changes shape and `SCHEMA_VERSION` is unaffected.
+
+- **Re-arm refuses to touch a spec it cannot read, and says so** (#640). `StoryTask` persists
+  `spec_file` relative to a worktree, so a re-arm of an isolated task could hold a path that
+  resolves against nothing — and both frontmatter writers answer that with `False`, not an
+  exception. The status flip and the baseline re-stamp would then BOTH silently do nothing,
+  leaving the spec on the escalated attempt's sha with no record anywhere. Re-arm now checks the
+  path first and journals `rearm-baseline-restamp-skipped`, which `resolve` echoes.
+
+- **The re-arm baseline records reach the TUI operator too** (#640). `bmad-loop resolve` echoed
+  the advance-failure and re-stamp records; the TUI's re-arm — which resumes the run in the same
+  gesture — printed only `re-armed <key>`. It now raises the same warnings before resuming. The
+  re-stamp notice is also differentiated on the `restore` flag it already carried: routine on a
+  patch-restore re-drive, a real divergence signal on a from-scratch one.
 
 - **`bmad-loop resolve` re-stamps the spec's `baseline_revision` on both re-drive legs**
   (#640), not only on a patch-restore. A from-scratch re-drive used to carry the escalated
