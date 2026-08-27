@@ -3468,7 +3468,19 @@ def verify_dev(
         expected_status=(
             AWAITING_OPERATOR if parked else ("in-review" if review_enabled else "done")
         ),
-        extra_exclude=engine_written,
+        # A park may legitimately produce no code: the story's remaining work is a
+        # human's, and a session that correctly recognized that on its first pass
+        # wrote only the spec and the board — both of which the proof-of-work
+        # exclude already removes, so the gate reads the park as "no changes" and
+        # retries it to budget exhaustion, then rolls the park back (#676). Skip
+        # the gate on this leg (`extra_exclude=None`), the same idiom the
+        # plan-halt leg uses in `verify_dev_stories` for the same reason. Park is
+        # not thereby a free pass: `_operator_actions_gate` above already refused
+        # a park declaring no usable `operator_actions`, and the (spec, board)
+        # pair still has to match. The cost is that a park which *did* produce
+        # code no longer clears proof-of-work either — harmless, because skipping
+        # a gate never fails work that passed it.
+        extra_exclude=None if parked else engine_written,
         fm=fm,
     )
     if gate is not None:
@@ -3979,6 +3991,27 @@ def verify_commands_outcome(policy: Policy, cwd: Path) -> VerifyOutcome:
     return verify_command_results_outcome(run_verify_commands(policy, cwd), cwd)
 
 
+def _verify_review_commands(policy: Policy, paths: ProjectPaths) -> VerifyOutcome:
+    """Run the review-side verify commands in the tree the dev side already uses.
+
+    `paths.repo_root`, not `paths.project`: the dev gate runs them in
+    `Engine.workspace.root` (`_verify_commands_with_results`), which is
+    `paths.repo_root` for `isolation = "none"` and the worktree dir under
+    worktree isolation. With a `repo_root` override the two gates otherwise
+    disagree — dev builds the code tree, review builds the artifact tree — and a
+    `[verify] commands` entry that passes for dev fails (or vacuously passes) for
+    review on the same commit (#695).
+
+    This deliberately splits the two roots the review gates use: the *artifacts*
+    each gate reads (`paths.sprint_status`, `paths.deferred_work`, the claimed
+    spec) stay project-rooted, because that is where BMAD writes them; only the
+    operator's shell commands move, because those are about the code. The three
+    `verify_review*` gates share this one function so the split cannot drift
+    between them.
+    """
+    return verify_commands_outcome(policy, paths.repo_root)
+
+
 def verify_review(
     task: StoryTask,
     paths: ProjectPaths,
@@ -4051,7 +4084,7 @@ def verify_review(
             f"sprint-status for {task.story_key} is {sprint!r}, expected {expected!r}"
         )
 
-    return verify_commands_outcome(policy, paths.project)
+    return _verify_review_commands(policy, paths)
 
 
 def _is_signoff_regression(sprint: str | None, sprint_reached_done: bool, policy: Policy) -> bool:
@@ -4083,7 +4116,7 @@ def verify_review_stories(task: StoryTask, paths: ProjectPaths, policy: Policy) 
     status = status_of(fm)
     if status != "done":
         return VerifyOutcome.retry(f"spec status is {status!r}, expected 'done'")
-    return verify_commands_outcome(policy, paths.project)
+    return _verify_review_commands(policy, paths)
 
 
 def verify_review_bundle(task: StoryTask, paths: ProjectPaths, policy: Policy) -> VerifyOutcome:
@@ -4123,7 +4156,7 @@ def verify_review_bundle(task: StoryTask, paths: ProjectPaths, policy: Policy) -
             fixable=True,
         )
 
-    return verify_commands_outcome(policy, paths.project)
+    return _verify_review_commands(policy, paths)
 
 
 def commit_story(repo: Path, message: str) -> str:

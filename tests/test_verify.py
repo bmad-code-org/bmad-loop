@@ -13,6 +13,7 @@ from conftest import (
     _OK,
     MISSING_TOOL_CMD,
     UNRESOLVABLE,
+    _file_exists_cmd,
     fault_read_text,
     git,
     make_git_noisy,
@@ -704,13 +705,19 @@ def test_verify_dev_review_disabled_expects_done(project):
 # ------------------------------------------- awaiting-operator pair (#335)
 
 
-def _park(project, *, sprint="awaiting-operator", actions=("publish the TXT record",)):
-    """A dev session that finished its agent-doable work and parked the rest."""
+def _park(project, *, sprint="awaiting-operator", actions=("publish the TXT record",), code=True):
+    """A dev session that finished its agent-doable work and parked the rest.
+
+    `code=False` is the park that got it right on the first pass: its only residue
+    is the spec and the board, both of which the proof-of-work exclude already
+    removes. Every other row here keeps the default `src.txt` write, which is why
+    none of them can see #676."""
     write_sprint(project, {"1-1-a": sprint})
     task = make_task(project)
     sp = spec_path(project, "1-1-a")
     write_spec(sp, "awaiting-operator", task.baseline_commit, operator_actions=list(actions))
-    (project.project / "src.txt").write_text("changed\n")
+    if code:
+        (project.project / "src.txt").write_text("changed\n")
     return task, sp
 
 
@@ -725,6 +732,35 @@ def test_verify_dev_accepts_the_park_pair(project):
 
     assert out.ok
     assert task.spec_file == str(sp)
+
+
+def test_verify_dev_park_with_no_code_residue_passes(project):
+    """#676: the parked leg skips proof-of-work outright, the same idiom the
+    plan-halt leg uses in `verify_dev_stories`.
+
+    A park is *defined* by owing the remainder to a human, so a session that
+    recognized that on its first pass legitimately wrote nothing but the spec and
+    the board — and `verify_dev_exclude_relpaths` excludes exactly those two by
+    name. The gate therefore read a correct park as "no changes", retried it until
+    the attempt budget ran out, and rolled the park back.
+
+    The second half is the control, and it is what stops this row passing for the
+    wrong reason: the SAME empty tree under the SAME flags, differing only in the
+    observed spec status, must still fail proof-of-work. If the tree were not
+    actually empty the control would go green and the first assertion would prove
+    nothing."""
+    task, sp = _park(project, code=False)
+
+    out = verify.verify_dev(task, project, dev_result(sp), review_enabled=False, operator_park=True)
+
+    assert out.ok
+    assert task.spec_file == str(sp)
+
+    # scoped to the parked leg, not a blanket disable of proof-of-work
+    write_sprint(project, {"1-1-a": "review"})
+    write_spec(sp, "in-review", task.baseline_commit)
+    ordinary = verify.verify_dev(task, project, dev_result(sp), operator_park=True)
+    assert not ordinary.ok and ordinary.reason == "no changes in worktree since baseline commit"
 
 
 def test_verify_dev_park_needs_the_matching_board(project):
@@ -2449,6 +2485,57 @@ def test_verify_review_bundle_missing_entry_fails(project):
     bundle_ledger(project, {"DW-1": "done 2026-06-11"})  # DW-2 absent entirely
     out = verify.verify_review_bundle(task, project, Policy())
     assert not out.ok and out.fixable and "DW-2" in out.reason
+
+
+@pytest.mark.parametrize("gate", ["review", "stories", "bundle"])
+def test_verify_review_commands_run_in_repo_root(project, tmp_path, gate):
+    """#695: the review-side `[verify] commands` run in `paths.repo_root` — the same
+    tree the dev gate uses (`Engine._verify_commands_with_results` runs them in
+    `Engine.workspace.root`, which `Workspace.default` sets to `paths.repo_root`).
+
+    Under `isolation = "none"` with a `repo_root` override the two gates otherwise
+    build different trees on the same commit: dev the code repo, review the
+    artifact project. The `project` fixture leaves `repo_root == project`, so no
+    existing row can tell the two apart.
+
+    Pinned from both sides, because one direction alone is satisfiable by a cwd
+    that is neither: a marker only `repo_root` holds must pass, and a marker only
+    `project` holds must fail. All three `verify_review*` gates are covered — they
+    share one helper precisely so the split cannot drift between them."""
+    code_root = tmp_path / "code-repo"
+    code_root.mkdir()
+    (code_root / "in-repo-root.txt").write_text("x", encoding="utf-8")
+    (project.project / "in-project.txt").write_text("x", encoding="utf-8")
+    paths = dataclasses.replace(project, repo_root=code_root)
+
+    if gate == "review":
+        write_sprint(paths, {"1-1-a": "done"})
+        task = make_task(paths)
+        sp = spec_path(paths, "1-1-a")
+        write_spec(sp, "done", task.baseline_commit)
+        run_gate = verify.verify_review
+    elif gate == "stories":
+        task = make_stories_task(paths, "1")
+        sp = write_story(
+            paths.planning_artifacts / "epic-a", "1", "x", "done", task.baseline_commit
+        )
+        run_gate = verify.verify_review_stories
+    else:
+        task = make_bundle_task(paths)
+        sp = paths.implementation_artifacts / "spec-dw-test-bundle.md"
+        write_spec(sp, "done", task.baseline_commit)
+        bundle_ledger(paths, {"DW-1": "done 2026-06-11", "DW-2": "done 2026-06-11"})
+        run_gate = verify.verify_review_bundle
+    task.spec_file = str(sp)
+
+    def gate_with(marker: str):
+        return run_gate(
+            task, paths, Policy(verify=VerifyPolicy(commands=(_file_exists_cmd(marker),)))
+        )
+
+    assert gate_with("in-repo-root.txt").ok
+    out = gate_with("in-project.txt")
+    assert not out.ok and "verify command failed" in out.reason
 
 
 def test_verify_shared_gates_oserror_degrades_to_retry(project, monkeypatch):

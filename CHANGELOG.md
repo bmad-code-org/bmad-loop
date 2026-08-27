@@ -74,6 +74,20 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **Review-side `[verify] commands` run in the same tree the dev gate uses** (#695). All three
+  `verify_review*` gates ran them in `paths.project`, while the dev gate runs them in the
+  workspace root — `paths.repo_root` under `isolation = "none"`. With a `repo_root` override the
+  two gates built different trees on the same commit, so a command that passed for dev could
+  fail (or vacuously pass) for review. The artifacts each gate reads stay project-rooted; only
+  the operator's shell commands move, and the three gates now share one helper so the split
+  cannot drift.
+- **A park that legitimately produced no code passes the front gate** (#676). The parked leg
+  ran proof-of-work with the spec and the board excluded by name — the only two files a
+  first-pass park writes — so a correct park read as "no changes", retried until the attempt
+  budget ran out, and was then rolled back. That leg now skips the gate outright, the same
+  idiom the plan-halt leg already uses. Park is not thereby a free pass: the gate refusing a
+  park that declares no usable `operator_actions` runs ahead of it, and the spec/board pair
+  still has to match.
 - **The git-add shield refuses to enable `extensions.worktreeConfig` over an operator's
   explicit disable** (#396), instead of enabling it and deleting the line on rollback. The
   probe read the flag `--type=bool`, so a `false`/`off`/`no`/`0` in the shared config read
