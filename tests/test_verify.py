@@ -872,7 +872,12 @@ def test_verify_dev_residue_free_non_park_still_fails_proof_of_work(
     policy flag alone, ignoring the observed status — left every row in this file
     green, and reddened only incidental `write_src=False` rows over in
     `test_engine.py` that are about harvest, not about park. A run with parking
-    enabled but a session that finished ordinarily must still owe a diff."""
+    enabled but a session that finished ordinarily must still owe a diff.
+
+    Ablation: delete the `if extra_exclude is not None and task.baseline_commit:`
+    proof-of-work block in `_verify_shared_gates` and all four rows fail on
+    `assert not out.ok` — the residue-free tree then verifies clean at every
+    terminal, which is the #676 behavior generalized past the park."""
     task, sp = _residue_free(project, status=status, sprint=sprint)
 
     out = verify.verify_dev(
@@ -894,7 +899,12 @@ def test_verify_dev_park_still_faces_the_workflow_tag_gate(project):
 
     This is the gate the park-leg docstrings promise "still runs" and that no row
     asserted: every other park row hands in a well-formed `dev_result(sp)`, so
-    deleting the whole shared-gate block on the parked leg left the suite green."""
+    deleting the whole shared-gate block on the parked leg left the suite green.
+
+    Ablation: delete the `if workflow != DEV_WORKFLOW:` refusal at the top of
+    `_verify_shared_gates` and this fails on `assert not out.ok`. With
+    proof-of-work already skipped for the park, that gate is the only thing left
+    to refuse the foreign tag, so the outcome goes straight to ok."""
     task, sp = _residue_free(
         project, status=verify.AWAITING_OPERATOR, sprint=verify.AWAITING_OPERATOR
     )
@@ -911,7 +921,15 @@ def test_verify_dev_park_still_faces_the_baseline_match_gate(project):
     was the park's last diff-based tie to the attempt, so baseline-match is now
     what remains binding a park to the attempt the orchestrator actually launched.
     A residue-free park claiming a baseline the orchestrator never recorded must
-    still be refused."""
+    still be refused.
+
+    Ablation: delete the `if task.baseline_commit and claimed_baseline not in
+    ("", "NO_VCS"):` block in `_verify_shared_gates` and this fails on
+    `assert not out.ok`. Ablate that whole block, NOT the inner `canonical_claimed
+    is None` early return on its own: the arms below it consume
+    `canonical_claimed`, so the narrower cut sends `None` on into
+    `commit_reachable_above_baseline` and reddens this row on a subprocess
+    `TypeError` instead — an ablation grading itself rather than the gate."""
     task, sp = _residue_free(
         project,
         status=verify.AWAITING_OPERATOR,
@@ -2695,7 +2713,13 @@ def test_verify_review_gates_run_commands_in_repo_root(project, tmp_path, mode):
     `repo_root` is a bare directory, not a git repo, deliberately: these three
     gates run no git in that root at all — only `subprocess.run(cwd=...)` — so a
     plain dir is the honest fixture. Turning it into a real repo would let a
-    regression that started shelling out to git there pass unnoticed."""
+    regression that started shelling out to git there pass unnoticed.
+
+    INVERSE ablation: restore the pre-#695 root — `verify_commands_outcome(policy,
+    paths.project)` in `_verify_review_commands` — and all three modes fail on the
+    FIRST assertion, the repo-root marker going missing, before the refusal leg is
+    reached. The gate here is a cwd choice rather than a check, so deleting code
+    cannot reproduce the bug; only putting the old root back does."""
     repo_root = tmp_path / "code-root"
     repo_root.mkdir()
     (repo_root / "only-in-repo-root.txt").write_text("x\n", encoding="utf-8")
@@ -2791,7 +2815,15 @@ def test_verify_review_gates_read_artifacts_from_the_project_root(project, tmp_p
     reading these artifacts altogether. Planting the same statuses in the project's
     own tree and requiring a refusal is what establishes they are load-bearing —
     the discrimination is then built here rather than borrowed from the rows that
-    happen to cover each failure separately."""
+    happen to cover each failure separately.
+
+    The control is ablated per mode, since each mode's refusal is carried by its
+    own artifact. ABLATION A1: delete the `if sprint != expected:` refusal in
+    `verify_review` and `[review]` fails on `assert not refused.ok` while
+    `[review_bundle]` still passes. ABLATION A2: delete the `if not_done:` refusal
+    in `verify_review_bundle` and `[review_bundle]` fails there instead, `[review]`
+    passing. Reddening DISJOINT params is the point — it is what shows neither
+    mode's control is being carried by the other mode's gate."""
     repo_root = tmp_path / "code-root"
     rel = project.implementation_artifacts.relative_to(project.project)
     decoy_paths = dataclasses.replace(project, implementation_artifacts=repo_root / rel)
