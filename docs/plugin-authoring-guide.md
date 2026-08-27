@@ -473,7 +473,9 @@ or act on it only from an explicitly configured plugin.
 **The dev phase is the whole of this surface.** `[verify] commands` also run at
 the _review_ gate — `verify_review` / `verify_review_stories` /
 `verify_review_bundle` end on the same core classifier — and **none of those runs
-are journalled or published to any hook.** Five engine gates reach them: the
+are journalled or published to any hook.** They run in `repo_root`, the same root
+the dev phase uses (#695); only the gates' own artifact reads — the spec, the
+sprint board, the deferred-work ledger — stay project-rooted. Five engine gates reach them: the
 converged review pass, the review-budget-exhaustion rescue, the review-timeout
 salvage, and both passes inside the skip-review commit path (which runs the gate
 again after a repair). `bmad-loop confirm --reverify` runs the commands too, out

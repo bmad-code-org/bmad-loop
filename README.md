@@ -227,7 +227,8 @@ sprint-status.yaml: 1-2-account-mgmt: ready-for-dev
   │          implements, self-reviews inline (parallel review layers),
   │          commits, finalizes spec → done … Stop hook signals the orchestrator
   ├─ VERIFY  spec exists · status done · baseline matches · diff non-empty
-  │          · run [verify].commands (pytest, ruff…) — a broken build never
+  │          (except a park, which may legitimately have produced none)
+  │          · run [verify].commands in repo_root (pytest, ruff…) — a broken build never
   │          reaches review; a failure spawns a fix session fed the output
   ├─ REVIEW  fresh window: claude "/bmad-build-auto <done spec>" — re-invoking on a
   │  (gated) done spec runs a fresh independent step-04 review pass (parallel review
@@ -235,7 +236,7 @@ sprint-status.yaml: 1-2-account-mgmt: ready-for-dev
   │          commit). Gated on the skill's `followup_review_recommended` flag
   │          (review.trigger = "recommended") or every story ("always"); bounded
   │          loop, default 3 cycles
-  ├─ VERIFY  spec done · sprint done · run [verify].commands again — a failure
+  ├─ VERIFY  spec done · sprint done · run [verify].commands again (repo_root) — a failure
   │          routes a feedback-driven dev fix session, then a fresh review cycle
   └─ COMMIT  orchestrator squashes the iteration's commits into one story commit
              (then, under [scm] isolation = "worktree", merges the unit branch
@@ -524,7 +525,7 @@ Merge-back is always **serialized** — `max_parallel` is a validated knob clamp
 <img src="docs/images/settings-scm.png" alt="The settings editor with the [scm] section expanded: isolation, branch_per, merge_strategy, the seed-adapter-configs switch, and the extra-worktree-seed-files field." width="880">
 </p>
 
-For a monorepo or any layout where the git root differs from the project dir, set an optional `repo_root` key in `_bmad/bmm/config.yaml` — it decouples where git/code work happens from where run state lives (defaults to the project dir). It is **not compatible with `isolation = "worktree"`**: provisioning seeds a worktree from `repo_root` while the preflight probes `project`, so `validate` reports the pair and `run`/`sweep`/`resume` refuse to start. Use one or the other — plumbing both through provisioning is tracked as #443.
+For a monorepo or any layout where the git root differs from the project dir, set an optional `repo_root` key in `_bmad/bmm/config.yaml` — it decouples where git/code work happens from where run state lives (defaults to the project dir). Your `[verify].commands` run there too — the code's root, not the BMAD project dir — while the orchestrator's own artifact reads stay project-rooted. It is **not compatible with `isolation = "worktree"`**: provisioning seeds a worktree from `repo_root` while the preflight probes `project`, so `validate` reports the pair and `run`/`sweep`/`resume` refuse to start. Use one or the other — plumbing both through provisioning is tracked as #443.
 
 ### Plugins
 
