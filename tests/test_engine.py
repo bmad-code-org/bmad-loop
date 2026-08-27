@@ -39,11 +39,13 @@ from bmad_loop import deferredwork, platform_util, runs, verify
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.engine import (
+    NOTICE_REASON_MAX,
     Engine,
     RunPaused,
     RunStopped,
     _digest_of,
     _LedgerAnchor,
+    _notice_reason,
     _run_depth,
     _session_task_id,
 )
@@ -2186,6 +2188,39 @@ def test_current_dev_session_index_follows_the_generation(project):
     assert engine._current_dev_session_index(task) == 1
 
 
+def test_notice_reason_caps_a_long_single_line_and_marks_the_trim():
+    """The LENGTH half of `_notice_reason`'s contract, which no engine-level row
+    reaches.
+
+    `test_dev_retry_notice_collapses_a_multiline_reason` grades only the first-line
+    collapse: its long run sits on the third line, so `first` never exceeds the cap
+    and its `len(retry) < 300` bound passes for any cap value — including none. A
+    single-line reason is the shape that actually crosses it: a `[verify] commands`
+    entry whose invocation carries many paths makes `verify command failed (rc=N):
+    <command>` one line well past the cap, and with the cap gone that whole line
+    lands verbatim in ATTENTION and in the toast payload.
+
+    Pinned as a direct unit row rather than through the engine because the cap is a
+    property of the helper, and routing a 500-char command through a dev session to
+    observe it would grade the plumbing instead.
+
+    Ablation: delete the `if len(first) > NOTICE_REASON_MAX:` block and this reddens
+    on the length assertion; the sibling engine row stays green.
+    """
+    capped = _notice_reason("z" * 500)
+    assert capped == "z" * NOTICE_REASON_MAX + " […]"
+    assert len(capped) == NOTICE_REASON_MAX + len(" […]")
+
+    # exactly at the cap is not a trim — the marker would otherwise claim a cut that
+    # did not happen, which is the ambiguity the marker exists to remove
+    assert _notice_reason("z" * NOTICE_REASON_MAX) == "z" * NOTICE_REASON_MAX
+
+    # the reasonless RETRY: the helper returns "" so the call site's `or` fallback
+    # ("dev attempt rejected with no reason recorded") is what reaches the operator
+    assert _notice_reason("") == ""
+    assert _notice_reason("   \n\n  ") == ""
+
+
 def test_dev_retry_notice_collapses_a_multiline_reason(project, monkeypatch):
     """The FIXABLE leg, which is where a `Decision.reason` is routinely multi-line:
     `verify.verify_command_results_outcome` appends the captured output tail below
@@ -2286,6 +2321,56 @@ def test_harvest_gate_exclude_is_rooted_on_the_code_tree(project, tmp_path):
         repo_root=project.project,
     )
     engine.workspace = Workspace(root=project.project, paths=diverged)
+    assert engine._harvest_gate_exclude(task) == ()
+
+
+def test_harvest_gate_exclude_degrade_arm_is_rooted_on_the_code_tree(
+    project, tmp_path, monkeypatch
+):
+    """The DEGRADE arm of the same exclude follows the same root.
+
+    The row above grades the resolved path. A filesystem resolve fault takes the
+    LEXICAL fallback instead, and that spelling moved with it — but no row observed
+    the move: the existing fault-injection row runs on the `project` fixture, where
+    the two roots are the same object, and the row above injects no fault.
+
+    Under the override the ledger sits outside the code tree, so `()` is the honest
+    answer. A `paths.project` spelling SUCCEEDS lexically there and emits a relpath
+    that git, running in the code tree, resolves against the wrong directory —
+    silently excluding whatever happens to sit at that relative path in the checkout,
+    which turns a real change into "no changes since baseline". Uncertainty must not
+    turn the engine's own append into session proof, and it must not turn a session's
+    work into nothing either.
+
+    Ablation: put the lexical fallback back on `paths.project` and this reddens with
+    the project-relative ledger entry.
+    """
+    from bmad_loop.workspace import Workspace
+
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.harvest_wrote_ledger = True
+
+    art = tmp_path / "artifacts-root"
+    (art / "_bmad-output" / "implementation-artifacts").mkdir(parents=True)
+    diverged = dataclasses.replace(
+        project,
+        project=art,
+        implementation_artifacts=art / "_bmad-output" / "implementation-artifacts",
+        planning_artifacts=art / "_bmad-output" / "planning-artifacts",
+        output_folder=art / "_bmad-output",
+        repo_root=project.project,
+    )
+    engine.workspace = Workspace(root=project.project, paths=diverged)
+
+    real_resolve = Path.resolve
+
+    def resolve_fault(self, *args, **kwargs):
+        if self == diverged.deferred_work:
+            raise OSError("injected ledger resolve fault")
+        return real_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve_fault)
     assert engine._harvest_gate_exclude(task) == ()
 
 

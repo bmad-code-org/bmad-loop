@@ -725,9 +725,10 @@ def has_changes_since(
 
     `exclude` is repo-relative posix dir prefixes whose changes don't count —
     used by the dev/bundle proof-of-work gate to ignore the orchestrator-owned
-    BMAD artifact folders (see `artifact_relpaths`), so a session that only
-    rewrites its own spec (e.g. the frontmatter-status reconcile) under those
-    folders doesn't register as real implementation work. Mirrors
+    BMAD artifacts (composed by `verify_dev_exclude_relpaths`, relative to the same
+    root this is invoked against), so a session that only rewrites its own spec
+    (e.g. the frontmatter-status reconcile) under them doesn't register as real
+    implementation work. Mirrors
     `attempt_dirty`'s exclusion. Default `()` keeps the unscoped behavior.
 
     `baseline_untracked` is the untracked-file snapshot taken when the baseline
@@ -3113,9 +3114,15 @@ def artifact_relpaths(paths: ProjectPaths) -> tuple[str, ...]:
     """Repo-relative posix prefixes of the orchestrator-owned BMAD artifact
     folders (the output root and the implementation/planning artifact dirs),
     relative to ``paths.project``. Folders configured outside the project tree
-    are skipped — nothing to exclude there. The same set as
-    ``Engine._protected_relpaths``; the dev/bundle proof-of-work gate passes
-    these to ``has_changes_since`` so spec-only edits never count as real work."""
+    are skipped — nothing to exclude there.
+
+    NO PRODUCTION CALLER. Both consumers it was written for have moved: the
+    dev/bundle proof-of-work gate now composes its excludes file-granularly through
+    ``verify_dev_exclude_relpaths``, rooted on ``paths.repo_root`` where git runs
+    (#716), and rollback protection builds its own list against the workspace root in
+    ``RecoveryFlow.protected_relpaths``. Its ``paths.project`` anchor is therefore
+    inert rather than correct — do not cite it as evidence that project-rooting is
+    right for anything, and re-derive the root if a caller is ever added."""
     out: list[str] = []
     for folder in (
         paths.output_folder,
@@ -3138,7 +3145,7 @@ def verify_dev_exclude_relpaths(
     spec_path: Path,
     restore_patch: str | None = None,
     *,
-    root: Path | None = None,
+    root: Path,
 ) -> tuple[str, ...]:
     """Repo-relative posix paths the dev/bundle proof-of-work gate excludes from
     `has_changes_since` — file-granularity, unlike `artifact_relpaths`' whole-folder
@@ -3174,15 +3181,19 @@ def verify_dev_exclude_relpaths(
 
     ``root`` is the tree the resulting pathspecs are relative to, and MUST be the
     same root the caller invokes git against — `paths.repo_root` for the
-    proof-of-work gate, which is where `has_changes_since` runs. It defaults to
-    `paths.project`, which is what every pre-#716 caller passed implicitly and
-    what the two roots collapse to in every configuration but the `repo_root`
-    override. A relpath computed against the wrong root does not raise: it simply
+    proof-of-work gate, which is where `has_changes_since` runs. REQUIRED, with no
+    default: an implicit `paths.project` anchor is #716's own root cause, and the
+    two roots collapse in every configuration but the `repo_root` override, so a
+    defaulted caller would look correct everywhere it was tested and be wrong only
+    on the one config that matters. Passing it explicitly turns a future wrong-root
+    caller into a type error instead of the silent no-op below.
+
+    A relpath computed against the wrong root does not raise: it simply
     matches nothing on git's side, so the exclusion silently disappears and a bare
     status flip starts counting as real work. The latched `restore_patch` is
     anchored on the SAME root for the same reason (a relative latch names a path
     in the tree it will be applied to)."""
-    base = paths.project if root is None else root
+    base = root
     candidates: list[Path] = [paths.sprint_status, spec_path]
     if restore_patch:
         candidates.append(resolve_restore_path(restore_patch, base))

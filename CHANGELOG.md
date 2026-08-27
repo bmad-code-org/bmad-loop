@@ -9,6 +9,12 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- **`repo_root` in run `state.json`** (#716). A run now records the git root its code work
+  happens in, so an out-of-process consumer — `bmad-loop resolve`'s re-arm — reads back the same
+  tree the run measured instead of re-deriving it. Forward and backward compatible: the field
+  loads through `d.get`, and a `state.json` written before it existed degrades to the project
+  directory, which is exactly the pre-upgrade behavior.
+
 - **Atomic writers gain an opt-in `require_writable_target` refusal** (#597). Callers over
   operator-curated files can ask for the `PermissionError` a plain `Path.write_text` used to
   raise on a read-only target. Off by default — what the other callers do today is a
@@ -25,8 +31,9 @@ breaking changes may land in a minor release.
   block that holds its body. Refuses while any engine run is live. Pure deterministic Python —
   no LLM involvement.
 
-- **A dev RETRY now notifies the operator, with the reason** (#640). RETRY was the only dev
-  outcome that raised no notice, and it is the one that discards a completed implementation —
+- **A dev RETRY now notifies the operator, with the reason** (#640). RETRY was the only dev outcome that
+  REJECTS an attempt without raising a notice, and it is the one that discards a completed
+  implementation —
   the non-fixable leg resets the tree to baseline. The reason lived only in the `dev-decision`
   journal line, so a run could spend its whole attempt budget throwing finished work away with
   nothing but the eventual exhaustion notice reaching a human.
@@ -45,6 +52,11 @@ breaking changes may land in a minor release.
   failing on a lock it never needed.
 
 ### Changed
+
+- **`bmad-loop diagnose` routes the re-arm records by field name** (#640, #716). `spec_file` is
+  aliased (it is a customer feature name) and `repo` is dropped (an absolute host path that
+  correlates nothing — one run has one code root). Applies to matching records already on disk,
+  so an existing run's dump changes shape too.
 
 - **`bmad-loop resolve` re-stamps the spec's `baseline_revision` on both re-drive legs**
   (#640), not only on a patch-restore. A from-scratch re-drive used to carry the escalated
@@ -107,8 +119,9 @@ breaking changes may land in a minor release.
   feed them — the gate's own file-granular excludes, the stories record/manifest excludes, and
   the engine's own ledger append. A marker only the project tree holds therefore no longer
   satisfies proof of work, and a correct attempt is no longer refused forever. The fourth
-  exclude helper, `artifact_relpaths`, stays project-rooted on purpose: its consumer is
-  rollback protection (`Engine._protected_relpaths`), not this gate. No effect where the two
+  exclude helper, `artifact_relpaths`, is deliberately untouched: it has no production
+  caller, so its root is inert. Rollback protection does not use it — it builds its own
+  list against the workspace root in `RecoveryFlow.protected_relpaths`. No effect where the two
   roots coincide, which is every other configuration.
 
 - **`bmad-loop resolve` advances the re-arm baseline in the code tree, and says so when it

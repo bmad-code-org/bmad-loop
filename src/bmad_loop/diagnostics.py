@@ -190,10 +190,13 @@ _JOURNAL_DROP_FIELDS = frozenset(
         # An absolute host path naming the run's code tree
         # (`rearm-baseline-advance-failed`). Dropped rather than aliased: unlike a
         # spec filename it correlates nothing across events — one run has one code
-        # root — while carrying the customer's directory layout, and
-        # `looks_like_identifier` would wave a one-segment root (`/srv`, `C:\code`)
-        # through verbatim on the `scrub_json` fallback. The `error=` field on the
-        # very same record is dropped for the same reason.
+        # root — while carrying the customer's directory layout. Dropped rather
+        # than left to the `scrub_json` fallback: that fallback happens to redact an
+        # absolute path (`_IDENTIFIER_RE` forbids `/`, `\` and `:`, so any real root
+        # collapses to `<redacted:str>`), but it fails closed only by accident of
+        # shape — a root that did parse as a bare identifier would pass verbatim, and
+        # nothing here should depend on a path never looking like one. The `error=`
+        # field on the very same record is dropped for the same reason.
         "repo",
     }
 )

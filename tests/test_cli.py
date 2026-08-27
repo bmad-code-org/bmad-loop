@@ -2590,6 +2590,57 @@ def test_resolve_echoes_this_rearms_stale_restore_events(tmp_path, monkeypatch, 
     assert "FROM-LAST-TIME.txt" not in err
 
 
+def test_resolve_echoes_the_rearm_baseline_records(tmp_path, monkeypatch, capsys):
+    """The two `rearm-baseline-*` records reach the operator on the same seam.
+
+    Both are warn-only by contract — a project that is not a git repo must not fail
+    re-arm — so stderr is the only place either ever surfaces. A failed advance is the
+    most actionable outcome of the whole re-arm: the re-drive rebuilds against the
+    tree as it stood BEFORE the resolve, and the re-stamp then refuses to write a sha
+    it did not earn, so spec and task stay honestly out of step rather than silently
+    agreeing on a stale value. Journal-only, that is invisible to the human running
+    `bmad-loop resolve` — the invisibility #640(b) exists to end.
+
+    Ablation: drop either `elif` arm from `_echo_stale_restore` and the matching
+    assertion reddens.
+    """
+    from bmad_loop import runs
+    from bmad_loop.journal import Journal
+
+    _escalated_run(tmp_path, "r1")
+
+    def fake_rearm(rd, key, *, restore_patch=None):
+        journal = Journal(rd)
+        journal.append(
+            "rearm-baseline-advance-failed",
+            story_key=key,
+            repo=str(tmp_path),
+            baseline="a" * 40,
+            error="GitError: not a git repository",
+        )
+        journal.append(
+            "rearm-baseline-restamped",
+            story_key=key,
+            spec_file="spec.md",
+            overwritten="b" * 40,
+            baseline="c" * 40,
+            restore=False,
+        )
+        return key
+
+    monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+    assert (
+        cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-interactive", "--resume"]) == 0
+    )
+
+    err = capsys.readouterr().err
+    assert "could not advance the re-drive baseline (GitError: not a git repository)" in err
+    assert "aaaaaaaaaaaa" in err
+    assert "deliberately NOT re-stamped" in err
+    assert "re-stamped the spec baseline bbbbbbbbbbbb.. -> cccccccccccc.." in err
+
+
 def test_resolve_interactive_runs_session_then_rearms(tmp_path, monkeypatch):
     from bmad_loop import resolve
     from bmad_loop.journal import load_state

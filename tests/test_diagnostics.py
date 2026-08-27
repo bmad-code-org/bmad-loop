@@ -522,9 +522,15 @@ def test_rearm_records_leak_neither_the_code_root_nor_a_spec_name():
     leaving the other would pseudonymize half a comparison — the assertion below
     is that BOTH come back aliased and DIFFERENT from each other.
 
-    Ablation: drop `repo` from `_JOURNAL_DROP_FIELDS` and the canary sweep reddens;
-    drop `spec_file` or `overwritten` from `_JOURNAL_ALIAS_FIELDS` and the alias
-    assertions redden (`spec_file` on the canary sweep too).
+    Ablation: drop `repo` from `_JOURNAL_DROP_FIELDS` and the PRESENCE assertion
+    below reddens — not the canary sweep, which stays green because `scrub_json`
+    already collapses an absolute path to `<redacted:str>` (verified by running that
+    ablation: `repo` comes back as `'<redacted:str>'`, so the canary never appears).
+    That is the whole point of the drop: the fallback happens to redact THIS path
+    shape, so only an assertion on the field's absence can grade a routing decision
+    taken for a shape the fallback would not catch. Drop `spec_file` or `overwritten`
+    from `_JOURNAL_ALIAS_FIELDS` and the alias assertions redden (`spec_file` on the
+    canary sweep too).
     """
     other_sha = "f" * 40
     pseudo = sanitize.Pseudonymizer(salt=b"fixed")

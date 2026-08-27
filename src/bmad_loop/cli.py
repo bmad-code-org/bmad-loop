@@ -2741,9 +2741,17 @@ def _resolve_restore_patch(
 
 
 def _echo_stale_restore(run_dir: Path, seen_entries: int) -> None:
-    """Surface the `stale-restore-*` events a just-completed re-arm journaled about
-    the restore attempt it abandoned (runs._stale_restore_residue). The commits
-    variant is the one the human must act on — nothing else will."""
+    """Surface the events a just-completed re-arm journaled: the `stale-restore-*`
+    residue of the restore attempt it abandoned (runs._stale_restore_residue), and
+    the two `rearm-baseline-*` records the advance and the re-stamp write. The
+    commits variant is the one the human must act on — nothing else will.
+
+    The baseline records are echoed for the same reason: a failed advance means the
+    re-drive rebuilds against the tree as it stood BEFORE the resolve, and the
+    re-stamp then deliberately refuses to write a sha it did not earn. Both are
+    warn-only by contract (a project that is not a repo must not fail re-arm), so
+    without an echo the whole degrade is journal-only — which is the invisibility
+    #640(b) exists to end, not to relocate."""
     for entry in Journal(run_dir).entries()[seen_entries:]:
         kind = entry.get("kind", "")
         if kind == "stale-restore-excluded":
@@ -2758,6 +2766,23 @@ def _echo_stale_restore(run_dir: Path, seen_entries: int) -> None:
                 f"warning: could not read the abandoned restore patch "
                 f"({entry.get('patch', '?')}) — its new files may be swept into the "
                 "next commit; check `git status` before resuming",
+                file=sys.stderr,
+            )
+        elif kind == "rearm-baseline-advance-failed":
+            print(
+                f"warning: could not advance the re-drive baseline "
+                f"({entry.get('error', '?')}) — it still names "
+                f"{str(entry.get('baseline', '') or '(none)')[:12]}, so the re-drive "
+                "rebuilds against the tree as it stood before your resolve; the spec "
+                "was deliberately NOT re-stamped. Check the baseline before resuming",
+                file=sys.stderr,
+            )
+        elif kind == "rearm-baseline-restamped":
+            print(
+                f"note: re-stamped the spec baseline "
+                f"{str(entry.get('overwritten', '?'))[:12]}.. -> "
+                f"{str(entry.get('baseline', '?'))[:12]}.. — if the old value was not "
+                "a stale leftover, the gate can no longer report the divergence",
                 file=sys.stderr,
             )
         elif kind == "stale-restore-commits":

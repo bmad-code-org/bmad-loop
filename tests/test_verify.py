@@ -5207,11 +5207,111 @@ def test_verify_dev_exclude_relpaths_follows_the_root_it_is_given(project, tmp_p
     sp.write_text("---\nstatus: in-review\n---\n", encoding="utf-8")
 
     # project-rooted (the default): the board and the spec are both inside it
-    default = verify.verify_dev_exclude_relpaths(paths, sp)
+    default = verify.verify_dev_exclude_relpaths(paths, sp, root=paths.project)
     assert any(r.endswith("sprint-status.yaml") for r in default)
     assert any(r.endswith("spec-1-1-a.md") for r in default)
     # code-tree-rooted: neither artifact lives there, so there is nothing to exclude
     assert verify.verify_dev_exclude_relpaths(paths, sp, root=paths.repo_root) == ()
+
+
+def test_verify_dev_accepts_a_newer_reachable_claim_in_the_code_tree(project, tmp_path):
+    """The `newer_ok` leg asks its ancestry question in the CODE tree.
+
+    An intervening commit before step-03 stamps `baseline_revision` makes the claim a
+    descendant of the recorded baseline. That reachability is a fact about the
+    checkout the code lives in; asked of `paths.project` — which under this override
+    is not a repository at all — `commit_reachable_above_baseline` reads the Git
+    failure as False and a correct attempt is refused forever. That is the
+    burn-every-attempt shape #716 exists to close, and no pre-existing row could see
+    it: every other ancestry row runs on the `project` fixture where the two roots
+    are the same object, and both divergent-root rows above claim a baseline EQUAL to
+    the recorded one, so neither enters this branch.
+
+    Adopting a newer claim sets `include_untracked_proof = False`, so the proof here
+    is a TRACKED modification rather than a new untracked file.
+
+    Ablation: re-anchor `commit_reachable_above_baseline` on `paths.project` and this
+    reddens with "does not match".
+    """
+    paths = _repo_root_override(project, tmp_path)
+    write_sprint(paths, {"1-1-a": "review"})
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.baseline_commit = verify.rev_parse_head(paths.repo_root)
+
+    # the session commits inside the unit before step-03 stamps its baseline
+    (paths.repo_root / "prior.txt").write_text("prior work\n")
+    git(paths.repo_root, "add", "-A")
+    git(paths.repo_root, "commit", "-q", "-m", "intervening commit in the code tree")
+    descendant = verify.rev_parse_head(paths.repo_root)
+
+    sp = spec_path(paths, "1-1-a")
+    write_spec(sp, "in-review", descendant)
+    (paths.repo_root / "src.txt").write_text("real work\n")
+
+    out = verify.verify_dev(task, paths, dev_result(sp))
+    assert out.ok
+
+
+def test_verify_dev_bundle_accepts_an_ancestor_claim_in_the_code_tree(project, tmp_path):
+    """The `older_ok` leg — #161's bundle-only relaxation — asks the same question in
+    the same tree.
+
+    `allow_ancestor_baseline` is set at exactly one site (`verify_dev_bundle`), so
+    this is the only route into `is_ancestor`. Anchored on `paths.project` the call
+    lands on a non-repository, `is_ancestor` reads any Git failure as False, and a
+    legitimate bundle adopting a story's older spec baseline is refused.
+
+    Ablation: re-anchor `is_ancestor` on `paths.project` and this reddens with
+    "does not match".
+    """
+    paths = _repo_root_override(project, tmp_path)
+    ancestor = verify.rev_parse_head(paths.repo_root)
+
+    # the unit worktree is cut after the story's own baseline
+    (paths.repo_root / "prior.txt").write_text("unit history\n")
+    git(paths.repo_root, "add", "-A")
+    git(paths.repo_root, "commit", "-q", "-m", "unit worktree cut")
+
+    task = StoryTask(story_key="dw-test-bundle", epic=0)
+    task.baseline_commit = verify.rev_parse_head(paths.repo_root)
+    sp = paths.implementation_artifacts / "spec-dw-test-bundle.md"
+    write_spec(sp, "in-review", ancestor)
+    (paths.repo_root / "src.txt").write_text("real work\n")
+
+    out = verify.verify_dev_bundle(task, paths, dev_result(sp))
+    assert out.ok
+
+
+def test_verify_dev_exclude_relpaths_anchors_the_restore_patch_on_the_root(project, tmp_path):
+    """The latched `restore_patch` follows `root` like every other candidate.
+
+    `base` feeds TWO steps — `resolve_restore_path`'s join and the `relative_to`
+    that follows — and only a RELATIVE latch can tell them apart. Joined under
+    `project` but measured against `repo_root`, it is not relative to that root at
+    all, raises `ValueError`, and drops out of the exclude set silently. A missing
+    exclusion does not raise — it just stops excluding, letting a restore re-drive
+    whose session produced nothing pass proof-of-work on the patch file's mere
+    presence, the hazard this function's own docstring names.
+
+    An ABSOLUTE latch deliberately is not the probe, even though it is what
+    `cli._resolve_restore_patch` stores: `resolve_restore_path` ignores its base for
+    an absolute input, so both halves agree however the join is anchored and the row
+    would pass with the anchor ablated.
+
+    The existing root row passes no `restore_patch`, and both restore-patch rows run
+    on the `project` fixture where the roots are the same object, so this line was
+    unpinned in both directions.
+
+    Ablation: pin the `resolve_restore_path` base to `paths.project` and the first
+    assertion reddens — the latch is no longer relative to the code tree and drops.
+    """
+    paths = _repo_root_override(project, tmp_path)
+    sp = spec_path(paths, "1-1-a")
+    sp.write_text("---\nstatus: in-review\n---\n", encoding="utf-8")
+    (paths.repo_root / "restore.patch").write_text("a saved intent-gap patch\n")
+
+    out = verify.verify_dev_exclude_relpaths(paths, sp, "restore.patch", root=paths.repo_root)
+    assert "restore.patch" in out
 
 
 def test_verify_dev_stories_roots_its_exclude_on_the_code_tree(project, tmp_path, monkeypatch):
@@ -5346,7 +5446,7 @@ def test_verify_dev_exclude_relpaths_is_file_granular(project):
     artifact-folder content (deferred-work.md, other stories' specs) is left
     un-excluded so it can register as real work."""
     sp = spec_path(project, "1-1-a")
-    rels = verify.verify_dev_exclude_relpaths(project, sp)
+    rels = verify.verify_dev_exclude_relpaths(project, sp, root=project.repo_root)
     assert "_bmad-output/implementation-artifacts/sprint-status.yaml" in rels
     assert "_bmad-output/implementation-artifacts/spec-1-1-a.md" in rels
     assert "_bmad-output/implementation-artifacts" not in rels
@@ -5364,9 +5464,11 @@ def test_verify_dev_exclude_relpaths_includes_latched_restore_patch(project):
     sp = spec_path(project, "1-1-a")
     patch = project.implementation_artifacts / "attempt.patch"
     rel = "_bmad-output/implementation-artifacts/attempt.patch"
-    assert rel in verify.verify_dev_exclude_relpaths(project, sp, str(patch))
-    assert rel in verify.verify_dev_exclude_relpaths(project, sp, rel)
-    assert rel not in verify.verify_dev_exclude_relpaths(project, sp)
+    assert rel in verify.verify_dev_exclude_relpaths(
+        project, sp, str(patch), root=project.repo_root
+    )
+    assert rel in verify.verify_dev_exclude_relpaths(project, sp, rel, root=project.repo_root)
+    assert rel not in verify.verify_dev_exclude_relpaths(project, sp, root=project.repo_root)
 
 
 def test_verify_dev_exclude_relpaths_omits_only_an_uncertain_candidate(project, monkeypatch):
@@ -5381,7 +5483,9 @@ def test_verify_dev_exclude_relpaths_omits_only_an_uncertain_candidate(project, 
     patch = project.implementation_artifacts / "attempt.patch"
     refuse_to_resolve(monkeypatch, project.project, refused_spec)
 
-    assert verify.verify_dev_exclude_relpaths(project, refused_spec, str(patch)) == (
+    assert verify.verify_dev_exclude_relpaths(
+        project, refused_spec, str(patch), root=project.repo_root
+    ) == (
         "_bmad-output/implementation-artifacts/sprint-status.yaml",
         "_bmad-output/implementation-artifacts/attempt.patch",
     )
@@ -5597,9 +5701,9 @@ def test_verify_dev_exclude_relpaths_normalizes_dotdot_segments(project):
         project.output_folder / "planning-artifacts" / ".." / "implementation-artifacts" / sp.name
     )
     assert messy != sp  # genuinely a different (messier) Path object
-    assert verify.verify_dev_exclude_relpaths(project, sp) == verify.verify_dev_exclude_relpaths(
-        project, messy
-    )
+    assert verify.verify_dev_exclude_relpaths(
+        project, sp, root=project.repo_root
+    ) == verify.verify_dev_exclude_relpaths(project, messy, root=project.repo_root)
 
 
 def test_verify_dev_own_spec_status_flip_via_dotdot_path_is_not_real_work(project):
@@ -5625,7 +5729,7 @@ def test_has_changes_since_ledger_content_counts_with_narrow_exclude(project):
     changes', while a bare own-spec + sprint-status bookkeeping edit still does."""
     baseline = verify.rev_parse_head(project.project)
     sp = spec_path(project, "1-1-a")
-    exclude = verify.verify_dev_exclude_relpaths(project, sp)
+    exclude = verify.verify_dev_exclude_relpaths(project, sp, root=project.repo_root)
 
     sp.write_text("bookkeeping\n")
     project.sprint_status.write_text("bookkeeping\n")

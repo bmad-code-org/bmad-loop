@@ -872,7 +872,20 @@ def test_rearm_reads_stale_restore_residue_from_the_code_tree(tmp_path):
 def test_rearm_falls_back_to_project_when_no_code_root_was_recorded(tmp_path):
     """A state.json written before `RunState.repo_root` existed carries no root, and
     must degrade to exactly the pre-upgrade behavior rather than to a path that does
-    not exist. `d.get(key, default)` on the load side is what makes that true."""
+    not exist. `d.get(key, default)` on the load side is what makes that true.
+
+    What actually grades this is the BASELINE assertion, not the deletion: the
+    `_escalated_run` fixture never sets `repo_root`, so the serialized value is
+    already `""` and the `del` below only makes the legacy shape explicit — it
+    changes nothing observable and would pass with the fallback broken. The final
+    assertion is what discriminates, because `RunState.code_root` spells the degrade
+    `Path(self.repo_root or self.project)`: drop the `or self.project` and the empty
+    string becomes `Path("")` — the process CWD, a different repository under pytest —
+    and the recorded baseline no longer matches this project's HEAD.
+
+    The positive direction (a recorded root actually being used) is pinned separately
+    by the divergent-root rows above.
+    """
     head = _resolve_repo(tmp_path)
     run_dir, _, _ = _escalated_run(tmp_path)
     raw = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
