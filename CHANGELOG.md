@@ -31,13 +31,6 @@ breaking changes may land in a minor release.
   block that holds its body. Refuses while any engine run is live. Pure deterministic Python —
   no LLM involvement.
 
-- **A dev RETRY now notifies the operator, with the reason** (#640). RETRY was the only dev outcome that
-  REJECTS an attempt without raising a notice, and it is the one that discards a completed
-  implementation —
-  the non-fixable leg resets the tree to baseline. The reason lived only in the `dev-decision`
-  journal line, so a run could spend its whole attempt budget throwing finished work away with
-  nothing but the eventual exhaustion notice reaching a human.
-
 - **Batched deferred-work ledger primitives** (#286, #469). `append_entries`,
   `mark_open_many`, `record_decision` and `mark_done_many`'s per-id `notes=` each collapse a
   sequence that used to be one write per row — or one write per half of an append-then-close
@@ -56,16 +49,24 @@ breaking changes may land in a minor release.
 - **`bmad-loop diagnose` routes the re-arm records by field name** (#640, #716). `spec_file` is
   aliased (it is a customer feature name), `overwritten` is aliased (it is half a baseline
   comparison, meaningless without its partner), and `repo` is dropped (an absolute host path
-  that correlates nothing — one run has one code root). Scoped to the journal kinds this
-  release introduces: no first-party producer emitted these fields before, so no existing run's
-  dump changes shape and `SCHEMA_VERSION` is unaffected.
+  that correlates nothing — one run has one code root). Routing is by FIELD NAME and applies to
+  every entry, not by kind: no first-party producer emitted these fields before, so no existing
+  run's dump changes shape today and `SCHEMA_VERSION` is unaffected — but a later producer of a
+  field with one of these names inherits the same treatment.
 
-- **Re-arm refuses to touch a spec it cannot read, and says so** (#640). `StoryTask` persists
-  `spec_file` relative to a worktree, so a re-arm of an isolated task could hold a path that
-  resolves against nothing — and both frontmatter writers answer that with `False`, not an
-  exception. The status flip and the baseline re-stamp would then BOTH silently do nothing,
-  leaving the spec on the escalated attempt's sha with no record anywhere. Re-arm now checks the
-  path first and journals `rearm-baseline-restamp-skipped`, which `resolve` echoes.
+- **Re-arm writes the spec the run actually used, and reports every write it could not make**
+  (#640). `StoryTask` persists `spec_file` RELATIVE to the worktree for an isolated task, and
+  re-arm resolved it against the process cwd. `bmad-loop resolve` runs from the project root,
+  where the main checkout carries the same `_bmad-output/specs/...` layout — so the path check
+  passed on the WRONG file, and both the status flip and the baseline re-stamp landed on the
+  main checkout's copy while the worktree's real spec kept the escalated attempt's sha. Re-arm
+  now re-anchors the recorded path on the worktree it was persisted against before either write.
+  Separately, both frontmatter writers answer a spec they cannot move with `False` rather than an
+  exception, and those returns were discarded: an unreadable spec now journals
+  `rearm-baseline-restamp-skipped`, and a flip that silently did nothing journals
+  `rearm-spec-flip-skipped`. The skip record no longer hides behind a successful git advance —
+  nesting it there meant a project that is not a repo reported only the git failure while the
+  flip had no-opped for an unrelated reason.
 
 - **The re-arm baseline records reach the TUI operator too** (#640). `bmad-loop resolve` echoed
   the advance-failure and re-stamp records; the TUI's re-arm — which resumes the run in the same
@@ -115,6 +116,44 @@ breaking changes may land in a minor release.
   previously-loading config.
 
 ### Fixed
+
+- **A re-arm no longer warns about a baseline divergence that did not happen** (#640). The
+  record that reports overwriting a spec's claimed baseline compared it against
+  `task.baseline_commit` — which the advance had already moved to the new HEAD. On every
+  ordinary from-scratch re-arm whose resolve session committed anything, spec and run agreed
+  exactly and the operator was still told they differed. It now compares against the baseline
+  the run RECORDED, so `rearm-baseline-restamped` fires only on a claim the run never made.
+
+- **The TUI and `resolve` surface the same re-arm records** (#640). Each carried its own copy of
+  the journal-kind → message routing and they had drifted: `resolve` handled six kinds, the TUI
+  three, silently dropping the whole `stale-restore-*` family — including the commits warning
+  that is the only notice telling a human to inspect the tree. Both now route through one table
+  (`runs.rearm_event_notice`). The TUI omits the trailing "before resuming" imperative, since it
+  resumes in the same gesture.
+
+- **A corrupt journal no longer blocks the TUI's re-arm** (#640). Reading the journal to diff
+  what a re-arm appended is new, and it decoded strict UTF-8 outside the action's error handling,
+  so an undecodable byte turned a corrupt journal into a gesture the operator could not perform.
+  It degrades to no echo instead, matching how the dashboard reads that file everywhere else.
+
+- **`bmad-loop resolve` still reports abandoned-restore residue when the re-arm aborts** (#640).
+  The residue is journalled before the re-stamp that can raise, so an abort discarded records
+  already written — including the commits warning. The echo now runs on both paths.
+
+- **A YAML boolean in a spec's baseline key no longer refuses the attempt** (#716). `no`, `off`,
+  `yes` and `on` parse as booleans, and the shared reader stringified them into the tokens
+  `"False"`/`"True"` — non-empty, so they were judged as a claimed sha, and a boolean on
+  `baseline_revision` outranked a `baseline_commit` naming the correct commit. Booleans are now
+  treated as absent, exactly as a YAML null already was.
+
+- **A dev RETRY now notifies the operator, with the reason** (#640). RETRY was the only dev
+  outcome that REJECTS an attempt without raising a notice, and it is the one that discards a
+  completed implementation — the non-fixable leg resets the tree to baseline. The reason lived
+  only in the `dev-decision` journal line, so a run could spend its whole attempt budget
+  throwing finished work away with nothing but the eventual exhaustion notice reaching a human.
+  The notice carries the reason's first line, capped and marked with `[…]` when trimmed; the
+  untruncated text stays in the journal. It can repeat for one attempt if the host dies between
+  the notice and the rollback and the run then replays that verdict on resume.
 
 - **A stale `baseline_commit` no longer outranks the fresh `baseline_revision` a spec
   claims** (#716). The two consumers of a claimed dev baseline carried byte-identical
