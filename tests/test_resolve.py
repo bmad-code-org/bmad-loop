@@ -43,6 +43,7 @@ def _escalated_run(
     baseline_commit="abc123",
     restore_patch=None,
     repo_root=None,
+    target_branch=None,
 ):
     """conftest's builder with this module's shape: a review-cycle-1 task carrying a
     completed review session (what `build_context` reads), returning the full triple.
@@ -55,7 +56,11 @@ def _escalated_run(
     ``repo_root`` records the divergent CODE tree on the saved state, so the
     divergent-root rows do not each re-open, mutate and re-save the file they just
     built. A row that forgot that save would silently degrade into the same-root
-    case it exists to distinguish, which is the failure this kwarg removes."""
+    case it exists to distinguish, which is the failure this kwarg removes.
+    ``target_branch`` is there for the same reason and with the same hazard: it pins
+    the branch the isolated re-drive cuts its fresh worktree from, and leaving it unset
+    degrades `_redrive_base_ref` to `HEAD` — the pre-fix anchor, which is exactly the
+    case the rows that pass it exist to separate themselves from."""
     run = escalated_run(
         project,
         run_id,
@@ -72,8 +77,11 @@ def _escalated_run(
         worktree_path=worktree_path,
         restore_patch=restore_patch,
     )
-    if repo_root is not None:
-        run.state.repo_root = str(repo_root)
+    if repo_root is not None or target_branch is not None:
+        if repo_root is not None:
+            run.state.repo_root = str(repo_root)
+        if target_branch is not None:
+            run.state.target_branch = target_branch
         save_state(run.run_dir, run.state)
     return run.run_dir, run.state, run.task
 
@@ -1910,6 +1918,116 @@ def test_rearm_warns_about_an_unreachable_spec_write_only_when_it_is_actionable(
     assert bool(unreachable) is warns
     if warns:
         assert unreachable[0]["status"] == "ready-for-dev"
+
+
+@pytest.mark.parametrize(
+    ("corrected_on_target", "warns"),
+    [(True, False), (False, True)],
+)
+def test_rearm_reads_the_committed_spec_from_the_redrive_base_not_the_current_head(
+    tmp_path, monkeypatch, corrected_on_target, warns
+):
+    """The proof is read at the run's PINNED target branch, not at the code root's HEAD.
+
+    An isolated re-drive never reads the main checkout's working ref:
+    `engine._finish_inflight` discards the escalated worktree AND its branch, and
+    `workspace.open_unit_workspace` cuts the replacement from the `base` handed to it —
+    `worktree_flow.run_isolated` passes `state.target_branch`, pinned once at run start.
+    `ensure_target_branch` leaves the main checkout ON that branch, so the two agree
+    until an operator checks out something else while the escalation is paused, which is
+    a wholly ordinary thing to do with a run parked for a human.
+
+    Both rows leave the main checkout on `side` and put the two candidate refs in
+    DISAGREEMENT, so neither can pass by reading the other:
+
+    - corrected on `main` (the target) — the re-drive will read `ready-for-dev` and
+      route. Reading `HEAD` sees `side`'s terminal status and holds a resume whose work
+      is already committed exactly where the re-drive looks for it.
+    - corrected on `side` (the current branch) — the re-drive reads `main`'s terminal
+      status and re-wedges. Reading `HEAD` sees the correction and SUPPRESSES the
+      record, which since `rearm_holds_the_resume` is not a mis-worded warning but the
+      default resolve flow resuming into the wedge it was meant to clear.
+
+    The worktree copy is held at `blocked` on both rows, so the only moving part is
+    which committed ref carries the correction.
+
+    Ablation: restore the revision argument in `_committed_spec_status` to a literal
+    `"HEAD"` and BOTH rows redden (`assert False is True` / `assert True is False`) —
+    the pair is the discriminator; either row alone also passes for the anchor it is
+    meant to reject.
+    """
+    rel = "_bmad-output/specs/6-4-cli-list-command.md"
+    _resolve_repo(tmp_path)
+    spec = tmp_path / rel
+    spec.parent.mkdir(parents=True, exist_ok=True)
+
+    def _commit(status, message):
+        spec.write_text(f"---\nstatus: {status}\n---\n\n## Intent\n\nx\n", encoding="utf-8")
+        git(tmp_path, "add", "-A")
+        git(tmp_path, "commit", "-q", "-m", message)
+
+    _commit("blocked", "escalated spec")  # on `main`, the target branch
+    git(tmp_path, "checkout", "-q", "-b", "side")
+    if corrected_on_target:
+        git(tmp_path, "checkout", "-q", "main")
+        _commit("ready-for-dev", "corrected on the target branch")
+        git(tmp_path, "checkout", "-q", "side")  # the operator wandered off again
+    else:
+        _commit("ready-for-dev", "corrected on the wrong branch")
+
+    wt_spec = tmp_path / "wt" / rel
+    wt_spec.parent.mkdir(parents=True, exist_ok=True)
+    wt_spec.write_text("---\nstatus: blocked\n---\n\n## Intent\n\nx\n", encoding="utf-8")
+
+    run_dir, _, _ = _escalated_run(
+        tmp_path, spec_file=rel, worktree_path=str(tmp_path / "wt"), target_branch="main"
+    )
+    monkeypatch.chdir(tmp_path)
+
+    runs.rearm_escalation(run_dir)
+
+    unreachable = [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-write-unreachable"]
+    assert bool(unreachable) is warns
+    if warns:
+        # the branch rides on the record because the remedy is worthless without it:
+        # "commit the corrected spec" is what this operator just DID, on `side`
+        assert unreachable[0]["base"] == "main"
+        assert "`main`" in runs.rearm_event_notice(unreachable[0])[2]
+
+
+def test_rearm_base_ref_degrades_to_head_for_a_run_that_pinned_no_target(tmp_path, monkeypatch):
+    """An unrecorded `target_branch` is a MISSING value, not a divergent one.
+
+    `ensure_target_branch` pins the field before any worktree can mount, so only a
+    state.json predating it reaches here with a `worktree_path` and no target — and it
+    must degrade to the ref it read before the fix rather than to `""`. Answering `""`
+    would make `_committed_spec_status` unprovable for every re-arm of such a run and
+    hold the resume on a per-configuration constant, the exact failure the record's
+    narrowing exists to avoid.
+
+    The committed spec here already carries the target status, so a degrade to `""`
+    is separable from the read succeeding: only an anchor that actually resolves can
+    suppress. Ablation: make `_redrive_base_ref` return `""` on the migrated shape and
+    this reddens on the record appearing.
+    """
+    rel = "_bmad-output/specs/6-4-cli-list-command.md"
+    _resolve_repo(tmp_path)
+    spec = tmp_path / rel
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    spec.write_text("---\nstatus: ready-for-dev\n---\n\n## Intent\n\nx\n", encoding="utf-8")
+    git(tmp_path, "add", "-A")
+    git(tmp_path, "commit", "-q", "-m", "corrected spec")
+    wt_spec = tmp_path / "wt" / rel
+    wt_spec.parent.mkdir(parents=True, exist_ok=True)
+    wt_spec.write_text("---\nstatus: blocked\n---\n\n## Intent\n\nx\n", encoding="utf-8")
+
+    # no `target_branch=`: the pre-upgrade shape, worktree_path set all the same
+    run_dir, _, _ = _escalated_run(tmp_path, spec_file=rel, worktree_path=str(tmp_path / "wt"))
+    monkeypatch.chdir(tmp_path)
+
+    runs.rearm_escalation(run_dir)
+
+    assert [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-write-unreachable"] == []
 
 
 @pytest.mark.parametrize("committed_status", ["ready-for-dev", "blocked"])

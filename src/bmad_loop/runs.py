@@ -2272,20 +2272,60 @@ def _spec_is_shared_with_the_redrive(state: RunState, task: StoryTask) -> bool:
         return False
 
 
+def _redrive_base_ref(state: RunState, task: StoryTask) -> str:
+    """The ref whose committed tree the re-drive will actually read this unit's spec
+    from: the run's PINNED `target_branch` for an isolated unit, ``HEAD`` otherwise.
+
+    Not `HEAD` in both cases, because the isolated re-drive never reads the main
+    checkout's working ref. `engine._finish_inflight` discards the escalated worktree
+    and its branch and `_run_story` mounts a replacement, and
+    `workspace.open_unit_workspace` cuts that fresh branch from the `base` it is handed
+    — `worktree_flow.run_isolated` passes `state.target_branch`, pinned once at run
+    start so resume keeps targeting the same branch. An operator who checks out another
+    branch in the main checkout while the escalation is paused therefore moves `HEAD`
+    off the tree the re-drive reads, in either direction: a correction committed on the
+    now-current branch is invisible to the re-drive, and one committed on the target
+    branch is invisible to `HEAD`.
+
+    That mattered once `rearm-spec-write-unreachable` began holding the resume
+    (`rearm_holds_the_resume`): reading the wrong ref does not merely mis-word a
+    warning, it either resumes a re-drive that re-wedges on the target branch's
+    terminal status, or holds a resume whose work is already committed where the
+    re-drive will find it.
+
+    The two guards are the same proxy the caller already uses. `task.worktree_path` is
+    how this file recognizes an isolated unit at all (`_task_spec_root`,
+    `_spec_is_shared_with_the_redrive`) — every isolated escalation carries a mounted
+    one. An empty `target_branch` beside it is a MISSING value, not a divergent one:
+    `ensure_target_branch` pins the field before any worktree mounts, so only a
+    state.json predating it can reach here, and that shape degrades to exactly the ref
+    it read before — the same migration `restamp_code_root` gives an unrecorded root.
+    Answering ``""`` instead would hold the resume on a per-configuration constant, the
+    failure the record's narrowing exists to avoid.
+    """
+    if task.worktree_path and state.target_branch:
+        return state.target_branch
+    return "HEAD"
+
+
 def _committed_spec_status(state: RunState, task: StoryTask) -> str:
-    """The spec's status as COMMITTED in the code tree, or ``""`` when unprovable.
+    """The spec's status as COMMITTED in the tree the re-drive reads, or ``""`` when
+    unprovable.
 
     Under isolation the re-drive reads the committed spec and never a working-tree
     write (see `rearm_escalation`'s note on `rearm-spec-write-unreachable`), so this is
     the value that decides whether the operator still has anything to do. Anchored on
-    `state.code_root` at ``HEAD`` — the same tree and ref the baseline advance reads.
+    `state.code_root` — the same tree the baseline advance reads — at the ref
+    `_redrive_base_ref` names, which is the run's pinned `target_branch` for an isolated
+    unit rather than that tree's current `HEAD`.
 
     Degrades to ``""`` on every uncertainty: a spec recorded absolute (nothing names
-    its position in the tree), an absent or non-blob path at HEAD, a non-UTF-8 blob, or
-    any `GitError` — which includes the project simply not being a repository. ``""``
-    never equals a target status, so the caller's record still fires. Suppression
-    therefore requires PROOF that the work is already done, and the non-repo case stays
-    non-fatal, as the story's Boundaries require.
+    its position in the tree), an absent or non-blob path at that ref, a non-UTF-8 blob,
+    or any `GitError` — which includes the project simply not being a repository, and a
+    `target_branch` the code root no longer carries. ``""`` never equals a target
+    status, so the caller's record still fires. Suppression therefore requires PROOF
+    that the work is already done, and the non-repo case stays non-fatal, as the story's
+    Boundaries require.
 
     The absolute arm is narrower than it looks: the caller has already answered the one
     absolute shape whose write the re-drive DOES read — the shared external spec — with
@@ -2297,7 +2337,9 @@ def _committed_spec_status(state: RunState, task: StoryTask) -> str:
     if not task.spec_file or raw.is_absolute():
         return ""
     try:
-        blob = verify.file_bytes_at_revision(state.code_root, "HEAD", raw.as_posix())
+        blob = verify.file_bytes_at_revision(
+            state.code_root, _redrive_base_ref(state, task), raw.as_posix()
+        )
     except verify.GitError:
         return ""
     if blob is None:
@@ -2540,7 +2582,17 @@ def rearm_escalation(
             # corrected spec") is already a no-op once the committed spec carries the
             # target status, which is precisely when the re-drive reads what it needs.
             # Suppression requires PROOF: an unreadable blob, a non-repo project, or any
-            # git fault leaves `""` and the record fires.
+            # git fault leaves `""` and the record fires. The proof is read at
+            # `_redrive_base_ref`, NOT at the code root's current `HEAD` — the two part
+            # company as soon as the operator checks out another branch while the
+            # escalation is paused, and this record now holds the resume.
+            #
+            # `base` rides along because the remedy needs it: on exactly the shape the
+            # ref fix rescues, "commit the corrected spec" without a branch sends the
+            # operator to commit again on the branch the re-drive does not read, and the
+            # next re-arm prints the same sentence. Empty for the migrated shape
+            # `_redrive_base_ref` degrades to `HEAD` for, and the notice drops the
+            # clause rather than naming a ref it cannot source.
             if (
                 not write_reaches_the_redrive
                 and _committed_spec_status(state, task) != target_status
@@ -2550,6 +2602,7 @@ def rearm_escalation(
                     story_key=key,
                     spec_file=str(spec_path),
                     status=target_status,
+                    base=state.target_branch,
                 )
             try:
                 flipped = verify.set_frontmatter_status(
@@ -3002,13 +3055,20 @@ def rearm_event_notice(
             "Check the baseline before resuming",
         )
     if kind == "rearm-spec-write-unreachable":
+        # The branch is the half an operator cannot infer: the re-drive cuts its fresh
+        # worktree from the run's PINNED target branch, so a correction committed on
+        # whatever the main checkout happens to have checked out is not the one it
+        # reads. Named only when the record carries it — a run predating the field
+        # leaves it empty, and a remedy that names no ref beats one that names a guess.
+        base = str(entry.get("base", "") or "")
+        where = f" on `{base}`" if base else ""
         return (
             "warning",
             f"this story ran under worktree isolation, so the re-arm's spec writes "
             f"({entry.get('spec_file', '?')}) land in a worktree the re-drive discards "
             "— the re-driven session reads the COMMITTED spec, so commit the corrected "
-            "spec or the story re-wedges on the escalated attempt's status",
-            "Commit the corrected spec before resuming",
+            f"spec{where} or the story re-wedges on the escalated attempt's status",
+            f"Commit the corrected spec{where} before resuming",
         )
     if kind == "rearm-spec-flip-skipped":
         # ONE kind, TWO outcomes, told apart by the flag the producer writes rather

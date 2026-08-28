@@ -91,7 +91,11 @@ breaking changes may land in a minor release.
   is silently lost. Re-arm journals `rearm-spec-write-unreachable` and both surfaces tell the
   operator to commit the corrected spec. It is raised only when the committed spec does not already
   carry the status the re-drive needs; gating on isolation alone fired on every isolated re-arm,
-  where the advice is a no-op. This record alone also HOLDS the resume both surfaces fold in behind
+  where the advice is a no-op. That proof is read at the run's pinned target branch — the ref the
+  replacement worktree is cut from — not at the code root's current `HEAD`, which parts company with
+  it the moment an operator checks out another branch while the run is paused; the record carries
+  the branch so the remedy names the tree the re-drive will actually read. This record alone also
+  HOLDS the resume both surfaces fold in behind
   the re-arm, since its advice is unactionable once the run has resumed, and `--resume` does not
   override the hold — the re-arm stands, and `bmad-loop resume <run-id>` picks the story up once the
   fix is committed.
