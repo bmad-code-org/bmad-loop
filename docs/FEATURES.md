@@ -85,22 +85,33 @@ See [README.md](../README.md) for the narrative overview and [setup-guide.md](se
   (`rearm-baseline-restamp-skipped`), and a status flip that quietly changed nothing is reported
   too (`rearm-spec-flip-skipped`) — though not when the spec was simply already at the target status,
   which is an ordinary re-arm rather than a failure; neither record depends on the git advance having
-  succeeded. On a spec that re-arm CAN read, that skip also refuses the re-arm outright: the routing
-  status is what the re-drive runs on, and a spec without one halts the re-driven session on an
-  unrecognized status, so the escalation stays armed for a corrected spec instead of being spent on a
-  session that cannot route. The spec is left byte-identical, down to the stale `## Auto Run Result`
-  section. A spec re-arm cannot read keeps warn-and-continue, because there the failed flip says
-  nothing about what the re-drive will read: the path is worktree-relative and the re-drive mounts a
-  fresh worktree and reads the COMMITTED spec either way. Under worktree isolation those writes land in a worktree the re-drive discards, and the
+  succeeded. On a spec the re-drive will actually READ, that skip also refuses the re-arm outright: the
+  routing status is what the re-drive runs on, and a spec without one halts the re-driven session on
+  an unrecognized status, so the escalation stays armed for a corrected spec instead of being spent
+  on a session that cannot route. The spec is left byte-identical, down to the stale `## Auto Run
+Result` section. Every other spec keeps warn-and-continue, and the record says which happened
+  (`refused`) so neither surface prints a refusal's remedy for a re-arm that completed. One a re-arm
+  cannot read at all is warn-and-continue because the failed flip says nothing about what the
+  re-drive will read: the path is worktree-relative and the re-drive mounts a fresh worktree and
+  reads the COMMITTED spec either way. A worktree-local one is warn-and-continue for the sharper
+  version of the same reason — the readable file is the copy that fresh mount destroys, so refusing
+  over it would demand a repair to a file nothing opens, even once the corrected spec is committed
+  and routable. Under worktree isolation those writes land in a worktree the re-drive discards, and the
   re-driven session reads the COMMITTED spec, so re-arm says so (`rearm-spec-write-unreachable`) and
   asks you to commit the corrected spec — but only when the spec really is worktree-local and the
   committed spec does not already carry the status the re-drive needs, so an isolated re-arm whose
   correction is already committed says nothing, and neither does one whose spec sits in an artifact
   directory configured outside the project: those are shared across checkouts rather than rebased
-  onto each worktree, so the flip lands on the one file every re-drive reads. All of these warnings reach the TUI's re-arm as well as `resolve`'s — both route every
+  onto each worktree, so the flip lands on the one file every re-drive reads. That record also HOLDS
+  the resume: both surfaces re-arm and resume in one gesture, which made its own "commit the
+  corrected spec before resuming" advice unactionable the moment it printed and then burned the
+  escalation on a session that halts blocked. They now stop after the re-arm — the story stays armed,
+  `bmad-loop resume <run-id>` picks it up once the fix is committed, and `--resume` does not override
+  it, since the record is written on proof rather than suspicion. The advisory warnings do not hold.
+  All of these warnings reach the TUI's re-arm as well as `resolve`'s — both route every
   kind through one shared table, so neither surface can silently learn a kind the other drops,
   though each still owns where it calls the echo from and the TUI drops the trailing "before
-  resuming" advice, since it resumes in the same gesture. Each re-arm also bumps a per-task
+  resuming" advice, since it otherwise resumes in the same gesture. Each re-arm also bumps a per-task
   **generation**, so the re-minted session id cannot collide with the abandoned attempt's record — ids
   already on disk keep their exact spelling, since the suffix appears only above generation zero
   (#705).

@@ -2515,6 +2515,20 @@ def rearm_escalation(
             # the restored diff); from-scratch -> ready-for-dev -> step-03
             # (re-implement). Independent of the resolve agent having set it.
             target_status = "in-review" if restore_patch else "ready-for-dev"
+            # Whether the writes below are the copy the re-driven session actually
+            # reads. Hoisted out of the record's condition because TWO decisions turn on
+            # it, and only one of them used to: the warning below, and the flip's
+            # REFUSAL one screen down, which was gated on `spec_path.is_file()` alone.
+            # Under isolation that readable file is the doomed worktree copy, so the
+            # refusal demanded a repair to the one file the re-drive destroys before
+            # reading anything — and demanded it even when `_committed_spec_status` had
+            # already proven the committed spec carries the status the re-drive routes
+            # on. See `_spec_is_shared_with_the_redrive` for why an isolated unit's spec
+            # is nevertheless reachable when it sits in an artifact dir configured
+            # outside the project tree.
+            write_reaches_the_redrive = not task.worktree_path or _spec_is_shared_with_the_redrive(
+                state, task
+            )
             # Narrowed to the case an operator can ACT on. Every isolated escalation
             # carries a mounted `worktree_path` — `worktree_flow.escalate_unit` never
             # clears it, and `keep_branch_and_escalate` deliberately leaves the worktree
@@ -2528,8 +2542,7 @@ def rearm_escalation(
             # Suppression requires PROOF: an unreadable blob, a non-repo project, or any
             # git fault leaves `""` and the record fires.
             if (
-                task.worktree_path
-                and not _spec_is_shared_with_the_redrive(state, task)
+                not write_reaches_the_redrive
                 and _committed_spec_status(state, task) != target_status
             ):
                 journal.append(
@@ -2568,15 +2581,24 @@ def rearm_escalation(
                     # as context, do not resume", and the story re-wedges with nothing on
                     # the record. The `FrontmatterWriteError` arm below covers only the
                     # shapes that RAISE; this covers the ones that lie quietly.
+                    # `refused` is written ON the record because ONE kind now covers
+                    # two outcomes and the operator surfaces must tell them apart —
+                    # they read the journal OUT OF PROCESS, with neither the task nor
+                    # the tree to re-derive it from. Printing the refusal's remedy
+                    # ("add a top-level `status:`") for a re-arm that COMPLETED sends
+                    # the human to repair a file nothing will read.
+                    refused = spec_path.is_file() and write_reaches_the_redrive
                     journal.append(
                         "rearm-spec-flip-skipped",
                         story_key=key,
                         spec_file=str(spec_path),
                         status=target_status,
+                        refused=refused,
                     )
                     # ...and then ABORT — but only for a spec that IS a readable file
-                    # here, which is the same `is_file` split the baseline re-stamp below
-                    # already draws, and for the same reason. On THAT shape the failure is
+                    # here AND is the copy the re-drive reads. The first half is the same
+                    # `is_file` split the baseline re-stamp below already draws, and for
+                    # the same reason. On THAT shape the failure is
                     # a REPAIR that did not land on the very file the re-drive reads, so it
                     # aborts for the same reason the `FrontmatterWriteError` arm does:
                     # journalling alone left the two default surfaces telling the operator
@@ -2602,10 +2624,25 @@ def rearm_escalation(
                     # prevent — an unreadable path is an observation, and observations
                     # degrade.
                     #
+                    # A worktree-local spec that IS readable takes that same lane, for a
+                    # sharper version of the same reason: `_task_spec_root` anchors this
+                    # write on the mounted worktree, so the readable file is the copy the
+                    # re-drive DISCARDS. The refusal's own remedy could not fix anything
+                    # there — an operator who added a `status:` to that file and re-ran
+                    # resolve would flip a spec that is deleted before it is read, while
+                    # the committed spec, the one thing that decides routing, went
+                    # untouched. Worse, the refusal fired even when the correction was
+                    # already committed: `_committed_spec_status` had just PROVEN the
+                    # re-drive routes correctly, and the re-arm was refused anyway over an
+                    # obsolete copy. The real remedy on that shape is
+                    # `rearm-spec-write-unreachable`'s ("commit the corrected spec"),
+                    # which fires from the block above on exactly the legs that need it
+                    # and now holds the resume rather than merely printing.
+                    #
                     # The record is written on BOTH sides of that split: the abort message
                     # reaches stderr only, and the journal is the run's audit trail —
                     # `_echo_rearm_events` surfaces it from a `finally` on this path.
-                    if spec_path.is_file():
+                    if refused:
                         raise RearmError(
                             f"cannot re-open story spec {spec_path} to `{target_status}` "
                             "for the re-drive: it has no frontmatter `status:` this re-arm "
@@ -2974,17 +3011,40 @@ def rearm_event_notice(
             "Commit the corrected spec before resuming",
         )
     if kind == "rearm-spec-flip-skipped":
-        # The one row in this table that always accompanies an ABORT: `rearm_escalation`
-        # raises `RearmError` right after journalling it. The message says so rather than
-        # predicting a re-wedge, because there is no re-drive left to wedge — and the
-        # next_step is the repair, not an inspection, for the same reason.
+        # ONE kind, TWO outcomes, told apart by the flag the producer writes rather
+        # than by anything readable from here: `rearm_escalation` raises `RearmError`
+        # right after journalling this only when the flip failed on the very copy the
+        # re-drive reads. It also journals it — and completes — when that copy is
+        # unreadable from this process, or is a worktree-local file the re-drive
+        # discards. This row used to claim the abort unconditionally, which told an
+        # operator whose re-arm had SUCCEEDED that it "was REFUSED" and sent them to
+        # add a `status:` to a file the re-drive never opens.
+        spec = entry.get("spec_file", "?")
+        status = entry.get("status", "?")
+        if entry.get("refused"):
+            # The message names the refusal rather than predicting a re-wedge, because
+            # there is no re-drive left to wedge — and the next_step is the repair, not
+            # an inspection, for the same reason.
+            return (
+                "warning",
+                f"the recorded spec for this story ({spec}) could not be re-opened to "
+                f"`{status}` — it carries no frontmatter `status:` to set, so the "
+                "re-arm was REFUSED rather than re-driving a session that would wedge "
+                "on the status it reads",
+                "Add a top-level `status:` to the spec, then re-run resolve",
+            )
+        # No next_step, and deliberately: on this leg there is nothing to do to THIS
+        # file. Whether anything is left to do at all is decided by the committed spec,
+        # and `rearm-spec-write-unreachable` — journalled from the same block, on
+        # exactly the legs where the committed spec is not already at the target —
+        # carries that imperative, and holds the resume behind it.
         return (
             "warning",
-            f"the recorded spec for this story ({entry.get('spec_file', '?')}) could "
-            f"not be re-opened to `{entry.get('status', '?')}` — it carries no "
-            "frontmatter `status:` to set, so the re-arm was REFUSED rather than "
-            "re-driving a session that would wedge on the status it reads",
-            "Add a top-level `status:` to the spec, then re-run resolve",
+            f"the recorded spec for this story ({spec}) could not be re-opened to "
+            f"`{status}` — the re-arm was NOT refused, because that copy is not what "
+            "the re-driven session reads: it mounts a fresh worktree and reads the "
+            "COMMITTED spec",
+            "",
         )
     if kind == "rearm-baseline-restamp-skipped":
         return (
@@ -3015,6 +3075,36 @@ def rearm_event_notice(
             "",
         )
     return None
+
+
+def rearm_holds_the_resume(entry: dict[str, Any]) -> bool:
+    """True for a re-arm record whose remedy has to land BEFORE the re-drive reads the
+    tree — so a surface that re-arms and resumes in ONE gesture must stop after the
+    re-arm and leave `bmad-loop resume` to the operator.
+
+    Exactly one kind qualifies, and the discriminator is PROOF, not urgency.
+    `rearm-spec-write-unreachable` is written only once `_committed_spec_status` has
+    established that the committed spec does NOT carry the status the re-drive routes
+    on, and only for a spec the working-tree flip cannot reach. Resuming on it is not
+    risky, it is futile: the re-drive discards the worktree, mounts a fresh one from
+    git, and step-01 reads a status it cannot route — `unrecognized status in existing
+    story file` halts it blocked, and the escalation is spent. The record's own
+    next_step already said "commit the corrected spec before resuming"; both default
+    surfaces then resumed in the same breath, which made the imperative unactionable at
+    the moment it rendered. The interactive resolve agent cannot close that gap either
+    — its skill forbids it from committing.
+
+    The other warnings stay advisory and do NOT hold. `stale-restore-commits`,
+    `stale-restore-unparseable` and `rearm-baseline-advance-failed` each report
+    something an operator may need to act on, but none of them PROVES the re-drive
+    cannot route, and holding on a maybe would turn the ordinary degrade path into a
+    two-command gesture for an outcome nothing decided.
+
+    Not folded into `rearm_event_notice`'s tuple, because they are different questions
+    asked of the same entry: that table answers "what do I tell the operator", this
+    answers "may this gesture still resume". Both surfaces ask both, in one walk.
+    """
+    return isinstance(entry, dict) and entry.get("kind") == "rearm-spec-write-unreachable"
 
 
 def _stale_restore_residue(

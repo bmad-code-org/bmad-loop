@@ -83,9 +83,14 @@ breaking changes may land in a minor release.
   `unrecognized status in existing story file` — spending the escalation on a session that could
   never route. The skip record now aborts the re-arm as well, leaving the escalation armed for a
   corrected spec, the run state untouched and the spec byte-identical (the stale `## Auto Run
-Result` strip is sequenced after the check). Narrowed to a spec re-arm can actually read: on an
-  unreachable path the failed flip says nothing about what the re-drive will read, since the path is
-  worktree-relative and the re-drive mounts a fresh worktree and reads the COMMITTED spec regardless.
+Result` strip is sequenced after the check). Narrowed to the spec the re-drive will actually READ,
+  not merely to one this process can open. On an unreachable path the failed flip says nothing about
+  what the re-drive will read, since the path is worktree-relative and the re-drive mounts a fresh
+  worktree and reads the COMMITTED spec regardless — and under isolation the readable file IS that
+  discarded worktree copy, so refusing over it demanded a repair to a file nothing opens, and
+  demanded it even when the corrected spec was already committed and proven routable. Both legs
+  record `refused: false` and warn without aborting, and the operator message follows the flag
+  rather than claiming a refusal that did not happen.
 
 - **Re-arm writes the spec the run actually used, and reports every write it could not make**
   (#640). `StoryTask` persists `spec_file` RELATIVE to the worktree for an isolated task, and
@@ -113,7 +118,13 @@ Result` strip is sequenced after the check). Narrowed to a spec re-arm can actua
   spec. The warning is raised only when the committed spec does not already carry the status
   the re-drive needs: gating it on isolation alone fired it on every re-arm of an isolated
   task, where the advice is a no-op and the noise trains the operator past the records that
-  matter.
+  matter. The record also HOLDS the resume both surfaces fold in behind the re-arm — its own
+  advice reads "commit the corrected spec before resuming", and resuming in the same gesture
+  made that unactionable the moment it printed, then burned the escalation on a session that
+  halts blocked. The re-arm still stands; `bmad-loop resume <run-id>` picks the story up once
+  the fix is committed, and `--resume` does not override the hold. Only this record holds:
+  the advisory warnings report something an operator may need to act on, but none of them
+  proves the re-drive cannot route.
 
 - **The re-arm baseline records reach the TUI operator too** (#640). Each surface carried its
   own copy of the journal-kind → message routing and they had drifted: `bmad-loop resolve`

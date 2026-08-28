@@ -4246,6 +4246,80 @@ async def test_escalation_rearm_surfaces_the_kinds_it_used_to_drop(project, monk
     assert any("re-armed 1" in n[0] for n in notes)  # the ordinary notice still fires
 
 
+async def test_escalation_rearm_holds_the_resume_it_folds_in(project, monkeypatch):
+    """This surface's whole gesture is re-arm + resume, so the hold has to break it.
+
+    `rearm-spec-write-unreachable` fires only once the re-arm has proven the committed
+    spec does not carry the status the re-drive routes on — and this path drops the
+    table's `next_step` precisely because it resumes in the same gesture. That silenced
+    the one record whose remedy MUST land first in BOTH halves: the imperative was
+    dropped as moot, and the resume it was warning against happened anyway, mounting a
+    fresh worktree onto the still-terminal committed spec.
+
+    The re-arm itself is kept — the story is armed and persisted — and the toast names
+    what the operator can finish from this screen: commit, then resume. The
+    `rearm-baseline-restamp-skipped` control keeps this a narrowing rather than
+    "warnings stop resumes": it is a warning on the same walk, and the resume still fires.
+
+    Ablation: drop the `if hold_resume:` arm from `_do_rearm` and the first leg reddens
+    on `calls == []`, with the resume firing behind the warning it was told to wait for.
+    Discard `_echo_rearm_events`' return and it reddens the same way.
+    """
+    from bmad_loop import resolve, runs
+    from bmad_loop.journal import Journal
+
+    calls: list[str] = []
+    notes: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+
+    def fake_rearm(rd, sk):
+        Journal(rd).append(
+            "rearm-spec-write-unreachable",
+            story_key=sk,
+            spec_file="wt/specs/s1.md",
+            status="ready-for-dev",
+        )
+        Journal(rd).append(  # a warning on the same walk that must NOT hold the resume
+            "rearm-baseline-restamp-skipped",
+            story_key=sk,
+            spec_file="wt/specs/s1.md",
+            baseline="c" * 40,
+        )
+        return "ready-for-dev"
+
+    monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
+    orig_notify = BmadLoopApp.notify
+    monkeypatch.setattr(
+        BmadLoopApp,
+        "notify",
+        lambda self, msg, **kw: notes.append(str(msg)) or orig_notify(self, msg, **kw),
+    )
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: needs a human decision on the auth scheme.",
+    )
+    marker = resolve.resolution_path(run_dir, "1")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{}", encoding="utf-8")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, EscalationModal)
+        await pilot.click(await ready(pilot, "#act-rearm"))
+        await until(pilot, lambda: any("not resuming" in n for n in notes))
+
+    assert calls == []  # the resume this gesture folds in did NOT fire
+    assert any("re-armed 1" in n for n in notes)  # ...while the re-arm itself stands
+    assert any("commit the corrected spec, then resume this run" in n for n in notes)
+    # the record that proved it still renders, and its warning sibling did not hold
+    assert any("land in a worktree the re-drive discards" in n for n in notes)
+    assert any("is not a readable file from here" in n for n in notes)
+
+
 async def test_escalation_rearm_echoes_residue_when_the_rearm_aborts(project, monkeypatch):
     """An aborted re-arm still surfaces what it already journalled — the CLI parity gap.
 

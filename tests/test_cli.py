@@ -2934,6 +2934,84 @@ def test_resolve_echoes_the_residue_even_when_the_rearm_aborts(tmp_path, monkeyp
     assert "re-armed" not in out  # ...and the failure is not dressed up as a success
 
 
+def test_resolve_holds_the_resume_when_the_correction_cannot_reach_the_redrive(
+    tmp_path, monkeypatch, capsys
+):
+    """The one record that PROVES a wedge breaks the re-arm+resume gesture.
+
+    `rearm-spec-write-unreachable` fires only once the re-arm has established that the
+    committed spec does not carry the status the re-drive routes on, and its own
+    next_step reads "Commit the corrected spec before resuming". This command printed
+    that and then resumed two lines later, so the imperative was already unactionable
+    when it rendered — and the interactive resolve agent cannot close the gap either,
+    since its skill forbids it from committing. The fresh worktree then checked out the
+    still-terminal committed spec, step-01 halted blocked on an unrecognized status, and
+    the escalation was spent.
+
+    `--resume` does not override it: that flag skips the confirmation prompt, while the
+    hold is a proof rather than a question. The re-arm itself SUCCEEDED, so this stays a
+    0, with the run armed and the resume command named.
+
+    The advance-failed leg is the control, and it is what makes this a narrowing rather
+    than "warnings stop resumes": it is the most actionable degrade the re-arm has, it
+    prints its own "before resuming" imperative, and it still resumes — because nothing
+    about it proves the re-drive cannot route.
+
+    Ablation: drop the `if hold_resume:` arm from `cmd_resolve` and the first leg
+    reddens on `assert [] == ['r1']`; make `runs.rearm_holds_the_resume` answer True for
+    every entry and the control leg reddens instead. Discard `_echo_rearm_events`' return
+    (keep `hold_resume = False`) and the first leg reddens alone.
+    """
+    from bmad_loop import runs
+    from bmad_loop.journal import Journal
+
+    def rearm_journalling(kind, **fields):
+        def fake_rearm(rd, key, *, restore_patch=None):
+            Journal(rd).append(kind, story_key=key, **fields)
+            return key
+
+        return fake_rearm
+
+    resumed: list[str] = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: resumed.append(rd.name) or 0)
+
+    _escalated_run(tmp_path, "r1")
+    monkeypatch.setattr(
+        runs,
+        "rearm_escalation",
+        rearm_journalling(
+            "rearm-spec-write-unreachable", spec_file="wt/specs/s1.md", status="ready-for-dev"
+        ),
+    )
+    assert (
+        cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-interactive", "--resume"]) == 0
+    )
+    out, err = capsys.readouterr()
+    assert "Commit the corrected spec before resuming" in err
+    assert "NOT resuming in this gesture" in out
+    assert "bmad-loop resume r1" in out  # the escape hatch, reachable once it is committed
+    assert resumed == []  # the gesture stopped; the story stays armed and resumable
+
+    _escalated_run(tmp_path, "r2")
+    monkeypatch.setattr(
+        runs,
+        "rearm_escalation",
+        rearm_journalling(
+            "rearm-baseline-advance-failed",
+            repo=str(tmp_path),
+            baseline="a" * 40,
+            error="GitError: not a git repository",
+        ),
+    )
+    assert (
+        cli.main(["resolve", "--project", str(tmp_path), "r2", "--no-interactive", "--resume"]) == 0
+    )
+    out, err = capsys.readouterr()
+    assert "Check the baseline before resuming" in err  # equally imperative...
+    assert "NOT resuming in this gesture" not in out
+    assert resumed == ["r2"]  # ...and it still resumes: an advisory is not a proof
+
+
 def test_resolve_appends_the_next_step_imperative(tmp_path, monkeypatch, capsys):
     """This surface renders `severity: message; next_step`; the TUI renders `message`.
 

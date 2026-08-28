@@ -762,6 +762,9 @@ def test_rearm_journals_a_status_flip_that_silently_did_nothing(tmp_path, shape)
         assert skipped["story_key"] == "6-4-cli-list-command"
         assert skipped["spec_file"] == str(spec)
         assert skipped["status"] == "ready-for-dev"
+        # the flag the operator surfaces render the refusal's remedy from; the sibling
+        # rows that DON'T abort carry it False
+        assert skipped["refused"] is True
         # the refusal left NOTHING behind but the record: not the re-stamp (which
         # `set_frontmatter_field` declines on the same missing block), not the result
         # strip (sequenced after the check), and not the task reset — the escalation is
@@ -1140,8 +1143,10 @@ def test_rearm_journals_a_skip_when_the_recorded_spec_is_not_readable(tmp_path):
     assert skipped["baseline"] == load_state(run_dir).tasks["6-4-cli-list-command"].baseline_commit
     # and the re-stamp record is NOT written, since nothing was stamped
     assert [e for e in kinds if e["kind"] == "rearm-baseline-restamped"] == []
-    # the flip records its no-op on this shape too, and the task is re-armed anyway
-    assert [e for e in kinds if e["kind"] == "rearm-spec-flip-skipped"] != []
+    # the flip records its no-op on this shape too, and the task is re-armed anyway —
+    # and says so on the record, so neither surface prints the refusal's remedy for it
+    (flip,) = [e for e in kinds if e["kind"] == "rearm-spec-flip-skipped"]
+    assert flip["refused"] is False
     assert load_state(run_dir).tasks["6-4-cli-list-command"].phase == Phase.PENDING
 
 
@@ -1907,6 +1912,64 @@ def test_rearm_warns_about_an_unreachable_spec_write_only_when_it_is_actionable(
         assert unreachable[0]["status"] == "ready-for-dev"
 
 
+@pytest.mark.parametrize("committed_status", ["ready-for-dev", "blocked"])
+def test_rearm_does_not_refuse_a_flip_the_redrive_never_reads(
+    tmp_path, monkeypatch, committed_status
+):
+    """The flip's REFUSAL is gated on reachability, not merely on readability.
+
+    A worktree-local spec is the one file the re-drive is guaranteed NOT to read: the
+    re-arm's final arm discards the worktree and `_run_story` mounts a fresh one, which
+    checks out TRACKED files only. Gating the abort on `spec_path.is_file()` alone
+    refused the re-arm over exactly that copy, and the refusal's remedy — "add a
+    top-level `status:` to the spec" — named a file deleted before anything opens it. An
+    operator who complied would flip a doomed copy, re-run resolve, and change nothing
+    about how the re-drive routes.
+
+    Both legs keep the worktree spec unflippable (no `---` block at all) and differ only
+    in what git has committed, which is what makes this a reachability claim rather than
+    a readability one:
+
+    - `ready-for-dev` — `_committed_spec_status` has already PROVEN the re-drive reads
+      the status it routes on. Refusing blocked an otherwise-complete re-arm over an
+      obsolete copy, with nothing for the operator to do at all.
+    - `blocked` — the correction really is outstanding, and the remedy is
+      `rearm-spec-write-unreachable`'s ("commit the corrected spec"), which fires from
+      the block above and holds the resume. The flip's own refusal would have named the
+      wrong file for the right problem.
+
+    Ablation: restore the abort's gate to a bare `if spec_path.is_file():` and BOTH legs
+    redden on `RearmError` before any assertion runs. Hard-code `write_reaches_the_redrive`
+    False instead and `test_rearm_journals_a_status_flip_that_silently_did_nothing[no-frontmatter]`
+    reddens on `DID NOT RAISE` — the half this must not take with it.
+    """
+    rel = "_bmad-output/specs/6-4-cli-list-command.md"
+    _resolve_repo(tmp_path)
+    main_spec = tmp_path / rel
+    main_spec.parent.mkdir(parents=True, exist_ok=True)
+    main_spec.write_text(
+        f"---\nstatus: {committed_status}\n---\n\n## Intent\n\nx\n", encoding="utf-8"
+    )
+    git(tmp_path, "add", "-A")
+    git(tmp_path, "commit", "-q", "-m", "spec")
+    wt_spec = tmp_path / "wt" / rel
+    wt_spec.parent.mkdir(parents=True, exist_ok=True)
+    wt_spec.write_text("# Spec\n\nno frontmatter block\n", encoding="utf-8")
+
+    run_dir, _, _ = _escalated_run(tmp_path, spec_file=rel, worktree_path=str(tmp_path / "wt"))
+    monkeypatch.chdir(tmp_path)
+
+    runs.rearm_escalation(run_dir)  # must not raise: this flip cannot reach the re-drive
+
+    kinds = _kinds(run_dir)
+    (skipped,) = [e for e in kinds if e["kind"] == "rearm-spec-flip-skipped"]
+    assert skipped["refused"] is False  # what the surfaces render the remedy from
+    assert load_state(run_dir).tasks["6-4-cli-list-command"].phase == Phase.PENDING
+    # ...and the record that DOES carry an actionable remedy fires only when it has one
+    unreachable = [e for e in kinds if e["kind"] == "rearm-spec-write-unreachable"]
+    assert bool(unreachable) is (committed_status != "ready-for-dev")
+
+
 def test_rearm_suppresses_the_unreachable_warning_only_on_proof(tmp_path, monkeypatch):
     """A project that is not a repo must still WARN, not fall silent.
 
@@ -2128,6 +2191,76 @@ def test_rearm_event_notice_survives_a_journal_shape_json_admits(field, value):
     severity, message, _ = notice
     assert severity in ("note", "warning")
     assert isinstance(message, str)
+
+
+def test_rearm_event_notice_splits_the_flip_skip_on_the_refusal():
+    """One kind, two outcomes — and the operator-facing halves must not be swapped.
+
+    `rearm-spec-flip-skipped` is journalled by a re-arm that ABORTED and by one that
+    completed, and this table reads the journal out of process, with neither the task
+    nor the tree to re-derive which happened. Before the producer wrote `refused` onto
+    the record, this row claimed the abort unconditionally: an operator whose re-arm had
+    SUCCEEDED was told it "was REFUSED" and sent to add a `status:` to a file the
+    re-drive never opens. The next_step is graded alongside the message because it is
+    the half that costs the operator time — a remedy aimed at the wrong file.
+
+    Ablation: delete the `if entry.get("refused")` branch and the second leg's
+    assertions redden; return the refusal's next_step on both and the last one does
+    alone.
+    """
+    entry = {
+        "kind": "rearm-spec-flip-skipped",
+        "spec_file": "wt/specs/s1.md",
+        "status": "ready-for-dev",
+    }
+    _, refused_msg, refused_step = runs.rearm_event_notice({**entry, "refused": True})
+    assert "REFUSED" in refused_msg
+    assert refused_step == "Add a top-level `status:` to the spec, then re-run resolve"
+
+    _, msg, step = runs.rearm_event_notice({**entry, "refused": False})
+    assert "NOT refused" in msg
+    assert "COMMITTED spec" in msg
+    # nothing to do to THIS file; `rearm-spec-write-unreachable` carries the remedy on
+    # exactly the legs that still have one, and holds the resume behind it
+    assert step == ""
+
+
+def test_rearm_holds_the_resume_only_on_the_record_that_proves_a_wedge():
+    """The hold is PROOF, not urgency — and it is asked of every kind the table knows.
+
+    `rearm-spec-write-unreachable` is written only once `_committed_spec_status` has
+    established that the committed spec does not carry the status the re-drive routes
+    on, so resuming on it is futile rather than risky: step-01 halts blocked on
+    `unrecognized status in existing story file` and the escalation is spent. Its
+    next_step already read "commit the corrected spec before resuming" while both
+    default surfaces resumed in the same breath.
+
+    The advisory kinds must NOT hold. `stale-restore-commits` is the record
+    `cli._echo_rearm_events`' own docstring calls the one a human must act on, and it
+    still does not qualify — nothing about it proves the re-drive cannot route, and
+    holding on a maybe would turn every ordinary degrade into a two-command gesture.
+    That asymmetry IS the predicate; one that answered True for every warning would be
+    indistinguishable from no predicate at all.
+
+    Ablation: widen the comparison to `str(kind).startswith("rearm-")` and the three
+    `rearm-baseline-*` legs redden; return False unconditionally and the first does.
+    """
+    assert runs.rearm_holds_the_resume({"kind": "rearm-spec-write-unreachable"}) is True
+    for kind in (
+        "stale-restore-commits",
+        "stale-restore-unparseable",
+        "stale-restore-excluded",
+        "rearm-baseline-advance-failed",
+        "rearm-baseline-restamp-skipped",
+        "rearm-baseline-restamped",
+        "rearm-spec-flip-skipped",
+        "story-escalation-resolved",
+    ):
+        assert runs.rearm_holds_the_resume({"kind": kind}) is False, kind
+    # the non-mapping shapes `rearm_event_notice` survives reach this in the SAME walk,
+    # and it is asked first — a raise here would replace the outcome the operator needs
+    assert runs.rearm_holds_the_resume(3) is False
+    assert runs.rearm_holds_the_resume(None) is False
 
 
 def test_rearm_event_notice_ignores_a_non_mapping_entry():
