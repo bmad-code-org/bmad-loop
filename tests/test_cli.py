@@ -2560,6 +2560,169 @@ def test_resolve_no_interactive_rearms_and_resumes(tmp_path, monkeypatch, capsys
     assert "ready-for-dev" in spec.read_text()
 
 
+# ------------------------------------ resolve aims the code root before it re-arms
+
+# `_resume_paused_run` re-stamps the persisted code root because the engine it arms
+# works in `paths.repo_root` — but `resolve` re-arms FIRST, so on this path that
+# re-stamp lands too late to aim `runs.rearm_escalation`, which reads the mirror out of
+# process. Three rows: the move is adopted and announced before the re-arm sees it, a
+# cancelled confirm writes nothing, and a config this process cannot read degrades
+# instead of guessing a tree.
+
+
+def _resolve_run_with_a_moved_code_root(project, monkeypatch):
+    """An escalated run whose recorded code root is NOT the one config.yaml now names.
+    Returns (run_dir, the tree config names, the tree the run recorded)."""
+    from bmad_loop.journal import load_state, save_state
+
+    install_bmad_config(project)
+    moved = project.project / "moved-code"
+    moved.mkdir()
+    _configure_repo_root(project, moved)
+    run_dir = _escalated_run(project.project, "r1")
+    recorded = project.project / "old-code"
+    state = load_state(run_dir)
+    state.repo_root = str(recorded)
+    save_state(run_dir, state)
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+    return run_dir, moved, recorded
+
+
+def test_resolve_restamps_the_code_root_before_it_rearms(project, monkeypatch, capsys):
+    """The ordering IS the fix. `rearm_escalation` advances the attempt baseline and
+    re-stamps `baseline_revision` against `RunState.code_root`; the engine resumed at the
+    bottom of the same command works in `paths.repo_root`. With the re-stamp left to
+    `_resume_paused_run`, a `repo_root:` edit made while the run was paused split those
+    two readers with no error anywhere — the re-arm armed one repository and the run
+    continued in another.
+
+    Asserted at the moment of the re-arm, not afterwards: a re-stamp that lands after
+    `rearm_escalation` returns is exactly the bug, and reading state.json at the end
+    cannot tell the two apart.
+
+    Ablation: move the `runs.restamp_code_root(...)` call below the `try:` that re-arms
+    and this reddens on the stale root while the warning assertion still passes.
+    """
+    from bmad_loop import runs
+    from bmad_loop.journal import load_state
+
+    run_dir, moved, _ = _resolve_run_with_a_moved_code_root(project, monkeypatch)
+    seen: list = []
+
+    def fake_rearm(rd, key, *, restore_patch=None):
+        seen.append(load_state(rd).code_root)
+        return key
+
+    monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
+
+    argv = ["resolve", "--project", str(project.project), "r1", "--no-interactive", "--resume"]
+    assert cli.main(argv) == 0
+
+    assert seen == [moved.resolve()]
+    err = capsys.readouterr().err
+    assert "the code root in _bmad/bmm/config.yaml has changed" in err
+    assert str(moved) not in err  # the warning names neither tree, matching resume's
+
+
+def test_resolve_declined_at_the_confirm_leaves_the_code_root_for_resume(
+    project, monkeypatch, capsys
+):
+    """The re-stamp sits AFTER the confirm on purpose. A cancelled resolve must write
+    nothing: adopting the new root there would silence the loud `code_root_changed`
+    warning `_resume_paused_run` raises on its own terms, and the operator would never
+    hear about the move they did not go through with.
+
+    Ablation: hoist the re-stamp above the `args.resume is None` confirm and this
+    reddens on both the persisted root and the silence.
+    """
+    from bmad_loop import runs
+    from bmad_loop.journal import load_state
+
+    run_dir, _moved, recorded = _resolve_run_with_a_moved_code_root(project, monkeypatch)
+    monkeypatch.setattr(cli, "_confirm", lambda _prompt: False)
+    monkeypatch.setattr(
+        runs, "rearm_escalation", lambda *a, **k: pytest.fail("re-armed after a decline")
+    )
+
+    assert cli.main(["resolve", "--project", str(project.project), "r1", "--no-interactive"]) == 0
+
+    assert load_state(run_dir).repo_root == str(recorded)
+    assert "code root" not in capsys.readouterr().err
+
+
+def test_resolve_refuses_worktree_isolation_before_it_mutates_anything(
+    project, monkeypatch, capsys
+):
+    """`resolve` re-arms and THEN resumes, so the isolation refusal `_resume_paused_run`
+    makes used to land after the whole re-arm had already been persisted.
+
+    On `isolation = "worktree"` beside a `repo_root` override, the re-stamp wrote the
+    unsupported root onto the mirror and `rearm_escalation` then advanced the attempt
+    baseline — and re-stamped the spec's `baseline_revision` — against it, all before
+    the refusal at the bottom of the command returned 1. The escalation was spent
+    either way: the story came back PENDING, and `resolve` needs an ESCALATED story, so
+    the operator could not re-run it to undo the damage after fixing the config.
+
+    It also made a configuration reachable that `runs.rearm_escalation` documents as
+    unreachable — it reads the code tree's HEAD on the stated premise that
+    `repo_root == project` "in every reachable configuration", which is true only
+    BECAUSE this refusal exists.
+
+    Both post-conditions are asserted, because a refusal that merely returns 1 is not
+    the fix — writing nothing is. `_resolve_run_with_a_moved_code_root` stubs
+    `_resume_paused_run` to 0, so the rc can only come from the hoisted check.
+
+    Ablation: move the `_reject_isolation_conflict(...)` call below the
+    `runs.restamp_code_root(...)` line and the persisted-root assertion reddens; delete
+    it outright and the rc assertion reddens too.
+    """
+    from bmad_loop import runs
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    run_dir, _moved, recorded = _resolve_run_with_a_moved_code_root(project, monkeypatch)
+    _write_policy(project.project, ISOLATION_WORKTREE_POLICY)
+    monkeypatch.setattr(
+        runs,
+        "rearm_escalation",
+        lambda *a, **k: pytest.fail("re-armed under a configuration the run refuses"),
+    )
+
+    argv = ["resolve", "--project", str(project.project), "r1", "--no-interactive", "--resume"]
+    assert cli.main(argv) == 1
+
+    assert REFUSAL in capsys.readouterr().err
+    state = load_state(run_dir)
+    assert state.repo_root == str(recorded)  # the mirror was never re-pointed
+    assert state.tasks["s1"].phase == Phase.ESCALATED  # still armed for a corrected config
+
+
+def test_resolve_degrades_when_the_config_cannot_name_the_code_root(tmp_path, monkeypatch, capsys):
+    """Reading config.yaml to learn the tree is an OBSERVATION, so it degrades: without
+    it this process cannot name the code root, and re-pointing the mirror at a guess is
+    the one outcome worse than leaving it alone. The re-arm proceeds against the root the
+    run recorded — what it did before this seam existed — and says so.
+
+    Ablation: turn the `except (bmadconfig.BmadConfigError, OSError)` arm into a
+    `return 1` and this reddens on the exit code; delete the warning it prints and it
+    reddens on the silence while the re-arm assertion still passes.
+    """
+    from bmad_loop import runs
+    from bmad_loop.journal import load_state
+
+    run_dir = _escalated_run(tmp_path, "r1")  # no _bmad/bmm/config.yaml anywhere
+    rearmed: list = []
+    monkeypatch.setattr(runs, "rearm_escalation", lambda rd, key, **k: rearmed.append(key) or key)
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+
+    argv = ["resolve", "--project", str(tmp_path), "r1", "--no-interactive", "--resume"]
+    assert cli.main(argv) == 0
+
+    assert rearmed == ["s1"]
+    assert load_state(run_dir).repo_root == ""  # nothing guessed onto the mirror
+    assert "cannot read the project config to confirm the code root" in capsys.readouterr().err
+
+
 def test_resolve_echoes_this_rearms_stale_restore_events(tmp_path, monkeypatch, capsys):
     """#90's journal entries reach the operator. The commits variant is warn-only —
     stderr is the only place it ever surfaces. Entries from *earlier* re-arms are
@@ -2588,6 +2751,361 @@ def test_resolve_echoes_this_rearms_stale_restore_events(tmp_path, monkeypatch, 
     assert "could not read the abandoned restore patch (b.patch)" in err
     assert "1 commit(s) sit below the re-drive's new baseline (ffffffffffff..)" in err
     assert "FROM-LAST-TIME.txt" not in err
+
+
+def test_resolve_echoes_the_rearm_baseline_records(tmp_path, monkeypatch, capsys):
+    """The two `rearm-baseline-*` records reach the operator on the same seam.
+
+    Both are warn-only by contract — a project that is not a git repo must not fail
+    re-arm — so stderr is the only place either ever surfaces. A failed advance is the
+    most actionable outcome of the whole re-arm: the re-drive rebuilds against the
+    tree as it stood BEFORE the resolve, and the re-stamp then refuses to write a sha
+    it did not earn, so spec and task stay honestly out of step rather than silently
+    agreeing on a stale value. Journal-only, that is invisible to the human running
+    `bmad-loop resolve` — the invisibility #640(b) exists to end.
+
+    Ablation: drop either `rearm-baseline-*` arm from `runs.rearm_event_notice`
+    (the shared table both surfaces route through) and the matching assertion
+    reddens.
+    """
+    from bmad_loop import runs
+    from bmad_loop.journal import Journal
+
+    _escalated_run(tmp_path, "r1")
+
+    def fake_rearm(rd, key, *, restore_patch=None):
+        journal = Journal(rd)
+        journal.append(
+            "rearm-baseline-advance-failed",
+            story_key=key,
+            repo=str(tmp_path),
+            baseline="a" * 40,
+            error="GitError: not a git repository",
+        )
+        journal.append(
+            "rearm-baseline-restamped",
+            story_key=key,
+            spec_file="spec.md",
+            overwritten="b" * 40,
+            baseline="c" * 40,
+            restore=False,
+        )
+        return key
+
+    monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+    assert (
+        cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-interactive", "--resume"]) == 0
+    )
+
+    err = capsys.readouterr().err
+    assert "could not advance the re-drive baseline (GitError: not a git repository)" in err
+    assert "aaaaaaaaaaaa" in err
+    assert "deliberately NOT re-stamped" in err
+    assert "re-stamped the spec baseline bbbbbbbbbbbb.. -> cccccccccccc.." in err
+
+
+def test_resolve_restamp_echo_warns_on_both_legs(tmp_path, monkeypatch, capsys):
+    """The record fires only on a REAL divergence, so both legs warn.
+
+    The `restore` split predated the record's condition moving to
+    `overwritten != old_baseline` — compared against what the RUN recorded, not against
+    the value the advance just wrote. Under that condition the record is written only
+    when the spec claimed a baseline the run never recorded, which is equally
+    exceptional whichever leg produced it; keeping the old "routine on a restore
+    re-drive" note meant the patch-restore leg's genuine divergence was the one
+    downgraded. The flag stays ON the record to say which leg it was.
+
+    Ablation: restore the `if entry.get("restore")` branch in `runs.rearm_event_notice`
+    and the `restore=True` leg reddens — it goes back to printing "routine" for a
+    divergence.
+    """
+    from bmad_loop import runs
+    from bmad_loop.journal import Journal
+
+    def rearm_with(restore: bool):
+        def fake_rearm(rd, key, *, restore_patch=None):
+            Journal(rd).append(
+                "rearm-baseline-restamped",
+                story_key=key,
+                spec_file="spec.md",
+                overwritten="b" * 40,
+                baseline="c" * 40,
+                restore=restore,
+            )
+            return key
+
+        return fake_rearm
+
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+
+    _escalated_run(tmp_path, "r1")
+    monkeypatch.setattr(runs, "rearm_escalation", rearm_with(True))
+    assert (
+        cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-interactive", "--resume"]) == 0
+    )
+    err = capsys.readouterr().err
+    assert "DIFFERENT baseline" in err  # the restore leg is NOT exempt
+    assert "routine on a restore re-drive" not in err
+
+    _escalated_run(tmp_path, "r2")
+    monkeypatch.setattr(runs, "rearm_escalation", rearm_with(False))
+    assert (
+        cli.main(["resolve", "--project", str(tmp_path), "r2", "--no-interactive", "--resume"]) == 0
+    )
+    err = capsys.readouterr().err
+    assert "DIFFERENT baseline" in err
+    assert "routine on a restore re-drive" not in err
+    # both legs reached the same sentence; only the flag on the record differs
+
+
+@pytest.mark.parametrize("outcome", ["ok", "rearm-error"])
+def test_resolve_survives_a_corrupt_journal(tmp_path, monkeypatch, capsys, outcome):
+    """An undecodable byte in journal.jsonl costs the echo, never the gesture — and
+    never the exit code.
+
+    The counterpart to `test_escalation_rearm_survives_a_corrupt_journal` in the TUI,
+    which had no CLI twin: the TUI's reads were guarded while `cmd_resolve`'s two were
+    left calling `Journal(run_dir).entries()` straight, and the echo then MOVED into a
+    `finally`. On the `RearmError` path that `finally` runs before `return 1`, so a
+    raise from the echo would replace an actionable error with a traceback and swallow
+    the original — the one path where the residue matters most.
+
+    Ablation: call `Journal(run_dir).entries()` directly in `_echo_rearm_events` and
+    both legs redden — `ok` with a UnicodeDecodeError escaping `cmd_resolve`, and
+    `rearm-error` with the same, losing the `RearmError` message entirely.
+    """
+    from bmad_loop import runs
+    from bmad_loop.journal import JOURNAL_FILE
+
+    def fake_rearm(rd, key, *, restore_patch=None):
+        if outcome == "rearm-error":
+            raise runs.RearmError("cannot re-open story spec /x/spec.md")
+        return key
+
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+    monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
+    run_dir = _escalated_run(tmp_path, "r1")
+    (run_dir / JOURNAL_FILE).write_bytes(
+        b'{"ts": 1.0, "kind": "session-start", "task_id": "t1"}\n\xff\xfe not utf-8\n'
+    )
+
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-interactive", "--resume"])
+    err = capsys.readouterr().err
+
+    if outcome == "rearm-error":
+        # the operator gets the real error, not a decode traceback from the `finally`
+        assert rc == 1
+        assert "cannot re-open story spec" in err
+    else:
+        assert rc == 0
+
+
+def test_resolve_echoes_a_skipped_restamp(tmp_path, monkeypatch, capsys):
+    """The unreadable-spec skip is warn-only like its two siblings, so stderr is the
+    only place it ever surfaces. Without the echo the operator resumes a re-drive
+    whose spec still names the escalated attempt's baseline.
+
+    Ablation: drop the `rearm-baseline-restamp-skipped` arm from
+    `runs.rearm_event_notice` and this reddens.
+    """
+    from bmad_loop import runs
+    from bmad_loop.journal import Journal
+
+    _escalated_run(tmp_path, "r1")
+
+    def fake_rearm(rd, key, *, restore_patch=None):
+        Journal(rd).append(
+            "rearm-baseline-restamp-skipped",
+            story_key=key,
+            spec_file="wt/specs/s1.md",
+            baseline="c" * 40,
+        )
+        return key
+
+    monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+    assert (
+        cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-interactive", "--resume"]) == 0
+    )
+
+    err = capsys.readouterr().err
+    assert "wt/specs/s1.md" in err
+    assert "not a readable file from here" in err
+
+
+def test_resolve_echoes_the_residue_even_when_the_rearm_aborts(tmp_path, monkeypatch, capsys):
+    """An abort is when the residue matters MOST, so the echo lives in a `finally`.
+
+    `runs._stale_restore_residue` journals BEFORE the re-stamp block that raises
+    `RearmError`, so on that path the records are already on disk when the abort
+    happens — and an echo placed after an early `return 1` threw away records the
+    re-arm had genuinely written. The one it threw away is the one that cannot be
+    recovered from anywhere else: `stale-restore-commits` names commits now sitting
+    below a baseline the operator is looking at in a half-run re-arm, and nothing
+    but this line will tell them. The failure and the residue are both true, and the
+    operator needs both to decide what to do with the tree.
+
+    Ablation (residue echo): move `_echo_rearm_events` out of the `finally` back under
+    the `try` and the commits assertion reddens while the `error:` line still prints.
+
+    Ablation (success output): deleting the gate outright does NOT grade the last
+    assertion. Drop `return 1` from `cmd_resolve`'s `except runs.RearmError` arm and the
+    success line does leak to stdout, but `main` then answers 0 and the exit-code
+    assertion above reddens first, so this line is never reached — a bare rc is a
+    worthless oracle for an absent-output claim. The mutation that grades it keeps
+    `return 1` and adds `print(f"re-armed {story_key}")` to that arm:
+    `AssertionError: assert 're-armed' not in 're-armed s1\n'`.
+    """
+    from bmad_loop import runs
+    from bmad_loop.journal import Journal
+
+    _escalated_run(tmp_path, "r1")
+
+    def fake_rearm(rd, key, *, restore_patch=None):
+        # journalled first, exactly as the real residue pass is ordered
+        Journal(rd).append(
+            "stale-restore-commits", story_key=key, old_baseline="f" * 40, commits=["c1", "c2"]
+        )
+        raise runs.RearmError("could not re-stamp the spec baseline")
+
+    monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+    assert (
+        cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-interactive", "--resume"]) == 1
+    )
+
+    out, err = capsys.readouterr()
+    assert "error: could not re-stamp the spec baseline" in err  # the abort still reports
+    assert "2 commit(s) sit below the re-drive's new baseline (ffffffffffff..)" in err
+    assert "re-armed" not in out  # ...and the failure is not dressed up as a success
+
+
+def test_resolve_holds_the_resume_when_the_correction_cannot_reach_the_redrive(
+    tmp_path, monkeypatch, capsys
+):
+    """The one record that PROVES a wedge breaks the re-arm+resume gesture.
+
+    `rearm-spec-write-unreachable` fires only once the re-arm has established that the
+    committed spec does not carry the status the re-drive routes on, and its own
+    next_step reads "Commit the corrected spec before resuming". This command printed
+    that and then resumed two lines later, so the imperative was already unactionable
+    when it rendered — and the interactive resolve agent cannot close the gap either,
+    since its skill forbids it from committing. The fresh worktree then checked out the
+    still-terminal committed spec, step-01 halted blocked on an unrecognized status, and
+    the escalation was spent.
+
+    `--resume` does not override it: that flag skips the confirmation prompt, while the
+    hold is a proof rather than a question. The re-arm itself SUCCEEDED, so this stays a
+    0, with the run armed and the resume command named.
+
+    The advance-failed leg is the control, and it is what makes this a narrowing rather
+    than "warnings stop resumes": it is the most actionable degrade the re-arm has, it
+    prints its own "before resuming" imperative, and it still resumes — because nothing
+    about it proves the re-drive cannot route.
+
+    Ablation: drop the `if hold_resume:` arm from `cmd_resolve` and the first leg
+    reddens on `assert [] == ['r1']`; make `runs.rearm_holds_the_resume` answer True for
+    every entry and the control leg reddens instead. Discard `_echo_rearm_events`' return
+    (keep `hold_resume = False`) and the first leg reddens alone.
+    """
+    from bmad_loop import runs
+    from bmad_loop.journal import Journal
+
+    def rearm_journalling(kind, **fields):
+        def fake_rearm(rd, key, *, restore_patch=None):
+            Journal(rd).append(kind, story_key=key, **fields)
+            return key
+
+        return fake_rearm
+
+    resumed: list[str] = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: resumed.append(rd.name) or 0)
+
+    _escalated_run(tmp_path, "r1")
+    monkeypatch.setattr(
+        runs,
+        "rearm_escalation",
+        rearm_journalling(
+            "rearm-spec-write-unreachable", spec_file="wt/specs/s1.md", status="ready-for-dev"
+        ),
+    )
+    assert (
+        cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-interactive", "--resume"]) == 0
+    )
+    out, err = capsys.readouterr()
+    assert "Commit the corrected spec before resuming" in err
+    assert "NOT resuming in this gesture" in out
+    assert "bmad-loop resume r1" in out  # the escape hatch, reachable once it is committed
+    assert resumed == []  # the gesture stopped; the story stays armed and resumable
+
+    _escalated_run(tmp_path, "r2")
+    monkeypatch.setattr(
+        runs,
+        "rearm_escalation",
+        rearm_journalling(
+            "rearm-baseline-advance-failed",
+            repo=str(tmp_path),
+            baseline="a" * 40,
+            error="GitError: not a git repository",
+        ),
+    )
+    assert (
+        cli.main(["resolve", "--project", str(tmp_path), "r2", "--no-interactive", "--resume"]) == 0
+    )
+    out, err = capsys.readouterr()
+    assert "Check the baseline before resuming" in err  # equally imperative...
+    assert "NOT resuming in this gesture" not in out
+    assert resumed == ["r2"]  # ...and it still resumes: an advisory is not a proof
+
+
+def test_resolve_appends_the_next_step_imperative(tmp_path, monkeypatch, capsys):
+    """This surface renders `severity: message; next_step`; the TUI renders `message`.
+
+    That split is the entire reason `runs.rearm_event_notice` returns three fields
+    instead of one formatted line — the TUI re-arms and RESUMES in a single gesture,
+    so "before resuming" is already moot there, while `resolve` leaves the run parked
+    and the imperative is the actionable half. Dropping it here would leave the field
+    with no observable purpose on either surface and nothing red to say so.
+
+    Graded both ways in one run, because the empty string is a real table value: a
+    row that carries a next_step prints it after `; `, and a row that carries "" must
+    print no dangling separator.
+
+    Ablation: drop `tail` from `_echo_rearm_events`' f-string and the first assertion
+    reddens; hard-code it to `f"; {next_step}"` and the second does.
+    """
+    from bmad_loop import runs
+    from bmad_loop.journal import Journal
+
+    _escalated_run(tmp_path, "r1")
+
+    def fake_rearm(rd, key, *, restore_patch=None):
+        journal = Journal(rd)
+        journal.append(  # table row with a next_step
+            "rearm-baseline-advance-failed",
+            story_key=key,
+            repo=str(tmp_path),
+            baseline="a" * 40,
+            error="GitError: not a git repository",
+        )
+        journal.append(  # table row whose next_step is ""
+            "stale-restore-commits", story_key=key, old_baseline="f" * 40, commits=["c1"]
+        )
+        return key
+
+    monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+    assert (
+        cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-interactive", "--resume"]) == 0
+    )
+
+    lines = capsys.readouterr().err.splitlines()
+    advance = next(ln for ln in lines if "could not advance the re-drive baseline" in ln)
+    assert advance.startswith("warning: ")
+    assert advance.endswith("; Check the baseline before resuming")
+    commits = next(ln for ln in lines if "commit(s) sit below" in ln)
+    assert commits.endswith("revert them now")
 
 
 def test_resolve_interactive_runs_session_then_rearms(tmp_path, monkeypatch):
@@ -3663,6 +4181,106 @@ def test_resume_restamps_policy_snapshot_for_sweep_runs(project, monkeypatch):
     assert cli._resume_paused_run(project.project, run_dir) == 0
 
     assert load_state(run_dir).cache_read_weight() == 0.5
+
+
+# ------------------------------------------- resume re-stamps the code root
+
+# `repo_root:` is the one ProjectPaths member that decides which git TREE the run
+# works in, and resume re-reads config.yaml, so it is also the one the persisted
+# mirror (`RunState.repo_root`, which `runs.rearm_escalation` reads back out of
+# process) can fall behind. The three rows below are the whole contract: a move is
+# adopted and announced, a run that did not move reports nothing, and a state.json
+# from before the field existed migrates without being called a move.
+
+
+def _configure_repo_root(project, root: Path) -> None:
+    """Add a `repo_root:` override to the config.yaml `install_bmad_config` wrote.
+    Appended rather than rewritten so the artifact keys keep their real values —
+    `load_paths` requires them, and a stub would move what the test is not about."""
+    cfg = project.project / "_bmad" / "bmm" / "config.yaml"
+    cfg.write_text(
+        cfg.read_text(encoding="utf-8") + f"repo_root: '{root.as_posix()}'\n", encoding="utf-8"
+    )
+
+
+def test_resume_restamps_the_code_root_when_the_config_moved(project, monkeypatch, capsys):
+    """Resume adopts the code root now on disk, so the mirror must follow it.
+
+    `compose_resume` builds the Workspace off the freshly loaded `paths`, never off
+    state.json, so after a `repo_root:` edit the engine works in the new tree while
+    `runs.rearm_escalation` — a separate process, reading `RunState.code_root` — would
+    still advance the attempt baseline and re-stamp `baseline_revision` in the old one.
+    Two readers, two trees, no error: `resolve` would report a re-arm that armed the
+    wrong repository.
+
+    Durable BEFORE the engine starts, like the snapshot and the digest beside it:
+    `rearm_escalation` reads the file, and `Engine._save()` may not fire for minutes.
+
+    Ablation: delete `state.repo_root = str(paths.repo_root)` from `_resume_paused_run`
+    and this reddens on the stale root (the legacy-migration row below reddens with
+    it); neutralize `code_root_changed` to a literal `False` and it reddens on the
+    journal field and the warning instead.
+    """
+    seen: list = []
+    run_dir = _paused_run_for_resume(
+        project, monkeypatch, repo_root=str(project.project / "old-code")
+    )
+    moved = project.project / "moved-code"
+    moved.mkdir()
+    _configure_repo_root(project, moved)
+    monkeypatch.setattr(cli, "Engine", _state_reading_engine(seen))
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+
+    (at_start,) = seen
+    assert at_start.code_root == moved.resolve()
+    assert _resume_entry(run_dir)["code_root_changed"] is True
+    err = capsys.readouterr().err
+    assert "the code root in _bmad/bmm/config.yaml has changed" in err
+    # the warning names neither tree: a journalled scalar, an operator-facing sentence
+    assert str(moved) not in err
+
+
+def test_resume_reports_no_code_root_change_when_the_config_did_not_move(
+    project, monkeypatch, capsys
+):
+    """The ordinary resume, and the reason the compare is exact rather than a
+    canonicalizing one: both sides are `str(paths.repo_root)` off `load_paths`, which
+    resolves every member or raises, so an unmoved config must compare equal on the
+    nose. A row that reported a change here would fire the warning on every resume —
+    the per-configuration constant the `rearm-spec-write-unreachable` narrowing exists
+    to avoid, one file over.
+    """
+    run_dir = _paused_run_for_resume(
+        project, monkeypatch, repo_root=str(Path(project.project).resolve())
+    )
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+
+    assert _resume_entry(run_dir)["code_root_changed"] is False
+    assert "code root" not in capsys.readouterr().err
+
+
+def test_resume_migrates_a_legacy_state_without_calling_it_a_move(project, monkeypatch, capsys):
+    """A state.json written before `repo_root` existed reads back "" — a MISSING value,
+    not a divergent one. The `bool(state.repo_root)` guard is what keeps it out of the
+    compare, and the unconditional re-stamp is what migrates it onto the root the run
+    was already using.
+
+    Ablation: drop that guard and this reddens on both the journal field and the
+    warning, on every legacy run's first resume — the exact false alarm the guard buys.
+    """
+    from bmad_loop.journal import load_state
+
+    run_dir = _paused_run_for_resume(project, monkeypatch)  # no repo_root: pre-field
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+
+    assert load_state(run_dir).repo_root == str(Path(project.project).resolve())
+    assert _resume_entry(run_dir)["code_root_changed"] is False
+    assert "code root" not in capsys.readouterr().err
 
 
 def test_resume_tolerates_a_corrupt_sweep_json(project, monkeypatch):

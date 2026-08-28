@@ -773,6 +773,7 @@ def build_run_state(
     *,
     run_id: str,
     project: Path,
+    repo_root: Path,
     policy: Policy,
     epic_filter: int | None,
     story_filter: str | None,
@@ -791,10 +792,16 @@ def build_run_state(
     tree by :func:`compose_run` (#498). The out-of-tree file is the one resume
     trusts; this copy is the secondary that travels with the run directory — see
     ``RunState.trusted_config_digest`` for why a run that outlives its state key
-    needs one."""
+    needs one.
+
+    ``repo_root`` records the git root code work happens in (``paths.repo_root``),
+    which equals ``project`` unless the BMAD config sets a `repo_root:` override.
+    ``runs.rearm_escalation`` runs out of process and reads it back to advance the
+    attempt baseline in the tree the proof-of-work gate actually measures."""
     return RunState(
         run_id=run_id,
         project=str(project),
+        repo_root=str(repo_root),
         started_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
         policy_snapshot=policy.to_dict(),
         epic_filter=epic_filter,
@@ -1009,6 +1016,7 @@ def compose_run(
         state = build_run_state(
             run_id=run_id,
             project=project,
+            repo_root=paths.repo_root,
             policy=policy,
             epic_filter=epic_filter,
             story_filter=story_filter,
@@ -1144,6 +1152,7 @@ def compose_sweep(
         state = RunState(
             run_id=run_id,
             project=str(project),
+            repo_root=str(paths.repo_root),
             started_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
             policy_snapshot=policy.to_dict(),
             run_type="sweep",

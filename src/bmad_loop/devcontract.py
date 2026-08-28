@@ -29,7 +29,7 @@ from typing import Any
 
 from . import deferredwork
 from .fences import fenced as _fenced
-from .frontmatter import _edit_frontmatter_block, status_of
+from .frontmatter import _edit_frontmatter_block, auto_dev_baseline_of, status_of
 from .platform_util import atomic_write_bytes, atomic_write_bytes_confined
 from .verify import DEV_WORKFLOW, operator_actions_of, read_frontmatter
 
@@ -386,8 +386,9 @@ def synthesize_result(
     status = fm_status or arr.status
     consistent = (not arr.present) or (not arr.status) or (arr.status == status)
 
-    # The skill names the baseline `baseline_revision`; verify reads `baseline_commit`.
-    baseline = str(fm.get("baseline_commit", fm.get("baseline_revision", ""))).strip()
+    # One reader, shared with verify's baseline-match gate, so the two halves of
+    # the contract cannot disagree about which key wins (#716).
+    baseline = auto_dev_baseline_of(fm)
 
     escalations: list[dict[str, Any]] = []
     if status == BLOCKED or arr.status == BLOCKED:

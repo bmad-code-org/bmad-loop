@@ -17,9 +17,11 @@ import tarfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Literal
 
 from . import devcontract, envvars, verify
 from .adapters.multiplexer import MultiplexerError, get_multiplexer, mux_usable
+from .frontmatter import auto_dev_baseline_of, parse_frontmatter, status_of
 from .journal import STATE_FILE, VERIFY_DIR, Journal, load_state, save_state
 from .model import PAUSE_ESCALATION, Phase, RunState, StoryTask
 from .platform_util import (
@@ -27,6 +29,7 @@ from .platform_util import (
     UnconfinedWriteError,
     _mkstemp_beside,
     atomic_replace,
+    atomic_write_bytes_confined,
     atomic_write_text_confined,
     create_exclusive_confined,
     has_parent_ref,
@@ -2172,6 +2175,285 @@ def validate_restore_latch(
     return None
 
 
+def _task_spec_path(task: StoryTask, state: RunState) -> Path:
+    """The recorded spec path, re-anchored on the tree it was persisted relative to.
+
+    `StoryTask._serialized_worktree_path` (`model.py`) persists a worktree-local spec
+    RELATIVE to the mounted worktree root, and `from_dict` reads it back raw. Resolving
+    that against the process cwd is not merely unreachable — it is actively wrong:
+    `bmad-loop resolve` runs from the project root, where the MAIN CHECKOUT carries the
+    same `_bmad-output/specs/...` layout, so a bare `Path(task.spec_file)` names the main
+    checkout's copy of the story spec. `is_file()` then answers True, `confine_root`
+    accepts it (it genuinely is under `project`), and the status flip and the baseline
+    re-stamp both land on a file the run never used while the worktree's real spec is
+    left on the escalated attempt's sha.
+
+    Absolute paths pass through: a spec outside the worktree is persisted verbatim.
+    """
+    raw = Path(task.spec_file or "")
+    if raw.is_absolute():
+        return raw
+    return _task_spec_root(task, state) / raw
+
+
+def _task_spec_root(task: StoryTask, state: RunState) -> Path:
+    """The tree a relative `task.spec_file` is anchored on — and confined to.
+
+    One definition backs both halves because they must not disagree: the root
+    `_task_spec_path` resolves against and the `confine_root` the writers validate the
+    result against are the same claim about which tree owns this spec. Passing
+    `state.project` while resolving against the worktree does not REFUSE the mismatch —
+    `set_frontmatter_status`, `devcontract.strip_auto_run_result` and
+    `verify.set_frontmatter_field` all answer an out-of-root path by silently dropping
+    to the plain no-follow write, losing the confined arm's O_NOFOLLOW walk of the
+    parent components (#593) with no signal at all.
+
+    Worktrees normally resolve under `<project>/.bmad-loop/runs/...`, so the confined
+    arm is taken by construction rather than by luck — no policy or env var can
+    relocate them. The one escape is that `workspace.open_unit_workspace` stores a
+    `.resolve()`d path: a symlinked `.bmad-loop`, `runs` or `worktrees` lands the spec
+    outside `project`, and before this anchor moved that silently degraded all three
+    writes.
+    """
+    return Path(task.worktree_path or state.project)
+
+
+def _spec_is_shared_with_the_redrive(state: RunState, task: StoryTask) -> bool:
+    """True when an isolated unit's recorded spec lives outside BOTH checkouts, so the
+    re-arm's status flip survives the worktree's disposal and the re-drive reads it.
+
+    The case: artifact dirs configured outside the project tree. `ProjectPaths.rebased`
+    leaves those exactly where they are ("configured outside the project tree; doesn't
+    move") — they are SHARED across checkouts, not per-worktree — so the spec the dev
+    session reported resolves to one file that every worktree sees. The re-drive reads it
+    back through `verify.resolve_spec_path`, whose absolute branch passes the value
+    through untouched, and `engine._dispatched_spec_for_attempt` then accepts it because
+    the rebased `implementation_artifacts` is still that same external directory.
+
+    Both roots are load-bearing, and neither implies the other:
+
+    - INSIDE the worktree — the file the fresh mount destroys. Unreachable.
+    - inside the PROJECT but outside the worktree — the main checkout's copy. The write
+      lands, but the re-drive cannot use it: under isolation `workspace.paths` is rebased
+      onto the fresh worktree, so `verify.spec_within_roots` measures the main
+      checkout's path against worktree-local roots and rejects it. Unreachable, and this
+      is the one shape the worktree test alone would wrongly exempt.
+    - outside both — the shared artifact dir above. Reachable.
+
+    (The two are not nested: worktrees normally sit under `<project>/.bmad-loop/runs/`,
+    but `workspace.open_unit_workspace` stores a `.resolve()`d path, so a symlinked
+    `.bmad-loop` puts the mount outside the project.)
+
+    The recorded spelling opens the question but does not answer it.
+    `StoryTask._serialized_worktree_path` persists a spec RELATIVE whenever it sits
+    under the mounted worktree and verbatim (absolute) otherwise, so an absolute value
+    on a task that HAS a worktree is the only shape that can be shared — but that
+    relativize is a LEXICAL `relative_to` against the same `worktree_path` read here, so
+    all an absolute value proves is that the two spellings did not share a prefix. A
+    spec reported through a symlink or a `..` segment sits inside the worktree and is
+    persisted absolute all the same, and answering "shared" for it would suppress the
+    warning on a spec that really is destroyed with the worktree.
+
+    So containment is decided on the CANONICAL paths, and a host that cannot canonicalize
+    one of them answers "not shared". That degrade is the safe direction and the reason
+    this does not use `resolve_or_lexical`: its fallback is `absolute()`, which does not
+    fold `..`, so a spec spelled through either checkout would come back looking external
+    and go silent — trading a wrong warning for no warning at all."""
+    raw = Path(task.spec_file or "")
+    if not task.worktree_path or not raw.is_absolute():
+        return False
+    try:
+        # the house pair — `resolve()` raises RuntimeError, not OSError, for a symlink
+        # loop on the 3.11/3.12 floor
+        real = raw.resolve()
+        return not real.is_relative_to(Path(task.worktree_path).resolve()) and not (
+            real.is_relative_to(Path(state.project).resolve())
+        )
+    except (OSError, RuntimeError):
+        return False
+
+
+def _redrive_base_ref(state: RunState, task: StoryTask) -> str:
+    """The ref whose committed tree the re-drive will actually read this unit's spec
+    from: the run's PINNED `target_branch` for an isolated unit, ``HEAD`` otherwise.
+
+    Not `HEAD` in both cases, because the isolated re-drive never reads the main
+    checkout's working ref. `engine._finish_inflight` discards the escalated worktree
+    and its branch and `_run_story` mounts a replacement, and
+    `workspace.open_unit_workspace` cuts that fresh branch from the `base` it is handed
+    — `worktree_flow.run_isolated` passes `state.target_branch`, pinned once at run
+    start so resume keeps targeting the same branch. An operator who checks out another
+    branch in the main checkout while the escalation is paused therefore moves `HEAD`
+    off the tree the re-drive reads, in either direction: a correction committed on the
+    now-current branch is invisible to the re-drive, and one committed on the target
+    branch is invisible to `HEAD`.
+
+    That mattered once `rearm-spec-write-unreachable` began holding the resume
+    (`rearm_holds_the_resume`): reading the wrong ref does not merely mis-word a
+    warning, it either resumes a re-drive that re-wedges on the target branch's
+    terminal status, or holds a resume whose work is already committed where the
+    re-drive will find it.
+
+    The two guards are the same proxy the caller already uses. `task.worktree_path` is
+    how this file recognizes an isolated unit at all (`_task_spec_root`,
+    `_spec_is_shared_with_the_redrive`) — every isolated escalation carries a mounted
+    one. An empty `target_branch` beside it is a MISSING value, not a divergent one:
+    `ensure_target_branch` pins the field before any worktree mounts, so only a
+    state.json predating it can reach here, and that shape degrades to exactly the ref
+    it read before — the same migration `restamp_code_root` gives an unrecorded root.
+    Answering ``""`` instead would hold the resume on a per-configuration constant, the
+    failure the record's narrowing exists to avoid.
+    """
+    if task.worktree_path and state.target_branch:
+        return state.target_branch
+    return "HEAD"
+
+
+def _restore_rearmed_spec(
+    spec_path: Path, original: bytes | None, task: StoryTask, state: RunState
+) -> None:
+    """Put back the bytes a re-arm FOUND on the spec, for the aborts that can fire after
+    a write has already landed.
+
+    `rearm_escalation` holds an invariant its own refusals depend on: an aborted re-arm
+    leaves the spec byte-identical, so the escalation stays armed and the human can fix
+    the file and re-run resolve. TWO of its four refusals earn that by SEQUENCING alone —
+    the flip's read-back check and the `FrontmatterWriteError` arm both raise before
+    `devcontract.strip_auto_run_result` runs, which is why that strip is deliberately
+    ordered after them, and `set_frontmatter_status` decides it cannot move a `status:`
+    before it writes anything. The other two cannot be sequenced out of the hazard, and
+    both call this:
+
+    * The baseline re-stamp needs `task.baseline_commit` from the advance, and the
+      advance must itself run after the spec block (a just-cleared stories sentinel would
+      otherwise be captured into `baseline_untracked` as phantom pre-existing residue).
+    * The `(OSError, UnicodeDecodeError)` arm spans BOTH spec helpers, and the strip is
+      the later one — a fault raised inside it is raised after the flip published.
+
+    By the time either can fail, the status flip has landed and `save_state` has not — so
+    the abort would otherwise leave the run's task ESCALATED against a spec already
+    flipped to the re-drive's status and (for the re-stamp) stripped of the terminal
+    `## Auto Run Result` the next resolve session reads as its context. That is exactly
+    the "one edit nothing else records" the sequencing exists to prevent.
+
+    Writes only what it can prove it changed. `original` is `None` when the spec was
+    unreadable before the first write (there is then nothing to restore, and nothing
+    could have been written either), and a spec that is gone or unreadable NOW is not a
+    state this undo can improve — recreating a file another process removed would fight
+    a concurrent actor rather than restore this function's own edit. Bytes equal to
+    `original` mean nothing landed, so nothing is rewritten and the mtime is left alone.
+
+    Byte-verbatim and CONFINED, matching the writes it undoes: `atomic_write_text_confined`
+    would re-encode and translate newlines, so a CRLF spec would come back subtly
+    different from the file this re-arm found, and an unconfined write would drop the
+    `O_NOFOLLOW` walk of the parent components (#593) that every other write to this path
+    takes. A restore that itself fails RAISES rather than degrading — the spec is then
+    half-written and only the operator can settle it, which is the loudest thing this can
+    be. `UnconfinedWriteError` is an `OSError`, so the one arm covers both.
+    """
+    if original is None:
+        return
+    try:
+        if spec_path.read_bytes() == original:
+            return
+    except OSError:
+        return
+    try:
+        atomic_write_bytes_confined(spec_path, original, confine_root=_task_spec_root(task, state))
+    except OSError as e:
+        raise RearmError(
+            f"cannot restore {spec_path} after a failed re-arm "
+            f"({e.__class__.__name__}: {e}) — the spec carries this re-arm's status flip "
+            "and has lost its `## Auto Run Result` section, while the story is still "
+            "escalated; restore the spec from git, then re-run resolve"
+        ) from e
+
+
+def _committed_spec_status(state: RunState, task: StoryTask) -> str:
+    """The spec's status as COMMITTED in the tree the re-drive reads, or ``""`` when
+    unprovable.
+
+    Under isolation the re-drive reads the committed spec and never a working-tree
+    write (see `rearm_escalation`'s note on `rearm-spec-write-unreachable`), so this is
+    the value that decides whether the operator still has anything to do. Anchored on
+    `state.code_root` — the same tree the baseline advance reads — at the ref
+    `_redrive_base_ref` names, which is the run's pinned `target_branch` for an isolated
+    unit rather than that tree's current `HEAD`.
+
+    Degrades to ``""`` on every uncertainty: a spec recorded absolute (nothing names
+    its position in the tree), an absent or non-blob path at that ref, a non-UTF-8 blob,
+    or any `GitError` — which includes the project simply not being a repository, and a
+    `target_branch` the code root no longer carries. ``""`` never equals a target
+    status, so the caller's record still fires. Suppression therefore requires PROOF
+    that the work is already done, and the non-repo case stays non-fatal, as the story's
+    Boundaries require.
+
+    The absolute arm is narrower than it looks: the caller has already answered the one
+    absolute shape whose write the re-drive DOES read — the shared external spec — with
+    `_spec_is_shared_with_the_redrive`. What still reaches here is an absolute spelling
+    of a path inside one of the two checkouts, which is genuinely unreachable and
+    genuinely unprovable, so degrading it to a warning is the right answer, not a gap.
+    """
+    raw = Path(task.spec_file or "")
+    if not task.spec_file or raw.is_absolute():
+        return ""
+    try:
+        blob = verify.file_bytes_at_revision(
+            state.code_root, _redrive_base_ref(state, task), raw.as_posix()
+        )
+    except verify.GitError:
+        return ""
+    if blob is None:
+        return ""
+    try:
+        text = blob.decode("utf-8")
+    except UnicodeDecodeError:
+        return ""
+    return status_of(parse_frontmatter(text))
+
+
+def restamp_code_root(run_dir: Path, repo_root: Path) -> str | None:
+    """Re-point a paused run's persisted code-root mirror at `repo_root` — the tree
+    the caller is about to act in — and return the warning an operator must see when
+    that MOVED a root the run had recorded (`None` when it already agreed, or when the
+    run predates the field).
+
+    Exists because `rearm_escalation` reads that mirror OUT OF PROCESS
+    (`RunState.code_root`) and has no `ProjectPaths` to consult, while `repo_root:` is
+    re-read from config.yaml by every process that arms an engine. `cli._resume_paused_run`
+    folds the same re-stamp into the one `save_state` that also carries the policy
+    snapshot and the config digest — this is the seam for the surfaces that re-arm
+    BEFORE they resume (`cli.cmd_resolve`, `TuiApp._do_rearm`), where that write lands
+    too late to aim the re-arm.
+
+    The compare is exact and uncanonicalized, matching resume's: both sides are
+    `str(paths.repo_root)` off `bmadconfig.load_paths`, which resolves every member or
+    raises, so they are spelled the same way whenever they name the same tree. An empty
+    recorded root is a MISSING value, not a divergent one — a state.json written before
+    the field existed — so it is migrated silently and reported as no move.
+
+    The message names neither tree, like resume's: what an operator needs is that the
+    run has changed repositories, and the paths are the half that would put an
+    attacker-controlled string on their terminal.
+    """
+    state = load_state(run_dir)
+    new = str(repo_root)
+    if state.repo_root == new:
+        return None
+    moved = bool(state.repo_root)
+    state.repo_root = new
+    save_state(run_dir, state)
+    if not moved:
+        return None
+    return (
+        f"run {run_dir.name}: the code root in _bmad/bmm/config.yaml has changed since "
+        "this run started — the re-drive works in the tree configured now, while the "
+        "baselines, preserve refs and branches this run already recorded name objects "
+        "in the previous one. Restore the previous `repo_root:` value if you did not "
+        "intend the move."
+    )
+
+
 def rearm_escalation(
     run_dir: Path, story_key: str | None = None, *, restore_patch: str | None = None
 ) -> str:
@@ -2180,13 +2462,30 @@ def rearm_escalation(
     Flips the escalated task out of its terminal ESCALATED phase back to
     PENDING — which makes `_finish_inflight` reset the tree to the story's
     baseline and re-run it (clean rebuild) against the now-corrected frozen
-    spec. The baseline itself is advanced to the project's current HEAD (and
-    the untracked snapshot refreshed) so commits and files the resolve session
+    spec. The baseline itself is advanced to the CODE TREE's current HEAD
+    (`state.code_root`, which is `paths.repo_root` — the tree the dev writer
+    stamps from and the proof-of-work gate measures, and the same directory as
+    `state.project` in every configuration without a `repo_root:` override) and
+    the untracked snapshot refreshed, so commits and files the resolve session
     produced count as the rebuild's starting point, not as attempt debris to
     roll back. Strips the escalated attempt's stale `## Auto Run Result`
     section so the re-drive cannot read as terminal from its first save, and
     sets the spec's frontmatter status so step-01 routes to the right stage.
     Does NOT clear the pause; the caller resumes the run separately.
+
+    Two consequences of the reset are load-bearing and easy to undo by accident:
+
+    - `task.generation` is bumped, because `attempt` returning to 0 would
+      otherwise let the re-drive re-mint a session id byte-equal to one the
+      abandoned attempt already recorded (#705). `task.sessions` is deliberately
+      NOT cleared — a second resolve cycle reads that run-dir audit trail — so
+      the id is what has to change.
+    - The spec's `baseline_revision` is re-stamped on BOTH legs, and only when the
+      advance above actually RAN — `advanced` records that both git reads succeeded,
+      not that HEAD changed, so a resolve session that committed nothing still
+      re-stamps (with the same sha, harmlessly). What it will not do is re-stamp
+      after a FAILED advance (see the block that does it for why each half of that
+      is the way it is).
 
     Two re-drive modes, selected by `restore_patch`:
 
@@ -2250,6 +2549,14 @@ def rearm_escalation(
     # engine._finish_inflight): a clean re-attempt against the corrected spec.
     task.phase = Phase.PENDING
     task.attempt = 0
+    # A new generation of this task. `attempt` going back to 0 (and the next
+    # dispatch bumping it to 1) would otherwise re-mint a session task_id
+    # byte-equal to one the abandoned attempt already recorded, and
+    # `Engine._resumable_session` — matching that id over the append-only
+    # `task.sessions`, which this function deliberately does NOT clear — would
+    # replay the abandoned verdict for the fresh attempt (#705). Bumped BEFORE any
+    # dispatch, so the id is unique from the re-drive's first session onward.
+    task.generation += 1
     task.review_cycle = 0
     task.followup_reviews_spent = 0  # human-resolved re-drive gets a fresh damping budget
     task.defer_reason = None
@@ -2259,8 +2566,12 @@ def rearm_escalation(
     # a prior restore attempt the human then chose to redo from scratch.
     task.restore_patch = restore_patch
 
+    # The bytes this re-arm found on the spec, for `_restore_rearmed_spec`. Declared out
+    # here because the baseline re-stamp that consumes it sits in a SECOND
+    # `if task.spec_file:` block, past the advance it depends on.
+    spec_before: bytes | None = None
     if task.spec_file:
-        spec_path = Path(task.spec_file)
+        spec_path = _task_spec_path(task, state)
         # Stories mode only: a fixed-slug pre-planning-halt sentinel
         # (`<id>-unresolved.md` / `<id>-ambiguous.md`) is cleared by deletion, not a
         # status flip. Clear it ONLY when the run recorded this task AS a sentinel at
@@ -2279,20 +2590,217 @@ def rearm_escalation(
             task.spec_file = None
             task.sentinel_kind = ""  # verdict discharged; the re-dispatch is clean
         else:
-            try:
-                # Route /bmad-build-auto via the spec's frontmatter status (decision
-                # table): patch-restore -> in-review -> step-04 (resume review on
-                # the restored diff); from-scratch -> ready-for-dev -> step-03
-                # (re-implement). Independent of the resolve agent having set it.
-                target_status = "in-review" if restore_patch else "ready-for-dev"
-                verify.set_frontmatter_status(
-                    spec_path, target_status, confine_root=Path(state.project)
+            # A WORKTREE-LOCAL spec's writes below land in the unit's worktree
+            # (`_task_spec_path`) — which the re-drive destroys before reading anything.
+            # A re-armed task (phase PENDING, `defer_reason` cleared, and no resumable
+            # session because `generation` was just bumped) falls to
+            # `engine._finish_inflight`'s final arm, which calls `discard_worktree` and
+            # lets `_run_story` mount a fresh one. The re-driven session then resolves
+            # its spec through `verify.resolve_spec_path(task.spec_file,
+            # workspace.paths)` (`engine._dispatched_spec_for_attempt`), and under
+            # isolation `workspace.paths` is rebased onto that FRESH worktree, which
+            # checks out TRACKED files only. So the re-drive reads the COMMITTED spec.
+            #
+            # No working-tree write reaches it — not this one, and not a write to the
+            # main checkout either: the fresh worktree comes from git rather than from a
+            # copy of that tree, and `seed_adapter_defaults` seeds adapter config files,
+            # not the output folder. The channel that DOES work is the human committing
+            # the corrected spec from the resolve session, which runs with `cwd=project`.
+            # The writes below are kept (they are correct for the in-place case, and
+            # harmless here), but the operator is told — a flip that cannot land is
+            # exactly the silent re-wedge #640(b) exists to end.
+            #
+            # "Worktree-local" is the load-bearing qualifier, and isolation does not
+            # imply it: an artifact dir configured OUTSIDE the project tree is shared
+            # across checkouts by `ProjectPaths.rebased`, so a spec that landed there is
+            # one file the fresh worktree reads through the very absolute path this
+            # writes to. `_spec_is_shared_with_the_redrive` carves out that case, and only
+            # that one: the main checkout's copy is outside the worktree too, and stays
+            # unreachable because the re-drive measures it against worktree-local roots.
+            # Route /bmad-build-auto via the spec's frontmatter status (decision
+            # table): patch-restore -> in-review -> step-04 (resume review on
+            # the restored diff); from-scratch -> ready-for-dev -> step-03
+            # (re-implement). Independent of the resolve agent having set it.
+            target_status = "in-review" if restore_patch else "ready-for-dev"
+            # Whether the writes below are the copy the re-driven session actually
+            # reads. Hoisted out of the record's condition because TWO decisions turn on
+            # it, and only one of them used to: the warning below, and the flip's
+            # REFUSAL one screen down, which was gated on `spec_path.is_file()` alone.
+            # Under isolation that readable file is the doomed worktree copy, so the
+            # refusal demanded a repair to the one file the re-drive destroys before
+            # reading anything — and demanded it even when `_committed_spec_status` had
+            # already proven the committed spec carries the status the re-drive routes
+            # on. See `_spec_is_shared_with_the_redrive` for why an isolated unit's spec
+            # is nevertheless reachable when it sits in an artifact dir configured
+            # outside the project tree.
+            write_reaches_the_redrive = not task.worktree_path or _spec_is_shared_with_the_redrive(
+                state, task
+            )
+            # Narrowed to the case an operator can ACT on. Every isolated escalation
+            # carries a mounted `worktree_path` — `worktree_flow.escalate_unit` never
+            # clears it, and `keep_branch_and_escalate` deliberately leaves the worktree
+            # up — so gating on that alone fired this warning on 100% of re-arms under
+            # `isolation = "worktree"`: a per-configuration constant, not an event, and
+            # the same "trains the operator to scroll past the meaningful one" failure
+            # that the `flipped` read-back below and the `overwritten != old_baseline`
+            # guard were each narrowed to avoid. The remedy it prints ("commit the
+            # corrected spec") is already a no-op once the committed spec carries the
+            # target status, which is precisely when the re-drive reads what it needs.
+            # Suppression requires PROOF: an unreadable blob, a non-repo project, or any
+            # git fault leaves `""` and the record fires. The proof is read at
+            # `_redrive_base_ref`, NOT at the code root's current `HEAD` — the two part
+            # company as soon as the operator checks out another branch while the
+            # escalation is paused, and this record now holds the resume.
+            #
+            # The branch rides along because the remedy needs it: on exactly the shape
+            # the ref fix rescues, "commit the corrected spec" without a branch sends
+            # the operator to commit again on the branch the re-drive does not read, and
+            # the next re-arm prints the same sentence. Empty for the migrated shape
+            # `_redrive_base_ref` degrades to `HEAD` for, and the notice drops the
+            # clause rather than naming a ref it cannot source.
+            #
+            # Spelled `target_branch` and NOT `base`, because `diagnostics` routes the
+            # scrub by field NAME: `target_branch` is already in `_JOURNAL_ALIAS_FIELDS`
+            # under the `branch` namespace (with no journal producer until now), while
+            # any new spelling falls through to `scrub_json`, which waves an
+            # identifier-shaped branch name through verbatim. In a normal run
+            # `ensure_target_branch` has already journalled the same string as `branch`,
+            # so the egress backstop would repair it and disclose a `backstop_repairs`
+            # routing gap; in a truncated journal missing that event nothing would catch
+            # it and the branch would ship in a shareable bundle. `target` — the
+            # spelling the merge kinds use — is NOT available: `board-advance-*` puts a
+            # sprint STATUS in that same field, and routing is by name, so aliasing it
+            # to `branch` would pseudonymize statuses as branches.
+            if (
+                not write_reaches_the_redrive
+                and _committed_spec_status(state, task) != target_status
+            ):
+                journal.append(
+                    "rearm-spec-write-unreachable",
+                    story_key=key,
+                    spec_file=str(spec_path),
+                    status=target_status,
+                    target_branch=state.target_branch,
                 )
+            # Captured immediately before the FIRST write, so an abort further down can
+            # put the spec back exactly as found. Unreadable degrades to `None`: the
+            # writes below answer such a path with `False` rather than an exception, so
+            # there would be nothing to undo either.
+            try:
+                spec_before = spec_path.read_bytes()
+            except OSError:
+                spec_before = None
+            try:
+                flipped = verify.set_frontmatter_status(
+                    spec_path, target_status, confine_root=_task_spec_root(task, state)
+                )
+                # `set_frontmatter_status` answers "nothing to change" with `False`
+                # for FOUR causes, not three — its own docstring lists them: no file,
+                # no frontmatter block, no top-level `status:`, and ALREADY AT THE
+                # TARGET (`_edit_frontmatter_block` returns None on
+                # `original[key] == value`). Only the first three are failures. The
+                # fourth is an ordinary, fully-successful re-arm: a second resolve
+                # cycle on an already-flipped spec, or the documented
+                # `resolve --no-interactive` flow where a human fixed the spec
+                # themselves — the case the comment above calls "Independent of the
+                # resolve agent having set it". Journalling it fired the operator
+                # warning ("could not be re-opened … may re-wedge on it") on a spec
+                # that was byte-identical and CORRECT, which is the "trains the
+                # operator to scroll past the meaningful one" failure the re-stamp's
+                # `overwritten != old_baseline` guard exists to prevent one screen
+                # below. Read the status back to tell the two apart: `read_frontmatter`
+                # degrades a missing/unreadable/unparseable spec to `{}` and `status_of`
+                # then answers `""`, so all three real failures still record.
+                if not flipped and verify.status_of(verify.read_frontmatter(spec_path)) != (
+                    target_status
+                ):
+                    # Discarding that return is how the flip
+                    # became a SILENT no-op: the re-drive is dispatched anyway, step-01
+                    # reads the unchanged terminal status, routes the session to "ingest
+                    # as context, do not resume", and the story re-wedges with nothing on
+                    # the record. The `FrontmatterWriteError` arm below covers only the
+                    # shapes that RAISE; this covers the ones that lie quietly.
+                    # `refused` is written ON the record because ONE kind now covers
+                    # two outcomes and the operator surfaces must tell them apart —
+                    # they read the journal OUT OF PROCESS, with neither the task nor
+                    # the tree to re-derive it from. Printing the refusal's remedy
+                    # ("add a top-level `status:`") for a re-arm that COMPLETED sends
+                    # the human to repair a file nothing will read.
+                    refused = spec_path.is_file() and write_reaches_the_redrive
+                    journal.append(
+                        "rearm-spec-flip-skipped",
+                        story_key=key,
+                        spec_file=str(spec_path),
+                        status=target_status,
+                        refused=refused,
+                    )
+                    # ...and then ABORT — but only for a spec that IS a readable file
+                    # here AND is the copy the re-drive reads. The first half is the same
+                    # `is_file` split the baseline re-stamp below already draws, and for
+                    # the same reason. On THAT shape the failure is
+                    # a REPAIR that did not land on the very file the re-drive reads, so it
+                    # aborts for the same reason the `FrontmatterWriteError` arm does:
+                    # journalling alone left the two default surfaces telling the operator
+                    # "re-armed <story>" and resuming in the same gesture, so the record's
+                    # own imperative was already unactionable when it rendered — while
+                    # step-01's contract for what reaches here is not a maybe. A spec with
+                    # no `status:` HALTs blocked on `unrecognized status in existing story
+                    # file`; one still carrying the escalated attempt's terminal status
+                    # routes to "ingest as context, do not resume". Either way the re-drive
+                    # re-wedges and the escalation is burned. Refusing keeps it armed: nothing
+                    # is persisted yet (`save_state` runs below), the spec is byte-identical
+                    # (the `## Auto Run Result` strip is deliberately sequenced AFTER this
+                    # check so an abort leaves nothing half-done), and the human fixes the
+                    # frontmatter and re-runs resolve.
+                    #
+                    # A spec that is NOT a file from here keeps warn-and-continue, because
+                    # there the flip's failure says nothing about what the re-drive will
+                    # read: `spec_file` is persisted RELATIVE to a worktree, an isolated
+                    # task's worktree may already be gone, and the re-drive mounts a fresh
+                    # one and reads the COMMITTED spec regardless. Aborting on it would
+                    # refuse the re-arms that the `rearm-baseline-restamp-skipped` and
+                    # `rearm-spec-write-unreachable` records exist to report rather than
+                    # prevent — an unreadable path is an observation, and observations
+                    # degrade.
+                    #
+                    # A worktree-local spec that IS readable takes that same lane, for a
+                    # sharper version of the same reason: `_task_spec_root` anchors this
+                    # write on the mounted worktree, so the readable file is the copy the
+                    # re-drive DISCARDS. The refusal's own remedy could not fix anything
+                    # there — an operator who added a `status:` to that file and re-ran
+                    # resolve would flip a spec that is deleted before it is read, while
+                    # the committed spec, the one thing that decides routing, went
+                    # untouched. Worse, the refusal fired even when the correction was
+                    # already committed: `_committed_spec_status` had just PROVEN the
+                    # re-drive routes correctly, and the re-arm was refused anyway over an
+                    # obsolete copy. The real remedy on that shape is
+                    # `rearm-spec-write-unreachable`'s ("commit the corrected spec"),
+                    # which fires from the block above on exactly the legs that need it
+                    # and now holds the resume rather than merely printing.
+                    #
+                    # The record is written on BOTH sides of that split: the abort message
+                    # reaches stderr only, and the journal is the run's audit trail —
+                    # `_echo_rearm_events` surfaces it from a `finally` on this path.
+                    if refused:
+                        raise RearmError(
+                            f"cannot re-open story spec {spec_path} to `{target_status}` "
+                            "for the re-drive: it has no frontmatter `status:` this re-arm "
+                            "can set, so the re-driven session would wedge on the status "
+                            "it reads — add a top-level `status:` to the spec's "
+                            "frontmatter block, then re-run resolve"
+                        )
                 # drop the stale `## Auto Run Result` section along with the status flip
                 # (mirrors engine._reset_spec_for_repair): find_result_artifact keys on
                 # that heading, so leaving it would let the re-driven session's first
                 # save of the spec parse as the prior attempt's terminal outcome.
-                devcontract.strip_auto_run_result(spec_path, confine_root=Path(state.project))
+                #
+                # Sequenced AFTER the read-back check above, not with the flip it mirrors:
+                # that check now raises, and an aborted re-arm must leave the spec exactly
+                # as it found it — a stripped result section on a spec the re-arm then
+                # refused would be the one edit nothing else records.
+                devcontract.strip_auto_run_result(
+                    spec_path, confine_root=_task_spec_root(task, state)
+                )
             except verify.FrontmatterWriteError as e:
                 # The spec reads fine but carries `status:` in a shape no line
                 # edit can move (a block scalar, a flow mapping, a value continued
@@ -2313,6 +2821,24 @@ def rearm_escalation(
                 # flip the re-drive would just re-wedge — abort BEFORE any state
                 # is persisted (save_state runs below) with an actionable error
                 # instead of a traceback; the escalation stays armed for a retry.
+                #
+                # ...and this arm is the SECOND refusal that can fire after a write has
+                # landed, which the sequencing argument above does not cover. It guards
+                # BOTH helpers, and `strip_auto_run_result` is the later one: by the
+                # time its own read/decode or its atomic write faults (an
+                # `atomic_write_bytes_confined` that cannot land — ENOSPC, EIO, a
+                # component swapped for a link under the `O_NOFOLLOW` walk — or a spec
+                # replaced under us between the two writes), the flip has already been
+                # published and `save_state` has not. Ordering the strip after the
+                # read-back check bought that check its byte-identical abort; it buys
+                # this one nothing, because the fault is IN the strip. So the same undo
+                # the re-stamp carries applies here, on the same terms.
+                #
+                # On the arm's other shape — the flip itself faulting on an
+                # unreadable/undecodable spec — nothing was written, `spec_before` still
+                # equals the bytes on disk, and `_restore_rearmed_spec` proves that and
+                # returns without touching the file or its mtime.
+                _restore_rearmed_spec(spec_path, spec_before, task, state)
                 raise RearmError(
                     f"cannot re-open story spec {spec_path} for the re-drive "
                     f"({e.__class__.__name__}: {e}) — fix or replace the file "
@@ -2330,12 +2856,39 @@ def rearm_escalation(
     # sentinel must not be snapshotted), and before it because it feeds it.
     # Nothing is deleted here: the re-drive's reset (verify.safe_rollback) removes
     # whatever the refreshed snapshot no longer blesses, at the right moment.
-    stale_residue = _stale_restore_residue(
-        Path(state.project), journal, key, old_latch, old_baseline
-    )
+    # The CODE tree, not `state.project`: every git read below (and every baseline
+    # the proof-of-work gate later measures against) must name the repository the
+    # dev writer stamps.
+    #
+    # That is `paths.repo_root` for every run this function can be reached from, but
+    # NOT because `paths.repo_root == workspace.root` universally — it does not.
+    # `Workspace.default` sets `root=paths.repo_root`, while the isolation constructor
+    # mounts `root=<run_dir>/worktrees/<unit>` and rebases a fresh `ProjectPaths` onto
+    # it, so under `isolation = "worktree"` the run-level `repo_root` is the main
+    # checkout and the baseline is stamped in the worktree.
+    #
+    # `bmadconfig.worktree_isolation_conflict` refuses worktree isolation beside a
+    # `repo_root:` OVERRIDE — a narrower fact than it looks. It forces
+    # `repo_root == project`; it says nothing about `repo_root` vs `workspace.root`.
+    # Under plain isolation with NO override those two still diverge and isolation is
+    # ON, so "wherever the roots could diverge, isolation is off" is false, and a rule
+    # built on it licenses treating `state.code_root` as the tree the dev writer
+    # stamped — which under isolation it is not.
+    #
+    # What is true, and the only claim to carry forward: `repo_root == project` in
+    # every reachable configuration, so reading HEAD here is right for the in-place
+    # case; and under isolation this value is deliberately SUPERSEDED rather than
+    # relied on — `engine._finish_inflight` discards the worktree and `_dev_phase`
+    # re-stamps `task.baseline_commit` from the fresh worktree's HEAD before any gate
+    # reads it. Do not carry an identity into new code; carry this argument.
+    #
+    # A pre-upgrade state.json with no recorded root degrades to `project` exactly as
+    # before.
+    repo = state.code_root
+    stale_residue = _stale_restore_residue(repo, journal, key, old_latch, old_baseline)
 
-    # Advance the attempt baseline to the project's current HEAD and refresh the
-    # untracked snapshot: whatever the human-driven resolve session left on the
+    # Advance the attempt baseline to the CODE TREE's current HEAD (`repo`, above)
+    # and refresh the untracked snapshot: whatever the human-driven resolve session left on the
     # branch (a committed fixture, a corrected ledger, ...) is authorized input
     # for the re-drive, not failed-attempt debris. Without this, the re-drive's
     # reset-to-baseline in engine._rollback_or_pause parks the resolution
@@ -2349,41 +2902,160 @@ def rearm_escalation(
     # pre-existing untracked file. The two locals are computed before either task
     # field is assigned, so a failure on either git call can't advance
     # baseline_commit while baseline_untracked stays stale, or vice versa.
+    advanced = False
     try:
-        repo = Path(state.project)
         head = verify.rev_parse_head(repo)
         untracked = sorted(verify.untracked_files(repo) - stale_residue)
+    except verify.GitError as e:
+        # `verify.GitError` is a TOTAL replacement for the `except Exception` that
+        # stood here, not a narrowing that leaks: both calls go through `_run_git`,
+        # which translates spawn (`GitSpawnError`), timeout (`GitTimeoutError`) and
+        # decode faults into this one taxonomy, and a non-zero rc into a plain
+        # `GitError`. Still swallowed rather than raised — a project that is not a
+        # git repo must not fail re-arm — but no longer SILENT: the degrade is the
+        # difference between "the re-drive starts from the resolution" and "it
+        # rebuilds against the tree the human just corrected away", and the
+        # re-stamp below now refuses to paper over it.
+        journal.append(
+            "rearm-baseline-advance-failed",
+            story_key=key,
+            repo=str(repo),
+            baseline=old_baseline or "",
+            error=f"{e.__class__.__name__}: {e}",
+        )
+    else:
         task.baseline_commit = head
         task.baseline_untracked = untracked
-    except Exception:  # nosec B110 - best-effort git read, must not fail re-arm
-        pass
+        advanced = True
 
-    # Patch-restore only: re-stamp the spec's own baseline to the advanced one.
-    # The in-review route skips step-03 — the only step that stamps
-    # `baseline_revision` — so without this the re-driven step-04 would build its
-    # review diff (and, on an intent-gap/bad-spec re-triage, revert) "since" the
-    # ORIGINAL pre-attempt sha, clawing back the very resolve-session commits the
-    # advance above just blessed as the re-drive's starting point. Loud on
-    # failure: a silently stale spec baseline is exactly the hazard being closed
-    # (the spec block above already proved the file readable, so this is remote).
-    if restore_patch and task.spec_file and task.baseline_commit:
-        try:
-            verify.set_frontmatter_field(
-                Path(task.spec_file),
-                "baseline_revision",
-                task.baseline_commit,
-                confine_root=Path(state.project),
+    # Re-stamp the spec's own baseline to the advanced one, on BOTH re-drive legs.
+    #
+    # The patch-restore leg needs it because the in-review route skips step-03 —
+    # the only step that stamps `baseline_revision` — so without it the re-driven
+    # step-04 would build its review diff (and, on an intent-gap/bad-spec
+    # re-triage, revert) "since" the ORIGINAL pre-attempt sha, clawing back the
+    # very resolve-session commits the advance above just blessed as the re-drive's
+    # starting point.
+    #
+    # The from-scratch leg gets it too (#640a). Its step-03 re-stamps the key
+    # itself, so the write is redundant on the happy path — but only ON that path:
+    # until step-03 runs, the spec carries the escalated attempt's sha, and every
+    # gate that reads a claimed baseline before then reads a stale one. The cost is
+    # recorded rather than hidden: re-stamping removes the gate's INDEPENDENT
+    # signal on this leg (it then compares a value the orchestrator itself wrote),
+    # so a claim that genuinely diverged is journalled on the way out instead of
+    # being silently normalized.
+    #
+    # Gated on `advanced`, not on truthiness of `task.baseline_commit`: a failed
+    # advance leaves the OLD sha in that field, which passes a truthiness test
+    # identically to a freshly advanced one. Writing it would make spec and task
+    # agree on a stale value — the one state in which nothing downstream can tell
+    # that the advance never happened, and the re-drive rebuilds from the wrong
+    # point with no error anywhere. Skipping keeps the failure legible (the degrade
+    # is journalled above) and keeps re-arm non-fatal outside a repo.
+    #
+    # Loud on WRITE failure: a silently stale spec baseline is exactly the hazard
+    # being closed.
+    #
+    # Guarded on `is_file` FIRST, because a spec this process cannot reach is not a
+    # write failure here — it is a SILENT one. Both frontmatter writers answer such a
+    # path with `False` rather than an exception (`verify.set_frontmatter_status`,
+    # `verify.set_frontmatter_field`), so without a check the re-stamp no-ops with
+    # nothing on the record and the spec keeps the escalated attempt's sha.
+    #
+    # `_task_spec_path` re-anchors the recorded path before we get here, which is what
+    # makes `is_file` mean what it says. Resolved raw it meant something else and worse:
+    # `spec_file` is persisted RELATIVE to the worktree for an isolated task, and the
+    # main checkout carries the same layout, so the check passed on the wrong file and
+    # the write landed there. The restore leg cannot reach any of this (its precondition
+    # rejects a truthy `task.worktree_path`); the from-scratch leg has no such guard,
+    # which is exactly why that precondition has to exist.
+    #
+    # `is_file` is necessary but not sufficient: a spec that EXISTS with no frontmatter
+    # block also returns `False` from both writers. That shape is caught by the flip's
+    # `flipped` check above and, here, by `overwritten` staying empty.
+    if task.spec_file:
+        spec_path = _task_spec_path(task, state)
+        if not spec_path.is_file():
+            # OUTSIDE the `advanced` gate on purpose. Nesting this record inside it
+            # made the two #640 legs shadow each other: on a project that is not a
+            # repo the advance fails, `advanced` is False, and an unreadable spec
+            # then produced NO record at all — the journal blamed git while the
+            # status flip above had silently no-opped for an entirely different
+            # reason. The two degrades compose; they do not substitute.
+            journal.append(
+                "rearm-baseline-restamp-skipped",
+                story_key=key,
+                spec_file=str(spec_path),
+                baseline=task.baseline_commit or "",
             )
-        except (OSError, UnicodeDecodeError, verify.FrontmatterWriteError) as e:
-            # FrontmatterWriteError joins the tuple rather than getting its own
-            # arm: the remedy is the same sentence ("fix the file"), and the
-            # exception already says which shape it could not move. What matters
-            # is that it aborts here — the stale-baseline hazard this block exists
-            # to close is exactly what a swallowed write would leave behind.
-            raise RearmError(
-                f"cannot re-stamp baseline_revision on {task.spec_file} "
-                f"({e.__class__.__name__}: {e}) — fix the file, then re-run resolve"
-            ) from e
+        elif advanced and task.baseline_commit:
+            try:
+                # Read through the same reader both consumers of a claimed baseline use,
+                # so what gets journalled as "overwritten" is the value the gate would
+                # have judged — not whichever key happened to be inspected here (#716).
+                #
+                # INSIDE the try, with the write it describes. `read_frontmatter` opens
+                # the file itself, so an OSError here would otherwise escape as a
+                # traceback from the one block whose whole contract is to turn a spec
+                # this re-arm cannot move into an actionable `RearmError`. What it does
+                # NOT rescue: `read_frontmatter` DEGRADES an unparseable YAML block to
+                # `{}` rather than raising, so on such a spec `overwritten` is `""`, the
+                # guard below is falsy, and no divergence record is written even though
+                # the insert lands. That is the reader's deliberate observe-degrade
+                # contract, not something to defeat here — the value is unknowable, and
+                # inventing one would be worse than the silence.
+                overwritten = auto_dev_baseline_of(verify.read_frontmatter(spec_path))
+                verify.set_frontmatter_field(
+                    spec_path,
+                    "baseline_revision",
+                    task.baseline_commit,
+                    confine_root=_task_spec_root(task, state),
+                )
+            except (OSError, UnicodeDecodeError, verify.FrontmatterWriteError) as e:
+                # FrontmatterWriteError joins the tuple rather than getting its own
+                # arm: the remedy is the same sentence ("fix the file"), and the
+                # exception already says which shape it could not move. What matters
+                # is that it aborts here — the stale-baseline hazard this block exists
+                # to close is exactly what a swallowed write would leave behind.
+                #
+                # ...and that the abort leaves the spec as this re-arm FOUND it. This is
+                # the LAST of the two refusals that can fire after a write has landed —
+                # the flip and the result strip are both behind us, `save_state` is not —
+                # so it carries the undo the sequenced refusals get for free (the other
+                # is the spec block's `(OSError, UnicodeDecodeError)` arm, which the
+                # strip raises through after the flip has published). Without
+                # it a spec with a movable `status:` beside an unmovable
+                # `baseline_revision:` came back flipped to the re-drive's status and
+                # stripped of the terminal result, while the run still called the story
+                # escalated.
+                _restore_rearmed_spec(spec_path, spec_before, task, state)
+                raise RearmError(
+                    f"cannot re-stamp baseline_revision on {spec_path} "
+                    f"({e.__class__.__name__}: {e}) — fix the file, then re-run resolve"
+                ) from e
+            if overwritten and overwritten != old_baseline:
+                # Compared against `old_baseline` — what the RUN recorded for the
+                # escalated attempt — NOT against `task.baseline_commit`, which the
+                # advance above has already moved to the new HEAD. Measuring against the
+                # advanced value made this fire on every ordinary from-scratch re-arm
+                # whose resolve session committed anything: the spec and the run agreed
+                # exactly, and the operator was still told they diverged. A record that
+                # fires on the routine case is the "trains the operator to scroll past
+                # the meaningful one" failure the `restore` split exists to prevent.
+                #
+                # What survives is the real signal, on BOTH legs: the spec claimed a
+                # baseline the run never recorded. That is the only trace left of a
+                # divergence the gate can no longer report, because the re-stamp is
+                # about to normalize it away.
+                journal.append(
+                    "rearm-baseline-restamped",
+                    story_key=key,
+                    spec_file=str(spec_path),
+                    overwritten=overwritten,
+                    baseline=task.baseline_commit,
+                    restore=bool(restore_patch),
+                )
 
     save_state(run_dir, state)
     journal.append(
@@ -2393,6 +3065,222 @@ def rearm_escalation(
         restore=bool(restore_patch),
     )
     return key
+
+
+def journal_entries_or_none(run_dir: Path) -> list[dict[str, Any]] | None:
+    """This run's journal entries, or ``None`` when the journal cannot be read.
+
+    The re-arm surfaces read the journal TWICE to diff what a re-arm appended, and
+    before that echo existed they read it not at all — so `Journal.entries()`' strict
+    UTF-8 decode would turn a corrupt journal into a re-arm the operator can no longer
+    perform, which is strictly worse than the missing echo and a regression against the
+    gesture's own history. Shared by `cli.cmd_resolve` and `TuiApp._do_rearm` rather
+    than living on one of them: the CLI's copy was left unguarded when the TUI's was
+    hardened, and the CLI's echo now runs from a `finally`, where a raise would replace
+    the `RearmError` the operator actually needs to see.
+
+    ``None`` rather than ``[]`` because the two callers DIFF two reads. Degrading a
+    failed FIRST read to ``[]`` sets the watermark to zero, and a second read that
+    succeeds then replays every historical `rearm-*`/`stale-restore-*` entry as if this
+    re-arm had just produced it. A caller that cannot establish both ends of the diff
+    must skip the echo, not guess at it.
+    """
+    try:
+        # Non-mapping lines are dropped HERE so the annotation is true for every
+        # caller: `Journal.entries()` appends `json.loads(line)` with no shape filter,
+        # so a bare `3` or `null` on its own line survives as a non-dict entry and its
+        # `list[dict[str, Any]]` return type is a claim about first-party producers,
+        # not a guarantee — pyright sees `Any` and is satisfied. Both reads apply the
+        # same filter, so the `len(before)` watermark stays exact.
+        return [e for e in Journal(run_dir).entries() if isinstance(e, dict)]
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _journal_sequence(value: Any) -> tuple[Any, ...]:
+    """A journal list field read back as a sequence, whatever the line actually held.
+
+    Every read in `rearm_event_notice` runs inside both operator surfaces' `finally`,
+    where a `TypeError` replaces the outcome the operator needs — on the TUI, whose
+    `_do_rearm` runs on Textual's message loop with no `_handle_exception` override,
+    it ends the app. `", ".join` and `len` are the two reads that raise on a shape the
+    journal admits (`"files": 3`, `"files": null`, `[1, 2]`); every sibling read is
+    already `str()`-wrapped or f-string-interpolated and cannot.
+
+    A bare string is deliberately NOT iterated: `", ".join("abc")` renders `"a, b, c"`,
+    which is worse than useless. It is wrapped as a single element instead, and `None`
+    — which `.get(key, default)` returns whenever the key EXISTS holding null, so the
+    default never applies — reads as empty.
+    """
+    if isinstance(value, (list, tuple)):
+        return tuple(value)
+    return () if value is None else (value,)
+
+
+def rearm_event_notice(
+    entry: dict[str, Any],
+) -> tuple[Literal["note", "warning"], str, str] | None:
+    """`(severity, message, next_step)` for a re-arm record an operator must see.
+
+    ONE table, two surfaces. `cli._echo_rearm_events` prints `message` followed by
+    `next_step`; `TuiApp._do_rearm` shows `message` alone. That split is the whole
+    reason this returns three fields instead of a formatted line: the TUI re-arms and
+    RESUMES in a single gesture, so an instruction to check something "before
+    resuming" is already unactionable by the time it renders — but the finding it
+    reports is not, and dropping the record to avoid the dead imperative is what left
+    the TUI silent on three kinds `resolve` echoed.
+
+    Returns None for journal kinds no operator has to act on, so a caller can walk
+    every new entry and let the table decide.
+
+    Severity is `"note"` or `"warning"`; each surface maps those onto its own channel.
+    """
+    if not isinstance(entry, dict):
+        return None
+    kind = entry.get("kind", "")
+    if kind == "stale-restore-excluded":
+        files = ", ".join(str(f) for f in _journal_sequence(entry.get("files")))
+        return (
+            "note",
+            f"excluded the abandoned restore's new files from the re-drive " f"baseline: {files}",
+            "",
+        )
+    if kind == "stale-restore-unparseable":
+        return (
+            "warning",
+            f"could not read the abandoned restore patch ({entry.get('patch', '?')}) "
+            "— its new files may be swept into the next commit",
+            "check `git status` before resuming",
+        )
+    if kind == "stale-restore-commits":
+        n = len(_journal_sequence(entry.get("commits")))
+        return (
+            "warning",
+            f"{n} commit(s) sit below the re-drive's new baseline "
+            f"({str(entry.get('old_baseline', '?'))[:12]}..) — if any came from the "
+            "abandoned attempt rather than your resolve, revert them now",
+            "",
+        )
+    if kind == "rearm-baseline-advance-failed":
+        return (
+            "warning",
+            f"could not advance the re-drive baseline ({entry.get('error', '?')}) — it "
+            f"still names {str(entry.get('baseline', '') or '(none)')[:12]}, so the "
+            "re-drive rebuilds against the tree as it stood before your resolve; the "
+            "spec was deliberately NOT re-stamped",
+            "Check the baseline before resuming",
+        )
+    if kind == "rearm-spec-write-unreachable":
+        # The branch is the half an operator cannot infer: the re-drive cuts its fresh
+        # worktree from the run's PINNED target branch, so a correction committed on
+        # whatever the main checkout happens to have checked out is not the one it
+        # reads. Named only when the record carries it — a run predating the field
+        # leaves it empty, and a remedy that names no ref beats one that names a guess.
+        base = str(entry.get("target_branch", "") or "")
+        where = f" on `{base}`" if base else ""
+        return (
+            "warning",
+            f"this story ran under worktree isolation, so the re-arm's spec writes "
+            f"({entry.get('spec_file', '?')}) land in a worktree the re-drive discards "
+            "— the re-driven session reads the COMMITTED spec, so commit the corrected "
+            f"spec{where} or the story re-wedges on the escalated attempt's status",
+            f"Commit the corrected spec{where} before resuming",
+        )
+    if kind == "rearm-spec-flip-skipped":
+        # ONE kind, TWO outcomes, told apart by the flag the producer writes rather
+        # than by anything readable from here: `rearm_escalation` raises `RearmError`
+        # right after journalling this only when the flip failed on the very copy the
+        # re-drive reads. It also journals it — and completes — when that copy is
+        # unreadable from this process, or is a worktree-local file the re-drive
+        # discards. This row used to claim the abort unconditionally, which told an
+        # operator whose re-arm had SUCCEEDED that it "was REFUSED" and sent them to
+        # add a `status:` to a file the re-drive never opens.
+        spec = entry.get("spec_file", "?")
+        status = entry.get("status", "?")
+        if entry.get("refused"):
+            # The message names the refusal rather than predicting a re-wedge, because
+            # there is no re-drive left to wedge — and the next_step is the repair, not
+            # an inspection, for the same reason.
+            return (
+                "warning",
+                f"the recorded spec for this story ({spec}) could not be re-opened to "
+                f"`{status}` — it carries no frontmatter `status:` to set, so the "
+                "re-arm was REFUSED rather than re-driving a session that would wedge "
+                "on the status it reads",
+                "Add a top-level `status:` to the spec, then re-run resolve",
+            )
+        # No next_step, and deliberately: on this leg there is nothing to do to THIS
+        # file. Whether anything is left to do at all is decided by the committed spec,
+        # and `rearm-spec-write-unreachable` — journalled from the same block, on
+        # exactly the legs where the committed spec is not already at the target —
+        # carries that imperative, and holds the resume behind it.
+        return (
+            "warning",
+            f"the recorded spec for this story ({spec}) could not be re-opened to "
+            f"`{status}` — the re-arm was NOT refused, because that copy is not what "
+            "the re-driven session reads: it mounts a fresh worktree and reads the "
+            "COMMITTED spec",
+            "",
+        )
+    if kind == "rearm-baseline-restamp-skipped":
+        return (
+            "warning",
+            f"the recorded spec for this story ({entry.get('spec_file', '?')}) is not a "
+            "readable file from here, so the baseline re-stamp was skipped — the spec "
+            "still names the escalated attempt's baseline",
+            "Check the recorded spec path before resuming",
+        )
+    if kind == "rearm-baseline-restamped":
+        head = (
+            f"re-stamped the spec baseline "
+            f"{str(entry.get('overwritten', '?'))[:12]}.. -> "
+            f"{str(entry.get('baseline', '?'))[:12]}.."
+        )
+        # NOT differentiated on the `restore` flag any more. That split predated the
+        # record's condition moving to `overwritten != old_baseline` (compared against
+        # what the RUN recorded, not against the just-advanced value): the record now
+        # fires ONLY when the spec claimed a baseline the run never recorded, which is
+        # equally exceptional on both legs. Keeping the split meant the patch-restore
+        # leg's real divergence was the one downgraded to a note. The flag stays ON the
+        # record because it says which leg produced it — not how routine it is.
+        return (
+            "warning",
+            f"{head} — the spec claimed a DIFFERENT baseline than the run recorded, "
+            "and this re-stamp is the only trace of it; the gate can no longer report "
+            "that divergence",
+            "",
+        )
+    return None
+
+
+def rearm_holds_the_resume(entry: dict[str, Any]) -> bool:
+    """True for a re-arm record whose remedy has to land BEFORE the re-drive reads the
+    tree — so a surface that re-arms and resumes in ONE gesture must stop after the
+    re-arm and leave `bmad-loop resume` to the operator.
+
+    Exactly one kind qualifies, and the discriminator is PROOF, not urgency.
+    `rearm-spec-write-unreachable` is written only once `_committed_spec_status` has
+    established that the committed spec does NOT carry the status the re-drive routes
+    on, and only for a spec the working-tree flip cannot reach. Resuming on it is not
+    risky, it is futile: the re-drive discards the worktree, mounts a fresh one from
+    git, and step-01 reads a status it cannot route — `unrecognized status in existing
+    story file` halts it blocked, and the escalation is spent. The record's own
+    next_step already said "commit the corrected spec before resuming"; both default
+    surfaces then resumed in the same breath, which made the imperative unactionable at
+    the moment it rendered. The interactive resolve agent cannot close that gap either
+    — its skill forbids it from committing.
+
+    The other warnings stay advisory and do NOT hold. `stale-restore-commits`,
+    `stale-restore-unparseable` and `rearm-baseline-advance-failed` each report
+    something an operator may need to act on, but none of them PROVES the re-drive
+    cannot route, and holding on a maybe would turn the ordinary degrade path into a
+    two-command gesture for an outcome nothing decided.
+
+    Not folded into `rearm_event_notice`'s tuple, because they are different questions
+    asked of the same entry: that table answers "what do I tell the operator", this
+    answers "may this gesture still resume". Both surfaces ask both, in one walk.
+    """
+    return isinstance(entry, dict) and entry.get("kind") == "rearm-spec-write-unreachable"
 
 
 def _stale_restore_residue(

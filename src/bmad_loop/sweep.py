@@ -946,6 +946,12 @@ class SweepEngine(Engine):
             raise RunPaused(reason, PAUSE_STORY_GATE, MIGRATE_KEY)
 
         if not task.baseline_commit:
+            # `self.workspace.root`, which is `paths.repo_root` — the same anchor the
+            # dev writer (`Engine._dev_phase`), the re-arm writer
+            # (`runs.rearm_escalation`) and every proof-of-work probe in
+            # `verify._verify_shared_gates` use. Under the `repo_root` override it is
+            # NOT `paths.project`, and a baseline stamped in one tree and measured in
+            # the other names a commit the measuring repo has never heard of (#716).
             task.baseline_commit = verify.rev_parse_head(self.workspace.root)
             task.baseline_untracked = sorted(verify.untracked_files(self.workspace.root))
 

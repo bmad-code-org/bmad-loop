@@ -17,6 +17,7 @@ at the end of the file.
 import dataclasses
 import shutil
 import types
+from pathlib import Path
 
 import pytest
 
@@ -24,7 +25,7 @@ from bmad_loop import bmadconfig
 from bmad_loop import policy as policy_mod
 from bmad_loop import runs, runsetup
 from bmad_loop.adapters.profile import ProfileError
-from bmad_loop.journal import Journal
+from bmad_loop.journal import Journal, load_state
 
 # A profile overlay carrying the whole launch surface the digest covers. It lives
 # under .bmad-loop/profiles/, inside the tree every driven session can write.
@@ -338,6 +339,101 @@ def _fake_paths(project):
         implementation_artifacts=project / "impl",
         planning_artifacts=project / "plan",
     )
+
+
+class _AcceptingEngine:
+    """Engine stand-in that CAN be built.
+
+    The sibling `_NeverBuilt` exists because every test around it aborts at
+    `make_adapters`; the rows below are about what a composition that SUCCEEDS
+    leaves on disk, so they need the opposite stand-in."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+
+def _split_root_paths(project):
+    """`_fake_paths` with the one supported divergence: `repo_root` naming a code
+    tree that is not the BMAD project dir (`isolation = "none"` plus a `repo_root:`
+    key; `bmadconfig.worktree_isolation_conflict` refuses the other combination).
+
+    `_fake_paths` leaves the two roots identical — as does the `project` fixture
+    everywhere else — so without this no composition test can tell a `repo_root`
+    that was WIRED from one that was hardcoded to `project`."""
+    return bmadconfig.ProjectPaths(
+        project=project,
+        implementation_artifacts=project / "impl",
+        planning_artifacts=project / "plan",
+        repo_root=project / "code",
+    )
+
+
+def _accepting_adapters(*_a, **_k):
+    return {role: None for role in runsetup.ROLES}
+
+
+@pytest.mark.parametrize("run_type", ["run", "sweep"])
+def test_composition_persists_the_code_root(tmp_path, run_type):
+    """`RunState.repo_root` is written at launch and read back OUT OF PROCESS by
+    `runs.rearm_escalation`, which has no `ProjectPaths` to consult — so the wiring
+    from `paths.repo_root` into the state is the whole mechanism, and it is
+    invisible everywhere the two roots coincide.
+
+    Both composers, because they build the state independently: `compose_run` goes
+    through `build_run_state` and `compose_sweep` constructs `RunState` inline, so
+    one being wired says nothing about the other.
+
+    Asserted on the PERSISTED state rather than the in-memory object: a re-arm
+    reads `state.json` from a different process, so an in-memory-only value would
+    satisfy an object assertion and still leave the consumer with nothing.
+
+    Ablation: hardcode `repo_root=project` (or drop the argument) at either
+    composer and that parametrization reddens alone.
+    """
+    paths = _split_root_paths(tmp_path)
+    assert paths.repo_root != paths.project  # the fixture really does diverge
+
+    if run_type == "run":
+        composed = runsetup.compose_run(
+            project=tmp_path,
+            paths=paths,
+            policy=policy_mod.loads(""),
+            run_id=RUN_ID,
+            epic_filter=None,
+            story_filter=None,
+            max_stories=None,
+            stories_on=False,
+            spec_folder="",
+            sweep_factory=lambda _trigger, *, started: None,
+            make_adapters=_accepting_adapters,
+            engine_cls=_AcceptingEngine,
+            stories_engine_cls=_AcceptingEngine,
+            trusted_config_digest="deadbeef",
+        )
+    else:
+        # NOT `_run_compose_sweep`: that helper bakes in `_fake_paths`, whose two
+        # roots coincide, so the sweep leg would compose without the divergence and
+        # the assertion below would hold for the wrong reason.
+        composed = runsetup.compose_sweep(
+            project=tmp_path,
+            paths=paths,
+            policy=policy_mod.loads(""),
+            run_id=RUN_ID,
+            prompting=False,
+            decisions_only=False,
+            max_bundles=None,
+            repeat=None,
+            max_cycles=None,
+            trigger="auto",
+            make_adapters=_accepting_adapters,
+            sweep_engine_cls=_AcceptingEngine,
+            trusted_config_digest="deadbeef",
+        )
+
+    persisted = load_state(composed.run_dir)
+    assert persisted.repo_root == str(paths.repo_root)
+    assert persisted.code_root == paths.repo_root
+    assert persisted.code_root != Path(persisted.project)
 
 
 @pytest.fixture

@@ -15,7 +15,7 @@ import subprocess
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import TypeVar
+from typing import Any, TypeVar
 
 from rich.text import Text
 from textual import work
@@ -821,6 +821,37 @@ class BmadLoopApp(App[None]):
         self.notify("plan reset to draft — the next dispatch re-plans")
         self._do_resume(run_id)
 
+    def _echo_rearm_events(self, run_dir: Path, before: list[dict[str, Any]] | None) -> bool:
+        """Toast the re-arm records `cli._echo_rearm_events` prints, same table.
+
+        Reads through `runs.journal_entries_or_none`, shared with the CLI so the two
+        surfaces cannot drift on robustness the way they drifted on routing. Both ends
+        of the diff must be readable: a failed FIRST read degraded to `[]` would set the
+        watermark to zero and replay every historical record as a fresh toast, so an
+        unreadable journal costs the echo and keeps the gesture.
+
+        The table's `next_step` is deliberately dropped: it reads "... before
+        resuming", and this path resumes in the same gesture.
+
+        Returns True when a record HOLDS that gesture (`runs.rearm_holds_the_resume`),
+        which is the one case where the dropped imperative was load-bearing rather than
+        moot — `_do_rearm` stops instead of resuming, and says so in its own words.
+        """
+        after = runs.journal_entries_or_none(run_dir)
+        if before is None or after is None:
+            return False
+        holds = False
+        for entry in after[len(before) :]:
+            # before the routing table can drop it: a `None` notice means "nothing to
+            # toast", never "nothing to decide"
+            holds = runs.rearm_holds_the_resume(entry) or holds
+            notice = runs.rearm_event_notice(entry)
+            if notice is None:
+                continue
+            severity, message, _next_step = notice
+            self.notify(message, severity="warning" if severity == "warning" else "information")
+        return holds
+
     def _do_rearm(
         self, run_id: str, run_dir: Path, story_key: str, *, restore_recorded: bool = False
     ) -> None:
@@ -828,11 +859,62 @@ class BmadLoopApp(App[None]):
         path (rearm_escalation handles sentinel auto-delete-with-preservation)."""
         if self._resolve_blocked_by_liveness(run_id, run_dir):
             return
+        # Same seam as `cli.cmd_resolve`, for the same reason and at the same moment:
+        # `runs.rearm_escalation` reads the persisted code root back out of the run
+        # state, and only a process that has just read config.yaml can tell whether a
+        # `repo_root:` edit made while the run was paused has moved it. Resume re-stamps
+        # it, but this gesture re-arms BEFORE it resumes, so the mirror has to be aimed
+        # here or the re-arm advances the baseline in the tree the run has left.
+        try:
+            paths = bmadconfig.load_paths(self.project)
+        except (bmadconfig.BmadConfigError, OSError) as e:
+            self.notify(
+                f"cannot read the project config to confirm the code root ({e}) — "
+                "re-arming against the root this run recorded",
+                severity="warning",
+            )
+        else:
+            # Same hoist as `cli.cmd_resolve`, for the same reason: this gesture
+            # re-arms and THEN resumes, so the isolation refusal the detached CLI makes
+            # in `_resume_paused_run` landed after the re-stamp had persisted the
+            # unsupported root and `rearm_escalation` had advanced the attempt baseline
+            # against it. The operator saw "re-armed <story>" and then a pane that
+            # refused, with the story no longer escalated for `resolve` to correct.
+            #
+            # An unreadable policy falls THROUGH to the re-arm rather than blocking,
+            # matching this surface's launch guard above: the check cannot tell "no
+            # conflict" from "could not look", and the detached CLI reads the same file
+            # and fails loudly on it. `paths` is already in hand, so only the policy
+            # read is guarded here.
+            try:
+                conflict = bmadconfig.worktree_isolation_conflict(
+                    paths, policy.load(self.project / POLICY_FILE).scm.isolation
+                )
+            except (policy.PolicyError, OSError):
+                conflict = None
+            if conflict is not None:
+                self.notify(conflict, severity="error")
+                return
+            if (moved := runs.restamp_code_root(run_dir, paths.repo_root)) is not None:
+                self.notify(moved, severity="warning")
+        before_entries = runs.journal_entries_or_none(run_dir)
+        hold_resume = False
         try:
             runs.rearm_escalation(run_dir, story_key)
         except RearmError as e:
             self.notify(f"re-arm failed: {e}", severity="error")
             return
+        finally:
+            # In the `finally`, matching `cli.cmd_resolve`. `_stale_restore_residue`
+            # journals BEFORE the re-stamp block that raises `RearmError`, so on that
+            # path the records were already written and returning early threw them
+            # away — including `stale-restore-commits`, the one record whose whole
+            # point is that nothing else will tell the human. This surface used to
+            # `return` there while the CLI echoed, so the two DID drift on the abort
+            # path even after they were unified on routing — and an abort is when the
+            # residue matters most: the re-arm half-ran and the operator has to decide
+            # what to do with the tree.
+            hold_resume = self._echo_rearm_events(run_dir, before_entries)
         if restore_recorded:
             self.notify(
                 "recorded restore patch NOT honored — this re-arm re-drives from "
@@ -840,6 +922,18 @@ class BmadLoopApp(App[None]):
                 severity="warning",
             )
         self.notify(f"re-armed {story_key}")
+        if hold_resume:
+            # The half of the gesture that still worked is kept: the story IS re-armed
+            # and persisted. What stops is the resume this surface folds in behind it,
+            # because the warning above proved the re-drive would read a spec it cannot
+            # route on and burn the escalation. Worded for a surface that drops
+            # `next_step`, and worded as an instruction the operator can finish here —
+            # the run stays paused and resumable from this same screen.
+            self.notify(
+                "not resuming: commit the corrected spec, then resume this run",
+                severity="warning",
+            )
+            return
         self._do_resume(run_id)
 
     def _resolve_blocked_by_liveness(self, run_id: str, run_dir: Path) -> bool:

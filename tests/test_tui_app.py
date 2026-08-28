@@ -4025,6 +4025,494 @@ async def test_escalation_rearm_warns_when_restore_recorded(project, monkeypatch
     assert any("NOT honored" in n for n in notes)  # the drop was surfaced, not silent
 
 
+async def test_escalation_rearm_surfaces_a_failed_baseline_advance(project, monkeypatch):
+    """The TUI re-arm RESUMES in the same gesture, so a degrade it does not surface
+    is a degrade the operator acts on without seeing.
+
+    `cli._echo_rearm_events` prints these to stderr on the other re-arm path; both
+    records are warn-only by contract (a project that is not a git repo must not
+    fail re-arm), so a journal line in a scrolling panel was the only trace here. A
+    failed advance means the re-drive rebuilds against the tree as it stood BEFORE
+    the resolve — the invisibility #640(b) exists to end, not to relocate to the
+    other caller.
+
+    Ablation: delete the journal read-back loop in `_do_rearm` and this reddens,
+    while the plain `re-armed 1` notice still fires.
+    """
+    from bmad_loop import resolve, runs
+    from bmad_loop.journal import Journal
+
+    calls: list[str] = []
+    notes: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+
+    def fake_rearm(rd, sk):
+        Journal(rd).append(
+            "rearm-baseline-advance-failed",
+            story_key=sk,
+            repo=str(rd),
+            baseline="a" * 40,
+            error="GitError: not a git repository",
+        )
+        return "ready-for-dev"
+
+    monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
+    orig_notify = BmadLoopApp.notify
+    monkeypatch.setattr(
+        BmadLoopApp,
+        "notify",
+        lambda self, msg, **kw: notes.append(str(msg)) or orig_notify(self, msg, **kw),
+    )
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: needs a human decision on the auth scheme.",
+    )
+    marker = resolve.resolution_path(run_dir, "1")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{}", encoding="utf-8")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, EscalationModal)
+        await pilot.click(await ready(pilot, "#act-rearm"))
+        await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
+    assert any("could not advance the re-drive baseline" in n for n in notes)
+    assert any("re-armed 1" in n for n in notes)  # the ordinary notice still fires
+
+
+async def test_escalation_rearm_aims_the_code_root_before_it_rearms(project, monkeypatch):
+    """Parity with `cli.cmd_resolve`, on the seam that has the same ordering.
+
+    This gesture re-arms and RESUMES in one click, and `runs.rearm_escalation` reads the
+    code tree out of the run state — so only a process that has just read config.yaml can
+    tell whether a `repo_root:` edit made while the run was paused moved it. Resume
+    re-stamps the mirror, but that is downstream of the re-arm here too: without this the
+    re-arm would advance the attempt baseline in the tree the run has left while the
+    resumed engine reset and measured in the new one.
+
+    Ablation: delete the `runs.restamp_code_root(...)` call from `_do_rearm` and this
+    reddens on the stale root; drop the `self.notify(moved, ...)` and it reddens on the
+    missing warning while the root assertion still passes.
+    """
+    from bmad_loop import resolve, runs
+    from bmad_loop.journal import load_state, save_state
+
+    calls: list[str] = []
+    notes: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    seen: list = []
+
+    def fake_rearm(rd, sk):
+        seen.append(load_state(rd).code_root)
+        return "ready-for-dev"
+
+    monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
+    orig_notify = BmadLoopApp.notify
+    monkeypatch.setattr(
+        BmadLoopApp,
+        "notify",
+        lambda self, msg, **kw: notes.append(str(msg)) or orig_notify(self, msg, **kw),
+    )
+    install_bmad_config(project)
+    moved = project.project / "moved-code"
+    moved.mkdir()
+    cfg = project.project / "_bmad" / "bmm" / "config.yaml"
+    cfg.write_text(
+        cfg.read_text(encoding="utf-8") + f"repo_root: '{moved.as_posix()}'\n", encoding="utf-8"
+    )
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: needs a human decision on the auth scheme.",
+    )
+    state = load_state(run_dir)
+    state.repo_root = str(project.project / "old-code")
+    save_state(run_dir, state)
+    marker = resolve.resolution_path(run_dir, "1")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{}", encoding="utf-8")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, EscalationModal)
+        await pilot.click(await ready(pilot, "#act-rearm"))
+        await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
+
+    assert seen == [moved.resolve()]
+    assert any("the code root in _bmad/bmm/config.yaml has changed" in n for n in notes)
+
+
+async def test_escalation_rearm_refuses_the_isolation_conflict_before_it_mutates(
+    project, monkeypatch
+):
+    """Parity with `cli.cmd_resolve` on the hoisted refusal, and for the same reason this
+    surface needed the re-stamp parity above: it re-arms and resumes in ONE click.
+
+    The detached CLI refuses `isolation = "worktree"` beside a `repo_root` override, but
+    it does so in `_resume_paused_run` — downstream of everything this gesture has
+    already written. So the re-stamp persisted the unsupported root, `rearm_escalation`
+    advanced the attempt baseline against it, the operator was toasted "re-armed 1", and
+    only then did the resumed pane refuse. The story was PENDING by then, and `resolve`
+    needs an ESCALATED story, so the escalation could not be recovered by re-running it.
+
+    Asserted against the sole producer of the text rather than a literal, matching the
+    launch guard's row, so a reworded message cannot drift this away from the CLI's.
+
+    Ablation: delete the `conflict is not None` arm from `_do_rearm` and this reddens on
+    the re-arm that must not happen; move it below the `runs.restamp_code_root(...)` call
+    and it reddens on the persisted root instead.
+    """
+    from bmad_loop import bmadconfig, resolve, runs
+    from bmad_loop.journal import load_state, save_state
+
+    calls: list[str] = []
+    notes: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    monkeypatch.setattr(
+        runs,
+        "rearm_escalation",
+        lambda *a, **k: pytest.fail("re-armed under a configuration the run refuses"),
+    )
+    orig_notify = BmadLoopApp.notify
+    monkeypatch.setattr(
+        BmadLoopApp,
+        "notify",
+        lambda self, msg, **kw: notes.append(str(msg)) or orig_notify(self, msg, **kw),
+    )
+    _split_root_tui_project(project)
+    expected = bmadconfig.worktree_isolation_conflict(
+        bmadconfig.load_paths(project.project), "worktree"
+    )
+    assert expected is not None, "the fixture really does carry the conflicting pair"
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: needs a human decision on the auth scheme.",
+    )
+    recorded = str(project.project / "old-code")
+    state = load_state(run_dir)
+    state.repo_root = recorded
+    save_state(run_dir, state)
+    marker = resolve.resolution_path(run_dir, "1")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{}", encoding="utf-8")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, EscalationModal)
+        await pilot.click(await ready(pilot, "#act-rearm"))
+        await until(pilot, lambda: expected in notes)
+
+    assert not calls  # the resume folded into this gesture never fired
+    assert load_state(run_dir).repo_root == recorded  # the mirror was never re-pointed
+
+
+async def test_escalation_rearm_surfaces_the_kinds_it_used_to_drop(project, monkeypatch):
+    """Every kind the shared table routes reaches this surface — not the three the
+    TUI's own copy of the chain happened to handle.
+
+    That copy carried `rearm-baseline-*` only and silently dropped the whole
+    `stale-restore-*` family, including `stale-restore-commits` — the record
+    `cli._echo_rearm_events`' docstring calls the one a human must act on, and the
+    one whose whole point is that nothing else will tell them. All of it is
+    warn-only by contract, so a toast is the only place this path can ever show it,
+    and this path RESUMES in the same gesture: a dropped record is a degrade the
+    operator acts on without ever seeing. Routing both surfaces through
+    `runs.rearm_event_notice` only buys anything if the TUI is graded against the
+    table's whole vocabulary, so this walks a record of every arm the old copy
+    missed plus the new spec-flip skip.
+
+    Two renderings, not two tables: the severity map is graded here too (`note` is
+    Textual's `information`, `warning` stays `warning`), as is the deliberate drop
+    of `next_step` — its imperative reads "... before resuming" and the resume is
+    already queued behind this toast.
+
+    Ablation: make `runs.rearm_event_notice` return None for any one of these kinds
+    and this reddens on that kind's message alone.
+    """
+    from bmad_loop import resolve, runs
+    from bmad_loop.journal import Journal
+
+    calls: list[str] = []
+    notes: list[tuple[str, str]] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+
+    def fake_rearm(rd, sk):
+        journal = Journal(rd)
+        journal.append(
+            "stale-restore-commits",
+            story_key=sk,
+            old_baseline="f" * 40,
+            commits=["c1", "c2"],
+        )
+        journal.append("stale-restore-excluded", story_key=sk, patch="a.patch", files=["new.txt"])
+        journal.append(
+            "rearm-baseline-restamp-skipped",
+            story_key=sk,
+            spec_file="wt/specs/s1.md",
+            baseline="c" * 40,
+        )
+        journal.append(
+            "rearm-spec-flip-skipped",
+            story_key=sk,
+            spec_file="wt/specs/s1.md",
+            status="ready-for-dev",
+        )
+        return "ready-for-dev"
+
+    monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
+    orig_notify = BmadLoopApp.notify
+    monkeypatch.setattr(
+        BmadLoopApp,
+        "notify",
+        lambda self, msg, **kw: notes.append((str(msg), str(kw.get("severity", "information"))))
+        or orig_notify(self, msg, **kw),
+    )
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: needs a human decision on the auth scheme.",
+    )
+    marker = resolve.resolution_path(run_dir, "1")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{}", encoding="utf-8")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, EscalationModal)
+        await pilot.click(await ready(pilot, "#act-rearm"))
+        await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
+
+    def severity_of(fragment: str) -> str:
+        hits = [n for n in notes if fragment in n[0]]
+        assert len(hits) == 1, f"{fragment!r} not surfaced exactly once: {notes}"
+        return hits[0][1]
+
+    # the one a human must act on — dropped entirely by the pre-table copy
+    assert severity_of("2 commit(s) sit below the re-drive's new baseline (ffffffffffff..)") == (
+        "warning"
+    )
+    assert severity_of("is not a readable file from here") == "warning"
+    assert severity_of("could not be re-opened to `ready-for-dev`") == "warning"
+    # `note` maps onto Textual's own channel name, not through unchanged
+    assert severity_of("excluded the abandoned restore's new files") == "information"
+    # the CLI's trailing imperative is omitted here: the resume is already queued
+    assert not any("before resuming" in n[0] for n in notes), notes
+    assert any("re-armed 1" in n[0] for n in notes)  # the ordinary notice still fires
+
+
+async def test_escalation_rearm_holds_the_resume_it_folds_in(project, monkeypatch):
+    """This surface's whole gesture is re-arm + resume, so the hold has to break it.
+
+    `rearm-spec-write-unreachable` fires only once the re-arm has proven the committed
+    spec does not carry the status the re-drive routes on — and this path drops the
+    table's `next_step` precisely because it resumes in the same gesture. That silenced
+    the one record whose remedy MUST land first in BOTH halves: the imperative was
+    dropped as moot, and the resume it was warning against happened anyway, mounting a
+    fresh worktree onto the still-terminal committed spec.
+
+    The re-arm itself is kept — the story is armed and persisted — and the toast names
+    what the operator can finish from this screen: commit, then resume. The
+    `rearm-baseline-restamp-skipped` control keeps this a narrowing rather than
+    "warnings stop resumes": it is a warning on the same walk, and the resume still fires.
+
+    Ablation: drop the `if hold_resume:` arm from `_do_rearm` and the first leg reddens
+    on `calls == []`, with the resume firing behind the warning it was told to wait for.
+    Discard `_echo_rearm_events`' return and it reddens the same way.
+    """
+    from bmad_loop import resolve, runs
+    from bmad_loop.journal import Journal
+
+    calls: list[str] = []
+    notes: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+
+    def fake_rearm(rd, sk):
+        Journal(rd).append(
+            "rearm-spec-write-unreachable",
+            story_key=sk,
+            spec_file="wt/specs/s1.md",
+            status="ready-for-dev",
+        )
+        Journal(rd).append(  # a warning on the same walk that must NOT hold the resume
+            "rearm-baseline-restamp-skipped",
+            story_key=sk,
+            spec_file="wt/specs/s1.md",
+            baseline="c" * 40,
+        )
+        return "ready-for-dev"
+
+    monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
+    orig_notify = BmadLoopApp.notify
+    monkeypatch.setattr(
+        BmadLoopApp,
+        "notify",
+        lambda self, msg, **kw: notes.append(str(msg)) or orig_notify(self, msg, **kw),
+    )
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: needs a human decision on the auth scheme.",
+    )
+    marker = resolve.resolution_path(run_dir, "1")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{}", encoding="utf-8")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, EscalationModal)
+        await pilot.click(await ready(pilot, "#act-rearm"))
+        await until(pilot, lambda: any("not resuming" in n for n in notes))
+
+    assert calls == []  # the resume this gesture folds in did NOT fire
+    assert any("re-armed 1" in n for n in notes)  # ...while the re-arm itself stands
+    assert any("commit the corrected spec, then resume this run" in n for n in notes)
+    # the record that proved it still renders, and its warning sibling did not hold
+    assert any("land in a worktree the re-drive discards" in n for n in notes)
+    assert any("is not a readable file from here" in n for n in notes)
+
+
+async def test_escalation_rearm_echoes_residue_when_the_rearm_aborts(project, monkeypatch):
+    """An aborted re-arm still surfaces what it already journalled — the CLI parity gap.
+
+    `runs._stale_restore_residue` journals BEFORE the re-stamp block that raises
+    `RearmError`, so on that path the records exist and the operator has to decide what
+    to do with the tree. `cli.cmd_resolve` echoes them from a `finally`; this surface
+    used to `return` inside the `except` and drop the whole family — including
+    `stale-restore-commits`, which `cli._echo_rearm_events`' own docstring calls the one
+    record a human must act on. The two surfaces had been unified on ROUTING while
+    still drifting on the abort path, and `docs/FEATURES.md` claimed they could not
+    drift at all.
+
+    Ablation: move the `self._echo_rearm_events(...)` call out of the `finally` and back
+    below the `try`, and this reddens — the commits warning never fires — while
+    `test_escalation_rearm_survives_a_corrupt_journal` still passes.
+    """
+    from bmad_loop import resolve, runs
+    from bmad_loop.journal import Journal
+    from bmad_loop.runs import RearmError
+
+    notes: list[str] = []
+    calls: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+
+    def fake_rearm(rd, sk):
+        # exactly the real ordering: residue journalled, THEN the abort
+        Journal(rd).append(
+            "stale-restore-commits", story_key=sk, old_baseline="f" * 40, commits=["c1"]
+        )
+        raise RearmError("cannot re-stamp baseline_revision on /x/spec.md")
+
+    monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
+    orig_notify = BmadLoopApp.notify
+    monkeypatch.setattr(
+        BmadLoopApp,
+        "notify",
+        lambda self, msg, **kw: notes.append(str(msg)) or orig_notify(self, msg, **kw),
+    )
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: needs a human decision on the auth scheme.",
+    )
+    marker = resolve.resolution_path(run_dir, "1")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{}", encoding="utf-8")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, EscalationModal)
+        await pilot.click(await ready(pilot, "#act-rearm"))
+        await until(pilot, lambda: any("re-arm failed" in n for n in notes))
+    # the abort is reported AND the residue it already wrote is surfaced
+    assert any("commit(s) sit below" in n for n in notes), notes
+    # ... and an aborted re-arm does not resume the run
+    assert calls == [], calls
+
+
+async def test_escalation_rearm_survives_a_corrupt_journal(project, monkeypatch):
+    """An undecodable byte in journal.jsonl costs the echo, never the gesture.
+
+    `_do_rearm` reads the journal twice to diff what the re-arm appended, and before
+    that echo existed it read it not at all — so `Journal.entries()`' strict UTF-8
+    decode would have turned a corrupt journal into a re-arm the operator can no
+    longer perform. That is strictly worse than the missing echo it was added to
+    fix, and a regression against the gesture's own history. `runs.journal_entries_or_none`
+    (shared with `cli.cmd_resolve`) answers `None`, and `_echo_rearm_events` skips the
+    echo when either end of the diff is unreadable rather than replaying the journal
+    from zero; the dashboard already reads this same file with `errors="replace"`
+    everywhere else.
+
+    Ablation: call `Journal(run_dir).entries()` directly in `_do_rearm` and this
+    reddens — the UnicodeDecodeError escapes into the Textual worker and no
+    `re-armed 1` notice ever fires.
+    """
+    from bmad_loop import resolve, runs
+    from bmad_loop.journal import JOURNAL_FILE, Journal
+
+    calls: list[str] = []
+    notes: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+
+    def fake_rearm(rd, sk):
+        Journal(rd).append(
+            "stale-restore-commits", story_key=sk, old_baseline="f" * 40, commits=["c1"]
+        )
+        return "ready-for-dev"
+
+    monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
+    orig_notify = BmadLoopApp.notify
+    monkeypatch.setattr(
+        BmadLoopApp,
+        "notify",
+        lambda self, msg, **kw: notes.append(str(msg)) or orig_notify(self, msg, **kw),
+    )
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: needs a human decision on the auth scheme.",
+    )
+    # a real corruption shape: a valid line, then a byte no UTF-8 decoder accepts
+    (run_dir / JOURNAL_FILE).write_bytes(
+        b'{"ts": 1.0, "kind": "session-start", "task_id": "t1"}\n\xff\xfe not utf-8\n'
+    )
+    marker = resolve.resolution_path(run_dir, "1")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{}", encoding="utf-8")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, EscalationModal)
+        await pilot.click(await ready(pilot, "#act-rearm"))
+        await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
+    # the re-arm ran and the run resumed: the corruption cost only the echo
+    assert any("re-armed 1" in n for n in notes)
+    assert not any("re-arm failed" in n for n in notes), notes
+    assert not any("commit(s) sit below" in n for n in notes), notes
+
+
 async def test_escalation_rearm_disabled_without_resolution(project, monkeypatch):
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
     _stories_paused_run(

@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 
 from bmad_loop import diagnostics, sanitize
-from bmad_loop.journal import Journal, save_state
+from bmad_loop.journal import Journal, load_state, save_state
 from bmad_loop.model import Phase, RunState, SessionRecord, StoryTask, TokenUsage
 from bmad_loop.policy import Policy
 
@@ -29,6 +29,13 @@ EMAIL = "victim.canary@example.com"
 STORY_KEY = "1.2-AcmeQuantumBillingEngine"
 PROPRIETARY = "AcmeQuantumBillingEngine"
 BRANCH = "feature/AcmeSecret"
+# A branch name with NO separator, for the one row that grades branch-field ROUTING.
+# `BRANCH` cannot: `scrub_json`'s `_IDENTIFIER_RE` forbids `/`, so a slashed name is
+# collapsed to `<redacted:str>` by the fallback and a canary sweep over it stays green
+# with the routing entry deleted — the same false green `repo` has, documented on
+# `test_rearm_journal_fields_are_routed`. Bare `main`/`develop`-style names are the
+# common case anyway, and they are exactly the ones the fallback waves through verbatim.
+REARM_BRANCH = "AcmeSecretRelease"
 SECRET_GH = "ghp_CANARYxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx01"
 SECRET_OPENAI = "sk-CANARYxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx99"
 SECRET_AWS = "AKIACANARY0123456789"
@@ -501,6 +508,210 @@ def test_verify_command_free_text_drops_to_presence_booleans():
 
     rendered = json.dumps(out)
     for canary in ("make", CODE, HOME_PATH, PROPRIETARY, *CANARIES):
+        assert canary not in rendered, f"LEAK: {canary!r}"
+
+
+def test_rearm_records_leak_neither_the_code_root_nor_a_spec_name():
+    """The two records `runs.rearm_escalation` added must be routed by FIELD NAME,
+    not left to the `scrub_json` fallback (#640, #716).
+
+    `repo` is an absolute host path naming the run's code tree, and the fallback
+    fails closed only by accident of shape — `looks_like_identifier` forbids `/`,
+    so a POSIX root collapses, but a one-segment root would ship verbatim. It is
+    DROPPED rather than aliased: one run has one code root, so it correlates
+    nothing, and the `error` field on the same record is already dropped.
+
+    `spec_file` is the customer's feature name (the very hazard
+    `_JOURNAL_ALIAS_FIELDS`' `spec` entry exists for) and is ALIASED, so a
+    maintainer can still follow one spec across events.
+
+    `overwritten` and `baseline` are both shas on one record, so aliasing one and
+    leaving the other would pseudonymize half a comparison — the assertion below
+    is that BOTH come back aliased and DIFFERENT from each other.
+
+    Ablation: drop `repo` from `_JOURNAL_DROP_FIELDS` and the PRESENCE assertion
+    below reddens — not the canary sweep, which stays green because `scrub_json`
+    already collapses an absolute path to `<redacted:str>` (verified by running that
+    ablation: `repo` comes back as `'<redacted:str>'`, so the canary never appears).
+    That is the whole point of the drop: the fallback happens to redact THIS path
+    shape, so only an assertion on the field's absence can grade a routing decision
+    taken for a shape the fallback would not catch. Drop `spec_file` or `overwritten`
+    from `_JOURNAL_ALIAS_FIELDS` and the alias assertions redden (`spec_file` on the
+    canary sweep too). Drop `target_branch` and the branch row reddens on BOTH the alias
+    lookup and the canary sweep — that field is identifier-shaped by design, so unlike
+    `repo` the fallback does not accidentally rescue it.
+    """
+    other_sha = "f" * 40
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    advance_failed = diagnostics._scrub_entry(
+        {
+            "ts": 1.0,
+            "kind": "rearm-baseline-advance-failed",
+            "story_key": STORY_KEY,
+            "repo": HOME_PATH,
+            "baseline": SHA,
+            "error": f"GitError: git rev-parse HEAD failed in {HOME_PATH}",
+        },
+        pseudo,
+        {},
+        1.0,
+    )
+    restamped = diagnostics._scrub_entry(
+        {
+            "ts": 2.0,
+            "kind": "rearm-baseline-restamped",
+            "story_key": STORY_KEY,
+            "spec_file": SPEC_ABS,
+            "overwritten": other_sha,
+            "baseline": SHA,
+            "restore": False,
+        },
+        pseudo,
+        {},
+        1.0,
+    )
+
+    assert "repo" not in advance_failed and advance_failed["repo_present"] is True
+    assert "error" not in advance_failed  # the sibling that was already routed
+    # aliased, not dropped: the key stays and the VALUE is replaced, which is what
+    # keeps the record correlatable across events
+    alias = next(a for ns, orig, a in pseudo.entries() if ns == "spec" and orig == SPEC_NAME)
+    assert restamped["spec_file"] == alias
+    # the absolute spelling reduced to the basename first, so this spec has ONE
+    # alias and the home path never entered the legend
+    assert [orig for ns, orig, _a in pseudo.entries() if ns == "spec"] == [SPEC_NAME]
+    # both shas aliased, and distinguishable from each other
+    assert restamped["overwritten"] != other_sha and restamped["baseline"] != SHA
+    assert restamped["overwritten"] != restamped["baseline"]
+    assert restamped["restore"] is False  # a plain flag still ships
+
+    # The OTHER three kinds `runs.rearm_escalation` journals `spec_file` on. Routing is
+    # by field NAME, so these ride the same `_JOURNAL_ALIAS_FIELDS` entry as
+    # `rearm-baseline-restamped` and are correct today for free — which is exactly why
+    # they belong in the sweep: the canary is what catches a field added to one of
+    # these kinds later, and a sweep that covers two of four grades the routing of a
+    # record shape nobody re-checks.
+    siblings = [
+        diagnostics._scrub_entry(
+            {"ts": 3.0, "kind": kind, "story_key": STORY_KEY, "spec_file": SPEC_ABS, **extra},
+            pseudo,
+            {},
+            1.0,
+        )
+        for kind, extra in (
+            ("rearm-spec-write-unreachable", {"target_branch": REARM_BRANCH}),
+            ("rearm-spec-flip-skipped", {"status": "ready-for-dev"}),
+            ("rearm-baseline-restamp-skipped", {"baseline": SHA}),
+        )
+    ]
+    # every one of them aliases to the SAME alias as the restamped record above: one
+    # spec, one alias, however many kinds carry it
+    assert [s["spec_file"] for s in siblings] == [alias, alias, alias]
+    assert [orig for ns, orig, _a in pseudo.entries() if ns == "spec"] == [SPEC_NAME]
+
+    # `rearm-spec-write-unreachable` names the branch the re-drive cuts its replacement
+    # worktree from, so the operator is told WHERE to commit. It is journalled as
+    # `target_branch` rather than a fresh spelling for exactly this reason: routing is
+    # by field NAME, and that name is already in `_JOURNAL_ALIAS_FIELDS` under the
+    # `branch` namespace. Graded on a SEPARATOR-FREE name (see `REARM_BRANCH`) because
+    # a slashed one dies at `scrub_json` and would pass with the routing deleted.
+    #
+    # In a real run `ensure_target_branch` journals the same string as `branch` first,
+    # so an unrouted spelling would be caught by the egress backstop and disclosed as a
+    # `backstop_repairs` gap — but a truncated journal missing that event has nothing to
+    # repair from, and the branch would ship verbatim in a shareable bundle.
+    branch_alias = next(
+        a for ns, orig, a in pseudo.entries() if ns == "branch" and orig == REARM_BRANCH
+    )
+    assert siblings[0]["target_branch"] == branch_alias != REARM_BRANCH
+
+    rendered = json.dumps([advance_failed, restamped, *siblings])
+    for canary in (SHA, other_sha, SPEC_NAME, PROPRIETARY, HOME_PATH, REARM_BRANCH, *CANARIES):
+        assert canary not in rendered, f"LEAK: {canary!r}"
+
+
+def test_target_field_routes_by_kind_because_it_carries_two_kinds_of_value():
+    """`target` is a BRANCH on the merge kinds and a sprint STATUS on `board-advance-*`.
+
+    That overload is why the field is absent from `_JOURNAL_ALIAS_FIELDS`: routing there
+    is by field NAME, so a single entry would have to be wrong for one of the two
+    families. Leaving it unrouted was the wrong half to be wrong on — a bare
+    `main`/`release`-style branch name is identifier-shaped, so `scrub_json` ships it
+    VERBATIM into a bundle whose guiding assumption is that it will be posted publicly.
+
+    The backstop is not the answer here. It repairs only values already in the legend,
+    so it rescues this exactly when `ensure_target_branch` journalled the same string as
+    `branch` earlier in the same file — and then discloses a `backstop_repairs` gap on a
+    routine run. A journal truncated past that event has nothing to repair from.
+
+    Both directions are graded, because either alone is satisfied by a wrong fix:
+
+    - the three merge kinds ALIAS, to the branch namespace, and to the SAME alias as the
+      `branch` field beside them when the value matches — a by-name entry would pass
+      this too.
+    - `board-advance-carried` keeps its `target` VERBATIM. A by-name entry reddens here,
+      rendering the sprint status a maintainer reads that kind for as `branch-<hex>`.
+
+    Separator-free names throughout: `_IDENTIFIER_RE` forbids `/`, so a `feature/x`
+    spelling is collapsed by the FALLBACK and every assertion below would pass with the
+    routing deleted (the same false green documented for `repo` above).
+
+    Ablation: empty `_JOURNAL_KIND_ALIAS_FIELDS` and the three merge rows redden on the
+    legend lookup (`StopIteration`); move `"target": "branch"` into
+    `_JOURNAL_ALIAS_FIELDS` instead and the board-advance row reddens on the status.
+    """
+    target_branch = "AcmeSecretIntegration"
+    unit_branch = "AcmeSecretUnit"
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    merges = [
+        diagnostics._scrub_entry(
+            {
+                "ts": 1.0,
+                "kind": kind,
+                "story_key": STORY_KEY,
+                "branch": unit_branch,
+                "target": target_branch,
+            },
+            pseudo,
+            {},
+            1.0,
+        )
+        for kind in ("unit-merge-started", "unit-merged", "resume-unit-merge")
+    ]
+    board = diagnostics._scrub_entry(
+        {
+            "ts": 2.0,
+            "kind": "board-advance-carried",
+            "story_key": STORY_KEY,
+            "target": "done",
+            "status": "done",
+        },
+        pseudo,
+        {},
+        1.0,
+    )
+
+    target_alias = next(
+        a for ns, orig, a in pseudo.entries() if ns == "branch" and orig == target_branch
+    )
+    unit_alias = next(
+        a for ns, orig, a in pseudo.entries() if ns == "branch" and orig == unit_branch
+    )
+    # every merge kind aliases the same target to the same alias — one branch, one alias,
+    # however many kinds name it
+    assert [m["target"] for m in merges] == [target_alias] * 3
+    # ...and the unit branch beside it stays DISTINGUISHABLE, so a maintainer can still
+    # read "this branch merged into that one" off the scrubbed record
+    assert [m["branch"] for m in merges] == [unit_alias] * 3
+    assert target_alias != unit_alias
+
+    # the other family keeps the same field verbatim: it is a sprint status, and
+    # aliasing it would destroy the only thing the record is read for
+    assert board["target"] == "done" and board["status"] == "done"
+    assert not [orig for ns, orig, _a in pseudo.entries() if ns == "branch" and orig == "done"]
+
+    rendered = json.dumps([*merges, board])
+    for canary in (target_branch, unit_branch, *CANARIES):
         assert canary not in rendered, f"LEAK: {canary!r}"
 
 
@@ -1338,3 +1549,117 @@ def test_env_git_version_is_none_when_the_probe_fails(monkeypatch):
 
     env = diagnostics.collect_env(ANY_PROJECT)
     assert env.git_version is None
+
+
+def test_diag_surfaces_the_split_code_root_and_the_task_generation(project):
+    """The two state fields this wave ADDED must be legible in a bug report.
+
+    `RunState.repo_root` and `StoryTask.generation` are new here, and both name the
+    exact conditions under which the re-anchored gates and the re-minted session ids
+    behave differently — yet neither reached the projection. `repo` was simultaneously
+    dropped from journal records (correctly: an absolute host path), which removed the
+    last trace of a split root from a dump altogether.
+
+    `generation` matters because without it a #705-class replay dumps as
+    `rearmed=True, attempt=1, n_sessions=2` — byte-identical to a HEALTHY post-re-arm
+    task, so the one field that separates "minted a fresh id" from "collided with the
+    abandoned record" is the one a triager cannot see.
+
+    Both are privacy-safe by construction and are asserted to be: a boolean in the
+    `paused_reason_present` / `worktree_isolated` style, and a small counter. The path
+    itself must NOT appear — that is what `_JOURNAL_DROP_FIELDS` drops.
+
+    Ablation: delete `repo_root_diverges=` from `collect_run` (or `generation=` from
+    `_task_diag`) and this reddens on the corresponding assertion; deleting the field
+    from the dataclass reddens as a TypeError at construction.
+    """
+    run_dir = _seed_run(project.project)
+    state = load_state(run_dir)
+    state.repo_root = str(project.project / "code-tree")
+    state.tasks[STORY_KEY].generation = 2
+    save_state(run_dir, state)
+
+    diag, _pseudo, combined = _render_all([run_dir])
+    (run,) = diag.runs
+
+    assert run.repo_root_diverges is True
+    assert run.tasks[0].generation == 2
+    # a presence flag, never the path — the same rule `repo` is dropped under
+    assert "code-tree" not in combined
+
+
+def test_diag_repo_root_diverges_is_false_for_the_ordinary_layout(project):
+    """The flag distinguishes; it is not simply always on.
+
+    Without this the assertion above passes for a hardcoded `True`, and the field
+    stops carrying the one bit it exists to carry.
+    """
+    run_dir = _seed_run(project.project)
+    diag, _pseudo, _combined = _render_all([run_dir])
+    (run,) = diag.runs
+
+    assert run.repo_root_diverges is False
+    assert run.tasks[0].generation == 0
+
+
+def _md_task_row(md: str) -> list[str]:
+    """The one task row of the report's task table, split into its cells."""
+    (row,) = [ln for ln in md.splitlines() if ln.startswith("| `")]
+    return [c.strip() for c in row.strip("|").split("|")]
+
+
+def test_the_markdown_report_carries_the_split_root_and_the_generation(project):
+    """Both fields must reach the report `diagnose` emits BY DEFAULT, not only `--json`.
+
+    The sibling tests above grade the collector, which is what `--json` dumps whole via
+    `asdict`. The markdown report is a different renderer that samples fields by hand,
+    and it is the artifact an operator actually produces and hands a maintainer — the
+    header says so ("Safe to share"). A field whose entire warrant is "a bug report that
+    cannot show this cannot be triaged" is not delivered until it renders here, so the
+    warrant is graded where it is spent.
+
+    `generation` rides beside `attempt` because that is the column pair a #705-class
+    replay turns on: a collided re-drive and a healthy post-re-arm task agree on every
+    other cell in this row.
+
+    Ablation: drop the `code root differs from project` line from `render_markdown` and
+    both this test and the sibling below redden on their first assertion. Drop
+    `{t.generation}` from the row f-string together with its header and separator cells
+    and this test reddens at `names[4]` (`"rev" != "gen"`) while the sibling reddens at
+    the row cell — as `"1" != "0"`, the review cycle shifted left rather than a missing
+    key, which is why the cell is read positionally and the three widths are compared.
+    """
+    run_dir = _seed_run(project.project)
+    state = load_state(run_dir)
+    state.repo_root = str(project.project / "code-tree")
+    state.tasks[STORY_KEY].generation = 2
+    save_state(run_dir, state)
+
+    pseudo = sanitize.Pseudonymizer()
+    diag = diagnostics.collect([run_dir], pseudo=pseudo, project=ANY_PROJECT)
+    md = diagnostics.render_markdown(diag, pseudo=pseudo)
+
+    assert "- **code root differs from project:** yes" in md
+    cells = _md_task_row(md)
+    (header,) = [ln for ln in md.splitlines() if ln.startswith("| alias |")]
+    (rule,) = [ln for ln in md.splitlines() if ln.startswith("|---|")]
+    names = [c.strip() for c in header.strip("|").split("|")]
+    assert names[4] == "gen"
+    # header, separator and row must agree on width or the table renders skewed
+    assert len(cells) == len(names) == len(rule.strip("|").split("|")) == 12
+    assert cells[3] == "2"  # attempt, seeded by `_seed_run`
+    assert cells[4] == "2"  # generation — NOT the review cycle, which is 1
+    assert cells[5] == "1"  # review cycle, still in its own column
+    # still a flag and a counter: the path itself never renders
+    assert "code-tree" not in md
+
+
+def test_the_markdown_report_says_no_for_the_ordinary_layout(project):
+    """The rendered line distinguishes; a hardcoded "yes" would pass the test above."""
+    run_dir = _seed_run(project.project)
+    pseudo = sanitize.Pseudonymizer()
+    diag = diagnostics.collect([run_dir], pseudo=pseudo, project=ANY_PROJECT)
+    md = diagnostics.render_markdown(diag, pseudo=pseudo)
+
+    assert "- **code root differs from project:** no" in md
+    assert _md_task_row(md)[4] == "0"

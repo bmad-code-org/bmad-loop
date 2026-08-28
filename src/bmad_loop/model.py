@@ -188,6 +188,17 @@ class StoryTask:
     # rather than burning another cycle. Reset to 0 by runs.rearm_escalation so a
     # human-resolved re-drive gets a fresh damping budget. Survives the round-trip.
     followup_reviews_spent: int = 0
+    # How many times a human re-arm (`runs.rearm_escalation`) has re-opened this
+    # task. Re-arm resets `attempt` to 0 and the next dispatch bumps it back to 1,
+    # so without a discriminator the re-minted session task_id is byte-equal to a
+    # record the ABANDONED attempt already appended to the append-only `sessions`
+    # list — and `Engine._resumable_session`, which matches on that id, replays the
+    # abandoned attempt's verdict for the fresh one (#705). Feeds
+    # `engine._session_task_id`, which emits the suffix only above zero, so every
+    # id already on disk stays byte-identical across the upgrade. `task.sessions`
+    # is deliberately NOT cleared at re-arm: the run-dir audit trail it indexes is
+    # read by a second resolve cycle.
+    generation: int = 0
     # set from the bmad-build-auto session's `followup_review_recommended`
     # frontmatter (PR #2505): when True and review.trigger = "recommended", the
     # orchestrator runs a follow-up review pass (bmad-build-auto re-invoked on the
@@ -390,6 +401,7 @@ class StoryTask:
             "attempt": self.attempt,
             "review_cycle": self.review_cycle,
             "followup_reviews_spent": self.followup_reviews_spent,
+            "generation": self.generation,
             "followup_review_recommended": self.followup_review_recommended,
             "baseline_commit": self.baseline_commit,
             "baseline_untracked": self.baseline_untracked,
@@ -470,6 +482,7 @@ class StoryTask:
             attempt=int(d.get("attempt", 0)),
             review_cycle=int(d.get("review_cycle", 0)),
             followup_reviews_spent=int(d.get("followup_reviews_spent", 0)),
+            generation=int(d.get("generation", 0)),
             followup_review_recommended=bool(d.get("followup_review_recommended", False)),
             baseline_commit=d.get("baseline_commit"),
             baseline_untracked=(
@@ -540,6 +553,15 @@ class RunState:
     run_id: str
     project: str
     started_at: str
+    # The git root this run's code work happens in — `paths.repo_root`, which is
+    # `paths.project` unless `_bmad/bmm/config.yaml` sets a `repo_root:` override.
+    # Persisted because `runs.rearm_escalation` runs OUT OF PROCESS from the engine
+    # and had only `project` to reach for, so it advanced the attempt baseline by
+    # reading HEAD of a repo the proof-of-work gate never measures. Empty means a
+    # state.json written before this field existed; `code_root` then falls back to
+    # `project`, which is exactly the pre-upgrade behavior and the correct answer
+    # for every run without the override.
+    repo_root: str = ""
     policy_snapshot: dict[str, Any] = field(default_factory=dict)
     # SECONDARY copy of the host-exec baseline (#498) — runsetup.config_digest over
     # the agent-writable config that reaches HOST code execution: verify commands,
@@ -625,6 +647,17 @@ class RunState:
     def paused(self) -> bool:
         return self.paused_reason is not None
 
+    @property
+    def code_root(self) -> Path:
+        """The tree git runs against for this run — ``repo_root`` when the run
+        recorded one, else ``project``.
+
+        The single reader of the pair, so an out-of-process consumer
+        (``runs.rearm_escalation``) cannot pick the wrong one, and a pre-upgrade
+        state.json (empty ``repo_root``) degrades to precisely what it did before
+        rather than to a path that does not exist."""
+        return Path(self.repo_root or self.project)
+
     def handled_keys(self) -> set[str]:
         """Story keys this run already drove to a terminal phase."""
         return {k for k, t in self.tasks.items() if t.terminal}
@@ -660,6 +693,7 @@ class RunState:
         return {
             "run_id": self.run_id,
             "project": self.project,
+            "repo_root": self.repo_root,
             "started_at": self.started_at,
             "policy_snapshot": self.policy_snapshot,
             "trusted_config_digest": self.trusted_config_digest,
@@ -690,6 +724,7 @@ class RunState:
         return cls(
             run_id=d["run_id"],
             project=d["project"],
+            repo_root=str(d.get("repo_root", "")),
             started_at=d["started_at"],
             policy_snapshot=d.get("policy_snapshot", {}),
             trusted_config_digest=str(d.get("trusted_config_digest", "")),

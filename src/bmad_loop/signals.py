@@ -134,11 +134,18 @@ class SignalWatcher:
         none may be lost.
 
         Events older than `since_ns` (wall-clock ns, the session's launch time)
-        are dropped: a resumed/re-armed run reuses task_ids, and a fresh watcher
-        re-sees the events directory from scratch, so a prior cycle's Stop event
-        would otherwise replay instantly and the old result.json be read as a
-        bogus completion. Sessions run sequentially, so since_ns only advances;
-        anything below the current floor is genuinely stale and safe to discard.
+        are dropped: a resumed run reuses task_ids, and a fresh watcher re-sees the
+        events directory from scratch, so a prior cycle's Stop event would
+        otherwise replay instantly and the old result.json be read as a bogus
+        completion. Sessions run sequentially, so since_ns only advances; anything
+        below the current floor is genuinely stale and safe to discard.
+
+        A re-ARMED run no longer reuses them — `runs.rearm_escalation` bumps
+        `StoryTask.generation`, which `engine._session_task_id` folds into the id
+        (#705). That removes one source of collision; it does not make this floor
+        redundant, because a plain resume re-mints the SAME id by design (that is
+        how crash replay finds its record) and is the case this guard was written
+        for.
         """
         deadline = clock() + timeout_s
         while True:

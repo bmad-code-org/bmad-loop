@@ -12,7 +12,7 @@ import sys
 import time
 from enum import IntEnum
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from . import (
     __version__,
@@ -2503,10 +2503,30 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
     if pinned is None:
         pinned = state.trusted_config_digest
     security_config_changed = bool(pinned) and new_digest != pinned
+    # The recorded code root against the one THIS process just loaded. Resume
+    # re-reads config.yaml, so a `repo_root:` key added, changed or removed while the
+    # run was paused re-points the engine at a different git tree — `compose_resume`
+    # below builds the Workspace off `paths`, not off state.json. The persisted
+    # mirror is what `runs.rearm_escalation` reads back OUT OF PROCESS
+    # (`RunState.code_root`), so leaving it at its launch value makes the two readers
+    # disagree exactly when the config moved: `resolve` would advance the attempt
+    # baseline in the old tree while the resumed engine resets and measures in the
+    # new one. Re-stamped below, with the snapshot and the digest.
+    #
+    # An exact string compare, deliberately, with no canonicalization: both sides are
+    # `str(paths.repo_root)` off `bmadconfig.load_paths`, which resolves every member
+    # or raises, so they are spelled the same way whenever they name the same tree.
+    # The `bool(state.repo_root)` guard is what keeps a legacy state.json — written
+    # before the field existed, and read back as "" — out of the comparison: it is a
+    # missing value, not a divergent one, and the re-stamp migrates it silently.
+    code_root_changed = bool(state.repo_root) and state.repo_root != str(paths.repo_root)
     fields: dict[str, object] = {
         # Scalars only, per the note above: a bool records THAT the pinned surface
         # moved without journaling a command, a binary path or a plugin name.
         "security_config_changed": security_config_changed,
+        # Same treatment, same reason: a bool, never either path. `diagnose` renders
+        # the split as a presence flag for exactly this reason (`repo_root_diverges`).
+        "code_root_changed": code_root_changed,
         "was_paused": state.paused_reason,
         "cache_read_weight": pol.limits.cache_read_weight,
         # Compare JSON-normalized, the way save_state persists it: to_dict()
@@ -2532,6 +2552,21 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
             " plugin allowlist. Resuming trusts the config now on disk; re-read"
             " .bmad-loop/policy.toml and .bmad-loop/profiles/ first if you did not"
             " make that edit.",
+            file=sys.stderr,
+        )
+    if code_root_changed:
+        # Loud, because the re-stamp below is not a repair: every sha this run already
+        # recorded — each task's `baseline_commit`, its preserve refs, its unit
+        # branches — names an object in the PREVIOUS tree, and nothing here can move
+        # them. The re-stamp only stops the two readers from disagreeing about which
+        # tree the run is in from here on; whether the new tree can honor those shas
+        # is the operator's call, and this is the moment they can still make it.
+        print(
+            f"warning: run {run_dir.name}: the code root in _bmad/bmm/config.yaml has"
+            " changed since this run started — the resumed engine works in the tree"
+            " configured now, while the baselines, preserve refs and branches this run"
+            " already recorded name objects in the previous one. Restore the previous"
+            " `repo_root:` value if you did not intend the move.",
             file=sys.stderr,
         )
     # Re-stamp: the snapshot must describe the policy THIS process enforces, for
@@ -2569,6 +2604,11 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
     # BMAD_LOOP_STATE_DIR. Tampering that removes the out-of-tree file is a
     # different problem with no fix at equal privilege — #571.
     state.trusted_config_digest = new_digest
+    # ...and the code root, for the same reason and at the same moment: this process
+    # arms an engine against `paths.repo_root` (compose_resume -> Workspace), so that
+    # is the tree `runs.rearm_escalation` must read back. Unconditional, so it also
+    # migrates a pre-field state.json onto the root it was already using.
+    state.repo_root = str(paths.repo_root)
     state.clear_pause()
     runs.write_pid(run_dir)
     # Persist before the engine starts: status, the TUI and diagnose only ever
@@ -2740,34 +2780,56 @@ def _resolve_restore_patch(
     return str(patch), None
 
 
-def _echo_stale_restore(run_dir: Path, seen_entries: int) -> None:
-    """Surface the `stale-restore-*` events a just-completed re-arm journaled about
-    the restore attempt it abandoned (runs._stale_restore_residue). The commits
-    variant is the one the human must act on — nothing else will."""
-    for entry in Journal(run_dir).entries()[seen_entries:]:
-        kind = entry.get("kind", "")
-        if kind == "stale-restore-excluded":
-            files = ", ".join(entry.get("files", []))
-            print(
-                f"note: excluded the abandoned restore's new files from the "
-                f"re-drive baseline: {files}",
-                file=sys.stderr,
-            )
-        elif kind == "stale-restore-unparseable":
-            print(
-                f"warning: could not read the abandoned restore patch "
-                f"({entry.get('patch', '?')}) — its new files may be swept into the "
-                "next commit; check `git status` before resuming",
-                file=sys.stderr,
-            )
-        elif kind == "stale-restore-commits":
-            n = len(entry.get("commits", []))
-            print(
-                f"warning: {n} commit(s) sit below the re-drive's new baseline "
-                f"({entry.get('old_baseline', '?')[:12]}..) — if any came from the "
-                "abandoned attempt rather than your resolve, revert them now",
-                file=sys.stderr,
-            )
+def _echo_rearm_events(run_dir: Path, before: list[dict[str, Any]] | None) -> bool:
+    """Surface the events a just-completed re-arm journaled: the `stale-restore-*`
+    residue of the restore attempt it abandoned (runs._stale_restore_residue), and the
+    `rearm-*` records the status flip, the advance and the re-stamp write. The commits
+    variant is the one the human must act on — nothing else will.
+
+    Named for the re-arm, not for the stale restore: it began as a `stale-restore-*`
+    echo and now carries the baseline family too, so a name from the narrower era
+    would send the next re-arm record somewhere else.
+
+    Routing lives in `runs.rearm_event_notice`, not here, because the TUI re-arms
+    through the same journal and used to carry its own divergent copy of this chain —
+    it surfaced three of the kinds and silently dropped the rest. One table, two
+    renderings: this one appends the `next_step` imperative, the TUI omits it because
+    it resumes in the same gesture.
+
+    The baseline records are echoed because a failed advance means the re-drive
+    rebuilds against the tree as it stood BEFORE the resolve, and the re-stamp then
+    deliberately refuses to write a sha it did not earn. All of it is warn-only by
+    contract (a project that is not a repo must not fail re-arm), so without an echo
+    the whole degrade is journal-only — the invisibility #640(b) exists to end, not to
+    relocate.
+
+    Returns True when one of those records HOLDS the resume
+    (`runs.rearm_holds_the_resume`): the caller re-arms and resumes in a single gesture,
+    and a record proving the re-drive cannot route has to break that gesture, or its own
+    "before resuming" imperative is already unactionable the moment it prints. The
+    question is asked here because this is the one walk over the entries the re-arm
+    added, and the answer has to survive the `finally` it is computed in."""
+    after = runs.journal_entries_or_none(run_dir)
+    if before is None or after is None:
+        # Either end of the diff is unreadable, so there is no trustworthy "new since
+        # the re-arm" window. Skip rather than guess: this runs from a `finally`, and a
+        # raise here would replace the `RearmError` the operator needs, while treating a
+        # failed read as "no entries seen" would replay the whole journal as new. The
+        # hold degrades with the echo, for the same reason: an unproven hold is a guess,
+        # and this is what the gesture did before either existed.
+        return False
+    holds = False
+    for entry in after[len(before) :]:
+        # asked of every entry, BEFORE the routing table can drop it — a `None` notice
+        # means "nothing to print here", never "nothing to decide here"
+        holds = runs.rearm_holds_the_resume(entry) or holds
+        notice = runs.rearm_event_notice(entry)
+        if notice is None:
+            continue
+        severity, message, next_step = notice
+        tail = f"; {next_step}" if next_step else ""
+        print(f"{severity}: {message}{tail}", file=sys.stderr)
+    return holds
 
 
 def cmd_resolve(args: argparse.Namespace) -> int:
@@ -2870,19 +2932,93 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     if args.resume is None and not _confirm(f"re-arm {story_key} and resume run {args.run_id}?"):
         print("cancelled — run is still paused at the escalation")
         return 0
-    seen_entries = len(Journal(run_dir).entries())
+    # The code root `runs.rearm_escalation` reads back OUT OF PROCESS
+    # (`RunState.code_root`). `_resume_paused_run` re-stamps it because the engine it
+    # arms works in `paths.repo_root` — but on THIS path the re-arm runs FIRST, so that
+    # re-stamp lands too late to aim it: a `repo_root:` key added, changed or removed
+    # while the run was paused split the two readers exactly the way the re-stamp exists
+    # to prevent — the attempt baseline advanced (and `baseline_revision` re-stamped) in
+    # the tree the run has LEFT, while the engine resumed at the bottom of this function
+    # reset and measured in the new one, with no error anywhere.
+    #
+    # AFTER the confirm, deliberately: a cancelled resolve writes nothing, so the
+    # divergence is still there for `resume` to report on its own terms.
+    try:
+        paths = bmadconfig.load_paths(project)
+    except (bmadconfig.BmadConfigError, OSError) as e:
+        # An observation, so it degrades: without the config this process cannot NAME
+        # the tree, and re-pointing the mirror at a guess is the one outcome worse than
+        # leaving it alone. The re-arm then reads the root the run recorded — precisely
+        # what it did before this seam existed — and the default flow's
+        # `_resume_paused_run` raises on the same config moments later. Reported, never
+        # silent: the write this could not aim is the whole subject of the block above.
+        print(
+            f"warning: run {args.run_id}: cannot read the project config to confirm the "
+            f"code root ({e}) — re-arming against the root this run recorded",
+            file=sys.stderr,
+        )
+    else:
+        # The SAME refusal `_resume_paused_run` makes, hoisted ahead of both writes
+        # below — because aiming the mirror at the tree config.yaml names is only
+        # correct for a configuration the orchestrator will actually run, and this is
+        # not one. `worktree_isolation_conflict` fires exactly when `repo_root` is an
+        # override beside `isolation = "worktree"`, so on that config the re-stamp
+        # persisted the unsupported root and `rearm_escalation` then advanced the
+        # attempt baseline (and re-stamped the spec's `baseline_revision`) against it
+        # — all of it before `_resume_paused_run` at the bottom of this function
+        # reached the refusal and returned 1.
+        #
+        # Everything about that was spent: the operator was told "re-armed <story>"
+        # and then refused, and the story was no longer ESCALATED, so `resolve` — which
+        # requires an escalation — could not re-run to correct it. The escalation was
+        # burned on a gesture the orchestrator had already decided it would not honor.
+        #
+        # It also falsified the premise the baseline advance is built on. `runs`
+        # reasons that `repo_root == project` "in every reachable configuration"
+        # BECAUSE this refusal exists, and reads the code tree's HEAD on that basis;
+        # a path that mutates first and refuses second made the unreachable
+        # configuration reachable, in the one function that had ruled it out.
+        #
+        # Ordered after the confirm with the re-stamp, not before it: a cancelled
+        # resolve still writes nothing, and an operator who declines is not owed a
+        # config lecture about a gesture they did not make.
+        if (rc := _reject_isolation_conflict(paths, pol)) is not None:
+            return rc
+        if (moved := runs.restamp_code_root(run_dir, paths.repo_root)) is not None:
+            print(f"warning: {moved}", file=sys.stderr)
+    before_entries = runs.journal_entries_or_none(run_dir)
+    hold_resume = False
     try:
         runs.rearm_escalation(run_dir, story_key, restore_patch=restore_patch)
     except runs.RearmError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
-    _echo_stale_restore(run_dir, seen_entries)
+    finally:
+        # In the `finally`, not after the `try`: `_stale_restore_residue` journals
+        # BEFORE the re-stamp block that raises `RearmError`, so on that path the
+        # records were already written and returning early threw them away — including
+        # `stale-restore-commits`, the one record whose whole point is that nothing
+        # else will tell the human. An abort is when that residue matters most: the
+        # re-arm half-ran and the operator has to decide what to do with the tree.
+        hold_resume = _echo_rearm_events(run_dir, before_entries)
     print(
         f"re-armed {story_key}"
         + (" (restoring the attempted change for review)" if restore_patch else "")
     )
     if args.resume is False:
         print(f"resume when ready: bmad-loop resume {args.run_id}")
+        return 0
+    if hold_resume:
+        # The re-arm SUCCEEDED — the task is armed and persisted — so this is a 0, and it
+        # stops the GESTURE, not the run. `--resume` does not override it: that flag
+        # skips the confirmation prompt, while the hold is not a question but a proof
+        # that resuming now spends the escalation on a session that cannot route
+        # (`runs.rearm_holds_the_resume`). The escape hatch is the command this prints,
+        # which the operator reaches the moment their correction is committed.
+        print(
+            "NOT resuming in this gesture — the correction has to reach the re-drive "
+            f"first (see the warning above). Then: bmad-loop resume {args.run_id}"
+        )
         return 0
     from .tui import launch  # import-safe: launch.py has no textual imports
 

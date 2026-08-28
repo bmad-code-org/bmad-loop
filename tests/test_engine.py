@@ -39,12 +39,15 @@ from bmad_loop import deferredwork, platform_util, runs, verify
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.engine import (
+    NOTICE_REASON_MAX,
     Engine,
     RunPaused,
     RunStopped,
     _digest_of,
     _LedgerAnchor,
+    _notice_reason,
     _run_depth,
+    _session_task_id,
 )
 from bmad_loop.journal import LOGS_DIR, VERIFY_DIR, Journal, load_state
 from bmad_loop.model import (
@@ -2076,6 +2079,344 @@ def test_resumable_session_matches_sanitized_task_id(project, key):
     role, result = resumable
     assert role == "dev"
     assert result.result_json == {"status": "done"}
+
+
+def test_session_task_id_is_byte_identical_at_generation_zero():
+    """The upgrade contract (#705): an in-flight run resumed across it must find its
+    `tasks/` directories, so generation 0 renders as no suffix AT ALL — not `-g0`.
+
+    Ablation: emit the suffix unconditionally and this reddens, which is the shape
+    that would strand every existing run's session directory.
+    """
+    # `generation` is REQUIRED, so there is no omitted spelling to assert: omitting it
+    # is a type error, which is the point (an implicit 0 is right in every run that
+    # never re-armed and silently re-opens #705 at a new mint site).
+    assert _session_task_id("1-1-a", "dev", 1, 0) == "1-1-a-dev-1"
+    assert _session_task_id("1-1-a", "dev", 1, 1) == "1-1-a-dev-1-g1"
+    # composed INSIDE the f-string: the sanitizer still sees one whole segment, so
+    # a key long enough to overflow the cap comes back capped WITH the suffix folded
+    # in rather than appended past it.
+    long_key = "k" * 130
+    long_ids = [_session_task_id(long_key, "dev", 1, g) for g in (0, 1, 2)]
+    assert all(len(i) <= platform_util.MAX_SEGMENT for i in long_ids)
+    # ... and the generations stay DISTINCT through that fold. This is the one thing
+    # that could silently fail here: over the cap the suffix is not appended, it is
+    # truncated away and the id ends in `safe_segment`'s digest of the raw input
+    # instead — so distinctness rests on the digest seeing the suffix, not on the
+    # suffix surviving. A cap applied AFTER composition would collapse all three to
+    # one id and re-open #705 for exactly the long keys that already stress the path.
+    assert len(set(long_ids)) == 3, long_ids
+
+
+def test_resumable_session_ignores_a_pre_rearm_record(project):
+    """#705. `rearm_escalation` resets `attempt` to 0 and deliberately does NOT
+    clear `task.sessions`, so the next dispatch's `attempt += 1` re-mints an id
+    byte-equal to a record the ABANDONED attempt already appended. A host death in
+    the window between that bump and `record_session` then resumes into
+    `_resumable_session`, which matches on the id and replays the abandoned
+    attempt's verdict for a session that never ran — the run wedges re-deciding a
+    story on a stale result.
+
+    The collision is asserted, not assumed: the first two lines below show the
+    pre-re-arm record's id is exactly what generation 0 would mint now.
+
+    Ablation: drop the generation argument from `_resumable_session`'s
+    `_session_task_id` call (or the suffix from the composition) and the stale
+    record matches again — this row reddens with a replayed result.
+    """
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project, [SessionResult(status="completed", result_json={"status": "abandoned"})]
+    )
+    task = StoryTask(story_key="1-1-a", epic=1)
+    engine.state.tasks[task.story_key] = task
+    engine._save()
+    engine._run_session(task, role="dev", prompt="p", seq=1)
+    (stale,) = task.sessions
+    assert stale.task_id == _session_task_id(task.story_key, "dev", 1, 0)
+    assert stale.status == "completed" and stale.result_json is not None
+
+    # the human re-arm, then the re-drive's first dispatch, then a host kill in the
+    # window before `record_session` (engine.py: `attempt += 1` … advance … _save)
+    task.generation += 1
+    task.attempt = 1
+    task.phase = Phase.DEV_RUNNING
+
+    assert engine._resumable_session(task) is None
+    assert task.sessions == [stale]  # the audit trail is kept, just not matched
+
+
+def test_resumable_session_matches_within_the_same_generation(project):
+    """The counterpart the row above needs to be worth anything: a re-armed task
+    that DOES record a session under its new generation still resumes from it, so
+    the discriminator has not simply disabled crash replay."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project, [SessionResult(status="completed", result_json={"status": "done"})]
+    )
+    task = StoryTask(story_key="1-1-a", epic=1, generation=1)
+    engine.state.tasks[task.story_key] = task
+    engine._save()
+    engine._run_session(task, role="dev", prompt="p", seq=1)
+    task.phase = Phase.DEV_RUNNING
+    task.attempt = 1
+
+    resumable = engine._resumable_session(task)
+    assert resumable is not None and resumable[1].result_json == {"status": "done"}
+
+
+def test_current_dev_session_index_follows_the_generation(project):
+    """The third mint site (`_current_dev_session_index`, which drives
+    `accepted_dev_session_index`) must move with the other two: left at generation
+    0 it would point the PROCEED receipt at the abandoned attempt's record."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            SessionResult(status="completed", result_json={"status": "abandoned"}),
+            SessionResult(status="completed", result_json={"status": "done"}),
+        ],
+    )
+    task = StoryTask(story_key="1-1-a", epic=1)
+    engine.state.tasks[task.story_key] = task
+    engine._save()
+    engine._run_session(task, role="dev", prompt="p", seq=1)  # pre-re-arm record
+
+    task.generation += 1
+    task.attempt = 1
+    assert engine._current_dev_session_index(task) is None  # the stale record is not it
+
+    engine._run_session(task, role="dev", prompt="p", seq=1)  # the re-drive's record
+    assert engine._current_dev_session_index(task) == 1
+
+
+def test_notice_reason_caps_a_long_single_line_and_marks_the_trim():
+    """The LENGTH half of `_notice_reason`'s contract, which no engine-level row
+    reaches.
+
+    `test_dev_retry_notice_collapses_a_multiline_reason` grades only the first-line
+    collapse: its long run sits on the third line, so `first` never exceeds the cap
+    and its `len(retry) < 300` bound passes for any cap value — including none. A
+    single-line reason is the shape that actually crosses it: a `[verify] commands`
+    entry whose invocation carries many paths makes `verify command failed (rc=N):
+    <command>` one line well past the cap, and with the cap gone that whole line
+    lands verbatim in ATTENTION and in the toast payload.
+
+    Pinned as a direct unit row rather than through the engine because the cap is a
+    property of the helper, and routing a 500-char command through a dev session to
+    observe it would grade the plumbing instead.
+
+    Ablation: delete the `if len(first) > NOTICE_REASON_MAX:` block and this reddens
+    on the length assertion; the sibling engine row stays green.
+    """
+    capped = _notice_reason("z" * 500)
+    assert capped == "z" * NOTICE_REASON_MAX + " […]"
+    assert len(capped) == NOTICE_REASON_MAX + len(" […]")
+
+    # exactly at the cap is not a trim — the marker would otherwise claim a cut that
+    # did not happen, which is the ambiguity the marker exists to remove
+    assert _notice_reason("z" * NOTICE_REASON_MAX) == "z" * NOTICE_REASON_MAX
+
+    # the reasonless RETRY: the helper returns "" so the call site's `or` fallback
+    # ("dev attempt rejected with no reason recorded") is what reaches the operator
+    assert _notice_reason("") == ""
+    assert _notice_reason("   \n\n  ") == ""
+
+
+def test_dev_retry_notice_collapses_a_multiline_reason(project, monkeypatch):
+    """The FIXABLE leg, which is where a `Decision.reason` is routinely multi-line:
+    `verify.verify_command_results_outcome` appends the captured output tail below
+    the command line on purpose, because the repair session reads that tail as its
+    feedback.
+
+    `gates.notify` writes exactly one `[stamp] title: message` line and hands the
+    same string to a desktop toast, so a raw reason spills a whole build log into
+    ATTENTION as many un-prefixed lines — breaking the file's own grammar for every
+    later reader — and into a notification bubble. The sibling row above passes
+    without this only because a baseline mismatch happens to be single-line.
+
+    Nothing is lost: the untruncated reason is in the `dev-decision` journal entry,
+    which this asserts explicitly so the trim can never be mistaken for a drop.
+
+    Ablation: pass `decision.reason` raw and the one-line assertion reddens with the
+    tail's lines loose in the file.
+    """
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a", followup_review=False),
+            dev_effect(project, "1-1-a", followup_review=False),
+        ],
+        policy=Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            review=ReviewPolicy(enabled=False),
+            limits=LimitsPolicy(max_dev_attempts=2),
+            verify=VerifyPolicy(commands=["pytest -q"]),
+        ),
+    )
+    tail = "FAILED tests/test_a.py::test_one\nFAILED tests/test_b.py::test_two\n" + "x" * 400
+    # fail exactly the first invocation, pass every later one: the run makes more
+    # verify calls than the retry alone (the commit gate re-runs them), and a
+    # fixed-length script exhausts into a StopIteration crash rather than the
+    # single retry this row is about.
+    failing = iter([[verify.CommandResult("pytest -q", 1, tail)]])
+    monkeypatch.setattr(
+        verify,
+        "run_verify_commands",
+        lambda policy, cwd: next(failing, [verify.CommandResult("pytest -q", 0, "ok")]),
+    )
+
+    assert engine.run().done == 1
+
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    lines = [ln for ln in attention.splitlines() if ln.strip()]
+    # every line the notice wrote still carries the file's `[stamp] title: ...` shape
+    assert all(ln.startswith("[") for ln in lines), attention
+    (retry,) = [ln for ln in lines if "dev retry: 1-1-a" in ln]
+    assert "verify command failed (rc=1): pytest -q" in retry
+    assert retry.endswith("[…]")  # the trim is marked, not silent
+    assert "FAILED tests/test_a.py" not in attention  # the tail stayed out
+    assert len(retry) < 300
+
+    # ... and the whole reason is still on the record a maintainer reads
+    (decision,) = [
+        e
+        for e in engine.journal.entries()
+        if e["kind"] == "dev-decision" and e["action"] == "retry"
+    ]
+    assert "FAILED tests/test_b.py::test_two" in decision["reason"]
+
+
+def test_harvest_gate_exclude_is_rooted_on_the_code_tree(project, tmp_path):
+    """The engine's own ledger append is excluded from proof of work by PATH, and
+    that path must be relative to the tree the gate invokes git in.
+
+    Under a `repo_root` override the ledger sits outside the code tree, where it
+    cannot satisfy proof-of-work at all — so `()` is the right answer. A
+    `project`-relative pathspec would instead be resolved by git against the CODE
+    tree and silently exclude whatever happens to live at that relative path there.
+
+    Ablation: put the relpath back on `paths.project` and the second half reddens
+    with the project-relative ledger entry.
+    """
+    from bmad_loop.workspace import Workspace
+
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.harvest_wrote_ledger = True
+
+    # default config: the two roots are the same object, ledger inside the tree
+    assert engine._harvest_gate_exclude(task) == (
+        "_bmad-output/implementation-artifacts/deferred-work.md",
+    )
+
+    art = tmp_path / "artifacts-root"
+    (art / "_bmad-output" / "implementation-artifacts").mkdir(parents=True)
+    diverged = dataclasses.replace(
+        project,
+        project=art,
+        implementation_artifacts=art / "_bmad-output" / "implementation-artifacts",
+        planning_artifacts=art / "_bmad-output" / "planning-artifacts",
+        output_folder=art / "_bmad-output",
+        repo_root=project.project,
+    )
+    engine.workspace = Workspace(root=project.project, paths=diverged)
+    assert engine._harvest_gate_exclude(task) == ()
+
+
+def test_harvest_gate_exclude_degrade_arm_is_rooted_on_the_code_tree(
+    project, tmp_path, monkeypatch
+):
+    """The DEGRADE arm of the same exclude follows the same root.
+
+    The row above grades the resolved path. A filesystem resolve fault takes the
+    LEXICAL fallback instead, and that spelling moved with it — but no row observed
+    the move: the existing fault-injection row runs on the `project` fixture, where
+    the two roots are the same object, and the row above injects no fault.
+
+    Under the override the ledger sits outside the code tree, so `()` is the honest
+    answer. A `paths.project` spelling SUCCEEDS lexically there and emits a relpath
+    that git, running in the code tree, resolves against the wrong directory —
+    silently excluding whatever happens to sit at that relative path in the checkout,
+    which turns a real change into "no changes since baseline". Uncertainty must not
+    turn the engine's own append into session proof, and it must not turn a session's
+    work into nothing either.
+
+    Ablation: put the lexical fallback back on `paths.project` and this reddens with
+    the project-relative ledger entry.
+    """
+    from bmad_loop.workspace import Workspace
+
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.harvest_wrote_ledger = True
+
+    art = tmp_path / "artifacts-root"
+    (art / "_bmad-output" / "implementation-artifacts").mkdir(parents=True)
+    diverged = dataclasses.replace(
+        project,
+        project=art,
+        implementation_artifacts=art / "_bmad-output" / "implementation-artifacts",
+        planning_artifacts=art / "_bmad-output" / "planning-artifacts",
+        output_folder=art / "_bmad-output",
+        repo_root=project.project,
+    )
+    engine.workspace = Workspace(root=project.project, paths=diverged)
+
+    real_resolve = Path.resolve
+
+    def resolve_fault(self, *args, **kwargs):
+        if self == diverged.deferred_work:
+            raise OSError("injected ledger resolve fault")
+        return real_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve_fault)
+    assert engine._harvest_gate_exclude(task) == ()
+
+
+def test_dev_retry_notifies_the_operator_with_the_reason(project):
+    """#640(d): RETRY was the only dev outcome that notified nothing, and it is the
+    outcome that DISCARDS a completed implementation — the non-fixable leg rolls the
+    tree back to baseline. The reason lived only in the `dev-decision` journal line,
+    so a run could burn its whole attempt budget throwing finished work away with
+    nothing on the operator's phone.
+
+    Ablation: delete the `gates.notify` call at the top of the RETRY branch and this
+    reddens alone. Ablate the CONTENT instead — pass a fixed string in place of
+    `decision.reason` — and it reddens on the reason assert, which is the point of
+    asserting the reason at all: "retry, attempt 1" tells a human nothing about
+    whether to intervene.
+    """
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            _baseline_liar_effect(project),  # non-fixable: rejected AFTER the work
+            dev_effect(project, "1-1-a", followup_review=False),
+        ],
+        policy=_harvest_policy(attempts=2),
+    )
+
+    assert engine.run().done == 1
+
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    retries = [line for line in attention.splitlines() if "dev retry: 1-1-a" in line]
+    assert len(retries) == 1  # exactly the one rejected attempt, not the accepted one
+    assert "(attempt 1)" in retries[0]
+    assert "does not match orchestrator-recorded baseline" in retries[0]
+    # the decision the notice describes is the one the journal recorded
+    (decision,) = [
+        e
+        for e in engine.journal.entries()
+        if e["kind"] == "dev-decision" and e["action"] == "retry"
+    ]
+    # the notice carries the reason's FIRST LINE, which is what `_notice_reason`
+    # promises — asserting the whole untrimmed reason passes only while that reason
+    # happens to stay single-line and under `NOTICE_REASON_MAX`, so it would go green
+    # for the wrong reason the moment a producer appended an evidence tail.
+    assert decision["reason"].splitlines()[0].strip() in retries[0]
 
 
 def test_token_budget_discounts_cache_reads(project):
@@ -15257,3 +15598,33 @@ def test_a_park_record_rollback_refused_as_unconfined_is_journaled(project):
     assert "UnconfinedWriteError" in journal  # journaled by NAME, not a bare errno
     escaped = _json.loads((outside / record.name).read_text(encoding="utf-8"))
     assert escaped["actions"] == ACTIONS  # this run's record, NOT the prior put back
+
+
+def test_notice_reason_bound_is_an_upper_bound_not_an_equality():
+    """`NOTICE_REASON_MAX + len(" […]")` is a ceiling the return need not attain.
+
+    The sibling row pins it with `"z" * 500` — whitespace-free, so the slice never
+    rstrips and the equality holds. Two shapes make it strictly less, and the comment
+    on the constant used to state the bound as though neither existed:
+
+    * a cut landing on whitespace, since the slice is `.rstrip()`ed;
+    * ANY multi-line reason, since `trimmed` is set by the line collapse regardless of
+      length — which is the common case, `verify.verify_command_results_outcome`
+      putting its output tail under a short classification line.
+
+    Behaviour is correct in every case; what was wrong was the claim about it, and a
+    test that pins one whitespace-free instance cannot tell the claim from the truth.
+
+    Ablation: this row grades the COMMENT, so the meaningful ablation is textual —
+    restore "runs to NOTICE_REASON_MAX + len(...)" without "AT MOST" and the assertions
+    below contradict it. For the code half, delete the `.rstrip()` and the
+    whitespace-boundary assertion reddens on `len(capped) == 204`.
+    """
+    capped = _notice_reason("a" * (NOTICE_REASON_MAX - 1) + " " + "b" * 300)
+    assert capped.endswith(" […]")  # a trim happened, and is marked
+    assert len(capped) < NOTICE_REASON_MAX + len(" […]")  # yet lands BELOW the bound
+    assert not capped.startswith("a" * NOTICE_REASON_MAX)  # because the slice rstripped
+
+    short = _notice_reason("short first line\nthe evidence lives here")
+    assert short == "short first line […]"  # marked well under the cap
+    assert len(short) < NOTICE_REASON_MAX
