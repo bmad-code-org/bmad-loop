@@ -850,6 +850,23 @@ class BmadLoopApp(App[None]):
         path (rearm_escalation handles sentinel auto-delete-with-preservation)."""
         if self._resolve_blocked_by_liveness(run_id, run_dir):
             return
+        # Same seam as `cli.cmd_resolve`, for the same reason and at the same moment:
+        # `runs.rearm_escalation` reads the persisted code root back out of the run
+        # state, and only a process that has just read config.yaml can tell whether a
+        # `repo_root:` edit made while the run was paused has moved it. Resume re-stamps
+        # it, but this gesture re-arms BEFORE it resumes, so the mirror has to be aimed
+        # here or the re-arm advances the baseline in the tree the run has left.
+        try:
+            code_root = bmadconfig.load_paths(self.project).repo_root
+        except (bmadconfig.BmadConfigError, OSError) as e:
+            self.notify(
+                f"cannot read the project config to confirm the code root ({e}) — "
+                "re-arming against the root this run recorded",
+                severity="warning",
+            )
+        else:
+            if (moved := runs.restamp_code_root(run_dir, code_root)) is not None:
+                self.notify(moved, severity="warning")
         before_entries = runs.journal_entries_or_none(run_dir)
         try:
             runs.rearm_escalation(run_dir, story_key)

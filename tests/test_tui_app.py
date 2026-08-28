@@ -4084,6 +4084,71 @@ async def test_escalation_rearm_surfaces_a_failed_baseline_advance(project, monk
     assert any("re-armed 1" in n for n in notes)  # the ordinary notice still fires
 
 
+async def test_escalation_rearm_aims_the_code_root_before_it_rearms(project, monkeypatch):
+    """Parity with `cli.cmd_resolve`, on the seam that has the same ordering.
+
+    This gesture re-arms and RESUMES in one click, and `runs.rearm_escalation` reads the
+    code tree out of the run state — so only a process that has just read config.yaml can
+    tell whether a `repo_root:` edit made while the run was paused moved it. Resume
+    re-stamps the mirror, but that is downstream of the re-arm here too: without this the
+    re-arm would advance the attempt baseline in the tree the run has left while the
+    resumed engine reset and measured in the new one.
+
+    Ablation: delete the `runs.restamp_code_root(...)` call from `_do_rearm` and this
+    reddens on the stale root; drop the `self.notify(moved, ...)` and it reddens on the
+    missing warning while the root assertion still passes.
+    """
+    from bmad_loop import resolve, runs
+    from bmad_loop.journal import load_state, save_state
+
+    calls: list[str] = []
+    notes: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    seen: list = []
+
+    def fake_rearm(rd, sk):
+        seen.append(load_state(rd).code_root)
+        return "ready-for-dev"
+
+    monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
+    orig_notify = BmadLoopApp.notify
+    monkeypatch.setattr(
+        BmadLoopApp,
+        "notify",
+        lambda self, msg, **kw: notes.append(str(msg)) or orig_notify(self, msg, **kw),
+    )
+    install_bmad_config(project)
+    moved = project.project / "moved-code"
+    moved.mkdir()
+    cfg = project.project / "_bmad" / "bmm" / "config.yaml"
+    cfg.write_text(
+        cfg.read_text(encoding="utf-8") + f"repo_root: '{moved.as_posix()}'\n", encoding="utf-8"
+    )
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: needs a human decision on the auth scheme.",
+    )
+    state = load_state(run_dir)
+    state.repo_root = str(project.project / "old-code")
+    save_state(run_dir, state)
+    marker = resolve.resolution_path(run_dir, "1")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{}", encoding="utf-8")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, EscalationModal)
+        await pilot.click(await ready(pilot, "#act-rearm"))
+        await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
+
+    assert seen == [moved.resolve()]
+    assert any("the code root in _bmad/bmm/config.yaml has changed" in n for n in notes)
+
+
 async def test_escalation_rearm_surfaces_the_kinds_it_used_to_drop(project, monkeypatch):
     """Every kind the shared table routes reaches this surface — not the three the
     TUI's own copy of the chain happened to handle.

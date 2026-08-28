@@ -2701,6 +2701,60 @@ def _escalated_run(tmp_path, spec_text, *, restore_patch_stale=None, git_project
     return run.run_dir, spec
 
 
+# --------------------------------------------------- restamp_code_root
+
+
+@pytest.mark.parametrize("recorded", ["moved", "unchanged", "legacy"])
+def test_restamp_code_root_aims_the_mirror_the_rearm_reads(tmp_path, recorded):
+    """`rearm_escalation` reads the CODE tree out of the run state (`RunState.code_root`)
+    and has no `ProjectPaths` to consult, so the surfaces that re-arm BEFORE they resume
+    have to aim that mirror first. Three rows, because the write and the warning answer
+    different questions:
+
+    - `moved` — a `repo_root:` edit while the run was paused. The mirror follows, and the
+      operator is told, because every sha the run already recorded names an object in the
+      previous tree and nothing here can move them.
+    - `unchanged` — the ordinary re-arm. No message, and no write at all: a row that
+      rewrote state.json on every re-arm would make the "durable before the engine
+      starts" ordering above it meaningless to reason about.
+    - `legacy` — a state.json written before the field existed reads back `""`. That is a
+      MISSING value, not a divergent one: it migrates silently, and calling it a move
+      would fire the warning once on every pre-upgrade run.
+
+    Ablation: drop the `if not moved: return None` arm and `legacy` reddens on the
+    message; return the message without the `save_state` and `moved` reddens on the
+    persisted root while the other two rows still pass.
+    """
+    from bmad_loop.journal import STATE_FILE
+
+    run = escalated_run(tmp_path, "r1", story_key="s1")
+    now = tmp_path / "code"
+    now.mkdir()
+    run.state.repo_root = {
+        "moved": str(tmp_path / "was"),
+        "unchanged": str(now),
+        "legacy": "",
+    }[recorded]
+    save_state(run.run_dir, run.state)
+    before = (run.run_dir / STATE_FILE).read_bytes()
+
+    message = runs.restamp_code_root(run.run_dir, now)
+
+    # whatever the row, the tree the re-arm will read is the one the caller is acting in
+    assert load_state(run.run_dir).code_root == now
+    rewritten = (run.run_dir / STATE_FILE).read_bytes() != before
+    assert rewritten is (recorded != "unchanged")
+    if recorded == "moved":
+        assert message is not None
+        assert "the code root in _bmad/bmm/config.yaml has changed" in message
+        # names NEITHER tree, like resume's: the fact is that the run changed
+        # repositories, and the paths are the half that puts arbitrary text on a terminal
+        assert str(now) not in message
+        assert str(tmp_path / "was") not in message
+    else:
+        assert message is None
+
+
 _SPEC_WITH_ARR = (
     "---\ntitle: t\nstatus: blocked\n---\n\n## Intent\n\nbody\n"
     "\n## Auto Run Result\n\n- Status: blocked\n\nboom\n"

@@ -2560,6 +2560,122 @@ def test_resolve_no_interactive_rearms_and_resumes(tmp_path, monkeypatch, capsys
     assert "ready-for-dev" in spec.read_text()
 
 
+# ------------------------------------ resolve aims the code root before it re-arms
+
+# `_resume_paused_run` re-stamps the persisted code root because the engine it arms
+# works in `paths.repo_root` — but `resolve` re-arms FIRST, so on this path that
+# re-stamp lands too late to aim `runs.rearm_escalation`, which reads the mirror out of
+# process. Three rows: the move is adopted and announced before the re-arm sees it, a
+# cancelled confirm writes nothing, and a config this process cannot read degrades
+# instead of guessing a tree.
+
+
+def _resolve_run_with_a_moved_code_root(project, monkeypatch):
+    """An escalated run whose recorded code root is NOT the one config.yaml now names.
+    Returns (run_dir, the tree config names, the tree the run recorded)."""
+    from bmad_loop.journal import load_state, save_state
+
+    install_bmad_config(project)
+    moved = project.project / "moved-code"
+    moved.mkdir()
+    _configure_repo_root(project, moved)
+    run_dir = _escalated_run(project.project, "r1")
+    recorded = project.project / "old-code"
+    state = load_state(run_dir)
+    state.repo_root = str(recorded)
+    save_state(run_dir, state)
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+    return run_dir, moved, recorded
+
+
+def test_resolve_restamps_the_code_root_before_it_rearms(project, monkeypatch, capsys):
+    """The ordering IS the fix. `rearm_escalation` advances the attempt baseline and
+    re-stamps `baseline_revision` against `RunState.code_root`; the engine resumed at the
+    bottom of the same command works in `paths.repo_root`. With the re-stamp left to
+    `_resume_paused_run`, a `repo_root:` edit made while the run was paused split those
+    two readers with no error anywhere — the re-arm armed one repository and the run
+    continued in another.
+
+    Asserted at the moment of the re-arm, not afterwards: a re-stamp that lands after
+    `rearm_escalation` returns is exactly the bug, and reading state.json at the end
+    cannot tell the two apart.
+
+    Ablation: move the `runs.restamp_code_root(...)` call below the `try:` that re-arms
+    and this reddens on the stale root while the warning assertion still passes.
+    """
+    from bmad_loop import runs
+    from bmad_loop.journal import load_state
+
+    run_dir, moved, _ = _resolve_run_with_a_moved_code_root(project, monkeypatch)
+    seen: list = []
+
+    def fake_rearm(rd, key, *, restore_patch=None):
+        seen.append(load_state(rd).code_root)
+        return key
+
+    monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
+
+    argv = ["resolve", "--project", str(project.project), "r1", "--no-interactive", "--resume"]
+    assert cli.main(argv) == 0
+
+    assert seen == [moved.resolve()]
+    err = capsys.readouterr().err
+    assert "the code root in _bmad/bmm/config.yaml has changed" in err
+    assert str(moved) not in err  # the warning names neither tree, matching resume's
+
+
+def test_resolve_declined_at_the_confirm_leaves_the_code_root_for_resume(
+    project, monkeypatch, capsys
+):
+    """The re-stamp sits AFTER the confirm on purpose. A cancelled resolve must write
+    nothing: adopting the new root there would silence the loud `code_root_changed`
+    warning `_resume_paused_run` raises on its own terms, and the operator would never
+    hear about the move they did not go through with.
+
+    Ablation: hoist the re-stamp above the `args.resume is None` confirm and this
+    reddens on both the persisted root and the silence.
+    """
+    from bmad_loop import runs
+    from bmad_loop.journal import load_state
+
+    run_dir, _moved, recorded = _resolve_run_with_a_moved_code_root(project, monkeypatch)
+    monkeypatch.setattr(cli, "_confirm", lambda _prompt: False)
+    monkeypatch.setattr(
+        runs, "rearm_escalation", lambda *a, **k: pytest.fail("re-armed after a decline")
+    )
+
+    assert cli.main(["resolve", "--project", str(project.project), "r1", "--no-interactive"]) == 0
+
+    assert load_state(run_dir).repo_root == str(recorded)
+    assert "code root" not in capsys.readouterr().err
+
+
+def test_resolve_degrades_when_the_config_cannot_name_the_code_root(tmp_path, monkeypatch, capsys):
+    """Reading config.yaml to learn the tree is an OBSERVATION, so it degrades: without
+    it this process cannot name the code root, and re-pointing the mirror at a guess is
+    the one outcome worse than leaving it alone. The re-arm proceeds against the root the
+    run recorded — what it did before this seam existed — and says so.
+
+    Ablation: turn the `except (bmadconfig.BmadConfigError, OSError)` arm into a
+    `return 1` and this reddens on the exit code; delete the warning it prints and it
+    reddens on the silence while the re-arm assertion still passes.
+    """
+    from bmad_loop import runs
+    from bmad_loop.journal import load_state
+
+    run_dir = _escalated_run(tmp_path, "r1")  # no _bmad/bmm/config.yaml anywhere
+    rearmed: list = []
+    monkeypatch.setattr(runs, "rearm_escalation", lambda rd, key, **k: rearmed.append(key) or key)
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+
+    argv = ["resolve", "--project", str(tmp_path), "r1", "--no-interactive", "--resume"]
+    assert cli.main(argv) == 0
+
+    assert rearmed == ["s1"]
+    assert load_state(run_dir).repo_root == ""  # nothing guessed onto the mirror
+    assert "cannot read the project config to confirm the code root" in capsys.readouterr().err
+
+
 def test_resolve_echoes_this_rearms_stale_restore_events(tmp_path, monkeypatch, capsys):
     """#90's journal entries reach the operator. The commits variant is warn-only —
     stderr is the only place it ever surfaces. Entries from *earlier* re-arms are

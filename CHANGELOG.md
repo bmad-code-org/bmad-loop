@@ -63,6 +63,30 @@ breaking changes may land in a minor release.
   to ask for JSON. They render as a `code root differs from project` yes/no line and a `gen`
   column beside `att`; the code root's path itself still never renders.
 
+- **`resolve` and the TUI's re-arm aim the code root before they re-arm, not after** (#716).
+  Resume re-stamps the run's persisted `repo_root` mirror because the engine it arms works in the
+  tree config.yaml names now — but both re-arm surfaces re-arm and THEN resume, so that re-stamp
+  landed after `runs.rearm_escalation` had already read the stale mirror out of process. A
+  `repo_root:` key added, changed or removed while a run was paused therefore split the two readers
+  exactly the way the re-stamp exists to prevent: the attempt baseline advanced (and
+  `baseline_revision` was re-stamped) in the tree the run had left, while the engine that resumed
+  seconds later reset and measured in the new one, with no error anywhere. Both surfaces now
+  re-stamp through one shared writer, after the confirm — so a cancelled resolve still leaves the
+  divergence for `resume` to report — and each warns that the run has changed repositories. A
+  config this process cannot read degrades instead of guessing a tree: the re-arm proceeds against
+  the root the run recorded, and says so.
+
+- **Re-arm refuses a story spec it cannot re-open, instead of re-driving onto a status the session
+  cannot route** (#640). A spec that exists and carries no top-level `status:` answers both
+  frontmatter writers with `False`, and the flip's failure was only journalled: the operator was
+  told "re-armed <story>", the run resumed in the same gesture, and the re-driven session halted on
+  `unrecognized status in existing story file` — spending the escalation on a session that could
+  never route. The skip record now aborts the re-arm as well, leaving the escalation armed for a
+  corrected spec, the run state untouched and the spec byte-identical (the stale `## Auto Run
+Result` strip is sequenced after the check). Narrowed to a spec re-arm can actually read: on an
+  unreachable path the failed flip says nothing about what the re-drive will read, since the path is
+  worktree-relative and the re-drive mounts a fresh worktree and reads the COMMITTED spec regardless.
+
 - **Re-arm writes the spec the run actually used, and reports every write it could not make**
   (#640). `StoryTask` persists `spec_file` RELATIVE to the worktree for an isolated task, and
   re-arm resolved it against the process cwd. `bmad-loop resolve` runs from the project root,

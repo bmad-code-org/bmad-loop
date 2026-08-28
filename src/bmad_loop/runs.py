@@ -2309,6 +2309,48 @@ def _committed_spec_status(state: RunState, task: StoryTask) -> str:
     return status_of(parse_frontmatter(text))
 
 
+def restamp_code_root(run_dir: Path, repo_root: Path) -> str | None:
+    """Re-point a paused run's persisted code-root mirror at `repo_root` — the tree
+    the caller is about to act in — and return the warning an operator must see when
+    that MOVED a root the run had recorded (`None` when it already agreed, or when the
+    run predates the field).
+
+    Exists because `rearm_escalation` reads that mirror OUT OF PROCESS
+    (`RunState.code_root`) and has no `ProjectPaths` to consult, while `repo_root:` is
+    re-read from config.yaml by every process that arms an engine. `cli._resume_paused_run`
+    folds the same re-stamp into the one `save_state` that also carries the policy
+    snapshot and the config digest — this is the seam for the surfaces that re-arm
+    BEFORE they resume (`cli.cmd_resolve`, `TuiApp._do_rearm`), where that write lands
+    too late to aim the re-arm.
+
+    The compare is exact and uncanonicalized, matching resume's: both sides are
+    `str(paths.repo_root)` off `bmadconfig.load_paths`, which resolves every member or
+    raises, so they are spelled the same way whenever they name the same tree. An empty
+    recorded root is a MISSING value, not a divergent one — a state.json written before
+    the field existed — so it is migrated silently and reported as no move.
+
+    The message names neither tree, like resume's: what an operator needs is that the
+    run has changed repositories, and the paths are the half that would put an
+    attacker-controlled string on their terminal.
+    """
+    state = load_state(run_dir)
+    new = str(repo_root)
+    if state.repo_root == new:
+        return None
+    moved = bool(state.repo_root)
+    state.repo_root = new
+    save_state(run_dir, state)
+    if not moved:
+        return None
+    return (
+        f"run {run_dir.name}: the code root in _bmad/bmm/config.yaml has changed since "
+        "this run started — the re-drive works in the tree configured now, while the "
+        "baselines, preserve refs and branches this run already recorded name objects "
+        "in the previous one. Restore the previous `repo_root:` value if you did not "
+        "intend the move."
+    )
+
+
 def rearm_escalation(
     run_dir: Path, story_key: str | None = None, *, restore_patch: str | None = None
 ) -> str:
@@ -2500,13 +2542,6 @@ def rearm_escalation(
                 flipped = verify.set_frontmatter_status(
                     spec_path, target_status, confine_root=_task_spec_root(task, state)
                 )
-                # drop the stale `## Auto Run Result` section along with the status flip
-                # (mirrors engine._reset_spec_for_repair): find_result_artifact keys on
-                # that heading, so leaving it would let the re-driven session's first
-                # save of the spec parse as the prior attempt's terminal outcome.
-                devcontract.strip_auto_run_result(
-                    spec_path, confine_root=_task_spec_root(task, state)
-                )
                 # `set_frontmatter_status` answers "nothing to change" with `False`
                 # for FOUR causes, not three — its own docstring lists them: no file,
                 # no frontmatter block, no top-level `status:`, and ALREADY AT THE
@@ -2539,6 +2574,57 @@ def rearm_escalation(
                         spec_file=str(spec_path),
                         status=target_status,
                     )
+                    # ...and then ABORT — but only for a spec that IS a readable file
+                    # here, which is the same `is_file` split the baseline re-stamp below
+                    # already draws, and for the same reason. On THAT shape the failure is
+                    # a REPAIR that did not land on the very file the re-drive reads, so it
+                    # aborts for the same reason the `FrontmatterWriteError` arm does:
+                    # journalling alone left the two default surfaces telling the operator
+                    # "re-armed <story>" and resuming in the same gesture, so the record's
+                    # own imperative was already unactionable when it rendered — while
+                    # step-01's contract for what reaches here is not a maybe. A spec with
+                    # no `status:` HALTs blocked on `unrecognized status in existing story
+                    # file`; one still carrying the escalated attempt's terminal status
+                    # routes to "ingest as context, do not resume". Either way the re-drive
+                    # re-wedges and the escalation is burned. Refusing keeps it armed: nothing
+                    # is persisted yet (`save_state` runs below), the spec is byte-identical
+                    # (the `## Auto Run Result` strip is deliberately sequenced AFTER this
+                    # check so an abort leaves nothing half-done), and the human fixes the
+                    # frontmatter and re-runs resolve.
+                    #
+                    # A spec that is NOT a file from here keeps warn-and-continue, because
+                    # there the flip's failure says nothing about what the re-drive will
+                    # read: `spec_file` is persisted RELATIVE to a worktree, an isolated
+                    # task's worktree may already be gone, and the re-drive mounts a fresh
+                    # one and reads the COMMITTED spec regardless. Aborting on it would
+                    # refuse the re-arms that the `rearm-baseline-restamp-skipped` and
+                    # `rearm-spec-write-unreachable` records exist to report rather than
+                    # prevent — an unreadable path is an observation, and observations
+                    # degrade.
+                    #
+                    # The record is written on BOTH sides of that split: the abort message
+                    # reaches stderr only, and the journal is the run's audit trail —
+                    # `_echo_rearm_events` surfaces it from a `finally` on this path.
+                    if spec_path.is_file():
+                        raise RearmError(
+                            f"cannot re-open story spec {spec_path} to `{target_status}` "
+                            "for the re-drive: it has no frontmatter `status:` this re-arm "
+                            "can set, so the re-driven session would wedge on the status "
+                            "it reads — add a top-level `status:` to the spec's "
+                            "frontmatter block, then re-run resolve"
+                        )
+                # drop the stale `## Auto Run Result` section along with the status flip
+                # (mirrors engine._reset_spec_for_repair): find_result_artifact keys on
+                # that heading, so leaving it would let the re-driven session's first
+                # save of the spec parse as the prior attempt's terminal outcome.
+                #
+                # Sequenced AFTER the read-back check above, not with the flip it mirrors:
+                # that check now raises, and an aborted re-arm must leave the spec exactly
+                # as it found it — a stripped result section on a spec the re-arm then
+                # refused would be the one edit nothing else records.
+                devcontract.strip_auto_run_result(
+                    spec_path, confine_root=_task_spec_root(task, state)
+                )
             except verify.FrontmatterWriteError as e:
                 # The spec reads fine but carries `status:` in a shape no line
                 # edit can move (a block scalar, a flow mapping, a value continued
@@ -2888,12 +2974,17 @@ def rearm_event_notice(
             "Commit the corrected spec before resuming",
         )
     if kind == "rearm-spec-flip-skipped":
+        # The one row in this table that always accompanies an ABORT: `rearm_escalation`
+        # raises `RearmError` right after journalling it. The message says so rather than
+        # predicting a re-wedge, because there is no re-drive left to wedge — and the
+        # next_step is the repair, not an inspection, for the same reason.
         return (
             "warning",
             f"the recorded spec for this story ({entry.get('spec_file', '?')}) could "
-            f"not be re-opened to `{entry.get('status', '?')}` — the re-drive will read "
-            "the escalated attempt's terminal status and may re-wedge on it",
-            "Check the recorded spec path before resuming",
+            f"not be re-opened to `{entry.get('status', '?')}` — it carries no "
+            "frontmatter `status:` to set, so the re-arm was REFUSED rather than "
+            "re-driving a session that would wedge on the status it reads",
+            "Add a top-level `status:` to the spec, then re-run resolve",
         )
     if kind == "rearm-baseline-restamp-skipped":
         return (

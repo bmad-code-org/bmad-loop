@@ -2918,6 +2918,34 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     if args.resume is None and not _confirm(f"re-arm {story_key} and resume run {args.run_id}?"):
         print("cancelled — run is still paused at the escalation")
         return 0
+    # The code root `runs.rearm_escalation` reads back OUT OF PROCESS
+    # (`RunState.code_root`). `_resume_paused_run` re-stamps it because the engine it
+    # arms works in `paths.repo_root` — but on THIS path the re-arm runs FIRST, so that
+    # re-stamp lands too late to aim it: a `repo_root:` key added, changed or removed
+    # while the run was paused split the two readers exactly the way the re-stamp exists
+    # to prevent — the attempt baseline advanced (and `baseline_revision` re-stamped) in
+    # the tree the run has LEFT, while the engine resumed at the bottom of this function
+    # reset and measured in the new one, with no error anywhere.
+    #
+    # AFTER the confirm, deliberately: a cancelled resolve writes nothing, so the
+    # divergence is still there for `resume` to report on its own terms.
+    try:
+        code_root = bmadconfig.load_paths(project).repo_root
+    except (bmadconfig.BmadConfigError, OSError) as e:
+        # An observation, so it degrades: without the config this process cannot NAME
+        # the tree, and re-pointing the mirror at a guess is the one outcome worse than
+        # leaving it alone. The re-arm then reads the root the run recorded — precisely
+        # what it did before this seam existed — and the default flow's
+        # `_resume_paused_run` raises on the same config moments later. Reported, never
+        # silent: the write this could not aim is the whole subject of the block above.
+        print(
+            f"warning: run {args.run_id}: cannot read the project config to confirm the "
+            f"code root ({e}) — re-arming against the root this run recorded",
+            file=sys.stderr,
+        )
+    else:
+        if (moved := runs.restamp_code_root(run_dir, code_root)) is not None:
+            print(f"warning: {moved}", file=sys.stderr)
     before_entries = runs.journal_entries_or_none(run_dir)
     try:
         runs.rearm_escalation(run_dir, story_key, restore_patch=restore_patch)

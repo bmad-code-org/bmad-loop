@@ -695,51 +695,79 @@ def test_rearm_journals_a_status_flip_that_silently_did_nothing(tmp_path, shape)
 
     - `no-frontmatter` — a spec that EXISTS and is readable but carries no `---` block:
       the writer returns False and leaves the file byte-identical, so the record is the
-      ONLY thing that distinguishes this from a flip that landed.
+      ONLY thing that distinguishes this from a flip that landed. It also ABORTS, because
+      the spec IS a readable file here: the routing status is what the re-drive runs on,
+      and step-01's contract for a spec without one is not a maybe — it HALTs blocked on
+      `unrecognized status in existing story file`. So the re-arm refuses instead of
+      burning the escalation on a session that cannot route, and the run is left exactly
+      as it was found: the task still ESCALATED (nothing is persisted before this point),
+      and the spec byte-identical down to the `## Auto Run Result` section, whose strip is
+      sequenced after the check. The other half of that split — a spec that is NOT a file
+      from here, where the flip's failure says nothing about what the re-drive will read
+      — is graded by `test_rearm_journals_a_skip_when_the_recorded_spec_is_not_readable`.
     - `ordinary` — the control. A spec that really moves must not produce the record, or
       the row would pass for a guard that fires on everything.
     - `already-at-target` — the REGRESSION leg. A second re-arm, or
       `resolve --no-interactive` after a human fixed the spec, hits a spec already at
       `ready-for-dev`. The writer returns False and the operator used to be warned the
-      spec "could not be re-opened" and might re-wedge, while the file was correct.
+      spec "could not be re-opened" and might re-wedge, while the file was correct. It
+      must NOT abort either — this is the ordinary flow, and refusing it would wedge
+      every second resolve cycle.
 
-    Ablation: delete the `if not flipped ...` append and the `no-frontmatter` leg
-    reddens with `ValueError: not enough values to unpack (expected 1, got 0)` while
-    both other legs still pass. Drop the `status_of(read_frontmatter(...)) != target`
-    conjunct and `already-at-target` reddens alone — which is the discrimination this
-    row exists for.
+    Ablation: delete the `if not flipped ...` arm and the `no-frontmatter` leg reddens
+    on `DID NOT RAISE` while both other legs still pass. Drop the
+    `status_of(read_frontmatter(...)) != target` conjunct and `already-at-target`
+    reddens alone, now on that same raise — which is the discrimination this row exists
+    for, and the leg that shows why the abort had to be narrowed to the same conjunct
+    the record is. Delete the `raise RearmError(...)` and keep the append and the
+    no-frontmatter leg reddens on `DID NOT RAISE` while its record assertions still
+    pass — the record is not the refusal. Move `strip_auto_run_result` back above the
+    check and the byte-identity assertion reddens alone.
     """
     _resolve_repo(tmp_path)
     spec = tmp_path / "spec.md"
+    # every leg carries the stale result section, so the strip's SEQUENCING is graded
+    # rather than assumed: on the two legs that proceed it must be gone, and on the leg
+    # that aborts it must still be there.
+    stale = "\n## Auto Run Result\n\nstatus: blocked\n"
     body = {
         "ordinary": SPEC,
         "no-frontmatter": "# Spec\n\nno frontmatter block\n",
         "already-at-target": SPEC.replace("status: in-review", "status: ready-for-dev"),
-    }[shape]
+    }[shape] + stale
     assert shape != "already-at-target" or "status: ready-for-dev" in body  # fixture is real
     spec.write_text(body, encoding="utf-8")
     before = spec.read_bytes()
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec))
 
-    runs.rearm_escalation(run_dir)
+    if shape == "no-frontmatter":
+        with pytest.raises(runs.RearmError, match="no frontmatter `status:`"):
+            runs.rearm_escalation(run_dir)
+    else:
+        runs.rearm_escalation(run_dir)
 
     records = [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-flip-skipped"]
     if shape == "already-at-target":
-        # the ordinary re-arm of an already-correct spec: no record, and the status the
-        # re-drive needs is exactly what it was
+        # the ordinary re-arm of an already-correct spec: no record, no refusal, and the
+        # status the re-drive needs is exactly what it was
         assert records == []
         assert verify.read_frontmatter(spec)["status"] == "ready-for-dev"
+        assert "## Auto Run Result" not in spec.read_text(encoding="utf-8")
     elif shape == "ordinary":
         assert records == []
         assert verify.read_frontmatter(spec)["status"] == "ready-for-dev"
+        assert "## Auto Run Result" not in spec.read_text(encoding="utf-8")
     else:
         (skipped,) = records
         assert skipped["story_key"] == "6-4-cli-list-command"
         assert skipped["spec_file"] == str(spec)
         assert skipped["status"] == "ready-for-dev"
-        # the no-op left NOTHING behind but the record — including the re-stamp, which
-        # `set_frontmatter_field` declines on the same missing block
+        # the refusal left NOTHING behind but the record: not the re-stamp (which
+        # `set_frontmatter_field` declines on the same missing block), not the result
+        # strip (sequenced after the check), and not the task reset — the escalation is
+        # still armed for the corrected spec, which is what makes the abort recoverable
         assert spec.read_bytes() == before
+        assert load_state(run_dir).tasks["6-4-cli-list-command"].phase == Phase.ESCALATED
 
 
 def test_rearm_journals_event(tmp_path):
@@ -1089,14 +1117,22 @@ def test_rearm_journals_a_skip_when_the_recorded_spec_is_not_readable(tmp_path):
     the baseline re-stamp both do nothing and the spec keeps the escalated attempt's
     sha with no record anywhere.
 
+    It is also the NEGATIVE control for the flip abort one screen above it. A spec that
+    exists and cannot take a status refuses the re-arm; an unreachable one must not,
+    because the flip's failure says nothing about what the re-drive will read — the path
+    is worktree-relative, the worktree may already be gone, and the re-drive mounts a
+    fresh one and reads the COMMITTED spec either way. Refusing here would turn the two
+    records this row exists to report into a wedge.
+
     Ablation: delete the `if not spec_path.is_file():` arm in `rearm_escalation` and
     this reddens on the missing record — re-arm still "succeeds", which is the whole
-    problem.
+    problem. Delete the `spec_path.is_file()` conjunct guarding the flip's `RearmError`
+    and it reddens on the raise instead, before any assertion runs.
     """
     _resolve_repo(tmp_path)
     run_dir, _, _ = _escalated_run(tmp_path, spec_file="wt/_bmad-output/specs/gone.md")
 
-    runs.rearm_escalation(run_dir)
+    runs.rearm_escalation(run_dir)  # must not raise: the flip's no-op is not a refusal
 
     kinds = _kinds(run_dir)
     (skipped,) = [e for e in kinds if e["kind"] == "rearm-baseline-restamp-skipped"]
@@ -1104,6 +1140,9 @@ def test_rearm_journals_a_skip_when_the_recorded_spec_is_not_readable(tmp_path):
     assert skipped["baseline"] == load_state(run_dir).tasks["6-4-cli-list-command"].baseline_commit
     # and the re-stamp record is NOT written, since nothing was stamped
     assert [e for e in kinds if e["kind"] == "rearm-baseline-restamped"] == []
+    # the flip records its no-op on this shape too, and the task is re-armed anyway
+    assert [e for e in kinds if e["kind"] == "rearm-spec-flip-skipped"] != []
+    assert load_state(run_dir).tasks["6-4-cli-list-command"].phase == Phase.PENDING
 
 
 @pytest.mark.parametrize("repo", [True, False])
