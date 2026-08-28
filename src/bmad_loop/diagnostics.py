@@ -151,6 +151,38 @@ _JOURNAL_ALIAS_FIELDS = {
     # one alias whichever shape either happens to carry.
     "spec_file": "spec",
 }
+# Kind-scoped routing, consulted BEFORE the by-name table above and losing to
+# `_JOURNAL_DROP_FIELDS`, which is stricter than any alias.
+#
+# It exists for ONE field, and the by-name rule genuinely cannot express it: `target`
+# carries the target BRANCH on the three merge kinds below and a sprint STATUS on the
+# `board-advance-*` family (`board-advance-carried`, `-carry-failed`,
+# `-carry-foreign-dirt`, `-carry-uncommitted`). Aliasing it by NAME would pseudonymize
+# statuses as branches, turning a legible `"target": "done"` into `branch-3f2a` and
+# destroying the field a maintainer reads those kinds for; leaving it unrouted — what
+# happened until now — ships an identifier-shaped branch name VERBATIM. A normal run
+# journals the same string as `branch` first (`ensure_target_branch`), so the egress
+# backstop repairs it and discloses a `backstop_repairs` gap, but that is a defense in
+# depth that only works because the value is already in the legend: a journal truncated
+# past that event, or a `unit-merged` read out of a bundle on its own, has nothing to
+# repair from.
+#
+# Deliberately NOT fixed by renaming the producers to `target_branch`, which is the
+# obvious move and is unsafe: `engine._replay_unlatched_ledger_carries` correlates
+# `unit-merge-started` against `unit-merged` on a tuple that INCLUDES this field, and it
+# reads a journal written by an earlier process — and possibly an earlier version. A
+# rename would make a run started before the change and resumed after it fail to
+# correlate, silently skipping the carry replay so a resumed sweep re-triages work that
+# already landed. The scrub is what is wrong, so the scrub is where the fix belongs.
+#
+# A closed set, not a growing one: any NEW producer should pick a name the by-name table
+# already routes (`branch`, or `target_branch` — see `runs.rearm_escalation`) rather than
+# add a row here.
+_JOURNAL_KIND_ALIAS_FIELDS: dict[str, dict[str, str]] = {
+    "unit-merge-started": {"target": "branch"},
+    "unit-merged": {"target": "branch"},
+    "resume-unit-merge": {"target": "branch"},
+}
 # Namespaces whose journalled value arrives in more than one shape and must be
 # reduced to its basename before it is aliased. `spec` is one: engine.py's
 # reconcile and marker-repair kinds journal `str(spec_path)` (absolute —
@@ -659,16 +691,21 @@ def _scrub_entry(
         out["ts_offset"] = round(ts - first_ts, 3)
     kind = str(entry.get("kind", "?"))
     out["kind"] = kind if sanitize.looks_like_identifier(kind) else "<redacted:str>"
+    # Read off the RAW kind, not the redacted spelling above: a kind that failed
+    # `looks_like_identifier` is not one of the three below anyway, and keying on the
+    # placeholder would silently unroute every entry in a dump that had one.
+    by_kind = _JOURNAL_KIND_ALIAS_FIELDS.get(kind, {})
     for k, v in entry.items():
         if k in ("ts", "kind"):
             continue
+        kind_ns = by_kind.get(k)
         if k in _JOURNAL_DROP_FIELDS:
             out[f"{k}_present"] = v is not None and v != ""
         elif k in _JOURNAL_KEYLIST_FIELDS and isinstance(v, list):
             ns = "story" if k == "keys" else "dw"
             out[k] = [pseudo.alias(x, ns=ns, epic=epic_by_key.get(str(x))) for x in v]
-        elif k in _JOURNAL_ALIAS_FIELDS:
-            ns = _JOURNAL_ALIAS_FIELDS[k]
+        elif kind_ns is not None or k in _JOURNAL_ALIAS_FIELDS:
+            ns = kind_ns or _JOURNAL_ALIAS_FIELDS[k]
             v = _alias_input(v, ns)
             epic = epic_by_key.get(str(v)) if ns == "story" else None
             out[k] = pseudo.alias(v, ns=ns, epic=epic)

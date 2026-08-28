@@ -630,6 +630,91 @@ def test_rearm_records_leak_neither_the_code_root_nor_a_spec_name():
         assert canary not in rendered, f"LEAK: {canary!r}"
 
 
+def test_target_field_routes_by_kind_because_it_carries_two_kinds_of_value():
+    """`target` is a BRANCH on the merge kinds and a sprint STATUS on `board-advance-*`.
+
+    That overload is why the field is absent from `_JOURNAL_ALIAS_FIELDS`: routing there
+    is by field NAME, so a single entry would have to be wrong for one of the two
+    families. Leaving it unrouted was the wrong half to be wrong on — a bare
+    `main`/`release`-style branch name is identifier-shaped, so `scrub_json` ships it
+    VERBATIM into a bundle whose guiding assumption is that it will be posted publicly.
+
+    The backstop is not the answer here. It repairs only values already in the legend,
+    so it rescues this exactly when `ensure_target_branch` journalled the same string as
+    `branch` earlier in the same file — and then discloses a `backstop_repairs` gap on a
+    routine run. A journal truncated past that event has nothing to repair from.
+
+    Both directions are graded, because either alone is satisfied by a wrong fix:
+
+    - the three merge kinds ALIAS, to the branch namespace, and to the SAME alias as the
+      `branch` field beside them when the value matches — a by-name entry would pass
+      this too.
+    - `board-advance-carried` keeps its `target` VERBATIM. A by-name entry reddens here,
+      rendering the sprint status a maintainer reads that kind for as `branch-<hex>`.
+
+    Separator-free names throughout: `_IDENTIFIER_RE` forbids `/`, so a `feature/x`
+    spelling is collapsed by the FALLBACK and every assertion below would pass with the
+    routing deleted (the same false green documented for `repo` above).
+
+    Ablation: empty `_JOURNAL_KIND_ALIAS_FIELDS` and the three merge rows redden on the
+    legend lookup (`StopIteration`); move `"target": "branch"` into
+    `_JOURNAL_ALIAS_FIELDS` instead and the board-advance row reddens on the status.
+    """
+    target_branch = "AcmeSecretIntegration"
+    unit_branch = "AcmeSecretUnit"
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    merges = [
+        diagnostics._scrub_entry(
+            {
+                "ts": 1.0,
+                "kind": kind,
+                "story_key": STORY_KEY,
+                "branch": unit_branch,
+                "target": target_branch,
+            },
+            pseudo,
+            {},
+            1.0,
+        )
+        for kind in ("unit-merge-started", "unit-merged", "resume-unit-merge")
+    ]
+    board = diagnostics._scrub_entry(
+        {
+            "ts": 2.0,
+            "kind": "board-advance-carried",
+            "story_key": STORY_KEY,
+            "target": "done",
+            "status": "done",
+        },
+        pseudo,
+        {},
+        1.0,
+    )
+
+    target_alias = next(
+        a for ns, orig, a in pseudo.entries() if ns == "branch" and orig == target_branch
+    )
+    unit_alias = next(
+        a for ns, orig, a in pseudo.entries() if ns == "branch" and orig == unit_branch
+    )
+    # every merge kind aliases the same target to the same alias — one branch, one alias,
+    # however many kinds name it
+    assert [m["target"] for m in merges] == [target_alias] * 3
+    # ...and the unit branch beside it stays DISTINGUISHABLE, so a maintainer can still
+    # read "this branch merged into that one" off the scrubbed record
+    assert [m["branch"] for m in merges] == [unit_alias] * 3
+    assert target_alias != unit_alias
+
+    # the other family keeps the same field verbatim: it is a sprint status, and
+    # aliasing it would destroy the only thing the record is read for
+    assert board["target"] == "done" and board["status"] == "done"
+    assert not [orig for ns, orig, _a in pseudo.entries() if ns == "branch" and orig == "done"]
+
+    rendered = json.dumps([*merges, board])
+    for canary in (target_branch, unit_branch, *CANARIES):
+        assert canary not in rendered, f"LEAK: {canary!r}"
+
+
 def test_structure_is_preserved(project):
     run_dir = _seed_run(project.project)
     diag, _pseudo, _combined = _render_all([run_dir])

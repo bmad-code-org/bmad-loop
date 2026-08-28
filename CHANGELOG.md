@@ -421,6 +421,21 @@ decisions` and the TUI decision modal now also catch the state-root failure that
 
 ### Security
 
+- **`bmad-loop diagnose` no longer ships a merge record's target branch verbatim** (#640).
+  The journal's `target` field carries a branch on `unit-merge-started`, `unit-merged` and
+  `resume-unit-merge` but a sprint status on the `board-advance-*` family, and per-field
+  routing is by field NAME — so the field was left unrouted and an identifier-shaped branch
+  name (`main`, `release`) passed through `scrub_json` into a bundle meant to be posted
+  publicly. The egress backstop only masked it: it repairs a value already in the legend, so
+  a run that journalled the same branch earlier was rescued while disclosing a
+  `backstop_repairs` gap, and a journal truncated past that event was not rescued at all.
+  Routing gains a narrow kind-scoped table for this one overloaded field; the sprint status
+  keeps rendering verbatim, since aliasing it would destroy what those records are read for.
+  The producers are deliberately NOT renamed —
+  `engine._replay_unlatched_ledger_carries` correlates the merge kinds on a tuple including
+  that field and reads journals written by earlier processes, so a rename would break the
+  carry replay across a version boundary.
+
 - **The run-archive staging temp is minted by `mkstemp` beside the destination — exclusive,
   `0600`, freshly named per attempt** (#591). The fixed temp name was created and unlinked by
   name, so a symlink planted there was followed and the cleanup could remove a concurrent
