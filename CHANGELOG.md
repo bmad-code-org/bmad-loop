@@ -70,7 +70,7 @@ breaking changes may land in a minor release.
   spec "could not be re-opened" and might re-wedge, while the file was correct. Re-arm now reads
   the status back to tell a failed write from nothing-to-write. The skip record no longer hides
   behind a successful git advance — nesting it there meant a project that is not a repo
-  reported only the git failure while the flip had no-opped for an unrelated reason.
+  reported only the git failure while the flip was a no-op for an unrelated reason.
 
 - **Re-arm warns when its spec writes cannot reach the re-drive** (#640). Under worktree
   isolation re-arm's status flip and baseline re-stamp land in a worktree the re-drive

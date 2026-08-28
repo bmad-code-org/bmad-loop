@@ -2783,8 +2783,16 @@ def test_resolve_echoes_the_residue_even_when_the_rearm_aborts(tmp_path, monkeyp
     but this line will tell them. The failure and the residue are both true, and the
     operator needs both to decide what to do with the tree.
 
-    Ablation: move `_echo_rearm_events` out of the `finally` back under the `try` and
-    the commits assertion reddens while the `error:` line still prints.
+    Ablation (residue echo): move `_echo_rearm_events` out of the `finally` back under
+    the `try` and the commits assertion reddens while the `error:` line still prints.
+
+    Ablation (success output): deleting the gate outright does NOT grade the last
+    assertion. Drop `return 1` from `cmd_resolve`'s `except runs.RearmError` arm and the
+    success line does leak to stdout, but `main` then answers 0 and the exit-code
+    assertion above reddens first, so this line is never reached — a bare rc is a
+    worthless oracle for an absent-output claim. The mutation that grades it keeps
+    `return 1` and adds `print(f"re-armed {story_key}")` to that arm:
+    `AssertionError: assert 're-armed' not in 're-armed s1\n'`.
     """
     from bmad_loop import runs
     from bmad_loop.journal import Journal
