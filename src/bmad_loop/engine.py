@@ -360,7 +360,7 @@ produces. If you end your turn without it, the session is eventually declared
 stalled and its work may be discarded."""
 
 
-def _session_task_id(story_key: str, part: str, seq: int, generation: int = 0) -> str:
+def _session_task_id(story_key: str, part: str, seq: int, generation: int) -> str:
     """Single composition point for session task ids. Sanitize the whole
     composition, not the parts: two individually capped parts can still compose
     past a Windows filename segment limit, and ``safe_segment``'s digest suffix
@@ -373,6 +373,12 @@ def _session_task_id(story_key: str, part: str, seq: int, generation: int = 0) -
     to a record the abandoned attempt already appended to ``task.sessions`` — and
     ``_resumable_session``, which scans that append-only list, replayed the
     abandoned attempt's verdict for the fresh one (#705).
+
+    REQUIRED, with no default, for the reason ``verify_dev_exclude_relpaths``' ``root``
+    is: an implicit ``generation=0`` is correct in every run that never re-armed — which
+    is nearly every test — and wrong only on the re-armed one, so a fourth mint site that
+    omitted it would look right everywhere it was exercised and silently re-open #705.
+    Requiring it turns OMISSION into a type error; it does not police a wrong value.
 
     The suffix is composed INSIDE the f-string, before ``safe_segment``, because
     the whole-composition cap and digest contract above is what makes the id a

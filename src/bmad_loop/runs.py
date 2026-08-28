@@ -17,7 +17,7 @@ import tarfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from . import devcontract, envvars, verify
 from .adapters.multiplexer import MultiplexerError, get_multiplexer, mux_usable
@@ -2327,6 +2327,31 @@ def rearm_escalation(
             task.spec_file = None
             task.sentinel_kind = ""  # verdict discharged; the re-dispatch is clean
         else:
+            # An isolated task's spec writes below land in the unit's WORKTREE
+            # (`_task_spec_path`) — which the re-drive destroys before reading
+            # anything. A re-armed task (phase PENDING, `defer_reason` cleared, and no
+            # resumable session because `generation` was just bumped) falls to
+            # `engine._finish_inflight`'s final arm, which calls `discard_worktree` and
+            # lets `_run_story` mount a fresh one. The re-driven session then resolves
+            # its spec through `verify.resolve_spec_path(task.spec_file,
+            # workspace.paths)` (`engine._dispatched_spec_for_attempt`), and under
+            # isolation `workspace.paths` is rebased onto that FRESH worktree, which
+            # checks out TRACKED files only. So the re-drive reads the COMMITTED spec.
+            #
+            # No working-tree write reaches it — not this one, and not a write to the
+            # main checkout either: the fresh worktree comes from git rather than from a
+            # copy of that tree, and `seed_adapter_defaults` seeds adapter config files,
+            # not the output folder. The channel that DOES work is the human committing
+            # the corrected spec from the resolve session, which runs with `cwd=project`.
+            # The writes below are kept (they are correct for the in-place case, and
+            # harmless here), but the operator is told — a flip that cannot land is
+            # exactly the silent re-wedge #640(b) exists to end.
+            if task.worktree_path:
+                journal.append(
+                    "rearm-spec-write-unreachable",
+                    story_key=key,
+                    spec_file=str(spec_path),
+                )
             try:
                 # Route /bmad-build-auto via the spec's frontmatter status (decision
                 # table): patch-restore -> in-review -> step-04 (resume review on
@@ -2341,10 +2366,27 @@ def rearm_escalation(
                 # that heading, so leaving it would let the re-driven session's first
                 # save of the spec parse as the prior attempt's terminal outcome.
                 devcontract.strip_auto_run_result(spec_path, confine_root=Path(state.project))
-                if not flipped:
-                    # `set_frontmatter_status` answers "nothing to change" with
-                    # `False`, never an exception — no file, no frontmatter block, no
-                    # top-level `status:`. Discarding that return is how the flip
+                # `set_frontmatter_status` answers "nothing to change" with `False`
+                # for FOUR causes, not three — its own docstring lists them: no file,
+                # no frontmatter block, no top-level `status:`, and ALREADY AT THE
+                # TARGET (`_edit_frontmatter_block` returns None on
+                # `original[key] == value`). Only the first three are failures. The
+                # fourth is an ordinary, fully-successful re-arm: a second resolve
+                # cycle on an already-flipped spec, or the documented
+                # `resolve --no-interactive` flow where a human fixed the spec
+                # themselves — the case the comment above calls "Independent of the
+                # resolve agent having set it". Journalling it fired the operator
+                # warning ("could not be re-opened … may re-wedge on it") on a spec
+                # that was byte-identical and CORRECT, which is the "trains the
+                # operator to scroll past the meaningful one" failure the re-stamp's
+                # `overwritten != old_baseline` guard exists to prevent one screen
+                # below. Read the status back to tell the two apart: `read_frontmatter`
+                # degrades a missing/unreadable/unparseable spec to `{}` and `status_of`
+                # then answers `""`, so all three real failures still record.
+                if not flipped and verify.status_of(verify.read_frontmatter(spec_path)) != (
+                    target_status
+                ):
+                    # Discarding that return is how the flip
                     # became a SILENT no-op: the re-drive is dispatched anyway, step-01
                     # reads the unchanged terminal status, routes the session to "ingest
                     # as context, do not resume", and the story re-wedges with nothing on
@@ -2545,7 +2587,7 @@ def rearm_escalation(
                 # is that it aborts here — the stale-baseline hazard this block exists
                 # to close is exactly what a swallowed write would leave behind.
                 raise RearmError(
-                    f"cannot re-stamp baseline_revision on {task.spec_file} "
+                    f"cannot re-stamp baseline_revision on {spec_path} "
                     f"({e.__class__.__name__}: {e}) — fix the file, then re-run resolve"
                 ) from e
             if overwritten and overwritten != old_baseline:
@@ -2558,9 +2600,9 @@ def rearm_escalation(
                 # fires on the routine case is the "trains the operator to scroll past
                 # the meaningful one" failure the `restore` split exists to prevent.
                 #
-                # What survives is the real signal: the spec claimed a baseline the run
-                # never recorded. On the from-scratch leg that is the only trace left of
-                # a divergence the gate can no longer report, because the re-stamp is
+                # What survives is the real signal, on BOTH legs: the spec claimed a
+                # baseline the run never recorded. That is the only trace left of a
+                # divergence the gate can no longer report, because the re-stamp is
                 # about to normalize it away.
                 journal.append(
                     "rearm-baseline-restamped",
@@ -2581,7 +2623,33 @@ def rearm_escalation(
     return key
 
 
-def rearm_event_notice(entry: dict[str, Any]) -> tuple[str, str, str] | None:
+def journal_entries_or_none(run_dir: Path) -> list[dict[str, Any]] | None:
+    """This run's journal entries, or ``None`` when the journal cannot be read.
+
+    The re-arm surfaces read the journal TWICE to diff what a re-arm appended, and
+    before that echo existed they read it not at all — so `Journal.entries()`' strict
+    UTF-8 decode would turn a corrupt journal into a re-arm the operator can no longer
+    perform, which is strictly worse than the missing echo and a regression against the
+    gesture's own history. Shared by `cli.cmd_resolve` and `TuiApp._do_rearm` rather
+    than living on one of them: the CLI's copy was left unguarded when the TUI's was
+    hardened, and the CLI's echo now runs from a `finally`, where a raise would replace
+    the `RearmError` the operator actually needs to see.
+
+    ``None`` rather than ``[]`` because the two callers DIFF two reads. Degrading a
+    failed FIRST read to ``[]`` sets the watermark to zero, and a second read that
+    succeeds then replays every historical `rearm-*`/`stale-restore-*` entry as if this
+    re-arm had just produced it. A caller that cannot establish both ends of the diff
+    must skip the echo, not guess at it.
+    """
+    try:
+        return Journal(run_dir).entries()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def rearm_event_notice(
+    entry: dict[str, Any],
+) -> tuple[Literal["note", "warning"], str, str] | None:
     """`(severity, message, next_step)` for a re-arm record an operator must see.
 
     ONE table, two surfaces. `cli._echo_rearm_events` prints `message` followed by
@@ -2630,6 +2698,15 @@ def rearm_event_notice(entry: dict[str, Any]) -> tuple[str, str, str] | None:
             "spec was deliberately NOT re-stamped",
             "Check the baseline before resuming",
         )
+    if kind == "rearm-spec-write-unreachable":
+        return (
+            "warning",
+            f"this story ran under worktree isolation, so the re-arm's spec writes "
+            f"({entry.get('spec_file', '?')}) land in a worktree the re-drive discards "
+            "— the re-driven session reads the COMMITTED spec, so commit the corrected "
+            "spec or the story re-wedges on the escalated attempt's status",
+            "Commit the corrected spec before resuming",
+        )
     if kind == "rearm-spec-flip-skipped":
         return (
             "warning",
@@ -2652,13 +2729,13 @@ def rearm_event_notice(entry: dict[str, Any]) -> tuple[str, str, str] | None:
             f"{str(entry.get('overwritten', '?'))[:12]}.. -> "
             f"{str(entry.get('baseline', '?'))[:12]}.."
         )
-        # Differentiated on the `restore` flag the record already carries, because the
-        # two legs mean different things. On the patch-restore leg an overwrite is
-        # ordinary; on the from-scratch leg the record is only written when the spec
-        # claimed a baseline the RUN never recorded, which is the last trace of a
-        # divergence the re-stamp is about to normalize away.
-        if entry.get("restore"):
-            return ("note", f"{head} — routine on a restore re-drive", "")
+        # NOT differentiated on the `restore` flag any more. That split predated the
+        # record's condition moving to `overwritten != old_baseline` (compared against
+        # what the RUN recorded, not against the just-advanced value): the record now
+        # fires ONLY when the spec claimed a baseline the run never recorded, which is
+        # equally exceptional on both legs. Keeping the split meant the patch-restore
+        # leg's real divergence was the one downgraded to a note. The flag stays ON the
+        # record because it says which leg produced it — not how routine it is.
         return (
             "warning",
             f"{head} — the spec claimed a DIFFERENT baseline than the run recorded, "

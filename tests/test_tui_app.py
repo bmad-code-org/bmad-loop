@@ -4181,6 +4181,67 @@ async def test_escalation_rearm_surfaces_the_kinds_it_used_to_drop(project, monk
     assert any("re-armed 1" in n[0] for n in notes)  # the ordinary notice still fires
 
 
+async def test_escalation_rearm_echoes_residue_when_the_rearm_aborts(project, monkeypatch):
+    """An aborted re-arm still surfaces what it already journalled — the CLI parity gap.
+
+    `runs._stale_restore_residue` journals BEFORE the re-stamp block that raises
+    `RearmError`, so on that path the records exist and the operator has to decide what
+    to do with the tree. `cli.cmd_resolve` echoes them from a `finally`; this surface
+    used to `return` inside the `except` and drop the whole family — including
+    `stale-restore-commits`, which `cli._echo_rearm_events`' own docstring calls the one
+    record a human must act on. The two surfaces had been unified on ROUTING while
+    still drifting on the abort path, and `docs/FEATURES.md` claimed they could not
+    drift at all.
+
+    Ablation: move the `self._echo_rearm_events(...)` call out of the `finally` and back
+    below the `try`, and this reddens — the commits warning never fires — while
+    `test_escalation_rearm_survives_a_corrupt_journal` still passes.
+    """
+    from bmad_loop import resolve, runs
+    from bmad_loop.journal import Journal
+    from bmad_loop.runs import RearmError
+
+    notes: list[str] = []
+    calls: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+
+    def fake_rearm(rd, sk):
+        # exactly the real ordering: residue journalled, THEN the abort
+        Journal(rd).append(
+            "stale-restore-commits", story_key=sk, old_baseline="f" * 40, commits=["c1"]
+        )
+        raise RearmError("cannot re-stamp baseline_revision on /x/spec.md")
+
+    monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
+    orig_notify = BmadLoopApp.notify
+    monkeypatch.setattr(
+        BmadLoopApp,
+        "notify",
+        lambda self, msg, **kw: notes.append(str(msg)) or orig_notify(self, msg, **kw),
+    )
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: needs a human decision on the auth scheme.",
+    )
+    marker = resolve.resolution_path(run_dir, "1")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{}", encoding="utf-8")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, EscalationModal)
+        await pilot.click(await ready(pilot, "#act-rearm"))
+        await until(pilot, lambda: any("re-arm failed" in n for n in notes))
+    # the abort is reported AND the residue it already wrote is surfaced
+    assert any("commit(s) sit below" in n for n in notes), notes
+    # ... and an aborted re-arm does not resume the run
+    assert calls == [], calls
+
+
 async def test_escalation_rearm_survives_a_corrupt_journal(project, monkeypatch):
     """An undecodable byte in journal.jsonl costs the echo, never the gesture.
 
@@ -4188,9 +4249,11 @@ async def test_escalation_rearm_survives_a_corrupt_journal(project, monkeypatch)
     that echo existed it read it not at all — so `Journal.entries()`' strict UTF-8
     decode would have turned a corrupt journal into a re-arm the operator can no
     longer perform. That is strictly worse than the missing echo it was added to
-    fix, and a regression against the gesture's own history. `_journal_entries_guarded`
-    degrades to `[]`; the dashboard already reads this same file with
-    `errors="replace"` everywhere else.
+    fix, and a regression against the gesture's own history. `runs.journal_entries_or_none`
+    (shared with `cli.cmd_resolve`) answers `None`, and `_echo_rearm_events` skips the
+    echo when either end of the diff is unreadable rather than replaying the journal
+    from zero; the dashboard already reads this same file with `errors="replace"`
+    everywhere else.
 
     Ablation: call `Journal(run_dir).entries()` directly in `_do_rearm` and this
     reddens — the UnicodeDecodeError escapes into the Textual worker and no

@@ -576,7 +576,31 @@ def test_rearm_records_leak_neither_the_code_root_nor_a_spec_name():
     assert restamped["overwritten"] != restamped["baseline"]
     assert restamped["restore"] is False  # a plain flag still ships
 
-    rendered = json.dumps([advance_failed, restamped])
+    # The OTHER three kinds `runs.rearm_escalation` journals `spec_file` on. Routing is
+    # by field NAME, so these ride the same `_JOURNAL_ALIAS_FIELDS` entry as
+    # `rearm-baseline-restamped` and are correct today for free — which is exactly why
+    # they belong in the sweep: the canary is what catches a field added to one of
+    # these kinds later, and a sweep that covers two of four grades the routing of a
+    # record shape nobody re-checks.
+    siblings = [
+        diagnostics._scrub_entry(
+            {"ts": 3.0, "kind": kind, "story_key": STORY_KEY, "spec_file": SPEC_ABS, **extra},
+            pseudo,
+            {},
+            1.0,
+        )
+        for kind, extra in (
+            ("rearm-spec-write-unreachable", {}),
+            ("rearm-spec-flip-skipped", {"status": "ready-for-dev"}),
+            ("rearm-baseline-restamp-skipped", {"baseline": SHA}),
+        )
+    ]
+    # every one of them aliases to the SAME alias as the restamped record above: one
+    # spec, one alias, however many kinds carry it
+    assert [s["spec_file"] for s in siblings] == [alias, alias, alias]
+    assert [orig for ns, orig, _a in pseudo.entries() if ns == "spec"] == [SPEC_NAME]
+
+    rendered = json.dumps([advance_failed, restamped, *siblings])
     for canary in (SHA, other_sha, SPEC_NAME, PROPRIETARY, HOME_PATH, *CANARIES):
         assert canary not in rendered, f"LEAK: {canary!r}"
 

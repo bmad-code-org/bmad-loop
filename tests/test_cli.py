@@ -2642,18 +2642,20 @@ def test_resolve_echoes_the_rearm_baseline_records(tmp_path, monkeypatch, capsys
     assert "re-stamped the spec baseline bbbbbbbbbbbb.. -> cccccccccccc.." in err
 
 
-def test_resolve_restamp_echo_distinguishes_the_two_legs(tmp_path, monkeypatch, capsys):
-    """The `restore` flag the record already carries decides which sentence prints.
+def test_resolve_restamp_echo_warns_on_both_legs(tmp_path, monkeypatch, capsys):
+    """The record fires only on a REAL divergence, so both legs warn.
 
-    It is journalled precisely because the two legs mean opposite things: on a
-    patch-restore re-drive an overwrite is the ORDINARY case (the spec still names
-    the pre-attempt sha), while on a from-scratch one it is the only surviving trace
-    of a divergence the gate can no longer report. One warning for both trains the
-    operator to scroll past the meaningful one.
+    The `restore` split predated the record's condition moving to
+    `overwritten != old_baseline` — compared against what the RUN recorded, not against
+    the value the advance just wrote. Under that condition the record is written only
+    when the spec claimed a baseline the run never recorded, which is equally
+    exceptional whichever leg produced it; keeping the old "routine on a restore
+    re-drive" note meant the patch-restore leg's genuine divergence was the one
+    downgraded. The flag stays ON the record to say which leg it was.
 
-    Ablation: collapse the `if entry.get("restore")` branch in
-    `runs.rearm_event_notice` back to one return and the `restore=True` assertion
-    reddens on the divergence wording appearing where nothing diverged.
+    Ablation: restore the `if entry.get("restore")` branch in `runs.rearm_event_notice`
+    and the `restore=True` leg reddens — it goes back to printing "routine" for a
+    divergence.
     """
     from bmad_loop import runs
     from bmad_loop.journal import Journal
@@ -2680,8 +2682,8 @@ def test_resolve_restamp_echo_distinguishes_the_two_legs(tmp_path, monkeypatch, 
         cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-interactive", "--resume"]) == 0
     )
     err = capsys.readouterr().err
-    assert "routine on a restore re-drive" in err
-    assert "DIFFERENT baseline" not in err
+    assert "DIFFERENT baseline" in err  # the restore leg is NOT exempt
+    assert "routine on a restore re-drive" not in err
 
     _escalated_run(tmp_path, "r2")
     monkeypatch.setattr(runs, "rearm_escalation", rearm_with(False))
@@ -2691,6 +2693,49 @@ def test_resolve_restamp_echo_distinguishes_the_two_legs(tmp_path, monkeypatch, 
     err = capsys.readouterr().err
     assert "DIFFERENT baseline" in err
     assert "routine on a restore re-drive" not in err
+    # both legs reached the same sentence; only the flag on the record differs
+
+
+@pytest.mark.parametrize("outcome", ["ok", "rearm-error"])
+def test_resolve_survives_a_corrupt_journal(tmp_path, monkeypatch, capsys, outcome):
+    """An undecodable byte in journal.jsonl costs the echo, never the gesture — and
+    never the exit code.
+
+    The counterpart to `test_escalation_rearm_survives_a_corrupt_journal` in the TUI,
+    which had no CLI twin: the TUI's reads were guarded while `cmd_resolve`'s two were
+    left calling `Journal(run_dir).entries()` straight, and the echo then MOVED into a
+    `finally`. On the `RearmError` path that `finally` runs before `return 1`, so a
+    raise from the echo would replace an actionable error with a traceback and swallow
+    the original — the one path where the residue matters most.
+
+    Ablation: call `Journal(run_dir).entries()` directly in `_echo_rearm_events` and
+    both legs redden — `ok` with a UnicodeDecodeError escaping `cmd_resolve`, and
+    `rearm-error` with the same, losing the `RearmError` message entirely.
+    """
+    from bmad_loop import runs
+    from bmad_loop.journal import JOURNAL_FILE
+
+    def fake_rearm(rd, key, *, restore_patch=None):
+        if outcome == "rearm-error":
+            raise runs.RearmError("cannot re-open story spec /x/spec.md")
+        return key
+
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+    monkeypatch.setattr(runs, "rearm_escalation", fake_rearm)
+    run_dir = _escalated_run(tmp_path, "r1")
+    (run_dir / JOURNAL_FILE).write_bytes(
+        b'{"ts": 1.0, "kind": "session-start", "task_id": "t1"}\n\xff\xfe not utf-8\n'
+    )
+
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-interactive", "--resume"])
+    err = capsys.readouterr().err
+
+    if outcome == "rearm-error":
+        # the operator gets the real error, not a decode traceback from the `finally`
+        assert rc == 1
+        assert "cannot re-open story spec" in err
+    else:
+        assert rc == 0
 
 
 def test_resolve_echoes_a_skipped_restamp(tmp_path, monkeypatch, capsys):

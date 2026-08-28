@@ -2088,7 +2088,9 @@ def test_session_task_id_is_byte_identical_at_generation_zero():
     Ablation: emit the suffix unconditionally and this reddens, which is the shape
     that would strand every existing run's session directory.
     """
-    assert _session_task_id("1-1-a", "dev", 1) == "1-1-a-dev-1"
+    # `generation` is REQUIRED, so there is no omitted spelling to assert: omitting it
+    # is a type error, which is the point (an implicit 0 is right in every run that
+    # never re-armed and silently re-opens #705 at a new mint site).
     assert _session_task_id("1-1-a", "dev", 1, 0) == "1-1-a-dev-1"
     assert _session_task_id("1-1-a", "dev", 1, 1) == "1-1-a-dev-1-g1"
     # composed INSIDE the f-string: the sanitizer still sees one whole segment, so
@@ -2131,7 +2133,7 @@ def test_resumable_session_ignores_a_pre_rearm_record(project):
     engine._save()
     engine._run_session(task, role="dev", prompt="p", seq=1)
     (stale,) = task.sessions
-    assert stale.task_id == _session_task_id(task.story_key, "dev", 1)
+    assert stale.task_id == _session_task_id(task.story_key, "dev", 1, 0)
     assert stale.status == "completed" and stale.result_json is not None
 
     # the human re-arm, then the re-drive's first dispatch, then a host kill in the
@@ -2410,7 +2412,11 @@ def test_dev_retry_notifies_the_operator_with_the_reason(project):
         for e in engine.journal.entries()
         if e["kind"] == "dev-decision" and e["action"] == "retry"
     ]
-    assert decision["reason"] in retries[0]
+    # the notice carries the reason's FIRST LINE, which is what `_notice_reason`
+    # promises — asserting the whole untrimmed reason passes only while that reason
+    # happens to stay single-line and under `NOTICE_REASON_MAX`, so it would go green
+    # for the wrong reason the moment a producer appended an evidence tail.
+    assert decision["reason"].splitlines()[0].strip() in retries[0]
 
 
 def test_token_budget_discounts_cache_reads(project):

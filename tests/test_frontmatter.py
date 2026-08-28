@@ -731,3 +731,62 @@ def test_set_frontmatter_status_refuses_a_readonly_spec(tmp_path):
 
     assert spec.read_bytes() == _PLAIN.encode("utf-8")
     assert list((root / "artifacts").glob("*.tmp")) == []  # a refusal stages nothing
+
+
+_FRESH = "b" * 40
+_STALE = "a" * 40
+
+
+@pytest.mark.parametrize(
+    "fm,expected",
+    [
+        # the key the skill actually stamps, alone
+        ({"baseline_revision": _FRESH}, _FRESH),
+        # legacy-only spec: the orchestrator's own name, kept readable
+        ({"baseline_commit": _STALE}, _STALE),
+        # THE #716 CASE. `rearm_escalation` inserts `baseline_revision` and never
+        # removes a pre-existing `baseline_commit`, so a re-armed spec carries both.
+        # The replaced expression was `fm.get("baseline_commit", fm.get(...))`, which
+        # ranked the leftover FIRST and failed an attempt that did everything right.
+        ({"baseline_revision": _FRESH, "baseline_commit": _STALE}, _FRESH),
+        # `dict.get`'s default fires only on a MISSING key, so an empty legacy value
+        # was SELECTED and yielded "" — which every consumer reads as "no claim",
+        # disabling the baseline-match gate outright.
+        ({"baseline_revision": _FRESH, "baseline_commit": ""}, _FRESH),
+        # the fallback is on the VALUE, not the key: an empty fresh key defers
+        ({"baseline_revision": "", "baseline_commit": _STALE}, _STALE),
+        # YAML-null on either key is absent, never the token "None" (#358)
+        ({"baseline_commit": None}, ""),
+        ({"baseline_revision": None, "baseline_commit": _STALE}, _STALE),
+        ({"baseline_revision": None, "baseline_commit": None}, ""),
+        # A YAML boolean is the same trap class: PyYAML resolves `no`/`off`/`false`
+        # to False, `str(False)` is the token "False", and the truthiness test runs on
+        # that STRING — so an unguarded bool reads back as a claimed sha.
+        ({"baseline_revision": False}, ""),
+        ({"baseline_revision": True}, ""),
+        ({"baseline_commit": False}, ""),
+        # the sharp case: a bool on the WINNING key must defer to a valid legacy sha
+        # rather than shadow it. Unguarded this returns "False", which the gate's
+        # non-empty filter admits and `_canonical_commit_oid` then rejects — refusing
+        # an attempt whose correct baseline was sitting on the very next line.
+        ({"baseline_revision": False, "baseline_commit": _STALE}, _STALE),
+        ({"baseline_revision": True, "baseline_commit": _STALE}, _STALE),
+        ({"baseline_revision": f"  {_FRESH}  "}, _FRESH),  # stripped
+        ({}, ""),  # claims nothing
+        ({"baseline_revision": 123}, "123"),  # a non-string scalar still reads back
+    ],
+)
+def test_auto_dev_baseline_of_precedence(fm, expected):
+    """The one reader both consumers of a claimed baseline go through (#716).
+
+    Lives here rather than in `test_verify.py` (which reached it through verify's
+    re-export) because AGENTS.md has the flat `tests/` mirror src modules by name and
+    the symbol is defined in `frontmatter.py`.
+
+    Ablation for the negative rows: delete the ``raw is None`` guard and the
+    YAML-null rows read back the token ``"None"``; delete the ``isinstance(raw, bool)``
+    guard and the boolean rows read back ``"True"``/``"False"``, including in place of
+    the legacy sha they must defer to; delete the ``if value:`` guard and the
+    empty-legacy-key row reads back ``""``.
+    """
+    assert frontmatter.auto_dev_baseline_of(fm) == expected

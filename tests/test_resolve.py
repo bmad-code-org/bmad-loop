@@ -617,36 +617,108 @@ def test_rearm_strips_stale_terminal_section(tmp_path):
     assert devcontract.find_result_artifact(tmp_path, since_ns=0) is None
 
 
-@pytest.mark.parametrize("frontmatter", [True, False])
-def test_rearm_journals_a_status_flip_that_silently_did_nothing(tmp_path, frontmatter):
-    """`verify.set_frontmatter_status` answers "nothing to change" with `False`, never
-    an exception — no file, no frontmatter block, no top-level `status:`. Its return
-    was DISCARDED, so on such a spec the flip no-opped invisibly: the re-drive was
-    dispatched anyway, step-01 read the unchanged terminal status, routed the session
-    to "ingest as context, do not resume", and the story re-wedged with nothing on the
-    record explaining why. The `FrontmatterWriteError` arm below it covers only the
-    shapes that RAISE; this covers the ones that lie quietly.
+def test_rearm_warns_when_an_isolated_tasks_spec_writes_cannot_reach_the_redrive(tmp_path):
+    """A worktree-isolated task's spec writes land in a directory the re-drive destroys.
 
-    Graded on a spec that EXISTS and is readable but carries no `---` block: the writer
-    returns False and leaves the file byte-identical, so the record is the ONLY thing
-    that distinguishes this from a flip that landed. The `frontmatter=True` leg is the
-    control — an ordinary spec must not produce the record, or the row would pass for a
-    guard that fires on everything.
+    `_task_spec_path` re-anchors the recorded spec on `task.worktree_path`, but a
+    re-armed task falls to `engine._finish_inflight`'s final arm, which calls
+    `discard_worktree` and lets `_run_story` mount a fresh one — and the re-driven
+    session resolves its spec against THAT worktree
+    (`engine._dispatched_spec_for_attempt` -> `verify.resolve_spec_path(...,
+    workspace.paths)`, rebased onto the mount under isolation), which checks out tracked
+    files only. So the re-drive reads the COMMITTED spec and no working-tree write
+    reaches it — the main checkout's copy included. The writes stay (they are correct
+    in-place, harmless here); the operator is told, because a flip that cannot land is
+    the silent re-wedge #640(b) exists to end.
 
-    Ablation: delete the `if not flipped:` append and the `False` leg reddens with
-    `ValueError: not enough values to unpack (expected 1, got 0)` while the control
-    still passes.
+    Ablation: delete the `if task.worktree_path:` append and this reddens while the
+    no-worktree control still passes.
     """
     _resolve_repo(tmp_path)
     spec = tmp_path / "spec.md"
-    spec.write_text(SPEC if frontmatter else "# Spec\n\nno frontmatter block\n", encoding="utf-8")
+    spec.write_text(SPEC, encoding="utf-8")
+    run_dir, _, _ = _escalated_run(
+        tmp_path, spec_file=str(spec), worktree_path=str(tmp_path / "wt" / "u1")
+    )
+
+    runs.rearm_escalation(run_dir)
+
+    (rec,) = [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-write-unreachable"]
+    assert rec["story_key"] == "6-4-cli-list-command"
+    assert rec["spec_file"] == str(spec)
+    # and it is routed to BOTH operator surfaces, not journal-only
+    severity, message, next_step = runs.rearm_event_notice(
+        {"kind": "rearm-spec-write-unreachable", **rec}
+    )
+    assert severity == "warning"
+    assert "commit the corrected spec" in message
+    assert next_step
+
+
+def test_rearm_does_not_warn_about_unreachable_writes_without_a_worktree(tmp_path):
+    """The control for the row above: the in-place case is where those writes DO land,
+    so a record there would fire on every ordinary re-arm."""
+    _resolve_repo(tmp_path)
+    spec = tmp_path / "spec.md"
+    spec.write_text(SPEC, encoding="utf-8")
+    run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec))
+
+    runs.rearm_escalation(run_dir)
+
+    assert [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-write-unreachable"] == []
+
+
+@pytest.mark.parametrize("shape", ["ordinary", "no-frontmatter", "already-at-target"])
+def test_rearm_journals_a_status_flip_that_silently_did_nothing(tmp_path, shape):
+    """`verify.set_frontmatter_status` answers "nothing to change" with `False`, never
+    an exception. Its return was DISCARDED, so on such a spec the flip no-opped
+    invisibly: the re-drive was dispatched anyway, step-01 read the unchanged terminal
+    status, routed the session to "ingest as context, do not resume", and the story
+    re-wedged with nothing on the record explaining why. The `FrontmatterWriteError`
+    arm below it covers only the shapes that RAISE; this covers the ones that lie
+    quietly.
+
+    `False` has FOUR causes, not three — no file, no frontmatter block, no top-level
+    `status:`, and ALREADY AT THE TARGET — and only the first three are failures. Three
+    legs, so the record is graded on the distinction rather than on the bool:
+
+    - `no-frontmatter` — a spec that EXISTS and is readable but carries no `---` block:
+      the writer returns False and leaves the file byte-identical, so the record is the
+      ONLY thing that distinguishes this from a flip that landed.
+    - `ordinary` — the control. A spec that really moves must not produce the record, or
+      the row would pass for a guard that fires on everything.
+    - `already-at-target` — the REGRESSION leg. A second re-arm, or
+      `resolve --no-interactive` after a human fixed the spec, hits a spec already at
+      `ready-for-dev`. The writer returns False and the operator used to be warned the
+      spec "could not be re-opened" and might re-wedge, while the file was correct.
+
+    Ablation: delete the `if not flipped ...` append and the `no-frontmatter` leg
+    reddens with `ValueError: not enough values to unpack (expected 1, got 0)` while
+    both other legs still pass. Drop the `status_of(read_frontmatter(...)) != target`
+    conjunct and `already-at-target` reddens alone — which is the discrimination this
+    row exists for.
+    """
+    _resolve_repo(tmp_path)
+    spec = tmp_path / "spec.md"
+    body = {
+        "ordinary": SPEC,
+        "no-frontmatter": "# Spec\n\nno frontmatter block\n",
+        "already-at-target": SPEC.replace("status: in-review", "status: ready-for-dev"),
+    }[shape]
+    assert shape != "already-at-target" or "status: ready-for-dev" in body  # fixture is real
+    spec.write_text(body, encoding="utf-8")
     before = spec.read_bytes()
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec))
 
     runs.rearm_escalation(run_dir)
 
     records = [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-flip-skipped"]
-    if frontmatter:
+    if shape == "already-at-target":
+        # the ordinary re-arm of an already-correct spec: no record, and the status the
+        # re-drive needs is exactly what it was
+        assert records == []
+        assert verify.read_frontmatter(spec)["status"] == "ready-for-dev"
+    elif shape == "ordinary":
         assert records == []
         assert verify.read_frontmatter(spec)["status"] == "ready-for-dev"
     else:

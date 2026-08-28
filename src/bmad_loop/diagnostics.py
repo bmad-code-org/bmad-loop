@@ -130,8 +130,12 @@ _JOURNAL_ALIAS_FIELDS = {
     # the value is normalized first: the producers do NOT agree on a bare basename.
     "spec": "spec",
     # The same value also arrives under a second field NAME. `runs.rearm_escalation`
-    # is the only journal producer of `spec_file` (its `rearm-baseline-restamped` and
-    # `rearm-baseline-restamp-skipped` kinds); `engine._park_awaiting_operator` passes
+    # is the only journal producer of `spec_file`, across FOUR kinds —
+    # `rearm-spec-write-unreachable`, `rearm-spec-flip-skipped`,
+    # `rearm-baseline-restamp-skipped` and `rearm-baseline-restamped`. Routing is by
+    # field NAME, not by kind, so the list is documentation rather than a gate — but an
+    # enumeration that undercounts is how the next reader concludes a kind is unrouted.
+    # `engine._park_awaiting_operator` passes
     # `spec_file=` to `operatoractions.record_park`, which is a record file, not the
     # journal. So the divergence is BETWEEN FIELDS, not between two producers of this
     # one: `spec` carries absolute paths from engine's reconcile and marker-repair

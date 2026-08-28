@@ -64,15 +64,33 @@ breaking changes may land in a minor release.
   Separately, both frontmatter writers answer a spec they cannot move with `False` rather than an
   exception, and those returns were discarded: an unreadable spec now journals
   `rearm-baseline-restamp-skipped`, and a flip that silently did nothing journals
-  `rearm-spec-flip-skipped`. The skip record no longer hides behind a successful git advance —
+  `rearm-spec-flip-skipped` — but only when the flip genuinely failed. `set_frontmatter_status`
+  answers `False` for four causes, not three, and the fourth is _already at the target_: an
+  ordinary second re-arm, or `resolve --no-interactive` after a human fixed the spec, was told its
+  spec "could not be re-opened" and might re-wedge, while the file was correct. Re-arm now reads
+  the status back to tell a failed write from nothing-to-write. The skip record no longer hides
+  behind a successful git advance —
   nesting it there meant a project that is not a repo reported only the git failure while the
   flip had no-opped for an unrelated reason.
 
-- **The re-arm baseline records reach the TUI operator too** (#640). `bmad-loop resolve` echoed
+- **Re-arm warns when its spec writes cannot reach the re-drive** (#640). Under worktree
+  isolation the recorded spec is re-anchored on the unit's worktree — which the re-drive
+  destroys: a re-armed task is discarded and re-mounted, and the re-driven session resolves its
+  spec against the FRESH worktree, which checks out tracked files only. So the re-drive reads the
+  committed spec, and no working-tree write reaches it — the main checkout's copy included, since
+  the fresh worktree comes from git rather than from a copy of that tree. Re-arm now journals
+  `rearm-spec-write-unreachable` and both surfaces tell the operator to commit the corrected spec.
+
+- **The re-arm baseline records reach the TUI operator too** (#640). The two surfaces now also
+  agree on the ABORT path: `resolve` echoed the residue a half-run re-arm had already journalled
+  while the TUI returned silently, losing `stale-restore-commits` exactly where it matters most.
+  Both read the journal through one shared guard, so a corrupt journal costs the echo on either
+  surface and never the gesture — and neither replays the whole journal when a read degrades. `bmad-loop resolve` echoed
   the advance-failure and re-stamp records; the TUI's re-arm — which resumes the run in the same
   gesture — printed only `re-armed <key>`. It now raises the same warnings before resuming. The
-  re-stamp notice is also differentiated on the `restore` flag it already carried: routine on a
-  patch-restore re-drive, a real divergence signal on a from-scratch one.
+  re-stamp notice warns on both legs: the record fires only when the spec claimed a baseline the
+  run never recorded, which is equally exceptional whichever leg produced it. The `restore` flag
+  stays on the record to say which leg that was.
 
 - **`bmad-loop resolve` re-stamps the spec's `baseline_revision` on both re-drive legs**
   (#640), not only on a patch-restore. A from-scratch re-drive used to carry the escalated

@@ -12,7 +12,7 @@ import sys
 import time
 from enum import IntEnum
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from . import (
     __version__,
@@ -2740,7 +2740,7 @@ def _resolve_restore_patch(
     return str(patch), None
 
 
-def _echo_rearm_events(run_dir: Path, seen_entries: int) -> None:
+def _echo_rearm_events(run_dir: Path, before: list[dict[str, Any]] | None) -> None:
     """Surface the events a just-completed re-arm journaled: the `stale-restore-*`
     residue of the restore attempt it abandoned (runs._stale_restore_residue), and the
     `rearm-*` records the status flip, the advance and the re-stamp write. The commits
@@ -2762,7 +2762,14 @@ def _echo_rearm_events(run_dir: Path, seen_entries: int) -> None:
     contract (a project that is not a repo must not fail re-arm), so without an echo
     the whole degrade is journal-only — the invisibility #640(b) exists to end, not to
     relocate."""
-    for entry in Journal(run_dir).entries()[seen_entries:]:
+    after = runs.journal_entries_or_none(run_dir)
+    if before is None or after is None:
+        # Either end of the diff is unreadable, so there is no trustworthy "new since
+        # the re-arm" window. Skip rather than guess: this runs from a `finally`, and a
+        # raise here would replace the `RearmError` the operator needs, while treating a
+        # failed read as "no entries seen" would replay the whole journal as new.
+        return
+    for entry in after[len(before) :]:
         notice = runs.rearm_event_notice(entry)
         if notice is None:
             continue
@@ -2871,7 +2878,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     if args.resume is None and not _confirm(f"re-arm {story_key} and resume run {args.run_id}?"):
         print("cancelled — run is still paused at the escalation")
         return 0
-    seen_entries = len(Journal(run_dir).entries())
+    before_entries = runs.journal_entries_or_none(run_dir)
     try:
         runs.rearm_escalation(run_dir, story_key, restore_patch=restore_patch)
     except runs.RearmError as e:
@@ -2884,7 +2891,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         # `stale-restore-commits`, the one record whose whole point is that nothing
         # else will tell the human. An abort is when that residue matters most: the
         # re-arm half-ran and the operator has to decide what to do with the tree.
-        _echo_rearm_events(run_dir, seen_entries)
+        _echo_rearm_events(run_dir, before_entries)
     print(
         f"re-armed {story_key}"
         + (" (restoring the attempted change for review)" if restore_patch else "")

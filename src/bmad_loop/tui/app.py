@@ -25,7 +25,7 @@ from tomlkit.exceptions import ParseError
 
 from .. import bmadconfig, decisions, devcontract, policy, resolve, runs, stories, verify
 from ..adapters.multiplexer import MultiplexerError, mux_usable
-from ..journal import Journal, load_state
+from ..journal import load_state
 from ..model import (
     PAUSE_EPIC_BOUNDARY,
     PAUSE_ESCALATION,
@@ -821,23 +821,27 @@ class BmadLoopApp(App[None]):
         self.notify("plan reset to draft — the next dispatch re-plans")
         self._do_resume(run_id)
 
-    @staticmethod
-    def _journal_entries_guarded(run_dir: Path) -> list[dict[str, Any]]:
-        """Journal entries, or `[]` when the journal cannot be read.
+    def _echo_rearm_events(self, run_dir: Path, before: list[dict[str, Any]] | None) -> None:
+        """Toast the re-arm records `cli._echo_rearm_events` prints, same table.
 
-        `_do_rearm` reads the journal twice to diff what a re-arm appended, and before
-        that echo existed it read it not at all. `Journal.entries()` decodes strict
-        UTF-8 and `Journal.__init__` mkdirs the run dir, so an undecodable byte or an
-        unreadable directory would turn a corrupt journal into a re-arm the operator
-        can no longer perform — a strictly worse failure than the missing echo, and a
-        regression against the gesture's own history. Degrading to `[]` costs the echo
-        and keeps the action; the dashboard already decodes this same file with
-        `errors="replace"` everywhere else it reads it.
+        Reads through `runs.journal_entries_or_none`, shared with the CLI so the two
+        surfaces cannot drift on robustness the way they drifted on routing. Both ends
+        of the diff must be readable: a failed FIRST read degraded to `[]` would set the
+        watermark to zero and replay every historical record as a fresh toast, so an
+        unreadable journal costs the echo and keeps the gesture.
+
+        The table's `next_step` is deliberately dropped: it reads "... before
+        resuming", and this path resumes in the same gesture.
         """
-        try:
-            return Journal(run_dir).entries()
-        except (OSError, UnicodeDecodeError):
-            return []
+        after = runs.journal_entries_or_none(run_dir)
+        if before is None or after is None:
+            return
+        for entry in after[len(before) :]:
+            notice = runs.rearm_event_notice(entry)
+            if notice is None:
+                continue
+            severity, message, _next_step = notice
+            self.notify(message, severity="warning" if severity == "warning" else "information")
 
     def _do_rearm(
         self, run_id: str, run_dir: Path, story_key: str, *, restore_recorded: bool = False
@@ -846,29 +850,23 @@ class BmadLoopApp(App[None]):
         path (rearm_escalation handles sentinel auto-delete-with-preservation)."""
         if self._resolve_blocked_by_liveness(run_id, run_dir):
             return
-        seen_entries = len(self._journal_entries_guarded(run_dir))
+        before_entries = runs.journal_entries_or_none(run_dir)
         try:
             runs.rearm_escalation(run_dir, story_key)
         except RearmError as e:
             self.notify(f"re-arm failed: {e}", severity="error")
             return
-        # The same records `cli._echo_rearm_events` prints, routed through the same
-        # table (`runs.rearm_event_notice`) so the two surfaces cannot drift apart
-        # again. This loop used to carry its own copy of the routing and handled three
-        # kinds where the CLI handled six — silently dropping the `stale-restore-*`
-        # family, including the `commits` warning the CLI's own docstring calls the one
-        # a human must act on. All of it is warn-only by contract, so without an echo
-        # the degrade is journal-only on the path that RESUMES in the same gesture —
-        # the invisibility #640(b) exists to end, not to relocate to the other caller.
-        #
-        # The table's `next_step` is deliberately dropped here: it reads "... before
-        # resuming", and this path resumes immediately below.
-        for entry in self._journal_entries_guarded(run_dir)[seen_entries:]:
-            notice = runs.rearm_event_notice(entry)
-            if notice is None:
-                continue
-            severity, message, _next_step = notice
-            self.notify(message, severity="warning" if severity == "warning" else "information")
+        finally:
+            # In the `finally`, matching `cli.cmd_resolve`. `_stale_restore_residue`
+            # journals BEFORE the re-stamp block that raises `RearmError`, so on that
+            # path the records were already written and returning early threw them
+            # away — including `stale-restore-commits`, the one record whose whole
+            # point is that nothing else will tell the human. This surface used to
+            # `return` there while the CLI echoed, so the two DID drift on the abort
+            # path even after they were unified on routing — and an abort is when the
+            # residue matters most: the re-arm half-ran and the operator has to decide
+            # what to do with the tree.
+            self._echo_rearm_events(run_dir, before_entries)
         if restore_recorded:
             self.notify(
                 "recorded restore patch NOT honored — this re-arm re-drives from "
