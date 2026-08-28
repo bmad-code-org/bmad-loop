@@ -866,7 +866,7 @@ class BmadLoopApp(App[None]):
         # it, but this gesture re-arms BEFORE it resumes, so the mirror has to be aimed
         # here or the re-arm advances the baseline in the tree the run has left.
         try:
-            code_root = bmadconfig.load_paths(self.project).repo_root
+            paths = bmadconfig.load_paths(self.project)
         except (bmadconfig.BmadConfigError, OSError) as e:
             self.notify(
                 f"cannot read the project config to confirm the code root ({e}) — "
@@ -874,7 +874,28 @@ class BmadLoopApp(App[None]):
                 severity="warning",
             )
         else:
-            if (moved := runs.restamp_code_root(run_dir, code_root)) is not None:
+            # Same hoist as `cli.cmd_resolve`, for the same reason: this gesture
+            # re-arms and THEN resumes, so the isolation refusal the detached CLI makes
+            # in `_resume_paused_run` landed after the re-stamp had persisted the
+            # unsupported root and `rearm_escalation` had advanced the attempt baseline
+            # against it. The operator saw "re-armed <story>" and then a pane that
+            # refused, with the story no longer escalated for `resolve` to correct.
+            #
+            # An unreadable policy falls THROUGH to the re-arm rather than blocking,
+            # matching this surface's launch guard above: the check cannot tell "no
+            # conflict" from "could not look", and the detached CLI reads the same file
+            # and fails loudly on it. `paths` is already in hand, so only the policy
+            # read is guarded here.
+            try:
+                conflict = bmadconfig.worktree_isolation_conflict(
+                    paths, policy.load(self.project / POLICY_FILE).scm.isolation
+                )
+            except (policy.PolicyError, OSError):
+                conflict = None
+            if conflict is not None:
+                self.notify(conflict, severity="error")
+                return
+            if (moved := runs.restamp_code_root(run_dir, paths.repo_root)) is not None:
                 self.notify(moved, severity="warning")
         before_entries = runs.journal_entries_or_none(run_dir)
         hold_resume = False

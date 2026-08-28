@@ -2650,6 +2650,53 @@ def test_resolve_declined_at_the_confirm_leaves_the_code_root_for_resume(
     assert "code root" not in capsys.readouterr().err
 
 
+def test_resolve_refuses_worktree_isolation_before_it_mutates_anything(
+    project, monkeypatch, capsys
+):
+    """`resolve` re-arms and THEN resumes, so the isolation refusal `_resume_paused_run`
+    makes used to land after the whole re-arm had already been persisted.
+
+    On `isolation = "worktree"` beside a `repo_root` override, the re-stamp wrote the
+    unsupported root onto the mirror and `rearm_escalation` then advanced the attempt
+    baseline — and re-stamped the spec's `baseline_revision` — against it, all before
+    the refusal at the bottom of the command returned 1. The escalation was spent
+    either way: the story came back PENDING, and `resolve` needs an ESCALATED story, so
+    the operator could not re-run it to undo the damage after fixing the config.
+
+    It also made a configuration reachable that `runs.rearm_escalation` documents as
+    unreachable — it reads the code tree's HEAD on the stated premise that
+    `repo_root == project` "in every reachable configuration", which is true only
+    BECAUSE this refusal exists.
+
+    Both post-conditions are asserted, because a refusal that merely returns 1 is not
+    the fix — writing nothing is. `_resolve_run_with_a_moved_code_root` stubs
+    `_resume_paused_run` to 0, so the rc can only come from the hoisted check.
+
+    Ablation: move the `_reject_isolation_conflict(...)` call below the
+    `runs.restamp_code_root(...)` line and the persisted-root assertion reddens; delete
+    it outright and the rc assertion reddens too.
+    """
+    from bmad_loop import runs
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    run_dir, _moved, recorded = _resolve_run_with_a_moved_code_root(project, monkeypatch)
+    _write_policy(project.project, ISOLATION_WORKTREE_POLICY)
+    monkeypatch.setattr(
+        runs,
+        "rearm_escalation",
+        lambda *a, **k: pytest.fail("re-armed under a configuration the run refuses"),
+    )
+
+    argv = ["resolve", "--project", str(project.project), "r1", "--no-interactive", "--resume"]
+    assert cli.main(argv) == 1
+
+    assert REFUSAL in capsys.readouterr().err
+    state = load_state(run_dir)
+    assert state.repo_root == str(recorded)  # the mirror was never re-pointed
+    assert state.tasks["s1"].phase == Phase.ESCALATED  # still armed for a corrected config
+
+
 def test_resolve_degrades_when_the_config_cannot_name_the_code_root(tmp_path, monkeypatch, capsys):
     """Reading config.yaml to learn the tree is an OBSERVATION, so it degrades: without
     it this process cannot name the code root, and re-pointing the mirror at a guess is

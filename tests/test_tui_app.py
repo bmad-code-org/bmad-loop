@@ -4149,6 +4149,74 @@ async def test_escalation_rearm_aims_the_code_root_before_it_rearms(project, mon
     assert any("the code root in _bmad/bmm/config.yaml has changed" in n for n in notes)
 
 
+async def test_escalation_rearm_refuses_the_isolation_conflict_before_it_mutates(
+    project, monkeypatch
+):
+    """Parity with `cli.cmd_resolve` on the hoisted refusal, and for the same reason this
+    surface needed the re-stamp parity above: it re-arms and resumes in ONE click.
+
+    The detached CLI refuses `isolation = "worktree"` beside a `repo_root` override, but
+    it does so in `_resume_paused_run` — downstream of everything this gesture has
+    already written. So the re-stamp persisted the unsupported root, `rearm_escalation`
+    advanced the attempt baseline against it, the operator was toasted "re-armed 1", and
+    only then did the resumed pane refuse. The story was PENDING by then, and `resolve`
+    needs an ESCALATED story, so the escalation could not be recovered by re-running it.
+
+    Asserted against the sole producer of the text rather than a literal, matching the
+    launch guard's row, so a reworded message cannot drift this away from the CLI's.
+
+    Ablation: delete the `conflict is not None` arm from `_do_rearm` and this reddens on
+    the re-arm that must not happen; move it below the `runs.restamp_code_root(...)` call
+    and it reddens on the persisted root instead.
+    """
+    from bmad_loop import bmadconfig, resolve, runs
+    from bmad_loop.journal import load_state, save_state
+
+    calls: list[str] = []
+    notes: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    monkeypatch.setattr(
+        runs,
+        "rearm_escalation",
+        lambda *a, **k: pytest.fail("re-armed under a configuration the run refuses"),
+    )
+    orig_notify = BmadLoopApp.notify
+    monkeypatch.setattr(
+        BmadLoopApp,
+        "notify",
+        lambda self, msg, **kw: notes.append(str(msg)) or orig_notify(self, msg, **kw),
+    )
+    _split_root_tui_project(project)
+    expected = bmadconfig.worktree_isolation_conflict(
+        bmadconfig.load_paths(project.project), "worktree"
+    )
+    assert expected is not None, "the fixture really does carry the conflicting pair"
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: needs a human decision on the auth scheme.",
+    )
+    recorded = str(project.project / "old-code")
+    state = load_state(run_dir)
+    state.repo_root = recorded
+    save_state(run_dir, state)
+    marker = resolve.resolution_path(run_dir, "1")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{}", encoding="utf-8")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, EscalationModal)
+        await pilot.click(await ready(pilot, "#act-rearm"))
+        await until(pilot, lambda: expected in notes)
+
+    assert not calls  # the resume folded into this gesture never fired
+    assert load_state(run_dir).repo_root == recorded  # the mirror was never re-pointed
+
+
 async def test_escalation_rearm_surfaces_the_kinds_it_used_to_drop(project, monkeypatch):
     """Every kind the shared table routes reaches this surface — not the three the
     TUI's own copy of the chain happened to handle.

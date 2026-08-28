@@ -2944,7 +2944,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     # AFTER the confirm, deliberately: a cancelled resolve writes nothing, so the
     # divergence is still there for `resume` to report on its own terms.
     try:
-        code_root = bmadconfig.load_paths(project).repo_root
+        paths = bmadconfig.load_paths(project)
     except (bmadconfig.BmadConfigError, OSError) as e:
         # An observation, so it degrades: without the config this process cannot NAME
         # the tree, and re-pointing the mirror at a guess is the one outcome worse than
@@ -2958,7 +2958,33 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     else:
-        if (moved := runs.restamp_code_root(run_dir, code_root)) is not None:
+        # The SAME refusal `_resume_paused_run` makes, hoisted ahead of both writes
+        # below — because aiming the mirror at the tree config.yaml names is only
+        # correct for a configuration the orchestrator will actually run, and this is
+        # not one. `worktree_isolation_conflict` fires exactly when `repo_root` is an
+        # override beside `isolation = "worktree"`, so on that config the re-stamp
+        # persisted the unsupported root and `rearm_escalation` then advanced the
+        # attempt baseline (and re-stamped the spec's `baseline_revision`) against it
+        # — all of it before `_resume_paused_run` at the bottom of this function
+        # reached the refusal and returned 1.
+        #
+        # Everything about that was spent: the operator was told "re-armed <story>"
+        # and then refused, and the story was no longer ESCALATED, so `resolve` — which
+        # requires an escalation — could not re-run to correct it. The escalation was
+        # burned on a gesture the orchestrator had already decided it would not honor.
+        #
+        # It also falsified the premise the baseline advance is built on. `runs`
+        # reasons that `repo_root == project` "in every reachable configuration"
+        # BECAUSE this refusal exists, and reads the code tree's HEAD on that basis;
+        # a path that mutates first and refuses second made the unreachable
+        # configuration reachable, in the one function that had ruled it out.
+        #
+        # Ordered after the confirm with the re-stamp, not before it: a cancelled
+        # resolve still writes nothing, and an operator who declines is not owed a
+        # config lecture about a gesture they did not make.
+        if (rc := _reject_isolation_conflict(paths, pol)) is not None:
+            return rc
+        if (moved := runs.restamp_code_root(run_dir, paths.repo_root)) is not None:
             print(f"warning: {moved}", file=sys.stderr)
     before_entries = runs.journal_entries_or_none(run_dir)
     hold_resume = False

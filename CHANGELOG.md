@@ -63,7 +63,11 @@ breaking changes may land in a minor release.
   in the new one, with no error anywhere. Both now re-stamp through one shared writer, after the
   confirm — so a cancelled resolve still leaves the divergence for `resume` to report — and each
   warns that the run has changed repositories. A config this process cannot read degrades to the
-  root the run recorded, and says so.
+  root the run recorded, and says so. The #414 isolation refusal is hoisted alongside it, ahead of
+  both writes: under `isolation = "worktree"` beside a `repo_root` override, both surfaces used to
+  re-stamp, advance the attempt baseline and report "re-armed" before resume refused the
+  configuration — spending an escalation `resolve` could no longer re-run, since the story was no
+  longer escalated.
 
 - **Re-arm refuses a story spec it cannot re-open, instead of re-driving onto a status the session
   cannot route** (#640). A spec carrying no top-level `status:` failed the flip silently: the
