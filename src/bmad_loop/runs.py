@@ -2587,12 +2587,25 @@ def rearm_escalation(
             # company as soon as the operator checks out another branch while the
             # escalation is paused, and this record now holds the resume.
             #
-            # `base` rides along because the remedy needs it: on exactly the shape the
-            # ref fix rescues, "commit the corrected spec" without a branch sends the
-            # operator to commit again on the branch the re-drive does not read, and the
-            # next re-arm prints the same sentence. Empty for the migrated shape
+            # The branch rides along because the remedy needs it: on exactly the shape
+            # the ref fix rescues, "commit the corrected spec" without a branch sends
+            # the operator to commit again on the branch the re-drive does not read, and
+            # the next re-arm prints the same sentence. Empty for the migrated shape
             # `_redrive_base_ref` degrades to `HEAD` for, and the notice drops the
             # clause rather than naming a ref it cannot source.
+            #
+            # Spelled `target_branch` and NOT `base`, because `diagnostics` routes the
+            # scrub by field NAME: `target_branch` is already in `_JOURNAL_ALIAS_FIELDS`
+            # under the `branch` namespace (with no journal producer until now), while
+            # any new spelling falls through to `scrub_json`, which waves an
+            # identifier-shaped branch name through verbatim. In a normal run
+            # `ensure_target_branch` has already journalled the same string as `branch`,
+            # so the egress backstop would repair it and disclose a `backstop_repairs`
+            # routing gap; in a truncated journal missing that event nothing would catch
+            # it and the branch would ship in a shareable bundle. `target` — the
+            # spelling the merge kinds use — is NOT available: `board-advance-*` puts a
+            # sprint STATUS in that same field, and routing is by name, so aliasing it
+            # to `branch` would pseudonymize statuses as branches.
             if (
                 not write_reaches_the_redrive
                 and _committed_spec_status(state, task) != target_status
@@ -2602,7 +2615,7 @@ def rearm_escalation(
                     story_key=key,
                     spec_file=str(spec_path),
                     status=target_status,
-                    base=state.target_branch,
+                    target_branch=state.target_branch,
                 )
             try:
                 flipped = verify.set_frontmatter_status(
@@ -3060,7 +3073,7 @@ def rearm_event_notice(
         # whatever the main checkout happens to have checked out is not the one it
         # reads. Named only when the record carries it — a run predating the field
         # leaves it empty, and a remedy that names no ref beats one that names a guess.
-        base = str(entry.get("base", "") or "")
+        base = str(entry.get("target_branch", "") or "")
         where = f" on `{base}`" if base else ""
         return (
             "warning",

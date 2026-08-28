@@ -1991,7 +1991,10 @@ def test_rearm_reads_the_committed_spec_from_the_redrive_base_not_the_current_he
     if warns:
         # the branch rides on the record because the remedy is worthless without it:
         # "commit the corrected spec" is what this operator just DID, on `side`
-        assert unreachable[0]["base"] == "main"
+        # spelled `target_branch` so `diagnostics._JOURNAL_ALIAS_FIELDS` routes it to
+        # the `branch` namespace; a new field name would fall to `scrub_json`, which
+        # ships an identifier-shaped branch verbatim
+        assert unreachable[0]["target_branch"] == "main"
         assert "`main`" in runs.rearm_event_notice(unreachable[0])[2]
 
 

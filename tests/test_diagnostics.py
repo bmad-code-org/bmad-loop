@@ -29,6 +29,13 @@ EMAIL = "victim.canary@example.com"
 STORY_KEY = "1.2-AcmeQuantumBillingEngine"
 PROPRIETARY = "AcmeQuantumBillingEngine"
 BRANCH = "feature/AcmeSecret"
+# A branch name with NO separator, for the one row that grades branch-field ROUTING.
+# `BRANCH` cannot: `scrub_json`'s `_IDENTIFIER_RE` forbids `/`, so a slashed name is
+# collapsed to `<redacted:str>` by the fallback and a canary sweep over it stays green
+# with the routing entry deleted — the same false green `repo` has, documented on
+# `test_rearm_journal_fields_are_routed`. Bare `main`/`develop`-style names are the
+# common case anyway, and they are exactly the ones the fallback waves through verbatim.
+REARM_BRANCH = "AcmeSecretRelease"
 SECRET_GH = "ghp_CANARYxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx01"
 SECRET_OPENAI = "sk-CANARYxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx99"
 SECRET_AWS = "AKIACANARY0123456789"
@@ -530,7 +537,9 @@ def test_rearm_records_leak_neither_the_code_root_nor_a_spec_name():
     shape, so only an assertion on the field's absence can grade a routing decision
     taken for a shape the fallback would not catch. Drop `spec_file` or `overwritten`
     from `_JOURNAL_ALIAS_FIELDS` and the alias assertions redden (`spec_file` on the
-    canary sweep too).
+    canary sweep too). Drop `target_branch` and the branch row reddens on BOTH the alias
+    lookup and the canary sweep — that field is identifier-shaped by design, so unlike
+    `repo` the fallback does not accidentally rescue it.
     """
     other_sha = "f" * 40
     pseudo = sanitize.Pseudonymizer(salt=b"fixed")
@@ -590,7 +599,7 @@ def test_rearm_records_leak_neither_the_code_root_nor_a_spec_name():
             1.0,
         )
         for kind, extra in (
-            ("rearm-spec-write-unreachable", {}),
+            ("rearm-spec-write-unreachable", {"target_branch": REARM_BRANCH}),
             ("rearm-spec-flip-skipped", {"status": "ready-for-dev"}),
             ("rearm-baseline-restamp-skipped", {"baseline": SHA}),
         )
@@ -600,8 +609,24 @@ def test_rearm_records_leak_neither_the_code_root_nor_a_spec_name():
     assert [s["spec_file"] for s in siblings] == [alias, alias, alias]
     assert [orig for ns, orig, _a in pseudo.entries() if ns == "spec"] == [SPEC_NAME]
 
+    # `rearm-spec-write-unreachable` names the branch the re-drive cuts its replacement
+    # worktree from, so the operator is told WHERE to commit. It is journalled as
+    # `target_branch` rather than a fresh spelling for exactly this reason: routing is
+    # by field NAME, and that name is already in `_JOURNAL_ALIAS_FIELDS` under the
+    # `branch` namespace. Graded on a SEPARATOR-FREE name (see `REARM_BRANCH`) because
+    # a slashed one dies at `scrub_json` and would pass with the routing deleted.
+    #
+    # In a real run `ensure_target_branch` journals the same string as `branch` first,
+    # so an unrouted spelling would be caught by the egress backstop and disclosed as a
+    # `backstop_repairs` gap — but a truncated journal missing that event has nothing to
+    # repair from, and the branch would ship verbatim in a shareable bundle.
+    branch_alias = next(
+        a for ns, orig, a in pseudo.entries() if ns == "branch" and orig == REARM_BRANCH
+    )
+    assert siblings[0]["target_branch"] == branch_alias != REARM_BRANCH
+
     rendered = json.dumps([advance_failed, restamped, *siblings])
-    for canary in (SHA, other_sha, SPEC_NAME, PROPRIETARY, HOME_PATH, *CANARIES):
+    for canary in (SHA, other_sha, SPEC_NAME, PROPRIETARY, HOME_PATH, REARM_BRANCH, *CANARIES):
         assert canary not in rendered, f"LEAK: {canary!r}"
 
 
