@@ -1490,3 +1490,66 @@ def test_diag_repo_root_diverges_is_false_for_the_ordinary_layout(project):
 
     assert run.repo_root_diverges is False
     assert run.tasks[0].generation == 0
+
+
+def _md_task_row(md: str) -> list[str]:
+    """The one task row of the report's task table, split into its cells."""
+    (row,) = [ln for ln in md.splitlines() if ln.startswith("| `")]
+    return [c.strip() for c in row.strip("|").split("|")]
+
+
+def test_the_markdown_report_carries_the_split_root_and_the_generation(project):
+    """Both fields must reach the report `diagnose` emits BY DEFAULT, not only `--json`.
+
+    The sibling tests above grade the collector, which is what `--json` dumps whole via
+    `asdict`. The markdown report is a different renderer that samples fields by hand,
+    and it is the artifact an operator actually produces and hands a maintainer — the
+    header says so ("Safe to share"). A field whose entire warrant is "a bug report that
+    cannot show this cannot be triaged" is not delivered until it renders here, so the
+    warrant is graded where it is spent.
+
+    `generation` rides beside `attempt` because that is the column pair a #705-class
+    replay turns on: a collided re-drive and a healthy post-re-arm task agree on every
+    other cell in this row.
+
+    Ablation: drop the `code root differs from project` line from `render_markdown` and
+    both this test and the sibling below redden on their first assertion. Drop
+    `{t.generation}` from the row f-string together with its header and separator cells
+    and this test reddens at `names[4]` (`"rev" != "gen"`) while the sibling reddens at
+    the row cell — as `"1" != "0"`, the review cycle shifted left rather than a missing
+    key, which is why the cell is read positionally and the three widths are compared.
+    """
+    run_dir = _seed_run(project.project)
+    state = load_state(run_dir)
+    state.repo_root = str(project.project / "code-tree")
+    state.tasks[STORY_KEY].generation = 2
+    save_state(run_dir, state)
+
+    pseudo = sanitize.Pseudonymizer()
+    diag = diagnostics.collect([run_dir], pseudo=pseudo, project=ANY_PROJECT)
+    md = diagnostics.render_markdown(diag, pseudo=pseudo)
+
+    assert "- **code root differs from project:** yes" in md
+    cells = _md_task_row(md)
+    (header,) = [ln for ln in md.splitlines() if ln.startswith("| alias |")]
+    (rule,) = [ln for ln in md.splitlines() if ln.startswith("|---|")]
+    names = [c.strip() for c in header.strip("|").split("|")]
+    assert names[4] == "gen"
+    # header, separator and row must agree on width or the table renders skewed
+    assert len(cells) == len(names) == len(rule.strip("|").split("|")) == 12
+    assert cells[3] == "2"  # attempt, seeded by `_seed_run`
+    assert cells[4] == "2"  # generation — NOT the review cycle, which is 1
+    assert cells[5] == "1"  # review cycle, still in its own column
+    # still a flag and a counter: the path itself never renders
+    assert "code-tree" not in md
+
+
+def test_the_markdown_report_says_no_for_the_ordinary_layout(project):
+    """The rendered line distinguishes; a hardcoded "yes" would pass the test above."""
+    run_dir = _seed_run(project.project)
+    pseudo = sanitize.Pseudonymizer()
+    diag = diagnostics.collect([run_dir], pseudo=pseudo, project=ANY_PROJECT)
+    md = diagnostics.render_markdown(diag, pseudo=pseudo)
+
+    assert "- **code root differs from project:** no" in md
+    assert _md_task_row(md)[4] == "0"

@@ -54,6 +54,15 @@ breaking changes may land in a minor release.
   run's dump changes shape today and `SCHEMA_VERSION` is unaffected — but a later producer of a
   field with one of these names inherits the same treatment.
 
+- **`bmad-loop diagnose`'s default report shows the split code root and the task generation**
+  (#705, #716). Both fields reached the collector, and so `--json`, but not the markdown
+  renderer, which samples its fields by hand. Markdown is what a bare `diagnose` emits and
+  what an operator hands a maintainer, so the two conditions the fields exist to name — a code
+  tree that is a different directory from the project root, and a re-armed task whose session
+  id could collide with the abandoned attempt's record — were legible only to whoever thought
+  to ask for JSON. They render as a `code root differs from project` yes/no line and a `gen`
+  column beside `att`; the code root's path itself still never renders.
+
 - **Re-arm writes the spec the run actually used, and reports every write it could not make**
   (#640). `StoryTask` persists `spec_file` RELATIVE to the worktree for an isolated task, and
   re-arm resolved it against the process cwd. `bmad-loop resolve` runs from the project root,

@@ -937,6 +937,13 @@ def render_markdown(
     for r in d.runs:
         out.append(f"## Run `{r.run_id}` ({r.run_type})")
         out.append(_fmt_kv("project", f"`{r.project_alias}`"))
+        # Rendered here and not only in `--json`: this is the report an operator
+        # produces by default and hands a maintainer, and the split layout is the
+        # one the re-anchored baseline probes behave differently in. A dump that
+        # cannot show it cannot be triaged — the whole warrant for the field.
+        out.append(
+            _fmt_kv("code root differs from project", "yes" if r.repo_root_diverges else "no")
+        )
         out.append(_fmt_kv("started", r.started_date or "—"))
         out.append(
             _fmt_kv(
@@ -971,16 +978,21 @@ def render_markdown(
 
         out.append("### Tasks")
         if r.tasks:
+            # `gen` rides beside `att` because the pair is the discriminator: a
+            # #705-class replay and a healthy post-re-arm task agree on every other
+            # column here, so dropping it from the human report leaves the one field
+            # that separates them visible only under `--json`.
             out.append(
-                "| alias | epic | phase | att | rev | committed | spec | dw | sessions "
+                "| alias | epic | phase | att | gen | rev | committed | spec | dw | sessions "
                 "| weighted | raw |"
             )
-            out.append("|---|---|---|---|---|---|---|---|---|---|---|")
+            out.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
             for t in r.tasks:
                 out.append(
-                    f"| `{t.alias}` | {t.epic} | {t.phase} | {t.attempt} | {t.review_cycle} "
-                    f"| {t.committed} | {t.spec_present} | {t.dw_count} | {t.n_sessions} "
-                    f"| {t.tokens.get('weighted', 0)} | {t.tokens.get('total', 0)} |"
+                    f"| `{t.alias}` | {t.epic} | {t.phase} | {t.attempt} | {t.generation} "
+                    f"| {t.review_cycle} | {t.committed} | {t.spec_present} | {t.dw_count} "
+                    f"| {t.n_sessions} | {t.tokens.get('weighted', 0)} "
+                    f"| {t.tokens.get('total', 0)} |"
                 )
         else:
             out.append("_no tasks._")

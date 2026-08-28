@@ -1464,7 +1464,7 @@ def test_rearm_journals_the_spec_baseline_it_overwrote(tmp_path):
     (a re-arm that changed nothing would report an overwrite).
     """
     old_head = _resolve_repo(tmp_path)
-    run_dir, spec, new_head = _escalated_spec_run(tmp_path, old_head)
+    run_dir, _spec, new_head = _escalated_spec_run(tmp_path, old_head)
 
     runs.rearm_escalation(run_dir)
 
