@@ -161,6 +161,18 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **The TUI's paused-spec read and its replan write anchor on the tree the run owns.** An
+  isolated unit's `spec_file` is persisted relative to its mounted worktree, and the dashboard
+  resolved that raw against its own cwd — the project root, which carries the same
+  `_bmad-output/specs/...` layout — so the review modals rendered the main checkout's copy of the
+  spec, and `Request replan` reset that copy to `draft` instead of the run's. Both writes reported
+  success (the wrong file genuinely is inside the confinement root), the run resumed, and the
+  worktree's real spec kept its terminal status, so the next dispatch did not re-plan. The path and
+  the confinement root now come from one claim about which tree owns the spec, and a spec missing at
+  the anchored path reads as an explicit read failure rather than an empty body.
+  `bmad-loop resolve`'s `context.json` reports `spec_file` as an absolute path for the same
+  reason.
+
 - **`resume` re-stamps the run's recorded code root** (#716). Resume arms the engine against the
   `repo_root` it re-reads from `_bmad/bmm/config.yaml` but left the `state.json` copy at its launch
   value, so after an edit the engine worked in one tree while the out-of-process re-arm advanced the

@@ -2175,7 +2175,7 @@ def validate_restore_latch(
     return None
 
 
-def _task_spec_path(task: StoryTask, state: RunState) -> Path:
+def task_spec_path(task: StoryTask, state: RunState) -> Path:
     """The recorded spec path, re-anchored on the tree it was persisted relative to.
 
     `StoryTask._serialized_worktree_path` (`model.py`) persists a worktree-local spec
@@ -2189,18 +2189,21 @@ def _task_spec_path(task: StoryTask, state: RunState) -> Path:
     left on the escalated attempt's sha.
 
     Absolute paths pass through: a spec outside the worktree is persisted verbatim.
+
+    Precondition: `task.spec_file` is non-empty. `Path("")` is `.`, so an empty one
+    yields the ROOT DIRECTORY rather than a spec — callers guard before calling.
     """
     raw = Path(task.spec_file or "")
     if raw.is_absolute():
         return raw
-    return _task_spec_root(task, state) / raw
+    return task_spec_root(task, state) / raw
 
 
-def _task_spec_root(task: StoryTask, state: RunState) -> Path:
+def task_spec_root(task: StoryTask, state: RunState) -> Path:
     """The tree a relative `task.spec_file` is anchored on — and confined to.
 
     One definition backs both halves because they must not disagree: the root
-    `_task_spec_path` resolves against and the `confine_root` the writers validate the
+    `task_spec_path` resolves against and the `confine_root` the writers validate the
     result against are the same claim about which tree owns this spec. Passing
     `state.project` while resolving against the worktree does not REFUSE the mismatch —
     `set_frontmatter_status`, `devcontract.strip_auto_run_result` and
@@ -2295,7 +2298,7 @@ def _redrive_base_ref(state: RunState, task: StoryTask) -> str:
     re-drive will find it.
 
     The two guards are the same proxy the caller already uses. `task.worktree_path` is
-    how this file recognizes an isolated unit at all (`_task_spec_root`,
+    how this file recognizes an isolated unit at all (`task_spec_root`,
     `_spec_is_shared_with_the_redrive`) — every isolated escalation carries a mounted
     one. An empty `target_branch` beside it is a MISSING value, not a divergent one:
     `ensure_target_branch` pins the field before any worktree mounts, so only a
@@ -2359,7 +2362,7 @@ def _restore_rearmed_spec(
     except OSError:
         return
     try:
-        atomic_write_bytes_confined(spec_path, original, confine_root=_task_spec_root(task, state))
+        atomic_write_bytes_confined(spec_path, original, confine_root=task_spec_root(task, state))
     except OSError as e:
         raise RearmError(
             f"cannot restore {spec_path} after a failed re-arm "
@@ -2571,7 +2574,7 @@ def rearm_escalation(
     # `if task.spec_file:` block, past the advance it depends on.
     spec_before: bytes | None = None
     if task.spec_file:
-        spec_path = _task_spec_path(task, state)
+        spec_path = task_spec_path(task, state)
         # Stories mode only: a fixed-slug pre-planning-halt sentinel
         # (`<id>-unresolved.md` / `<id>-ambiguous.md`) is cleared by deletion, not a
         # status flip. Clear it ONLY when the run recorded this task AS a sentinel at
@@ -2591,7 +2594,7 @@ def rearm_escalation(
             task.sentinel_kind = ""  # verdict discharged; the re-dispatch is clean
         else:
             # A WORKTREE-LOCAL spec's writes below land in the unit's worktree
-            # (`_task_spec_path`) — which the re-drive destroys before reading anything.
+            # (`task_spec_path`) — which the re-drive destroys before reading anything.
             # A re-armed task (phase PENDING, `defer_reason` cleared, and no resumable
             # session because `generation` was just bumped) falls to
             # `engine._finish_inflight`'s final arm, which calls `discard_worktree` and
@@ -2692,7 +2695,7 @@ def rearm_escalation(
                 spec_before = None
             try:
                 flipped = verify.set_frontmatter_status(
-                    spec_path, target_status, confine_root=_task_spec_root(task, state)
+                    spec_path, target_status, confine_root=task_spec_root(task, state)
                 )
                 # `set_frontmatter_status` answers "nothing to change" with `False`
                 # for FOUR causes, not three — its own docstring lists them: no file,
@@ -2764,7 +2767,7 @@ def rearm_escalation(
                     # degrade.
                     #
                     # A worktree-local spec that IS readable takes that same lane, for a
-                    # sharper version of the same reason: `_task_spec_root` anchors this
+                    # sharper version of the same reason: `task_spec_root` anchors this
                     # write on the mounted worktree, so the readable file is the copy the
                     # re-drive DISCARDS. The refusal's own remedy could not fix anything
                     # there — an operator who added a `status:` to that file and re-ran
@@ -2799,7 +2802,7 @@ def rearm_escalation(
                 # as it found it — a stripped result section on a spec the re-arm then
                 # refused would be the one edit nothing else records.
                 devcontract.strip_auto_run_result(
-                    spec_path, confine_root=_task_spec_root(task, state)
+                    spec_path, confine_root=task_spec_root(task, state)
                 )
             except verify.FrontmatterWriteError as e:
                 # The spec reads fine but carries `status:` in a shape no line
@@ -2963,7 +2966,7 @@ def rearm_escalation(
     # `verify.set_frontmatter_field`), so without a check the re-stamp no-ops with
     # nothing on the record and the spec keeps the escalated attempt's sha.
     #
-    # `_task_spec_path` re-anchors the recorded path before we get here, which is what
+    # `task_spec_path` re-anchors the recorded path before we get here, which is what
     # makes `is_file` mean what it says. Resolved raw it meant something else and worse:
     # `spec_file` is persisted RELATIVE to the worktree for an isolated task, and the
     # main checkout carries the same layout, so the check passed on the wrong file and
@@ -2975,7 +2978,7 @@ def rearm_escalation(
     # block also returns `False` from both writers. That shape is caught by the flip's
     # `flipped` check above and, here, by `overwritten` staying empty.
     if task.spec_file:
-        spec_path = _task_spec_path(task, state)
+        spec_path = task_spec_path(task, state)
         if not spec_path.is_file():
             # OUTSIDE the `advanced` gate on purpose. Nesting this record inside it
             # made the two #640 legs shadow each other: on a project that is not a
@@ -3010,7 +3013,7 @@ def rearm_escalation(
                     spec_path,
                     "baseline_revision",
                     task.baseline_commit,
-                    confine_root=_task_spec_root(task, state),
+                    confine_root=task_spec_root(task, state),
                 )
             except (OSError, UnicodeDecodeError, verify.FrontmatterWriteError) as e:
                 # FrontmatterWriteError joins the tuple rather than getting its own

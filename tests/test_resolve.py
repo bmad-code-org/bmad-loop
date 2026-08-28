@@ -2,6 +2,7 @@
 
 import json
 import sys
+from pathlib import Path
 
 import pytest
 import yaml
@@ -533,6 +534,83 @@ def test_build_context_gathers_critical_escalations(tmp_path):
     assert "\\" not in ctx["resolution_path"]
 
 
+def test_build_context_absolutizes_an_isolated_units_worktree_relative_spec(tmp_path, monkeypatch):
+    """`context.json` names the spec in the tree the RUN owns, absolute.
+
+    `StoryTask._serialized_worktree_path` persists an isolated unit's `spec_file`
+    RELATIVE to the mounted worktree and `from_dict` reads it back raw, so the raw
+    value handed to the agent was a bare relpath. The `bmad-loop-resolve` session runs
+    from the PROJECT root, where the main checkout carries the very same
+    `_bmad-output/specs/...` layout — so that relpath resolved, silently, onto the
+    main checkout's twin, and the human and the agent edited a spec the run never used
+    while `rearm_escalation` (which re-anchors through `task_spec_path`) flipped the
+    worktree's. `build_context` now emits the same re-anchor the re-arm writes
+    through, which is also the absolute shape `bmad-loop-resolve/SKILL.md` documents.
+
+    The EQUALITY is what grades this row, and it is the whole instrument:
+    `is_absolute()` alone is satisfied by a PROJECT-anchored resolve, which is the
+    same bug wearing an absolute path. Two things here are deliberately NOT load-
+    bearing, so nobody reads them as proof they are not: `build_context` never opens
+    the spec, so both on-disk copies are inert scenery, and the `chdir` cannot change
+    an emitted value computed by pure path arithmetic. They are kept because a future
+    `abspath`/`resolve()`-shaped resolver WOULD consult the cwd, and pinning it to
+    the tree the agent really runs from keeps this row honest under that change.
+
+    Shape, not just value: `.as_posix()` matches `resolution_path`'s contract two
+    fields below — one string on every OS — so the assertion compares posix
+    spellings and re-uses that field's no-backslash check. `str()` here would have
+    regressed Windows, where the value it replaced was already posix
+    (`_serialized_worktree_path` persists the relative form with `.as_posix()`).
+    Both halves of that check are INERT on POSIX, where `str()` and `.as_posix()`
+    agree — exactly as the sibling `resolution_path` assertion is. Windows CI is
+    where they grade; do not read a green run here as having exercised them.
+
+    Ablation: revert `build_context`'s field to `task.spec_file if task else None` and
+    this reddens on `is_absolute()` — the emitted value is the bare relpath.
+    """
+    rel = "_bmad-output/specs/6-4-cli-list-command.md"
+    wt = tmp_path / "wt"
+    for root in (wt, tmp_path):  # the run's own copy, and the main checkout's twin
+        spec = root / rel
+        spec.parent.mkdir(parents=True, exist_ok=True)
+        spec.write_text(SPEC, encoding="utf-8")
+
+    run_dir, state, _ = _escalated_run(tmp_path, spec_file=rel, worktree_path=str(wt))
+    monkeypatch.chdir(tmp_path)  # what the resolve session actually runs from
+
+    path = resolve.build_context(state, run_dir, "6-4-cli-list-command")
+    ctx = json.loads(path.read_text(encoding="utf-8"))
+    assert Path(ctx["spec_file"]).is_absolute()
+    # the worktree's copy, not the main checkout's twin — compared as posix, which is
+    # also the contract shape (no backslashes leak in on Windows).
+    assert ctx["spec_file"] == (wt / rel).as_posix()
+    assert "\\" not in ctx["spec_file"]
+
+
+def test_build_context_spec_file_is_none_without_a_task_or_a_spec(tmp_path):
+    """The re-anchor must not manufacture a path out of nothing. `Path("")` is `.`,
+    so an unguarded `root / raw` would emit the worktree root itself — a real
+    directory — as the story's spec. Both empty legs stay `None`, which is what the
+    agent reads as "there is no frozen spec to edit" (a spec-less escalation, or a
+    key with no task at all).
+
+    Ablation: drop the `and task.spec_file` guard from `build_context`'s field and the
+    spec-less leg reddens with the worktree root in place of `None`."""
+    wt = tmp_path / "wt"
+    run_dir, state, _ = _escalated_run(tmp_path, spec_file=None, worktree_path=str(wt))
+
+    ctx = json.loads(
+        resolve.build_context(state, run_dir, "6-4-cli-list-command").read_text(encoding="utf-8")
+    )
+    assert ctx["spec_file"] is None  # task present, spec-less escalation
+
+    assert "no-such-story" not in state.tasks
+    ctx = json.loads(
+        resolve.build_context(state, run_dir, "no-such-story").read_text(encoding="utf-8")
+    )
+    assert ctx["spec_file"] is None  # no task at all
+
+
 def test_build_context_no_session_files(tmp_path):
     run_dir, state, _ = _escalated_run(tmp_path, with_session=False)
     path = resolve.build_context(state, run_dir, "6-4-cli-list-command")
@@ -628,7 +706,7 @@ def test_rearm_strips_stale_terminal_section(tmp_path):
 def test_rearm_warns_when_an_isolated_tasks_spec_writes_cannot_reach_the_redrive(tmp_path):
     """A worktree-isolated task's spec writes land in a directory the re-drive destroys.
 
-    `_task_spec_path` re-anchors the recorded spec on `task.worktree_path`, but a
+    `task_spec_path` re-anchors the recorded spec on `task.worktree_path`, but a
     re-armed task falls to `engine._finish_inflight`'s final arm, which calls
     `discard_worktree` and lets `_run_story` mount a fresh one — and the re-driven
     session resolves its spec against THAT worktree
@@ -1077,7 +1155,7 @@ def test_rearm_writes_the_worktree_spec_not_the_main_checkouts_copy(monkeypatch,
     flip AND the baseline re-stamp landed on a spec the run never used, while the
     worktree's real spec kept the escalated attempt's sha and the re-drive re-wedged.
 
-    `_task_spec_path` now anchors a relative path on `task.worktree_path` (falling back
+    `task_spec_path` now anchors a relative path on `task.worktree_path` (falling back
     to `state.project`) and passes an absolute one through.
 
     The cwd is set EXPLICITLY: pytest's own cwd is not this sandbox, so without the
@@ -1086,7 +1164,7 @@ def test_rearm_writes_the_worktree_spec_not_the_main_checkouts_copy(monkeypatch,
     carry distinguishable `baseline_revision` claims for the same reason — "the right
     file was written" has to be checkable against "the other one was not".
 
-    Ablation: revert `_task_spec_path`'s body to `return Path(task.spec_file or "")`
+    Ablation: revert `task_spec_path`'s body to `return Path(task.spec_file or "")`
     and this reddens on the worktree copy with
     `AssertionError: assert 'blocked' == 'ready-for-dev'` — the flip went to the main
     checkout — and the byte-identity assertion on the main copy reddens behind it.
@@ -2341,7 +2419,7 @@ def test_rearm_warns_when_the_spec_cannot_be_placed_against_the_worktree(tmp_pat
 
 
 def test_rearm_writes_the_project_rooted_spec_when_no_worktree_was_recorded(tmp_path, monkeypatch):
-    """The `state.project` half of `_task_spec_path` — graded, not merely reachable.
+    """The `state.project` half of `task_spec_path` — graded, not merely reachable.
 
     `engine._finish_inflight` clears `task.worktree_path` while leaving `spec_file`
     relative, and `model._serialized_worktree_path` returns it unchanged when
@@ -2354,7 +2432,7 @@ def test_rearm_writes_the_project_rooted_spec_when_no_worktree_was_recorded(tmp_
     directory this process actually runs from, so a cwd-anchored resolve has somewhere
     plausible to land.
 
-    Ablation: change `_task_spec_root` to `Path(task.worktree_path or "")` and this
+    Ablation: change `task_spec_root` to `Path(task.worktree_path or "")` and this
     reddens twice over — the project spec keeps `status: blocked`, and the decoy's
     byte-identity assertion fails behind it.
     """

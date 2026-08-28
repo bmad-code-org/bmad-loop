@@ -23,7 +23,7 @@ from typing import Any
 from .adapters.base import SessionSpec
 from .model import RunState
 from .platform_util import safe_segment
-from .runs import validate_restore_latch
+from .runs import task_spec_path, validate_restore_latch
 
 RESOLVE_DIR = "resolve"
 
@@ -110,7 +110,18 @@ def build_context(state: RunState, run_dir: Path, story_key: str, *, isolation: 
     context = {
         "story_key": story_key,
         "run_id": state.run_id,
-        "spec_file": task.spec_file if task else None,
+        # Absolute, matching the shape `bmad-loop-resolve/SKILL.md` documents: an
+        # isolated unit's `spec_file` is persisted RELATIVE to the mounted worktree
+        # (`model.StoryTask._serialized_worktree_path`) and the agent session runs
+        # from the project root, where the main checkout carries the same
+        # `_bmad-output/specs/...` layout — the raw value would name the wrong
+        # tree's copy. `task_spec_path` is the same re-anchor `rearm_escalation`
+        # writes through, so the agent edits the file the re-arm will flip.
+        # as_posix() for the same reason `resolution_path` below uses it — the
+        # context contract is one string on every OS — and because the value this
+        # replaces was ALREADY posix under isolation: `_serialized_worktree_path`
+        # persists the relative form with `.as_posix()`.
+        "spec_file": (task_spec_path(task, state).as_posix() if task and task.spec_file else None),
         "baseline_commit": task.baseline_commit if task else None,
         "paused_reason": state.paused_reason,
         "escalations": _gather_escalations(run_dir, state, story_key),

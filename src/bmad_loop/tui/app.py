@@ -624,7 +624,7 @@ class BmadLoopApp(App[None]):
                 if spec_path is None:
                     self.notify("no spec file to reset for replan", severity="error")
                     return
-                self._do_replan(run_id, spec_path)
+                self._do_replan(run_id, spec_path, self._paused_spec_root(state))
 
         self.push_screen(modal, done)
 
@@ -785,10 +785,18 @@ class BmadLoopApp(App[None]):
             )
         self.notify(f"resume of {run_id} launched (control session {launch.CTL_SESSION})")
 
-    def _do_replan(self, run_id: str, spec_path: Path) -> None:
+    def _do_replan(self, run_id: str, spec_path: Path, confine_root: Path) -> None:
         """Request-replan: reset the planned spec to draft + strip its Auto Run
         Result, then resume — the next dispatch re-enters step-02 planning. Uses
-        the same devcontract primitives the engine's repair path uses."""
+        the same devcontract primitives the engine's repair path uses.
+
+        `confine_root` arrives from the caller (`_paused_spec_root`) rather than being
+        `self.project` here: this method has no task in scope, and the root these two
+        writers validate against must be the SAME claim about which tree owns the spec
+        that `_paused_spec` anchored the path on. `runs.task_spec_root`'s docstring
+        carries the rationale — a `confine_root` that disagrees with the anchor is not
+        REFUSED, it silently drops both writes to the plain no-follow arm and loses the
+        confined arm's O_NOFOLLOW walk (#593) with no signal at all."""
         # Guard a possibly-live engine BEFORE mutating the spec — a draft-reset +
         # strip under a still-running session would race its writes (the rearm path
         # already checks liveness first; match it so replan can't corrupt a live
@@ -797,8 +805,8 @@ class BmadLoopApp(App[None]):
         if self._resolve_blocked_by_liveness(run_id, run_dir):
             return
         try:
-            reset = devcontract.reset_spec_status(spec_path, "draft", confine_root=self.project)
-            devcontract.strip_auto_run_result(spec_path, confine_root=self.project)
+            reset = devcontract.reset_spec_status(spec_path, "draft", confine_root=confine_root)
+            devcontract.strip_auto_run_result(spec_path, confine_root=confine_root)
         except (OSError, verify.FrontmatterWriteError) as e:
             # FrontmatterWriteError is not an OSError: a spec whose `status:` is a
             # block scalar or a flow mapping reads fine and fails the WRITE. It
@@ -946,15 +954,43 @@ class BmadLoopApp(App[None]):
 
     def _paused_spec(self, state: RunState) -> tuple[Path | None, str]:
         """(spec path, spec text) for the paused story, or (None, "") when the
-        task has no spec file (e.g. an ambiguous-match escalation)."""
+        task has no spec file (e.g. an ambiguous-match escalation).
+
+        The path is re-anchored through `runs.task_spec_path`, never `Path(...)` on the
+        raw value: `model.StoryTask._serialized_worktree_path` persists an isolated
+        unit's spec RELATIVE to the mounted worktree root and `from_dict` reads it back
+        raw, so a bare `Path(task.spec_file)` resolves against the TUI process cwd —
+        where the main checkout carries the very same `_bmad-output/specs/...` layout
+        and answers with the WRONG tree's copy of the story spec."""
         task = state.tasks.get(state.paused_story_key) if state.paused_story_key else None
         if task is None or not task.spec_file:
             return None, ""
-        path = Path(task.spec_file)
+        path = runs.task_spec_path(task, state)
         try:
             return path, path.read_text(encoding="utf-8")
-        except OSError:
-            return path, ""
+        except (OSError, UnicodeDecodeError) as e:
+            # An absent spec at the ANCHORED path is the signal that the anchoring is
+            # wrong, so it must not reduce to "" — SpecReviewModal renders that as
+            # "(empty spec)", which is also what a present-but-blank spec renders as.
+            # Report the failure as the body so the two cases read differently.
+            #
+            # UnicodeDecodeError is a ValueError, so the OSError arm alone let a
+            # non-UTF-8 spec past — and all three review surfaces call this from the
+            # Textual event loop, where an escaping raise takes the dashboard down
+            # instead of rendering the fault. Same trap `_commit_subject` closes.
+            return path, f"(spec could not be read — {e})"
+
+    def _paused_spec_root(self, state: RunState) -> Path:
+        """The tree the paused story's spec is anchored on — and confined to.
+
+        The mirror of `_paused_spec`'s anchor, kept as a sibling so the three read-only
+        consumers keep the untouched two-value read. `_do_replan` WRITES the path
+        `_paused_spec` returned, and `runs.task_spec_root` is the single definition
+        backing both halves: an anchor and a `confine_root` that name different trees do
+        not refuse, they silently degrade the write (#593). No task means nothing was
+        re-anchored, so the project root stays the honest root."""
+        task = state.tasks.get(state.paused_story_key) if state.paused_story_key else None
+        return runs.task_spec_root(task, state) if task else self.project
 
     def _story_subtitle(self, state: RunState) -> Text:
         key = state.paused_story_key or "?"

@@ -140,7 +140,7 @@ _JOURNAL_ALIAS_FIELDS = {
     # journal. So the divergence is BETWEEN FIELDS, not between two producers of this
     # one — but BOTH fields are mixed-shape, and neither is the reliable one:
     # `spec_file` is now always ABSOLUTE, because all four kinds journal
-    # `str(_task_spec_path(...))`, whose anchors (`task.worktree_path`, `state.project`)
+    # `str(task_spec_path(...))`, whose anchors (`task.worktree_path`, `state.project`)
     # are absolute in every production path; while `spec` is NOT uniformly absolute —
     # engine's reconcile and marker-repair kinds journal an absolute `str(spec_path)`,
     # but `stories_engine`'s `checkpoint-pause` journals the raw persisted

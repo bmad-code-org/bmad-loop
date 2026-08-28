@@ -3335,9 +3335,17 @@ def _stories_paused_run(
     review_cycle: int = 0,
     blocked_result: str = "",
     sentinel: bool = False,
+    worktree_path: str = "",
 ) -> tuple[Path, Path]:
     """A stories-mode run paused at `stage`, with the id-keyed story spec on disk
-    and a StoryTask pointing at it. Returns (run_dir, spec_path)."""
+    and a StoryTask pointing at it. Returns (run_dir, spec_path).
+
+    `worktree_path` expresses the worktree-isolation shape: the run's own copy of the
+    spec is written under that tree while the main checkout keeps a TWIN at the same
+    relative path, and `task.spec_file` is the absolute worktree path — which
+    `StoryTask.to_dict` persists RELATIVE to the mount, so `load_state` hands the app
+    back the bare relpath production actually stores. The returned spec path is then
+    the worktree's copy; the twin is the decoy a cwd-anchored resolve lands on."""
     import yaml
 
     folder = root / "epic-1"
@@ -3366,6 +3374,16 @@ def _stories_paused_run(
     spec.write_text(body, encoding="utf-8")
     task = StoryTask(story_key=story_key, epic=0, phase=Phase.DEV_VERIFY)
     task.spec_file = str(spec)
+    if worktree_path:
+        # The isolated shape. The body differs per tree so "the worktree copy was
+        # read/written" is checkable against "the main-checkout twin was not" — with
+        # identical payloads either assertion could pass on the wrong file.
+        twin = spec  # the main checkout keeps today's body, at the same relpath
+        spec = Path(worktree_path) / twin.relative_to(root)
+        spec.parent.mkdir(parents=True, exist_ok=True)
+        spec.write_text(body.replace("# plan for", "# worktree plan for"), encoding="utf-8")
+        task.worktree_path = worktree_path
+        task.spec_file = str(spec)  # to_dict re-persists this RELATIVE to the mount
     task.review_cycle = review_cycle
     if commit_sha:
         task.commit_sha = commit_sha
@@ -3432,6 +3450,176 @@ async def test_plan_checkpoint_replan_resets_and_resumes(project, monkeypatch):
         # own parent would be lexically confined and behaviourally inert (#593).
         assert resets == [(spec, "draft", project.project)]
         assert strips == [(spec, project.project)]
+
+
+def _unit_worktree(root: Path, run_id: str = "20260611-100000-aaaa", unit: str = "1") -> Path:
+    """Where `workspace.open_unit_workspace` actually mounts a unit's worktree."""
+    return root / RUNS_DIR / run_id / "worktrees" / unit
+
+
+async def test_plan_checkpoint_replan_writes_the_worktree_spec_not_the_main_twin(
+    project, monkeypatch
+):
+    """Under isolation the replan must reset the spec the RUN owns, not its twin.
+
+    `StoryTask._serialized_worktree_path` persists an isolated unit's `spec_file`
+    RELATIVE to the mounted worktree and `from_dict` reads it back raw, so
+    `_paused_spec`'s bare `Path(task.spec_file)` resolved against the TUI process cwd
+    — the project root, which carries the very same `epic-1/stories/...` layout. Both
+    destructive writers then landed on the MAIN CHECKOUT's twin: `confine_root` (the
+    project) accepted it because it genuinely is under `project`, `reset_spec_status`
+    answered True, the operator got a "plan reset to draft" notice and the run
+    resumed — while the worktree's real spec kept its terminal status, so the next
+    dispatch did not re-plan, and an unrelated tracked file was rewritten.
+
+    The cwd is set EXPLICITLY: pytest does not run from the sandbox, so without the
+    `chdir` the reverted code would merely fail to resolve the relpath and this row
+    would pass for the wrong reason instead of reproducing the hazard. The two copies
+    carry distinguishable bodies for the same reason — "the right file was written"
+    has to be checkable against "the other one was not".
+
+    `confine_root` is captured as well as graded on bytes, because the two halves are
+    not one ablation: the worktree here is UNDER `project` (that is where
+    `workspace.open_unit_workspace` mounts it), so a root reverted to `self.project`
+    still lands on the right file — it just silently drops both writers off the
+    confined arm and loses its O_NOFOLLOW walk (#593), with no signal at all.
+
+    Ablations: revert `_paused_spec` to `Path(task.spec_file)` and this reddens on
+    the worktree copy's status AND on the twin's byte-identity; pass `self.project`
+    as `_do_replan`'s `confine_root` and it reddens on the captured roots.
+    """
+    from bmad_loop import devcontract
+
+    calls: list[str] = []
+    roots: list[Path] = []
+    real_reset, real_strip = devcontract.reset_spec_status, devcontract.strip_auto_run_result
+
+    def spy_reset(p, s, **kw):
+        roots.append(kw["confine_root"])
+        return real_reset(p, s, **kw)
+
+    def spy_strip(p, **kw):
+        roots.append(kw["confine_root"])
+        return real_strip(p, **kw)
+
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    monkeypatch.setattr(devcontract, "reset_spec_status", spy_reset)
+    monkeypatch.setattr(devcontract, "strip_auto_run_result", spy_strip)
+    wt = _unit_worktree(project.project)
+    _run_dir, spec = _stories_paused_run(
+        project.project, stage="plan-checkpoint", worktree_path=str(wt)
+    )
+    twin = project.project / spec.relative_to(wt)
+    untouched = twin.read_bytes()
+    monkeypatch.chdir(project.project)  # what the TUI actually runs from
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+        await pilot.click(await ready(pilot, "#act-replan"))
+        await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
+    assert verify.read_frontmatter(spec)["status"] == "draft"
+    assert twin.read_bytes() == untouched
+    assert roots == [wt, wt]
+
+
+async def test_plan_checkpoint_renders_the_worktree_spec_under_isolation(project, monkeypatch):
+    """The read half of the same anchor: the viewers show the spec the run used.
+
+    Pre-fix the raw relpath resolved against the TUI's cwd and the modal rendered the
+    main checkout's twin — same layout, different file, nothing on screen to say so.
+    The `chdir` and the per-tree bodies are load-bearing for the same reasons the
+    replan row documents.
+
+    Ablation: revert `_paused_spec` to `Path(task.spec_file)` and this reddens — the
+    body is the twin's "# plan for 1".
+    """
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    _stories_paused_run(
+        project.project,
+        stage="plan-checkpoint",
+        worktree_path=str(_unit_worktree(project.project)),
+    )
+    monkeypatch.chdir(project.project)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+        body = render(app.screen.query_one("#spec Static", Static).content)
+        assert "# worktree plan for 1" in body
+        assert "# plan for 1" not in body  # the main-checkout twin's body
+
+
+async def test_spec_approval_gate_renders_the_worktree_spec_under_isolation(project, monkeypatch):
+    """The same anchor on the surface the matrix row names: the GATE viewer.
+
+    `_paused_spec` has three consumers and they reach it by different stages —
+    plan-checkpoint (`_review_plan_checkpoint`), the spec-approval / epic-boundary /
+    story-gate trio (`_review_gate`), and escalation (`_review_escalation`). The
+    replan rows above only reach the first, so this pins the gate arm: an operator
+    approving a frozen spec must be looking at the spec the run actually froze, not
+    the main checkout's twin at the same relpath.
+
+    Ablation: revert `_paused_spec` to `Path(task.spec_file)` and this reddens — the
+    body is the twin's "# plan for 1".
+    """
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    _stories_paused_run(
+        project.project,
+        stage="spec-approval",
+        worktree_path=str(_unit_worktree(project.project)),
+    )
+    monkeypatch.chdir(project.project)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+        body = render(app.screen.query_one("#spec Static", Static).content)
+        assert "# worktree plan for 1" in body
+        assert "# plan for 1" not in body  # the main-checkout twin's body
+
+
+async def test_paused_spec_undecodable_spec_does_not_crash_the_dashboard(project, monkeypatch):
+    """A non-UTF-8 spec must render as a read failure, not take the TUI down.
+
+    `read_text(encoding="utf-8")` raises `UnicodeDecodeError`, which is a ValueError
+    and so escaped the `except OSError` arm entirely — and all three review surfaces
+    call `_paused_spec` from the Textual event loop, where an escaping raise kills the
+    dashboard instead of rendering the fault. The same trap `_commit_subject` closes
+    for git subject bytes.
+
+    Ablation: narrow the arm back to `except OSError` and this reddens — the modal
+    never opens, because the worker raised.
+    """
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    _run_dir, spec = _stories_paused_run(project.project, stage="plan-checkpoint")
+    spec.write_bytes(b"---\nstatus: ready-for-dev\n---\n\n# plan caf\xe9 for 1\n")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+        body = render(app.screen.query_one("#spec Static", Static).content)
+        assert "(empty spec)" not in body
+        assert "could not be read" in body
+
+
+async def test_paused_spec_missing_at_the_anchor_reads_as_not_found(project, monkeypatch):
+    """An absent spec at the ANCHORED path is the signal that the anchoring failed, so
+    it must not render as `SpecReviewModal`'s `(empty spec)` — which is also what a
+    spec that read fine and is blank renders as. Ablation: return `path, ""` from
+    `_paused_spec`'s degrade arm and this reddens on the `(empty spec)` assertion."""
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    _run_dir, spec = _stories_paused_run(project.project, stage="plan-checkpoint")
+    spec.unlink()
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+        body = render(app.screen.query_one("#spec Static", Static).content)
+        assert "(empty spec)" not in body
+        assert "could not be read" in body
 
 
 async def test_story_checkpoint_continue_resumes(project, monkeypatch):
@@ -4625,10 +4813,13 @@ async def test_epic_boundary_pause_shows_reason_and_run_id_subtitle(project, mon
 
 
 async def test_spec_approval_unreadable_spec_still_uses_spec_viewer(project, monkeypatch):
-    """An unreadable spec file returns (path, "") from _paused_spec — a spec that
+    """An unreadable spec file still returns its PATH from _paused_spec — a spec that
     exists in the task and cannot be read, not a spec-less gate. It keeps the spec
-    viewer (path line + "(empty spec)"), which pins the branch as `spec_path is
-    None` rather than `not spec_text`."""
+    viewer, which pins the branch as `spec_path is None` rather than `not spec_text`.
+    The body is now the read failure rather than "" (an absent spec at the anchored
+    path is the signal that anchoring failed, so it must not render as "(empty spec)"
+    — see `test_paused_spec_missing_at_the_anchor_reads_as_not_found`); this row
+    grades only that the viewer, not the reason-only modal, is chosen."""
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
     task = StoryTask(story_key="1-1-a", epic=1, phase=Phase.DEV_VERIFY)
     task.spec_file = str(project.project / "gone" / "spec-1-1-a.md")
