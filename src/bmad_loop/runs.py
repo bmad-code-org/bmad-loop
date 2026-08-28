@@ -2312,20 +2312,27 @@ def _redrive_base_ref(state: RunState, task: StoryTask) -> str:
 def _restore_rearmed_spec(
     spec_path: Path, original: bytes | None, task: StoryTask, state: RunState
 ) -> None:
-    """Put back the bytes a re-arm FOUND on the spec, for the one abort that can fire
-    after a write has already landed.
+    """Put back the bytes a re-arm FOUND on the spec, for the aborts that can fire after
+    a write has already landed.
 
     `rearm_escalation` holds an invariant its own refusals depend on: an aborted re-arm
     leaves the spec byte-identical, so the escalation stays armed and the human can fix
-    the file and re-run resolve. Every other refusal earns that by SEQUENCING — the
-    flip's read-back check raises before `devcontract.strip_auto_run_result` runs, which
-    is why that strip is deliberately ordered after it. The baseline re-stamp cannot be
-    sequenced the same way: it needs `task.baseline_commit` from the advance, and the
-    advance must itself run after the spec block (a just-cleared stories sentinel would
-    otherwise be captured into `baseline_untracked` as phantom pre-existing residue). By
-    the time it can fail, the status flip and the result strip have both landed and
-    `save_state` has not — so the abort would otherwise leave the run's task ESCALATED
-    against a spec already flipped to the re-drive's status and stripped of the terminal
+    the file and re-run resolve. TWO of its four refusals earn that by SEQUENCING alone —
+    the flip's read-back check and the `FrontmatterWriteError` arm both raise before
+    `devcontract.strip_auto_run_result` runs, which is why that strip is deliberately
+    ordered after them, and `set_frontmatter_status` decides it cannot move a `status:`
+    before it writes anything. The other two cannot be sequenced out of the hazard, and
+    both call this:
+
+    * The baseline re-stamp needs `task.baseline_commit` from the advance, and the
+      advance must itself run after the spec block (a just-cleared stories sentinel would
+      otherwise be captured into `baseline_untracked` as phantom pre-existing residue).
+    * The `(OSError, UnicodeDecodeError)` arm spans BOTH spec helpers, and the strip is
+      the later one — a fault raised inside it is raised after the flip published.
+
+    By the time either can fail, the status flip has landed and `save_state` has not — so
+    the abort would otherwise leave the run's task ESCALATED against a spec already
+    flipped to the re-drive's status and (for the re-stamp) stripped of the terminal
     `## Auto Run Result` the next resolve session reads as its context. That is exactly
     the "one edit nothing else records" the sequencing exists to prevent.
 
@@ -2814,6 +2821,24 @@ def rearm_escalation(
                 # flip the re-drive would just re-wedge — abort BEFORE any state
                 # is persisted (save_state runs below) with an actionable error
                 # instead of a traceback; the escalation stays armed for a retry.
+                #
+                # ...and this arm is the SECOND refusal that can fire after a write has
+                # landed, which the sequencing argument above does not cover. It guards
+                # BOTH helpers, and `strip_auto_run_result` is the later one: by the
+                # time its own read/decode or its atomic write faults (an
+                # `atomic_write_bytes_confined` that cannot land — ENOSPC, EIO, a
+                # component swapped for a link under the `O_NOFOLLOW` walk — or a spec
+                # replaced under us between the two writes), the flip has already been
+                # published and `save_state` has not. Ordering the strip after the
+                # read-back check bought that check its byte-identical abort; it buys
+                # this one nothing, because the fault is IN the strip. So the same undo
+                # the re-stamp carries applies here, on the same terms.
+                #
+                # On the arm's other shape — the flip itself faulting on an
+                # unreadable/undecodable spec — nothing was written, `spec_before` still
+                # equals the bytes on disk, and `_restore_rearmed_spec` proves that and
+                # returns without touching the file or its mtime.
+                _restore_rearmed_spec(spec_path, spec_before, task, state)
                 raise RearmError(
                     f"cannot re-open story spec {spec_path} for the re-drive "
                     f"({e.__class__.__name__}: {e}) — fix or replace the file "
@@ -2995,9 +3020,11 @@ def rearm_escalation(
                 # to close is exactly what a swallowed write would leave behind.
                 #
                 # ...and that the abort leaves the spec as this re-arm FOUND it. This is
-                # the ONE refusal that can fire after a write has landed — the flip and
-                # the result strip are both behind us, `save_state` is not — so it
-                # carries the undo the other refusals get from sequencing alone. Without
+                # the LAST of the two refusals that can fire after a write has landed —
+                # the flip and the result strip are both behind us, `save_state` is not —
+                # so it carries the undo the sequenced refusals get for free (the other
+                # is the spec block's `(OSError, UnicodeDecodeError)` arm, which the
+                # strip raises through after the flip has published). Without
                 # it a spec with a movable `status:` beside an unmovable
                 # `baseline_revision:` came back flipped to the re-drive's status and
                 # stripped of the terminal result, while the run still called the story

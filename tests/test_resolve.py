@@ -1566,6 +1566,53 @@ def test_rearm_restores_the_spec_when_the_baseline_restamp_aborts(tmp_path):
     assert load_state(run_dir).tasks["6-4-cli-list-command"].phase == Phase.ESCALATED
 
 
+def test_rearm_restores_the_spec_when_the_result_strip_faults(tmp_path, monkeypatch):
+    """The re-stamp is not the only abort that fires after a write has landed — the spec
+    block's own `(OSError, UnicodeDecodeError)` arm is the other, and it needs the same
+    undo.
+
+    The sequencing argument that buys the read-back check its byte-identical abort does
+    not reach here. That arm guards BOTH spec helpers, and `strip_auto_run_result` is the
+    later one: ordering the strip after the check protects the CHECK, but a fault raised
+    inside the strip itself is raised with the status flip already published and
+    `save_state` still ahead. `strip_auto_run_result` documents that it lets a
+    present-but-unreadable spec and a failing write raise rather than swallowing them
+    (silently skipping the strip is the worse bug), so this is its contracted behavior,
+    not an accident — and its write is the confined atomic writer, which raises on ENOSPC,
+    on EIO, and on a parent component swapped for a link under the `O_NOFOLLOW` walk.
+
+    Injected rather than provoked, because no in-process fault can order itself between
+    the two writes: both helpers decode the same file as UTF-8 and write through the same
+    `require_writable_target=True` path, so every natural fault that reddens the strip
+    reddens the flip first and leaves nothing to restore. The injection stands in for the
+    faults above, which are real and are exactly what the atomic writers exist for.
+
+    Ablation: drop the `_restore_rearmed_spec(...)` call from that arm and this reddens on
+    the byte comparison alone — the `RearmError` and the ESCALATED phase both still pass,
+    since the flip landing is precisely what neither observes.
+    """
+    _resolve_repo(tmp_path)
+    spec = tmp_path / "spec.md"
+    spec.write_text(
+        "---\nstatus: blocked\n---\n\n## Intent\n\nx\n\n## Auto Run Result\n\nterminal verdict\n",
+        encoding="utf-8",
+    )
+    before = spec.read_bytes()
+    run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec))
+
+    def boom(spec_path, *, confine_root):
+        raise OSError(28, "No space left on device")
+
+    # patched on the module under test, so the flip runs for real and PUBLISHES
+    monkeypatch.setattr(runs.devcontract, "strip_auto_run_result", boom)
+
+    with pytest.raises(runs.RearmError, match="No space left on device"):
+        runs.rearm_escalation(run_dir)
+
+    assert spec.read_bytes() == before  # the published flip is rolled back
+    assert load_state(run_dir).tasks["6-4-cli-list-command"].phase == Phase.ESCALATED
+
+
 def test_rearm_journals_the_spec_baseline_it_overwrote(tmp_path):
     """A claim the re-stamp normalizes away is the only trace of a divergence the
     gate can no longer report, so it lands in the journal on the way out — read
