@@ -506,7 +506,13 @@ def test_set_frontmatter_field_refuses_a_readonly_spec(tmp_path):
 
 
 def test_build_context_gathers_critical_escalations(tmp_path):
-    run_dir, state, task = _escalated_run(tmp_path, spec_file="/abs/spec.md")
+    # An absolute `spec_file` passes through `runs.task_spec_path` verbatim. The literal
+    # has to be OS-absolute, not merely rooted: on Windows "/abs/spec.md" is DRIVE-relative
+    # (`Path.is_absolute()` is False), so it takes the anchoring arm instead and pathlib's
+    # `/` keeps the root's drive while discarding its path — yielding "D:/abs/spec.md", a
+    # shape no real run persists. `tmp_path` is absolute on every OS.
+    spec = tmp_path / "abs" / "spec.md"
+    run_dir, state, task = _escalated_run(tmp_path, spec_file=str(spec))
     task_dir = run_dir / "tasks" / "6-4-cli-list-command-review-1"
     task_dir.mkdir(parents=True)
     (task_dir / "result.json").write_text(
@@ -523,7 +529,7 @@ def test_build_context_gathers_critical_escalations(tmp_path):
     path = resolve.build_context(state, run_dir, "6-4-cli-list-command")
     ctx = json.loads(path.read_text(encoding="utf-8"))
     assert ctx["story_key"] == "6-4-cli-list-command"
-    assert ctx["spec_file"] == "/abs/spec.md"
+    assert ctx["spec_file"] == spec.as_posix()
     assert ctx["baseline_commit"] == "abc123"
     details = [e["detail"] for e in ctx["escalations"]]
     assert "names not unique" in details
