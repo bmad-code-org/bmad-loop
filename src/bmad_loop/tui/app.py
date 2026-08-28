@@ -987,10 +987,18 @@ class BmadLoopApp(App[None]):
         consumers keep the untouched two-value read. `_do_replan` WRITES the path
         `_paused_spec` returned, and `runs.task_spec_root` is the single definition
         backing both halves: an anchor and a `confine_root` that name different trees do
-        not refuse, they silently degrade the write (#593). No task means nothing was
-        re-anchored, so the project root stays the honest root."""
+        not refuse, they silently degrade the write (#593).
+
+        The no-task arm is `Path(state.project)`, NOT `self.project`, so both arms make
+        one claim: the delegate answers from the state the run persisted at launch,
+        while `self.project` is the constructor's `resolve_or_lexical` of the operator's
+        argument, and the two can differ. That arm is currently unreachable from the
+        write path — `_review_plan_checkpoint`'s `done()` refuses a `None` `spec_path`
+        before calling `_do_replan`, and `_paused_spec` returns `None` exactly when
+        there is no task — so this is about not leaving a second claim lying around for
+        a future caller, not a live bug."""
         task = state.tasks.get(state.paused_story_key) if state.paused_story_key else None
-        return runs.task_spec_root(task, state) if task else self.project
+        return runs.task_spec_root(task, state) if task else Path(state.project)
 
     def _story_subtitle(self, state: RunState) -> Text:
         key = state.paused_story_key or "?"

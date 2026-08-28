@@ -3833,3 +3833,72 @@ def test_project_of_a_real_run_dir_is_the_project_root(tmp_path):
     run_dir = _make_state_run(tmp_path, "r1")
 
     assert runs._project_of_run_dir(run_dir) == tmp_path
+
+
+# ---- task_spec_root: the root must be able to CONFINE the path task_spec_path returns
+
+
+def test_task_spec_root_yields_the_project_when_the_worktree_cannot_confine_the_spec(tmp_path):
+    """An absolute `spec_file` beside a set `worktree_path` is the OUT-OF-MOUNT shape.
+
+    `model._serialized_worktree_path` keeps a path verbatim exactly when
+    `relative_to(worktree_path)` raises, so this pair means the spec is lexically
+    outside the mount. `task_spec_path` passes an absolute path through untouched, so
+    answering the worktree here names a root that can NEVER contain the anchored path:
+    `devcontract._atomic_write_spec` gates on the same lexical `is_relative_to` and
+    would silently take the plain no-follow arm — losing #593's O_NOFOLLOW walk — while
+    `_restore_rearmed_spec`, which calls `atomic_write_bytes_confined` directly, would
+    raise `UnconfinedWriteError` and turn a recoverable re-arm abort into a lost undo.
+
+    The project is not guaranteed to contain it either, but it can, and where it cannot
+    the outcome is byte-identical to today's — so this arm only ever trades a skipped
+    or refused confined write for a taken one.
+
+    Ablation: revert the body to `Path(task.worktree_path or state.project)` and this
+    reddens — the root is the worktree, which cannot confine the spec.
+    """
+    wt = tmp_path / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    spec = tmp_path / "_bmad-output" / "specs" / "6-4.md"  # in the project, not the mount
+    run = escalated_run(tmp_path, "r1", spec_file=str(spec), worktree_path=str(wt))
+
+    assert runs.task_spec_root(run.task, run.state) == tmp_path
+    # the anchored path is confinable by the root, which is the whole point
+    assert runs.task_spec_path(run.task, run.state).is_relative_to(
+        runs.task_spec_root(run.task, run.state)
+    )
+
+
+def test_task_spec_root_stays_on_the_worktree_for_specs_it_can_confine(tmp_path):
+    """The guard against an over-broad fix: only the out-of-mount shape moves.
+
+    Two shapes must keep answering the worktree — the RELATIVE spec (the common
+    isolated case, which `task_spec_path` resolves against this very root), and an
+    ABSOLUTE spec that does sit under the mount. A fix that returned the project
+    whenever `worktree_path` was set would re-break the defect the anchor exists to
+    fix, sending the isolated read and write back to the main checkout's twin.
+
+    Ablation: drop the `raw.is_absolute() and` conjunct so the arm keys on containment
+    alone, and the relative row reddens (`Path("_bmad-output/...")` is not relative to
+    the mount); return `Path(state.project)` whenever a worktree is set and both redden.
+    """
+    wt = tmp_path / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+
+    run = escalated_run(
+        tmp_path, "r1", spec_file="_bmad-output/specs/6-4.md", worktree_path=str(wt)
+    )
+    assert runs.task_spec_root(run.task, run.state) == wt  # relative: the common case
+
+    inside = wt / "_bmad-output" / "specs" / "6-4.md"
+    run = escalated_run(tmp_path, "r2", spec_file=str(inside), worktree_path=str(wt))
+    assert runs.task_spec_root(run.task, run.state) == wt  # absolute, but under the mount
+
+
+def test_task_spec_root_without_a_worktree_is_the_project(tmp_path):
+    """The no-worktree fallback is untouched by the confinement arm: an absolute spec
+    that the project cannot confine still answers the project, because there is no
+    second candidate to choose and the pre-existing behavior is the contract.
+
+    Ablation: return `Path(state.project)` only when the project confines the spec and
+    this reddens — an out-of-project spec has nowhere else to go."""
+    run = escalated_run(tmp_path, "r1", spec_file="/elsewhere/6-4.md")
+    assert runs.task_spec_root(run.task, run.state) == tmp_path

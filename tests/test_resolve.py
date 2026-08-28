@@ -1688,6 +1688,51 @@ def test_rearm_restores_the_spec_when_the_result_strip_faults(tmp_path, monkeypa
         runs.rearm_escalation(run_dir)
 
     assert spec.read_bytes() == before  # the published flip is rolled back
+
+
+def test_rearm_restores_an_isolated_tasks_spec_that_sits_outside_the_worktree(
+    tmp_path, monkeypatch
+):
+    """The undo must still land when the mount cannot confine the spec.
+
+    An absolute `spec_file` beside a set `worktree_path` means the spec is lexically
+    OUTSIDE the mount (`model._serialized_worktree_path` keeps a path verbatim exactly
+    when `relative_to(worktree_path)` raises) — the shape a shared artifact directory
+    produces. `_restore_rearmed_spec` calls `atomic_write_bytes_confined` DIRECTLY, so
+    a `confine_root` naming the worktree does not merely degrade the write the way the
+    three `_atomic_write_spec` writers do: it raises `UnconfinedWriteError`, which the
+    arm re-raises as "cannot restore ...". The operator was then left with the exact
+    state the undo exists to prevent — a spec carrying this re-arm's status flip and
+    stripped of its `## Auto Run Result`, on a story the run still calls ESCALATED —
+    plus a second error masking the first.
+
+    `task_spec_root` now answers the project for that shape, which CAN confine the
+    spec, so the restore lands and the original fault is the one that surfaces.
+
+    Ablation: revert `task_spec_root` to `Path(task.worktree_path or state.project)`
+    and this reddens twice — the `match=` fails on "cannot restore ... UnconfinedWrite
+    Error", and the byte comparison fails behind it.
+    """
+    _resolve_repo(tmp_path)
+    wt = tmp_path / ".bmad-loop" / "runs" / "wt-mount"  # the mount, which holds no spec
+    wt.mkdir(parents=True, exist_ok=True)
+    spec = tmp_path / "spec.md"  # in the project, outside the mount
+    spec.write_text(
+        "---\nstatus: blocked\n---\n\n## Intent\n\nx\n\n## Auto Run Result\n\nterminal verdict\n",
+        encoding="utf-8",
+    )
+    before = spec.read_bytes()
+    run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec), worktree_path=str(wt))
+
+    def boom(spec_path, *, confine_root):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(runs.devcontract, "strip_auto_run_result", boom)
+
+    with pytest.raises(runs.RearmError, match="No space left on device"):
+        runs.rearm_escalation(run_dir)
+
+    assert spec.read_bytes() == before  # the undo reached a spec outside the mount
     assert load_state(run_dir).tasks["6-4-cli-list-command"].phase == Phase.ESCALATED
 
 

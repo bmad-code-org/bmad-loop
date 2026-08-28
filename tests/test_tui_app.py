@@ -3336,6 +3336,7 @@ def _stories_paused_run(
     blocked_result: str = "",
     sentinel: bool = False,
     worktree_path: str = "",
+    spec_outside_worktree: bool = False,
 ) -> tuple[Path, Path]:
     """A stories-mode run paused at `stage`, with the id-keyed story spec on disk
     and a StoryTask pointing at it. Returns (run_dir, spec_path).
@@ -3345,7 +3346,12 @@ def _stories_paused_run(
     relative path, and `task.spec_file` is the absolute worktree path — which
     `StoryTask.to_dict` persists RELATIVE to the mount, so `load_state` hands the app
     back the bare relpath production actually stores. The returned spec path is then
-    the worktree's copy; the twin is the decoy a cwd-anchored resolve lands on."""
+    the worktree's copy; the twin is the decoy a cwd-anchored resolve lands on.
+
+    `spec_outside_worktree` keeps the mount but leaves the spec at the main-checkout
+    path — the shape a shared artifact dir produces, where
+    `_serialized_worktree_path`'s `relative_to` raises and the ABSOLUTE path is
+    persisted verbatim beside a set `worktree_path`."""
     import yaml
 
     folder = root / "epic-1"
@@ -3375,6 +3381,8 @@ def _stories_paused_run(
     task = StoryTask(story_key=story_key, epic=0, phase=Phase.DEV_VERIFY)
     task.spec_file = str(spec)
     if worktree_path:
+        task.worktree_path = worktree_path
+    if worktree_path and not spec_outside_worktree:
         # The isolated shape. The body differs per tree so "the worktree copy was
         # read/written" is checkable against "the main-checkout twin was not" — with
         # identical payloads either assertion could pass on the wrong file.
@@ -3382,7 +3390,6 @@ def _stories_paused_run(
         spec = Path(worktree_path) / twin.relative_to(root)
         spec.parent.mkdir(parents=True, exist_ok=True)
         spec.write_text(body.replace("# plan for", "# worktree plan for"), encoding="utf-8")
-        task.worktree_path = worktree_path
         task.spec_file = str(spec)  # to_dict re-persists this RELATIVE to the mount
     task.review_cycle = review_cycle
     if commit_sha:
@@ -3525,6 +3532,62 @@ async def test_plan_checkpoint_replan_writes_the_worktree_spec_not_the_main_twin
     assert roots == [wt, wt]
 
 
+async def test_plan_checkpoint_replan_confines_on_the_project_for_an_out_of_mount_spec(
+    project, monkeypatch
+):
+    """Matrix row 5 end-to-end: the root is the tree that can CONFINE the spec.
+
+    An absolute `spec_file` beside a set `worktree_path` means the spec sits outside
+    the mount (`_serialized_worktree_path` keeps it verbatim exactly when
+    `relative_to` raises) — a shared artifact dir. The path passes through unchanged,
+    but the mount can never contain it, so a `confine_root` naming the worktree sends
+    both writers to the plain no-follow arm and drops #593's O_NOFOLLOW walk.
+
+    The captured root is the ONLY discriminator at this layer, and deliberately so:
+    both roots land the write here (the confined gate is lexical, and its else-branch
+    still writes), so the reset-to-draft assertion below cannot tell them apart. It is
+    kept because the replan must still actually work for this shape, not to grade the
+    root.
+
+    Ablation: revert `task_spec_root` to `Path(task.worktree_path or state.project)`
+    and this reddens on the captured roots — they become the mount.
+    """
+    from bmad_loop import devcontract
+
+    calls: list[str] = []
+    roots: list[Path] = []
+    real_reset, real_strip = devcontract.reset_spec_status, devcontract.strip_auto_run_result
+
+    def spy_reset(p, s, **kw):
+        roots.append(kw["confine_root"])
+        return real_reset(p, s, **kw)
+
+    def spy_strip(p, **kw):
+        roots.append(kw["confine_root"])
+        return real_strip(p, **kw)
+
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    monkeypatch.setattr(devcontract, "reset_spec_status", spy_reset)
+    monkeypatch.setattr(devcontract, "strip_auto_run_result", spy_strip)
+    _run_dir, spec = _stories_paused_run(
+        project.project,
+        stage="plan-checkpoint",
+        worktree_path=str(_unit_worktree(project.project)),
+        spec_outside_worktree=True,
+    )
+    assert not spec.is_relative_to(_unit_worktree(project.project))  # the shape under test
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+        await pilot.click(await ready(pilot, "#act-replan"))
+        await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
+    assert roots == [project.project, project.project]
+    assert verify.read_frontmatter(spec)["status"] == "draft"
+
+
 async def test_plan_checkpoint_renders_the_worktree_spec_under_isolation(project, monkeypatch):
     """The read half of the same anchor: the viewers show the spec the run used.
 
@@ -3603,6 +3666,34 @@ async def test_paused_spec_undecodable_spec_does_not_crash_the_dashboard(project
         body = render(app.screen.query_one("#spec Static", Static).content)
         assert "(empty spec)" not in body
         assert "could not be read" in body
+
+
+def test_paused_spec_root_without_a_task_answers_the_states_project(tmp_path):
+    """Both arms of `_paused_spec_root` make ONE claim about the project.
+
+    The delegate (`runs.task_spec_root`) answers from `state.project` — the string the
+    run persisted at launch — while `self.project` is the constructor's
+    `resolve_or_lexical` of whatever path the operator opened the dashboard with. The
+    two can differ, so a no-task arm returning `self.project` left a second claim lying
+    around for a future caller to trip on.
+
+    Graded directly because the arm is unreachable from the write path today:
+    `_review_plan_checkpoint`'s `done()` refuses a `None` `spec_path` before calling
+    `_do_replan`, and `_paused_spec` returns `None` exactly when there is no task. An
+    end-to-end row could not reach it, so this calls the method.
+
+    Ablation: return `self.project` from the no-task arm and this reddens — the two
+    directories are deliberately different here.
+    """
+    app = BmadLoopApp(tmp_path / "opened-here")
+    state = RunState(
+        run_id="20260611-100000-aaaa",
+        project=str(tmp_path / "persisted-at-launch"),
+        started_at="2026-06-11T10:00:00",
+    )
+    assert state.paused_story_key is None  # the no-task arm
+    assert app._paused_spec_root(state) == tmp_path / "persisted-at-launch"
+    assert app._paused_spec_root(state) != app.project
 
 
 async def test_paused_spec_missing_at_the_anchor_reads_as_not_found(project, monkeypatch):

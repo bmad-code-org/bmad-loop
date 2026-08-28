@@ -2200,7 +2200,7 @@ def task_spec_path(task: StoryTask, state: RunState) -> Path:
 
 
 def task_spec_root(task: StoryTask, state: RunState) -> Path:
-    """The tree a relative `task.spec_file` is anchored on — and confined to.
+    """The tree a `task.spec_file` is anchored on — and confined to.
 
     One definition backs both halves because they must not disagree: the root
     `task_spec_path` resolves against and the `confine_root` the writers validate the
@@ -2217,8 +2217,33 @@ def task_spec_root(task: StoryTask, state: RunState) -> Path:
     `.resolve()`d path: a symlinked `.bmad-loop`, `runs` or `worktrees` lands the spec
     outside `project`, and before this anchor moved that silently degraded all three
     writes.
+
+    A worktree that CANNOT confine the anchored path yields the project instead. An
+    absolute `spec_file` beside a set `worktree_path` is precisely the out-of-mount
+    shape: `model._serialized_worktree_path` keeps a path verbatim exactly when
+    `relative_to(worktree_path)` raises, so the two spellings did not share a prefix.
+    Returning the worktree there would name a root that can never contain the path
+    `task_spec_path` passes through — the three `_atomic_write_spec` writers would
+    silently take the plain no-follow arm (losing #593's O_NOFOLLOW walk) and
+    `_restore_rearmed_spec`, which calls the confined writer directly, would RAISE.
+    The project can often confine it; when it cannot, the outcome is what it already
+    was, so this arm only ever trades a skipped or refused confined write for a taken
+    one.
+
+    The test is the LEXICAL `is_relative_to` that `devcontract._atomic_write_spec`
+    itself gates on, so the root and the writer's own check agree by construction.
+    Deliberately not canonicalized: `_spec_is_shared_with_the_redrive` answers a
+    DIFFERENT question (is this spec reachable by the re-drive) and canonicalizes for
+    it, but matching that here would diverge from the gate this value is measured
+    against and change writes that are correct today.
     """
-    return Path(task.worktree_path or state.project)
+    worktree = task.worktree_path
+    if not worktree:
+        return Path(state.project)
+    raw = Path(task.spec_file or "")
+    if raw.is_absolute() and not raw.is_relative_to(worktree):
+        return Path(state.project)
+    return Path(worktree)
 
 
 def _spec_is_shared_with_the_redrive(state: RunState, task: StoryTask) -> bool:

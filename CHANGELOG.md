@@ -169,9 +169,18 @@ breaking changes may land in a minor release.
   success (the wrong file genuinely is inside the confinement root), the run resumed, and the
   worktree's real spec kept its terminal status, so the next dispatch did not re-plan. The path and
   the confinement root now come from one claim about which tree owns the spec, and a spec missing at
-  the anchored path reads as an explicit read failure rather than an empty body.
-  `bmad-loop resolve`'s `context.json` reports `spec_file` as an absolute path for the same
-  reason.
+  the anchored path reads as an explicit read failure rather than an empty body — including a
+  spec that is present but not valid UTF-8, which previously escaped the read guard as a
+  `UnicodeDecodeError` and took the dashboard down. `bmad-loop resolve`'s `context.json` reports
+  `spec_file` as an absolute path for the same reason.
+
+  The confinement root now also has to be a tree that can actually contain the spec. A spec
+  recorded as an absolute path alongside a worktree sits outside that worktree by construction,
+  so naming the worktree left every spec write unable to satisfy its own containment check: the
+  status flip, the result strip and the baseline re-stamp silently fell back to an unguarded
+  write, and the re-arm's undo failed outright, leaving a half-rewritten spec on a story the run
+  still reported as escalated. Such a spec now anchors on the project, which can contain it.
+  Where nothing can, the behavior is unchanged.
 
 - **`resume` re-stamps the run's recorded code root** (#716). Resume arms the engine against the
   `repo_root` it re-reads from `_bmad/bmm/config.yaml` but left the `state.json` copy at its launch
