@@ -116,7 +116,11 @@ breaking changes may land in a minor release.
   (`rearm-baseline-restamped`) instead of being silently normalized, and a re-stamp is refused
   outright when the baseline advance failed, so spec and task can never agree on a stale sha. The
   record compares against the baseline the run RECORDED, so it fires only on a claim the run never
-  made.
+  made. That refusal now also puts the spec back: it is the one abort that fires after the status
+  flip and the `## Auto Run Result` strip have already landed — the others are sequenced ahead of
+  every write — so a spec carrying a movable `status:` beside an unmovable `baseline_revision:`
+  used to come back flipped and stripped while the run still called the story escalated. A restore
+  that itself fails raises rather than degrading.
 
 - **A published run archive now lands at mode `0600`** instead of a umask-derived mode (#591).
   It is staged through a file the orchestrator creates itself rather than one `tarfile` opens

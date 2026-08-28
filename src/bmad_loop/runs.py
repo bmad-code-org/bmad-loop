@@ -29,6 +29,7 @@ from .platform_util import (
     UnconfinedWriteError,
     _mkstemp_beside,
     atomic_replace,
+    atomic_write_bytes_confined,
     atomic_write_text_confined,
     create_exclusive_confined,
     has_parent_ref,
@@ -2308,6 +2309,59 @@ def _redrive_base_ref(state: RunState, task: StoryTask) -> str:
     return "HEAD"
 
 
+def _restore_rearmed_spec(
+    spec_path: Path, original: bytes | None, task: StoryTask, state: RunState
+) -> None:
+    """Put back the bytes a re-arm FOUND on the spec, for the one abort that can fire
+    after a write has already landed.
+
+    `rearm_escalation` holds an invariant its own refusals depend on: an aborted re-arm
+    leaves the spec byte-identical, so the escalation stays armed and the human can fix
+    the file and re-run resolve. Every other refusal earns that by SEQUENCING — the
+    flip's read-back check raises before `devcontract.strip_auto_run_result` runs, which
+    is why that strip is deliberately ordered after it. The baseline re-stamp cannot be
+    sequenced the same way: it needs `task.baseline_commit` from the advance, and the
+    advance must itself run after the spec block (a just-cleared stories sentinel would
+    otherwise be captured into `baseline_untracked` as phantom pre-existing residue). By
+    the time it can fail, the status flip and the result strip have both landed and
+    `save_state` has not — so the abort would otherwise leave the run's task ESCALATED
+    against a spec already flipped to the re-drive's status and stripped of the terminal
+    `## Auto Run Result` the next resolve session reads as its context. That is exactly
+    the "one edit nothing else records" the sequencing exists to prevent.
+
+    Writes only what it can prove it changed. `original` is `None` when the spec was
+    unreadable before the first write (there is then nothing to restore, and nothing
+    could have been written either), and a spec that is gone or unreadable NOW is not a
+    state this undo can improve — recreating a file another process removed would fight
+    a concurrent actor rather than restore this function's own edit. Bytes equal to
+    `original` mean nothing landed, so nothing is rewritten and the mtime is left alone.
+
+    Byte-verbatim and CONFINED, matching the writes it undoes: `atomic_write_text_confined`
+    would re-encode and translate newlines, so a CRLF spec would come back subtly
+    different from the file this re-arm found, and an unconfined write would drop the
+    `O_NOFOLLOW` walk of the parent components (#593) that every other write to this path
+    takes. A restore that itself fails RAISES rather than degrading — the spec is then
+    half-written and only the operator can settle it, which is the loudest thing this can
+    be. `UnconfinedWriteError` is an `OSError`, so the one arm covers both.
+    """
+    if original is None:
+        return
+    try:
+        if spec_path.read_bytes() == original:
+            return
+    except OSError:
+        return
+    try:
+        atomic_write_bytes_confined(spec_path, original, confine_root=_task_spec_root(task, state))
+    except OSError as e:
+        raise RearmError(
+            f"cannot restore {spec_path} after a failed re-arm "
+            f"({e.__class__.__name__}: {e}) — the spec carries this re-arm's status flip "
+            "and has lost its `## Auto Run Result` section, while the story is still "
+            "escalated; restore the spec from git, then re-run resolve"
+        ) from e
+
+
 def _committed_spec_status(state: RunState, task: StoryTask) -> str:
     """The spec's status as COMMITTED in the tree the re-drive reads, or ``""`` when
     unprovable.
@@ -2505,6 +2559,10 @@ def rearm_escalation(
     # a prior restore attempt the human then chose to redo from scratch.
     task.restore_patch = restore_patch
 
+    # The bytes this re-arm found on the spec, for `_restore_rearmed_spec`. Declared out
+    # here because the baseline re-stamp that consumes it sits in a SECOND
+    # `if task.spec_file:` block, past the advance it depends on.
+    spec_before: bytes | None = None
     if task.spec_file:
         spec_path = _task_spec_path(task, state)
         # Stories mode only: a fixed-slug pre-planning-halt sentinel
@@ -2617,6 +2675,14 @@ def rearm_escalation(
                     status=target_status,
                     target_branch=state.target_branch,
                 )
+            # Captured immediately before the FIRST write, so an abort further down can
+            # put the spec back exactly as found. Unreadable degrades to `None`: the
+            # writes below answer such a path with `False` rather than an exception, so
+            # there would be nothing to undo either.
+            try:
+                spec_before = spec_path.read_bytes()
+            except OSError:
+                spec_before = None
             try:
                 flipped = verify.set_frontmatter_status(
                     spec_path, target_status, confine_root=_task_spec_root(task, state)
@@ -2927,6 +2993,16 @@ def rearm_escalation(
                 # exception already says which shape it could not move. What matters
                 # is that it aborts here — the stale-baseline hazard this block exists
                 # to close is exactly what a swallowed write would leave behind.
+                #
+                # ...and that the abort leaves the spec as this re-arm FOUND it. This is
+                # the ONE refusal that can fire after a write has landed — the flip and
+                # the result strip are both behind us, `save_state` is not — so it
+                # carries the undo the other refusals get from sequencing alone. Without
+                # it a spec with a movable `status:` beside an unmovable
+                # `baseline_revision:` came back flipped to the re-drive's status and
+                # stripped of the terminal result, while the run still called the story
+                # escalated.
+                _restore_rearmed_spec(spec_path, spec_before, task, state)
                 raise RearmError(
                     f"cannot re-stamp baseline_revision on {spec_path} "
                     f"({e.__class__.__name__}: {e}) — fix the file, then re-run resolve"

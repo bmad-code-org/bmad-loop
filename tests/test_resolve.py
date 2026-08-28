@@ -1516,6 +1516,56 @@ def test_rearm_restamps_spec_baseline_on_the_from_scratch_leg_too(tmp_path):
     assert load_state(run_dir).tasks["6-4-cli-list-command"].baseline_commit == new_head
 
 
+def test_rearm_restores_the_spec_when_the_baseline_restamp_aborts(tmp_path):
+    """An aborted re-arm leaves the spec byte-identical — INCLUDING the abort that fires
+    after two writes have already landed.
+
+    Every other refusal in `rearm_escalation` earns that invariant by sequencing: the
+    flip's read-back check raises before `strip_auto_run_result` runs, which is the whole
+    reason that strip is ordered after it. The baseline re-stamp cannot be sequenced the
+    same way — it needs `task.baseline_commit` from an advance that must itself run after
+    the spec block, or a just-cleared stories sentinel is captured as phantom untracked
+    residue — so by the time it can fail, the status flip and the result strip are both
+    behind it and `save_state` is not.
+
+    This spec is the shape that separates the two writes: a plain, perfectly movable
+    `status:` beside a `baseline_revision:` block scalar, which
+    `frontmatter._edit_frontmatter_block` refuses (no line edit re-parses to the intended
+    value, so no candidate verifies). Without the undo the operator was left with the
+    worst of both: the run still calling the story ESCALATED, and a spec already flipped
+    to `ready-for-dev` and stripped of the `## Auto Run Result` section the next resolve
+    session reads as its context — the one edit nothing else records.
+
+    Ablation: drop the `_restore_rearmed_spec(...)` call from the re-stamp's except arm
+    and this reddens on the byte comparison (the status flip and the strip both stand),
+    while the `RearmError` and the ESCALATED phase keep passing — which is exactly why
+    those two alone do not grade this.
+    """
+    old_head = _resolve_repo(tmp_path)
+    spec = tmp_path / "spec.md"
+    spec.write_text(
+        "---\n"
+        "status: blocked\n"
+        "baseline_revision: |\n"
+        f"  {old_head}\n"
+        "---\n\n## Intent\n\nx\n\n## Auto Run Result\n\nterminal verdict\n",
+        encoding="utf-8",
+    )
+    before = spec.read_bytes()
+    run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec))
+    # a resolve-session commit, so the advance really runs and the re-stamp is reached
+    (tmp_path / "fixture.txt").write_text("resolution fixture\n")
+    git(tmp_path, "add", "-A")
+    git(tmp_path, "commit", "-q", "-m", "resolution fixture")
+
+    with pytest.raises(runs.RearmError, match="baseline_revision"):
+        runs.rearm_escalation(run_dir)
+
+    assert spec.read_bytes() == before  # flip AND strip both undone
+    # nothing was persisted either, so the escalation is still armed for a corrected spec
+    assert load_state(run_dir).tasks["6-4-cli-list-command"].phase == Phase.ESCALATED
+
+
 def test_rearm_journals_the_spec_baseline_it_overwrote(tmp_path):
     """A claim the re-stamp normalizes away is the only trace of a divergence the
     gate can no longer report, so it lands in the journal on the way out — read
