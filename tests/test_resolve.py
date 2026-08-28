@@ -631,8 +631,19 @@ def test_rearm_warns_when_an_isolated_tasks_spec_writes_cannot_reach_the_redrive
     in-place, harmless here); the operator is told, because a flip that cannot land is
     the silent re-wedge #640(b) exists to end.
 
-    Ablation: delete the `if task.worktree_path:` append and this reddens while the
-    no-worktree control still passes.
+    The main-checkout copy is the row this shape pins, and it is the reason
+    `_spec_is_shared_with_the_redrive` tests the PROJECT as well as the worktree. That
+    write does land — the spec is outside `confine_root`, which
+    `set_frontmatter_status` answers with its plain no-follow arm — but the re-drive
+    still cannot use it: `engine._dispatched_spec_for_attempt` measures the absolute
+    path with `verify.spec_within_roots` against `workspace.paths`, rebased onto the
+    fresh worktree, and a main-checkout path is under none of those roots. "Outside the
+    worktree" alone would exempt it; only "outside both checkouts" is shared.
+
+    Ablation: delete the `if task.worktree_path:` term and this reddens while the
+    no-worktree control still passes. Drop the `state.project` half of
+    `_spec_is_shared_with_the_redrive` and this reddens alone — the shared-artifact-dir
+    row is the one that must stay silent, and it does.
     """
     _resolve_repo(tmp_path)
     spec = tmp_path / "spec.md"
@@ -1885,6 +1896,128 @@ def test_rearm_suppresses_the_unreachable_warning_only_on_proof(tmp_path, monkey
     assert unreachable["status"] == "ready-for-dev"
     # and the advance's own degrade is reported alongside it, not instead of it
     assert [e for e in kinds if e["kind"] == "rearm-baseline-advance-failed"]
+
+
+def test_rearm_does_not_warn_when_the_spec_dir_is_shared_with_the_redrive(tmp_path, monkeypatch):
+    """A spec in an artifact dir configured OUTSIDE the project is reachable.
+
+    `ProjectPaths.rebased` leaves an artifact dir outside the project tree exactly
+    where it is — shared across checkouts, not per-worktree — and
+    `verify.resolve_spec_path` passes an absolute value through untouched, so the fresh
+    worktree's re-drive opens the very file this flip writes. Under isolation that is
+    also the only shape `model._serialized_worktree_path` can persist ABSOLUTE: a spec
+    under the mounted worktree is stored relative to it.
+
+    So the warning's whole premise — "the re-drive destroys the worktree before reading
+    anything" — is false here, and firing it told the operator to commit a file that is
+    not in the repository at all, on 100% of re-arms in that layout. The status
+    assertion is what makes this a reachability claim rather than a silence claim: the
+    write lands on the shared path (`set_frontmatter_status` keeps the plain no-follow
+    arm for a spec outside `confine_root`, which its docstring names as this exact
+    supported configuration), so there is nothing left for the operator to do.
+
+    Ablation: drop the `not _spec_is_shared_with_the_redrive(task)` term from the gate
+    in `rearm_escalation` and this reddens on the record's presence
+    (`assert [] == []` fails with the entry).
+    """
+    _resolve_repo(tmp_path)
+    shared = tmp_path.parent / "shared-artifacts"  # outside the project tree
+    spec = shared / "specs" / "6-4-cli-list-command.md"
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    spec.write_text("---\nstatus: blocked\n---\n\n## Intent\n\nx\n", encoding="utf-8")
+
+    run_dir, _, _ = _escalated_run(
+        tmp_path, spec_file=str(spec), worktree_path=str(tmp_path / "wt")
+    )
+    monkeypatch.chdir(tmp_path)
+
+    runs.rearm_escalation(run_dir)
+
+    assert [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-write-unreachable"] == []
+    # and the flip really landed on the shared file the re-drive will read
+    assert "status: ready-for-dev" in spec.read_text(encoding="utf-8")
+
+
+def test_rearm_still_warns_for_a_spec_spelled_out_of_but_resolving_into_the_worktree(
+    tmp_path, monkeypatch
+):
+    """The exemption is containment, not spelling.
+
+    `model._serialized_worktree_path` relativizes with a LEXICAL `relative_to`, so any
+    spelling that does not share a literal prefix with `worktree_path` is persisted
+    absolute — including one that walks back INTO the worktree through a sibling. That
+    spec is discarded with the worktree like any other, so the warning must survive; a
+    helper that read `is_absolute()` as "shared" would go silent on it. (The lexical
+    prefix test cannot separate the two rows: it is the same comparison, on the same
+    two operands, that decided the value was stored absolute in the first place.)
+
+    The mount is deliberately outside the project, so the helper's project half cannot
+    carry this row — `test_rearm_warns_when_an_isolated_tasks_spec_writes_cannot_reach_the_redrive`
+    grades that one. Dropping the worktree half reddens here and nowhere else.
+
+    Ablation: replace the canonical comparison in `_spec_is_shared_with_the_redrive`
+    with `return True` — accepting the recorded spelling as proof — and this reddens on
+    the missing record (`ValueError: not enough values to unpack`), while the
+    shared-artifact-dir row above keeps passing. That asymmetry is the containment test.
+    """
+    _resolve_repo(tmp_path)
+    # the mount sits OUTSIDE the project, so the project half of the test cannot answer
+    # this row — `workspace.open_unit_workspace` stores a resolved path, and a symlinked
+    # `.bmad-loop` puts it here. Only the worktree half can keep the warning.
+    wt = tmp_path.parent / "u1-worktree"
+    (tmp_path.parent / "u1-side").mkdir(exist_ok=True)  # real, so `u1-side/..` folds
+    real = wt / "_bmad-output" / "specs" / "6-4-cli-list-command.md"
+    real.parent.mkdir(parents=True, exist_ok=True)
+    real.write_text("---\nstatus: blocked\n---\n\n## Intent\n\nx\n", encoding="utf-8")
+    # lexically outside `wt` (the components diverge at `u1-side`), canonically inside it
+    spelled = tmp_path.parent / "u1-side" / ".." / wt.name / "_bmad-output" / "specs" / real.name
+
+    run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spelled), worktree_path=str(wt))
+    monkeypatch.chdir(tmp_path)
+
+    runs.rearm_escalation(run_dir)
+
+    (unreachable,) = [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-write-unreachable"]
+    assert unreachable["status"] == "ready-for-dev"
+
+
+def test_rearm_warns_when_the_spec_cannot_be_placed_against_the_worktree(tmp_path, monkeypatch):
+    """A host that cannot canonicalize the spec keeps the warning.
+
+    `_spec_is_shared_with_the_redrive` decides on `resolve()`, which raises on the hosts
+    #552 is about (a registered-but-not-serving WSL UNC provider) — and an uncertain
+    answer must not buy silence, the same direction `_committed_spec_status` degrades
+    in. This row is the shared-artifact-dir row above with resolution taken away, so it
+    is the fault, not the layout, that flips the outcome.
+
+    Ablation: drop the `except (OSError, RuntimeError)` arm and this reddens with the
+    OSError escaping `rearm_escalation` — a re-arm that crashes on an observation is
+    strictly worse than one that warns.
+    """
+    _resolve_repo(tmp_path)
+    shared = tmp_path.parent / "shared-artifacts-unresolvable"
+    spec = shared / "specs" / "6-4-cli-list-command.md"
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    spec.write_text("---\nstatus: blocked\n---\n\n## Intent\n\nx\n", encoding="utf-8")
+
+    real_resolve = platform_util.Path.resolve
+
+    def _refuse(self, *a, **kw):
+        if "shared-artifacts-unresolvable" in str(self):
+            raise OSError(64, "The specified network name is no longer available")
+        return real_resolve(self, *a, **kw)
+
+    monkeypatch.setattr(platform_util.Path, "resolve", _refuse)
+
+    run_dir, _, _ = _escalated_run(
+        tmp_path, spec_file=str(spec), worktree_path=str(tmp_path / "wt")
+    )
+    monkeypatch.chdir(tmp_path)
+
+    runs.rearm_escalation(run_dir)
+
+    (unreachable,) = [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-write-unreachable"]
+    assert unreachable["status"] == "ready-for-dev"
 
 
 def test_rearm_writes_the_project_rooted_spec_when_no_worktree_was_recorded(tmp_path, monkeypatch):

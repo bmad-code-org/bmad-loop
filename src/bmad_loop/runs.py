@@ -2217,6 +2217,61 @@ def _task_spec_root(task: StoryTask, state: RunState) -> Path:
     return Path(task.worktree_path or state.project)
 
 
+def _spec_is_shared_with_the_redrive(state: RunState, task: StoryTask) -> bool:
+    """True when an isolated unit's recorded spec lives outside BOTH checkouts, so the
+    re-arm's status flip survives the worktree's disposal and the re-drive reads it.
+
+    The case: artifact dirs configured outside the project tree. `ProjectPaths.rebased`
+    leaves those exactly where they are ("configured outside the project tree; doesn't
+    move") — they are SHARED across checkouts, not per-worktree — so the spec the dev
+    session reported resolves to one file that every worktree sees. The re-drive reads it
+    back through `verify.resolve_spec_path`, whose absolute branch passes the value
+    through untouched, and `engine._dispatched_spec_for_attempt` then accepts it because
+    the rebased `implementation_artifacts` is still that same external directory.
+
+    Both roots are load-bearing, and neither implies the other:
+
+    - INSIDE the worktree — the file the fresh mount destroys. Unreachable.
+    - inside the PROJECT but outside the worktree — the main checkout's copy. The write
+      lands, but the re-drive cannot use it: under isolation `workspace.paths` is rebased
+      onto the fresh worktree, so `verify.spec_within_roots` measures the main
+      checkout's path against worktree-local roots and rejects it. Unreachable, and this
+      is the one shape the worktree test alone would wrongly exempt.
+    - outside both — the shared artifact dir above. Reachable.
+
+    (The two are not nested: worktrees normally sit under `<project>/.bmad-loop/runs/`,
+    but `workspace.open_unit_workspace` stores a `.resolve()`d path, so a symlinked
+    `.bmad-loop` puts the mount outside the project.)
+
+    The recorded spelling opens the question but does not answer it.
+    `StoryTask._serialized_worktree_path` persists a spec RELATIVE whenever it sits
+    under the mounted worktree and verbatim (absolute) otherwise, so an absolute value
+    on a task that HAS a worktree is the only shape that can be shared — but that
+    relativize is a LEXICAL `relative_to` against the same `worktree_path` read here, so
+    all an absolute value proves is that the two spellings did not share a prefix. A
+    spec reported through a symlink or a `..` segment sits inside the worktree and is
+    persisted absolute all the same, and answering "shared" for it would suppress the
+    warning on a spec that really is destroyed with the worktree.
+
+    So containment is decided on the CANONICAL paths, and a host that cannot canonicalize
+    one of them answers "not shared". That degrade is the safe direction and the reason
+    this does not use `resolve_or_lexical`: its fallback is `absolute()`, which does not
+    fold `..`, so a spec spelled through either checkout would come back looking external
+    and go silent — trading a wrong warning for no warning at all."""
+    raw = Path(task.spec_file or "")
+    if not task.worktree_path or not raw.is_absolute():
+        return False
+    try:
+        # the house pair — `resolve()` raises RuntimeError, not OSError, for a symlink
+        # loop on the 3.11/3.12 floor
+        real = raw.resolve()
+        return not real.is_relative_to(Path(task.worktree_path).resolve()) and not (
+            real.is_relative_to(Path(state.project).resolve())
+        )
+    except (OSError, RuntimeError):
+        return False
+
+
 def _committed_spec_status(state: RunState, task: StoryTask) -> str:
     """The spec's status as COMMITTED in the code tree, or ``""`` when unprovable.
 
@@ -2231,6 +2286,12 @@ def _committed_spec_status(state: RunState, task: StoryTask) -> str:
     never equals a target status, so the caller's record still fires. Suppression
     therefore requires PROOF that the work is already done, and the non-repo case stays
     non-fatal, as the story's Boundaries require.
+
+    The absolute arm is narrower than it looks: the caller has already answered the one
+    absolute shape whose write the re-drive DOES read — the shared external spec — with
+    `_spec_is_shared_with_the_redrive`. What still reaches here is an absolute spelling
+    of a path inside one of the two checkouts, which is genuinely unreachable and
+    genuinely unprovable, so degrading it to a warning is the right answer, not a gap.
     """
     raw = Path(task.spec_file or "")
     if not task.spec_file or raw.is_absolute():
@@ -2380,10 +2441,10 @@ def rearm_escalation(
             task.spec_file = None
             task.sentinel_kind = ""  # verdict discharged; the re-dispatch is clean
         else:
-            # An isolated task's spec writes below land in the unit's WORKTREE
-            # (`_task_spec_path`) — which the re-drive destroys before reading
-            # anything. A re-armed task (phase PENDING, `defer_reason` cleared, and no
-            # resumable session because `generation` was just bumped) falls to
+            # A WORKTREE-LOCAL spec's writes below land in the unit's worktree
+            # (`_task_spec_path`) — which the re-drive destroys before reading anything.
+            # A re-armed task (phase PENDING, `defer_reason` cleared, and no resumable
+            # session because `generation` was just bumped) falls to
             # `engine._finish_inflight`'s final arm, which calls `discard_worktree` and
             # lets `_run_story` mount a fresh one. The re-driven session then resolves
             # its spec through `verify.resolve_spec_path(task.spec_file,
@@ -2399,6 +2460,14 @@ def rearm_escalation(
             # The writes below are kept (they are correct for the in-place case, and
             # harmless here), but the operator is told — a flip that cannot land is
             # exactly the silent re-wedge #640(b) exists to end.
+            #
+            # "Worktree-local" is the load-bearing qualifier, and isolation does not
+            # imply it: an artifact dir configured OUTSIDE the project tree is shared
+            # across checkouts by `ProjectPaths.rebased`, so a spec that landed there is
+            # one file the fresh worktree reads through the very absolute path this
+            # writes to. `_spec_is_shared_with_the_redrive` carves out that case, and only
+            # that one: the main checkout's copy is outside the worktree too, and stays
+            # unreachable because the re-drive measures it against worktree-local roots.
             # Route /bmad-build-auto via the spec's frontmatter status (decision
             # table): patch-restore -> in-review -> step-04 (resume review on
             # the restored diff); from-scratch -> ready-for-dev -> step-03
@@ -2416,7 +2485,11 @@ def rearm_escalation(
             # target status, which is precisely when the re-drive reads what it needs.
             # Suppression requires PROOF: an unreadable blob, a non-repo project, or any
             # git fault leaves `""` and the record fires.
-            if task.worktree_path and _committed_spec_status(state, task) != target_status:
+            if (
+                task.worktree_path
+                and not _spec_is_shared_with_the_redrive(state, task)
+                and _committed_spec_status(state, task) != target_status
+            ):
                 journal.append(
                     "rearm-spec-write-unreachable",
                     story_key=key,

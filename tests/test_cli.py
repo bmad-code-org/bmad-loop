@@ -3942,6 +3942,106 @@ def test_resume_restamps_policy_snapshot_for_sweep_runs(project, monkeypatch):
     assert load_state(run_dir).cache_read_weight() == 0.5
 
 
+# ------------------------------------------- resume re-stamps the code root
+
+# `repo_root:` is the one ProjectPaths member that decides which git TREE the run
+# works in, and resume re-reads config.yaml, so it is also the one the persisted
+# mirror (`RunState.repo_root`, which `runs.rearm_escalation` reads back out of
+# process) can fall behind. The three rows below are the whole contract: a move is
+# adopted and announced, a run that did not move reports nothing, and a state.json
+# from before the field existed migrates without being called a move.
+
+
+def _configure_repo_root(project, root: Path) -> None:
+    """Add a `repo_root:` override to the config.yaml `install_bmad_config` wrote.
+    Appended rather than rewritten so the artifact keys keep their real values —
+    `load_paths` requires them, and a stub would move what the test is not about."""
+    cfg = project.project / "_bmad" / "bmm" / "config.yaml"
+    cfg.write_text(
+        cfg.read_text(encoding="utf-8") + f"repo_root: '{root.as_posix()}'\n", encoding="utf-8"
+    )
+
+
+def test_resume_restamps_the_code_root_when_the_config_moved(project, monkeypatch, capsys):
+    """Resume adopts the code root now on disk, so the mirror must follow it.
+
+    `compose_resume` builds the Workspace off the freshly loaded `paths`, never off
+    state.json, so after a `repo_root:` edit the engine works in the new tree while
+    `runs.rearm_escalation` — a separate process, reading `RunState.code_root` — would
+    still advance the attempt baseline and re-stamp `baseline_revision` in the old one.
+    Two readers, two trees, no error: `resolve` would report a re-arm that armed the
+    wrong repository.
+
+    Durable BEFORE the engine starts, like the snapshot and the digest beside it:
+    `rearm_escalation` reads the file, and `Engine._save()` may not fire for minutes.
+
+    Ablation: delete `state.repo_root = str(paths.repo_root)` from `_resume_paused_run`
+    and this reddens on the stale root (the legacy-migration row below reddens with
+    it); neutralize `code_root_changed` to a literal `False` and it reddens on the
+    journal field and the warning instead.
+    """
+    seen: list = []
+    run_dir = _paused_run_for_resume(
+        project, monkeypatch, repo_root=str(project.project / "old-code")
+    )
+    moved = project.project / "moved-code"
+    moved.mkdir()
+    _configure_repo_root(project, moved)
+    monkeypatch.setattr(cli, "Engine", _state_reading_engine(seen))
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+
+    (at_start,) = seen
+    assert at_start.code_root == moved.resolve()
+    assert _resume_entry(run_dir)["code_root_changed"] is True
+    err = capsys.readouterr().err
+    assert "the code root in _bmad/bmm/config.yaml has changed" in err
+    # the warning names neither tree: a journalled scalar, an operator-facing sentence
+    assert str(moved) not in err
+
+
+def test_resume_reports_no_code_root_change_when_the_config_did_not_move(
+    project, monkeypatch, capsys
+):
+    """The ordinary resume, and the reason the compare is exact rather than a
+    canonicalizing one: both sides are `str(paths.repo_root)` off `load_paths`, which
+    resolves every member or raises, so an unmoved config must compare equal on the
+    nose. A row that reported a change here would fire the warning on every resume —
+    the per-configuration constant the `rearm-spec-write-unreachable` narrowing exists
+    to avoid, one file over.
+    """
+    run_dir = _paused_run_for_resume(
+        project, monkeypatch, repo_root=str(Path(project.project).resolve())
+    )
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+
+    assert _resume_entry(run_dir)["code_root_changed"] is False
+    assert "code root" not in capsys.readouterr().err
+
+
+def test_resume_migrates_a_legacy_state_without_calling_it_a_move(project, monkeypatch, capsys):
+    """A state.json written before `repo_root` existed reads back "" — a MISSING value,
+    not a divergent one. The `bool(state.repo_root)` guard is what keeps it out of the
+    compare, and the unconditional re-stamp is what migrates it onto the root the run
+    was already using.
+
+    Ablation: drop that guard and this reddens on both the journal field and the
+    warning, on every legacy run's first resume — the exact false alarm the guard buys.
+    """
+    from bmad_loop.journal import load_state
+
+    run_dir = _paused_run_for_resume(project, monkeypatch)  # no repo_root: pre-field
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+
+    assert load_state(run_dir).repo_root == str(Path(project.project).resolve())
+    assert _resume_entry(run_dir)["code_root_changed"] is False
+    assert "code root" not in capsys.readouterr().err
+
+
 def test_resume_tolerates_a_corrupt_sweep_json(project, monkeypatch):
     """A torn/corrupt sweep.json (a crash mid-write on an older run) must not abort
     resume — the recovery path. compose_resume guards the read and falls back to the

@@ -2503,10 +2503,30 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
     if pinned is None:
         pinned = state.trusted_config_digest
     security_config_changed = bool(pinned) and new_digest != pinned
+    # The recorded code root against the one THIS process just loaded. Resume
+    # re-reads config.yaml, so a `repo_root:` key added, changed or removed while the
+    # run was paused re-points the engine at a different git tree — `compose_resume`
+    # below builds the Workspace off `paths`, not off state.json. The persisted
+    # mirror is what `runs.rearm_escalation` reads back OUT OF PROCESS
+    # (`RunState.code_root`), so leaving it at its launch value makes the two readers
+    # disagree exactly when the config moved: `resolve` would advance the attempt
+    # baseline in the old tree while the resumed engine resets and measures in the
+    # new one. Re-stamped below, with the snapshot and the digest.
+    #
+    # An exact string compare, deliberately, with no canonicalization: both sides are
+    # `str(paths.repo_root)` off `bmadconfig.load_paths`, which resolves every member
+    # or raises, so they are spelled the same way whenever they name the same tree.
+    # The `bool(state.repo_root)` guard is what keeps a legacy state.json — written
+    # before the field existed, and read back as "" — out of the comparison: it is a
+    # missing value, not a divergent one, and the re-stamp migrates it silently.
+    code_root_changed = bool(state.repo_root) and state.repo_root != str(paths.repo_root)
     fields: dict[str, object] = {
         # Scalars only, per the note above: a bool records THAT the pinned surface
         # moved without journaling a command, a binary path or a plugin name.
         "security_config_changed": security_config_changed,
+        # Same treatment, same reason: a bool, never either path. `diagnose` renders
+        # the split as a presence flag for exactly this reason (`repo_root_diverges`).
+        "code_root_changed": code_root_changed,
         "was_paused": state.paused_reason,
         "cache_read_weight": pol.limits.cache_read_weight,
         # Compare JSON-normalized, the way save_state persists it: to_dict()
@@ -2532,6 +2552,21 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
             " plugin allowlist. Resuming trusts the config now on disk; re-read"
             " .bmad-loop/policy.toml and .bmad-loop/profiles/ first if you did not"
             " make that edit.",
+            file=sys.stderr,
+        )
+    if code_root_changed:
+        # Loud, because the re-stamp below is not a repair: every sha this run already
+        # recorded — each task's `baseline_commit`, its preserve refs, its unit
+        # branches — names an object in the PREVIOUS tree, and nothing here can move
+        # them. The re-stamp only stops the two readers from disagreeing about which
+        # tree the run is in from here on; whether the new tree can honor those shas
+        # is the operator's call, and this is the moment they can still make it.
+        print(
+            f"warning: run {run_dir.name}: the code root in _bmad/bmm/config.yaml has"
+            " changed since this run started — the resumed engine works in the tree"
+            " configured now, while the baselines, preserve refs and branches this run"
+            " already recorded name objects in the previous one. Restore the previous"
+            " `repo_root:` value if you did not intend the move.",
             file=sys.stderr,
         )
     # Re-stamp: the snapshot must describe the policy THIS process enforces, for
@@ -2569,6 +2604,11 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
     # BMAD_LOOP_STATE_DIR. Tampering that removes the out-of-tree file is a
     # different problem with no fix at equal privilege — #571.
     state.trusted_config_digest = new_digest
+    # ...and the code root, for the same reason and at the same moment: this process
+    # arms an engine against `paths.repo_root` (compose_resume -> Workspace), so that
+    # is the tree `runs.rearm_escalation` must read back. Unconditional, so it also
+    # migrates a pre-field state.json onto the root it was already using.
+    state.repo_root = str(paths.repo_root)
     state.clear_pause()
     runs.write_pid(run_dir)
     # Persist before the engine starts: status, the TUI and diagnose only ever

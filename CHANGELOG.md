@@ -152,6 +152,25 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **`resume` re-stamps the run's recorded code root** (#716). Resume re-reads
+  `_bmad/bmm/config.yaml` and arms the engine against the `repo_root` it finds there, but left
+  the copy in `state.json` at its launch value — so after a `repo_root:` edit the engine worked
+  in one tree while the out-of-process re-arm (`bmad-loop resolve`) advanced the attempt baseline
+  and re-stamped `baseline_revision` in the other, with no error on either side. The mirror now
+  follows the paths resume adopts, and a move is announced rather than silent: the baselines,
+  preserve refs and branches the run already recorded name objects in the previous tree. A
+  `state.json` from before the field existed migrates without being reported as a move.
+
+- **The unreachable-spec-write warning no longer fires on a shared artifact directory** (#640).
+  Under worktree isolation the re-arm warned whenever the committed spec did not already carry
+  the re-drive's status — but an artifact directory configured outside the project is left where
+  it is by `ProjectPaths.rebased`, shared across checkouts instead of rebased onto each worktree,
+  so the flip lands on the one file every re-drive reads and there was never anything to commit.
+  That layout took the warning on every re-arm, and its remedy ("commit the corrected spec")
+  named a file outside the repository. Containment is decided on the canonical paths, so a spec
+  spelled out of but resolving back into the worktree still warns, as does one the host cannot
+  canonicalize.
+
 - **`bmad-loop resolve` still reports abandoned-restore residue when the re-arm aborts** (#640).
   The residue is journalled before the re-stamp that can raise, so an abort discarded records
   already written — including the commits warning. The echo now runs on both paths.
