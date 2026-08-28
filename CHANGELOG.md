@@ -69,28 +69,33 @@ breaking changes may land in a minor release.
   ordinary second re-arm, or `resolve --no-interactive` after a human fixed the spec, was told its
   spec "could not be re-opened" and might re-wedge, while the file was correct. Re-arm now reads
   the status back to tell a failed write from nothing-to-write. The skip record no longer hides
-  behind a successful git advance —
-  nesting it there meant a project that is not a repo reported only the git failure while the
-  flip had no-opped for an unrelated reason.
+  behind a successful git advance — nesting it there meant a project that is not a repo
+  reported only the git failure while the flip had no-opped for an unrelated reason.
 
 - **Re-arm warns when its spec writes cannot reach the re-drive** (#640). Under worktree
-  isolation the recorded spec is re-anchored on the unit's worktree — which the re-drive
-  destroys: a re-armed task is discarded and re-mounted, and the re-driven session resolves its
-  spec against the FRESH worktree, which checks out tracked files only. So the re-drive reads the
-  committed spec, and no working-tree write reaches it — the main checkout's copy included, since
-  the fresh worktree comes from git rather than from a copy of that tree. Re-arm now journals
-  `rearm-spec-write-unreachable` and both surfaces tell the operator to commit the corrected spec.
+  isolation re-arm's status flip and baseline re-stamp land in a worktree the re-drive
+  discards before reading it, and the re-driven session reads the COMMITTED spec instead — so
+  a correction left only in the working tree is silently lost. Re-arm now journals
+  `rearm-spec-write-unreachable` and both surfaces tell the operator to commit the corrected
+  spec. The warning is raised only when the committed spec does not already carry the status
+  the re-drive needs: gating it on isolation alone fired it on every re-arm of an isolated
+  task, where the advice is a no-op and the noise trains the operator past the records that
+  matter.
 
-- **The re-arm baseline records reach the TUI operator too** (#640). The two surfaces now also
-  agree on the ABORT path: `resolve` echoed the residue a half-run re-arm had already journalled
-  while the TUI returned silently, losing `stale-restore-commits` exactly where it matters most.
-  Both read the journal through one shared guard, so a corrupt journal costs the echo on either
-  surface and never the gesture — and neither replays the whole journal when a read degrades. `bmad-loop resolve` echoed
-  the advance-failure and re-stamp records; the TUI's re-arm — which resumes the run in the same
-  gesture — printed only `re-armed <key>`. It now raises the same warnings before resuming. The
-  re-stamp notice warns on both legs: the record fires only when the spec claimed a baseline the
-  run never recorded, which is equally exceptional whichever leg produced it. The `restore` flag
-  stays on the record to say which leg that was.
+- **The re-arm baseline records reach the TUI operator too** (#640). Each surface carried its
+  own copy of the journal-kind → message routing and they had drifted: `bmad-loop resolve`
+  echoed the advance-failure and re-stamp records across six kinds, while the TUI's re-arm —
+  which resumes the run in the same gesture — printed only `re-armed <key>` and handled three,
+  silently dropping the whole `stale-restore-*` family, including the commits warning that is
+  the only notice telling a human to inspect the tree. Both now route through one table
+  (`runs.rearm_event_notice`) and raise the same warnings before resuming. They also agree on
+  the ABORT path, where `resolve` echoed residue a half-run re-arm had already journalled while
+  the TUI returned silently. Both read the journal through one shared guard, so a corrupt
+  journal costs the echo on either surface and never the gesture, and neither replays the whole
+  journal when a read degrades. The TUI omits the trailing "before resuming" imperative, since
+  it resumes in the same gesture. The re-stamp notice warns on both legs — the record fires only
+  when the spec claimed a baseline the run never recorded, equally exceptional whichever leg
+  produced it — and the `restore` flag stays on the record to say which leg that was.
 
 - **`bmad-loop resolve` re-stamps the spec's `baseline_revision` on both re-drive legs**
   (#640), not only on a patch-restore. A from-scratch re-drive used to carry the escalated
@@ -99,7 +104,10 @@ breaking changes may land in a minor release.
   compares a value the orchestrator itself wrote, so a claim that genuinely diverged is
   journalled (`rearm-baseline-restamped`) instead of being silently normalized. A re-stamp is
   refused outright when the baseline advance failed, so spec and task can never agree on a
-  stale sha.
+  stale sha. That record compares against the baseline the run RECORDED, not against
+  `task.baseline_commit`, which the advance has already moved to the new HEAD — so it fires
+  only on a claim the run never made, rather than on every ordinary from-scratch re-arm whose
+  resolve session committed anything.
 
 - **A published run archive now lands at mode `0600`** instead of a umask-derived mode (#591).
   It is staged through a file the orchestrator creates itself rather than one `tarfile` opens
@@ -134,25 +142,6 @@ breaking changes may land in a minor release.
   previously-loading config.
 
 ### Fixed
-
-- **A re-arm no longer warns about a baseline divergence that did not happen** (#640). The
-  record that reports overwriting a spec's claimed baseline compared it against
-  `task.baseline_commit` — which the advance had already moved to the new HEAD. On every
-  ordinary from-scratch re-arm whose resolve session committed anything, spec and run agreed
-  exactly and the operator was still told they differed. It now compares against the baseline
-  the run RECORDED, so `rearm-baseline-restamped` fires only on a claim the run never made.
-
-- **The TUI and `resolve` surface the same re-arm records** (#640). Each carried its own copy of
-  the journal-kind → message routing and they had drifted: `resolve` handled six kinds, the TUI
-  three, silently dropping the whole `stale-restore-*` family — including the commits warning
-  that is the only notice telling a human to inspect the tree. Both now route through one table
-  (`runs.rearm_event_notice`). The TUI omits the trailing "before resuming" imperative, since it
-  resumes in the same gesture.
-
-- **A corrupt journal no longer blocks the TUI's re-arm** (#640). Reading the journal to diff
-  what a re-arm appended is new, and it decoded strict UTF-8 outside the action's error handling,
-  so an undecodable byte turned a corrupt journal into a gesture the operator could not perform.
-  It degrades to no echo instead, matching how the dashboard reads that file everywhere else.
 
 - **`bmad-loop resolve` still reports abandoned-restore residue when the re-arm aborts** (#640).
   The residue is journalled before the re-stamp that can raise, so an abort discarded records

@@ -6499,3 +6499,47 @@ def test_git_below_floor_honours_the_floor_argument(project, monkeypatch):
     _fake_git_version(monkeypatch, "git version 2.30.0\n")
     assert verify.git_below_floor(project.project, (2, 20)) is None
     assert verify.git_below_floor(project.project, (2, 40)) == "git version 2.30.0"
+
+
+def test_verify_dev_roots_its_exclude_on_the_code_tree(project, tmp_path, monkeypatch):
+    """The gate's OWN exclude composition, pinned at the seam.
+
+    `_stories_relpaths` has carried a seam pin since this wave landed; the sprint
+    gate's call did not, and no outcome row can supply one. Under the supported
+    override the artifact tree is disjoint from the code tree, so a `project`-rooted
+    exclude yields pathspecs git matches nothing against — and `has_changes_since`
+    fails OPEN (`rc != 0 -> return True`), so the passing row stays green and the
+    refusal row reddens for its own unrelated reason. Reverting `root=paths.repo_root`
+    to `root=paths.project` left the entire suite green before this row existed, which
+    is how the anchor this wave exists to establish could be silently undone.
+
+    The contract is therefore the ROOT itself, exactly as the stories-mode row states
+    it: a pathspec relative to the wrong root is not merely wrong, it is SILENTLY
+    wrong.
+
+    Ablation: pass `root=paths.project` at the call site and the recorded root reddens.
+    """
+    paths = _repo_root_override(project, tmp_path)
+    write_sprint(paths, {"1-1-a": "review"})
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.baseline_commit = verify.rev_parse_head(paths.repo_root)
+    sp = spec_path(paths, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+    # the session's work lands where the session's cwd is: the CODE tree
+    (paths.repo_root / "src.txt").write_text("real work\n")
+
+    seen = []
+    real = verify.verify_dev_exclude_relpaths
+    monkeypatch.setattr(
+        verify,
+        "verify_dev_exclude_relpaths",
+        lambda *a, **kw: (seen.append(kw.get("root")), real(*a, **kw))[1],
+    )
+    out = verify.verify_dev(task, paths, dev_result(sp))
+
+    assert out.ok
+    assert seen == [paths.repo_root]
+    # the premise the assertion above rests on: under this override the two roots are
+    # genuinely different directories. Should the fixture ever collapse them, the
+    # recorded-root assertion stops separating the two spellings and this reddens.
+    assert paths.project != paths.repo_root

@@ -15598,3 +15598,33 @@ def test_a_park_record_rollback_refused_as_unconfined_is_journaled(project):
     assert "UnconfinedWriteError" in journal  # journaled by NAME, not a bare errno
     escaped = _json.loads((outside / record.name).read_text(encoding="utf-8"))
     assert escaped["actions"] == ACTIONS  # this run's record, NOT the prior put back
+
+
+def test_notice_reason_bound_is_an_upper_bound_not_an_equality():
+    """`NOTICE_REASON_MAX + len(" […]")` is a ceiling the return need not attain.
+
+    The sibling row pins it with `"z" * 500` — whitespace-free, so the slice never
+    rstrips and the equality holds. Two shapes make it strictly less, and the comment
+    on the constant used to state the bound as though neither existed:
+
+    * a cut landing on whitespace, since the slice is `.rstrip()`ed;
+    * ANY multi-line reason, since `trimmed` is set by the line collapse regardless of
+      length — which is the common case, `verify.verify_command_results_outcome`
+      putting its output tail under a short classification line.
+
+    Behaviour is correct in every case; what was wrong was the claim about it, and a
+    test that pins one whitespace-free instance cannot tell the claim from the truth.
+
+    Ablation: this row grades the COMMENT, so the meaningful ablation is textual —
+    restore "runs to NOTICE_REASON_MAX + len(...)" without "AT MOST" and the assertions
+    below contradict it. For the code half, delete the `.rstrip()` and the
+    whitespace-boundary assertion reddens on `len(capped) == 204`.
+    """
+    capped = _notice_reason("a" * (NOTICE_REASON_MAX - 1) + " " + "b" * 300)
+    assert capped.endswith(" […]")  # a trim happened, and is marked
+    assert len(capped) < NOTICE_REASON_MAX + len(" […]")  # yet lands BELOW the bound
+    assert not capped.startswith("a" * NOTICE_REASON_MAX)  # because the slice rstripped
+
+    short = _notice_reason("short first line\nthe evidence lives here")
+    assert short == "short first line […]"  # marked well under the cap
+    assert len(short) < NOTICE_REASON_MAX

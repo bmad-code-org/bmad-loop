@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 
 from bmad_loop import diagnostics, sanitize
-from bmad_loop.journal import Journal, save_state
+from bmad_loop.journal import Journal, load_state, save_state
 from bmad_loop.model import Phase, RunState, SessionRecord, StoryTask, TokenUsage
 from bmad_loop.policy import Policy
 
@@ -1439,3 +1439,54 @@ def test_env_git_version_is_none_when_the_probe_fails(monkeypatch):
 
     env = diagnostics.collect_env(ANY_PROJECT)
     assert env.git_version is None
+
+
+def test_diag_surfaces_the_split_code_root_and_the_task_generation(project):
+    """The two state fields this wave ADDED must be legible in a bug report.
+
+    `RunState.repo_root` and `StoryTask.generation` are new here, and both name the
+    exact conditions under which the re-anchored gates and the re-minted session ids
+    behave differently — yet neither reached the projection. `repo` was simultaneously
+    dropped from journal records (correctly: an absolute host path), which removed the
+    last trace of a split root from a dump altogether.
+
+    `generation` matters because without it a #705-class replay dumps as
+    `rearmed=True, attempt=1, n_sessions=2` — byte-identical to a HEALTHY post-re-arm
+    task, so the one field that separates "minted a fresh id" from "collided with the
+    abandoned record" is the one a triager cannot see.
+
+    Both are privacy-safe by construction and are asserted to be: a boolean in the
+    `paused_reason_present` / `worktree_isolated` style, and a small counter. The path
+    itself must NOT appear — that is what `_JOURNAL_DROP_FIELDS` drops.
+
+    Ablation: delete `repo_root_diverges=` from `collect_run` (or `generation=` from
+    `_task_diag`) and this reddens on the corresponding assertion; deleting the field
+    from the dataclass reddens as a TypeError at construction.
+    """
+    run_dir = _seed_run(project.project)
+    state = load_state(run_dir)
+    state.repo_root = str(project.project / "code-tree")
+    state.tasks[STORY_KEY].generation = 2
+    save_state(run_dir, state)
+
+    diag, _pseudo, combined = _render_all([run_dir])
+    (run,) = diag.runs
+
+    assert run.repo_root_diverges is True
+    assert run.tasks[0].generation == 2
+    # a presence flag, never the path — the same rule `repo` is dropped under
+    assert "code-tree" not in combined
+
+
+def test_diag_repo_root_diverges_is_false_for_the_ordinary_layout(project):
+    """The flag distinguishes; it is not simply always on.
+
+    Without this the assertion above passes for a hardcoded `True`, and the field
+    stops carrying the one bit it exists to carry.
+    """
+    run_dir = _seed_run(project.project)
+    diag, _pseudo, _combined = _render_all([run_dir])
+    (run,) = diag.runs
+
+    assert run.repo_root_diverges is False
+    assert run.tasks[0].generation == 0

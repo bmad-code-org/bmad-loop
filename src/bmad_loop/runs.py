@@ -21,7 +21,7 @@ from typing import Any, Literal
 
 from . import devcontract, envvars, verify
 from .adapters.multiplexer import MultiplexerError, get_multiplexer, mux_usable
-from .frontmatter import auto_dev_baseline_of
+from .frontmatter import auto_dev_baseline_of, parse_frontmatter, status_of
 from .journal import STATE_FILE, VERIFY_DIR, Journal, load_state, save_state
 from .model import PAUSE_ESCALATION, Phase, RunState, StoryTask
 from .platform_util import (
@@ -2192,7 +2192,60 @@ def _task_spec_path(task: StoryTask, state: RunState) -> Path:
     raw = Path(task.spec_file or "")
     if raw.is_absolute():
         return raw
-    return Path(task.worktree_path or state.project) / raw
+    return _task_spec_root(task, state) / raw
+
+
+def _task_spec_root(task: StoryTask, state: RunState) -> Path:
+    """The tree a relative `task.spec_file` is anchored on — and confined to.
+
+    One definition backs both halves because they must not disagree: the root
+    `_task_spec_path` resolves against and the `confine_root` the writers validate the
+    result against are the same claim about which tree owns this spec. Passing
+    `state.project` while resolving against the worktree does not REFUSE the mismatch —
+    `set_frontmatter_status`, `devcontract.strip_auto_run_result` and
+    `verify.set_frontmatter_field` all answer an out-of-root path by silently dropping
+    to the plain no-follow write, losing the confined arm's O_NOFOLLOW walk of the
+    parent components (#593) with no signal at all.
+
+    Worktrees normally resolve under `<project>/.bmad-loop/runs/...`, so the confined
+    arm is taken by construction rather than by luck — no policy or env var can
+    relocate them. The one escape is that `workspace.open_unit_workspace` stores a
+    `.resolve()`d path: a symlinked `.bmad-loop`, `runs` or `worktrees` lands the spec
+    outside `project`, and before this anchor moved that silently degraded all three
+    writes.
+    """
+    return Path(task.worktree_path or state.project)
+
+
+def _committed_spec_status(state: RunState, task: StoryTask) -> str:
+    """The spec's status as COMMITTED in the code tree, or ``""`` when unprovable.
+
+    Under isolation the re-drive reads the committed spec and never a working-tree
+    write (see `rearm_escalation`'s note on `rearm-spec-write-unreachable`), so this is
+    the value that decides whether the operator still has anything to do. Anchored on
+    `state.code_root` at ``HEAD`` — the same tree and ref the baseline advance reads.
+
+    Degrades to ``""`` on every uncertainty: a spec recorded absolute (nothing names
+    its position in the tree), an absent or non-blob path at HEAD, a non-UTF-8 blob, or
+    any `GitError` — which includes the project simply not being a repository. ``""``
+    never equals a target status, so the caller's record still fires. Suppression
+    therefore requires PROOF that the work is already done, and the non-repo case stays
+    non-fatal, as the story's Boundaries require.
+    """
+    raw = Path(task.spec_file or "")
+    if not task.spec_file or raw.is_absolute():
+        return ""
+    try:
+        blob = verify.file_bytes_at_revision(state.code_root, "HEAD", raw.as_posix())
+    except verify.GitError:
+        return ""
+    if blob is None:
+        return ""
+    try:
+        text = blob.decode("utf-8")
+    except UnicodeDecodeError:
+        return ""
+    return status_of(parse_frontmatter(text))
 
 
 def rearm_escalation(
@@ -2346,26 +2399,41 @@ def rearm_escalation(
             # The writes below are kept (they are correct for the in-place case, and
             # harmless here), but the operator is told — a flip that cannot land is
             # exactly the silent re-wedge #640(b) exists to end.
-            if task.worktree_path:
+            # Route /bmad-build-auto via the spec's frontmatter status (decision
+            # table): patch-restore -> in-review -> step-04 (resume review on
+            # the restored diff); from-scratch -> ready-for-dev -> step-03
+            # (re-implement). Independent of the resolve agent having set it.
+            target_status = "in-review" if restore_patch else "ready-for-dev"
+            # Narrowed to the case an operator can ACT on. Every isolated escalation
+            # carries a mounted `worktree_path` — `worktree_flow.escalate_unit` never
+            # clears it, and `keep_branch_and_escalate` deliberately leaves the worktree
+            # up — so gating on that alone fired this warning on 100% of re-arms under
+            # `isolation = "worktree"`: a per-configuration constant, not an event, and
+            # the same "trains the operator to scroll past the meaningful one" failure
+            # that the `flipped` read-back below and the `overwritten != old_baseline`
+            # guard were each narrowed to avoid. The remedy it prints ("commit the
+            # corrected spec") is already a no-op once the committed spec carries the
+            # target status, which is precisely when the re-drive reads what it needs.
+            # Suppression requires PROOF: an unreadable blob, a non-repo project, or any
+            # git fault leaves `""` and the record fires.
+            if task.worktree_path and _committed_spec_status(state, task) != target_status:
                 journal.append(
                     "rearm-spec-write-unreachable",
                     story_key=key,
                     spec_file=str(spec_path),
+                    status=target_status,
                 )
             try:
-                # Route /bmad-build-auto via the spec's frontmatter status (decision
-                # table): patch-restore -> in-review -> step-04 (resume review on
-                # the restored diff); from-scratch -> ready-for-dev -> step-03
-                # (re-implement). Independent of the resolve agent having set it.
-                target_status = "in-review" if restore_patch else "ready-for-dev"
                 flipped = verify.set_frontmatter_status(
-                    spec_path, target_status, confine_root=Path(state.project)
+                    spec_path, target_status, confine_root=_task_spec_root(task, state)
                 )
                 # drop the stale `## Auto Run Result` section along with the status flip
                 # (mirrors engine._reset_spec_for_repair): find_result_artifact keys on
                 # that heading, so leaving it would let the re-driven session's first
                 # save of the spec parse as the prior attempt's terminal outcome.
-                devcontract.strip_auto_run_result(spec_path, confine_root=Path(state.project))
+                devcontract.strip_auto_run_result(
+                    spec_path, confine_root=_task_spec_root(task, state)
+                )
                 # `set_frontmatter_status` answers "nothing to change" with `False`
                 # for FOUR causes, not three — its own docstring lists them: no file,
                 # no frontmatter block, no top-level `status:`, and ALREADY AT THE
@@ -2444,11 +2512,22 @@ def rearm_escalation(
     # `Workspace.default` sets `root=paths.repo_root`, while the isolation constructor
     # mounts `root=<run_dir>/worktrees/<unit>` and rebases a fresh `ProjectPaths` onto
     # it, so under `isolation = "worktree"` the run-level `repo_root` is the main
-    # checkout and the baseline is stamped in the worktree. The two configurations are
-    # mutually exclusive: `bmadconfig.worktree_isolation_conflict` refuses worktree
-    # isolation beside a `repo_root:` override, so wherever the roots could diverge,
-    # isolation is off and `repo_root` IS the tree the dev writer used. Do not carry
-    # the identity itself into new code; carry this argument.
+    # checkout and the baseline is stamped in the worktree.
+    #
+    # `bmadconfig.worktree_isolation_conflict` refuses worktree isolation beside a
+    # `repo_root:` OVERRIDE — a narrower fact than it looks. It forces
+    # `repo_root == project`; it says nothing about `repo_root` vs `workspace.root`.
+    # Under plain isolation with NO override those two still diverge and isolation is
+    # ON, so "wherever the roots could diverge, isolation is off" is false, and a rule
+    # built on it licenses treating `state.code_root` as the tree the dev writer
+    # stamped — which under isolation it is not.
+    #
+    # What is true, and the only claim to carry forward: `repo_root == project` in
+    # every reachable configuration, so reading HEAD here is right for the in-place
+    # case; and under isolation this value is deliberately SUPERSEDED rather than
+    # relied on — `engine._finish_inflight` discards the worktree and `_dev_phase`
+    # re-stamps `task.baseline_commit` from the fresh worktree's HEAD before any gate
+    # reads it. Do not carry an identity into new code; carry this argument.
     #
     # A pre-upgrade state.json with no recorded root degrades to `project` exactly as
     # before.
@@ -2578,7 +2657,7 @@ def rearm_escalation(
                     spec_path,
                     "baseline_revision",
                     task.baseline_commit,
-                    confine_root=Path(state.project),
+                    confine_root=_task_spec_root(task, state),
                 )
             except (OSError, UnicodeDecodeError, verify.FrontmatterWriteError) as e:
                 # FrontmatterWriteError joins the tuple rather than getting its own
@@ -2642,9 +2721,35 @@ def journal_entries_or_none(run_dir: Path) -> list[dict[str, Any]] | None:
     must skip the echo, not guess at it.
     """
     try:
-        return Journal(run_dir).entries()
+        # Non-mapping lines are dropped HERE so the annotation is true for every
+        # caller: `Journal.entries()` appends `json.loads(line)` with no shape filter,
+        # so a bare `3` or `null` on its own line survives as a non-dict entry and its
+        # `list[dict[str, Any]]` return type is a claim about first-party producers,
+        # not a guarantee — pyright sees `Any` and is satisfied. Both reads apply the
+        # same filter, so the `len(before)` watermark stays exact.
+        return [e for e in Journal(run_dir).entries() if isinstance(e, dict)]
     except (OSError, UnicodeDecodeError):
         return None
+
+
+def _journal_sequence(value: Any) -> tuple[Any, ...]:
+    """A journal list field read back as a sequence, whatever the line actually held.
+
+    Every read in `rearm_event_notice` runs inside both operator surfaces' `finally`,
+    where a `TypeError` replaces the outcome the operator needs — on the TUI, whose
+    `_do_rearm` runs on Textual's message loop with no `_handle_exception` override,
+    it ends the app. `", ".join` and `len` are the two reads that raise on a shape the
+    journal admits (`"files": 3`, `"files": null`, `[1, 2]`); every sibling read is
+    already `str()`-wrapped or f-string-interpolated and cannot.
+
+    A bare string is deliberately NOT iterated: `", ".join("abc")` renders `"a, b, c"`,
+    which is worse than useless. It is wrapped as a single element instead, and `None`
+    — which `.get(key, default)` returns whenever the key EXISTS holding null, so the
+    default never applies — reads as empty.
+    """
+    if isinstance(value, (list, tuple)):
+        return tuple(value)
+    return () if value is None else (value,)
 
 
 def rearm_event_notice(
@@ -2665,9 +2770,11 @@ def rearm_event_notice(
 
     Severity is `"note"` or `"warning"`; each surface maps those onto its own channel.
     """
+    if not isinstance(entry, dict):
+        return None
     kind = entry.get("kind", "")
     if kind == "stale-restore-excluded":
-        files = ", ".join(entry.get("files", []))
+        files = ", ".join(str(f) for f in _journal_sequence(entry.get("files")))
         return (
             "note",
             f"excluded the abandoned restore's new files from the re-drive " f"baseline: {files}",
@@ -2681,7 +2788,7 @@ def rearm_event_notice(
             "check `git status` before resuming",
         )
     if kind == "stale-restore-commits":
-        n = len(entry.get("commits", []))
+        n = len(_journal_sequence(entry.get("commits")))
         return (
             "warning",
             f"{n} commit(s) sit below the re-drive's new baseline "

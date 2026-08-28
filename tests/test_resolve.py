@@ -1805,3 +1805,187 @@ def test_build_context_sprint_mode_has_no_stories_block(tmp_path):
         resolve.build_context(state, run_dir, "6-4-cli-list-command").read_text(encoding="utf-8")
     )
     assert "stories" not in ctx
+
+
+@pytest.mark.parametrize(
+    ("committed_status", "warns"),
+    [("ready-for-dev", False), ("blocked", True)],
+)
+def test_rearm_warns_about_an_unreachable_spec_write_only_when_it_is_actionable(
+    tmp_path, monkeypatch, committed_status, warns
+):
+    """`rearm-spec-write-unreachable` must name an EVENT, not a configuration.
+
+    Every escalated task under `isolation = "worktree"` carries a mounted
+    `worktree_path` — `worktree_flow.escalate_unit` never clears it — so gating the
+    record on that alone fired it on 100% of re-arms in that configuration. The advice
+    it prints ("commit the corrected spec") is already a no-op once the committed spec
+    carries the status the re-drive needs, which is exactly the state in which the
+    re-drive reads what it needs. A record that fires on the routine case is the
+    "trains the operator to scroll past the meaningful one" failure that the `flipped`
+    read-back and the `overwritten != old_baseline` guard were each narrowed to avoid.
+
+    Both legs keep the WORKTREE spec at `blocked`, so the only thing separating them is
+    what git has committed — which is the whole claim.
+
+    Ablation: restore the gate to a bare `if task.worktree_path:` and the
+    `committed_status="ready-for-dev"` row reddens on `assert True is False`, while the
+    `"blocked"` row keeps passing. That asymmetry IS the narrowing; a gate that fires
+    for both is indistinguishable from no gate at all.
+    """
+    rel = "_bmad-output/specs/6-4-cli-list-command.md"
+    _resolve_repo(tmp_path)
+    main_spec = tmp_path / rel
+    main_spec.parent.mkdir(parents=True, exist_ok=True)
+    main_spec.write_text(
+        f"---\nstatus: {committed_status}\n---\n\n## Intent\n\nx\n", encoding="utf-8"
+    )
+    git(tmp_path, "add", "-A")
+    git(tmp_path, "commit", "-q", "-m", "spec")
+    wt_spec = tmp_path / "wt" / rel
+    wt_spec.parent.mkdir(parents=True, exist_ok=True)
+    wt_spec.write_text("---\nstatus: blocked\n---\n\n## Intent\n\nx\n", encoding="utf-8")
+
+    run_dir, _, _ = _escalated_run(tmp_path, spec_file=rel, worktree_path=str(tmp_path / "wt"))
+    monkeypatch.chdir(tmp_path)
+
+    runs.rearm_escalation(run_dir)
+
+    unreachable = [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-write-unreachable"]
+    assert bool(unreachable) is warns
+    if warns:
+        assert unreachable[0]["status"] == "ready-for-dev"
+
+
+def test_rearm_suppresses_the_unreachable_warning_only_on_proof(tmp_path, monkeypatch):
+    """A project that is not a repo must still WARN, not fall silent.
+
+    `_committed_spec_status` degrades to `""` on every uncertainty — a `GitError`
+    (which covers "not a repository"), an absent blob, a non-UTF-8 blob. `""` never
+    equals a target status, so the record fires. This is the direction the narrowing
+    must fail in: suppressing a warning demands proof the work is done, and the
+    re-arm advance stays non-fatal outside a repo, as the story's Boundaries require.
+
+    Ablation: make `_committed_spec_status` return `target_status` on `GitError`
+    instead of `""` and this reddens on the missing record — the re-arm still
+    "succeeds", which is exactly the silence #640(b) exists to end.
+    """
+    rel = "_bmad-output/specs/6-4-cli-list-command.md"  # no _resolve_repo: not a repo
+    wt_spec = tmp_path / "wt" / rel
+    wt_spec.parent.mkdir(parents=True, exist_ok=True)
+    wt_spec.write_text("---\nstatus: blocked\n---\n\n## Intent\n\nx\n", encoding="utf-8")
+
+    run_dir, _, _ = _escalated_run(tmp_path, spec_file=rel, worktree_path=str(tmp_path / "wt"))
+    monkeypatch.chdir(tmp_path)
+
+    runs.rearm_escalation(run_dir)
+
+    kinds = _kinds(run_dir)
+    (unreachable,) = [e for e in kinds if e["kind"] == "rearm-spec-write-unreachable"]
+    assert unreachable["status"] == "ready-for-dev"
+    # and the advance's own degrade is reported alongside it, not instead of it
+    assert [e for e in kinds if e["kind"] == "rearm-baseline-advance-failed"]
+
+
+def test_rearm_writes_the_project_rooted_spec_when_no_worktree_was_recorded(tmp_path, monkeypatch):
+    """The `state.project` half of `_task_spec_path` — graded, not merely reachable.
+
+    `engine._finish_inflight` clears `task.worktree_path` while leaving `spec_file`
+    relative, and `model._serialized_worktree_path` returns it unchanged when
+    `worktree_path` is falsy, so a state.json legitimately holds a relative spec with
+    no worktree. Both rows that reach this branch today name a file absent under EITHER
+    root, so they answer `is_file() -> False` identically whichever root is used and
+    pass with the anchor reverted to the process cwd.
+
+    The decoy is the grading instrument: it sits at the SAME relative path under the
+    directory this process actually runs from, so a cwd-anchored resolve has somewhere
+    plausible to land.
+
+    Ablation: change `_task_spec_root` to `Path(task.worktree_path or "")` and this
+    reddens twice over — the project spec keeps `status: blocked`, and the decoy's
+    byte-identity assertion fails behind it.
+    """
+    head = _resolve_repo(tmp_path)
+    rel = "_bmad-output/specs/6-4-cli-list-command.md"
+    body = "---\nstatus: blocked\nbaseline_revision: stale-sha\n---\n\n## Intent\n\nx\n"
+    spec = tmp_path / rel
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    spec.write_text(body, encoding="utf-8")
+    decoy = tmp_path / "elsewhere" / rel
+    decoy.parent.mkdir(parents=True, exist_ok=True)
+    decoy.write_text(body, encoding="utf-8")
+    untouched = decoy.read_bytes()
+
+    run_dir, _, _ = _escalated_run(tmp_path, spec_file=rel)  # worktree_path="" -> the fallback
+    monkeypatch.chdir(tmp_path / "elsewhere")
+
+    runs.rearm_escalation(run_dir)
+
+    fm = verify.read_frontmatter(spec)
+    assert fm["status"] == "ready-for-dev"  # the project-rooted copy was flipped
+    assert fm["baseline_revision"] == head  # and re-stamped
+    assert decoy.read_bytes() == untouched  # the cwd-rooted decoy is unread
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("files", 3), ("files", None), ("files", [1, 2]), ("commits", 3), ("commits", None)],
+)
+def test_rearm_event_notice_survives_a_journal_shape_json_admits(field, value):
+    """A malformed journal line must not raise out of either surface's `finally`.
+
+    `Journal.entries()` appends `json.loads(line)` with no shape filter, so its
+    `list[dict[str, Any]]` annotation is a claim about first-party producers rather
+    than a guarantee — pyright sees `Any` and is satisfied. `", ".join` and `len` are
+    the only two reads in `rearm_event_notice` that raise on a shape the journal
+    admits; every sibling is `str()`-wrapped or f-string-interpolated. Both run inside
+    `cli.cmd_resolve`'s and `TuiApp._do_rearm`'s `finally`, and the TUI has no
+    `_handle_exception` override, so there a `TypeError` ends the app.
+
+    Note `entry.get("files", [])` does NOT protect against `null`: the key EXISTS, so
+    the default never applies and `.get` returns `None`.
+
+    Ablation: restore `", ".join(entry.get("files", []))` and `len(entry.get(
+    "commits", []))` and every row but `("files", [1, 2])` reddens with `TypeError`;
+    that row reddens too, on `sequence item 0: expected str instance, int found`.
+    """
+    kind = "stale-restore-excluded" if field == "files" else "stale-restore-commits"
+    notice = runs.rearm_event_notice({"kind": kind, field: value})
+
+    assert notice is not None
+    severity, message, _ = notice
+    assert severity in ("note", "warning")
+    assert isinstance(message, str)
+
+
+def test_rearm_event_notice_ignores_a_non_mapping_entry():
+    """A bare scalar on its own journal line is not an entry.
+
+    `journal_entries_or_none` drops non-mappings so the annotation is true for every
+    caller, and both reads apply the same filter so the `len(before)` watermark stays
+    exact. This pins the notice's own guard as well, since it is reachable from any
+    other caller walking raw `Journal.entries()`.
+
+    Ablation: delete the `if not isinstance(entry, dict)` arm and this reddens with
+    `AttributeError: 'int' object has no attribute 'get'`.
+    """
+    assert runs.rearm_event_notice(3) is None
+    assert runs.rearm_event_notice(None) is None
+
+
+def test_journal_entries_or_none_drops_a_non_mapping_line(tmp_path):
+    """The watermark both surfaces diff is a list of MAPPINGS.
+
+    Ablation: return `Journal(run_dir).entries()` unfiltered and this reddens on the
+    length assertion — the bare `3` survives into the window the surfaces walk.
+    """
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "journal.jsonl").write_text(
+        '{"kind": "a"}\n3\nnull\n{"kind": "b"}\n', encoding="utf-8"
+    )
+
+    entries = runs.journal_entries_or_none(run_dir)
+
+    assert entries is not None
+    assert [e["kind"] for e in entries] == ["a", "b"]

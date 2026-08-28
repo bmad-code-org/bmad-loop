@@ -87,9 +87,11 @@ See [README.md](../README.md) for the narrative overview and [setup-guide.md](se
   which is an ordinary re-arm rather than a failure; neither record depends on the git advance having
   succeeded. Under worktree isolation those writes land in a worktree the re-drive discards, and the
   re-driven session reads the COMMITTED spec, so re-arm says so (`rearm-spec-write-unreachable`) and
-  asks you to commit the corrected spec. All
-  of these warnings reach the TUI's re-arm as well as `resolve`'s — both render one shared routing
-  table, so the two surfaces cannot drift apart — though the TUI drops the trailing "before
+  asks you to commit the corrected spec — but only when the committed spec does not already carry
+  the status the re-drive needs, so an isolated re-arm whose correction is already committed says
+  nothing. All of these warnings reach the TUI's re-arm as well as `resolve`'s — both route every
+  kind through one shared table, so neither surface can silently learn a kind the other drops,
+  though each still owns where it calls the echo from and the TUI drops the trailing "before
   resuming" advice, since it resumes in the same gesture. Each re-arm also bumps a per-task
   **generation**, so the re-minted session id cannot collide with the abandoned attempt's record — ids
   already on disk keep their exact spelling, since the suffix appears only above generation zero

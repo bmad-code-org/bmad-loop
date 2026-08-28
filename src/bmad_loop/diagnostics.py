@@ -138,11 +138,17 @@ _JOURNAL_ALIAS_FIELDS = {
     # `engine._park_awaiting_operator` passes
     # `spec_file=` to `operatoractions.record_park`, which is a record file, not the
     # journal. So the divergence is BETWEEN FIELDS, not between two producers of this
-    # one: `spec` carries absolute paths from engine's reconcile and marker-repair
-    # kinds, while `spec_file` carries whatever `StoryTask` persisted — worktree-relative
-    # for a task that ran under isolation. Same value, same hazard, same namespace, and
-    # `_JOURNAL_BASENAME_NAMESPACES` keys on the namespace rather than the field, so
-    # both spellings still reduce to one alias.
+    # one — but BOTH fields are mixed-shape, and neither is the reliable one:
+    # `spec_file` is now always ABSOLUTE, because all four kinds journal
+    # `str(_task_spec_path(...))`, whose anchors (`task.worktree_path`, `state.project`)
+    # are absolute in every production path; while `spec` is NOT uniformly absolute —
+    # engine's reconcile and marker-repair kinds journal an absolute `str(spec_path)`,
+    # but `stories_engine`'s `checkpoint-pause` journals the raw persisted
+    # `task.spec_file`, which is worktree-relative for a task that ran under isolation.
+    # Same value, same hazard, same namespace. Do NOT read this as "one field is
+    # already normalized, so the basename step is dead": `_JOURNAL_BASENAME_NAMESPACES`
+    # keys on the NAMESPACE rather than the field precisely so both spellings reduce to
+    # one alias whichever shape either happens to carry.
     "spec_file": "spec",
 }
 # Namespaces whose journalled value arrives in more than one shape and must be
@@ -280,6 +286,10 @@ class TaskDiag:
     deferred_with_reason: bool
     spec_present: bool
     worktree_isolated: bool
+    # The discriminator a #705-class replay turns on. Without it a collided re-drive
+    # dumps as `rearmed=True, attempt=1, n_sessions=2` — byte-identical to a HEALTHY
+    # post-re-arm task. A counter, so it carries no customer content.
+    generation: int
     dw_count: int
     n_sessions: int
     sessions: SessionTally
@@ -311,6 +321,13 @@ class RunDiag:
     paused: bool
     paused_stage: str | None
     paused_reason_present: bool
+    # Whether this run's code tree is a DIFFERENT directory from its project root.
+    # A presence flag in the `paused_reason_present` / `worktree_isolated` style, never
+    # the path — `_JOURNAL_DROP_FIELDS` drops `repo` as an absolute host path, and that
+    # drop otherwise removes the last trace of the split from a dump. The split layout
+    # is exactly the one in which the re-anchored baseline probes behave differently,
+    # so a bug report that cannot show it cannot be triaged.
+    repo_root_diverges: bool
     current_epic: int | None
     sweep_cycle: int
     sweeps_triggered: list[str]
@@ -553,6 +570,7 @@ def _task_diag(task: StoryTask, pseudo: sanitize.Pseudonymizer, weight: float) -
         deferred_with_reason=bool(task.defer_reason),
         spec_present=bool(task.spec_file),
         worktree_isolated=bool(task.worktree_path),
+        generation=task.generation,
         dw_count=len(task.dw_ids),
         n_sessions=len(task.sessions),
         sessions=_session_tally([task]),
@@ -764,6 +782,7 @@ def collect_run(run_dir: Path, *, pseudo: sanitize.Pseudonymizer, cap: int) -> R
         paused=state.paused,
         paused_stage=state.paused_stage,
         paused_reason_present=state.paused_reason is not None,
+        repo_root_diverges=bool(state.repo_root) and Path(state.repo_root) != Path(state.project),
         current_epic=state.current_epic,
         sweep_cycle=state.sweep_cycle,
         sweeps_triggered=[
@@ -827,6 +846,7 @@ def _unreadable_run(run_dir: Path, err: Exception) -> RunDiag:
         paused=False,
         paused_stage=None,
         paused_reason_present=False,
+        repo_root_diverges=False,
         current_epic=None,
         sweep_cycle=0,
         sweeps_triggered=[],

@@ -63,18 +63,16 @@ def _split_frontmatter(text: str) -> tuple[str, str, str] | None:
     return None
 
 
-def read_frontmatter(path: Path) -> dict[str, Any]:
-    if not path.is_file():
-        return {}
-    try:
-        text = path.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
-        # A non-UTF-8 file carries no readable frontmatter — degrade exactly like
-        # unparseable YAML below. Every status gate then reads status "" and
-        # returns a clean retry/repair outcome instead of crashing mid-verify
-        # (UnicodeDecodeError is a ValueError, so it slipped past callers'
-        # except-OSError guards).
-        return {}
+def parse_frontmatter(text: str) -> dict[str, Any]:
+    """The frontmatter mapping ``text`` carries, or ``{}`` when it carries none.
+
+    Split out of `read_frontmatter` so a spec that never touches the filesystem — a
+    blob read back out of git with `verify.file_bytes_at_revision`, say — parses
+    through the SAME reader as a live file rather than through a second copy free to
+    drift from it. Degrades rather than raising on every shape: no frontmatter block,
+    unparseable YAML, or a document that is not a mapping. Callers tell "absent" from
+    "present but empty" by asking the `*_of` readers, never by inspecting this.
+    """
     split = _split_frontmatter(text)
     if split is None:
         return {}
@@ -83,6 +81,21 @@ def read_frontmatter(path: Path) -> dict[str, Any]:
     except yaml.YAMLError:
         return {}
     return doc if isinstance(doc, dict) else {}
+
+
+def read_frontmatter(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        # A non-UTF-8 file carries no readable frontmatter — degrade exactly like the
+        # unparseable-YAML arm in `parse_frontmatter` above. Every status gate then
+        # reads status "" and returns a clean retry/repair outcome instead of crashing
+        # mid-verify (UnicodeDecodeError is a ValueError, so it slipped past callers'
+        # except-OSError guards).
+        return {}
+    return parse_frontmatter(text)
 
 
 def status_of(fm: dict[str, Any]) -> str:

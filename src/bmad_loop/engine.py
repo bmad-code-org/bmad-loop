@@ -391,8 +391,11 @@ def _session_task_id(story_key: str, part: str, seq: int, generation: int) -> st
 
 
 # Longest single-line `reason` a notification channel carries — the returned string
-# runs to NOTICE_REASON_MAX + len(" […]") when a trim is marked, which is the bound
-# `test_notice_reason_caps_a_long_single_line_and_marks_the_trim` pins. Not a display
+# runs to AT MOST NOTICE_REASON_MAX + len(" […]"), the bound
+# `test_notice_reason_caps_a_long_single_line_and_marks_the_trim` pins. At most, not
+# exactly, in two ways: the slice is `.rstrip()`ed, so a cut landing on whitespace
+# returns less; and `trimmed` is set for ANY multi-line reason regardless of length, so
+# a short first line followed by evidence is marked far below the cap. Not a display
 # preference: `gates.notify` normally writes one `[stamp] title: message` line into
 # ATTENTION and hands the same string to a desktop toast, while a `Decision.reason`
 # is routinely MULTI-line — `verify.verify_command_results_outcome` appends the
@@ -2364,8 +2367,8 @@ class Engine:
                 # was the only dev outcome that REJECTS an attempt without raising a
                 # notice (PROCEED raises none either, but it accepts the work rather
                 # than discarding it), and it is the arm that DISCARDS a completed
-                # implementation — the
-                # non-fixable leg below rolls the tree back to baseline. Without
+                # implementation — the non-fixable leg below rolls the tree back to
+                # baseline. Without
                 # this the only record was the `dev-decision` journal line, so a
                 # run could burn its whole attempt budget throwing away finished
                 # work with nothing on the operator's phone but the eventual
