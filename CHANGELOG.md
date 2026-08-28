@@ -9,11 +9,10 @@ breaking changes may land in a minor release.
 
 ### Added
 
-- **`repo_root` in run `state.json`** (#716). A run now records the git root its code work
-  happens in, so an out-of-process consumer — `bmad-loop resolve`'s re-arm — reads back the same
-  tree the run measured instead of re-deriving it. Forward and backward compatible: the field
-  loads through `d.get`, and a `state.json` written before it existed degrades to the project
-  directory, which is exactly the pre-upgrade behavior.
+- **`repo_root` in run `state.json`** (#716). A run records the git root its code work happens in,
+  so an out-of-process reader — `bmad-loop resolve`'s re-arm — uses the tree the run measured
+  instead of re-deriving one. A `state.json` written before the field existed degrades to the
+  project directory, which is the pre-upgrade behavior.
 
 - **Atomic writers gain an opt-in `require_writable_target` refusal** (#597). Callers over
   operator-curated files can ask for the `PermissionError` a plain `Path.write_text` used to
@@ -46,112 +45,74 @@ breaking changes may land in a minor release.
 
 ### Changed
 
-- **`bmad-loop diagnose` routes the re-arm records by field name** (#640, #716). `spec_file` is
-  aliased (it is a customer feature name), `overwritten` is aliased (it is half a baseline
-  comparison, meaningless without its partner), and `repo` is dropped (an absolute host path
-  that correlates nothing — one run has one code root). Routing is by FIELD NAME and applies to
-  every entry, not by kind: no first-party producer emitted these fields before, so no existing
-  run's dump changes shape today and `SCHEMA_VERSION` is unaffected — but a later producer of a
-  field with one of these names inherits the same treatment.
+- **`bmad-loop diagnose` routes the re-arm records by field name** (#640, #716). `spec_file` and
+  `overwritten` are aliased, and `repo` is dropped — an absolute host path that correlates nothing.
+  Routing is by field name across every entry rather than by kind, so no existing run's dump changes
+  shape and `SCHEMA_VERSION` is unaffected.
 
 - **`bmad-loop diagnose`'s default report shows the split code root and the task generation**
-  (#705, #716). Both fields reached the collector, and so `--json`, but not the markdown
-  renderer, which samples its fields by hand. Markdown is what a bare `diagnose` emits and
-  what an operator hands a maintainer, so the two conditions the fields exist to name — a code
-  tree that is a different directory from the project root, and a re-armed task whose session
-  id could collide with the abandoned attempt's record — were legible only to whoever thought
-  to ask for JSON. They render as a `code root differs from project` yes/no line and a `gen`
-  column beside `att`; the code root's path itself still never renders.
+  (#705, #716). Both fields reached `--json` but not the markdown renderer, which samples its fields
+  by hand — so the two conditions they exist to name were legible only to whoever thought to ask for
+  JSON. They render as a `code root differs from project` yes/no line and a `gen` column beside
+  `att`; the code root's path itself still never renders.
 
-- **`resolve` and the TUI's re-arm aim the code root before they re-arm, not after** (#716).
-  Resume re-stamps the run's persisted `repo_root` mirror because the engine it arms works in the
-  tree config.yaml names now — but both re-arm surfaces re-arm and THEN resume, so that re-stamp
-  landed after `runs.rearm_escalation` had already read the stale mirror out of process. A
-  `repo_root:` key added, changed or removed while a run was paused therefore split the two readers
-  exactly the way the re-stamp exists to prevent: the attempt baseline advanced (and
-  `baseline_revision` was re-stamped) in the tree the run had left, while the engine that resumed
-  seconds later reset and measured in the new one, with no error anywhere. Both surfaces now
-  re-stamp through one shared writer, after the confirm — so a cancelled resolve still leaves the
-  divergence for `resume` to report — and each warns that the run has changed repositories. A
-  config this process cannot read degrades instead of guessing a tree: the re-arm proceeds against
-  the root the run recorded, and says so.
+- **`resolve` and the TUI's re-arm aim the code root before they re-arm, not after** (#716). Both
+  surfaces re-armed and THEN resumed, so resume's `repo_root` re-stamp landed after the re-arm had
+  already read the stale mirror out of process: a `repo_root:` edit made while a run was paused
+  advanced the attempt baseline in the tree the run had left, while the engine that resumed measured
+  in the new one, with no error anywhere. Both now re-stamp through one shared writer, after the
+  confirm — so a cancelled resolve still leaves the divergence for `resume` to report — and each
+  warns that the run has changed repositories. A config this process cannot read degrades to the
+  root the run recorded, and says so.
 
 - **Re-arm refuses a story spec it cannot re-open, instead of re-driving onto a status the session
-  cannot route** (#640). A spec that exists and carries no top-level `status:` answers both
-  frontmatter writers with `False`, and the flip's failure was only journalled: the operator was
-  told "re-armed <story>", the run resumed in the same gesture, and the re-driven session halted on
-  `unrecognized status in existing story file` — spending the escalation on a session that could
-  never route. The skip record now aborts the re-arm as well, leaving the escalation armed for a
-  corrected spec, the run state untouched and the spec byte-identical (the stale `## Auto Run
-Result` strip is sequenced after the check). Narrowed to the spec the re-drive will actually READ,
-  not merely to one this process can open. On an unreachable path the failed flip says nothing about
-  what the re-drive will read, since the path is worktree-relative and the re-drive mounts a fresh
-  worktree and reads the COMMITTED spec regardless — and under isolation the readable file IS that
-  discarded worktree copy, so refusing over it demanded a repair to a file nothing opens, and
-  demanded it even when the corrected spec was already committed and proven routable. Both legs
-  record `refused: false` and warn without aborting, and the operator message follows the flag
-  rather than claiming a refusal that did not happen.
+  cannot route** (#640). A spec carrying no top-level `status:` failed the flip silently: the
+  operator was told "re-armed <story>", the run resumed in the same gesture, and the re-driven
+  session halted on `unrecognized status in existing story file`, spending the escalation. The skip
+  record now aborts the re-arm, leaving the escalation armed for a corrected spec, the run state
+  untouched and the spec byte-identical. Narrowed to the spec the re-drive will actually READ — an
+  unreachable path only warns, since the re-drive mounts a fresh worktree and reads the committed
+  spec regardless.
 
 - **Re-arm writes the spec the run actually used, and reports every write it could not make**
-  (#640). `StoryTask` persists `spec_file` RELATIVE to the worktree for an isolated task, and
-  re-arm resolved it against the process cwd. `bmad-loop resolve` runs from the project root,
-  where the main checkout carries the same `_bmad-output/specs/...` layout — so the path check
-  passed on the WRONG file, and both the status flip and the baseline re-stamp landed on the
-  main checkout's copy while the worktree's real spec kept the escalated attempt's sha. Re-arm
-  now re-anchors the recorded path on the worktree it was persisted against before either write.
+  (#640). `StoryTask` persists `spec_file` relative to the worktree and re-arm resolved it against
+  the process cwd, where the main checkout carries the same layout — so the status flip and the
+  baseline re-stamp landed on the WRONG file while the worktree's real spec kept the escalated
+  attempt's sha. The recorded path is now re-anchored on the worktree before either write.
   Separately, both frontmatter writers answer a spec they cannot move with `False` rather than an
-  exception, and those returns were discarded: an unreadable spec now journals
-  `rearm-baseline-restamp-skipped`, and a flip that silently did nothing journals
-  `rearm-spec-flip-skipped` — but only when the flip genuinely failed. `set_frontmatter_status`
-  answers `False` for four causes, not three, and the fourth is _already at the target_: an
-  ordinary second re-arm, or `resolve --no-interactive` after a human fixed the spec, was told its
-  spec "could not be re-opened" and might re-wedge, while the file was correct. Re-arm now reads
-  the status back to tell a failed write from nothing-to-write. The skip record no longer hides
-  behind a successful git advance — nesting it there meant a project that is not a repo
-  reported only the git failure while the flip was a no-op for an unrelated reason.
+  exception and those returns were discarded; they now journal `rearm-baseline-restamp-skipped` and
+  `rearm-spec-flip-skipped`, on genuine failure only — re-arm reads the status back, so an ordinary
+  second re-arm is no longer told its spec "could not be re-opened". The skip record no longer nests
+  behind a successful git advance.
 
-- **Re-arm warns when its spec writes cannot reach the re-drive** (#640). Under worktree
-  isolation re-arm's status flip and baseline re-stamp land in a worktree the re-drive
-  discards before reading it, and the re-driven session reads the COMMITTED spec instead — so
-  a correction left only in the working tree is silently lost. Re-arm now journals
-  `rearm-spec-write-unreachable` and both surfaces tell the operator to commit the corrected
-  spec. The warning is raised only when the committed spec does not already carry the status
-  the re-drive needs: gating it on isolation alone fired it on every re-arm of an isolated
-  task, where the advice is a no-op and the noise trains the operator past the records that
-  matter. The record also HOLDS the resume both surfaces fold in behind the re-arm — its own
-  advice reads "commit the corrected spec before resuming", and resuming in the same gesture
-  made that unactionable the moment it printed, then burned the escalation on a session that
-  halts blocked. The re-arm still stands; `bmad-loop resume <run-id>` picks the story up once
-  the fix is committed, and `--resume` does not override the hold. Only this record holds:
-  the advisory warnings report something an operator may need to act on, but none of them
-  proves the re-drive cannot route.
+- **Re-arm warns when its spec writes cannot reach the re-drive** (#640). Under worktree isolation
+  the status flip and baseline re-stamp land in a worktree the re-drive discards before reading it,
+  and the re-driven session reads the COMMITTED spec — so a correction left only in the working tree
+  is silently lost. Re-arm journals `rearm-spec-write-unreachable` and both surfaces tell the
+  operator to commit the corrected spec. It is raised only when the committed spec does not already
+  carry the status the re-drive needs; gating on isolation alone fired on every isolated re-arm,
+  where the advice is a no-op. This record alone also HOLDS the resume both surfaces fold in behind
+  the re-arm, since its advice is unactionable once the run has resumed, and `--resume` does not
+  override the hold — the re-arm stands, and `bmad-loop resume <run-id>` picks the story up once the
+  fix is committed.
 
-- **The re-arm baseline records reach the TUI operator too** (#640). Each surface carried its
-  own copy of the journal-kind → message routing and they had drifted: `bmad-loop resolve`
-  echoed the advance-failure and re-stamp records across six kinds, while the TUI's re-arm —
-  which resumes the run in the same gesture — printed only `re-armed <key>` and handled three,
-  silently dropping the whole `stale-restore-*` family, including the commits warning that is
-  the only notice telling a human to inspect the tree. Both now route through one table
-  (`runs.rearm_event_notice`) and raise the same warnings before resuming. They also agree on
-  the ABORT path, where `resolve` echoed residue a half-run re-arm had already journalled while
-  the TUI returned silently. Both read the journal through one shared guard, so a corrupt
-  journal costs the echo on either surface and never the gesture, and neither replays the whole
-  journal when a read degrades. The TUI omits the trailing "before resuming" imperative, since
-  it resumes in the same gesture. The re-stamp notice warns on both legs — the record fires only
-  when the spec claimed a baseline the run never recorded, equally exceptional whichever leg
-  produced it — and the `restore` flag stays on the record to say which leg that was.
+- **The re-arm baseline records reach the TUI operator too** (#640). Each surface carried its own
+  copy of the journal-kind → message routing and they had drifted: the TUI printed only
+  `re-armed <key>` and handled three kinds to `resolve`'s six, silently dropping the whole
+  `stale-restore-*` family — including the commits warning that is the only notice telling a human
+  to inspect the tree. Both now route through one table (`runs.rearm_event_notice`), raise the same
+  warnings before resuming, and agree on the ABORT path. Both read the journal through one shared
+  guard, so a corrupt journal costs the echo and never the gesture. The TUI omits the trailing
+  "before resuming" imperative, since it resumes in the same gesture.
 
-- **`bmad-loop resolve` re-stamps the spec's `baseline_revision` on both re-drive legs**
-  (#640), not only on a patch-restore. A from-scratch re-drive used to carry the escalated
-  attempt's sha until step-03 re-stamped it, so every gate reading a claimed baseline before
-  then read a stale one. The trade is recorded rather than hidden: on that leg the gate now
-  compares a value the orchestrator itself wrote, so a claim that genuinely diverged is
-  journalled (`rearm-baseline-restamped`) instead of being silently normalized. A re-stamp is
-  refused outright when the baseline advance failed, so spec and task can never agree on a
-  stale sha. That record compares against the baseline the run RECORDED, not against
-  `task.baseline_commit`, which the advance has already moved to the new HEAD — so it fires
-  only on a claim the run never made, rather than on every ordinary from-scratch re-arm whose
-  resolve session committed anything.
+- **`bmad-loop resolve` re-stamps the spec's `baseline_revision` on both re-drive legs** (#640),
+  not only on a patch-restore. A from-scratch re-drive carried the escalated attempt's sha until
+  step-03 re-stamped it, so every gate reading a claimed baseline before then read a stale one. The
+  trade is recorded rather than hidden: a claim that genuinely diverged is journalled
+  (`rearm-baseline-restamped`) instead of being silently normalized, and a re-stamp is refused
+  outright when the baseline advance failed, so spec and task can never agree on a stale sha. The
+  record compares against the baseline the run RECORDED, so it fires only on a claim the run never
+  made.
 
 - **A published run archive now lands at mode `0600`** instead of a umask-derived mode (#591).
   It is staged through a file the orchestrator creates itself rather than one `tarfile` opens
@@ -187,82 +148,69 @@ Result` strip is sequenced after the check). Narrowed to the spec the re-drive w
 
 ### Fixed
 
-- **`resume` re-stamps the run's recorded code root** (#716). Resume re-reads
-  `_bmad/bmm/config.yaml` and arms the engine against the `repo_root` it finds there, but left
-  the copy in `state.json` at its launch value — so after a `repo_root:` edit the engine worked
-  in one tree while the out-of-process re-arm (`bmad-loop resolve`) advanced the attempt baseline
-  and re-stamped `baseline_revision` in the other, with no error on either side. The mirror now
-  follows the paths resume adopts, and a move is announced rather than silent: the baselines,
-  preserve refs and branches the run already recorded name objects in the previous tree. A
-  `state.json` from before the field existed migrates without being reported as a move.
+- **`resume` re-stamps the run's recorded code root** (#716). Resume arms the engine against the
+  `repo_root` it re-reads from `_bmad/bmm/config.yaml` but left the `state.json` copy at its launch
+  value, so after an edit the engine worked in one tree while the out-of-process re-arm advanced the
+  attempt baseline in the other, with no error on either side. The mirror now follows the paths
+  resume adopts, and a move is announced rather than silent — the baselines, preserve refs and
+  branches already recorded name objects in the previous tree. A `state.json` from before the field
+  existed migrates without being reported as a move.
 
-- **The unreachable-spec-write warning no longer fires on a shared artifact directory** (#640).
-  Under worktree isolation the re-arm warned whenever the committed spec did not already carry
-  the re-drive's status — but an artifact directory configured outside the project is left where
-  it is by `ProjectPaths.rebased`, shared across checkouts instead of rebased onto each worktree,
-  so the flip lands on the one file every re-drive reads and there was never anything to commit.
-  That layout took the warning on every re-arm, and its remedy ("commit the corrected spec")
-  named a file outside the repository. Containment is decided on the canonical paths, so a spec
-  spelled out of but resolving back into the worktree still warns, as does one the host cannot
-  canonicalize.
+- **The unreachable-spec-write warning no longer fires on a shared artifact directory** (#640). An
+  artifact directory configured outside the project is left where it is by `ProjectPaths.rebased`,
+  shared across checkouts instead of rebased onto each worktree — so the flip lands on the one file
+  every re-drive reads and there was never anything to commit, yet that layout took the warning on
+  every re-arm with a remedy naming a file outside the repository. Containment is decided on the
+  canonical paths, so a spec spelled out of but resolving back into the worktree still warns, as
+  does one the host cannot canonicalize.
 
 - **`bmad-loop resolve` still reports abandoned-restore residue when the re-arm aborts** (#640).
   The residue is journalled before the re-stamp that can raise, so an abort discarded records
   already written — including the commits warning. The echo now runs on both paths.
 
 - **A YAML boolean in a spec's baseline key no longer refuses the attempt** (#716). `no`, `off`,
-  `yes` and `on` parse as booleans, and the shared reader stringified them into the tokens
-  `"False"`/`"True"` — non-empty, so they were judged as a claimed sha, and a boolean on
-  `baseline_revision` outranked a `baseline_commit` naming the correct commit. Booleans are now
-  treated as absent, exactly as a YAML null already was.
+  `yes` and `on` parse as booleans, and the shared reader stringified them into `"False"`/`"True"` —
+  non-empty, so they were judged as a claimed sha and outranked a `baseline_commit` naming the
+  correct commit. Booleans are now treated as absent, exactly as a YAML null already was.
 
-- **A dev RETRY now notifies the operator, with the reason** (#640). RETRY was the only dev
-  outcome that REJECTS an attempt without raising a notice, and it is the one that discards a
-  completed implementation — the non-fixable leg resets the tree to baseline. The reason lived
-  only in the `dev-decision` journal line, so a run could spend its whole attempt budget
-  throwing finished work away with nothing but the eventual exhaustion notice reaching a human.
-  The notice carries the reason's first line, capped and marked with `[…]` when trimmed; the
-  untruncated text stays in the journal. It can repeat for one attempt if the host dies between
-  the notice and the rollback and the run then replays that verdict on resume.
+- **A dev RETRY now notifies the operator, with the reason** (#640). RETRY was the only dev outcome
+  that REJECTS an attempt without raising a notice, and it is the one that discards a completed
+  implementation. The reason lived only in the `dev-decision` journal line, so a run could spend its
+  whole attempt budget throwing finished work away with nothing but the eventual exhaustion notice
+  reaching a human. The notice carries the reason's first line, capped and marked with `[…]` when
+  trimmed; the untruncated text stays in the journal. It can repeat for one attempt if the host dies
+  between the notice and the rollback.
 
-- **A stale `baseline_commit` no longer outranks the fresh `baseline_revision` a spec
-  claims** (#716). The two consumers of a claimed dev baseline carried byte-identical
-  expressions that ranked the legacy key first — and `bmad-loop resolve` manufactures exactly
-  that dual-key spec, inserting `baseline_revision` while never removing a pre-existing
-  `baseline_commit`. The gate then judged the leftover and failed an attempt that had done
-  everything right. One shared reader (`frontmatter.auto_dev_baseline_of`) now backs both:
-  `baseline_revision` wins whenever it is non-empty, `baseline_commit` remains the
-  backward-compatible fallback, and an empty or YAML-null value on either key reads as absent
-  rather than as a claim of `""` or the token `"None"`.
+- **A stale `baseline_commit` no longer outranks the fresh `baseline_revision` a spec claims**
+  (#716). Both consumers of a claimed dev baseline ranked the legacy key first — and `bmad-loop
+resolve` manufactures exactly that dual-key spec, inserting `baseline_revision` while never
+  removing a pre-existing `baseline_commit`, so the gate judged the leftover and failed an attempt
+  that had done everything right. One shared reader (`frontmatter.auto_dev_baseline_of`) now backs
+  both: `baseline_revision` wins whenever it is non-empty, `baseline_commit` remains the
+  backward-compatible fallback, and an empty or YAML-null value on either key reads as absent.
 
 - **The dev proof-of-work gate measures the tree the baseline was written in** (#716). Under an
-  explicit `repo_root:` with `isolation = "none"`, the baseline is stamped in the git root
-  (where the session's cwd is) but every gate probe — the commit-identity lookup, both
-  ancestry checks and `has_changes_since` — asked the BMAD project directory about it. The
-  four probes now share the git root, and so do the three proof-of-work exclude sources that
-  feed them — the gate's own file-granular excludes, the stories record/manifest excludes, and
-  the engine's own ledger append. A marker only the project tree holds therefore no longer
-  satisfies proof of work, and a correct attempt is no longer refused forever. The fourth
-  exclude helper, `artifact_relpaths`, is deliberately untouched: it has no production
-  caller, so its root is inert. Rollback protection does not use it — it builds its own
-  list against the workspace root in `RecoveryFlow.protected_relpaths`. No effect where the two
-  roots coincide, which is every other configuration.
+  explicit `repo_root:` with `isolation = "none"` the baseline is stamped in the git root, but every
+  gate probe — the commit-identity lookup, both ancestry checks and `has_changes_since` — asked the
+  BMAD project directory about it, so a marker only the project tree held satisfied proof of work
+  and a correct attempt was refused forever. The four probes now share the git root, and so do the
+  three exclude sources that feed them. `artifact_relpaths` is deliberately untouched: it has no
+  production caller, and rollback protection builds its own list against the workspace root. No
+  effect where the two roots coincide, which is every other configuration.
 
-- **`bmad-loop resolve` advances the re-arm baseline in the code tree, and says so when it
-  cannot** (#640). The advance read HEAD of the BMAD project directory rather than the git
-  root, and swallowed every failure with a bare `except Exception`, so a re-drive that
-  silently rebuilt against the pre-resolution tree looked exactly like one that adopted the
-  human's fix. It is still non-fatal outside a repository, but now narrowed to the typed git
-  errors and journalled (`rearm-baseline-advance-failed`); anything that is not a git answer
-  propagates.
+- **`bmad-loop resolve` advances the re-arm baseline in the code tree, and says so when it cannot**
+  (#640). The advance read HEAD of the BMAD project directory rather than the git root, and
+  swallowed every failure with a bare `except Exception`, so a re-drive that silently rebuilt
+  against the pre-resolution tree looked exactly like one that adopted the human's fix. It is still
+  non-fatal outside a repository, but now narrowed to the typed git errors and journalled
+  (`rearm-baseline-advance-failed`); anything that is not a git answer propagates.
 
-- **A re-armed story can no longer replay the abandoned attempt's verdict** (#705). Re-arm
-  resets `attempt` to 0 and deliberately keeps `task.sessions`, so the next dispatch re-minted
-  a session id byte-equal to a record the abandoned attempt had already written — and a host
-  death before the new record landed resumed straight into that stale result. A per-task
-  generation counter now discriminates the id. It is emitted only above zero, so every id
-  already on disk stays byte-identical and a run resumed across the upgrade still finds its
-  `tasks/` directories.
+- **A re-armed story can no longer replay the abandoned attempt's verdict** (#705). Re-arm resets
+  `attempt` to 0 and deliberately keeps `task.sessions`, so the next dispatch re-minted a session id
+  byte-equal to a record the abandoned attempt had already written — and a host death before the new
+  record landed resumed straight into that stale result. A per-task generation counter now
+  discriminates the id, emitted only above zero, so every id already on disk stays byte-identical
+  and a run resumed across the upgrade still finds its `tasks/` directories.
 
 - **The three review gates run `[verify] commands` in the git root, not the BMAD project
   root** (#695). Under an explicit `repo_root:` with `isolation = "none"` they shelled out in
