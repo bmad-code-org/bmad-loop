@@ -2388,7 +2388,7 @@ def test_rearm_reads_the_committed_spec_from_the_redrive_base_not_the_current_he
     The worktree copy is held at `blocked` on both rows, so the only moving part is
     which committed ref carries the correction.
 
-    Ablation: restore the revision argument in `_committed_spec_status` to a literal
+    Ablation: restore the revision argument in `_redrive_spec_status` to a literal
     `"HEAD"` and BOTH rows redden (`assert False is True` / `assert True is False`) —
     the pair is the discriminator; either row alone also passes for the anchor it is
     meant to reject.
@@ -2465,7 +2465,7 @@ def test_rearm_records_the_in_place_remedy_when_isolation_was_turned_off(tmp_pat
     spec = tmp_path / rel
     spec.parent.mkdir(parents=True, exist_ok=True)
     # the MAIN CHECKOUT's copy — the tree the in-place re-drive reads — left terminal,
-    # so `_committed_spec_status` cannot suppress the record
+    # so `_redrive_spec_status` cannot suppress the record
     spec.write_text("---\nstatus: blocked\n---\n\n## Intent\n\nx\n", encoding="utf-8")
     git(tmp_path, "add", "-A")
     git(tmp_path, "commit", "-q", "-m", "escalated spec")
@@ -2494,6 +2494,53 @@ def test_rearm_records_the_in_place_remedy_when_isolation_was_turned_off(tmp_pat
     assert "isolation policy changed" in message
     # and the flip still holds the resume: the remedy is upstream of the re-drive's read
     assert runs.rearm_holds_the_resume(rec)
+
+
+def test_rearm_in_place_proof_reads_the_working_tree_not_the_commit(tmp_path, monkeypatch):
+    """The in-place remedy has to be able to CLEAR the record it is printed on.
+
+    `rearm-spec-write-unreachable` holds the resume (`rearm_holds_the_resume`), and its
+    in-place notice tells the operator to re-apply the correction in the main checkout —
+    no commit, because an in-place re-drive reads that tree's WORKING copy. So the proof
+    that suppresses it has to read the working copy too. Measuring the committed tree
+    instead would demand a commit the re-drive never needs, and the operator who did
+    exactly what the notice said would re-run resolve and be held again, forever.
+
+    Both rows leave the COMMITTED spec terminal, so only the working tree moves:
+
+    - working tree corrected -> the re-drive routes, and the record is suppressed.
+    - working tree still terminal -> it re-wedges, and the record fires.
+
+    Ablation: delete the `if not isolated_redrive:` arm from `_redrive_spec_status` so
+    both rows fall through to the committed read, and the first row reddens — the
+    correction the re-drive will read is reported as absent.
+    """
+    rel = "_bmad-output/specs/6-4-cli-list-command.md"
+    for corrected, warns in ((True, False), (False, True)):
+        root = tmp_path / f"row-{corrected}"
+        root.mkdir()
+        _resolve_repo(root)
+        spec = root / rel
+        spec.parent.mkdir(parents=True, exist_ok=True)
+        # committed terminal on BOTH rows: a committed read can never suppress here
+        spec.write_text("---\nstatus: blocked\n---\n\n## Intent\n\nx\n", encoding="utf-8")
+        git(root, "add", "-A")
+        git(root, "commit", "-q", "-m", "escalated spec")
+        if corrected:  # uncommitted, exactly as the in-place notice instructs
+            spec.write_text("---\nstatus: ready-for-dev\n---\n\n## Intent\n\nx\n", encoding="utf-8")
+
+        mount = root / "wt"
+        (mount / rel).parent.mkdir(parents=True, exist_ok=True)
+        (mount / rel).write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+
+        run_dir, _, _ = _escalated_run(
+            root, spec_file=rel, worktree_path=str(mount), target_branch="main"
+        )
+        monkeypatch.chdir(root)
+        runs.rearm_escalation(run_dir, isolated_redrive=False)
+
+        fired = [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-write-unreachable"]
+        assert bool(fired) is warns, f"corrected={corrected}"
 
 
 def test_rearm_event_notice_reads_a_pre_discriminator_record_as_isolated():
@@ -2527,7 +2574,7 @@ def test_rearm_base_ref_degrades_to_head_for_a_run_that_pinned_no_target(tmp_pat
     `ensure_target_branch` pins the field before any worktree can mount, so only a
     state.json predating it reaches here with a `worktree_path` and no target — and it
     must degrade to the ref it read before the fix rather than to `""`. Answering `""`
-    would make `_committed_spec_status` unprovable for every re-arm of such a run and
+    would make `_redrive_spec_status` unprovable for every re-arm of such a run and
     hold the resume on a per-configuration constant, the exact failure the record's
     narrowing exists to avoid.
 
@@ -2574,7 +2621,7 @@ def test_rearm_does_not_refuse_a_flip_the_redrive_never_reads(
     in what git has committed, which is what makes this a reachability claim rather than
     a readability one:
 
-    - `ready-for-dev` — `_committed_spec_status` has already PROVEN the re-drive reads
+    - `ready-for-dev` — `_redrive_spec_status` has already PROVEN the re-drive reads
       the status it routes on. Refusing blocked an otherwise-complete re-arm over an
       obsolete copy, with nothing for the operator to do at all.
     - `blocked` — the correction really is outstanding, and the remedy is
@@ -2619,13 +2666,13 @@ def test_rearm_does_not_refuse_a_flip_the_redrive_never_reads(
 def test_rearm_suppresses_the_unreachable_warning_only_on_proof(tmp_path, monkeypatch):
     """A project that is not a repo must still WARN, not fall silent.
 
-    `_committed_spec_status` degrades to `""` on every uncertainty — a `GitError`
+    `_redrive_spec_status` degrades to `""` on every uncertainty — a `GitError`
     (which covers "not a repository"), an absent blob, a non-UTF-8 blob. `""` never
     equals a target status, so the record fires. This is the direction the narrowing
     must fail in: suppressing a warning demands proof the work is done, and the
     re-arm advance stays non-fatal outside a repo, as the story's Boundaries require.
 
-    Ablation: make `_committed_spec_status` return `target_status` on `GitError`
+    Ablation: make `_redrive_spec_status` return `target_status` on `GitError`
     instead of `""` and this reddens on the missing record — the re-arm still
     "succeeds", which is exactly the silence #640(b) exists to end.
     """
@@ -2734,7 +2781,7 @@ def test_rearm_warns_when_the_spec_cannot_be_placed_against_the_worktree(tmp_pat
 
     `_spec_is_shared_with_the_redrive` decides on `resolve()`, which raises on the hosts
     #552 is about (a registered-but-not-serving WSL UNC provider) — and an uncertain
-    answer must not buy silence, the same direction `_committed_spec_status` degrades
+    answer must not buy silence, the same direction `_redrive_spec_status` degrades
     in. This row is the shared-artifact-dir row above with resolution taken away, so it
     is the fault, not the layout, that flips the outcome.
 
@@ -2874,7 +2921,7 @@ def test_rearm_event_notice_splits_the_flip_skip_on_the_refusal():
 def test_rearm_holds_the_resume_only_on_the_record_that_proves_a_wedge():
     """The hold is PROOF, not urgency — and it is asked of every kind the table knows.
 
-    `rearm-spec-write-unreachable` is written only once `_committed_spec_status` has
+    `rearm-spec-write-unreachable` is written only once `_redrive_spec_status` has
     established that the committed spec does not carry the status the re-drive routes
     on, so resuming on it is futile rather than risky: step-01 halts blocked on
     `unrecognized status in existing story file` and the escalation is spent. Its

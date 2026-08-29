@@ -2573,19 +2573,32 @@ def _restore_rearmed_spec(
         ) from e
 
 
-def _committed_spec_status(state: RunState, task: StoryTask, *, isolated_redrive: bool) -> str:
-    """The spec's status as COMMITTED in the tree the re-drive reads, or ``""`` when
-    unprovable.
+def _redrive_spec_status(state: RunState, task: StoryTask, *, isolated_redrive: bool) -> str:
+    """The spec's status AS THE RE-DRIVE WILL READ IT, or ``""`` when unprovable.
 
-    Under isolation the re-drive reads the committed spec and never a working-tree
-    write (see `rearm_escalation`'s note on `rearm-spec-write-unreachable`), so this is
-    the value that decides whether the operator still has anything to do. Anchored on
-    `state.code_root` — the same tree the baseline advance reads — at the ref
-    `redrive_base_ref` names, which is the run's pinned `target_branch` when the re-drive
-    will mount rather than that tree's current `HEAD`. `isolated_redrive` is forwarded
-    verbatim for that call and read nowhere else here: this function must measure at the
-    same ref the caller's remedy names, or the proof and the instruction describe two
-    trees.
+    The proof that decides whether the operator still has anything to do, so it has to
+    read the same file the caller's remedy names — otherwise the record holds a resume
+    over work that is already done, or clears on work that is not.
+
+    Two sources, because the two re-drive modes read two different things:
+
+    * MOUNTING: the fresh worktree is cut from git and checks out TRACKED files only, so
+      it reads the COMMITTED spec and never a working-tree write. Anchored on
+      `state.code_root` — the same tree the baseline advance reads — at the ref
+      `redrive_base_ref` names, the run's pinned `target_branch` rather than that tree's
+      current `HEAD`.
+    * IN PLACE: the story re-runs in the main checkout, which reads its WORKING TREE. A
+      commit is neither required nor sufficient there, so measuring the committed tree
+      would hold the resume until the operator committed a correction the re-drive would
+      have read uncommitted — and `rearm_event_notice`'s in-place remedy tells them to
+      do exactly that (re-apply it in the main checkout, no commit), so a committed-only
+      proof would make the record's own instruction unable to clear it.
+
+    Reached only when the write does NOT reach the re-drive, so the in-place arm is
+    always the isolation-flip shape: the flip's write landed in the mount the escalated
+    attempt recorded while the re-drive reads `state.project`. That is the tree
+    `task_spec_root` answers for a task with no mount, which is what the resume makes
+    this task once `release_mount_owned_state` runs.
 
     Degrades to ``""`` on every uncertainty: a spec recorded absolute (nothing names
     its position in the tree), an absent or non-blob path at that ref, a non-UTF-8 blob,
@@ -2595,15 +2608,23 @@ def _committed_spec_status(state: RunState, task: StoryTask, *, isolated_redrive
     that the work is already done, and the non-repo case stays non-fatal, as the story's
     Boundaries require.
 
-    The absolute arm is narrower than it looks: the caller has already answered the one
+    Degrades to ``""`` on every uncertainty in BOTH arms, including a spec recorded
+    absolute. That arm is narrower than it looks: the caller has already answered the one
     absolute shape whose write the re-drive DOES read — the shared external spec — with
     `_spec_is_shared_with_the_redrive`. What still reaches here is an absolute spelling
-    of a path inside one of the two checkouts, which is genuinely unreachable and
-    genuinely unprovable, so degrading it to a warning is the right answer, not a gap.
+    of a path inside one of the two checkouts, which is genuinely unreachable, and whose
+    position in the re-drive's tree nothing here can name, so degrading it to a warning
+    is the right answer rather than a gap.
     """
     raw = Path(task.spec_file or "")
     if not task.spec_file or raw.is_absolute():
         return ""
+    if not isolated_redrive:
+        try:
+            text = (Path(state.project) / raw).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return ""
+        return status_of(parse_frontmatter(text))
     try:
         blob = verify.file_bytes_at_revision(
             state.code_root,
@@ -2852,7 +2873,7 @@ def rearm_escalation(
             # REFUSAL one screen down, which was gated on `spec_path.is_file()` alone.
             # Under isolation that readable file is the doomed worktree copy, so the
             # refusal demanded a repair to the one file the re-drive destroys before
-            # reading anything — and demanded it even when `_committed_spec_status` had
+            # reading anything — and demanded it even when `_redrive_spec_status` had
             # already proven the committed spec carries the status the re-drive routes
             # on. See `_spec_is_shared_with_the_redrive` for why an isolated unit's spec
             # is nevertheless reachable when it sits in an artifact dir configured
@@ -2909,7 +2930,7 @@ def rearm_escalation(
             # to `branch` would pseudonymize statuses as branches.
             if (
                 not write_reaches_the_redrive
-                and _committed_spec_status(state, task, isolated_redrive=isolated_redrive)
+                and _redrive_spec_status(state, task, isolated_redrive=isolated_redrive)
                 != target_status
             ):
                 journal.append(
@@ -3009,7 +3030,7 @@ def rearm_escalation(
                     # resolve would flip a spec that is deleted before it is read, while
                     # the committed spec, the one thing that decides routing, went
                     # untouched. Worse, the refusal fired even when the correction was
-                    # already committed: `_committed_spec_status` had just PROVEN the
+                    # already committed: `_redrive_spec_status` had just PROVEN the
                     # re-drive routes correctly, and the re-arm was refused anyway over an
                     # obsolete copy. The real remedy on that shape is
                     # `rearm-spec-write-unreachable`'s ("commit the corrected spec"),
@@ -3519,7 +3540,7 @@ def rearm_holds_the_resume(entry: dict[str, Any]) -> bool:
     re-arm and leave `bmad-loop resume` to the operator.
 
     Exactly one kind qualifies, and the discriminator is PROOF, not urgency.
-    `rearm-spec-write-unreachable` is written only once `_committed_spec_status` has
+    `rearm-spec-write-unreachable` is written only once `_redrive_spec_status` has
     established that the committed spec does NOT carry the status the re-drive routes
     on, and only for a spec the working-tree flip cannot reach. Resuming on it is not
     risky, it is futile: the re-drive discards the worktree, mounts a fresh one from
