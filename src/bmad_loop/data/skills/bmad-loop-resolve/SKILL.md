@@ -32,6 +32,7 @@ These environment variables are set:
   "story_key": "6-4-cli-list-command",
   "run_id": "20260613-111429-6a14",
   "spec_file": "/abs/path/to/_bmad-output/implementation-artifacts/spec-<story>.md",
+  "spec_reaches_the_redrive": true,
   "baseline_commit": "<sha>",
   "paused_reason": "CRITICAL escalation from review session: ...",
   "escalations": [
@@ -44,6 +45,20 @@ These environment variables are set:
   "resolution_path": "/abs/path/to/<run>/resolve/<story>/resolution.json"
 }
 ```
+
+**`spec_reaches_the_redrive` says whether your edit has a future.** Under worktree
+isolation the run's mount is discarded before the re-drive reads anything, so a spec
+that lives inside that mount is destroyed with it. When this field is `false`, every
+write to `spec_file` still SUCCEEDS and is then thrown away — worse than not editing
+at all, because the session looks resolved. `null` means the task has no spec on
+record: there is nothing to edit and step 4 does not apply.
+
+Do not skip the edit when it is `false` — the corrected spec is what gets carried
+over. Do step 4 as usual, then tell the human, in the same breath as the resolution,
+that **this copy does not survive the re-arm and the correction has to be committed
+to reach the re-driven session**. The orchestrator prints the same remedy, with the
+branch to commit on, when it re-arms; say it here so they hear it before they close
+the session rather than after.
 
 In **stories mode** (folder+id dispatch) the context also carries a `stories`
 block — the manifest intent for this story, so you can see WHAT it is meant to do
@@ -105,7 +120,10 @@ case below — omit it entirely for an ordinary resolution.
    `<frozen-after-approval>` block and any affected acceptance criteria / test
    matrix rows so a fresh dev session has exactly one correct reading. Make the
    smallest change that removes the ambiguity. You MAY use the `bmad-spec` or
-   `bmad-correct-course` skills if a larger spec change is warranted.
+   `bmad-correct-course` skills if a larger spec change is warranted. **If
+   `spec_reaches_the_redrive` is `false`, make the same edit and then say plainly
+   that this copy is discarded with the run's worktree, so the correction must be
+   committed to reach the re-drive** — an unflagged edit here is lost work.
 5. **Write the resolution marker** at `resolution_path` (schema above), then tell
    the human the resolution is recorded and they can exit this session — the
    orchestrator will offer to **re-arm the story and resume the run** (a clean
@@ -170,7 +188,10 @@ entirely: the orchestrator re-drives from scratch against the corrected intent.
   field — the orchestrator deterministically re-arms the spec status on resume.
   Edit spec **content** only.
 - **Do NOT** implement the story, write feature code, run tests, or commit. Your
-  job ends at a corrected spec + the resolution marker.
+  job ends at a corrected spec + the resolution marker. That holds when
+  `spec_reaches_the_redrive` is `false` too: committing the corrected spec is the
+  HUMAN's step, on the branch the orchestrator names at re-arm. Tell them it is
+  required; do not do it yourself.
 - **Do NOT** widen scope. Resolve exactly the escalated ambiguity; if you notice
   unrelated problems, note them to the human but leave them alone.
 

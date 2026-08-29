@@ -162,48 +162,30 @@ breaking changes may land in a minor release.
 ### Fixed
 
 - Anchor the TUI's paused-spec read and its `Request replan` write on the tree the run
-  owns. An isolated unit's `spec_file` is persisted relative to its mounted worktree, and
-  the dashboard resolved it against its own cwd — the project root, which carries the same
-  layout — so the review modals showed the main checkout's copy and the replan reset that
-  copy to `draft`. Both writes reported success, so the run resumed with the worktree's
-  real spec still at its terminal status and the next dispatch did not re-plan. The path
-  and the confinement root now come from one claim about which tree owns the spec, an
-  absent spec reads as a read failure rather than an empty body, an undecodable one
-  degrades a byte rather than the document, and `bmad-loop resolve`'s `context.json`
-  reports `spec_file` absolute.
-- Anchor the confinement root on a tree that can actually contain the spec. A spec recorded
-  absolute beside a worktree sits outside it by construction, so naming the worktree left
-  every spec write failing its own containment check and falling back to an unguarded
-  write, while the re-arm's undo failed outright. Such a spec now anchors on the project.
-  One deliberate, graded exception: a spec inside the project but reached through a
-  symlinked component moves from a succeeding unguarded write to a refused confined one —
-  predicting that walk would make the root depend on filesystem state.
-- Re-anchor spec ownership and the attempt baseline before discarding a mount, in both the
-  engine and sweep. The restart arm cleared `worktree_path` but left `baseline_commit`,
-  `baseline_untracked`, `spec_file` and `dispatched_spec_file` — all measured inside the
-  mount — and saves before the replacement is mounted, so a git spawn fault persisted them
-  beside an empty `worktree_path`. Later resumes then probed the main checkout: a rollback
-  could delete untracked files the operator already had, and recovery could restore a dead
-  attempt's snapshot over their own copy of the spec. Sweep never inherited the engine's
-  fix at all, because `SweepEngine` replaces `_loop` wholesale and the base engine's
-  `_finish_inflight` carries the re-anchor.
+  owns. Under isolation both resolved against the main checkout, so the review modals
+  showed that copy of the spec and the replan reset it — reporting success while the run's
+  real spec kept its terminal status, so the next dispatch did not re-plan.
+- Anchor a spec's confinement root on a tree that can actually contain it, so the status
+  flip, the result strip and the baseline re-stamp no longer fall back to an unguarded
+  write, and the re-arm's undo no longer fails outright.
+- Re-anchor spec ownership and the attempt baseline before a discarded worktree is dropped,
+  in both the engine and sweep. A later resume could otherwise probe the main checkout —
+  deleting untracked files the operator already had, or restoring a dead attempt's spec
+  over their own copy.
 - Locate the stories folder from the workspace root rather than from the spec's confinement
-  root. The sentinel indicator and `context.json`'s stories block borrowed the confinement
-  answer, which falls back to the project for a spec outside the mount, so one modal could
-  read its spec text from the run's tree and its sentinel from the project — and show a
-  pre-planning sentinel wedge as an ordinary escalation.
-- Anchor pause notifications and the `checkpoint-pause` journal on the run's tree. The
-  spec-approval and plan-checkpoint pauses printed the raw worktree-relative path on the
-  surface the operator reads first; sprint mode is included. The dev-session prompt keeps
-  the raw field: that session's working directory is the mount.
-- Refuse the destructive verbs on a spec that could not be read. `Approve & resume` and
-  `Re-arm` act on the spec — re-arm flips its frontmatter, strips its result and re-stamps
-  the baseline — so a gate nobody could review is refused at the source. `Resolve` stays
-  offered: it writes nothing and is what repairs a bad anchor. The escalation modal now
-  reports the blocking condition as unknown rather than absent.
-- Report in `context.json` whether an edit to the spec survives to the re-drive. Under
-  isolation the mount is discarded first, so a resolve session could edit a worktree-local
-  spec, see every write succeed, and lose the work.
+  root, so one modal can no longer read its spec from the run's tree and its sentinel from
+  the project.
+- Anchor pause notifications and the `checkpoint-pause` journal on the run's tree, sprint
+  mode included. The dev-session prompt keeps the raw path — that session runs in the mount.
+- Keep the dashboard up on a spec that is absent or undecodable: an absent spec reads as an
+  explicit read failure rather than an empty body, and a bad byte degrades in place instead
+  of losing the document.
+- Refuse `Re-arm & resume` on a spec that could not be read, and report its blocking
+  condition as unknown rather than absent. `Resolve` stays offered — it writes nothing and
+  is what repairs a bad anchor.
+- Report in `context.json` whether an edit to the spec survives to the re-drive, and teach
+  the resolve skill to act on it: under isolation the mount is discarded first, so an edit
+  to a worktree-local spec is lost unless it is committed.
 
 - **`resume` re-stamps the run's recorded code root** (#716). Resume arms the engine against the
   `repo_root` it re-reads from `_bmad/bmm/config.yaml` but left the `state.json` copy at its launch
