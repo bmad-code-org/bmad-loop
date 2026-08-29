@@ -84,6 +84,33 @@ def test_every_emitted_context_key_is_documented(skill_md):
     )
 
 
+def test_skill_branches_on_the_in_place_remedy(skill_md):
+    """`spec_reaches_the_redrive: false` has TWO remedies, and the wrong one is lost
+    work in the other direction.
+
+    A `redrive_base_ref` of `HEAD` means the re-drive runs in the main checkout and
+    reads its WORKING tree — reachable when the run's isolation policy is edited to
+    `none` while the story sits escalated, which leaves `spec_file` pointing into a
+    mount the run has stopped using. The skill's own remedy text was written for the
+    isolated case alone, and applied verbatim it sends the human to commit onto a
+    branch this run never reads while the file the re-drive DOES read stays wrong. So
+    the skill has to name `HEAD` and say the remedy is different there, not merely
+    document the field.
+
+    Ablation: delete the "When `redrive_base_ref` is `HEAD`" paragraph from SKILL.md
+    and this reddens on the first assertion.
+    """
+    normalized = " ".join(skill_md.split())
+
+    assert "When `redrive_base_ref` is `HEAD`, do not tell them to commit anything." in normalized
+    # ...and it says WHERE instead, in the tree the in-place re-drive actually reads
+    assert "make the same edit to the main checkout's copy of the spec" in normalized
+    # step 4 and the prohibition both have to carry the fork too, or the agent reads a
+    # blanket "commit it" two screens after the paragraph that carved the exception
+    assert "re-applied in the main checkout, uncommitted" in normalized
+    assert "re-applying it in the main checkout when it is `HEAD`" in normalized
+
+
 def test_context_key_scan_is_not_vacuous():
     """The guard above asserts an ABSENCE, so it passes for every reason the key set
     could come back empty — a renamed function, a refactor to a builder, an `ast`
@@ -114,5 +141,5 @@ def test_skill_branches_on_spec_reachability(skill_md):
     assert "committed on `redrive_base_ref`" in normalized
     assert "cannot include the file you edited" in normalized
     assert "cut fresh from `redrive_base_ref`" in normalized
-    # and the prohibition names whose job the commit is, rather than just refusing it
-    assert "committing the corrected spec is the HUMAN's step" in normalized
+    # and the prohibition names whose job the landing is, rather than just refusing it
+    assert "is the HUMAN's step" in normalized

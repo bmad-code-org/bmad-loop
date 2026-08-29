@@ -1731,20 +1731,22 @@ class Engine:
                     # from the workspace it actually re-enters.
                     orphan = task.worktree_path
                     task.release_mount_owned_state()
-                    # ...and the CLAIM goes too. `worktree_path` is overloaded: it
-                    # names a directory AND is how `runs` recognizes an isolated unit
-                    # at all (`task_spec_root`, `task_stories_root`,
-                    # `spec_reaches_the_redrive`, `redrive_base_ref` all gate on it).
-                    # Keeping it set to avoid deleting the tree left the task
-                    # CLAIMING a mount it no longer runs in, so those helpers answered
-                    # for the unit while execution used the main checkout —
-                    # `redrive_base_ref` in particular returned the run's pinned
-                    # `target_branch` when an in-place re-drive reads `HEAD`, which
-                    # would send a resolve session to commit its correction on a
-                    # branch this run will not read. Clearing the field is not
-                    # deleting the tree: the directory stays exactly where it is, and
-                    # the journal records it so an orphan left by a policy change is
+                    # ...and the CLAIM goes too. `worktree_path` names a directory AND
+                    # is how `runs` answers which tree owns the state this task already
+                    # persisted (`task_spec_root`, `task_stories_root`). Keeping it set
+                    # to avoid deleting the tree left the task CLAIMING a mount it no
+                    # longer runs in, so those readers anchored on a tree the run has
+                    # left while execution used the main checkout. Clearing the field is
+                    # not deleting the tree: the directory stays exactly where it is,
+                    # and the journal records it so an orphan left by a policy change is
                     # not silent.
+                    #
+                    # It does NOT fix `redrive_base_ref` / `spec_reaches_the_redrive`,
+                    # and was never able to: those describe the re-drive rather than the
+                    # attempt, and `bmad-loop resolve` asks them in a SEPARATE process
+                    # before this resume runs, so a write here is invisible to the
+                    # reader that needed it. They take the live isolation mode as a
+                    # parameter instead — see `runs.redrive_base_ref`.
                     task.worktree_path = ""
                     task.branch = ""
                     self.journal.append(

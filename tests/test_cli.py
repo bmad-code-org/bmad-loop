@@ -2609,7 +2609,7 @@ def test_resolve_restamps_the_code_root_before_it_rearms(project, monkeypatch, c
     run_dir, moved, _ = _resolve_run_with_a_moved_code_root(project, monkeypatch)
     seen: list = []
 
-    def fake_rearm(rd, key, *, restore_patch=None):
+    def fake_rearm(rd, key, *, restore_patch=None, isolated_redrive=False):
         seen.append(load_state(rd).code_root)
         return key
 
@@ -2733,7 +2733,7 @@ def test_resolve_echoes_this_rearms_stale_restore_events(tmp_path, monkeypatch, 
     run_dir = _escalated_run(tmp_path, "r1")
     Journal(run_dir).append("stale-restore-excluded", story_key="s1", files=["FROM-LAST-TIME.txt"])
 
-    def fake_rearm(rd, key, *, restore_patch=None):
+    def fake_rearm(rd, key, *, restore_patch=None, isolated_redrive=False):
         journal = Journal(rd)
         journal.append("stale-restore-excluded", story_key=key, patch="a.patch", files=["new.txt"])
         journal.append("stale-restore-unparseable", story_key=key, patch="b.patch", error="OSErr")
@@ -2773,7 +2773,7 @@ def test_resolve_echoes_the_rearm_baseline_records(tmp_path, monkeypatch, capsys
 
     _escalated_run(tmp_path, "r1")
 
-    def fake_rearm(rd, key, *, restore_patch=None):
+    def fake_rearm(rd, key, *, restore_patch=None, isolated_redrive=False):
         journal = Journal(rd)
         journal.append(
             "rearm-baseline-advance-failed",
@@ -2824,7 +2824,7 @@ def test_resolve_restamp_echo_warns_on_both_legs(tmp_path, monkeypatch, capsys):
     from bmad_loop.journal import Journal
 
     def rearm_with(restore: bool):
-        def fake_rearm(rd, key, *, restore_patch=None):
+        def fake_rearm(rd, key, *, restore_patch=None, isolated_redrive=False):
             Journal(rd).append(
                 "rearm-baseline-restamped",
                 story_key=key,
@@ -2878,7 +2878,7 @@ def test_resolve_survives_a_corrupt_journal(tmp_path, monkeypatch, capsys, outco
     from bmad_loop import runs
     from bmad_loop.journal import JOURNAL_FILE
 
-    def fake_rearm(rd, key, *, restore_patch=None):
+    def fake_rearm(rd, key, *, restore_patch=None, isolated_redrive=False):
         if outcome == "rearm-error":
             raise runs.RearmError("cannot re-open story spec /x/spec.md")
         return key
@@ -2914,7 +2914,7 @@ def test_resolve_echoes_a_skipped_restamp(tmp_path, monkeypatch, capsys):
 
     _escalated_run(tmp_path, "r1")
 
-    def fake_rearm(rd, key, *, restore_patch=None):
+    def fake_rearm(rd, key, *, restore_patch=None, isolated_redrive=False):
         Journal(rd).append(
             "rearm-baseline-restamp-skipped",
             story_key=key,
@@ -2962,7 +2962,7 @@ def test_resolve_echoes_the_residue_even_when_the_rearm_aborts(tmp_path, monkeyp
 
     _escalated_run(tmp_path, "r1")
 
-    def fake_rearm(rd, key, *, restore_patch=None):
+    def fake_rearm(rd, key, *, restore_patch=None, isolated_redrive=False):
         # journalled first, exactly as the real residue pass is ordered
         Journal(rd).append(
             "stale-restore-commits", story_key=key, old_baseline="f" * 40, commits=["c1", "c2"]
@@ -3013,7 +3013,7 @@ def test_resolve_holds_the_resume_when_the_correction_cannot_reach_the_redrive(
     from bmad_loop.journal import Journal
 
     def rearm_journalling(kind, **fields):
-        def fake_rearm(rd, key, *, restore_patch=None):
+        def fake_rearm(rd, key, *, restore_patch=None, isolated_redrive=False):
             Journal(rd).append(kind, story_key=key, **fields)
             return key
 
@@ -3080,7 +3080,7 @@ def test_resolve_appends_the_next_step_imperative(tmp_path, monkeypatch, capsys)
 
     _escalated_run(tmp_path, "r1")
 
-    def fake_rearm(rd, key, *, restore_patch=None):
+    def fake_rearm(rd, key, *, restore_patch=None, isolated_redrive=False):
         journal = Journal(rd)
         journal.append(  # table row with a next_step
             "rearm-baseline-advance-failed",

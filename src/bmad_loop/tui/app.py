@@ -847,8 +847,7 @@ class BmadLoopApp(App[None]):
             # status, or is already draft), so the next dispatch would NOT re-enter
             # planning. Surface it instead of a misleading "reset" notice + resume.
             self.notify(
-                "replan: could not reset the plan to draft (no frontmatter status?) "
-                "— not resuming",
+                "replan: could not reset the plan to draft (no frontmatter status?) — not resuming",
                 severity="error",
             )
             return
@@ -893,6 +892,30 @@ class BmadLoopApp(App[None]):
         path (rearm_escalation handles sentinel auto-delete-with-preservation)."""
         if self._resolve_blocked_by_liveness(run_id, run_dir):
             return
+        # The LIVE isolation mode, read once and used twice below. `runs.rearm_escalation`
+        # requires it: how the re-drive WILL run is a policy question, and the recorded
+        # `task.worktree_path` answers only how the escalated attempt ran — the two part
+        # company on exactly the mid-run policy edit the conflict check below is also
+        # about.
+        #
+        # Unreadable REFUSES here, unlike the launch guard above and unlike this block's
+        # own previous disposition. That fall-through was correct while the policy fed
+        # one optional CHECK: "no conflict" and "could not look" are different answers
+        # and neither blocks a launch the detached CLI will re-read the same file for.
+        # It is not correct for an INPUT to a repair write. Without the mode this
+        # gesture cannot say which ref the re-drive reads, so it would flip the spec and
+        # then tell the operator to put the correction in a tree picked by a default —
+        # silently, and unrecoverably, since a re-arm consumes the escalation.
+        # `cli.cmd_resolve` raises on the same unreadable file before it re-arms.
+        try:
+            isolation = policy.load(self.project / POLICY_FILE).scm.isolation
+        except (policy.PolicyError, OSError) as e:
+            self.notify(
+                f"cannot read policy.toml to determine the re-drive's isolation mode "
+                f"({e}) — fix it, then re-arm; the story is still escalated",
+                severity="error",
+            )
+            return
         # Same seam as `cli.cmd_resolve`, for the same reason and at the same moment:
         # `runs.rearm_escalation` reads the persisted code root back out of the run
         # state, and only a process that has just read config.yaml can tell whether a
@@ -915,17 +938,10 @@ class BmadLoopApp(App[None]):
             # against it. The operator saw "re-armed <story>" and then a pane that
             # refused, with the story no longer escalated for `resolve` to correct.
             #
-            # An unreadable policy falls THROUGH to the re-arm rather than blocking,
-            # matching this surface's launch guard above: the check cannot tell "no
-            # conflict" from "could not look", and the detached CLI reads the same file
-            # and fails loudly on it. `paths` is already in hand, so only the policy
-            # read is guarded here.
-            try:
-                conflict = bmadconfig.worktree_isolation_conflict(
-                    paths, policy.load(self.project / POLICY_FILE).scm.isolation
-                )
-            except (policy.PolicyError, OSError):
-                conflict = None
+            # Reads the mode hoisted above rather than loading policy.toml a second
+            # time: two reads of one file in one gesture can disagree under a concurrent
+            # edit, and the refusal must be about the same mode the re-arm is told.
+            conflict = bmadconfig.worktree_isolation_conflict(paths, isolation)
             if conflict is not None:
                 self.notify(conflict, severity="error")
                 return
@@ -934,7 +950,7 @@ class BmadLoopApp(App[None]):
         before_entries = runs.journal_entries_or_none(run_dir)
         hold_resume = False
         try:
-            runs.rearm_escalation(run_dir, story_key)
+            runs.rearm_escalation(run_dir, story_key, isolated_redrive=isolation == "worktree")
         except RearmError as e:
             self.notify(f"re-arm failed: {e}", severity="error")
             return

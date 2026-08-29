@@ -1329,7 +1329,7 @@ def test_blocked_resolve_rearm_then_redispatch_to_done(project):
     assert not any(s.role == "dev" for s in adapter.sessions)  # story 2 not leapfrogged
 
     # human fixed the frozen spec → re-arm (must run while still escalation-paused)
-    runs.rearm_escalation(engine.run_dir, "1")
+    runs.rearm_escalation(engine.run_dir, "1", isolated_redrive=False)
     assert status_of(read_frontmatter(story_spec(project, "1"))) == "ready-for-dev"
 
     # resume re-drives the re-armed story, then continues the schedule to story 2
@@ -1369,7 +1369,9 @@ def test_resolved_wedge_is_still_gated_on_redispatch(project):
     wedged = load_state(engine.run_dir).tasks["1"]
     assert wedged.phase == Phase.ESCALATED and wedged.attempt == 0 and not wedged.sessions
 
-    runs.rearm_escalation(engine.run_dir, "1")  # human fixed the frozen spec
+    runs.rearm_escalation(
+        engine.run_dir, "1", isolated_redrive=False
+    )  # human fixed the frozen spec
     assert load_state(engine.run_dir).tasks["1"].rearmed  # ...and the re-drive is armed
     # a gate on story 1 lands while the run is down
     write_gated_ledger(project, {"DW-1": ("open", ["gate: 1"])})
@@ -1403,7 +1405,7 @@ def test_sentinel_rearm_deletes_by_recorded_verdict_e2e(project):
     assert engine.run().paused
     assert load_state(engine.run_dir).tasks["1"].sentinel_kind == "unresolved"  # recorded
 
-    runs.rearm_escalation(engine.run_dir, "1")
+    runs.rearm_escalation(engine.run_dir, "1", isolated_redrive=False)
     assert not sentinel.exists()  # cleared by the recorded verdict
     assert (engine.run_dir / "sentinels" / "1-unresolved.md").is_file()  # copy preserved
     reloaded = load_state(engine.run_dir)

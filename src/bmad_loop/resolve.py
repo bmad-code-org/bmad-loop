@@ -100,9 +100,20 @@ def _gather_escalations(run_dir: Path, state: RunState, story_key: str) -> list[
     return found
 
 
-def build_context(state: RunState, run_dir: Path, story_key: str, *, isolation: str = "") -> Path:
-    """Write resolve/<story_key>/context.json for the resolve skill to read."""
+def build_context(state: RunState, run_dir: Path, story_key: str, *, isolation: str) -> Path:
+    """Write resolve/<story_key>/context.json for the resolve skill to read.
+
+    `isolation` is the LIVE policy's `scm.isolation`, and it is required rather than
+    defaulted for the reason this surface exists at all: three of the fields below —
+    `restore_supported`, `spec_reaches_the_redrive`, `redrive_base_ref` — are claims
+    about a re-drive that has NOT happened yet, and run state cannot answer them. The
+    mode is re-read at every resume and a mid-run change is journalled, never refused,
+    so the recorded `task.worktree_path` says only how the escalated attempt RAN. A
+    defaulted mode would hand the agent an in-place answer for a run that mounts (or the
+    reverse) with nothing to signal it — the defect being fixed, re-introduced at the
+    seam that reports it."""
     task = state.tasks.get(story_key)
+    isolated_redrive = isolation == "worktree"
     # Patch-restore availability (#2564): the shared `validate_restore_latch`
     # verdict, not a local copy of one leg. Any of them — worktree isolation (the
     # re-drive discards and re-mounts the unit's worktree), a spec-less escalation,
@@ -110,8 +121,7 @@ def build_context(state: RunState, run_dir: Path, story_key: str, *, isolation: 
     # `restore_patch` after the session; told to the agent up front so it never
     # negotiates a restore it can't honor.
     restore_supported = task is not None and (
-        validate_restore_latch(state, task, story_key, worktree_isolation=isolation == "worktree")
-        is None
+        validate_restore_latch(state, task, story_key, worktree_isolation=isolated_redrive) is None
     )
     # Which tree holds this run's STORY MANIFEST — the workspace root, answered by
     # `task_stories_root` rather than by `task_spec_root`. The latter answers a
@@ -156,7 +166,9 @@ def build_context(state: RunState, run_dir: Path, story_key: str, *, isolation: 
         # emitting one invited the session to act on a reachability answer for a file
         # the same document says does not exist. Both fields are one claim.
         "spec_reaches_the_redrive": (
-            spec_reaches_the_redrive(task, state) if task and task.spec_file else None
+            spec_reaches_the_redrive(task, state, isolated_redrive=isolated_redrive)
+            if task and task.spec_file
+            else None
         ),
         # WHERE a correction has to land to be read. Emitted beside the verdict
         # because on its own `spec_reaches_the_redrive: false` states a problem with
@@ -165,10 +177,20 @@ def build_context(state: RunState, run_dir: Path, story_key: str, *, isolation: 
         # from the main checkout cannot include a file that lives in the linked unit
         # worktree, and committing on the unit's own branch does not put it on the ref
         # the replacement worktree is cut from. That ref is this one — the run's
-        # PINNED `target_branch` while a mount is recorded, `HEAD` otherwise — and it
-        # is the same value `rearm_escalation`'s unreachable-write record names, so
+        # PINNED `target_branch` when the re-drive will MOUNT, `HEAD` otherwise — and
+        # it is the same value `rearm_escalation`'s unreachable-write record names, so
         # the session and the orchestrator quote one answer.
-        "redrive_base_ref": redrive_base_ref(state, task) if task else None,
+        #
+        # Keyed on the LIVE isolation mode, not on the recorded mount. This file is
+        # written by a SEPARATE process, before the resume runs, so it is the one
+        # consumer no amount of resume-time bookkeeping on `task.worktree_path` could
+        # reach: reading the mount here sent the session to commit on the pinned branch
+        # for a run whose policy had since flipped to `none`, where the re-drive reads
+        # `HEAD` in the main checkout and never looks — and answered `HEAD` for the
+        # mirror flip, where it mounts and never reads a working tree at all.
+        "redrive_base_ref": (
+            redrive_base_ref(state, isolated_redrive=isolated_redrive) if task else None
+        ),
     }
     # Stories mode: hand the resolver the manifest intent (the story entry) and a
     # sentinel indicator, so it sees WHAT the story is meant to do and WHETHER the

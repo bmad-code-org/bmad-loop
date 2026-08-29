@@ -4274,8 +4274,10 @@ async def test_active_agent_shows_in_header_and_task_cell(project, monkeypatch):
         tasks_table = screen.query_one("#tasks", DataTable)
         await until(
             pilot,
-            lambda: tasks_table.row_count == 1
-            and tasks_table.get_cell("1-1-alpha", "agent") == "claude·opus",
+            lambda: (
+                tasks_table.row_count == 1
+                and tasks_table.get_cell("1-1-alpha", "agent") == "claude·opus"
+            ),
         )
 
 
@@ -4330,8 +4332,10 @@ async def test_idle_run_shows_configured_agents_and_cell_falls_back(project, mon
         # cell reads the stamped record's model (haiku), distinct from the config
         await until(
             pilot,
-            lambda: tasks_table.row_count == 1
-            and tasks_table.get_cell("1-1-alpha", "agent") == "claude·haiku",
+            lambda: (
+                tasks_table.row_count == 1
+                and tasks_table.get_cell("1-1-alpha", "agent") == "claude·haiku"
+            ),
         )
 
 
@@ -4367,7 +4371,9 @@ async def test_escalation_rearm_resumes_when_resolution_ready(project, monkeypat
     monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
     monkeypatch.setattr(
-        runs, "rearm_escalation", lambda rd, sk: rearms.append(sk) or "ready-for-dev"
+        runs,
+        "rearm_escalation",
+        lambda rd, sk, **_k: rearms.append(sk) or "ready-for-dev",
     )
     run_dir, _spec = _stories_paused_run(
         project.project,
@@ -4387,6 +4393,119 @@ async def test_escalation_rearm_resumes_when_resolution_ready(project, monkeypat
         assert "Auto Run Result" in app.screen._blocking
         await pilot.click(await ready(pilot, "#act-rearm"))
         await until(pilot, lambda: rearms == ["1"] and calls == ["20260611-100000-aaaa"])
+
+
+async def test_escalation_rearm_hands_the_rearm_the_live_isolation_mode(project, monkeypatch):
+    """The mode `runs.rearm_escalation` needs comes from policy.toml, read HERE.
+
+    It decides three things the operator acts on — which ref a correction has to reach,
+    whether the working-tree flip reaches the re-drive at all, whether a restore latch
+    can be honored — and run state cannot answer any of them: `scm.isolation` is re-read
+    at every resume, and a mid-run change is journalled rather than refused, so the
+    recorded `task.worktree_path` describes only the attempt that already ran. This
+    gesture re-arms BEFORE it resumes, so nothing downstream can supply the value later.
+
+    Ablation: pass a literal `isolated_redrive=False` at the call site and this reddens
+    — the modes stop tracking policy.toml and every isolated run gets the in-place
+    answers.
+    """
+    from bmad_loop import resolve, runs
+
+    bmad = project.project / ".bmad-loop"
+    bmad.mkdir(parents=True, exist_ok=True)
+    (bmad / "policy.toml").write_text('[scm]\nisolation = "worktree"\n', encoding="utf-8")
+    seen: list[bool] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: None)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    monkeypatch.setattr(
+        runs,
+        "rearm_escalation",
+        lambda rd, sk, *, isolated_redrive: seen.append(isolated_redrive) or "ready-for-dev",
+    )
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: needs a human decision on the auth scheme.",
+    )
+    marker = resolve.resolution_path(run_dir, "1")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{}", encoding="utf-8")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, EscalationModal)
+        await pilot.click(await ready(pilot, "#act-rearm"))
+        await until(pilot, lambda: seen == [True])
+
+    # ...and the other mode is not a constant: the same gesture on `none` says so
+    (bmad / "policy.toml").write_text('[scm]\nisolation = "none"\n', encoding="utf-8")
+    seen.clear()
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, EscalationModal)
+        await pilot.click(await ready(pilot, "#act-rearm"))
+        await until(pilot, lambda: seen == [False])
+
+
+async def test_escalation_rearm_refuses_when_the_policy_cannot_be_read(project, monkeypatch):
+    """An unreadable policy.toml REFUSES this gesture — a deliberate departure from how
+    this surface treats every other read of that file.
+
+    The launch guard and this block's own conflict check both fall through on an
+    unreadable policy, and correctly: they cannot tell "no conflict" from "could not
+    look", and the detached CLI re-reads the same file and fails loudly on it. That
+    reasoning does not extend to an INPUT of a repair write. Without the mode the re-arm
+    would still flip the spec and then name a tree chosen by a default — and a re-arm
+    CONSUMES the escalation, so the story is no longer ESCALATED for `resolve` to
+    correct. Refusing costs the operator one fix-and-retry; proceeding costs them the
+    escalation.
+
+    Graded on the re-arm not running at all, not merely on the notice: the message is
+    the trace, the un-consumed escalation is the property.
+
+    Ablation: restore the fall-through (default the mode instead of returning) and this
+    reddens on `rearms` — the gesture re-arms against a guessed isolation mode.
+    """
+    from bmad_loop import resolve, runs
+
+    bmad = project.project / ".bmad-loop"
+    bmad.mkdir(parents=True, exist_ok=True)
+    # bytes no UTF-8 decoder accepts
+    (bmad / "policy.toml").write_bytes(b'[scm]\nisolation = "\xff\xfe"\n')
+    rearms: list[str] = []
+    notes: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: None)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    monkeypatch.setattr(
+        runs, "rearm_escalation", lambda rd, sk, **_k: rearms.append(sk) or "ready-for-dev"
+    )
+    orig_notify = BmadLoopApp.notify
+    monkeypatch.setattr(
+        BmadLoopApp,
+        "notify",
+        lambda self, msg, **kw: notes.append(str(msg)) or orig_notify(self, msg, **kw),
+    )
+    run_dir, _spec = _stories_paused_run(
+        project.project,
+        stage="escalation",
+        spec_status="blocked",
+        spec_checkpoint=False,
+        blocked_result="Blocked: needs a human decision on the auth scheme.",
+    )
+    marker = resolve.resolution_path(run_dir, "1")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{}", encoding="utf-8")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, EscalationModal)
+        await pilot.click(await ready(pilot, "#act-rearm"))
+        await until(pilot, lambda: any("isolation mode" in n for n in notes))
+
+    assert rearms == []  # the escalation is NOT consumed
+    assert not any("re-armed" in n for n in notes)
 
 
 def test_restore_recorded_helper(tmp_path):
@@ -4420,7 +4539,9 @@ async def test_escalation_rearm_warns_when_restore_recorded(project, monkeypatch
     monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
     monkeypatch.setattr(
-        runs, "rearm_escalation", lambda rd, sk: rearms.append(sk) or "ready-for-dev"
+        runs,
+        "rearm_escalation",
+        lambda rd, sk, **_k: rearms.append(sk) or "ready-for-dev",
     )
     orig_notify = BmadLoopApp.notify
     monkeypatch.setattr(
@@ -4470,7 +4591,7 @@ async def test_escalation_rearm_surfaces_a_failed_baseline_advance(project, monk
     monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
 
-    def fake_rearm(rd, sk):
+    def fake_rearm(rd, sk, *, isolated_redrive=False):
         Journal(rd).append(
             "rearm-baseline-advance-failed",
             story_key=sk,
@@ -4530,7 +4651,7 @@ async def test_escalation_rearm_aims_the_code_root_before_it_rearms(project, mon
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
     seen: list = []
 
-    def fake_rearm(rd, sk):
+    def fake_rearm(rd, sk, *, isolated_redrive=False):
         seen.append(load_state(rd).code_root)
         return "ready-for-dev"
 
@@ -4671,7 +4792,7 @@ async def test_escalation_rearm_surfaces_the_kinds_it_used_to_drop(project, monk
     monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
 
-    def fake_rearm(rd, sk):
+    def fake_rearm(rd, sk, *, isolated_redrive=False):
         journal = Journal(rd)
         journal.append(
             "stale-restore-commits",
@@ -4699,8 +4820,10 @@ async def test_escalation_rearm_surfaces_the_kinds_it_used_to_drop(project, monk
     monkeypatch.setattr(
         BmadLoopApp,
         "notify",
-        lambda self, msg, **kw: notes.append((str(msg), str(kw.get("severity", "information"))))
-        or orig_notify(self, msg, **kw),
+        lambda self, msg, **kw: (
+            notes.append((str(msg), str(kw.get("severity", "information"))))
+            or orig_notify(self, msg, **kw)
+        ),
     )
     run_dir, _spec = _stories_paused_run(
         project.project,
@@ -4764,7 +4887,7 @@ async def test_escalation_rearm_holds_the_resume_it_folds_in(project, monkeypatc
     monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
 
-    def fake_rearm(rd, sk):
+    def fake_rearm(rd, sk, *, isolated_redrive=False):
         Journal(rd).append(
             "rearm-spec-write-unreachable",
             story_key=sk,
@@ -4806,7 +4929,7 @@ async def test_escalation_rearm_holds_the_resume_it_folds_in(project, monkeypatc
     assert any("re-armed 1" in n for n in notes)  # ...while the re-arm itself stands
     assert any("commit the corrected spec, then resume this run" in n for n in notes)
     # the record that proved it still renders, and its warning sibling did not hold
-    assert any("land in a worktree the re-drive discards" in n for n in notes)
+    assert any("land in a tree it discards" in n for n in notes)
     assert any("is not a readable file from here" in n for n in notes)
 
 
@@ -4836,7 +4959,7 @@ async def test_escalation_rearm_echoes_residue_when_the_rearm_aborts(project, mo
     monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
 
-    def fake_rearm(rd, sk):
+    def fake_rearm(rd, sk, *, isolated_redrive=False):
         # exactly the real ordering: residue journalled, THEN the abort
         Journal(rd).append(
             "stale-restore-commits", story_key=sk, old_baseline="f" * 40, commits=["c1"]
@@ -4897,7 +5020,7 @@ async def test_escalation_rearm_survives_a_corrupt_journal(project, monkeypatch)
     monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
 
-    def fake_rearm(rd, sk):
+    def fake_rearm(rd, sk, *, isolated_redrive=False):
         Journal(rd).append(
             "stale-restore-commits", story_key=sk, old_baseline="f" * 40, commits=["c1"]
         )

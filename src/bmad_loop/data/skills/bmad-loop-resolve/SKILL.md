@@ -47,12 +47,16 @@ These environment variables are set:
 }
 ```
 
-**`spec_reaches_the_redrive` says whether your edit has a future.** Under worktree
-isolation the run's mount is discarded before the re-drive reads anything, so a spec
-that lives inside that mount is destroyed with it. When this field is `false`, every
-write to `spec_file` still SUCCEEDS and is then thrown away — worse than not editing
-at all, because the session looks resolved. `null` means the task has no spec on
-record: there is nothing to edit and step 4 does not apply.
+**`spec_reaches_the_redrive` says whether your edit has a future.** The re-drive
+reads one tree; `spec_file` may name another. Under worktree isolation the run's mount
+is discarded before the re-drive reads anything, so a spec inside that mount is
+destroyed with it. When this field is `false`, every write to `spec_file` still
+SUCCEEDS and is then thrown away — worse than not editing at all, because the session
+looks resolved. `null` means the task has no spec on record: there is nothing to edit
+and step 4 does not apply.
+
+**`redrive_base_ref` tells you which of the two remedies applies.** Read it before you
+tell the human anything: a branch name and `HEAD` mean opposite things.
 
 Do not skip the edit when it is `false` — the corrected spec is what gets carried
 over, and it is the clearest statement of what you and the human agreed. Do step 4 as
@@ -71,6 +75,15 @@ So the correction has to reach `redrive_base_ref` itself: make the same edit to 
 tree's copy of the spec and commit it there. The orchestrator names the same ref when
 it re-arms; say it here so they hear it before they close the session rather than
 after.
+
+**When `redrive_base_ref` is `HEAD`, do not tell them to commit anything.** That means
+the re-drive runs in the **main checkout** and reads its WORKING TREE, so an edit there
+is read as-is. `spec_reaches_the_redrive: false` beside a `HEAD` base is the opposite
+problem from the one above: `spec_file` points into a worktree this run has STOPPED
+using, because its isolation policy changed while the story sat escalated. The remedy
+is to make the same edit to the main checkout's copy of the spec — no commit, no
+branch. Telling them to commit here sends them to a tree the re-drive does not read,
+which is the same lost work in the other direction.
 
 In **stories mode** (folder+id dispatch) the context also carries a `stories`
 block — the manifest intent for this story, so you can see WHAT it is meant to do
@@ -134,10 +147,11 @@ case below — omit it entirely for an ordinary resolution.
    smallest change that removes the ambiguity. You MAY use the `bmad-spec` or
    `bmad-correct-course` skills if a larger spec change is warranted. **If
    `spec_reaches_the_redrive` is `false`, make the same edit and then say plainly
-   that this copy is discarded with the run's worktree, so the correction must be
-   committed on `redrive_base_ref` to reach the re-drive** — an unflagged edit here
-   is lost work, and a commit in the wrong tree or on the wrong branch is lost work
-   that looks done.
+   that this copy is not the one the re-drive reads, and name the remedy that
+   `redrive_base_ref` selects: on a branch, the correction must be
+   committed on `redrive_base_ref`; on `HEAD`, it must be re-applied in the main
+   checkout, uncommitted** — an unflagged edit here is lost work, and a commit in the
+   wrong tree or on the wrong branch is lost work that looks done.
 5. **Write the resolution marker** at `resolution_path` (schema above), then tell
    the human the resolution is recorded and they can exit this session — the
    orchestrator will offer to **re-arm the story and resume the run** (a clean
@@ -203,9 +217,10 @@ entirely: the orchestrator re-drives from scratch against the corrected intent.
   Edit spec **content** only.
 - **Do NOT** implement the story, write feature code, run tests, or commit. Your
   job ends at a corrected spec + the resolution marker. That holds when
-  `spec_reaches_the_redrive` is `false` too: committing the corrected spec is the
-  HUMAN's step, on `redrive_base_ref`. Tell them it is required, and where; do not do
-  it yourself.
+  `spec_reaches_the_redrive` is `false` too: landing the corrected spec where the
+  re-drive reads it is the HUMAN's step — committing it on `redrive_base_ref` when that
+  names a branch, re-applying it in the main checkout when it is `HEAD`. Tell them it
+  is required, and which one; do not do it yourself.
 - **Do NOT** widen scope. Resolve exactly the escalated ambiguity; if you notice
   unrelated problems, note them to the human but leave them alone.
 

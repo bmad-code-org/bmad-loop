@@ -2330,8 +2330,16 @@ def task_stories_root(task: StoryTask | None, state: RunState) -> Path:
 
 
 def _spec_is_shared_with_the_redrive(state: RunState, task: StoryTask) -> bool:
-    """True when an isolated unit's recorded spec lives outside BOTH checkouts, so the
-    re-arm's status flip survives the worktree's disposal and the re-drive reads it.
+    """True when the recorded spec lives outside BOTH checkouts, so the re-arm's status
+    flip survives a mount's disposal and the ISOLATED re-drive reads it.
+
+    Asked only of a re-drive that will mount (`spec_reaches_the_redrive`'s isolated
+    arm), and deliberately not of a task that HAS a mount: those are two different
+    questions, and a policy flip separates them. A run switched from `isolation = "none"`
+    to `"worktree"` while an escalation is paused re-drives isolated with no mount
+    recorded at all, and the recorded spec is then measured against the project alone —
+    which is the whole point, since the fresh worktree is cut from git and reads no
+    working tree.
 
     The case: artifact dirs configured outside the project tree. `ProjectPaths.rebased`
     leaves those exactly where they are ("configured outside the project tree; doesn't
@@ -2356,14 +2364,15 @@ def _spec_is_shared_with_the_redrive(state: RunState, task: StoryTask) -> bool:
     `.bmad-loop` puts the mount outside the project.)
 
     The recorded spelling opens the question but does not answer it.
-    `StoryTask._serialized_worktree_path` persists a spec RELATIVE whenever it sits
-    under the mounted worktree and verbatim (absolute) otherwise, so an absolute value
-    on a task that HAS a worktree is the only shape that can be shared — but that
-    relativize is a LEXICAL `relative_to` against the same `worktree_path` read here, so
-    all an absolute value proves is that the two spellings did not share a prefix. A
-    spec reported through a symlink or a `..` segment sits inside the worktree and is
-    persisted absolute all the same, and answering "shared" for it would suppress the
-    warning on a spec that really is destroyed with the worktree.
+    `StoryTask._serialized_worktree_path` persists a spec RELATIVE whenever it sits under
+    the mounted worktree (and, with no mount, whenever the run recorded it relative to
+    the project), and verbatim (absolute) otherwise — so an absolute value is the only
+    shape that can be shared. But that relativize is a LEXICAL `relative_to` against the
+    same `worktree_path` read here, so all an absolute value proves is that the two
+    spellings did not share a prefix. A spec reported through a symlink or a `..` segment
+    sits inside the worktree and is persisted absolute all the same, and answering
+    "shared" for it would suppress the warning on a spec that really is destroyed with
+    the worktree.
 
     So containment is decided on the CANONICAL paths, and a host that cannot canonicalize
     one of them answers "not shared". That degrade is the safe direction and the reason
@@ -2371,22 +2380,62 @@ def _spec_is_shared_with_the_redrive(state: RunState, task: StoryTask) -> bool:
     fold `..`, so a spec spelled through either checkout would come back looking external
     and go silent — trading a wrong warning for no warning at all."""
     raw = Path(task.spec_file or "")
-    if not task.worktree_path or not raw.is_absolute():
+    if not raw.is_absolute():
         return False
     try:
         # the house pair — `resolve()` raises RuntimeError, not OSError, for a symlink
         # loop on the 3.11/3.12 floor
         real = raw.resolve()
-        return not real.is_relative_to(Path(task.worktree_path).resolve()) and not (
-            real.is_relative_to(Path(state.project).resolve())
-        )
+        if real.is_relative_to(Path(state.project).resolve()):
+            return False
+        if task.worktree_path and real.is_relative_to(Path(task.worktree_path).resolve()):
+            return False
+        return True
     except (OSError, RuntimeError):
         return False
 
 
-def redrive_base_ref(state: RunState, task: StoryTask) -> str:
+def _spec_is_inside_the_mount(task: StoryTask) -> bool:
+    """True when the file `task_spec_path` names sits INSIDE the mount this task
+    recorded — so a write to it cannot reach an IN-PLACE re-drive, which reads the main
+    checkout.
+
+    The mirror of `_spec_is_shared_with_the_redrive`, for the other arm of
+    `spec_reaches_the_redrive`. Reachable only through a policy flip: a run switched
+    from `isolation = "worktree"` to `"none"` while an escalation is paused still
+    carries the escalated attempt's `worktree_path`, so `task_spec_path` re-anchors the
+    edit on that mount while `engine._run_story` re-runs the story in the main checkout.
+    `_finish_inflight` releases the mount-owned spelling at RESUME, which is after
+    `bmad-loop resolve` has already written the context and re-armed — this is what the
+    human and the agent are told in the meantime.
+
+    Unlike the shared test, containment inside the PROJECT is not disqualifying: an
+    in-place re-drive reads the main checkout's working tree, so a spec anywhere the
+    project can see it reaches. Only the mount is out of reach.
+
+    A relative spelling beside a recorded mount is inside it BY CONSTRUCTION —
+    `_serialized_worktree_path` relativizes exactly when `relative_to(worktree_path)`
+    succeeds — so it needs no filesystem probe and gets none. Absolute spellings are
+    canonicalized for the same reason the shared test does it (a `..` segment or a
+    symlinked component puts a physically-inside path outside lexically), and a host
+    that cannot canonicalize degrades to "inside": the safe direction here is the one
+    that WARNS, matching the shared test's own degrade.
+    """
+    if not task.worktree_path:
+        return False
+    raw = Path(task.spec_file or "")
+    if not raw.is_absolute():
+        return True
+    try:
+        return raw.resolve().is_relative_to(Path(task.worktree_path).resolve())
+    except (OSError, RuntimeError):
+        return True
+
+
+def redrive_base_ref(state: RunState, *, isolated_redrive: bool) -> str:
     """The ref whose committed tree the re-drive will actually read this unit's spec
-    from: the run's PINNED `target_branch` for an isolated unit, ``HEAD`` otherwise.
+    from: the run's PINNED `target_branch` when the re-drive will MOUNT, ``HEAD``
+    otherwise.
 
     Not `HEAD` in both cases, because the isolated re-drive never reads the main
     checkout's working ref. `engine._finish_inflight` discards the escalated worktree
@@ -2405,36 +2454,63 @@ def redrive_base_ref(state: RunState, task: StoryTask) -> str:
     terminal status, or holds a resume whose work is already committed where the
     re-drive will find it.
 
-    The two guards are the same proxy the caller already uses. `task.worktree_path` is
-    how this file recognizes an isolated unit at all (`task_spec_root`,
-    `_spec_is_shared_with_the_redrive`) — every isolated escalation carries a mounted
-    one. An empty `target_branch` beside it is a MISSING value, not a divergent one:
-    `ensure_target_branch` pins the field before any worktree mounts, so only a
-    state.json predating it can reach here, and that shape degrades to exactly the ref
-    it read before — the same migration `restamp_code_root` gives an unrecorded root.
-    Answering ``""`` instead would hold the resume on a per-configuration constant, the
-    failure the record's narrowing exists to avoid.
+    `isolated_redrive` is the LIVE policy's isolation mode, injected by the caller, and
+    the task drops out of the signature entirely. It used to be inferred from
+    `task.worktree_path` — a recorded mount — and that is the retrospective fact, not
+    this one. `engine._run_story` selects the mode from `self._isolated` alone, and an
+    isolation change mid-run is journalled, never refused, so the recorded mount and the
+    next re-drive part company in BOTH directions: a run flipped to `"none"` still
+    carries the escalated attempt's mount and would name the pinned branch for an
+    in-place re-drive that reads `HEAD`, and one flipped to `"worktree"` carries no
+    mount at all and would name `HEAD` for a re-drive that mounts. Both send a
+    correction to a tree the run does not read. The same injection is how
+    `validate_restore_latch` already learns this fact.
+
+    That the caller must supply it is the point: `bmad-loop resolve` computes this
+    context in a SEPARATE process, before the resume ever runs, so no amount of
+    resume-time bookkeeping on `task.worktree_path` could have reached it. The fact
+    enters the pure core as a parameter and nothing here reads policy.
+
+    An empty `target_branch` beside an isolated re-drive is a MISSING value, not a
+    divergent one: `ensure_target_branch` pins the field before any worktree mounts, so
+    only a state.json predating it can reach here, and that shape degrades to exactly
+    the ref it read before — the same migration `restamp_code_root` gives an unrecorded
+    root. Answering ``""`` instead would hold the resume on a per-configuration
+    constant, the failure the record's narrowing exists to avoid.
     """
-    if task.worktree_path and state.target_branch:
+    if isolated_redrive and state.target_branch:
         return state.target_branch
     return "HEAD"
 
 
-def spec_reaches_the_redrive(task: StoryTask, state: RunState) -> bool:
+def spec_reaches_the_redrive(task: StoryTask, state: RunState, *, isolated_redrive: bool) -> bool:
     """Whether an edit to this task's spec survives to the re-drive that reads it.
 
-    The other half of `task_spec_path`'s answer. That one says WHICH file the run's own
-    tooling writes; this says whether that file still exists by the time the re-drive
-    reads it. They differ exactly under isolation: `engine._finish_inflight` discards
-    the mount, so a worktree-local spec is destroyed with it, while a spec in an
-    artifact dir configured outside the project tree is shared across checkouts and
-    survives (`_spec_is_shared_with_the_redrive` carries that argument in full).
+    The other half of `task_spec_path`'s answer, and the two ask different questions of
+    different sources. That one is RETROSPECTIVE — which tree owns the state this task
+    already persisted — and reads the recorded mount, correctly. This one is
+    PROSPECTIVE, so it reads `isolated_redrive`: the live policy's mode, injected by the
+    caller exactly as `redrive_base_ref` and `validate_restore_latch` take it.
+
+    Both arms are about the same gap between where the edit LANDS (`task_spec_path`) and
+    where the re-drive READS:
+
+    - the re-drive will MOUNT: it reads the COMMITTED tree of a fresh worktree, so only
+      a spec outside both checkouts is one file they share
+      (`_spec_is_shared_with_the_redrive` carries that argument in full). True whether
+      or not a mount is recorded — a run flipped to `isolation = "worktree"` mid-pause
+      has none, and its working-tree edit vanishes just as silently.
+    - the re-drive runs IN PLACE: it reads the main checkout's working tree, so the edit
+      reaches unless it landed inside a recorded mount (`_spec_is_inside_the_mount`) —
+      the flip in the other direction.
 
     Public because `resolve.build_context` needs it for the same reason
     `rearm_escalation` does: the context hands a human and an agent a `spec_file` to
     edit, and an edit to a doomed copy is worse than no edit — it looks like it landed.
     """
-    return not task.worktree_path or _spec_is_shared_with_the_redrive(state, task)
+    if isolated_redrive:
+        return _spec_is_shared_with_the_redrive(state, task)
+    return not _spec_is_inside_the_mount(task)
 
 
 def _restore_rearmed_spec(
@@ -2497,7 +2573,7 @@ def _restore_rearmed_spec(
         ) from e
 
 
-def _committed_spec_status(state: RunState, task: StoryTask) -> str:
+def _committed_spec_status(state: RunState, task: StoryTask, *, isolated_redrive: bool) -> str:
     """The spec's status as COMMITTED in the tree the re-drive reads, or ``""`` when
     unprovable.
 
@@ -2505,8 +2581,11 @@ def _committed_spec_status(state: RunState, task: StoryTask) -> str:
     write (see `rearm_escalation`'s note on `rearm-spec-write-unreachable`), so this is
     the value that decides whether the operator still has anything to do. Anchored on
     `state.code_root` — the same tree the baseline advance reads — at the ref
-    `redrive_base_ref` names, which is the run's pinned `target_branch` for an isolated
-    unit rather than that tree's current `HEAD`.
+    `redrive_base_ref` names, which is the run's pinned `target_branch` when the re-drive
+    will mount rather than that tree's current `HEAD`. `isolated_redrive` is forwarded
+    verbatim for that call and read nowhere else here: this function must measure at the
+    same ref the caller's remedy names, or the proof and the instruction describe two
+    trees.
 
     Degrades to ``""`` on every uncertainty: a spec recorded absolute (nothing names
     its position in the tree), an absent or non-blob path at that ref, a non-UTF-8 blob,
@@ -2527,7 +2606,9 @@ def _committed_spec_status(state: RunState, task: StoryTask) -> str:
         return ""
     try:
         blob = verify.file_bytes_at_revision(
-            state.code_root, redrive_base_ref(state, task), raw.as_posix()
+            state.code_root,
+            redrive_base_ref(state, isolated_redrive=isolated_redrive),
+            raw.as_posix(),
         )
     except verify.GitError:
         return ""
@@ -2583,7 +2664,11 @@ def restamp_code_root(run_dir: Path, repo_root: Path) -> str | None:
 
 
 def rearm_escalation(
-    run_dir: Path, story_key: str | None = None, *, restore_patch: str | None = None
+    run_dir: Path,
+    story_key: str | None = None,
+    *,
+    restore_patch: str | None = None,
+    isolated_redrive: bool,
 ) -> str:
     """Re-arm an escalation-paused story so the next resume re-drives it.
 
@@ -2639,6 +2724,17 @@ def rearm_escalation(
     with the blocking condition, and delete it, so the re-dispatch resolves to a
     clean PENDING and re-plans from scratch (leg 1 again for a spec_checkpoint id).
 
+    `isolated_redrive` is the LIVE policy's isolation mode (`scm.isolation ==
+    "worktree"`), which run state cannot carry: the mode is re-read at every resume and
+    a mid-run change is journalled, never refused, so the recorded `task.worktree_path`
+    says how the escalated attempt RAN and only policy says how the re-drive WILL run.
+    Keyword-only and required, because every consumer of it here is an answer a human
+    acts on — which ref to commit the corrected spec on, whether the working-tree flip
+    reaches the re-drive at all, whether a restore latch can be honored — and a
+    defaulted mode would answer all three for the wrong tree in silence, which is the
+    defect this parameter exists to close. Both callers (`cli.cmd_resolve`,
+    `tui.TuiApp._do_rearm`) hold a loaded policy already.
+
     Returns the re-armed story key. Raises RearmError when the run is not paused at
     the escalation stage, the target story is not escalated, or a supplied
     `restore_patch` fails `validate_restore_latch` (the shared precondition set —
@@ -2664,7 +2760,7 @@ def rearm_escalation(
     # of the interactive session; this call is what makes a programmatic caller
     # (TUI restore parity, scripts) unable to bypass it.
     if restore_patch:
-        err = validate_restore_latch(state, task, key)
+        err = validate_restore_latch(state, task, key, worktree_isolation=isolated_redrive)
         if err is not None:
             raise RearmError(err)
 
@@ -2761,7 +2857,9 @@ def rearm_escalation(
             # on. See `_spec_is_shared_with_the_redrive` for why an isolated unit's spec
             # is nevertheless reachable when it sits in an artifact dir configured
             # outside the project tree.
-            write_reaches_the_redrive = spec_reaches_the_redrive(task, state)
+            write_reaches_the_redrive = spec_reaches_the_redrive(
+                task, state, isolated_redrive=isolated_redrive
+            )
             # Narrowed to the case an operator can ACT on. Every isolated escalation
             # carries a mounted `worktree_path` — `worktree_flow.escalate_unit` never
             # clears it, and `keep_branch_and_escalate` deliberately leaves the worktree
@@ -2783,7 +2881,19 @@ def rearm_escalation(
             # the operator to commit again on the branch the re-drive does not read, and
             # the next re-arm prints the same sentence. Empty for the migrated shape
             # `redrive_base_ref` degrades to `HEAD` for, and the notice drops the
-            # clause rather than naming a ref it cannot source.
+            # clause rather than naming a ref it cannot source — and empty for an
+            # IN-PLACE re-drive, which has no branch to name at all.
+            #
+            # `redrive` is that second shape's discriminator, and it goes ON the record
+            # because the reader is out of process: `rearm_event_notice` renders from a
+            # journal line alone and cannot re-read the policy that produced it. One
+            # kind, two remedies. Isolated: the writes landed in a mount the re-drive
+            # discards, so the correction must be COMMITTED on the named branch. In
+            # place: the writes landed in the mount the escalated attempt recorded while
+            # the re-drive now reads the main checkout, so the correction must be made
+            # THERE — a commit is neither required nor sufficient. Telling the second
+            # operator to commit sends them to the wrong tree, which is the same class
+            # of silent loss this whole record exists to end.
             #
             # Spelled `target_branch` and NOT `base`, because `diagnostics` routes the
             # scrub by field NAME: `target_branch` is already in `_JOURNAL_ALIAS_FIELDS`
@@ -2799,14 +2909,16 @@ def rearm_escalation(
             # to `branch` would pseudonymize statuses as branches.
             if (
                 not write_reaches_the_redrive
-                and _committed_spec_status(state, task) != target_status
+                and _committed_spec_status(state, task, isolated_redrive=isolated_redrive)
+                != target_status
             ):
                 journal.append(
                     "rearm-spec-write-unreachable",
                     story_key=key,
                     spec_file=str(spec_path),
                     status=target_status,
-                    target_branch=state.target_branch,
+                    target_branch=state.target_branch if isolated_redrive else "",
+                    redrive="isolated" if isolated_redrive else "in-place",
                 )
             # Captured immediately before the FIRST write, so an abort further down can
             # put the spec back exactly as found. Unreadable degrades to `None`: the
@@ -3268,7 +3380,7 @@ def rearm_event_notice(
         files = ", ".join(str(f) for f in _journal_sequence(entry.get("files")))
         return (
             "note",
-            f"excluded the abandoned restore's new files from the re-drive " f"baseline: {files}",
+            f"excluded the abandoned restore's new files from the re-drive baseline: {files}",
             "",
         )
     if kind == "stale-restore-unparseable":
@@ -3297,6 +3409,28 @@ def rearm_event_notice(
             "Check the baseline before resuming",
         )
     if kind == "rearm-spec-write-unreachable":
+        # ONE kind, TWO remedies, told apart by the `redrive` field its producer writes
+        # — the live isolation mode of the re-drive, which this reader runs too late and
+        # in the wrong process to determine for itself. A record predating the field is
+        # an ISOLATED one: that was the only shape the producer could journal before the
+        # in-place arm existed, so the absent field is a known value, not an unknown.
+        spec = entry.get("spec_file", "?")
+        if str(entry.get("redrive", "isolated") or "isolated") == "in-place":
+            # The mirror shape: `isolation` was edited to `"none"` while the escalation
+            # was paused, so the writes went into the mount the escalated attempt
+            # recorded and the re-drive reads the main checkout instead. Committing is
+            # not the remedy here and naming a branch would be actively wrong — the
+            # in-place re-drive reads a WORKING TREE, so the edit simply has to be made
+            # in the checkout the run resumes into.
+            return (
+                "warning",
+                f"this run's isolation policy changed to `none` while the story was "
+                f"escalated, so the re-arm's spec writes ({spec}) landed in the "
+                "escalated attempt's worktree while the re-drive now runs in the main "
+                "checkout — re-apply the correction to the main checkout's copy of the "
+                "spec or the story re-wedges on the escalated attempt's status",
+                "Correct the spec in the main checkout before resuming",
+            )
         # The branch is the half an operator cannot infer: the re-drive cuts its fresh
         # worktree from the run's PINNED target branch, so a correction committed on
         # whatever the main checkout happens to have checked out is not the one it
@@ -3306,9 +3440,9 @@ def rearm_event_notice(
         where = f" on `{base}`" if base else ""
         return (
             "warning",
-            f"this story ran under worktree isolation, so the re-arm's spec writes "
-            f"({entry.get('spec_file', '?')}) land in a worktree the re-drive discards "
-            "— the re-driven session reads the COMMITTED spec, so commit the corrected "
+            f"the re-drive of this story will mount a fresh worktree, so the re-arm's "
+            f"spec writes ({spec}) land in a tree it discards — the re-driven session "
+            "reads the COMMITTED spec, so commit the corrected "
             f"spec{where} or the story re-wedges on the escalated attempt's status",
             f"Commit the corrected spec{where} before resuming",
         )

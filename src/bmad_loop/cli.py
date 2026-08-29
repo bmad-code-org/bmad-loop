@@ -2989,7 +2989,12 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     before_entries = runs.journal_entries_or_none(run_dir)
     hold_resume = False
     try:
-        runs.rearm_escalation(run_dir, story_key, restore_patch=restore_patch)
+        runs.rearm_escalation(
+            run_dir,
+            story_key,
+            restore_patch=restore_patch,
+            isolated_redrive=pol.scm.isolation == "worktree",
+        )
     except runs.RearmError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1

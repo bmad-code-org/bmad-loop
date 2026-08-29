@@ -183,10 +183,10 @@ breaking changes may land in a minor release.
   unit's `baseline_commit`/`baseline_untracked` into an in-place rollback of the main
   checkout, where a unit's empty untracked snapshot marks every untracked file in the
   operator's own tree as attempt debris — deleted outright under an auto-recovering cause.
-  The task also stops CLAIMING the mount: `worktree_path` doubles as the isolated-unit
-  proxy, so keeping it set made the spec, stories-root and re-drive-ref helpers answer for
-  the unit while execution used the project checkout. The directory itself is left
-  standing and the orphan is journaled.
+  The task also stops CLAIMING the mount: `worktree_path` doubles as the record of which
+  tree owns a task's persisted state, so keeping it set made the spec and stories-root
+  helpers answer for the unit while execution used the project checkout. The directory
+  itself is left standing and the orphan is journaled.
 - Fall back to the project when a task's recorded worktree is gone. Successful integration
   retires a task without clearing `worktree_path`, so the TUI's story-checkpoint card
   looked for `stories.yaml` under a deleted mount and lost the committed story's title and
@@ -209,6 +209,17 @@ breaking changes may land in a minor release.
 - Report in `context.json` whether an edit to the spec survives to the re-drive, and teach
   the resolve skill to act on it: under isolation the mount is discarded first, so an edit
   to a worktree-local spec is lost unless it is committed.
+- Decide whether the re-drive will run isolated from live policy instead of from the mount
+  the escalated attempt recorded. `resolve` builds `context.json` in a separate process
+  before the resume, so editing `[scm] isolation` while a story sat escalated made its
+  advice wrong in opposite directions: switched to `none`, the session was told to commit
+  the correction on the run's pinned branch, which an in-place re-drive never reads;
+  switched to `worktree`, it was told a working-tree edit was safe when the replacement
+  mount reads only committed content. The re-arm's unreachable-write record now says which
+  of the two remedies applies, and the resolve skill spells out that a `HEAD` base means
+  re-applying the correction in the main checkout rather than committing it anywhere. The
+  TUI's re-arm refuses when `policy.toml` cannot be read rather than guessing a mode — a
+  re-arm consumes the escalation, so a wrong guess is unrecoverable.
 
 - **`resume` re-stamps the run's recorded code root** (#716). Resume arms the engine against the
   `repo_root` it re-reads from `_bmad/bmm/config.yaml` but left the `state.json` copy at its launch

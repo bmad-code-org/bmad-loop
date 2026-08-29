@@ -2101,7 +2101,7 @@ def test_a_re_armed_story_does_not_carry_the_abandoned_attempt_s_followup(projec
     assert not project.deferred_work.exists()  # the row is only in the doomed worktree
 
     monkeypatch.setattr(verify, "finalize_commit", real_finalize)
-    assert runs.rearm_escalation(engine.run_dir, "1-1-a") == "1-1-a"
+    assert runs.rearm_escalation(engine.run_dir, "1-1-a", isolated_redrive=True) == "1-1-a"
 
     state = load_state(engine.run_dir)
     state.clear_pause()
@@ -2510,16 +2510,21 @@ def test_isolation_flip_releases_the_units_baseline_before_the_in_place_rollback
     cleared fields: the fields are the mechanism, the un-entered leg is the property.
 
     The mount's CLAIM and the mount's DIRECTORY are separated, and both are asserted.
-    `worktree_path` is overloaded — it names a directory and is also how `runs`
-    recognizes an isolated unit (`task_spec_root`, `task_stories_root`,
-    `spec_reaches_the_redrive` and `redrive_base_ref` all gate on it) — so a task that
-    keeps the field set while executing in the main checkout makes those helpers
-    answer for the wrong tree. `redrive_base_ref` is the sharpest case: it would
-    return the run's pinned `target_branch` when an in-place re-drive reads `HEAD`,
-    sending a resolve session to commit its correction where this run never looks. The
-    directory itself stays: this arm did not build it, and a policy change is not an
-    instruction to delete the operator's tree. The orphan is journaled so that is not
-    silent.
+    `worktree_path` names a directory and is also how `runs` answers the RETROSPECTIVE
+    question — which tree owns the state this task already persisted (`task_spec_root`,
+    `task_stories_root`) — so a task that keeps the field set while executing in the
+    main checkout makes those readers answer for a tree the run has left. The directory
+    itself stays: this arm did not build it, and a policy change is not an instruction
+    to delete the operator's tree. The orphan is journaled so that is not silent.
+
+    The PROSPECTIVE readers are deliberately absent from that list and from the
+    assertions below. `redrive_base_ref` and `spec_reaches_the_redrive` describe the
+    re-drive that has not happened yet, and they take the live isolation mode as a
+    parameter rather than inferring it here — because `bmad-loop resolve` asks them in
+    a separate process BEFORE this resume runs, where no amount of claim-clearing is
+    visible. Asserting them here would grade the argument this test passes them, not
+    the field it is about; `test_redrive_base_ref_reads_live_policy_not_the_recorded_mount`
+    (tests/test_runs.py) carries that direction against both flips.
 
     Ablation: narrow the arm back to `release_spec_paths_from_mount()` and this
     reddens on the spy — the leg fires with the unit's operands, which is the state
@@ -2573,11 +2578,11 @@ def test_isolation_flip_releases_the_units_baseline_before_the_in_place_rollback
     assert saved.dispatched_spec_file is None
     assert saved.dispatched_spec_snapshot is None
 
-    # the CLAIM is dropped: every isolation-gated helper must now answer in-place
+    # the CLAIM is dropped: the retrospective readers must now answer the main checkout
     assert saved.worktree_path == ""
     assert saved.branch == ""
-    assert runs.redrive_base_ref(engine.state, saved) == "HEAD"  # not target_branch
     assert runs.task_stories_root(saved, engine.state) == project.project
+    assert runs.task_spec_root(saved, engine.state) == project.project
 
     # ...but the DIRECTORY is not deleted, and the orphan is on the record
     assert mount.is_dir()  # left standing: this arm did not build it
@@ -4032,7 +4037,7 @@ _MERGE_FAILURE_PHRASES = (
         ),
         (
             lambda: verify.GitError(
-                "git merge --no-ff feat failed in /repo: fatal: some state no probe " "measured"
+                "git merge --no-ff feat failed in /repo: fatal: some state no probe measured"
             ),
             "was not classified",
         ),
@@ -5647,7 +5652,7 @@ def test_a_re_armed_story_does_not_carry_a_withdrawn_declaration(project, monkey
     assert _ledger_entry(project, "DW-1").open
 
     monkeypatch.setattr(verify, "finalize_commit", real_finalize)
-    assert runs.rearm_escalation(engine.run_dir, "1-1-a") == "1-1-a"
+    assert runs.rearm_escalation(engine.run_dir, "1-1-a", isolated_redrive=True) == "1-1-a"
 
     state = load_state(engine.run_dir)
     state.clear_pause()

@@ -3334,7 +3334,9 @@ def test_sweep_bundle_restore_redrive_reaches_done_and_clears_latch(project, mon
     patch.parent.mkdir(parents=True, exist_ok=True)
     patch.write_text("dummy\n")
 
-    runs.rearm_escalation(engine.run_dir, "dw-fix", restore_patch=str(patch))
+    runs.rearm_escalation(
+        engine.run_dir, "dw-fix", restore_patch=str(patch), isolated_redrive=False
+    )
 
     resumed, adapter = resume_sweep(
         project,
@@ -3373,7 +3375,9 @@ def test_sweep_restore_redrive_exhaustion_pauses_not_defers(project, monkeypatch
     patch = project.implementation_artifacts / "attempt-dw-fix.patch"
     patch.parent.mkdir(parents=True, exist_ok=True)
     patch.write_text("dummy\n")
-    runs.rearm_escalation(engine.run_dir, "dw-fix", restore_patch=str(patch))
+    runs.rearm_escalation(
+        engine.run_dir, "dw-fix", restore_patch=str(patch), isolated_redrive=False
+    )
 
     resumed, _ = resume_sweep(project, engine, [lambda spec: SessionResult(status="died")])
     summary = resumed.run()
@@ -3393,7 +3397,9 @@ def test_sweep_from_scratch_redrive_exhaustion_pauses_not_defers(project):
         limits=LimitsPolicy(max_dev_attempts=1),
     )
     engine = _run_to_dev_escalation(project, policy=policy)
-    runs.rearm_escalation(engine.run_dir, "dw-fix")  # from-scratch, no restore
+    runs.rearm_escalation(
+        engine.run_dir, "dw-fix", isolated_redrive=False
+    )  # from-scratch, no restore
 
     resumed, _ = resume_sweep(project, engine, [lambda spec: SessionResult(status="died")])
     summary = resumed.run()
@@ -4532,7 +4538,7 @@ def test_rearmed_bundle_redrives_when_triage_json_lost(project):
     # cached triage plan reloaded and re-emitted its name. Recovery now keys on
     # the persisted task, so losing the cache changes nothing.
     engine = _run_to_dev_escalation(project)
-    runs.rearm_escalation(engine.run_dir, "dw-fix")
+    runs.rearm_escalation(engine.run_dir, "dw-fix", isolated_redrive=False)
     _lose_triage(engine.run_dir)
 
     resumed, adapter = resume_sweep(project, engine, _redrive_script(project))
@@ -4554,7 +4560,7 @@ def test_fresh_triage_different_bundle_name_no_double_drive(project, corruption)
     # would orphan the re-armed one. It must re-drive by identity, and its ids
     # must have left the open set before the fresh triage sees them.
     engine = _run_two_bundle_dev_escalation(project)
-    runs.rearm_escalation(engine.run_dir, "dw-fix")
+    runs.rearm_escalation(engine.run_dir, "dw-fix", isolated_redrive=False)
     _lose_triage(engine.run_dir, corruption)
 
     fresh = triage_result(
@@ -4591,7 +4597,9 @@ def test_restore_patch_latch_honored_when_triage_json_lost(project, monkeypatch)
     patch = project.implementation_artifacts / "attempt-dw-fix.patch"
     patch.parent.mkdir(parents=True, exist_ok=True)
     patch.write_text("dummy\n")
-    runs.rearm_escalation(engine.run_dir, "dw-fix", restore_patch=str(patch))
+    runs.rearm_escalation(
+        engine.run_dir, "dw-fix", restore_patch=str(patch), isolated_redrive=False
+    )
     _lose_triage(engine.run_dir)
 
     resumed, adapter = resume_sweep(project, engine, _redrive_script(project))
@@ -4715,7 +4723,7 @@ def test_regenerated_intent_when_bundle_file_missing(project):
     # The triage session's authored prose is the one unrecoverable piece; the
     # verbatim ledger entries are re-attached and become the contract.
     engine = _run_to_dev_escalation(project)
-    runs.rearm_escalation(engine.run_dir, "dw-fix")
+    runs.rearm_escalation(engine.run_dir, "dw-fix", isolated_redrive=False)
     _lose_triage(engine.run_dir)
     intent = Path(engine.state.tasks["dw-fix"].bundle_file)
     intent.unlink()
