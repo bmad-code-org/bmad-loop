@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from bmad_loop import adapters
 from bmad_loop.adapters import multiplexer as m
 from bmad_loop.adapters.multiplexer import MultiplexerError
 from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer
@@ -587,6 +588,18 @@ def test_a_failed_builtin_import_leaves_the_seeding_retryable(fresh_registry, mo
     # that property. The adapter twin sets its flag at the very top only because
     # its builtins are lazy thunks with nothing to import first.
     key = "bmad_loop.adapters.psmux_backend"
+    # Evicting the entry alone leaks: the retry below re-imports the module for
+    # real, which rebinds `psmux_backend` on the *parent package object* to the
+    # new module, and restoring sys.modules does not undo that rebinding. Pin the
+    # attribute through monkeypatch so the original comes back with it. Without
+    # it the two import spellings disagree for the rest of the worker --
+    # `from bmad_loop.adapters import psmux_backend` is a getattr on the package
+    # and answers the new module, while `from bmad_loop.adapters.psmux_backend
+    # import x` resolves through sys.modules and answers the original -- so a
+    # later test asserts on one module's globals while the code under test writes
+    # the other's. (Same hazard, same fix, as the `bmad_loop.tui` eviction in
+    # tests/test_tui_app.py.)
+    monkeypatch.setattr(adapters, "psmux_backend", sys.modules[key])
     # A None value in sys.modules makes `from ... import ...` raise
     # ModuleNotFoundError (an ImportError subclass) without touching the disk.
     monkeypatch.setitem(sys.modules, key, None)

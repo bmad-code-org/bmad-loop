@@ -73,6 +73,7 @@ from .runs import (
     graceful_stop_requested,
     kill_session,
     owner_run_dir,
+    pinned_state_env,
     read_stop_request_mode,
     reset_owner_run_dir,
     set_owner_run_dir,
@@ -5455,6 +5456,16 @@ class Engine:
         adapter = self.adapters[role]
         cfg = self.policy.adapter.resolved(role)
         env = {
+            # The state root this process settled on, handed over rather than left
+            # to inheritance — same rule, and same reason, as the events dir below.
+            # A multiplexer may give a pane child none of our environment (psmux's
+            # PSMUX_BARE_ENV=1 keeps a 14-name allowlist that drops both
+            # BMAD_LOOP_STATE_DIR and the LOCALAPPDATA its default falls back to),
+            # and a bmad-loop invoked inside the session would then answer with a
+            # different state root: a different registry, so attach/stop/liveness
+            # read this very session as gone. `{}` when none is derivable, which is
+            # the one case there is nothing to say (see runs.pinned_state_env).
+            **pinned_state_env(),
             "BMAD_LOOP_MODE": "1",
             "BMAD_LOOP_RUN_DIR": str(self.run_dir),
             # Where this session's hook relay writes its events (#494). The one

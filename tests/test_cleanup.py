@@ -372,7 +372,11 @@ def test_cmd_clean_protects_a_run_whose_agent_session_is_still_live(project, mon
     wt.parent.mkdir(parents=True)
     verify.worktree_add(repo, wt, "fb", "main")
     save_state(run_dir, RunState(run_id="r", project=str(repo), started_at="x", finished=True))
-    monkeypatch.setattr(runs, "mux_sessions", lambda: ["bmad-loop-20260101-000000-aaaa"])
+    from test_runs import _LivenessMux
+
+    monkeypatch.setattr(
+        runs, "get_multiplexer", lambda: _LivenessMux(["bmad-loop-20260101-000000-aaaa"])
+    )
 
     assert cli.cmd_clean(_clean_args(repo, retain=0)) == 0
 
@@ -463,11 +467,15 @@ def test_cmd_clean_reclaims_past_a_session_proven_to_be_another_project_s(
     repo = project.project
     run_dir = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
     save_state(run_dir, RunState(run_id="r", project=str(repo), started_at="x", finished=True))
-    monkeypatch.setattr(runs, "mux_sessions", lambda: ["bmad-loop-20260101-000000-aaaa"])
+    from test_runs import _LivenessMux
+
     monkeypatch.setattr(
         runs,
-        "session_project_tags",
-        lambda: {"bmad-loop-20260101-000000-aaaa": runs.project_tag(repo / "someone-else")},
+        "get_multiplexer",
+        lambda: _LivenessMux(
+            ["bmad-loop-20260101-000000-aaaa"],
+            tags={"bmad-loop-20260101-000000-aaaa": runs.project_tag(repo / "someone-else")},
+        ),
     )
 
     assert cli.cmd_clean(_clean_args(repo, retain=0)) == 0
@@ -649,7 +657,11 @@ def test_cmd_clean_json_reports_a_live_session_run_as_protected(project, monkeyp
     repo = project.project
     run_dir = repo / ".bmad-loop" / "runs" / "20260101-000000-aaaa"
     save_state(run_dir, RunState(run_id="r", project=str(repo), started_at="x", finished=True))
-    monkeypatch.setattr(runs, "mux_sessions", lambda: ["bmad-loop-20260101-000000-aaaa"])
+    from test_runs import _LivenessMux
+
+    monkeypatch.setattr(
+        runs, "get_multiplexer", lambda: _LivenessMux(["bmad-loop-20260101-000000-aaaa"])
+    )
 
     doc = _clean_json(repo, capsys, "--retain", "0")
 

@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from bmad_loop import cli, documents, envvars, platform_util
+from bmad_loop import cli, documents, envvars, platform_util, runs
 from bmad_loop.adapters.base import SessionResult, SessionSpec
 from bmad_loop.bmadconfig import ProjectPaths
 from bmad_loop.checks import ValidationReport
@@ -128,6 +128,25 @@ def force_tmux_backend(monkeypatch):
     from bmad_loop.adapters import multiplexer
 
     monkeypatch.setenv("BMAD_LOOP_MUX_BACKEND", "tmux")
+    multiplexer.get_multiplexer.cache_clear()
+    yield
+    multiplexer.get_multiplexer.cache_clear()
+
+
+@pytest.fixture
+def force_psmux_backend(monkeypatch):
+    """Pin the psmux transport backend by name, regardless of host platform.
+
+    The mirror of :func:`force_tmux_backend`, for the tests that assert what
+    happens on a transport that namespaces sessions by registry. The registry
+    root is exported only when the selected backend has such a namespace, so
+    without this pin those tests read the *host's* default backend — passing on
+    win32 and vacuously "passing" on Linux, where tmux is selected and nothing
+    is exported at all. A forced name bypasses the platform predicate and
+    ``available()``, and nothing here spawns psmux, so no binary is needed."""
+    from bmad_loop.adapters import multiplexer
+
+    monkeypatch.setenv("BMAD_LOOP_MUX_BACKEND", "psmux")
     multiplexer.get_multiplexer.cache_clear()
     yield
     multiplexer.get_multiplexer.cache_clear()
@@ -417,6 +436,48 @@ def _isolate_state_root(tmp_path_factory: pytest.TempPathFactory, monkeypatch):
     the ones they need, and share this fixture's monkeypatch instance, so the
     override comes off cleanly for exactly that test."""
     monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path_factory.mktemp("state-root")))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_mux_registry(monkeypatch):
+    """Keep the psmux registry root, and the inside-a-pane marker, out of the
+    cross-test environment.
+
+    `runs.export_psmux_registry_root` writes `PSMUX_DATA_DIR` into `os.environ`
+    directly — that IS its contract, since every psmux verb inherits the process
+    environment — so any test that runs `cli.main` leaves the root of ITS temp
+    state dir behind for every later test in the worker. Two of them care: the
+    live psmux gate reads the default registry to prove a session is NOT visible
+    there, and a stale root would make that read answer about a temp directory
+    instead. `delenv` rather than `setenv`: monkeypatch then restores the
+    operator's own value (or its absence) at teardown regardless of what the code
+    under test put there, and unset is the state the tests that assert an override
+    are written against.
+
+    ``TMUX``/``TMUX_PANE`` go with it, for the developer half of the same problem:
+    a multiplexer sets them on every pane child, so running the suite from inside
+    tmux or psmux would otherwise put every test in the run inside a pane. The
+    registry export no longer cares (it derives either way, and a test asserts
+    exactly that), but `PsmuxMultiplexer._display_message` does branch on ``TMUX``,
+    and the live module builds envs that assume it is absent.
+
+    ``PSMUX_BARE_ENV`` too: bmad-loop does not support that mode and the psmux
+    backend warns once per process about it, so a developer whose profile sets
+    it would otherwise start every worker with the warning already spent (and
+    an unexpected stderr line in whichever test spawned psmux first).
+
+    The backend's record of the root it *displaced* is reset on the same rule
+    and for a sharper reason: it is written by the same export, it survives in
+    module state rather than in the environment (which is the whole point of
+    it), and a leftover value makes `legacy_registries()` hand every later test
+    an extra registry to sweep."""
+    from bmad_loop.adapters import psmux_backend
+
+    monkeypatch.delenv(runs.PSMUX_DATA_DIR, raising=False)
+    monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.delenv("TMUX_PANE", raising=False)
+    monkeypatch.delenv("PSMUX_BARE_ENV", raising=False)
+    monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", None)
 
 
 @pytest.fixture(scope="session")

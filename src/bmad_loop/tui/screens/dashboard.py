@@ -39,7 +39,7 @@ from ... import policy as policy_mod
 from ... import sprintstatus, stories
 from ...model import RunState, StoryTask
 from ...runs import RUNS_DIR
-from .. import data
+from .. import data, launch
 from ..widgets import (
     DeferredEntryOption,
     JournalEntryOption,
@@ -730,7 +730,8 @@ class DashboardScreen(Screen[None]):
         if self._pending_run is not None and time.monotonic() > self._pending_deadline:
             self._pending_run = None
             self.notify(
-                "launch may have failed — attach to control session bmad-loop-ctl",
+                "launch may have failed — attach to control session "
+                f"{launch.ctl_session(self.project)}",
                 severity="error",
                 timeout=15,
             )

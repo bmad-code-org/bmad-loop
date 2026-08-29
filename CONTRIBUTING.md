@@ -96,6 +96,10 @@ trunk check      # lint + format verification on changed files, as CI does
 trunk check --all # the whole repo — catches files your change didn't touch
 ```
 
+The checkout uses CRLF while Prettier is configured for LF. A direct local
+`prettier --check` can therefore disagree with CI; CI checks LF-normalized
+content, so use the trunk commands above for the authoritative result.
+
 ### CHANGELOG
 
 **Every user-visible change needs a CHANGELOG entry.** Add it under the `## [Unreleased]` heading in [CHANGELOG.md](CHANGELOG.md), and only under one of the six [Keep a Changelog](https://keepachangelog.com) subsections — `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`, `Security`. Keep entries terse, scannable, and imperative.

@@ -39,7 +39,15 @@ gate count is unreadable are moves the server may have completed; a session
 with nothing attached is a move it cannot have made, but there is nobody here
 to keep prompting either. ``False`` is left to the exits that do carry the
 whole claim, both of which dispatch nothing: no session to measure, and a
-spawn fault with no fallback. ``available()`` additionally gates on the
+spawn fault with no fallback. psmux resolves every target
+through a *registry* — the ``PSMUX_DATA_DIR`` directory of per-session
+``.port``/``.key`` files — and bmad-loop points it at a per-project root
+(``runs.mux_registry_root``), so this backend owns the two rules that follow
+from that: it refuses to spawn under a root psmux would panic on, and it can
+mint an instance bound to psmux's own default registry so cleanup can still
+address sessions created before the move (``legacy_registries``). Both live in
+the ``_run`` override, the one place psmux is spawned.
+``available()`` additionally gates on the
 reported version —
 see ``_LAST_UNSUPPORTED`` for what the floor buys and why it moves.
 ``has_session``
@@ -71,17 +79,71 @@ import shlex
 import shutil
 import subprocess
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 from .tmux_base import PARKED_RETURN_DETACH, BaseTmuxBackend, TmuxError
 
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# psmux's registry-root variable, as psmux spells it. `runs.PSMUX_DATA_DIR` holds
+# the same name for the export side; the two are deliberately separate constants
+# rather than one import, because the dependency only runs one way — `runs`
+# imports the adapter seam, never the reverse — and a transport name belongs in
+# the transport leaf.
+_DATA_DIR = "PSMUX_DATA_DIR"
 
 
 def _pwsh_quote(value: str) -> str:
     # A single-quoted PowerShell literal: no interpolation, and the only escape
     # is doubling the quote itself.
     return "'" + value.replace("'", "''") + "'"
+
+
+# One warning per process about `PSMUX_BARE_ENV`, not per verb — see
+# `PsmuxMultiplexer._warn_if_bare_env`.
+_BARE_ENV_WARNED = False
+
+
+def _bare_env_on(value: str | None) -> bool:
+    """psmux's own predicate for `PSMUX_BARE_ENV` (`src/pane.rs:890-892`,
+    source-read at v3.3.8): on iff the value is "1" or case-insensitively
+    "true"."""
+    return value is not None and (value == "1" or value.lower() == "true")
+
+
+# The `PSMUX_DATA_DIR` that was in force before this process derived its own and
+# overwrote it (`runs.export_psmux_registry_root`), or None when nothing was
+# displaced. Process-local, and the *only* record of it: the variable itself is
+# gone by the time anything asks. See `note_displaced_registry`.
+_DISPLACED_ROOT: str | None = None
+
+
+def note_displaced_registry(value: str | None) -> None:
+    """Record the registry root this process took over from, so the migration
+    sweep can still reach the sessions living in it.
+
+    Before #537 the backend simply inherited whatever ``PSMUX_DATA_DIR`` the
+    environment carried, so an operator who exported an absolute root of their
+    own has *their* pre-upgrade bmad-loop sessions in THAT registry — not in
+    psmux's default. This process now overrides the variable, which makes those
+    sessions unaddressable by every later verb: `stop`, `attach` and `cleanup`
+    would each report nothing while the coding processes ran on. The default
+    registry cannot stand in for it; the two are different directories, and
+    which one a machine used is a fact only the displaced value carries.
+
+    First non-empty value wins, and a later call is ignored. The caller runs
+    once per process, ahead of dispatch (``cli._configure_mux``), so the first
+    value is the one the operator's environment actually had; a second call
+    would be handing back a root *this* process exported. Ceiling, named: a
+    single process that configured two different projects in turn would record
+    the first project's root as the second's displaced one. ``main()`` does not
+    do that, and the consequence if something ever did is a no-op sweep rather
+    than a hazard — the legacy pass demands this project's tag, which the other
+    project's sessions do not carry.
+    """
+    global _DISPLACED_ROOT
+    if _DISPLACED_ROOT is None and value:
+        _DISPLACED_ROOT = value
 
 
 class PsmuxMultiplexer(BaseTmuxBackend):
@@ -100,6 +162,218 @@ class PsmuxMultiplexer(BaseTmuxBackend):
     # format-string output, and a stray byte must degrade visibly, not raise.
     _ENCODING = "utf-8"
     _ERRORS = "backslashreplace"
+
+    def __init__(self, *, default_registry: bool = False, registry_root: str | None = None) -> None:
+        """``default_registry=True`` binds this instance to psmux's OWN registry
+        root — the one it computes when ``PSMUX_DATA_DIR`` is unset — regardless
+        of what this process exports. That is the legacy registry every psmux
+        session bmad-loop created before the per-project root existed still lives
+        in, and the only reason to build such an instance is to sweep it (see
+        :meth:`legacy_registries`).
+
+        ``registry_root`` binds the instance to one NAMED root instead, for the
+        other pre-upgrade world: a machine whose operator exported an absolute
+        ``PSMUX_DATA_DIR`` before the upgrade kept its bmad-loop sessions there,
+        not in psmux's default (see :func:`note_displaced_registry`). Same
+        purpose, same single caller, and the same rule below about not touching
+        the process environment to do it.
+
+        The two are mutually exclusive and ``default_registry`` wins if both are
+        passed — a programming error either way, since a registry is one place.
+
+        Bound per instance rather than swapped into ``os.environ`` around a call:
+        the sweep runs on a TUI worker thread beside other threads issuing
+        ordinary verbs, and a global swap would aim one of *those* at the wrong
+        registry for as long as it was in place.
+
+        Unbinding is done by REMOVING the variable, never by re-deriving psmux's
+        default here: that default is ``<home>\\.psmux``, where the home is
+        ``USERPROFILE`` when it is set and non-empty, then the profile API
+        (``GetUserProfileDirectoryW``), then ``HOMEDRIVE``+``HOMEPATH``, then
+        ``HOME`` (``src/paths.rs`` ``home_dir``, source-read at v3.3.8) — and a
+        second spelling of that cascade in Python is a second thing to keep in
+        sync. A named ``registry_root`` is the opposite case and needs no
+        cascade: the value is the root, verbatim as the operator spelled it.
+        """
+        self._default_registry = default_registry
+        self._registry_root = None if default_registry else registry_root
+
+    def _run(
+        self,
+        argv: list[str],
+        *,
+        check: bool = True,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        """The base's one spawn point, plus this backend's registry-root rules.
+
+        Two things happen here and nowhere else, because this is the only place
+        psmux is spawned:
+
+        1. **Registry binding.** A ``default_registry`` instance spawns with
+           ``PSMUX_DATA_DIR`` removed, so psmux computes its own root. The parent
+           env is *copied* first — a Windows child needs ``SystemRoot`` and
+           friends — and an explicit per-call ``env`` is honoured as the base, so
+           ``new_session``'s scrubbed env keeps its scrubbing.
+        2. **The absoluteness gate.** psmux ``assert!``s ``PSMUX_DATA_DIR``
+           absolute and non-empty (``src/paths.rs``, source-read at v3.3.8) and
+           **panics** otherwise: a Rust panic message on stderr and a nonzero
+           exit, which ``has_session`` and friends read as an ordinary "no" —
+           a live session reading as gone, for a reason nothing in the output
+           names. Refusing here turns that into one bmad-named error naming the
+           variable and its value. Checked on the *effective* env, so a per-call
+           ``env`` carrying a bad value is caught too, not just the inherited one.
+
+        The unbound, well-formed case adds one dict lookup and no copy.
+        """
+        effective = env if env is not None else os.environ
+        self._warn_if_bare_env(effective)
+        if self._default_registry:
+            env = {k: v for k, v in effective.items() if k != _DATA_DIR}
+        else:
+            if self._registry_root is not None:
+                # Bound instance: the root is set in the child's env, never in
+                # this process's — same threading rule as `default_registry`.
+                env = {**effective, _DATA_DIR: self._registry_root}
+            value = env.get(_DATA_DIR) if env is not None else effective.get(_DATA_DIR)
+            if value is not None and not (value and os.path.isabs(value)):
+                raise TmuxError(
+                    f"{_DATA_DIR}={value!r} is not an absolute path; psmux panics on a "
+                    "relative or empty registry root, so no verb can run under it — "
+                    f"unset {_DATA_DIR} to use psmux's default registry, or set it to "
+                    "an absolute directory"
+                )
+        return super()._run(argv, check=check, env=env)
+
+    @staticmethod
+    def _warn_if_bare_env(effective: Mapping[str, str]) -> None:
+        """Say once per process when ``PSMUX_BARE_ENV`` is on: bmad-loop does
+        not support that mode, and what it breaks is quiet.
+
+        Under it psmux ``env_clear``s every pane child and repopulates from a
+        14-name allowlist (``src/pane.rs:889-908``, source-read at v3.3.8;
+        measured in a real pane) that drops ``BMAD_LOOP_STATE_DIR`` *and* the
+        ``LOCALAPPDATA`` its default cascade falls back to. Coding-CLI windows
+        still get the state root — their env rides the in-source
+        ``-EncodedCommand`` prelude, which runs in the pane after the clear
+        (see ``_window_launch``) — but a session's window-0 shell and the TUI's
+        parked engine windows rely on inheritance, so a bmad-loop run in one of
+        those re-derives the state root from what survived. That diverges, and
+        the run then reads this very session as gone, in exactly two cases:
+        ``BMAD_LOOP_STATE_DIR`` was in force (the clear drops it, and the
+        default cascade answers somewhere else), or ``LOCALAPPDATA`` names
+        something other than ``%USERPROFILE%\\AppData\\Local`` (a redirected
+        or roaming profile). ``USERPROFILE`` *is* on the allowlist, so on a
+        default profile the fallback arm lands on the same root and nothing
+        diverges — the mode is unsupported because the failure is silent when
+        it does happen, not because it always does. Supporting it means an env
+        transport on the session and parked-window verbs, which is its own
+        seam change — tracked
+        as a follow-up issue, deliberately outside #537.
+
+        Warned, not refused: the variable is psmux's (an operator may run their
+        own sessions under it), and most commands never open a window. Ceiling:
+        psmux reads the switch in the *server* process at pane spawn; this
+        process's effective env is a proxy for it, so a server already running
+        with the mode on under a clean client is not detected here.
+        """
+        global _BARE_ENV_WARNED
+        if _BARE_ENV_WARNED or not _bare_env_on(effective.get("PSMUX_BARE_ENV")):
+            return
+        _BARE_ENV_WARNED = True
+        print(
+            "warning: PSMUX_BARE_ENV is on, which bmad-loop does not support — "
+            "session and parked-window shells lose BMAD_LOOP_STATE_DIR and derive "
+            "their own state root and registry, so a run can read as gone; unset "
+            "PSMUX_BARE_ENV for bmad-loop's sessions",
+            file=sys.stderr,
+        )
+
+    def registry_root(self) -> str | None:
+        """The registry root a verb from this instance inherits — the process
+        environment's, which is what ``_run``'s ``env=None`` default passes on.
+
+        A per-call ``env`` can still name another one; nothing reads this to
+        decide where a verb goes, only to disclose where they normally go.
+
+        A ``default_registry`` instance answers ``None`` — it spawns with the
+        variable *removed*, and the root psmux then computes for itself is
+        deliberately not respelled here (see :meth:`__init__`). ``None`` from
+        the ordinary instance likewise means psmux is on its own default
+        registry; :meth:`has_registry_namespace` is what separates either from
+        tmux's "no namespace exists", and a reader deciding ownership must use
+        it — the default registry is shared with every project and with the
+        operator, which is precisely what a ``None`` here must not be read as
+        disclaiming.
+
+        An instance bound to a named ``registry_root`` answers that root: it is
+        where its verbs actually go, and the environment's value is not.
+        """
+        if self._default_registry:
+            return None
+        return self._registry_root or os.environ.get(_DATA_DIR)
+
+    def has_registry_namespace(self) -> bool:
+        # A property of the transport, not of the instance binding: even a
+        # `default_registry` instance addresses A registry — psmux's own.
+        return True
+
+    def session_name_key(self, name: str) -> str:
+        """psmux resolves a session by opening ``<data dir>\\<name>.port`` by
+        name (``src/paths.rs:113``, source-read at v3.3.8), and NTFS opens
+        names case-insensitively — measured: with ``bmad-loop-ctl-x`` live,
+        target ``bmad-loop-CTL-x`` answers ``has-session``, is refused as a
+        duplicate by ``new-session``, and a kill through it takes the
+        lowercase session down. So on this transport two names differing only
+        by ASCII case denote one session, and comparisons must fold."""
+        return name.lower()
+
+    def legacy_registries(self) -> list["PsmuxMultiplexer"]:
+        """The registries a pre-upgrade session of ours may still be living in:
+        psmux's default, and the root this process displaced.
+
+        Sessions bmad-loop created before the per-project root existed are still
+        there, and after the move nothing else can address them: cleanup would
+        report a clean sweep while their servers ran on. An extra pass over each
+        is the whole migration, and an already-migrated machine just finds
+        nothing in either.
+
+        **Two of them, because there were two pre-upgrade worlds.** The old
+        backend inherited whatever ``PSMUX_DATA_DIR`` the process carried, so a
+        machine that never set it kept its sessions in psmux's *default* root,
+        while one whose operator exported an absolute root of their own kept
+        them THERE. Returning only the default assumed the first machine and
+        left the second's sessions — and their live coding processes —
+        unreachable by every verb, with cleanup reporting success. The displaced
+        root is remembered by :func:`note_displaced_registry`, because the
+        variable no longer holds it.
+
+        Neither pass gets extra reach from being here: ``prune_sessions`` runs
+        every legacy registry with ``require_tag=True``, so a session is claimed
+        only on its own ownership tag and never on run-directory evidence, which
+        proves nothing in a registry shared with other projects and with the
+        operator's own psmux sessions. That is what keeps this off a by-name
+        kill in somebody else's registry.
+
+        The default-registry pass is skipped when ``PSMUX_DATA_DIR`` is unset
+        (this process IS on the default registry — the primary pass already
+        covers it) and when it is set to a value psmux would panic on, where the
+        primary pass is not running either and a sweep would be the only thing
+        that appeared to work. The displaced pass is skipped when nothing was
+        displaced, when the displaced value is one psmux would panic on, and
+        when it is the root in force (nothing moved). A displaced value that
+        happens to spell psmux's own default is swept twice, harmlessly:
+        ``prune_sessions`` unions its passes by run id, so one session cannot
+        become two kills.
+        """
+        value = os.environ.get(_DATA_DIR)
+        registries: list[PsmuxMultiplexer] = []
+        if value and os.path.isabs(value):
+            registries.append(type(self)(default_registry=True))
+        displaced = _DISPLACED_ROOT
+        if displaced and os.path.isabs(displaced) and displaced != value:
+            registries.append(type(self)(registry_root=displaced))
+        return registries
 
     # ------------------------------------------- shell dialect (PowerShell)
 
@@ -187,8 +461,12 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         # source that must run the CLAUDE_* scrub (_source_prefix) in-pane
         # anyway, so the prelude is the transport already present — `-e` flags
         # would be a second one whose values the scrub then has to be ordered
-        # against. `command` arrives POSIX-quoted (callers shlex-quote each
-        # arg), so split it here and re-quote for pwsh.
+        # against. The prelude also survives `PSMUX_BARE_ENV=1` (measured both
+        # ways on 3.3.8: an in-source assignment runs in the pane after the
+        # allowlist clear), which is why a coding-CLI window keeps its
+        # `BMAD_LOOP_STATE_DIR` pin even under that mode — see the bare-env
+        # warning in `_run` for what does not. `command` arrives POSIX-quoted
+        # (callers shlex-quote each arg), so split it here and re-quote for pwsh.
         for key in env:
             if not _ENV_NAME.fullmatch(key):
                 raise TmuxError(f"invalid environment variable name: {key!r}")
