@@ -2589,6 +2589,116 @@ def test_isolation_flip_releases_the_units_baseline_before_the_in_place_rollback
     assert "isolation-flip-orphaned-worktree" in journal_kinds(engine)
 
 
+def test_isolation_flip_releases_the_mount_on_the_continuation_arms_too(project, monkeypatch):
+    """Every non-isolated leg undoes the re-anchor, not just the restart arm.
+
+    `_finish_inflight` re-anchors `spec_file` INTO the recorded mount unconditionally,
+    above the `isolated` gate. Three arms below then reach the MAIN workspace on their
+    non-isolated legs and `return` without ever reaching the restart arm that first
+    carried the release — the spec-approval `DEV_VERIFY` continuation graded here, the
+    recorded-result `_resumable_session` continuation and the `COMMITTING` finalizer.
+    Left unreleased, each continues with `spec_file` absolutized into a mount the run
+    has already left: `_dispatched_spec_for_attempt` resolves that `strict=True`,
+    raises, and leaves the attempt unbound, and an explicit-spec prompt meets the
+    snapshot gate with nothing bound.
+
+    Graded at the moment the continuation RUNS, not on the saved state — the defect is
+    what the arm consumes, and a later save could launder it. That is also why this
+    cannot be folded into the restart-arm row above: that one never enters an arm.
+
+    Ablation: drop `self._release_orphaned_mount(task)` from the `DEV_VERIFY` else-leg
+    and `seen["spec_file"]` becomes the absolute path into the mount.
+    """
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    in_place = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(isolation="none"),
+    )
+    engine, _ = make_engine(project, [], policy=in_place)
+    assert not engine._isolated  # the premise: live policy says in-place
+
+    mount = project.project / ".bmad-loop" / "runs" / "test-run" / "worktrees" / "1-1-a"
+    rel = "_bmad-output/accepted.md"
+    (mount / rel).parent.mkdir(parents=True, exist_ok=True)
+    (mount / rel).write_text("# spec\n", encoding="utf-8")
+
+    task = StoryTask("1-1-a", 1, phase=Phase.DEV_VERIFY)
+    task.worktree_path = str(mount)  # the persisted mount the live policy ignores
+    task.spec_file = rel  # persisted RELATIVE, as `_serialized_worktree_path` writes it
+    task.dispatched_spec_file = rel
+    task.dispatched_spec_snapshot = b"pre-launch bytes"
+    task.baseline_commit = rev_parse_head(project.project)
+    task.baseline_untracked = []
+    engine.state.tasks["1-1-a"] = task
+
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(
+        engine,
+        "_resume_after_dev_verify",
+        lambda t: seen.update(
+            spec_file=t.spec_file,
+            dispatched=t.dispatched_spec_file,
+            worktree_path=t.worktree_path,
+            baseline_commit=t.baseline_commit,
+        ),
+    )
+
+    engine._finish_inflight()
+
+    assert seen, "the DEV_VERIFY continuation arm never ran"
+    # the arm acts on the spelling the MAIN workspace re-probes, not the orphan's
+    assert seen["spec_file"] == rel
+    assert seen["spec_file"] != str(mount / rel)
+    assert seen["dispatched"] is None  # the attempt died with its tree
+    assert seen["worktree_path"] == ""  # the claim is dropped BEFORE the arm acts
+    assert seen["baseline_commit"] is None  # unit operands never reach the main checkout
+    assert "isolation-flip-orphaned-worktree" in journal_kinds(engine)
+    assert mount.is_dir()  # released, not deleted
+
+
+def test_open_unit_workspace_reclaims_the_orphan_holding_its_mount_path(project):
+    """A flip back to `worktree` is not blocked by the orphan the flip left behind.
+
+    `unit_branch_name` and the mount path are both DETERMINISTIC in
+    (run_id, unit_key, run_dir), so a re-mount targets the exact directory a previous
+    mount used. `engine._release_orphaned_mount` deliberately leaves that directory
+    standing when live policy drops isolation — a policy change is not an instruction
+    to delete the tree — so a later flip BACK re-derives the same path and met a
+    `git worktree add` that refuses both an existing target and a branch checked out
+    elsewhere, deferring the task instead of resuming it.
+
+    The BRANCH is deliberately spared by the reclaim: under `branch_per=run` this name
+    is the SHARED run branch carrying commits earlier units already landed, so a
+    force-delete would drop real work. The reclaim drops only the worktree, and the
+    `branch_exists` fork re-mounts the branch from its own HEAD — which is what the
+    committed file below grades.
+
+    Ablation: delete the `discard_worktree(...)` call in `open_unit_workspace` and the
+    second mount raises `GitError`; swap its `""` back to `branch` and `landed.txt` is
+    gone because the shared branch was force-deleted.
+    """
+    from bmad_loop.workspace import open_unit_workspace
+
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    args = (project.project, project, "test-run", "1-1-a", "main", "run", run_dir)
+
+    first = open_unit_workspace(*args)
+    (first.path / "landed.txt").write_text("earlier unit\n", encoding="utf-8")
+    git(first.path, "add", "landed.txt")
+    git(first.path, "commit", "-m", "landed on the shared run branch")
+
+    # the orphan: nothing tore this down, exactly as the isolation flip leaves it
+    assert first.path.is_dir()
+
+    second = open_unit_workspace(*args)
+
+    assert second.path == first.path  # the same deterministic mount point
+    assert second.branch == first.branch
+    # the branch was NOT force-deleted: the earlier unit's commit is still on it
+    assert (second.path / "landed.txt").read_text(encoding="utf-8") == "earlier unit\n"
+
+
 def test_worktree_spec_approval_pause_resumes_in_same_worktree(project):
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
     gated = Policy(

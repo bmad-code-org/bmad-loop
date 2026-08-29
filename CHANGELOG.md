@@ -185,8 +185,14 @@ breaking changes may land in a minor release.
   operator's own tree as attempt debris — deleted outright under an auto-recovering cause.
   The task also stops CLAIMING the mount: `worktree_path` doubles as the record of which
   tree owns a task's persisted state, so keeping it set made the spec and stories-root
-  helpers answer for the unit while execution used the project checkout. The directory
-  itself is left standing and the orphan is journaled.
+  helpers answer for the unit while execution used the project checkout. Every
+  non-isolated leg releases, not only the restart: the spec-approval, recorded-result and
+  commit-finalizer continuations each finish their work and return without ever reaching
+  it, so they went on consuming a spec absolutized into the orphan. The directory itself is
+  left standing and the orphan is journaled, and a later flip back to `worktree` now
+  reclaims it — the mount path is deterministic, so the leftover checkout made that second
+  flip fail outright. The shared run branch is spared by the reclaim, keeping the commits
+  earlier units landed on it.
 - Fall back to the project when a task's recorded worktree is gone. Successful integration
   retires a task without clearing `worktree_path`, so the TUI's story-checkpoint card
   looked for `stories.yaml` under a deleted mount and lost the committed story's title and
