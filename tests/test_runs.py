@@ -4023,6 +4023,10 @@ def test_task_stories_root_stays_on_the_mount_for_an_out_of_mount_spec(tmp_path)
     # MOUNT, not outside the project, so anchoring on `tmp_path` keeps the shape while
     # being absolute on every OS.
     outside = tmp_path / "elsewhere" / "6-4.md"
+    # the mount has to EXIST: a live isolated unit's does, and `task_stories_root`
+    # degrades to the project for one that is gone (see the row below), so a
+    # never-created path would grade that fallback instead of this divergence.
+    wt.mkdir(parents=True, exist_ok=True)
     run = escalated_run(tmp_path, "r1", spec_file=str(outside), worktree_path=str(wt))
 
     assert runs.task_stories_root(run.task, run.state) == wt
@@ -4035,3 +4039,24 @@ def test_task_stories_root_without_a_worktree_is_the_project(tmp_path):
     run = escalated_run(tmp_path, "r1", spec_file="epic-1/stories/6-4.md")
     assert runs.task_stories_root(run.task, run.state) == tmp_path
     assert runs.task_stories_root(None, run.state) == tmp_path
+
+
+def test_task_stories_root_falls_back_when_the_mount_is_gone(tmp_path):
+    """A terminal task keeps naming the worktree its own teardown removed.
+
+    `worktree_path` is cleared at exactly ONE site in the engine — the restart
+    discard — so successful integration retires a task with the field still set while
+    the mount is deleted. The `done_checkpoint` pause is raised in that window and the
+    TUI reads this root for the checkpoint card's title and description, so trusting
+    the stale field looked for `stories.yaml` under a deleted directory and dropped
+    the committed story's manifest, which by then is merged into the project.
+
+    Ablation: drop the `is_dir()` guard from `task_stories_root` and this reddens with
+    the deleted mount; the sibling row above (whose mount exists) stays green, so the
+    guard cannot be satisfied by collapsing the function to the project.
+    """
+    gone = tmp_path / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"  # never created
+    run = escalated_run(tmp_path, "r1", spec_file="epic-1/stories/6-4.md", worktree_path=str(gone))
+
+    assert not gone.exists()
+    assert runs.task_stories_root(run.task, run.state) == tmp_path

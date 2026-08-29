@@ -2302,11 +2302,31 @@ def task_stories_root(task: StoryTask | None, state: RunState) -> Path:
     folder is located by `state.spec_folder` relative to the workspace root, and a
     task's spec being elsewhere says nothing about where its story manifest lives.
 
+    A mount that is GONE degrades to the project. `worktree_path` is cleared at
+    exactly one site in the engine — the restart discard — so a task that reached a
+    terminal phase through successful integration keeps naming the unit worktree its
+    teardown already removed. The `done_checkpoint` pause is raised in precisely that
+    window, and the TUI reads this for the checkpoint card's title and description, so
+    trusting the stale field lost the committed story's manifest to a deleted
+    directory while the merged copy sat in the project checkout.
+
+    Answering on filesystem state is right HERE and would be wrong in
+    `task_spec_root`: that one is a write-confinement root, where a value that moves
+    under a `mkdir` is not a definition. This is a READ locator, and observation
+    degrades rather than raising — a probe that cannot answer falls back to the tree
+    that always exists.
+
     Accepts `None` so the two call sites do not each re-spell the no-task fallback.
     """
     if task is None or not task.worktree_path:
         return Path(state.project)
-    return Path(task.worktree_path)
+    mount = Path(task.worktree_path)
+    try:
+        if not mount.is_dir():
+            return Path(state.project)
+    except OSError:
+        return Path(state.project)
+    return mount
 
 
 def _spec_is_shared_with_the_redrive(state: RunState, task: StoryTask) -> bool:
@@ -2364,7 +2384,7 @@ def _spec_is_shared_with_the_redrive(state: RunState, task: StoryTask) -> bool:
         return False
 
 
-def _redrive_base_ref(state: RunState, task: StoryTask) -> str:
+def redrive_base_ref(state: RunState, task: StoryTask) -> str:
     """The ref whose committed tree the re-drive will actually read this unit's spec
     from: the run's PINNED `target_branch` for an isolated unit, ``HEAD`` otherwise.
 
@@ -2485,7 +2505,7 @@ def _committed_spec_status(state: RunState, task: StoryTask) -> str:
     write (see `rearm_escalation`'s note on `rearm-spec-write-unreachable`), so this is
     the value that decides whether the operator still has anything to do. Anchored on
     `state.code_root` — the same tree the baseline advance reads — at the ref
-    `_redrive_base_ref` names, which is the run's pinned `target_branch` for an isolated
+    `redrive_base_ref` names, which is the run's pinned `target_branch` for an isolated
     unit rather than that tree's current `HEAD`.
 
     Degrades to ``""`` on every uncertainty: a spec recorded absolute (nothing names
@@ -2507,7 +2527,7 @@ def _committed_spec_status(state: RunState, task: StoryTask) -> str:
         return ""
     try:
         blob = verify.file_bytes_at_revision(
-            state.code_root, _redrive_base_ref(state, task), raw.as_posix()
+            state.code_root, redrive_base_ref(state, task), raw.as_posix()
         )
     except verify.GitError:
         return ""
@@ -2754,7 +2774,7 @@ def rearm_escalation(
             # target status, which is precisely when the re-drive reads what it needs.
             # Suppression requires PROOF: an unreadable blob, a non-repo project, or any
             # git fault leaves `""` and the record fires. The proof is read at
-            # `_redrive_base_ref`, NOT at the code root's current `HEAD` — the two part
+            # `redrive_base_ref`, NOT at the code root's current `HEAD` — the two part
             # company as soon as the operator checks out another branch while the
             # escalation is paused, and this record now holds the resume.
             #
@@ -2762,7 +2782,7 @@ def rearm_escalation(
             # the ref fix rescues, "commit the corrected spec" without a branch sends
             # the operator to commit again on the branch the re-drive does not read, and
             # the next re-arm prints the same sentence. Empty for the migrated shape
-            # `_redrive_base_ref` degrades to `HEAD` for, and the notice drops the
+            # `redrive_base_ref` degrades to `HEAD` for, and the notice drops the
             # clause rather than naming a ref it cannot source.
             #
             # Spelled `target_branch` and NOT `base`, because `diagnostics` routes the

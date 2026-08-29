@@ -24,6 +24,7 @@ from .adapters.base import SessionSpec
 from .model import RunState
 from .platform_util import safe_segment
 from .runs import (
+    redrive_base_ref,
     spec_reaches_the_redrive,
     task_spec_path,
     task_stories_root,
@@ -157,6 +158,17 @@ def build_context(state: RunState, run_dir: Path, story_key: str, *, isolation: 
         "spec_reaches_the_redrive": (
             spec_reaches_the_redrive(task, state) if task and task.spec_file else None
         ),
+        # WHERE a correction has to land to be read. Emitted beside the verdict
+        # because on its own `spec_reaches_the_redrive: false` states a problem with
+        # no remedy: the session is told the edit is doomed, and the obvious repair
+        # (commit it) is wrong in two different ways for an isolated unit. Committing
+        # from the main checkout cannot include a file that lives in the linked unit
+        # worktree, and committing on the unit's own branch does not put it on the ref
+        # the replacement worktree is cut from. That ref is this one — the run's
+        # PINNED `target_branch` while a mount is recorded, `HEAD` otherwise — and it
+        # is the same value `rearm_escalation`'s unreachable-write record names, so
+        # the session and the orchestrator quote one answer.
+        "redrive_base_ref": redrive_base_ref(state, task) if task else None,
     }
     # Stories mode: hand the resolver the manifest intent (the story entry) and a
     # sentinel indicator, so it sees WHAT the story is meant to do and WHETHER the

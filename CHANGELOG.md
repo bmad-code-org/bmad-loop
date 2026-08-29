@@ -177,6 +177,18 @@ breaking changes may land in a minor release.
   spec returns to its mount-relative spelling; left absolute into the deleted tree it
   resolved to nothing, and the restarted attempt ran unbound with the repair prompt naming
   a path that no longer existed.
+- Release spec ownership when a resumed run stops treating a persisted mount as isolated.
+  Flipping `[scm] isolation` to `none` left the re-anchored spec absolute inside a mount
+  the resume neither reopens nor discards, so the in-place attempt ran unbound against a
+  spec outside its own roots. The mount itself is left standing.
+- Fall back to the project when a task's recorded worktree is gone. Successful integration
+  retires a task without clearing `worktree_path`, so the TUI's story-checkpoint card
+  looked for `stories.yaml` under a deleted mount and lost the committed story's title and
+  description.
+- Tell the resolve session where an unreachable correction has to land. `context.json` now
+  carries `redrive_base_ref` beside the reachability verdict, and the skill spells out that
+  committing from the main checkout cannot include a file in a linked worktree and that the
+  unit's own branch is not what the replacement mount is cut from.
 - Locate the stories folder from the workspace root rather than from the spec's confinement
   root, so one modal can no longer read its spec from the run's tree and its sentinel from
   the project.

@@ -107,6 +107,12 @@ def test_skill_branches_on_spec_reachability(skill_md):
     assert '"spec_reaches_the_redrive": true,' in skill_md  # schema block
     # the edit still happens — skipping it would leave nothing to carry over
     assert "make the same edit and then say plainly" in normalized
-    assert "the correction must be committed to reach the re-drive" in normalized
+    # and it names WHERE the correction has to land. Without this the field states a
+    # problem with no remedy, and both obvious moves fail silently: the main checkout
+    # cannot commit a file living in a linked worktree, and the unit's own branch is
+    # not what the replacement mount is cut from.
+    assert "committed on `redrive_base_ref`" in normalized
+    assert "cannot include the file you edited" in normalized
+    assert "cut fresh from `redrive_base_ref`" in normalized
     # and the prohibition names whose job the commit is, rather than just refusing it
     assert "committing the corrected spec is the HUMAN's step" in normalized

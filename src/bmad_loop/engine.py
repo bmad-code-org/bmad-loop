@@ -1704,7 +1704,26 @@ class Engine:
                 if isolated:
                     # drop the half-built worktree; _run_story mounts a fresh one
                     self._discard_unit_for_restart(task)
-                elif task.baseline_commit:
+                elif task.worktree_path:
+                    # A persisted mount the live policy no longer treats as isolated:
+                    # `isolation` is re-read every resume and a change is journaled,
+                    # never refused, so `worktree -> none` reaches here with the mount
+                    # still recorded. The re-anchor above has already made `spec_file`
+                    # absolute INTO that mount (it must — `recovery_flow` would
+                    # otherwise resolve the relative spelling against the main
+                    # checkout), but nothing below reopens or discards it, and the
+                    # re-run happens in the main workspace. Left as-is the attempt
+                    # would resolve a spec outside its live roots,
+                    # `_dispatched_spec_for_attempt` would leave it unbound, and an
+                    # explicit-spec prompt would meet the snapshot gate with nothing
+                    # bound. Releasing gives back the relative spelling the main
+                    # workspace re-probes, and drops an attempt binding whose tree
+                    # this run will not enter again. The mount itself is deliberately
+                    # left standing: this arm did not build it and an isolation flip
+                    # is not an instruction to delete the operator's tree.
+                    task.release_spec_paths_from_mount()
+
+                if not isolated and task.baseline_commit:
                     # latch resolved_redrive so the corrected spec stays protected
                     # through every reset of this re-drive, not just this first one
                     task.resolved_redrive = task.resolved_redrive or task.rearmed

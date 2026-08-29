@@ -2240,6 +2240,43 @@ def test_build_context_reports_whether_the_spec_reaches_the_redrive(tmp_path):
     assert plain["spec_reaches_the_redrive"] is True
 
 
+def test_build_context_names_where_an_unreachable_correction_has_to_land(tmp_path):
+    """`spec_reaches_the_redrive: false` on its own states a problem with no remedy.
+
+    The session is told its edit is doomed, and both obvious repairs fail silently for
+    an isolated unit: committing from the main checkout cannot include a file that
+    lives in the linked unit worktree, and committing on the unit's own branch does
+    not put it on the ref the replacement worktree is cut from. That ref is the run's
+    PINNED `target_branch`, which is what this field carries — the same value
+    `rearm_escalation`'s unreachable-write record names, so the session and the
+    orchestrator quote one answer instead of two.
+
+    Ablation: return `"HEAD"` unconditionally and the isolated leg reddens; drop the
+    key and the skill-contract guard reddens too, since the schema documents it.
+    """
+    wt = tmp_path / ".bmad-loop" / "runs" / "20260613-111429-6a14" / "worktrees" / "1"
+    run_dir, state, _ = _escalated_run(tmp_path, spec_file="specs/6-4.md", worktree_path=str(wt))
+    state.target_branch = "feat/the-pinned-one"
+    ctx = json.loads(
+        resolve.build_context(state, run_dir, "6-4-cli-list-command").read_text(encoding="utf-8")
+    )
+    # the paired claim: the edit has no future, and THIS is the tree that does
+    assert ctx["spec_reaches_the_redrive"] is False
+    assert ctx["redrive_base_ref"] == "feat/the-pinned-one"
+
+    # in-place: no mount, so the re-drive reads the working ref
+    plain_dir, plain_state, _ = _escalated_run(
+        tmp_path, "20260613-111429-6a15", spec_file=str(tmp_path / "specs" / "6-4.md")
+    )
+    plain_state.target_branch = "feat/the-pinned-one"  # set, but no mount to make it apply
+    plain = json.loads(
+        resolve.build_context(plain_state, plain_dir, "6-4-cli-list-command").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert plain["redrive_base_ref"] == "HEAD"
+
+
 @pytest.mark.parametrize(
     ("committed_status", "warns"),
     [("ready-for-dev", False), ("blocked", True)],
