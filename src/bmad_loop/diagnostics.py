@@ -250,6 +250,16 @@ _JOURNAL_DROP_FIELDS = frozenset(
         # free-text rule above (it is a `GitError` string quoting git's own stderr),
         # not this identifier-shape argument — same set, different rationale.
         "repo",
+        # An absolute host path naming the folder a sentinel's upstream correction has
+        # to land in (`rearm-upstream-write-unreachable`). Dropped for `repo`'s reason,
+        # not aliased for `spec_file`'s: it is a DIRECTORY, journalled by one kind, and
+        # one run has one spec folder — so it correlates nothing across events, while a
+        # `spec` alias would additionally be wrong, since that namespace reduces to a
+        # basename and every run we author would collapse onto the same `stories`-ish
+        # tail. `scrub_json` already redacts any real path (`_IDENTIFIER_RE` forbids
+        # `/`, `\` and `:`), so — exactly as for `repo` — only an assertion on the
+        # field's ABSENCE can grade this, and the canary sweep cannot.
+        "stories_root",
     }
 )
 # Journal fields whose value is a LIST of story keys (sprint unknown-keys).

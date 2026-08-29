@@ -2513,6 +2513,160 @@ def spec_reaches_the_redrive(task: StoryTask, state: RunState, *, isolated_redri
     return not _spec_is_inside_the_mount(task)
 
 
+def _upstream_artifacts_folder(state: RunState) -> Path:
+    """The folder holding the UPSTREAM stories artifacts a sentinel's correction goes
+    into — anchored on the project, never on a mount.
+
+    Deliberately NOT `task_stories_root`, which answers "which tree does this RUN read
+    its manifest out of" and is the mount whenever the task holds one. This answers
+    "which folder does the CORRECTION land in", and `resolve.run_session` settles that
+    independently of the mount: the agent runs with `cwd=project` and the artifacts are
+    named by a project-relative `state.spec_folder`, so the writes go to the main
+    checkout even for a task that recorded a worktree. An absolute `spec_folder` — the
+    external-artifact-dir layout `[stories] source` allows — is left where it is, which
+    is what `resolve_spec_folder` already does and what makes it shared across
+    checkouts.
+
+    One locator for all three consumers (the gate, the proof, and the journal record)
+    so a record can never name a folder its own gate did not measure.
+    """
+    from .stories import resolve_spec_folder
+
+    return resolve_spec_folder(Path(state.project), state.spec_folder)
+
+
+def stories_reach_the_redrive(task: StoryTask, state: RunState, *, isolated_redrive: bool) -> bool:
+    """Whether an edit to this run's UPSTREAM stories artifacts survives to the re-drive.
+
+    `spec_reaches_the_redrive` asked of `SPEC.md` / `stories.yaml` instead of the frozen
+    spec, for the one wedge where the spec is not the artifact being corrected: a
+    fixed-slug pre-planning-halt SENTINEL. A sentinel is cleared by DELETION, so the
+    re-arm drops `task.spec_file` and there is no spec write whose reachability that
+    helper could measure — which is why its arm is an `else` this path never entered,
+    and why no hold ever fired for a sentinel. But the correction that stops the
+    sentinel RECURRING is upstream, in the artifacts `bmad-loop-resolve/SKILL.md` sends
+    the agent to instead of the sentinel, and it faces the identical gap: an isolated
+    re-drive mounts fresh from `redrive_base_ref` and re-plans from a COMMITTED tree, so
+    an uncommitted upstream edit is invisible and the re-plan mints the sentinel again.
+
+    The two arms are NOT the spec question's, and the difference is where the write
+    lands. `task_spec_path` re-anchors a spec write ON the recorded mount, so a policy
+    flip separates writer from reader in BOTH directions. The upstream artifacts are
+    named by a project-relative `state.spec_folder` and `resolve.run_session` runs the
+    agent with `cwd=project`, so the correction lands in the MAIN CHECKOUT whichever way
+    the flip went. That collapses one arm:
+
+    - the re-drive runs IN PLACE: it reads the main checkout's working tree —
+      `stories_engine._stories_folder` anchors a relative folder on the live workspace
+      root, which is the project under `isolation = "none"`. Writer and reader are the
+      same tree, so the edit reaches. The recorded mount does not enter into it; a run
+      flipped `"worktree" -> "none"` mid-pause still carries one, and it is not where
+      the correction went.
+    - the re-drive will MOUNT: the fresh worktree is cut from git and checks out TRACKED
+      files, so no working-tree write reaches it — with the single exception
+      `_spec_is_shared_with_the_redrive` carries in full, an artifact dir configured
+      OUTSIDE the project tree, which `ProjectPaths.rebased` leaves exactly where it is
+      and every worktree therefore reads through the same absolute path. True whether or
+      not a mount is recorded: a run flipped `"none" -> "worktree"` has none, and its
+      working-tree edit vanishes just as silently.
+
+    Both roots are tested on the mounting arm for the same reason that helper tests
+    both: worktrees normally sit under `<project>/.bmad-loop/runs/`, but
+    `workspace.open_unit_workspace` stores a `.resolve()`d path, so a symlinked
+    `.bmad-loop` puts the mount outside the project and "outside the project" alone
+    would not be "shared".
+
+    Canonicalized because a `..` segment or a symlinked component puts a
+    physically-inside path outside lexically, and a host that cannot canonicalize
+    degrades to UNREACHABLE — the direction that warns, matching the degrade both spec
+    helpers already chose.
+    """
+    if not isolated_redrive:
+        return True
+    try:
+        real = _upstream_artifacts_folder(state).resolve()
+        if real.is_relative_to(Path(state.project).resolve()):
+            return False
+        if task.worktree_path and real.is_relative_to(Path(task.worktree_path).resolve()):
+            return False
+        return True
+    except (OSError, RuntimeError):
+        return False
+
+
+# The two upstream artifacts `bmad-loop-resolve/SKILL.md` names for a sentinel wedge:
+# the epic spec and the story manifest the planner reads. Fixed names, discovered as
+# siblings in the spec folder (`stories.STORIES_FILENAME`'s own docstring says so), so
+# the proof below can name them without parsing anything.
+_UPSTREAM_ARTIFACTS = ("SPEC.md", "stories.yaml")
+
+
+def _redrive_reads_the_upstream_artifacts(state: RunState) -> bool:
+    """PROOF that the tree the re-drive re-plans from already carries this checkout's
+    upstream artifacts byte-for-byte. ``False`` on every uncertainty.
+
+    `_redrive_spec_status`'s counterpart for the sentinel path, and it exists for the
+    same reason: without it the record its caller writes is a per-configuration
+    CONSTANT. Every isolated stories run resolves its spec folder inside the project,
+    so `stories_reach_the_redrive` answers "unreachable" for 100% of sentinel re-arms
+    under `isolation = "worktree"` — and that record now HOLDS THE RESUME
+    (`rearm_holds_the_resume`), so an unnarrowed gate would not merely train the
+    operator to scroll past a warning, it would turn every one of those re-arms into a
+    two-command gesture for an outcome nothing decided. That is the exact failure the
+    spec arm's own narrowing exists to avoid, and it is worse here.
+
+    There is no status to read for a sentinel — it is cleared by deletion and the
+    re-plan routes on nothing — so the proof is byte equality instead: if the ref the
+    fresh worktree is cut from already holds what this checkout holds, the re-drive
+    re-plans from exactly the tree the operator is looking at and there is nothing left
+    to commit. If it does not, the operator has upstream work the re-drive will not read.
+
+    Read at `redrive_base_ref` and NOT at the code root's `HEAD`, for the reason that
+    function documents: an operator who checks out another branch while the escalation
+    is paused moves `HEAD` off the tree the re-drive reads, in either direction. It is
+    asked for the MOUNTING mode unconditionally, and takes no `isolated_redrive` to say
+    so, because there is exactly one reachable caller and it has already established
+    that: `stories_reach_the_redrive` answers "reaches" for every in-place re-drive, so
+    the `and` short-circuits before this runs. Carrying a second in-place arm here would
+    not be defence in depth — it would SHADOW that one, leaving the reachability arm
+    ungraded by any test and a wrong answer there invisible.
+
+    Every uncertainty answers ``False`` so the record fires and the resume holds: a
+    folder outside the code root (which includes the external artifact dir, already
+    exempted one gate earlier as SHARED), an unreadable working-tree file, an untracked
+    or non-blob path at that ref (the read answers ``None``, which no byte string
+    equals), or any `GitError` — including the project simply not being a repository. Suppression requires proof that the work is already done.
+
+    The blob is materialized through `worktree_file_bytes_at_revision`, not read raw:
+    that function exists for precisely this comparison — a live checkout file against
+    its committed counterpart — because Git's smudge, EOL and working-tree-encoding
+    filters mean a byte-exact LF blob is legitimately a CRLF file on disk under
+    `core.autocrlf=true`. Comparing raw blob bytes would mismatch every artifact on a
+    Windows checkout and re-create, on one platform, the constant this narrowing exists
+    to prevent.
+    """
+    base = _upstream_artifacts_folder(state)
+    code_root = state.code_root
+    ref = redrive_base_ref(state, isolated_redrive=True)
+    for name in _UPSTREAM_ARTIFACTS:
+        live = base / name
+        try:
+            rel = live.relative_to(code_root).as_posix()
+        except ValueError:
+            return False
+        try:
+            committed = verify.worktree_file_bytes_at_revision(code_root, ref, rel)
+        except verify.GitError:
+            return False
+        try:
+            working = live.read_bytes()
+        except OSError:
+            return False
+        if committed != working:
+            return False
+    return True
+
+
 def _restore_rearmed_spec(
     spec_path: Path, original: bytes | None, task: StoryTask, state: RunState
 ) -> None:
@@ -2834,6 +2988,44 @@ def rearm_escalation(
             _clear_sentinel(run_dir, journal, spec_path, key, sentinel_kind)
             task.spec_file = None
             task.sentinel_kind = ""  # verdict discharged; the re-dispatch is clean
+            # Deleting the sentinel does not make the re-plan produce a different one:
+            # the correction that does lives UPSTREAM, in the `SPEC.md` / `stories.yaml`
+            # the resolve skill sends the agent to instead of this file. That correction
+            # faces the same reachability gap the spec arm below measures, and faced NO
+            # gate at all — this arm cleared `spec_file` and fell through, so
+            # `write_reaches_the_redrive` was never computed and the resume was never
+            # held for a sentinel. An isolated re-drive then mounts fresh from
+            # `redrive_base_ref`, re-plans from a committed tree that never saw the
+            # edit, mints the same sentinel again, and the escalation is spent.
+            #
+            # Narrowed by PROOF for the reason the spec record below is, and the need is
+            # sharper here: `stories_reach_the_redrive` answers "unreachable" for EVERY
+            # isolated stories run whose spec folder sits inside the project, which is
+            # every one we author. Gating on it alone would fire — and hold the resume —
+            # on 100% of isolated sentinel re-arms, a per-configuration constant rather
+            # than an event. `_redrive_reads_the_upstream_artifacts` is what makes it an
+            # event: it fires only while this checkout still holds upstream bytes the
+            # ref the re-drive mounts from does not.
+            #
+            # No `redrive` discriminator, unlike the spec record: this one has a single
+            # remedy because it has a single reachable shape. An in-place re-drive reads
+            # the main checkout's working tree, which is exactly where `cwd=project` put
+            # the correction, so `stories_reach_the_redrive` short-circuits that leg to
+            # reachable and no record is written for it at all.
+            if not stories_reach_the_redrive(
+                task, state, isolated_redrive=isolated_redrive
+            ) and not _redrive_reads_the_upstream_artifacts(state):
+                journal.append(
+                    "rearm-upstream-write-unreachable",
+                    story_key=key,
+                    # `task_stories_root` names the tree the RUN owns; the correction
+                    # lands in the checkout the resolve session ran in. Both are the
+                    # project on this leg unless a mount is recorded, and the operator
+                    # needs the folder to act, so the record carries the folder the
+                    # remedy is about rather than the run's read locator.
+                    stories_root=str(_upstream_artifacts_folder(state)),
+                    target_branch=state.target_branch,
+                )
         else:
             # A WORKTREE-LOCAL spec's writes below land in the unit's worktree
             # (`task_spec_path`) — which the re-drive destroys before reading anything.
@@ -3467,6 +3659,29 @@ def rearm_event_notice(
             f"spec{where} or the story re-wedges on the escalated attempt's status",
             f"Commit the corrected spec{where} before resuming",
         )
+    if kind == "rearm-upstream-write-unreachable":
+        # The sentinel counterpart, and ONE remedy rather than the two above: the
+        # producer only reaches this record on the mounting leg, because an in-place
+        # re-drive reads the very checkout `resolve.run_session` ran the agent in. So
+        # there is no `redrive` discriminator to read and no in-place arm to get wrong.
+        #
+        # It names the FOLDER, not a file, because the correction is not one file: the
+        # skill sends the agent to `SPEC.md` or to this story's entry in `stories.yaml`,
+        # and which of the two moved is the agent's choice, not something a journal
+        # reader can recover. Naming both and the folder they sit in is what makes the
+        # remedy actionable without claiming more than the record proves.
+        root = str(entry.get("stories_root", "?"))
+        base = str(entry.get("target_branch", "") or "")
+        where = f" on `{base}`" if base else ""
+        return (
+            "warning",
+            f"the sentinel was cleared, but the re-drive of this story will mount a "
+            f"fresh worktree and re-plan from the COMMITTED tree — the upstream "
+            f"correction in {root} (`SPEC.md` / `stories.yaml`) is uncommitted there, "
+            f"so the re-plan reads the same intent that wedged and mints the sentinel "
+            "again",
+            f"Commit the corrected SPEC.md / stories.yaml{where} before resuming",
+        )
     if kind == "rearm-spec-flip-skipped":
         # ONE kind, TWO outcomes, told apart by the flag the producer writes rather
         # than by anything readable from here: `rearm_escalation` raises `RearmError`
@@ -3539,7 +3754,7 @@ def rearm_holds_the_resume(entry: dict[str, Any]) -> bool:
     tree — so a surface that re-arms and resumes in ONE gesture must stop after the
     re-arm and leave `bmad-loop resume` to the operator.
 
-    Exactly one kind qualifies, and the discriminator is PROOF, not urgency.
+    TWO kinds qualify, and the discriminator is PROOF, not urgency.
     `rearm-spec-write-unreachable` is written only once `_redrive_spec_status` has
     established that the committed spec does NOT carry the status the re-drive routes
     on, and only for a spec the working-tree flip cannot reach. Resuming on it is not
@@ -3551,6 +3766,15 @@ def rearm_holds_the_resume(entry: dict[str, Any]) -> bool:
     the moment it rendered. The interactive resolve agent cannot close that gap either
     — its skill forbids it from committing.
 
+    `rearm-upstream-write-unreachable` earns it the same way on the sentinel path,
+    where there is no spec write to measure at all: the sentinel is cleared by
+    deletion, and the correction that stops it recurring sits upstream in `SPEC.md` /
+    `stories.yaml`. Its proof is `_redrive_reads_the_upstream_artifacts`, which fires
+    the record only while the ref the re-drive mounts from does NOT already hold this
+    checkout's copy of those two files — so, exactly as above, resuming is not risky
+    but futile: the re-drive re-plans from a tree that never saw the correction and
+    mints the same sentinel again.
+
     The other warnings stay advisory and do NOT hold. `stale-restore-commits`,
     `stale-restore-unparseable` and `rearm-baseline-advance-failed` each report
     something an operator may need to act on, but none of them PROVES the re-drive
@@ -3561,7 +3785,10 @@ def rearm_holds_the_resume(entry: dict[str, Any]) -> bool:
     asked of the same entry: that table answers "what do I tell the operator", this
     answers "may this gesture still resume". Both surfaces ask both, in one walk.
     """
-    return isinstance(entry, dict) and entry.get("kind") == "rearm-spec-write-unreachable"
+    return isinstance(entry, dict) and entry.get("kind") in (
+        "rearm-spec-write-unreachable",
+        "rearm-upstream-write-unreachable",
+    )
 
 
 def _stale_restore_residue(

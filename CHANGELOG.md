@@ -226,6 +226,19 @@ breaking changes may land in a minor release.
   re-applying the correction in the main checkout rather than committing it anywhere. The
   TUI's re-arm refuses when `policy.toml` cannot be read rather than guessing a mode — a
   re-arm consumes the escalation, so a wrong guess is unrecoverable.
+- Hold a re-armed SENTINEL until its upstream correction reaches the re-drive. A
+  pre-planning sentinel is cleared by deletion, so that arm dropped the spec and returned
+  before the reachability gate the status-flip arm runs — no gate was ever computed for it.
+  The correction that stops the sentinel recurring is upstream (`SPEC.md` / `stories.yaml`,
+  where the resolve skill sends the agent instead of the sentinel), and an isolated re-drive
+  re-plans from the committed tree of a fresh mount, so an uncommitted upstream edit was
+  invisible and the re-plan minted the same sentinel again, spending the escalation. The
+  re-arm now records `rearm-upstream-write-unreachable`, names the folder and the branch to
+  commit on, and stops the re-arm-and-resume gesture. Narrowed by proof rather than by
+  configuration: the record fires only while the ref the re-drive mounts from does not
+  already hold this checkout's copy of those two files, so a correction already committed
+  there resumes in one gesture as before. An in-place re-drive never records — it reads the
+  main checkout, which is where the resolve session runs.
 
 - **`resume` re-stamps the run's recorded code root** (#716). Resume arms the engine against the
   `repo_root` it re-reads from `_bmad/bmm/config.yaml` but left the `state.json` copy at its launch

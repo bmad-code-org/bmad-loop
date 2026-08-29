@@ -45,6 +45,7 @@ def _escalated_run(
     restore_patch=None,
     repo_root=None,
     target_branch=None,
+    spec_folder=None,
 ):
     """conftest's builder with this module's shape: a review-cycle-1 task carrying a
     completed review session (what `build_context` reads), returning the full triple.
@@ -78,11 +79,13 @@ def _escalated_run(
         worktree_path=worktree_path,
         restore_patch=restore_patch,
     )
-    if repo_root is not None or target_branch is not None:
+    if repo_root is not None or target_branch is not None or spec_folder is not None:
         if repo_root is not None:
             run.state.repo_root = str(repo_root)
         if target_branch is not None:
             run.state.target_branch = target_branch
+        if spec_folder is not None:
+            run.state.spec_folder = spec_folder
         save_state(run.run_dir, run.state)
     return run.run_dir, run.state, run.task
 
@@ -2433,6 +2436,244 @@ def test_rearm_reads_the_committed_spec_from_the_redrive_base_not_the_current_he
         # ships an identifier-shaped branch verbatim
         assert unreachable[0]["target_branch"] == "main"
         assert "`main`" in runs.rearm_event_notice(unreachable[0])[2]
+
+
+SPEC_FOLDER = "_bmad-output/epic-6"
+WEDGED_INTENT = "# Epic 6\n\nDo the thing, somehow.\n"
+CORRECTED_INTENT = "# Epic 6\n\nDo the thing by rotating the vault key first.\n"
+MANIFEST = "- id: 6-4-cli-list-command\n  title: List command\n  description: list them\n"
+
+
+def _sentinel_run(
+    tmp_path,
+    *,
+    committed_intent,
+    working_intent,
+    spec_folder=SPEC_FOLDER,
+    target_branch="main",
+):
+    """A stories-mode run wedged on a pre-planning SENTINEL, in a real repo.
+
+    The upstream artifacts (`SPEC.md` + `stories.yaml`) are COMMITTED holding
+    ``committed_intent`` and then left in the working tree holding
+    ``working_intent`` — the two halves the re-arm's proof compares. Equal strings
+    mean "the operator's correction is already on the branch the re-drive mounts
+    from"; different ones mean it is still only in this checkout.
+
+    A `worktree_path` is always recorded, because that is what an escalated unit
+    under `isolation = "worktree"` really carries (`worktree_flow.escalate_unit`
+    never clears it) and because it is the field that must NOT move the answer: the
+    correction lands in the main checkout either way, since `resolve.run_session`
+    runs the agent with `cwd=project`.
+    """
+    key = "6-4-cli-list-command"
+    _resolve_repo(tmp_path)
+    folder = Path(spec_folder)
+    folder = folder if folder.is_absolute() else tmp_path / folder
+    folder.mkdir(parents=True, exist_ok=True)
+    spec_md, manifest = folder / "SPEC.md", folder / "stories.yaml"
+    spec_md.write_text(committed_intent, encoding="utf-8")
+    manifest.write_text(MANIFEST, encoding="utf-8")
+    if folder.is_relative_to(tmp_path):
+        git(tmp_path, "add", "-A")
+        git(tmp_path, "commit", "-q", "-m", "upstream artifacts")
+    # an external artifact dir is outside the repo entirely — there is nothing to commit,
+    # which is the whole point of the row that uses one
+    spec_md.write_text(working_intent, encoding="utf-8")
+
+    sentinel = folder / f"{key}-unresolved.md"
+    sentinel.write_text(
+        "---\nstatus: blocked\n---\n\n## Auto Run Result\n\n" "Status: blocked\nintent too vague\n",
+        encoding="utf-8",
+    )
+    mount = tmp_path / "wt"
+    mount.mkdir(exist_ok=True)
+    run_dir, state, _ = _escalated_run(
+        tmp_path,
+        spec_file=str(sentinel),
+        source="stories",
+        sentinel_kind="unresolved",
+        worktree_path=str(mount),
+        spec_folder=spec_folder,
+        target_branch=target_branch,
+    )
+    return run_dir, state, sentinel
+
+
+def _upstream_records(run_dir):
+    return [e for e in _kinds(run_dir) if e["kind"] == "rearm-upstream-write-unreachable"]
+
+
+@pytest.mark.parametrize(
+    ("isolated", "committed_matches", "warns"),
+    [(True, False, True), (True, True, False), (False, False, False)],
+)
+def test_rearm_holds_a_sentinel_until_the_upstream_correction_reaches_the_redrive(
+    tmp_path, monkeypatch, isolated, committed_matches, warns
+):
+    """The sentinel arm used to fall through the reachability gate entirely.
+
+    A sentinel is cleared by DELETION, so the arm drops `task.spec_file` and returns —
+    and `spec_reaches_the_redrive` / `rearm-spec-write-unreachable` live wholly in the
+    `else`. The consequence is not a missing warning but a spent escalation: the
+    correction that stops the sentinel RECURRING is upstream (`SPEC.md` /
+    `stories.yaml`, where `bmad-loop-resolve/SKILL.md` sends the agent instead of the
+    sentinel), an isolated re-drive mounts fresh from `redrive_base_ref` and re-plans
+    from a COMMITTED tree, and the re-plan mints the same sentinel again.
+
+    Three rows, because two of them are the narrowing and the third is the axis:
+
+    - isolated + the correction only in this checkout: the record fires and HOLDS the
+      resume. This is the P1.
+    - isolated + the same bytes already committed on the target branch: SILENT. Without
+      this proof the record is a per-configuration CONSTANT — every isolated stories run
+      resolves its spec folder inside the project, so `stories_reach_the_redrive` says
+      "unreachable" for 100% of sentinel re-arms under `isolation = "worktree"`, and
+      since the kind holds the resume that would turn every one of them into a
+      two-command gesture for an outcome nothing decided.
+    - IN PLACE, same uncommitted tree: SILENT. The re-drive reads the main checkout's
+      working tree, which is exactly where `cwd=project` put the correction. The
+      recorded mount is identical on all three rows precisely so it cannot be what
+      separates them.
+
+    Ablation: drop the `_redrive_reads_the_upstream_artifacts` conjunct from the gate
+    and row 2 reddens on `assert True is False`; make `stories_reach_the_redrive` return
+    False for the in-place leg and row 3 reddens; delete the whole `if` and row 1
+    reddens on `assert [] != []`. Every row alone is satisfied by a wrong fix.
+    """
+    intent = CORRECTED_INTENT if committed_matches else WEDGED_INTENT
+    run_dir, state, sentinel = _sentinel_run(
+        tmp_path, committed_intent=intent, working_intent=CORRECTED_INTENT
+    )
+    monkeypatch.chdir(tmp_path)
+
+    runs.rearm_escalation(run_dir, isolated_redrive=isolated)
+
+    assert not sentinel.exists()  # the sentinel really was cleared on every row
+    records = _upstream_records(run_dir)
+    assert bool(records) is warns
+    if not warns:
+        return
+    (rec,) = records
+    # the FOLDER the correction lands in — the main checkout's, not `task_stories_root`'s
+    # mount, because the resolve agent runs with `cwd=project`
+    assert rec["stories_root"] == str(tmp_path / SPEC_FOLDER)
+    assert rec["target_branch"] == "main"
+    # a resume in the same gesture would re-plan from the tree that wedged
+    assert runs.rearm_holds_the_resume(rec) is True
+    severity, message, next_step = runs.rearm_event_notice(rec)
+    assert severity == "warning"
+    assert "SPEC.md" in message and "stories.yaml" in message
+    assert next_step == "Commit the corrected SPEC.md / stories.yaml on `main` before resuming"
+
+
+@pytest.mark.parametrize(
+    ("corrected_on_target", "warns"),
+    [(True, False), (False, True)],
+)
+def test_rearm_reads_the_upstream_artifacts_at_the_redrive_base_not_the_current_head(
+    tmp_path, monkeypatch, corrected_on_target, warns
+):
+    """The proof is read at the run's PINNED target branch, not at the code root's HEAD.
+
+    The same seam `test_rearm_reads_the_committed_spec_from_the_redrive_base_not_the_current_head`
+    pins for the spec record, asked of the sentinel path: an isolated re-drive never
+    reads the main checkout's working ref, because `worktree_flow.run_isolated` cuts the
+    replacement worktree from `state.target_branch`. An operator who checks out another
+    branch while the escalation is parked — a wholly ordinary thing to do with a run
+    waiting on a human — moves `HEAD` off the tree the re-drive reads.
+
+    Both rows leave the checkout on `side` and put the two candidate refs in
+    DISAGREEMENT, so neither can pass by reading the other:
+
+    - the target branch already carries what this checkout holds: reading `main`
+      suppresses (nothing left to commit); reading `HEAD` sees `side`'s wedged blob and
+      holds a resume whose work is already where the re-drive looks for it.
+    - the correction was committed on `side` and `main` still holds the wedged intent:
+      reading `main` fires; reading `HEAD` sees the correction and SUPPRESSES — which,
+      because this kind holds the resume, is the default resolve flow resuming straight
+      into the wedge it was meant to clear.
+
+    Ablation: pass a literal `"HEAD"` instead of `redrive_base_ref` in
+    `_redrive_reads_the_upstream_artifacts` and BOTH rows redden. Either row alone also
+    passes for the anchor it exists to reject.
+    """
+    key = "6-4-cli-list-command"
+    _resolve_repo(tmp_path)
+    folder = tmp_path / SPEC_FOLDER
+    folder.mkdir(parents=True)
+    spec_md, manifest = folder / "SPEC.md", folder / "stories.yaml"
+    manifest.write_text(MANIFEST, encoding="utf-8")
+
+    def _commit(intent, message):
+        spec_md.write_text(intent, encoding="utf-8")
+        git(tmp_path, "add", "-A")
+        git(tmp_path, "commit", "-q", "-m", message)
+
+    if corrected_on_target:
+        _commit(CORRECTED_INTENT, "corrected on the target branch")
+        git(tmp_path, "checkout", "-q", "-b", "side")
+        _commit(WEDGED_INTENT, "side went its own way")
+        # the operator's checkout still shows the correction the target branch carries
+        spec_md.write_text(CORRECTED_INTENT, encoding="utf-8")
+    else:
+        _commit(WEDGED_INTENT, "the intent that wedged")
+        git(tmp_path, "checkout", "-q", "-b", "side")
+        _commit(CORRECTED_INTENT, "corrected on the wrong branch")
+
+    sentinel = folder / f"{key}-unresolved.md"
+    sentinel.write_text("---\nstatus: blocked\n---\n\n## Auto Run Result\n\nx\n", "utf-8")
+    mount = tmp_path / "wt"
+    mount.mkdir()
+    run_dir, _, _ = _escalated_run(
+        tmp_path,
+        spec_file=str(sentinel),
+        source="stories",
+        sentinel_kind="unresolved",
+        worktree_path=str(mount),
+        spec_folder=SPEC_FOLDER,
+        target_branch="main",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    runs.rearm_escalation(run_dir, isolated_redrive=True)
+
+    records = _upstream_records(run_dir)
+    assert bool(records) is warns
+    if warns:
+        assert records[0]["target_branch"] == "main"
+
+
+@pytest.mark.parametrize("external", [False, True])
+def test_rearm_exempts_a_stories_folder_configured_outside_the_project(
+    tmp_path, monkeypatch, external
+):
+    """An artifact dir configured OUTSIDE the project tree is the one folder an isolated
+    re-drive still reads through the working tree.
+
+    `ProjectPaths.rebased` leaves such a dir exactly where it is rather than rebasing it
+    onto the mount, so every worktree opens the same absolute path — the identical carve
+    -out `_spec_is_shared_with_the_redrive` makes for a spec, asked of the stories
+    folder. Nothing is committed on either row, so the ONLY moving part is where the
+    folder lives; an in-project folder must fire and an external one must not.
+
+    Ablation: delete the `is_relative_to(project)` arm of `stories_reach_the_redrive` and
+    the in-project row reddens; make the isolated arm answer False unconditionally and
+    the external row reddens.
+    """
+    outside = tmp_path.parent / f"{tmp_path.name}-artifacts" / "epic-6"
+    spec_folder = str(outside) if external else SPEC_FOLDER
+    run_dir, _, _ = _sentinel_run(
+        tmp_path,
+        committed_intent=WEDGED_INTENT,
+        working_intent=CORRECTED_INTENT,
+        spec_folder=spec_folder,
+    )
+    monkeypatch.chdir(tmp_path)
+
+    runs.rearm_escalation(run_dir, isolated_redrive=True)
+
+    assert bool(_upstream_records(run_dir)) is not external
 
 
 def test_rearm_records_the_in_place_remedy_when_isolation_was_turned_off(tmp_path, monkeypatch):

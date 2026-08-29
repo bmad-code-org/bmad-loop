@@ -243,6 +243,16 @@ block inside it. So for a sentinel:
   planning pass can succeed: usually that means clarifying `SPEC.md` (the epic
   spec) or this story's entry in `stories.yaml` — the `title` / `description` /
   `invoke_dev_with` the planner reads — with the human.
+- **`redrive_base_ref` decides where that upstream edit has to land, exactly as it
+  does for a spec.** `spec_reaches_the_redrive` does not answer this — it is about
+  `spec_file`, which for a sentinel is the file being deleted. The artifacts you
+  actually edit are `SPEC.md` / `stories.yaml`, and they face the same question: when
+  `redrive_base_ref` names a **branch**, the re-drive mounts a fresh worktree and
+  re-plans from that branch's COMMITTED tree, so an uncommitted edit is invisible and
+  the re-plan mints the same sentinel again — tell the human it has to be committed
+  there. When it is `HEAD`, the re-drive re-plans in the main checkout's working tree
+  and the edit is read as-is — do not tell them to commit. The orchestrator re-arms on
+  the same rule and will hold the resume until the branch carries it.
 - On **re-arm** the orchestrator does NOT flip the sentinel to `ready-for-dev`
   (there is no plan to route to). It **preserves a copy** of the sentinel under
   `{run}/sentinels/<id>-<kind>.md` as a breadcrumb, **deletes** the sentinel, and

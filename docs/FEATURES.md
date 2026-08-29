@@ -117,6 +117,15 @@ Result` section. Every other spec keeps warn-and-continue, and the record says w
   escalation on a session that halts blocked. They now stop after the re-arm — the story stays armed,
   `bmad-loop resume <run-id>` picks it up once the fix is committed, and `--resume` does not override
   it, since the record is written on proof rather than suspicion. The advisory warnings do not hold.
+  A pre-planning **sentinel** gets the same treatment on its own artifacts. It is cleared by
+  deletion rather than a status flip, so there is no spec write to measure — but the correction that
+  stops it recurring is upstream (`SPEC.md` / `stories.yaml`, where the resolve skill sends the agent
+  instead of the sentinel), and an isolated re-drive re-plans from the committed tree of a fresh
+  mount. Re-arm now says so (`rearm-upstream-write-unreachable`), names the folder and the branch,
+  and holds the resume the same way. Narrowed on the same principle: it fires only while the branch
+  the re-drive mounts from does not already hold this checkout's copy of those two files, so a
+  correction already committed there resumes in one gesture, and an in-place re-drive never records
+  at all — it reads the main checkout, which is where the resolve session runs.
   All of these warnings reach the TUI's re-arm as well as `resolve`'s — both route every
   kind through one shared table, so neither surface can silently learn a kind the other drops,
   though each still owns where it calls the echo from and the TUI drops the trailing "before

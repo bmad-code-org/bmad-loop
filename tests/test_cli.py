@@ -2984,7 +2984,11 @@ def test_resolve_echoes_the_residue_even_when_the_rearm_aborts(tmp_path, monkeyp
 def test_resolve_holds_the_resume_when_the_correction_cannot_reach_the_redrive(
     tmp_path, monkeypatch, capsys
 ):
-    """The one record that PROVES a wedge breaks the re-arm+resume gesture.
+    """A record that PROVES a wedge breaks the re-arm+resume gesture.
+
+    Two kinds qualify (`rearm-spec-write-unreachable` here, and the sentinel path's
+    `rearm-upstream-write-unreachable`); this grades the gesture, which is shared, so it
+    drives the spec one and leaves the sentinel producer to tests/test_resolve.py.
 
     `rearm-spec-write-unreachable` fires only once the re-arm has established that the
     committed spec does not carry the status the re-drive routes on, and its own
