@@ -476,6 +476,38 @@ class StoryTask:
         except ValueError:
             return path  # spec lives outside the worktree; keep absolute
 
+    def release_spec_paths_from_mount(self) -> None:
+        """Give up the spec ownership a mount being DISCARDED carried.
+
+        The counterpart to :meth:`rebase_spec_paths_on`, and deliberately not its
+        exact inverse — the two fields part company here because their roles do:
+
+        * `dispatched_spec_file` / `dispatched_spec_snapshot` are the ATTEMPT's
+          binding, the pair `recovery_flow` restores bytes through. The attempt died
+          with its tree, so the binding has nothing left to name; clearing both
+          together keeps the authority pair whole (a path without its snapshot is the
+          one shape `_bind_dispatched_spec_for_attempt` never persists).
+        * `spec_file` is the ACCEPTED artifact and outlives the attempt. The
+          replacement mount will carry the same story's spec at the same
+          mount-relative place, so the relative spelling is the one that re-resolves
+          onto it — `verify.resolve_spec_path` probes a relative value against the
+          live workspace and passes an absolute one through untouched.
+
+        Leaving `spec_file` absolute into the deleted mount is what made the fresh
+        attempt start UNBOUND: `_dispatched_spec_for_attempt` resolves it
+        `strict=True`, the dead path raises, and the miss is silent because an
+        unbound attempt is a legal state. `_record_dev_spec` cannot repair it either
+        — it no-ops while `spec_file` is set.
+
+        Uses the same relativization as `to_dict`, so the discarded-mount spelling
+        and the persisted one cannot drift, which also means a spec OUTSIDE the mount
+        stays verbatim: it was never the mount's to give up. MUST be called while
+        `worktree_path` still names the mount.
+        """
+        self.dispatched_spec_file = None
+        self.dispatched_spec_snapshot = None
+        self.spec_file = self._serialized_worktree_path(self.spec_file)
+
     def rebase_spec_paths_on(self, root: Path) -> None:
         """Re-absolutize both spec-ownership paths against the tree that owns them.
 

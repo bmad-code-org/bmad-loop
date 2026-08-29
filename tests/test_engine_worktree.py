@@ -2364,6 +2364,85 @@ def test_restart_arm_clears_the_baseline_it_measured_in_the_discarded_mount(proj
     assert saved.baseline_untracked is None
 
 
+def test_restart_arm_leaves_a_spec_the_replacement_mount_can_bind(project, monkeypatch):
+    """The property the re-anchor broke: after the discard, the fresh mount BINDS.
+
+    `_finish_inflight` re-anchors `spec_file` onto the mount (correct — recovery must
+    not resolve it against the main checkout), and the restart arm then DELETES that
+    mount. Left absolute, the value names a tree that no longer exists:
+    `verify.resolve_spec_path` passes an absolute path through untouched,
+    `_dispatched_spec_for_attempt` resolves it `strict=True` and swallows the
+    `FileNotFoundError`, and the fresh attempt starts unbound on a story whose spec is
+    sitting in the replacement mount at the same relative place. Nothing downstream
+    repairs it — `_record_dev_spec` no-ops while `spec_file` is set — so the repair
+    prompt keeps naming the deleted path.
+
+    Graded on the DURABLE state and then on the resolution itself, because the
+    spelling is only a proxy: what matters is that the replacement mount answers with
+    ITS copy, and neither the dead path nor the main checkout's identical layout.
+
+    Ablation: drop `task.release_spec_paths_from_mount()` from
+    `_discard_unit_for_restart` and this reddens on the durable-spelling assertion —
+    the saved `spec_file` comes back absolute into the deleted mount, which is the
+    state that shipped. That assertion fires before the binding one, so the binding
+    assertion is not what the ablation proves; it is what states the CONSEQUENCE, and
+    it holds the row to the replacement mount's copy rather than merely to some
+    resolvable path (the main checkout carries the identical layout and would answer
+    a relative value too, from the wrong tree).
+    """
+    from bmad_loop import verify
+    from bmad_loop.workspace import open_unit_workspace
+
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+
+    unit = open_unit_workspace(
+        project.project, project, "test-run", "1-1-a", "main", "story", engine.run_dir
+    )
+    rel = "_bmad-output/implementation-artifacts/spec-1-1-a.md"
+    (unit.path / rel).parent.mkdir(parents=True, exist_ok=True)
+    (unit.path / rel).write_text("---\nstatus: ready-for-dev\n---\n", encoding="utf-8")
+
+    task = StoryTask("1-1-a", 1, phase=Phase.DEV_RUNNING)
+    task.worktree_path = str(unit.path)
+    task.branch = unit.branch
+    # persisted RELATIVE, exactly as `_serialized_worktree_path` writes it — the
+    # re-anchor inside `_finish_inflight` is what makes it absolute
+    task.spec_file = rel
+    task.dispatched_spec_file = rel
+    task.dispatched_spec_snapshot = b"pre-launch bytes"
+    engine.state.tasks["1-1-a"] = task
+
+    class _StopBeforeRerun(Exception):
+        pass
+
+    monkeypatch.setattr(
+        engine, "_run_story", lambda *a, **k: (_ for _ in ()).throw(_StopBeforeRerun())
+    )
+
+    with pytest.raises(_StopBeforeRerun):
+        engine._finish_inflight()
+
+    saved = load_state(engine.run_dir).tasks["1-1-a"]
+    assert saved.worktree_path == ""
+    assert saved.spec_file == rel  # relative again, not absolute into the deleted tree
+    assert saved.dispatched_spec_file is None  # the attempt died with its tree
+    assert saved.dispatched_spec_snapshot is None
+
+    # the replacement mount `_run_story` would have opened, carrying the same spec
+    replacement = open_unit_workspace(
+        project.project, project, "test-run", "1-1-a", "main", "story", engine.run_dir
+    )
+    (replacement.path / rel).parent.mkdir(parents=True, exist_ok=True)
+    (replacement.path / rel).write_text("---\nstatus: ready-for-dev\n---\n", encoding="utf-8")
+
+    # the binding `_dispatched_spec_for_attempt` makes, against the live workspace
+    bound = verify.resolve_spec_path(saved.spec_file, replacement.workspace.paths).resolve(
+        strict=True
+    )
+    assert bound == (replacement.path / rel).resolve()
+
+
 def test_finish_inflight_anchors_on_the_persisted_mount_not_the_live_isolation_policy(project):
     """The relative spelling is persisted state; `isolated` is re-read policy.
 

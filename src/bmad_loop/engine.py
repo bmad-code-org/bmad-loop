@@ -1361,12 +1361,25 @@ class Engine:
 
         Scoped deliberately: `worktree_path`, `branch`, `baseline_commit` and
         `baseline_untracked` all name the mount or a measurement taken inside it, and
-        each is wrong the moment it is gone. The spec-ownership pair
-        (`dispatched_spec_file`, `dispatched_spec_snapshot`) is NOT cleared here — it
-        records which spec an attempt owned, which outlives the mount, and
-        `_bind_dispatched_spec_for_attempt` rebinds it on the next attempt before any
-        reader can act on it. Note the caller re-anchors that pair immediately above, so
-        between here and the rebind it holds an absolute path into the deleted tree.
+        each is wrong the moment it is gone.
+
+        Spec ownership is released through `task.release_spec_paths_from_mount()`,
+        which clears the attempt-owned pair and returns `spec_file` to the
+        mount-relative spelling. It runs BEFORE `worktree_path` is cleared, because
+        the relativization is measured against it.
+
+        An earlier version left that pair alone, reasoning that
+        `_bind_dispatched_spec_for_attempt` rebinds on the next attempt before any
+        reader acts on it. The rebind does run — and returns None. The caller
+        re-anchors both fields immediately above, so by the time the mount is deleted
+        `spec_file` is an ABSOLUTE path into it; `_dispatched_spec_for_attempt`
+        resolves that `strict=True`, raises, and leaves the fresh attempt unbound on
+        a story whose spec is sitting in the replacement mount at the same relative
+        place. Nothing downstream repairs it — `_record_dev_spec` no-ops while
+        `spec_file` is set — so the repair prompt goes on naming the deleted path.
+        The relative spelling is what `verify.resolve_spec_path` re-probes against
+        the live workspace, which is how this bound correctly before the re-anchor
+        existed.
 
         `baseline_ledger_digest` and the `pre_harvest_ledger` pair are measured in the
         mount too (`_ledger_digest` reads `workspace.paths.deferred_work`, which is
@@ -1412,6 +1425,8 @@ class Engine:
         discard_worktree(
             self.paths.repo_root, task.worktree_path, task.branch, run_dir=self.run_dir
         )
+        # before the clear below: the relativization is measured against this field
+        task.release_spec_paths_from_mount()
         task.worktree_path = ""
         task.branch = ""
         task.baseline_commit = None

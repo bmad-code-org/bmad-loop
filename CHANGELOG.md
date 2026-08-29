@@ -172,6 +172,11 @@ breaking changes may land in a minor release.
   in both the engine and sweep. A later resume could otherwise probe the main checkout —
   deleting untracked files the operator already had, or restoring a dead attempt's spec
   over their own copy.
+- Release spec ownership when a half-built worktree is discarded for a restart, so the
+  replacement mount can bind the spec. The attempt's binding is cleared and the accepted
+  spec returns to its mount-relative spelling; left absolute into the deleted tree it
+  resolved to nothing, and the restarted attempt ran unbound with the repair prompt naming
+  a path that no longer existed.
 - Locate the stories folder from the workspace root rather than from the spec's confinement
   root, so one modal can no longer read its spec from the run's tree and its sentinel from
   the project.
