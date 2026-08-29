@@ -239,6 +239,13 @@ breaking changes may land in a minor release.
   already hold this checkout's copy of those two files, so a correction already committed
   there resumes in one gesture as before. An in-place re-drive never records — it reads the
   main checkout, which is where the resolve session runs.
+- Re-read `[scm] isolation` after the interactive resolve session, before the re-arm.
+  `resolve` loaded policy, then blocked on a human conversation of unbounded length, then
+  keyed the re-arm on that stale answer while the engine it arms re-read policy for itself.
+  Editing isolation while the agent was open therefore split the two readers: `none` to
+  `worktree` re-armed treating the main-checkout correction as reachable, emitted no hold,
+  then mounted a fresh worktree cut from git that could not see it. A change across the
+  session is now reported on stderr.
 
 - **`resume` re-stamps the run's recorded code root** (#716). Resume arms the engine against the
   `repo_root` it re-reads from `_bmad/bmm/config.yaml` but left the `state.json` copy at its launch

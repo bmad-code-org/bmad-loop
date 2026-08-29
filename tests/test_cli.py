@@ -3572,6 +3572,74 @@ def test_resolve_interactive_restore_patch_from_resolution_json(tmp_path, monkey
     assert "in-review" in spec.read_text()
 
 
+@pytest.mark.parametrize("flipped_mid_session", [False, True])
+def test_resolve_rereads_isolation_after_the_agent_session(
+    tmp_path, monkeypatch, capsys, flipped_mid_session
+):
+    """`pol` is read BEFORE a session that blocks on a human conversation of arbitrary
+    length, and the re-arm below it is keyed on that stale answer.
+
+    Everything after `resolve.run_session` returns — the restore-patch latch, the
+    isolation-conflict refusal, and `rearm_escalation`'s `isolated_redrive` — used the
+    mode as it stood when the operator TYPED the command, while `_resume_paused_run` at
+    the bottom of the same function re-reads policy for the engine it arms. So a
+    `none -> worktree` edit made while the agent was open split the two readers in the
+    one window nobody can bound: the re-arm treated the main-checkout correction as
+    reachable and emitted no hold, then the engine mounted a fresh worktree cut from git
+    that could not see it. The escalation was spent and the story re-wedged, with no
+    error anywhere.
+
+    The window is real precisely because this session is INTERACTIVE by contract — a
+    human is present, the skill is allowed to ask, and `run_session` blocks on
+    `subprocess.run` until they exit. Editing policy while a resolve agent is open is
+    not exotic; deciding the story needs isolation is one of the things a resolve
+    conversation concludes.
+
+    The control row is what makes this a re-read rather than a hardcode: an untouched
+    policy must still re-arm on its own answer and print nothing.
+
+    Ablation: delete the second `pol = policy_mod.load(...)` in `cmd_resolve` and the
+    flipped row reddens on `assert False is True` — the re-arm goes back to the mode
+    read before the conversation. Drop the warning `print` and the row reddens on
+    stderr alone, with the isolation assertion still passing.
+    """
+    from bmad_loop import resolve, runs
+
+    spec = tmp_path / "spec.md"
+    spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+    _write_policy(tmp_path, '[scm]\nisolation = "none"\n')
+    _escalated_run(tmp_path, "r1", spec_file=str(spec))
+
+    def fake_session(adapter, project, rd, story_key, *, model=""):
+        # the human and the agent conclude the story needs isolation, and the operator
+        # edits policy.toml from another terminal while the session is still open
+        if flipped_mid_session:
+            _write_policy(tmp_path, '[scm]\nisolation = "worktree"\n')
+        marker = resolve.resolution_path(rd, story_key)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("{}", encoding="utf-8")
+        return True
+
+    seen: list[bool] = []
+
+    def recording_rearm(rd, key, *, restore_patch=None, isolated_redrive=False):
+        seen.append(isolated_redrive)
+        return key
+
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
+    monkeypatch.setattr(resolve, "build_context", lambda *a, **k: None)
+    monkeypatch.setattr(resolve, "run_session", fake_session)
+    monkeypatch.setattr(runs, "rearm_escalation", recording_rearm)
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+    assert cli.main(["resolve", "--project", str(tmp_path), "r1", "--resume"]) == 0
+
+    # the re-arm keyed on the mode in force when it ran, not the one read before the
+    # conversation started
+    assert seen == [flipped_mid_session]
+    err = capsys.readouterr().err
+    assert ("[scm] isolation changed none -> worktree" in err) is flipped_mid_session
+
+
 def test_resolve_corrupt_resolution_json_aborts_loudly(tmp_path, monkeypatch, capsys):
     """A present-but-unparseable resolution.json may carry the agent's recorded
     restore decision, and a re-arm consumes the escalation — so corruption must
