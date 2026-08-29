@@ -525,7 +525,12 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         return argv
 
     def interactive_env(self, spec: SessionSpec) -> dict[str, str]:
-        return {**self.profile.env, **spec.env}
+        # The pin chokepoint (runs.pin_state_root): the profile's [env] table
+        # must not be able to move a session off this process's state root —
+        # including when no root derives, where there is no pin key for a mere
+        # spread ordering to protect. `start_session`'s window merge applies
+        # the same rule.
+        return runs.pin_state_root({**self.profile.env, **spec.env})
 
     def build_command(self, spec: SessionSpec) -> str:
         return " ".join(shlex.quote(a) for a in self.interactive_argv(spec))
@@ -565,7 +570,9 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             self.session_name,
             spec.task_id[-40:],
             spec.cwd,
-            {**self.profile.env, **spec.env},
+            # Same merge as interactive_env, same pin chokepoint: the profile's
+            # [env] table must not move the window off this process's state root.
+            runs.pin_state_root({**self.profile.env, **spec.env}),
             self.build_command(spec),
         )
         # pipe_pane tolerates the window having already died (a CLI that crashes on

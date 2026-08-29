@@ -32,6 +32,7 @@ class StubMux(TerminalMultiplexer):
 
     def __init__(self):
         self.calls: list[str] = []
+        self.window_env: dict[str, str] = {}
         self._sessions: set[str] = set()
         self._windows: dict[str, list[str]] = {}
         self._next = 0
@@ -41,7 +42,7 @@ class StubMux(TerminalMultiplexer):
         self.calls.append("has_session")
         return name in self._sessions
 
-    def new_session(self, name, cwd, cols, lines):
+    def new_session(self, name, cwd, cols=None, lines=None):
         self.calls.append("new_session")
         self._sessions.add(name)
         self._windows[name] = []
@@ -51,6 +52,7 @@ class StubMux(TerminalMultiplexer):
 
     def new_window(self, session, name, cwd, env, command):
         self.calls.append("new_window")
+        self.window_env = env
         self._next += 1
         win = f"@stub{self._next}"
         self._windows.setdefault(session, []).append(win)
@@ -193,6 +195,56 @@ def test_generic_adapter_drives_only_the_mux(tmp_path, no_tmux):
 
     adapter.kill(handle)
     assert "kill_window" in stub.calls
+
+
+def test_generic_adapter_window_env_pins_the_state_root_over_profile(
+    tmp_path, no_tmux, monkeypatch
+):
+    """The engine's window merge (`{**profile.env, **spec.env}`) rides through
+    the `runs.pin_state_root` chokepoint: a profile `[env]` table declaring
+    `BMAD_LOOP_STATE_DIR` is forced to this process's resolved root when one
+    derives, and STRIPPED when none does — with an underivable root there is no
+    pin key in `spec.env` for mere merge order to protect, and the profile's
+    absolute value would otherwise aim the coding window at a registry its own
+    orchestrator cannot see. `interactive_env` (the attached resolve path)
+    applies the same rule.
+
+    Ablate the `runs.pin_state_root` wrap at either merge and the matching
+    assertion fails."""
+    import dataclasses
+
+    from bmad_loop import envvars, runs
+
+    def make_adapter():
+        stub = StubMux()
+        adapter = GenericAdapter(
+            run_dir=tmp_path / "run",
+            policy=Policy(limits=LimitsPolicy()),
+            profile=dataclasses.replace(
+                get_profile("claude"), env={envvars.STATE_DIR: str(tmp_path / "S2")}
+            ),
+            mux=stub,
+            events_dir=tmp_path / "state" / "events",
+        )
+        return stub, adapter
+
+    spec = _spec(tmp_path)
+
+    # derivable: the profile's S2 is overwritten with the resolved root
+    monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "S1"))
+    stub, adapter = make_adapter()
+    adapter.start_session(spec)
+    assert stub.window_env[envvars.STATE_DIR] == str(runs.state_root())
+    assert adapter.interactive_env(spec)[envvars.STATE_DIR] == str(runs.state_root())
+
+    # underivable: no pin exists, so the profile's entry is stripped outright
+    monkeypatch.setenv(envvars.STATE_DIR, "relative-root")
+    stub, adapter = make_adapter()
+    adapter.start_session(spec)
+    assert envvars.STATE_DIR not in stub.window_env
+    assert envvars.STATE_DIR not in adapter.interactive_env(spec)
+    # ...and the rest of the profile/spec env is untouched
+    assert stub.window_env["BMAD_LOOP_TASK_ID"] == spec.task_id
 
 
 # --------------------------------------------------------------- seam honesty
@@ -791,6 +843,15 @@ def test_new_parked_window_posix_argv_byte_identical(monkeypatch, tmp_path):
         "-c",
         _PARKED_SH_SOURCE,
     ]
+
+
+def test_new_session_argv_byte_identical(monkeypatch, tmp_path):
+    rec = _RecordRun()
+    monkeypatch.setattr(tmux_base.subprocess, "run", rec)
+
+    TmuxMultiplexer().new_session("s", tmp_path)
+
+    assert rec.argv == ["tmux", "new-session", "-d", "-s", "s", "-c", str(tmp_path)]
 
 
 def test_new_window_posix_argv_byte_identical(monkeypatch, tmp_path):

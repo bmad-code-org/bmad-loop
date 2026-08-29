@@ -72,7 +72,9 @@ screen). An explicit `TEXTUAL_FPS` in the environment still wins.
 The TUI never runs an engine in-process. The two halves:
 
 - **Launcher** — `r`, `s`, and `e` spawn detached `bmad-loop` processes as
-  windows of a dedicated tmux session, `bmad-loop-ctl`. Windows are named
+  windows of a dedicated tmux session, `bmad-loop-ctl` (on psmux the name
+  carries a per-project registry suffix — the launch toast names the exact
+  session; see [multiplexer backends](multiplexer-backends.md)). Windows are named
   `run-<run-id>`, `sweep-<run-id>`, or `resume-<run-id>`, run the same Python
   interpreter as the TUI (`python -m bmad_loop.cli`, immune to PATH/venv drift
   inside tmux), and stay open after exit showing
@@ -693,7 +695,7 @@ if the operator has marked `policy.toml` read-only (#593, #597).
 | `multiplexer backend unavailable — launch/attach disabled`                          | install the selected backend's binary (tmux by default — see `bmad-loop mux`); the dashboard still works read-only                   |
 | `git worktree is not clean — commit or stash first`                                 | the launch guard; commit/stash and retry. `.bmad-loop/policy.toml` is exempt, so saving in the settings editor never blocks a launch |
 | `another run is live: <ids>`                                                        | a second engine on the same project may conflict — confirm only if you know they won't touch the same stories                        |
-| `launch may have failed — attach to control session bmad-loop-ctl`                  | no `state.json` within 10 s of launch; attach to the ctl window to read the error (the window stays open with the exit code)         |
+| `launch may have failed — attach to control session <name>`                         | no `state.json` within 10 s of launch; attach to the named ctl session to read the error (the window stays open with the exit code)  |
 | `no run selected`                                                                   | `e` / `a` need a selected run — the project has no runs yet                                                                          |
 | `state for run <id> is unreadable`                                                  | corrupt/missing `state.json`; inspect the run dir                                                                                    |
 | `run <id> already finished`                                                         | finished runs can't be resumed                                                                                                       |

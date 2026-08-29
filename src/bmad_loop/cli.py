@@ -146,14 +146,34 @@ def _policy_path(project: Path) -> Path:
 
 
 def _configure_mux(project: Path) -> None:
-    """Install the policy ``[mux] backend`` choice into the multiplexer seam.
+    """Install the policy ``[mux] backend`` choice into the multiplexer seam, and
+    point this process at the project's multiplexer registry root.
 
     The single configuration point, called from ``main()`` before dispatch so
     every mux consumer — including probe/diagnose/attach/stop, which never load
     policy themselves — selects under the persisted choice. Tolerant of a broken
     policy file: diagnostics must keep working on a misconfigured host, and the
-    commands that need policy re-load it loudly themselves."""
-    from .adapters.multiplexer import configure_multiplexer
+    commands that need policy re-load it loudly themselves.
+
+    The registry export belongs *here*, and not at backend construction, for two
+    reasons this is the only place that satisfies at once: it is the last point
+    that still knows the project (``--project`` has been parsed, no handler has
+    run) and it precedes every psmux spawn in the process, the ctl session the
+    TUI mints included. Backend construction knows neither — a factory takes no
+    arguments, and ``detect_multiplexers`` builds every registered backend for a
+    diagnostic table, which must not move a registry as a side effect.
+    ``runs.export_psmux_registry_root`` never raises, on the same
+    keep-diagnostics-working rule as the policy read above.
+
+    It also *overrides* an ambient ``PSMUX_DATA_DIR`` rather than honouring it —
+    the root is derived, always, so that two processes given one project cannot
+    disagree about where its sessions live (the full argument is in that
+    function). Overriding an operator's variable silently is how someone loses an
+    hour to `psmux ls` showing nothing, so it is said once, here, at the only
+    point that runs ahead of every command. stderr, not stdout: the ``--json``
+    contract is one object on stdout and nothing else, and this is the
+    ``unverifiable_pid`` precedent."""
+    from .adapters.multiplexer import MultiplexerError, configure_multiplexer, get_multiplexer
 
     path = _policy_path(project)
     try:
@@ -161,6 +181,80 @@ def _configure_mux(project: Path) -> None:
     except (policy_mod.PolicyError, OSError):
         name = None
     configure_multiplexer(name, origin=path)
+    # Automatic selection probes availability before returning its cached
+    # instance. Give that probe the derived root first: psmux's version probe
+    # reaches `_run`, which must reject an empty/relative ambient value, and a
+    # failed probe stays cached for this process. The override is temporary in
+    # every arm: the ambient value is restored before the real export, which is
+    # the last reader of it.
+    # The gate asks only the seam's `has_registry_namespace()` question. Ceiling,
+    # named: an out-of-tree backend that namespaces through some other variable
+    # still sees this export, because the seam has no finer question. Adding one
+    # for a backend that does not exist yet is not worth expanding the seam;
+    # `bmad-loop mux` discloses the root either way.
+    ambient = os.environ.get(runs.PSMUX_DATA_DIR)
+    try:
+        probe_root = str(runs.mux_registry_root(project))
+    except (runs.StateRootError, OSError, RuntimeError):
+        probe_root = None
+    if probe_root is not None:
+        os.environ[runs.PSMUX_DATA_DIR] = probe_root
+    try:
+        namespaced = get_multiplexer().has_registry_namespace()
+    except MultiplexerError:
+        # A backend that cannot even be selected runs no verb, so there is
+        # nothing to point anywhere; diagnostics keep working.
+        return
+    finally:
+        # Undone on EVERY arm, the psmux one included, because the export below
+        # is the last reader of the operator's own value. Restore only the
+        # namespace-less arms and `export_psmux_registry_root` reads the derived
+        # root back as the displaced one, finds it equal to what it is about to
+        # write, and skips `note_displaced_registry` — so a machine that had an
+        # absolute `PSMUX_DATA_DIR` before the upgrade keeps its pre-upgrade
+        # sessions in a registry `legacy_registries` can no longer name, and
+        # cleanup reports a clean machine while their coding processes run on.
+        if probe_root is not None:
+            if ambient is None:
+                os.environ.pop(runs.PSMUX_DATA_DIR, None)
+            else:
+                os.environ[runs.PSMUX_DATA_DIR] = ambient
+    if not namespaced:
+        return
+    root = runs.export_psmux_registry_root(project)
+    if root is not None:
+        if ambient is not None and ambient != root:
+            print(
+                f"note: using bmad-loop's own psmux registry {root} — your "
+                f"{runs.PSMUX_DATA_DIR}={ambient} is left for your own sessions "
+                f"(`bmad-loop mux` prints the export that reaches these)",
+                file=sys.stderr,
+            )
+        return
+    # The degrade arms, and the ones an operator most needs told: no root could
+    # be derived, so every psmux verb this command runs — the kill path included
+    # — addresses a registry that is not bmad-loop's own. With an ambient value
+    # that is THEIR registry as found; with none it is psmux's shared default.
+    # Cleanup will not claim an untagged session in either
+    # (`runs._registry_proves_ownership`), but silence would still read as
+    # "bmad-loop is using its own registry".
+    if ambient is not None:
+        print(
+            f"warning: no state root could be derived, so bmad-loop has no registry of "
+            f"its own here and is using {runs.PSMUX_DATA_DIR}={ambient} as found — set "
+            f"{envvars.STATE_DIR} to an absolute path, or unset it, to get one",
+            file=sys.stderr,
+        )
+        return
+    # No ambient value either: psmux's shared default is what every verb here
+    # will address. Unconditional now — the namespacing gate above already
+    # returned on a transport with no registry for the degrade to have cost.
+    print(
+        f"warning: no state root could be derived, so bmad-loop has no registry of "
+        f"its own here and is using the multiplexer's shared default registry — set "
+        f"{envvars.STATE_DIR} to an absolute path, or unset it, to get one",
+        file=sys.stderr,
+    )
 
 
 def _reject_bad_run_id(run_id: str | None) -> int | None:
@@ -171,7 +265,8 @@ def _reject_bad_run_id(run_id: str | None) -> int | None:
     if run_id is not None and not runs.is_valid_run_id(run_id):
         print(
             f"error: invalid --run-id {run_id!r} — expected {runs.RUN_ID_RE.pattern} "
-            f"(at most {MAX_SEGMENT} characters, not a reserved device name)",
+            f"(at most {MAX_SEGMENT} characters, not a reserved device name, and not "
+            f"the reserved control-session shape 'ctl'/'ctl-…' in any letter case)",
             file=sys.stderr,
         )
         return 1
@@ -894,7 +989,71 @@ def cmd_mux(args: argparse.Namespace) -> int:
     # fallback, which is tmux by contract — not a stale hardcoding
     name = chosen.name if chosen else "tmux"
     print(f"selection: {name} ({type(backend).__name__}) — {reason}")
+    _print_registry(project)
     return 0
+
+
+def _print_registry(project: Path) -> None:
+    """Name the multiplexer registry this project's sessions live in, and how to
+    reach them from a bare psmux.
+
+    Without this the repo lies by omission: bmad-loop points psmux at a
+    per-project root (``runs.mux_registry_root``), so an operator's own
+    ``psmux ls`` — which reads psmux's default registry — shows none of this
+    project's sessions and answers "no sessions" rather than erroring. Printing
+    the root and a paste-ready export turns that into a fact they can act on.
+    Silent on a backend with no registry namespace (tmux), which has nothing to
+    disclose, and on one that cannot be selected at all — the caller has already
+    reported that.
+
+    Line per fact rather than a table row: this is a path, which is exactly the
+    cell an aligned table mangles (#321), and there is only one of them."""
+    from .adapters.multiplexer import MultiplexerError, get_multiplexer
+
+    try:
+        mux = get_multiplexer()
+        root = mux.registry_root()
+        if root is None:
+            # For a namespacing backend, no root in force means the shared
+            # default registry — the one situation `registry:` must not stay
+            # silent about, since silence reads as "per-project as usual".
+            if mux.has_registry_namespace():
+                print(
+                    "registry: the multiplexer's shared default (no state root "
+                    f"could be derived — set {envvars.STATE_DIR} to an absolute "
+                    "path, or unset it, to get a per-project one)"
+                )
+            return
+    except MultiplexerError:
+        return
+    try:
+        derived = str(runs.mux_registry_root(project))
+    except (runs.StateRootError, OSError, RuntimeError):
+        derived = None
+    # bmad-loop always derives, so a mismatch is not an operator's honoured
+    # export — that is not a thing any more — but the one case the export
+    # degrades on: an underivable state root, where it leaves whatever it found
+    # rather than inventing a root. Saying "derived" there would be a lie about
+    # the one situation an operator most needs told.
+    origin = (
+        "derived from the project"
+        if root == derived
+        else f"NOT bmad-loop's — ${runs.PSMUX_DATA_DIR} as found, "
+        "because no state root could be derived here"
+    )
+    print(f"registry: {root} ({origin})")
+    # A single-quoted PowerShell literal, whose only escape is doubling the quote:
+    # an unescaped `C:\Users\O'Brien\...` ends the string mid-path and the line
+    # will not parse. Anything printed as paste-ready has to actually paste. Same
+    # rule as `psmux_backend._pwsh_quote`, spelled out rather than imported — a
+    # backend's argv quoting is not this module's to reach into, and the
+    # dependency only runs the other way.
+    quoted = root.replace("'", "''")
+    print(
+        f"  a bare `psmux ls` reads psmux's default registry, not this one — "
+        f"export {runs.PSMUX_DATA_DIR} to see these sessions: "
+        f"$env:{runs.PSMUX_DATA_DIR} = '{quoted}'"
+    )
 
 
 def _mux_set(project: Path, args: argparse.Namespace) -> int:
@@ -2398,6 +2557,31 @@ def _sweep_dry_run(paths: bmadconfig.ProjectPaths, pol) -> int:
 def _resume_paused_run(project: Path, run_dir: Path) -> int:
     """Resume the engine for a paused/interrupted run. Shared by `resume` and
     the re-arm step of `resolve`."""
+    # An id that aliases a control session (`ctl` / `ctl-<16hex>` —
+    # runs.run_id_aliases_control_session; NOT the mint's broader reservation,
+    # since a historical `ctl-foo` run has a genuine agent session and resumes
+    # safely) can reach here only from a run dir an OLDER release persisted:
+    # minting refuses the shape, but validation never sees what is already on
+    # disk. Driving such a run is not possible — its agent session name IS the
+    # control session's, so the relaunch would adopt the live control session —
+    # and the refusal names the way out instead of just the wall: stop/delete
+    # work on the run dir and, via the kill_session chokepoint, never touch any
+    # session under this name. This is `resume`'s gate and the backstop for any
+    # future caller; `resolve` gates AT ENTRY (cmd_resolve), because its flow
+    # runs the interactive session and re-arms the escalation before reaching
+    # here, and a refusal after those is a refusal after the side effects.
+    if runs.run_id_aliases_control_session(run_dir.name):
+        print(
+            f"run {run_dir.name}: cannot resume — its agent session name "
+            f"({runs.session_name(run_dir.name)}) is the control session's own, so "
+            "driving it would take over the live control session (ids of this shape "
+            "are now refused at creation; this run predates that). The run directory "
+            "and any worktree are intact: recover the work by hand, then remove the "
+            f"run with `bmad-loop delete {run_dir.name}` — stop and delete do not "
+            "touch any session under this name",
+            file=sys.stderr,
+        )
+        return 1
     paths = bmadconfig.load_paths(project)
     state = load_state(run_dir)
     if state.finished:
@@ -2842,6 +3026,24 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         print(str(e), file=sys.stderr)
         return 1
     args.run_id = run_dir.name  # normalize so echoed hints show the full id
+    # Ahead of EVERY side effect, not delegated to _resume_paused_run's gate:
+    # this flow launches the interactive resolve session and re-arms the
+    # escalation before it reaches that helper, and refusing after either
+    # leaves the run re-armed-but-not-running (or a whole agent conversation
+    # thrown away). Same rule, same message shape as the resume gate.
+    if runs.run_id_aliases_control_session(run_dir.name):
+        print(
+            f"run {run_dir.name}: cannot resolve — its agent session name "
+            f"({runs.session_name(run_dir.name)}) is the control session's own, so "
+            "re-arming and resuming it would take over the live control session "
+            "(ids of this shape are now refused at creation; this run predates "
+            "that). The run directory and any worktree are intact: recover the "
+            f"work by hand, then remove the run with `bmad-loop delete "
+            f"{run_dir.name}` — stop and delete do not touch any session under "
+            "this name",
+            file=sys.stderr,
+        )
+        return 1
     state = load_state(run_dir)
     if state.paused_stage != PAUSE_ESCALATION:
         print(
@@ -3023,7 +3225,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     from .tui import launch  # import-safe: launch.py has no textual imports
 
     if launch.in_ctl_session():
-        # We are inside the TUI's bmad-loop-ctl window the user is attached to.
+        # We are inside the TUI's control-session window the user is attached to.
         # Tell them, hand the terminal back, and let the engine run on here — a
         # tmux pane keeps running after its client detaches.
         print(
@@ -3733,6 +3935,46 @@ def cmd_archive(args: argparse.Namespace) -> int:
     return 0
 
 
+def _warn_legacy_leftovers(leftovers: dict[str, list[str]]) -> None:
+    """Name what each legacy multiplexer registry still holds after the sweep.
+
+    Silent on the normal path — the list is empty on every platform without a
+    registry namespace and on every machine that never ran the pre-registry
+    build. When it is not empty, saying nothing would be the failure: cleanup
+    prints a removal count, and a count that quietly excludes sessions it chose
+    not to migrate reads as "everything is clean". stderr rather than stdout, the
+    `unverifiable_pid` precedent, so `cleanup > log` keeps the receipt; in
+    `--json` mode this lives in the document instead and stderr stays empty.
+
+    **One line per registry, naming it.** There is more than one legacy registry
+    now — psmux's default, and any root this process displaced — and the
+    operator's next action is to open the one holding these sessions. A message
+    that named the default for all of them sent the reader to a registry the
+    sessions are not in, and at documentation about a registry that is not
+    theirs. `runs.legacy_registry_leftovers` maps names to registries so this
+    does not have to guess, and omits a registry that holds nothing so no line
+    here points somewhere empty.
+
+    Points at the docs rather than printing a command. One of the things named
+    here is the machine-wide control session, and `psmux kill-session` on it kills
+    every child process in every one of its windows — including, on this
+    backend, a window still running an engine (the parked wrapper runs the
+    command first and parks only after it exits). A remedy this prints has to be
+    safe to run at the moment it is printed; that one is not, so the care lives
+    where there is room to state it.
+
+    Deliberately unconditional on dry-run: a preview that omits the remainder
+    would disagree with the run it is previewing."""
+    for registry, names in leftovers.items():
+        print(
+            f"left in {registry} (not migrated): "
+            + ", ".join(names)
+            + " — still running, ownership unprovable there, or the shared control "
+            "session; see docs/multiplexer-backends.md before removing any of them",
+            file=sys.stderr,
+        )
+
+
 def cmd_cleanup(args: argparse.Namespace) -> int:
     from .adapters.multiplexer import MultiplexerError
     from .tui import launch  # pure stdlib; no textual import
@@ -3741,6 +3983,12 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     # one partition sample drives the prune and every message below, so the
     # warnings and live count always match what was actually killed/skipped
     killed, live, unknown = runs.prune_sessions(project, dry_run=args.dry_run)
+    # Read AFTER the prune, and by presence: what is still standing in the legacy
+    # registry now that the sweep has run. On a dry run nothing was killed, so the
+    # ids just announced as would-kills are handed over to be excluded — the plan
+    # this command printed, never a second sample of it. Never raises (observation
+    # degrades to []).
+    leftovers = runs.legacy_registry_leftovers(project, announced=killed if args.dry_run else ())
     if not args.json:
         for run_id in sorted(unknown):
             # warn-only: unknown never blocks cleanup (same wording as delete/archive).
@@ -3788,6 +4036,10 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
                 windows_survived=survived,
                 windows_unverifiable=unverifiable,
                 scan_error=scan_error,
+                # Flattened: `sessions.legacy_leftovers` is a documented
+                # list of names and widening it would bump the schema. The
+                # grouping serves the text mode, which has room to say where.
+                legacy_leftovers=sorted({n for names in leftovers.values() for n in names}),
             )
         )
         return 0
@@ -3801,6 +4053,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
                 print(f"would close ctl window {name}")
         if live:
             print(f"leaving {len(live)} live session(s) untouched")
+        _warn_legacy_leftovers(leftovers)
         return 0
     # The count now excludes non-removals, so on stdout alone a smaller number is
     # indistinguishable from a quieter sweep — and `cleanup > log` keeps only
@@ -3818,6 +4071,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
         # Same wording as the TUI toast: one claim, one phrase, so an operator
         # moving between the two surfaces is reading the same thing.
         print(f"ctl window(s) still open after the kill: {', '.join(survived)}", file=sys.stderr)
+    _warn_legacy_leftovers(leftovers)
     if unverifiable:
         # Not "killed but unverifiable": kill_window is a silent no-op on a
         # transport failure, so whether the kill even reached the server is part

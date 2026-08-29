@@ -2764,6 +2764,101 @@ async def test_cleanup_sessions_mux_error_notifies(project, monkeypatch, fault, 
         assert isinstance(app.screen, DashboardScreen)  # worker failed soft, no crash
 
 
+@pytest.mark.parametrize(
+    "fault, toast",
+    [
+        (MultiplexerError("PSMUX_DATA_DIR='' is not an absolute path"), "not an absolute path"),
+        (UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"), "invalid start byte"),
+    ],
+)
+async def test_cleanup_sessions_session_prune_error_notifies(project, monkeypatch, fault, toast):
+    """The session half is raiser-side too, and the worker must fail as soft.
+
+    The psmux backend refuses a registry root that would fail its pre-spawn
+    absoluteness gate, and that raise happens before the tolerant listing
+    wrapper can degrade it — so `prune_sessions` can raise where every other
+    caller has a backstop that names the error. A worker thread has none, and
+    an escape takes the whole dashboard down (Textual's `exit_on_error`).
+
+    The opposite conclusion to its ctl-window twin above, on purpose: nothing
+    has been killed yet, so there is no completed work to keep reporting and
+    the worker stops. A summary toast here would claim a sweep that never ran.
+
+    Ablate the guard (call `prune_sessions` outside the try) and the app is no
+    longer on the dashboard — the worker's exception took it down."""
+    from bmad_loop import runs
+
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+
+    def boom(_p):
+        raise fault
+
+    monkeypatch.setattr(runs, "prune_sessions", boom)
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
+    make_run(project.project, "20260611-100000-aaaa")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("c")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        await until(pilot, lambda: any(toast in m for m in notifications(app)))
+        assert isinstance(app.screen, DashboardScreen)  # worker failed soft, no crash
+        # nothing ran, so nothing is summarised as having run
+        assert not any("removed" in m and "session(s)" in m for m in notifications(app))
+
+
+async def test_cleanup_warns_about_sessions_left_in_the_legacy_registry(project, monkeypatch):
+    """The cli cleanup arm's stderr line, as a toast.
+
+    The summary below it counts only what this registry's sweep removed, so a
+    tagged pre-upgrade session the migration pass declined to claim is silently
+    absent from it — and a count that quietly excludes them reads as "all
+    clean". Read after the prune, so it names what is left standing.
+
+    Ablate the toast and this fails; the twin CLI assertion lives in
+    `test_cli.py`, and the reader itself is unit-tested in `test_runs.py`."""
+    from bmad_loop import runs
+
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(runs, "prune_sessions", lambda _p: ([], [], set()))
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], []))
+    monkeypatch.setattr(
+        runs,
+        "legacy_registry_leftovers",
+        lambda _p: {
+            runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-ctl"],
+            r"D:	heir-own-registry": ["bmad-loop-old-1"],
+        },
+    )
+    make_run(project.project, "20260611-100000-aaaa")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("c")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        # One toast per registry, each naming its own — the CLI arm's twin.
+        # A single toast calling both "the default registry" sent an operator
+        # whose sessions are in their own displaced root to the wrong place.
+        await until(
+            pilot,
+            lambda: any(
+                f"1 session(s) left in {runs.DEFAULT_REGISTRY_LABEL}" in m
+                and "bmad-loop-ctl" in m
+                and "bmad-loop-old-1" not in m
+                for m in notifications(app)
+            ),
+        )
+        await until(
+            pilot,
+            lambda: any(
+                r"1 session(s) left in D:	heir-own-registry" in m and "bmad-loop-old-1" in m
+                for m in notifications(app)
+            ),
+        )
+
+
 async def test_cleanup_warns_about_ctl_windows_that_survived_the_kill(project, monkeypatch):
     # The summary counts only verified removals now (#435), so a window that
     # outlived its kill would otherwise just be missing from the toast with
@@ -3327,6 +3422,7 @@ def _stories_paused_run(
     root: Path,
     *,
     stage: str,
+    run_id: str = "20260611-100000-aaaa",
     story_key: str = "1",
     spec_status: str = "ready-for-dev",
     spec_checkpoint: bool = True,
@@ -3371,7 +3467,7 @@ def _stories_paused_run(
         task.commit_sha = commit_sha
     run_dir = make_run(
         root,
-        "20260611-100000-aaaa",
+        run_id,
         source="stories",
         spec_folder="epic-1",
         paused_stage=stage,
@@ -3432,6 +3528,65 @@ async def test_plan_checkpoint_replan_resets_and_resumes(project, monkeypatch):
         # own parent would be lexically confined and behaviourally inert (#593).
         assert resets == [(spec, "draft", project.project)]
         assert strips == [(spec, project.project)]
+
+
+async def test_plan_checkpoint_replan_refuses_a_control_alias_run_before_mutating(
+    project, monkeypatch
+):
+    """Through the ENTRY POINT (the modal's Replan button): a run persisted by
+    an older release under `ctl` must not have its spec reset to draft ahead
+    of the child `bmad-loop resume`'s refusal — the TUI is a second frontend
+    onto the same state, and it kept the mutate-then-refuse shape after the
+    CLI entry gates closed it.
+
+    Ablate `_blocked_by_control_alias` in `_do_replan` and this fails: the
+    spec is reset and the resume child is launched."""
+    from bmad_loop import devcontract
+
+    calls: list[str] = []
+    resets: list[tuple] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    monkeypatch.setattr(
+        devcontract, "reset_spec_status", lambda p, s, **kw: resets.append((p, s)) or True
+    )
+    monkeypatch.setattr(devcontract, "strip_auto_run_result", lambda p, **kw: True)
+    _stories_paused_run(project.project, stage="plan-checkpoint", run_id="ctl")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+        await pilot.click(await ready(pilot, "#act-replan"))
+        await until(pilot, lambda: not isinstance(app.screen, SpecReviewModal))
+        await pilot.pause()
+        assert resets == []  # the spec was NOT rewritten ahead of the refusal
+        assert calls == []  # and no resume child was launched to bounce off the CLI gate
+
+
+async def test_tui_rearm_refuses_a_control_alias_run_before_mutating(project, monkeypatch):
+    """The re-arm path (`_do_rearm`, resolve-modal Re-arm & resume) gates
+    ahead of `rearm_escalation` — the pre-launch mutation the launcher's own
+    chokepoint gate cannot protect. Direct method drive inside a running app
+    — the modal wiring is pinned by the existing checkpoint tests, and the
+    launch paths themselves (resume, resolve, and any future button) are
+    gated at their convergence, `launch.start_detached`, graded in
+    test_tui_launch.py.
+
+    Ablate `_blocked_by_control_alias` in `_do_rearm` and the rearm recorder
+    fills."""
+    from bmad_loop import runs
+
+    rearms: list[tuple] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    monkeypatch.setattr(runs, "rearm_escalation", lambda rd, sk, **kw: rearms.append((rd, sk)))
+    run_dir, _spec = _stories_paused_run(project.project, stage="plan-checkpoint", run_id="ctl")
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        app._do_rearm("ctl", run_dir, "1")
+        await pilot.pause()
+        assert rearms == []
 
 
 async def test_story_checkpoint_continue_resumes(project, monkeypatch):

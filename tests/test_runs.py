@@ -2468,7 +2468,7 @@ def test_delete_run_refuses_while_the_agent_session_is_live(tmp_path, monkeypatc
     dir is the only ownership proof a later prune can read, so the dir must outlive
     the session, not the other way round."""
     run_dir = _make_state_run(tmp_path, "r1")
-    monkeypatch.setattr(runs, "mux_sessions", lambda: ["bmad-loop-r1"])
+    monkeypatch.setattr(runs, "get_multiplexer", lambda: _LivenessMux(["bmad-loop-r1"]))
     with pytest.raises(runs.LiveSessionError, match="still live") as exc:
         runs.delete_run(tmp_path, run_dir)
     assert run_dir.exists()
@@ -2490,11 +2490,13 @@ def test_delete_run_ignores_a_session_proven_to_be_another_project_s(tmp_path, m
     has no override. Untagged still refuses: unread is not proof (see the
     degradation test above)."""
     run_dir = _make_state_run(tmp_path, "r1")
-    monkeypatch.setattr(runs, "mux_sessions", lambda: ["bmad-loop-r1"])
     monkeypatch.setattr(
         runs,
-        "session_project_tags",
-        lambda: {"bmad-loop-r1": runs.project_tag(tmp_path / "someone-else")},
+        "get_multiplexer",
+        lambda: _LivenessMux(
+            ["bmad-loop-r1"],
+            tags={"bmad-loop-r1": runs.project_tag(tmp_path / "someone-else")},
+        ),
     )
     runs.delete_run(tmp_path, run_dir)
     assert not run_dir.exists()
@@ -2505,9 +2507,10 @@ def test_delete_run_refuses_a_session_tagged_as_ours(tmp_path, monkeypatch):
     tag clears the guard". Our own tag proves nothing about whether the removal is
     safe — it only fails to prove the session foreign — so the refusal stands."""
     run_dir = _make_state_run(tmp_path, "r1")
-    monkeypatch.setattr(runs, "mux_sessions", lambda: ["bmad-loop-r1"])
     monkeypatch.setattr(
-        runs, "session_project_tags", lambda: {"bmad-loop-r1": runs.project_tag(tmp_path)}
+        runs,
+        "get_multiplexer",
+        lambda: _LivenessMux(["bmad-loop-r1"], tags={"bmad-loop-r1": runs.project_tag(tmp_path)}),
     )
     with pytest.raises(runs.LiveSessionError):
         runs.delete_run(tmp_path, run_dir)
@@ -2520,30 +2523,28 @@ def test_delete_run_proceeds_when_the_session_listing_raises(tmp_path, monkeypat
     bundled one answers `[]`. Both must reach the same place, or the guard would
     turn a transient transport error into a failed `delete`/`archive`/`clean` —
     and `clean` has no override. Degrading to "no session" matches what tmux
-    already does for a dead server."""
+    already does for a dead server. (A stronger contract — refuse on the raise —
+    was built on this branch and withdrawn: the guard's degrade is main's
+    documented decision, and the measured cost is filed for its owner.)"""
     run_dir = _make_state_run(tmp_path, "r1")
-
-    def boom():
-        raise MultiplexerError("transport down")
-
-    monkeypatch.setattr(runs, "mux_sessions", boom)
+    monkeypatch.setattr(runs, "get_multiplexer", lambda: _LivenessMux([], unanswerable=True))
     runs.delete_run(tmp_path, run_dir)
     assert not run_dir.exists()
 
 
 def test_delete_run_refuses_when_the_tag_read_raises(tmp_path, monkeypatch):
-    """The other read degrades the other way. By the time the tag is queried the
-    listing has already proven a session live, and a tag that could not be read is
-    not proof it is another project's — so it reads as untagged and the refusal
-    stands. Asserted separately from the listing case: one `except` returning the
-    wrong constant would otherwise hide behind the other."""
+    """The tag read degrades the other way. By the time the tag is queried the
+    probe has already proven a session live, and a tag that could not be read
+    is not proof it is another project's — so it reads as untagged and the
+    refusal stands. Asserted separately from the probe case: one `except`
+    landing the wrong constant would otherwise hide behind the other."""
     run_dir = _make_state_run(tmp_path, "r1")
 
-    def boom(*_args):
-        raise MultiplexerError("option read failed")
+    class _TagsBroken(_LivenessMux):
+        def session_options(self, option):
+            raise MultiplexerError("option read failed")
 
-    monkeypatch.setattr(runs, "mux_sessions", lambda: ["bmad-loop-r1"])
-    monkeypatch.setattr(runs, "session_project_tags", boom)
+    monkeypatch.setattr(runs, "get_multiplexer", lambda: _TagsBroken(["bmad-loop-r1"]))
     with pytest.raises(runs.LiveSessionError):
         runs.delete_run(tmp_path, run_dir)
     assert run_dir.exists()
@@ -2554,7 +2555,11 @@ def test_delete_run_matches_the_session_by_exact_run_id(tmp_path, monkeypatch):
     including one whose id merely extends ours — must not block this removal, or one
     live run would wedge cleanup for every id it prefixes."""
     run_dir = _make_state_run(tmp_path, "r1")
-    monkeypatch.setattr(runs, "mux_sessions", lambda: ["bmad-loop-r1-2", "bmad-loop-ctl", "r1"])
+    monkeypatch.setattr(
+        runs,
+        "get_multiplexer",
+        lambda: _LivenessMux(["bmad-loop-r1-2", "bmad-loop-ctl", "r1"]),
+    )
     runs.delete_run(tmp_path, run_dir)
     assert not run_dir.exists()
 
@@ -2681,6 +2686,26 @@ def test_delete_run_refuses_a_redirected_run_dir(tmp_path, level):
     with pytest.raises(platform_util.UnconfinedWriteError):
         runs.delete_run(project, run_dir, force=True)
     assert canary.is_file()
+
+
+def test_delete_run_never_consults_availability(tmp_path, monkeypatch):
+    """A regression this branch once shipped and withdrew: an arm that read
+    `mux_usable(False)` as session absence. Usability folds in helper binaries
+    and version gates — psmux with `pwsh` off PATH probes unavailable while its
+    server hosts this very session — so the guard must key on the listing
+    alone: a listable live session refuses even when `available()` is False.
+
+    Ablate by re-adding a `mux_usable` short-circuit ahead of the listing and
+    this fails with the run dir gone under the live session."""
+    run_dir = _make_state_run(tmp_path, "r1")
+    monkeypatch.setattr(
+        runs,
+        "get_multiplexer",
+        lambda: _LivenessMux(["bmad-loop-r1"], unavailable=True),
+    )
+    with pytest.raises(runs.LiveSessionError, match="still live"):
+        runs.delete_run(tmp_path, run_dir)
+    assert run_dir.exists()
 
 
 def _escalated_run(tmp_path, spec_text, *, restore_patch_stale=None, git_project=False):
@@ -3177,7 +3202,9 @@ def test_archive_run_refuses_while_the_agent_session_is_live(tmp_path, monkeypat
     """Same backstop as delete (#419), and it runs before the tarball is written —
     a refusal must not leave a half-archived run behind for the operator to find."""
     run_dir = _make_state_run(tmp_path, "20260611-100000-aaaa")
-    monkeypatch.setattr(runs, "mux_sessions", lambda: ["bmad-loop-20260611-100000-aaaa"])
+    monkeypatch.setattr(
+        runs, "get_multiplexer", lambda: _LivenessMux(["bmad-loop-20260611-100000-aaaa"])
+    )
     with pytest.raises(runs.LiveSessionError, match="still live"):
         runs.archive_run(tmp_path, run_dir)
     assert run_dir.exists()
@@ -3833,3 +3860,1278 @@ def test_project_of_a_real_run_dir_is_the_project_root(tmp_path):
     run_dir = _make_state_run(tmp_path, "r1")
 
     assert runs._project_of_run_dir(run_dir) == tmp_path
+
+
+# ------------------------------------------------- psmux registry root (#537)
+
+
+def test_mux_registry_root_lives_under_the_projects_state_subtree(tmp_path):
+    root = runs.mux_registry_root(tmp_path)
+    assert root == runs.project_state_root(tmp_path) / runs.MUX_REGISTRY_DIR
+    assert root.parent.name == runs.project_tag(tmp_path)
+    assert root.is_absolute()
+
+
+def test_mux_registry_root_can_never_collide_with_a_run(tmp_path):
+    """`--run-id` is caller-supplied, so a run whose id spelled the registry's
+    directory name would key its state dir ONTO the registry — the run's control
+    plane and every live server's addressing files in one directory, each side
+    deleting the other's entries. The leading underscore is what makes that
+    unreachable: RUN_ID_RE requires an alphanumeric first character. Ablate it
+    (name the directory `mux`) and this fails."""
+    assert not runs.is_valid_run_id(runs.MUX_REGISTRY_DIR)
+    assert runs.mux_registry_root(tmp_path) != runs.state_dir_for(tmp_path, "mux")
+
+
+def test_mux_registry_root_agrees_across_two_spellings_of_one_project(tmp_path):
+    """The whole cross-process contract: two processes reaching one project by
+    different paths must land on the SAME registry, or each reads the other's
+    live sessions as gone. Guaranteed by project_tag resolving first, which is
+    why the root reuses it rather than deriving a second identity."""
+    nested = tmp_path / "a" / "b"
+    nested.mkdir(parents=True)
+    detoured = tmp_path / "a" / ".." / "a" / "b"
+    assert runs.mux_registry_root(nested) == runs.mux_registry_root(detoured)
+
+
+def test_mux_registry_root_separates_two_projects(tmp_path):
+    one, two = tmp_path / "one", tmp_path / "two"
+    one.mkdir()
+    two.mkdir()
+    assert runs.mux_registry_root(one) != runs.mux_registry_root(two)
+
+
+def test_export_psmux_registry_root_sets_the_derived_root(tmp_path, monkeypatch):
+    monkeypatch.delenv(runs.PSMUX_DATA_DIR, raising=False)
+    expected = str(runs.mux_registry_root(tmp_path))
+    assert runs.export_psmux_registry_root(tmp_path) == expected
+    assert os.environ[runs.PSMUX_DATA_DIR] == expected
+
+
+def test_export_psmux_registry_root_overrides_an_operators_own(tmp_path, monkeypatch):
+    """The rule, and the absence of an exception to it is the point: the root is
+    derived from (project, state root), full stop, so two bmad-loop processes
+    given one project cannot land in different registries.
+
+    Honouring an ambient value was tried and is the thing that was cut. It makes
+    the registry a function of the launch *shell* — a TUI from the Start menu
+    derives while a run from a dev shell whose profile exports a root honours it,
+    two registries on one machine — and no rule can be right for both operators,
+    because the process that finds a root in its environment cannot tell one
+    typed in this shell alone from one the profile exports into every shell.
+
+    Ablate the unconditional export (restore an if-unset guard) and this fails."""
+    theirs = str(tmp_path / "theirs")
+    derived = str(runs.mux_registry_root(tmp_path))
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, theirs)
+
+    assert runs.export_psmux_registry_root(tmp_path) == derived
+    assert os.environ[runs.PSMUX_DATA_DIR] == derived
+
+
+@pytest.mark.parametrize("ambient", ["", "relative/root", ".", "/an/absolute/one"])
+def test_export_psmux_registry_root_overrides_any_ambient_spelling(tmp_path, monkeypatch, ambient):
+    """Including the ones psmux would panic on. An earlier rule left a relative or
+    empty value untouched so as not to countermand something the operator typed —
+    which, now that nothing ambient is honoured, only preserved a value that makes
+    every verb fail. Replacing it is strictly better: the derived root works."""
+    derived = str(runs.mux_registry_root(tmp_path))
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, ambient)
+
+    assert runs.export_psmux_registry_root(tmp_path) == derived
+    assert os.environ[runs.PSMUX_DATA_DIR] == derived
+
+
+def test_export_psmux_registry_root_is_indifferent_to_being_inside_a_pane(tmp_path, monkeypatch):
+    """A pane child derives exactly what a clean process derives — the convergence
+    four rounds of inherited-token designs were trying to buy, and which having no
+    token buys outright.
+
+    psmux hands a pane child the server's whole environment (measured on 3.3.8),
+    so `bmad-loop --project B` from a pane of project A's session arrives carrying
+    A's root; it must still get B's. And it must get the same answer whether or
+    not it is in a pane at all, since pane-ness says nothing about which registry
+    a project's sessions belong in."""
+    a_root = str(tmp_path / "registry-A")
+    project_b = tmp_path / "B"
+    project_b.mkdir()
+    derived = str(runs.mux_registry_root(project_b))
+
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, a_root)
+    monkeypatch.setenv("TMUX", "/tmp/psmux-1000/default,123,0")  # inside a pane
+    assert runs.export_psmux_registry_root(project_b) == derived
+
+    monkeypatch.delenv("TMUX", raising=False)  # and outside one
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, a_root)
+    assert runs.export_psmux_registry_root(project_b) == derived
+
+
+def test_export_psmux_registry_root_converges_a_pane_child_that_moves_the_state_root(
+    tmp_path, monkeypatch
+):
+    """The scenario every round of review found a way to break, in its final form:
+    whatever a pane child concludes is what a clean process under the same
+    conditions concludes — for a pinned root and a derived one alike, because
+    there is no longer a difference between them.
+
+    The registry lives under the state root, so a child running under a different
+    one must re-derive; keeping the parent's would put it where nothing else
+    looks."""
+    pinned = str(tmp_path / "pinned")
+    monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "S1"))
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, pinned)
+    under_s1 = runs.export_psmux_registry_root(tmp_path)
+
+    # the pane child, carrying S1's settled root, now under S2
+    monkeypatch.setenv("TMUX", "/tmp/psmux-1000/default,123,0")
+    monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "S2"))
+    child = runs.export_psmux_registry_root(tmp_path)
+
+    # a clean process under S2: no pane, no inherited root
+    monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.delenv(runs.PSMUX_DATA_DIR, raising=False)
+    clean = runs.export_psmux_registry_root(tmp_path)
+
+    # ...and one under S2 whose PROFILE exports the pin into every shell
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, pinned)
+    clean_pinned = runs.export_psmux_registry_root(tmp_path)
+
+    assert child != under_s1 and child != pinned
+    assert child == clean == clean_pinned == str(runs.mux_registry_root(tmp_path))
+
+
+def test_pinned_state_env_resolves_rather_than_forwards(tmp_path, monkeypatch):
+    """What travels is the answer this process reached, not the override it was
+    handed. Forwarding only when the operator set something leaves the common case
+    — no override at all — with nothing to pass, and that is exactly the case
+    `PSMUX_BARE_ENV=1` also breaks: its allowlist drops `LOCALAPPDATA` and
+    `XDG_STATE_HOME` too, so a child there cannot recompute the default either.
+
+    Ablate the resolve (return the raw environment value, or `{}` when unset) and
+    the second half fails."""
+    monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "S"))
+    assert runs.pinned_state_env() == {envvars.STATE_DIR: str(runs.state_root())}
+
+    monkeypatch.delenv(envvars.STATE_DIR, raising=False)
+    assert runs.pinned_state_env() == {envvars.STATE_DIR: str(runs.state_root())}
+
+
+def test_pinned_state_env_degrades_on_an_underivable_state_root(monkeypatch):
+    """`{}` rather than a raise: a child told nothing derives its own answer and
+    fails on the same broken environment with its own message, which beats a
+    launcher that cannot report anything at all.
+
+    Ablate the `except StateRootError` and this raises."""
+
+    def boom():
+        raise runs.StateRootError("no state root")
+
+    monkeypatch.setattr(runs, "state_root", boom)
+    assert runs.pinned_state_env() == {}
+
+
+class _NamespaceStub:
+    """Duck-typed mux answering only the namespace question — all
+    ctl_session_for consults."""
+
+    def __init__(self, namespaced):
+        self._namespaced = namespaced
+
+    def has_registry_namespace(self):
+        return self._namespaced
+
+
+def test_ctl_session_for_is_fixed_without_a_registry_namespace(tmp_path):
+    """tmux keeps the machine-shared `bmad-loop-ctl` byte-identically — the
+    shared session is correct there and every pinned tmux argv depends on it.
+
+    Ablate the `has_registry_namespace()` arm (suffix always) and this fails."""
+    assert runs.ctl_session_for(tmp_path, _NamespaceStub(False)) == runs.CTL_SESSION
+
+
+def test_ctl_session_for_carries_the_registry_identity(tmp_path, monkeypatch):
+    """On a namespacing transport the name is per REGISTRY, because psmux's
+    duplicate-server mutex is keyed on the session name alone, machine-wide
+    (`Local\\psmux-session-{name}`, source-read at v3.3.8): a fixed name lets
+    only one registry on the machine hold a control session, and the second
+    project's create is rejected as a duplicate server (measured: rc 1). Both
+    axes of the registry key must move the name — a project-only tag would
+    recreate the collision for one project under two state roots.
+
+    Ablate the suffix (return the fixed name always) and every assertion but
+    the stability one fails; key the suffix on `project_tag` alone and the
+    state-root case fails."""
+    mux = _NamespaceStub(True)
+    a, b = tmp_path / "proj-a", tmp_path / "proj-b"
+    a.mkdir()
+    b.mkdir()
+
+    name_a = runs.ctl_session_for(a, mux)
+    name_b = runs.ctl_session_for(b, mux)
+    assert name_a.startswith(runs.CTL_SESSION + "-") and name_b.startswith(runs.CTL_SESSION + "-")
+    assert name_a != name_b  # two projects, two registries, two names
+    assert runs.ctl_session_for(a, mux) == name_a  # stable per registry
+
+    # ...and the OTHER axis of the registry key: same project, moved state root
+    monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "S2"))
+    assert runs.ctl_session_for(a, mux) != name_a
+
+
+def test_ctl_session_for_converges_across_spellings_of_one_root(tmp_path, monkeypatch):
+    """Two spellings of one state root reach ONE physical registry (the OS
+    resolves both to the same files; psmux keeps the spelling only while
+    constructing those paths — src/paths.rs:79, source-read at v3.3.8), so
+    they must mint ONE control-session name: an as-spelled digest gave the
+    same registry two ctl sessions, each blind to the other's parked windows.
+
+    Ablate the `.resolve()` in ctl_session_for and this fails."""
+    mux = _NamespaceStub(True)
+    project = tmp_path / "proj"
+    project.mkdir()
+    (tmp_path / "state").mkdir()
+    (tmp_path / "alias").mkdir()
+    plain = str(tmp_path / "state")
+    detour = str(tmp_path / "alias" / ".." / "state")
+    assert plain != detour  # the premise: two spellings, not one
+
+    monkeypatch.setenv(envvars.STATE_DIR, plain)
+    name_plain = runs.ctl_session_for(project, mux)
+    monkeypatch.setenv(envvars.STATE_DIR, detour)
+    name_detour = runs.ctl_session_for(project, mux)
+
+    assert name_plain.startswith(runs.CTL_SESSION + "-")
+    assert name_plain == name_detour
+
+
+def test_ctl_session_for_degrades_to_the_fixed_name(tmp_path, monkeypatch):
+    """The underivable arm runs on the transport's shared default registry —
+    the one place psmux is in the tmux-shaped world where a shared session
+    scoped by window tags is correct, and where a pre-#537 legacy ctl session
+    under the fixed name may exist to be reused rather than collided with."""
+    monkeypatch.setenv(envvars.STATE_DIR, "relative-root")
+    assert runs.ctl_session_for(tmp_path, _NamespaceStub(True)) == runs.CTL_SESSION
+
+
+def test_is_ctl_session_name_shapes():
+    """Exactly the shapes ctl_session_for can mint — the fixed name and a
+    16-hex suffix. An arbitrary suffix is NOT a control session: it is the
+    agent session of a run an older release accepted (`--run-id ctl-foo`),
+    and reading it as a control session made it unreachable by stop and the
+    prune both. Ablate the 16-hex narrowing (back to any `-` suffix) and the
+    arbitrary-suffix refusals fail."""
+    assert runs.is_ctl_session_name(runs.CTL_SESSION)
+    assert runs.is_ctl_session_name(runs.CTL_SESSION + "-0123456789abcdef")
+    assert not runs.is_ctl_session_name("bmad-loop-ctl2")  # no `-` boundary
+    assert not runs.is_ctl_session_name("bmad-loop-20260825-000000-run1")
+    assert not runs.is_ctl_session_name("")
+    # historical agent-session shapes, not control sessions:
+    assert not runs.is_ctl_session_name("bmad-loop-ctl-foo")
+    assert not runs.is_ctl_session_name("bmad-loop-ctl-0123456789abcde")  # 15 hex
+    assert not runs.is_ctl_session_name("bmad-loop-ctl-0123456789abcdeff")  # 17 hex
+    assert not runs.is_ctl_session_name(
+        "bmad-loop-ctl-0123456789ABCDEF"
+    )  # case: exact-name predicate
+
+
+def test_agent_run_id_never_reads_a_ctl_session_as_a_run():
+    """`bmad-loop-ctl-<16hex>` strips to `ctl-<16hex>`, which RUN_ID_RE admits —
+    so without the control-alias exclusion the prune partition would treat
+    this project's own control session as an untagged agent session, making
+    the prune a kill path into the control plane. Ablate the
+    `run_id_aliases_control_session` check in `_agent_run_id` and this
+    fails."""
+    assert runs._agent_run_id(runs.CTL_SESSION) is None
+    assert runs._agent_run_id(runs.CTL_SESSION + "-0123456789abcdef") is None
+    assert runs._agent_run_id("bmad-loop-20260825-000000-run1") == "20260825-000000-run1"
+
+
+def test_agent_run_id_reads_a_historical_ctl_prefixed_run():
+    """The inverse boundary: `bmad-loop-ctl-foo` is NOT a control session — it
+    is the agent session of a run an older release accepted as `--run-id
+    ctl-foo` — and the parse must return its id or the sweep can never reach
+    the session (the mint refuses the shape, so nothing new can collide).
+    Ablate the parse back to `is_valid_run_id` (the mint's broad reservation)
+    and this fails."""
+    assert runs._agent_run_id("bmad-loop-ctl-foo") == "ctl-foo"
+    assert not runs.is_valid_run_id("ctl-foo")  # ...while the mint still refuses it
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "ctl",
+        "ctl-0123456789abcdef",
+        "ctl-x",
+        "ctl-run-1",
+        # case variants: psmux resolves session names through a case-folding
+        # filesystem, so `bmad-loop-CTL-<digest>` addresses — and kills — the
+        # lowercase control session (measured on 3.3.8)
+        "CTL",
+        "Ctl-0123456789abcdef",
+        "cTl-x",
+    ],
+)
+def test_run_id_of_the_ctl_shape_is_refused(bad):
+    """The control-session namespace is reserved: `session_name("ctl")` IS the
+    fixed control session, and `session_name("ctl-<16hex>")` can equal a
+    per-registry one exactly — the adapter would adopt the live control
+    session as the run's agent session and the run's teardown would kill it.
+    Case-insensitively, because the adoption and the kill both go through the
+    multiplexer's case-folding name resolution on Windows.
+
+    Ablate the `is_reserved_run_id(value)` clause and every case fails;
+    ablate only the `.lower()` inside `is_reserved_run_id` and the case
+    variants fail."""
+    assert not runs.is_valid_run_id(bad)
+    # every refusal here is exactly the reservation — the overlap with the
+    # control-session namespace under the platform's worst-case name folding
+    assert runs.is_reserved_run_id(bad)
+
+
+@pytest.mark.parametrize("near_miss", ["ctl2", "CTL2", "ctlfoo", "ctl_x", "controller-1"])
+def test_run_id_reservation_stops_at_the_ctl_shape(near_miss):
+    """The inverse sweep: ids that merely start with `ctl` stay valid — the
+    reservation is the predicate's own boundary (`ctl`, `ctl-…`), not a
+    prefix ban, and the case fold widens no further than the shape."""
+    assert runs.is_valid_run_id(near_miss)
+
+
+def test_ctl_session_for_folds_case_only_where_the_filesystem_does(tmp_path, monkeypatch):
+    """Two case spellings of a NOT-YET-created state root: `resolve()` can
+    return stored case only for a path that exists, and the registry root
+    usually does not exist at name time — so the digest folds case itself,
+    via `os.path.normcase`. On Windows both spellings land in ONE physical
+    registry (the `.port` files open case-insensitively), so they must mint
+    one name; on POSIX case is significant — two case spellings ARE two
+    registries and must keep two names.
+
+    Ablate the normcase and the win32 arm fails; replace it with an
+    unconditional `str.lower` and the POSIX arm fails."""
+    mux = _NamespaceStub(True)
+    project = tmp_path / "proj"
+    project.mkdir()
+    monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "MiXeD-State"))  # never created
+    name_mixed = runs.ctl_session_for(project, mux)
+    monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "mixed-state"))  # never created
+    name_lower = runs.ctl_session_for(project, mux)
+    if sys.platform == "win32":
+        assert name_mixed == name_lower
+    else:
+        assert name_mixed != name_lower
+
+
+def test_kill_session_never_addresses_a_control_session_alias():
+    """An id that aliases a control session (`ctl`, `ctl-<16 hex>`, folded)
+    can only address the control plane, so its kill is skipped — reachable
+    only through run dirs an older release persisted, replayed by `stop`,
+    `delete` and resume's stale-session sweep. A historical `ctl-foo` id is
+    NOT an alias: its `bmad-loop-ctl-foo` session is a genuine agent session,
+    distinct and exactly addressable, and skipping it stranded the session
+    (the prune already refuses the id, so nothing else could reach it).
+
+    Ablate the guard and the alias cases fail; widen the alias test back to
+    every ctl-* shape and the `ctl-foo` case fails."""
+    killed = []
+
+    class _Recorder:
+        def kill_session(self, name):
+            killed.append(name)
+
+    runs.kill_session("ctl", _Recorder())
+    runs.kill_session("ctl-0123456789abcdef", _Recorder())
+    runs.kill_session("CTL-0123456789ABCDEF", _Recorder())
+    assert killed == []
+    runs.kill_session("ctl-foo", _Recorder())  # historical agent session: killable
+    runs.kill_session("20260826-000000-run1", _Recorder())
+    assert killed == ["bmad-loop-ctl-foo", "bmad-loop-20260826-000000-run1"]
+
+
+class _LivenessMux:
+    """Duck-typed mux for live_session_may_be_ours: transport-controlled name
+    key (`fold`), a listing that raises when `unanswerable` (the out-of-tree
+    seam shape the guard's degrade arm exists for), foldable tags.
+    `unavailable` drives `available()` only — the guard must never consult
+    availability, which is exactly what the degraded-backend test grades."""
+
+    def __init__(self, sessions, tags=None, fold=False, unanswerable=False, unavailable=False):
+        self._sessions = sessions
+        self._tags = tags or {}
+        self._fold = fold
+        self._unanswerable = unanswerable
+        self._unavailable = unavailable
+
+    def available(self):
+        return not self._unavailable
+
+    def session_name_key(self, name):
+        return name.lower() if self._fold else name
+
+    def has_registry_namespace(self):
+        return False  # tmux-shaped: ctl_session_for answers the fixed name
+
+    def list_sessions(self):
+        if self._unanswerable:
+            raise MultiplexerError("simulated transport failure")
+        return list(self._sessions)
+
+    def session_options(self, option):
+        if self._unanswerable:
+            raise MultiplexerError("simulated transport failure")
+        return dict(self._tags)
+
+
+def test_live_session_may_be_ours_compares_names_the_transports_way(tmp_path, monkeypatch):
+    """Two layers of the same rule. The discount answers the INSTANCE question
+    — "is this name the control session this process addresses" — never the
+    shape question (round-17: the shape discount destroyed a tmux run dir
+    under a live `ctl-<16 hex>` agent). And every name comparison goes
+    through the transport's `session_name_key`, never a constant fold: tmux
+    is case-sensitive (measured on 3.4 — `bmad-loop-ctl` and `bmad-loop-CTL`
+    coexist), so the unconditional `.lower()` discounted a persisted `CTL`
+    run's genuinely live uppercase agent as "the control session" and its
+    run dir was deleted.
+
+    Ablate the discount entirely and the `ctl` case fails; restore the
+    round-16 shape predicate and the tmux digest case fails; restore the
+    round-17 constant fold (base `session_name_key` returning `lower()`)
+    and the tmux `CTL` case fails."""
+    sessions = [
+        "bmad-loop-ctl",
+        "bmad-loop-CTL",
+        "bmad-loop-ctl-foo",
+        "bmad-loop-ctl-0123456789abcdef",
+        "bmad-loop-ctl-aaaabbbbccccdddd",
+    ]
+
+    # tmux shape: case-sensitive, the only control session is the fixed name
+    monkeypatch.setattr(runs, "get_multiplexer", lambda: _LivenessMux(sessions, fold=False))
+    monkeypatch.setattr(runs, "ctl_session_for", lambda project, mux=None: runs.CTL_SESSION)
+    assert not runs.live_session_may_be_ours(tmp_path, "ctl")
+    # a case-variant is a DIFFERENT, coexisting session on tmux — live evidence
+    assert runs.live_session_may_be_ours(tmp_path, "CTL")
+    # ...and a digest-shaped id is a genuine agent session there
+    assert runs.live_session_may_be_ours(tmp_path, "ctl-0123456789abcdef")
+    assert runs.live_session_may_be_ours(tmp_path, "ctl-foo")
+
+    # psmux shape: the transport folds, so the case-variant IS the control session
+    monkeypatch.setattr(runs, "get_multiplexer", lambda: _LivenessMux(sessions, fold=True))
+    assert not runs.live_session_may_be_ours(tmp_path, "CTL")
+    # this project's derived name is also the control session's
+    monkeypatch.setattr(
+        runs, "ctl_session_for", lambda project, mux=None: "bmad-loop-ctl-aaaabbbbccccdddd"
+    )
+    assert not runs.live_session_may_be_ours(tmp_path, "ctl-aaaabbbbccccdddd")
+    # ...while an OTHER digest in this registry is still not the control session
+    assert runs.live_session_may_be_ours(tmp_path, "ctl-0123456789abcdef")
+
+
+def test_live_session_may_be_ours_degrades_an_unanswerable_listing_to_absent(tmp_path, monkeypatch):
+    """Observation degrades — the guard's documented contract, restored over
+    this branch's withdrawn raise-propagation: a listing that cannot answer
+    reads as "no session", the same answer the bundled backend gives for a
+    missing multiplexer or a dead server. The control-name discount still
+    answers before any probe at all, so the recovery `bmad-loop delete ctl`
+    needs no transport."""
+    monkeypatch.setattr(
+        runs, "get_multiplexer", lambda: _LivenessMux([], fold=False, unanswerable=True)
+    )
+    monkeypatch.setattr(runs, "ctl_session_for", lambda project, mux=None: runs.CTL_SESSION)
+    assert not runs.live_session_may_be_ours(tmp_path, "20260826-000000-run1")
+    assert not runs.live_session_may_be_ours(tmp_path, "ctl")
+
+
+def test_live_session_may_be_ours_degrades_an_unselectable_backend_to_absent(tmp_path, monkeypatch):
+    """Selection is part of the listing read, so it degrades the listing's way.
+
+    `mux_sessions()` selects the backend *inside* the call the guard catches, so
+    a persisted `[mux] backend` naming a backend that is no longer registered has
+    always read as "no live session" — a misconfigured host still gets a working
+    `delete`/`archive`/`clean`. Naming the backend outside the handler turns that
+    degrade into an abort on every removal path, including `clean`, which has no
+    `--force`.
+
+    Ablation: hoist the selection back above the `try` and this fails with the
+    `MultiplexerError` the misconfiguration raises."""
+
+    def unselectable():
+        raise MultiplexerError("[mux] backend = 'ghost' matches no registered backend")
+
+    monkeypatch.setattr(runs, "get_multiplexer", unselectable)
+    assert not runs.live_session_may_be_ours(tmp_path, "20260826-000000-run1")
+    # ...and the control-name discount needs the transport too, so it degrades alike
+    assert not runs.live_session_may_be_ours(tmp_path, "ctl")
+
+
+def test_prune_sessions_claims_a_historical_ctl_prefixed_session(tmp_path, monkeypatch):
+    """End to end through the sweep: a `bmad-loop-ctl-foo` session minted by an
+    older release (`--run-id ctl-foo`), untagged, with this project's dead run
+    dir as ownership proof, is prunable in the project's own registry — the
+    round-16 leak was this exact session being unreachable by both `stop` and
+    the prune. Ablate `_agent_run_id`'s wellformed-not-valid split and this
+    fails (the id never enters the partition)."""
+    (_make_state_run(tmp_path, "ctl-foo") / "engine.pid").write_text(str(_dead_pid()))
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, str(runs.mux_registry_root(tmp_path)))
+    monkeypatch.setattr(runs, "mux_sessions", lambda: ["bmad-loop-ctl-foo"])
+    monkeypatch.setattr(runs, "session_project_tags", lambda: {})
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [])
+
+    assert runs.prune_sessions(tmp_path, dry_run=True) == (["ctl-foo"], [], set())
+
+
+def test_no_valid_run_id_can_mint_the_control_session_name(tmp_path):
+    """The reviewer's reproduction, pinned end to end: read the live per-registry
+    control-session name, replay its suffix as a --run-id, and the id is
+    refused before `session_name` can alias the two session types. Covers the
+    fixed name too — `--run-id ctl` minted `bmad-loop-ctl` itself, on every
+    transport."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    ctl = runs.ctl_session_for(project, _NamespaceStub(True))
+    colliding_id = ctl[len("bmad-loop-") :]
+    assert runs.session_name(colliding_id) == ctl  # the alias, were the id valid
+    assert not runs.is_valid_run_id(colliding_id)
+    # ...nor its case variants: a Windows multiplexer resolves the uppercase
+    # target onto the lowercase control session (measured on psmux 3.3.8)
+    assert not runs.is_valid_run_id(colliding_id.upper())
+    assert runs.session_name("ctl") == runs.CTL_SESSION
+    assert not runs.is_valid_run_id("ctl")
+
+
+def test_pin_state_root_overwrites_a_colliding_entry(tmp_path, monkeypatch):
+    """The chokepoint's derivable arm: a caller-supplied (profile `[env]`)
+    `BMAD_LOOP_STATE_DIR` is forced to this process's resolved root; other
+    keys pass through untouched.
+
+    Ablate the assignment (return `dict(env)` unchanged) and this fails."""
+    monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "S1"))
+    pinned = runs.pin_state_root({"CALLER": "1", envvars.STATE_DIR: str(tmp_path / "S2")})
+    assert pinned == {"CALLER": "1", envvars.STATE_DIR: str(runs.state_root())}
+
+
+def test_pin_state_root_strips_the_entry_when_no_root_derives(monkeypatch):
+    """The chokepoint's underivable arm — the round-11 gap: with no pin key to
+    spread, an ordering rule protects nothing, so the key is REMOVED instead.
+    The child then inherits the parent's own broken value and fails as the
+    parent fails, rather than being aimed at a state root — and so a
+    per-project registry — its parent cannot see.
+
+    Ablate the `pop` (leave the caller's entry standing) and this fails."""
+    monkeypatch.setenv(envvars.STATE_DIR, "relative-root")  # underivable
+    pinned = runs.pin_state_root({"CALLER": "1", envvars.STATE_DIR: r"C:\S2"})
+    assert pinned == {"CALLER": "1"}
+
+
+def test_export_psmux_registry_root_degrades_on_an_underivable_state_root(tmp_path, monkeypatch):
+    """Runs ahead of every command, `diagnose` and `validate` included, so a
+    broken environment must not take the diagnostics down with it."""
+
+    def boom(_project):
+        raise runs.StateRootError("no state root")
+
+    monkeypatch.delenv(runs.PSMUX_DATA_DIR, raising=False)
+    monkeypatch.setattr(runs, "project_state_root", boom)
+    assert runs.export_psmux_registry_root(tmp_path) is None
+    assert runs.PSMUX_DATA_DIR not in os.environ
+
+    # And an ambient value is left exactly as found here — the one case there is
+    # nothing better to put in its place. `bmad-loop mux` reports that the root in
+    # force is not bmad-loop's, rather than calling it derived.
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, "/whatever/they/had")
+    assert runs.export_psmux_registry_root(tmp_path) is None
+    assert os.environ[runs.PSMUX_DATA_DIR] == "/whatever/they/had"
+
+
+def test_orphan_state_sweep_never_reaps_the_registry(tmp_path):
+    """The registry holds the .port/.key files every psmux verb resolves a
+    session through; sweeping it while a server is up leaves that server alive,
+    unreachable, and invisible to `psmux ls` in any registry. Ablate the guard
+    (drop the MUX_REGISTRY_DIR arm) and this fails, since `mux` is never a live
+    run dir name — the sibling below is the other half, proving the guard did not
+    simply stop the sweep."""
+    registry = runs.mux_registry_root(tmp_path)
+    registry.mkdir(parents=True)
+    port = registry / "bmad-loop-r1.port"
+    port.write_text("54321\n")
+
+    assert runs.reconcile_orphan_state_dirs(tmp_path) == []
+    assert port.exists()
+
+
+def test_orphan_state_sweep_still_reaps_a_real_orphan_beside_the_registry(tmp_path):
+    """The ablation's other half: sparing `mux` must not spare the orphan run
+    dirs the sweep exists for."""
+    runs.mux_registry_root(tmp_path).mkdir(parents=True)
+    orphan = runs.state_dir_for(tmp_path, "20260101-000000-dead")
+    orphan.mkdir(parents=True)
+
+    assert runs.reconcile_orphan_state_dirs(tmp_path) == [orphan]
+    assert not orphan.exists()
+    assert runs.mux_registry_root(tmp_path).exists()
+
+
+class _RegistryMux:
+    """A backend bound to one registry, standing in for the cleanup sweep's
+    second pass. Only the verbs the partition, the kill and the remainder use.
+
+    `root` is what `registry_root()` answers: `None` is psmux's own default
+    registry (the seam deliberately never respells its home cascade), which the
+    remainder labels `runs.DEFAULT_REGISTRY_LABEL`.
+
+    `fold` is the transport's name comparison: the seam's identity default
+    (tmux, exact) unless set, `name.lower()` when set (psmux, whose registry is
+    a directory of per-session files NTFS opens case-insensitively)."""
+
+    def __init__(self, sessions, tags, root=None, fold=False):
+        self._sessions, self._tags = sessions, tags
+        self._root = root
+        self._fold = fold
+        self.killed: list[str] = []
+
+    def registry_root(self):
+        return self._root
+
+    def session_name_key(self, name):
+        return name.lower() if self._fold else name
+
+    def list_sessions(self):
+        return list(self._sessions)
+
+    def session_options(self, _option):
+        return dict(self._tags)
+
+    def kill_session(self, name):
+        self.killed.append(name)
+
+
+def test_prune_sessions_sweeps_a_legacy_registry(tmp_path, monkeypatch):
+    """Sessions created before the per-project root existed are addressable only
+    from a backend bound to the old registry; without the second pass cleanup
+    reports a clean sweep while their servers run on."""
+    monkeypatch.setattr(runs, "mux_sessions", lambda: [])
+    monkeypatch.setattr(runs, "session_project_tags", lambda: {})
+    monkeypatch.setattr(runs, "engine_liveness", lambda _d: "dead")
+    legacy = _RegistryMux(["bmad-loop-old-1"], {"bmad-loop-old-1": runs.project_tag(tmp_path)})
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
+
+    assert runs.prune_sessions(tmp_path) == (["old-1"], [], set())
+    assert legacy.killed == ["bmad-loop-old-1"]
+
+
+def test_prune_sessions_leaves_another_projects_session_in_the_legacy_registry(
+    tmp_path, monkeypatch
+):
+    """The second pass buys no extra reach: ownership is judged by the same
+    partition, so a neighbouring project's sessions — and the operator's own
+    psmux sessions — are skipped there exactly as they are in the primary pass."""
+    monkeypatch.setattr(runs, "mux_sessions", lambda: [])
+    monkeypatch.setattr(runs, "session_project_tags", lambda: {})
+    legacy = _RegistryMux(["bmad-loop-old-1"], {"bmad-loop-old-1": "0123456789abcdef"})
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
+
+    assert runs.prune_sessions(tmp_path) == ([], [], set())
+    assert legacy.killed == []
+
+
+def test_prune_sessions_dry_run_kills_nothing_in_a_legacy_registry(tmp_path, monkeypatch):
+    monkeypatch.setattr(runs, "mux_sessions", lambda: [])
+    monkeypatch.setattr(runs, "session_project_tags", lambda: {})
+    monkeypatch.setattr(runs, "engine_liveness", lambda _d: "dead")
+    legacy = _RegistryMux(["bmad-loop-old-1"], {"bmad-loop-old-1": runs.project_tag(tmp_path)})
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
+
+    assert runs.prune_sessions(tmp_path, dry_run=True) == (["old-1"], [], set())
+    assert legacy.killed == []
+
+
+def test_prune_sessions_carries_an_unknown_pid_out_of_the_legacy_registry(tmp_path, monkeypatch):
+    """The legacy pass reports an unverifiable engine pid like the primary one.
+
+    `unknown` is the killed subset whose liveness could not be read (win32
+    ERROR_ACCESS_DENIED), and every cleanup frontend turns it into the "may
+    still be live" warning. A session swept out of a legacy registry is exactly
+    as unverifiable as one swept here, and the union in `prune_sessions` is what
+    carries it — an arm that stayed green for years because the sibling tests
+    stubbed `engine_liveness` with a tuple, which compares equal to neither
+    "alive" nor "unknown".
+
+    Ablate `unknown |= extra_unknown` in `prune_sessions` and this fails."""
+    monkeypatch.setattr(runs, "mux_sessions", lambda: [])
+    monkeypatch.setattr(runs, "session_project_tags", lambda: {})
+    monkeypatch.setattr(runs, "engine_liveness", lambda _d: "unknown")
+    legacy = _RegistryMux(["bmad-loop-old-1"], {"bmad-loop-old-1": runs.project_tag(tmp_path)})
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
+
+    # still killed — unknown never blocks cleanup — but named as unverifiable
+    assert runs.prune_sessions(tmp_path) == (["old-1"], [], {"old-1"})
+    assert legacy.killed == ["bmad-loop-old-1"]
+
+
+def test_prune_sessions_leaves_a_live_legacy_session_standing(tmp_path, monkeypatch):
+    """The live arm of the same union: a legacy session whose engine is provably
+    running is reported live and never killed.
+
+    Ablate `live += [...]` in `prune_sessions` and the tuple goes empty; ablate
+    the `liveness == "alive"` continue and the session is killed."""
+    monkeypatch.setattr(runs, "mux_sessions", lambda: [])
+    monkeypatch.setattr(runs, "session_project_tags", lambda: {})
+    monkeypatch.setattr(runs, "engine_liveness", lambda _d: "alive")
+    legacy = _RegistryMux(["bmad-loop-old-1"], {"bmad-loop-old-1": runs.project_tag(tmp_path)})
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
+
+    assert runs.prune_sessions(tmp_path) == ([], ["old-1"], set())
+    assert legacy.killed == []
+
+
+def test_export_records_the_root_it_displaced_for_the_migration_sweep(tmp_path, monkeypatch):
+    """The wiring, end to end: the value the export overwrites is the only record
+    of where a pre-upgrade machine's sessions live, and it is handed to the
+    backend at the one moment it is still readable.
+
+    Before #537 the backend inherited `PSMUX_DATA_DIR` as found, so an operator
+    who exported an absolute root of their own has THEIR bmad-loop sessions in
+    THAT registry — not in psmux's default. Without this hand-off the override
+    strands exactly the sessions it displaced, with `cleanup` reporting a clean
+    machine while the coding processes run on.
+
+    Ablate the `note_displaced_registry` call in `export_psmux_registry_root`
+    and the sweep is back to psmux's default alone."""
+    from bmad_loop.adapters import psmux_backend
+
+    # Before the export, never after: `monkeypatch.setattr` records whatever it
+    # finds as the value to restore, so a reset placed *below* a real write would
+    # record that write and hand it back at teardown. The autouse
+    # `_isolate_mux_registry` fixture registers the same reset first and so
+    # restores last (undo is LIFO), which is what keeps that mistake from
+    # actually leaking — but a test whose own hygiene depends on the ordering of
+    # a fixture in another file is one edit away from being wrong.
+    monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", None)
+    theirs = str(tmp_path / "their-own-registry")
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, theirs)
+
+    root = runs.export_psmux_registry_root(tmp_path)
+    assert root == str(runs.mux_registry_root(tmp_path)) != theirs
+    assert psmux_backend._DISPLACED_ROOT == theirs
+
+
+def test_export_records_nothing_when_it_displaced_nothing(tmp_path, monkeypatch):
+    """The other half, split into its own test rather than reset mid-body: a pane
+    child of this project's own session already carries the derived root, which is
+    the ordinary way the variable is set, and recording it would hand the sweep
+    this project's *current* registry as a legacy one.
+
+    Ablate the `displaced != root` guard in `export_psmux_registry_root` and this
+    fails."""
+    from bmad_loop.adapters import psmux_backend
+
+    monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", None)
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, str(runs.mux_registry_root(tmp_path)))
+
+    runs.export_psmux_registry_root(tmp_path)
+    assert psmux_backend._DISPLACED_ROOT is None
+
+
+def test_legacy_registries_degrades_when_no_backend_can_be_selected(monkeypatch):
+    """A cleanup that already swept the primary registry must report that work
+    rather than die on the migration pass."""
+
+    def boom():
+        raise MultiplexerError("no backend")
+
+    monkeypatch.setattr(runs, "get_multiplexer", boom)
+    assert runs._legacy_registries() == []
+
+
+# --------------------------------- legacy registry: ownership and remainder
+
+
+def test_prune_sessions_refuses_an_untagged_legacy_session_claimed_only_by_a_run_dir(
+    tmp_path, monkeypatch
+):
+    """The legacy registry is shared by every project, so a matching run dir here
+    is not evidence about a session over there: run ids are unique only within one
+    project and `--run-id` is caller-supplied. This project holding a dead
+    `shared-id` must not let it kill another project's live, untagged
+    `bmad-loop-shared-id`.
+
+    Ablate the `require_tag` term in prunable_sessions (or stop passing it from
+    the legacy pass) and this fails with the session killed — the cross-project
+    reap the per-project registry removed from the primary pass, reintroduced in
+    the one registry where every project's sessions sit together."""
+    ours = tmp_path / "ours"
+    ours.mkdir()
+    (_make_state_run(ours, "shared-id") / "engine.pid").write_text(str(_dead_pid()))
+    monkeypatch.setattr(runs, "mux_sessions", lambda: [])
+    monkeypatch.setattr(runs, "session_project_tags", lambda: {})
+    legacy = _RegistryMux(["bmad-loop-shared-id"], {})  # untagged: someone else's
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
+
+    assert runs.prune_sessions(ours) == ([], [], set())
+    assert legacy.killed == []
+
+
+def test_prune_sessions_still_claims_an_untagged_session_in_the_primary_registry(
+    tmp_path, monkeypatch
+):
+    """The other half of the ablation: `require_tag` must not leak into the
+    primary pass. There the registry itself proves ownership, so the run-dir
+    fallback keeps the reach it always had — a session whose tag write failed is
+    still cleanable by its own project. The export is put in force first, as
+    `cli._configure_mux` does ahead of every command: with nothing exported a
+    namespacing backend is on its shared default registry, where the fallback is
+    correctly refused (the round-8 gate) — the reach this test pins is
+    conditional on the registry being ours, not unconditional."""
+    (_make_state_run(tmp_path, "fin-1") / "engine.pid").write_text(str(_dead_pid()))
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, str(runs.mux_registry_root(tmp_path)))
+    monkeypatch.setattr(runs, "mux_sessions", lambda: ["bmad-loop-fin-1"])
+    monkeypatch.setattr(runs, "session_project_tags", lambda: {})
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [])
+
+    assert runs.prune_sessions(tmp_path, dry_run=True) == (["fin-1"], [], set())
+
+
+class _RootedMux(_RegistryMux):
+    """A registry mux that also answers which registry root it addresses, and
+    whether the transport namespaces at all. The default couples the two the
+    way the bundled backends do — a root in force implies a namespace, no root
+    implies none (tmux) — and `namespaced=True` with `root=None` is the psmux
+    default-registry shape."""
+
+    def __init__(self, sessions, tags, root, namespaced=None):
+        super().__init__(sessions, tags)
+        self._root = root
+        self._namespaced = (root is not None) if namespaced is None else namespaced
+
+    def registry_root(self):
+        return self._root
+
+    def has_registry_namespace(self):
+        return self._namespaced
+
+
+def test_prune_refuses_an_untagged_session_in_a_registry_it_does_not_own(tmp_path, monkeypatch):
+    """The untagged run-dir fallback is evidence only where the registry has
+    already restricted the listing to this project. When the derivation fails,
+    `export_psmux_registry_root` leaves whatever ambient `PSMUX_DATA_DIR` it found
+    in force and psmux honours any absolute value — so the primary pass addresses
+    the OPERATOR'S registry while this project's run dirs go on looking like
+    ownership, and a run id is unique within a project, not across a registry
+    shared with someone else.
+
+    This is round-1 finding 2 reopened by the derivation-failure arm: the cut made
+    an ambient value a no-op on the success path and left it live here.
+
+    Ablate the `require_tag=not _registry_proves_ownership(project)` term and the
+    kill lands in their registry."""
+    (_make_state_run(tmp_path, "shared-1") / "engine.pid").write_text(str(_dead_pid()))
+    theirs = _RootedMux(["bmad-loop-shared-1"], {}, str(tmp_path / "their-registry"))
+    monkeypatch.setattr(runs, "get_multiplexer", lambda: theirs)
+    monkeypatch.setattr(runs, "mux_sessions", theirs.list_sessions)
+    monkeypatch.setattr(runs, "session_project_tags", lambda: {})
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [])
+    killed: list[str] = []
+    monkeypatch.setattr(runs, "kill_session", lambda rid, mux=None: killed.append(rid))
+
+    assert runs.prune_sessions(tmp_path) == ([], [], set())
+    assert killed == []
+
+
+def test_prune_still_claims_an_untagged_session_in_the_registry_it_derived(tmp_path, monkeypatch):
+    """The other half, and the one that proves the gate did not simply stop the
+    sweep: in bmad-loop's own per-project registry the fallback is sound, because
+    the registry itself is what restricts the listing to this project."""
+    (_make_state_run(tmp_path, "mine-1") / "engine.pid").write_text(str(_dead_pid()))
+    ours = _RootedMux(["bmad-loop-mine-1"], {}, str(runs.mux_registry_root(tmp_path)))
+    monkeypatch.setattr(runs, "get_multiplexer", lambda: ours)
+    monkeypatch.setattr(runs, "mux_sessions", ours.list_sessions)
+    monkeypatch.setattr(runs, "session_project_tags", lambda: {})
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [])
+    killed: list[str] = []
+    monkeypatch.setattr(runs, "kill_session", lambda rid, mux=None: killed.append(rid))
+
+    assert runs.prune_sessions(tmp_path) == (["mine-1"], [], set())
+    assert killed == ["mine-1"]
+
+
+def test_prune_keeps_its_historical_reach_with_no_registry_namespace(tmp_path, monkeypatch):
+    """A backend with NO registry namespace (tmux: one server for the machine)
+    keeps the reach it always had — its `registry_root()` None means exactly
+    "there is nothing to compare", and narrowing it would be a regression
+    dressed as caution. An earlier revision of this test read every None this
+    way, which pinned the unsafe kill its sibling below now refuses."""
+    (_make_state_run(tmp_path, "tmux-1") / "engine.pid").write_text(str(_dead_pid()))
+    plain = _RootedMux(["bmad-loop-tmux-1"], {}, None)
+    monkeypatch.setattr(runs, "get_multiplexer", lambda: plain)
+    monkeypatch.setattr(runs, "mux_sessions", plain.list_sessions)
+    monkeypatch.setattr(runs, "session_project_tags", lambda: {})
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [])
+    killed: list[str] = []
+    monkeypatch.setattr(runs, "kill_session", lambda rid, mux=None: killed.append(rid))
+
+    assert runs.prune_sessions(tmp_path) == (["tmux-1"], [], set())
+
+
+def test_prune_refuses_an_untagged_session_on_a_backends_default_registry(tmp_path, monkeypatch):
+    """`registry_root()` None from a backend that DOES namespace is not tmux's
+    None: psmux with no root in force runs on its own user-wide default registry
+    — shared with every project and with the operator — and there a dead run dir
+    here proves nothing about an untagged session over there. Reachable when the
+    export degrades on an underivable state root and no ambient value is set.
+
+    Ablate the `has_registry_namespace()` term in `_registry_proves_ownership`
+    (read every None as "nothing to own") and the kill lands in the shared
+    default registry."""
+    (_make_state_run(tmp_path, "shared-2") / "engine.pid").write_text(str(_dead_pid()))
+    default = _RootedMux(["bmad-loop-shared-2"], {}, None, namespaced=True)
+    monkeypatch.setattr(runs, "get_multiplexer", lambda: default)
+    monkeypatch.setattr(runs, "mux_sessions", default.list_sessions)
+    monkeypatch.setattr(runs, "session_project_tags", lambda: {})
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [])
+    killed: list[str] = []
+    monkeypatch.setattr(runs, "kill_session", lambda rid, mux=None: killed.append(rid))
+
+    assert runs.prune_sessions(tmp_path) == ([], [], set())
+    assert killed == []
+
+
+def test_registry_ownership_demands_a_tag_when_it_cannot_be_asked(tmp_path, monkeypatch):
+    """A backend that cannot be selected answers False, so the pass requires the
+    tag. The safe direction is to leave a session standing rather than kill one on
+    evidence that may not hold."""
+
+    def boom():
+        raise MultiplexerError("no backend")
+
+    monkeypatch.setattr(runs, "get_multiplexer", boom)
+    assert runs._registry_proves_ownership(tmp_path) is False
+
+
+def test_legacy_registry_leftovers_names_an_untagged_session(tmp_path, monkeypatch):
+    """A sweep that silently declines to migrate something is the same silence
+    this change exists to remove: cleanup prints a removal count, and a count that
+    excludes what it chose not to claim reads as "everything is clean"."""
+    legacy = _RegistryMux(["bmad-loop-old-1"], {})
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
+    assert runs.legacy_registry_leftovers(tmp_path) == {
+        runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-old-1"]
+    }
+
+
+def test_legacy_registry_leftovers_keys_each_session_to_its_own_registry(tmp_path, monkeypatch):
+    """The grouping is the whole point of the shape: the operator's next action is
+    to open the registry and look, and there are two of them now — psmux's own
+    default, and any absolute `PSMUX_DATA_DIR` this process displaced.
+
+    A flat list, or a grouping that keyed everything on the default, told an
+    operator whose sessions are in their own exported root to go look in a
+    registry those sessions are not in.
+
+    `registry_root()` answers `None` for psmux's default — the seam deliberately
+    never respells its home cascade — so that arm is labelled instead.
+
+    Ablate `legacy.registry_root() or DEFAULT_REGISTRY_LABEL` down to the
+    constant and both keys collapse into one."""
+    theirs = r"D:	heir-own-registry"
+    default_reg = _RegistryMux(["bmad-loop-ctl"], {})
+    displaced = _RegistryMux(["bmad-loop-old-1"], {}, root=theirs)
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [default_reg, displaced])
+
+    assert runs.legacy_registry_leftovers(tmp_path) == {
+        runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-ctl"],
+        theirs: ["bmad-loop-old-1"],
+    }
+
+
+def test_legacy_registry_leftovers_merges_two_registries_that_name_one_root(tmp_path, monkeypatch):
+    """A displaced root that happens to spell psmux's own default is admitted
+    twice, and the rows merge rather than the second overwriting the first.
+
+    Ablate the `grouped.get(label, [])` merge and the first registry's sessions
+    vanish from a message that claims to name what is standing."""
+    both = _RegistryMux(["bmad-loop-a"], {}), _RegistryMux(["bmad-loop-b"], {})
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: list(both))
+
+    assert runs.legacy_registry_leftovers(tmp_path) == {
+        runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-a", "bmad-loop-b"]
+    }
+
+
+def test_legacy_registry_leftovers_names_a_surviving_control_session(tmp_path, monkeypatch):
+    """The prune partition never touches CTL_SESSION and the ctl-window sweep runs
+    against the current registry only, so a pre-upgrade control session survives
+    the migration. Naming it is the whole remedy."""
+    legacy = _RegistryMux([runs.CTL_SESSION], {})
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
+    assert runs.legacy_registry_leftovers(tmp_path) == {
+        runs.DEFAULT_REGISTRY_LABEL: [runs.CTL_SESSION]
+    }
+
+
+def test_legacy_leftovers_names_a_case_variant_ctl_where_the_transport_folds(tmp_path, monkeypatch):
+    """psmux resolves a session by opening `<data dir>\\<name>.port`, and NTFS
+    opens names case-insensitively, so in ITS registry `bmad-loop-CTL-<hex>` is
+    the control session. Asking `is_ctl_session_name` about the name as spelled
+    misses it, and it then falls through `_agent_run_id` — which refuses every
+    ctl-aliasing id, case-folded — so the leftover goes unreported by both arms.
+
+    Ablate `legacy.session_name_key(name)` back to `name` and this fails with
+    `{}`: the survivor is standing in a registry nothing else addresses, unnamed."""
+    upper = runs.CTL_SESSION.upper() + "-0123456789ABCDEF"
+    legacy = _RegistryMux([upper], {}, fold=True)
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
+    assert runs.legacy_registry_leftovers(tmp_path) == {runs.DEFAULT_REGISTRY_LABEL: [upper]}
+
+
+def test_legacy_leftovers_leaves_a_case_variant_alone_where_the_transport_is_exact(
+    tmp_path, monkeypatch
+):
+    """The other direction, and the reason the fold cannot be a constant here.
+    On an exact transport (tmux: `bmad-loop-ctl` and `bmad-loop-CTL` coexist as
+    distinct sessions, measured on 3.4) that name is NOT the control session, and
+    it is not a session of ours either — the mint refuses every ctl-aliasing id
+    case-folded, so bmad-loop cannot have created it. Naming it would send the
+    operator after somebody else's session.
+
+    Ablate to the blanket `.lower()` the review proposed and this fails."""
+    upper = runs.CTL_SESSION.upper() + "-0123456789ABCDEF"
+    legacy = _RegistryMux([upper], {})  # identity key: the seam default
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
+    assert runs.legacy_registry_leftovers(tmp_path) == {}
+
+
+def test_legacy_registry_leftovers_degrades_on_a_transport_fault(tmp_path, monkeypatch):
+    """Observation degrades: the sweep's own report still stands, and a migration
+    remainder nobody could read is not a reason to fail a cleanup that already
+    killed sessions."""
+
+    class _Broken(_RegistryMux):
+        def list_sessions(self):
+            raise MultiplexerError("no server")
+
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [_Broken([], {})])
+    assert runs.legacy_registry_leftovers(tmp_path) == {}
+
+
+def test_legacy_registry_leftovers_is_empty_with_no_legacy_registry(tmp_path, monkeypatch):
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [])
+    assert runs.legacy_registry_leftovers(tmp_path) == {}
+
+
+# ------------------ legacy remainder: our own stranded sessions (#537)
+
+
+def test_legacy_registry_leftovers_names_our_own_live_session(tmp_path, monkeypatch):
+    """Tagged is not the same as dealt with. The legacy partition correctly
+    declines to kill a live run of ours, and that session then sits in a registry
+    ordinary attach and cleanup no longer address — the stranding worth naming.
+    Ablate the `live` arm and this fails while the sweep still reports nothing."""
+    runs.write_pid(_make_state_run(tmp_path, "live-1"))
+    legacy = _RegistryMux(["bmad-loop-live-1"], {"bmad-loop-live-1": runs.project_tag(tmp_path)})
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
+
+    # the sweep itself is right: not prunable, and not killed
+    assert runs.prune_sessions(tmp_path) == ([], ["live-1"], set())
+    assert legacy.killed == []
+    # ...and the remainder says so
+    assert runs.legacy_registry_leftovers(tmp_path) == {
+        runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-live-1"]
+    }
+
+
+def test_legacy_registry_leftovers_stays_quiet_about_a_dead_session_the_sweep_takes(
+    tmp_path, monkeypatch
+):
+    """The other half of the ablation: a tagged, dead session of ours is the
+    sweep's to remove, and reporting it as a leftover would contradict the
+    "removed" line printed beside it — in --dry-run too, where it is announced as
+    a would-kill."""
+    (_make_state_run(tmp_path, "fin-1") / "engine.pid").write_text(str(_dead_pid()))
+    legacy = _RegistryMux(["bmad-loop-fin-1"], {"bmad-loop-fin-1": runs.project_tag(tmp_path)})
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
+
+    plan = runs.prune_sessions(tmp_path, dry_run=True)
+    assert plan == (["fin-1"], [], set())
+    assert runs.legacy_registry_leftovers(tmp_path, announced=plan[0]) == {}
+
+
+def test_legacy_registry_leftovers_still_stays_quiet_about_another_projects_session(
+    tmp_path, monkeypatch
+):
+    """Unchanged and load-bearing: another project's tagged session is not this
+    operator's business, and the sweep skipping it is the correct outcome rather
+    than a remainder."""
+    legacy = _RegistryMux(
+        ["bmad-loop-theirs-1", "not-a-bmad-session"],
+        {"bmad-loop-theirs-1": "0123456789abcdef"},
+    )
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
+    assert runs.legacy_registry_leftovers(tmp_path) == {}
+
+
+# ---------------- legacy remainder: presence, not a resampled partition (#537)
+
+
+class _VanishingMux(_RegistryMux):
+    """A registry whose engine exits between the sweep and the read.
+
+    The sweep sees the run alive and correctly leaves it; by the time the reader
+    looks, the pid is gone. A reader that re-ran the partition would call the
+    session `prunable` and drop it from every arm it checks — reported by nobody,
+    with no kill ever attempted. Presence has no such window.
+    """
+
+    def __init__(self, sessions, tags, run_dir):
+        super().__init__(sessions, tags)
+        self._run_dir = run_dir
+        self.reads = 0
+
+    def session_options(self, option):
+        self.reads += 1
+        if self.reads > 1:  # the reader's look, after the sweep's
+            (self._run_dir / "engine.pid").write_text(str(_dead_pid()))
+        return super().session_options(option)
+
+
+def test_legacy_leftovers_names_a_session_whose_engine_exited_mid_sweep(tmp_path, monkeypatch):
+    """The race the presence rule exists for. Ablate it back to consuming a
+    re-run partition's `live` arm and this fails with `[]` — a session standing in
+    a registry nothing addresses, and no kill attempted to explain it."""
+    run_dir = _make_state_run(tmp_path, "race-live")
+    runs.write_pid(run_dir)
+    legacy = _VanishingMux(
+        ["bmad-loop-race-live"], {"bmad-loop-race-live": runs.project_tag(tmp_path)}, run_dir
+    )
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
+
+    # the sweep: alive, so correctly left standing and never killed
+    assert runs.prune_sessions(tmp_path) == ([], ["race-live"], set())
+    assert legacy.killed == []
+    # ...and the reader names it even though it now looks prunable
+    assert runs.legacy_registry_leftovers(tmp_path) == {
+        runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-race-live"]
+    }
+
+
+def test_legacy_leftovers_names_a_session_whose_kill_did_not_land(tmp_path, monkeypatch):
+    """`kill_session` is best-effort and silent by contract, so `sessions.removed`
+    has always been an *attempted* kill. Presence closes that for the legacy
+    registry at no extra cost: the session is still listed, so it is still named."""
+
+    class _DeafMux(_RegistryMux):
+        def kill_session(self, name):
+            self.killed.append(name)  # recorded, but the session survives
+
+    (_make_state_run(tmp_path, "fin-1") / "engine.pid").write_text(str(_dead_pid()))
+    legacy = _DeafMux(["bmad-loop-fin-1"], {"bmad-loop-fin-1": runs.project_tag(tmp_path)})
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
+
+    assert runs.prune_sessions(tmp_path) == (["fin-1"], [], set())
+    assert legacy.killed == ["bmad-loop-fin-1"]
+    assert runs.legacy_registry_leftovers(tmp_path) == {
+        runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-fin-1"]
+    }
+
+
+def test_legacy_leftovers_is_quiet_once_the_sweep_actually_removed_the_session(
+    tmp_path, monkeypatch
+):
+    """The other half of the presence ablation: a session the sweep really did
+    remove is gone from the listing, so it must not be named — otherwise every
+    successful migration would report itself as unfinished."""
+
+    class _RealMux(_RegistryMux):
+        def kill_session(self, name):
+            self.killed.append(name)
+            self._sessions = [n for n in self._sessions if n != name]
+
+    (_make_state_run(tmp_path, "fin-1") / "engine.pid").write_text(str(_dead_pid()))
+    legacy = _RealMux(["bmad-loop-fin-1"], {"bmad-loop-fin-1": runs.project_tag(tmp_path)})
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
+
+    assert runs.prune_sessions(tmp_path) == (["fin-1"], [], set())
+    assert runs.legacy_registry_leftovers(tmp_path) == {}
+
+
+def test_legacy_leftovers_dry_run_excludes_what_the_preview_announced(tmp_path, monkeypatch):
+    """A dry run kills nothing, so presence alone would name every would-kill
+    session the preview just listed — the preview would contradict itself. Those
+    ids are excluded from the same partition the preview used."""
+    (_make_state_run(tmp_path, "fin-1") / "engine.pid").write_text(str(_dead_pid()))
+    runs.write_pid(_make_state_run(tmp_path, "live-1"))
+    tag = runs.project_tag(tmp_path)
+    legacy = _RegistryMux(
+        ["bmad-loop-fin-1", "bmad-loop-live-1"],
+        {"bmad-loop-fin-1": tag, "bmad-loop-live-1": tag},
+    )
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
+
+    plan = runs.prune_sessions(tmp_path, dry_run=True)
+    assert plan == (["fin-1"], ["live-1"], set())
+    assert runs.legacy_registry_leftovers(tmp_path, announced=plan[0]) == {
+        runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-live-1"]
+    }
+
+
+def test_legacy_leftovers_dry_run_never_drops_what_the_preview_did_not_announce(
+    tmp_path, monkeypatch
+):
+    """The dry-run half of the same race the presence rule closed for real cleanup,
+    and the reason the plan is passed in rather than rediscovered here.
+
+    The preview sees this run alive, so it prints it as live and announces no
+    would-kill. The engine then exits. A reader that re-ran the partition to
+    rediscover the plan would find the session prunable *now*, treat it as
+    announced, and drop it from the preview entirely — a standing session named by
+    nobody. Consuming the plan the preview actually printed cannot disagree with
+    it.
+
+    Ablate by re-deriving `announced` inside the reader (a second
+    `prunable_sessions(..., require_tag=True)` call) and this fails with `[]`."""
+    run_dir = _make_state_run(tmp_path, "race-live")
+    runs.write_pid(run_dir)
+    legacy = _VanishingMux(
+        ["bmad-loop-race-live"], {"bmad-loop-race-live": runs.project_tag(tmp_path)}, run_dir
+    )
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
+
+    plan = runs.prune_sessions(tmp_path, dry_run=True)
+    assert plan == ([], ["race-live"], set())  # nothing announced as a would-kill
+    assert legacy.killed == []
+    assert runs.legacy_registry_leftovers(tmp_path, announced=plan[0]) == {
+        runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-race-live"]
+    }
+
+
+def test_legacy_leftovers_dry_run_keeps_what_the_legacy_pass_cannot_claim(tmp_path, monkeypatch):
+    """`prune_sessions` unions the ids of every pass, so the flat plan says only
+    "some registry would kill this id" — and applying it here as a global name set
+    let a would-kill in the PRIMARY registry silence a same-named session in a
+    legacy one that the legacy pass, running with `require_tag=True`, deliberately
+    cannot claim. The preview then disagreed with the cleanup it previews.
+
+    Both halves are asserted against the same two registries: the real sweep leaves
+    and reports the untagged session, and the dry run must say the same thing.
+
+    Ablate by hoisting the exclusion back above the tag arms and the dry-run half
+    fails with `{}` while the real half still reports it — the disagreement itself.
+
+    Legacy refusal-gate ablation: temporarily changed the legacy call's
+    ``require_tag=True`` to ``False`` and ran this test; it failed as intended,
+    with ``legacy.killed == ['bmad-loop-dup']`` (the untagged session was killed).
+    The gate was restored."""
+    (_make_state_run(tmp_path, "dup") / "engine.pid").write_text(str(_dead_pid()))
+    ours = _RootedMux(["bmad-loop-dup"], {}, str(runs.mux_registry_root(tmp_path)))
+    monkeypatch.setattr(runs, "get_multiplexer", lambda: ours)
+    monkeypatch.setattr(runs, "mux_sessions", ours.list_sessions)
+    monkeypatch.setattr(runs, "session_project_tags", lambda: {})
+    # untagged over there: the run dir proves nothing in a shared registry
+    legacy = _RegistryMux(["bmad-loop-dup"], {})
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
+
+    plan = runs.prune_sessions(tmp_path, dry_run=True)
+    assert plan == (["dup"], [], set())  # announced by the primary pass alone
+    preview = runs.legacy_registry_leftovers(tmp_path, announced=plan[0])
+
+    assert runs.prune_sessions(tmp_path) == (["dup"], [], set())
+    assert legacy.killed == []  # the legacy pass declined it, as it must
+    assert preview == runs.legacy_registry_leftovers(tmp_path)
+    assert preview == {runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-dup"]}

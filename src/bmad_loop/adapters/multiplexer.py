@@ -94,6 +94,25 @@ class TerminalMultiplexer(ABC):
 
     # ----------------------------------------------------------- sessions
 
+    def session_name_key(self, name: str) -> str:
+        """Canonical comparison key for a session name on this transport: two
+        names denote the same live session exactly when their keys are equal.
+
+        Identity by default — tmux resolves session names case-sensitively
+        (measured on 3.4: ``bmad-loop-ctl`` and ``bmad-loop-CTL`` coexist), so
+        exact comparison is the truth there. A transport that resolves names
+        through a case-folding store overrides (psmux: the registry is a
+        directory of per-session files opened by name, and NTFS opens names
+        case-insensitively). Non-abstract so released out-of-tree backends
+        keep their exact-comparison behavior unchanged.
+
+        This is where "are these the same session name?" gets its answer:
+        core must never decide it with a constant, because the same fold that
+        is required on one transport destroys data on the other — a
+        case-variant agent session discounted as "the control session" on
+        tmux is a genuinely live session whose run dir then gets deleted."""
+        return name
+
     @abstractmethod
     def has_session(self, name: str) -> bool:
         """True iff a session named exactly ``name`` exists.
@@ -400,6 +419,72 @@ class TerminalMultiplexer(ABC):
         handed another thread's probe. :func:`detect_multiplexers` is the one
         in-tree reader and builds its own instance per row."""
         return None
+
+    def registry_root(self) -> str | None:
+        """The registry this backend's verbs currently resolve targets through,
+        or ``None`` when the backend has no registry namespace at all.
+
+        ``None`` is the default and the tmux answer: tmux addresses a server by
+        socket, and there is no root an operator could be pointed at. Backends
+        that DO namespace (see :meth:`legacy_registries` for the concept) answer
+        the root in force, so a frontend can disclose it — an operator whose own
+        client reads a different root sees none of these sessions, and is told
+        "no sessions" rather than an error.
+
+        A diagnostic, like :meth:`version_error`: must not raise, and a value it
+        cannot use (one the transport would reject) still comes back verbatim
+        rather than as ``None`` — "the root is unusable" and "there is no root"
+        are different facts and the caller acts on the difference.
+
+        ``None`` from a backend that DOES namespace means "no root in force":
+        its verbs then address the transport's own *default* registry, which is
+        shared with every project and with the operator. That is a different
+        fact from tmux's ``None`` (no namespace exists), and
+        :meth:`has_registry_namespace` is how a caller tells them apart."""
+        return None
+
+    def has_registry_namespace(self) -> bool:
+        """Whether this transport namespaces sessions by registry at all — a
+        property of the backend, independent of whether a root is currently in
+        force (see :meth:`registry_root` / :meth:`legacy_registries` for the
+        concept).
+
+        ``False`` is the default and the tmux answer: one server for the
+        machine, and ``registry_root() is None`` means exactly that. A backend
+        answering ``True`` here with ``registry_root()`` ``None`` is running on
+        its own default registry — shared, not this project's — which is what
+        ``runs._registry_proves_ownership`` needs to know before it lets an
+        untagged session be claimed on run-directory evidence."""
+        return False
+
+    def legacy_registries(self) -> list[TerminalMultiplexer]:
+        """Backends addressing *other* registries this one's own sessions may
+        still be living in, for the cleanup sweep. ``[]`` by default — a backend
+        with a single registry, tmux included, has nothing to sweep.
+
+        **The registry-namespace seam concept.** A *registry* is wherever a
+        multiplexer keeps the per-session addressing state its verbs resolve a
+        target through: for psmux, the ``PSMUX_DATA_DIR`` directory of
+        ``.port``/``.key`` files, one per session. It is a namespace, not a
+        filter — a session in registry A is not merely hidden from a verb aimed
+        at registry B, it is unaddressable from it. bmad-loop aims psmux at a
+        per-project root (``runs.mux_registry_root``), which is what makes this
+        method necessary: sessions created before that root existed are in
+        psmux's default registry, addressable only by a backend pointed there.
+
+        Each element must be an independent instance bound to its registry, and
+        must NOT work by mutating this process's environment: the callers include
+        a TUI worker thread running beside other threads issuing ordinary verbs,
+        and a global swap would silently aim one of *those* at the wrong
+        registry — the same live-session-reads-as-gone failure the per-project
+        root exists to prevent.
+
+        A porting note for a new OS or multiplexer: if the transport has no such
+        namespace, inherit this default and nothing else changes. If it does,
+        the seam wants the derivation in ``runs`` (keyed on the project, never on
+        the run or the shell) and the sweep here — see
+        ``docs/porting-to-a-new-os.md``."""
+        return []
 
     def window_pane_pids(self, target: str) -> list[int]:
         """Best-effort OS pids of ``target``'s pane root processes, for the kill
