@@ -1673,7 +1673,10 @@ def test_rearm_restores_the_spec_when_the_result_strip_faults(tmp_path, monkeypa
 
     Ablation: drop the `_restore_rearmed_spec(...)` call from that arm and this reddens on
     the byte comparison alone — the `RearmError` and the ESCALATED phase both still pass,
-    since the flip landing is precisely what neither observes.
+    since the flip landing is precisely what neither observes. Both of those assertions
+    are load-bearing for that claim, so both stay in THIS test: an isolated sibling row
+    was once inserted between them and silently adopted the phase check, leaving this
+    docstring citing an assertion the test no longer made.
     """
     _resolve_repo(tmp_path)
     spec = tmp_path / "spec.md"
@@ -1694,6 +1697,7 @@ def test_rearm_restores_the_spec_when_the_result_strip_faults(tmp_path, monkeypa
         runs.rearm_escalation(run_dir)
 
     assert spec.read_bytes() == before  # the published flip is rolled back
+    assert load_state(run_dir).tasks["6-4-cli-list-command"].phase == Phase.ESCALATED
 
 
 def test_rearm_restores_an_isolated_tasks_spec_that_sits_outside_the_worktree(
@@ -2094,6 +2098,99 @@ def test_build_context_sprint_mode_has_no_stories_block(tmp_path):
         resolve.build_context(state, run_dir, "6-4-cli-list-command").read_text(encoding="utf-8")
     )
     assert "stories" not in ctx
+
+
+def test_build_context_leaves_an_out_of_mount_spec_unchanged(tmp_path):
+    """Matrix row 5 graded at the layer that PUBLISHES the path to a human.
+
+    An absolute `spec_file` beside a set `worktree_path` is the out-of-mount shape
+    (`_serialized_worktree_path` keeps a path verbatim exactly when
+    `relative_to(worktree_path)` raises). `task_spec_path` passes it through untouched,
+    so `context.json` must show it unchanged rather than re-anchored onto either tree.
+    The row exists here because the `runs` and TUI layers grade the resolver while this
+    is the surface that hands the value to the resolve agent.
+    """
+    wt = tmp_path / ".bmad-loop" / "runs" / "20260613-111429-6a14" / "worktrees" / "1"
+    spec = tmp_path / "shared-artifacts" / "6-4.md"
+    spec.parent.mkdir(parents=True)
+    spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+    run_dir, state, _ = _escalated_run(tmp_path, spec_file=str(spec), worktree_path=str(wt))
+
+    ctx = json.loads(
+        resolve.build_context(state, run_dir, "6-4-cli-list-command").read_text(encoding="utf-8")
+    )
+    assert ctx["spec_file"] == spec.as_posix()
+
+
+def test_build_context_stories_block_names_the_same_tree_as_spec_file(tmp_path):
+    """One `context.json` must not name two different trees for one story.
+
+    `spec_file` is anchored on the tree the run owns, but `_stories_context` resolved
+    its folder from `Path(state.project)` — so under isolation the sentinel indicator
+    and its recorded blocking condition described the MAIN CHECKOUT while `spec_file`
+    named the mount. The agent was then told there is no frozen spec to edit (or handed
+    a stale twin's blocking condition) for a story whose real sentinel sits in the
+    worktree the re-arm actually writes to.
+
+    The decoy is load-bearing: the project carries a sentinel at the same relpath with a
+    DIFFERENT blocking condition, so "read the right tree" is checkable against "did not
+    read the other one".
+
+    Ablation: revert `_stories_context` to `stories.resolve_spec_folder(Path(state.project),
+    ...)` and this reddens on the blocking condition — it reports the decoy's.
+    """
+    key = "6-4-cli-list-command"
+    run_id = "20260613-111429-6a14"
+    wt = tmp_path / ".bmad-loop" / "runs" / run_id / "worktrees" / "1"
+
+    for root, condition in ((wt, "the mount's real halt"), (tmp_path, "the decoy twin")):
+        folder = root / "epic-1"
+        _stories_manifest(folder, [{"id": key, "title": "t", "description": "d"}])
+        (folder / "stories" / f"{key}-unresolved.md").write_text(
+            f"---\nstatus: blocked\n---\n\n## Auto Run Result\n\nStatus: blocked\n{condition}\n",
+            encoding="utf-8",
+        )
+
+    rel = f"epic-1/stories/{key}-unresolved.md"
+    run_dir, state, _ = _escalated_run(
+        tmp_path, run_id, spec_file=rel, source="stories", worktree_path=str(wt)
+    )
+    state.spec_folder = "epic-1"
+
+    ctx = json.loads(resolve.build_context(state, run_dir, key).read_text(encoding="utf-8"))
+    assert ctx["spec_file"] == (wt / rel).as_posix()
+    sent = ctx["stories"]["sentinel"]
+    assert "the mount's real halt" in sent["blocking_condition"]
+    assert "decoy" not in sent["blocking_condition"]
+    assert Path(sent["path"]).is_relative_to(wt)  # the same tree spec_file named
+
+
+def test_build_context_reports_whether_the_spec_reaches_the_redrive(tmp_path):
+    """The agent is told when the file it is being sent to edit has no future.
+
+    Under isolation `engine._finish_inflight` discards the mount, so an edit to a
+    worktree-local spec succeeds and then vanishes before the re-drive reads anything.
+    `rearm_escalation` already journals `rearm-spec-write-unreachable` on this verdict;
+    emitting it here is what lets the session act on it rather than discover it after.
+
+    Ablation: hardcode the field to `True` and the isolated leg reddens.
+    """
+    wt = tmp_path / ".bmad-loop" / "runs" / "20260613-111429-6a14" / "worktrees" / "1"
+    run_dir, state, _ = _escalated_run(tmp_path, spec_file="specs/6-4.md", worktree_path=str(wt))
+    ctx = json.loads(
+        resolve.build_context(state, run_dir, "6-4-cli-list-command").read_text(encoding="utf-8")
+    )
+    assert ctx["spec_reaches_the_redrive"] is False
+
+    plain_dir, plain_state, _ = _escalated_run(
+        tmp_path, "20260613-111429-6a15", spec_file=str(tmp_path / "specs" / "6-4.md")
+    )
+    plain = json.loads(
+        resolve.build_context(plain_state, plain_dir, "6-4-cli-list-command").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert plain["spec_reaches_the_redrive"] is True
 
 
 @pytest.mark.parametrize(

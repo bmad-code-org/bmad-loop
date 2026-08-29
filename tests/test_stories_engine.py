@@ -964,6 +964,34 @@ def test_plan_checkpoint_pause_then_resume_implements(project):
     assert "BMAD_LOOP_PLAN_HALT" not in leg2.env
 
 
+def test_operator_spec_path_anchors_an_isolated_units_spec(project):
+    """The pause notice is the FIRST surface an operator meets — before any dashboard.
+
+    Every pause here hands a human a path and says "review it, then resume", and the
+    `checkpoint-pause` journal records the same string. `task.spec_file` is persisted
+    RELATIVE to the mounted worktree (`model._serialized_worktree_path`), so the raw
+    value resolved against whatever directory the operator happened to be in — the main
+    checkout, which carries the same `epic-1/stories/...` layout and answers with the
+    wrong tree's copy. The TUI's `_paused_spec` carries a docstring about exactly this;
+    the notification reaches the operator earlier and had none.
+
+    NOT applied to the dev-session prompt at `spec_ref`: that session's cwd IS the
+    mount, so the relative spelling is the correct one there. The anchor belongs to the
+    consumer, not to the field.
+
+    Ablation: revert either site to a bare `task.spec_file` and this reddens.
+    """
+    engine, _adapter = make_engine(project, [])
+    wt = project.project / ".bmad-loop" / "runs" / "test-run" / "worktrees" / "1"
+    rel = "epic-1/stories/1-slug.md"
+    task = StoryTask("1", 0, spec_file=rel)
+    task.worktree_path = str(wt)
+
+    assert engine._operator_spec_path(task) == str(wt / rel)
+    # a spec-less task falls back to the story key rather than raising out of a notice
+    assert engine._operator_spec_path(StoryTask("1", 0)) == "1"
+
+
 # -------- MAJOR-B: a spec_checkpoint story can never commit without a plan review
 
 

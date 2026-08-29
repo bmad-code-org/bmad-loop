@@ -23,7 +23,12 @@ from typing import Any
 from .adapters.base import SessionSpec
 from .model import RunState
 from .platform_util import safe_segment
-from .runs import task_spec_path, validate_restore_latch
+from .runs import (
+    spec_reaches_the_redrive,
+    task_spec_path,
+    task_spec_root,
+    validate_restore_latch,
+)
 
 RESOLVE_DIR = "resolve"
 
@@ -107,6 +112,10 @@ def build_context(state: RunState, run_dir: Path, story_key: str, *, isolation: 
         validate_restore_latch(state, task, story_key, worktree_isolation=isolation == "worktree")
         is None
     )
+    # The one claim about which tree owns this story, shared by every field below that
+    # names a file. `task_spec_root` is the same definition the re-arm's writers confine
+    # against, so the context cannot describe a tree the write will not land on.
+    spec_root = task_spec_root(task, state) if task else Path(state.project)
     context = {
         "story_key": story_key,
         "run_id": state.run_id,
@@ -120,7 +129,10 @@ def build_context(state: RunState, run_dir: Path, story_key: str, *, isolation: 
         # as_posix() for the same reason `resolution_path` below uses it — the
         # context contract is one string on every OS — and because the value this
         # replaces was ALREADY posix under isolation: `_serialized_worktree_path`
-        # persists the relative form with `.as_posix()`.
+        # persists the relative form with `.as_posix()`. It also normalizes the
+        # NON-isolated absolute case, which was previously emitted verbatim: on Windows
+        # that changes `C:\\...\\spec.md` to `C:/.../spec.md`. Deliberate — one
+        # spelling for every reader — and consumed by an agent, which accepts '/'.
         "spec_file": (task_spec_path(task, state).as_posix() if task and task.spec_file else None),
         "baseline_commit": task.baseline_commit if task else None,
         "paused_reason": state.paused_reason,
@@ -129,13 +141,20 @@ def build_context(state: RunState, run_dir: Path, story_key: str, *, isolation: 
         # path is consumed by the agent, and Python/tools accept '/' on Windows).
         "resolution_path": resolution_path(run_dir, story_key).as_posix(),
         "restore_supported": restore_supported,
+        # Whether an edit to `spec_file` survives to the re-drive that reads it. Under
+        # isolation the mount is discarded by `engine._finish_inflight`, so the agent
+        # can otherwise spend a whole session editing a file with no future and see
+        # every write succeed. `rearm_escalation` already journals
+        # `rearm-spec-write-unreachable` on this same verdict; naming it here is what
+        # lets the session act on it instead of learning it afterwards.
+        "spec_reaches_the_redrive": (spec_reaches_the_redrive(task, state) if task else None),
     }
     # Stories mode: hand the resolver the manifest intent (the story entry) and a
     # sentinel indicator, so it sees WHAT the story is meant to do and WHETHER the
     # frozen spec even exists yet (a sentinel has no plan to edit — resolve the
     # underlying ambiguity instead). Sprint mode leaves the context unchanged.
     if state.source == "stories":
-        stories_ctx = _stories_context(state, story_key)
+        stories_ctx = _stories_context(state, story_key, spec_root)
         if stories_ctx:
             context["stories"] = stories_ctx
     path = context_path(run_dir, story_key)
@@ -144,7 +163,7 @@ def build_context(state: RunState, run_dir: Path, story_key: str, *, isolation: 
     return path
 
 
-def _stories_context(state: RunState, story_key: str) -> dict[str, Any]:
+def _stories_context(state: RunState, story_key: str, root: Path) -> dict[str, Any]:
     """The stories-mode extension of the resolve context: the spec folder, the
     manifest entry for the story (title/description/checkpoint flags/invoke_dev_with),
     and — when the escalated spec is a fixed-slug pre-planning-halt sentinel — a
@@ -152,8 +171,12 @@ def _stories_context(state: RunState, story_key: str) -> dict[str, Any]:
     an unreadable manifest just yields the folder (resolve still runs)."""
     from . import stories
 
-    project = Path(state.project)
-    folder = stories.resolve_spec_folder(project, state.spec_folder)
+    # `root`, not `Path(state.project)`: this block describes the same story whose
+    # `spec_file` the caller anchored on the run's own tree, and one `context.json` that
+    # names two trees is worse than one that names the wrong one — `sentinel.path` and
+    # `blocking_condition` would describe a file the re-arm will never touch, or vanish
+    # entirely because the main checkout has no sentinel while the mount does.
+    folder = stories.resolve_spec_folder(root, state.spec_folder)
     ctx: dict[str, Any] = {"spec_folder": state.spec_folder}
     try:
         entry = stories.load_stories(folder).get(story_key)

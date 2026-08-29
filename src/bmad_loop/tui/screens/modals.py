@@ -535,6 +535,7 @@ class SpecReviewModal(BaseDialog):
         spec_path: Path | None,
         spec_text: str,
         actions: list[tuple[str, str, str]],
+        unreadable: bool = False,
     ):
         super().__init__()
         self._title = title
@@ -542,6 +543,7 @@ class SpecReviewModal(BaseDialog):
         self._spec_path = spec_path
         self._spec_text = spec_text
         self._actions = actions
+        self._unreadable = unreadable
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
@@ -555,12 +557,28 @@ class SpecReviewModal(BaseDialog):
             yield Static(path_line, classes="path")
             with VerticalScroll(id="spec"):
                 body = self._spec_text.strip()
-                yield Static(Text(body) if body else Text("(empty spec)", style="dim"))
+                if self._unreadable:
+                    # Dimmed like "(empty spec)", never as plain body text: this string
+                    # is THIS modal's report of a failed read, and rendering it in the
+                    # style reserved for the spec's own words invites it to be read as
+                    # spec content that happens to open with that sentence.
+                    yield Static(Text(body, style="dim"))
+                else:
+                    yield Static(Text(body) if body else Text("(empty spec)", style="dim"))
             with Horizontal(classes="buttons"):
                 if self._spec_path is not None:
                     yield Button("copy path", id="copy-path")
                 for verb, label, variant in self._actions:
-                    yield Button(label, variant=variant, id=f"act-{verb}")  # type: ignore[arg-type]
+                    # Every verb this modal offers acts ON the spec — approve resumes the
+                    # run past the gate, replan rewrites the file. A spec nobody could
+                    # read is one nobody reviewed, so the actions are refused at the
+                    # source rather than left to fail (or worse, succeed) downstream.
+                    yield Button(
+                        label,
+                        variant=variant,  # type: ignore[arg-type]
+                        id=f"act-{verb}",
+                        disabled=self._unreadable,
+                    )
                 yield Button("close", id="cancel")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:

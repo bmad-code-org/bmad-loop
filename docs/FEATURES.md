@@ -78,9 +78,14 @@ See [README.md](../README.md) for the narrative overview and [setup-guide.md](se
   spec and task never silently agree on a stale sha (#640). A re-stamp that does overwrite a differing
   claim records what it replaced, and warns on either leg: the record fires only when the spec claimed
   a baseline the run never recorded, which is the only remaining trace of a divergence the gate can no
-  longer report. `spec_file` is persisted relative to a worktree for an isolated task, so re-arm re-anchors it on
-  that worktree before writing — resolved against the process cwd it named the main checkout's copy
-  of the same story spec, and both writes landed on a file the run never used. A spec re-arm still
+  longer report. `spec_file` is persisted relative to a worktree for an isolated task, so every out-of-process reader
+  re-anchors it on the tree the run owns before reading or writing — resolved against the process cwd it named the main checkout's copy
+  of the same story spec, and both writes landed on a file the run never used. The same
+  anchor backs the dashboard's review modals and their replan write, `context.json`'s
+  `spec_file`, and the paths the pause notifications print; the fields beside it (the sentinel
+  indicator, the stories block) answer from that one root rather than the project, so a single
+  surface cannot describe two trees. The dev session's own prompt keeps the relative spelling,
+  because that session runs inside the mount. A spec re-arm still
   cannot read has its baseline re-stamp skipped rather than silently no-oped
   (`rearm-baseline-restamp-skipped`), and a status flip that quietly changed nothing is reported
   too (`rearm-spec-flip-skipped`) — though not when the spec was simply already at the target status,

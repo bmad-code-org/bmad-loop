@@ -470,7 +470,11 @@ artifacts the engine already wrote.
 
 - **Plan checkpoint** (`spec_checkpoint`, stories mode) — a read-only viewer of
   the planned `ready-for-dev` spec at its id-keyed path (shown prominently, with a
-  copy-path action). **Approve & resume** resumes straight to implementation;
+  copy-path action). Under worktree isolation the path is anchored on the tree the
+  run owns, not on the directory the dashboard was launched from, so the viewer and
+  the replan write both act on the run's own copy rather than the main checkout's
+  twin. A spec that cannot be read at that path says so explicitly and its actions
+  are disabled — an unreviewable gate is not approvable. **Approve & resume** resumes straight to implementation;
   **Request replan** resets the spec to `draft` and strips its Auto Run Result
   (via the same `devcontract` primitives the engine's repair path uses), then
   resumes so the next dispatch re-plans. Edit the markdown in your own editor — the

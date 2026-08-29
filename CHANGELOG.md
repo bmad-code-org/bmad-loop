@@ -180,7 +180,41 @@ breaking changes may land in a minor release.
   status flip, the result strip and the baseline re-stamp silently fell back to an unguarded
   write, and the re-arm's undo failed outright, leaving a half-rewritten spec on a story the run
   still reported as escalated. Such a spec now anchors on the project, which can contain it.
-  Where nothing can, the behavior is unchanged.
+  Where nothing can, the write lands on the arm it already took — with one exception, which is
+  deliberate and now graded: a spec lexically inside the project but reached through a symlinked
+  component moves from a succeeding unguarded write to a refused confined one. Predicting that
+  walk would make the confinement root depend on filesystem state, so the narrow loud failure is
+  kept over a root that changes under a `mkdir`.
+
+- **The tree the spec is anchored on is now the tree its neighbouring fields describe.** The
+  re-anchor had been adopted for `spec_file` alone, leaving the fields beside it resolving against
+  the main checkout. The escalation modal read its spec text from the run's tree while its sentinel
+  indicator scanned the project, so one modal could contradict itself and show a pre-planning
+  sentinel wedge as an ordinary escalation; `context.json` named the run's tree in `spec_file` and
+  the project's in `stories.sentinel`, describing a file the re-arm will never touch. Both now
+  answer from one root.
+
+- **Pause notifications hand the operator a path that resolves from where they are standing.**
+  The spec-approval and plan-checkpoint pauses, and the `checkpoint-pause` journal record, printed
+  the raw worktree-relative `spec_file` — the same wrong-tree string the dashboard fix removed, on
+  the surface the operator reads first. The dev-session prompt is deliberately left relative: that
+  session's working directory is the mount, so the anchor belongs to the consumer, not the field.
+
+- **`Request replan` no longer takes the dashboard down on a spec that is not valid UTF-8.**
+  Making the read survive a bad byte made the button reachable on such a spec, where the reset
+  decodes strictly and raised past a guard that caught only `OSError`. A non-UTF-8 spec now
+  degrades one byte rather than losing the whole document to a failure sentence, and the failure
+  body is reserved for a spec that is actually absent.
+
+- **A spec that could not be read no longer offers `Approve & resume`.** The verbs act on the
+  spec — approve resumes the run past the gate — so a gate nobody could review is refused at the
+  source rather than downstream, and the failure text is dimmed instead of being rendered in the
+  style reserved for the spec's own words.
+
+- **`context.json` reports whether an edit to the spec survives to the re-drive.** Under worktree
+  isolation the mount is discarded before the re-drive reads anything, so a resolve session could
+  edit a worktree-local spec, see every write succeed, and have the work vanish. The verdict the
+  re-arm already journals is now carried in the context the session reads.
 
 - **`resume` re-stamps the run's recorded code root** (#716). Resume arms the engine against the
   `repo_root` it re-reads from `_bmad/bmm/config.yaml` but left the `state.json` copy at its launch

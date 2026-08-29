@@ -54,7 +54,7 @@ from .model import (
     Phase,
     StoryTask,
 )
-from .runs import graceful_stop_requested
+from .runs import graceful_stop_requested, task_spec_path
 
 
 @dataclass(frozen=True)
@@ -598,7 +598,7 @@ class StoriesEngine(Engine):
                 self.policy,
                 self.run_dir,
                 f"spec ready for approval: {task.story_key}",
-                f"review {task.spec_file}, then `bmad-loop resume {self.state.run_id}`",
+                f"review {self._operator_spec_path(task)}, then `bmad-loop resume {self.state.run_id}`",
             )
             raise RunPaused(
                 f"awaiting spec approval for {task.story_key}",
@@ -607,6 +607,24 @@ class StoriesEngine(Engine):
             )
         self._review_and_commit(task)
 
+    def _operator_spec_path(self, task: StoryTask) -> str:
+        """The task's spec spelled the way an operator can actually open it.
+
+        Every pause below hands a human a path and tells them to review it, and the
+        journal records the same string. `task.spec_file` is persisted RELATIVE to the
+        mounted worktree under isolation (`model._serialized_worktree_path`), so the raw
+        value resolves against whatever directory the operator happens to be in — the
+        main checkout, which carries the same layout and answers with the wrong tree's
+        copy. That is the identical defect the TUI's `_paused_spec` carries a docstring
+        about; this is the surface the operator meets FIRST, before any dashboard.
+
+        Falls back to the story key on a spec-less task, matching `spec_ref` above
+        rather than raising out of a notification path.
+        """
+        if not task.spec_file:
+            return task.story_key
+        return str(task_spec_path(task, self.state))
+
     def _pause_plan_checkpoint(self, task: StoryTask) -> None:
         """Leg 1 of a spec_checkpoint story verified (plan at ready-for-dev): pause
         for human plan review. The task stays at DEV_VERIFY with
@@ -614,13 +632,16 @@ class StoriesEngine(Engine):
         :meth:`_resume_after_dev_verify` for the implement leg. Always raises."""
         task.plan_review_owed = False  # discharged: we are pausing for the review now
         self.journal.append(
-            "checkpoint-pause", story_key=task.story_key, checkpoint="plan", spec=task.spec_file
+            "checkpoint-pause",
+            story_key=task.story_key,
+            checkpoint="plan",
+            spec=self._operator_spec_path(task),
         )
         gates.notify(
             self.policy,
             self.run_dir,
             f"plan ready for review: {task.story_key}",
-            f"review the planned spec {task.spec_file}, then "
+            f"review the planned spec {self._operator_spec_path(task)}, then "
             f"`bmad-loop resume {self.state.run_id}`",
         )
         self._save()
@@ -647,7 +668,7 @@ class StoriesEngine(Engine):
             "checkpoint-pause",
             story_key=task.story_key,
             checkpoint="plan",
-            spec=task.spec_file,
+            spec=self._operator_spec_path(task),
             owed_after_implement=True,
         )
         gates.notify(
@@ -655,7 +676,7 @@ class StoriesEngine(Engine):
             self.run_dir,
             f"plan review owed (already implemented): {task.story_key}",
             f"the story was implemented before its plan checkpoint fired — review "
-            f"{task.spec_file}, then `bmad-loop resume {self.state.run_id}`",
+            f"{self._operator_spec_path(task)}, then `bmad-loop resume {self.state.run_id}`",
         )
         self._save()
         raise RunPaused(

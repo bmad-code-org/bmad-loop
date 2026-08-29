@@ -3460,7 +3460,14 @@ async def test_plan_checkpoint_replan_resets_and_resumes(project, monkeypatch):
 
 
 def _unit_worktree(root: Path, run_id: str = "20260611-100000-aaaa", unit: str = "1") -> Path:
-    """Where `workspace.open_unit_workspace` actually mounts a unit's worktree."""
+    """The UNRESOLVED spelling of where `workspace.open_unit_workspace` mounts a unit.
+
+    Production stores `unresolved_wt.resolve()`, so on a symlinked temp root (macOS
+    `/tmp` -> `/private/tmp`) this and the real mount differ. Deliberately not resolved
+    here: that `.resolve()` divergence is the one way an isolated spec lands outside
+    `project`, which `runs.task_spec_root` treats as its own case, and pinning the
+    lexical spelling keeps these rows measuring the anchor rather than the sandbox.
+    """
     return root / RUNS_DIR / run_id / "worktrees" / unit
 
 
@@ -3645,15 +3652,19 @@ async def test_spec_approval_gate_renders_the_worktree_spec_under_isolation(proj
 
 
 async def test_paused_spec_undecodable_spec_does_not_crash_the_dashboard(project, monkeypatch):
-    """A non-UTF-8 spec must render as a read failure, not take the TUI down.
+    """A non-UTF-8 spec degrades one byte, not the whole document — and never raises.
 
-    `read_text(encoding="utf-8")` raises `UnicodeDecodeError`, which is a ValueError
-    and so escaped the `except OSError` arm entirely — and all three review surfaces
-    call `_paused_spec` from the Textual event loop, where an escaping raise kills the
-    dashboard instead of rendering the fault. The same trap `_commit_subject` closes
-    for git subject bytes.
+    `read_text(encoding="utf-8")` raises `UnicodeDecodeError`, which is a ValueError and
+    so escaped the `except OSError` arm entirely; all three review surfaces call
+    `_paused_spec` from the Textual event loop, where an escaping raise kills the
+    dashboard instead of rendering the fault. Closed the way `_commit_subject` closes it
+    — `errors="replace"` — rather than by widening the except arm, because replacing the
+    entire body with a failure sentence cost the reviewer the WHOLE spec at a gate whose
+    only purpose is reading it. The failure body is now reserved for ABSENCE, which is
+    the case the anchoring argument is actually about
+    (`test_paused_spec_missing_at_the_anchor_reads_as_not_found`).
 
-    Ablation: narrow the arm back to `except OSError` and this reddens — the modal
+    Ablation: restore `path.read_text(encoding="utf-8")` and this reddens — the modal
     never opens, because the worker raised.
     """
     monkeypatch.setattr(launch, "mux_available", lambda: True)
@@ -3665,7 +3676,133 @@ async def test_paused_spec_undecodable_spec_does_not_crash_the_dashboard(project
         await _open_review(app, pilot, SpecReviewModal)
         body = render(app.screen.query_one("#spec Static", Static).content)
         assert "(empty spec)" not in body
+        assert "could not be read" not in body
+        assert "plan caf" in body  # the readable remainder survived the bad byte
+        # a decode fault is not an unreviewable spec, so the actions stay live
+        assert not app.screen.query_one("#act-approve", Button).disabled
+
+
+async def test_replan_on_an_undecodable_spec_does_not_crash_the_dashboard(project, monkeypatch):
+    """The read-side fix made this button REACHABLE; the write side had to catch up.
+
+    `devcontract.reset_spec_status` decodes strictly (`read_bytes().decode("utf-8")`),
+    and `_do_replan` caught only `(OSError, FrontmatterWriteError)` —
+    `UnicodeDecodeError` is a ValueError, so it escaped both. Before this change the
+    dashboard died earlier, at render, so the operator never got here. Once `_paused_spec`
+    began degrading a non-UTF-8 spec in place, the modal opens, the button is live, and
+    pressing it raised inside a Textual worker: the same event-loop crash the read-side
+    fix exists to prevent, moved one click later.
+
+    Ablation: drop `UnicodeDecodeError` from `_do_replan`'s except tuple and this reddens
+    — the worker raises instead of notifying, and the run never fails safe.
+    """
+    calls: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    _run_dir, spec = _stories_paused_run(project.project, stage="plan-checkpoint")
+    spec.write_bytes(b"---\nstatus: ready-for-dev\n---\n\n# plan caf\xe9 for 1\n")
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+        await pilot.click(await ready(pilot, "#act-replan"))
+        await pilot.pause()
+        assert app.is_running  # the dashboard survived the failed write
+    assert calls == []  # and the run was NOT resumed on an unreplanned spec
+
+
+async def test_unreadable_spec_refuses_the_destructive_actions(project, monkeypatch):
+    """A spec nobody could read is a gate nobody reviewed.
+
+    `_paused_spec` reports the read failure as the body so it cannot be confused with
+    "(empty spec)", but the modal still rendered it in the style reserved for the spec's
+    own words and still offered `Approve & resume` — which resumes the run past a gate
+    whose whole purpose is a human reading the file. The verb is refused at the source
+    rather than left to fail downstream (replan was safe only by accident: the reset
+    returns False and the "could not reset" branch declines).
+
+    Ablation: drop `disabled=self._unreadable` from `SpecReviewModal.compose` and this
+    reddens on the button state.
+    """
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    _run_dir, spec = _stories_paused_run(project.project, stage="plan-checkpoint")
+    spec.unlink()  # absent at the anchored path
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+        body = render(app.screen.query_one("#spec Static", Static).content)
         assert "could not be read" in body
+        assert app.screen.query_one("#act-approve", Button).disabled
+        assert app.screen.query_one("#act-replan", Button).disabled
+
+
+async def test_escalation_modal_reads_the_worktree_spec_under_isolation(project, monkeypatch):
+    """Matrix row 3's THIRD consumer — the one the operator re-arms from.
+
+    `_paused_spec` feeds `_blocking_condition`, whose `## Auto Run Result` block is the
+    terminal verdict an operator reads before deciding to re-arm or resolve. The plan-
+    checkpoint and gate surfaces were graded under isolation; this one was not, so the
+    pre-fix bug — showing the MAIN CHECKOUT's verdict for a run whose real halt is in
+    the mount — had no row at all.
+
+    Ablation: revert `_paused_spec` to `Path(task.spec_file)` and this reddens on the
+    blocking condition — the modal reports the decoy twin's.
+    """
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    wt = _unit_worktree(project.project)
+    _run_dir, spec = _stories_paused_run(
+        project.project, stage="escalation", worktree_path=str(wt), blocked_result="decoy halt"
+    )
+    # the fixture copies one body into both trees; the halt text has to differ for
+    # "read the run's tree" to be checkable against "did not read the other one"
+    spec.write_text(
+        spec.read_text(encoding="utf-8").replace("decoy halt", "the mounts real halt"),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(project.project)  # what the TUI actually runs from
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, EscalationModal)
+        body = render(app.screen.query_one("#blocking Static", Static).content)
+        assert "the mounts real halt" in body
+        assert "decoy halt" not in body
+
+
+async def test_sentinel_indicator_reads_the_worktree_under_isolation(project, monkeypatch):
+    """The other half of the same modal had to move with it.
+
+    `_sentinel_kind` scanned `self.project` while `_paused_spec` anchored on the run's
+    tree, and BOTH feed one `EscalationModal`. Under isolation the engine writes the
+    sentinel into the mount (`stories_engine._stories_folder` IS the worktree during a
+    driven story), so a modal built from two trees could show the mount's spec text
+    beside "no sentinel" — a pre-planning wedge presenting as an ordinary escalation,
+    which is a different operator decision.
+
+    The main checkout's copy is removed so the two anchors give different answers;
+    with a twin present, both spellings find a sentinel and nothing is graded.
+
+    Ablation: revert `_sentinel_kind` to `stories.resolve_spec_folder(self.project, ...)`
+    and this reddens — the indicator disappears.
+    """
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    wt = _unit_worktree(project.project)
+    _run_dir, spec = _stories_paused_run(
+        project.project, stage="escalation", worktree_path=str(wt), sentinel=True
+    )
+    (project.project / spec.relative_to(wt)).unlink()  # only the mount has the sentinel
+    monkeypatch.chdir(project.project)
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, EscalationModal)
+        shown = " ".join(render(s.content) for s in app.screen.query(Static))
+        assert "pre-planning-halt sentinel" in shown
 
 
 def test_paused_spec_root_without_a_task_answers_the_states_project(tmp_path):

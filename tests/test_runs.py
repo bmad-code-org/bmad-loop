@@ -3850,9 +3850,11 @@ def test_task_spec_root_yields_the_project_when_the_worktree_cannot_confine_the_
     `_restore_rearmed_spec`, which calls `atomic_write_bytes_confined` directly, would
     raise `UnconfinedWriteError` and turn a recoverable re-arm abort into a lost undo.
 
-    The project is not guaranteed to contain it either, but it can, and where it cannot
-    the outcome is byte-identical to today's — so this arm only ever trades a skipped
-    or refused confined write for a taken one.
+    The project is not guaranteed to contain it either; where nothing does, the write
+    lands on the arm it already took. That is not unconditional, and the exception is
+    graded by `test_task_spec_root_refuses_a_spec_the_project_cannot_reach` rather than
+    asserted here — a lexically-contained spec reached through a symlinked component
+    moves from a succeeding plain write to a refused confined one.
 
     Ablation: revert the body to `Path(task.worktree_path or state.project)` and this
     reddens — the root is the worktree, which cannot confine the spec.
@@ -3866,6 +3868,83 @@ def test_task_spec_root_yields_the_project_when_the_worktree_cannot_confine_the_
     assert runs.task_spec_path(run.task, run.state).is_relative_to(
         runs.task_spec_root(run.task, run.state)
     )
+
+
+def test_task_spec_root_refuses_a_spec_the_project_cannot_reach(tmp_path):
+    """The out-of-mount arm's one REGRESSION, pinned so it is graded rather than assumed.
+
+    `task_spec_root`'s docstring used to claim this arm "only ever trades a skipped or
+    refused confined write for a taken one". That is false for a spec which is lexically
+    under the project but reached THROUGH a symlinked component: `_atomic_write_spec`
+    selects its arm on the lexical `is_relative_to` — which passes — and the confined
+    arm it selects then walks the components below the root and refuses the redirect. So
+    a write that previously took the plain no-follow arm and SUCCEEDED now raises
+    `UnconfinedWriteError`, which `rearm_escalation` re-raises as `RearmError`.
+
+    Kept as behavior rather than fixed, because the fix is worse: gating the arm on
+    `path_is_confined` makes the root depend on filesystem state (that predicate answers
+    False for a component it cannot probe, so an absent parent directory would anchor on
+    the worktree and the same spec would anchor on the project once it existed). A
+    confine root that moves under a `mkdir` is not a definition. This row exists so the
+    trade is visible and a future reader does not rediscover it as a surprise.
+
+    Ablation: make `task_spec_root` return the worktree for the out-of-mount shape and
+    this reddens on the root assertion — and the refusal disappears with it, because the
+    writer would take the plain arm instead.
+    """
+    wt = tmp_path / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    real = tmp_path / "elsewhere"
+    real.mkdir()
+    (tmp_path / "_bmad-output").mkdir()
+    link = tmp_path / "_bmad-output" / "specs"
+    link.symlink_to(real, target_is_directory=True)  # a REDIRECT below the project root
+    spec = link / "6-4.md"
+    spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+    run = escalated_run(tmp_path, "r1", spec_file=str(spec), worktree_path=str(wt))
+
+    root = runs.task_spec_root(run.task, run.state)
+    assert root == tmp_path  # lexically contained, so the confined arm is selected
+    assert spec.is_relative_to(root)
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        platform_util.atomic_write_bytes_confined(spec, b"x", confine_root=root)
+
+
+def test_task_spec_path_refuses_an_empty_spec_file(tmp_path):
+    """`Path("")` is `.`, so an empty `spec_file` would answer the ROOT DIRECTORY.
+
+    The helper is public now, so the precondition is enforced instead of documented: a
+    caller that skips the guard every current call site has gets an exception rather
+    than a write target pointing at the tree root.
+
+    Ablation: restore `raw = Path(task.spec_file or "")` and drop the raise — this
+    reddens, and `task_spec_path` answers the worktree itself.
+    """
+    wt = tmp_path / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    run = escalated_run(tmp_path, "r1", spec_file="", worktree_path=str(wt))
+
+    with pytest.raises(ValueError, match="non-empty"):
+        runs.task_spec_path(run.task, run.state)
+    # the ROOT still answers, because naming a tree needs no spec
+    assert runs.task_spec_root(run.task, run.state) == wt
+
+
+def test_spec_reaches_the_redrive_is_false_for_a_worktree_local_spec(tmp_path):
+    """The verdict `build_context` publishes so the resolve agent is not lied to.
+
+    A worktree-local spec is destroyed with the mount by `engine._finish_inflight`
+    before the re-drive reads anything, so an edit to it succeeds and then vanishes.
+    `rearm_escalation` already journals `rearm-spec-write-unreachable` on this same
+    verdict; promoting it is what lets the context carry it too.
+
+    Ablation: return a bare `True` from `spec_reaches_the_redrive` and this reddens on
+    the isolated leg.
+    """
+    wt = tmp_path / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    isolated = escalated_run(tmp_path, "r1", spec_file="specs/6-4.md", worktree_path=str(wt))
+    assert runs.spec_reaches_the_redrive(isolated.task, isolated.state) is False
+
+    plain = escalated_run(tmp_path, "r2", spec_file=str(tmp_path / "specs" / "6-4.md"))
+    assert runs.spec_reaches_the_redrive(plain.task, plain.state) is True
 
 
 def test_task_spec_root_stays_on_the_worktree_for_specs_it_can_confine(tmp_path):

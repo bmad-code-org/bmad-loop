@@ -2190,10 +2190,14 @@ def task_spec_path(task: StoryTask, state: RunState) -> Path:
 
     Absolute paths pass through: a spec outside the worktree is persisted verbatim.
 
-    Precondition: `task.spec_file` is non-empty. `Path("")` is `.`, so an empty one
-    yields the ROOT DIRECTORY rather than a spec — callers guard before calling.
+    Raises `ValueError` on an empty `task.spec_file` rather than documenting a
+    precondition nothing enforces: `Path("")` is `.`, so `root / raw` would answer the
+    ROOT DIRECTORY — a write target, not a spec. Every caller already guards; this is
+    public now, so the next one gets an exception instead of a silent tree root.
     """
-    raw = Path(task.spec_file or "")
+    if not task.spec_file:
+        raise ValueError("task_spec_path requires a non-empty task.spec_file")
+    raw = Path(task.spec_file)
     if raw.is_absolute():
         return raw
     return task_spec_root(task, state) / raw
@@ -2226,13 +2230,32 @@ def task_spec_root(task: StoryTask, state: RunState) -> Path:
     `task_spec_path` passes through — the three `_atomic_write_spec` writers would
     silently take the plain no-follow arm (losing #593's O_NOFOLLOW walk) and
     `_restore_rearmed_spec`, which calls the confined writer directly, would RAISE.
-    The project can often confine it; when it cannot, the outcome is what it already
-    was, so this arm only ever trades a skipped or refused confined write for a taken
-    one.
 
-    The test is the LEXICAL `is_relative_to` that `devcontract._atomic_write_spec`
-    itself gates on, so the root and the writer's own check agree by construction.
-    Deliberately not canonicalized: `_spec_is_shared_with_the_redrive` answers a
+    The project can often confine it, and where nothing can, the write lands on the arm
+    it already took. NOT unconditionally, though, and the exception is graded by
+    `test_task_spec_root_refuses_a_spec_the_project_cannot_reach`: `_atomic_write_spec`
+    picks its arm on a LEXICAL `is_relative_to`, but the confined arm it picks then
+    walks the components below the root and refuses a redirect (`open_dir_confined` on
+    POSIX, `path_is_confined` on win32). A spec that is lexically under the project but
+    reached THROUGH a symlinked component — a symlinked `_bmad-output`, say — therefore
+    moves from a succeeding plain no-follow write to `UnconfinedWriteError`, which
+    `rearm_escalation` re-raises as `RearmError`. That is a re-arm which used to
+    complete and now aborts, so this arm is not the pure improvement an earlier draft of
+    this docstring claimed.
+
+    It is kept anyway, because the alternative is worse. Predicting the walk here (gate
+    the arm on `path_is_confined` and fall back to the worktree) makes the ROOT depend
+    on filesystem state: `path_is_confined` answers False for a component it cannot
+    probe, so a spec whose parent does not exist yet would anchor on the worktree and
+    the same spec would anchor on the project once the directory appeared. A confine
+    root that moves under a `mkdir` is not a definition. The refusal is also the correct
+    posture on its own terms — #593 exists to refuse writes through a link on a path
+    that came from a session-driven scan — so this trades a narrow, LOUD failure for a
+    deterministic rule, and the failure names the path in its message.
+
+    The test is the same lexical `is_relative_to` the writer gates on, so the root and
+    the writer's ARM SELECTION agree by construction; only the walk below can still
+    refuse. Deliberately not canonicalized: `_spec_is_shared_with_the_redrive` answers a
     DIFFERENT question (is this spec reachable by the re-drive) and canonicalizes for
     it, but matching that here would diverge from the gate this value is measured
     against and change writes that are correct today.
@@ -2335,6 +2358,23 @@ def _redrive_base_ref(state: RunState, task: StoryTask) -> str:
     if task.worktree_path and state.target_branch:
         return state.target_branch
     return "HEAD"
+
+
+def spec_reaches_the_redrive(task: StoryTask, state: RunState) -> bool:
+    """Whether an edit to this task's spec survives to the re-drive that reads it.
+
+    The other half of `task_spec_path`'s answer. That one says WHICH file the run's own
+    tooling writes; this says whether that file still exists by the time the re-drive
+    reads it. They differ exactly under isolation: `engine._finish_inflight` discards
+    the mount, so a worktree-local spec is destroyed with it, while a spec in an
+    artifact dir configured outside the project tree is shared across checkouts and
+    survives (`_spec_is_shared_with_the_redrive` carries that argument in full).
+
+    Public because `resolve.build_context` needs it for the same reason
+    `rearm_escalation` does: the context hands a human and an agent a `spec_file` to
+    edit, and an edit to a doomed copy is worse than no edit — it looks like it landed.
+    """
+    return not task.worktree_path or _spec_is_shared_with_the_redrive(state, task)
 
 
 def _restore_rearmed_spec(
@@ -2661,9 +2701,7 @@ def rearm_escalation(
             # on. See `_spec_is_shared_with_the_redrive` for why an isolated unit's spec
             # is nevertheless reachable when it sits in an artifact dir configured
             # outside the project tree.
-            write_reaches_the_redrive = not task.worktree_path or _spec_is_shared_with_the_redrive(
-                state, task
-            )
+            write_reaches_the_redrive = spec_reaches_the_redrive(task, state)
             # Narrowed to the case an operator can ACT on. Every isolated escalation
             # carries a mounted `worktree_path` — `worktree_flow.escalate_unit` never
             # clears it, and `keep_branch_and_escalate` deliberately leaves the worktree

@@ -139,16 +139,16 @@ _JOURNAL_ALIAS_FIELDS = {
     # `spec_file=` to `operatoractions.record_park`, which is a record file, not the
     # journal. So the divergence is BETWEEN FIELDS, not between two producers of this
     # one — but BOTH fields are mixed-shape, and neither is the reliable one:
-    # `spec_file` is now always ABSOLUTE, because all four kinds journal
-    # `str(task_spec_path(...))`, whose anchors (`task.worktree_path`, `state.project`)
-    # are absolute in every production path; while `spec` is NOT uniformly absolute —
-    # engine's reconcile and marker-repair kinds journal an absolute `str(spec_path)`,
-    # but `stories_engine`'s `checkpoint-pause` journals the raw persisted
-    # `task.spec_file`, which is worktree-relative for a task that ran under isolation.
-    # Same value, same hazard, same namespace. Do NOT read this as "one field is
-    # already normalized, so the basename step is dead": `_JOURNAL_BASENAME_NAMESPACES`
-    # keys on the NAMESPACE rather than the field precisely so both spellings reduce to
-    # one alias whichever shape either happens to carry.
+    # Both fields now journal an absolute path wherever they carry one: `spec_file`
+    # through `str(task_spec_path(...))` on all four kinds, and `spec` through
+    # `stories_engine._operator_spec_path` (which anchors `checkpoint-pause` the same
+    # way) alongside engine's already-absolute reconcile and marker-repair kinds. Same
+    # value, same namespace. Do NOT read that convergence as "both fields are
+    # normalized, so the basename step is dead" — it is not a guarantee this module
+    # holds. `_operator_spec_path` still answers a bare STORY KEY for a spec-less task,
+    # nothing stops a future producer from journaling a raw `task.spec_file`, and
+    # `_JOURNAL_BASENAME_NAMESPACES` keys on the NAMESPACE rather than the field
+    # precisely so every spelling reduces to one alias whichever shape it carries.
     "spec_file": "spec",
 }
 # Kind-scoped routing, consulted BEFORE the by-name table above and losing to
