@@ -2312,6 +2312,58 @@ def test_restart_arm_anchors_spec_ownership_before_it_discards_the_mount(project
     assert seen["dispatched_spec_file"] == str(unit.path / "_bmad-output/dispatched.md")
 
 
+def test_restart_arm_clears_the_baseline_it_measured_in_the_discarded_mount(project, monkeypatch):
+    """`baseline_commit`/`baseline_untracked` describe the mount and must die with it.
+
+    `_dev_phase` stamps both from `self.workspace.root` — the unit worktree under
+    isolation. The restart arm discards that mount and saves, so leaving them set
+    persists two operands that describe a tree which no longer exists. Any later
+    resume finding `worktree_path` empty takes the `elif task.baseline_commit:` leg
+    into `recovery_flow.rollback_or_pause` against the MAIN checkout, and neither
+    operand fails loud there: linked worktrees share the object database, so the
+    baseline still resolves and a reset onto it succeeds, while a fresh worktree's
+    empty untracked snapshot makes `verify._rollback_cleanup_plan` treat every
+    untracked file in the operator's checkout as this attempt's debris.
+
+    Asserted on the DURABLE state, not the in-memory task: state.json is what the
+    next resume reads, and the save happens between the discard and the re-run.
+
+    Ablation: drop the two `= None` clears from `_discard_unit_for_restart` and the
+    baseline assertions fail while the `worktree_path` one stays green — which is
+    precisely the split that made this reachable.
+    """
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    from bmad_loop.workspace import open_unit_workspace
+
+    unit = open_unit_workspace(
+        project.project, project, "test-run", "1-1-a", "main", "story", engine.run_dir
+    )
+    task = StoryTask("1-1-a", 1, phase=Phase.DEV_RUNNING)
+    task.worktree_path = str(unit.path)
+    task.branch = unit.branch
+    task.baseline_commit = rev_parse_head(unit.path)
+    task.baseline_untracked = []  # a fresh mount is a tracked-only checkout
+    engine.state.tasks["1-1-a"] = task
+
+    class _StopBeforeRerun(Exception):
+        pass
+
+    def _stop(*_args, **_kwargs):
+        raise _StopBeforeRerun
+
+    monkeypatch.setattr(engine, "_run_story", _stop)
+
+    with pytest.raises(_StopBeforeRerun):
+        engine._finish_inflight()
+
+    saved = load_state(engine.run_dir).tasks["1-1-a"]
+    assert saved.worktree_path == ""
+    assert saved.branch == ""
+    assert saved.baseline_commit is None
+    assert saved.baseline_untracked is None
+
+
 def test_finish_inflight_anchors_on_the_persisted_mount_not_the_live_isolation_policy(project):
     """The relative spelling is persisted state; `isolated` is re-read policy.
 

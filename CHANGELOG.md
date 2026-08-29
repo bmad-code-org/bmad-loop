@@ -200,6 +200,23 @@ breaking changes may land in a minor release.
   the surface the operator reads first. The dev-session prompt is deliberately left relative: that
   session's working directory is the mount, so the anchor belongs to the consumer, not the field.
 
+- **A discarded worktree no longer leaves its baseline pointing at a tree that is gone.** The
+  restart arm cleared `worktree_path` and `branch` when it dropped a half-built unit, but left
+  `baseline_commit` and `baseline_untracked` — both measured INSIDE that mount by `_dev_phase`.
+  The arm saves before the replacement is mounted, and `run_isolated` records the new
+  `worktree_path` only after `open_unit_workspace` returns, so a git spawn fault there (no host
+  death needed) persists that pair beside an empty `worktree_path`. Any later resume then took the
+  in-place `elif task.baseline_commit:` leg and probed the MAIN checkout with them. Neither
+  operand failed loud: linked worktrees share the main repo's object database, so force-deleting
+  the unit branch left the baseline resolvable and a reset onto it succeeding, while a fresh
+  worktree's empty untracked snapshot made `_rollback_cleanup_plan`'s
+  `untracked_files(repo) - baseline_untracked` name every untracked file in the operator's own
+  checkout as attempt debris — deleted outright under `scm.rollback_on_failure`, and with the
+  default off, a dirtiness no operator action could clear, so the manual-recovery loop could not
+  terminate. Both fields are now cleared with the mount that defined them; `_dev_phase` re-stamps
+  them from the replacement, so the leg becomes a correct no-op instead of a probe of the wrong
+  tree. The sweep's identical arm routes through the same helper.
+
 - **A discarded worktree no longer leaves its spec ownership pointing at the main checkout.**
   `spec_file` and `dispatched_spec_file` are both persisted relative to the mounted worktree, and
   resume read them back raw. Every arm of the in-flight reconcile that continues an isolated unit

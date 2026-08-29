@@ -29,7 +29,6 @@ from .platform_util import (
 )
 from .runs import _project_of_run_dir
 from .statemachine import advance
-from .workspace import discard_worktree
 
 
 def _read_json(path: Path) -> Any:
@@ -844,11 +843,7 @@ class SweepEngine(Engine):
             return True
         if isolated:
             # drop the half-built worktree; _run_story mounts a fresh one
-            discard_worktree(
-                self.paths.repo_root, task.worktree_path, task.branch, run_dir=self.run_dir
-            )
-            task.worktree_path = ""
-            task.branch = ""
+            self._discard_unit_for_restart(task)
         elif task.baseline_commit:
             # latch resolved_redrive so the corrected spec + restored diff stay
             # protected through every reset of this re-drive, not just this
