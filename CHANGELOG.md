@@ -183,7 +183,10 @@ breaking changes may land in a minor release.
   unit's `baseline_commit`/`baseline_untracked` into an in-place rollback of the main
   checkout, where a unit's empty untracked snapshot marks every untracked file in the
   operator's own tree as attempt debris — deleted outright under an auto-recovering cause.
-  The mount itself is left standing.
+  The task also stops CLAIMING the mount: `worktree_path` doubles as the isolated-unit
+  proxy, so keeping it set made the spec, stories-root and re-drive-ref helpers answer for
+  the unit while execution used the project checkout. The directory itself is left
+  standing and the orphan is journaled.
 - Fall back to the project when a task's recorded worktree is gone. Successful integration
   retires a task without clearing `worktree_path`, so the TUI's story-checkpoint card
   looked for `stories.yaml` under a deleted mount and lost the committed story's title and

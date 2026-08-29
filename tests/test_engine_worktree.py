@@ -2508,12 +2508,23 @@ def test_isolation_flip_releases_the_units_baseline_before_the_in_place_rollback
 
     Graded on the rollback leg not being entered at all, rather than only on the
     cleared fields: the fields are the mechanism, the un-entered leg is the property.
-    The mount is asserted still standing — this arm did not build it, and an isolation
-    flip is not an instruction to delete the operator's tree.
+
+    The mount's CLAIM and the mount's DIRECTORY are separated, and both are asserted.
+    `worktree_path` is overloaded — it names a directory and is also how `runs`
+    recognizes an isolated unit (`task_spec_root`, `task_stories_root`,
+    `spec_reaches_the_redrive` and `redrive_base_ref` all gate on it) — so a task that
+    keeps the field set while executing in the main checkout makes those helpers
+    answer for the wrong tree. `redrive_base_ref` is the sharpest case: it would
+    return the run's pinned `target_branch` when an in-place re-drive reads `HEAD`,
+    sending a resolve session to commit its correction where this run never looks. The
+    directory itself stays: this arm did not build it, and a policy change is not an
+    instruction to delete the operator's tree. The orphan is journaled so that is not
+    silent.
 
     Ablation: narrow the arm back to `release_spec_paths_from_mount()` and this
     reddens on the spy — the leg fires with the unit's operands, which is the state
-    that would have deleted them.
+    that would have deleted them. Separately, drop the `worktree_path = ""` and the
+    claim assertions redden while the spy stays green, which is why both are here.
     """
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
     in_place = Policy(
@@ -2561,7 +2572,16 @@ def test_isolation_flip_releases_the_units_baseline_before_the_in_place_rollback
     assert saved.spec_file == "_bmad-output/accepted.md"  # relative again
     assert saved.dispatched_spec_file is None
     assert saved.dispatched_spec_snapshot is None
+
+    # the CLAIM is dropped: every isolation-gated helper must now answer in-place
+    assert saved.worktree_path == ""
+    assert saved.branch == ""
+    assert runs.redrive_base_ref(engine.state, saved) == "HEAD"  # not target_branch
+    assert runs.task_stories_root(saved, engine.state) == project.project
+
+    # ...but the DIRECTORY is not deleted, and the orphan is on the record
     assert mount.is_dir()  # left standing: this arm did not build it
+    assert "isolation-flip-orphaned-worktree" in journal_kinds(engine)
 
 
 def test_worktree_spec_approval_pause_resumes_in_same_worktree(project):

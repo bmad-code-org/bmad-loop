@@ -1729,7 +1729,29 @@ class Engine:
                     # outright under an auto-recovering cause. Releasing clears them,
                     # so that leg becomes a correct no-op and `_dev_phase` re-stamps
                     # from the workspace it actually re-enters.
+                    orphan = task.worktree_path
                     task.release_mount_owned_state()
+                    # ...and the CLAIM goes too. `worktree_path` is overloaded: it
+                    # names a directory AND is how `runs` recognizes an isolated unit
+                    # at all (`task_spec_root`, `task_stories_root`,
+                    # `spec_reaches_the_redrive`, `redrive_base_ref` all gate on it).
+                    # Keeping it set to avoid deleting the tree left the task
+                    # CLAIMING a mount it no longer runs in, so those helpers answered
+                    # for the unit while execution used the main checkout —
+                    # `redrive_base_ref` in particular returned the run's pinned
+                    # `target_branch` when an in-place re-drive reads `HEAD`, which
+                    # would send a resolve session to commit its correction on a
+                    # branch this run will not read. Clearing the field is not
+                    # deleting the tree: the directory stays exactly where it is, and
+                    # the journal records it so an orphan left by a policy change is
+                    # not silent.
+                    task.worktree_path = ""
+                    task.branch = ""
+                    self.journal.append(
+                        "isolation-flip-orphaned-worktree",
+                        story_key=task.story_key,
+                        worktree=orphan,
+                    )
 
                 if not isolated and task.baseline_commit:
                     # latch resolved_redrive so the corrected spec stays protected
