@@ -1425,12 +1425,10 @@ class Engine:
         discard_worktree(
             self.paths.repo_root, task.worktree_path, task.branch, run_dir=self.run_dir
         )
-        # before the clear below: the relativization is measured against this field
-        task.release_spec_paths_from_mount()
+        # before the clears below: the relativization is measured against this field
+        task.release_mount_owned_state()
         task.worktree_path = ""
         task.branch = ""
-        task.baseline_commit = None
-        task.baseline_untracked = None
 
     def _safe_reset(self, task: StoryTask, *, preserve: tuple[str, ...] = ()) -> None:
         self._recovery_flow.safe_reset(task, preserve=preserve)
@@ -1721,7 +1719,17 @@ class Engine:
                     # this run will not enter again. The mount itself is deliberately
                     # left standing: this arm did not build it and an isolation flip
                     # is not an instruction to delete the operator's tree.
-                    task.release_spec_paths_from_mount()
+                    #
+                    # The BASELINE goes with it, not just the spec: `baseline_commit`
+                    # and `baseline_untracked` were measured inside that mount, and
+                    # the leg below would otherwise hand them to
+                    # `_rollback_or_pause` against the main checkout — where a unit's
+                    # empty untracked snapshot makes every untracked file in the
+                    # operator's own checkout read as this attempt's debris, deleted
+                    # outright under an auto-recovering cause. Releasing clears them,
+                    # so that leg becomes a correct no-op and `_dev_phase` re-stamps
+                    # from the workspace it actually re-enters.
+                    task.release_mount_owned_state()
 
                 if not isolated and task.baseline_commit:
                     # latch resolved_redrive so the corrected spec stays protected

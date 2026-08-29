@@ -508,6 +508,35 @@ class StoryTask:
         self.dispatched_spec_snapshot = None
         self.spec_file = self._serialized_worktree_path(self.spec_file)
 
+    def release_mount_owned_state(self) -> None:
+        """Give up EVERYTHING a mount owned: its spec ownership and the measurements
+        taken inside it.
+
+        One method because the two callers that stop using a mount — the restart
+        discard and the isolation-flip arm — must give up the same set, and the second
+        was written releasing only the spec half. That half-release is not a smaller
+        version of the same thing, it is a different bug: `baseline_commit` and
+        `baseline_untracked` are stamped from `self.workspace.root` (the unit under
+        isolation), so leaving them set hands unit-mount operands to
+        `recovery_flow.rollback_or_pause` running against the MAIN checkout. Neither
+        fails loud there — linked worktrees share the object database, so the baseline
+        still resolves and a reset onto it succeeds, while a fresh worktree is a
+        tracked-only checkout whose empty untracked snapshot makes
+        `verify._rollback_cleanup_plan` compute `untracked_files(repo) -
+        baseline_untracked` as every untracked file in the operator's own checkout.
+        Under an auto-recovering cause those are DELETED.
+
+        Costs the re-run nothing: `_dev_phase` re-stamps both from whatever workspace
+        it re-enters with, so clearing turns the `baseline_commit` leg into a correct
+        no-op instead of a probe of the wrong tree.
+
+        MUST be called while `worktree_path` still names the mount — the spec
+        relativization is measured against it.
+        """
+        self.release_spec_paths_from_mount()
+        self.baseline_commit = None
+        self.baseline_untracked = None
+
     def rebase_spec_paths_on(self, root: Path) -> None:
         """Re-absolutize both spec-ownership paths against the tree that owns them.
 

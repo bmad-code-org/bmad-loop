@@ -2487,6 +2487,83 @@ def test_finish_inflight_anchors_on_the_persisted_mount_not_the_live_isolation_p
     assert task.dispatched_spec_file == str(mount / "_bmad-output/dispatched.md")
 
 
+def test_isolation_flip_releases_the_units_baseline_before_the_in_place_rollback(
+    project, monkeypatch
+):
+    """The mount-measured operands must not reach a rollback of the MAIN checkout.
+
+    `[scm] isolation` is re-read on every resume and a change is journaled, never
+    refused, so `worktree -> none` reaches the restart arm with a mount still recorded.
+    That arm re-runs in place, and the leg below it hands `baseline_commit` /
+    `baseline_untracked` to `recovery_flow.rollback_or_pause` — but both were stamped
+    from `self.workspace.root`, the UNIT, and the workspace is now the main checkout.
+
+    Neither operand fails loud there. Linked worktrees share the object database, so
+    the unit baseline still resolves and a reset onto it succeeds; and a fresh
+    worktree is a tracked-only checkout, so its empty `baseline_untracked` makes
+    `verify._rollback_cleanup_plan` compute `untracked_files(repo) -
+    baseline_untracked` as EVERY untracked file in the operator's own checkout. Under
+    an auto-recovering cause those are deleted outright — the operator's own files,
+    for a story that merely changed isolation mode.
+
+    Graded on the rollback leg not being entered at all, rather than only on the
+    cleared fields: the fields are the mechanism, the un-entered leg is the property.
+    The mount is asserted still standing — this arm did not build it, and an isolation
+    flip is not an instruction to delete the operator's tree.
+
+    Ablation: narrow the arm back to `release_spec_paths_from_mount()` and this
+    reddens on the spy — the leg fires with the unit's operands, which is the state
+    that would have deleted them.
+    """
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    in_place = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(isolation="none"),
+    )
+    engine, _ = make_engine(project, [], policy=in_place)
+    assert not engine._isolated  # the premise: live policy says in-place
+
+    mount = project.project / ".bmad-loop" / "runs" / "test-run" / "worktrees" / "1-1-a"
+    (mount / "_bmad-output").mkdir(parents=True, exist_ok=True)
+    (mount / "_bmad-output" / "accepted.md").write_text("# spec\n", encoding="utf-8")
+
+    task = StoryTask("1-1-a", 1, phase=Phase.DEV_RUNNING)
+    task.worktree_path = str(mount)  # the persisted mount the live policy ignores
+    task.spec_file = "_bmad-output/accepted.md"
+    task.dispatched_spec_file = "_bmad-output/accepted.md"
+    task.dispatched_spec_snapshot = b"pre-launch bytes"
+    # measured INSIDE the unit by `_dev_phase`; a fresh mount is tracked-only, which
+    # is what makes the untracked half so destructive against another tree
+    task.baseline_commit = rev_parse_head(project.project)
+    task.baseline_untracked = []
+    engine.state.tasks["1-1-a"] = task
+
+    rolled: list[str] = []
+    monkeypatch.setattr(engine, "_rollback_or_pause", lambda t, cause: rolled.append(cause))
+
+    class _StopBeforeRerun(Exception):
+        pass
+
+    def _stop(*_a, **_k):
+        raise _StopBeforeRerun
+
+    monkeypatch.setattr(engine, "_run_story", _stop)
+
+    with pytest.raises(_StopBeforeRerun):
+        engine._finish_inflight()
+
+    assert rolled == []  # the leg never ran, so the unit operands never travelled
+
+    saved = load_state(engine.run_dir).tasks["1-1-a"]
+    assert saved.baseline_commit is None
+    assert saved.baseline_untracked is None
+    assert saved.spec_file == "_bmad-output/accepted.md"  # relative again
+    assert saved.dispatched_spec_file is None
+    assert saved.dispatched_spec_snapshot is None
+    assert mount.is_dir()  # left standing: this arm did not build it
+
+
 def test_worktree_spec_approval_pause_resumes_in_same_worktree(project):
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
     gated = Policy(

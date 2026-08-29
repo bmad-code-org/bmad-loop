@@ -177,10 +177,13 @@ breaking changes may land in a minor release.
   spec returns to its mount-relative spelling; left absolute into the deleted tree it
   resolved to nothing, and the restarted attempt ran unbound with the repair prompt naming
   a path that no longer existed.
-- Release spec ownership when a resumed run stops treating a persisted mount as isolated.
-  Flipping `[scm] isolation` to `none` left the re-anchored spec absolute inside a mount
-  the resume neither reopens nor discards, so the in-place attempt ran unbound against a
-  spec outside its own roots. The mount itself is left standing.
+- Release a mount's state when a resumed run stops treating it as isolated. Flipping
+  `[scm] isolation` to `none` left the re-anchored spec absolute inside a mount the resume
+  neither reopens nor discards, so the in-place attempt ran unbound; worse, it carried the
+  unit's `baseline_commit`/`baseline_untracked` into an in-place rollback of the main
+  checkout, where a unit's empty untracked snapshot marks every untracked file in the
+  operator's own tree as attempt debris — deleted outright under an auto-recovering cause.
+  The mount itself is left standing.
 - Fall back to the project when a task's recorded worktree is gone. Successful integration
   retires a task without clearing `worktree_path`, so the TUI's story-checkpoint card
   looked for `stories.yaml` under a deleted mount and lost the committed story's title and
