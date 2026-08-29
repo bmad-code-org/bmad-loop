@@ -2676,6 +2676,50 @@ def test_rearm_exempts_a_stories_folder_configured_outside_the_project(
     assert bool(_upstream_records(run_dir)) is not external
 
 
+def test_rearm_of_a_sentinel_survives_a_project_that_is_not_a_repository(tmp_path, monkeypatch):
+    """The proof reads git, and a non-repo project must still re-arm.
+
+    `_redrive_spec_status` already carries this requirement for the spec record ("the
+    non-repo case stays non-fatal, as the story's Boundaries require"); the sentinel arm
+    now runs git too, so it inherits the same obligation on a path that did not read git
+    at all before. A `GitError` escaping here would abort a re-arm that has ALREADY
+    deleted the sentinel and preserved its copy — the escalation spent on a traceback.
+
+    The degrade direction is the warning one: no proof means the record fires and the
+    resume holds, so an operator on a non-repo project is told to commit rather than
+    quietly resumed into a re-plan nothing verified.
+
+    Deliberately not `_sentinel_run`, which git-inits: this row's whole premise is the
+    absence of a repository.
+
+    Ablation: drop the `except verify.GitError` arm in
+    `_redrive_reads_the_upstream_artifacts` and this reddens with the GitError escaping
+    `rearm_escalation` — the sentinel already gone from disk.
+    """
+    key = "6-4-cli-list-command"
+    folder = tmp_path / SPEC_FOLDER
+    folder.mkdir(parents=True)
+    (folder / "SPEC.md").write_text(CORRECTED_INTENT, encoding="utf-8")
+    (folder / "stories.yaml").write_text(MANIFEST, encoding="utf-8")
+    sentinel = folder / f"{key}-unresolved.md"
+    sentinel.write_text("---\nstatus: blocked\n---\n\n## Auto Run Result\n\nvague\n", "utf-8")
+    run_dir, _, _ = _escalated_run(
+        tmp_path,
+        spec_file=str(sentinel),
+        source="stories",
+        sentinel_kind="unresolved",
+        spec_folder=SPEC_FOLDER,
+        target_branch="main",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    assert runs.rearm_escalation(run_dir, isolated_redrive=True) == key  # no GitError
+
+    assert not sentinel.exists()  # the destructive half still completed
+    (rec,) = _upstream_records(run_dir)
+    assert runs.rearm_holds_the_resume(rec) is True
+
+
 def test_rearm_records_the_in_place_remedy_when_isolation_was_turned_off(tmp_path, monkeypatch):
     """The mirror of the isolated warning, and a DIFFERENT remedy — which is why the
     record carries a discriminator rather than leaving the reader to guess.
