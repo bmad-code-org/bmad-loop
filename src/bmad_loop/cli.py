@@ -184,8 +184,9 @@ def _configure_mux(project: Path) -> None:
     # Automatic selection probes availability before returning its cached
     # instance. Give that probe the derived root first: psmux's version probe
     # reaches `_run`, which must reject an empty/relative ambient value, and a
-    # failed probe stays cached for this process. Restore the ambient value
-    # before the real export when the selected transport has no registry.
+    # failed probe stays cached for this process. The override is temporary in
+    # every arm: the ambient value is restored before the real export, which is
+    # the last reader of it.
     # The gate asks only the seam's `has_registry_namespace()` question. Ceiling,
     # named: an out-of-tree backend that namespaces through some other variable
     # still sees this export, because the seam has no finer question. Adding one
@@ -201,20 +202,24 @@ def _configure_mux(project: Path) -> None:
     try:
         namespaced = get_multiplexer().has_registry_namespace()
     except MultiplexerError:
-        if probe_root is not None:
-            if ambient is None:
-                os.environ.pop(runs.PSMUX_DATA_DIR, None)
-            else:
-                os.environ[runs.PSMUX_DATA_DIR] = ambient
         # A backend that cannot even be selected runs no verb, so there is
         # nothing to point anywhere; diagnostics keep working.
         return
-    if not namespaced:
+    finally:
+        # Undone on EVERY arm, the psmux one included, because the export below
+        # is the last reader of the operator's own value. Restore only the
+        # namespace-less arms and `export_psmux_registry_root` reads the derived
+        # root back as the displaced one, finds it equal to what it is about to
+        # write, and skips `note_displaced_registry` — so a machine that had an
+        # absolute `PSMUX_DATA_DIR` before the upgrade keeps its pre-upgrade
+        # sessions in a registry `legacy_registries` can no longer name, and
+        # cleanup reports a clean machine while their coding processes run on.
         if probe_root is not None:
             if ambient is None:
                 os.environ.pop(runs.PSMUX_DATA_DIR, None)
             else:
                 os.environ[runs.PSMUX_DATA_DIR] = ambient
+    if not namespaced:
         return
     root = runs.export_psmux_registry_root(project)
     if root is not None:

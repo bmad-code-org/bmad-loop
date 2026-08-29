@@ -10541,6 +10541,43 @@ def test_main_leaves_psmux_data_dir_alone_on_a_namespace_less_transport(
     assert capsys.readouterr().err == ""
 
 
+def test_main_hands_the_export_the_displaced_registry_not_the_probe_root(tmp_path, monkeypatch):
+    """The availability probe's override is temporary on the psmux arm too,
+    because `export_psmux_registry_root` is the last reader of the operator's own
+    root.
+
+    `_configure_mux` points `PSMUX_DATA_DIR` at the derived root before selection,
+    since automatic selection probes `available()` and caches a failure. Leave that
+    override standing and the export reads the DERIVED root back as the displaced
+    one, finds it equal to the value it is about to write, and records nothing — so
+    a machine that had an absolute `PSMUX_DATA_DIR` before the upgrade keeps its
+    pre-upgrade sessions in a registry `legacy_registries()` can no longer name,
+    and `cleanup` reports a clean machine while their coding processes run on.
+
+    The registry-level halves of this are pinned in test_runs.py; only the
+    composition can catch it, which is why it is asserted here.
+
+    Ablate by moving the restore back out of the `finally` and into the two
+    namespace-less arms alone: `_DISPLACED_ROOT` comes back `None`."""
+    from bmad_loop.adapters import multiplexer as multiplexer_mod
+    from bmad_loop.adapters import psmux_backend
+
+    class _Namespaced:
+        def has_registry_namespace(self):
+            return True
+
+    monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", None)
+    theirs = str(tmp_path / "their-own-registry")
+    monkeypatch.setenv(runs.PSMUX_DATA_DIR, theirs)
+    monkeypatch.setattr(multiplexer_mod, "get_multiplexer", lambda: _Namespaced())
+    monkeypatch.setattr(cli, "cmd_list", lambda _args: 0)
+
+    assert cli.main(["list", "--project", str(tmp_path)]) == 0
+    assert psmux_backend._DISPLACED_ROOT == theirs
+    # The restore is a hand-off, not an abandonment: the export still landed.
+    assert os.environ[runs.PSMUX_DATA_DIR] == str(runs.mux_registry_root(tmp_path))
+
+
 def test_main_leaves_psmux_data_dir_alone_when_no_backend_can_be_selected(
     tmp_path, capsys, monkeypatch
 ):
