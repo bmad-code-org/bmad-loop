@@ -141,7 +141,7 @@ _JOURNAL_ALIAS_FIELDS = {
     # one — but BOTH fields are mixed-shape, and neither is the reliable one:
     # Both fields now journal an absolute path wherever they carry one: `spec_file`
     # through `str(task_spec_path(...))` on all four kinds, and `spec` through
-    # `stories_engine._operator_spec_path` (which anchors `checkpoint-pause` the same
+    # `engine._operator_spec_path` (which anchors `checkpoint-pause` the same
     # way) alongside engine's already-absolute reconcile and marker-repair kinds. Same
     # value, same namespace. Do NOT read that convergence as "both fields are
     # normalized, so the basename step is dead" — it is not a guarantee this module

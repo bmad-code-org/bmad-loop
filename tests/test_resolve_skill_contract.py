@@ -98,15 +98,25 @@ def test_skill_branches_on_the_in_place_remedy(skill_md):
     document the field.
 
     Ablation: delete the "When `redrive_base_ref` is `HEAD`" paragraph from SKILL.md
-    and this reddens on the first assertion.
+    and this reddens on the first assertion; restore the instruction sentence to its
+    unconditional "**where the correction has to land to be read**: committed on
+    `redrive_base_ref`." and it reddens on the three-site assertion instead.
     """
     normalized = " ".join(skill_md.split())
 
     assert "When `redrive_base_ref` is `HEAD`, do not tell them to commit anything." in normalized
     # ...and it says WHERE instead, in the tree the in-place re-drive actually reads
     assert "make the same edit to the main checkout's copy of the spec" in normalized
-    # step 4 and the prohibition both have to carry the fork too, or the agent reads a
-    # blanket "commit it" two screens after the paragraph that carved the exception
+    # THREE sites carry the fork, not two. The instruction sentence, step 4 and the
+    # prohibition each tell the human where the correction lands, and any one of them
+    # left unconditional is a blanket "commit it" the agent can act on before reaching
+    # the paragraph that carved the exception. This row first enumerated only the
+    # latter two; the instruction sentence — the one that most directly says "tell the
+    # human" — kept the absolute spelling for four commits because nothing graded it.
+    assert (
+        "which the field decides: when `redrive_base_ref` names a branch, committed on "
+        "`redrive_base_ref`; when it is `HEAD`, re-applied in the main checkout, uncommitted."
+    ) in normalized
     assert "re-applied in the main checkout, uncommitted" in normalized
     assert "re-applying it in the main checkout when it is `HEAD`" in normalized
 

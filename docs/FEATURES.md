@@ -82,9 +82,13 @@ See [README.md](../README.md) for the narrative overview and [setup-guide.md](se
   re-anchors it on the tree the run owns before reading or writing — resolved against the process cwd it named the main checkout's copy
   of the same story spec, and both writes landed on a file the run never used. The same
   anchor backs the dashboard's review modals and their replan write, `context.json`'s
-  `spec_file`, and the paths the pause notifications print; the fields beside it (the sentinel
-  indicator, the stories block) answer from that one root rather than the project, so a single
-  surface cannot describe two trees. The dev session's own prompt keeps the relative spelling,
+  `spec_file`, and the paths the pause notifications print. The fields beside it (the sentinel
+  indicator, the stories block) take a DIFFERENT root by design: they resolve against the
+  workspace stories root, not the spec's confinement root, whose out-of-mount arm falls back to
+  the project so a `confine_root` can always contain the path it validates — borrowing that
+  answer for a READ would look the stories folder up in the main checkout while the dev session
+  answered the worktree. Each names the tree the run owns, so a single surface cannot describe
+  two trees. The dev session's own prompt keeps the relative spelling,
   because that session runs inside the mount. A spec re-arm still
   cannot read has its baseline re-stamp skipped rather than silently no-oped
   (`rearm-baseline-restamp-skipped`), and a status flip that quietly changed nothing is reported

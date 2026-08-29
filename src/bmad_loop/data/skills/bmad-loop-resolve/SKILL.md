@@ -61,7 +61,9 @@ tell the human anything: a branch name and `HEAD` mean opposite things.
 Do not skip the edit when it is `false` — the corrected spec is what gets carried
 over, and it is the clearest statement of what you and the human agreed. Do step 4 as
 usual, then tell the human, in the same breath as the resolution, **where the
-correction has to land to be read**: committed on `redrive_base_ref`.
+correction has to land to be read** — which the field decides: when `redrive_base_ref`
+names a branch, committed on `redrive_base_ref`; when it is `HEAD`, re-applied in the
+main checkout, uncommitted. The two paragraphs below carry each arm.
 
 Be precise about this, because the two obvious moves both fail silently:
 

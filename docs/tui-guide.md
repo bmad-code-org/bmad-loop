@@ -493,9 +493,10 @@ artifacts the engine already wrote.
   unknown rather than absent — the two are otherwise indistinguishable — and
   refuses **Re-arm & resume**, which would flip the spec's frontmatter, strip its
   result and re-stamp the baseline on evidence nobody could read. **Resolve** stays
-  offered: it writes nothing, it is what repairs a bad anchor, and gating it would
-  have left `close` as the modal's only action while the `R` binding reached the same
-  agent anyway. **Resolve** launches the same interactive agent as `R`;
+  offered: it neither re-arms nor rewrites the spec — it writes the resolver's
+  `context.json` and starts the repair session, which is what repairs a bad anchor — and
+  gating it would have left `close` as the modal's only action while the `R` binding
+  reached the same agent anyway. **Resolve** launches the same interactive agent as `R`;
   **Re-arm & resume** (offered once the resolve agent has recorded a resolution)
   re-arms and resumes — deleting a sentinel with a preserved copy for a clean
   re-dispatch. Both refuse a still-live engine.
