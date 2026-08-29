@@ -26,6 +26,7 @@ from conftest import (
     install_build_auto_skill,
     refuse_to_resolve,
     set_sprint,
+    write_gated_ledger,
     write_ledger,
     write_spec,
     write_sprint,
@@ -2256,6 +2257,103 @@ def test_worktree_reopen_reabsolutizes_both_spec_ownership_paths(project, tmp_pa
     engine._reopen_unit(task)
     assert task.spec_file == outside_spec
     assert task.dispatched_spec_file == outside_dispatched
+
+
+def test_restart_arm_anchors_spec_ownership_before_it_discards_the_mount(project, monkeypatch):
+    """The restart arm destroys the only tree that can resolve the persisted spelling.
+
+    `_finish_inflight`'s restart arm is the one arm that never calls `reopen_unit`:
+    it discards the worktree, clears `task.worktree_path` and saves. Both spec paths
+    are persisted RELATIVE to that mount (`model._serialized_worktree_path`), so
+    without a re-anchor the save leaves a worktree-relative spelling beside an empty
+    `worktree_path`, and the next resume resolves it against the MAIN checkout — which
+    carries the same layout, so `recovery_flow._attempt_owned_spec` finds exactly one
+    candidate and `spec_within_roots` accepts it. The snapshot restore then rewrites
+    the operator's own copy. Anchored on the mount instead, the binding names a tree
+    that no longer exists and recovery refuses it loudly.
+
+    Graded at the discard rather than after it: the ordering is the whole property, and
+    `_run_story` rebinds the field moments later, so a post-hoc assertion would pass
+    with the re-anchor deleted.
+
+    Ablation: drop `task.rebase_spec_paths_on(...)` from `_finish_inflight` and both
+    assertions fail with the bare relative spellings.
+    """
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    from bmad_loop.workspace import open_unit_workspace
+
+    unit = open_unit_workspace(
+        project.project, project, "test-run", "1-1-a", "main", "story", engine.run_dir
+    )
+    task = StoryTask("1-1-a", 1, phase=Phase.DEV_RUNNING)
+    task.worktree_path = str(unit.path)
+    task.branch = unit.branch
+    task.spec_file = "_bmad-output/accepted.md"
+    task.dispatched_spec_file = "_bmad-output/dispatched.md"
+    engine.state.tasks["1-1-a"] = task
+
+    seen: dict[str, str | None] = {}
+
+    class _StopAtDiscard(Exception):
+        pass
+
+    def _spy(*_args, **_kwargs):
+        seen["spec_file"] = task.spec_file
+        seen["dispatched_spec_file"] = task.dispatched_spec_file
+        raise _StopAtDiscard
+
+    monkeypatch.setattr("bmad_loop.engine.discard_worktree", _spy)
+
+    with pytest.raises(_StopAtDiscard):
+        engine._finish_inflight()
+
+    assert seen["spec_file"] == str(unit.path / "_bmad-output/accepted.md")
+    assert seen["dispatched_spec_file"] == str(unit.path / "_bmad-output/dispatched.md")
+
+
+def test_finish_inflight_anchors_on_the_persisted_mount_not_the_live_isolation_policy(project):
+    """The relative spelling is persisted state; `isolated` is re-read policy.
+
+    `model._serialized_worktree_path` relativizes whenever `task.worktree_path` is
+    set, but `_finish_inflight` gates its `reopen_unit` arms on
+    `self._isolated and task.worktree_path` — and `self._isolated` comes from a policy
+    file re-read on every resume, where an `isolation` change is journaled and never
+    refused. Flip `[scm] isolation` to "none" between a crash and a resume and every
+    arm runs without `reopen_unit` on a task whose paths are still mount-relative.
+
+    The story gate stops the restart arm before it mutates anything, so what is graded
+    is the re-anchor alone — and it must have happened despite `isolated` being false.
+
+    Ablation: move `task.rebase_spec_paths_on(...)` inside the `if isolated:` arm (or
+    delete it) and both assertions fail with the bare relative spellings. Note the
+    sibling test above stays GREEN under that first ablation, which is why this row
+    exists separately.
+    """
+    from bmad_loop.engine import RunPaused
+
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    in_place = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(isolation="none"),
+    )
+    engine, _ = make_engine(project, [], policy=in_place)
+    assert not engine._isolated  # the premise: live policy says in-place
+
+    mount = project.project / ".bmad-loop" / "runs" / "test-run" / "worktrees" / "1-1-a"
+    task = StoryTask("1-1-a", 1, phase=Phase.DEV_RUNNING)
+    task.worktree_path = str(mount)  # ...but the persisted task still carries one
+    task.spec_file = "_bmad-output/accepted.md"
+    task.dispatched_spec_file = "_bmad-output/dispatched.md"
+    engine.state.tasks["1-1-a"] = task
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 1-1"])})
+
+    with pytest.raises(RunPaused):
+        engine._finish_inflight()
+
+    assert task.spec_file == str(mount / "_bmad-output/accepted.md")
+    assert task.dispatched_spec_file == str(mount / "_bmad-output/dispatched.md")
 
 
 def test_worktree_spec_approval_pause_resumes_in_same_worktree(project):

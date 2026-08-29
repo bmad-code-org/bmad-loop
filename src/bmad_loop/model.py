@@ -174,6 +174,20 @@ class SessionRecord:
         )
 
 
+def _rebased_on(path: str | None, root: Path) -> str | None:
+    """One persisted spec path, re-anchored on `root`; absolute values pass through.
+
+    Split out so `StoryTask.rebase_spec_paths_on` states the rule once per field
+    without repeating the guard, and so the guard itself is unmissable: the
+    is-absolute test is what keeps an out-of-mount spec (persisted verbatim by
+    `_serialized_worktree_path`) from being joined onto a root that does not
+    contain it.
+    """
+    if not path or Path(path).is_absolute():
+        return path
+    return str(root / path)
+
+
 @dataclass
 class StoryTask:
     story_key: str
@@ -461,6 +475,31 @@ class StoryTask:
             return Path(path).relative_to(self.worktree_path).as_posix()
         except ValueError:
             return path  # spec lives outside the worktree; keep absolute
+
+    def rebase_spec_paths_on(self, root: Path) -> None:
+        """Re-absolutize both spec-ownership paths against the tree that owns them.
+
+        The read-side inverse of :meth:`_serialized_worktree_path`, and the single
+        implementation of that rule: `to_dict` persists a worktree-local spec
+        RELATIVE to the mount and `from_dict` reads it back raw, so a consumer that
+        resolves the raw value against anything else names the wrong tree. The main
+        checkout carries the same `_bmad-output/...` layout, so that wrong tree
+        answers `is_file()` and passes containment — the failure is silent, not an
+        error.
+
+        Both fields move together because they are one asymmetry: `spec_file` is the
+        accepted/result artifact and `dispatched_spec_file` the attempt-owned input,
+        and a caller re-anchoring one and not the other leaves a task naming two
+        trees at once.
+
+        Idempotent: an absolute value is already anchored (a spec outside the mount
+        is persisted verbatim) and passes through untouched, so re-running this
+        against the same root cannot double-join. `root` is the tree the values were
+        persisted relative to — `task.worktree_path` — never the caller's cwd or
+        project.
+        """
+        self.spec_file = _rebased_on(self.spec_file, root)
+        self.dispatched_spec_file = _rebased_on(self.dispatched_spec_file, root)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "StoryTask":

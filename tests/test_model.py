@@ -239,6 +239,52 @@ def test_dispatched_spec_file_defaults_none_for_legacy_state():
     assert StoryTask.from_dict(doc).dispatched_spec_file is None
 
 
+def test_rebase_spec_paths_on_reanchors_both_ownership_fields():
+    """The read-side inverse of `_serialized_worktree_path`, on both fields at once.
+
+    `to_dict` relativizes `spec_file` and `dispatched_spec_file` together, so a
+    re-anchor that moved only one would leave a task naming two trees. Absolute
+    values are already anchored (a spec outside the mount persists verbatim) and
+    must pass through, which is also what makes the call idempotent.
+    """
+    mount = Path("/repo/.bmad-loop/runs/r1/worktrees/1-1-a")
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        spec_file="_out/accepted.md",
+        dispatched_spec_file="_out/dispatched.md",
+    )
+
+    task.rebase_spec_paths_on(mount)
+
+    assert task.spec_file == str(mount / "_out/accepted.md")
+    assert task.dispatched_spec_file == str(mount / "_out/dispatched.md")
+
+    # idempotent: a second pass finds both absolute and leaves them alone
+    task.rebase_spec_paths_on(mount)
+    assert task.spec_file == str(mount / "_out/accepted.md")
+    assert task.dispatched_spec_file == str(mount / "_out/dispatched.md")
+
+
+def test_rebase_spec_paths_on_leaves_absolute_and_empty_values_untouched():
+    """An out-of-mount spec and an unbound field are both already correct.
+
+    `_serialized_worktree_path` keeps a path verbatim exactly when
+    `relative_to(worktree_path)` raises, so an absolute value beside a set
+    `worktree_path` is the out-of-mount shape — joining it onto the mount would
+    invent a path no tree contains. `None` must survive as `None` rather than
+    becoming the mount root: `Path("")` is `.`, so a bare join would answer the
+    tree root, which is a write target, not a spec.
+    """
+    outside = str(Path("/elsewhere/spec.md"))
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=outside)
+
+    task.rebase_spec_paths_on(Path("/repo/wt"))
+
+    assert task.spec_file == outside
+    assert task.dispatched_spec_file is None
+
+
 def test_dispatched_spec_snapshot_round_trips_byte_exactly():
     snapshot = b"---\r\nstatus: ready-for-dev\r\n---\r\n\xffoperator intent\r\n"
     task = StoryTask(story_key="1-1-a", epic=1, dispatched_spec_snapshot=snapshot)

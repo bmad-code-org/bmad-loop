@@ -1497,6 +1497,22 @@ class Engine:
         for task in list(self.state.tasks.values()):
             if task.terminal:
                 continue
+            if task.worktree_path:
+                # Re-anchor BEFORE the `isolated` gate, because that gate is live
+                # policy (`self._isolated`) while the relative spelling is persisted
+                # state: `model._serialized_worktree_path` relativizes whenever
+                # `worktree_path` is set, and `from_dict` reads it back raw. Two arms
+                # below then act on a task whose paths `reopen_unit` never
+                # re-absolutized — an `isolation` flip across a resume (policy is
+                # re-read and only journaled, never refused), and the restart arm,
+                # which discards the mount and clears `worktree_path` before it saves.
+                # Either way the raw value resolves against the MAIN checkout, which
+                # carries the same layout, so `recovery_flow._attempt_owned_spec` finds
+                # exactly one candidate, `spec_within_roots` accepts it, and the
+                # snapshot restore rewrites the operator's own copy. Anchoring here
+                # names the tree that actually owned the attempt; when that tree is
+                # gone the binding is unresolvable and recovery refuses it loudly.
+                task.rebase_spec_paths_on(Path(task.worktree_path))
             isolated = self._isolated and task.worktree_path
             if isolated and task.defer_reason is not None:
                 # _defer records its reason before carrying harvested findings.

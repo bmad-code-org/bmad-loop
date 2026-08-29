@@ -200,6 +200,21 @@ breaking changes may land in a minor release.
   the surface the operator reads first. The dev-session prompt is deliberately left relative: that
   session's working directory is the mount, so the anchor belongs to the consumer, not the field.
 
+- **A discarded worktree no longer leaves its spec ownership pointing at the main checkout.**
+  `spec_file` and `dispatched_spec_file` are both persisted relative to the mounted worktree, and
+  resume read them back raw. Every arm of the in-flight reconcile that continues an isolated unit
+  re-anchors them first, but two do not: the restart arm discards the mount and clears
+  `worktree_path` before saving, and the `isolated` test is live policy — an `isolation` change
+  across a resume is journaled, never refused — so a task that still carries a mount takes the
+  in-place arms. Either way the raw value then resolved against the main checkout, which carries
+  the same layout, so recovery's attempt-owned spec lookup found exactly one candidate and
+  containment accepted it: a rollback could restore a dead attempt's snapshot bytes over the
+  operator's own copy of the spec, and its Git exclusion named the wrong tree's file. Both fields
+  are now re-anchored on the mount recorded on the task before either arm runs, so a binding whose
+  tree is gone is unresolvable and recovery refuses it loudly instead of rewriting a file the run
+  never used. The engine's own reader was never exposed — it resolves strictly and compares the
+  result against the spelling it started from, which no relative path can satisfy.
+
 - **`Request replan` no longer takes the dashboard down on a spec that is not valid UTF-8.**
   Making the read survive a bad byte made the button reachable on such a spec, where the reset
   decodes strictly and raised past a guard that caught only `OSError`. A non-UTF-8 spec now
