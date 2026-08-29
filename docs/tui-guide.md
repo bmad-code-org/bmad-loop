@@ -491,7 +491,11 @@ artifacts the engine already wrote.
   unit's mount, and reading either from the launch directory let one modal
   contradict itself. A spec that cannot be read reports its blocking condition as
   unknown rather than absent — the two are otherwise indistinguishable — and
-  refuses both verbs. **Resolve** launches the same interactive agent as `R`;
+  refuses **Re-arm & resume**, which would flip the spec's frontmatter, strip its
+  result and re-stamp the baseline on evidence nobody could read. **Resolve** stays
+  offered: it writes nothing, it is what repairs a bad anchor, and gating it would
+  have left `close` as the modal's only action while the `R` binding reached the same
+  agent anyway. **Resolve** launches the same interactive agent as `R`;
   **Re-arm & resume** (offered once the resolve agent has recorded a resolution)
   re-arms and resumes — deleting a sentinel with a preserved copy for a clean
   re-dispatch. Both refuse a still-live engine.

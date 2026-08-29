@@ -1060,8 +1060,17 @@ class BmadLoopApp(App[None]):
         """(title, description) from stories.yaml in stories mode, else ("", "")."""
         if state.source != "stories" or not state.spec_folder:
             return "", ""
+        # `task_stories_root`, not `self.project`, for the reason `_sentinel_kind`
+        # states below: BOTH feed one `EscalationModal` — this supplies its title and
+        # description, that its sentinel indicator — so a manifest read from the main
+        # checkout beside a sentinel read from the mount is the same one-surface-two-trees
+        # defect the anchor exists to close. `self.project` is also the wrong VALUE for
+        # the no-task arm: it is the constructor's `resolve_or_lexical` of the operator's
+        # argument, while every other anchored read here answers from `state.project`,
+        # the path the run persisted at launch.
+        root = runs.task_stories_root(state.tasks.get(key), state)
         try:
-            folder = stories.resolve_spec_folder(self.project, state.spec_folder)
+            folder = stories.resolve_spec_folder(root, state.spec_folder)
             entry = stories.load_stories(folder).get(key)
         except stories.StoriesError:
             return "", ""

@@ -2165,6 +2165,53 @@ def test_build_context_stories_block_names_the_same_tree_as_spec_file(tmp_path):
     assert Path(sent["path"]).is_relative_to(wt)  # the same tree spec_file named
 
 
+def test_build_context_stories_block_stays_on_the_mount_for_an_out_of_mount_spec(tmp_path):
+    """The consumer half of the divergent shape, at the surface that motivated the split.
+
+    `test_build_context_stories_block_names_the_same_tree_as_spec_file` above builds the
+    isolated case with a RELATIVE `spec_file`, where `task_spec_root` and
+    `task_stories_root` return the same tree — so it passes with either resolver wired in
+    and cannot grade the choice. Here `spec_file` is ABSOLUTE and lexically outside the
+    mount (the shape `_serialized_worktree_path` persists verbatim, reachable whenever a
+    symlinked component makes a spec that physically lives in the mount look outside it,
+    since `verify.resolve_spec_path` deliberately does not `.resolve()`).
+
+    There `task_spec_root` answers the PROJECT — a write-confinement decision — while the
+    story manifest still lives in the mount, exactly where `stories_engine._stories_folder`
+    looks for it.
+
+    Ablation: revert `_stories_context`'s root to `task_spec_root(task, state)` and this
+    reddens on the blocking condition — it reports the decoy twin's."""
+    key = "6-4-cli-list-command"
+    run_id = "20260613-111429-6a14"
+    wt = tmp_path / ".bmad-loop" / "runs" / run_id / "worktrees" / "1"
+
+    for root, condition in ((wt, "the mount's real halt"), (tmp_path, "the decoy twin")):
+        folder = root / "epic-1"
+        _stories_manifest(folder, [{"id": key, "title": "t", "description": "d"}])
+        (folder / "stories" / f"{key}-unresolved.md").write_text(
+            f"---\nstatus: blocked\n---\n\n## Auto Run Result\n\nStatus: blocked\n{condition}\n",
+            encoding="utf-8",
+        )
+
+    # absolute and outside the mount: the two resolvers now answer different trees
+    outside = tmp_path / "shared-artifacts" / f"{key}.md"
+    outside.parent.mkdir(parents=True, exist_ok=True)
+    outside.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+
+    run_dir, state, _ = _escalated_run(
+        tmp_path, run_id, spec_file=str(outside), source="stories", worktree_path=str(wt)
+    )
+    state.spec_folder = "epic-1"
+
+    ctx = json.loads(resolve.build_context(state, run_dir, key).read_text(encoding="utf-8"))
+    assert ctx["spec_file"] == outside.as_posix()  # unchanged: absolute passes through
+    sent = ctx["stories"]["sentinel"]
+    assert "the mount's real halt" in sent["blocking_condition"]
+    assert "decoy" not in sent["blocking_condition"]
+    assert Path(sent["path"]).is_relative_to(wt)  # the mount, NOT task_spec_root's project
+
+
 def test_build_context_reports_whether_the_spec_reaches_the_redrive(tmp_path):
     """The agent is told when the file it is being sent to edit has no future.
 

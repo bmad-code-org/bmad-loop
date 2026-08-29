@@ -3870,6 +3870,7 @@ def test_task_spec_root_yields_the_project_when_the_worktree_cannot_confine_the_
     )
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
 def test_task_spec_root_refuses_a_spec_the_project_cannot_reach(tmp_path):
     """The out-of-mount arm's one REGRESSION, pinned so it is graded rather than assumed.
 
@@ -3993,3 +3994,37 @@ def test_task_spec_root_without_a_worktree_is_the_project(tmp_path):
     this reddens — an out-of-project spec has nowhere else to go."""
     run = escalated_run(tmp_path, "r1", spec_file="/elsewhere/6-4.md")
     assert runs.task_spec_root(run.task, run.state) == tmp_path
+
+
+def test_task_stories_root_stays_on_the_mount_for_an_out_of_mount_spec(tmp_path):
+    """The ONE shape where `task_stories_root` and `task_spec_root` disagree — which is
+    the entire reason the second function exists.
+
+    `task_spec_root` answers "which tree can CONFINE a write to `task.spec_file`", so its
+    out-of-mount arm falls back to the project precisely so a `confine_root` can never
+    fail to contain the anchored path. The stories FOLDER is a different question: it is
+    located from the workspace root by `state.spec_folder`, and a task's spec being
+    elsewhere says nothing about where its manifest lives. `stories_engine._stories_folder`
+    answers the mount for this task, so borrowing the confinement answer made one surface
+    describe two trees.
+
+    Every other row builds the isolated shape with a RELATIVE `spec_file`, where the two
+    resolvers agree by construction and cannot tell each other apart — which is why
+    collapsing `task_stories_root` back into `task_spec_root` left the whole suite green.
+
+    Ablation: make `task_stories_root` delegate to `task_spec_root` and this reddens on
+    the first assertion; the second pins that the two genuinely diverge here, so a future
+    change that made them agree could not satisfy both."""
+    wt = tmp_path / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    run = escalated_run(tmp_path, "r1", spec_file="/elsewhere/6-4.md", worktree_path=str(wt))
+
+    assert runs.task_stories_root(run.task, run.state) == wt
+    assert runs.task_spec_root(run.task, run.state) == tmp_path  # deliberately different
+
+
+def test_task_stories_root_without_a_worktree_is_the_project(tmp_path):
+    """The no-worktree and no-task arms, which the two call sites rely on rather than
+    re-spelling the fallback."""
+    run = escalated_run(tmp_path, "r1", spec_file="epic-1/stories/6-4.md")
+    assert runs.task_stories_root(run.task, run.state) == tmp_path
+    assert runs.task_stories_root(None, run.state) == tmp_path

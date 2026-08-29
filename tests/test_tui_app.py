@@ -3354,6 +3354,12 @@ def _stories_paused_run(
     persisted verbatim beside a set `worktree_path`."""
     import yaml
 
+    # The two parameters are one shape, not two: "outside the worktree" is meaningless
+    # without a worktree, and the combination silently built a non-isolated run that
+    # graded nothing while reading like an isolated row.
+    if spec_outside_worktree and not worktree_path:
+        raise ValueError("spec_outside_worktree requires worktree_path")
+
     folder = root / "epic-1"
     (folder / "stories").mkdir(parents=True, exist_ok=True)
     (folder / "SPEC.md").write_text("# Epic 1\n", encoding="utf-8")
@@ -5778,7 +5784,7 @@ async def test_gate_unreadable_spec_refuses_approve_and_resume(project, monkeypa
         assert app.screen.query_one("#act-resume", Button).disabled
 
 
-async def test_escalation_unreadable_spec_refuses_rearm_and_resolve(project, monkeypatch):
+async def test_escalation_unreadable_spec_refuses_rearm_but_keeps_resolve(project, monkeypatch):
     """The escalation modal discarded the read verdict entirely.
 
     `_review_escalation` bound `_readable` and dropped it, so an unreadable spec reached
@@ -5790,8 +5796,15 @@ async def test_escalation_unreadable_spec_refuses_rearm_and_resolve(project, mon
     baseline, so that is a destructive write driven from a modal reporting evidence
     nobody could read.
 
+    The refusal is asymmetric, and deliberately so. `Re-arm` is refused: it flips the
+    spec's frontmatter, strips its result and re-stamps the baseline. `Resolve` is NOT —
+    it opens an interactive agent and writes nothing itself, it is precisely what repairs
+    a bad anchor, and gating it left `close` as the modal's only action while the `R`
+    binding (`action_resolve_run`, which has no readability check) reached the same agent
+    anyway, making the refusal advisory rather than enforced.
+
     Ablation: drop `unreadable=` from `_review_escalation`'s `EscalationModal(...)` and
-    this reddens on both the notice and the two button states.
+    this reddens on the notice, the re-arm button and the hint.
     """
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
@@ -5806,8 +5819,21 @@ async def test_escalation_unreadable_spec_refuses_rearm_and_resolve(project, mon
         )
         # the distinguishing claim: unknown, NOT absent
         assert "could not be read" in rendered
+        # and the lie is GONE, not merely outvoted by a warning above it. The unreadable
+        # arm used to prepend its notice and then fall through to the shared body render,
+        # which answers "" for the failure sentence — so the modal showed the warning and
+        # "(no blocking condition recorded)" together, the second denying the first.
+        assert "no blocking condition recorded" not in rendered
         assert app.screen.query_one("#act-rearm", Button).disabled
-        assert app.screen.query_one("#act-resolve", Button).disabled
+        # Resolve stays OPEN — the non-destructive remedy for the failure on screen
+        assert not app.screen.query_one("#act-resolve", Button).disabled
+        # The hint explains THIS refusal. Unasserted, it could silently revert to the
+        # restore-latch or "re-arm unlocks once..." text — both of which explain a
+        # condition that is not why the button is dark — while the button state stayed
+        # green.
+        hint = render(app.screen.query_one("#hint", Static).content)
+        assert "unreadable" in hint
+        assert "bmad-loop resolve" in hint  # the CLI fallback is named, not just refused
 
 
 async def test_replan_on_a_spec_that_vanished_after_render_names_the_anchored_path(

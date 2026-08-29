@@ -763,18 +763,23 @@ class EscalationModal(BaseDialog):
                         # reduces the read-failure body to "" like any other non-halt
                         # text, so this arm cannot be inferred downstream — it has to
                         # be carried in.
+                        #
+                        # REPLACES the body rather than prefixing it: `body` is always
+                        # "" on this arm (the failure sentence carries no halt block),
+                        # so an `if` that fell through still rendered the very sentence
+                        # the paragraph above calls a lie, directly under the warning
+                        # denying it.
                         yield Static(
                             Text(
                                 "⚠ the spec could not be read at the anchored path — "
-                                "the blocking condition below is unknown, not absent",
+                                "the blocking condition is unknown, not absent",
                                 style="red",
                             )
                         )
-                    yield Static(
-                        Text(body)
-                        if body
-                        else Text("(no blocking condition recorded)", style="dim")
-                    )
+                    elif body:
+                        yield Static(Text(body))
+                    else:
+                        yield Static(Text("(no blocking condition recorded)", style="dim"))
                 if self._engine_live:
                     yield Static(
                         Text("engine may still be live — stop it before resolving", style="yellow")
@@ -786,9 +791,11 @@ class EscalationModal(BaseDialog):
                 # Precedence over both branches below: they explain when Re-arm
                 # unlocks, and neither is true while the evidence cannot be read.
                 hint.append(
-                    "both verbs are refused while the spec is unreadable — re-arm "
-                    "flips its frontmatter, strips the result and re-stamps the "
-                    "baseline, and an unreviewable escalation is not actionable",
+                    "re-arm is refused while the spec is unreadable — it flips the "
+                    "frontmatter, strips the result and re-stamps the baseline on "
+                    "evidence nobody could read. Resolve stays OPEN: it is the "
+                    "non-destructive remedy, and a bad anchor is exactly what it "
+                    "repairs — `bmad-loop resolve` does the same from the CLI",
                     style="red",
                 )
             elif self._restore_recorded:
@@ -811,11 +818,18 @@ class EscalationModal(BaseDialog):
                 )
             yield Static(hint, id="hint")
             with Horizontal(classes="buttons"):
+                # NOT gated on `_unreadable`. Resolve opens an interactive agent to
+                # repair the frozen spec and writes nothing itself, so it is the one
+                # verb an unreadable spec is a REASON to offer — refusing it left the
+                # modal with `close` as its only action, on the very failure the
+                # resolve agent exists to fix. It also kept the modal out of step with
+                # `action_resolve_run` (the `R` binding), which has no readability
+                # check, so the refusal was advisory rather than enforced.
                 yield Button(
                     "Resolve",
                     variant="primary",
                     id="act-resolve",
-                    disabled=self._engine_live or self._unreadable,
+                    disabled=self._engine_live,
                 )
                 yield Button(
                     "Re-arm & resume",

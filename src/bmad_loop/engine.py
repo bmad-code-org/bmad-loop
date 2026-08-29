@@ -1368,6 +1368,18 @@ class Engine:
         reader can act on it. Note the caller re-anchors that pair immediately above, so
         between here and the rebind it holds an absolute path into the deleted tree.
 
+        `baseline_ledger_digest` and the `pre_harvest_ledger` pair are measured in the
+        mount too (`_ledger_digest` reads `workspace.paths.deferred_work`, which is
+        rebased onto the unit under isolation) and are deliberately NOT cleared. The
+        criterion is not "measured in the mount" but "read before anything re-measures
+        it": `baseline_commit` has the `elif task.baseline_commit:` arm below, which
+        fires on a later resume that finds `worktree_path` empty, while every path out
+        of here forces `Phase.PENDING` and saves — so `_resumable_session` (which
+        answers only for `*_RUNNING`/`*_VERIFY`) returns None and `_dev_phase` always
+        re-enters with `resume_result is None`, re-stamping the digest at its own
+        fresh-entry block. Clearing the ledger pair would be actively wrong: it is the
+        crash-replay attribution `_disarm_ledger_snapshot` exists to preserve.
+
         `worktree_path`/`branch` name the mount; `baseline_commit`/`baseline_untracked`
         were MEASURED in it (`_dev_phase` stamps both from `self.workspace.root`, which
         is the unit under isolation). Clearing only the first pair leaves the second
