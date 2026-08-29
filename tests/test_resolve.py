@@ -2542,7 +2542,7 @@ def test_rearm_holds_a_sentinel_until_the_upstream_correction_reaches_the_redriv
     reddens on `assert [] != []`. Every row alone is satisfied by a wrong fix.
     """
     intent = CORRECTED_INTENT if committed_matches else WEDGED_INTENT
-    run_dir, state, sentinel = _sentinel_run(
+    run_dir, _, sentinel = _sentinel_run(
         tmp_path, committed_intent=intent, working_intent=CORRECTED_INTENT
     )
     monkeypatch.chdir(tmp_path)
