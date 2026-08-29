@@ -4016,7 +4016,14 @@ def test_task_stories_root_stays_on_the_mount_for_an_out_of_mount_spec(tmp_path)
     the first assertion; the second pins that the two genuinely diverge here, so a future
     change that made them agree could not satisfy both."""
     wt = tmp_path / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
-    run = escalated_run(tmp_path, "r1", spec_file="/elsewhere/6-4.md", worktree_path=str(wt))
+    # OS-absolute, not merely rooted. `task_spec_root`'s out-of-mount arm gates on
+    # `Path.is_absolute()`, and on Windows "/elsewhere/6-4.md" is DRIVE-relative — so the
+    # arm never fired there, the fallback returned the worktree, and the row graded the
+    # divergence it exists to pin on POSIX only. What the arm needs is a spec outside the
+    # MOUNT, not outside the project, so anchoring on `tmp_path` keeps the shape while
+    # being absolute on every OS.
+    outside = tmp_path / "elsewhere" / "6-4.md"
+    run = escalated_run(tmp_path, "r1", spec_file=str(outside), worktree_path=str(wt))
 
     assert runs.task_stories_root(run.task, run.state) == wt
     assert runs.task_spec_root(run.task, run.state) == tmp_path  # deliberately different
