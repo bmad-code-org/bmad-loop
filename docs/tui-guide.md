@@ -486,13 +486,19 @@ artifacts the engine already wrote.
 - **Escalation** — the escalation view enriched with story context: the story
   entry's title/description (from `stories.yaml`), the blocking condition parsed
   from the spec's `## Auto Run Result`, and a sentinel indicator when the matched
-  spec is a fixed-slug pre-planning-halt sentinel. **Resolve** launches the same
-  interactive agent as `R`; **Re-arm & resume** (offered once the resolve agent has
-  recorded a resolution) re-arms and resumes — deleting a sentinel with a preserved
-  copy for a clean re-dispatch. Both refuse a still-live engine.
+  spec is a fixed-slug pre-planning-halt sentinel. Both of those answer from the
+  tree the run owns: under isolation the spec text and the sentinel live in the
+  unit's mount, and reading either from the launch directory let one modal
+  contradict itself. A spec that cannot be read reports its blocking condition as
+  unknown rather than absent — the two are otherwise indistinguishable — and
+  refuses both verbs. **Resolve** launches the same interactive agent as `R`;
+  **Re-arm & resume** (offered once the resolve agent has recorded a resolution)
+  re-arms and resumes — deleting a sentinel with a preserved copy for a clean
+  re-dispatch. Both refuse a still-live engine.
 - **Spec-approval / epic / story gate** — a spec-approval gate reuses the spec viewer
   (view the finalized spec, then **Approve & resume**), so the pre-existing sprint-mode
-  gate inherits the same richer surface. Story-gate and epic-boundary pauses have no
+  gate inherits the same richer surface — including the anchored read and the refusal
+  of **Approve & resume** on a spec that cannot be read. Story-gate and epic-boundary pauses have no
   spec to show — a story gate fires before the story is recorded, an epic boundary has
   no story at all — so they open a compact pause-reason viewer instead: the reason names
   the blocking entries and the remedy, and **Resume** re-picks the story and re-asks the

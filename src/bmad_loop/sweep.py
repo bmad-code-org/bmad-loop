@@ -804,6 +804,23 @@ class SweepEngine(Engine):
         result. Lifting that is a resume-fidelity change of its own. The
         COMMITTING window IS recovered, though — same as the base engine's
         resume-commit arm (#115)."""
+        if task.worktree_path:
+            # The same re-anchor `Engine._finish_inflight` makes, for the same reason
+            # and in the same position — ABOVE the `isolated` gate. Sweep does not
+            # inherit it: `SweepEngine` replaces `_loop` wholesale and `Engine._loop`
+            # is the only caller of `_finish_inflight`, so nothing on this path had
+            # re-absolutized the persisted spelling. Both legs below need it. The
+            # restart arm discards the mount and clears `worktree_path` before the
+            # caller saves, which would strand the mount-RELATIVE value beside an
+            # empty `worktree_path` (`_serialized_worktree_path` only relativizes
+            # while that field is set); and the gate is live policy, so an
+            # `isolation` flip across a resume drops the `elif task.baseline_commit`
+            # and the two non-isolated arms onto never-re-anchored paths. Either way
+            # the raw value resolves against the MAIN checkout — same layout, so
+            # `recovery_flow._attempt_owned_spec` finds one candidate,
+            # `spec_within_roots` accepts it, and the snapshot restore rewrites the
+            # operator's own copy.
+            task.rebase_spec_paths_on(Path(task.worktree_path))
         isolated = self._isolated and task.worktree_path
         if task.phase == Phase.COMMITTING:
             # the gate+advance save landed pre-death; finish the commit

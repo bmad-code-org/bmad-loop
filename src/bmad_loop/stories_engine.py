@@ -54,7 +54,7 @@ from .model import (
     Phase,
     StoryTask,
 )
-from .runs import graceful_stop_requested, task_spec_path
+from .runs import graceful_stop_requested
 
 
 @dataclass(frozen=True)
@@ -606,24 +606,6 @@ class StoriesEngine(Engine):
                 task.story_key,
             )
         self._review_and_commit(task)
-
-    def _operator_spec_path(self, task: StoryTask) -> str:
-        """The task's spec spelled the way an operator can actually open it.
-
-        Every pause below hands a human a path and tells them to review it, and the
-        journal records the same string. `task.spec_file` is persisted RELATIVE to the
-        mounted worktree under isolation (`model._serialized_worktree_path`), so the raw
-        value resolves against whatever directory the operator happens to be in — the
-        main checkout, which carries the same layout and answers with the wrong tree's
-        copy. That is the identical defect the TUI's `_paused_spec` carries a docstring
-        about; this is the surface the operator meets FIRST, before any dashboard.
-
-        Falls back to the story key on a spec-less task, matching `spec_ref` above
-        rather than raising out of a notification path.
-        """
-        if not task.spec_file:
-            return task.story_key
-        return str(task_spec_path(task, self.state))
 
     def _pause_plan_checkpoint(self, task: StoryTask) -> None:
         """Leg 1 of a spec_checkpoint story verified (plan at ready-for-dev): pause

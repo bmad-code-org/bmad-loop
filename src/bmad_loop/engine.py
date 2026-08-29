@@ -76,6 +76,7 @@ from .runs import (
     read_stop_request_mode,
     reset_owner_run_dir,
     set_owner_run_dir,
+    task_spec_path,
 )
 from .sprintstatus import ACTIONABLE_STATUSES, STATUS_ORDER, SprintStatusError
 from .sprintstatus import advance as sprint_advance
@@ -1356,7 +1357,16 @@ class Engine:
         self._recovery_flow.rollback_or_pause(task, cause=cause)
 
     def _discard_unit_for_restart(self, task: StoryTask) -> None:
-        """Drop a half-built unit worktree and EVERY field that described it.
+        """Drop a half-built unit worktree and the four fields that LOCATE it.
+
+        Scoped deliberately: `worktree_path`, `branch`, `baseline_commit` and
+        `baseline_untracked` all name the mount or a measurement taken inside it, and
+        each is wrong the moment it is gone. The spec-ownership pair
+        (`dispatched_spec_file`, `dispatched_spec_snapshot`) is NOT cleared here — it
+        records which spec an attempt owned, which outlives the mount, and
+        `_bind_dispatched_spec_for_attempt` rebinds it on the next attempt before any
+        reader can act on it. Note the caller re-anchors that pair immediately above, so
+        between here and the rebind it holds an absolute path into the deleted tree.
 
         `worktree_path`/`branch` name the mount; `baseline_commit`/`baseline_untracked`
         were MEASURED in it (`_dev_phase` stamps both from `self.workspace.root`, which
@@ -1960,6 +1970,30 @@ class Engine:
             self._drive_story(task)
         self._emit("post_story", task)
 
+    def _operator_spec_path(self, task: StoryTask) -> str:
+        """The task's spec spelled the way an operator can actually open it.
+
+        Every pause that hands a human a path and tells them to review it goes through
+        here, and the journal records the same string. `task.spec_file` is persisted
+        RELATIVE to the mounted worktree under isolation
+        (`model._serialized_worktree_path`), so the raw value resolves against whatever
+        directory the operator happens to be in — the main checkout, which carries the
+        same layout and answers with the wrong tree's copy. That is the identical defect
+        the TUI's `_paused_spec` carries a docstring about; this is the surface the
+        operator meets FIRST, before any dashboard.
+
+        Defined on `Engine` rather than on `StoriesEngine`, where it started, because
+        sprint mode pauses for spec approval too (`_drive_story` below) and it is
+        isolation-capable through `_run_isolated` — so the same relative spelling
+        reached the same operator from the sibling engine.
+
+        Falls back to the story key on a spec-less task, matching `spec_ref` in
+        stories mode rather than raising out of a notification path.
+        """
+        if not task.spec_file:
+            return task.story_key
+        return str(task_spec_path(task, self.state))
+
     def _drive_story(self, task: StoryTask, dev_resume: SessionResult | None = None) -> None:
         if not self._dev_phase(task, resume_result=dev_resume):
             return
@@ -1968,7 +2002,8 @@ class Engine:
                 self.policy,
                 self.run_dir,
                 f"spec ready for approval: {task.story_key}",
-                f"review {task.spec_file}, then `bmad-loop resume {self.state.run_id}`",
+                f"review {self._operator_spec_path(task)}, then "
+                f"`bmad-loop resume {self.state.run_id}`",
             )
             raise RunPaused(
                 f"awaiting spec approval for {task.story_key}",

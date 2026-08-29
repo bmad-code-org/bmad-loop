@@ -169,10 +169,9 @@ breaking changes may land in a minor release.
   success (the wrong file genuinely is inside the confinement root), the run resumed, and the
   worktree's real spec kept its terminal status, so the next dispatch did not re-plan. The path and
   the confinement root now come from one claim about which tree owns the spec, and a spec missing at
-  the anchored path reads as an explicit read failure rather than an empty body — including a
-  spec that is present but not valid UTF-8, which previously escaped the read guard as a
-  `UnicodeDecodeError` and took the dashboard down. `bmad-loop resolve`'s `context.json` reports
-  `spec_file` as an absolute path for the same reason.
+  the anchored path reads as an explicit read failure rather than an empty body.
+  `bmad-loop resolve`'s `context.json` reports `spec_file` as an absolute path for the same
+  reason.
 
   The confinement root now also has to be a tree that can actually contain the spec. A spec
   recorded as an absolute path alongside a worktree sits outside that worktree by construction,
@@ -186,6 +185,21 @@ breaking changes may land in a minor release.
   walk would make the confinement root depend on filesystem state, so the narrow loud failure is
   kept over a root that changes under a `mkdir`.
 
+- **A sweep bundle's restart arm re-anchors spec ownership before it discards the mount.** The
+  engine's arm was fixed; sweep's was not, and it never inherited the fix — `SweepEngine` replaces
+  `_loop` wholesale, so the base engine's `_finish_inflight` (which carries the re-anchor) never
+  runs, while both engines share the discard helper itself. A bundle interrupted under isolation
+  therefore persisted a mount-relative spec path beside an emptied `worktree_path`, and recovery
+  resolved it against the main checkout — where the same layout answers, so the snapshot restore
+  rewrote the operator's own copy of the spec.
+
+- **The stories folder is located from the workspace root, not from the spec's confinement root.**
+  The sentinel indicator and `context.json`'s stories block borrowed `task_spec_root`, which
+  answers which tree can CONFINE a write to `spec_file` and falls back to the project for a spec
+  outside the mount. For such a run they read the main checkout while the engine's own
+  `_stories_folder` stayed on the worktree, so one surface could again describe two trees. They now
+  use a separate resolver that mirrors the engine's rule.
+
 - **The tree the spec is anchored on is now the tree its neighbouring fields describe.** The
   re-anchor had been adopted for `spec_file` alone, leaving the fields beside it resolving against
   the main checkout. The escalation modal read its spec text from the run's tree while its sentinel
@@ -197,8 +211,10 @@ breaking changes may land in a minor release.
 - **Pause notifications hand the operator a path that resolves from where they are standing.**
   The spec-approval and plan-checkpoint pauses, and the `checkpoint-pause` journal record, printed
   the raw worktree-relative `spec_file` — the same wrong-tree string the dashboard fix removed, on
-  the surface the operator reads first. The dev-session prompt is deliberately left relative: that
-  session's working directory is the mount, so the anchor belongs to the consumer, not the field.
+  the surface the operator reads first. Sprint mode's spec-approval pause is included: it prints
+  through the same helper, which now lives on `Engine` rather than on `StoriesEngine`. The
+  dev-session prompt keeps the raw field, whatever spelling it holds: that session's working
+  directory is the mount, so the anchor belongs to the consumer, not the field.
 
 - **A discarded worktree no longer leaves its baseline pointing at a tree that is gone.** The
   restart arm cleared `worktree_path` and `branch` when it dropped a half-built unit, but left
@@ -238,10 +254,13 @@ breaking changes may land in a minor release.
   degrades one byte rather than losing the whole document to a failure sentence, and the failure
   body is reserved for a spec that is actually absent.
 
-- **A spec that could not be read no longer offers `Approve & resume`.** The verbs act on the
-  spec — approve resumes the run past the gate — so a gate nobody could review is refused at the
+- **A spec that could not be read no longer offers `Approve & resume`, `Re-arm` or `Resolve`.**
+  The verbs act on the spec — approve resumes the run past the gate, re-arm flips its frontmatter,
+  strips its result and re-stamps the baseline — so a gate nobody could review is refused at the
   source rather than downstream, and the failure text is dimmed instead of being rendered in the
-  style reserved for the spec's own words.
+  style reserved for the spec's own words. The escalation modal reports the blocking condition as
+  UNKNOWN rather than absent: it is parsed from the spec, so an unreadable one previously rendered
+  "(no blocking condition recorded)" — indistinguishable from a spec that halted without one.
 
 - **`context.json` reports whether an edit to the spec survives to the re-drive.** Under worktree
   isolation the mount is discarded before the re-drive reads anything, so a resolve session could

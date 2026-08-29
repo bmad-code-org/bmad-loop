@@ -5519,3 +5519,61 @@ def test_migration_restore_accepts_an_already_restored_symlink_ledger(project, t
     assert "changed underneath the failed migration attempt" not in engine.state.paused_reason
     assert target.read_text(encoding="utf-8") == LEGACY_LEDGER
     assert len(adapter.sessions) == 2
+
+
+def test_bundle_restart_arm_anchors_spec_ownership_before_it_discards_the_mount(
+    project, monkeypatch
+):
+    """Sweep's restart arm is the engine's, and it needed the same re-anchor.
+
+    `SweepEngine` replaces `_loop` wholesale and `Engine._loop` is the ONLY caller of
+    `_finish_inflight`, so the re-anchor that method makes never runs here — while
+    `_recover_inflight_bundle` reaches the very same shared
+    `Engine._discard_unit_for_restart`. The baseline half of that helper was therefore
+    inherited by sweep and the spec-ownership half was not.
+
+    Both spec paths are persisted RELATIVE to the mount
+    (`model._serialized_worktree_path`), and the restart arm discards the worktree and
+    clears `task.worktree_path` before the caller saves — so without the re-anchor the
+    save strands a worktree-relative spelling beside an EMPTY `worktree_path`, and the
+    next resume resolves it against the main checkout, which carries the same layout.
+    `recovery_flow._attempt_owned_spec` then finds exactly one candidate,
+    `spec_within_roots` accepts it, and the snapshot restore rewrites the operator's own
+    copy.
+
+    Graded at the discard, like its engine sibling: the ordering is the property, and a
+    later rebind would let a post-hoc assertion pass with the re-anchor deleted.
+
+    Ablation: drop `task.rebase_spec_paths_on(...)` from `_recover_inflight_bundle` and
+    both assertions fail with the bare relative spellings.
+    """
+    from bmad_loop.workspace import open_unit_workspace
+
+    engine, _ = make_sweep(project, [], policy=isolated_policy())
+    unit = open_unit_workspace(
+        project.project, project, "sweep-run", "dw-fix", "main", "bundle", engine.run_dir
+    )
+    task = StoryTask("dw-fix", 1, phase=Phase.DEV_RUNNING)
+    task.worktree_path = str(unit.path)
+    task.branch = unit.branch
+    task.spec_file = "_bmad-output/accepted.md"
+    task.dispatched_spec_file = "_bmad-output/dispatched.md"
+    engine.state.tasks["dw-fix"] = task
+
+    seen: dict[str, str | None] = {}
+
+    class _StopAtDiscard(Exception):
+        pass
+
+    def _spy(*_args, **_kwargs):
+        seen["spec_file"] = task.spec_file
+        seen["dispatched_spec_file"] = task.dispatched_spec_file
+        raise _StopAtDiscard
+
+    monkeypatch.setattr("bmad_loop.engine.discard_worktree", _spy)
+
+    with pytest.raises(_StopAtDiscard):
+        engine._recover_inflight_bundle(task)
+
+    assert seen["spec_file"] == str(unit.path / "_bmad-output/accepted.md")
+    assert seen["dispatched_spec_file"] == str(unit.path / "_bmad-output/dispatched.md")

@@ -3879,7 +3879,10 @@ def test_task_spec_root_refuses_a_spec_the_project_cannot_reach(tmp_path):
     selects its arm on the lexical `is_relative_to` — which passes — and the confined
     arm it selects then walks the components below the root and refuses the redirect. So
     a write that previously took the plain no-follow arm and SUCCEEDED now raises
-    `UnconfinedWriteError`, which `rearm_escalation` re-raises as `RearmError`.
+    `UnconfinedWriteError`. Graded here through `devcontract.reset_spec_status`, one of
+    the three `_atomic_write_spec` writers, so the arm SELECTION is what reaches the
+    refusal rather than being assumed. `rearm_escalation` converting it to `RearmError`
+    is its own arm and is graded by the re-arm rows, not by this one.
 
     Kept as behavior rather than fixed, because the fix is worse: gating the arm on
     `path_is_confined` makes the root depend on filesystem state (that predicate answers
@@ -3905,8 +3908,17 @@ def test_task_spec_root_refuses_a_spec_the_project_cannot_reach(tmp_path):
     root = runs.task_spec_root(run.task, run.state)
     assert root == tmp_path  # lexically contained, so the confined arm is selected
     assert spec.is_relative_to(root)
+    # Driven through `_atomic_write_spec`, NOT through the primitive: calling
+    # `atomic_write_bytes_confined` directly proves only that the primitive refuses a
+    # symlinked component, which was never in doubt. The claim is that the WRITER's
+    # lexical arm selection reaches that refusal for this root — so the real writer has
+    # to be the thing that raises.
+    from bmad_loop import devcontract
+
     with pytest.raises(platform_util.UnconfinedWriteError):
-        platform_util.atomic_write_bytes_confined(spec, b"x", confine_root=root)
+        devcontract.reset_spec_status(spec, "draft", confine_root=root)
+    # and the spec is untouched by the aborted write
+    assert spec.read_text(encoding="utf-8") == "---\nstatus: blocked\n---\n"
 
 
 def test_task_spec_path_refuses_an_empty_spec_file(tmp_path):

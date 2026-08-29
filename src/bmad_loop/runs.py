@@ -2231,8 +2231,18 @@ def task_spec_root(task: StoryTask, state: RunState) -> Path:
     silently take the plain no-follow arm (losing #593's O_NOFOLLOW walk) and
     `_restore_rearmed_spec`, which calls the confined writer directly, would RAISE.
 
-    The project can often confine it, and where nothing can, the write lands on the arm
-    it already took. NOT unconditionally, though, and the exception is graded by
+    The project can often confine it. Where nothing can, the THREE `_atomic_write_spec`
+    writers land on the arm they already took — they select lexically, so an out-of-root
+    path simply takes the plain no-follow write as before. That is not true of every
+    writer: `_restore_rearmed_spec` calls `atomic_write_bytes_confined` DIRECTLY with no
+    lexical arm, so for a spec outside both the mount and the project — the shared
+    artifact dir `_spec_is_shared_with_the_redrive` treats as first-class and reachable —
+    it raises `UnconfinedWriteError` and the re-arm's undo is lost with the spec already
+    flipped and stripped. That asymmetry PRE-DATES this anchor (the previous body
+    returned the worktree there, which equally cannot confine the path) and is tracked
+    separately; it is named here so the paragraph is not read as covering it.
+
+    The arm is not unconditionally an improvement either, and that exception is graded by
     `test_task_spec_root_refuses_a_spec_the_project_cannot_reach`: `_atomic_write_spec`
     picks its arm on a LEXICAL `is_relative_to`, but the confined arm it picks then
     walks the components below the root and refuses a redirect (`open_dir_confined` on
@@ -2267,6 +2277,36 @@ def task_spec_root(task: StoryTask, state: RunState) -> Path:
     if raw.is_absolute() and not raw.is_relative_to(worktree):
         return Path(state.project)
     return Path(worktree)
+
+
+def task_stories_root(task: StoryTask | None, state: RunState) -> Path:
+    """The tree this run's STORIES FOLDER lives in — the workspace root, not a
+    confinement root.
+
+    Deliberately NOT `task_spec_root`, which the sentinel and stories-block readers
+    used to borrow. That function answers "which tree can CONFINE a write to
+    `task.spec_file`", and its out-of-mount arm falls back to the project precisely so
+    a `confine_root` can never fail to contain the anchored path. Reusing that answer
+    here imported a write-confinement decision into a READ of a different file: for an
+    isolated run whose `spec_file` is absolute and lexically outside the mount — the
+    shape `model._serialized_worktree_path` persists verbatim, reachable whenever a
+    symlinked component makes a spec that physically lives in the mount look outside
+    it, since `verify.resolve_spec_path` deliberately does not `.resolve()` — the
+    stories folder would be looked up in the MAIN CHECKOUT while
+    `stories_engine._stories_folder` answers the worktree for the same task. One
+    surface would then describe two trees, which is the exact defect the spec anchor
+    exists to close.
+
+    So this mirrors `_stories_folder`'s own rule instead: the mount whenever the task
+    holds one, the project otherwise. `spec_file` does not enter into it — the stories
+    folder is located by `state.spec_folder` relative to the workspace root, and a
+    task's spec being elsewhere says nothing about where its story manifest lives.
+
+    Accepts `None` so the two call sites do not each re-spell the no-task fallback.
+    """
+    if task is None or not task.worktree_path:
+        return Path(state.project)
+    return Path(task.worktree_path)
 
 
 def _spec_is_shared_with_the_redrive(state: RunState, task: StoryTask) -> bool:

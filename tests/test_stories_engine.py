@@ -979,7 +979,11 @@ def test_operator_spec_path_anchors_an_isolated_units_spec(project):
     mount, so the relative spelling is the correct one there. The anchor belongs to the
     consumer, not to the field.
 
-    Ablation: revert either site to a bare `task.spec_file` and this reddens.
+    Ablation: change the helper's body to return `task.spec_file` and this reddens.
+    NOTE this row grades the HELPER only — reverting a CALL SITE to a bare
+    `task.spec_file` leaves it green, which is why
+    `test_plan_checkpoint_pause_journals_the_mount_anchored_spec` below pins the
+    journalled value that an actual pause emits.
     """
     engine, _adapter = make_engine(project, [])
     wt = project.project / ".bmad-loop" / "runs" / "test-run" / "worktrees" / "1"
@@ -990,6 +994,38 @@ def test_operator_spec_path_anchors_an_isolated_units_spec(project):
     assert engine._operator_spec_path(task) == str(wt / rel)
     # a spec-less task falls back to the story key rather than raising out of a notice
     assert engine._operator_spec_path(StoryTask("1", 0)) == "1"
+
+
+def test_plan_checkpoint_pause_journals_the_mount_anchored_spec(project):
+    """The CALL SITE, not the helper — the two can regress independently.
+
+    `test_operator_spec_path_anchors_an_isolated_units_spec` calls the helper directly,
+    so every one of the five notification/journal sites could be reverted to a bare
+    `task.spec_file` with the whole suite still green: the stories engine builds its
+    policy with `notify=QUIET`, so no row observes a notification body, and every other
+    `checkpoint-pause` assertion reads `checkpoint` and never `spec`.
+
+    This pins the value an actual pause emits, which is also the premise
+    `diagnostics.py` now records for the `spec` alias field.
+
+    Ablation: revert `_pause_plan_checkpoint`'s `spec=` to `task.spec_file` and this
+    reddens on the bare relative spelling.
+    """
+    from bmad_loop.engine import RunPaused
+
+    engine, _adapter = make_engine(project, [])
+    wt = project.project / ".bmad-loop" / "runs" / "test-run" / "worktrees" / "1"
+    rel = "epic-1/stories/1-slug.md"
+    task = StoryTask("1", 0, spec_file=rel)
+    task.worktree_path = str(wt)
+    engine.state.tasks["1"] = task
+
+    with pytest.raises(RunPaused):
+        engine._pause_plan_checkpoint(task)
+
+    record = _kinds(engine.journal, "checkpoint-pause")[-1]
+    assert record["spec"] == str(wt / rel)
+    assert record["checkpoint"] == "plan"
 
 
 # -------- MAJOR-B: a spec_checkpoint story can never commit without a plan review

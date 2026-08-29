@@ -722,6 +722,7 @@ class EscalationModal(BaseDialog):
         resolution_ready: bool,
         engine_live: bool,
         restore_recorded: bool = False,
+        unreadable: bool = False,
     ):
         super().__init__()
         self._story_key = story_key
@@ -732,6 +733,7 @@ class EscalationModal(BaseDialog):
         self._resolution_ready = resolution_ready
         self._engine_live = engine_live
         self._restore_recorded = restore_recorded
+        self._unreadable = unreadable
 
     def compose(self) -> ComposeResult:
         head = Text()
@@ -753,6 +755,21 @@ class EscalationModal(BaseDialog):
                     )
                 with Vertical(id="blocking"):
                     body = self._blocking.strip()
+                    if self._unreadable:
+                        # The spec could not be READ at the anchored path, so there is
+                        # no blocking condition to parse and "(no blocking condition
+                        # recorded)" would be a lie indistinguishable from a readable
+                        # spec that simply halted without one. `_blocking_condition`
+                        # reduces the read-failure body to "" like any other non-halt
+                        # text, so this arm cannot be inferred downstream — it has to
+                        # be carried in.
+                        yield Static(
+                            Text(
+                                "⚠ the spec could not be read at the anchored path — "
+                                "the blocking condition below is unknown, not absent",
+                                style="red",
+                            )
+                        )
                     yield Static(
                         Text(body)
                         if body
@@ -765,7 +782,16 @@ class EscalationModal(BaseDialog):
             # The restore-discard branch below gates an enabled Re-arm, so the hint
             # is docked outside #body (never scrolled off) — directly above the buttons.
             hint = Text()
-            if self._restore_recorded:
+            if self._unreadable:
+                # Precedence over both branches below: they explain when Re-arm
+                # unlocks, and neither is true while the evidence cannot be read.
+                hint.append(
+                    "both verbs are refused while the spec is unreadable — re-arm "
+                    "flips its frontmatter, strips the result and re-stamps the "
+                    "baseline, and an unreviewable escalation is not actionable",
+                    style="red",
+                )
+            elif self._restore_recorded:
                 # honoring the latch from here would be unsafe (a stale marker is
                 # indistinguishable from a fresh one), so Re-arm stays a plain
                 # from-scratch re-drive — but never a silent drop of the decision.
@@ -786,13 +812,16 @@ class EscalationModal(BaseDialog):
             yield Static(hint, id="hint")
             with Horizontal(classes="buttons"):
                 yield Button(
-                    "Resolve", variant="primary", id="act-resolve", disabled=self._engine_live
+                    "Resolve",
+                    variant="primary",
+                    id="act-resolve",
+                    disabled=self._engine_live or self._unreadable,
                 )
                 yield Button(
                     "Re-arm & resume",
                     variant="warning",
                     id="act-rearm",
-                    disabled=not self._resolution_ready or self._engine_live,
+                    disabled=not self._resolution_ready or self._engine_live or self._unreadable,
                 )
                 yield Button("close", id="cancel")
 

@@ -26,7 +26,7 @@ from .platform_util import safe_segment
 from .runs import (
     spec_reaches_the_redrive,
     task_spec_path,
-    task_spec_root,
+    task_stories_root,
     validate_restore_latch,
 )
 
@@ -112,10 +112,13 @@ def build_context(state: RunState, run_dir: Path, story_key: str, *, isolation: 
         validate_restore_latch(state, task, story_key, worktree_isolation=isolation == "worktree")
         is None
     )
-    # The one claim about which tree owns this story, shared by every field below that
-    # names a file. `task_spec_root` is the same definition the re-arm's writers confine
-    # against, so the context cannot describe a tree the write will not land on.
-    spec_root = task_spec_root(task, state) if task else Path(state.project)
+    # Which tree holds this run's STORY MANIFEST — the workspace root, answered by
+    # `task_stories_root` rather than by `task_spec_root`. The latter answers a
+    # write-confinement question about `spec_file` and falls back to the project for an
+    # out-of-mount spec; borrowing it here pointed the sentinel and the stories block at
+    # the main checkout while `stories_engine._stories_folder` was still the mount, so
+    # one `context.json` could name two trees.
+    stories_root = task_stories_root(task, state)
     context = {
         "story_key": story_key,
         "run_id": state.run_id,
@@ -147,14 +150,20 @@ def build_context(state: RunState, run_dir: Path, story_key: str, *, isolation: 
         # every write succeed. `rearm_escalation` already journals
         # `rearm-spec-write-unreachable` on this same verdict; naming it here is what
         # lets the session act on it instead of learning it afterwards.
-        "spec_reaches_the_redrive": (spec_reaches_the_redrive(task, state) if task else None),
+        # Guarded on `task.spec_file` exactly as `spec_file` above is: a verdict about
+        # whether an edit SURVIVES is meaningless beside a `"spec_file": null`, and
+        # emitting one invited the session to act on a reachability answer for a file
+        # the same document says does not exist. Both fields are one claim.
+        "spec_reaches_the_redrive": (
+            spec_reaches_the_redrive(task, state) if task and task.spec_file else None
+        ),
     }
     # Stories mode: hand the resolver the manifest intent (the story entry) and a
     # sentinel indicator, so it sees WHAT the story is meant to do and WHETHER the
     # frozen spec even exists yet (a sentinel has no plan to edit — resolve the
     # underlying ambiguity instead). Sprint mode leaves the context unchanged.
     if state.source == "stories":
-        stories_ctx = _stories_context(state, story_key, spec_root)
+        stories_ctx = _stories_context(state, story_key, stories_root)
         if stories_ctx:
             context["stories"] = stories_ctx
     path = context_path(run_dir, story_key)
@@ -171,11 +180,12 @@ def _stories_context(state: RunState, story_key: str, root: Path) -> dict[str, A
     an unreadable manifest just yields the folder (resolve still runs)."""
     from . import stories
 
-    # `root`, not `Path(state.project)`: this block describes the same story whose
-    # `spec_file` the caller anchored on the run's own tree, and one `context.json` that
-    # names two trees is worse than one that names the wrong one — `sentinel.path` and
-    # `blocking_condition` would describe a file the re-arm will never touch, or vanish
-    # entirely because the main checkout has no sentinel while the mount does.
+    # `root`, not `Path(state.project)`: the caller resolved it with
+    # `task_stories_root`, so this block reads the manifest and sentinel out of the tree
+    # the RUN owns. One `context.json` that names two trees is worse than one that names
+    # the wrong one — `sentinel.path` and `blocking_condition` would otherwise describe a
+    # file the re-arm will never touch, or vanish entirely because the main checkout has
+    # no sentinel while the mount does.
     folder = stories.resolve_spec_folder(root, state.spec_folder)
     ctx: dict[str, Any] = {"spec_folder": state.spec_folder}
     try:

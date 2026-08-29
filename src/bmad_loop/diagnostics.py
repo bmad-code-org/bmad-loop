@@ -186,9 +186,12 @@ _JOURNAL_KIND_ALIAS_FIELDS: dict[str, dict[str, str]] = {
 # Namespaces whose journalled value arrives in more than one shape and must be
 # reduced to its basename before it is aliased. `spec` is one: engine.py's
 # reconcile and marker-repair kinds journal `str(spec_path)` (absolute —
-# `verify.resolve_spec_path` returns an absolute path), while stories_engine's
-# `checkpoint-pause` journals `task.spec_file`, which `StoryTask` persists
-# worktree-relative (a bare basename for a spec at the worktree root). Aliasing
+# `verify.resolve_spec_path` returns an absolute path). Every producer is absolute
+# TODAY — `checkpoint-pause` moved to `_operator_spec_path` — but the reduction is
+# keyed on the NAMESPACE rather than on any producer precisely so that stays a
+# property this module does not have to trust: `_operator_spec_path` still answers a
+# bare STORY KEY for a spec-less task, and nothing stops a future producer journaling
+# a raw `task.spec_file`. Aliasing
 # the raw string would give ONE spec TWO aliases in a single dump, defeating the
 # correlation these fields are aliased rather than dropped to preserve, and would
 # park an absolute home path in the local `--legend` file (before `spec` was

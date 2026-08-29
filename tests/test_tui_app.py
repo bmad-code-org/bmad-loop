@@ -5743,3 +5743,95 @@ async def test_decision_modal_survives_lock_and_state_root_failures(project, mon
         # walk behind it. The `run_test` context exiting without raising is the
         # other half — an escape into the event loop surfaces there, not here.
         assert app.is_running
+
+
+async def test_gate_unreadable_spec_refuses_approve_and_resume(project, monkeypatch):
+    """The GATE arm of the same refusal — its sibling row grades plan-checkpoint only.
+
+    `_review_gate` and `_review_plan_checkpoint` both build a `SpecReviewModal` and both
+    forward `unreadable=not readable`, but the verbs differ: the checkpoint offers
+    `#act-approve`/`#act-replan` and the gate offers `#act-resume`. Only the checkpoint
+    pair was pinned, so `unreadable=` could be dropped from `_review_gate` with
+    `tests/test_tui_app.py` fully green — and `Approve & resume` at a spec-approval gate
+    is the verb that carries the run PAST the gate whose only purpose is a human reading
+    that file.
+
+    Ablation: pass `unreadable=False` in `_review_gate` and this reddens on the button
+    state.
+    """
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    task = StoryTask(story_key="1-1-a", epic=1, phase=Phase.DEV_VERIFY)
+    task.spec_file = str(project.project / "gone" / "spec-1-1-a.md")
+    make_run(
+        project.project,
+        "20260611-100000-aaaa",
+        paused_stage="spec-approval",
+        paused_reason="awaiting spec approval",
+        paused_story_key="1-1-a",
+        tasks={"1-1-a": task},
+    )
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+        body = render(app.screen.query_one("#spec Static", Static).content)
+        assert "could not be read" in body
+        assert app.screen.query_one("#act-resume", Button).disabled
+
+
+async def test_escalation_unreadable_spec_refuses_rearm_and_resolve(project, monkeypatch):
+    """The escalation modal discarded the read verdict entirely.
+
+    `_review_escalation` bound `_readable` and dropped it, so an unreadable spec reached
+    `_blocking_condition` — a `find("## Auto Run Result")` that answers "" for the read-
+    failure sentence exactly as it does for any spec without a halt block. The modal
+    then rendered "(no blocking condition recorded)", BYTE-IDENTICAL to a spec that was
+    read fine and simply halted without one, while `Re-arm & resume` stayed live. Re-arm
+    flips the spec's frontmatter, strips its `## Auto Run Result` and re-stamps the
+    baseline, so that is a destructive write driven from a modal reporting evidence
+    nobody could read.
+
+    Ablation: drop `unreadable=` from `_review_escalation`'s `EscalationModal(...)` and
+    this reddens on both the notice and the two button states.
+    """
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    _run_dir, spec = _stories_paused_run(project.project, stage="escalation")
+    spec.unlink()  # absent at the anchored path
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, EscalationModal)
+        rendered = " ".join(
+            render(s.content) for s in app.screen.query("#blocking Static").results(Static)
+        )
+        # the distinguishing claim: unknown, NOT absent
+        assert "could not be read" in rendered
+        assert app.screen.query_one("#act-rearm", Button).disabled
+        assert app.screen.query_one("#act-resolve", Button).disabled
+
+
+async def test_replan_on_a_spec_that_vanished_after_render_names_the_anchored_path(
+    project, monkeypatch
+):
+    """`_do_replan`'s absent-spec branch, which no row reached.
+
+    The branch is narrow by construction — the same absence that produces it also
+    disables `#act-replan`, so only a spec deleted BETWEEN render and click gets here —
+    but it is the arm that distinguishes "absent at the anchor" from "present with no
+    frontmatter status", and `reset_spec_status` answers False to both. Driven directly
+    because the TOCTOU window cannot be opened through the modal.
+
+    Ablation: delete the `is_file()` branch and this reddens — the shared "could not
+    reset the plan to draft" notice takes over and never names the path consulted.
+    """
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    run_dir, spec = _stories_paused_run(project.project, stage="plan-checkpoint")
+    run_id = run_dir.name
+    spec.unlink()  # vanished after the modal rendered
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        app._do_replan(run_id, spec, project.project)
+        await pilot.pause()
+        assert any(f"no spec at {spec}" in m for m in notifications(app))
+        assert not any("could not reset" in m for m in notifications(app))

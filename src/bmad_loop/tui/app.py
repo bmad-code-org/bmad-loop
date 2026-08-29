@@ -718,14 +718,22 @@ class BmadLoopApp(App[None]):
 
     def _review_escalation(self, run_id: str, run_dir: Path, state: RunState) -> None:
         story_key = state.paused_story_key or "?"
-        spec_path, spec_text, _readable = self._paused_spec(state)
+        spec_path, spec_text, readable = self._paused_spec(state)
         title, description = self._story_context(state, story_key)
         restore_recorded = self._restore_recorded(run_dir, story_key)
         modal = EscalationModal(
             story_key=story_key,
             title=title,
             description=description,
+            # `_blocking_condition` reduces the read-failure body to "" like any
+            # other text without a halt block, so an unreadable spec would render
+            # "(no blocking condition recorded)" — indistinguishable from a spec that
+            # was read fine and simply halted without one. The verdict has to be
+            # carried in, and it also REFUSES both verbs: re-arm flips the spec's
+            # frontmatter, strips its result and re-stamps the baseline, which is not
+            # an action to take on evidence nobody could read.
             blocking=self._blocking_condition(spec_text),
+            unreadable=not readable,
             sentinel_kind=self._sentinel_kind(state, story_key),
             resolution_ready=resolve.resolution_path(run_dir, story_key).is_file(),
             engine_live=_engine_possibly_live(run_dir),
@@ -1070,8 +1078,13 @@ class BmadLoopApp(App[None]):
         # `_blocking_condition`, this through `sentinel_kind` — so anchoring them on
         # different trees let a single modal disagree with itself and rendered a
         # pre-planning sentinel wedge as an ordinary escalation.
-        task = state.tasks.get(key)
-        root = runs.task_spec_root(task, state) if task else Path(state.project)
+        #
+        # `task_stories_root`, not `task_spec_root`: the folder is located from the
+        # workspace root, and the latter's out-of-mount arm answers a confinement
+        # question about `spec_file` that would send this read to the main checkout
+        # while `_stories_folder` stayed on the mount. It also takes `None`, so the
+        # no-task fallback is not re-spelled here.
+        root = runs.task_stories_root(state.tasks.get(key), state)
         # resolve_story_spec globs + reads frontmatter; a file removed mid-scan (a
         # re-arm clearing the sentinel while the viewer refreshes) can raise OSError.
         # Degrade to "" rather than let a race-window read crash the render.
