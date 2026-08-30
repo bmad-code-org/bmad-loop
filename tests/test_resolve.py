@@ -624,6 +624,9 @@ def test_build_context_spec_file_is_none_without_a_task_or_a_spec(tmp_path):
         )
     )
     assert ctx["spec_file"] is None  # no task at all
+    # ... and the escalation gather degrades on the same absence rather than
+    # dereferencing the missing task (`_gather_escalations` returns [] up front).
+    assert ctx["escalations"] == []
 
 
 def test_build_context_no_session_files(tmp_path):
@@ -2007,12 +2010,12 @@ def test_rearm_rejects_unescalated_story(tmp_path):
 
 def test_gather_escalations_reads_one_escalation_once_per_distinct_id(tmp_path):
     """The outermost surface DW-7 names. `_gather_escalations` walks the append-only
-    `task.sessions` — which a re-arm deliberately does NOT clear — and reads
-    `tasks/<record.task_id>/escalation.json` once per record. While the ESCALATED
-    restart re-minted an id byte-equal to the abandoned attempt's, BOTH records
-    addressed the one file, so the abandoned cycle's escalation was returned a second
-    time as the fresh session's. Bumping `generation` gives the fresh record its own
-    id, and the file is read exactly once."""
+    `task.sessions` — which a re-arm deliberately does NOT clear — and now opens each
+    distinct `tasks/<record.task_id>` directory once. Before that reader guard, an
+    ESCALATED restart that re-minted the abandoned attempt's id made BOTH records
+    address one file and returned its escalation twice. Bumping `generation` gives the
+    fresh record its own artifact namespace; the reader also degrades safely on older
+    persisted state where the collision already exists."""
     run_dir, state, task = _escalated_run(tmp_path)
     key = "6-4-cli-list-command"
     abandoned = _session_task_id(key, "triage", 1, 0)
@@ -2032,11 +2035,413 @@ def test_gather_escalations_reads_one_escalation_once_per_distinct_id(tmp_path):
     found = resolve._gather_escalations(run_dir, state, key)
     assert [e["detail"] for e in found] == ["abandoned cycle"]  # once, not twice
 
-    # the pre-fix shape for contrast: one shared id makes the SAME file answer both
-    # records, and the abandoned escalation is attributed to the fresh session too
+    # DW-71: the id bump only protects records minted AFTER it. State persisted
+    # before the bump still carries two records under ONE id, both addressing that
+    # directory's single mutable escalation.json — the reader itself has to return
+    # the escalation once rather than attribute it to the fresh session too.
     task.sessions[1] = SessionRecord(task_id=abandoned, role="dev", status="completed")
     collided = resolve._gather_escalations(run_dir, state, key)
-    assert [e["detail"] for e in collided] == ["abandoned cycle", "abandoned cycle"]
+    assert [e["detail"] for e in collided] == ["abandoned cycle"]
+
+
+def test_gather_escalations_opens_a_repeated_task_id_once(tmp_path, monkeypatch):
+    """DW-71's own leg, watched at the I/O rather than the return value.
+
+    Content de-duplication would hide a re-read behind the identical entry it
+    yields, so "returned once" alone cannot tell the `seen_ids` guard from the
+    content map. Two records under one `task_id` must OPEN that directory's
+    artifacts exactly once — which is also what stops a directory rewritten
+    mid-pass from answering two records differently."""
+    run_dir, state, task = _escalated_run(tmp_path)
+    key = "6-4-cli-list-command"
+    shared = _session_task_id(key, "triage", 1, 0)
+    task.sessions.clear()
+    for _ in range(2):
+        task.sessions.append(SessionRecord(task_id=shared, role="dev", status="completed"))
+    esc_dir = run_dir / "tasks" / shared
+    esc_dir.mkdir(parents=True, exist_ok=True)
+    result_file = esc_dir / "result.json"
+    result_file.write_text(json.dumps({"escalations": []}), encoding="utf-8")
+    esc_file = esc_dir / "escalation.json"
+    esc_file.write_text(
+        json.dumps({"escalations": [{"severity": "CRITICAL", "detail": "shared id"}]}),
+        encoding="utf-8",
+    )
+
+    reads: list[str] = []
+    real_read_text = Path.read_text
+
+    def counting_read_text(self, *args, **kwargs):
+        reads.append(str(self))
+        return real_read_text(self, *args, **kwargs)
+
+    # `monkeypatch.context()`, NOT a bare `setattr` + `undo()`: the autouse
+    # `_isolate_state_root` / `_isolate_mux_registry` fixtures record onto the SAME
+    # function-scoped monkeypatch instance this test receives (conftest says so in
+    # `_isolate_state_root`'s own docstring), so an explicit `undo()` here would roll
+    # back the suite's `BMAD_LOOP_STATE_DIR` isolation too, mid-test.
+    with monkeypatch.context() as mp:
+        mp.setattr(Path, "read_text", counting_read_text)
+        found = resolve._gather_escalations(run_dir, state, key)
+
+    assert reads.count(str(result_file)) == 1  # each artifact once, not once per record
+    assert reads.count(str(esc_file)) == 1
+    assert [e["detail"] for e in found] == ["shared id"]
+
+
+def _two_session_dirs(tmp_path):
+    """A task carrying TWO records with DISTINCT `task_id`s, plus both task
+    directories. `task.sessions` is append-only and chronological, so `sessions[1]`
+    is the NEWER attempt and `reversed(...)` must reach its directory first.
+
+    This shape exists because no single-directory row can see either of this
+    reader's cross-session contracts: rescope the content map per directory, or
+    drop `reversed`, and every one-directory row below stays green."""
+    run_dir, state, task = _escalated_run(tmp_path)
+    key = "6-4-cli-list-command"
+    older = _session_task_id(key, "triage", 1, 0)
+    newer = _session_task_id(key, "triage", 1, 1)  # post-bump: the -g1 namespace
+    assert older != newer
+    task.sessions.clear()
+    dirs: list[Path] = []
+    for task_id in (older, newer):
+        task.sessions.append(SessionRecord(task_id=task_id, role="dev", status="completed"))
+        d = run_dir / "tasks" / task_id
+        d.mkdir(parents=True, exist_ok=True)
+        dirs.append(d)
+    return run_dir, state, key, dirs[0], dirs[1]
+
+
+def test_gather_escalations_dedupes_one_entry_across_two_sessions(tmp_path):
+    """De-duplication is GLOBAL across the pass, not scoped to one directory.
+
+    An escalation a retry does not resolve is re-raised by the next attempt, so two
+    DIFFERENT `tasks/<id>/` directories carry the byte-identical entry and the
+    operator learns nothing from the repeat. This is the only row that can tell a
+    global content map from a per-directory one."""
+    run_dir, state, key, older_dir, newer_dir = _two_session_dirs(tmp_path)
+    entry = {"type": "spec-gap", "severity": "CRITICAL", "detail": "unresolved across attempts"}
+    for d in (older_dir, newer_dir):
+        (d / "escalation.json").write_text(json.dumps({"escalations": [entry]}), encoding="utf-8")
+
+    found = resolve._gather_escalations(run_dir, state, key)
+    assert [e["detail"] for e in found] == ["unresolved across attempts"]
+
+
+def test_gather_escalations_orders_distinct_sessions_newest_first(tmp_path):
+    """The documented "newest first" order is a CROSS-SESSION property: nothing
+    inside one directory can pin it, because `reversed(task.sessions)` is what
+    reaches the newer record's directory before the older one's. Drop `reversed`
+    and only this row notices."""
+    run_dir, state, key, older_dir, newer_dir = _two_session_dirs(tmp_path)
+    for d, detail in ((older_dir, "older"), (newer_dir, "newer")):
+        (d / "escalation.json").write_text(
+            json.dumps({"escalations": [{"severity": "CRITICAL", "detail": detail}]}),
+            encoding="utf-8",
+        )
+
+    found = resolve._gather_escalations(run_dir, state, key)
+    assert [e["detail"] for e in found] == ["newer", "older"]
+
+
+def _task_dir(run_dir, task):
+    """Where `_gather_escalations` looks for result.json / escalation.json, DERIVED
+    from the session record the fixture actually appended — never a literal.
+
+    A hardcoded directory name is a false green waiting on a fixture change: it can
+    drift off the record the reader walks, and a row asserting an EMPTY result would
+    then pass because nothing was read rather than because the filter worked."""
+    d = run_dir / "tasks" / task.sessions[-1].task_id
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def test_gather_escalations_returns_a_mirrored_entry_once(tmp_path):
+    """DW-68/72. The sweep skill's contract (bmad-loop-sweep/automation-mode.md)
+    tells a producer to write escalation.json and then mirror the same entries into
+    result.json `escalations` — so every COMPLIANT escalation reached the operator
+    twice. The mirroring stays; the reader absorbs it. Asserted through
+    `build_context` because `context.json` is the surface the human reads."""
+    run_dir, state, task = _escalated_run(tmp_path)
+    entry = {"type": "spec-gap", "severity": "CRITICAL", "detail": "mirrored once"}
+    # Same JSON object, deliberately authored in a different member order. Raw
+    # `json.dumps(esc)` keys would treat these as distinct; `sort_keys=True` must
+    # make the de-duplication key semantic rather than source-order-sensitive.
+    reordered = {"detail": "mirrored once", "severity": "CRITICAL", "type": "spec-gap"}
+    task_dir = _task_dir(run_dir, task)
+    for fname, value in (("result.json", entry), ("escalation.json", reordered)):
+        (task_dir / fname).write_text(json.dumps({"escalations": [value]}), encoding="utf-8")
+
+    ctx = json.loads(
+        resolve.build_context(state, run_dir, "6-4-cli-list-command", isolation="").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert ctx["escalations"] == [entry]
+
+
+def test_gather_escalations_keeps_distinct_entries_from_both_files(tmp_path):
+    """De-duplication removes only the exact repeat. A directory whose result.json
+    carries A and whose escalation.json carries A + B still yields both, in
+    newest-first order (result.json before escalation.json) — the guard must not
+    collapse a partially-mirrored pair into one."""
+    run_dir, state, task = _escalated_run(tmp_path)
+    a = {"type": "spec-gap", "severity": "CRITICAL", "detail": "A"}
+    b = {"type": "spec-gap", "severity": "CRITICAL", "detail": "B"}
+    task_dir = _task_dir(run_dir, task)
+    (task_dir / "result.json").write_text(json.dumps({"escalations": [a]}), encoding="utf-8")
+    (task_dir / "escalation.json").write_text(json.dumps({"escalations": [a, b]}), encoding="utf-8")
+
+    found = resolve._gather_escalations(run_dir, state, "6-4-cli-list-command")
+    assert [e["detail"] for e in found] == ["A", "B"]
+
+
+def test_gather_escalations_keeps_full_objects_that_share_a_detail(tmp_path):
+    """Exact content, not one convenient field, defines a duplicate. Two
+    escalations may explain the same symptom while identifying different gaps;
+    both complete dictionaries must reach the resolver."""
+    run_dir, state, task = _escalated_run(tmp_path)
+    task_dir = _task_dir(run_dir, task)
+    first = {
+        "type": "spec-gap",
+        "severity": "CRITICAL",
+        "detail": "same operator-facing explanation",
+        "location": "SPEC.md",
+    }
+    second = {
+        "type": "environment-gap",
+        "severity": "CRITICAL",
+        "detail": "same operator-facing explanation",
+        "location": "policy.toml",
+    }
+    (task_dir / "result.json").write_text(
+        json.dumps({"escalations": [first, second]}), encoding="utf-8"
+    )
+
+    assert resolve._gather_escalations(run_dir, state, "6-4-cli-list-command") == [first, second]
+
+
+def test_gather_escalations_preserves_result_before_escalation_file_order(tmp_path):
+    """Within one session directory, result.json precedes escalation.json."""
+    run_dir, state, task = _escalated_run(tmp_path)
+    task_dir = _task_dir(run_dir, task)
+    first = {"severity": "CRITICAL", "detail": "from result"}
+    second = {"severity": "CRITICAL", "detail": "from escalation"}
+    (task_dir / "result.json").write_text(json.dumps({"escalations": [first]}), encoding="utf-8")
+    (task_dir / "escalation.json").write_text(
+        json.dumps({"escalations": [second]}), encoding="utf-8"
+    )
+
+    assert resolve._gather_escalations(run_dir, state, "6-4-cli-list-command") == [first, second]
+
+
+def test_gather_escalations_keeps_a_duplicates_first_position(tmp_path):
+    """A later copy must not move an entry behind intervening distinct content."""
+    run_dir, state, task = _escalated_run(tmp_path)
+    task_dir = _task_dir(run_dir, task)
+    first = {"severity": "CRITICAL", "detail": "first"}
+    second = {"severity": "CRITICAL", "detail": "second"}
+    (task_dir / "result.json").write_text(json.dumps({"escalations": [first]}), encoding="utf-8")
+    (task_dir / "escalation.json").write_text(
+        json.dumps({"escalations": [second, first]}), encoding="utf-8"
+    )
+
+    assert resolve._gather_escalations(run_dir, state, "6-4-cli-list-command") == [first, second]
+
+
+def test_gather_escalations_dedupes_repeats_inside_one_list(tmp_path):
+    """The content map spans the whole pass, including one producer's list."""
+    run_dir, state, task = _escalated_run(tmp_path)
+    task_dir = _task_dir(run_dir, task)
+    entry = {"severity": "CRITICAL", "detail": "listed twice"}
+    (task_dir / "result.json").write_text(
+        json.dumps({"escalations": [entry, entry]}), encoding="utf-8"
+    )
+
+    assert resolve._gather_escalations(run_dir, state, "6-4-cli-list-command") == [entry]
+
+
+def test_gather_escalations_keeps_mixed_case_critical_and_drops_non_dicts(tmp_path):
+    """Delegating the filter preserves its case-insensitive and shape semantics."""
+    run_dir, state, task = _escalated_run(tmp_path)
+    task_dir = _task_dir(run_dir, task)
+    critical = {"severity": "critical", "detail": "case folded"}
+    preference = {"severity": "PREFERENCE", "detail": "not critical"}
+    (task_dir / "result.json").write_text(
+        json.dumps({"escalations": [None, "junk", preference, critical]}), encoding="utf-8"
+    )
+
+    assert resolve._gather_escalations(run_dir, state, "6-4-cli-list-command") == [critical]
+
+
+def test_gather_escalations_skips_a_non_utf8_artifact(tmp_path):
+    """DW-70/73. `UnicodeDecodeError` is a `ValueError`, not an `OSError`, so the
+    old `except (OSError, json.JSONDecodeError)` let a non-UTF-8 artifact crash
+    `build_context` — the interactive resolve path, an OBSERVATION surface that must
+    degrade. The bad file costs its own contents and nothing more."""
+    run_dir, state, task = _escalated_run(tmp_path)
+    task_dir = _task_dir(run_dir, task)
+    (task_dir / "result.json").write_bytes(_BAD_UTF8)
+    (task_dir / "escalation.json").write_text(
+        json.dumps({"escalations": [{"severity": "CRITICAL", "detail": "still readable"}]}),
+        encoding="utf-8",
+    )
+
+    ctx = json.loads(
+        resolve.build_context(state, run_dir, "6-4-cli-list-command", isolation="").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert [e["detail"] for e in ctx["escalations"]] == ["still readable"]
+
+
+def test_gather_escalations_skips_a_plain_json_value_error(tmp_path, monkeypatch):
+    """`json.loads` raises plain ValueError, not JSONDecodeError, when an integer
+    exceeds Python's configured digit limit. That malformed file costs only its
+    contents; its valid sibling still reaches context.json."""
+    run_dir, state, task = _escalated_run(tmp_path)
+    task_dir = _task_dir(run_dir, task)
+    marker = '"detail":' + ("9" * 5000)
+    (task_dir / "result.json").write_text(
+        '{"escalations":[{"severity":"CRITICAL",' + marker + "}]}", encoding="utf-8"
+    )
+    (task_dir / "escalation.json").write_text(
+        json.dumps({"escalations": [{"severity": "CRITICAL", "detail": "sibling survives"}]}),
+        encoding="utf-8",
+    )
+
+    real_loads = json.loads
+
+    def loads_with_digit_limit(data, *args, **kwargs):
+        if marker in data:
+            raise ValueError("integer exceeds configured digit limit")
+        return real_loads(data, *args, **kwargs)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(resolve.json, "loads", loads_with_digit_limit)
+        path = resolve.build_context(state, run_dir, "6-4-cli-list-command", isolation="")
+
+    ctx = json.loads(path.read_text(encoding="utf-8"))
+    assert [e["detail"] for e in ctx["escalations"]] == ["sibling survives"]
+
+
+def test_gather_escalations_skips_a_json_recursion_error(tmp_path):
+    """A deeply nested artifact can exceed the decoder's recursion guard.
+
+    Confirm the real decoder failure first so this stays a regression test for
+    ``RecursionError`` rather than another synthetic exception row. The bad file
+    still costs only its own contents; its valid sibling reaches context.json.
+    """
+    run_dir, state, task = _escalated_run(tmp_path)
+    task_dir = _task_dir(run_dir, task)
+    depth = sys.getrecursionlimit() * 20
+    nested = "[" * depth + "0" + "]" * depth
+    malformed = '{"escalations":[{"severity":"CRITICAL","detail":' + nested + "}]}"
+    with pytest.raises(RecursionError):
+        json.loads(malformed)
+    (task_dir / "result.json").write_text(malformed, encoding="utf-8")
+    (task_dir / "escalation.json").write_text(
+        json.dumps({"escalations": [{"severity": "CRITICAL", "detail": "sibling survives"}]}),
+        encoding="utf-8",
+    )
+
+    ctx = json.loads(
+        resolve.build_context(state, run_dir, "6-4-cli-list-command", isolation="").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert [e["detail"] for e in ctx["escalations"]] == ["sibling survives"]
+
+
+def test_gather_escalations_skips_a_canonicalization_recursion_error(tmp_path, monkeypatch):
+    """Canonical-key construction is part of the guarded artifact read too."""
+    run_dir, state, task = _escalated_run(tmp_path)
+    task_dir = _task_dir(run_dir, task)
+    bad = {"severity": "CRITICAL", "detail": "canonicalization recurses"}
+    sibling = {"severity": "CRITICAL", "detail": "sibling survives"}
+    (task_dir / "result.json").write_text(json.dumps({"escalations": [bad]}), encoding="utf-8")
+    (task_dir / "escalation.json").write_text(
+        json.dumps({"escalations": [sibling]}), encoding="utf-8"
+    )
+    real_dumps = json.dumps
+
+    def dumps_with_recursion_error(value, *args, **kwargs):
+        if value == bad:
+            raise RecursionError("canonicalization depth exceeded")
+        return real_dumps(value, *args, **kwargs)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(resolve.json, "dumps", dumps_with_recursion_error)
+        path = resolve.build_context(state, run_dir, "6-4-cli-list-command", isolation="")
+
+    ctx = json.loads(path.read_text(encoding="utf-8"))
+    assert ctx["escalations"] == [sibling]
+
+
+@pytest.mark.parametrize("bad", [None, 1, "x", {}])
+def test_gather_escalations_skips_a_non_list_escalations_field(tmp_path, monkeypatch, bad):
+    """DW-70/73's other half. `escalation.critical_escalations` iterates
+    `escalations` with no list guard of its own, so `{"escalations": null}` raised
+    `TypeError` straight out of `build_context`. The guard sits in this caller; the
+    shared predicate stays the single definition of CRITICAL.
+
+    Every parameter must fail when the list guard is ablated. ``None`` and ``1``
+    raise without it; the call trace below distinguishes the iterable ``"x"`` and
+    ``{}`` shapes, which the shared filter would otherwise accept as empty."""
+    run_dir, state, task = _escalated_run(tmp_path)
+    task_dir = _task_dir(run_dir, task)
+    (task_dir / "result.json").write_text(json.dumps({"escalations": bad}), encoding="utf-8")
+    (task_dir / "escalation.json").write_text(
+        json.dumps({"escalations": [{"severity": "CRITICAL", "detail": "sibling survives"}]}),
+        encoding="utf-8",
+    )
+
+    filtered: list[dict] = []
+    real_critical_escalations = resolve.critical_escalations
+
+    def recording_critical_escalations(doc):
+        filtered.append(doc)
+        return real_critical_escalations(doc)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(resolve, "critical_escalations", recording_critical_escalations)
+        path = resolve.build_context(state, run_dir, "6-4-cli-list-command", isolation="")
+
+    ctx = json.loads(path.read_text(encoding="utf-8"))
+    assert filtered == [
+        {
+            "escalations": [
+                {"severity": "CRITICAL", "detail": "sibling survives"},
+            ]
+        }
+    ]
+    assert [e["detail"] for e in ctx["escalations"]] == ["sibling survives"]
+
+
+def test_gather_escalations_preference_only_yields_nothing(tmp_path):
+    """The CRITICAL-only filter is unchanged by the de-duplication rewrite: a
+    directory carrying only non-CRITICAL entries contributes nothing, and mirroring
+    a PREFERENCE across both files still contributes nothing.
+
+    The second half is the POSITIVE CONTROL, and it is what makes the first half
+    mean anything. `== []` passes just as well when the directory was never read, so
+    the same files are re-written with a CRITICAL alongside the PREFERENCE and that
+    entry must come back. Absence then evidences the severity filter rather than an
+    unread path."""
+    run_dir, state, task = _escalated_run(tmp_path)
+    key = "6-4-cli-list-command"
+    pref = {"type": "nit", "severity": "PREFERENCE", "detail": "ignore me"}
+    task_dir = _task_dir(run_dir, task)
+    for fname in ("result.json", "escalation.json"):
+        (task_dir / fname).write_text(json.dumps({"escalations": [pref]}), encoding="utf-8")
+
+    assert resolve._gather_escalations(run_dir, state, key) == []
+
+    crit = {"type": "spec-gap", "severity": "CRITICAL", "detail": "kept"}
+    for fname in ("result.json", "escalation.json"):
+        (task_dir / fname).write_text(json.dumps({"escalations": [pref, crit]}), encoding="utf-8")
+    found = resolve._gather_escalations(run_dir, state, key)
+    assert [e["detail"] for e in found] == ["kept"]  # this directory IS read
 
 
 # ----------------------------------------------------------- run_session

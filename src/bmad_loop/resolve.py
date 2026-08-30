@@ -22,6 +22,7 @@ from typing import Any
 
 from .adapters.base import SessionSpec
 from .engine import _session_task_id
+from .escalation import critical_escalations
 from .model import RunState
 from .platform_util import safe_segment
 from .runs import (
@@ -77,15 +78,56 @@ def read_resolution(run_dir: Path, story_key: str) -> dict[str, Any] | None:
 
 
 def _gather_escalations(run_dir: Path, state: RunState, story_key: str) -> list[dict[str, Any]]:
-    """The CRITICAL escalations recorded by this story's sessions, newest first.
+    """The CRITICAL escalations recorded by this story's sessions, newest first,
+    each DISTINCT escalation exactly once.
 
     Reads each session's tasks/<task_id>/result.json (and escalation.json) — the
-    same files the engine inspected when it decided to pause."""
+    same files the engine inspected when it decided to pause. Ordering is
+    `reversed(task.sessions)` and, within a directory, result.json before
+    escalation.json; a duplicate keeps its FIRST occurrence's position, which is
+    what preserves "newest first". Three guards, each for a defect this reader
+    hit on the way to the operator:
+
+    * ``seen_ids`` — ``task.sessions`` is append-only and a re-arm deliberately
+      does NOT clear it, so state can carry two records under one ``task_id``.
+      ``sweep._rearm_generation`` bumps the id namespace for new restarts but
+      does not migrate records already persisted, and both records address the
+      SAME mutable ``tasks/<id>/escalation.json`` — reading it per record
+      attributes the abandoned cycle's escalation to the fresh session too.
+      Open each directory once.
+    * the content-keyed map — the sweep skill's own contract
+      (``data/skills/bmad-loop-sweep/automation-mode.md``) tells a producer to
+      write ``escalation.json`` and then mirror the same entries into
+      ``result.json`` ``escalations``. That mirroring is deliberate and stays;
+      the READER absorbs it, so a compliant producer is not shown to the human
+      twice. The key is canonical JSON because the two copies are parsed
+      separately — identity cannot see the mirroring and ``dict`` is unhashable
+      — and ``setdefault`` makes the first occurrence win. De-duplication is
+      global across the pass, not per directory; it removes only exact repeats,
+      so a directory holding CRITICAL A in one file and A + B in the other still
+      yields both.
+    * the ``except`` tuple and the ``list`` check — ``build_context`` is an
+      OBSERVATION path: a malformed artifact must cost its own contents and
+      nothing more, never raise out to the interactive resolve command.
+      ``UnicodeDecodeError`` is a ``ValueError``, not an ``OSError`` (the same
+      rationale recorded on ``read_resolution`` above), and ``json.loads`` can
+      also raise a plain ``ValueError`` when an integer exceeds Python's configured
+      digit limit. Deeply nested input can raise ``RecursionError`` while either
+      parsing the document or canonicalizing an entry, so both operations live
+      under the same artifact-level guard. Meanwhile,
+      ``critical_escalations`` iterates ``escalations`` with no list guard of its
+      own, so a ``{"escalations": null}`` artifact would raise ``TypeError``
+      here. The guard belongs in this caller; the shared predicate stays the
+      single definition of CRITICAL."""
     task = state.tasks.get(story_key)
-    found: list[dict[str, Any]] = []
     if task is None:
-        return found
+        return []
+    seen_ids: set[str] = set()
+    found: dict[str, dict[str, Any]] = {}
     for session in reversed(task.sessions):
+        if session.task_id in seen_ids:
+            continue
+        seen_ids.add(session.task_id)
         task_dir = run_dir / "tasks" / session.task_id
         for fname in ("result.json", "escalation.json"):
             fpath = task_dir / fname
@@ -93,12 +135,16 @@ def _gather_escalations(run_dir: Path, state: RunState, story_key: str) -> list[
                 continue
             try:
                 doc = json.loads(fpath.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+                if not isinstance(doc, dict) or not isinstance(doc.get("escalations"), list):
+                    continue
+                artifact_entries: dict[str, dict[str, Any]] = {}
+                for esc in critical_escalations(doc):
+                    artifact_entries.setdefault(json.dumps(esc, sort_keys=True), esc)
+            except (OSError, ValueError, RecursionError):
                 continue
-            for esc in doc.get("escalations", []) if isinstance(doc, dict) else []:
-                if isinstance(esc, dict) and str(esc.get("severity", "")).upper() == "CRITICAL":
-                    found.append(esc)
-    return found
+            for key, esc in artifact_entries.items():
+                found.setdefault(key, esc)
+    return list(found.values())
 
 
 def build_context(state: RunState, run_dir: Path, story_key: str, *, isolation: str) -> Path:
