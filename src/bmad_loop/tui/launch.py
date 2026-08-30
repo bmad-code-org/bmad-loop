@@ -373,34 +373,92 @@ def ctl_window_id(project: Path, run_id: str) -> str | None:
     replayed: a target that no longer resolves is the dangerous kind of stale —
     on psmux an unresolvable `-t` lands on the *active* window (psmux/psmux#545;
     tmux merely errors, which the best-effort consumers turn into a silent
-    no-op). With no record at all the answer is the first match, exactly as
-    before.
+    no-op). With no record at all the answer is the first match among the rows
+    that got in — which, since #531, means the first *tagged* match: a row with
+    no tag needs the record to be a candidate at all (below), so the recordless
+    case never has an untagged one to fall back to.
 
-    Scoped to `project` by the PROJECT_OPTION tag, on the same rule as
-    _ctl_window_candidates: the control session is shared across projects, and a
-    run id is only unique within one (`--run-id` is caller-supplied), so a
-    same-id window belonging to another project would otherwise be a legal match
-    here — for `x` that means killing a *live* orchestrator next door. An
-    untagged window is admitted when this project has the run dir, which keeps a
-    window whose (best-effort) tag write failed reachable by its own project
-    rather than by nobody.
+    Scoped to `project` by the PROJECT_OPTION tag: the control session is shared
+    across projects, and a run id is only unique within one (`--run-id` is
+    caller-supplied), so a same-id window belonging to another project would
+    otherwise be a legal match here — for `x` that means killing a *live*
+    orchestrator next door. _ctl_window_candidates reads tags by the same rule,
+    but only that half is still shared: its untagged windows are admitted by the
+    run dir this one stopped trusting, because the pruning consumer of that
+    shape is #419's and the fix is partitioned there.
 
-    Untagged is a *fallback*, not a peer: an untagged window proves nothing
-    about who owns it, so it is consulted only when nothing carries this
-    project's tag. Merged into one listing-ordered list they would compete on
-    index, and a neighbouring project's untagged window listed first would beat
-    this project's correctly tagged one — for `x`, killing next door's
-    orchestrator. That case is not hypothetical: the record cannot break the tie
-    for a fresh `run`, where recording is deliberately skipped."""
+    An untagged row is admitted only when the record names that exact window.
+    Holding the run dir was the earlier gate, and a run dir is a coincidence
+    rather than a claim: `--run-id` is caller-supplied and deterministic, so two
+    projects scripting the same id both hold one, and each then admitted the
+    *other's* untagged window — machine-wide on tmux, where the control session
+    carries a fixed name (#531). The record is the opposite kind of fact: this
+    project wrote it, about the window its own launch minted. It survives the
+    failure this fallback exists for because start_detached records *before* it
+    tags, so a window whose (best-effort) set_window_option never landed still
+    has one.
+
+    What the proof costs is reach for a window minted before any record exists —
+    a fresh `run`/`sweep`, where _record_ctl_window deliberately skips because
+    the run dir is not minted yet, and anything that lost its record since. Those
+    answer None until a relaunch records one, and the two consumers wear that
+    differently: `a` falls through to the live agent session, or says "nothing to
+    attach" when there is none, while `x` kills nothing — kill_ctl_window no-ops
+    on None — and still reports the run stopped, so the orchestrator window is
+    left running with no notice. That is the honest price of the gate, and it is
+    the cheaper half: fail closed is right here because the alternative is not
+    "reach my window" but "reach *a* window": with nothing proving ownership the
+    untagged bucket is filled by listing order, and `x` would kill whatever
+    sorted first — possibly a neighbour's live orchestrator.
+
+    Untagged stays a *fallback*, not a peer: merged into one listing-ordered
+    list a recorded untagged row would compete on index with a correctly tagged
+    one, and the tag is the stronger proof of the two, so untagged is consulted
+    only when nothing carries this project's tag.
+
+    One residual survives, and it is a conjunction rather than a case: a backend
+    that reuses a freed window id (a supported divergence — see the id-reuse row
+    in the tests) hands the neighbour the id this project recorded, while both
+    projects script the same run id AND the neighbour's own tag write failed AND
+    the window this record named is already gone. Name and id then both match and
+    the neighbour is admitted. Closing it needs a channel that says *this window
+    is mine* rather than *an id I once minted*, and the only one available is the
+    tag — which this function must read, never write: re-tagging on read is
+    claiming, not proving, and would hand a neighbour's window this project's
+    tag. So it is left open, deliberately and visibly. Wherever `runs.is_run` still
+    holds, every condition in that conjunction was already satisfied by the gate
+    this replaces — which admitted the neighbour on the run-id collision alone,
+    with no id reuse and no dead window required — so over those states this is a
+    strict narrowing. It is not a narrowing everywhere, and the exception is the
+    residual reached from the other side: _read_ctl_window asks nothing about the
+    run dir, so an untagged row named by a readable record whose run `runs.is_run`
+    now rejects (a partial prune is one route there, not the only one) is admitted
+    here and would have been refused by the old gate — and if that recorded id has
+    since been reused by an untagged neighbour under this run's name, the row
+    admitted is the neighbour's. That is the whole of what this gate trades away.
+    Narrowing it is a mechanism question
+    — an identity channel written at mint time and read here — and this function
+    is the wrong place to decide it."""
     if not mux_available():
         return None
     mine = runs.accepted_tags(project)
-    local = runs.is_run(runs.run_dir_for(project, run_id))
     tagged: list[str] = []
     untagged: list[str] = []
     rows = get_multiplexer().list_windows(
         ctl_session(project), ["window_id", "window_name", runs.PROJECT_OPTION]
     )
+    # Below the listing, above the loop. The loop needs it — it is what admits an
+    # untagged row — but listing and record are two reads of a state a concurrent
+    # relaunch can move between them, never one snapshot, so the ordering is the
+    # only thing to get right and this keeps the one the record has always had.
+    # Read FIRST, a relaunch landing in the gap leaves a record older than the
+    # listing: it names the window that relaunch superseded, the listing shows it,
+    # and `recorded in matches` replays the corpse. Read here, the same relaunch
+    # leaves a record newer than the listing, naming a window the listing does not
+    # carry yet — so it fails the re-prove and the answer falls back to a match
+    # that was at least live when the listing was taken. `rows` is materialized
+    # (list_windows returns a list), so the loop pays nothing for the move.
+    recorded = _read_ctl_window(project, run_id)
     for win_id, name, tag in rows:
         # win_id can be "": psmux's qualifier passes a falsy id through. An
         # empty id must never become a target — an empty `-t` resolves against
@@ -430,17 +488,21 @@ def ctl_window_id(project: Path, run_id: str) -> str | None:
         # unreachable by `a` and `x`, which resolve through here.
         if tag in mine:
             tagged.append(win_id)
-        elif not tag and local:
-            # untagged, and this project holds the run dir — ownership is
-            # plausible but unproven, so it only counts if nothing is tagged
+        elif not tag and win_id == recorded:
+            # untagged, but this project's own launch recorded this window —
+            # proof of the mint, not of the tag, so it only counts if nothing
+            # is tagged
             untagged.append(win_id)
     matches = tagged or untagged
     if not matches:
         return None
-    # Membership in `matches`, not mere presence in the listing: it re-proves the
-    # name and the project too, so neither a backend that reuses a freed window
-    # id nor a record naming a neighbouring project's window can be replayed.
-    recorded = _read_ctl_window(project, run_id)
+    # Membership in `matches`, not mere presence in the listing: it re-checks the
+    # name and the project-scoping predicates, so a record whose id is absent from
+    # the scoped matches — killed, pruned, renamed onto another run, or naming a
+    # row this project cannot claim — is not replayed. Not a proof of identity: a
+    # reused id under this run's name still passes, which is the residual the
+    # docstring names. But it is what turns a stale id from a replayed target
+    # into a fallthrough.
     return recorded if recorded in matches else matches[0]
 
 
