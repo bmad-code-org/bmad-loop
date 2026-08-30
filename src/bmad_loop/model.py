@@ -213,19 +213,6 @@ class StoryTask:
     # is deliberately NOT cleared when a task is reopened: the run-dir audit trail
     # it indexes is read by a later resolve cycle.
     generation: int = 0
-    # How much of the append-only `sessions` list an accepted escalation resolution
-    # already covered: a LENGTH, i.e. an index INTO `task.sessions`, not a count of
-    # escalations and not a generation number. `resolve._gather_escalations` shows only
-    # the escalations recorded by sessions at or after this position, so a second
-    # resolve cycle does not re-present entries the human already disambiguated
-    # (DW-11). Stamped in `runs.rearm_escalation`, and only when its caller passes
-    # `resolution_recorded=True` — a re-arm that accepted nothing must not advance it,
-    # or escalations nobody answered become invisible forever. `record_session` is the
-    # sole mutation of `sessions` in `src/`, and a re-arm deliberately does NOT clear
-    # the list, which is what makes a length stable across cycles. 0 = nothing answered
-    # yet, which is also what a pre-upgrade `state.json` deserializes to (unfiltered,
-    # the pre-DW-11 behavior).
-    escalations_resolved_upto: int = 0
     # set from the bmad-build-auto session's `followup_review_recommended`
     # frontmatter (PR #2505): when True and review.trigger = "recommended", the
     # orchestrator runs a follow-up review pass (bmad-build-auto re-invoked on the
@@ -443,7 +430,6 @@ class StoryTask:
             "review_cycle": self.review_cycle,
             "followup_reviews_spent": self.followup_reviews_spent,
             "generation": self.generation,
-            "escalations_resolved_upto": self.escalations_resolved_upto,
             "followup_review_recommended": self.followup_review_recommended,
             "baseline_commit": self.baseline_commit,
             "baseline_untracked": self.baseline_untracked,
@@ -612,7 +598,6 @@ class StoryTask:
             review_cycle=int(d.get("review_cycle", 0)),
             followup_reviews_spent=int(d.get("followup_reviews_spent", 0)),
             generation=int(d.get("generation", 0)),
-            escalations_resolved_upto=int(d.get("escalations_resolved_upto", 0)),
             followup_review_recommended=bool(d.get("followup_review_recommended", False)),
             baseline_commit=d.get("baseline_commit"),
             baseline_untracked=(

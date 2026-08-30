@@ -5481,7 +5481,7 @@ def test_closes_deferred_lands_once_when_a_failed_commit_is_re_driven(project):
     # the resolve workflow's re-arm: a resolved re-drive, which is precisely the
     # recovery that PRESERVES the artifact folders' tracked content through
     # `safe_reset` — so a close left standing here would never be reverted.
-    rearm_escalation(engine.run_dir, isolated_redrive=False, resolution_recorded=True)
+    rearm_escalation(engine.run_dir, isolated_redrive=False)
 
     resumed, _ = resume_engine(
         project,
@@ -9138,9 +9138,7 @@ def test_resolved_escalation_resume_skips_clean_rollback(project):
     assert summary.paused and summary.escalated == 1
     assert load_state(engine.run_dir).tasks["1-1-a"].phase == Phase.ESCALATED
 
-    rearm_escalation(
-        engine.run_dir, isolated_redrive=False, resolution_recorded=True
-    )  # the resolve workflow's re-arm step
+    rearm_escalation(engine.run_dir, isolated_redrive=False)  # the resolve workflow's re-arm step
 
     resumed, _ = resume_engine(
         project,
@@ -9187,9 +9185,7 @@ def test_resolved_escalation_resume_dirty_tree_auto_recovers(project):
     summary = engine.run()
     assert summary.paused and summary.escalated == 1
 
-    rearm_escalation(
-        engine.run_dir, isolated_redrive=False, resolution_recorded=True
-    )  # the resolve workflow's re-arm step
+    rearm_escalation(engine.run_dir, isolated_redrive=False)  # the resolve workflow's re-arm step
 
     resumed, _ = resume_engine(
         project,
@@ -9277,7 +9273,7 @@ def test_resolved_redrive_owned_dirty_spec_routes_explicitly_and_converges(proje
     corrected = sp.read_text().replace("test spec", "human corrected frozen intent")
     sp.write_text(corrected)
     head_before_rearm = rev_parse_head(repo)
-    rearm_escalation(engine.run_dir, isolated_redrive=False, resolution_recorded=True)
+    rearm_escalation(engine.run_dir, isolated_redrive=False)
 
     assert rev_parse_head(repo) == head_before_rearm  # no correction commit at re-arm
     assert read_frontmatter(sp)["status"] == "ready-for-dev"
@@ -9848,9 +9844,7 @@ def test_dev_escalation_records_spec_for_rearm(project):
     assert task.phase == Phase.ESCALATED
     assert task.spec_file and Path(task.spec_file).name == sp.name  # recorded despite HALT
 
-    rearm_escalation(
-        engine.run_dir, isolated_redrive=False, resolution_recorded=True
-    )  # the resolve workflow's re-arm step
+    rearm_escalation(engine.run_dir, isolated_redrive=False)  # the resolve workflow's re-arm step
     assert read_frontmatter(sp)["status"] == "ready-for-dev"  # re-drive will not HALT
 
 
@@ -10086,7 +10080,7 @@ def test_intent_gap_restore_redrive_applies_patch_and_lands_done(project):
     assert engine.run().escalated == 1
 
     rearm_escalation(
-        engine.run_dir, restore_patch=str(patch), isolated_redrive=False, resolution_recorded=True
+        engine.run_dir, restore_patch=str(patch), isolated_redrive=False
     )  # human confirmed the reading
     sp = spec_path(project, "1-1-a")
     assert read_frontmatter(sp)["status"] == "in-review"  # routes step-01 -> step-04
@@ -10115,9 +10109,7 @@ def test_restore_redrive_prompt_points_at_the_spec(project):
     engine, _ = make_engine(project, [_escalate_with_patch(project, "1-1-a", patch)])
     assert engine.run().escalated == 1
 
-    rearm_escalation(
-        engine.run_dir, restore_patch=str(patch), isolated_redrive=False, resolution_recorded=True
-    )
+    rearm_escalation(engine.run_dir, restore_patch=str(patch), isolated_redrive=False)
     seen: list[str] = []
     resumed, adapter = resume_engine(
         project, engine, [_restoring_dev_effect(project, "1-1-a", seen)]
@@ -10138,9 +10130,7 @@ def test_intent_gap_restore_reapplies_after_mid_redrive_rollback(project):
     patch = project.implementation_artifacts / "attempt.patch"
     engine, _ = make_engine(project, [_escalate_with_patch(project, "1-1-a", patch)])
     assert engine.run().escalated == 1
-    rearm_escalation(
-        engine.run_dir, restore_patch=str(patch), isolated_redrive=False, resolution_recorded=True
-    )
+    rearm_escalation(engine.run_dir, restore_patch=str(patch), isolated_redrive=False)
 
     seen: list[str] = []
     resumed, _ = resume_engine(
@@ -10175,9 +10165,7 @@ def test_intent_gap_restore_escalates_when_resolution_commits_overlap(project):
     (repo / "src.txt").write_text("corrected by resolution\n")
     git(repo, "add", "src.txt")
     git(repo, "commit", "-q", "-m", "resolution: overlapping fix")
-    rearm_escalation(
-        engine.run_dir, restore_patch=str(patch), isolated_redrive=False, resolution_recorded=True
-    )
+    rearm_escalation(engine.run_dir, restore_patch=str(patch), isolated_redrive=False)
 
     seen: list[str] = []
     resumed, _ = resume_engine(project, engine, [_restoring_dev_effect(project, "1-1-a", seen)])
@@ -10564,9 +10552,7 @@ def test_resume_re_gates_a_human_armed_re_drive(project):
     )
     engine, _ = make_engine(project, [escalating])
     assert engine.run().escalated == 1
-    rearm_escalation(
-        engine.run_dir, isolated_redrive=False, resolution_recorded=True
-    )  # the resolve workflow's re-arm step
+    rearm_escalation(engine.run_dir, isolated_redrive=False)  # the resolve workflow's re-arm step
     assert load_state(engine.run_dir).tasks["1-1-a"].attempt == 0  # the confusable state
     # a gate lands on the story while the operator is resolving it
     write_gated_ledger(project, {"DW-1": ("open", ["gate: 1-1"])})
@@ -11093,7 +11079,7 @@ def test_session_env_fault_pauses_dev_without_burning_budget(project):
     assert end["env_fault_evidence"] == evidence
 
     # the resolve workflow's re-arm step restores the attempt budget
-    rearm_escalation(engine.run_dir, isolated_redrive=False, resolution_recorded=True)
+    rearm_escalation(engine.run_dir, isolated_redrive=False)
     assert load_state(engine.run_dir).tasks["1-1-a"].attempt == 0
 
 
@@ -12281,9 +12267,7 @@ def test_resume_with_epic_filter_stays_in_scoped_epic(project):
     assert summary.paused and summary.escalated == 1
     assert engine.state.current_epic == 9
 
-    rearm_escalation(
-        engine.run_dir, isolated_redrive=False, resolution_recorded=True
-    )  # the resolve workflow's re-arm step
+    rearm_escalation(engine.run_dir, isolated_redrive=False)  # the resolve workflow's re-arm step
     resumed, _ = resume_engine(
         project,
         engine,
@@ -12345,9 +12329,7 @@ def test_resolved_redrive_reescalates_instead_of_deferring(project):
     summary = engine.run()
     assert summary.paused and summary.escalated == 1
 
-    rearm_escalation(
-        engine.run_dir, isolated_redrive=False, resolution_recorded=True
-    )  # human resolved; re-drive re-armed
+    rearm_escalation(engine.run_dir, isolated_redrive=False)  # human resolved; re-drive re-armed
     # re-drive never reaches `done` (env still blocked): both attempts land at
     # in-progress with no escalation — the exact non-convergence that used to defer
     resumed, _ = resume_engine(

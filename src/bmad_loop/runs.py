@@ -3657,7 +3657,6 @@ def rearm_escalation(
     *,
     restore_patch: str | None = None,
     isolated_redrive: bool,
-    resolution_recorded: bool,
 ) -> str:
     """Re-arm an escalation-paused story so the next resume re-drives it.
 
@@ -3681,10 +3680,7 @@ def rearm_escalation(
       otherwise let the re-drive re-mint a session id byte-equal to one the
       abandoned attempt already recorded (#705). `task.sessions` is deliberately
       NOT cleared — a second resolve cycle reads that run-dir audit trail — so
-      the id is what has to change. That preserved trail is also what
-      `resolution_recorded` watermarks: keeping it whole is what lets a later
-      cycle tell the answered prefix from the unanswered tail, instead of
-      choosing between re-presenting everything and losing the audit (DW-11).
+      the id is what has to change.
     - The spec's `baseline_revision` is re-stamped on BOTH legs, and only when the
       advance above actually RAN — `advanced` records that both git reads succeeded,
       not that HEAD changed, so a resolve session that committed nothing still
@@ -3726,25 +3722,6 @@ def rearm_escalation(
     defaulted mode would answer all three for the wrong tree in silence, which is the
     defect this parameter exists to close. Both callers (`cli.cmd_resolve`,
     `tui.TuiApp._do_rearm`) hold a loaded policy already.
-
-    `resolution_recorded` says whether THIS gesture accepted a resolution, and it
-    alone gates the `escalations_resolved_upto` watermark (DW-11): the next resolve
-    cycle hides every escalation recorded below it, so advancing it over entries no
-    human answered would bury them forever and report them as already answered — the
-    inverse of the defect the watermark exists to fix. Keyword-only and REQUIRED for
-    the same reason as `isolated_redrive`: a default would be wrong in silence on
-    exactly the path that matters. It is a PARAMETER rather than a disk read because
-    the fact is not on disk. `resolution.json` is unlinked at one site in `src/`
-    (`resolve.run_session`, before it launches), which only `cli.cmd_resolve`'s
-    interactive arm reaches, and nothing deletes the marker at or after a re-arm — so
-    the marker survives the re-arm that consumed it, and `resolve --no-interactive` or
-    the TUI's Re-arm button would read the PREVIOUS cycle's marker as its own. The
-    caller already holds the answer: `cmd_resolve` binds it from `resolve.run_session`,
-    and both non-interactive callers know by construction that no session ran. Do not
-    unlink the marker here either — the TUI's Re-arm button is gated on its presence.
-
-    The generation bump stays UNCONDITIONAL beside the gated stamp: it answers session-id
-    reuse (#705), which an abandoned attempt needs exactly as much as a resolved one.
 
     Returns the re-armed story key. Raises RearmError when the run is not paused at
     the escalation stage, the target story is not escalated, or a supplied
@@ -3792,17 +3769,6 @@ def rearm_escalation(
     # replay the abandoned verdict for the fresh attempt (#705). Bumped BEFORE any
     # dispatch, so the id is unique from the re-drive's first session onward.
     task.generation += 1
-    # DW-11. How much of the preserved audit trail this resolution covered, so the next
-    # `resolve` shows the human only what they have not already answered. Gated on the
-    # CALLER's answer, never on `resolution.json`: the marker survives the re-arm that
-    # consumed it (only `resolve.run_session` unlinks it, and two of the three callers
-    # never run one), so reading it here would let a later marker-less gesture stamp
-    # over escalations nobody saw. A length, taken BEFORE the re-drive appends anything
-    # — `record_session` is the sole mutation of this list — and left where it stands
-    # when nothing was accepted, which reproduces the pre-DW-11 behavior for that
-    # gesture: everything shown, nothing reported withheld.
-    if resolution_recorded:
-        task.escalations_resolved_upto = len(task.sessions)
     task.review_cycle = 0
     task.followup_reviews_spent = 0  # human-resolved re-drive gets a fresh damping budget
     task.defer_reason = None

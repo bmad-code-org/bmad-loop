@@ -77,21 +77,9 @@ def read_resolution(run_dir: Path, story_key: str) -> dict[str, Any] | None:
     return doc
 
 
-def _gather_escalations(
-    run_dir: Path, state: RunState, story_key: str, *, start: int = 0
-) -> tuple[list[dict[str, Any]], int]:
+def _gather_escalations(run_dir: Path, state: RunState, story_key: str) -> list[dict[str, Any]]:
     """The CRITICAL escalations recorded by this story's sessions, newest first,
-    each DISTINCT escalation exactly once, paired with how many DISTINCT entries
-    were withheld as already answered.
-
-    ``start`` is ``task.escalations_resolved_upto`` — a position in the append-only
-    ``task.sessions`` list, stamped by ``runs.rearm_escalation`` when a resolve cycle
-    recorded a resolution (DW-11). Records BELOW it were already put to the human and
-    answered, so their escalations are not shown again; the count of those the human
-    can no longer see is returned for the operator, never written into
-    ``context.json`` (the agent-facing contract is the unanswered set alone). The
-    default 0 reproduces the pre-DW-11 walk byte-for-byte, which is what a
-    pre-upgrade ``state.json`` deserializes to.
+    each DISTINCT escalation exactly once.
 
     Reads each session's tasks/<task_id>/result.json (and escalation.json) — the
     same files the engine inspected when it decided to pause. Ordering is
@@ -130,31 +118,16 @@ def _gather_escalations(
       ``critical_escalations`` iterates ``escalations`` with no list guard of its
       own, so a ``{"escalations": null}`` artifact would raise ``TypeError``
       here. The guard belongs in this caller; the shared predicate stays the
-      single definition of CRITICAL.
-
-    The watermark is a FOURTH concern layered onto that same single walk, not a
-    second pass: ``reversed(task.sessions)`` reaches the unanswered tail first, so
-    entries are routed into two content-keyed maps by the record's own index and the
-    suppressed count is the answered keys that never appeared in the shown map. Two
-    consequences are deliberate. An entry raised on BOTH sides of the watermark is
-    shown and counted 0 — "not shown" is the claim the number makes, so it must never
-    count something the operator can see. And ``start`` only SELECTS a map; nothing is
-    indexed with it, so a watermark past the end of the list yields an empty shown
-    list rather than an IndexError. A ``task_id`` repeated across the watermark is
-    opened once by ``seen_ids``, at its newest occurrence — the shown side, the
-    conservative direction."""
+      single definition of CRITICAL."""
     task = state.tasks.get(story_key)
     if task is None:
-        return [], 0
+        return []
     seen_ids: set[str] = set()
     found: dict[str, dict[str, Any]] = {}
-    answered: dict[str, dict[str, Any]] = {}
-    last = len(task.sessions) - 1
-    for offset, session in enumerate(reversed(task.sessions)):
+    for session in reversed(task.sessions):
         if session.task_id in seen_ids:
             continue
         seen_ids.add(session.task_id)
-        target = found if last - offset >= start else answered
         task_dir = run_dir / "tasks" / session.task_id
         for fname in ("result.json", "escalation.json"):
             fpath = task_dir / fname
@@ -170,21 +143,12 @@ def _gather_escalations(
             except (OSError, ValueError, RecursionError):
                 continue
             for key, esc in artifact_entries.items():
-                target.setdefault(key, esc)
-    return list(found.values()), sum(1 for key in answered if key not in found)
+                found.setdefault(key, esc)
+    return list(found.values())
 
 
-def build_context(
-    state: RunState, run_dir: Path, story_key: str, *, isolation: str
-) -> tuple[Path, int]:
-    """Write resolve/<story_key>/context.json for the resolve skill to read, and
-    return it beside the number of already-answered escalations withheld from it.
-
-    The count is for the OPERATOR's terminal (`cli.cmd_resolve` prints it) and is
-    deliberately not a `context.json` field: the skill's contract is singular — resolve
-    the escalation you are shown — and a count of things the agent cannot see is not
-    something it can act on. It comes from the same single walk that produced the shown
-    list, never from a second `_gather_escalations` call subtracting lengths.
+def build_context(state: RunState, run_dir: Path, story_key: str, *, isolation: str) -> Path:
+    """Write resolve/<story_key>/context.json for the resolve skill to read.
 
     `isolation` is the LIVE policy's `scm.isolation`, and it is required rather than
     defaulted for the reason this surface exists at all: three of the fields below —
@@ -213,12 +177,6 @@ def build_context(
     # the main checkout while `stories_engine._stories_folder` was still the mount, so
     # one `context.json` could name two trees.
     stories_root = task_stories_root(task, state)
-    # DW-11: hide what an earlier resolve cycle already answered. `start` is the task's
-    # own watermark — 0 for a task never resolved, and for every pre-upgrade
-    # `state.json`, which is the unfiltered pre-DW-11 walk.
-    escalations, withheld = _gather_escalations(
-        run_dir, state, story_key, start=task.escalations_resolved_upto if task else 0
-    )
     context = {
         "story_key": story_key,
         "run_id": state.run_id,
@@ -239,7 +197,7 @@ def build_context(
         "spec_file": (task_spec_path(task, state).as_posix() if task and task.spec_file else None),
         "baseline_commit": task.baseline_commit if task else None,
         "paused_reason": state.paused_reason,
-        "escalations": escalations,
+        "escalations": _gather_escalations(run_dir, state, story_key),
         # as_posix so the context contract is the same string on every OS (the
         # path is consumed by the agent, and Python/tools accept '/' on Windows).
         "resolution_path": resolution_path(run_dir, story_key).as_posix(),
@@ -292,7 +250,7 @@ def build_context(
     path = context_path(run_dir, story_key)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(context, indent=2), encoding="utf-8")
-    return path, withheld
+    return path
 
 
 def _stories_context(state: RunState, story_key: str, root: Path) -> dict[str, Any]:
