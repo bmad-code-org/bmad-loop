@@ -969,19 +969,7 @@ class BmadLoopApp(App[None]):
         before_entries = runs.journal_entries_or_none(run_dir)
         hold_resume = False
         try:
-            runs.rearm_escalation(
-                run_dir,
-                story_key,
-                isolated_redrive=isolation == "worktree",
-                # DW-11. This gesture runs no resolve session, so it accepted nothing:
-                # the escalation watermark must not advance. A `resolution.json` on
-                # disk is NOT evidence to the contrary here — `_restore_recorded`
-                # already records the governing fact for this surface, that a stale
-                # marker is indistinguishable from a fresh one, which is why this path
-                # declines the restore latch too. Stamping on its presence would bury
-                # escalations raised since the marker was written.
-                resolution_recorded=False,
-            )
+            runs.rearm_escalation(run_dir, story_key, isolated_redrive=isolation == "worktree")
         except RearmError as e:
             self.notify(f"re-arm failed: {e}", severity="error")
             return

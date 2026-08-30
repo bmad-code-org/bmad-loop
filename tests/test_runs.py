@@ -2791,12 +2791,7 @@ def test_rearm_restore_mode_sets_in_review_strips_arr_and_latches(tmp_path):
     from bmad_loop.model import Phase
 
     run_dir, spec = _escalated_run(tmp_path, _SPEC_WITH_ARR)
-    runs.rearm_escalation(
-        run_dir,
-        restore_patch="artifacts/attempt.patch",
-        isolated_redrive=False,
-        resolution_recorded=True,
-    )
+    runs.rearm_escalation(run_dir, restore_patch="artifacts/attempt.patch", isolated_redrive=False)
 
     task = load_state(run_dir).tasks["1-1-a"]
     assert task.phase == Phase.PENDING and task.attempt == 0
@@ -2814,9 +2809,7 @@ def test_rearm_plain_mode_sets_ready_for_dev_and_clears_stale_latch(tmp_path):
 
     # a stale latch from a prior restore attempt the human then chose to redo fresh
     run_dir, spec = _escalated_run(tmp_path, _SPEC_WITH_ARR, restore_patch_stale="old.patch")
-    runs.rearm_escalation(
-        run_dir, isolated_redrive=False, resolution_recorded=True
-    )  # no restore_patch => from-scratch
+    runs.rearm_escalation(run_dir, isolated_redrive=False)  # no restore_patch => from-scratch
 
     task = load_state(run_dir).tasks["1-1-a"]
     assert task.phase == Phase.PENDING
@@ -2847,10 +2840,7 @@ def test_rearm_aborts_when_the_spec_status_cannot_be_reopened(tmp_path):
 
     with pytest.raises(runs.RearmError, match="re-open story spec"):
         runs.rearm_escalation(
-            run_dir,
-            restore_patch="artifacts/attempt.patch",
-            isolated_redrive=False,
-            resolution_recorded=True,
+            run_dir, restore_patch="artifacts/attempt.patch", isolated_redrive=False
         )
 
     assert spec.read_text(encoding="utf-8") == spec_text  # byte-identical
@@ -2870,7 +2860,7 @@ def test_rearm_resets_followup_reviews_spent(tmp_path):
     state.tasks["1-1-a"].review_cycle = 2
     save_state(run_dir, state)
 
-    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+    runs.rearm_escalation(run_dir, isolated_redrive=False)
 
     task = load_state(run_dir).tasks["1-1-a"]
     assert task.followup_reviews_spent == 0
@@ -2915,9 +2905,7 @@ def test_rearm_excludes_stale_restore_residue_from_baseline_snapshot(tmp_path):
     story's commit. The resolve session's own untracked file still is."""
     run_dir, _spec, patch = _stale_restore_tree(tmp_path)
 
-    runs.rearm_escalation(
-        run_dir, isolated_redrive=False, resolution_recorded=True
-    )  # from-scratch re-arm replaces the latch
+    runs.rearm_escalation(run_dir, isolated_redrive=False)  # from-scratch re-arm replaces the latch
 
     task = load_state(run_dir).tasks["1-1-a"]
     assert "human.txt" in task.baseline_untracked
@@ -2934,12 +2922,7 @@ def test_rearm_re_latching_the_same_patch_still_excludes_its_residue(tmp_path):
     still residue (and `git apply` would otherwise fail with 'already exists')."""
     run_dir, _spec, _patch = _stale_restore_tree(tmp_path)
 
-    runs.rearm_escalation(
-        run_dir,
-        restore_patch="artifacts/attempt.patch",
-        isolated_redrive=False,
-        resolution_recorded=True,
-    )
+    runs.rearm_escalation(run_dir, restore_patch="artifacts/attempt.patch", isolated_redrive=False)
 
     task = load_state(run_dir).tasks["1-1-a"]
     assert task.restore_patch == "artifacts/attempt.patch"
@@ -2957,9 +2940,7 @@ def test_rearm_missing_stale_patch_degrades_loudly_without_raising(tmp_path):
     git(tmp_path, "add", "committed.txt")
     git(tmp_path, "commit", "-q", "-m", "attempt commit")
 
-    runs.rearm_escalation(
-        run_dir, isolated_redrive=False, resolution_recorded=True
-    )  # must not raise RearmError
+    runs.rearm_escalation(run_dir, isolated_redrive=False)  # must not raise RearmError
 
     task = load_state(run_dir).tasks["1-1-a"]
     assert {"human.txt", "newfile.txt"} <= set(task.baseline_untracked)  # full snapshot
@@ -2975,12 +2956,7 @@ def test_rearm_without_a_stale_latch_journals_no_stale_restore_events(tmp_path):
     run_dir, _spec = _escalated_run(tmp_path, _SPEC_WITH_ARR, git_project=True)
     (tmp_path / "human.txt").write_text("from the resolve session\n")
 
-    runs.rearm_escalation(
-        run_dir,
-        restore_patch="artifacts/attempt.patch",
-        isolated_redrive=False,
-        resolution_recorded=True,
-    )
+    runs.rearm_escalation(run_dir, restore_patch="artifacts/attempt.patch", isolated_redrive=False)
 
     assert "human.txt" in load_state(run_dir).tasks["1-1-a"].baseline_untracked
     assert _kinds(run_dir) == []
@@ -2996,7 +2972,7 @@ def test_rearm_warns_about_commits_below_the_refreshed_baseline(tmp_path):
     git(tmp_path, "commit", "-q", "-m", "attempt commit")
     old_baseline = load_state(run_dir).tasks["1-1-a"].baseline_commit
 
-    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+    runs.rearm_escalation(run_dir, isolated_redrive=False)
 
     task = load_state(run_dir).tasks["1-1-a"]
     assert task.baseline_commit != old_baseline  # baseline advanced past the commit
@@ -3022,7 +2998,7 @@ def test_rearm_survives_a_git_fault_reading_commits_above_the_old_baseline(tmp_p
     task.baseline_commit = "0" * 39 + "1"  # sha-shaped, but names no object
     save_state(run_dir, state)
 
-    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+    runs.rearm_escalation(run_dir, isolated_redrive=False)
 
     task = load_state(run_dir).tasks["1-1-a"]
     assert task.phase == Phase.PENDING
@@ -3053,7 +3029,7 @@ def test_rearm_survives_a_non_repo_code_tree_when_reading_commits(tmp_path):
     with pytest.raises(verify.GitError):
         verify.commits_above(tmp_path, task.baseline_commit)
 
-    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+    runs.rearm_escalation(run_dir, isolated_redrive=False)
 
     task = load_state(run_dir).tasks["1-1-a"]
     assert task.phase == Phase.PENDING
@@ -3078,7 +3054,7 @@ def test_rearm_does_not_swallow_a_non_git_fault_from_the_commits_probe(monkeypat
 
     monkeypatch.setattr(runs.verify, "commits_above", boom)
     with pytest.raises(MemoryError, match="not a git answer"):
-        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+        runs.rearm_escalation(run_dir, isolated_redrive=False)
 
 
 def test_archive_run(tmp_path):
