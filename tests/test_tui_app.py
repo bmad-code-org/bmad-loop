@@ -3071,8 +3071,11 @@ async def test_attach_uses_the_recorded_ctl_window(project, monkeypatch):
     # The one attach test that does NOT replace ctl_window_id, so it pins the
     # seam every other one stubs out: that the TUI hands it the same project root
     # the launch recorded the window under (#482). Point app.py at anything else
-    # — the run dir, an unresolved path — and the record is unfindable, the scan
-    # answers the parked `run-` corpse, and attach + return-stamp both go there.
+    # — the run dir, an unresolved path — and the record is unfindable under that
+    # root, so these untagged rows prove nothing and the lookup answers None
+    # (#531). session_exists is stubbed True here, so `a` then takes the live
+    # agent session instead of the ctl window: nothing is selected and nothing is
+    # stamped, and both assertions below fail.
     import subprocess as _subprocess
 
     from bmad_loop.adapters import tmux_base
