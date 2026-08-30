@@ -852,6 +852,11 @@ def test_symlinked_run_dir_is_refused(fake_run, tmp_path: Path):
 
     # The launch still succeeds, and the lookup is not warned about: only one
     # window carries the run id, so the scan answers it correctly with no record.
+    # Tagged as start_detached leaves it, which FakeRun does not fold into its
+    # scripted listing: the record write is the thing refused here, so since #531
+    # the tag is the only proof of ownership left and an untagged row would
+    # answer None for that reason rather than for the confinement this is about.
+    fake_run.windows = f"@7\tresume-RID\t{runs.project_tag(tmp_path)}\n"
     assert launch.resume_detached(tmp_path, "RID") == "@7"
     assert not (outside / launch._CTL_WINDOW_FILE).exists()  # nothing escaped
 
@@ -904,6 +909,9 @@ def test_record_falls_back_to_the_confinement_check_without_dir_fd(fake_run, tmp
     run_dir.parent.mkdir(parents=True)
     run_dir.symlink_to(outside)
 
+    # Tagged for the same reason as the dir-fd sibling above: the refused write
+    # leaves the tag as the only ownership proof this listing can carry.
+    fake_run.windows = f"@7\tresume-RID\t{runs.project_tag(tmp_path)}\n"
     assert launch.resume_detached(tmp_path, "RID") == "@7"
     assert not (outside / launch._CTL_WINDOW_FILE).exists()
 
