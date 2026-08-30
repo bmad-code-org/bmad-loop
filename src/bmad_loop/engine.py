@@ -2299,6 +2299,15 @@ class Engine:
             # never hidden along with the orchestrator's own append. A fixable
             # retry rebases it onto the tree that retry deliberately keeps.
             task.baseline_ledger_digest = self._ledger_digest()
+            # Whether this phase may newly ELECT a park, on the same anchor and
+            # for the same reason as the baseline above: the proof-of-work skip
+            # this authorizes is measured from that baseline, so the expectation
+            # and the diff it guards have to be captured at one instant. A fixable
+            # repair therefore inherits the phase's answer (it deliberately keeps
+            # the previous session's tree, park declaration included, so
+            # re-observing per attempt would make every repair of a malformed park
+            # ineligible), and a crash-replayed attempt keeps the persisted one.
+            task.park_eligible = self._park_eligible_at_dispatch(task)
         feedback: Path | None = None
         while True:
             replayed = resume_result is not None
@@ -3549,6 +3558,76 @@ class Engine:
         gate — support for either is a follow-up, not an accident of where the
         branch happens to sit."""
         return self.policy.operator.enabled
+
+    def _park_eligible_at_dispatch(self, task: StoryTask) -> bool:
+        """Whether the attempt about to be dispatched could newly ELECT a park —
+        the orchestrator-side half of :func:`verify.verify_dev`'s two-part
+        proof-of-work skip selector (#335, #676).
+
+        The skip used to be selected entirely by state a fresh session can
+        INHERIT: ``operator_park`` (a policy flag) plus the spec's own
+        ``awaiting-operator`` status, which an earlier attempt may already have
+        written. A re-drive over such a spec therefore selected #676's relaxation
+        while having done nothing at all, and verified green on someone else's
+        park declaration. This is the fact that cannot be inherited: at the moment
+        the phase is dispatched, was the story's bound spec ALREADY parked?
+
+        ``False`` when parking is off (the skip is unreachable anyway, so this
+        costs no read), when the bound spec already reads ``awaiting-operator``,
+        and on the two genuinely unobservable shapes: a recorded ``spec_file``
+        that no longer resolves to a trusted regular file, and one whose read
+        raises ``OSError`` (journaled ``spec-read-failed``). Those fail closed onto
+        the ordinary gated path, where an honest park with a real diff still
+        passes.
+
+        An UNPARSEABLE spec is deliberately not in that list, and the distinction
+        is worth stating because it looks like a gap. ``read_frontmatter``
+        degrades malformed YAML and non-UTF-8 to ``{}`` rather than raising, so
+        ``status_of`` reads ``""`` and this returns True. That is correct rather
+        than merely tolerated: an unparseable spec demonstrably does not say
+        "parked", and ``verify_dev``'s own gate reads the very same ``{}``, so
+        ``parked`` is False there too and the skip is unreachable on that leg no
+        matter what this answers. Only OSError and an unresolvable binding are
+        uncertainty about a spec that *does* say something.
+
+        ``True`` when nothing is bound at all — the ordinary case, not a fallback.
+        Note precisely what that tests: ``task.spec_file`` is an IN-RUN binding,
+        set only after a session returns and its artifacts verify, so "unbound"
+        means "this task object has no binding", NOT "no earlier park exists on
+        disk". A story whose spec was parked by a previous RUN, or edited into the
+        park status out of band, presents as unbound here and is eligible. The
+        residual is recorded as a deferred finding on this change's spec rather
+        than closed silently; closing it means keying eligibility on the spec the
+        story resolves to rather than on the task's binding, which is a wider
+        change than the one this gate makes.
+
+        Called only from ``_dev_phase``'s ``resume_result is None`` block, beside
+        the baseline capture — see the comment there for why the anchor is the
+        PHASE and not the attempt. Reuses ``_dispatched_spec_for_attempt`` for the
+        symlink/roots checks rather than re-deriving them: a second, laxer
+        resolution here would be a second answer to "which file is this attempt's
+        spec", and recovery already owns that question.
+
+        Consequence worth knowing before touching either caller: that resolver is
+        now invoked TWICE per dev phase — once here at phase entry, and once by
+        the binder inside the attempt loop. They are two observations of the same
+        path at different instants and neither may be folded into the other (this
+        one must precede the first attempt; the binder's must be the one that
+        promotes). Any test that counts calls to it has to say which observation
+        it means — ``test_transient_initial_binding_fault_does_not_promote_after_bare_prompt``
+        pins this one out for exactly that reason.
+        """
+        if not self._operator_park_enabled():
+            return False
+        if not task.spec_file:
+            return True
+        bound = self._dispatched_spec_for_attempt(task)
+        if bound is None:
+            return False
+        fm = self._observed_frontmatter(Path(bound), task.story_key, "park-eligibility")
+        if fm is None:
+            return False
+        return verify.status_of(fm) != verify.AWAITING_OPERATOR
 
     def _dev_review_enabled(self) -> bool:
         """Spec-status/sprint semantics for verify_dev and the sprint sync. The
@@ -5200,14 +5279,43 @@ class Engine:
         return (rel.as_posix(),)
 
     def _verify_dev_artifacts(self, task: StoryTask, result_json: dict | None):
-        return verify.verify_dev(
+        outcome = verify.verify_dev(
             task,
             self.workspace.paths,
             result_json,
             review_enabled=self._dev_review_enabled(),
             operator_park=self._operator_park_enabled(),
+            # The dispatch-time half of the park's proof-of-work skip selector,
+            # read from the task rather than re-observed: it was captured on this
+            # phase's fresh entry, and re-deriving it now would answer about the
+            # spec the session just finished writing (#676).
+            park_eligible=task.park_eligible,
             engine_written=self._harvest_gate_exclude(task),
         )
+        # The record marks the WAIVED GATE, so it keys on the waiver itself
+        # (`park_proof_skipped`) and never on what the probe managed to say. The
+        # observation is a field on the record, not its trigger: `zero_diff` is
+        # `true` when the session's whole residue was the spec and the board (the
+        # #676 shape the skip exists for), `false` when it also carried real code,
+        # and JSON `null` when the probe could not answer — a git fault, or an
+        # attempt with no baseline commit to measure from. Keying on
+        # `park_zero_diff is not None` instead would drop exactly the unanswerable
+        # case — a gate that WAS waived, silently, which is the silence this record
+        # exists to end. An unknown answer is a truthful field value, not a reason
+        # to withhold the record.
+        #
+        # Only ACCEPTED parks reach here with the flag set: it rides the `passed()`
+        # return, so a park that waived proof-of-work and then failed the sprint
+        # pair records nothing. That is the intended scope — the question this
+        # answers is which parks got IN without proving work.
+        if outcome.park_proof_skipped:
+            self.journal.append(
+                "park-proof-of-work-skipped",
+                story_key=task.story_key,
+                attempt=task.attempt,
+                zero_diff=outcome.park_zero_diff,
+            )
+        return outcome
 
     def _verify_review(self, task: StoryTask):
         # `not _dev_review_enabled()` is exactly the case where _post_dev_state_sync

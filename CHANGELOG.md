@@ -180,6 +180,22 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Require the orchestrator's own dispatch-time expectation before an `awaiting-operator`
+  park skips the dev gate's proof-of-work check (#335, #676). The skip was selected by the
+  policy flag plus the spec's own status, both of which a fresh session inherits, so a
+  re-drive over a spec an earlier attempt had already parked verified green having done
+  nothing. The expectation is captured once per dev phase, on the same anchor as the
+  attempt baseline, so a fixable repair of a malformed park still passes. An inherited park
+  that did real work is unaffected — only the skip narrows, not the park. One upgrade
+  note: the expectation defaults to "not eligible" for state written before it existed, so
+  a run interrupted mid-park and resumed after upgrading holds that in-flight park to
+  proof-of-work — if it produced no code, it is retried and may defer rather than parking.
+  Re-running the story is enough; nothing is lost.
+- Journal `park-proof-of-work-skipped` with a `zero_diff` flag whenever an accepted park's
+  gate is waived (#676), so a park that wrote nothing and a park that committed real code
+  stop being indistinguishable after the fact. The probe is an observation only: when it
+  cannot answer — a git fault, or no recorded baseline — the flag is `null` and the outcome
+  is unchanged.
 - Anchor the TUI's paused-spec read and its `Request replan` write on the tree the run
   owns. Under isolation both resolved against the main checkout, so the review modals
   showed that copy of the spec and the replan reset it — reporting success while the run's

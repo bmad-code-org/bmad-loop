@@ -1369,6 +1369,13 @@ def test_transient_initial_binding_fault_does_not_promote_after_bare_prompt(proj
         return real_resolve(bound_task)
 
     monkeypatch.setattr(engine, "_dispatched_spec_for_attempt", transient_first_fault)
+    # The phase-entry park-eligibility read is a SECOND, unrelated consumer of the
+    # same resolver (`_park_eligible_at_dispatch`, DW-1) and would otherwise absorb
+    # the injected fault, handing the binder a clean second observation and
+    # inverting exactly what this row measures. Pin it out so `observations` counts
+    # the binder alone — this test is about prompt construction and recovery
+    # ownership, not about whether the story could newly elect a park.
+    monkeypatch.setattr(engine, "_park_eligible_at_dispatch", lambda _task: False)
 
     assert engine._dev_phase(task)
 
@@ -2763,6 +2770,321 @@ def test_park_without_usable_actions_is_repaired_not_committed(project):
     assert len(adapter.sessions) == 2  # the park attempt, then the repair
     kinds = [e["kind"] for e in engine.journal.entries()]
     assert "story-awaiting-operator" not in kinds and "story-done" in kinds
+
+
+def test_dispatch_over_an_already_parked_spec_is_not_park_eligible(project):
+    """DW-1's engine half: the proof-of-work skip is authorized by an expectation
+    the orchestrator records at dispatch, and a story whose bound spec ALREADY
+    reads `awaiting-operator` cannot newly elect a park — whatever the session
+    that runs next leaves behind, the declaration on disk when it launched was
+    someone else's.
+
+    The answer is captured on the fresh entry into `_dev_phase`, on the same
+    `resume_result is None` condition as `baseline_commit`, and persisted, so a
+    crash-replayed attempt reads back the same expectation rather than
+    re-deriving one from the tree the replayed session already wrote.
+
+    Ablation: move the capture out of the `resume_result is None` block (or drop
+    the `!= AWAITING_OPERATOR` test) and this fails — the re-drive becomes
+    eligible and #676's relaxation applies to a session that inherited its park."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [dev_effect(project, "1-1-a")], policy=_park_policy())
+    recorded = spec_path(project, "1-1-a")
+    write_spec(
+        recorded, "awaiting-operator", rev_parse_head(project.project), operator_actions=ACTIONS
+    )
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(recorded))
+    engine.state.tasks[task.story_key] = task
+
+    engine._dev_phase(task)
+
+    assert task.park_eligible is False
+    assert load_state(engine.run_dir).tasks["1-1-a"].park_eligible is False
+
+
+def test_inherited_park_is_refused_end_to_end_through_the_engine(project):
+    """The JOIN, which both halves being pinned separately does not cover: that
+    `_verify_dev_artifacts` actually forwards `task.park_eligible` into
+    `verify_dev`. Its sibling row stops at the flag, and every refusal row in
+    `test_verify.py` hand-passes `park_eligible=False` straight into the gate — so
+    the one wiring point between them was untested, and the whole fix could be
+    reverted there with the suite green.
+
+    Driven through the engine's own binding lifecycle: the story's spec_file is
+    bound to a spec ALREADY at `awaiting-operator`, so eligibility is reached via
+    the bound branch (every other `engine.run()`-level park row reaches it
+    unbound, and therefore eligible). The re-driven session writes no code and
+    re-declares the same park — the inherited-park shape — and must NOT verify
+    green.
+
+    Ablation: replace `park_eligible=task.park_eligible` with the literal `True`
+    in `_verify_dev_artifacts` and this row fails; without it that mutation passes
+    the entire suite."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "awaiting-operator"})
+    engine, _ = make_engine(
+        project,
+        [
+            generic_dev_effect(
+                project,
+                "1-1-a",
+                final_status="awaiting-operator",
+                operator_actions=ACTIONS,
+                write_src=False,
+            )
+        ]
+        * 3,
+        policy=_park_policy(),
+    )
+    recorded = spec_path(project, "1-1-a")
+    write_spec(
+        recorded, "awaiting-operator", rev_parse_head(project.project), operator_actions=ACTIONS
+    )
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(recorded))
+    engine.state.tasks[task.story_key] = task
+
+    # The refusal is non-fixable, so the attempt is rolled back and the phase ends
+    # in the pause its unrecoverable binding forces. The PAUSE is the point for
+    # this row's purposes — "did not verify green" — and the journal below names
+    # the cause. Under the mutation this row exists to catch, the park verifies,
+    # commits, and nothing raises at all.
+    with pytest.raises(RunPaused):
+        engine._dev_phase(task)
+
+    assert task.park_eligible is False
+    reasons = [e["reason"] for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert reasons and all(r == "no changes in worktree since baseline commit" for r in reasons)
+    # the waiver never fired, so nothing was journaled as a skipped gate
+    assert "park-proof-of-work-skipped" not in [e["kind"] for e in engine.journal.entries()]
+
+
+def test_dispatch_with_no_bound_spec_is_park_eligible(project):
+    """The ordinary case, not a fallback: a story's first attempt has no
+    `spec_file` yet, so there is no earlier declaration for it to inherit and the
+    #676 relaxation must remain available. Fail-CLOSED applies to uncertainty
+    about a spec that exists, not to the absence of one."""
+    engine, _ = make_engine(project, [], policy=_park_policy())
+
+    assert engine._park_eligible_at_dispatch(StoryTask(story_key="1-1-a", epic=1)) is True
+
+
+def test_park_eligibility_fails_closed_on_an_unresolvable_binding(project):
+    """The OTHER fail-closed arm, and a genuinely separate one: this is the
+    `bound is None` refusal from `_dispatched_spec_for_attempt` (a symlinked
+    binding, the shape it exists to refuse), not the later `fm is None` OSError
+    arm its sibling row covers. A spec_file that will not resolve to a trusted
+    regular file is a spec whose status the orchestrator does not know, and an
+    unknown status must not authorize waiving proof-of-work.
+
+    Ablation: invert this arm to `return True` and this row fails while the whole
+    rest of the suite stays green — nothing else reaches it, which is why it
+    needed its own row rather than sharing the unreadable-spec one."""
+    engine, _ = make_engine(project, [], policy=_park_policy())
+    real = spec_path(project, "1-1-a")
+    write_spec(real, "ready-for-dev", rev_parse_head(project.project))
+    link = real.parent / "spec-1-1-a-symlink.md"
+    link.symlink_to(real)
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(link))
+
+    # the binding resolves to nothing usable, even though the TARGET is a
+    # perfectly readable non-parked spec — it is the binding that is untrusted
+    assert engine._dispatched_spec_for_attempt(task) is None
+    assert engine._park_eligible_at_dispatch(task) is False
+
+
+def test_park_eligibility_fails_closed_on_an_unreadable_spec(project):
+    """Observation degrades, and here degrading means denying the relaxation: a
+    bound spec the orchestrator cannot read is a spec whose status it does not
+    know, and an unknown status must not authorize skipping proof-of-work. The
+    skip is what would be lost, not the park — an honest park with a real diff
+    still passes the ordinary gate.
+
+    Silent it is not: the read goes through `_observed_frontmatter`, so the skip
+    lands a `spec-read-failed` entry naming this site."""
+    engine, _ = make_engine(project, [], policy=_park_policy())
+    recorded = spec_path(project, "1-1-a")
+    write_spec(recorded, "ready-for-dev", rev_parse_head(project.project))
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(recorded))
+
+    def boom(_path):
+        raise OSError("spec vanished mid-read")
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(verify, "read_frontmatter", boom)
+        assert engine._park_eligible_at_dispatch(task) is False
+
+    failures = [e for e in engine.journal.entries() if e["kind"] == "spec-read-failed"]
+    assert [e["site"] for e in failures] == ["park-eligibility"]
+
+
+def test_park_eligibility_is_captured_once_per_phase_not_per_attempt(project):
+    """A fixable repair deliberately keeps the previous session's tree, so the
+    malformed park it is repairing is on disk when it launches. Re-observing
+    eligibility per ATTEMPT would therefore make every such repair ineligible,
+    and its fix — one frontmatter block, which proof-of-work already excludes —
+    would fail the gate it just re-armed. The expectation is anchored to the
+    phase, on the same `resume_result is None` condition as `baseline_commit`,
+    precisely so the expectation and the diff it guards cannot disagree.
+
+    Both sessions run with `write_src=False`, which is what makes this row
+    evidence: the tree never holds any code residue, so the ONLY thing that can
+    carry the repair past proof-of-work is the retained eligibility.
+
+    Ablation (measured, not assumed): move `task.park_eligible = ...` out of the
+    `resume_result is None` block and into `_dev_phase`'s per-attempt branch, and
+    attempt 2 re-observes the parked spec attempt 1 left behind, turns ineligible,
+    and its `dev-decision` reads exactly `no changes in worktree since baseline
+    commit` -> DEFER. Note what the row then fails ON: the defer's spec-restore
+    finds the binding unusable and raises `RunPaused`, so the visible surface is a
+    pause, not the assertion below. The refusal is the cause and the journal
+    records it; the pause is its consequence."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [
+            # attempt 1: parks, but declares nothing -> fixable
+            generic_dev_effect(
+                project,
+                "1-1-a",
+                final_status="awaiting-operator",
+                operator_actions=[],
+                write_src=False,
+            ),
+            # the repair: a well-formed park, still with no code of its own
+            generic_dev_effect(
+                project,
+                "1-1-a",
+                final_status="awaiting-operator",
+                operator_actions=ACTIONS,
+                write_src=False,
+            ),
+        ],
+        policy=_park_policy(),
+    )
+    recorded = spec_path(project, "1-1-a")
+    write_spec(recorded, "ready-for-dev", rev_parse_head(project.project))
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(recorded))
+    engine.state.tasks[task.story_key] = task
+
+    assert engine._dev_phase(task) is True
+
+    assert task.park_eligible is True
+    assert len(adapter.sessions) == 2  # the malformed park, then its repair
+    # the repair's park was ACCEPTED with the gate waived, on a tree that holds no
+    # code at all — the whole point of retaining the phase's answer
+    records = [e for e in engine.journal.entries() if e["kind"] == "park-proof-of-work-skipped"]
+    assert [(e["attempt"], e["zero_diff"]) for e in records] == [(2, True)]
+
+
+@pytest.mark.parametrize(
+    "write_src, zero_diff",
+    [(False, True), (True, False)],
+    ids=["residue-free", "with-code"],
+)
+def test_accepted_park_records_whether_the_skipped_gate_would_have_passed(
+    project, write_src, zero_diff
+):
+    """DW-6: the skip stops being silent. Proof-of-work is waived for every
+    ELECTED park, so afterwards a park that wrote real code and one that wrote
+    nothing at all were indistinguishable — the same green outcome, no trace of
+    which gate was waived or what it would have said.
+
+    The record carries the discriminator ON the entry rather than in its kind,
+    because its readers are out-of-process: `zero_diff` is `true` when the whole
+    residue was the spec and the board (the #676 shape the relaxation exists for)
+    and `false` when the session also committed real work and simply happened not
+    to need the waiver. One kind, one attempt, one answer.
+
+    The probe runs inside the shared gate on purpose — it measures from the
+    baseline that gate derived, so a commit the newer-claim branch re-anchored
+    past cannot be credited to this attempt.
+
+    Ablation: drop the `park_zero_diff is not None` journal in
+    `_verify_dev_artifacts` and both legs fail on the empty record list; hardcode
+    the observation to `True` and only the `with-code` leg reddens, which is why
+    both are parametrized here rather than only the zero-diff one."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            generic_dev_effect(
+                project,
+                "1-1-a",
+                final_status="awaiting-operator",
+                operator_actions=ACTIONS,
+                write_src=write_src,
+            )
+        ],
+        policy=_park_policy(),
+    )
+
+    summary = engine.run()
+
+    assert summary.awaiting_operator == 1
+    records = [e for e in engine.journal.entries() if e["kind"] == "park-proof-of-work-skipped"]
+    assert len(records) == 1
+    assert records[0]["story_key"] == "1-1-a" and records[0]["attempt"] == 1
+    assert records[0]["zero_diff"] is zero_diff
+
+
+def test_accepted_park_still_records_when_the_zero_diff_probe_faults(project):
+    """The record marks the WAIVED GATE, not the probe's success. A git fault
+    leaves the observation unanswerable, but the gate was waived all the same —
+    and that is precisely the case DW-6 must not lose, because it is the one where
+    nothing else on disk says proof-of-work was skipped.
+
+    So the entry is still written and `zero_diff` carries JSON `null`: an unknown
+    answer is a truthful field value, not a reason to withhold the record. The
+    park is unaffected — the observation degrades and never escalates.
+
+    Ablation: key the journal on `park_zero_diff is not None` (the collapsed
+    single-field form) instead of on `park_proof_skipped` and this row fails on an
+    empty record list, while every other park row here stays green — they all have
+    an answerable probe, so only this one can tell the two spellings apart."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            generic_dev_effect(
+                project, "1-1-a", final_status="awaiting-operator", operator_actions=ACTIONS
+            )
+        ],
+        policy=_park_policy(),
+    )
+    real = verify.has_changes_since
+
+    def fault_the_observation(*args, **kwargs):
+        raise verify.GitError("git diff exploded")
+
+    # NOTE the patch is module-GLOBAL, not narrowed to the observation arm — this
+    # row works because the park path reaches no other `has_changes_since` caller,
+    # not because the fault was targeted. `zero_diff is None` is what proves the
+    # observation arm is the one that swallowed it: only its `except GitError`
+    # produces that value.
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(verify, "has_changes_since", fault_the_observation)
+        summary = engine.run()
+
+    # the context manager UNDID the patch — this says nothing about its breadth
+    assert verify.has_changes_since is real
+    assert summary.awaiting_operator == 1
+    assert engine.state.tasks["1-1-a"].phase == Phase.AWAITING_OPERATOR
+    records = [e for e in engine.journal.entries() if e["kind"] == "park-proof-of-work-skipped"]
+    assert len(records) == 1
+    assert records[0]["attempt"] == 1
+    assert records[0]["zero_diff"] is None
+
+
+def test_no_park_record_when_the_gate_actually_ran(project):
+    """The control: the record marks a WAIVED gate, so an ordinary story that
+    cleared proof-of-work on its own must leave none. Without this the record
+    would be indistinguishable from "a dev session verified", and the DW-6
+    inventory would count every story as a skipped park."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [generic_dev_effect(project, "1-1-a")], policy=_park_policy())
+
+    engine.run()
+
+    assert "park-proof-of-work-skipped" not in [e["kind"] for e in engine.journal.entries()]
 
 
 def test_park_disabled_by_policy_never_commits_the_token(project):
