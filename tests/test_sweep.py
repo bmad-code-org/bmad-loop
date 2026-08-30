@@ -2405,8 +2405,10 @@ def test_triage_session_env_fault_escalates_then_resume_restores_budget(project)
     # ...and it does so in a NEW generation. The attempt reset above is exactly what
     # would otherwise re-mint `attempt == 1` — an id byte-equal to the abandoned
     # attempt's, pointing the fresh record at the abandoned cycle's
-    # tasks/<id>/escalation.json, which `resolve._gather_escalations` reads per record.
-    # (result.json is not the hazard here: both start_sessions unlink it on launch.)
+    # tasks/<id>/escalation.json. Both adapters now clear cycle outputs at launch, and
+    # `resolve._gather_escalations` opens each distinct task_id once, but neither makes
+    # two historical records stop aliasing one mutable directory. The fresh id preserves
+    # a separate artifact namespace for each cycle, independent of cleanup.
     assert resumed.state.tasks["sweep-triage"].generation == 1
     assert [s.task_id for s in radapter.sessions] == ["sweep-triage-triage-1-g1"]
     assert radapter.sessions[0].task_id not in abandoned

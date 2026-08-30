@@ -210,6 +210,8 @@ breaking changes may land in a minor release.
 - Emit `diagnose --json` v2, replacing journal `patch` / `stashed_to` paths with
   `patch_present` / `stashed_to_present`, and silently degrade Git stale-commit probe
   failures while propagating non-Git faults.
+- De-duplicate interactive-resolution escalations across repeated task IDs and mirrored
+  artifacts, and skip malformed artifacts without aborting resolution.
 - Prevent escalated sweep restarts from reusing abandoned session ids, and clear stale
   `escalation.json` artifacts when either adapter reuses a task directory.
 - Route interactive resolve task ids through the shared whole-composition sanitizer while
