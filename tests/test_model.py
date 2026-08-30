@@ -14,7 +14,6 @@ from bmad_loop.model import (
     SessionRecord,
     StoryTask,
     TokenUsage,
-    VerifyOutcome,
 )
 
 
@@ -186,50 +185,6 @@ def test_followup_review_recommended_defaults_false_for_legacy_state():
     doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
     del doc["followup_review_recommended"]  # state.json from before the field existed
     assert StoryTask.from_dict(doc).followup_review_recommended is False
-
-
-def test_park_eligible_round_trips():
-    """The dispatch-time expectation gating the park's proof-of-work skip is
-    captured once per dev phase, so it has to survive the crash/resume boundary —
-    a replayed attempt that re-derived it would answer about the spec the session
-    it is replaying already parked."""
-    task = StoryTask(story_key="1-1-a", epic=1, park_eligible=True)
-    assert StoryTask.from_dict(task.to_dict()).park_eligible is True
-
-
-def test_park_eligible_defaults_false_for_legacy_state():
-    """And it defaults to the FAIL-CLOSED value, which is the load-bearing half: a
-    run resumed from a state.json written before the field existed has no recorded
-    answer, and the absent one must deny the skip rather than grant it. Defaulting
-    True would make every legacy resume the exact DW-1 hole this field closes."""
-    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
-    del doc["park_eligible"]  # state.json from before the field existed
-    assert StoryTask.from_dict(doc).park_eligible is False
-
-
-def test_verify_outcome_park_fields_are_absent_by_default():
-    """Both park fields are opt-in on the one leg that waives proof-of-work, and
-    every other outcome must leave them at the inert pair — `park_proof_skipped`
-    is what `Engine._verify_dev_artifacts` journals on, so a default of True
-    anywhere would file every ordinary story as a waived gate.
-
-    They are asserted TOGETHER because the whole point of splitting them is that
-    `park_zero_diff is None` no longer means "no waiver": on a waived leg whose
-    probe faulted it means "unknown", and only `park_proof_skipped` separates the
-    two."""
-    assert VerifyOutcome.passed().park_proof_skipped is False
-    assert VerifyOutcome.passed().park_zero_diff is None
-    assert VerifyOutcome.retry("nope").park_proof_skipped is False
-    assert VerifyOutcome.retry("nope").park_zero_diff is None
-    assert VerifyOutcome.escalate("boom").park_proof_skipped is False
-    assert VerifyOutcome.escalate("boom").park_zero_diff is None
-
-    # settable, and independently: the waived-but-unanswerable pair is a real
-    # state, not an unreachable combination
-    waived = VerifyOutcome.passed(park_proof_skipped=True, park_zero_diff=True)
-    assert waived.park_proof_skipped is True and waived.park_zero_diff is True
-    unknown = VerifyOutcome.passed(park_proof_skipped=True)
-    assert unknown.park_proof_skipped is True and unknown.park_zero_diff is None
 
 
 def test_followup_reviews_spent_round_trips():

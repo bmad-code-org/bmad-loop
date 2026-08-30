@@ -294,20 +294,6 @@ class StoryTask:
     # owes, and nothing re-derives it once the session that wrote the spec is
     # gone).
     operator_actions: list[str] = field(default_factory=list)
-    # Whether THIS dev phase was in a position to newly elect a park: captured
-    # once, on the fresh entry into `Engine._dev_phase` (`resume_result is None`),
-    # from the same instant and the same condition as `baseline_commit` — so the
-    # expectation and the diff it guards share one anchor. False when the bound
-    # spec was ALREADY at `awaiting-operator` on entry (an earlier attempt's park
-    # is on disk, so a park observed afterwards may be inherited rather than
-    # elected), when parking is disabled, or when the spec could not be read at
-    # all (fail closed). It gates exactly one thing: `verify_dev`'s proof-of-work
-    # skip on the park leg (#335, #676). Every other park gate still selects on the
-    # observed status alone, so an ineligible park with a real diff still passes.
-    # Deliberately per-PHASE, not per-attempt: a fixable repair keeps the previous
-    # session's tree, so re-observing would make every repair of a malformed park
-    # ineligible and fail it on the gate it just re-armed.
-    park_eligible: bool = False
     defer_reason: str | None = None
     # the recovery ref this attempt's work was parked on by the last auto-rollback
     # — an `attempt-preserve/*` branch (commits above baseline) or, when the tree
@@ -456,7 +442,6 @@ class StoryTask:
             ),
             "commit_sha": self.commit_sha,
             "operator_actions": self.operator_actions,
-            "park_eligible": self.park_eligible,
             "defer_reason": self.defer_reason,
             "preserve_ref": self.preserve_ref,
             "preserve_partial": self.preserve_partial,
@@ -644,7 +629,6 @@ class StoryTask:
             dispatched_spec_snapshot=dispatched_spec_snapshot,
             commit_sha=d.get("commit_sha"),
             operator_actions=[str(a) for a in d.get("operator_actions", [])],
-            park_eligible=bool(d.get("park_eligible", False)),
             defer_reason=d.get("defer_reason"),
             preserve_ref=d.get("preserve_ref"),
             preserve_partial=bool(d.get("preserve_partial", False)),
@@ -884,51 +868,10 @@ class VerifyOutcome:
     # time): no further session can reconcile it, so it routes to a pause with
     # both sides named rather than to another cycle (#334)
     contradiction: bool = False
-    # Whether this ACCEPTED outcome waived the dev gate's proof-of-work check on
-    # the park leg (`verify_dev`'s two-part park selector fired). The fact of the
-    # waiver, not its result: `Engine._verify_dev_artifacts` journals exactly the
-    # attempts this is True for, so an accepted park's waived gate always leaves a
-    # trace (#676).
-    #
-    # Scoped to ACCEPTED deliberately, and it is the whole guarantee: this rides
-    # only the `passed()` return, so a leg that waived proof-of-work and then
-    # failed a LATER gate — the sprint pair is the reachable one — records nothing.
-    # That is the intended bound, not a gap: the record answers "which accepted
-    # parks got in without proving work", and a park that was refused did not get
-    # in. Anything wider would need the flag on the failing constructors too.
-    park_proof_skipped: bool = False
-    # An OBSERVATION, never a gate: on that same waived leg, whether the tree was
-    # in fact free of code residue since the attempt's baseline. `True` = the
-    # accepted park wrote nothing beyond what proof-of-work already excludes,
-    # `False` = it carried a real diff, `None` = the probe could not answer. Two
-    # things produce that `None`: a git fault (it degrades rather than escalating)
-    # and an attempt with no `baseline_commit` to measure from. Nothing branches
-    # on it. Note also that `False` is the weaker of the two definite answers:
-    # the probe inherits `has_changes_since`'s fail-open, so a git REFUSAL (rc 128,
-    # e.g. an unresolvable baseline) reads as "there are changes" rather than
-    # raising, and is recorded as `False`.
-    #
-    # The two fields are deliberately separate, and collapsing them is the bug
-    # this pair exists to prevent: one says a gate was waived, the other says what
-    # that gate would have found. Keyed on the observation alone, an unanswerable
-    # probe is indistinguishable from no waiver at all — so a park whose probe
-    # faulted would go unrecorded, re-creating exactly the silence this pair ends.
-    # A waived gate is recorded whatever the probe managed to say; `None` is a
-    # truthful field value, not a reason to withhold the record.
-    park_zero_diff: bool | None = None
 
     @classmethod
-    def passed(
-        cls,
-        *,
-        park_proof_skipped: bool = False,
-        park_zero_diff: bool | None = None,
-    ) -> "VerifyOutcome":
-        return cls(
-            ok=True,
-            park_proof_skipped=park_proof_skipped,
-            park_zero_diff=park_zero_diff,
-        )
+    def passed(cls) -> "VerifyOutcome":
+        return cls(ok=True)
 
     @classmethod
     def retry(cls, reason: str, fixable: bool = False) -> "VerifyOutcome":
