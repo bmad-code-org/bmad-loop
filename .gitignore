@@ -15,3 +15,8 @@ _bmad/
 dev/skills/bmad-release/
 RELEASING.md
 _bmad-output/
+.bmad-loop/cache/
+.bmad-loop/policy.toml
+_bmad/render/
+.bmad-loop/
+.codex/
