@@ -3098,10 +3098,21 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             print(err, file=sys.stderr)
             return 1
 
+    # DW-11: whether THIS gesture accepted a resolution, which is what gates the
+    # `escalations_resolved_upto` watermark in `runs.rearm_escalation`. False here
+    # covers `--no-interactive` deliberately: that path accepted nothing IN THIS
+    # GESTURE (the human may have fixed the spec by hand, but nothing recorded which
+    # escalations that answered), so the next cycle shows everything — today's
+    # behavior, and the safe direction. Not derived from `resolution.json`: the marker
+    # survives the re-arm that consumed it, so its presence says nothing about this
+    # gesture.
+    resolution_recorded = False
     if args.interactive:
         adapters = _make_adapters(project, run_dir, pol)
         model = pol.adapter.resolved("dev").model
-        resolve.build_context(state, run_dir, story_key, isolation=pol.scm.isolation)
+        _ctx_path, withheld = resolve.build_context(
+            state, run_dir, story_key, isolation=pol.scm.isolation
+        )
         print(f"launching resolve agent for {story_key} — converse, fix the spec, then exit…")
         try:
             produced = resolve.run_session(
@@ -3123,6 +3134,25 @@ def cmd_resolve(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
+        resolution_recorded = bool(produced)
+        # DW-11. Reported to the operator, never into `context.json`: filtering the
+        # agent's list silently would trade one misleading surface for another — the
+        # human would have no way to tell "nothing else was ever raised" from "the rest
+        # is hidden". Worded for what the code can prove: these entries were PRESENTED
+        # to an earlier resolve cycle that recorded a resolution — not that any
+        # particular one of them was individually answered.
+        #
+        # Printed here rather than beside the context build, because until
+        # `run_session` returns without `NotImplementedError` this adapter is not known
+        # to support an interactive session at all — and an operator whose command is
+        # about to fail must not be told escalations were withheld from an agent that
+        # never launched.
+        if withheld:
+            print(
+                f"{withheld} earlier escalation(s) for {story_key} were not shown to the "
+                "agent: they were presented to an earlier resolve cycle that recorded a "
+                "resolution"
+            )
         if not produced:
             print(
                 f"no resolution recorded for {story_key} (agent did not write resolution.json)",
@@ -3227,6 +3257,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             story_key,
             restore_patch=restore_patch,
             isolated_redrive=pol.scm.isolation == "worktree",
+            resolution_recorded=resolution_recorded,
         )
     except runs.RearmError as e:
         print(f"error: {e}", file=sys.stderr)
