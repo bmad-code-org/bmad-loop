@@ -180,30 +180,14 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
-- Require the orchestrator's own dispatch-time expectation before an `awaiting-operator`
-  park skips the dev gate's proof-of-work check (#335, #676). The skip was selected by the
-  policy flag plus the spec's own status, both of which a fresh session inherits, so a
-  re-drive over a spec an earlier attempt had already parked verified green having done
-  nothing. The expectation is captured once per dev phase, on the same anchor as the
-  attempt baseline, so a fixable repair of a malformed park still passes. An inherited park
-  that did real work is unaffected — only the skip narrows, not the park. The expectation is
-  read from the run's own binding for the story, which bounds what it catches: a park
-  inherited from a previous run, written out of band, or re-armed out of an escalation
-  (re-arming reopens the spec without clearing `operator_actions:`) still reaches a
-  dispatch that is eligible. Both residuals are tracked as deferred work. One upgrade
-  note: the expectation defaults to "not eligible" for state written before it existed, so
-  a run interrupted mid-park and resumed after upgrading holds that in-flight park to
-  proof-of-work — if it produced no code, it is retried and may defer rather than parking.
-  Re-running the story is enough; nothing is lost.
-- Journal `park-proof-of-work-skipped` with a `zero_diff` flag for every attempt that clears
-  the dev artifact gate on a park with proof-of-work waived (#676), so a park that wrote
-  nothing and a park that wrote real code stop being indistinguishable after the fact. The
-  record is scoped to that gate: a waiver refused by a later check inside it leaves no
-  entry, while the stages after it (your `[verify]` commands, the review loop, the commit)
-  can still reject the attempt with its entry already written — join
-  `review-skipped-awaiting-operator` on the story key for the parks that reached commit.
-  The probe is an observation only: when it cannot answer — a git fault, or no recorded
-  baseline — the flag is `null` and the outcome is unchanged.
+- Require a dispatch-time expectation before an `awaiting-operator` park skips proof-of-work,
+  so a re-drive cannot verify green by inheriting an earlier in-run park; inherited parks with
+  real changes still pass (#335, #676). Journal each waived artifact-gate pass as
+  `park-proof-of-work-skipped`, with `zero_diff` reporting no non-excluded residue (`true`),
+  residue (`false`), or an unanswerable probe (`null`). The record does not mean the park
+  committed; use the later `story-awaiting-operator` event for that. Cross-run, out-of-band,
+  and re-armed parks remain deferred. On upgrade, an in-flight legacy park defaults ineligible
+  and may retry; re-running the story is sufficient.
 - Anchor the TUI's paused-spec read and its `Request replan` write on the tree the run
   owns. Under isolation both resolved against the main checkout, so the review modals
   showed that copy of the spec and the replan reset it — reporting success while the run's

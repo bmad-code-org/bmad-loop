@@ -749,8 +749,60 @@ def has_changes_since(
     "work happened" (a pre-snapshot run must not have its gate silently
     weakened into never seeing new files), while a rollback gate must fail open
     toward "nothing to remove" (never delete a file it cannot prove this attempt
-    created). Keep it that way."""
+    created). Keep it that way.
+
+    Every non-zero `git diff` result reads as "changed" here, INCLUDING a refusal
+    (rc 128 — an unresolvable baseline, a repo git will not read). That is the
+    fail-open above, and it is deliberate for a gate. A caller that needs to tell
+    "git said there are changes" from "git would not answer" calls
+    :func:`_changes_since`, whose tri-state this function collapses; the collapse
+    lives in one place so the gate and any observer share one body."""
+    answer = _changes_since(
+        repo,
+        baseline,
+        exclude,
+        baseline_untracked=baseline_untracked,
+        include_untracked=include_untracked,
+    )
+    # unanswerable -> the stricter reading for a gate: assume work happened
+    return True if answer is None else answer
+
+
+def _changes_since(
+    repo: Path,
+    baseline: str,
+    exclude: tuple[str, ...] = (),
+    *,
+    baseline_untracked: list[str] | None = None,
+    include_untracked: bool = True,
+) -> bool | None:
+    """:func:`has_changes_since` before its fail-open is applied: ``True`` /
+    ``False`` when git answered, and ``None`` when git REFUSED to answer at all.
+
+    `git diff --quiet` reports "no differences" as rc 0 and "differences" as rc 1;
+    anything else is the command failing rather than answering (rc 128 for a
+    baseline it cannot resolve or a directory that is not a repository). The gate
+    above cannot act on that distinction — uncertainty there must keep the
+    stricter path — but a pure OBSERVATION must, because recording an
+    unanswerable probe as a confident ``False`` (`_verify_shared_gates`'
+    ``observe_skipped_proof`` arm) files "the gate would have found changes"
+    about a question git never answered.
+
+    This is the body BOTH proof arms reach, and by only one route: the
+    `proof_of_work_probe` closure in :func:`_verify_shared_gates`, which is what
+    actually makes "the observation measures exactly what the gate would have"
+    structural. The guarantee is the closure's, not this function's — one closure
+    over one `proof_baseline` / `include_untracked_proof` / exclusion set, so the
+    gate arm and the observation arm cannot be given different inputs. All this
+    body decides is what an unanswerable git call looks like; each arm then reads
+    that `None` under its own policy.
+
+    :func:`has_changes_since` is the fail-open COLLAPSE of this tri-state, kept for
+    the gates that want it — it folds `None` into `True` and is what a caller
+    should reach for unless it can act on "git would not answer"."""
     rc, _ = _git(repo, "diff", "--quiet", baseline, "--", ".", *_exclude_specs(exclude))
+    if rc not in (0, 1):
+        return None
     if rc != 0:
         return True
     if not include_untracked:
@@ -778,8 +830,9 @@ def path_changed_since(
     counting every ordinary untracked path. Ignored paths are absent from
     :func:`untracked_files` and therefore cannot become proof of work here.
 
-    Any non-zero diff result fails open toward "changed", matching the
-    authoritative :func:`has_changes_since` gate. The literal pathspec is
+    Any non-zero diff result fails open toward "changed", matching what the
+    proof-of-work gate does with :func:`_changes_since`'s unanswerable `None` (and
+    what :func:`has_changes_since` collapses it to). The literal pathspec is
     required for operator-configured ledger paths containing Git wildmatch
     characters.
     """
@@ -1033,14 +1086,15 @@ def _exclude_specs(dirs: tuple[str, ...]) -> list[str]:
     `literal` for the same reason as :func:`_literal_specs` — git reads a positional
     operand as a PATHSPEC, so `[`, `]`, `*` and `?` in an operator-configured dir are
     wildmatch metacharacters — but the harm here runs the other way: an over-matching
-    exclusion HIDES a diff instead of exposing a file. `has_changes_since` and
+    exclusion HIDES a diff instead of exposing a file. `_changes_since` (the
+    proof-of-work probe's body, which `has_changes_since` collapses) and
     `attempt_dirty` both spend these on `diff --quiet . :(exclude)<dir>`, so a dir
     whose name carries a `*` excludes a sibling tree as well and the attempt reads
     CLEAN when it changed — the same false "no changes" that a dev attempt's dirtiness
     check exists to prevent (#423 item 3).
 
     It also realigns this half with :func:`_path_under_any`, the Python `startswith`
-    that filters the untracked half of the very same `has_changes_since` call. The two
+    that filters the untracked half of the very same `_changes_since` call. The two
     disagreed on exactly the shapes that glob (#423 item 4): the tracked half excluded
     a path the untracked half still counted, so one function's two branches answered
     differently about what "under the artifact dir" means. Literal is the reading
@@ -1068,7 +1122,7 @@ def _path_under_any(path: str, prefixes: tuple[str, ...]) -> bool:
 
     The literal reading of "under", and since #423 item 4 the one `_exclude_specs`
     agrees with — the two filter the tracked and untracked halves of a single
-    `has_changes_since` answer and must not disagree."""
+    `_changes_since` answer and must not disagree."""
     return any(path == p or path.startswith(p.rstrip("/") + "/") for p in prefixes)
 
 
@@ -1123,7 +1177,7 @@ def path_tracked(repo: Path, rel: str) -> bool:
     operator-named `implementation_artifacts` (`bmadconfig._resolve` takes that key
     verbatim, metacharacters and all) outlived the rollback that discarded the code it
     described. Not the global `--literal-pathspecs` / `GIT_LITERAL_PATHSPECS` form,
-    which would also disarm the `:(exclude)` magic `worktree_clean`, `has_changes_since`
+    which would also disarm the `:(exclude)` magic `worktree_clean`, `_changes_since`
     and `attempt_dirty` are built on; the per-operand prefix is scoped to this call. It
     costs the callers nothing: that same literal comparison is what matches a DIRECTORY
     prefix, so `_bmad/render` still lists everything beneath it (`cmd_validate`'s
@@ -3148,7 +3202,8 @@ def verify_dev_exclude_relpaths(
     root: Path,
 ) -> tuple[str, ...]:
     """Repo-relative posix paths the dev/bundle proof-of-work gate excludes from
-    `has_changes_since` — file-granularity, unlike `artifact_relpaths`' whole-folder
+    its probe (`_changes_since`, via `_verify_shared_gates.proof_of_work_probe`) —
+    file-granularity, unlike `artifact_relpaths`' whole-folder
     exclusion. `artifact_relpaths` has NO production caller left: rollback
     protection builds its own list in `recovery_flow.protected_relpaths` against
     `workspace.root`, and `Engine._protected_relpaths` merely delegates there. Do
@@ -3184,7 +3239,7 @@ def verify_dev_exclude_relpaths(
 
     ``root`` is the tree the resulting pathspecs are relative to, and MUST be the
     same root the caller invokes git against — `paths.repo_root` for the
-    proof-of-work gate, which is where `has_changes_since` runs. REQUIRED, with no
+    proof-of-work gate, which is where the probe runs. REQUIRED, with no
     default: an implicit `paths.project` anchor is #716's own root cause, and the
     two roots collapse in every configuration but the `repo_root` override, so a
     defaulted caller would look correct everywhere it was tested and be wrong only
@@ -3302,7 +3357,12 @@ class _SharedGateResult:
     proof-of-work and asked to be told anyway (``observe_skipped_proof``), it is
     ``True`` when the tree held no changes the gate would have counted, ``False``
     when it held some, and ``None`` when nothing was observed — no skip, no
-    request, no baseline, or a git fault. It is deliberately a return value and
+    request, no baseline, or a probe that could not answer (a ``GitError``, or a
+    git refusal such as an unresolvable baseline). Note what ``False`` does and
+    does not say: the gate would have found changes it counts, measured under the
+    gate's own exclusions. It does not say who wrote them — in a shared checkout
+    the gate itself cannot attribute residue to a session, and this observation
+    inherits exactly that limit. It is deliberately a return value and
     not a gate input: the observation must be made HERE because the baseline it
     measures from is derived here (the newer-claim branch can re-anchor
     ``proof_baseline`` and drop untracked evidence), and no caller can reproduce
@@ -3359,9 +3419,9 @@ def _verify_shared_gates(
     and the answer rides out on ``_SharedGateResult.skipped_proof_zero_diff``.
     Nothing branches on it here: a fault degrades to ``None`` rather than
     escalating, and the leg's outcome is identical either way. It exists so an
-    accepted park's skipped gate stops being silent (#676) — a park that wrote
-    code and a park that wrote nothing are otherwise indistinguishable after the
-    fact.
+    accepted park's skipped gate stops being silent (#676) — a park the waived
+    gate would have passed and one it would have refused are otherwise
+    indistinguishable after the fact.
 
     Exactly one of the two skipping legs asks for it, and the asymmetry is
     deliberate rather than an omission: only sprint mode's PARK passes it.
@@ -3422,8 +3482,10 @@ def _verify_shared_gates(
     # `bmadconfig.worktree_isolation_conflict` refuses the other) the session's cwd
     # IS the code tree, so a `project`-anchored probe judged a tree the session never
     # touched. WHICH probe burned the attempt depends on the layout, and the burn is
-    # not `has_changes_since` in both: it fails OPEN (`rc != 0` -> True), so wherever
-    # `project` is not a checkout the failing git call PASSES that gate. Nested
+    # not the proof-of-work probe in both: `_changes_since` answers `None` when git
+    # will not run, and the gate arm below accepts anything that is not a positive
+    # "nothing changed" (`is False`), so wherever `project` is not a checkout the
+    # failing git call PASSES that gate. Nested
     # (`project` a subdirectory of the code tree) the call succeeds but is scoped to
     # that subdirectory, and the "no changes" forever-burn is real. Disjoint
     # (`project` beside the checkout) git fails and the burn moves to the probes that
@@ -3478,7 +3540,7 @@ def _verify_shared_gates(
                     )
                 )
 
-    def proof_of_work_probe(mode_exclude: tuple[str, ...]) -> bool:
+    def proof_of_work_probe(mode_exclude: tuple[str, ...]) -> bool | None:
         """The one place proof-of-work is measured, called by BOTH arms below.
 
         The gate arm and the observation arm differ in exactly one input — which
@@ -3497,8 +3559,16 @@ def _verify_shared_gates(
         (`Engine._harvest_gate_exclude`, `_stories_relpaths`). A pathspec relative
         to a different root is not merely wrong, it is SILENTLY wrong — git
         matches nothing and the exclusion evaporates.
+
+        Tri-state on purpose: ``None`` means git REFUSED to answer — any rc outside
+        the two that ARE answers, rc 128 being the everyday one — which the two arms
+        below must read differently. The gate treats it as the
+        stricter "there are changes" — exactly `has_changes_since`'s fail-open,
+        which this function used to call and whose behavior the gate arm keeps
+        byte-for-byte — while the observation arm records it as unknown rather
+        than as a confident answer it never got.
         """
-        return has_changes_since(
+        return _changes_since(
             paths.repo_root,
             proof_baseline,
             exclude=verify_dev_exclude_relpaths(
@@ -3511,7 +3581,11 @@ def _verify_shared_gates(
 
     if extra_exclude is not None and task.baseline_commit:
         try:
-            if not proof_of_work_probe(extra_exclude):
+            # `is False` is the gate's fail-open spelled out: only a probe that
+            # positively answered "nothing changed" refuses the attempt, so a git
+            # REFUSAL (`None`) keeps the stricter path exactly as it did when this
+            # arm called `has_changes_since` and let that function collapse it.
+            if proof_of_work_probe(extra_exclude) is False:
                 return _SharedGateResult(
                     VerifyOutcome.retry("no changes in worktree since baseline commit")
                 )
@@ -3519,20 +3593,21 @@ def _verify_shared_gates(
             return _SharedGateResult(VerifyOutcome.escalate(str(e)))
     elif observe_skipped_proof is not None and task.baseline_commit:
         # The gate was skipped; run its probe anyway and report, never refuse.
-        # Only `GitError` is caught, so a non-git bug still surfaces — but that is
-        # a narrower guarantee than "an unanswerable probe records None". The
-        # observation inherits `has_changes_since`'s deliberate fail-open: any
-        # non-zero rc reads as "there are changes", and only timeout, spawn and
-        # decode faults raise `GitError` at all. So a git REFUSAL — an unresolvable
-        # baseline, rc 128 — is recorded as `zero_diff: False`, "this park
-        # committed real code". The bias is toward the less alarming record, which
-        # is the right direction for a field nothing gates on, but it means a
-        # `False` here is weaker evidence than a `True`.
+        #
+        # Unanswerable is recorded as unanswerable, in BOTH of the ways a probe
+        # can fail to answer: a `GitError` (timeout, spawn or decode fault) and a
+        # git REFUSAL (any rc that is not one of the two real answers — rc 128 for
+        # an unresolvable baseline is the everyday one), which the tri-state
+        # probe reports as `None` rather than collapsing into the gate's
+        # fail-open. Collapsing it would file "the gate would have found changes"
+        # about a question git never answered — the one reading a reader cannot
+        # correct, because nothing downstream re-asks. A non-git bug still
+        # surfaces: only `GitError` is caught.
         try:
-            skipped_proof_zero_diff = not proof_of_work_probe(observe_skipped_proof)
+            observed = proof_of_work_probe(observe_skipped_proof)
         except GitError:
-            skipped_proof_zero_diff = None
-        return _SharedGateResult(None, skipped_proof_zero_diff)
+            observed = None
+        return _SharedGateResult(None, None if observed is None else not observed)
 
     return _SharedGateResult()
 
@@ -3671,23 +3746,30 @@ def verify_dev(
     the waiver itself — ``skip_proof``, ``False`` on every other leg. When it
     fires, the shared gate additionally runs the proof-of-work probe as a pure
     OBSERVATION (``observe_skipped_proof=engine_written``) and what that probe
-    found rides out on ``VerifyOutcome.park_zero_diff``: ``True`` for a park with
-    no code residue, ``False`` for one carrying a real diff, ``None`` when the
-    probe could not answer. What separates "unknown" from "no skip happened" is
+    found rides out on ``VerifyOutcome.park_zero_diff``: ``True`` when the waived
+    gate would have found nothing it counts, ``False`` when it would have found
+    something, ``None`` when the probe could not answer. Read ``False`` as exactly
+    that and no further — the residue the gate counts is not attributed to a
+    session, here or in the gate itself, because under a shared checkout it cannot
+    be (see the newer-claim paragraph above, and `docs/FEATURES.md` on
+    ``isolation``). What separates "unknown" from "no skip happened" is
     ``park_proof_skipped``, not this field — collapsing the two into
     ``park_zero_diff is not None`` would make a park whose probe faulted look like
     a leg that never waived anything, and it would go unrecorded — the silence
-    this record exists to end. ``None`` has exactly two causes now, both of them
-    "the probe could not answer": a git fault, and an attempt carrying no
-    ``task.baseline_commit`` to measure from (the shared gate runs neither arm
-    without one). Neither field changes an outcome: a git fault degrades to
-    ``None`` rather than escalating, and an eligible park verifies identically
-    either way. Their consumer is
+    this record exists to end. ``None`` means "the probe could not answer", and
+    reaches here three ways: a ``GitError`` (timeout, spawn or decode fault), a
+    git REFUSAL such as an unresolvable baseline (any rc that is not one of git's
+    two real answers, rc 128 being the everyday one — the gate arm folds that into
+    its fail-open, the observation arm keeps it as unknown), and an attempt
+    carrying no ``task.baseline_commit`` to measure from (the shared gate runs
+    neither arm without one). Neither field changes an outcome: an unanswerable
+    probe degrades rather than escalating, and an eligible park verifies
+    identically either way. Their consumer is
     :meth:`Engine._verify_dev_artifacts`, which journals
     ``park-proof-of-work-skipped`` for a waived gate that this function then
     PASSED, and carries the observation as that record's ``zero_diff`` field, so a
-    park that wrote code and a park that wrote nothing stop being
-    indistinguishable afterwards (#676). Both ends of that scope are set here: a
+    park the waived gate would have passed and one it would have refused stop
+    being indistinguishable afterwards (#676). Both ends of that scope are set here: a
     waiver refused by a later check in this function (the sprint pair) never
     reaches the record, and a record that IS written asserts only that this gate
     was cleared with proof-of-work waived — the configured ``[verify]`` commands,
@@ -3704,7 +3786,7 @@ def verify_dev(
     passed as ``observe_skipped_proof`` instead of ``extra_exclude``: no gate
     consumes them there, but the zero-diff observation must exclude exactly what
     the gate would have, or the orchestrator's own bookkeeping writes would be
-    recorded as the park's code residue.
+    counted as residue on the park's record.
     """
     rj = result_json or {}
     spec_file = rj.get("spec_file")
@@ -4538,8 +4620,8 @@ def resolve_restore_path(raw: str, root: Path) -> Path:
     `model.StoryTask.restore_patch` documents the field as repo-relative-or-absolute,
     and every consumer must resolve it against the base it actually reads the tree
     from — the engine's live workspace root (the unit worktree under isolation),
-    `paths.repo_root` for the proof-of-work exclude (which is where
-    `has_changes_since` runs, so the latch has to name a path in that tree; #716),
+    `paths.repo_root` for the proof-of-work exclude (which is where the gate's own
+    probe runs, so the latch has to name a path in that tree; #716),
     the CLI's `--project`. Hence the caller-supplied `root` rather than one
     baked-in base.
 

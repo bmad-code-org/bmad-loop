@@ -5295,14 +5295,16 @@ class Engine:
         # The record marks the WAIVED GATE, so it keys on the waiver itself
         # (`park_proof_skipped`) and never on what the probe managed to say. The
         # observation is a field on the record, not its trigger: `zero_diff` is
-        # `true` when the session's whole residue was the spec and the board (the
-        # #676 shape the skip exists for), `false` when it also carried real code,
-        # and JSON `null` when the probe could not answer — a git fault, or an
-        # attempt with no baseline commit to measure from. Keying on
+        # `true` when the waived gate would have found nothing it counts (the #676
+        # shape the skip exists for), `false` when it would have found something,
+        # and JSON `null` when the probe could not answer — a `GitError`, a git
+        # refusal, or an attempt with no baseline commit to measure from. Keying on
         # `park_zero_diff is not None` instead would drop exactly the unanswerable
         # case — a gate that WAS waived, silently, which is the silence this record
         # exists to end. An unknown answer is a truthful field value, not a reason
-        # to withhold the record.
+        # to withhold the record. And `false` is a fact about the TREE: the gate
+        # this stands in for cannot attribute residue to a session (a shared
+        # checkout may hold a commit from outside it), so neither can the record.
         #
         # What the record asserts is bounded at BOTH ends by this seam, and it is
         # narrower than "this park was accepted". The flag rides the `passed()`
@@ -5314,11 +5316,30 @@ class Engine:
         # loop, the pre-commit workflows and the commit itself. A retried or
         # deferred attempt therefore leaves a record too, one per attempt. So the
         # fact here is exactly "this attempt cleared the dev ARTIFACT gate with
-        # proof-of-work waived" — never that the park committed. The terminal half
-        # of that question is `_skip_review_and_commit`'s
-        # `review-skipped-awaiting-operator`, which fires for every park that
-        # reaches commit; a reader wanting "waived AND committed" joins the two on
-        # the story key.
+        # proof-of-work waived" — never that the park committed.
+        #
+        # The terminal half of that question is `_finalize_commit_phase`'s
+        # `story-awaiting-operator`, appended AFTER `finalize_commit` stamps
+        # `task.commit_sha` and carrying that sha. Do NOT read
+        # `_skip_review_and_commit`'s `review-skipped-awaiting-operator` as that
+        # half: it is the FIRST statement of that method, ahead of
+        # `_verify_review`, the repair loop, the pre-commit workflows and
+        # `_commit`, so it exists just as much for a park those stages then
+        # reject. It means "the park entered the commit path", never "the park
+        # committed".
+        #
+        # A reader wanting "waived AND committed" correlates on `story_key` plus
+        # journal ORDER: the committed park's waiver is the last
+        # `park-proof-of-work-skipped` for that story preceding its
+        # `story-awaiting-operator`. No attempt-level key is promised, and the
+        # reason is structural rather than an omission — neither terminal event
+        # carries `attempt`, and adding one would not help: `_fix_phase`
+        # increments `task.attempt` and the park commit path calls it, so the
+        # attempt current at commit can exceed the one on this record. A join
+        # shaped like `(story_key, attempt)` would miss on exactly the
+        # multi-attempt runs it exists for, which is worse than an honestly
+        # coarser correlation. Nothing here persists past this outcome for the
+        # same reason: the correlation is the journal's, not the task's.
         if outcome.park_proof_skipped:
             self.journal.append(
                 "park-proof-of-work-skipped",

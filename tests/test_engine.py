@@ -2980,6 +2980,251 @@ def test_park_eligibility_is_captured_once_per_phase_not_per_attempt(project):
     assert [(e["attempt"], e["zero_diff"]) for e in records] == [(2, True)]
 
 
+def test_replayed_attempt_reuses_the_persisted_park_eligibility(project):
+    """Crash replay: the host died after the dev session finished and before its
+    result was consumed, so `_finish_inflight` resets the task to PENDING and
+    re-enters `_dev_phase` with the recorded result instead of a session
+    (`engine.py`'s `resumable` arm). The fresh-entry block is skipped wholesale on
+    that path, which is exactly why eligibility is captured there — a replayed
+    attempt must read back the answer the DEAD phase recorded, never derive a new
+    one from the tree the session it is replaying already wrote.
+
+    The setup makes the two answers differ: the spec on disk is ALREADY parked
+    (the replayed session's own work), so a re-observation at this point returns
+    False and the residue-free tree would then owe proof-of-work it cannot show.
+    The persisted `True` is the only thing that carries the park through.
+
+    Ablation: move `task.park_eligible = self._park_eligible_at_dispatch(task)`
+    out of `_dev_phase`'s `if resume_result is None:` block and this fails — the
+    replay re-observes its own parked spec, turns ineligible, and the park is
+    refused for "no changes in worktree since baseline commit". This is the row
+    the sibling capture-once test explicitly does NOT cover: that one measures a
+    second ATTEMPT inside a live phase, this one a replayed phase with no
+    attempt of its own."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(project, [], policy=_park_policy())
+    baseline = rev_parse_head(project.project)
+    # captured in production order: the phase's snapshot predates the session that
+    # wrote the park below
+    untracked = sorted(verify.untracked_files(project.project))
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "awaiting-operator", baseline, operator_actions=ACTIONS)
+    task = StoryTask(story_key="1-1-a", epic=1, phase=Phase.PENDING, attempt=1)
+    task.spec_file = str(sp)
+    task.baseline_commit = baseline
+    task.baseline_untracked = untracked
+    # what the dead phase recorded at ITS dispatch, when the spec was unparked
+    task.park_eligible = True
+    engine.state.tasks[task.story_key] = task
+    result_json = {
+        "workflow": "auto-dev",
+        "story_key": "1-1-a",
+        "spec_file": str(sp),
+        "baseline_commit": baseline,
+        "escalations": [],
+        "followup_review_recommended": False,
+    }
+    # the persisted record the resume arm replays FROM — `_accept_current_dev_session`
+    # latches it as the accepted tree owner, so its task_id has to be the one the
+    # replayed attempt derives
+    task.record_session(
+        SessionRecord(
+            task_id=_session_task_id("1-1-a", "dev", task.attempt, task.generation),
+            role="dev",
+            status="completed",
+            result_json=dict(result_json),
+        )
+    )
+    recorded = SessionResult(status="completed", result_json=result_json)
+
+    assert engine._dev_phase(task, resume_result=recorded) is True
+
+    # the recorded result replaced the session: nothing was dispatched, so the
+    # only observation available was the persisted one
+    assert adapter.sessions == []
+    assert task.park_eligible is True
+    records = [e for e in engine.journal.entries() if e["kind"] == "park-proof-of-work-skipped"]
+    assert [(e["attempt"], e["zero_diff"]) for e in records] == [(1, True)]
+
+
+def test_no_waiver_record_when_a_later_check_inside_the_gate_rejects_the_park(project):
+    """The record's NEAR end, at the seam that writes it: the waiver fires and the
+    observation runs, but a check still inside `verify_dev` — the sprint pair, the
+    reachable one — then refuses the attempt. The flag rides only the passing
+    return, so nothing is journaled.
+
+    That bound is what the record means. DW-6 asks which parks got IN without
+    proving work; an attempt refused by the same gate did not get in, and filing
+    it would make the inventory count refusals as admissions.
+
+    Driven at `_verify_dev_artifacts` rather than through `engine.run()` because
+    the mismatch cannot survive the run loop: `_post_dev_state_sync` mirrors the
+    spec's status onto the board a dozen lines before this gate, so the pair is
+    already reconciled by the time a live run reaches here. The seam is the
+    subject anyway — this method is where the append lives.
+
+    Ablation, measured: delete the `if outcome.park_proof_skipped:` gate so the
+    append is unconditional, and this fails on a non-empty record list (three
+    sibling rows fail with it). Re-keying the append on
+    `outcome.park_zero_diff is not None` is not an ablation for this row: it leaves
+    the row green because the
+    failing constructors carry neither park field, so a refused attempt is silent
+    under both spellings. That spelling's defect is the opposite one, a WAIVED
+    gate whose probe could not answer going unrecorded, and its detector is
+    `test_accepted_park_still_records_when_the_zero_diff_probe_faults`."""
+    # the board never reached the token — the pair `verify_dev` demands is broken
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "in-progress"})
+    engine, _ = make_engine(project, [], policy=_park_policy())
+    baseline = rev_parse_head(project.project)
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "awaiting-operator", baseline, operator_actions=ACTIONS)
+    task = StoryTask(story_key="1-1-a", epic=1, attempt=1)
+    task.spec_file = str(sp)
+    task.baseline_commit = baseline
+    task.baseline_untracked = sorted(verify.untracked_files(project.project))
+    task.park_eligible = True
+
+    outcome = engine._verify_dev_artifacts(task, {"workflow": "auto-dev", "spec_file": str(sp)})
+
+    # refused for the sprint pair, NOT for proof-of-work: the waiver did fire
+    assert not outcome.ok and outcome.retryable
+    assert "sprint" in outcome.reason and "no changes in worktree" not in outcome.reason
+    assert outcome.park_proof_skipped is False
+    assert [e for e in engine.journal.entries() if e["kind"] == "park-proof-of-work-skipped"] == []
+
+
+def test_the_waiver_record_stands_when_a_later_stage_rejects_the_park(project):
+    """The record's FAR end, and the half its prose is likeliest to overclaim: the
+    artifact gate passes with the waiver in force and the entry is written, then a
+    configured `[verify]` command fails and the attempt is rejected. The entry
+    stays — it never claimed the park was accepted, only that THIS ATTEMPT cleared
+    the dev ARTIFACT gate without proving work, which is true and stays true.
+
+    Everything downstream of `_verify_dev_artifacts` runs after the append:
+    `_dev_phase` replaces this outcome with the verify commands' result a few
+    lines later, then decision routing, the review loop, the pre-commit workflows
+    and the commit. A reader treating the record as "this park committed" would
+    count this story, which never parked at all.
+
+    Both attempts waive and both are recorded, one per attempt — the phase's
+    eligibility is captured once and a fresh attempt inside it inherits it — which
+    is also why no attempt-level join to a terminal event is promised."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [
+            generic_dev_effect(
+                project,
+                "1-1-a",
+                final_status="awaiting-operator",
+                operator_actions=ACTIONS,
+                write_src=False,
+            )
+        ]
+        * 2,
+        # host-shell fail verb, not `false` (#302)
+        policy=_park_policy(verify=VerifyPolicy(commands=(_FAIL,))),
+    )
+
+    summary = engine.run()
+
+    # the park never happened: the verify commands rejected every attempt
+    assert summary.awaiting_operator == 0 and summary.deferred == 1
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "story-awaiting-operator" not in kinds
+    # ...and the waiver records stand anyway, one per attempt that cleared the
+    # artifact gate. They say what the gate saw, not what the run decided.
+    records = [e for e in engine.journal.entries() if e["kind"] == "park-proof-of-work-skipped"]
+    assert [(e["attempt"], e["zero_diff"]) for e in records] == [(1, True), (2, True)]
+    assert len(adapter.sessions) == 2
+
+
+def test_eligible_phase_waives_on_a_different_spec_than_it_was_authorized_over(project):
+    """CHARACTERIZATION of behavior this change deliberately LEAVES OPEN — not a
+    guarantee, and not a gate. It is the shipped answer to the intent's I/O row
+    "Eligible phase, attempt resolves a DIFFERENT spec", and it is folded into the
+    first `deferred` entry on this change's spec ("the same authorization is also
+    never re-validated against spec IDENTITY"). A later change that closes that
+    deferral is EXPECTED to rewrite this row rather than be blocked by it.
+
+    What it pins: `park_eligible` is a PHASE-level authorization answering one
+    question about ONE observation — was `task.spec_file` already parked at the
+    instant the phase was dispatched? Here it was not (the binding is a
+    `ready-for-dev` spec), so the phase is eligible. The session then returns a
+    result naming a DIFFERENT spec that was already at `awaiting-operator` before
+    the phase began, and writes no code at all. The authorization is not
+    re-validated against that identity, so the waiver is spent on an inherited
+    park declaration the phase was never authorized over, the residue-free tree is
+    accepted, and the attempt is journaled as a waived gate.
+
+    ENGINE layer, and the choice is forced rather than preferred: `verify_dev`
+    takes `park_eligible` as a bare argument and has no notion of the phase
+    binding at all, so at that layer "the authorization was computed about another
+    spec" is not expressible — a caller can only assert the value it just passed
+    in. Only `_dev_phase` holds both halves: it computes eligibility from
+    `task.spec_file` at fresh entry and later hands the session's own
+    `result_json["spec_file"]` to the gate. Nothing between the two compares them,
+    which is precisely the finding. (No binding or roots gate refuses the
+    construction: the foreign spec sits inside `implementation_artifacts`, so
+    `spec_within_roots` admits it, and no verify gate reads `result.json`'s
+    `story_key`.)
+
+    Ablation, measured rather than predicted: bind eligibility to the returned
+    spec identity in `verify_dev` with
+    `skip_proof = parked and park_eligible and
+    (not task.spec_file or str(spec_path) == task.spec_file)` — and this row fails
+    with `ScriptExhausted: no scripted result for session 1-1-a-dev-2`. Note the
+    surface it fails on, because it is a consequence and not the assertion below:
+    the waiver no longer fires, the residue-free tree owes a diff it never
+    produced, `verify_dev` refuses it with "no changes in worktree since baseline
+    commit", and the engine asks for the retry the one-entry script cannot supply.
+    The refusal is the cause and the `dev-decision` journal entry records it; the
+    exhausted script is only how the retry becomes visible. That failure is the
+    expected shape of CLOSING the deferral, which is why this row is
+    characterization rather than warranty — close it and rewrite this row."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    baseline = rev_parse_head(project.project)
+    # the phase's binding: NOT parked, so the dispatch-time answer is "eligible"
+    bound = spec_path(project, "1-1-a")
+    write_spec(bound, "ready-for-dev", baseline)
+    # somebody else's park, on disk before this phase ever starts
+    inherited = spec_path(project, "1-2-b")
+    write_spec(inherited, "awaiting-operator", baseline, operator_actions=ACTIONS)
+
+    def resolves_the_other_spec(_spec):
+        # writes nothing — no code, and not even its own spec: the park
+        # declaration it reports was already there
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "auto-dev",
+                "story_key": "1-1-a",
+                "spec_file": str(inherited),
+                "baseline_commit": baseline,
+                "escalations": [],
+                "followup_review_recommended": False,
+            },
+        )
+
+    # exactly ONE scripted session: the shipped behavior accepts on the first
+    # attempt, and under the ablation below the engine's request for a second is
+    # the whole signal
+    engine, adapter = make_engine(project, [resolves_the_other_spec], policy=_park_policy())
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(bound))
+    engine.state.tasks[task.story_key] = task
+
+    assert engine._dev_phase(task) is True
+
+    assert len(adapter.sessions) == 1  # accepted on the first attempt, never retried
+    # authorized over the bound spec...
+    assert task.park_eligible is True
+    assert read_frontmatter(bound)["status"] == "ready-for-dev"
+    # ...and spent on the other one, which the gate then rebound the task to
+    assert task.spec_file == str(inherited)
+    records = [e for e in engine.journal.entries() if e["kind"] == "park-proof-of-work-skipped"]
+    assert [(e["attempt"], e["zero_diff"]) for e in records] == [(1, True)]
+
+
 @pytest.mark.parametrize(
     "write_src, zero_diff",
     [(False, True), (True, False)],
@@ -2989,15 +3234,17 @@ def test_accepted_park_records_whether_the_skipped_gate_would_have_passed(
     project, write_src, zero_diff
 ):
     """DW-6: the skip stops being silent. Proof-of-work is waived for every
-    ELECTED park, so afterwards a park that wrote real code and one that wrote
-    nothing at all were indistinguishable — the same green outcome, no trace of
-    which gate was waived or what it would have said.
+    ELECTED park, so afterwards a park the waived gate would have passed and one
+    it would have refused were indistinguishable — the same green outcome, no
+    trace of which gate was waived or what it would have said.
 
     The record carries the discriminator ON the entry rather than in its kind,
     because its readers are out-of-process: `zero_diff` is `true` when the whole
     residue was the spec and the board (the #676 shape the relaxation exists for)
-    and `false` when the session also committed real work and simply happened not
-    to need the waiver. One kind, one attempt, one answer.
+    and `false` when the gate would have found more than that and the waiver was
+    therefore not what carried the attempt. It is a fact about the TREE — the gate
+    it stands in for cannot attribute residue to a session either. One kind, one
+    attempt, one answer.
 
     The probe runs inside the shared gate on purpose — it measures from the
     baseline that gate derived, so a commit the newer-claim branch re-anchored
@@ -3031,6 +3278,70 @@ def test_accepted_park_records_whether_the_skipped_gate_would_have_passed(
     assert records[0]["zero_diff"] is zero_diff
 
 
+def test_a_committed_waived_park_correlates_by_story_key_and_journal_order(project):
+    """The JOIN the docs now hand to out-of-process readers, which nothing else
+    pins: `park-proof-of-work-skipped` answers "which attempts cleared the dev
+    artifact gate without proving work", `story-awaiting-operator` answers "which
+    parks committed", and a reader wanting BOTH correlates them on `story_key`
+    plus journal ORDER — the committed park's waiver being the last such record
+    preceding that event.
+
+    The pair must be exercised together: testing each record separately would not
+    catch documentation that points readers at
+    `review-skipped-awaiting-operator`, which is appended when a park *enters* the
+    commit path and also exists for parks the later stages reject. This row pins
+    the supported post-commit correlation.
+
+    It also pins the attempt asymmetry the docs rest their "no attempt-keyed join"
+    on, because that too was stated wrongly once: the WAIVER carries `attempt`, the
+    TERMINAL event does not. Both halves are asserted, so a future change that
+    added `attempt` to the terminal event would redden here and force the docs to
+    be re-read rather than silently drifting.
+
+    Deliberately a residue-free park (`write_src=False`): the waiver has to be the
+    thing that carried it through the gate, or the row would be a correlation
+    between two records that would both exist anyway."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            generic_dev_effect(
+                project,
+                "1-1-a",
+                final_status="awaiting-operator",
+                operator_actions=ACTIONS,
+                write_src=False,
+            )
+        ],
+        policy=_park_policy(),
+    )
+
+    summary = engine.run()
+
+    assert summary.awaiting_operator == 1
+    entries = engine.journal.entries()
+    waivers = [
+        i
+        for i, e in enumerate(entries)
+        if e["kind"] == "park-proof-of-work-skipped" and e["story_key"] == "1-1-a"
+    ]
+    committed = [
+        i
+        for i, e in enumerate(entries)
+        if e["kind"] == "story-awaiting-operator" and e["story_key"] == "1-1-a"
+    ]
+    assert len(waivers) == 1 and len(committed) == 1
+
+    # the join: same story key, and the waiver PRECEDES the terminal event
+    assert waivers[0] < committed[0]
+    # the terminal event is genuinely post-commit — it carries the sha
+    assert entries[committed[0]]["commit"] == engine.state.tasks["1-1-a"].commit_sha
+    assert entries[committed[0]]["commit"]
+    # ...and the asymmetry that makes an attempt-keyed join unpromisable
+    assert entries[waivers[0]]["attempt"] == 1
+    assert "attempt" not in entries[committed[0]]
+
+
 def test_accepted_park_still_records_when_the_zero_diff_probe_faults(project):
     """The record marks the WAIVED GATE, not the probe's success. A git fault
     leaves the observation unanswerable, but the gate was waived all the same —
@@ -3055,22 +3366,25 @@ def test_accepted_park_still_records_when_the_zero_diff_probe_faults(project):
         ],
         policy=_park_policy(),
     )
-    real = verify.has_changes_since
+    real = verify._changes_since
 
     def fault_the_observation(*args, **kwargs):
         raise verify.GitError("git diff exploded")
 
     # NOTE the patch is module-GLOBAL, not narrowed to the observation arm — this
-    # row works because the park path reaches no other `has_changes_since` caller,
-    # not because the fault was targeted. `zero_diff is None` is what proves the
+    # row works because the park path reaches no other proof-of-work probe, not
+    # because the fault was targeted. `zero_diff is None` is what proves the
     # observation arm is the one that swallowed it: only its `except GitError`
-    # produces that value.
+    # produces that value. `_changes_since` is the target rather than
+    # `has_changes_since` because the shared probe calls the tri-state body
+    # directly; patching the fail-open wrapper would leave the probe intact and
+    # this row would pass having faulted nothing.
     with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(verify, "has_changes_since", fault_the_observation)
+        mp.setattr(verify, "_changes_since", fault_the_observation)
         summary = engine.run()
 
     # the context manager UNDID the patch — this says nothing about its breadth
-    assert verify.has_changes_since is real
+    assert verify._changes_since is real
     assert summary.awaiting_operator == 1
     assert engine.state.tasks["1-1-a"].phase == Phase.AWAITING_OPERATOR
     records = [e for e in engine.journal.entries() if e["kind"] == "park-proof-of-work-skipped"]

@@ -644,7 +644,19 @@ class StoryTask:
             dispatched_spec_snapshot=dispatched_spec_snapshot,
             commit_sha=d.get("commit_sha"),
             operator_actions=[str(a) for a in d.get("operator_actions", [])],
-            park_eligible=bool(d.get("park_eligible", False)),
+            # `is True`, not `bool(...)`, and this is the one field on this task
+            # where the difference is load-bearing. Every sibling bool above
+            # merely restores bookkeeping; this one AUTHORIZES a gate to be
+            # waived, so its failure direction is not symmetric — a wrong False
+            # costs one retryable proof-of-work refusal, a wrong True re-opens
+            # the inheritance hole the field exists to close (#335, #676). Under
+            # `bool()` every truthy non-boolean grants the waiver, and the
+            # likeliest one is the string "false" (a hand-edited state.json, a
+            # bridge that stringifies JSON scalars): `bool("false")` is True.
+            # Only a real JSON `true` may authorize; anything else — absent,
+            # null, a string, a number — fails closed onto the ordinary gated
+            # path, where an honest park with a real diff still passes.
+            park_eligible=d.get("park_eligible") is True,
             defer_reason=d.get("defer_reason"),
             preserve_ref=d.get("preserve_ref"),
             preserve_partial=bool(d.get("preserve_partial", False)),
@@ -901,16 +913,27 @@ class VerifyOutcome:
     # written. So a True here means "the artifact gate was cleared with
     # proof-of-work waived", never "this park committed".
     park_proof_skipped: bool = False
-    # An OBSERVATION, never a gate: on that same waived leg, whether the tree was
-    # in fact free of code residue since the attempt's baseline. `True` = the
-    # accepted park wrote nothing beyond what proof-of-work already excludes,
-    # `False` = it carried a real diff, `None` = the probe could not answer. Two
-    # things produce that `None`: a git fault (it degrades rather than escalating)
-    # and an attempt with no `baseline_commit` to measure from. Nothing branches
-    # on it. Note also that `False` is the weaker of the two definite answers:
-    # the probe inherits `has_changes_since`'s fail-open, so a git REFUSAL (rc 128,
-    # e.g. an unresolvable baseline) reads as "there are changes" rather than
-    # raising, and is recorded as `False`.
+    # An OBSERVATION, never a gate: on that same waived leg, what the skipped
+    # proof-of-work gate WOULD have found, measured from the same baseline and
+    # under the same exclusions it would have used. `True` = nothing it counts —
+    # the residue was confined to what proof-of-work already excludes, the #676
+    # shape the waiver exists for. `False` = it would have found changes. `None` =
+    # the probe could not answer.
+    #
+    # `False` is a statement about the TREE, not about a session, and the wording
+    # matters because the tempting shorthand ("the park wrote real code") is a
+    # claim this seam cannot make: the gate it stands in for cannot attribute
+    # residue to a session either — under `isolation = "none"` a commit that
+    # arrived in the shared checkout from outside the session satisfies it — so
+    # the observation inherits exactly that limit rather than improving on it.
+    #
+    # Three things produce `None`, all of them "the probe could not answer": a
+    # `GitError` (it degrades rather than escalating), a git REFUSAL such as an
+    # unresolvable baseline (any rc that is not one of git's two real answers, rc
+    # 128 being the everyday one — `_changes_since` reports it as unknown instead
+    # of letting the gate's fail-open record a confident `False`), and an
+    # attempt with no `baseline_commit` to measure from. Nothing branches on any
+    # of the three.
     #
     # The two fields are deliberately separate, and collapsing them is the bug
     # this pair exists to prevent: one says a gate was waived, the other says what

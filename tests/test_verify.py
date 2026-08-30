@@ -15,6 +15,7 @@ from conftest import (
     OMIT,
     UNRESOLVABLE,
     _file_exists_cmd,
+    _Omit,
     fault_read_text,
     git,
     make_git_noisy,
@@ -784,7 +785,7 @@ def test_verify_dev_park_unknown_when_the_policy_is_off(project):
     assert "'awaiting-operator'" in out.reason and "expected 'done'" in out.reason
 
 
-def _residue_free(project, *, status, sprint, baseline=None):
+def _residue_free(project, *, status, sprint, baseline: str | _Omit | None = None):
     """A dev attempt whose ONLY residue is the spec and the sprint board — the two
     paths proof-of-work already excludes.
 
@@ -807,8 +808,19 @@ def _residue_free(project, *, status, sprint, baseline=None):
     `verify.AWAITING_OPERATOR` rather than the bare literal so they move with the
     branch above on a rename: were the two to drift, this helper would quietly stop
     writing the field and every park row would fail on "declares no usable
-    operator_actions" instead of on the thing it tests. `baseline` overrides what
-    the spec claims, for the row that probes the baseline-match gate."""
+    operator_actions" instead of on the thing it tests.
+
+    `baseline` has three meanings, and the third is not a special case of the
+    second. ``None`` (the default) claims the task's own recorded baseline — the
+    matching pair every ordinary row wants. A STRING overrides what the spec
+    claims, for the row that probes the baseline-match gate. ``OMIT`` writes no
+    `baseline_revision` key at all, which is the only way to reach the
+    proof-of-work probe with a baseline git cannot resolve: with a claim present
+    the baseline-match gate refuses first and the probe is never asked, so the
+    git-refusal rows would pass for the wrong reason. That third meaning rides on
+    ``OMIT`` being truthy in the `baseline or task.baseline_commit` expression
+    below — deliberate, but load-bearing, so do not "simplify" that expression to
+    an ``is None`` test without giving ``OMIT`` its own branch."""
     write_sprint(project, {"1-1-a": sprint})
     task = make_task(project)
     sp = spec_path(project, "1-1-a")
@@ -1013,13 +1025,13 @@ def test_verify_dev_elected_park_with_code_residue_records_a_non_zero_diff(proje
 
 
 def test_verify_dev_park_zero_diff_observation_degrades_to_unknown(project, monkeypatch):
-    """The observation must never change an outcome. `has_changes_since` can raise
-    `GitError`, and on the gated legs that escalates the attempt — here the same
-    fault has to leave the park accepted and the answer honestly unknown.
+    """The observation must never change an outcome. The proof-of-work probe can
+    raise `GitError` (timeout, spawn or decode fault), and on the gated legs that
+    escalates the attempt — here the same fault has to leave the park accepted and
+    the answer honestly unknown.
 
-    Load-bearing because the probe fails OPEN (`rc != 0` -> "there are changes"),
-    so a fault swallowed at the wrong level would be recorded as a confident
-    `False` — a zero-diff park filed as one that wrote code, which is worse than no
+    Load-bearing because a fault swallowed at the wrong level would be recorded as
+    a confident answer about a question git never answered, which is worse than no
     record at all.
 
     This is the row that separates the two reasons `park_zero_diff` can be `None`:
@@ -1027,6 +1039,11 @@ def test_verify_dev_park_zero_diff_observation_degrades_to_unknown(project, monk
     facts and they live on different fields — `park_proof_skipped` stays True here.
     Collapsing them would make this park look like an ordinary leg and drop its
     journal record, which is the exact silence DW-6 exists to end.
+
+    The patch target is `_changes_since`, the tri-state body BOTH proof arms share
+    (`has_changes_since` is its fail-open collapse and no longer what the gate
+    calls) — patching the wrapper would leave the probe untouched and this row
+    would pass for no reason at all.
 
     Ablation: drop the `except GitError` in the observation arm and this fails with
     the GitError propagating out of `verify_dev`, turning a bookkeeping probe into
@@ -1038,7 +1055,7 @@ def test_verify_dev_park_zero_diff_observation_degrades_to_unknown(project, monk
     def boom(*_a, **_kw):
         raise verify.GitError("git diff exploded")
 
-    monkeypatch.setattr(verify, "has_changes_since", boom)
+    monkeypatch.setattr(verify, "_changes_since", boom)
 
     out = verify.verify_dev(
         task,
@@ -1056,6 +1073,78 @@ def test_verify_dev_park_zero_diff_observation_degrades_to_unknown(project, monk
     assert out.park_proof_skipped is True
 
 
+def test_verify_dev_park_zero_diff_is_unknown_when_git_refuses_the_probe(project):
+    """The THIRD cause of `zero_diff: null`, and the one that used to be recorded
+    as a confident answer: git refusing the diff outright.
+
+    `git diff --quiet` reports rc 0 for "no differences" and rc 1 for
+    "differences"; anything else — rc 128 for a baseline it cannot resolve — is the
+    command failing rather than answering. The gate that this observation stands in
+    for reads every non-zero rc as "there are changes", which is right for a gate
+    (uncertainty must keep the stricter path) and wrong for a record: it filed "the
+    waived gate would have found changes" about a question git never answered, and
+    nothing downstream ever re-asks.
+
+    No monkeypatch: the refusal is REAL, produced the way production produces one —
+    a recorded baseline that does not resolve in this repository, with the spec
+    carrying no `baseline_revision` claim so the baseline-match gate has nothing to
+    compare and the attempt reaches the probe. rc 128 is asserted directly first, so
+    a future git that answered differently would fail here rather than silently
+    turning this row into a duplicate of its `GitError` sibling.
+
+    Two ablations, both measured, and they fail this row to DIFFERENT values —
+    which is the point, because only one of them is the defect that shipped. Point
+    `proof_of_work_probe` back at `has_changes_since` (the pre-fix spelling, where
+    the wrapper folds the refusal into its fail-open) and this fails with
+    `park_zero_diff is False`: the record asserting the gate would have found
+    changes. Collapse the observation arm's mapping to `not observed` instead and
+    it fails with `True`, because `not None` is True — a different wrong answer
+    from a different place, and the reason the arm maps the unknown explicitly
+    rather than negating it."""
+    task, sp = _residue_free(
+        project, status=verify.AWAITING_OPERATOR, sprint=verify.AWAITING_OPERATOR, baseline=OMIT
+    )
+    task.baseline_commit = "0" * 40
+    rc, _ = verify._git(project.repo_root, "diff", "--quiet", task.baseline_commit, "--", ".")
+    assert rc == 128, "the premise: git REFUSES this baseline rather than answering"
+
+    out = verify.verify_dev(
+        task,
+        project,
+        dev_result(sp),
+        review_enabled=False,
+        operator_park=True,
+        park_eligible=True,
+    )
+
+    assert out.ok
+    # the waiver is recorded; only the observation is honestly unknown
+    assert out.park_proof_skipped is True
+    assert out.park_zero_diff is None
+
+
+def test_verify_dev_proof_of_work_gate_still_fails_open_on_a_refused_probe(project):
+    """The control for the row above, and the reason it can be trusted to have
+    changed only the record: the GATE's reading of the identical refusal is
+    unchanged. An ordinary terminal on a residue-free tree whose baseline git will
+    not resolve still PASSES proof-of-work, because uncertainty at a gate keeps the
+    stricter path — the same answer the arm gave when it called `has_changes_since`
+    and let that function collapse the refusal.
+
+    Without this row the tri-state could have been introduced by narrowing the gate
+    too (refusing on `None`), which would turn every unresolvable baseline into a
+    burned attempt, and only this residue-free tree — where the refusal is the ONLY
+    thing standing between the attempt and a "no changes" retry — can tell the two
+    spellings apart."""
+    task, sp = _residue_free(project, status="done", sprint="done", baseline=OMIT)
+    task.baseline_commit = "0" * 40
+
+    out = verify.verify_dev(task, project, dev_result(sp), review_enabled=False)
+
+    assert out.ok
+    assert out.park_proof_skipped is False and out.park_zero_diff is None
+
+
 def test_verify_dev_park_zero_diff_is_unknown_without_a_recorded_baseline(project):
     """The SECOND documented cause of `zero_diff: null`, and the one a reader is
     likeliest to mistake for the first: not a git fault, but an attempt carrying
@@ -1063,14 +1152,21 @@ def test_verify_dev_park_zero_diff_is_unknown_without_a_recorded_baseline(projec
     one, so there is nothing to measure from and the observation never happens —
     yet the waiver did, and the record still has to say so.
 
-    Both causes are named in `verify_dev`'s docstring, in `VerifyOutcome`'s field
-    comment and in `docs/FEATURES.md`; its sibling row above covers the git fault,
-    and this one covers the missing baseline, so neither claim rests on prose.
+    All three causes are named in `verify_dev`'s docstring, in `VerifyOutcome`'s
+    field comment and in `docs/FEATURES.md`; the sibling rows cover the `GitError`
+    and the git refusal, and this one covers the missing baseline, so no claim
+    rests on prose.
 
-    Ablation: drop `and task.baseline_commit` from the observation arm's guard and
-    this fails with `park_zero_diff is False` — the probe runs against an empty
-    baseline, `has_changes_since` fails OPEN on the resulting git error, and an
-    attempt with nothing to measure gets filed as one that wrote real code."""
+    Ablation, measured rather than assumed, and the measurement changed when the
+    refusal fix landed: dropping `and task.baseline_commit` from the observation
+    arm's guard ALONE now leaves this row green, because the probe then runs
+    against an empty baseline, git REFUSES it, and `_changes_since` reports that
+    refusal as the same `None` the guard was suppressing. That convergence is the
+    point of the refusal fix, not a hole — the guard is now a spared git spawn
+    rather than the only thing standing between this attempt and a confident
+    answer. What does redden the row is the pre-fix PAIR: drop the guard and
+    collapse the arm's unknown mapping to `not observed`, and an attempt with
+    nothing to measure is filed `zero_diff: true`."""
     task, sp = _residue_free(
         project, status=verify.AWAITING_OPERATOR, sprint=verify.AWAITING_OPERATOR
     )
@@ -1098,8 +1194,8 @@ def test_verify_dev_park_zero_diff_excludes_the_orchestrators_own_writes(project
     this is the misattribution most likely to be audited: the orchestrator appends
     a harvested deferral to the ledger DURING the attempt, so a park whose session
     wrote nothing still leaves that file changed. Counted, the record would read
-    `zero_diff: false` — "this park committed real code" — about a diff the
-    orchestrator itself produced, and an audit of which parks got in without
+    `zero_diff: false` — "the waived gate would have found changes" — about a diff
+    the orchestrator itself produced, and an audit of which parks got in without
     proving work would quietly exonerate exactly the wrong ones.
 
     `engine_written` is what `Engine._harvest_gate_exclude` supplies for this, and
@@ -5355,10 +5451,12 @@ def test_verify_dev_measures_proof_of_work_in_the_code_tree(project, tmp_path):
     cannot be resolved there.
 
     The proof-of-work probe deliberately is NOT graded by this row, and cannot be:
-    `has_changes_since` fails OPEN (`rc != 0 -> return True`), so pointing it at a
-    non-repo returns "there are changes" and a passing row stays green for the
-    wrong reason. The refusal row below is what grades it, which is why that one
-    asserts the exact reason rather than `not out.ok`.
+    the gate arm refuses only on a positive "nothing changed" (`is False` over
+    `_changes_since`'s tri-state), so pointing the probe at a non-repo yields the
+    unanswerable `None`, the gate PASSES, and a green row proves nothing. Measured:
+    re-anchor `proof_of_work_probe` on `paths.project` and this row stays green
+    while its sibling below reddens. That sibling is what grades the probe, which
+    is why it asserts the exact reason rather than `not out.ok`.
     """
     paths = _repo_root_override(project, tmp_path)
     write_sprint(paths, {"1-1-a": "review"})
@@ -5379,16 +5477,20 @@ def test_verify_dev_refuses_proof_of_work_only_the_project_tree_holds(project, t
     that anything was implemented, because no session writes code there.
 
     The assertion is on the exact refusal REASON, not merely on `not out.ok` — but
-    NOT for the reason a reader might assume. Re-anchoring `has_changes_since` on
-    `paths.project` does not make the gate fault: `has_changes_since` fails OPEN
-    (`rc != 0 -> return True`, verify.py), so pointing it at a directory that is not
-    a git repository reports "there are changes" and the gate PASSES. The exact-reason
-    assertion is still the right call, for the neighbouring row's sake — that one
-    cannot grade this probe at all, precisely because the fail-open answer is also
-    the answer a correct run gives.
+    NOT for the reason a reader might assume. Re-anchoring the probe on
+    `paths.project` does not make the gate fault: pointing `_changes_since` at a
+    directory that is not a git repository yields its unanswerable `None`, which the
+    gate arm folds toward "there are changes" (`is False` is the only refusal), so
+    the gate PASSES. The exact-reason assertion is still the right call, for the
+    neighbouring row's sake — that one cannot grade this probe at all, precisely
+    because the fail-open answer is also the answer a correct run gives.
 
-    Ablation: re-anchor `has_changes_since` on `paths.project` and this row reddens
-    on `not out.ok` with `ok=True`.
+    Ablation names the surface actually reached, not `has_changes_since`: that
+    wrapper has no production caller left, so substituting it would prove nothing.
+    Change `proof_of_work_probe`'s first argument from `paths.repo_root` to
+    `paths.project` (verify.py, in `_verify_shared_gates`) and this row reddens,
+    measured, on `assert not out.ok` with `ok=True` — the neighbouring row staying
+    green in the same run.
     """
     paths = _repo_root_override(project, tmp_path)
     write_sprint(paths, {"1-1-a": "review"})
@@ -5621,6 +5723,38 @@ def test_has_changes_since_excludes_artifact_only_edit(project):
         )
         is True
     )
+
+
+def test_changes_since_reports_a_git_refusal_and_has_changes_since_collapses_it(project):
+    """The two-function split, at its own layer: `_changes_since` answers the
+    tri-state and `has_changes_since` is its fail-open collapse.
+
+    `git diff --quiet` uses rc 0 / rc 1 for its two real answers, so any other rc
+    is git failing rather than answering. A GATE must read that as "there are
+    changes" — uncertainty keeps the stricter path, which is the long-standing
+    behavior this asserts unchanged — while an OBSERVER (the parked leg's skipped
+    proof-of-work record) must be able to say "unknown" rather than file a
+    confident answer git never gave.
+
+    Both are asserted against ONE refusal so the collapse is pinned as a collapse:
+    the same call that answers `None` here answers `True` there. Ablation: make
+    `has_changes_since` return the tri-state unchanged and its assertion fails on
+    `None is True`; make `_changes_since` fold rc 128 back into `True` and its own
+    assertion fails.
+
+    The refusal is real rather than injected — an all-zero oid no repository
+    resolves — so this row also carries the premise the park observation rows rest
+    on."""
+    baseline = "0" * 40
+
+    assert verify._changes_since(project.project, baseline) is None
+    assert verify.has_changes_since(project.project, baseline) is True
+
+    # and a resolvable baseline is untouched by the split: both answer the same
+    # real question, `False` on a tree that has not moved
+    head = verify.rev_parse_head(project.project)
+    assert verify._changes_since(project.project, head) is False
+    assert verify.has_changes_since(project.project, head) is False
 
 
 def test_has_changes_since_subtracts_baseline_untracked(project):

@@ -207,6 +207,40 @@ def test_park_eligible_defaults_false_for_legacy_state():
     assert StoryTask.from_dict(doc).park_eligible is False
 
 
+@pytest.mark.parametrize(
+    "stored",
+    ["false", "true", "", 0, 1, None, [], ["x"], {}],
+    ids=["str-false", "str-true", "str-empty", "int-0", "int-1", "null", "list", "list-x", "dict"],
+)
+def test_park_eligible_only_a_real_boolean_true_authorizes_the_waiver(stored):
+    """`from_dict` reads this one field STRICTLY, and the asymmetry is the reason.
+    Every sibling bool on the task restores bookkeeping; this one authorizes the
+    dev gate's proof-of-work check to be WAIVED, so a wrong `False` costs one
+    retryable refusal while a wrong `True` re-opens the inheritance hole the field
+    exists to close.
+
+    Under the ordinary `bool(...)` spelling every truthy non-boolean grants that
+    waiver, and the likeliest one is the string `"false"` — a hand-edited
+    state.json, or any bridge that stringifies JSON scalars — for which
+    `bool("false")` is True. The `"true"`/`1` rows are here for the same reason
+    from the other side: reading them as authorization would be GUESSING that a
+    non-boolean meant yes, and fail-closed does not guess.
+
+    Ablation: restore `bool(d.get("park_eligible", False))` and the `str-false`,
+    `str-true`, `int-1` and `list-x` rows all fail."""
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    doc["park_eligible"] = stored
+    assert StoryTask.from_dict(doc).park_eligible is False
+
+
+def test_park_eligible_round_trips_the_authorized_value():
+    """The other direction, so strictness is not mistaken for "always False": a
+    real JSON `true` — the only value `to_dict` ever writes — survives."""
+    doc = StoryTask(story_key="1-1-a", epic=1, park_eligible=True).to_dict()
+    assert doc["park_eligible"] is True
+    assert StoryTask.from_dict(doc).park_eligible is True
+
+
 def test_verify_outcome_park_fields_are_absent_by_default():
     """Both park fields are opt-in on the one leg that waives proof-of-work, and
     every other outcome must leave them at the inert pair — `park_proof_skipped`
