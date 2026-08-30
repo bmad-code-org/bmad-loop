@@ -472,7 +472,11 @@ artifacts the engine already wrote.
 
 - **Plan checkpoint** (`spec_checkpoint`, stories mode) — a read-only viewer of
   the planned `ready-for-dev` spec at its id-keyed path (shown prominently, with a
-  copy-path action). **Approve & resume** resumes straight to implementation;
+  copy-path action). Under worktree isolation the path is anchored on the tree the
+  run owns, not on the directory the dashboard was launched from, so the viewer and
+  the replan write both act on the run's own copy rather than the main checkout's
+  twin. A spec that cannot be read at that path says so explicitly and its actions
+  are disabled — an unreviewable gate is not approvable. **Approve & resume** resumes straight to implementation;
   **Request replan** resets the spec to `draft` and strips its Auto Run Result
   (via the same `devcontract` primitives the engine's repair path uses), then
   resumes so the next dispatch re-plans. Edit the markdown in your own editor — the
@@ -484,13 +488,24 @@ artifacts the engine already wrote.
 - **Escalation** — the escalation view enriched with story context: the story
   entry's title/description (from `stories.yaml`), the blocking condition parsed
   from the spec's `## Auto Run Result`, and a sentinel indicator when the matched
-  spec is a fixed-slug pre-planning-halt sentinel. **Resolve** launches the same
-  interactive agent as `R`; **Re-arm & resume** (offered once the resolve agent has
-  recorded a resolution) re-arms and resumes — deleting a sentinel with a preserved
-  copy for a clean re-dispatch. Both refuse a still-live engine.
+  spec is a fixed-slug pre-planning-halt sentinel. Both of those answer from the
+  tree the run owns: under isolation the spec text and the sentinel live in the
+  unit's mount, and reading either from the launch directory let one modal
+  contradict itself. A spec that cannot be read reports its blocking condition as
+  unknown rather than absent — the two are otherwise indistinguishable — and
+  refuses **Re-arm & resume**, which would flip the spec's frontmatter, strip its
+  result and re-stamp the baseline on evidence nobody could read. **Resolve** stays
+  offered: it neither re-arms nor rewrites the spec — it writes the resolver's
+  `context.json` and starts the repair session, which is what repairs a bad anchor — and
+  gating it would have left `close` as the modal's only action while the `R` binding
+  reached the same agent anyway. **Resolve** launches the same interactive agent as `R`;
+  **Re-arm & resume** (offered once the resolve agent has recorded a resolution)
+  re-arms and resumes — deleting a sentinel with a preserved copy for a clean
+  re-dispatch. Both refuse a still-live engine.
 - **Spec-approval / epic / story gate** — a spec-approval gate reuses the spec viewer
   (view the finalized spec, then **Approve & resume**), so the pre-existing sprint-mode
-  gate inherits the same richer surface. Story-gate and epic-boundary pauses have no
+  gate inherits the same richer surface — including the anchored read and the refusal
+  of **Approve & resume** on a spec that cannot be read. Story-gate and epic-boundary pauses have no
   spec to show — a story gate fires before the story is recorded, an epic boundary has
   no story at all — so they open a compact pause-reason viewer instead: the reason names
   the blocking entries and the remedy, and **Resume** re-picks the story and re-asks the

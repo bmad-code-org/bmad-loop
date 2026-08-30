@@ -174,6 +174,20 @@ class SessionRecord:
         )
 
 
+def _rebased_on(path: str | None, root: Path) -> str | None:
+    """One persisted spec path, re-anchored on `root`; absolute values pass through.
+
+    Split out so `StoryTask.rebase_spec_paths_on` states the rule once per field
+    without repeating the guard, and so the guard itself is unmissable: the
+    is-absolute test is what keeps an out-of-mount spec (persisted verbatim by
+    `_serialized_worktree_path`) from being joined onto a root that does not
+    contain it.
+    """
+    if not path or Path(path).is_absolute():
+        return path
+    return str(root / path)
+
+
 @dataclass
 class StoryTask:
     story_key: str
@@ -461,6 +475,92 @@ class StoryTask:
             return Path(path).relative_to(self.worktree_path).as_posix()
         except ValueError:
             return path  # spec lives outside the worktree; keep absolute
+
+    def release_spec_paths_from_mount(self) -> None:
+        """Give up the spec ownership a mount being DISCARDED carried.
+
+        The counterpart to :meth:`rebase_spec_paths_on`, and deliberately not its
+        exact inverse — the two fields part company here because their roles do:
+
+        * `dispatched_spec_file` / `dispatched_spec_snapshot` are the ATTEMPT's
+          binding, the pair `recovery_flow` restores bytes through. The attempt died
+          with its tree, so the binding has nothing left to name; clearing both
+          together keeps the authority pair whole (a path without its snapshot is the
+          one shape `_bind_dispatched_spec_for_attempt` never persists).
+        * `spec_file` is the ACCEPTED artifact and outlives the attempt. The
+          replacement mount will carry the same story's spec at the same
+          mount-relative place, so the relative spelling is the one that re-resolves
+          onto it — `verify.resolve_spec_path` probes a relative value against the
+          live workspace and passes an absolute one through untouched.
+
+        Leaving `spec_file` absolute into the deleted mount is what made the fresh
+        attempt start UNBOUND: `_dispatched_spec_for_attempt` resolves it
+        `strict=True`, the dead path raises, and the miss is silent because an
+        unbound attempt is a legal state. `_record_dev_spec` cannot repair it either
+        — it no-ops while `spec_file` is set.
+
+        Uses the same relativization as `to_dict`, so the discarded-mount spelling
+        and the persisted one cannot drift, which also means a spec OUTSIDE the mount
+        stays verbatim: it was never the mount's to give up. MUST be called while
+        `worktree_path` still names the mount.
+        """
+        self.dispatched_spec_file = None
+        self.dispatched_spec_snapshot = None
+        self.spec_file = self._serialized_worktree_path(self.spec_file)
+
+    def release_mount_owned_state(self) -> None:
+        """Give up EVERYTHING a mount owned: its spec ownership and the measurements
+        taken inside it.
+
+        One method because the two callers that stop using a mount — the restart
+        discard and the isolation-flip arm — must give up the same set, and the second
+        was written releasing only the spec half. That half-release is not a smaller
+        version of the same thing, it is a different bug: `baseline_commit` and
+        `baseline_untracked` are stamped from `self.workspace.root` (the unit under
+        isolation), so leaving them set hands unit-mount operands to
+        `recovery_flow.rollback_or_pause` running against the MAIN checkout. Neither
+        fails loud there — linked worktrees share the object database, so the baseline
+        still resolves and a reset onto it succeeds, while a fresh worktree is a
+        tracked-only checkout whose empty untracked snapshot makes
+        `verify._rollback_cleanup_plan` compute `untracked_files(repo) -
+        baseline_untracked` as every untracked file in the operator's own checkout.
+        Under an auto-recovering cause those are DELETED.
+
+        Costs the re-run nothing: `_dev_phase` re-stamps both from whatever workspace
+        it re-enters with, so clearing turns the `baseline_commit` leg into a correct
+        no-op instead of a probe of the wrong tree.
+
+        MUST be called while `worktree_path` still names the mount — the spec
+        relativization is measured against it.
+        """
+        self.release_spec_paths_from_mount()
+        self.baseline_commit = None
+        self.baseline_untracked = None
+
+    def rebase_spec_paths_on(self, root: Path) -> None:
+        """Re-absolutize both spec-ownership paths against the tree that owns them.
+
+        The read-side inverse of :meth:`_serialized_worktree_path`, and the single
+        implementation of that rule: `to_dict` persists a worktree-local spec
+        RELATIVE to the mount and `from_dict` reads it back raw, so a consumer that
+        resolves the raw value against anything else names the wrong tree. The main
+        checkout carries the same `_bmad-output/...` layout, so that wrong tree
+        answers `is_file()` and passes containment — the failure is silent, not an
+        error.
+
+        Both fields move together because they are one asymmetry: `spec_file` is the
+        accepted/result artifact and `dispatched_spec_file` the attempt-owned input,
+        and a caller re-anchoring one and not the other leaves a task naming two
+        trees at once.
+
+        Idempotent: an absolute value is already anchored (a spec outside the mount
+        is persisted verbatim) and passes through untouched, so re-running this
+        against the same root cannot double-join. `root` is the tree the values were
+        persisted relative to — `task.worktree_path` — never the caller's cwd or
+        project.
+        """
+        self.spec_file = _rebased_on(self.spec_file, root)
+        self.dispatched_spec_file = _rebased_on(self.dispatched_spec_file, root)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "StoryTask":

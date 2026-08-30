@@ -3119,6 +3119,28 @@ def cmd_resolve(args: argparse.Namespace) -> int:
                 f"no resolution recorded for {story_key} (agent did not write resolution.json)",
                 file=sys.stderr,
             )
+        # `pol` was read BEFORE a session that blocks on a human conversation of
+        # arbitrary length, and everything below keys the re-arm on its isolation mode
+        # while `_resume_paused_run` at the bottom of this function re-reads policy for
+        # the engine. An edit made while the agent was open would therefore re-arm under
+        # the old answer and re-drive under the new one — `none -> worktree` re-arms
+        # treating the main-checkout edit as reachable, emits no hold, and then mounts a
+        # fresh worktree cut from git that cannot see it: the escalation is spent and the
+        # story re-wedges. Re-read so the re-arm and the engine agree, which is also what
+        # lets the reachability gate below fire against the mode actually in force.
+        # Unguarded, exactly like the first load above: nothing has been mutated yet, so
+        # an unreadable policy aborts before the re-arm rather than guessing a mode — and
+        # `resolution.json` is already on disk, so `--no-interactive` resumes the work.
+        isolation_before_session = pol.scm.isolation
+        pol = policy_mod.load(_policy_path(project))
+        if pol.scm.isolation != isolation_before_session:
+            print(
+                f"warning: [scm] isolation changed "
+                f"{isolation_before_session} -> {pol.scm.isolation} during the resolve "
+                "session; re-arming against the new mode (the agent was told where the "
+                "correction had to land under the old one)",
+                file=sys.stderr,
+            )
 
     # resolution.json restore latch: only exists after the session ran, so this
     # arm of the validation cannot be hoisted above it.
@@ -3191,7 +3213,12 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     before_entries = runs.journal_entries_or_none(run_dir)
     hold_resume = False
     try:
-        runs.rearm_escalation(run_dir, story_key, restore_patch=restore_patch)
+        runs.rearm_escalation(
+            run_dir,
+            story_key,
+            restore_patch=restore_patch,
+            isolated_redrive=pol.scm.isolation == "worktree",
+        )
     except runs.RearmError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1

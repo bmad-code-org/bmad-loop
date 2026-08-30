@@ -23,7 +23,13 @@ from typing import Any
 from .adapters.base import SessionSpec
 from .model import RunState
 from .platform_util import safe_segment
-from .runs import validate_restore_latch
+from .runs import (
+    redrive_base_ref,
+    spec_reaches_the_redrive,
+    task_spec_path,
+    task_stories_root,
+    validate_restore_latch,
+)
 
 RESOLVE_DIR = "resolve"
 
@@ -94,9 +100,20 @@ def _gather_escalations(run_dir: Path, state: RunState, story_key: str) -> list[
     return found
 
 
-def build_context(state: RunState, run_dir: Path, story_key: str, *, isolation: str = "") -> Path:
-    """Write resolve/<story_key>/context.json for the resolve skill to read."""
+def build_context(state: RunState, run_dir: Path, story_key: str, *, isolation: str) -> Path:
+    """Write resolve/<story_key>/context.json for the resolve skill to read.
+
+    `isolation` is the LIVE policy's `scm.isolation`, and it is required rather than
+    defaulted for the reason this surface exists at all: three of the fields below —
+    `restore_supported`, `spec_reaches_the_redrive`, `redrive_base_ref` — are claims
+    about a re-drive that has NOT happened yet, and run state cannot answer them. The
+    mode is re-read at every resume and a mid-run change is journalled, never refused,
+    so the recorded `task.worktree_path` says only how the escalated attempt RAN. A
+    defaulted mode would hand the agent an in-place answer for a run that mounts (or the
+    reverse) with nothing to signal it — the defect being fixed, re-introduced at the
+    seam that reports it."""
     task = state.tasks.get(story_key)
+    isolated_redrive = isolation == "worktree"
     # Patch-restore availability (#2564): the shared `validate_restore_latch`
     # verdict, not a local copy of one leg. Any of them — worktree isolation (the
     # re-drive discards and re-mounts the unit's worktree), a spec-less escalation,
@@ -104,13 +121,33 @@ def build_context(state: RunState, run_dir: Path, story_key: str, *, isolation: 
     # `restore_patch` after the session; told to the agent up front so it never
     # negotiates a restore it can't honor.
     restore_supported = task is not None and (
-        validate_restore_latch(state, task, story_key, worktree_isolation=isolation == "worktree")
-        is None
+        validate_restore_latch(state, task, story_key, worktree_isolation=isolated_redrive) is None
     )
+    # Which tree holds this run's STORY MANIFEST — the workspace root, answered by
+    # `task_stories_root` rather than by `task_spec_root`. The latter answers a
+    # write-confinement question about `spec_file` and falls back to the project for an
+    # out-of-mount spec; borrowing it here pointed the sentinel and the stories block at
+    # the main checkout while `stories_engine._stories_folder` was still the mount, so
+    # one `context.json` could name two trees.
+    stories_root = task_stories_root(task, state)
     context = {
         "story_key": story_key,
         "run_id": state.run_id,
-        "spec_file": task.spec_file if task else None,
+        # Absolute, matching the shape `bmad-loop-resolve/SKILL.md` documents: an
+        # isolated unit's `spec_file` is persisted RELATIVE to the mounted worktree
+        # (`model.StoryTask._serialized_worktree_path`) and the agent session runs
+        # from the project root, where the main checkout carries the same
+        # `_bmad-output/specs/...` layout — the raw value would name the wrong
+        # tree's copy. `task_spec_path` is the same re-anchor `rearm_escalation`
+        # writes through, so the agent edits the file the re-arm will flip.
+        # as_posix() for the same reason `resolution_path` below uses it — the
+        # context contract is one string on every OS — and because the value this
+        # replaces was ALREADY posix under isolation: `_serialized_worktree_path`
+        # persists the relative form with `.as_posix()`. It also normalizes the
+        # NON-isolated absolute case, which was previously emitted verbatim: on Windows
+        # that changes `C:\\...\\spec.md` to `C:/.../spec.md`. Deliberate — one
+        # spelling for every reader — and consumed by an agent, which accepts '/'.
+        "spec_file": (task_spec_path(task, state).as_posix() if task and task.spec_file else None),
         "baseline_commit": task.baseline_commit if task else None,
         "paused_reason": state.paused_reason,
         "escalations": _gather_escalations(run_dir, state, story_key),
@@ -118,13 +155,49 @@ def build_context(state: RunState, run_dir: Path, story_key: str, *, isolation: 
         # path is consumed by the agent, and Python/tools accept '/' on Windows).
         "resolution_path": resolution_path(run_dir, story_key).as_posix(),
         "restore_supported": restore_supported,
+        # Whether an edit to `spec_file` survives to the re-drive that reads it. Under
+        # isolation the mount is discarded by `engine._finish_inflight`, so the agent
+        # can otherwise spend a whole session editing a file with no future and see
+        # every write succeed. `rearm_escalation` already journals
+        # `rearm-spec-write-unreachable` on this same verdict; naming it here is what
+        # lets the session act on it instead of learning it afterwards.
+        # Guarded on `task.spec_file` exactly as `spec_file` above is: a verdict about
+        # whether an edit SURVIVES is meaningless beside a `"spec_file": null`, and
+        # emitting one invited the session to act on a reachability answer for a file
+        # the same document says does not exist. Both fields are one claim.
+        "spec_reaches_the_redrive": (
+            spec_reaches_the_redrive(task, state, isolated_redrive=isolated_redrive)
+            if task and task.spec_file
+            else None
+        ),
+        # WHERE a correction has to land to be read. Emitted beside the verdict
+        # because on its own `spec_reaches_the_redrive: false` states a problem with
+        # no remedy: the session is told the edit is doomed, and the obvious repair
+        # (commit it) is wrong in two different ways for an isolated unit. Committing
+        # from the main checkout cannot include a file that lives in the linked unit
+        # worktree, and committing on the unit's own branch does not put it on the ref
+        # the replacement worktree is cut from. That ref is this one — the run's
+        # PINNED `target_branch` when the re-drive will MOUNT, `HEAD` otherwise — and
+        # it is the same value `rearm_escalation`'s unreachable-write record names, so
+        # the session and the orchestrator quote one answer.
+        #
+        # Keyed on the LIVE isolation mode, not on the recorded mount. This file is
+        # written by a SEPARATE process, before the resume runs, so it is the one
+        # consumer no amount of resume-time bookkeeping on `task.worktree_path` could
+        # reach: reading the mount here sent the session to commit on the pinned branch
+        # for a run whose policy had since flipped to `none`, where the re-drive reads
+        # `HEAD` in the main checkout and never looks — and answered `HEAD` for the
+        # mirror flip, where it mounts and never reads a working tree at all.
+        "redrive_base_ref": (
+            redrive_base_ref(state, isolated_redrive=isolated_redrive) if task else None
+        ),
     }
     # Stories mode: hand the resolver the manifest intent (the story entry) and a
     # sentinel indicator, so it sees WHAT the story is meant to do and WHETHER the
     # frozen spec even exists yet (a sentinel has no plan to edit — resolve the
     # underlying ambiguity instead). Sprint mode leaves the context unchanged.
     if state.source == "stories":
-        stories_ctx = _stories_context(state, story_key)
+        stories_ctx = _stories_context(state, story_key, stories_root)
         if stories_ctx:
             context["stories"] = stories_ctx
     path = context_path(run_dir, story_key)
@@ -133,7 +206,7 @@ def build_context(state: RunState, run_dir: Path, story_key: str, *, isolation: 
     return path
 
 
-def _stories_context(state: RunState, story_key: str) -> dict[str, Any]:
+def _stories_context(state: RunState, story_key: str, root: Path) -> dict[str, Any]:
     """The stories-mode extension of the resolve context: the spec folder, the
     manifest entry for the story (title/description/checkpoint flags/invoke_dev_with),
     and — when the escalated spec is a fixed-slug pre-planning-halt sentinel — a
@@ -141,8 +214,13 @@ def _stories_context(state: RunState, story_key: str) -> dict[str, Any]:
     an unreadable manifest just yields the folder (resolve still runs)."""
     from . import stories
 
-    project = Path(state.project)
-    folder = stories.resolve_spec_folder(project, state.spec_folder)
+    # `root`, not `Path(state.project)`: the caller resolved it with
+    # `task_stories_root`, so this block reads the manifest and sentinel out of the tree
+    # the RUN owns. One `context.json` that names two trees is worse than one that names
+    # the wrong one — `sentinel.path` and `blocking_condition` would otherwise describe a
+    # file the re-arm will never touch, or vanish entirely because the main checkout has
+    # no sentinel while the mount does.
+    folder = stories.resolve_spec_folder(root, state.spec_folder)
     ctx: dict[str, Any] = {"spec_folder": state.spec_folder}
     try:
         entry = stories.load_stories(folder).get(story_key)

@@ -126,6 +126,25 @@ def open_unit_workspace(
             f"cannot resolve worktree mount path for {unit_key} ({unresolved_wt}): {e}"
         ) from e
     wt.parent.mkdir(parents=True, exist_ok=True)
+    # Reclaim whatever still occupies this unit's mount point before adding.
+    # `wt` and `branch` are both DETERMINISTIC in (run_id, unit_key, run_dir), so a
+    # re-mount targets the exact path a previous mount used — and `worktree_add`
+    # refuses a target that exists or a branch checked out elsewhere, which makes a
+    # leftover registration a hard `GitError` rather than a recoverable state.
+    # `engine._finish_inflight` reaches that shape by design: when live policy leaves
+    # isolation it releases the mount's state and clears the task's claim but
+    # deliberately LEAVES the directory standing (the journal names it), so a later
+    # flip back to `worktree` re-derives this same path and used to be unrecoverable
+    # through the normal run flow. Reclaiming here rather than deleting at the flip
+    # keeps that preservation intact for the in-place run and spends the orphan only
+    # when a mount actually needs its path.
+    #
+    # The BRANCH is deliberately not passed: `discard_worktree` would force-delete it,
+    # and under `branch_per=run` this name is the SHARED run branch carrying commits
+    # earlier units already landed. Dropping only the worktree frees the checkout that
+    # blocks `worktree_add` while leaving those commits reachable, so the
+    # `branch_exists` fork below still re-mounts the branch from its own HEAD.
+    discard_worktree(repo_root, str(wt), "", run_dir=run_dir)
     if verify.branch_exists(repo_root, branch):
         verify.worktree_add(repo_root, wt, branch, create=False)
     else:

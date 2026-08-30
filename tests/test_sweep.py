@@ -3334,7 +3334,9 @@ def test_sweep_bundle_restore_redrive_reaches_done_and_clears_latch(project, mon
     patch.parent.mkdir(parents=True, exist_ok=True)
     patch.write_text("dummy\n")
 
-    runs.rearm_escalation(engine.run_dir, "dw-fix", restore_patch=str(patch))
+    runs.rearm_escalation(
+        engine.run_dir, "dw-fix", restore_patch=str(patch), isolated_redrive=False
+    )
 
     resumed, adapter = resume_sweep(
         project,
@@ -3373,7 +3375,9 @@ def test_sweep_restore_redrive_exhaustion_pauses_not_defers(project, monkeypatch
     patch = project.implementation_artifacts / "attempt-dw-fix.patch"
     patch.parent.mkdir(parents=True, exist_ok=True)
     patch.write_text("dummy\n")
-    runs.rearm_escalation(engine.run_dir, "dw-fix", restore_patch=str(patch))
+    runs.rearm_escalation(
+        engine.run_dir, "dw-fix", restore_patch=str(patch), isolated_redrive=False
+    )
 
     resumed, _ = resume_sweep(project, engine, [lambda spec: SessionResult(status="died")])
     summary = resumed.run()
@@ -3393,7 +3397,9 @@ def test_sweep_from_scratch_redrive_exhaustion_pauses_not_defers(project):
         limits=LimitsPolicy(max_dev_attempts=1),
     )
     engine = _run_to_dev_escalation(project, policy=policy)
-    runs.rearm_escalation(engine.run_dir, "dw-fix")  # from-scratch, no restore
+    runs.rearm_escalation(
+        engine.run_dir, "dw-fix", isolated_redrive=False
+    )  # from-scratch, no restore
 
     resumed, _ = resume_sweep(project, engine, [lambda spec: SessionResult(status="died")])
     summary = resumed.run()
@@ -4532,7 +4538,7 @@ def test_rearmed_bundle_redrives_when_triage_json_lost(project):
     # cached triage plan reloaded and re-emitted its name. Recovery now keys on
     # the persisted task, so losing the cache changes nothing.
     engine = _run_to_dev_escalation(project)
-    runs.rearm_escalation(engine.run_dir, "dw-fix")
+    runs.rearm_escalation(engine.run_dir, "dw-fix", isolated_redrive=False)
     _lose_triage(engine.run_dir)
 
     resumed, adapter = resume_sweep(project, engine, _redrive_script(project))
@@ -4554,7 +4560,7 @@ def test_fresh_triage_different_bundle_name_no_double_drive(project, corruption)
     # would orphan the re-armed one. It must re-drive by identity, and its ids
     # must have left the open set before the fresh triage sees them.
     engine = _run_two_bundle_dev_escalation(project)
-    runs.rearm_escalation(engine.run_dir, "dw-fix")
+    runs.rearm_escalation(engine.run_dir, "dw-fix", isolated_redrive=False)
     _lose_triage(engine.run_dir, corruption)
 
     fresh = triage_result(
@@ -4591,7 +4597,9 @@ def test_restore_patch_latch_honored_when_triage_json_lost(project, monkeypatch)
     patch = project.implementation_artifacts / "attempt-dw-fix.patch"
     patch.parent.mkdir(parents=True, exist_ok=True)
     patch.write_text("dummy\n")
-    runs.rearm_escalation(engine.run_dir, "dw-fix", restore_patch=str(patch))
+    runs.rearm_escalation(
+        engine.run_dir, "dw-fix", restore_patch=str(patch), isolated_redrive=False
+    )
     _lose_triage(engine.run_dir)
 
     resumed, adapter = resume_sweep(project, engine, _redrive_script(project))
@@ -4715,7 +4723,7 @@ def test_regenerated_intent_when_bundle_file_missing(project):
     # The triage session's authored prose is the one unrecoverable piece; the
     # verbatim ledger entries are re-attached and become the contract.
     engine = _run_to_dev_escalation(project)
-    runs.rearm_escalation(engine.run_dir, "dw-fix")
+    runs.rearm_escalation(engine.run_dir, "dw-fix", isolated_redrive=False)
     _lose_triage(engine.run_dir)
     intent = Path(engine.state.tasks["dw-fix"].bundle_file)
     intent.unlink()
@@ -5519,3 +5527,61 @@ def test_migration_restore_accepts_an_already_restored_symlink_ledger(project, t
     assert "changed underneath the failed migration attempt" not in engine.state.paused_reason
     assert target.read_text(encoding="utf-8") == LEGACY_LEDGER
     assert len(adapter.sessions) == 2
+
+
+def test_bundle_restart_arm_anchors_spec_ownership_before_it_discards_the_mount(
+    project, monkeypatch
+):
+    """Sweep's restart arm is the engine's, and it needed the same re-anchor.
+
+    `SweepEngine` replaces `_loop` wholesale and `Engine._loop` is the ONLY caller of
+    `_finish_inflight`, so the re-anchor that method makes never runs here — while
+    `_recover_inflight_bundle` reaches the very same shared
+    `Engine._discard_unit_for_restart`. The baseline half of that helper was therefore
+    inherited by sweep and the spec-ownership half was not.
+
+    Both spec paths are persisted RELATIVE to the mount
+    (`model._serialized_worktree_path`), and the restart arm discards the worktree and
+    clears `task.worktree_path` before the caller saves — so without the re-anchor the
+    save strands a worktree-relative spelling beside an EMPTY `worktree_path`, and the
+    next resume resolves it against the main checkout, which carries the same layout.
+    `recovery_flow._attempt_owned_spec` then finds exactly one candidate,
+    `spec_within_roots` accepts it, and the snapshot restore rewrites the operator's own
+    copy.
+
+    Graded at the discard, like its engine sibling: the ordering is the property, and a
+    later rebind would let a post-hoc assertion pass with the re-anchor deleted.
+
+    Ablation: drop `task.rebase_spec_paths_on(...)` from `_recover_inflight_bundle` and
+    both assertions fail with the bare relative spellings.
+    """
+    from bmad_loop.workspace import open_unit_workspace
+
+    engine, _ = make_sweep(project, [], policy=isolated_policy())
+    unit = open_unit_workspace(
+        project.project, project, "sweep-run", "dw-fix", "main", "bundle", engine.run_dir
+    )
+    task = StoryTask("dw-fix", 1, phase=Phase.DEV_RUNNING)
+    task.worktree_path = str(unit.path)
+    task.branch = unit.branch
+    task.spec_file = "_bmad-output/accepted.md"
+    task.dispatched_spec_file = "_bmad-output/dispatched.md"
+    engine.state.tasks["dw-fix"] = task
+
+    seen: dict[str, str | None] = {}
+
+    class _StopAtDiscard(Exception):
+        pass
+
+    def _spy(*_args, **_kwargs):
+        seen["spec_file"] = task.spec_file
+        seen["dispatched_spec_file"] = task.dispatched_spec_file
+        raise _StopAtDiscard
+
+    monkeypatch.setattr("bmad_loop.engine.discard_worktree", _spy)
+
+    with pytest.raises(_StopAtDiscard):
+        engine._recover_inflight_bundle(task)
+
+    assert seen["spec_file"] == str(unit.path / "_bmad-output/accepted.md")
+    assert seen["dispatched_spec_file"] == str(unit.path / "_bmad-output/dispatched.md")

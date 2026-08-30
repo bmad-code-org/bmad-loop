@@ -630,6 +630,56 @@ def test_rearm_records_leak_neither_the_code_root_nor_a_spec_name():
         assert canary not in rendered, f"LEAK: {canary!r}"
 
 
+def test_sentinel_upstream_record_drops_the_stories_root_it_names():
+    """`rearm-upstream-write-unreachable` carries an absolute host path naming the
+    folder a sentinel's upstream correction has to land in.
+
+    Routed like `repo` and NOT like `spec_file`, and the two precedents genuinely
+    disagree: a spec filename is the customer's feature name and correlates one spec
+    across four kinds, so it is ALIASED. This is a DIRECTORY, journalled by one kind,
+    and one run has one spec folder — it correlates nothing, and a `spec` alias would
+    additionally be wrong, since that namespace reduces to a basename and every run we
+    author would collapse onto the same `epic-*` tail.
+
+    Graded on the field's ABSENCE, because the canary sweep below is a false green on
+    its own: `_IDENTIFIER_RE` forbids `/`, so `scrub_json` already collapses any real
+    path to `<redacted:str>` and the home path never appears whether the field is routed
+    or not. That is precisely the argument `repo`'s own row makes, and the reason both
+    are asserted the same way. `target_branch` beside it is the control: identifier-
+    shaped by design, so it must come back ALIASED rather than dropped, and it does leak
+    through the sweep when unrouted.
+
+    Ablation: drop `stories_root` from `_JOURNAL_DROP_FIELDS` and the presence assertion
+    reddens while the canary sweep stays green; drop `target_branch` from
+    `_JOURNAL_ALIAS_FIELDS` and the branch assertions redden on BOTH.
+    """
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    scrubbed = diagnostics._scrub_entry(
+        {
+            "ts": 2.0,
+            "kind": "rearm-upstream-write-unreachable",
+            "story_key": STORY_KEY,
+            "stories_root": f"{HOME_PATH}/_bmad-output/epic-6",
+            "target_branch": REARM_BRANCH,
+        },
+        pseudo,
+        {},
+        1.0,
+    )
+
+    assert "stories_root" not in scrubbed and scrubbed["stories_root_present"] is True
+    branch_alias = next(
+        a for ns, orig, a in pseudo.entries() if ns == "branch" and orig == REARM_BRANCH
+    )
+    assert scrubbed["target_branch"] == branch_alias != REARM_BRANCH
+    # the folder never entered the legend either — dropped means dropped, not aliased
+    assert not [orig for ns, orig, _a in pseudo.entries() if ns == "spec"]
+
+    rendered = json.dumps(scrubbed)
+    for canary in (HOME_PATH, REARM_BRANCH, PROPRIETARY, *CANARIES):
+        assert canary not in rendered, f"LEAK: {canary!r}"
+
+
 def test_target_field_routes_by_kind_because_it_carries_two_kinds_of_value():
     """`target` is a BRANCH on the merge kinds and a sprint STATUS on `board-advance-*`.
 

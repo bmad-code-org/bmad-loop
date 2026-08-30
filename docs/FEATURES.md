@@ -78,9 +78,18 @@ See [README.md](../README.md) for the narrative overview and [setup-guide.md](se
   spec and task never silently agree on a stale sha (#640). A re-stamp that does overwrite a differing
   claim records what it replaced, and warns on either leg: the record fires only when the spec claimed
   a baseline the run never recorded, which is the only remaining trace of a divergence the gate can no
-  longer report. `spec_file` is persisted relative to a worktree for an isolated task, so re-arm re-anchors it on
-  that worktree before writing — resolved against the process cwd it named the main checkout's copy
-  of the same story spec, and both writes landed on a file the run never used. A spec re-arm still
+  longer report. `spec_file` is persisted relative to a worktree for an isolated task, so every out-of-process reader
+  re-anchors it on the tree the run owns before reading or writing — resolved against the process cwd it named the main checkout's copy
+  of the same story spec, and both writes landed on a file the run never used. The same
+  anchor backs the dashboard's review modals and their replan write, `context.json`'s
+  `spec_file`, and the paths the pause notifications print. The fields beside it (the sentinel
+  indicator, the stories block) take a DIFFERENT root by design: they resolve against the
+  workspace stories root, not the spec's confinement root, whose out-of-mount arm falls back to
+  the project so a `confine_root` can always contain the path it validates — borrowing that
+  answer for a READ would look the stories folder up in the main checkout while the dev session
+  answered the worktree. Each names the tree the run owns, so a single surface cannot describe
+  two trees. The dev session's own prompt keeps the relative spelling,
+  because that session runs inside the mount. A spec re-arm still
   cannot read has its baseline re-stamp skipped rather than silently no-oped
   (`rearm-baseline-restamp-skipped`), and a status flip that quietly changed nothing is reported
   too (`rearm-spec-flip-skipped`) — though not when the spec was simply already at the target status,
@@ -108,6 +117,15 @@ Result` section. Every other spec keeps warn-and-continue, and the record says w
   escalation on a session that halts blocked. They now stop after the re-arm — the story stays armed,
   `bmad-loop resume <run-id>` picks it up once the fix is committed, and `--resume` does not override
   it, since the record is written on proof rather than suspicion. The advisory warnings do not hold.
+  A pre-planning **sentinel** gets the same treatment on its own artifacts. It is cleared by
+  deletion rather than a status flip, so there is no spec write to measure — but the correction that
+  stops it recurring is upstream (`SPEC.md` / `stories.yaml`, where the resolve skill sends the agent
+  instead of the sentinel), and an isolated re-drive re-plans from the committed tree of a fresh
+  mount. Re-arm now says so (`rearm-upstream-write-unreachable`), names the folder and the branch,
+  and holds the resume the same way. Narrowed on the same principle: it fires only while the branch
+  the re-drive mounts from does not already hold this checkout's copy of those two files, so a
+  correction already committed there resumes in one gesture, and an in-place re-drive never records
+  at all — it reads the main checkout, which is where the resolve session runs.
   All of these warnings reach the TUI's re-arm as well as `resolve`'s — both route every
   kind through one shared table, so neither surface can silently learn a kind the other drops,
   though each still owns where it calls the echo from and the TUI drops the trailing "before

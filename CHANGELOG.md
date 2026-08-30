@@ -180,6 +180,92 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Anchor the TUI's paused-spec read and its `Request replan` write on the tree the run
+  owns. Under isolation both resolved against the main checkout, so the review modals
+  showed that copy of the spec and the replan reset it — reporting success while the run's
+  real spec kept its terminal status, so the next dispatch did not re-plan.
+- Anchor a spec's confinement root on a tree that can actually contain it, so the status
+  flip, the result strip and the baseline re-stamp no longer fall back to an unguarded
+  write, and the re-arm's undo no longer fails outright.
+- Re-anchor spec ownership and the attempt baseline before a discarded worktree is dropped,
+  in both the engine and sweep. A later resume could otherwise probe the main checkout —
+  deleting untracked files the operator already had, or restoring a dead attempt's spec
+  over their own copy.
+- Release spec ownership when a half-built worktree is discarded for a restart, so the
+  replacement mount can bind the spec. The attempt's binding is cleared and the accepted
+  spec returns to its mount-relative spelling; left absolute into the deleted tree it
+  resolved to nothing, and the restarted attempt ran unbound with the repair prompt naming
+  a path that no longer existed.
+- Release a mount's state when a resumed run stops treating it as isolated. Flipping
+  `[scm] isolation` to `none` left the re-anchored spec absolute inside a mount the resume
+  neither reopens nor discards, so the in-place attempt ran unbound; worse, it carried the
+  unit's `baseline_commit`/`baseline_untracked` into an in-place rollback of the main
+  checkout, where a unit's empty untracked snapshot marks every untracked file in the
+  operator's own tree as attempt debris — deleted outright under an auto-recovering cause.
+  The task also stops CLAIMING the mount: `worktree_path` doubles as the record of which
+  tree owns a task's persisted state, so keeping it set made the spec and stories-root
+  helpers answer for the unit while execution used the project checkout. Every
+  non-isolated leg releases, not only the restart: the spec-approval, recorded-result and
+  commit-finalizer continuations each finish their work and return without ever reaching
+  it, so they went on consuming a spec absolutized into the orphan. The directory itself is
+  left standing and the orphan is journaled, and a later flip back to `worktree` now
+  reclaims it — the mount path is deterministic, so the leftover checkout made that second
+  flip fail outright. The shared run branch is spared by the reclaim, keeping the commits
+  earlier units landed on it.
+- Fall back to the project when a task's recorded worktree is gone. Successful integration
+  retires a task without clearing `worktree_path`, so the TUI's story-checkpoint card
+  looked for `stories.yaml` under a deleted mount and lost the committed story's title and
+  description.
+- Tell the resolve session where an unreachable correction has to land. `context.json` now
+  carries `redrive_base_ref` beside the reachability verdict, and the skill spells out that
+  committing from the main checkout cannot include a file in a linked worktree and that the
+  unit's own branch is not what the replacement mount is cut from.
+- Locate the stories folder from the workspace root rather than from the spec's confinement
+  root, so one modal can no longer read its spec from the run's tree and its sentinel from
+  the project.
+- Anchor pause notifications and the `checkpoint-pause` journal on the run's tree, sprint
+  mode included. The dev-session prompt keeps the raw path — that session runs in the mount.
+- Keep the dashboard up on a spec that is absent or undecodable: an absent spec reads as an
+  explicit read failure rather than an empty body, and a bad byte degrades in place instead
+  of losing the document.
+- Refuse `Re-arm & resume` on a spec that could not be read, and report its blocking
+  condition as unknown rather than absent. `Resolve` stays offered — it writes nothing and
+  is what repairs a bad anchor.
+- Report in `context.json` whether an edit to the spec survives to the re-drive, and teach
+  the resolve skill to act on it: under isolation the mount is discarded first, so an edit
+  to a worktree-local spec is lost unless it is committed.
+- Decide whether the re-drive will run isolated from live policy instead of from the mount
+  the escalated attempt recorded. `resolve` builds `context.json` in a separate process
+  before the resume, so editing `[scm] isolation` while a story sat escalated made its
+  advice wrong in opposite directions: switched to `none`, the session was told to commit
+  the correction on the run's pinned branch, which an in-place re-drive never reads;
+  switched to `worktree`, it was told a working-tree edit was safe when the replacement
+  mount reads only committed content. The re-arm's unreachable-write record now says which
+  of the two remedies applies, and the resolve skill spells out that a `HEAD` base means
+  re-applying the correction in the main checkout rather than committing it anywhere. The
+  TUI's re-arm refuses when `policy.toml` cannot be read rather than guessing a mode — a
+  re-arm consumes the escalation, so a wrong guess is unrecoverable.
+- Hold a re-armed SENTINEL until its upstream correction reaches the re-drive. A
+  pre-planning sentinel is cleared by deletion, so that arm dropped the spec and returned
+  before the reachability gate the status-flip arm runs — no gate was ever computed for it.
+  The correction that stops the sentinel recurring is upstream (`SPEC.md` / `stories.yaml`,
+  where the resolve skill sends the agent instead of the sentinel), and an isolated re-drive
+  re-plans from the committed tree of a fresh mount, so an uncommitted upstream edit was
+  invisible and the re-plan minted the same sentinel again, spending the escalation. The
+  re-arm now records `rearm-upstream-write-unreachable`, names the folder and the branch to
+  commit on, and stops the re-arm-and-resume gesture. Narrowed by proof rather than by
+  configuration: the record fires only while the ref the re-drive mounts from does not
+  already hold this checkout's copy of those two files, so a correction already committed
+  there resumes in one gesture as before. An in-place re-drive never records — it reads the
+  main checkout, which is where the resolve session runs.
+- Re-read `[scm] isolation` after the interactive resolve session, before the re-arm.
+  `resolve` loaded policy, then blocked on a human conversation of unbounded length, then
+  keyed the re-arm on that stale answer while the engine it arms re-read policy for itself.
+  Editing isolation while the agent was open therefore split the two readers: `none` to
+  `worktree` re-armed treating the main-checkout correction as reachable, emitted no hold,
+  then mounted a fresh worktree cut from git that could not see it. A change across the
+  session is now reported on stderr.
+
 - **`resume` re-stamps the run's recorded code root** (#716). Resume arms the engine against the
   `repo_root` it re-reads from `_bmad/bmm/config.yaml` but left the `state.json` copy at its launch
   value, so after an edit the engine worked in one tree while the out-of-process re-arm advanced the

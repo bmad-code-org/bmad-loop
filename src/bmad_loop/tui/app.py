@@ -35,6 +35,7 @@ from ..model import (
     PAUSE_STORY_CHECKPOINT,
     PAUSE_STORY_GATE,
     RunState,
+    StoryTask,
 )
 from ..platform_util import resolve_or_lexical
 from ..policy import POLICY_FILE
@@ -610,12 +611,13 @@ class BmadLoopApp(App[None]):
         return run_id, run_dir, state
 
     def _review_plan_checkpoint(self, run_id: str, run_dir: Path, state: RunState) -> None:
-        spec_path, spec_text = self._paused_spec(state)
+        spec_path, spec_text, readable = self._paused_spec(state)
         modal = SpecReviewModal(
             title="plan checkpoint — review the planned spec before implementation",
             subtitle=self._story_subtitle(state),
             spec_path=spec_path,
             spec_text=spec_text,
+            unreadable=not readable,
             actions=[
                 ("approve", "Approve & resume", "primary"),
                 ("replan", "Request replan", "warning"),
@@ -629,13 +631,13 @@ class BmadLoopApp(App[None]):
                 if spec_path is None:
                     self.notify("no spec file to reset for replan", severity="error")
                     return
-                self._do_replan(run_id, spec_path)
+                self._do_replan(run_id, spec_path, self._paused_spec_root(state))
 
         self.push_screen(modal, done)
 
     def _review_gate(self, run_id: str, run_dir: Path, state: RunState) -> None:
         label = widgets.pause_label(state.paused_stage or "")[0] or "gate"
-        spec_path, spec_text = self._paused_spec(state)
+        spec_path, spec_text, readable = self._paused_spec(state)
 
         def done(verb: str | None) -> None:
             if verb == "resume":
@@ -664,6 +666,7 @@ class BmadLoopApp(App[None]):
             subtitle=self._story_subtitle(state),
             spec_path=spec_path,
             spec_text=spec_text,
+            unreadable=not readable,
             actions=[("resume", "Approve & resume", "primary")],
         )
         self.push_screen(modal, done)
@@ -720,14 +723,22 @@ class BmadLoopApp(App[None]):
 
     def _review_escalation(self, run_id: str, run_dir: Path, state: RunState) -> None:
         story_key = state.paused_story_key or "?"
-        spec_path, spec_text = self._paused_spec(state)
+        spec_path, spec_text, readable = self._paused_spec(state)
         title, description = self._story_context(state, story_key)
         restore_recorded = self._restore_recorded(run_dir, story_key)
         modal = EscalationModal(
             story_key=story_key,
             title=title,
             description=description,
+            # `_blocking_condition` reduces the read-failure body to "" like any
+            # other text without a halt block, so an unreadable spec would render
+            # "(no blocking condition recorded)" — indistinguishable from a spec that
+            # was read fine and simply halted without one. The verdict has to be
+            # carried in, and it also REFUSES both verbs: re-arm flips the spec's
+            # frontmatter, strips its result and re-stamps the baseline, which is not
+            # an action to take on evidence nobody could read.
             blocking=self._blocking_condition(spec_text),
+            unreadable=not readable,
             sentinel_kind=self._sentinel_kind(state, story_key),
             resolution_ready=resolve.resolution_path(run_dir, story_key).is_file(),
             engine_live=_engine_possibly_live(run_dir),
@@ -795,10 +806,18 @@ class BmadLoopApp(App[None]):
             f"resume of {run_id} launched (control session {launch.ctl_session(self.project)})"
         )
 
-    def _do_replan(self, run_id: str, spec_path: Path) -> None:
+    def _do_replan(self, run_id: str, spec_path: Path, confine_root: Path) -> None:
         """Request-replan: reset the planned spec to draft + strip its Auto Run
         Result, then resume — the next dispatch re-enters step-02 planning. Uses
-        the same devcontract primitives the engine's repair path uses."""
+        the same devcontract primitives the engine's repair path uses.
+
+        `confine_root` arrives from the caller (`_paused_spec_root`) rather than being
+        `self.project` here: this method has no task in scope, and the root these two
+        writers validate against must be the SAME claim about which tree owns the spec
+        that `_paused_spec` anchored the path on. `runs.task_spec_root`'s docstring
+        carries the rationale — a `confine_root` that disagrees with the anchor is not
+        REFUSED, it silently drops both writes to the plain no-follow arm and loses the
+        confined arm's O_NOFOLLOW walk (#593) with no signal at all."""
         # Guard a possibly-live engine BEFORE mutating the spec — a draft-reset +
         # strip under a still-running session would race its writes (the rearm path
         # already checks liveness first; match it so replan can't corrupt a live
@@ -811,16 +830,31 @@ class BmadLoopApp(App[None]):
         run_dir = self.project / RUNS_DIR / run_id
         if self._resolve_blocked_by_liveness(run_id, run_dir):
             return
+        if not spec_path.is_file():
+            # `reset_spec_status` returns False for an ABSENT spec and for one with no
+            # frontmatter status alike, and the shared notice below blamed the
+            # frontmatter for both. Now that the path is re-anchored on the run's own
+            # tree, an absent spec is the signal that the ANCHORING is wrong, so it
+            # earns its own message naming the path actually consulted.
+            self.notify(f"replan: no spec at {spec_path} — not resuming", severity="error")
+            return
         try:
-            reset = devcontract.reset_spec_status(spec_path, "draft", confine_root=self.project)
-            devcontract.strip_auto_run_result(spec_path, confine_root=self.project)
-        except (OSError, verify.FrontmatterWriteError) as e:
+            reset = devcontract.reset_spec_status(spec_path, "draft", confine_root=confine_root)
+            devcontract.strip_auto_run_result(spec_path, confine_root=confine_root)
+        except (OSError, UnicodeDecodeError, verify.FrontmatterWriteError) as e:
             # FrontmatterWriteError is not an OSError: a spec whose `status:` is a
             # block scalar or a flow mapping reads fine and fails the WRITE. It
             # lands in the same notice as a permissions failure because it has the
             # same shape for the operator — the replan did not happen and the run
             # is not resumed — and because an uncaught raise inside a Textual
             # worker takes the dashboard down instead of saying so.
+            #
+            # UnicodeDecodeError is a ValueError, so neither sibling arm caught it and
+            # `reset_spec_status` decodes STRICTLY (`read_bytes().decode("utf-8")`).
+            # That raise became reachable when `_paused_spec` started degrading a
+            # non-UTF-8 spec in place instead of raising at render: the operator can now
+            # open the modal on one and press replan, which is precisely the event-loop
+            # crash the read-side fix exists to prevent.
             self.notify(f"replan failed: {e}", severity="error")
             return
         if not reset:
@@ -828,8 +862,7 @@ class BmadLoopApp(App[None]):
             # status, or is already draft), so the next dispatch would NOT re-enter
             # planning. Surface it instead of a misleading "reset" notice + resume.
             self.notify(
-                "replan: could not reset the plan to draft (no frontmatter status?) "
-                "— not resuming",
+                "replan: could not reset the plan to draft (no frontmatter status?) — not resuming",
                 severity="error",
             )
             return
@@ -878,6 +911,30 @@ class BmadLoopApp(App[None]):
             return
         if self._resolve_blocked_by_liveness(run_id, run_dir):
             return
+        # The LIVE isolation mode, read once and used twice below. `runs.rearm_escalation`
+        # requires it: how the re-drive WILL run is a policy question, and the recorded
+        # `task.worktree_path` answers only how the escalated attempt ran — the two part
+        # company on exactly the mid-run policy edit the conflict check below is also
+        # about.
+        #
+        # Unreadable REFUSES here, unlike the launch guard above and unlike this block's
+        # own previous disposition. That fall-through was correct while the policy fed
+        # one optional CHECK: "no conflict" and "could not look" are different answers
+        # and neither blocks a launch the detached CLI will re-read the same file for.
+        # It is not correct for an INPUT to a repair write. Without the mode this
+        # gesture cannot say which ref the re-drive reads, so it would flip the spec and
+        # then tell the operator to put the correction in a tree picked by a default —
+        # silently, and unrecoverably, since a re-arm consumes the escalation.
+        # `cli.cmd_resolve` raises on the same unreadable file before it re-arms.
+        try:
+            isolation = policy.load(self.project / POLICY_FILE).scm.isolation
+        except (policy.PolicyError, OSError) as e:
+            self.notify(
+                f"cannot read policy.toml to determine the re-drive's isolation mode "
+                f"({e}) — fix it, then re-arm; the story is still escalated",
+                severity="error",
+            )
+            return
         # Same seam as `cli.cmd_resolve`, for the same reason and at the same moment:
         # `runs.rearm_escalation` reads the persisted code root back out of the run
         # state, and only a process that has just read config.yaml can tell whether a
@@ -900,17 +957,10 @@ class BmadLoopApp(App[None]):
             # against it. The operator saw "re-armed <story>" and then a pane that
             # refused, with the story no longer escalated for `resolve` to correct.
             #
-            # An unreadable policy falls THROUGH to the re-arm rather than blocking,
-            # matching this surface's launch guard above: the check cannot tell "no
-            # conflict" from "could not look", and the detached CLI reads the same file
-            # and fails loudly on it. `paths` is already in hand, so only the policy
-            # read is guarded here.
-            try:
-                conflict = bmadconfig.worktree_isolation_conflict(
-                    paths, policy.load(self.project / POLICY_FILE).scm.isolation
-                )
-            except (policy.PolicyError, OSError):
-                conflict = None
+            # Reads the mode hoisted above rather than loading policy.toml a second
+            # time: two reads of one file in one gesture can disagree under a concurrent
+            # edit, and the refusal must be about the same mode the re-arm is told.
+            conflict = bmadconfig.worktree_isolation_conflict(paths, isolation)
             if conflict is not None:
                 self.notify(conflict, severity="error")
                 return
@@ -919,7 +969,7 @@ class BmadLoopApp(App[None]):
         before_entries = runs.journal_entries_or_none(run_dir)
         hold_resume = False
         try:
-            runs.rearm_escalation(run_dir, story_key)
+            runs.rearm_escalation(run_dir, story_key, isolated_redrive=isolation == "worktree")
         except RearmError as e:
             self.notify(f"re-arm failed: {e}", severity="error")
             return
@@ -983,17 +1033,75 @@ class BmadLoopApp(App[None]):
 
     # ---------------------------------------------------- pause-context readers
 
-    def _paused_spec(self, state: RunState) -> tuple[Path | None, str]:
-        """(spec path, spec text) for the paused story, or (None, "") when the
-        task has no spec file (e.g. an ambiguous-match escalation)."""
-        task = state.tasks.get(state.paused_story_key) if state.paused_story_key else None
+    def _paused_task(self, state: RunState) -> StoryTask | None:
+        """The paused story's task, or None when nothing is paused.
+
+        One lookup for both `_paused_spec` (which anchors the READ) and
+        `_paused_spec_root` (which supplies the destructive write's `confine_root`).
+        The whole point of routing both through `runs.task_spec_path`/`task_spec_root`
+        is that the anchor and the root must name one tree; two copies of the lookup
+        would let them drift on the very state that decides it."""
+        return state.tasks.get(state.paused_story_key) if state.paused_story_key else None
+
+    def _paused_spec(self, state: RunState) -> tuple[Path | None, str, bool]:
+        """(spec path, spec text, readable) for the paused story, or (None, "", True)
+        when the task has no spec file (e.g. an ambiguous-match escalation).
+
+        `readable` is False only when the spec could not be READ at the anchored path,
+        which is the signal that the anchoring is wrong. It is returned rather than left
+        for the renderer to infer, because the alternative is sniffing the body for the
+        failure sentence — the failure text and a spec that merely opens with the same
+        words are not distinguishable after the fact, and one of them must not disable
+        an operator's approve button.
+
+        The path is re-anchored through `runs.task_spec_path`, never `Path(...)` on the
+        raw value: `model.StoryTask._serialized_worktree_path` persists an isolated
+        unit's spec RELATIVE to the mounted worktree root and `from_dict` reads it back
+        raw, so a bare `Path(task.spec_file)` resolves against the TUI process cwd —
+        where the main checkout carries the very same `_bmad-output/specs/...` layout
+        and answers with the WRONG tree's copy of the story spec."""
+        task = self._paused_task(state)
         if task is None or not task.spec_file:
-            return None, ""
-        path = Path(task.spec_file)
+            return None, "", True
+        path = runs.task_spec_path(task, state)
         try:
-            return path, path.read_text(encoding="utf-8")
-        except OSError:
-            return path, ""
+            # `errors="replace"` for the same reason `_commit_subject` uses it: a story
+            # spec is agent- or human-authored, so an odd byte is a fact about the file,
+            # not a reason to withhold it. Decoding strictly here cost the reviewer the
+            # WHOLE document at a gate whose only purpose is reading it — and, because
+            # every review surface calls this from the Textual event loop, an escaping
+            # UnicodeDecodeError (a ValueError, so no OSError arm catches it) took the
+            # dashboard down rather than rendering the fault.
+            return path, path.read_bytes().decode("utf-8", errors="replace"), True
+        except OSError as e:
+            # An absent spec at the ANCHORED path is the signal that the anchoring is
+            # wrong, so it must not reduce to "" — SpecReviewModal renders that as
+            # "(empty spec)", which is also what a present-but-blank spec renders as.
+            # Report the failure as the body so the two cases read differently, and
+            # keep this arm to ABSENCE now that a decode fault degrades in place.
+            return path, f"(spec could not be read — {e})", False
+
+    def _paused_spec_root(self, state: RunState) -> Path:
+        """The tree the paused story's spec is anchored on — and confined to.
+
+        The mirror of `_paused_spec`'s anchor, kept as a sibling so the three read-only
+        consumers keep the untouched two-value read. `_do_replan` WRITES the path
+        `_paused_spec` returned, and `runs.task_spec_root` is the single definition
+        backing both halves: an anchor and a `confine_root` that name different trees do
+        not refuse, they silently degrade the write (#593).
+
+        The no-task arm is `Path(state.project)`, NOT `self.project`, so both arms make
+        one claim: the delegate answers from the state the run persisted at launch,
+        while `self.project` is the constructor's `resolve_or_lexical` of the operator's
+        argument, and the two can differ. That arm is currently unreachable from the
+        write path — `_review_plan_checkpoint`'s `done()` refuses a `None` `spec_path`
+        before calling `_do_replan`, and `_paused_spec` returns `None` on BOTH of its
+        arms (no task, and a task carrying no `spec_file`) — so this is about not
+        leaving a second claim lying around for a future caller, not a live bug. The
+        no-task arm is the only one reachable here: a task with an empty `spec_file`
+        still answers from `task_spec_root`, which needs no spec to name a tree."""
+        task = self._paused_task(state)
+        return runs.task_spec_root(task, state) if task else Path(state.project)
 
     def _story_subtitle(self, state: RunState) -> Text:
         key = state.paused_story_key or "?"
@@ -1007,8 +1115,17 @@ class BmadLoopApp(App[None]):
         """(title, description) from stories.yaml in stories mode, else ("", "")."""
         if state.source != "stories" or not state.spec_folder:
             return "", ""
+        # `task_stories_root`, not `self.project`, for the reason `_sentinel_kind`
+        # states below: BOTH feed one `EscalationModal` — this supplies its title and
+        # description, that its sentinel indicator — so a manifest read from the main
+        # checkout beside a sentinel read from the mount is the same one-surface-two-trees
+        # defect the anchor exists to close. `self.project` is also the wrong VALUE for
+        # the no-task arm: it is the constructor's `resolve_or_lexical` of the operator's
+        # argument, while every other anchored read here answers from `state.project`,
+        # the path the run persisted at launch.
+        root = runs.task_stories_root(state.tasks.get(key), state)
         try:
-            folder = stories.resolve_spec_folder(self.project, state.spec_folder)
+            folder = stories.resolve_spec_folder(root, state.spec_folder)
             entry = stories.load_stories(folder).get(key)
         except stories.StoriesError:
             return "", ""
@@ -1017,11 +1134,26 @@ class BmadLoopApp(App[None]):
     def _sentinel_kind(self, state: RunState, key: str) -> str:
         if state.source != "stories" or not state.spec_folder:
             return ""
+        # Anchored on the tree the RUN owns, for the same reason `_paused_spec` is: the
+        # sentinel the engine wrote lives in the unit's mount under isolation
+        # (`stories_engine._stories_folder` IS the worktree during a driven story),
+        # while the main checkout carries the same layout and holds a stale twin or
+        # nothing. Both values feed ONE `EscalationModal` — the spec text through
+        # `_blocking_condition`, this through `sentinel_kind` — so anchoring them on
+        # different trees let a single modal disagree with itself and rendered a
+        # pre-planning sentinel wedge as an ordinary escalation.
+        #
+        # `task_stories_root`, not `task_spec_root`: the folder is located from the
+        # workspace root, and the latter's out-of-mount arm answers a confinement
+        # question about `spec_file` that would send this read to the main checkout
+        # while `_stories_folder` stayed on the mount. It also takes `None`, so the
+        # no-task fallback is not re-spelled here.
+        root = runs.task_stories_root(state.tasks.get(key), state)
         # resolve_story_spec globs + reads frontmatter; a file removed mid-scan (a
         # re-arm clearing the sentinel while the viewer refreshes) can raise OSError.
         # Degrade to "" rather than let a race-window read crash the render.
         try:
-            folder = stories.resolve_spec_folder(self.project, state.spec_folder)
+            folder = stories.resolve_spec_folder(root, state.spec_folder)
             st = stories.resolve_story_spec(folder, key)
         except OSError:
             return ""

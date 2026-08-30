@@ -26,6 +26,7 @@ from conftest import (
     install_build_auto_skill,
     refuse_to_resolve,
     set_sprint,
+    write_gated_ledger,
     write_ledger,
     write_spec,
     write_sprint,
@@ -2100,7 +2101,7 @@ def test_a_re_armed_story_does_not_carry_the_abandoned_attempt_s_followup(projec
     assert not project.deferred_work.exists()  # the row is only in the doomed worktree
 
     monkeypatch.setattr(verify, "finalize_commit", real_finalize)
-    assert runs.rearm_escalation(engine.run_dir, "1-1-a") == "1-1-a"
+    assert runs.rearm_escalation(engine.run_dir, "1-1-a", isolated_redrive=True) == "1-1-a"
 
     state = load_state(engine.run_dir)
     state.clear_pause()
@@ -2256,6 +2257,446 @@ def test_worktree_reopen_reabsolutizes_both_spec_ownership_paths(project, tmp_pa
     engine._reopen_unit(task)
     assert task.spec_file == outside_spec
     assert task.dispatched_spec_file == outside_dispatched
+
+
+def test_restart_arm_anchors_spec_ownership_before_it_discards_the_mount(project, monkeypatch):
+    """The restart arm destroys the only tree that can resolve the persisted spelling.
+
+    `_finish_inflight`'s restart arm is the one arm that never calls `reopen_unit`:
+    it discards the worktree, clears `task.worktree_path` and saves. Both spec paths
+    are persisted RELATIVE to that mount (`model._serialized_worktree_path`), so
+    without a re-anchor the save leaves a worktree-relative spelling beside an empty
+    `worktree_path`, and the next resume resolves it against the MAIN checkout — which
+    carries the same layout, so `recovery_flow._attempt_owned_spec` finds exactly one
+    candidate and `spec_within_roots` accepts it. The snapshot restore then rewrites
+    the operator's own copy. Anchored on the mount instead, the binding names a tree
+    that no longer exists and recovery refuses it loudly.
+
+    Graded at the discard rather than after it: the ordering is the whole property, and
+    `_run_story` rebinds the field moments later, so a post-hoc assertion would pass
+    with the re-anchor deleted.
+
+    Ablation: drop `task.rebase_spec_paths_on(...)` from `_finish_inflight` and both
+    assertions fail with the bare relative spellings.
+    """
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    from bmad_loop.workspace import open_unit_workspace
+
+    unit = open_unit_workspace(
+        project.project, project, "test-run", "1-1-a", "main", "story", engine.run_dir
+    )
+    task = StoryTask("1-1-a", 1, phase=Phase.DEV_RUNNING)
+    task.worktree_path = str(unit.path)
+    task.branch = unit.branch
+    task.spec_file = "_bmad-output/accepted.md"
+    task.dispatched_spec_file = "_bmad-output/dispatched.md"
+    engine.state.tasks["1-1-a"] = task
+
+    seen: dict[str, str | None] = {}
+
+    class _StopAtDiscard(Exception):
+        pass
+
+    def _spy(*_args, **_kwargs):
+        seen["spec_file"] = task.spec_file
+        seen["dispatched_spec_file"] = task.dispatched_spec_file
+        raise _StopAtDiscard
+
+    monkeypatch.setattr("bmad_loop.engine.discard_worktree", _spy)
+
+    with pytest.raises(_StopAtDiscard):
+        engine._finish_inflight()
+
+    assert seen["spec_file"] == str(unit.path / "_bmad-output/accepted.md")
+    assert seen["dispatched_spec_file"] == str(unit.path / "_bmad-output/dispatched.md")
+
+
+def test_restart_arm_clears_the_baseline_it_measured_in_the_discarded_mount(project, monkeypatch):
+    """`baseline_commit`/`baseline_untracked` describe the mount and must die with it.
+
+    `_dev_phase` stamps both from `self.workspace.root` — the unit worktree under
+    isolation. The restart arm discards that mount and saves, so leaving them set
+    persists two operands that describe a tree which no longer exists. Any later
+    resume finding `worktree_path` empty takes the `elif task.baseline_commit:` leg
+    into `recovery_flow.rollback_or_pause` against the MAIN checkout, and neither
+    operand fails loud there: linked worktrees share the object database, so the
+    baseline still resolves and a reset onto it succeeds, while a fresh worktree's
+    empty untracked snapshot makes `verify._rollback_cleanup_plan` treat every
+    untracked file in the operator's checkout as this attempt's debris.
+
+    Asserted on the DURABLE state, not the in-memory task: state.json is what the
+    next resume reads, and the save happens between the discard and the re-run.
+
+    Ablation: drop the two `= None` clears from `_discard_unit_for_restart` and the
+    baseline assertions fail while the `worktree_path` one stays green — which is
+    precisely the split that made this reachable.
+    """
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    from bmad_loop.workspace import open_unit_workspace
+
+    unit = open_unit_workspace(
+        project.project, project, "test-run", "1-1-a", "main", "story", engine.run_dir
+    )
+    task = StoryTask("1-1-a", 1, phase=Phase.DEV_RUNNING)
+    task.worktree_path = str(unit.path)
+    task.branch = unit.branch
+    task.baseline_commit = rev_parse_head(unit.path)
+    task.baseline_untracked = []  # a fresh mount is a tracked-only checkout
+    engine.state.tasks["1-1-a"] = task
+
+    class _StopBeforeRerun(Exception):
+        pass
+
+    def _stop(*_args, **_kwargs):
+        raise _StopBeforeRerun
+
+    monkeypatch.setattr(engine, "_run_story", _stop)
+
+    with pytest.raises(_StopBeforeRerun):
+        engine._finish_inflight()
+
+    saved = load_state(engine.run_dir).tasks["1-1-a"]
+    assert saved.worktree_path == ""
+    assert saved.branch == ""
+    assert saved.baseline_commit is None
+    assert saved.baseline_untracked is None
+
+
+def test_restart_arm_leaves_a_spec_the_replacement_mount_can_bind(project, monkeypatch):
+    """The property the re-anchor broke: after the discard, the fresh mount BINDS.
+
+    `_finish_inflight` re-anchors `spec_file` onto the mount (correct — recovery must
+    not resolve it against the main checkout), and the restart arm then DELETES that
+    mount. Left absolute, the value names a tree that no longer exists:
+    `verify.resolve_spec_path` passes an absolute path through untouched,
+    `_dispatched_spec_for_attempt` resolves it `strict=True` and swallows the
+    `FileNotFoundError`, and the fresh attempt starts unbound on a story whose spec is
+    sitting in the replacement mount at the same relative place. Nothing downstream
+    repairs it — `_record_dev_spec` no-ops while `spec_file` is set — so the repair
+    prompt keeps naming the deleted path.
+
+    Graded on the DURABLE state and then on the resolution itself, because the
+    spelling is only a proxy: what matters is that the replacement mount answers with
+    ITS copy, and neither the dead path nor the main checkout's identical layout.
+
+    Ablation: drop `task.release_spec_paths_from_mount()` from
+    `_discard_unit_for_restart` and this reddens on the durable-spelling assertion —
+    the saved `spec_file` comes back absolute into the deleted mount, which is the
+    state that shipped. That assertion fires before the binding one, so the binding
+    assertion is not what the ablation proves; it is what states the CONSEQUENCE, and
+    it holds the row to the replacement mount's copy rather than merely to some
+    resolvable path (the main checkout carries the identical layout and would answer
+    a relative value too, from the wrong tree).
+    """
+    from bmad_loop import verify
+    from bmad_loop.workspace import open_unit_workspace
+
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+
+    unit = open_unit_workspace(
+        project.project, project, "test-run", "1-1-a", "main", "story", engine.run_dir
+    )
+    rel = "_bmad-output/implementation-artifacts/spec-1-1-a.md"
+    (unit.path / rel).parent.mkdir(parents=True, exist_ok=True)
+    (unit.path / rel).write_text("---\nstatus: ready-for-dev\n---\n", encoding="utf-8")
+
+    task = StoryTask("1-1-a", 1, phase=Phase.DEV_RUNNING)
+    task.worktree_path = str(unit.path)
+    task.branch = unit.branch
+    # persisted RELATIVE, exactly as `_serialized_worktree_path` writes it — the
+    # re-anchor inside `_finish_inflight` is what makes it absolute
+    task.spec_file = rel
+    task.dispatched_spec_file = rel
+    task.dispatched_spec_snapshot = b"pre-launch bytes"
+    engine.state.tasks["1-1-a"] = task
+
+    class _StopBeforeRerun(Exception):
+        pass
+
+    monkeypatch.setattr(
+        engine, "_run_story", lambda *a, **k: (_ for _ in ()).throw(_StopBeforeRerun())
+    )
+
+    with pytest.raises(_StopBeforeRerun):
+        engine._finish_inflight()
+
+    saved = load_state(engine.run_dir).tasks["1-1-a"]
+    assert saved.worktree_path == ""
+    assert saved.spec_file == rel  # relative again, not absolute into the deleted tree
+    assert saved.dispatched_spec_file is None  # the attempt died with its tree
+    assert saved.dispatched_spec_snapshot is None
+
+    # the replacement mount `_run_story` would have opened, carrying the same spec
+    replacement = open_unit_workspace(
+        project.project, project, "test-run", "1-1-a", "main", "story", engine.run_dir
+    )
+    (replacement.path / rel).parent.mkdir(parents=True, exist_ok=True)
+    (replacement.path / rel).write_text("---\nstatus: ready-for-dev\n---\n", encoding="utf-8")
+
+    # the binding `_dispatched_spec_for_attempt` makes, against the live workspace
+    bound = verify.resolve_spec_path(saved.spec_file, replacement.workspace.paths).resolve(
+        strict=True
+    )
+    assert bound == (replacement.path / rel).resolve()
+
+
+def test_finish_inflight_anchors_on_the_persisted_mount_not_the_live_isolation_policy(project):
+    """The relative spelling is persisted state; `isolated` is re-read policy.
+
+    `model._serialized_worktree_path` relativizes whenever `task.worktree_path` is
+    set, but `_finish_inflight` gates its `reopen_unit` arms on
+    `self._isolated and task.worktree_path` — and `self._isolated` comes from a policy
+    file re-read on every resume, where an `isolation` change is journaled and never
+    refused. Flip `[scm] isolation` to "none" between a crash and a resume and every
+    arm runs without `reopen_unit` on a task whose paths are still mount-relative.
+
+    The story gate stops the restart arm before it mutates anything, so what is graded
+    is the re-anchor alone — and it must have happened despite `isolated` being false.
+
+    Ablation: move `task.rebase_spec_paths_on(...)` inside the `if isolated:` arm (or
+    delete it) and both assertions fail with the bare relative spellings. Note the
+    sibling test above stays GREEN under that first ablation, which is why this row
+    exists separately.
+    """
+    from bmad_loop.engine import RunPaused
+
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    in_place = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(isolation="none"),
+    )
+    engine, _ = make_engine(project, [], policy=in_place)
+    assert not engine._isolated  # the premise: live policy says in-place
+
+    mount = project.project / ".bmad-loop" / "runs" / "test-run" / "worktrees" / "1-1-a"
+    task = StoryTask("1-1-a", 1, phase=Phase.DEV_RUNNING)
+    task.worktree_path = str(mount)  # ...but the persisted task still carries one
+    task.spec_file = "_bmad-output/accepted.md"
+    task.dispatched_spec_file = "_bmad-output/dispatched.md"
+    engine.state.tasks["1-1-a"] = task
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 1-1"])})
+
+    with pytest.raises(RunPaused):
+        engine._finish_inflight()
+
+    assert task.spec_file == str(mount / "_bmad-output/accepted.md")
+    assert task.dispatched_spec_file == str(mount / "_bmad-output/dispatched.md")
+
+
+def test_isolation_flip_releases_the_units_baseline_before_the_in_place_rollback(
+    project, monkeypatch
+):
+    """The mount-measured operands must not reach a rollback of the MAIN checkout.
+
+    `[scm] isolation` is re-read on every resume and a change is journaled, never
+    refused, so `worktree -> none` reaches the restart arm with a mount still recorded.
+    That arm re-runs in place, and the leg below it hands `baseline_commit` /
+    `baseline_untracked` to `recovery_flow.rollback_or_pause` — but both were stamped
+    from `self.workspace.root`, the UNIT, and the workspace is now the main checkout.
+
+    Neither operand fails loud there. Linked worktrees share the object database, so
+    the unit baseline still resolves and a reset onto it succeeds; and a fresh
+    worktree is a tracked-only checkout, so its empty `baseline_untracked` makes
+    `verify._rollback_cleanup_plan` compute `untracked_files(repo) -
+    baseline_untracked` as EVERY untracked file in the operator's own checkout. Under
+    an auto-recovering cause those are deleted outright — the operator's own files,
+    for a story that merely changed isolation mode.
+
+    Graded on the rollback leg not being entered at all, rather than only on the
+    cleared fields: the fields are the mechanism, the un-entered leg is the property.
+
+    The mount's CLAIM and the mount's DIRECTORY are separated, and both are asserted.
+    `worktree_path` names a directory and is also how `runs` answers the RETROSPECTIVE
+    question — which tree owns the state this task already persisted (`task_spec_root`,
+    `task_stories_root`) — so a task that keeps the field set while executing in the
+    main checkout makes those readers answer for a tree the run has left. The directory
+    itself stays: this arm did not build it, and a policy change is not an instruction
+    to delete the operator's tree. The orphan is journaled so that is not silent.
+
+    The PROSPECTIVE readers are deliberately absent from that list and from the
+    assertions below. `redrive_base_ref` and `spec_reaches_the_redrive` describe the
+    re-drive that has not happened yet, and they take the live isolation mode as a
+    parameter rather than inferring it here — because `bmad-loop resolve` asks them in
+    a separate process BEFORE this resume runs, where no amount of claim-clearing is
+    visible. Asserting them here would grade the argument this test passes them, not
+    the field it is about; `test_redrive_base_ref_reads_live_policy_not_the_recorded_mount`
+    (tests/test_runs.py) carries that direction against both flips.
+
+    Ablation: narrow the arm back to `release_spec_paths_from_mount()` and this
+    reddens on the spy — the leg fires with the unit's operands, which is the state
+    that would have deleted them. Separately, drop the `worktree_path = ""` and the
+    claim assertions redden while the spy stays green, which is why both are here.
+    """
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    in_place = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(isolation="none"),
+    )
+    engine, _ = make_engine(project, [], policy=in_place)
+    assert not engine._isolated  # the premise: live policy says in-place
+
+    mount = project.project / ".bmad-loop" / "runs" / "test-run" / "worktrees" / "1-1-a"
+    (mount / "_bmad-output").mkdir(parents=True, exist_ok=True)
+    (mount / "_bmad-output" / "accepted.md").write_text("# spec\n", encoding="utf-8")
+
+    task = StoryTask("1-1-a", 1, phase=Phase.DEV_RUNNING)
+    task.worktree_path = str(mount)  # the persisted mount the live policy ignores
+    task.spec_file = "_bmad-output/accepted.md"
+    task.dispatched_spec_file = "_bmad-output/accepted.md"
+    task.dispatched_spec_snapshot = b"pre-launch bytes"
+    # measured INSIDE the unit by `_dev_phase`; a fresh mount is tracked-only, which
+    # is what makes the untracked half so destructive against another tree
+    task.baseline_commit = rev_parse_head(project.project)
+    task.baseline_untracked = []
+    engine.state.tasks["1-1-a"] = task
+
+    rolled: list[str] = []
+    monkeypatch.setattr(engine, "_rollback_or_pause", lambda t, cause: rolled.append(cause))
+
+    class _StopBeforeRerun(Exception):
+        pass
+
+    def _stop(*_a, **_k):
+        raise _StopBeforeRerun
+
+    monkeypatch.setattr(engine, "_run_story", _stop)
+
+    with pytest.raises(_StopBeforeRerun):
+        engine._finish_inflight()
+
+    assert rolled == []  # the leg never ran, so the unit operands never travelled
+
+    saved = load_state(engine.run_dir).tasks["1-1-a"]
+    assert saved.baseline_commit is None
+    assert saved.baseline_untracked is None
+    assert saved.spec_file == "_bmad-output/accepted.md"  # relative again
+    assert saved.dispatched_spec_file is None
+    assert saved.dispatched_spec_snapshot is None
+
+    # the CLAIM is dropped: the retrospective readers must now answer the main checkout
+    assert saved.worktree_path == ""
+    assert saved.branch == ""
+    assert runs.task_stories_root(saved, engine.state) == project.project
+    assert runs.task_spec_root(saved, engine.state) == project.project
+
+    # ...but the DIRECTORY is not deleted, and the orphan is on the record
+    assert mount.is_dir()  # left standing: this arm did not build it
+    assert "isolation-flip-orphaned-worktree" in journal_kinds(engine)
+
+
+def test_isolation_flip_releases_the_mount_on_the_continuation_arms_too(project, monkeypatch):
+    """Every non-isolated leg undoes the re-anchor, not just the restart arm.
+
+    `_finish_inflight` re-anchors `spec_file` INTO the recorded mount unconditionally,
+    above the `isolated` gate. Three arms below then reach the MAIN workspace on their
+    non-isolated legs and `return` without ever reaching the restart arm that first
+    carried the release — the spec-approval `DEV_VERIFY` continuation graded here, the
+    recorded-result `_resumable_session` continuation and the `COMMITTING` finalizer.
+    Left unreleased, each continues with `spec_file` absolutized into a mount the run
+    has already left: `_dispatched_spec_for_attempt` resolves that `strict=True`,
+    raises, and leaves the attempt unbound, and an explicit-spec prompt meets the
+    snapshot gate with nothing bound.
+
+    Graded at the moment the continuation RUNS, not on the saved state — the defect is
+    what the arm consumes, and a later save could launder it. That is also why this
+    cannot be folded into the restart-arm row above: that one never enters an arm.
+
+    Ablation: drop `self._release_orphaned_mount(task)` from the `DEV_VERIFY` else-leg
+    and `seen["spec_file"]` becomes the absolute path into the mount.
+    """
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    in_place = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(isolation="none"),
+    )
+    engine, _ = make_engine(project, [], policy=in_place)
+    assert not engine._isolated  # the premise: live policy says in-place
+
+    mount = project.project / ".bmad-loop" / "runs" / "test-run" / "worktrees" / "1-1-a"
+    rel = "_bmad-output/accepted.md"
+    (mount / rel).parent.mkdir(parents=True, exist_ok=True)
+    (mount / rel).write_text("# spec\n", encoding="utf-8")
+
+    task = StoryTask("1-1-a", 1, phase=Phase.DEV_VERIFY)
+    task.worktree_path = str(mount)  # the persisted mount the live policy ignores
+    task.spec_file = rel  # persisted RELATIVE, as `_serialized_worktree_path` writes it
+    task.dispatched_spec_file = rel
+    task.dispatched_spec_snapshot = b"pre-launch bytes"
+    task.baseline_commit = rev_parse_head(project.project)
+    task.baseline_untracked = []
+    engine.state.tasks["1-1-a"] = task
+
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(
+        engine,
+        "_resume_after_dev_verify",
+        lambda t: seen.update(
+            spec_file=t.spec_file,
+            dispatched=t.dispatched_spec_file,
+            worktree_path=t.worktree_path,
+            baseline_commit=t.baseline_commit,
+        ),
+    )
+
+    engine._finish_inflight()
+
+    assert seen, "the DEV_VERIFY continuation arm never ran"
+    # the arm acts on the spelling the MAIN workspace re-probes, not the orphan's
+    assert seen["spec_file"] == rel
+    assert seen["spec_file"] != str(mount / rel)
+    assert seen["dispatched"] is None  # the attempt died with its tree
+    assert seen["worktree_path"] == ""  # the claim is dropped BEFORE the arm acts
+    assert seen["baseline_commit"] is None  # unit operands never reach the main checkout
+    assert "isolation-flip-orphaned-worktree" in journal_kinds(engine)
+    assert mount.is_dir()  # released, not deleted
+
+
+def test_open_unit_workspace_reclaims_the_orphan_holding_its_mount_path(project):
+    """A flip back to `worktree` is not blocked by the orphan the flip left behind.
+
+    `unit_branch_name` and the mount path are both DETERMINISTIC in
+    (run_id, unit_key, run_dir), so a re-mount targets the exact directory a previous
+    mount used. `engine._release_orphaned_mount` deliberately leaves that directory
+    standing when live policy drops isolation — a policy change is not an instruction
+    to delete the tree — so a later flip BACK re-derives the same path and met a
+    `git worktree add` that refuses both an existing target and a branch checked out
+    elsewhere, deferring the task instead of resuming it.
+
+    The BRANCH is deliberately spared by the reclaim: under `branch_per=run` this name
+    is the SHARED run branch carrying commits earlier units already landed, so a
+    force-delete would drop real work. The reclaim drops only the worktree, and the
+    `branch_exists` fork re-mounts the branch from its own HEAD — which is what the
+    committed file below grades.
+
+    Ablation: delete the `discard_worktree(...)` call in `open_unit_workspace` and the
+    second mount raises `GitError`; swap its `""` back to `branch` and `landed.txt` is
+    gone because the shared branch was force-deleted.
+    """
+    from bmad_loop.workspace import open_unit_workspace
+
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    args = (project.project, project, "test-run", "1-1-a", "main", "run", run_dir)
+
+    first = open_unit_workspace(*args)
+    (first.path / "landed.txt").write_text("earlier unit\n", encoding="utf-8")
+    git(first.path, "add", "landed.txt")
+    git(first.path, "commit", "-m", "landed on the shared run branch")
+
+    # the orphan: nothing tore this down, exactly as the isolation flip leaves it
+    assert first.path.is_dir()
+
+    second = open_unit_workspace(*args)
+
+    assert second.path == first.path  # the same deterministic mount point
+    assert second.branch == first.branch
+    # the branch was NOT force-deleted: the earlier unit's commit is still on it
+    assert (second.path / "landed.txt").read_text(encoding="utf-8") == "earlier unit\n"
 
 
 def test_worktree_spec_approval_pause_resumes_in_same_worktree(project):
@@ -3706,7 +4147,7 @@ _MERGE_FAILURE_PHRASES = (
         ),
         (
             lambda: verify.GitError(
-                "git merge --no-ff feat failed in /repo: fatal: some state no probe " "measured"
+                "git merge --no-ff feat failed in /repo: fatal: some state no probe measured"
             ),
             "was not classified",
         ),
@@ -5321,7 +5762,7 @@ def test_a_re_armed_story_does_not_carry_a_withdrawn_declaration(project, monkey
     assert _ledger_entry(project, "DW-1").open
 
     monkeypatch.setattr(verify, "finalize_commit", real_finalize)
-    assert runs.rearm_escalation(engine.run_dir, "1-1-a") == "1-1-a"
+    assert runs.rearm_escalation(engine.run_dir, "1-1-a", isolated_redrive=True) == "1-1-a"
 
     state = load_state(engine.run_dir)
     state.clear_pause()

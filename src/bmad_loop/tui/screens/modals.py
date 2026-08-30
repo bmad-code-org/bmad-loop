@@ -535,6 +535,7 @@ class SpecReviewModal(BaseDialog):
         spec_path: Path | None,
         spec_text: str,
         actions: list[tuple[str, str, str]],
+        unreadable: bool = False,
     ):
         super().__init__()
         self._title = title
@@ -542,6 +543,7 @@ class SpecReviewModal(BaseDialog):
         self._spec_path = spec_path
         self._spec_text = spec_text
         self._actions = actions
+        self._unreadable = unreadable
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
@@ -555,12 +557,28 @@ class SpecReviewModal(BaseDialog):
             yield Static(path_line, classes="path")
             with VerticalScroll(id="spec"):
                 body = self._spec_text.strip()
-                yield Static(Text(body) if body else Text("(empty spec)", style="dim"))
+                if self._unreadable:
+                    # Dimmed like "(empty spec)", never as plain body text: this string
+                    # is THIS modal's report of a failed read, and rendering it in the
+                    # style reserved for the spec's own words invites it to be read as
+                    # spec content that happens to open with that sentence.
+                    yield Static(Text(body, style="dim"))
+                else:
+                    yield Static(Text(body) if body else Text("(empty spec)", style="dim"))
             with Horizontal(classes="buttons"):
                 if self._spec_path is not None:
                     yield Button("copy path", id="copy-path")
                 for verb, label, variant in self._actions:
-                    yield Button(label, variant=variant, id=f"act-{verb}")  # type: ignore[arg-type]
+                    # Every verb this modal offers acts ON the spec — approve resumes the
+                    # run past the gate, replan rewrites the file. A spec nobody could
+                    # read is one nobody reviewed, so the actions are refused at the
+                    # source rather than left to fail (or worse, succeed) downstream.
+                    yield Button(
+                        label,
+                        variant=variant,  # type: ignore[arg-type]
+                        id=f"act-{verb}",
+                        disabled=self._unreadable,
+                    )
                 yield Button("close", id="cancel")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -704,6 +722,7 @@ class EscalationModal(BaseDialog):
         resolution_ready: bool,
         engine_live: bool,
         restore_recorded: bool = False,
+        unreadable: bool = False,
     ):
         super().__init__()
         self._story_key = story_key
@@ -714,6 +733,7 @@ class EscalationModal(BaseDialog):
         self._resolution_ready = resolution_ready
         self._engine_live = engine_live
         self._restore_recorded = restore_recorded
+        self._unreadable = unreadable
 
     def compose(self) -> ComposeResult:
         head = Text()
@@ -735,11 +755,31 @@ class EscalationModal(BaseDialog):
                     )
                 with Vertical(id="blocking"):
                     body = self._blocking.strip()
-                    yield Static(
-                        Text(body)
-                        if body
-                        else Text("(no blocking condition recorded)", style="dim")
-                    )
+                    if self._unreadable:
+                        # The spec could not be READ at the anchored path, so there is
+                        # no blocking condition to parse and "(no blocking condition
+                        # recorded)" would be a lie indistinguishable from a readable
+                        # spec that simply halted without one. `_blocking_condition`
+                        # reduces the read-failure body to "" like any other non-halt
+                        # text, so this arm cannot be inferred downstream — it has to
+                        # be carried in.
+                        #
+                        # REPLACES the body rather than prefixing it: `body` is always
+                        # "" on this arm (the failure sentence carries no halt block),
+                        # so an `if` that fell through still rendered the very sentence
+                        # the paragraph above calls a lie, directly under the warning
+                        # denying it.
+                        yield Static(
+                            Text(
+                                "⚠ the spec could not be read at the anchored path — "
+                                "the blocking condition is unknown, not absent",
+                                style="red",
+                            )
+                        )
+                    elif body:
+                        yield Static(Text(body))
+                    else:
+                        yield Static(Text("(no blocking condition recorded)", style="dim"))
                 if self._engine_live:
                     yield Static(
                         Text("engine may still be live — stop it before resolving", style="yellow")
@@ -747,7 +787,18 @@ class EscalationModal(BaseDialog):
             # The restore-discard branch below gates an enabled Re-arm, so the hint
             # is docked outside #body (never scrolled off) — directly above the buttons.
             hint = Text()
-            if self._restore_recorded:
+            if self._unreadable:
+                # Precedence over both branches below: they explain when Re-arm
+                # unlocks, and neither is true while the evidence cannot be read.
+                hint.append(
+                    "re-arm is refused while the spec is unreadable — it flips the "
+                    "frontmatter, strips the result and re-stamps the baseline on "
+                    "evidence nobody could read. Resolve stays OPEN: it is the "
+                    "non-destructive remedy, and a bad anchor is exactly what it "
+                    "repairs — `bmad-loop resolve` does the same from the CLI",
+                    style="red",
+                )
+            elif self._restore_recorded:
                 # honoring the latch from here would be unsafe (a stale marker is
                 # indistinguishable from a fresh one), so Re-arm stays a plain
                 # from-scratch re-drive — but never a silent drop of the decision.
@@ -767,14 +818,24 @@ class EscalationModal(BaseDialog):
                 )
             yield Static(hint, id="hint")
             with Horizontal(classes="buttons"):
+                # NOT gated on `_unreadable`. Resolve opens an interactive agent to
+                # repair the frozen spec and writes nothing itself, so it is the one
+                # verb an unreadable spec is a REASON to offer — refusing it left the
+                # modal with `close` as its only action, on the very failure the
+                # resolve agent exists to fix. It also kept the modal out of step with
+                # `action_resolve_run` (the `R` binding), which has no readability
+                # check, so the refusal was advisory rather than enforced.
                 yield Button(
-                    "Resolve", variant="primary", id="act-resolve", disabled=self._engine_live
+                    "Resolve",
+                    variant="primary",
+                    id="act-resolve",
+                    disabled=self._engine_live,
                 )
                 yield Button(
                     "Re-arm & resume",
                     variant="warning",
                     id="act-rearm",
-                    disabled=not self._resolution_ready or self._engine_live,
+                    disabled=not self._resolution_ready or self._engine_live or self._unreadable,
                 )
                 yield Button("close", id="cancel")
 

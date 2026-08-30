@@ -2791,7 +2791,7 @@ def test_rearm_restore_mode_sets_in_review_strips_arr_and_latches(tmp_path):
     from bmad_loop.model import Phase
 
     run_dir, spec = _escalated_run(tmp_path, _SPEC_WITH_ARR)
-    runs.rearm_escalation(run_dir, restore_patch="artifacts/attempt.patch")
+    runs.rearm_escalation(run_dir, restore_patch="artifacts/attempt.patch", isolated_redrive=False)
 
     task = load_state(run_dir).tasks["1-1-a"]
     assert task.phase == Phase.PENDING and task.attempt == 0
@@ -2809,7 +2809,7 @@ def test_rearm_plain_mode_sets_ready_for_dev_and_clears_stale_latch(tmp_path):
 
     # a stale latch from a prior restore attempt the human then chose to redo fresh
     run_dir, spec = _escalated_run(tmp_path, _SPEC_WITH_ARR, restore_patch_stale="old.patch")
-    runs.rearm_escalation(run_dir)  # no restore_patch => from-scratch
+    runs.rearm_escalation(run_dir, isolated_redrive=False)  # no restore_patch => from-scratch
 
     task = load_state(run_dir).tasks["1-1-a"]
     assert task.phase == Phase.PENDING
@@ -2839,7 +2839,9 @@ def test_rearm_aborts_when_the_spec_status_cannot_be_reopened(tmp_path):
     assert verify.status_of(verify.read_frontmatter(spec)) == "blocked"  # the reader is fine
 
     with pytest.raises(runs.RearmError, match="re-open story spec"):
-        runs.rearm_escalation(run_dir, restore_patch="artifacts/attempt.patch")
+        runs.rearm_escalation(
+            run_dir, restore_patch="artifacts/attempt.patch", isolated_redrive=False
+        )
 
     assert spec.read_text(encoding="utf-8") == spec_text  # byte-identical
     task = load_state(run_dir).tasks["1-1-a"]
@@ -2858,7 +2860,7 @@ def test_rearm_resets_followup_reviews_spent(tmp_path):
     state.tasks["1-1-a"].review_cycle = 2
     save_state(run_dir, state)
 
-    runs.rearm_escalation(run_dir)
+    runs.rearm_escalation(run_dir, isolated_redrive=False)
 
     task = load_state(run_dir).tasks["1-1-a"]
     assert task.followup_reviews_spent == 0
@@ -2903,7 +2905,7 @@ def test_rearm_excludes_stale_restore_residue_from_baseline_snapshot(tmp_path):
     story's commit. The resolve session's own untracked file still is."""
     run_dir, _spec, patch = _stale_restore_tree(tmp_path)
 
-    runs.rearm_escalation(run_dir)  # from-scratch re-arm replaces the latch
+    runs.rearm_escalation(run_dir, isolated_redrive=False)  # from-scratch re-arm replaces the latch
 
     task = load_state(run_dir).tasks["1-1-a"]
     assert "human.txt" in task.baseline_untracked
@@ -2920,7 +2922,7 @@ def test_rearm_re_latching_the_same_patch_still_excludes_its_residue(tmp_path):
     still residue (and `git apply` would otherwise fail with 'already exists')."""
     run_dir, _spec, _patch = _stale_restore_tree(tmp_path)
 
-    runs.rearm_escalation(run_dir, restore_patch="artifacts/attempt.patch")
+    runs.rearm_escalation(run_dir, restore_patch="artifacts/attempt.patch", isolated_redrive=False)
 
     task = load_state(run_dir).tasks["1-1-a"]
     assert task.restore_patch == "artifacts/attempt.patch"
@@ -2938,7 +2940,7 @@ def test_rearm_missing_stale_patch_degrades_loudly_without_raising(tmp_path):
     git(tmp_path, "add", "committed.txt")
     git(tmp_path, "commit", "-q", "-m", "attempt commit")
 
-    runs.rearm_escalation(run_dir)  # must not raise RearmError
+    runs.rearm_escalation(run_dir, isolated_redrive=False)  # must not raise RearmError
 
     task = load_state(run_dir).tasks["1-1-a"]
     assert {"human.txt", "newfile.txt"} <= set(task.baseline_untracked)  # full snapshot
@@ -2954,7 +2956,7 @@ def test_rearm_without_a_stale_latch_journals_no_stale_restore_events(tmp_path):
     run_dir, _spec = _escalated_run(tmp_path, _SPEC_WITH_ARR, git_project=True)
     (tmp_path / "human.txt").write_text("from the resolve session\n")
 
-    runs.rearm_escalation(run_dir, restore_patch="artifacts/attempt.patch")
+    runs.rearm_escalation(run_dir, restore_patch="artifacts/attempt.patch", isolated_redrive=False)
 
     assert "human.txt" in load_state(run_dir).tasks["1-1-a"].baseline_untracked
     assert _kinds(run_dir) == []
@@ -2970,7 +2972,7 @@ def test_rearm_warns_about_commits_below_the_refreshed_baseline(tmp_path):
     git(tmp_path, "commit", "-q", "-m", "attempt commit")
     old_baseline = load_state(run_dir).tasks["1-1-a"].baseline_commit
 
-    runs.rearm_escalation(run_dir)
+    runs.rearm_escalation(run_dir, isolated_redrive=False)
 
     task = load_state(run_dir).tasks["1-1-a"]
     assert task.baseline_commit != old_baseline  # baseline advanced past the commit
@@ -3860,6 +3862,412 @@ def test_project_of_a_real_run_dir_is_the_project_root(tmp_path):
     run_dir = _make_state_run(tmp_path, "r1")
 
     assert runs._project_of_run_dir(run_dir) == tmp_path
+
+
+# ---- task_spec_root: the root must be able to CONFINE the path task_spec_path returns
+
+
+def test_task_spec_root_yields_the_project_when_the_worktree_cannot_confine_the_spec(tmp_path):
+    """An absolute `spec_file` beside a set `worktree_path` is the OUT-OF-MOUNT shape.
+
+    `model._serialized_worktree_path` keeps a path verbatim exactly when
+    `relative_to(worktree_path)` raises, so this pair means the spec is lexically
+    outside the mount. `task_spec_path` passes an absolute path through untouched, so
+    answering the worktree here names a root that can NEVER contain the anchored path:
+    `devcontract._atomic_write_spec` gates on the same lexical `is_relative_to` and
+    would silently take the plain no-follow arm — losing #593's O_NOFOLLOW walk — while
+    `_restore_rearmed_spec`, which calls `atomic_write_bytes_confined` directly, would
+    raise `UnconfinedWriteError` and turn a recoverable re-arm abort into a lost undo.
+
+    The project is not guaranteed to contain it either; where nothing does, the write
+    lands on the arm it already took. That is not unconditional, and the exception is
+    graded by `test_task_spec_root_refuses_a_spec_the_project_cannot_reach` rather than
+    asserted here — a lexically-contained spec reached through a symlinked component
+    moves from a succeeding plain write to a refused confined one.
+
+    Ablation: revert the body to `Path(task.worktree_path or state.project)` and this
+    reddens — the root is the worktree, which cannot confine the spec.
+    """
+    wt = tmp_path / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    spec = tmp_path / "_bmad-output" / "specs" / "6-4.md"  # in the project, not the mount
+    run = escalated_run(tmp_path, "r1", spec_file=str(spec), worktree_path=str(wt))
+
+    assert runs.task_spec_root(run.task, run.state) == tmp_path
+    # the anchored path is confinable by the root, which is the whole point
+    assert runs.task_spec_path(run.task, run.state).is_relative_to(
+        runs.task_spec_root(run.task, run.state)
+    )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_task_spec_root_refuses_a_spec_the_project_cannot_reach(tmp_path):
+    """The out-of-mount arm's one REGRESSION, pinned so it is graded rather than assumed.
+
+    `task_spec_root`'s docstring used to claim this arm "only ever trades a skipped or
+    refused confined write for a taken one". That is false for a spec which is lexically
+    under the project but reached THROUGH a symlinked component: `_atomic_write_spec`
+    selects its arm on the lexical `is_relative_to` — which passes — and the confined
+    arm it selects then walks the components below the root and refuses the redirect. So
+    a write that previously took the plain no-follow arm and SUCCEEDED now raises
+    `UnconfinedWriteError`. Graded here through `devcontract.reset_spec_status`, one of
+    the three `_atomic_write_spec` writers, so the arm SELECTION is what reaches the
+    refusal rather than being assumed. `rearm_escalation` converting it to `RearmError`
+    is its own arm and is graded by the re-arm rows, not by this one.
+
+    Kept as behavior rather than fixed, because the fix is worse: gating the arm on
+    `path_is_confined` makes the root depend on filesystem state (that predicate answers
+    False for a component it cannot probe, so an absent parent directory would anchor on
+    the worktree and the same spec would anchor on the project once it existed). A
+    confine root that moves under a `mkdir` is not a definition. This row exists so the
+    trade is visible and a future reader does not rediscover it as a surprise.
+
+    Ablation: make `task_spec_root` return the worktree for the out-of-mount shape and
+    this reddens on the root assertion — and the refusal disappears with it, because the
+    writer would take the plain arm instead.
+    """
+    wt = tmp_path / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    real = tmp_path / "elsewhere"
+    real.mkdir()
+    (tmp_path / "_bmad-output").mkdir()
+    link = tmp_path / "_bmad-output" / "specs"
+    link.symlink_to(real, target_is_directory=True)  # a REDIRECT below the project root
+    spec = link / "6-4.md"
+    spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+    run = escalated_run(tmp_path, "r1", spec_file=str(spec), worktree_path=str(wt))
+
+    root = runs.task_spec_root(run.task, run.state)
+    assert root == tmp_path  # lexically contained, so the confined arm is selected
+    assert spec.is_relative_to(root)
+    # Driven through `_atomic_write_spec`, NOT through the primitive: calling
+    # `atomic_write_bytes_confined` directly proves only that the primitive refuses a
+    # symlinked component, which was never in doubt. The claim is that the WRITER's
+    # lexical arm selection reaches that refusal for this root — so the real writer has
+    # to be the thing that raises.
+    from bmad_loop import devcontract
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        devcontract.reset_spec_status(spec, "draft", confine_root=root)
+    # and the spec is untouched by the aborted write
+    assert spec.read_text(encoding="utf-8") == "---\nstatus: blocked\n---\n"
+
+
+def test_task_spec_path_refuses_an_empty_spec_file(tmp_path):
+    """`Path("")` is `.`, so an empty `spec_file` would answer the ROOT DIRECTORY.
+
+    The helper is public now, so the precondition is enforced instead of documented: a
+    caller that skips the guard every current call site has gets an exception rather
+    than a write target pointing at the tree root.
+
+    Ablation: restore `raw = Path(task.spec_file or "")` and drop the raise — this
+    reddens, and `task_spec_path` answers the worktree itself.
+    """
+    wt = tmp_path / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    run = escalated_run(tmp_path, "r1", spec_file="", worktree_path=str(wt))
+
+    with pytest.raises(ValueError, match="non-empty"):
+        runs.task_spec_path(run.task, run.state)
+    # the ROOT still answers, because naming a tree needs no spec
+    assert runs.task_spec_root(run.task, run.state) == wt
+
+
+def test_spec_reaches_the_redrive_is_false_for_a_worktree_local_spec(tmp_path):
+    """The verdict `build_context` publishes so the resolve agent is not lied to.
+
+    A worktree-local spec is destroyed with the mount by `engine._finish_inflight`
+    before the re-drive reads anything, so an edit to it succeeds and then vanishes.
+    `rearm_escalation` already journals `rearm-spec-write-unreachable` on this same
+    verdict; promoting it is what lets the context carry it too.
+
+    The two no-flip rows only. `isolated_redrive` agrees with the recorded mount on
+    both, which is what makes them the rows a `task.worktree_path` proxy also passed —
+    the rows that grade the SOURCE are in
+    `test_spec_reaches_the_redrive_reads_live_policy_not_the_recorded_mount`.
+
+    Ablation: return a bare `True` from `spec_reaches_the_redrive` and this reddens on
+    the isolated leg.
+    """
+    wt = tmp_path / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    isolated = escalated_run(tmp_path, "r1", spec_file="specs/6-4.md", worktree_path=str(wt))
+    assert (
+        runs.spec_reaches_the_redrive(isolated.task, isolated.state, isolated_redrive=True) is False
+    )
+
+    plain = escalated_run(tmp_path, "r2", spec_file=str(tmp_path / "specs" / "6-4.md"))
+    assert runs.spec_reaches_the_redrive(plain.task, plain.state, isolated_redrive=False) is True
+
+
+def test_spec_reaches_the_redrive_reads_live_policy_not_the_recorded_mount(tmp_path):
+    """The two rows where the recorded mount and the live policy DISAGREE — which is
+    the whole reason this takes a parameter instead of reading `task.worktree_path`.
+
+    `scm.isolation` is re-read at every resume and a mid-run change is journalled,
+    never refused (`engine._finish_inflight`), so an operator who edits policy.toml
+    while a story sits escalated makes the recorded mount describe the attempt that
+    RAN and nothing about the re-drive that WILL run. `bmad-loop resolve` builds
+    context.json in a separate process BEFORE that resume, so no resume-time
+    bookkeeping on the recorded mount can reach it: the fact has to arrive as an
+    argument or not at all.
+
+    - `worktree` -> `none`: the mount is still recorded and the writes still land in
+      it (`task_spec_path` anchors there), but `_run_story` now re-runs the story in
+      the main checkout, which never reads that tree. False.
+    - `none` -> `worktree`: no mount was ever recorded, and the fresh one is cut from
+      git — so the working-tree edit the agent was sent to make is not in it. False,
+      and this is the row the `task.worktree_path` proxy answered TRUE for: the agent
+      was told its edit was safe while it silently vanished.
+
+    Ablation: restore `not task.worktree_path or _spec_is_shared_with_the_redrive(...)`
+    as the body and the `none -> worktree` row reddens (True for a doomed edit). The
+    `worktree -> none` row does NOT redden under that ablation — it agreed by accident,
+    which is why `test_redrive_base_ref_reads_live_policy_not_the_recorded_mount`
+    carries that direction.
+    """
+    wt = tmp_path / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+
+    flipped_off = escalated_run(tmp_path, "r1", spec_file="specs/6-4.md", worktree_path=str(wt))
+    assert (
+        runs.spec_reaches_the_redrive(flipped_off.task, flipped_off.state, isolated_redrive=False)
+        is False
+    )
+
+    flipped_on = escalated_run(tmp_path, "r2", spec_file="specs/6-4.md")
+    assert not flipped_on.task.worktree_path  # the premise: nothing recorded to gate on
+    assert (
+        runs.spec_reaches_the_redrive(flipped_on.task, flipped_on.state, isolated_redrive=True)
+        is False
+    )
+
+
+def test_spec_reaches_the_redrive_in_place_measures_the_mount_not_its_presence(tmp_path):
+    """The in-place arm asks WHERE the edit lands, not WHETHER a mount was recorded.
+
+    After a `worktree` -> `none` flip the recorded mount is still set on every row here,
+    so `bool(task.worktree_path)` cannot tell them apart — but the re-drive reads the
+    main checkout's working tree, and only a spec inside the mount is out of its reach:
+
+    - relative: `_serialized_worktree_path` relativizes exactly when the spec sits under
+      the mount, so a relative spelling IS inside it, by construction and with no probe.
+    - absolute, under the mount: the same file spelled the other way. Also unreachable.
+    - absolute, outside the mount but under the PROJECT: the main checkout's own copy —
+      which is precisely what an in-place re-drive reads. Reachable, and the row that
+      separates this from the isolated arm, where the same shape is unreachable because
+      a fresh worktree measures it against worktree-local roots.
+
+    Ablation: return `bool(task.worktree_path)` from `_spec_is_inside_the_mount` and the
+    third row reddens — a spec the re-drive reads is reported as doomed.
+    """
+    mount = tmp_path / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    mount.mkdir(parents=True)
+
+    relative = escalated_run(tmp_path, "r1", spec_file="specs/6-4.md", worktree_path=str(mount))
+    assert (
+        runs.spec_reaches_the_redrive(relative.task, relative.state, isolated_redrive=False)
+        is False
+    )
+
+    inside = escalated_run(
+        tmp_path, "r2", spec_file=str(mount / "specs" / "6-4.md"), worktree_path=str(mount)
+    )
+    assert runs.spec_reaches_the_redrive(inside.task, inside.state, isolated_redrive=False) is False
+
+    outside = escalated_run(
+        tmp_path, "r3", spec_file=str(tmp_path / "specs" / "6-4.md"), worktree_path=str(mount)
+    )
+    assert (
+        runs.spec_reaches_the_redrive(outside.task, outside.state, isolated_redrive=False) is True
+    )
+    # ...and the SAME task under isolation is unreachable: the fresh mount measures the
+    # main checkout's copy against worktree-local roots and rejects it
+    assert (
+        runs.spec_reaches_the_redrive(outside.task, outside.state, isolated_redrive=True) is False
+    )
+
+
+def test_spec_reaches_the_redrive_keeps_a_shared_external_spec_without_a_mount(tmp_path):
+    """`_spec_is_shared_with_the_redrive` had to lose its `not task.worktree_path`
+    early return, or generalizing the isolated arm would have traded one wrong answer
+    for another.
+
+    An artifact dir configured outside the project tree is SHARED across checkouts
+    (`ProjectPaths.rebased` leaves it where it is), so a spec that lands there is one
+    file every worktree sees — reachable whether or not a mount is recorded. Without
+    the generalization the `none -> worktree` flip above would warn on every such run:
+    wrong-but-loud rather than silent, but still a doom notice on a spec that is fine,
+    and the operator trained to scroll past it is the failure the record's narrowing
+    exists to avoid.
+
+    Ablation: restore `if not task.worktree_path or not raw.is_absolute(): return False`
+    and the no-mount leg reddens.
+    """
+    shared = tmp_path / "outside" / "artifacts" / "6-4.md"
+    shared.parent.mkdir(parents=True)
+    shared.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+    project = tmp_path / "project"
+    project.mkdir()
+
+    no_mount = escalated_run(project, "r1", spec_file=str(shared))
+    assert (
+        runs.spec_reaches_the_redrive(no_mount.task, no_mount.state, isolated_redrive=True) is True
+    )
+
+    wt = project / ".bmad-loop" / "runs" / "r2" / "worktrees" / "1"
+    mounted = escalated_run(project, "r2", spec_file=str(shared), worktree_path=str(wt))
+    assert runs.spec_reaches_the_redrive(mounted.task, mounted.state, isolated_redrive=True) is True
+
+
+def test_redrive_base_ref_reads_live_policy_not_the_recorded_mount(tmp_path):
+    """Where a correction has to be committed to be read — answered from the mode the
+    re-drive will RUN in, not from the mount the escalated attempt left behind.
+
+    The pinned `target_branch` is only the right answer when the re-drive mounts:
+    `workspace.open_unit_workspace` cuts the replacement worktree from it. An in-place
+    re-drive reads the main checkout's working ref instead, and naming a branch there
+    sends the resolve session to commit where this run never looks — the reported
+    defect, and unreachable by any resume-time fix because `bmad-loop resolve` computes
+    this in another process first.
+
+    Four rows: both no-flip rows, and both flips. `task` is gone from the signature, so
+    the recorded mount cannot influence any of them — the flip rows are what prove it.
+
+    Ablation: restore `if task.worktree_path and state.target_branch` (re-adding the
+    parameter) and BOTH flip rows redden — `worktree -> none` answers the pinned branch
+    for a re-drive reading `HEAD`, and `none -> worktree` answers `HEAD` for one that
+    reads the branch.
+    """
+    wt = tmp_path / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    mounted = escalated_run(tmp_path, "r1", spec_file="specs/6-4.md", worktree_path=str(wt))
+    mounted.state.target_branch = "feat/the-pinned-one"
+
+    # no flip
+    assert runs.redrive_base_ref(mounted.state, isolated_redrive=True) == "feat/the-pinned-one"
+    # `worktree` -> `none`: the mount is still recorded, and it must not decide this
+    assert runs.redrive_base_ref(mounted.state, isolated_redrive=False) == "HEAD"
+
+    unmounted = escalated_run(tmp_path, "r2", spec_file="specs/6-4.md")
+    unmounted.state.target_branch = "feat/the-pinned-one"
+    assert not unmounted.task.worktree_path  # the premise: nothing recorded to gate on
+
+    # no flip
+    assert runs.redrive_base_ref(unmounted.state, isolated_redrive=False) == "HEAD"
+    # `none` -> `worktree`: the re-drive mounts from the pin, with no mount on record
+    assert runs.redrive_base_ref(unmounted.state, isolated_redrive=True) == "feat/the-pinned-one"
+
+
+def test_redrive_base_ref_degrades_to_head_without_a_pinned_target(tmp_path):
+    """The migration shape, kept from the version that read `task.worktree_path`:
+    `ensure_target_branch` pins the field before any worktree mounts, so an empty
+    `target_branch` beside an isolated re-drive is a state.json predating the field —
+    a MISSING value, not a divergent one. It degrades to exactly the ref it read
+    before, rather than to `""`, which would hold the resume on a per-configuration
+    constant.
+
+    Ablation: drop the `and state.target_branch` conjunct and this reddens with `""`.
+    """
+    run = escalated_run(tmp_path, "r1", spec_file="specs/6-4.md")
+    assert run.state.target_branch == ""
+    assert runs.redrive_base_ref(run.state, isolated_redrive=True) == "HEAD"
+
+
+def test_task_spec_root_stays_on_the_worktree_for_specs_it_can_confine(tmp_path):
+    """The guard against an over-broad fix: only the out-of-mount shape moves.
+
+    Two shapes must keep answering the worktree — the RELATIVE spec (the common
+    isolated case, which `task_spec_path` resolves against this very root), and an
+    ABSOLUTE spec that does sit under the mount. A fix that returned the project
+    whenever `worktree_path` was set would re-break the defect the anchor exists to
+    fix, sending the isolated read and write back to the main checkout's twin.
+
+    Ablation: drop the `raw.is_absolute() and` conjunct so the arm keys on containment
+    alone, and the relative row reddens (`Path("_bmad-output/...")` is not relative to
+    the mount); return `Path(state.project)` whenever a worktree is set and both redden.
+    """
+    wt = tmp_path / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+
+    run = escalated_run(
+        tmp_path, "r1", spec_file="_bmad-output/specs/6-4.md", worktree_path=str(wt)
+    )
+    assert runs.task_spec_root(run.task, run.state) == wt  # relative: the common case
+
+    inside = wt / "_bmad-output" / "specs" / "6-4.md"
+    run = escalated_run(tmp_path, "r2", spec_file=str(inside), worktree_path=str(wt))
+    assert runs.task_spec_root(run.task, run.state) == wt  # absolute, but under the mount
+
+
+def test_task_spec_root_without_a_worktree_is_the_project(tmp_path):
+    """The no-worktree fallback is untouched by the confinement arm: an absolute spec
+    that the project cannot confine still answers the project, because there is no
+    second candidate to choose and the pre-existing behavior is the contract.
+
+    Ablation: return `Path(state.project)` only when the project confines the spec and
+    this reddens — an out-of-project spec has nowhere else to go."""
+    run = escalated_run(tmp_path, "r1", spec_file="/elsewhere/6-4.md")
+    assert runs.task_spec_root(run.task, run.state) == tmp_path
+
+
+def test_task_stories_root_stays_on_the_mount_for_an_out_of_mount_spec(tmp_path):
+    """The ONE shape where `task_stories_root` and `task_spec_root` disagree — which is
+    the entire reason the second function exists.
+
+    `task_spec_root` answers "which tree can CONFINE a write to `task.spec_file`", so its
+    out-of-mount arm falls back to the project precisely so a `confine_root` can never
+    fail to contain the anchored path. The stories FOLDER is a different question: it is
+    located from the workspace root by `state.spec_folder`, and a task's spec being
+    elsewhere says nothing about where its manifest lives. `stories_engine._stories_folder`
+    answers the mount for this task, so borrowing the confinement answer made one surface
+    describe two trees.
+
+    Every other row builds the isolated shape with a RELATIVE `spec_file`, where the two
+    resolvers agree by construction and cannot tell each other apart — which is why
+    collapsing `task_stories_root` back into `task_spec_root` left the whole suite green.
+
+    Ablation: make `task_stories_root` delegate to `task_spec_root` and this reddens on
+    the first assertion; the second pins that the two genuinely diverge here, so a future
+    change that made them agree could not satisfy both."""
+    wt = tmp_path / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"
+    # OS-absolute, not merely rooted. `task_spec_root`'s out-of-mount arm gates on
+    # `Path.is_absolute()`, and on Windows "/elsewhere/6-4.md" is DRIVE-relative — so the
+    # arm never fired there, the fallback returned the worktree, and the row graded the
+    # divergence it exists to pin on POSIX only. What the arm needs is a spec outside the
+    # MOUNT, not outside the project, so anchoring on `tmp_path` keeps the shape while
+    # being absolute on every OS.
+    outside = tmp_path / "elsewhere" / "6-4.md"
+    # the mount has to EXIST: a live isolated unit's does, and `task_stories_root`
+    # degrades to the project for one that is gone (see the row below), so a
+    # never-created path would grade that fallback instead of this divergence.
+    wt.mkdir(parents=True, exist_ok=True)
+    run = escalated_run(tmp_path, "r1", spec_file=str(outside), worktree_path=str(wt))
+
+    assert runs.task_stories_root(run.task, run.state) == wt
+    assert runs.task_spec_root(run.task, run.state) == tmp_path  # deliberately different
+
+
+def test_task_stories_root_without_a_worktree_is_the_project(tmp_path):
+    """The no-worktree and no-task arms, which the two call sites rely on rather than
+    re-spelling the fallback."""
+    run = escalated_run(tmp_path, "r1", spec_file="epic-1/stories/6-4.md")
+    assert runs.task_stories_root(run.task, run.state) == tmp_path
+    assert runs.task_stories_root(None, run.state) == tmp_path
+
+
+def test_task_stories_root_falls_back_when_the_mount_is_gone(tmp_path):
+    """A terminal task keeps naming the worktree its own teardown removed.
+
+    `worktree_path` is cleared at exactly ONE site in the engine — the restart
+    discard — so successful integration retires a task with the field still set while
+    the mount is deleted. The `done_checkpoint` pause is raised in that window and the
+    TUI reads this root for the checkpoint card's title and description, so trusting
+    the stale field looked for `stories.yaml` under a deleted directory and dropped
+    the committed story's manifest, which by then is merged into the project.
+
+    Ablation: drop the `is_dir()` guard from `task_stories_root` and this reddens with
+    the deleted mount; the sibling row above (whose mount exists) stays green, so the
+    guard cannot be satisfied by collapsing the function to the project.
+    """
+    gone = tmp_path / ".bmad-loop" / "runs" / "r1" / "worktrees" / "1"  # never created
+    run = escalated_run(tmp_path, "r1", spec_file="epic-1/stories/6-4.md", worktree_path=str(gone))
+
+    assert not gone.exists()
+    assert runs.task_stories_root(run.task, run.state) == tmp_path
 
 
 # ------------------------------------------------- psmux registry root (#537)

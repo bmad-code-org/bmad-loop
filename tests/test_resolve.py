@@ -2,6 +2,7 @@
 
 import json
 import sys
+from pathlib import Path
 
 import pytest
 import yaml
@@ -44,6 +45,7 @@ def _escalated_run(
     restore_patch=None,
     repo_root=None,
     target_branch=None,
+    spec_folder=None,
 ):
     """conftest's builder with this module's shape: a review-cycle-1 task carrying a
     completed review session (what `build_context` reads), returning the full triple.
@@ -77,11 +79,13 @@ def _escalated_run(
         worktree_path=worktree_path,
         restore_patch=restore_patch,
     )
-    if repo_root is not None or target_branch is not None:
+    if repo_root is not None or target_branch is not None or spec_folder is not None:
         if repo_root is not None:
             run.state.repo_root = str(repo_root)
         if target_branch is not None:
             run.state.target_branch = target_branch
+        if spec_folder is not None:
+            run.state.spec_folder = spec_folder
         save_state(run.run_dir, run.state)
     return run.run_dir, run.state, run.task
 
@@ -505,7 +509,13 @@ def test_set_frontmatter_field_refuses_a_readonly_spec(tmp_path):
 
 
 def test_build_context_gathers_critical_escalations(tmp_path):
-    run_dir, state, task = _escalated_run(tmp_path, spec_file="/abs/spec.md")
+    # An absolute `spec_file` passes through `runs.task_spec_path` verbatim. The literal
+    # has to be OS-absolute, not merely rooted: on Windows "/abs/spec.md" is DRIVE-relative
+    # (`Path.is_absolute()` is False), so it takes the anchoring arm instead and pathlib's
+    # `/` keeps the root's drive while discarding its path — yielding "D:/abs/spec.md", a
+    # shape no real run persists. `tmp_path` is absolute on every OS.
+    spec = tmp_path / "abs" / "spec.md"
+    run_dir, state, task = _escalated_run(tmp_path, spec_file=str(spec))
     task_dir = run_dir / "tasks" / "6-4-cli-list-command-review-1"
     task_dir.mkdir(parents=True)
     (task_dir / "result.json").write_text(
@@ -519,10 +529,10 @@ def test_build_context_gathers_critical_escalations(tmp_path):
         ),
         encoding="utf-8",
     )
-    path = resolve.build_context(state, run_dir, "6-4-cli-list-command")
+    path = resolve.build_context(state, run_dir, "6-4-cli-list-command", isolation="")
     ctx = json.loads(path.read_text(encoding="utf-8"))
     assert ctx["story_key"] == "6-4-cli-list-command"
-    assert ctx["spec_file"] == "/abs/spec.md"
+    assert ctx["spec_file"] == spec.as_posix()
     assert ctx["baseline_commit"] == "abc123"
     details = [e["detail"] for e in ctx["escalations"]]
     assert "names not unique" in details
@@ -533,9 +543,90 @@ def test_build_context_gathers_critical_escalations(tmp_path):
     assert "\\" not in ctx["resolution_path"]
 
 
+def test_build_context_absolutizes_an_isolated_units_worktree_relative_spec(tmp_path, monkeypatch):
+    """`context.json` names the spec in the tree the RUN owns, absolute.
+
+    `StoryTask._serialized_worktree_path` persists an isolated unit's `spec_file`
+    RELATIVE to the mounted worktree and `from_dict` reads it back raw, so the raw
+    value handed to the agent was a bare relpath. The `bmad-loop-resolve` session runs
+    from the PROJECT root, where the main checkout carries the very same
+    `_bmad-output/specs/...` layout — so that relpath resolved, silently, onto the
+    main checkout's twin, and the human and the agent edited a spec the run never used
+    while `rearm_escalation` (which re-anchors through `task_spec_path`) flipped the
+    worktree's. `build_context` now emits the same re-anchor the re-arm writes
+    through, which is also the absolute shape `bmad-loop-resolve/SKILL.md` documents.
+
+    The EQUALITY is what grades this row, and it is the whole instrument:
+    `is_absolute()` alone is satisfied by a PROJECT-anchored resolve, which is the
+    same bug wearing an absolute path. Two things here are deliberately NOT load-
+    bearing, so nobody reads them as proof they are not: `build_context` never opens
+    the spec, so both on-disk copies are inert scenery, and the `chdir` cannot change
+    an emitted value computed by pure path arithmetic. They are kept because a future
+    `abspath`/`resolve()`-shaped resolver WOULD consult the cwd, and pinning it to
+    the tree the agent really runs from keeps this row honest under that change.
+
+    Shape, not just value: `.as_posix()` matches `resolution_path`'s contract two
+    fields below — one string on every OS — so the assertion compares posix
+    spellings and re-uses that field's no-backslash check. `str()` here would have
+    regressed Windows, where the value it replaced was already posix
+    (`_serialized_worktree_path` persists the relative form with `.as_posix()`).
+    Both halves of that check are INERT on POSIX, where `str()` and `.as_posix()`
+    agree — exactly as the sibling `resolution_path` assertion is. Windows CI is
+    where they grade; do not read a green run here as having exercised them.
+
+    Ablation: revert `build_context`'s field to `task.spec_file if task else None` and
+    this reddens on `is_absolute()` — the emitted value is the bare relpath.
+    """
+    rel = "_bmad-output/specs/6-4-cli-list-command.md"
+    wt = tmp_path / "wt"
+    for root in (wt, tmp_path):  # the run's own copy, and the main checkout's twin
+        spec = root / rel
+        spec.parent.mkdir(parents=True, exist_ok=True)
+        spec.write_text(SPEC, encoding="utf-8")
+
+    run_dir, state, _ = _escalated_run(tmp_path, spec_file=rel, worktree_path=str(wt))
+    monkeypatch.chdir(tmp_path)  # what the resolve session actually runs from
+
+    path = resolve.build_context(state, run_dir, "6-4-cli-list-command", isolation="worktree")
+    ctx = json.loads(path.read_text(encoding="utf-8"))
+    assert Path(ctx["spec_file"]).is_absolute()
+    # the worktree's copy, not the main checkout's twin — compared as posix, which is
+    # also the contract shape (no backslashes leak in on Windows).
+    assert ctx["spec_file"] == (wt / rel).as_posix()
+    assert "\\" not in ctx["spec_file"]
+
+
+def test_build_context_spec_file_is_none_without_a_task_or_a_spec(tmp_path):
+    """The re-anchor must not manufacture a path out of nothing. `Path("")` is `.`,
+    so an unguarded `root / raw` would emit the worktree root itself — a real
+    directory — as the story's spec. Both empty legs stay `None`, which is what the
+    agent reads as "there is no frozen spec to edit" (a spec-less escalation, or a
+    key with no task at all).
+
+    Ablation: drop the `and task.spec_file` guard from `build_context`'s field and the
+    spec-less leg reddens with the worktree root in place of `None`."""
+    wt = tmp_path / "wt"
+    run_dir, state, _ = _escalated_run(tmp_path, spec_file=None, worktree_path=str(wt))
+
+    ctx = json.loads(
+        resolve.build_context(
+            state, run_dir, "6-4-cli-list-command", isolation="worktree"
+        ).read_text(encoding="utf-8")
+    )
+    assert ctx["spec_file"] is None  # task present, spec-less escalation
+
+    assert "no-such-story" not in state.tasks
+    ctx = json.loads(
+        resolve.build_context(state, run_dir, "no-such-story", isolation="worktree").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert ctx["spec_file"] is None  # no task at all
+
+
 def test_build_context_no_session_files(tmp_path):
     run_dir, state, _ = _escalated_run(tmp_path, with_session=False)
-    path = resolve.build_context(state, run_dir, "6-4-cli-list-command")
+    path = resolve.build_context(state, run_dir, "6-4-cli-list-command", isolation="")
     ctx = json.loads(path.read_text(encoding="utf-8"))
     assert ctx["escalations"] == []
     assert ctx["paused_reason"].startswith("CRITICAL")
@@ -550,25 +641,25 @@ def test_build_context_restore_supported_signal(tmp_path):
     run_dir, state, task = _escalated_run(tmp_path, spec_file="/abs/spec.md", with_session=False)
     key = "6-4-cli-list-command"
 
-    path = resolve.build_context(state, run_dir, key)
+    path = resolve.build_context(state, run_dir, key, isolation="")
     assert json.loads(path.read_text(encoding="utf-8"))["restore_supported"] is True
 
     path = resolve.build_context(state, run_dir, key, isolation="worktree")
     assert json.loads(path.read_text(encoding="utf-8"))["restore_supported"] is False
 
     task.worktree_path = str(tmp_path / "wt")  # recorded worktree execution
-    path = resolve.build_context(state, run_dir, key)
+    path = resolve.build_context(state, run_dir, key, isolation="")
     assert json.loads(path.read_text(encoding="utf-8"))["restore_supported"] is False
 
     task.worktree_path = ""
     task.spec_file = None  # spec-less escalation: a restored patch has no review to resume
-    path = resolve.build_context(state, run_dir, key)
+    path = resolve.build_context(state, run_dir, key, isolation="")
     assert json.loads(path.read_text(encoding="utf-8"))["restore_supported"] is False
 
     task.spec_file = "/abs/spec.md"
     state.source = "stories"
     task.sentinel_kind = "missing-prd"  # pre-planning wedge: nothing attempted to restore
-    path = resolve.build_context(state, run_dir, key)
+    path = resolve.build_context(state, run_dir, key, isolation="")
     assert json.loads(path.read_text(encoding="utf-8"))["restore_supported"] is False
 
 
@@ -579,7 +670,7 @@ def test_build_context_sanitizes_dirty_story_key(tmp_path):
     dirty = "6-4:cli?list"
     seg = safe_segment(dirty)
     assert seg != dirty
-    path = resolve.build_context(state, run_dir, dirty)
+    path = resolve.build_context(state, run_dir, dirty, isolation="")
     assert path.parent.name == seg
     ctx = json.loads(path.read_text(encoding="utf-8"))
     assert ctx["story_key"] == dirty
@@ -593,7 +684,7 @@ def test_rearm_flips_phase_and_spec_status(tmp_path):
     spec = tmp_path / "spec.md"
     spec.write_text(SPEC, encoding="utf-8")
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec))
-    key = runs.rearm_escalation(run_dir)
+    key = runs.rearm_escalation(run_dir, isolated_redrive=False)
     assert key == "6-4-cli-list-command"
     state = load_state(run_dir)
     task = state.tasks[key]
@@ -617,7 +708,7 @@ def test_rearm_strips_stale_terminal_section(tmp_path):
         encoding="utf-8",
     )
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec))
-    runs.rearm_escalation(run_dir)
+    runs.rearm_escalation(run_dir, isolated_redrive=False)
     text = spec.read_text(encoding="utf-8")
     assert "Auto Run Result" not in text and "names not unique" not in text
     assert verify.read_frontmatter(spec)["status"] == "ready-for-dev"
@@ -628,7 +719,7 @@ def test_rearm_strips_stale_terminal_section(tmp_path):
 def test_rearm_warns_when_an_isolated_tasks_spec_writes_cannot_reach_the_redrive(tmp_path):
     """A worktree-isolated task's spec writes land in a directory the re-drive destroys.
 
-    `_task_spec_path` re-anchors the recorded spec on `task.worktree_path`, but a
+    `task_spec_path` re-anchors the recorded spec on `task.worktree_path`, but a
     re-armed task falls to `engine._finish_inflight`'s final arm, which calls
     `discard_worktree` and lets `_run_story` mount a fresh one — and the re-driven
     session resolves its spec against THAT worktree
@@ -660,7 +751,7 @@ def test_rearm_warns_when_an_isolated_tasks_spec_writes_cannot_reach_the_redrive
         tmp_path, spec_file=str(spec), worktree_path=str(tmp_path / "wt" / "u1")
     )
 
-    runs.rearm_escalation(run_dir)
+    runs.rearm_escalation(run_dir, isolated_redrive=True)
 
     (rec,) = [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-write-unreachable"]
     assert rec["story_key"] == "6-4-cli-list-command"
@@ -682,7 +773,7 @@ def test_rearm_does_not_warn_about_unreachable_writes_without_a_worktree(tmp_pat
     spec.write_text(SPEC, encoding="utf-8")
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec))
 
-    runs.rearm_escalation(run_dir)
+    runs.rearm_escalation(run_dir, isolated_redrive=False)
 
     assert [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-write-unreachable"] == []
 
@@ -750,9 +841,9 @@ def test_rearm_journals_a_status_flip_that_silently_did_nothing(tmp_path, shape)
 
     if shape == "no-frontmatter":
         with pytest.raises(runs.RearmError, match="no frontmatter `status:`"):
-            runs.rearm_escalation(run_dir)
+            runs.rearm_escalation(run_dir, isolated_redrive=False)
     else:
-        runs.rearm_escalation(run_dir)
+        runs.rearm_escalation(run_dir, isolated_redrive=False)
 
     records = [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-flip-skipped"]
     if shape == "already-at-target":
@@ -783,7 +874,7 @@ def test_rearm_journals_a_status_flip_that_silently_did_nothing(tmp_path, shape)
 
 def test_rearm_journals_event(tmp_path):
     run_dir, _, _ = _escalated_run(tmp_path)
-    runs.rearm_escalation(run_dir)
+    runs.rearm_escalation(run_dir, isolated_redrive=False)
     journal = (run_dir / "journal.jsonl").read_text(encoding="utf-8")
     assert "story-escalation-resolved" in journal
 
@@ -802,7 +893,7 @@ def test_rearm_advances_baseline_to_resolved_head(project):
     # a file the resolve session (or the user) left untracked must enter the
     # snapshot, so the redrive reset treats it as pre-existing, not run-created
     (root / "leftover.txt").write_text("keep me\n", encoding="utf-8")
-    runs.rearm_escalation(run_dir)
+    runs.rearm_escalation(run_dir, isolated_redrive=False)
     task = load_state(run_dir).tasks["6-4-cli-list-command"]
     assert task.baseline_commit == git(root, "rev-parse", "HEAD")
     assert task.baseline_commit != old_head
@@ -821,7 +912,7 @@ def test_rearm_baseline_all_or_nothing_on_partial_git_failure(monkeypatch, proje
         raise verify.GitError("simulated failure")
 
     monkeypatch.setattr(runs.verify, "untracked_files", boom)
-    runs.rearm_escalation(run_dir)
+    runs.rearm_escalation(run_dir, isolated_redrive=False)
     task = load_state(run_dir).tasks["6-4-cli-list-command"]
     assert task.baseline_commit == "abc123"
     assert task.baseline_untracked is None
@@ -831,7 +922,7 @@ def test_rearm_keeps_stale_baseline_outside_a_repo(tmp_path):
     # best-effort contract: a project dir that is not a git repo (or a broken
     # one) must not make re-arm fail — the old baseline simply stands
     run_dir, _, _ = _escalated_run(tmp_path)
-    runs.rearm_escalation(run_dir)
+    runs.rearm_escalation(run_dir, isolated_redrive=False)
     task = load_state(run_dir).tasks["6-4-cli-list-command"]
     assert task.baseline_commit == "abc123"
 
@@ -851,7 +942,7 @@ def test_rearm_journals_a_failed_baseline_advance(tmp_path):
     """
     run_dir, _, _ = _escalated_run(tmp_path)  # tmp_path is not a git repo
 
-    runs.rearm_escalation(run_dir)
+    runs.rearm_escalation(run_dir, isolated_redrive=False)
 
     (entry,) = [e for e in _kinds(run_dir) if e["kind"] == "rearm-baseline-advance-failed"]
     assert entry["story_key"] == "6-4-cli-list-command"
@@ -879,7 +970,7 @@ def test_rearm_does_not_swallow_a_non_git_fault_from_the_advance(monkeypatch, tm
 
     monkeypatch.setattr(runs.verify, "untracked_files", boom)
     with pytest.raises(MemoryError):
-        runs.rearm_escalation(run_dir)
+        runs.rearm_escalation(run_dir, isolated_redrive=False)
 
 
 @pytest.mark.parametrize("restore", [None, "artifacts/attempt.patch"])
@@ -903,7 +994,7 @@ def test_rearm_does_not_restamp_a_baseline_the_advance_did_not_move(monkeypatch,
         raise verify.GitError("simulated failure")
 
     monkeypatch.setattr(runs.verify, "untracked_files", boom)
-    runs.rearm_escalation(run_dir, restore_patch=restore)
+    runs.rearm_escalation(run_dir, restore_patch=restore, isolated_redrive=False)
 
     fm = verify.read_frontmatter(spec)
     assert fm["baseline_revision"] == old_head  # NOT re-stamped with the stale sha
@@ -928,7 +1019,7 @@ def test_rearm_bumps_the_task_generation(tmp_path):
     before = load_state(run_dir).tasks["6-4-cli-list-command"]
     assert before.generation == 0 and len(before.sessions) == 1
 
-    runs.rearm_escalation(run_dir)
+    runs.rearm_escalation(run_dir, isolated_redrive=False)
 
     task = load_state(run_dir).tasks["6-4-cli-list-command"]
     assert task.generation == 1
@@ -936,7 +1027,7 @@ def test_rearm_bumps_the_task_generation(tmp_path):
     assert len(task.sessions) == 1  # the audit trail survives the re-arm
 
     save_state(run_dir, _rearmable(run_dir))
-    runs.rearm_escalation(run_dir)
+    runs.rearm_escalation(run_dir, isolated_redrive=False)
     assert load_state(run_dir).tasks["6-4-cli-list-command"].generation == 2
 
 
@@ -961,7 +1052,7 @@ def test_rearm_advances_the_baseline_in_the_code_tree(tmp_path):
     git(code, "commit", "-q", "-m", "resolution fixture")
     (code / "leftover.txt").write_text("keep me\n")
 
-    runs.rearm_escalation(run_dir)
+    runs.rearm_escalation(run_dir, isolated_redrive=False)
 
     task = load_state(run_dir).tasks["6-4-cli-list-command"]
     assert task.baseline_commit == git(code, "rev-parse", "HEAD") != head
@@ -1019,7 +1110,7 @@ def test_rearm_reads_stale_restore_residue_from_the_code_tree(tmp_path):
     git(code, "commit", "-q", "-m", "resolution fixture")
     new_head = git(code, "rev-parse", "HEAD")
 
-    runs.rearm_escalation(run_dir)  # from scratch: the latch is dropped
+    runs.rearm_escalation(run_dir, isolated_redrive=False)  # from scratch: the latch is dropped
 
     task = load_state(run_dir).tasks["6-4-cli-list-command"]
     assert task.baseline_commit == new_head
@@ -1060,7 +1151,7 @@ def test_rearm_falls_back_to_project_when_no_code_root_was_recorded(tmp_path):
     (run_dir / "state.json").write_text(json.dumps(raw), encoding="utf-8")
 
     assert load_state(run_dir).repo_root == ""
-    runs.rearm_escalation(run_dir)
+    runs.rearm_escalation(run_dir, isolated_redrive=False)
     assert load_state(run_dir).tasks["6-4-cli-list-command"].baseline_commit == head
 
 
@@ -1077,7 +1168,7 @@ def test_rearm_writes_the_worktree_spec_not_the_main_checkouts_copy(monkeypatch,
     flip AND the baseline re-stamp landed on a spec the run never used, while the
     worktree's real spec kept the escalated attempt's sha and the re-drive re-wedged.
 
-    `_task_spec_path` now anchors a relative path on `task.worktree_path` (falling back
+    `task_spec_path` now anchors a relative path on `task.worktree_path` (falling back
     to `state.project`) and passes an absolute one through.
 
     The cwd is set EXPLICITLY: pytest's own cwd is not this sandbox, so without the
@@ -1086,7 +1177,7 @@ def test_rearm_writes_the_worktree_spec_not_the_main_checkouts_copy(monkeypatch,
     carry distinguishable `baseline_revision` claims for the same reason — "the right
     file was written" has to be checkable against "the other one was not".
 
-    Ablation: revert `_task_spec_path`'s body to `return Path(task.spec_file or "")`
+    Ablation: revert `task_spec_path`'s body to `return Path(task.spec_file or "")`
     and this reddens on the worktree copy with
     `AssertionError: assert 'blocked' == 'ready-for-dev'` — the flip went to the main
     checkout — and the byte-identity assertion on the main copy reddens behind it.
@@ -1107,7 +1198,7 @@ def test_rearm_writes_the_worktree_spec_not_the_main_checkouts_copy(monkeypatch,
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=rel, worktree_path=str(wt))
     monkeypatch.chdir(tmp_path)  # what `bmad-loop resolve` actually runs from
 
-    runs.rearm_escalation(run_dir)
+    runs.rearm_escalation(run_dir, isolated_redrive=True)
 
     fm = verify.read_frontmatter(wt / rel)
     assert fm["status"] == "ready-for-dev"  # the flip landed in the WORKTREE
@@ -1143,7 +1234,9 @@ def test_rearm_journals_a_skip_when_the_recorded_spec_is_not_readable(tmp_path):
     _resolve_repo(tmp_path)
     run_dir, _, _ = _escalated_run(tmp_path, spec_file="wt/_bmad-output/specs/gone.md")
 
-    runs.rearm_escalation(run_dir)  # must not raise: the flip's no-op is not a refusal
+    runs.rearm_escalation(
+        run_dir, isolated_redrive=False
+    )  # must not raise: the flip's no-op is not a refusal
 
     kinds = _kinds(run_dir)
     (skipped,) = [e for e in kinds if e["kind"] == "rearm-baseline-restamp-skipped"]
@@ -1182,7 +1275,7 @@ def test_rearm_records_an_unreachable_spec_even_when_the_advance_failed(tmp_path
         _resolve_repo(tmp_path)
     run_dir, _, _ = _escalated_run(tmp_path, spec_file="wt/_bmad-output/specs/gone.md")
 
-    runs.rearm_escalation(run_dir)
+    runs.rearm_escalation(run_dir, isolated_redrive=False)
 
     kinds = _kinds(run_dir)
     (skipped,) = [e for e in kinds if e["kind"] == "rearm-baseline-restamp-skipped"]
@@ -1210,7 +1303,7 @@ def test_rearm_restamps_normally_when_the_spec_resolves(tmp_path):
     spec.write_text("---\nstatus: 'escalated'\nbaseline_revision: 'old'\n---\n\nbody\n")
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec))
 
-    runs.rearm_escalation(run_dir)
+    runs.rearm_escalation(run_dir, isolated_redrive=False)
 
     kinds = _kinds(run_dir)
     assert [e for e in kinds if e["kind"] == "rearm-baseline-restamp-skipped"] == []
@@ -1239,7 +1332,7 @@ def test_rearm_clears_sentinel_preserving_a_copy(tmp_path):
         tmp_path, spec_file=str(sentinel), source="stories", sentinel_kind="unresolved"
     )
 
-    returned = runs.rearm_escalation(run_dir)
+    returned = runs.rearm_escalation(run_dir, isolated_redrive=False)
     assert returned == key
 
     # sentinel deleted from disk, a copy preserved under the run dir
@@ -1279,7 +1372,7 @@ def test_rearm_non_sentinel_spec_still_flips_status(tmp_path):
     # detected as a sentinel) → status-flip, not delete.
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec), source="stories")
 
-    runs.rearm_escalation(run_dir)
+    runs.rearm_escalation(run_dir, isolated_redrive=False)
     assert spec.is_file()  # not deleted
     assert verify.read_frontmatter(spec)["status"] == "ready-for-dev"
     assert load_state(run_dir).tasks[key].spec_file == str(spec)  # kept
@@ -1299,7 +1392,7 @@ def test_rearm_sentinel_named_spec_never_detected_is_not_deleted(tmp_path):
     # stories mode, but sentinel_kind unset — the run never classified it as a sentinel
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec), source="stories")
 
-    runs.rearm_escalation(run_dir)
+    runs.rearm_escalation(run_dir, isolated_redrive=False)
     assert spec.is_file()  # NOT deleted despite the sentinel-shaped name
     assert verify.read_frontmatter(spec)["status"] == "ready-for-dev"
     assert load_state(run_dir).tasks[key].spec_file == str(spec)  # kept
@@ -1316,7 +1409,7 @@ def test_rearm_sprint_spec_named_like_a_sentinel_is_not_deleted(tmp_path):
     spec.write_text("---\nstatus: blocked\n---\n\n## Intent\n\nreal work\n", encoding="utf-8")
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec))  # sprint-status source
 
-    runs.rearm_escalation(run_dir)
+    runs.rearm_escalation(run_dir, isolated_redrive=False)
     assert spec.is_file()  # NOT deleted despite the sentinel-shaped name
     assert verify.read_frontmatter(spec)["status"] == "ready-for-dev"  # flipped like any spec
     assert load_state(run_dir).tasks[key].spec_file == str(spec)  # kept
@@ -1342,7 +1435,9 @@ def test_rearm_rejects_restore_patch_on_a_sentinel(tmp_path):
     )
 
     with pytest.raises(runs.RearmError, match="sentinel"):
-        runs.rearm_escalation(run_dir, restore_patch="artifacts/attempt.patch")
+        runs.rearm_escalation(
+            run_dir, restore_patch="artifacts/attempt.patch", isolated_redrive=False
+        )
 
     assert sentinel.is_file()  # nothing deleted, copy NOT preserved — no clear happened
     task = load_state(run_dir).tasks[key]
@@ -1362,14 +1457,18 @@ def test_rearm_rejects_restore_patch_without_a_spec_file(tmp_path):
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=None)
 
     with pytest.raises(runs.RearmError, match="no recorded spec file"):
-        runs.rearm_escalation(run_dir, restore_patch="artifacts/attempt.patch")
+        runs.rearm_escalation(
+            run_dir, restore_patch="artifacts/attempt.patch", isolated_redrive=False
+        )
 
     task = load_state(run_dir).tasks["6-4-cli-list-command"]
     assert task.phase == Phase.ESCALATED  # not re-armed; the escalation stays armed
     assert task.restore_patch is None  # no latch persisted
     assert not (run_dir / "journal.jsonl").exists()  # nothing journaled
 
-    runs.rearm_escalation(run_dir)  # a from-scratch re-arm remains available
+    runs.rearm_escalation(
+        run_dir, isolated_redrive=False
+    )  # a from-scratch re-arm remains available
     assert load_state(run_dir).tasks["6-4-cli-list-command"].phase == Phase.PENDING
 
 
@@ -1385,13 +1484,15 @@ def test_rearm_rejects_restore_patch_for_a_worktree_executed_task(tmp_path):
     )
 
     with pytest.raises(runs.RearmError, match="worktree-isolation"):
-        runs.rearm_escalation(run_dir, restore_patch="artifacts/attempt.patch")
+        runs.rearm_escalation(
+            run_dir, restore_patch="artifacts/attempt.patch", isolated_redrive=True
+        )
 
     task = load_state(run_dir).tasks["6-4-cli-list-command"]
     assert task.phase == Phase.ESCALATED  # nothing mutated; still armed for a re-resolve
     assert task.restore_patch is None
     # a from-scratch re-arm of the same task is unaffected — the guard is latch-only
-    assert runs.rearm_escalation(run_dir) == "6-4-cli-list-command"
+    assert runs.rearm_escalation(run_dir, isolated_redrive=True) == "6-4-cli-list-command"
 
 
 def test_validate_restore_latch_passes_a_clean_in_place_escalation(tmp_path):
@@ -1418,7 +1519,7 @@ def test_rearm_restore_patch_on_a_real_stories_spec_is_allowed(tmp_path):
     spec.write_text("---\nstatus: blocked\n---\n\n## Intent\n\nx\n", encoding="utf-8")
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec), source="stories")
 
-    runs.rearm_escalation(run_dir, restore_patch="artifacts/attempt.patch")
+    runs.rearm_escalation(run_dir, restore_patch="artifacts/attempt.patch", isolated_redrive=False)
     task = load_state(run_dir).tasks[key]
     assert task.phase == Phase.PENDING
     assert task.restore_patch == "artifacts/attempt.patch"
@@ -1458,7 +1559,7 @@ def test_rearm_restore_patch_restamps_spec_baseline(tmp_path):
     git(tmp_path, "commit", "-q", "-m", "resolution fixture")
     new_head = git(tmp_path, "rev-parse", "HEAD")
 
-    runs.rearm_escalation(run_dir, restore_patch="artifacts/attempt.patch")
+    runs.rearm_escalation(run_dir, restore_patch="artifacts/attempt.patch", isolated_redrive=False)
 
     fm = verify.read_frontmatter(spec)
     assert fm["baseline_revision"] == new_head  # step-04 diffs from the ADVANCED baseline
@@ -1508,7 +1609,7 @@ def test_rearm_restamps_spec_baseline_on_the_from_scratch_leg_too(tmp_path):
     old_head = _resolve_repo(tmp_path)
     run_dir, spec, new_head = _escalated_spec_run(tmp_path, old_head)
 
-    runs.rearm_escalation(run_dir)  # no restore
+    runs.rearm_escalation(run_dir, isolated_redrive=False)  # no restore
 
     fm = verify.read_frontmatter(spec)
     assert fm["baseline_revision"] == new_head
@@ -1559,7 +1660,7 @@ def test_rearm_restores_the_spec_when_the_baseline_restamp_aborts(tmp_path):
     git(tmp_path, "commit", "-q", "-m", "resolution fixture")
 
     with pytest.raises(runs.RearmError, match="baseline_revision"):
-        runs.rearm_escalation(run_dir)
+        runs.rearm_escalation(run_dir, isolated_redrive=False)
 
     assert spec.read_bytes() == before  # flip AND strip both undone
     # nothing was persisted either, so the escalation is still armed for a corrected spec
@@ -1589,7 +1690,10 @@ def test_rearm_restores_the_spec_when_the_result_strip_faults(tmp_path, monkeypa
 
     Ablation: drop the `_restore_rearmed_spec(...)` call from that arm and this reddens on
     the byte comparison alone — the `RearmError` and the ESCALATED phase both still pass,
-    since the flip landing is precisely what neither observes.
+    since the flip landing is precisely what neither observes. Both of those assertions
+    are load-bearing for that claim, so both stay in THIS test: an isolated sibling row
+    was once inserted between them and silently adopted the phase check, leaving this
+    docstring citing an assertion the test no longer made.
     """
     _resolve_repo(tmp_path)
     spec = tmp_path / "spec.md"
@@ -1607,9 +1711,55 @@ def test_rearm_restores_the_spec_when_the_result_strip_faults(tmp_path, monkeypa
     monkeypatch.setattr(runs.devcontract, "strip_auto_run_result", boom)
 
     with pytest.raises(runs.RearmError, match="No space left on device"):
-        runs.rearm_escalation(run_dir)
+        runs.rearm_escalation(run_dir, isolated_redrive=False)
 
     assert spec.read_bytes() == before  # the published flip is rolled back
+    assert load_state(run_dir).tasks["6-4-cli-list-command"].phase == Phase.ESCALATED
+
+
+def test_rearm_restores_an_isolated_tasks_spec_that_sits_outside_the_worktree(
+    tmp_path, monkeypatch
+):
+    """The undo must still land when the mount cannot confine the spec.
+
+    An absolute `spec_file` beside a set `worktree_path` means the spec is lexically
+    OUTSIDE the mount (`model._serialized_worktree_path` keeps a path verbatim exactly
+    when `relative_to(worktree_path)` raises) — the shape a shared artifact directory
+    produces. `_restore_rearmed_spec` calls `atomic_write_bytes_confined` DIRECTLY, so
+    a `confine_root` naming the worktree does not merely degrade the write the way the
+    three `_atomic_write_spec` writers do: it raises `UnconfinedWriteError`, which the
+    arm re-raises as "cannot restore ...". The operator was then left with the exact
+    state the undo exists to prevent — a spec carrying this re-arm's status flip and
+    stripped of its `## Auto Run Result`, on a story the run still calls ESCALATED —
+    plus a second error masking the first.
+
+    `task_spec_root` now answers the project for that shape, which CAN confine the
+    spec, so the restore lands and the original fault is the one that surfaces.
+
+    Ablation: revert `task_spec_root` to `Path(task.worktree_path or state.project)`
+    and this reddens twice — the `match=` fails on "cannot restore ... UnconfinedWrite
+    Error", and the byte comparison fails behind it.
+    """
+    _resolve_repo(tmp_path)
+    wt = tmp_path / ".bmad-loop" / "runs" / "wt-mount"  # the mount, which holds no spec
+    wt.mkdir(parents=True, exist_ok=True)
+    spec = tmp_path / "spec.md"  # in the project, outside the mount
+    spec.write_text(
+        "---\nstatus: blocked\n---\n\n## Intent\n\nx\n\n## Auto Run Result\n\nterminal verdict\n",
+        encoding="utf-8",
+    )
+    before = spec.read_bytes()
+    run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec), worktree_path=str(wt))
+
+    def boom(spec_path, *, confine_root):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(runs.devcontract, "strip_auto_run_result", boom)
+
+    with pytest.raises(runs.RearmError, match="No space left on device"):
+        runs.rearm_escalation(run_dir, isolated_redrive=True)
+
+    assert spec.read_bytes() == before  # the undo reached a spec outside the mount
     assert load_state(run_dir).tasks["6-4-cli-list-command"].phase == Phase.ESCALATED
 
 
@@ -1626,7 +1776,7 @@ def test_rearm_journals_the_spec_baseline_it_overwrote(tmp_path):
     old_head = _resolve_repo(tmp_path)
     run_dir, _spec, new_head = _escalated_spec_run(tmp_path, old_head)
 
-    runs.rearm_escalation(run_dir)
+    runs.rearm_escalation(run_dir, isolated_redrive=False)
 
     (entry,) = [e for e in _kinds(run_dir) if e["kind"] == "rearm-baseline-restamped"]
     assert entry["overwritten"] == old_head
@@ -1635,7 +1785,7 @@ def test_rearm_journals_the_spec_baseline_it_overwrote(tmp_path):
 
     # a second re-arm has nothing left to overwrite: no duplicate record
     save_state(run_dir, _rearmable(run_dir))
-    runs.rearm_escalation(run_dir)
+    runs.rearm_escalation(run_dir, isolated_redrive=False)
     assert len([e for e in _kinds(run_dir) if e["kind"] == "rearm-baseline-restamped"]) == 1
 
 
@@ -1661,7 +1811,7 @@ def test_rearm_does_not_report_a_divergence_the_run_never_had(tmp_path):
     old_head = _resolve_repo(tmp_path)
     run_dir, spec, new_head = _escalated_spec_run(tmp_path, old_head, recorded=old_head)
 
-    runs.rearm_escalation(run_dir)
+    runs.rearm_escalation(run_dir, isolated_redrive=False)
 
     # the re-stamp itself ran: this row is about what was REPORTED, not what was skipped
     assert verify.read_frontmatter(spec)["baseline_revision"] == new_head
@@ -1697,7 +1847,7 @@ def test_rearm_reports_a_claim_the_advanced_head_would_have_masked(tmp_path):
         encoding="utf-8",
     )
 
-    runs.rearm_escalation(run_dir)
+    runs.rearm_escalation(run_dir, isolated_redrive=False)
 
     (entry,) = [e for e in _kinds(run_dir) if e["kind"] == "rearm-baseline-restamped"]
     assert entry["overwritten"] == new_head  # the claim, carried verbatim
@@ -1714,7 +1864,7 @@ def test_rearm_prefers_the_fresh_revision_when_the_spec_carries_both_keys(tmp_pa
         tmp_path, old_head, extra=f"baseline_commit: {'a' * 40}\n"
     )
 
-    runs.rearm_escalation(run_dir)
+    runs.rearm_escalation(run_dir, isolated_redrive=False)
 
     (entry,) = [e for e in _kinds(run_dir) if e["kind"] == "rearm-baseline-restamped"]
     assert entry["overwritten"] == old_head  # NOT the stale baseline_commit
@@ -1750,7 +1900,7 @@ def test_build_context_tolerates_non_utf8_present_spec(tmp_path):
     (stories_dir / f"{key}-slug.md").write_bytes(_BAD_UTF8)  # a real spec, undecodable
     run_dir, state, _ = _escalated_run(tmp_path, source="stories")
 
-    path = resolve.build_context(state, run_dir, key)  # must not raise
+    path = resolve.build_context(state, run_dir, key, isolation="")  # must not raise
     ctx = json.loads(path.read_text(encoding="utf-8"))
     assert ctx["stories"]["spec_folder"] == ""  # best-effort context still produced
     assert "sentinel" not in ctx["stories"]  # the undecodable spec yields no sentinel
@@ -1765,7 +1915,7 @@ def test_build_context_tolerates_non_utf8_sentinel(tmp_path):
     (stories_dir / f"{key}-unresolved.md").write_bytes(_BAD_UTF8)  # undecodable sentinel
     run_dir, state, _ = _escalated_run(tmp_path, source="stories", sentinel_kind="unresolved")
 
-    path = resolve.build_context(state, run_dir, key)  # must not raise
+    path = resolve.build_context(state, run_dir, key, isolation="")  # must not raise
     ctx = json.loads(path.read_text(encoding="utf-8"))
     assert ctx["stories"]["sentinel"]["kind"] == "unresolved"
     assert ctx["stories"]["sentinel"]["blocking_condition"] == ""  # unreadable → empty
@@ -1786,7 +1936,7 @@ def test_rearm_non_utf8_present_spec_fails_clean_and_stays_armed(tmp_path):
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spec), source="stories")
 
     with pytest.raises(runs.RearmError) as exc:
-        runs.rearm_escalation(run_dir)
+        runs.rearm_escalation(run_dir, isolated_redrive=False)
     assert "UTF-8" in str(exc.value) and "resolve" in str(exc.value)
     assert spec.read_bytes() == _BAD_UTF8  # spec untouched
     task = load_state(run_dir).tasks[key]
@@ -1806,7 +1956,7 @@ def test_rearm_tolerates_non_utf8_sentinel(tmp_path):
         tmp_path, spec_file=str(sentinel), source="stories", sentinel_kind="unresolved"
     )
 
-    assert runs.rearm_escalation(run_dir) == key  # must not raise
+    assert runs.rearm_escalation(run_dir, isolated_redrive=False) == key  # must not raise
     assert not sentinel.exists()  # cleared by deletion
     assert (run_dir / "sentinels" / f"{key}-unresolved.md").is_file()  # copy preserved
     assert load_state(run_dir).tasks[key].spec_file is None  # cleared → PENDING re-dispatch
@@ -1839,7 +1989,7 @@ def test_rearm_rejects_non_escalation_stage(tmp_path):
         ),
     )
     with pytest.raises(runs.RearmError, match="not paused at an escalation"):
-        runs.rearm_escalation(run_dir)
+        runs.rearm_escalation(run_dir, isolated_redrive=False)
 
 
 def test_rearm_rejects_unescalated_story(tmp_path):
@@ -1847,7 +1997,7 @@ def test_rearm_rejects_unescalated_story(tmp_path):
     task.phase = Phase.DONE  # terminal but not escalated
     save_state(run_dir, state)
     with pytest.raises(runs.RearmError, match="not escalated"):
-        runs.rearm_escalation(run_dir)
+        runs.rearm_escalation(run_dir, isolated_redrive=False)
 
 
 # ----------------------------------------------------------- run_session
@@ -1866,7 +2016,7 @@ class _FakeAdapter:
 
 def test_run_session_detects_resolution(tmp_path, monkeypatch):
     run_dir, state, _ = _escalated_run(tmp_path)
-    resolve.build_context(state, run_dir, "6-4-cli-list-command")
+    resolve.build_context(state, run_dir, "6-4-cli-list-command", isolation="")
 
     def fake_subprocess_run(argv, cwd, env):
         # simulate the agent writing the resolution marker
@@ -1879,7 +2029,7 @@ def test_run_session_detects_resolution(tmp_path, monkeypatch):
 
 def test_run_session_no_resolution(tmp_path, monkeypatch):
     run_dir, state, _ = _escalated_run(tmp_path)
-    resolve.build_context(state, run_dir, "6-4-cli-list-command")
+    resolve.build_context(state, run_dir, "6-4-cli-list-command", isolation="")
     monkeypatch.setattr(resolve.subprocess, "run", lambda *a, **k: None)
     assert (
         resolve.run_session(_FakeAdapter(None), tmp_path, run_dir, "6-4-cli-list-command") is False
@@ -1890,7 +2040,7 @@ def test_run_session_clears_stale_marker(tmp_path, monkeypatch):
     """A marker left by a previous resolve of this story must not be read as
     this session's output (the agent that says 'already resolved' writes none)."""
     run_dir, state, _ = _escalated_run(tmp_path)
-    resolve.build_context(state, run_dir, "6-4-cli-list-command")
+    resolve.build_context(state, run_dir, "6-4-cli-list-command", isolation="")
     stale = resolve.resolution_path(run_dir, "6-4-cli-list-command")
     stale.parent.mkdir(parents=True, exist_ok=True)
     stale.write_text('{"from": "last time"}', encoding="utf-8")
@@ -1928,7 +2078,9 @@ def test_build_context_stories_carries_manifest_entry(tmp_path):
     run_dir, state, _ = _escalated_run(tmp_path, spec_file="/abs/spec.md", source="stories")
     state.spec_folder = "epic-1"
 
-    ctx = json.loads(resolve.build_context(state, run_dir, key).read_text(encoding="utf-8"))
+    ctx = json.loads(
+        resolve.build_context(state, run_dir, key, isolation="").read_text(encoding="utf-8")
+    )
     st = ctx["stories"]
     assert st["spec_folder"] == "epic-1"
     assert st["story"]["title"] == "List command"
@@ -1952,7 +2104,9 @@ def test_build_context_stories_sentinel_indicator(tmp_path):
     run_dir, state, _ = _escalated_run(tmp_path, spec_file=str(sentinel), source="stories")
     state.spec_folder = "epic-1"
 
-    ctx = json.loads(resolve.build_context(state, run_dir, key).read_text(encoding="utf-8"))
+    ctx = json.loads(
+        resolve.build_context(state, run_dir, key, isolation="").read_text(encoding="utf-8")
+    )
     sent = ctx["stories"]["sentinel"]
     assert sent["kind"] == "unresolved"
     assert "intent too vague" in sent["blocking_condition"]
@@ -1962,9 +2116,198 @@ def test_build_context_sprint_mode_has_no_stories_block(tmp_path):
     """Sprint mode leaves the context contract unchanged — no stories block."""
     run_dir, state, _ = _escalated_run(tmp_path, spec_file="/abs/spec.md")  # sprint source
     ctx = json.loads(
-        resolve.build_context(state, run_dir, "6-4-cli-list-command").read_text(encoding="utf-8")
+        resolve.build_context(state, run_dir, "6-4-cli-list-command", isolation="").read_text(
+            encoding="utf-8"
+        )
     )
     assert "stories" not in ctx
+
+
+def test_build_context_leaves_an_out_of_mount_spec_unchanged(tmp_path):
+    """Matrix row 5 graded at the layer that PUBLISHES the path to a human.
+
+    An absolute `spec_file` beside a set `worktree_path` is the out-of-mount shape
+    (`_serialized_worktree_path` keeps a path verbatim exactly when
+    `relative_to(worktree_path)` raises). `task_spec_path` passes it through untouched,
+    so `context.json` must show it unchanged rather than re-anchored onto either tree.
+    The row exists here because the `runs` and TUI layers grade the resolver while this
+    is the surface that hands the value to the resolve agent.
+    """
+    wt = tmp_path / ".bmad-loop" / "runs" / "20260613-111429-6a14" / "worktrees" / "1"
+    spec = tmp_path / "shared-artifacts" / "6-4.md"
+    spec.parent.mkdir(parents=True)
+    spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+    run_dir, state, _ = _escalated_run(tmp_path, spec_file=str(spec), worktree_path=str(wt))
+
+    ctx = json.loads(
+        resolve.build_context(
+            state, run_dir, "6-4-cli-list-command", isolation="worktree"
+        ).read_text(encoding="utf-8")
+    )
+    assert ctx["spec_file"] == spec.as_posix()
+
+
+def test_build_context_stories_block_names_the_same_tree_as_spec_file(tmp_path):
+    """One `context.json` must not name two different trees for one story.
+
+    `spec_file` is anchored on the tree the run owns, but `_stories_context` resolved
+    its folder from `Path(state.project)` — so under isolation the sentinel indicator
+    and its recorded blocking condition described the MAIN CHECKOUT while `spec_file`
+    named the mount. The agent was then told there is no frozen spec to edit (or handed
+    a stale twin's blocking condition) for a story whose real sentinel sits in the
+    worktree the re-arm actually writes to.
+
+    The decoy is load-bearing: the project carries a sentinel at the same relpath with a
+    DIFFERENT blocking condition, so "read the right tree" is checkable against "did not
+    read the other one".
+
+    Ablation: revert `_stories_context` to `stories.resolve_spec_folder(Path(state.project),
+    ...)` and this reddens on the blocking condition — it reports the decoy's.
+    """
+    key = "6-4-cli-list-command"
+    run_id = "20260613-111429-6a14"
+    wt = tmp_path / ".bmad-loop" / "runs" / run_id / "worktrees" / "1"
+
+    for root, condition in ((wt, "the mount's real halt"), (tmp_path, "the decoy twin")):
+        folder = root / "epic-1"
+        _stories_manifest(folder, [{"id": key, "title": "t", "description": "d"}])
+        (folder / "stories" / f"{key}-unresolved.md").write_text(
+            f"---\nstatus: blocked\n---\n\n## Auto Run Result\n\nStatus: blocked\n{condition}\n",
+            encoding="utf-8",
+        )
+
+    rel = f"epic-1/stories/{key}-unresolved.md"
+    run_dir, state, _ = _escalated_run(
+        tmp_path, run_id, spec_file=rel, source="stories", worktree_path=str(wt)
+    )
+    state.spec_folder = "epic-1"
+
+    ctx = json.loads(
+        resolve.build_context(state, run_dir, key, isolation="worktree").read_text(encoding="utf-8")
+    )
+    assert ctx["spec_file"] == (wt / rel).as_posix()
+    sent = ctx["stories"]["sentinel"]
+    assert "the mount's real halt" in sent["blocking_condition"]
+    assert "decoy" not in sent["blocking_condition"]
+    assert Path(sent["path"]).is_relative_to(wt)  # the same tree spec_file named
+
+
+def test_build_context_stories_block_stays_on_the_mount_for_an_out_of_mount_spec(tmp_path):
+    """The consumer half of the divergent shape, at the surface that motivated the split.
+
+    `test_build_context_stories_block_names_the_same_tree_as_spec_file` above builds the
+    isolated case with a RELATIVE `spec_file`, where `task_spec_root` and
+    `task_stories_root` return the same tree — so it passes with either resolver wired in
+    and cannot grade the choice. Here `spec_file` is ABSOLUTE and lexically outside the
+    mount (the shape `_serialized_worktree_path` persists verbatim, reachable whenever a
+    symlinked component makes a spec that physically lives in the mount look outside it,
+    since `verify.resolve_spec_path` deliberately does not `.resolve()`).
+
+    There `task_spec_root` answers the PROJECT — a write-confinement decision — while the
+    story manifest still lives in the mount, exactly where `stories_engine._stories_folder`
+    looks for it.
+
+    Ablation: revert `_stories_context`'s root to `task_spec_root(task, state)` and this
+    reddens on the blocking condition — it reports the decoy twin's."""
+    key = "6-4-cli-list-command"
+    run_id = "20260613-111429-6a14"
+    wt = tmp_path / ".bmad-loop" / "runs" / run_id / "worktrees" / "1"
+
+    for root, condition in ((wt, "the mount's real halt"), (tmp_path, "the decoy twin")):
+        folder = root / "epic-1"
+        _stories_manifest(folder, [{"id": key, "title": "t", "description": "d"}])
+        (folder / "stories" / f"{key}-unresolved.md").write_text(
+            f"---\nstatus: blocked\n---\n\n## Auto Run Result\n\nStatus: blocked\n{condition}\n",
+            encoding="utf-8",
+        )
+
+    # absolute and outside the mount: the two resolvers now answer different trees
+    outside = tmp_path / "shared-artifacts" / f"{key}.md"
+    outside.parent.mkdir(parents=True, exist_ok=True)
+    outside.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+
+    run_dir, state, _ = _escalated_run(
+        tmp_path, run_id, spec_file=str(outside), source="stories", worktree_path=str(wt)
+    )
+    state.spec_folder = "epic-1"
+
+    ctx = json.loads(
+        resolve.build_context(state, run_dir, key, isolation="worktree").read_text(encoding="utf-8")
+    )
+    assert ctx["spec_file"] == outside.as_posix()  # unchanged: absolute passes through
+    sent = ctx["stories"]["sentinel"]
+    assert "the mount's real halt" in sent["blocking_condition"]
+    assert "decoy" not in sent["blocking_condition"]
+    assert Path(sent["path"]).is_relative_to(wt)  # the mount, NOT task_spec_root's project
+
+
+def test_build_context_reports_whether_the_spec_reaches_the_redrive(tmp_path):
+    """The agent is told when the file it is being sent to edit has no future.
+
+    Under isolation `engine._finish_inflight` discards the mount, so an edit to a
+    worktree-local spec succeeds and then vanishes before the re-drive reads anything.
+    `rearm_escalation` already journals `rearm-spec-write-unreachable` on this verdict;
+    emitting it here is what lets the session act on it rather than discover it after.
+
+    Ablation: hardcode the field to `True` and the isolated leg reddens.
+    """
+    wt = tmp_path / ".bmad-loop" / "runs" / "20260613-111429-6a14" / "worktrees" / "1"
+    run_dir, state, _ = _escalated_run(tmp_path, spec_file="specs/6-4.md", worktree_path=str(wt))
+    ctx = json.loads(
+        resolve.build_context(
+            state, run_dir, "6-4-cli-list-command", isolation="worktree"
+        ).read_text(encoding="utf-8")
+    )
+    assert ctx["spec_reaches_the_redrive"] is False
+
+    plain_dir, plain_state, _ = _escalated_run(
+        tmp_path, "20260613-111429-6a15", spec_file=str(tmp_path / "specs" / "6-4.md")
+    )
+    plain = json.loads(
+        resolve.build_context(
+            plain_state, plain_dir, "6-4-cli-list-command", isolation=""
+        ).read_text(encoding="utf-8")
+    )
+    assert plain["spec_reaches_the_redrive"] is True
+
+
+def test_build_context_names_where_an_unreachable_correction_has_to_land(tmp_path):
+    """`spec_reaches_the_redrive: false` on its own states a problem with no remedy.
+
+    The session is told its edit is doomed, and both obvious repairs fail silently for
+    an isolated unit: committing from the main checkout cannot include a file that
+    lives in the linked unit worktree, and committing on the unit's own branch does
+    not put it on the ref the replacement worktree is cut from. That ref is the run's
+    PINNED `target_branch`, which is what this field carries — the same value
+    `rearm_escalation`'s unreachable-write record names, so the session and the
+    orchestrator quote one answer instead of two.
+
+    Ablation: return `"HEAD"` unconditionally and the isolated leg reddens; drop the
+    key and the skill-contract guard reddens too, since the schema documents it.
+    """
+    wt = tmp_path / ".bmad-loop" / "runs" / "20260613-111429-6a14" / "worktrees" / "1"
+    run_dir, state, _ = _escalated_run(tmp_path, spec_file="specs/6-4.md", worktree_path=str(wt))
+    state.target_branch = "feat/the-pinned-one"
+    ctx = json.loads(
+        resolve.build_context(
+            state, run_dir, "6-4-cli-list-command", isolation="worktree"
+        ).read_text(encoding="utf-8")
+    )
+    # the paired claim: the edit has no future, and THIS is the tree that does
+    assert ctx["spec_reaches_the_redrive"] is False
+    assert ctx["redrive_base_ref"] == "feat/the-pinned-one"
+
+    # in-place: no mount, so the re-drive reads the working ref
+    plain_dir, plain_state, _ = _escalated_run(
+        tmp_path, "20260613-111429-6a15", spec_file=str(tmp_path / "specs" / "6-4.md")
+    )
+    plain_state.target_branch = "feat/the-pinned-one"  # set, but no mount to make it apply
+    plain = json.loads(
+        resolve.build_context(
+            plain_state, plain_dir, "6-4-cli-list-command", isolation=""
+        ).read_text(encoding="utf-8")
+    )
+    assert plain["redrive_base_ref"] == "HEAD"
 
 
 @pytest.mark.parametrize(
@@ -2009,7 +2352,7 @@ def test_rearm_warns_about_an_unreachable_spec_write_only_when_it_is_actionable(
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=rel, worktree_path=str(tmp_path / "wt"))
     monkeypatch.chdir(tmp_path)
 
-    runs.rearm_escalation(run_dir)
+    runs.rearm_escalation(run_dir, isolated_redrive=True)
 
     unreachable = [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-write-unreachable"]
     assert bool(unreachable) is warns
@@ -2048,7 +2391,7 @@ def test_rearm_reads_the_committed_spec_from_the_redrive_base_not_the_current_he
     The worktree copy is held at `blocked` on both rows, so the only moving part is
     which committed ref carries the correction.
 
-    Ablation: restore the revision argument in `_committed_spec_status` to a literal
+    Ablation: restore the revision argument in `_redrive_spec_status` to a literal
     `"HEAD"` and BOTH rows redden (`assert False is True` / `assert True is False`) —
     the pair is the discriminator; either row alone also passes for the anchor it is
     meant to reject.
@@ -2081,7 +2424,7 @@ def test_rearm_reads_the_committed_spec_from_the_redrive_base_not_the_current_he
     )
     monkeypatch.chdir(tmp_path)
 
-    runs.rearm_escalation(run_dir)
+    runs.rearm_escalation(run_dir, isolated_redrive=True)
 
     unreachable = [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-write-unreachable"]
     assert bool(unreachable) is warns
@@ -2095,13 +2438,428 @@ def test_rearm_reads_the_committed_spec_from_the_redrive_base_not_the_current_he
         assert "`main`" in runs.rearm_event_notice(unreachable[0])[2]
 
 
+SPEC_FOLDER = "_bmad-output/epic-6"
+WEDGED_INTENT = "# Epic 6\n\nDo the thing, somehow.\n"
+CORRECTED_INTENT = "# Epic 6\n\nDo the thing by rotating the vault key first.\n"
+MANIFEST = "- id: 6-4-cli-list-command\n  title: List command\n  description: list them\n"
+
+
+def _sentinel_run(
+    tmp_path,
+    *,
+    committed_intent,
+    working_intent,
+    spec_folder=SPEC_FOLDER,
+    target_branch="main",
+):
+    """A stories-mode run wedged on a pre-planning SENTINEL, in a real repo.
+
+    The upstream artifacts (`SPEC.md` + `stories.yaml`) are COMMITTED holding
+    ``committed_intent`` and then left in the working tree holding
+    ``working_intent`` — the two halves the re-arm's proof compares. Equal strings
+    mean "the operator's correction is already on the branch the re-drive mounts
+    from"; different ones mean it is still only in this checkout.
+
+    A `worktree_path` is always recorded, because that is what an escalated unit
+    under `isolation = "worktree"` really carries (`worktree_flow.escalate_unit`
+    never clears it) and because it is the field that must NOT move the answer: the
+    correction lands in the main checkout either way, since `resolve.run_session`
+    runs the agent with `cwd=project`.
+    """
+    key = "6-4-cli-list-command"
+    _resolve_repo(tmp_path)
+    folder = Path(spec_folder)
+    folder = folder if folder.is_absolute() else tmp_path / folder
+    folder.mkdir(parents=True, exist_ok=True)
+    spec_md, manifest = folder / "SPEC.md", folder / "stories.yaml"
+    spec_md.write_text(committed_intent, encoding="utf-8")
+    manifest.write_text(MANIFEST, encoding="utf-8")
+    if folder.is_relative_to(tmp_path):
+        git(tmp_path, "add", "-A")
+        git(tmp_path, "commit", "-q", "-m", "upstream artifacts")
+    # an external artifact dir is outside the repo entirely — there is nothing to commit,
+    # which is the whole point of the row that uses one
+    spec_md.write_text(working_intent, encoding="utf-8")
+
+    sentinel = folder / f"{key}-unresolved.md"
+    sentinel.write_text(
+        "---\nstatus: blocked\n---\n\n## Auto Run Result\n\n" "Status: blocked\nintent too vague\n",
+        encoding="utf-8",
+    )
+    mount = tmp_path / "wt"
+    mount.mkdir(exist_ok=True)
+    run_dir, state, _ = _escalated_run(
+        tmp_path,
+        spec_file=str(sentinel),
+        source="stories",
+        sentinel_kind="unresolved",
+        worktree_path=str(mount),
+        spec_folder=spec_folder,
+        target_branch=target_branch,
+    )
+    return run_dir, state, sentinel
+
+
+def _upstream_records(run_dir):
+    return [e for e in _kinds(run_dir) if e["kind"] == "rearm-upstream-write-unreachable"]
+
+
+@pytest.mark.parametrize(
+    ("isolated", "committed_matches", "warns"),
+    [(True, False, True), (True, True, False), (False, False, False)],
+)
+def test_rearm_holds_a_sentinel_until_the_upstream_correction_reaches_the_redrive(
+    tmp_path, monkeypatch, isolated, committed_matches, warns
+):
+    """The sentinel arm used to fall through the reachability gate entirely.
+
+    A sentinel is cleared by DELETION, so the arm drops `task.spec_file` and returns —
+    and `spec_reaches_the_redrive` / `rearm-spec-write-unreachable` live wholly in the
+    `else`. The consequence is not a missing warning but a spent escalation: the
+    correction that stops the sentinel RECURRING is upstream (`SPEC.md` /
+    `stories.yaml`, where `bmad-loop-resolve/SKILL.md` sends the agent instead of the
+    sentinel), an isolated re-drive mounts fresh from `redrive_base_ref` and re-plans
+    from a COMMITTED tree, and the re-plan mints the same sentinel again.
+
+    Three rows, because two of them are the narrowing and the third is the axis:
+
+    - isolated + the correction only in this checkout: the record fires and HOLDS the
+      resume. This is the P1.
+    - isolated + the same bytes already committed on the target branch: SILENT. Without
+      this proof the record is a per-configuration CONSTANT — every isolated stories run
+      resolves its spec folder inside the project, so `stories_reach_the_redrive` says
+      "unreachable" for 100% of sentinel re-arms under `isolation = "worktree"`, and
+      since the kind holds the resume that would turn every one of them into a
+      two-command gesture for an outcome nothing decided.
+    - IN PLACE, same uncommitted tree: SILENT. The re-drive reads the main checkout's
+      working tree, which is exactly where `cwd=project` put the correction. The
+      recorded mount is identical on all three rows precisely so it cannot be what
+      separates them.
+
+    Ablation: drop the `_redrive_reads_the_upstream_artifacts` conjunct from the gate
+    and row 2 reddens on `assert True is False`; make `stories_reach_the_redrive` return
+    False for the in-place leg and row 3 reddens; delete the whole `if` and row 1
+    reddens on `assert [] != []`. Every row alone is satisfied by a wrong fix.
+    """
+    intent = CORRECTED_INTENT if committed_matches else WEDGED_INTENT
+    run_dir, _, sentinel = _sentinel_run(
+        tmp_path, committed_intent=intent, working_intent=CORRECTED_INTENT
+    )
+    monkeypatch.chdir(tmp_path)
+
+    runs.rearm_escalation(run_dir, isolated_redrive=isolated)
+
+    assert not sentinel.exists()  # the sentinel really was cleared on every row
+    records = _upstream_records(run_dir)
+    assert bool(records) is warns
+    if not warns:
+        return
+    (rec,) = records
+    # the FOLDER the correction lands in — the main checkout's, not `task_stories_root`'s
+    # mount, because the resolve agent runs with `cwd=project`
+    assert rec["stories_root"] == str(tmp_path / SPEC_FOLDER)
+    assert rec["target_branch"] == "main"
+    # a resume in the same gesture would re-plan from the tree that wedged
+    assert runs.rearm_holds_the_resume(rec) is True
+    severity, message, next_step = runs.rearm_event_notice(rec)
+    assert severity == "warning"
+    assert "SPEC.md" in message and "stories.yaml" in message
+    assert next_step == "Commit the corrected SPEC.md / stories.yaml on `main` before resuming"
+
+
+@pytest.mark.parametrize(
+    ("corrected_on_target", "warns"),
+    [(True, False), (False, True)],
+)
+def test_rearm_reads_the_upstream_artifacts_at_the_redrive_base_not_the_current_head(
+    tmp_path, monkeypatch, corrected_on_target, warns
+):
+    """The proof is read at the run's PINNED target branch, not at the code root's HEAD.
+
+    The same seam `test_rearm_reads_the_committed_spec_from_the_redrive_base_not_the_current_head`
+    pins for the spec record, asked of the sentinel path: an isolated re-drive never
+    reads the main checkout's working ref, because `worktree_flow.run_isolated` cuts the
+    replacement worktree from `state.target_branch`. An operator who checks out another
+    branch while the escalation is parked — a wholly ordinary thing to do with a run
+    waiting on a human — moves `HEAD` off the tree the re-drive reads.
+
+    Both rows leave the checkout on `side` and put the two candidate refs in
+    DISAGREEMENT, so neither can pass by reading the other:
+
+    - the target branch already carries what this checkout holds: reading `main`
+      suppresses (nothing left to commit); reading `HEAD` sees `side`'s wedged blob and
+      holds a resume whose work is already where the re-drive looks for it.
+    - the correction was committed on `side` and `main` still holds the wedged intent:
+      reading `main` fires; reading `HEAD` sees the correction and SUPPRESSES — which,
+      because this kind holds the resume, is the default resolve flow resuming straight
+      into the wedge it was meant to clear.
+
+    Ablation: pass a literal `"HEAD"` instead of `redrive_base_ref` in
+    `_redrive_reads_the_upstream_artifacts` and BOTH rows redden. Either row alone also
+    passes for the anchor it exists to reject.
+    """
+    key = "6-4-cli-list-command"
+    _resolve_repo(tmp_path)
+    folder = tmp_path / SPEC_FOLDER
+    folder.mkdir(parents=True)
+    spec_md, manifest = folder / "SPEC.md", folder / "stories.yaml"
+    manifest.write_text(MANIFEST, encoding="utf-8")
+
+    def _commit(intent, message):
+        spec_md.write_text(intent, encoding="utf-8")
+        git(tmp_path, "add", "-A")
+        git(tmp_path, "commit", "-q", "-m", message)
+
+    if corrected_on_target:
+        _commit(CORRECTED_INTENT, "corrected on the target branch")
+        git(tmp_path, "checkout", "-q", "-b", "side")
+        _commit(WEDGED_INTENT, "side went its own way")
+        # the operator's checkout still shows the correction the target branch carries
+        spec_md.write_text(CORRECTED_INTENT, encoding="utf-8")
+    else:
+        _commit(WEDGED_INTENT, "the intent that wedged")
+        git(tmp_path, "checkout", "-q", "-b", "side")
+        _commit(CORRECTED_INTENT, "corrected on the wrong branch")
+
+    sentinel = folder / f"{key}-unresolved.md"
+    sentinel.write_text("---\nstatus: blocked\n---\n\n## Auto Run Result\n\nx\n", "utf-8")
+    mount = tmp_path / "wt"
+    mount.mkdir()
+    run_dir, _, _ = _escalated_run(
+        tmp_path,
+        spec_file=str(sentinel),
+        source="stories",
+        sentinel_kind="unresolved",
+        worktree_path=str(mount),
+        spec_folder=SPEC_FOLDER,
+        target_branch="main",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    runs.rearm_escalation(run_dir, isolated_redrive=True)
+
+    records = _upstream_records(run_dir)
+    assert bool(records) is warns
+    if warns:
+        assert records[0]["target_branch"] == "main"
+
+
+@pytest.mark.parametrize("external", [False, True])
+def test_rearm_exempts_a_stories_folder_configured_outside_the_project(
+    tmp_path, monkeypatch, external
+):
+    """An artifact dir configured OUTSIDE the project tree is the one folder an isolated
+    re-drive still reads through the working tree.
+
+    `ProjectPaths.rebased` leaves such a dir exactly where it is rather than rebasing it
+    onto the mount, so every worktree opens the same absolute path — the identical carve
+    -out `_spec_is_shared_with_the_redrive` makes for a spec, asked of the stories
+    folder. Nothing is committed on either row, so the ONLY moving part is where the
+    folder lives; an in-project folder must fire and an external one must not.
+
+    Ablation: delete the `is_relative_to(project)` arm of `stories_reach_the_redrive` and
+    the in-project row reddens; make the isolated arm answer False unconditionally and
+    the external row reddens.
+    """
+    outside = tmp_path.parent / f"{tmp_path.name}-artifacts" / "epic-6"
+    spec_folder = str(outside) if external else SPEC_FOLDER
+    run_dir, _, _ = _sentinel_run(
+        tmp_path,
+        committed_intent=WEDGED_INTENT,
+        working_intent=CORRECTED_INTENT,
+        spec_folder=spec_folder,
+    )
+    monkeypatch.chdir(tmp_path)
+
+    runs.rearm_escalation(run_dir, isolated_redrive=True)
+
+    assert bool(_upstream_records(run_dir)) is not external
+
+
+def test_rearm_of_a_sentinel_survives_a_project_that_is_not_a_repository(tmp_path, monkeypatch):
+    """The proof reads git, and a non-repo project must still re-arm.
+
+    `_redrive_spec_status` already carries this requirement for the spec record ("the
+    non-repo case stays non-fatal, as the story's Boundaries require"); the sentinel arm
+    now runs git too, so it inherits the same obligation on a path that did not read git
+    at all before. A `GitError` escaping here would abort a re-arm that has ALREADY
+    deleted the sentinel and preserved its copy — the escalation spent on a traceback.
+
+    The degrade direction is the warning one: no proof means the record fires and the
+    resume holds, so an operator on a non-repo project is told to commit rather than
+    quietly resumed into a re-plan nothing verified.
+
+    Deliberately not `_sentinel_run`, which git-inits: this row's whole premise is the
+    absence of a repository.
+
+    Ablation: drop the `except verify.GitError` arm in
+    `_redrive_reads_the_upstream_artifacts` and this reddens with the GitError escaping
+    `rearm_escalation` — the sentinel already gone from disk.
+    """
+    key = "6-4-cli-list-command"
+    folder = tmp_path / SPEC_FOLDER
+    folder.mkdir(parents=True)
+    (folder / "SPEC.md").write_text(CORRECTED_INTENT, encoding="utf-8")
+    (folder / "stories.yaml").write_text(MANIFEST, encoding="utf-8")
+    sentinel = folder / f"{key}-unresolved.md"
+    sentinel.write_text("---\nstatus: blocked\n---\n\n## Auto Run Result\n\nvague\n", "utf-8")
+    run_dir, _, _ = _escalated_run(
+        tmp_path,
+        spec_file=str(sentinel),
+        source="stories",
+        sentinel_kind="unresolved",
+        spec_folder=SPEC_FOLDER,
+        target_branch="main",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    assert runs.rearm_escalation(run_dir, isolated_redrive=True) == key  # no GitError
+
+    assert not sentinel.exists()  # the destructive half still completed
+    (rec,) = _upstream_records(run_dir)
+    assert runs.rearm_holds_the_resume(rec) is True
+
+
+def test_rearm_records_the_in_place_remedy_when_isolation_was_turned_off(tmp_path, monkeypatch):
+    """The mirror of the isolated warning, and a DIFFERENT remedy — which is why the
+    record carries a discriminator rather than leaving the reader to guess.
+
+    Setup is a `worktree` -> `none` flip: the task still carries the escalated
+    attempt's mount (nothing clears it until the resume runs `_finish_inflight`), so
+    `task_spec_path` anchors the re-arm's status flip inside that mount — while
+    `_run_story` will re-run the story in the main checkout, which never reads it. The
+    write is unreachable, exactly as under isolation, and for the opposite reason.
+
+    So the remedy inverts. Under isolation the correction must be COMMITTED, because
+    the replacement worktree is cut from git and reads no working tree. Here the
+    re-drive reads the main checkout's WORKING tree, so the correction has to be
+    re-applied there and a commit is beside the point — and naming `target_branch`
+    would send the operator to the one place this re-drive does not look. Both fields
+    move: `redrive` says which shape it is, and `target_branch` goes empty.
+
+    `rearm_event_notice` renders out of process from the journal line alone, so it
+    cannot re-read the policy that produced the record; the discriminator has to be ON
+    the line or the reader falls back to the isolated wording it cannot verify.
+
+    Ablation: drop the `redrive` field from the `journal.append` and the notice falls
+    to its isolated arm — this reddens on `next_step`, which tells the operator to
+    commit onto a branch this re-drive never reads.
+    """
+    rel = "_bmad-output/specs/6-4-cli-list-command.md"
+    _resolve_repo(tmp_path)
+    spec = tmp_path / rel
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    # the MAIN CHECKOUT's copy — the tree the in-place re-drive reads — left terminal,
+    # so `_redrive_spec_status` cannot suppress the record
+    spec.write_text("---\nstatus: blocked\n---\n\n## Intent\n\nx\n", encoding="utf-8")
+    git(tmp_path, "add", "-A")
+    git(tmp_path, "commit", "-q", "-m", "escalated spec")
+
+    wt_spec = tmp_path / "wt" / rel
+    wt_spec.parent.mkdir(parents=True, exist_ok=True)
+    wt_spec.write_text("---\nstatus: blocked\n---\n\n## Intent\n\nx\n", encoding="utf-8")
+
+    run_dir, _, _ = _escalated_run(
+        tmp_path, spec_file=rel, worktree_path=str(tmp_path / "wt"), target_branch="main"
+    )
+    monkeypatch.chdir(tmp_path)
+
+    # the flip: policy now says `none`, while the recorded mount still says otherwise
+    runs.rearm_escalation(run_dir, isolated_redrive=False)
+
+    (rec,) = [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-write-unreachable"]
+    assert rec["redrive"] == "in-place"
+    # the pin survives the flip on the state, but must not reach a record whose reader
+    # would turn it into "commit here"
+    assert rec["target_branch"] == ""
+
+    severity, message, next_step = runs.rearm_event_notice(rec)
+    assert severity == "warning"
+    assert "main checkout" in next_step and "commit" not in next_step.lower()
+    assert "isolation policy changed" in message
+    # and the flip still holds the resume: the remedy is upstream of the re-drive's read
+    assert runs.rearm_holds_the_resume(rec)
+
+
+def test_rearm_in_place_proof_reads_the_working_tree_not_the_commit(tmp_path, monkeypatch):
+    """The in-place remedy has to be able to CLEAR the record it is printed on.
+
+    `rearm-spec-write-unreachable` holds the resume (`rearm_holds_the_resume`), and its
+    in-place notice tells the operator to re-apply the correction in the main checkout —
+    no commit, because an in-place re-drive reads that tree's WORKING copy. So the proof
+    that suppresses it has to read the working copy too. Measuring the committed tree
+    instead would demand a commit the re-drive never needs, and the operator who did
+    exactly what the notice said would re-run resolve and be held again, forever.
+
+    Both rows leave the COMMITTED spec terminal, so only the working tree moves:
+
+    - working tree corrected -> the re-drive routes, and the record is suppressed.
+    - working tree still terminal -> it re-wedges, and the record fires.
+
+    Ablation: delete the `if not isolated_redrive:` arm from `_redrive_spec_status` so
+    both rows fall through to the committed read, and the first row reddens — the
+    correction the re-drive will read is reported as absent.
+    """
+    rel = "_bmad-output/specs/6-4-cli-list-command.md"
+    for corrected, warns in ((True, False), (False, True)):
+        root = tmp_path / f"row-{corrected}"
+        root.mkdir()
+        _resolve_repo(root)
+        spec = root / rel
+        spec.parent.mkdir(parents=True, exist_ok=True)
+        # committed terminal on BOTH rows: a committed read can never suppress here
+        spec.write_text("---\nstatus: blocked\n---\n\n## Intent\n\nx\n", encoding="utf-8")
+        git(root, "add", "-A")
+        git(root, "commit", "-q", "-m", "escalated spec")
+        if corrected:  # uncommitted, exactly as the in-place notice instructs
+            spec.write_text("---\nstatus: ready-for-dev\n---\n\n## Intent\n\nx\n", encoding="utf-8")
+
+        mount = root / "wt"
+        (mount / rel).parent.mkdir(parents=True, exist_ok=True)
+        (mount / rel).write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+
+        run_dir, _, _ = _escalated_run(
+            root, spec_file=rel, worktree_path=str(mount), target_branch="main"
+        )
+        monkeypatch.chdir(root)
+        runs.rearm_escalation(run_dir, isolated_redrive=False)
+
+        fired = [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-write-unreachable"]
+        assert bool(fired) is warns, f"corrected={corrected}"
+
+
+def test_rearm_event_notice_reads_a_pre_discriminator_record_as_isolated():
+    """A record written before the `redrive` field existed is an ISOLATED one — that
+    was the only shape the producer could journal — so the absent field is a KNOWN
+    value, not an unknown, and must not degrade to the in-place wording.
+
+    A journal is append-only and read back by later versions (`_echo_rearm_events`
+    walks lines this process did not write), so the migration shape is reachable in a
+    plain upgrade, not just in a contrived fixture.
+
+    Ablation: default the `redrive` read to `"in-place"` and this reddens — the legacy
+    record renders the working-tree remedy for a re-drive that reads only committed
+    trees.
+    """
+    legacy = {
+        "kind": "rearm-spec-write-unreachable",
+        "story_key": "s1",
+        "spec_file": "wt/specs/s1.md",
+        "status": "ready-for-dev",
+        "target_branch": "main",
+    }
+    _, message, next_step = runs.rearm_event_notice(legacy)
+    assert "Commit the corrected spec on `main`" in next_step
+    assert "mount a fresh worktree" in message
+
+
 def test_rearm_base_ref_degrades_to_head_for_a_run_that_pinned_no_target(tmp_path, monkeypatch):
     """An unrecorded `target_branch` is a MISSING value, not a divergent one.
 
     `ensure_target_branch` pins the field before any worktree can mount, so only a
     state.json predating it reaches here with a `worktree_path` and no target — and it
     must degrade to the ref it read before the fix rather than to `""`. Answering `""`
-    would make `_committed_spec_status` unprovable for every re-arm of such a run and
+    would make `_redrive_spec_status` unprovable for every re-arm of such a run and
     hold the resume on a per-configuration constant, the exact failure the record's
     narrowing exists to avoid.
 
@@ -2125,7 +2883,7 @@ def test_rearm_base_ref_degrades_to_head_for_a_run_that_pinned_no_target(tmp_pat
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=rel, worktree_path=str(tmp_path / "wt"))
     monkeypatch.chdir(tmp_path)
 
-    runs.rearm_escalation(run_dir)
+    runs.rearm_escalation(run_dir, isolated_redrive=True)
 
     assert [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-write-unreachable"] == []
 
@@ -2148,7 +2906,7 @@ def test_rearm_does_not_refuse_a_flip_the_redrive_never_reads(
     in what git has committed, which is what makes this a reachability claim rather than
     a readability one:
 
-    - `ready-for-dev` — `_committed_spec_status` has already PROVEN the re-drive reads
+    - `ready-for-dev` — `_redrive_spec_status` has already PROVEN the re-drive reads
       the status it routes on. Refusing blocked an otherwise-complete re-arm over an
       obsolete copy, with nothing for the operator to do at all.
     - `blocked` — the correction really is outstanding, and the remedy is
@@ -2177,7 +2935,9 @@ def test_rearm_does_not_refuse_a_flip_the_redrive_never_reads(
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=rel, worktree_path=str(tmp_path / "wt"))
     monkeypatch.chdir(tmp_path)
 
-    runs.rearm_escalation(run_dir)  # must not raise: this flip cannot reach the re-drive
+    runs.rearm_escalation(
+        run_dir, isolated_redrive=True
+    )  # must not raise: this flip cannot reach the re-drive
 
     kinds = _kinds(run_dir)
     (skipped,) = [e for e in kinds if e["kind"] == "rearm-spec-flip-skipped"]
@@ -2191,13 +2951,13 @@ def test_rearm_does_not_refuse_a_flip_the_redrive_never_reads(
 def test_rearm_suppresses_the_unreachable_warning_only_on_proof(tmp_path, monkeypatch):
     """A project that is not a repo must still WARN, not fall silent.
 
-    `_committed_spec_status` degrades to `""` on every uncertainty — a `GitError`
+    `_redrive_spec_status` degrades to `""` on every uncertainty — a `GitError`
     (which covers "not a repository"), an absent blob, a non-UTF-8 blob. `""` never
     equals a target status, so the record fires. This is the direction the narrowing
     must fail in: suppressing a warning demands proof the work is done, and the
     re-arm advance stays non-fatal outside a repo, as the story's Boundaries require.
 
-    Ablation: make `_committed_spec_status` return `target_status` on `GitError`
+    Ablation: make `_redrive_spec_status` return `target_status` on `GitError`
     instead of `""` and this reddens on the missing record — the re-arm still
     "succeeds", which is exactly the silence #640(b) exists to end.
     """
@@ -2209,7 +2969,7 @@ def test_rearm_suppresses_the_unreachable_warning_only_on_proof(tmp_path, monkey
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=rel, worktree_path=str(tmp_path / "wt"))
     monkeypatch.chdir(tmp_path)
 
-    runs.rearm_escalation(run_dir)
+    runs.rearm_escalation(run_dir, isolated_redrive=True)
 
     kinds = _kinds(run_dir)
     (unreachable,) = [e for e in kinds if e["kind"] == "rearm-spec-write-unreachable"]
@@ -2251,7 +3011,7 @@ def test_rearm_does_not_warn_when_the_spec_dir_is_shared_with_the_redrive(tmp_pa
     )
     monkeypatch.chdir(tmp_path)
 
-    runs.rearm_escalation(run_dir)
+    runs.rearm_escalation(run_dir, isolated_redrive=True)
 
     assert [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-write-unreachable"] == []
     # and the flip really landed on the shared file the re-drive will read
@@ -2295,7 +3055,7 @@ def test_rearm_still_warns_for_a_spec_spelled_out_of_but_resolving_into_the_work
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=str(spelled), worktree_path=str(wt))
     monkeypatch.chdir(tmp_path)
 
-    runs.rearm_escalation(run_dir)
+    runs.rearm_escalation(run_dir, isolated_redrive=True)
 
     (unreachable,) = [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-write-unreachable"]
     assert unreachable["status"] == "ready-for-dev"
@@ -2306,7 +3066,7 @@ def test_rearm_warns_when_the_spec_cannot_be_placed_against_the_worktree(tmp_pat
 
     `_spec_is_shared_with_the_redrive` decides on `resolve()`, which raises on the hosts
     #552 is about (a registered-but-not-serving WSL UNC provider) — and an uncertain
-    answer must not buy silence, the same direction `_committed_spec_status` degrades
+    answer must not buy silence, the same direction `_redrive_spec_status` degrades
     in. This row is the shared-artifact-dir row above with resolution taken away, so it
     is the fault, not the layout, that flips the outcome.
 
@@ -2334,14 +3094,14 @@ def test_rearm_warns_when_the_spec_cannot_be_placed_against_the_worktree(tmp_pat
     )
     monkeypatch.chdir(tmp_path)
 
-    runs.rearm_escalation(run_dir)
+    runs.rearm_escalation(run_dir, isolated_redrive=True)
 
     (unreachable,) = [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-write-unreachable"]
     assert unreachable["status"] == "ready-for-dev"
 
 
 def test_rearm_writes_the_project_rooted_spec_when_no_worktree_was_recorded(tmp_path, monkeypatch):
-    """The `state.project` half of `_task_spec_path` — graded, not merely reachable.
+    """The `state.project` half of `task_spec_path` — graded, not merely reachable.
 
     `engine._finish_inflight` clears `task.worktree_path` while leaving `spec_file`
     relative, and `model._serialized_worktree_path` returns it unchanged when
@@ -2354,7 +3114,7 @@ def test_rearm_writes_the_project_rooted_spec_when_no_worktree_was_recorded(tmp_
     directory this process actually runs from, so a cwd-anchored resolve has somewhere
     plausible to land.
 
-    Ablation: change `_task_spec_root` to `Path(task.worktree_path or "")` and this
+    Ablation: change `task_spec_root` to `Path(task.worktree_path or "")` and this
     reddens twice over — the project spec keeps `status: blocked`, and the decoy's
     byte-identity assertion fails behind it.
     """
@@ -2372,7 +3132,7 @@ def test_rearm_writes_the_project_rooted_spec_when_no_worktree_was_recorded(tmp_
     run_dir, _, _ = _escalated_run(tmp_path, spec_file=rel)  # worktree_path="" -> the fallback
     monkeypatch.chdir(tmp_path / "elsewhere")
 
-    runs.rearm_escalation(run_dir)
+    runs.rearm_escalation(run_dir, isolated_redrive=False)
 
     fm = verify.read_frontmatter(spec)
     assert fm["status"] == "ready-for-dev"  # the project-rooted copy was flipped
@@ -2446,7 +3206,7 @@ def test_rearm_event_notice_splits_the_flip_skip_on_the_refusal():
 def test_rearm_holds_the_resume_only_on_the_record_that_proves_a_wedge():
     """The hold is PROOF, not urgency — and it is asked of every kind the table knows.
 
-    `rearm-spec-write-unreachable` is written only once `_committed_spec_status` has
+    `rearm-spec-write-unreachable` is written only once `_redrive_spec_status` has
     established that the committed spec does not carry the status the re-drive routes
     on, so resuming on it is futile rather than risky: step-01 halts blocked on
     `unrecognized status in existing story file` and the escalation is spent. Its

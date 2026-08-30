@@ -2620,7 +2620,7 @@ def test_resolve_restamps_the_code_root_before_it_rearms(project, monkeypatch, c
     run_dir, moved, _ = _resolve_run_with_a_moved_code_root(project, monkeypatch)
     seen: list = []
 
-    def fake_rearm(rd, key, *, restore_patch=None):
+    def fake_rearm(rd, key, *, restore_patch=None, isolated_redrive=False):
         seen.append(load_state(rd).code_root)
         return key
 
@@ -2744,7 +2744,7 @@ def test_resolve_echoes_this_rearms_stale_restore_events(tmp_path, monkeypatch, 
     run_dir = _escalated_run(tmp_path, "r1")
     Journal(run_dir).append("stale-restore-excluded", story_key="s1", files=["FROM-LAST-TIME.txt"])
 
-    def fake_rearm(rd, key, *, restore_patch=None):
+    def fake_rearm(rd, key, *, restore_patch=None, isolated_redrive=False):
         journal = Journal(rd)
         journal.append("stale-restore-excluded", story_key=key, patch="a.patch", files=["new.txt"])
         journal.append("stale-restore-unparseable", story_key=key, patch="b.patch", error="OSErr")
@@ -2784,7 +2784,7 @@ def test_resolve_echoes_the_rearm_baseline_records(tmp_path, monkeypatch, capsys
 
     _escalated_run(tmp_path, "r1")
 
-    def fake_rearm(rd, key, *, restore_patch=None):
+    def fake_rearm(rd, key, *, restore_patch=None, isolated_redrive=False):
         journal = Journal(rd)
         journal.append(
             "rearm-baseline-advance-failed",
@@ -2835,7 +2835,7 @@ def test_resolve_restamp_echo_warns_on_both_legs(tmp_path, monkeypatch, capsys):
     from bmad_loop.journal import Journal
 
     def rearm_with(restore: bool):
-        def fake_rearm(rd, key, *, restore_patch=None):
+        def fake_rearm(rd, key, *, restore_patch=None, isolated_redrive=False):
             Journal(rd).append(
                 "rearm-baseline-restamped",
                 story_key=key,
@@ -2889,7 +2889,7 @@ def test_resolve_survives_a_corrupt_journal(tmp_path, monkeypatch, capsys, outco
     from bmad_loop import runs
     from bmad_loop.journal import JOURNAL_FILE
 
-    def fake_rearm(rd, key, *, restore_patch=None):
+    def fake_rearm(rd, key, *, restore_patch=None, isolated_redrive=False):
         if outcome == "rearm-error":
             raise runs.RearmError("cannot re-open story spec /x/spec.md")
         return key
@@ -2925,7 +2925,7 @@ def test_resolve_echoes_a_skipped_restamp(tmp_path, monkeypatch, capsys):
 
     _escalated_run(tmp_path, "r1")
 
-    def fake_rearm(rd, key, *, restore_patch=None):
+    def fake_rearm(rd, key, *, restore_patch=None, isolated_redrive=False):
         Journal(rd).append(
             "rearm-baseline-restamp-skipped",
             story_key=key,
@@ -2973,7 +2973,7 @@ def test_resolve_echoes_the_residue_even_when_the_rearm_aborts(tmp_path, monkeyp
 
     _escalated_run(tmp_path, "r1")
 
-    def fake_rearm(rd, key, *, restore_patch=None):
+    def fake_rearm(rd, key, *, restore_patch=None, isolated_redrive=False):
         # journalled first, exactly as the real residue pass is ordered
         Journal(rd).append(
             "stale-restore-commits", story_key=key, old_baseline="f" * 40, commits=["c1", "c2"]
@@ -2995,7 +2995,11 @@ def test_resolve_echoes_the_residue_even_when_the_rearm_aborts(tmp_path, monkeyp
 def test_resolve_holds_the_resume_when_the_correction_cannot_reach_the_redrive(
     tmp_path, monkeypatch, capsys
 ):
-    """The one record that PROVES a wedge breaks the re-arm+resume gesture.
+    """A record that PROVES a wedge breaks the re-arm+resume gesture.
+
+    Two kinds qualify (`rearm-spec-write-unreachable` here, and the sentinel path's
+    `rearm-upstream-write-unreachable`); this grades the gesture, which is shared, so it
+    drives the spec one and leaves the sentinel producer to tests/test_resolve.py.
 
     `rearm-spec-write-unreachable` fires only once the re-arm has established that the
     committed spec does not carry the status the re-drive routes on, and its own
@@ -3024,7 +3028,7 @@ def test_resolve_holds_the_resume_when_the_correction_cannot_reach_the_redrive(
     from bmad_loop.journal import Journal
 
     def rearm_journalling(kind, **fields):
-        def fake_rearm(rd, key, *, restore_patch=None):
+        def fake_rearm(rd, key, *, restore_patch=None, isolated_redrive=False):
             Journal(rd).append(kind, story_key=key, **fields)
             return key
 
@@ -3091,7 +3095,7 @@ def test_resolve_appends_the_next_step_imperative(tmp_path, monkeypatch, capsys)
 
     _escalated_run(tmp_path, "r1")
 
-    def fake_rearm(rd, key, *, restore_patch=None):
+    def fake_rearm(rd, key, *, restore_patch=None, isolated_redrive=False):
         journal = Journal(rd)
         journal.append(  # table row with a next_step
             "rearm-baseline-advance-failed",
@@ -3577,6 +3581,74 @@ def test_resolve_interactive_restore_patch_from_resolution_json(tmp_path, monkey
     task = load_state(run_dir).tasks["s1"]
     assert task.restore_patch == str(patch.resolve())  # picked up from resolution.json
     assert "in-review" in spec.read_text()
+
+
+@pytest.mark.parametrize("flipped_mid_session", [False, True])
+def test_resolve_rereads_isolation_after_the_agent_session(
+    tmp_path, monkeypatch, capsys, flipped_mid_session
+):
+    """`pol` is read BEFORE a session that blocks on a human conversation of arbitrary
+    length, and the re-arm below it is keyed on that stale answer.
+
+    Everything after `resolve.run_session` returns — the restore-patch latch, the
+    isolation-conflict refusal, and `rearm_escalation`'s `isolated_redrive` — used the
+    mode as it stood when the operator TYPED the command, while `_resume_paused_run` at
+    the bottom of the same function re-reads policy for the engine it arms. So a
+    `none -> worktree` edit made while the agent was open split the two readers in the
+    one window nobody can bound: the re-arm treated the main-checkout correction as
+    reachable and emitted no hold, then the engine mounted a fresh worktree cut from git
+    that could not see it. The escalation was spent and the story re-wedged, with no
+    error anywhere.
+
+    The window is real precisely because this session is INTERACTIVE by contract — a
+    human is present, the skill is allowed to ask, and `run_session` blocks on
+    `subprocess.run` until they exit. Editing policy while a resolve agent is open is
+    not exotic; deciding the story needs isolation is one of the things a resolve
+    conversation concludes.
+
+    The control row is what makes this a re-read rather than a hardcode: an untouched
+    policy must still re-arm on its own answer and print nothing.
+
+    Ablation: delete the second `pol = policy_mod.load(...)` in `cmd_resolve` and the
+    flipped row reddens on `assert False is True` — the re-arm goes back to the mode
+    read before the conversation. Drop the warning `print` and the row reddens on
+    stderr alone, with the isolation assertion still passing.
+    """
+    from bmad_loop import resolve, runs
+
+    spec = tmp_path / "spec.md"
+    spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+    _write_policy(tmp_path, '[scm]\nisolation = "none"\n')
+    _escalated_run(tmp_path, "r1", spec_file=str(spec))
+
+    def fake_session(adapter, project, rd, story_key, *, model=""):
+        # the human and the agent conclude the story needs isolation, and the operator
+        # edits policy.toml from another terminal while the session is still open
+        if flipped_mid_session:
+            _write_policy(tmp_path, '[scm]\nisolation = "worktree"\n')
+        marker = resolve.resolution_path(rd, story_key)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("{}", encoding="utf-8")
+        return True
+
+    seen: list[bool] = []
+
+    def recording_rearm(rd, key, *, restore_patch=None, isolated_redrive=False):
+        seen.append(isolated_redrive)
+        return key
+
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
+    monkeypatch.setattr(resolve, "build_context", lambda *a, **k: None)
+    monkeypatch.setattr(resolve, "run_session", fake_session)
+    monkeypatch.setattr(runs, "rearm_escalation", recording_rearm)
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+    assert cli.main(["resolve", "--project", str(tmp_path), "r1", "--resume"]) == 0
+
+    # the re-arm keyed on the mode in force when it ran, not the one read before the
+    # conversation started
+    assert seen == [flipped_mid_session]
+    err = capsys.readouterr().err
+    assert ("[scm] isolation changed none -> worktree" in err) is flipped_mid_session
 
 
 def test_resolve_corrupt_resolution_json_aborts_loudly(tmp_path, monkeypatch, capsys):

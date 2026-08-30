@@ -239,6 +239,52 @@ def test_dispatched_spec_file_defaults_none_for_legacy_state():
     assert StoryTask.from_dict(doc).dispatched_spec_file is None
 
 
+def test_rebase_spec_paths_on_reanchors_both_ownership_fields():
+    """The read-side inverse of `_serialized_worktree_path`, on both fields at once.
+
+    `to_dict` relativizes `spec_file` and `dispatched_spec_file` together, so a
+    re-anchor that moved only one would leave a task naming two trees. Absolute
+    values are already anchored (a spec outside the mount persists verbatim) and
+    must pass through, which is also what makes the call idempotent.
+    """
+    mount = Path("/repo/.bmad-loop/runs/r1/worktrees/1-1-a")
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        spec_file="_out/accepted.md",
+        dispatched_spec_file="_out/dispatched.md",
+    )
+
+    task.rebase_spec_paths_on(mount)
+
+    assert task.spec_file == str(mount / "_out/accepted.md")
+    assert task.dispatched_spec_file == str(mount / "_out/dispatched.md")
+
+    # idempotent: a second pass finds both absolute and leaves them alone
+    task.rebase_spec_paths_on(mount)
+    assert task.spec_file == str(mount / "_out/accepted.md")
+    assert task.dispatched_spec_file == str(mount / "_out/dispatched.md")
+
+
+def test_rebase_spec_paths_on_leaves_absolute_and_empty_values_untouched():
+    """An out-of-mount spec and an unbound field are both already correct.
+
+    `_serialized_worktree_path` keeps a path verbatim exactly when
+    `relative_to(worktree_path)` raises, so an absolute value beside a set
+    `worktree_path` is the out-of-mount shape — joining it onto the mount would
+    invent a path no tree contains. `None` must survive as `None` rather than
+    becoming the mount root: `Path("")` is `.`, so a bare join would answer the
+    tree root, which is a write target, not a spec.
+    """
+    outside = str(Path("/elsewhere/spec.md"))
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=outside)
+
+    task.rebase_spec_paths_on(Path("/repo/wt"))
+
+    assert task.spec_file == outside
+    assert task.dispatched_spec_file is None
+
+
 def test_dispatched_spec_snapshot_round_trips_byte_exactly():
     snapshot = b"---\r\nstatus: ready-for-dev\r\n---\r\n\xffoperator intent\r\n"
     task = StoryTask(story_key="1-1-a", epic=1, dispatched_spec_snapshot=snapshot)
@@ -602,3 +648,66 @@ def test_cache_read_weight_defaults_when_limits_not_a_dict():
 def test_cache_read_weight_defaults_when_value_not_a_number():
     state = _state(policy_snapshot={"limits": {"cache_read_weight": "high"}})
     assert state.cache_read_weight() == 0.1
+
+
+def test_release_spec_paths_from_mount_relativizes_the_accepted_spec():
+    """The accepted spec goes back to the spelling the REPLACEMENT mount re-resolves.
+
+    `_discard_unit_for_restart` deletes the mount and the next attempt mounts a fresh
+    one carrying the same story's spec at the same relative place. An absolute path
+    into the deleted tree is what `verify.resolve_spec_path` passes through untouched,
+    so `_dispatched_spec_for_attempt` resolves it `strict=True` and the fresh attempt
+    starts unbound; the relative spelling is re-probed against the live workspace and
+    binds. `spec_file` outlives the attempt, so it is relativized rather than cleared.
+
+    Ablation: drop the `_serialized_worktree_path` call from
+    `release_spec_paths_from_mount` and this reddens on the absolute spelling.
+    """
+    task = StoryTask("1-1-a", 1)
+    task.worktree_path = "/runs/r1/worktrees/1"
+    task.spec_file = "/runs/r1/worktrees/1/_bmad-output/spec.md"
+
+    task.release_spec_paths_from_mount()
+
+    assert task.spec_file == "_bmad-output/spec.md"
+
+
+def test_release_spec_paths_from_mount_clears_the_attempt_binding():
+    """The attempt-owned pair died with its tree, and both halves go together.
+
+    `dispatched_spec_file`/`dispatched_spec_snapshot` are the authority pair
+    `recovery_flow` restores bytes through. A path without its snapshot is a shape
+    `_bind_dispatched_spec_for_attempt` never persists, so clearing one and not the
+    other would invent it.
+
+    Ablation: drop either `= None` and this reddens on that half.
+    """
+    task = StoryTask("1-1-a", 1)
+    task.worktree_path = "/runs/r1/worktrees/1"
+    task.dispatched_spec_file = "/runs/r1/worktrees/1/_bmad-output/spec.md"
+    task.dispatched_spec_snapshot = b"frozen bytes"
+
+    task.release_spec_paths_from_mount()
+
+    assert task.dispatched_spec_file is None
+    assert task.dispatched_spec_snapshot is None
+
+
+def test_release_spec_paths_from_mount_keeps_an_out_of_mount_spec_verbatim():
+    """A spec outside the mount was never the mount's to give up.
+
+    `_serialized_worktree_path` keeps such a path verbatim exactly when
+    `relative_to` raises — the shared-artifact-dir shape that survives the re-drive.
+    Relativizing it would be meaningless, and reusing that one helper is what makes
+    the discarded-mount spelling and the persisted one agree by construction.
+
+    Ablation: replace the helper call with an unconditional `relative_to`/join and
+    this reddens (or raises) while the in-mount row above stays green.
+    """
+    task = StoryTask("1-1-a", 1)
+    task.worktree_path = "/runs/r1/worktrees/1"
+    task.spec_file = "/shared-artifacts/spec.md"
+
+    task.release_spec_paths_from_mount()
+
+    assert task.spec_file == "/shared-artifacts/spec.md"

@@ -55,6 +55,28 @@ TMUX_BACKENDS = {"adapters/tmux_base.py", "adapters/tmux_backend.py"}
 # TUI checkpoint modal, and a probe ignoring `limits.git_timeout_s`.
 GIT_CHOKEPOINT = {"verify.py"}
 
+# Files where resolving a raw `task.spec_file` / `task.dispatched_spec_file` with a
+# bare `Path(...)` is CORRECT, because the reader runs inside the tree the value was
+# recorded against. `runs.py` is the chokepoint itself; `engine.py`, `verify.py` and
+# `recovery_flow.py` are in-process consumers driving a live run, where the field is
+# still the absolute path the engine stamped and no reload has round-tripped it
+# through `StoryTask.to_dict`.
+#
+# Everywhere else the field arrives from `load_state`, and
+# `_serialized_worktree_path` persists an isolated unit's spec RELATIVE to the mount.
+# A bare `Path(...)` there resolves against the READER's cwd — the main checkout,
+# which carries the same `_bmad-output/specs/...` layout and answers with the wrong
+# tree's copy. That defect shipped in `tui/app.py::_paused_spec`, where it reached a
+# destructive write, and was then re-found one surface at a time in `resolve.py`,
+# `sweep.py`, `stories_engine.py` and `worktree_flow.py` across four review rounds.
+# Nothing enforced the rule, which is why each round only ever found the next one.
+#
+# Adding a file here is a claim that its cwd IS the run's tree. If it is not, route
+# the read through `runs.task_spec_path` (or `StoryTask.rebase_spec_paths_on` when
+# re-anchoring persisted state) instead.
+SPEC_ANCHOR_CHOKEPOINT = {"runs.py", "engine.py", "verify.py", "recovery_flow.py"}
+SPEC_PATH_FIELDS = {"spec_file", "dispatched_spec_file"}
+
 # Files that may name a bare POSIX path, each on a line carrying a `# portability:`
 # ack. process_host.py's Linux identity reader walks `/proc/<pid>/stat` behind a
 # sys.platform branch; the Unity teardown scripts are POSIX-only. verify.py is the
@@ -601,6 +623,22 @@ def _scan_source(src: str, rel: str):
             # source line — a read spelled through a constant does not carry it.
             findings.append(("envread", rel, node.lineno, line_at(node.lineno), env_key))
 
+    # A raw `Path(x.spec_file)` / `Path(x.dispatched_spec_file)`: the persisted value
+    # may be worktree-RELATIVE, so this resolves against the reader's cwd rather than
+    # the tree the run owns. Detected as the call shape rather than by name, so an
+    # alias (`Path(t.spec_file)`, `Path(self._task.dispatched_spec_file)`) is caught
+    # too; the enclosing `if x.spec_file else` ternary does not hide it.
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "Path"
+            and node.args
+            and isinstance(node.args[0], ast.Attribute)
+            and node.args[0].attr in SPEC_PATH_FIELDS
+        ):
+            findings.append(("specanchor", rel, node.lineno, line_at(node.lineno)))
+
     return findings
 
 
@@ -646,6 +684,62 @@ def test_no_git_invocation_outside_verify():
         "verify.git_bytes or a sibling helper instead:\n"
         + "\n".join(f"  {rel}:{ln}: {txt.strip()}" for rel, ln, txt in offenders)
     )
+
+
+def test_spec_path_resolved_only_through_the_anchor():
+    """A persisted `spec_file` is re-anchored through ``runs.task_spec_path``, never
+    resolved with a bare ``Path(...)``, outside the tree-local consumers.
+
+    ``StoryTask._serialized_worktree_path`` persists an isolated unit's spec RELATIVE
+    to its mounted worktree and ``from_dict`` reads it back raw, so every reader that
+    loads state from disk must say WHICH tree the value is relative to. The four
+    allowlisted files run inside that tree already; everything else — the TUI, the
+    resolve-context builder, the sweep and stories engines, the read-model
+    projections — does not, and the main checkout carries an identical
+    ``_bmad-output/specs/...`` layout that answers a bare ``Path(...)`` with the wrong
+    copy. That is not a hypothetical: it shipped in ``tui/app.py::_paused_spec``,
+    where ``_do_replan`` then WROTE to the main checkout's file and the operator's
+    replan silently did not happen.
+
+    This is the guard's whole point — the same defect was found and fixed one surface
+    at a time over four review rounds, each round discovering the next unanchored
+    reader, because nothing made the rule checkable.
+
+    Ablation: revert ``_paused_spec``'s ``runs.task_spec_path(task, state)`` to
+    ``Path(task.spec_file)`` and this reddens naming ``tui/app.py``."""
+    offenders = [
+        (rel, ln, txt) for _, rel, ln, txt in _of("specanchor") if rel not in SPEC_ANCHOR_CHOKEPOINT
+    ]
+    assert not offenders, (
+        "a persisted spec path resolved against the reader's cwd — route it through "
+        "runs.task_spec_path (or StoryTask.rebase_spec_paths_on) so the anchor names "
+        "the tree the run owns:\n"
+        + "\n".join(f"  {rel}:{ln}: {txt.strip()}" for rel, ln, txt in offenders)
+    )
+
+
+def test_spec_anchor_detector_flags_the_shipped_defect():
+    """The guard above asserts an ABSENCE, so it passes for every reason a match could
+    be missing. Feed it the exact line the defect shipped as, through the same
+    ``_scan_source`` the real scan uses."""
+    found = _scan_source("from pathlib import Path\npath = Path(task.spec_file)\n", "tui/app.py")
+    assert [f[0] for f in found if f[0] == "specanchor"] == ["specanchor"]
+    # and the dispatched twin, which carries the identical serialization hazard
+    found = _scan_source(
+        "from pathlib import Path\np = Path(self._task.dispatched_spec_file)\n", "tui/app.py"
+    )
+    assert [f[0] for f in found if f[0] == "specanchor"] == ["specanchor"]
+
+
+def test_spec_anchor_detector_stays_silent_on_the_anchored_form():
+    """The sanctioned spellings must not trip it, or the guard becomes noise that
+    gets allowlisted away."""
+    for src in (
+        "p = runs.task_spec_path(task, state)\n",
+        "task.rebase_spec_paths_on(wt)\n",
+        "from pathlib import Path\np = Path(state.project)\n",
+    ):
+        assert not [f for f in _scan_source(src, "tui/app.py") if f[0] == "specanchor"]
 
 
 def test_no_hardcoded_posix_paths():

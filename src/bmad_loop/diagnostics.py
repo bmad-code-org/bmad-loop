@@ -139,16 +139,16 @@ _JOURNAL_ALIAS_FIELDS = {
     # `spec_file=` to `operatoractions.record_park`, which is a record file, not the
     # journal. So the divergence is BETWEEN FIELDS, not between two producers of this
     # one — but BOTH fields are mixed-shape, and neither is the reliable one:
-    # `spec_file` is now always ABSOLUTE, because all four kinds journal
-    # `str(_task_spec_path(...))`, whose anchors (`task.worktree_path`, `state.project`)
-    # are absolute in every production path; while `spec` is NOT uniformly absolute —
-    # engine's reconcile and marker-repair kinds journal an absolute `str(spec_path)`,
-    # but `stories_engine`'s `checkpoint-pause` journals the raw persisted
-    # `task.spec_file`, which is worktree-relative for a task that ran under isolation.
-    # Same value, same hazard, same namespace. Do NOT read this as "one field is
-    # already normalized, so the basename step is dead": `_JOURNAL_BASENAME_NAMESPACES`
-    # keys on the NAMESPACE rather than the field precisely so both spellings reduce to
-    # one alias whichever shape either happens to carry.
+    # Both fields now journal an absolute path wherever they carry one: `spec_file`
+    # through `str(task_spec_path(...))` on all four kinds, and `spec` through
+    # `engine._operator_spec_path` (which anchors `checkpoint-pause` the same
+    # way) alongside engine's already-absolute reconcile and marker-repair kinds. Same
+    # value, same namespace. Do NOT read that convergence as "both fields are
+    # normalized, so the basename step is dead" — it is not a guarantee this module
+    # holds. `_operator_spec_path` still answers a bare STORY KEY for a spec-less task,
+    # nothing stops a future producer from journaling a raw `task.spec_file`, and
+    # `_JOURNAL_BASENAME_NAMESPACES` keys on the NAMESPACE rather than the field
+    # precisely so every spelling reduces to one alias whichever shape it carries.
     "spec_file": "spec",
 }
 # Kind-scoped routing, consulted BEFORE the by-name table above and losing to
@@ -186,9 +186,12 @@ _JOURNAL_KIND_ALIAS_FIELDS: dict[str, dict[str, str]] = {
 # Namespaces whose journalled value arrives in more than one shape and must be
 # reduced to its basename before it is aliased. `spec` is one: engine.py's
 # reconcile and marker-repair kinds journal `str(spec_path)` (absolute —
-# `verify.resolve_spec_path` returns an absolute path), while stories_engine's
-# `checkpoint-pause` journals `task.spec_file`, which `StoryTask` persists
-# worktree-relative (a bare basename for a spec at the worktree root). Aliasing
+# `verify.resolve_spec_path` returns an absolute path). Every producer is absolute
+# TODAY — `checkpoint-pause` moved to `_operator_spec_path` — but the reduction is
+# keyed on the NAMESPACE rather than on any producer precisely so that stays a
+# property this module does not have to trust: `_operator_spec_path` still answers a
+# bare STORY KEY for a spec-less task, and nothing stops a future producer journaling
+# a raw `task.spec_file`. Aliasing
 # the raw string would give ONE spec TWO aliases in a single dump, defeating the
 # correlation these fields are aliased rather than dropped to preserve, and would
 # park an absolute home path in the local `--legend` file (before `spec` was
@@ -247,6 +250,16 @@ _JOURNAL_DROP_FIELDS = frozenset(
         # free-text rule above (it is a `GitError` string quoting git's own stderr),
         # not this identifier-shape argument — same set, different rationale.
         "repo",
+        # An absolute host path naming the folder a sentinel's upstream correction has
+        # to land in (`rearm-upstream-write-unreachable`). Dropped for `repo`'s reason,
+        # not aliased for `spec_file`'s: it is a DIRECTORY, journalled by one kind, and
+        # one run has one spec folder — so it correlates nothing across events, while a
+        # `spec` alias would additionally be wrong, since that namespace reduces to a
+        # basename and every run we author would collapse onto the same `stories`-ish
+        # tail. `scrub_json` already redacts any real path (`_IDENTIFIER_RE` forbids
+        # `/`, `\` and `:`), so — exactly as for `repo` — only an assertion on the
+        # field's ABSENCE can grade this, and the canary sweep cannot.
+        "stories_root",
     }
 )
 # Journal fields whose value is a LIST of story keys (sprint unknown-keys).
