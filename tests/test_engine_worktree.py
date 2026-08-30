@@ -2101,12 +2101,7 @@ def test_a_re_armed_story_does_not_carry_the_abandoned_attempt_s_followup(projec
     assert not project.deferred_work.exists()  # the row is only in the doomed worktree
 
     monkeypatch.setattr(verify, "finalize_commit", real_finalize)
-    assert (
-        runs.rearm_escalation(
-            engine.run_dir, "1-1-a", isolated_redrive=True, resolution_recorded=True
-        )
-        == "1-1-a"
-    )
+    assert runs.rearm_escalation(engine.run_dir, "1-1-a", isolated_redrive=True) == "1-1-a"
 
     state = load_state(engine.run_dir)
     state.clear_pause()
@@ -5767,12 +5762,7 @@ def test_a_re_armed_story_does_not_carry_a_withdrawn_declaration(project, monkey
     assert _ledger_entry(project, "DW-1").open
 
     monkeypatch.setattr(verify, "finalize_commit", real_finalize)
-    assert (
-        runs.rearm_escalation(
-            engine.run_dir, "1-1-a", isolated_redrive=True, resolution_recorded=True
-        )
-        == "1-1-a"
-    )
+    assert runs.rearm_escalation(engine.run_dir, "1-1-a", isolated_redrive=True) == "1-1-a"
 
     state = load_state(engine.run_dir)
     state.clear_pause()

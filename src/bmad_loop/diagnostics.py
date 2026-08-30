@@ -349,11 +349,6 @@ class TaskDiag:
     # dumps as `rearmed=True, attempt=1, n_sessions=2` — byte-identical to a HEALTHY
     # post-re-arm task. A counter, so it carries no customer content.
     generation: int
-    # DW-11's watermark: how far into the append-only `sessions` list an accepted
-    # resolution reached. Without it a support bundle cannot explain a SHORT
-    # `context.json` — a story whose older escalations are filtered out dumps
-    # identically to one that only ever raised the entries shown. A counter too.
-    escalations_resolved_upto: int
     dw_count: int
     n_sessions: int
     sessions: SessionTally
@@ -635,7 +630,6 @@ def _task_diag(task: StoryTask, pseudo: sanitize.Pseudonymizer, weight: float) -
         spec_present=bool(task.spec_file),
         worktree_isolated=bool(task.worktree_path),
         generation=task.generation,
-        escalations_resolved_upto=task.escalations_resolved_upto,
         dw_count=len(task.dw_ids),
         n_sessions=len(task.sessions),
         sessions=_session_tally([task]),
@@ -1051,20 +1045,15 @@ def render_markdown(
             # `gen` rides beside `att` because the pair is the discriminator: a
             # #705-class replay and a healthy post-re-arm task agree on every other
             # column here, so dropping it from the human report leaves the one field
-            # that separates them visible only under `--json`. `esc-upto` rides beside
-            # `gen` on that same rule: DW-11's watermark is the only field separating
-            # "this story raised one escalation" from "its earlier ones are filtered
-            # out as already answered", and a short `context.json` is read off exactly
-            # this report.
+            # that separates them visible only under `--json`.
             out.append(
-                "| alias | epic | phase | att | gen | esc-upto | rev | committed | spec | dw "
-                "| sessions | weighted | raw |"
+                "| alias | epic | phase | att | gen | rev | committed | spec | dw | sessions "
+                "| weighted | raw |"
             )
-            out.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+            out.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
             for t in r.tasks:
                 out.append(
                     f"| `{t.alias}` | {t.epic} | {t.phase} | {t.attempt} | {t.generation} "
-                    f"| {t.escalations_resolved_upto} "
                     f"| {t.review_cycle} | {t.committed} | {t.spec_present} | {t.dw_count} "
                     f"| {t.n_sessions} | {t.tokens.get('weighted', 0)} "
                     f"| {t.tokens.get('total', 0)} |"

@@ -1749,22 +1749,14 @@ def test_diag_surfaces_the_split_code_root_and_the_task_generation(project):
     `paused_reason_present` / `worktree_isolated` style, and a small counter. The path
     itself must NOT appear — that is what `_JOURNAL_DROP_FIELDS` drops.
 
-    `escalations_resolved_upto` (DW-11) is projected on the same warrant and asserted
-    here for the same reason: a task whose older escalations are filtered out of
-    `context.json` dumps identically to one that only ever raised the entries shown,
-    so a support bundle cannot explain a short resolve context without it. A counter
-    too — it indexes `task.sessions`, so it carries no customer content.
-
-    Ablation: delete `repo_root_diverges=` from `collect_run` (or `generation=` /
-    `escalations_resolved_upto=` from `_task_diag`) and this reddens on the
-    corresponding assertion; deleting the field from the dataclass reddens as a
-    TypeError at construction.
+    Ablation: delete `repo_root_diverges=` from `collect_run` (or `generation=` from
+    `_task_diag`) and this reddens on the corresponding assertion; deleting the field
+    from the dataclass reddens as a TypeError at construction.
     """
     run_dir = _seed_run(project.project)
     state = load_state(run_dir)
     state.repo_root = str(project.project / "code-tree")
     state.tasks[STORY_KEY].generation = 2
-    state.tasks[STORY_KEY].escalations_resolved_upto = 3
     save_state(run_dir, state)
 
     diag, _pseudo, combined = _render_all([run_dir])
@@ -1772,7 +1764,6 @@ def test_diag_surfaces_the_split_code_root_and_the_task_generation(project):
 
     assert run.repo_root_diverges is True
     assert run.tasks[0].generation == 2
-    assert run.tasks[0].escalations_resolved_upto == 3
     # a presence flag, never the path — the same rule `repo` is dropped under
     assert "code-tree" not in combined
 
@@ -1789,7 +1780,6 @@ def test_diag_repo_root_diverges_is_false_for_the_ordinary_layout(project):
 
     assert run.repo_root_diverges is False
     assert run.tasks[0].generation == 0
-    assert run.tasks[0].escalations_resolved_upto == 0
 
 
 def _md_task_row(md: str) -> list[str]:
@@ -1810,28 +1800,19 @@ def test_the_markdown_report_carries_the_split_root_and_the_generation(project):
 
     `generation` rides beside `attempt` because that is the column pair a #705-class
     replay turns on: a collided re-drive and a healthy post-re-arm task agree on every
-    other cell in this row. DW-11's `escalations_resolved_upto` rides beside it on the
-    same warrant, stated verbatim in its own field comment: it is the only field that
-    separates "this story raised one escalation" from "its earlier ones are filtered
-    out of `context.json` as already answered", and that question is asked of a bug
-    report. Seeded to a value that is neither the attempt, the generation nor the
-    review cycle, so a cell reading a NEIGHBOUR cannot pass.
+    other cell in this row.
 
     Ablation: drop the `code root differs from project` line from `render_markdown` and
     both this test and the sibling below redden on their first assertion. Drop
     `{t.generation}` from the row f-string together with its header and separator cells
-    and this test reddens at `names[4]` (`"esc-upto" != "gen"`) while the sibling
-    reddens at the row cell — the review cycle shifted left rather than a missing key,
-    which is why the cell is read positionally and the three widths are compared. Drop
-    `{t.escalations_resolved_upto}` the same way and this test reddens at `names[5]`
-    (`"rev" != "esc-upto"`); drop ONLY the row cell and it reddens on the width
-    comparison, which is what a skewed table actually looks like.
+    and this test reddens at `names[4]` (`"rev" != "gen"`) while the sibling reddens at
+    the row cell — as `"1" != "0"`, the review cycle shifted left rather than a missing
+    key, which is why the cell is read positionally and the three widths are compared.
     """
     run_dir = _seed_run(project.project)
     state = load_state(run_dir)
     state.repo_root = str(project.project / "code-tree")
     state.tasks[STORY_KEY].generation = 2
-    state.tasks[STORY_KEY].escalations_resolved_upto = 3
     save_state(run_dir, state)
 
     pseudo = sanitize.Pseudonymizer()
@@ -1844,13 +1825,11 @@ def test_the_markdown_report_carries_the_split_root_and_the_generation(project):
     (rule,) = [ln for ln in md.splitlines() if ln.startswith("|---|")]
     names = [c.strip() for c in header.strip("|").split("|")]
     assert names[4] == "gen"
-    assert names[5] == "esc-upto"
     # header, separator and row must agree on width or the table renders skewed
-    assert len(cells) == len(names) == len(rule.strip("|").split("|")) == 13
+    assert len(cells) == len(names) == len(rule.strip("|").split("|")) == 12
     assert cells[3] == "2"  # attempt, seeded by `_seed_run`
     assert cells[4] == "2"  # generation — NOT the review cycle, which is 1
-    assert cells[5] == "3"  # the DW-11 watermark, in its own column
-    assert cells[6] == "1"  # review cycle, still in its own column
+    assert cells[5] == "1"  # review cycle, still in its own column
     # still a flag and a counter: the path itself never renders
     assert "code-tree" not in md
 

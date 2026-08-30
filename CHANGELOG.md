@@ -207,11 +207,6 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
-- Stop a second resolve cycle re-presenting escalations the human already answered
-  (DW-11). A re-arm that accepted a `resolution.json` watermarks the story's
-  append-only session trail; later cycles hand the agent only what was recorded since
-  and print the withheld count. A re-arm that accepted no resolution — no session, or
-  a session that wrote none — never moves it.
 - Emit `diagnose --json` v2, replacing journal `patch` / `stashed_to` paths with
   `patch_present` / `stashed_to_present`, and silently degrade Git stale-commit probe
   failures while propagating non-Git faults.
