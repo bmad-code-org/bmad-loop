@@ -482,6 +482,26 @@ def test_ctl_window_id_refuses_an_untagged_neighbour_on_a_run_id_collision(
     assert launch.ctl_window_id(theirs, "RID") == "@4"
 
 
+def test_ctl_window_id_admits_a_record_naming_a_window_it_never_minted(monkeypatch, tmp_path: Path):
+    # Characterization (#750), not an endorsement: the record is a claim, and it
+    # sits under the project root every coding session can write (see
+    # _read_ctl_window), so its content proves the mint only as far as it is
+    # unforgeable — which it is not. A record naming an untagged window this
+    # project never minted is admitted here, and `x` resolves through here.
+    #
+    # Not a regression, which is the whole reason it is pinned rather than
+    # fixed: the gate this replaced was `runs.is_run(run_dir_for(...))`, and
+    # anything that can write the record can equally mint the run dir — which
+    # admitted EVERY untagged row under the name, with no id to guess. Closing
+    # it needs an identity channel the session does not own (the window's pane
+    # pid, recorded at mint and re-proven here), so this test is the state that
+    # fix has to change.
+    _ctl_listing(monkeypatch, "@4\tresume-RID\t\n")  # untagged, and not ours
+    _make_run(tmp_path)
+    _write_record(tmp_path, "RID", "@4")
+    assert launch.ctl_window_id(tmp_path, "RID") == "@4"
+
+
 def test_ctl_window_id_prefers_a_tagged_window_over_an_untagged_one(monkeypatch, tmp_path: Path):
     # Untagged is a fallback, not a peer, even now that it takes a record to get
     # in. Merged into one listing-ordered list the recorded untagged row beats
