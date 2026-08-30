@@ -4090,6 +4090,17 @@ class CommandResult:
     cut one. ``None`` means nothing was cut and the stream is the whole of it, so
     the many callers that build a result from three fields stay correct without
     knowing this exists.
+
+    ``spawn_error`` is the discriminator for the one shape that has no return
+    code at all: the child was never started. The typical cause is the ``cwd``
+    it was to run in — missing, not a directory, or unsearchable — and the
+    message names that directory as context, but the fault is caught as any
+    spawn-time ``OSError`` and the set is not closed: a missing shell, EMFILE
+    or ENOMEM reach the same field, and the wrapped exception is what says
+    which. ``None`` on every result that came from a process that actually ran —
+    including a timeout, which ran and hung. It is LAST and defaulted because the
+    construction sites pass three to seven POSITIONAL arguments; a field inserted
+    anywhere else would silently re-bind them.
     """
 
     command: str
@@ -4099,6 +4110,34 @@ class CommandResult:
     stderr: str = ""
     stdout_full_bytes: int | None = None
     stderr_full_bytes: int | None = None
+    spawn_error: str | None = None
+
+
+# The synthetic return code on a result whose child never started.
+#
+# The magnitude is the load-bearing part. On POSIX ``subprocess`` reports ``-N``
+# for a child KILLED BY signal N, so every small negative integer is a real
+# return code some child can produce: ``-2`` is SIGINT, ``-9`` SIGKILL, ``-15``
+# SIGTERM. A sentinel inside that range would be indistinguishable from a
+# verify command the operator (or an OOM killer) had just killed. 1000 is far
+# above the largest real-time signal any platform defines, so this value cannot
+# be minted by a child that ran.
+#
+# Negative because two live arms depend on the sign: the win32 probe's
+# ``returncode < 0`` early-out, and the ordinary ``returncode != 0`` failure arm
+# that must still read it as a failure if anything ever reaches that far. And
+# distinct from the timeout leg's ``-1``, because both are "no exit status
+# exists" sentinels and a reader that conflated them would read a child that
+# never started as one that ran and hung.
+#
+# ``spawn_error`` — not this code — is what the classifiers key on; the code
+# exists so the journal record and the plugin payload carry an rc that no real
+# child could have produced.
+SPAWN_FAULT_RC = -1000
+
+# The sink a caller hands :func:`verify_commands_outcome` to observe the results
+# it is about to classify — the engine journals review-gate results through it.
+CommandSink = Callable[[tuple[CommandResult, ...]], None]
 
 
 # sh launcher convention (verify commands run shell=True): 126 = command found
@@ -4181,8 +4220,12 @@ def _win32_env_fault_reason(result: CommandResult, cwd: Path) -> str | None:
     """Windows env-fault evidence, cheapest signal first, or None. Each signal is
     independently sufficient; see the _CMD_* constants for why the rc alone isn't."""
     if result.returncode < 0:
-        # the timeout sentinel: the command ran and hung, so it was found and it
-        # was runnable — none of the signals below can apply to it.
+        # One of the two "no exit status" sentinels, or a signal-killed child.
+        # None of the signals below can apply to any of them, though for opposite
+        # reasons: a timeout (`-1`) and a signal death mean the command WAS found
+        # and WAS runnable, while a spawn fault (`SPAWN_FAULT_RC`) means no child
+        # existed to probe — and that one is already answered by `spawn_error`,
+        # ahead of this function being called at all (see `env_fault_reason`).
         return None
     if result.returncode == _CMD_ENV_FAULT_RC:
         return f"rc={_CMD_ENV_FAULT_RC} — cmd reported the command as not found"
@@ -4232,7 +4275,17 @@ def _win32_env_fault_reason(result: CommandResult, cwd: Path) -> str | None:
 def env_fault_reason(result: CommandResult, cwd: Path) -> str | None:
     """Why this verify command is an environment fault rather than a story
     failure, or None if it is not one. Per-shell: verify commands run through
-    the host shell, and sh and cmd signal a broken environment differently."""
+    the host shell, and sh and cmd signal a broken environment differently.
+
+    ``spawn_error`` is answered FIRST and unconditionally, before any rc reading
+    and before the win32 probe. Not merely an ordering preference: the probe
+    resolves a command's leading token as ``cwd / token`` to decide whether the
+    tool exists, and on this leg no child was started, so that lookup is about a
+    directory nothing ever entered and cannot speak to why. The result also
+    carries no exit status to read (see :data:`SPAWN_FAULT_RC`), which is why
+    the rc arms cannot classify it either."""
+    if result.spawn_error is not None:
+        return result.spawn_error
     if result.returncode in ENV_FAULT_RCS:
         return f"rc={result.returncode}"
     if sys.platform != "win32":
@@ -4285,7 +4338,13 @@ def run_verify_commands(policy: Policy, cwd: Path) -> list[CommandResult]:
     ``[-2000:]``), and one undecodable byte must not raise mid-loop and lose
     *every* command's result. Decoding stays on the locale codec (``text=True``)
     precisely because these are host tools — contrast tui/launch.py, which pins
-    ``encoding="utf-8"`` because its child is our own UTF-8 CLI."""
+    ``encoding="utf-8"`` because its child is our own UTF-8 CLI.
+
+    "One apiece" holds across all three legs: a completed child, a timeout, and a
+    child that could never be spawned each append exactly one result and the loop
+    goes on to the next command. The three are told apart on the result itself —
+    an rc for the first, ``rc=-1``/``"timed out"`` for the second,
+    ``spawn_error`` plus :data:`SPAWN_FAULT_RC` for the third."""
     results = []
     for command in policy.verify.commands:
         try:
@@ -4319,6 +4378,42 @@ def run_verify_commands(policy: Policy, cwd: Path) -> list[CommandResult]:
             results.append(
                 CommandResult(command, -1, "timed out", t_out, t_err, t_out_full, t_err_full)
             )
+        except OSError as exc:
+            # The child was never started, so no exit status exists to classify:
+            # `subprocess.run` raises out of the fork/exec (or CreateProcess)
+            # itself when `cwd` is unusable — FileNotFoundError (missing),
+            # NotADirectoryError (a regular file, or a path beneath one),
+            # PermissionError (a directory without +x). `except OSError` rather
+            # than the three names because they are the reachable shapes TODAY,
+            # not a closed set: the base class is what the platform actually
+            # guarantees, and one uncaught sibling here crashes the whole run.
+            #
+            # Translated instead of raised, the same doctrine `_run_git` follows
+            # for the faults that land before a return code exists (#343): left
+            # uncaught this escapes every `except` in the engine's verification
+            # path and ends the run as a crash, when the fact it reports — a cwd
+            # no command can run in — is a textbook environment fault, identical
+            # for every story and unfixable by a repair session.
+            #
+            # A result is APPENDED and the loop CONTINUES, honouring this
+            # function's documented "one CommandResult apiece": a caller zipping
+            # results against `policy.verify.commands` must not silently lose the
+            # tail of the list to the first broken spawn.
+            results.append(
+                CommandResult(
+                    command,
+                    SPAWN_FAULT_RC,
+                    f"{type(exc).__name__}: {exc}",
+                    # What was OBSERVED, not a diagnosis. `except OSError` is
+                    # wider than the cwd shapes that motivated it — a missing
+                    # `/bin/sh`, EMFILE, ENOMEM all land here — so the cwd is
+                    # named as context ("cwd was X") rather than blamed, and the
+                    # exception carries whatever the real cause was. No "could
+                    # not run" phrasing: `cli._reverify` prefixes its own
+                    # ("<cmd>' could not run: ..."), and the two stuttered.
+                    spawn_error=(f"child not started; cwd was {cwd}; {type(exc).__name__}: {exc}"),
+                )
+            )
     return results
 
 
@@ -4337,12 +4432,23 @@ def verify_command_results_outcome(results: list[CommandResult], cwd: Path) -> V
     for result in results:
         reason = env_fault_reason(result, cwd)
         if reason is not None:
+            # The explanatory clause branches on WHICH fault this is, because the
+            # rc-based one is a claim about the command and the spawn one is not:
+            # a child that never started was never looked for, so "command not
+            # found / not executable" would send the reader hunting for a binary
+            # when the directory is what is broken. Everything after the dash is
+            # shared — the remedy (fix the environment, re-arm) is the same.
+            clause = (
+                "the command could not be started at all"
+                if result.spawn_error is not None
+                else "command not found / not executable"
+            )
+            output = "" if result.spawn_error is not None else f"\n{result.output_tail}"
             return VerifyOutcome.escalate(
                 f"verify environment fault ({reason}): {result.command}\n"
-                "command not found / not executable — this is the run environment, "
+                f"{clause} — this is the run environment, "
                 "not the story; fix the environment, then re-arm the escalation "
-                "(the attempt budget resets on re-arm)\n"
-                f"{result.output_tail}",
+                f"(the attempt budget resets on re-arm){output}",
                 env_fault=True,
             )
     for result in results:
@@ -4355,12 +4461,37 @@ def verify_command_results_outcome(results: list[CommandResult], cwd: Path) -> V
     return VerifyOutcome.passed()
 
 
-def verify_commands_outcome(policy: Policy, cwd: Path) -> VerifyOutcome:
-    """Run the policy's deterministic verify commands and classify the results."""
-    return verify_command_results_outcome(run_verify_commands(policy, cwd), cwd)
+def verify_commands_outcome(
+    policy: Policy, cwd: Path, *, on_results: CommandSink | None = None
+) -> VerifyOutcome:
+    """Run the policy's deterministic verify commands and classify the results.
+
+    ``on_results`` observes the results BEFORE they are classified, which is the
+    same order ``Engine._verify_commands_with_results`` uses on the dev side:
+    journal first, decide second, so the record exists whatever the classifier
+    then does with it — including an escalation that ends the run. It is called
+    exactly once per invocation, with an empty tuple when no commands are
+    configured, because "the pass ran and executed nothing" and "no pass ran" are
+    different facts and only the second one is signalled by never getting here.
+
+    The contract on the sink is that IT must not raise; this function adds no
+    guard of its own, deliberately. The engine's sink
+    (``_journal_verify_command_results``) degrades on stream-capture faults — an
+    ``OSError`` from a ``verify/`` write becomes a ``capture_error`` field — but
+    the ``Journal.append`` beneath it has no handler, so ENOSPC or a read-only run
+    dir still propagates. That is the same fail-loud boundary the dev leg already
+    stands on, and wrapping the call here would trade it for silence: a lost
+    journal write is a lost audit record, which is exactly the class of failure
+    that must not pass quietly."""
+    results = run_verify_commands(policy, cwd)
+    if on_results is not None:
+        on_results(tuple(results))
+    return verify_command_results_outcome(results, cwd)
 
 
-def _verify_review_commands(policy: Policy, paths: ProjectPaths) -> VerifyOutcome:
+def _verify_review_commands(
+    policy: Policy, paths: ProjectPaths, *, on_results: CommandSink | None = None
+) -> VerifyOutcome:
     """Run a review gate's ``[verify] commands`` in ``paths.repo_root``.
 
     The two roots split by what is being addressed, and the split is deliberate:
@@ -4392,8 +4523,18 @@ def _verify_review_commands(policy: Policy, paths: ProjectPaths) -> VerifyOutcom
     ``paths.repo_root`` is the ONLY member of ``paths`` this reads — it takes the
     whole dataclass to keep the three call sites uniform, not because it consults
     anything else. A future caller must not infer that artifact paths reach here.
+
+    ``on_results`` is forwarded, not consumed: an engine-supplied sink is how
+    review-gate results reach the journal, which the dev side has always had and
+    these gates had not. Optional, so the gates stay callable from core (and from
+    tests) with no engine at all — no sink simply means nothing is recorded,
+    which is what every direct caller got before.
+
+    This is also the ONLY sanctioned caller of ``verify_commands_outcome``; a
+    fourth gate reaching past it would re-open #695. Enforced, not merely stated
+    — see ``tests/test_portability_guard.py``.
     """
-    return verify_commands_outcome(policy, paths.repo_root)
+    return verify_commands_outcome(policy, paths.repo_root, on_results=on_results)
 
 
 def verify_review(
@@ -4403,6 +4544,7 @@ def verify_review(
     *,
     sprint_reached_done: bool = False,
     operator_park: bool = False,
+    on_results: CommandSink | None = None,
 ) -> VerifyOutcome:
     """Gate a completed review pass: spec at ``done``, sprint-status at ``done``,
     deterministic verify commands green.
@@ -4434,7 +4576,12 @@ def verify_review(
     disagree about whether this run parks. They would: the engine's
     ``_operator_park_enabled`` is an override seam, and a mode that opts out of
     parking while still reaching this gate would otherwise find it accepting a
-    park the engine itself refuses to take."""
+    park the engine itself refuses to take.
+
+    ``on_results`` is handed straight to ``_verify_review_commands`` and is the
+    engine's hook for journalling this gate's verifier results; see there. It is
+    invoked only if the gate reaches its commands — an earlier refusal ran
+    nothing, so there is nothing to record."""
     if not task.spec_file:
         return VerifyOutcome.retry("no spec file recorded for task")
     fm = _gate_frontmatter(Path(task.spec_file))
@@ -4471,7 +4618,7 @@ def verify_review(
             f"sprint-status for {task.story_key} is {sprint!r}, expected {expected!r}"
         )
 
-    return _verify_review_commands(policy, paths)
+    return _verify_review_commands(policy, paths, on_results=on_results)
 
 
 def _is_signoff_regression(sprint: str | None, sprint_reached_done: bool, policy: Policy) -> bool:
@@ -4490,11 +4637,22 @@ def _is_signoff_regression(sprint: str | None, sprint_reached_done: bool, policy
     return STATUS_ORDER.index(sprint) < STATUS_ORDER.index("done")
 
 
-def verify_review_stories(task: StoryTask, paths: ProjectPaths, policy: Policy) -> VerifyOutcome:
+def verify_review_stories(
+    task: StoryTask,
+    paths: ProjectPaths,
+    policy: Policy,
+    *,
+    on_results: CommandSink | None = None,
+) -> VerifyOutcome:
     """verify_review for stories mode: same spec-done + verify-commands gates,
     minus the sprint-status gate (stories mode has no sprint board — the story
     spec's own frontmatter status is authoritative). ``task.spec_file`` is the
-    id-keyed story spec ``verify_dev_stories`` recorded on the dev pass."""
+    id-keyed story spec ``verify_dev_stories`` recorded on the dev pass.
+
+    ``on_results`` is handed straight to ``_verify_review_commands`` and is the
+    engine's hook for journalling this gate's verifier results; see there. It is
+    invoked only if the gate reaches its commands — an earlier refusal ran
+    nothing, so there is nothing to record."""
     if not task.spec_file:
         return VerifyOutcome.retry("no spec file recorded for task")
     fm = _gate_frontmatter(Path(task.spec_file))
@@ -4503,16 +4661,27 @@ def verify_review_stories(task: StoryTask, paths: ProjectPaths, policy: Policy) 
     status = status_of(fm)
     if status != "done":
         return VerifyOutcome.retry(f"spec status is {status!r}, expected 'done'")
-    return _verify_review_commands(policy, paths)
+    return _verify_review_commands(policy, paths, on_results=on_results)
 
 
-def verify_review_bundle(task: StoryTask, paths: ProjectPaths, policy: Policy) -> VerifyOutcome:
+def verify_review_bundle(
+    task: StoryTask,
+    paths: ProjectPaths,
+    policy: Policy,
+    *,
+    on_results: CommandSink | None = None,
+) -> VerifyOutcome:
     """verify_review for a deferred-work bundle: no sprint-status check, but
     every dw id the bundle owns must be marked done in the ledger on disk. The
     legacy --dw-bundle skill flips them; on the generic bmad-build-auto path the
     orchestrator flips them after dev and, if review rewrites the ledger diff,
     again immediately before this review gate. Either way this gate is why we
-    can trust it happened."""
+    can trust it happened.
+
+    ``on_results`` is handed straight to ``_verify_review_commands`` and is the
+    engine's hook for journalling this gate's verifier results; see there. It is
+    invoked only if the gate reaches its commands — an earlier refusal ran
+    nothing, so there is nothing to record."""
     if not task.spec_file:
         return VerifyOutcome.retry("no spec file recorded for task")
     fm = _gate_frontmatter(Path(task.spec_file))
@@ -4543,7 +4712,7 @@ def verify_review_bundle(task: StoryTask, paths: ProjectPaths, policy: Policy) -
             fixable=True,
         )
 
-    return _verify_review_commands(policy, paths)
+    return _verify_review_commands(policy, paths, on_results=on_results)
 
 
 def commit_story(repo: Path, message: str) -> str:

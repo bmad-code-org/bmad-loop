@@ -1876,7 +1876,12 @@ class SweepEngine(Engine):
             self._close_bundle_ledger_when_spec_status(
                 task, task.spec_file, "done", kind="sweep-bundle-reclosed"
             )
-        return verify.verify_review_bundle(task, self.workspace.paths, self.policy)
+        return verify.verify_review_bundle(
+            task,
+            self.workspace.paths,
+            self.policy,
+            on_results=self._review_command_sink(task),
+        )
 
     def _operator_park_enabled(self) -> bool:
         # A bundle carries no sprint-status entry, so the pair a park is verified

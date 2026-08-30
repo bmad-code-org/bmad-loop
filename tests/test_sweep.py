@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 from conftest import (
+    _OK,
     _file_exists_cmd,
     attach_profile,
     bundle_dev_effect,
@@ -2119,6 +2120,38 @@ def test_bundle_pre_gate_state_sync_is_a_noop(project):
     # and no sprint-board intent either: a bundle has no board row, and this
     # override being a no-op is the whole of `_carry_board_advance`'s guard (#350)
     assert task.board_advance_intended is None
+
+
+def test_bundle_review_gate_journals_its_verify_commands(project):
+    """`SweepEngine._verify_review` threads the base engine's review sink, so a
+    bundle's review-leg verifier pass lands the same `verify-command-result`
+    records a story's does.
+
+    Its own row rather than a claim carried by `test_engine.py`: the sink is
+    passed at each override, so dropping it here would leave every sweep run
+    silently unrecorded while the base engine's tests stayed green — which is the
+    shape the #695 root bug already took across these same three gates.
+
+    Ablation: remove `on_results=` from `SweepEngine._verify_review` and the
+    record assertion fails at zero entries."""
+    write_ledger(project, {"DW-1": "done 2026-06-11"})
+    pol = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        verify=VerifyPolicy(commands=(_OK,)),
+    )
+    engine, _ = make_sweep(project, [], policy=pol)
+    spec = project.implementation_artifacts / "spec-dw-fix.md"
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    write_spec(spec, "done", git(project.project, "rev-parse", "HEAD"))
+    task = StoryTask(story_key="dw-fix", epic=0, dw_ids=["DW-1"])
+    task.spec_file = str(spec)
+
+    assert engine._verify_review(task).ok
+
+    (entry,) = [e for e in engine.journal.entries() if e["kind"] == "verify-command-result"]
+    assert entry["verification_stage"] == "review"
+    assert entry["command"] == _OK and entry["story_key"] == "dw-fix"
 
 
 def test_bundle_ledger_close_skips_on_unreadable_spec(project, monkeypatch):

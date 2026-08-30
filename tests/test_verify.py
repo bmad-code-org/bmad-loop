@@ -1,5 +1,6 @@
 import dataclasses
 import hashlib
+import inspect
 import io
 import json
 import os
@@ -2079,6 +2080,257 @@ def test_verify_commands_rc1_stays_fixable_retry(tmp_path):
     assert not out.ok and out.fixable and out.retryable and not out.env_fault
 
 
+# ---- unusable `cwd`: the spawn fault has no return code (DW-2) ----------------
+
+_unsearchable_dir_skips = (
+    pytest.mark.skipif(os.name == "nt", reason="Windows chmod only toggles the read-only flag"),
+    pytest.mark.skipif(
+        os.geteuid() == 0 if hasattr(os, "geteuid") else False,
+        reason="root searches a 000 directory",
+    ),
+)
+
+
+def _unusable_cwd(request, tmp_path, shape: str) -> Path:
+    """One of the ``cwd`` shapes ``subprocess.run`` refuses before the target
+    program starts — the reachable OSError subclasses of the spawn leg.
+
+    Each is a real filesystem state, never a monkeypatched raise: what is being
+    pinned is that the OS's own refusal is caught, and a synthetic
+    ``FileNotFoundError`` would pass just as well against a handler that only
+    named that one class (the narrowing this change exists to avoid).
+
+    The 000 directory's mode is restored by a finalizer — ``tmp_path``'s own
+    cleanup cannot remove a directory it may not search, and the leftover turns
+    into an rm_rf warning on every later session sharing the tmp root."""
+    if shape == "missing":
+        return tmp_path / "nowhere"  # FileNotFoundError
+    if shape == "file":
+        target = tmp_path / "a-file"
+        target.write_text("x\n", encoding="utf-8")
+        return target  # NotADirectoryError
+    if shape == "under-file":
+        target = tmp_path / "a-file-2"
+        target.write_text("x\n", encoding="utf-8")
+        return target / "beneath"  # NotADirectoryError, one level down
+    unsearchable = tmp_path / "locked"
+    unsearchable.mkdir()
+    request.addfinalizer(lambda: unsearchable.chmod(0o700))
+    unsearchable.chmod(0o000)
+    return unsearchable  # PermissionError
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        "missing",
+        "file",
+        "under-file",
+        pytest.param("unsearchable", marks=_unsearchable_dir_skips),
+    ],
+)
+def test_unusable_cwd_becomes_a_result_instead_of_an_exception(request, tmp_path, shape):
+    """A `cwd` no command can run in yields a RESULT, not a raised OSError.
+
+    Before this, `run_verify_commands`' only handler was `except
+    subprocess.TimeoutExpired`, so all three shapes escaped every guard in the
+    engine's verification path and ended the run as a crash (`crash.txt` +
+    `state.crashed`) — over a fact that is a textbook environment problem.
+
+    All three shapes are driven, not just the first: `except FileNotFoundError`
+    would be a perfectly plausible fix and would leave two of them uncaught, so a
+    single-shape row could not tell the narrow handler from the right one.
+
+    Ablation: remove the `except OSError` arm and every parametrization fails with
+    the raw OSError, not with a wrong-message assertion."""
+    cwd = _unusable_cwd(request, tmp_path, shape)
+    policy = Policy(verify=VerifyPolicy(commands=(_OK,)))
+
+    (result,) = verify.run_verify_commands(policy, cwd)
+
+    assert result.command == _OK
+    assert result.spawn_error is not None
+    assert str(cwd) in result.spawn_error  # the failing cwd, which is the finding
+    assert result.returncode == verify.SPAWN_FAULT_RC
+    assert result.returncode != -1  # NOT the timeout sentinel: no child ran at all
+    assert result.output_tail  # names the exception, for the human reading it
+
+
+def test_unusable_cwd_yields_one_result_per_command(tmp_path):
+    """The documented "one CommandResult apiece" holds on the spawn leg too: the
+    loop appends and CONTINUES rather than aborting on the first refusal.
+
+    A caller zipping results against `policy.verify.commands` — or merely counting
+    them — must not silently lose the tail of the list, and the engine journals one
+    record per result, so a short list is a short audit trail.
+
+    Ablation: `break` (or `raise`) instead of `continue` in the new arm and the
+    length assertion fails at 1."""
+    commands = ("first-check", "second-check", "third-check")
+    policy = Policy(verify=VerifyPolicy(commands=commands))
+
+    results = verify.run_verify_commands(policy, tmp_path / "nowhere")
+
+    assert [r.command for r in results] == list(commands)
+    assert all(r.spawn_error is not None for r in results)
+    outcome = verify.verify_command_results_outcome(results, tmp_path / "nowhere")
+    assert "first-check" in outcome.reason
+    assert "second-check" not in outcome.reason and "third-check" not in outcome.reason
+
+
+def test_a_spawn_fault_unrelated_to_the_cwd_translates_too(tmp_path, monkeypatch):
+    """The handler is `except OSError`, not three named cwd classes — and the
+    record must not describe every one of them as a directory problem.
+
+    A missing `/bin/sh`, EMFILE from a descriptor-exhausted host, ENOMEM from a
+    fork that could not allocate: all reach the same arm, none is a fact about
+    the working directory. The message therefore states what was OBSERVED (the
+    child was not started) and names the cwd as context only, leaving the wrapped
+    exception to say why.
+
+    Injected, because a real ENOMEM cannot be provoked from a test without
+    breaking the host running it. What that costs is honest: this row grades the
+    message and the classification, while the sibling rows above drive the OS's
+    own refusals for real.
+
+    Ablation: restore a message hardcoding the cwd as the cause (`could not run
+    in {cwd}: ...`) and the "does not blame the directory" assertion fails."""
+    real_run = subprocess.run
+
+    def out_of_memory(*args, **kwargs):
+        if kwargs.get("shell"):
+            raise OSError(12, "Cannot allocate memory")
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", out_of_memory)
+    policy = Policy(verify=VerifyPolicy(commands=(_OK,)))
+
+    (result,) = verify.run_verify_commands(policy, tmp_path)
+
+    assert result.spawn_error is not None
+    assert "Cannot allocate memory" in result.spawn_error  # the real cause survives
+    # the cwd is context, not a verdict: it appears, but not as the diagnosis
+    assert str(tmp_path) in result.spawn_error
+    assert "could not run in" not in result.spawn_error
+
+    out = verify.verify_command_results_outcome([result], tmp_path)
+    assert not out.ok and out.env_fault and not out.retryable
+
+
+def test_unusable_cwd_escalates_as_an_environment_fault(tmp_path):
+    """Classified, the spawn fault escalates and PAUSES rather than retrying.
+
+    Same channel as rc 126/127 and for the same reason: an unusable `cwd` is
+    deterministic for a given tree, identical for every story, and unfixable by a
+    repair session — which is what `env_fault=True` means. A `retryable` outcome
+    would burn the attempt budget re-running the same refusal.
+
+    The explanatory clause is asserted from BOTH directions. The rc-based leg's
+    fixed "command not found / not executable" is a claim about the command, and
+    on this leg no command was ever looked for — so it must be gone, not merely
+    joined by better text."""
+    cwd = tmp_path / "nowhere"
+    policy = Policy(verify=VerifyPolicy(commands=(_OK,)))
+
+    out = verify.verify_commands_outcome(policy, cwd)
+
+    assert not out.ok and out.env_fault
+    assert not out.retryable and not out.fixable
+    assert "verify environment fault" in out.reason
+    assert str(cwd) in out.reason
+    assert "could not be started" in out.reason
+    assert "command not found / not executable" not in out.reason
+    # The exception already rides `spawn_error`, which is interpolated as the
+    # environment-fault reason. Repeating `output_tail` would print it twice.
+    assert out.reason.count("FileNotFoundError") == 1
+
+
+def test_rc_env_fault_keeps_its_own_explanatory_clause(tmp_path):
+    """The complement, so the branch is pinned from both sides: rc 127 still says
+    "command not found / not executable" — that leg IS a claim about the command,
+    and branching must not have quietly rewritten it for everyone."""
+    policy = Policy(verify=VerifyPolicy(commands=("exit 127",)))
+
+    out = verify.verify_commands_outcome(policy, tmp_path)
+
+    assert not out.ok and out.env_fault
+    assert "command not found / not executable" in out.reason
+    assert "could not be started" not in out.reason
+
+
+def test_spawn_fault_rc_cannot_collide_with_a_real_return_code():
+    """The sentinel sits outside every value a child that RAN can report.
+
+    On POSIX `subprocess` reports `-N` for a child killed by signal N, so the
+    small negatives are all real return codes: `-2` is SIGINT, `-9` SIGKILL. A
+    sentinel in that range would make "the verify command was killed" and "the
+    verify command never started" the same observation to anything keying on the
+    rc — and the journal record invites exactly that, since it ships the rc to
+    out-of-process readers.
+
+    Asserted against `signal.Signals` rather than a hardcoded ceiling, so a
+    platform with higher real-time signals grades this honestly instead of
+    against this test's idea of the range.
+
+    Ablation: set `SPAWN_FAULT_RC = -2` — the value this shipped with first — and
+    the collision assertion fails naming SIGINT."""
+    import signal as signal_mod
+
+    assert verify.SPAWN_FAULT_RC < 0  # the win32 early-out and the failure arm
+    assert verify.SPAWN_FAULT_RC != -1  # not the timeout leg's sentinel
+    collisions = [s for s in signal_mod.Signals if -s.value == verify.SPAWN_FAULT_RC]
+    assert not collisions, f"SPAWN_FAULT_RC is a signal death: {collisions}"
+    # nor an ordinary exit status, which is what the positive range holds
+    assert verify.SPAWN_FAULT_RC not in verify.ENV_FAULT_RCS
+
+
+def test_spawn_fault_is_answered_before_any_rc_or_win32_probe(tmp_path):
+    """`env_fault_reason` reads `spawn_error` FIRST, ahead of the rc arms and the
+    win32 token probe.
+
+    Not a style preference. The probe resolves a command's leading token as `cwd /
+    token` to tell "tool missing" from "command failed" — and on this leg `cwd` is
+    exactly what could not be used, so it has nothing true to say about a directory
+    the child never entered. Driven through `env_fault_reason` directly so the row
+    holds on POSIX, where the probe is not reached at all.
+
+    The result carries `SPAWN_FAULT_RC`, which is in neither `ENV_FAULT_RCS` nor
+    `{0}` — so if the ordering ever regressed, the rc arms could not answer for it
+    and the reason would come back None on POSIX."""
+    result = verify.CommandResult(
+        "pytest -q", verify.SPAWN_FAULT_RC, "NotADirectoryError: ...", spawn_error="cwd is a file"
+    )
+
+    assert verify.env_fault_reason(result, tmp_path) == "cwd is a file"
+    # and a result from a child that really ran is untouched by the new arm
+    assert verify.env_fault_reason(verify.CommandResult("pytest -q", 1, "F"), tmp_path) is None
+
+
+def test_timeout_stays_an_ordinary_fixable_retry_with_no_spawn_error(tmp_path, monkeypatch):
+    """The two "no exit status" shapes must not collapse into one.
+
+    A timed-out command RAN — it was found, it was executable, it hung — so it
+    stays a fixable retry a repair session can act on. Only a child that never
+    started is an environment fault. Sharing a sentinel between them (or letting
+    the new arm swallow the timeout) would pause runs over slow test suites.
+
+    Ablation: set `SPAWN_FAULT_RC = -1` and the sentinel assertion below stops
+    discriminating; set `spawn_error` on the timeout leg and the classification
+    flips to `env_fault`."""
+    monkeypatch.setattr(verify, "COMMAND_TIMEOUT_S", 0.5)
+    sleeper = tmp_path / "sleeper.py"
+    sleeper.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+    policy = Policy(verify=VerifyPolicy(commands=(f'"{sys.executable}" "{sleeper}"',)))
+
+    (result,) = verify.run_verify_commands(policy, tmp_path)
+
+    assert result.spawn_error is None
+    assert result.returncode == -1 and result.output_tail == "timed out"
+
+    out = verify.verify_command_results_outcome([result], tmp_path)
+    assert not out.ok and out.retryable and out.fixable and not out.env_fault
+
+
 def test_verify_commands_bound_a_stream_instead_of_holding_it_whole(tmp_path, monkeypatch):
     """A chatty command's stream is cut to `MAX_STREAM_MEMORY_BYTES` as it is
     collected, and what it emitted is recorded rather than lost.
@@ -3141,6 +3393,123 @@ def test_verify_review_gates_classify_against_the_root_they_run_in(
     # both hops, not just execution: the classifier decides escalate-vs-retry
     assert seen["run"] == repo_root
     assert seen["classify"] == repo_root
+
+
+def _break_the_check_before_the_commands(project, task, mode) -> None:
+    """Fail the LAST gate check that precedes the verify commands, per mode.
+
+    Deliberately the last one rather than the first: every gate opens on the spec
+    status, so breaking that would prove only that the earliest check
+    short-circuits and would leave the sprint and ledger checks — the ones that
+    sit immediately in front of the commands — unexercised in all three modes.
+    ``review_stories`` has no later check to break, so its spec status is the
+    honest subject there."""
+    if mode == "review":
+        write_sprint(project, {"1-1-a": "in-progress"})
+    elif mode == "review_stories":
+        write_spec(Path(task.spec_file), "in-progress", task.baseline_commit)
+    else:
+        bundle_ledger(project, {"DW-1": "open", "DW-2": "open"})
+
+
+@pytest.mark.parametrize("mode", ["review", "review_stories", "review_bundle"])
+def test_verify_review_gates_hand_their_results_to_the_sink(project, mode):
+    """Every review gate offers its verifier results to `on_results` — the seam
+    the engine journals review-leg `verify-command-result` records through.
+
+    Before this the three gates discarded their `CommandResult`s inside core, so a
+    review pass left no per-command record and no `verify/` stream files, unlike
+    the dev side. The results are handed over BEFORE classification (the order
+    `Engine._verify_commands_with_results` already used), so the record exists
+    whatever the classifier then decides — including an escalation that ends the
+    run.
+
+    Both commands are asserted, not just the count: the sink receives the whole
+    tuple in configured order, which is what makes a record-per-command possible."""
+    task, gate = _review_gate_at_done(project, mode)
+    seen: list[tuple[verify.CommandResult, ...]] = []
+    policy = Policy(verify=VerifyPolicy(commands=(_OK, _FAIL)))
+
+    out = gate(task, project, policy, on_results=seen.append)
+
+    assert not out.ok and out.fixable  # the classification is unchanged by the sink
+    (results,) = seen  # called exactly once per gate invocation
+    assert [r.command for r in results] == [_OK, _FAIL]
+    assert [r.returncode for r in results] == [0, 1]
+
+
+@pytest.mark.parametrize(
+    "subject",
+    [
+        verify.verify_commands_outcome,
+        verify._verify_review_commands,
+        verify.verify_review,
+        verify.verify_review_stories,
+        verify.verify_review_bundle,
+    ],
+)
+def test_review_result_sinks_are_keyword_only_with_a_default(subject):
+    """The additive observation seam cannot silently bind a new positional
+    argument at any layer; every existing call shape remains valid."""
+    parameter = inspect.signature(subject).parameters["on_results"]
+
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is None
+
+
+@pytest.mark.parametrize("mode", ["review", "review_stories", "review_bundle"])
+def test_verify_review_gates_skip_the_sink_when_they_short_circuit(project, mode):
+    """A gate that refuses before reaching its commands offers nothing: nothing
+    ran, so there is nothing to record.
+
+    The distinction is load-bearing for the journal — a record claims a verifier
+    pass happened — and it is why the sink is threaded through the composition
+    rather than fired at the top of each gate.
+
+    Ablation: fire the sink at the top of each gate — necessarily with an empty
+    tuple, since no results exist there yet — and every mode fails here on
+    `seen == []`."""
+    task, gate = _review_gate_at_done(project, mode)
+    _break_the_check_before_the_commands(project, task, mode)
+    seen: list[tuple[verify.CommandResult, ...]] = []
+
+    out = gate(task, project, Policy(verify=VerifyPolicy(commands=(_OK,))), on_results=seen.append)
+
+    assert not out.ok
+    assert seen == []
+
+
+@pytest.mark.parametrize("mode", ["review", "review_stories", "review_bundle"])
+def test_verify_review_gates_call_the_sink_with_no_commands_configured(project, mode):
+    """With `[verify] commands` empty the sink is still called, with `()`.
+
+    "The pass ran and executed nothing" and "no pass ran" are different facts, and
+    only the second is signalled by never calling the sink — which is precisely
+    what the short-circuit row above asserts. The engine's sink then records
+    nothing and allocates no sequence for an empty tuple, so this costs no journal
+    entry; what it buys is that the two cases stay distinguishable at the seam."""
+    task, gate = _review_gate_at_done(project, mode)
+    seen: list[tuple[verify.CommandResult, ...]] = []
+
+    assert gate(task, project, Policy(), on_results=seen.append).ok
+
+    assert seen == [()]
+
+
+@pytest.mark.parametrize("mode", ["review", "review_stories", "review_bundle"])
+def test_verify_review_gates_are_unchanged_with_no_sink(project, mode):
+    """Called from core with no sink — as every pre-existing caller does — the
+    gates behave exactly as before: `on_results` is keyword-with-default, and its
+    absence is not a second code path.
+
+    Both verdicts, so the row cannot be satisfied by a gate that started refusing
+    (or accepting) everything."""
+    task, gate = _review_gate_at_done(project, mode)
+
+    assert gate(task, project, Policy(verify=VerifyPolicy(commands=(_OK,)))).ok
+
+    refused = gate(task, project, Policy(verify=VerifyPolicy(commands=(_FAIL,))))
+    assert not refused.ok and refused.fixable and "verify command failed" in refused.reason
 
 
 @pytest.mark.parametrize("mode", ["review", "review_bundle"])

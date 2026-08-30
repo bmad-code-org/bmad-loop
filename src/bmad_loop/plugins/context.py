@@ -222,6 +222,16 @@ class HookContext:
         in the order the commands ran. Read-only observability for
         ``post_dev_verify``; nothing here feeds an engine decision.
 
+        Each record carries ``command``, ``returncode``, the merged bounded
+        ``output_tail``, the separate ``stdout`` / ``stderr`` streams with their
+        optional ``*_full_bytes`` emission counts (``None`` means the matching
+        stream was retained whole), and ``spawn_error``. That last one is normally
+        ``None`` and is set when the child could not be STARTED — its ``returncode``
+        is then ``verify.SPAWN_FAULT_RC``, a sentinel outside the range any real
+        child reports, so a handler must not read the rc of such a record as an
+        exit status. The pass that produced it always ends the attempt as an
+        environment fault.
+
         Empty is ambiguous ON ITS OWN and must not be read as "the commands did
         not run" — read it together with :attr:`verification_stage`, which is what
         separates the cases:

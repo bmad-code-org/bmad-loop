@@ -537,8 +537,17 @@ class StoriesEngine(Engine):
 
     def _verify_review(self, task: StoryTask):
         # Drop the sprint-status gate (stories mode has no board); the id-keyed
-        # story spec's own `done` frontmatter is authoritative.
-        return verify.verify_review_stories(task, self.workspace.paths, self.policy)
+        # story spec's own `done` frontmatter is authoritative. The sink is the
+        # base engine's: stories mode runs the same verifier commands and its
+        # results belong in the same journal record kind (see
+        # `Engine._review_command_sink`), so a mode-specific one would only be a
+        # way for the three gates to drift apart on what they record.
+        return verify.verify_review_stories(
+            task,
+            self.workspace.paths,
+            self.policy,
+            on_results=self._review_command_sink(task),
+        )
 
     def _sprint_board_instruction(self) -> str:
         # Stories mode has no sprint-status.yaml: `_post_dev_state_sync` is a no-op

@@ -8009,6 +8009,46 @@ def test_confirm_reverify_success_lets_the_flip_through(project, capsys, monkeyp
     assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "done"
 
 
+def test_confirm_reverify_reports_an_unusable_cwd_instead_of_crashing(
+    project, tmp_path, capsys, monkeypatch
+):
+    """A `repo_root` no command can run in refuses the confirmation; it does not
+    raise out of the CLI.
+
+    `_reverify` deliberately does not classify into the engine's vocabulary, but
+    it does reuse `env_fault_reason` — so it inherits the spawn-fault translation
+    with no edit of its own, and this row is what pins that inheritance. Before
+    it, the OSError from `subprocess.run` escaped `cmd_confirm` entirely and the
+    operator saw a traceback in place of "NOT confirmed".
+
+    The park record and the board must be untouched, for the same reason the
+    red-command row beside this one asserts it: a refused `--reverify` has to
+    leave every record exactly where it found it."""
+    from bmad_loop import operatoractions, sprintstatus
+
+    install_bmad_config(project)
+    missing = tmp_path / "no-such-code-root"
+    (project.project / "_bmad" / "bmm" / "config.yaml").write_text(
+        "implementation_artifacts: '{project-root}/_bmad-output/implementation-artifacts'\n"
+        "planning_artifacts: '{project-root}/_bmad-output/planning-artifacts'\n"
+        f"repo_root: '{missing.as_posix()}'\n",
+        encoding="utf-8",
+    )
+    sp = _park_story(project)
+    before = sp.read_text()
+    _write_policy(project.project, '[verify]\ncommands = ["python -c \\"pass\\""]\n')
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    assert cli.main(_confirm_argv(project, "1-1-a", "--reverify")) == 1
+
+    err = capsys.readouterr().err
+    assert "--reverify failed" in err and "NOT confirmed" in err
+    assert "could not run" in err and str(missing) in err
+    assert sp.read_text() == before
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
+    assert "1-1-a" in operatoractions.load(project.project)
+
+
 def test_confirm_reverify_says_so_when_nothing_is_configured(project, capsys, monkeypatch):
     """An empty command list is not a green gate, and must not be reported as one."""
     install_bmad_config(project)
@@ -8425,6 +8465,36 @@ def test_a_resume_still_honors_reverify_and_says_what_was_not_done(project, caps
     assert cli.main(_confirm_argv(project, "1-1-a", "--reverify")) == 1
     err = capsys.readouterr().err
     assert "NOT advanced" in err and "NOT confirmed" not in err
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
+    assert "1-1-a" in operatoractions.load(project.project)
+
+
+def test_a_resume_reverify_reports_an_unusable_cwd_without_losing_partial_state(
+    project, tmp_path, capsys, monkeypatch
+):
+    """The resumable confirmation caller gets the same spawn-fault translation
+    as the initial confirmation and preserves the already-written sign-off."""
+    from bmad_loop import operatoractions, sprintstatus
+
+    install_bmad_config(project)
+    missing = tmp_path / "no-such-resume-code-root"
+    (project.project / "_bmad" / "bmm" / "config.yaml").write_text(
+        "implementation_artifacts: '{project-root}/_bmad-output/implementation-artifacts'\n"
+        "planning_artifacts: '{project-root}/_bmad-output/planning-artifacts'\n"
+        f"repo_root: '{missing.as_posix()}'\n",
+        encoding="utf-8",
+    )
+    spec = _interrupted_story(project)
+    before = spec.read_text(encoding="utf-8")
+    _write_policy(project.project, '[verify]\ncommands = ["python -c \\"pass\\""]\n')
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    assert cli.main(_confirm_argv(project, "1-1-a", "--reverify")) == 1
+
+    err = capsys.readouterr().err
+    assert "NOT advanced" in err and "NOT confirmed" not in err
+    assert "could not run" in err and str(missing) in err
+    assert spec.read_text(encoding="utf-8") == before
     assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
     assert "1-1-a" in operatoractions.load(project.project)
 

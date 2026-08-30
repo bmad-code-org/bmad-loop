@@ -212,7 +212,9 @@ _PATH_SEP_RE = re.compile(r"[\\/]")
 # The `verify-command-result` group at the end is the same convention applied to
 # the verifier records: `command` is operator-authored shell (`[verify] commands`),
 # `output_tail` is a build's own output, `capture_error` is an OSError string
-# carrying a path, and the two pointers embed the story key. Routing them here
+# carrying a path, `spawn_error` names the run's code root explicitly as its cwd
+# (and a cwd-related wrapped exception may name it again), and the two pointers
+# embed the story key. Routing them here
 # rather than leaving them to `scrub_json` is deliberate — that fallback fails
 # closed only by accident of shape, since `_IDENTIFIER_RE` forbids `/` and spaces
 # and so collapses paths, argv-ish commands and multi-line tails, while a
@@ -235,6 +237,7 @@ _JOURNAL_DROP_FIELDS = frozenset(
         "command",
         "output_tail",
         "capture_error",
+        "spawn_error",
         "stdout_path",
         "stderr_path",
         # An absolute host path naming the run's code tree

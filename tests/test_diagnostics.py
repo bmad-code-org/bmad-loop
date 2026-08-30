@@ -454,19 +454,21 @@ def test_a_windows_spec_path_normalizes_to_the_same_alias():
 def test_verify_command_free_text_drops_to_presence_booleans():
     """A `verify-command-result` record ships its correlation half, never its text.
 
-    `_scrub_entry` routes by field NAME, and five of this record's fields are free
+    `_scrub_entry` routes by field NAME, and six of this record's fields are free
     text: `command` is operator-authored shell, `output_tail` is a build's own
-    output, `capture_error` is an OSError string carrying a path, and the two
-    stream pointers embed the story key. Left to the `scrub_json` fallback they
-    fail closed only by ACCIDENT of shape — `_IDENTIFIER_RE` forbids `/` and
-    spaces, so paths, argv-ish commands and multi-line tails collapse — but a
-    one-word command like `make` satisfies it and ships verbatim.
+    output, `capture_error` is an OSError string carrying a path, `spawn_error` is
+    an OSError string carrying the run's code root twice, and the two stream
+    pointers embed the story key. Left to the `scrub_json` fallback they fail
+    closed only by ACCIDENT of shape — `_IDENTIFIER_RE` forbids `/` and spaces, so
+    paths, argv-ish commands and multi-line tails collapse — but a one-word
+    command like `make` satisfies it and ships verbatim.
 
-    Ablation: remove the five names from `_JOURNAL_DROP_FIELDS`. `command` comes
+    Ablation: remove the six names from `_JOURNAL_DROP_FIELDS`. `command` comes
     back as the literal `make` (reddening the presence assertion AND the canary
-    sweep), while `output_tail` / `capture_error` / `stdout_path` merely turn into
-    `<redacted:str>` — which is why `make` is the value under test and not a
-    path-shaped one: only it separates the drop list from the fallback.
+    sweep), while `output_tail` / `capture_error` / `spawn_error` / `stdout_path`
+    merely turn into `<redacted:str>` — which is why `make` is the value under
+    test and not a path-shaped one: only it separates the drop list from the
+    fallback.
     """
     pseudo = sanitize.Pseudonymizer(salt=b"fixed")
     out = diagnostics._scrub_entry(
@@ -482,6 +484,10 @@ def test_verify_command_free_text_drops_to_presence_booleans():
             "returncode": 1,
             "output_tail": CODE,
             "capture_error": f"stdout: [Errno 28] No space left on device: '{HOME_PATH}/x'",
+            "spawn_error": (
+                f"child not started; cwd was {HOME_PATH}/code; "
+                f"NotADirectoryError: [Errno 20] Not a directory: '{HOME_PATH}/code'"
+            ),
             "stdout_path": f"verify/verify-{STORY_KEY}-dev-2-3-0.stdout.log",
             "stderr_path": None,
             "stdout_bytes": 12,
@@ -492,11 +498,19 @@ def test_verify_command_free_text_drops_to_presence_booleans():
         1.0,
     )
 
-    for field in ("command", "output_tail", "capture_error", "stdout_path", "stderr_path"):
+    for field in (
+        "command",
+        "output_tail",
+        "capture_error",
+        "spawn_error",
+        "stdout_path",
+        "stderr_path",
+    ):
         assert field not in out, f"{field} must never be emitted"
     assert out["command_present"] is True
     assert out["output_tail_present"] is True
     assert out["capture_error_present"] is True
+    assert out["spawn_error_present"] is True
     # the pointers keep the one fact they are worth: whether a stream was retained
     # at all — `stream_capture_kb = 0` and a failed write both leave it null.
     assert out["stdout_path_present"] is True

@@ -454,9 +454,15 @@ def test_post_dev_verify_reaches_a_real_plugin_through_the_bus(project, monkeypa
     assert summary.done == 1
     assert seen == [("dev", 1, (result,))]
     # and the keys the plugin was handed are the ones its journal record carries,
-    # which is the correlation the whole surface exists for
-    (entry,) = [e for e in engine.journal.entries() if e["kind"] == "verify-command-result"]
-    assert (entry["verification_stage"], entry["verification_sequence"]) == ("dev", 1)
+    # which is the correlation the whole surface exists for. Scoped to the dev
+    # stage: the review gate journals its own pass now, and that one deliberately
+    # reaches no plugin — the single `seen` entry above is the other half of that.
+    (entry,) = [
+        e
+        for e in engine.journal.entries()
+        if e["kind"] == "verify-command-result" and e["verification_stage"] == "dev"
+    ]
+    assert entry["verification_sequence"] == 1
     assert entry["story_key"] == "1-1-a" and entry["command"] == "pytest -q"
 
 

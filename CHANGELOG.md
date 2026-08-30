@@ -9,6 +9,19 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- **Review-gate verify commands are journalled** (#656, partial). The three review gates
+  (`verify_review`, `verify_review_stories`, `verify_review_bundle`) now emit one
+  `verify-command-result` per command, `verification_stage: "review"`, sharing the story's
+  `verification_sequence` with its dev and fix passes and writing the same `verify/` stream
+  files. `post_dev_verify` stays dev/fix only — #656 narrows to the hook stage. A gate that
+  refuses before reaching its commands records nothing.
+
+- **Portability guard: `verify_commands_outcome` is callable only from
+  `verify._verify_review_commands`.** A fourth review gate composing run+classify itself would
+  reintroduce #695's project-vs-repo root split; the guard now fails and names the file and
+  line. Deliberately not widened to `run_verify_commands`, which has three legitimate callers
+  on two roots.
+
 - **`repo_root` in run `state.json`** (#716). A run records the git root its code work happens in,
   so an out-of-process reader — `bmad-loop resolve`'s re-arm — uses the tree the run measured
   instead of re-deriving one. A `state.json` written before the field existed degrades to the
@@ -44,6 +57,20 @@ breaking changes may land in a minor release.
   failing on a lock it never needed.
 
 ### Changed
+
+- **A story's `verification_sequence` now numbers its review passes too**, so the ordinals a
+  `post_dev_verify` handler receives shift: for an unchanged run whose review gate sits between
+  the dev and repair legs, the `fix` pass moves from 2 to 3. The ordinal was always documented
+  as a per-story counter across a run's verify passes rather than a per-leg one, and the review
+  passes are now among them — but a plugin that hardcoded the numbers, rather than joining on
+  the `verification_sequence` its context hands it, will read the wrong records.
+
+- **The `verify-command-result` census inverts its meaning.** It was "the dev-phase passes only,
+  never a complete count"; it is now every in-run pass — dev, fix and review — with only
+  `bmad-loop confirm --reverify` outside it (and a pass with no `[verify] commands` configured,
+  which records nothing because nothing ran). A run therefore retains one record set plus a
+  `verify/` stream file pair per command per review pass where the review leg previously
+  retained none, so `verify/` grows with the review budget on a story that loops.
 
 - **psmux sessions now live in a per-project registry** (#537). bmad-loop points
   `PSMUX_DATA_DIR` at `<state root>/<project>/_mux`, so a prune in one project cannot address
@@ -180,6 +207,15 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- A verify command whose child cannot be started pauses the run instead of crashing it. Any
+  spawn-time `OSError` — most often a working directory that is missing, is a regular file, or
+  cannot be searched, but a missing shell or EMFILE too — raised out of `subprocess.run` past
+  every guard and ended the run with `crash.txt` + `state.crashed`. It is now translated into
+  one `CommandResult` per command carrying a `spawn_error` (and a synthetic return code outside
+  the range a signal-killed child reports, distinct from the timeout leg's `-1`), classified as
+  an environment fault, and escalated — budget untouched, re-armable.
+  `bmad-loop confirm --reverify` reports it as a refusal too. A command that merely times out
+  is unchanged: still an ordinary fixable retry.
 - Require a dispatch-time expectation before an `awaiting-operator` park skips proof-of-work,
   so a re-drive cannot verify green by inheriting an earlier in-run park; inherited parks with
   real changes still pass (#335, #676). Journal each waived artifact-gate pass as

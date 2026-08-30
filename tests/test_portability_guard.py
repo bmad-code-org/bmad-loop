@@ -55,6 +55,48 @@ TMUX_BACKENDS = {"adapters/tmux_base.py", "adapters/tmux_backend.py"}
 # TUI checkpoint modal, and a probe ignoring `limits.git_timeout_s`.
 GIT_CHOKEPOINT = {"verify.py"}
 
+# The one file allowed to CALL ``verify_commands_outcome`` — and within it, only
+# from inside ``_verify_review_commands``, the helper that resolves the review
+# gates' command cwd to ``paths.repo_root``. Three gates used to call the
+# composition directly with ``paths.project``, which is #695; the helper exists so
+# they cannot drift apart on that root again, and a fourth gate calling past it
+# would silently reintroduce the bug in exactly the same shape. Like the git
+# exemption the sanction is a call POSITION, not the whole file: verify.py could
+# perfectly well grow another helper that calls the composition with some other
+# cwd, and that is the thing being refused.
+#
+# Deliberately NOT widened to ``run_verify_commands``: that has three legitimate
+# callers on two roots (the dev side in ``Workspace.root``, this helper in
+# ``repo_root``, and ``cli._reverify``, handed ``repo_root`` by its callers), so it
+# is not a chokepoint of this shape and a guard over it would be an allowlist that
+# grows with every caller until it means nothing. Said here rather than left
+# implied, because "why is only one of the two functions guarded" is the first
+# question the next reader will have.
+VERIFY_COMMANDS_CHOKEPOINT = {"verify.py"}
+VERIFY_COMMANDS_SANCTIONED_CALLER = "_verify_review_commands"
+
+# The other half of the same invariant. Fencing the WRAPPER alone leaves the bug
+# fully reachable: a fourth gate can spell the composition by hand —
+# `verify_command_results_outcome(run_verify_commands(policy, paths.project),
+# paths.project)` — and reintroduce #695 with the wrapper guard silent. That is
+# also the likely way one gets written, because `Engine._verify_commands_with_results`
+# already spells exactly that composition inline, so it is the shape a new gate
+# would be copied from.
+#
+# Two sanctioned positions, keyed file -> the ONE enclosing function, because the
+# two are different functions in different modules: `verify_commands_outcome` is
+# the review/CLI composition point, `_verify_commands_with_results` the dev side's
+# (which must keep its own spelling — it retains the results for the hook payload
+# between the two calls, which is the whole reason it does not use the wrapper).
+#
+# Deliberately NOT extended to `run_verify_commands`: the spec forbids it, and its
+# three callers legitimately run on two different roots, so a guard there would be
+# an allowlist that grows with every caller until it means nothing.
+VERIFY_CLASSIFY_CHOKEPOINT = {
+    "verify.py": "verify_commands_outcome",
+    "engine.py": "_verify_commands_with_results",
+}
+
 # Files where resolving a raw `task.spec_file` / `task.dispatched_spec_file` with a
 # bare `Path(...)` is CORRECT, because the reader runs inside the tree the value was
 # recorded against. `runs.py` is the chokepoint itself; `engine.py`, `verify.py` and
@@ -405,6 +447,93 @@ def _env_read_key(node: ast.expr | None, aliases: dict[str, str]) -> str | None:
     return None
 
 
+def _called_name(func: ast.expr) -> str | None:
+    """The trailing name of a call's callee, or None when the callee is neither a
+    plain name nor an attribute access.
+
+    Both spellings resolve to the same name, because both reach the same
+    function: the bare name (inside the defining module, and after a
+    ``from .verify import`` anywhere else) and the attribute form
+    (``verify.verify_commands_outcome``, which is how every module outside core
+    reaches it). The module qualifier is deliberately ignored — a bypass written
+    as ``v.verify_commands_outcome`` under an aliased import is the same bypass,
+    and the cost of the looser match is a false positive, which is a review
+    prompt rather than a miss."""
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return None
+
+
+def _verify_call_aliases(tree: ast.AST, target: str) -> frozenset[str]:
+    """Bare names statically bound to one guarded verify-call target.
+
+    The call-site spelling alone misses the ordinary Python aliases a future
+    caller may use: rename-on-import and a local assignment from either the
+    module attribute or an already-known alias. Resolve those cheap, explicit
+    bindings while keeping this a single-file AST scan; computed names remain a
+    review-time concern because proving their value requires executing code.
+    """
+    aliases = {
+        alias.asname or alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+        if alias.name == target
+    }
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            value = node.value
+            if value is None:
+                continue
+            value_name = _called_name(value)
+            if value_name != target and value_name not in aliases:
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for assignment_target in targets:
+                if isinstance(assignment_target, ast.Name) and assignment_target.id not in aliases:
+                    aliases.add(assignment_target.id)
+                    changed = True
+    return frozenset(aliases)
+
+
+def _names_guarded_verify_call(
+    func: ast.expr, target: str, aliases: frozenset[str] = frozenset()
+) -> bool:
+    name = _called_name(func)
+    if name == target or name in aliases:
+        return True
+    return (
+        isinstance(func, ast.Call)
+        and isinstance(func.func, ast.Name)
+        and func.func.id == "getattr"
+        and len(func.args) >= 2
+        and isinstance(func.args[1], ast.Constant)
+        and func.args[1].value == target
+    )
+
+
+def _names_verify_commands_outcome(func: ast.expr, aliases: frozenset[str] = frozenset()) -> bool:
+    """Whether a call's callee names ``verify_commands_outcome``.
+
+    Direct names, attributes, rename-on-import, assignment aliases, and literal
+    ``getattr`` calls are covered. A computed target name is deliberately beyond
+    this static tripwire and remains a review-time concern."""
+    return _names_guarded_verify_call(func, "verify_commands_outcome", aliases)
+
+
+def _names_verify_classifier(func: ast.expr, aliases: frozenset[str] = frozenset()) -> bool:
+    """Whether a call's callee names ``verify_command_results_outcome`` — the
+    classifier half of the composition. Same reach and computed-name bound as
+    :func:`_names_verify_commands_outcome`."""
+    return _names_guarded_verify_call(func, "verify_command_results_outcome", aliases)
+
+
 def _scan():
     """Single pass over the tree → list of (kind, rel, lineno, line_text)."""
     findings = []
@@ -428,6 +557,8 @@ def _scan_source(src: str, rel: str):
     tree = ast.parse(src, filename=rel)
     docs = _docstring_node_ids(tree)
     env_aliases = _env_name_aliases(tree)
+    verify_command_aliases = _verify_call_aliases(tree, "verify_commands_outcome")
+    verify_classifier_aliases = _verify_call_aliases(tree, "verify_command_results_outcome")
 
     # First positional args of `_run_git(...)` calls — the one position where a
     # git argv literal feeds the chokepoint instead of bypassing it. Collected up
@@ -443,6 +574,40 @@ def _scan_source(src: str, rel: str):
         and call.args
     }
     git_heads, git_commands = _git_name_bindings(tree)
+
+    # `verify_commands_outcome(...)` calls that sit inside a
+    # `_verify_review_commands` definition — the review gates' single sanctioned
+    # composition point. Collected up front, exactly like `run_git_argvs` above,
+    # so the walk can tag each finding with the position bit instead of trying to
+    # rediscover its enclosing function from a bare node.
+    #
+    # Nested defs are covered because `ast.walk` descends into the function body,
+    # and the enclosing-name check is paired with a FILE check in the offender
+    # filter — a `_verify_review_commands` grown in some other module must not
+    # sanction itself by name alone.
+    sanctioned_verify_command_calls = {
+        id(call)
+        for fn in ast.walk(tree)
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and fn.name == VERIFY_COMMANDS_SANCTIONED_CALLER
+        for call in ast.walk(fn)
+        if isinstance(call, ast.Call)
+        and _names_verify_commands_outcome(call.func, verify_command_aliases)
+    }
+
+    # The same collection for the classifier half. `.get(rel)` is None in every
+    # file that has no sanctioned position, and no function is named None, so the
+    # set comes out empty there — which is what makes the file half of the filter
+    # bite without a second membership test here.
+    sanctioned_classify_calls = {
+        id(call)
+        for fn in ast.walk(tree)
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and fn.name == VERIFY_CLASSIFY_CHOKEPOINT.get(rel)
+        for call in ast.walk(fn)
+        if isinstance(call, ast.Call)
+        and _names_verify_classifier(call.func, verify_classifier_aliases)
+    }
 
     def line_at(lineno: int) -> str:
         return lines[lineno - 1] if 1 <= lineno <= len(lines) else ""
@@ -502,6 +667,42 @@ def _scan_source(src: str, rel: str):
                 or (isinstance(cmd, ast.Name) and cmd.id in git_commands)
             ):
                 findings.append(("git", rel, node.lineno, line_at(node.lineno), False))
+
+        # A call to `verify_commands_outcome` — the run+classify composition the
+        # three review gates reach through `_verify_review_commands`. Each finding
+        # carries one extra field: whether it sits inside that helper, the only
+        # position the exemption covers. Prose naming the function (its own
+        # docstrings, `cli._reverify`'s "Deliberately NOT ...") is a Constant, not
+        # a Call, so it never reaches here.
+        if isinstance(node, ast.Call) and _names_verify_commands_outcome(
+            node.func, verify_command_aliases
+        ):
+            findings.append(
+                (
+                    "verifycmd",
+                    rel,
+                    node.lineno,
+                    line_at(node.lineno),
+                    id(node) in sanctioned_verify_command_calls,
+                )
+            )
+
+        # ... and the classifier half, so a gate that skips the wrapper and
+        # composes run+classify by hand is caught by the same pass. Same shape:
+        # the finding carries whether it sits in this file's one sanctioned
+        # enclosing function.
+        if isinstance(node, ast.Call) and _names_verify_classifier(
+            node.func, verify_classifier_aliases
+        ):
+            findings.append(
+                (
+                    "verifyclassify",
+                    rel,
+                    node.lineno,
+                    line_at(node.lineno),
+                    id(node) in sanctioned_classify_calls,
+                )
+            )
 
         # bare POSIX path string literal (skip docstrings)
         if (
@@ -682,6 +883,82 @@ def test_no_git_invocation_outside_verify():
     assert not offenders, (
         "git spawned outside the _run_git chokepoint — route it through "
         "verify.git_bytes or a sibling helper instead:\n"
+        + "\n".join(f"  {rel}:{ln}: {txt.strip()}" for rel, ln, txt in offenders)
+    )
+
+
+def _verify_command_offenders(findings) -> list[tuple[str, int, str]]:
+    """The review-gate chokepoint as a filter: a ``verify_commands_outcome`` call
+    is sanctioned only in a ``VERIFY_COMMANDS_CHOKEPOINT`` file AND only from
+    inside ``_verify_review_commands`` — the file alone is not enough, for the
+    same reason the git exemption is not file-wide."""
+    return [
+        (rel, ln, txt)
+        for _, rel, ln, txt, inside_helper in findings
+        if not (rel in VERIFY_COMMANDS_CHOKEPOINT and inside_helper)
+    ]
+
+
+def test_verify_commands_outcome_called_only_from_the_review_chokepoint():
+    """Only ``verify.py``'s ``_verify_review_commands`` may call
+    ``verify_commands_outcome`` — every review gate goes through that helper.
+
+    The helper is what pins the review legs' command cwd to ``paths.repo_root``
+    (#695). Three gates previously each spelled the composition themselves against
+    ``paths.project``; folding them onto one helper fixed all three at once, but
+    nothing stopped a fourth gate from spelling it out again and reintroducing the
+    bug in exactly the same shape — which is what this refuses.
+
+    The bound is narrow on purpose and stated rather than implied: it does NOT
+    extend to ``run_verify_commands``, whose three callers legitimately run on two
+    different roots. See ``VERIFY_COMMANDS_CHOKEPOINT``."""
+    offenders = _verify_command_offenders(_of("verifycmd"))
+    assert not offenders, (
+        "verify_commands_outcome called outside verify.py's _verify_review_commands "
+        "— route the review gate through that helper so its command cwd stays "
+        "repo_root (#695):\n"
+        + "\n".join(f"  {rel}:{ln}: {txt.strip()}" for rel, ln, txt in offenders)
+    )
+
+
+def _verify_classify_offenders(findings) -> list[tuple[str, int, str]]:
+    """The classifier half's invariant as a filter: a
+    ``verify_command_results_outcome`` call is sanctioned only in a
+    ``VERIFY_CLASSIFY_CHOKEPOINT`` file AND only inside that file's one listed
+    enclosing function."""
+    return [
+        (rel, ln, txt)
+        for _, rel, ln, txt, inside_helper in findings
+        if not (rel in VERIFY_CLASSIFY_CHOKEPOINT and inside_helper)
+    ]
+
+
+def test_verify_command_results_outcome_called_only_from_its_two_compositions():
+    """``verify_command_results_outcome`` is callable only from
+    ``verify.verify_commands_outcome`` and ``Engine._verify_commands_with_results``.
+
+    The sibling guard above fences the WRAPPER, which on its own leaves #695 fully
+    reachable: a fourth review gate that skips `verify_commands_outcome` and writes
+    ``verify_command_results_outcome(run_verify_commands(policy, paths.project),
+    paths.project)`` picks its own root, twice, with that guard silent. And it is
+    the shape such a gate would most likely take, since the dev side already spells
+    that composition inline for its own (good) reason — it keeps the results
+    between the two calls to build the hook payload.
+
+    Two sanctioned positions rather than one because the two compositions are
+    genuinely different functions in different modules; the pair is listed in
+    ``VERIFY_CLASSIFY_CHOKEPOINT`` and both halves — file and enclosing function —
+    are required.
+
+    Still NOT extended to ``run_verify_commands``: the spec forbids it, and its
+    three callers legitimately run on two roots."""
+    offenders = _verify_classify_offenders(_of("verifyclassify"))
+    assert not offenders, (
+        "verify_command_results_outcome called outside its two sanctioned "
+        "compositions (verify.verify_commands_outcome, "
+        "Engine._verify_commands_with_results) — a review gate must reach the "
+        "commands through verify._verify_review_commands so its cwd stays "
+        "repo_root (#695):\n"
         + "\n".join(f"  {rel}:{ln}: {txt.strip()}" for rel, ln, txt in offenders)
     )
 
@@ -1174,6 +1451,318 @@ def test_git_argv_exemption_is_scoped_to_the_chokepoint_call(label, rel, source,
     assert bool(offenders) is is_offender, (
         f"a git argv in {rel} here should {'be refused' if is_offender else 'be allowed'}:\n"
         f"{source}"
+    )
+
+
+# The review-gate chokepoint's scoping, as rows: `(rel, source, is_offender)`.
+# The repo-wide assertion above cannot distinguish a working detector from a
+# broken one — today's tree has exactly one call, inside the sanctioned helper, so
+# "nothing is flagged" is green both when the invariant holds and when the scan
+# stopped seeing calls at all. Only synthetic sources separate the two, and only
+# they can carry the bypass that does not exist yet.
+VERIFY_COMMANDS_SCOPE_CASES = [
+    # The bug this refuses, in the shape it would actually take: a fourth review
+    # gate composing run+classify itself, against whichever root it picked (#695).
+    (
+        "fourth-gate-direct-call",
+        "verify.py",
+        "def verify_review_epic(task, paths, policy):\n"
+        "    return verify_commands_outcome(policy, paths.project)\n",
+        True,
+    ),
+    # Same bypass reached through the module attribute, from outside core — the
+    # spelling any non-verify caller would use.
+    (
+        "engine-attribute-call",
+        "engine.py",
+        "from . import verify\n"
+        "def _verify_review(self, task):\n"
+        "    return verify.verify_commands_outcome(self.policy, self.workspace.root)\n",
+        True,
+    ),
+    # Being verify.py is not enough on its own: a second helper in the same file
+    # calling the composition with some other cwd is exactly what the position
+    # bit exists to catch, and a file-wide exemption would wave it through.
+    (
+        "verify-other-helper",
+        "verify.py",
+        "def _verify_something_else(policy, paths):\n"
+        "    return verify_commands_outcome(policy, paths.project)\n",
+        True,
+    ),
+    # The name does not travel: a `_verify_review_commands` grown in another
+    # module cannot sanction itself, which is why the filter pairs the enclosing
+    # function with the FILE.
+    (
+        "helper-name-in-another-file",
+        "sweep.py",
+        "def _verify_review_commands(policy, paths):\n"
+        "    return verify_commands_outcome(policy, paths.repo_root)\n",
+        True,
+    ),
+    # …while the real sanctioned site stays silent.
+    (
+        "sanctioned-helper",
+        "verify.py",
+        "def _verify_review_commands(policy, paths, *, on_results=None):\n"
+        "    return verify_commands_outcome(policy, paths.repo_root, on_results=on_results)\n",
+        False,
+    ),
+    (
+        "rename-on-import",
+        "engine.py",
+        "from .verify import verify_commands_outcome as classify\n"
+        "def _verify_review(self, task):\n"
+        "    return classify(self.policy, self.workspace.root)\n",
+        True,
+    ),
+    (
+        "assignment-alias",
+        "engine.py",
+        "from . import verify\n"
+        "classify = verify.verify_commands_outcome\n"
+        "def _verify_review(self, task):\n"
+        "    return classify(self.policy, self.workspace.root)\n",
+        True,
+    ),
+    (
+        "annotated-assignment-alias",
+        "engine.py",
+        "from . import verify\n"
+        "classify: object = verify.verify_commands_outcome\n"
+        "def _verify_review(self, task):\n"
+        "    return classify(self.policy, self.workspace.root)\n",
+        True,
+    ),
+    (
+        "literal-getattr",
+        "engine.py",
+        "from . import verify\n"
+        "def _verify_review(self, task):\n"
+        "    return getattr(verify, 'verify_commands_outcome')(self.policy, self.workspace.root)\n",
+        True,
+    ),
+    (
+        "sanctioned-assignment-alias",
+        "verify.py",
+        "classify = verify_commands_outcome\n"
+        "def _verify_review_commands(policy, paths, *, on_results=None):\n"
+        "    return classify(policy, paths.repo_root, on_results=on_results)\n",
+        False,
+    ),
+    # A nested def inside the helper is still inside it — `ast.walk` descends, and
+    # a closure that forwards the composition is not a second call site.
+    (
+        "nested-inside-helper",
+        "verify.py",
+        "def _verify_review_commands(policy, paths, *, on_results=None):\n"
+        "    def run():\n"
+        "        return verify_commands_outcome(policy, paths.repo_root, on_results=on_results)\n"
+        "    return run()\n",
+        False,
+    ),
+    # The bound this guard deliberately does NOT claim: `run_verify_commands` has
+    # three legitimate callers on two roots, so calling it directly is not an
+    # offence here. Widening to it would turn the allowlist into a caller list.
+    (
+        "run_verify_commands-untouched",
+        "cli.py",
+        "for result in verify.run_verify_commands(pol, cwd):\n    pass\n",
+        False,
+    ),
+    # Prose naming the function is a Constant, not a Call — `cli._reverify`'s
+    # "Deliberately NOT `verify_commands_outcome`" docstring must stay silent, or
+    # the first fix would be to delete the sentence that explains the design.
+    (
+        "prose-in-docstring",
+        "cli.py",
+        'def _reverify(project, cwd):\n    """Deliberately NOT verify_commands_outcome."""\n',
+        False,
+    ),
+]
+
+
+# The classifier half's scoping, as rows: `(rel, source, is_offender)`. Same
+# reason the wrapper's matrix is executable — today's tree has exactly two calls,
+# both sanctioned, so the repo-wide assertion is green whether the invariant holds
+# or the scan stopped seeing calls.
+VERIFY_CLASSIFY_SCOPE_CASES = [
+    # THE hole the wrapper guard leaves open, in the shape it would actually be
+    # written: a fourth gate composing run+classify by hand and picking its own
+    # root, twice. Note `run_verify_commands` inside it is deliberately NOT an
+    # offence — only the classifier call is flagged.
+    (
+        "hand-composed-fourth-gate",
+        "verify.py",
+        "def verify_review_epic(task, paths, policy):\n"
+        "    return verify_command_results_outcome(\n"
+        "        run_verify_commands(policy, paths.project), paths.project\n"
+        "    )\n",
+        True,
+    ),
+    # The same bypass from outside core, through the module attribute.
+    (
+        "sweep-attribute-call",
+        "sweep.py",
+        "from . import verify\n"
+        "def _verify_review(self, task):\n"
+        "    results = verify.run_verify_commands(self.policy, self.workspace.paths.project)\n"
+        "    return verify.verify_command_results_outcome(results, self.workspace.paths.project)\n",
+        True,
+    ),
+    # Being verify.py is not enough: a second helper there calling the classifier
+    # is exactly what the position bit exists to catch.
+    (
+        "verify-other-helper",
+        "verify.py",
+        "def _classify_somewhere_else(results, cwd):\n"
+        "    return verify_command_results_outcome(results, cwd)\n",
+        True,
+    ),
+    # The two sanctioned positions stay silent — and they are FILE-SPECIFIC ...
+    (
+        "sanctioned-wrapper-in-verify",
+        "verify.py",
+        "def verify_commands_outcome(policy, cwd, *, on_results=None):\n"
+        "    results = run_verify_commands(policy, cwd)\n"
+        "    return verify_command_results_outcome(results, cwd)\n",
+        False,
+    ),
+    (
+        "rename-on-import",
+        "sweep.py",
+        "from .verify import verify_command_results_outcome as classify\n"
+        "def _verify_review(self, task):\n"
+        "    return classify(results, self.workspace.root)\n",
+        True,
+    ),
+    (
+        "assignment-alias",
+        "sweep.py",
+        "from . import verify\n"
+        "classify = verify.verify_command_results_outcome\n"
+        "def _verify_review(self, task):\n"
+        "    return classify(results, self.workspace.root)\n",
+        True,
+    ),
+    (
+        "annotated-assignment-alias",
+        "sweep.py",
+        "from . import verify\n"
+        "classify: object = verify.verify_command_results_outcome\n"
+        "def _verify_review(self, task):\n"
+        "    return classify(results, self.workspace.root)\n",
+        True,
+    ),
+    (
+        "sanctioned-dev-side-in-engine",
+        "engine.py",
+        "def _verify_commands_with_results(self, task, verification_stage):\n"
+        "    results = tuple(verify.run_verify_commands(self.policy, self.workspace.root))\n"
+        "    return verify.verify_command_results_outcome(list(results), self.workspace.root)\n",
+        False,
+    ),
+    # ... which is the half a NAME-ONLY collection would lose: each sanctioned
+    # function name, in the OTHER file, is an offender. Note where that half is
+    # actually enforced — `sanctioned_classify_calls` keys the enclosing name off
+    # `VERIFY_CLASSIFY_CHOKEPOINT.get(rel)`, so a call in the wrong file never
+    # enters the set at all. The `rel in VERIFY_CLASSIFY_CHOKEPOINT` test in
+    # `_verify_classify_offenders` is therefore belt-and-braces, kept for symmetry
+    # with the wrapper filter (where it IS load-bearing, since that sanctioned
+    # caller is a bare name). ABLATION for these two rows: relax the collection to
+    # `fn.name in set(VERIFY_CLASSIFY_CHOKEPOINT.values())` — dropping the filter's
+    # redundant file test does NOT redden them, and mistaking one for the other
+    # would leave the real keying untested.
+    (
+        "dev-side-name-in-verify",
+        "verify.py",
+        "def _verify_commands_with_results(self, task, verification_stage):\n"
+        "    return verify_command_results_outcome(results, self.workspace.root)\n",
+        True,
+    ),
+    (
+        "wrapper-name-in-engine",
+        "engine.py",
+        "def verify_commands_outcome(policy, cwd):\n"
+        "    return verify_command_results_outcome(run_verify_commands(policy, cwd), cwd)\n",
+        True,
+    ),
+    # A nested def inside a sanctioned function is still inside it.
+    (
+        "nested-inside-sanctioned",
+        "verify.py",
+        "def verify_commands_outcome(policy, cwd, *, on_results=None):\n"
+        "    def classify(results):\n"
+        "        return verify_command_results_outcome(results, cwd)\n"
+        "    return classify(run_verify_commands(policy, cwd))\n",
+        False,
+    ),
+    # Prose is a Constant, not a Call: the docstrings that explain this very
+    # split must not be the thing that trips it.
+    (
+        "prose-in-docstring",
+        "verify.py",
+        "def _verify_review_commands(policy, paths):\n"
+        '    """Kept separate from verify_command_results_outcome."""\n',
+        False,
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("label", "rel", "source", "is_offender"),
+    VERIFY_CLASSIFY_SCOPE_CASES,
+    ids=[c[0] for c in VERIFY_CLASSIFY_SCOPE_CASES],
+)
+def test_verify_classify_detector_is_scoped_to_its_two_compositions(
+    label, rel, source, is_offender
+):
+    """Both halves of the classifier detector, driven through `_scan_source` — the
+    same code path the real scan uses — so "flags the hand-composed gate" and
+    "stays silent on the two real compositions" are asserted rather than inferred
+    from an empty repo-wide result."""
+    findings = [f for f in _scan_source(source, rel) if f[0] == "verifyclassify"]
+    offenders = _verify_classify_offenders(findings)
+    assert bool(offenders) is is_offender, (
+        f"a verify_command_results_outcome call in {rel} here should "
+        f"{'be refused' if is_offender else 'be allowed'}:\n{source}"
+    )
+
+
+def test_verify_classify_detector_leaves_run_verify_commands_alone():
+    """The bound this guard does NOT claim, asserted so it cannot drift shut.
+
+    `run_verify_commands` has three legitimate callers on two different roots (the
+    dev side in `Workspace.root`, `_verify_review_commands` in `repo_root`, and
+    `cli._reverify`), so it is not a chokepoint of this shape and the spec forbids
+    widening to it. The hand-composed probe above contains such a call precisely so
+    a future widening reddens here instead of silently turning the allowlist into a
+    caller list."""
+    source = (
+        "def verify_review_epic(task, paths, policy):\n"
+        "    return verify_command_results_outcome(\n"
+        "        run_verify_commands(policy, paths.project), paths.project\n"
+        "    )\n"
+    )
+    findings = _scan_source(source, "verify.py")
+    # exactly ONE finding from that snippet, and it is the classifier call
+    assert [f[0] for f in findings if f[0].startswith("verify")] == ["verifyclassify"]
+
+
+@pytest.mark.parametrize(
+    ("label", "rel", "source", "is_offender"),
+    VERIFY_COMMANDS_SCOPE_CASES,
+    ids=[c[0] for c in VERIFY_COMMANDS_SCOPE_CASES],
+)
+def test_verify_commands_detector_is_scoped_to_the_review_helper(label, rel, source, is_offender):
+    """Both halves of the detector, driven through `_scan_source` — the same code
+    path the real scan uses — so "flags the bad shape" and "stays silent on the
+    good one" are asserted rather than inferred from an empty repo-wide result."""
+    findings = [f for f in _scan_source(source, rel) if f[0] == "verifycmd"]
+    offenders = _verify_command_offenders(findings)
+    assert bool(offenders) is is_offender, (
+        f"a verify_commands_outcome call in {rel} here should "
+        f"{'be refused' if is_offender else 'be allowed'}:\n{source}"
     )
 
 
